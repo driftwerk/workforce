@@ -201,14 +201,18 @@ jobs:
         timeout-minutes: 30
         run: |
           set -euo pipefail
-          # The image runs as its own user; let it write the cached models.
-          mkdir -p ~/vellev-models && chmod 0777 ~/vellev-models
+          # The image runs as its own user; give it writable host directories
+          # for its store and cache, and the cached models.
+          mkdir -p ~/vellev-models "$RUNNER_TEMP/vellev-data"
+          chmod 0777 ~/vellev-models "$RUNNER_TEMP/vellev-data"
           docker run -d --name vellev --network host \
             -e VELLEV_LISTEN=127.0.0.1:8080 \
             -e VELLEV_DATABASE_URL=postgres://vellev:vellev@127.0.0.1:5432/vellev \
-            -e VELLEV_STORE=file:///var/lib/vellev/store \
+            -e VELLEV_STORE=file:///data/store \
+            -e VELLEV_CACHE_DIR=/data/cache \
             -e VELLEV_MODEL_DIR=/models \
             -e VELLEV_API_KEYS="$VELLEV_TEST_KEY" \
+            -v "$RUNNER_TEMP/vellev-data:/data" \
             -v "$HOME/vellev-models:/models" \
             "$VELLEV_IMAGE" serve
           for _ in $(seq 1 120); do
