@@ -1,0 +1,7 @@
+[package]
+name = "workforce-build-support"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "Build-script helpers: declare directories embedded at compile time as build inputs"

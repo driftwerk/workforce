@@ -1,0 +1,379 @@
+---
+title: Skills
+description: WASM extensions that add tools, and instruction skills that teach procedures, installed and updated on every agent without a hub restart.
+---
+
+# Skills
+
+A WASM skill is a small WebAssembly program that adds one or more tools to the agents
+on an install. They run in a sandbox: they can only reach the hosts, credentials, and
+platform tools their manifest declares, and every call runs as the person who asked
+for it, never as the agent. Installing or updating a skill takes effect immediately
+on every agent, with no restart.
+
+Built-in service integrations such as Jira, Datadog, and Metabase are also called
+skills in the admin UI; those are enabled with credentials and are covered under
+[adapters](/docs/adapters/jira). This page is about the skills you write or install:
+WASM skills, and the [instruction skills](#instruction-skills) that teach agents a
+procedure.
+
+## Installing skills
+
+A skill comes in one of two kinds, and the files in its directory tell you which:
+
+| The directory has | Kind | What it does |
+|---|---|---|
+| `SKILL.md` | External (instruction) skill | Instructions an agent loads with `system.enable_skill` and carries out with its own tools |
+| `Skill.toml` and Rust source | WASM skill | Adds tools named `<skill>.<tool>` |
+
+There are two ways to install either kind.
+
+**From a catalog, by name.** If a [catalog](#installing-from-a-catalog) configured on the
+install lists the skill, install it from the Skills page, or ask an agent to: it finds the
+skill with `system.list_catalog_skills` and installs it with
+`system.install_catalog_skill`. The catalog knows each skill's kind. Check here first.
+
+**From its repository.** Any other skill installs from where it lives, with the tool for
+its kind: `system.install_external_skill` for a `SKILL.md`, `wasm_skill.install` for a
+`Skill.toml`. Both take the same GitHub reference:
+
+```
+system.install_external_skill github_repo="acme/skills@main#subpath=hello-world"
+wasm_skill.install github_repo="acme/skills@<40-hex-commit>#subpath=hello-counter"
+```
+
+`owner/repo` names the repository, `@<ref>` a branch, tag, or commit (the default branch
+when it is left out), and `#subpath=<dir>` the skill's directory inside it. A WASM install
+must be pinned to the exact bytes it loads: name a full 40-hex commit, which is built on
+the install and so needs permission to build there, or, for a skill at the root of its
+repository, pass the `sha256` of a published release `.wasm`. Call the tool for the wrong
+kind and it says which kind it found and gives the call to make.
+
+`system.install_external_skill` also takes `source`: a skill directory in your workspace,
+such as one you have just written (a relative path is read from your workspace). A holder
+of `skills_manage` can also pass any directory on the install or a git URL on another host.
+`wasm_skill.install` also takes a project in your workspace (`project_path`) or a built
+module (`wasm_path`). A directory holding both a `SKILL.md` and a `Skill.toml` installs as
+whichever kind the tool you call handles.
+
+### Private repositories
+
+Both tools read GitHub with a personal access token from the vault, the same token the
+[GitHub adapter](/docs/adapters/github) uses: `skills/github/workspaces/<owner>/token` for
+that organisation, otherwise `skills/github/token`. A token you store with `vault.set` is
+your own and wins over any token an administrator stores for everyone. Without a token
+only public repositories can be read, and a failed install says which vault path to set.
+Repositories on other hosts are cloned without credentials, so they must be public; the
+GitHub token is never sent to them. A catalog reads its repository with its own token
+instead.
+
+### Updating, removing, and who can install
+
+| | External skill | WASM skill |
+|---|---|---|
+| Update | Install it again, from its catalog, its repository or its directory. It keeps its `config.toml`, owner and sharing. | Install it again. A catalog install keeps its configuration. `wasm_skill.install` replaces the configuration with the `config` you pass, so pass all of it. `wasm_skill.update` moves a skill installed from a release tag to a newer release. |
+| List what is installed | `system.list_external_skills` | `wasm_skill.list` |
+| Remove | `system.uninstall_external_skill` | `wasm_skill.uninstall` |
+| Who can install | Any user, for a skill of their own, from GitHub or a directory in their workspace. Holders of the `skills_manage` capability (administrators by default) install for everyone, from any directory on the install or any git host. A catalog install needs `skills_manage`. | Any user, for a skill of their own; building from a commit or a project also needs permission to build on the install. A catalog install needs `skills_manage`. |
+| Who can use it | Whoever installed it, until they [share it](#who-can-use-a-skill). An install by a holder of `skills_manage`, a catalog install, and a skill put in the skills directory by hand are for everyone. | Whoever installed it, until they [share it](#who-can-use-a-skill). A catalog install is for everyone. |
+
+A skill is identified by its name wherever it came from, so installing it again from its
+catalog replaces a copy installed from its repository, and the other way round. The
+exception is an external skill installed from a local directory whose name differs from
+the skill's: remove that copy first. A name belongs to one skill: you cannot install over a
+skill that belongs to someone else or to everyone unless you manage it, over a built-in
+skill's name, or, with an external skill of your own, over a WASM skill's name.
+
+From Claude Code over [remote MCP](/docs/reference/remote-mcp), the `wasm_skill.*` tools
+manage WASM skills, and `system.install_external_skill`, `system.list_external_skills`,
+`system.uninstall_external_skill` and `system.publish_external_skill` manage external
+skills. A `source` directory there is on the install, not your machine, so install an
+external skill you wrote locally by pushing it to GitHub and passing `github_repo`. The
+catalog install tool is offered there only when an operator adds it to
+`[remote_mcp] tools_allow`; otherwise install catalog skills in chat with an agent, or on
+the Skills page.
+
+## Lifecycle
+
+The `wasm_skill` tools carry a skill from idea to production, in chat or from
+Claude Code over [remote MCP](/docs/reference/remote-mcp):
+
+1. `wasm_skill.guide` returns the full authoring reference: the manifest format,
+   the guest API, budgets, and worked examples. Read it before writing one.
+2. `wasm_skill.scaffold` creates a project from a description.
+3. `wasm_skill.build` compiles it, and `wasm_skill.install` makes the skill's tools
+   live for the agents. Installing again replaces it.
+4. `wasm_skill.test` runs one of an installed skill's tools against mock credentials
+   and platform tools, with no grants needed.
+5. `wasm_skill.list` shows the skills you can use, with their owner, visibility, and
+   your access level. `wasm_skill.update` moves a skill installed from a GitHub release
+   to a newer release, and `wasm_skill.uninstall` removes it.
+
+You can also install straight from GitHub (see [Installing skills](#installing-skills)),
+move a skill between installs with `wasm_skill.export` and `wasm_skill.import`, and open
+a pull request to a catalog with `wasm_skill.publish`.
+
+## What a skill declares
+
+The manifest is the skill's consent contract. It lists the capabilities the skill
+uses, the network hosts it may fetch from, the credentials it needs, the platform
+tools it may invoke, and the tools it exposes. Anything not declared is refused at
+runtime.
+
+```toml
+[capabilities]
+http = true
+vault = true
+tools = true
+
+[network]
+allowed_hosts = ["api.example.com"]
+
+[[credentials]]
+name = "api_token"
+scope = "user"          # each user provides their own, or "shared" for one value
+
+[[permissions]]
+tool = "slack.post_message"
+
+[[tools]]
+name = "enable_users"
+description = "Enable a batch of user emails"
+```
+
+## Credentials and consent
+
+The agent can never place a secret within a skill's reach. Only a person can, by
+typing two commands in chat:
+
+```
+cmd: secret api_token <value>
+cmd: skill grant my-skill api_token
+```
+
+The first stashes the value for a short time. The second copies it into a vault
+locker that only this skill can read and records your consent for the skill's
+current contract. A `shared` credential is one value for every caller, so the
+skill's owner provides it.
+
+Tool permissions need their own approval: `cmd: skill grant my-skill tools` lets
+the skill invoke its declared platform tools as you. An administrator can approve
+that for everyone with `cmd: skill grant my-skill tools shared`.
+
+Grants are pinned to the contract. Rebuilding the code keeps every grant; changing
+the capabilities, hosts, credentials, or permissions invalidates them until you run
+`cmd: skill grant` again. `cmd: skill grants` shows your grants and whether they are
+still valid, and `cmd: skill revoke my-skill api_token` removes one along with its
+stored value.
+
+### From Claude Code
+
+The same approvals are `skill.*` tools on your [remote MCP](/docs/reference/remote-mcp)
+connection, where the caller is you under your own token rather than an agent. The
+value still never passes through the grant tool: store it in your own vault first,
+then grant it.
+
+```
+vault.set   path="api_token" value="<value>"      # your per-user scope
+skill.grant skill="my-skill" credential="api_token"
+```
+
+`skill.grant` reads the value from your per-user vault path (the credential's name
+by default, or `vault_path` to point elsewhere) and copies it into the skill's
+locker. `credential = "tools"` approves the declared tool permissions, with
+`shared = true` for an administrator to cover everyone. `skill.grants` reports
+validity, `skill.revoke` removes a grant, and `skill.share`, `skill.unshare`, and
+`skill.visibility` control who can use a skill you own, of either kind. Ask `help` for
+the topic `skill` to read this page from Claude Code.
+
+## Who can use a skill
+
+A skill of either kind belongs to whoever installed it and starts private. The owner
+controls access:
+
+- `cmd: skill visibility my-skill everyone` makes it available to every user on the
+  install, `team` to anyone who shares a team with you, and `private` takes both back.
+  Passing `visibility = "everyone"` or `visibility = "team"` on install does the same.
+  A team-visible skill lets a teammate **use** it, never edit it, and a teammate who
+  joins or leaves a team gains or loses it at once. `team` follows *your* teams, so
+  while you are in none it reaches nobody but you, and the reply says so.
+- `cmd: skill share my-skill @someone` lets one person use it; add `manage` to let
+  them update and uninstall it too. `cmd: skill unshare` reverses it. Name a whole
+  team with `team:<name>` to share it with its members, at either level.
+- `cmd: skill shares my-skill` lists who it is shared with, each marked `run` or
+  `manage`, people and teams alike. Chat changes one grantee at a time; the Skills
+  page replaces the whole set at once.
+- `cmd: skill transfer my-skill @someone`, or **Transfer** on the Skills page, hands
+  the skill to another active member for good: they own it afterwards and you keep
+  nothing, unless you tick **Keep manage access** in the dialog, which leaves you a
+  `manage` share in the same step — enough to edit it, never to re-share it or take it
+  back. Nobody has to re-approve anything — a grant pins the skill's contract, not
+  its owner — but if the skill declares a `shared`-scope credential, only you could
+  ever have placed its value, and any value you did place stays in the vault and stays
+  readable by code they now control. The reply names each such credential so you can
+  decide whether to rotate or revoke it.
+- Only the owner or an administrator changes who can reach a skill, or hands it over.
+  A `manage` grantee can edit it but not re-share it, and never transfers it. A
+  [workflow](/docs/concepts/workflows#sharing-and-visibility),
+  [playbook](/docs/concepts/playbooks#sharing) or
+  [monitor](/docs/concepts/monitors#sharing-and-visibility) a member owns reads the
+  same way. Whenever an administrator reaches past an owner — a skill's or a
+  definition's — it is written to the audit log against them; an owner's own work,
+  and a `manage` grantee's, is not.
+
+A private external skill stays out of every other user's agent prompt, and
+`system.enable_skill` will not load it for them. If a WASM skill and an external skill
+have the same name, these commands act on the WASM skill; manage the external one on the
+Skills page.
+
+Skills installed for the whole install have no owner: catalog installs, external skills
+installed by a holder of `skills_manage`, and skills put in the skills directory by hand.
+Everyone can use them. Admins administer those WASM skills, and holders of
+`skills_manage` administer those external skills.
+
+## Instruction skills
+
+An instruction skill is a directory holding a `SKILL.md`: a short header, then the
+procedure an agent follows, carried out with the tools it already has. Tools and the
+Skills page call these external skills.
+
+```markdown
+---
+name: hello-world
+version: 1.0.0
+description: Welcome a new starter with a link to the handbook
+requires:
+  bins: [curl]
+---
+1. Check the handbook is reachable with `curl` through `exec.run`.
+2. Send the new starter a welcome message that links to it.
+```
+
+`requires` lists the binaries (`bins`) and environment variables (`env`) the procedure
+needs. Every agent sees the name and description of each installed skill its user can
+use, and calls `system.enable_skill` with the name to load the full procedure when a task
+needs it.
+
+Installing, editing, or removing an instruction skill from the Skills page, the API, or
+the agent tools takes effect for every agent that can use it on its next message, with no
+restart. A skill whose requirements are not met, or whose files fail the security scan,
+stays installed but unusable until that is fixed. Install one from its repository with
+`system.install_external_skill` (see [Installing skills](#installing-skills)).
+
+### Writing an instruction skill
+
+Any user can write an instruction skill with an agent, in chat:
+
+1. The agent saves the `SKILL.md` in a directory in your workspace, for example
+   `skills/hello-world/SKILL.md`.
+2. It installs that directory with `system.install_external_skill source="skills/hello-world"`.
+   The skill is yours and private, and your agents can use it from your next message.
+3. To change it, edit the file and install the same directory again. Bump `version` in the
+   header when a change should be published.
+4. To let others use it, type `cmd: skill share hello-world @someone`,
+   `cmd: skill share hello-world team:platform`, or
+   `cmd: skill visibility hello-world team|everyone`.
+5. To add it to a catalog, ask the agent to run
+   `system.publish_external_skill skill="hello-world"`, which opens a pull request on the
+   catalog's repository with the skill's files and its entry (see
+   [Adding a skill to a catalog](#adding-a-skill-to-a-catalog)).
+6. Once the pull request is merged, anyone with `skills_manage` can install it from the
+   catalog, for everyone on an install that does not have it yet. Where your copy is already
+   installed, a catalog install keeps you as its owner and keeps its sharing, so step 4 is
+   still how others there get to use it.
+
+`system.list_external_skills` shows the skills you can use with their owner and visibility,
+and `system.uninstall_external_skill` removes one you manage. The Skills page lists them
+under External skills, where their owner can share them, choose who reaches them —
+**Private**, **My teams** or **Everyone** — or uninstall them. **Everyone** opens the
+skill to this install only; it is not a catalog pull request.
+
+## Installing from a catalog
+
+A catalog is a Git repository that lists skills of both kinds for installs to pick
+from. An administrator adds it to `workforce.toml`:
+
+```toml
+[[skills.catalogs]]
+name = "example"
+repo = "https://github.com/acme/skills"
+ref = "main"
+```
+
+A private repository also needs a token in the shared vault at
+`skills/catalog/example/token`.
+
+The catalog's skills appear on the Skills page, and agents can use
+`system.list_catalog_skills` to list them and `system.install_catalog_skill` to install
+one. The install tool needs the `skills_manage` capability, which only administrators
+have by default. Without it, ask an administrator to install the skill: a catalog install
+is for everyone. Either way, the skill is live on every agent as soon as the install
+returns, unless its requirements or security scan hold it back, in which case the install
+says why.
+
+A skill installed from a catalog belongs to the whole install, not to whoever installed
+it, so everyone can use it. Admins administer a WASM skill installed this way, and holders
+of `skills_manage` an external one.
+
+Installing a skill that is already installed updates it to the catalog's version. An
+instruction skill keeps its `config.toml`, owner, and sharing, and a WASM skill keeps its
+configuration, owner, and sharing, so a skill someone installed for themselves stays
+theirs.
+
+Some WASM entries are built from source when they are installed. From chat, those
+installs also follow the `[skills.wasm]` settings: `allow_build_on_install` must be on,
+`require_sha256_pin` needs the catalog's `ref` to be a full commit, and the caller must
+be allowed to build skills on the install.
+
+`workforce skill catalog-install` installs from a catalog on the command line. It runs
+outside the hub, so a running hub picks the skill up when it next starts.
+
+### Adding a skill to a catalog
+
+A catalog repository keeps each skill in a directory of its own and lists it in its
+manifest, `workforce/catalog.json` unless the catalog's `manifest` setting names another
+path:
+
+```
+workforce/
+  catalog.json
+  external/hello-world/SKILL.md
+  wasm/hello-counter/Skill.toml, Cargo.toml, Cargo.lock, src/
+```
+
+```json
+{
+  "skills": [
+    { "name": "hello-world", "kind": "external", "subpath": "workforce/external/hello-world",
+      "version": "1.0.0", "description": "Welcome a new starter with a link to the handbook",
+      "requires_bins": ["curl"] },
+    { "name": "hello-counter", "kind": "wasm", "subpath": "workforce/wasm/hello-counter",
+      "version": "0.1.0", "description": "Count the greetings sent this week" }
+  ]
+}
+```
+
+`name` must match the name in the skill's `SKILL.md` or `Skill.toml`. A WASM entry without
+a built module is built from source when it is installed; to ship a built module instead,
+commit the `.wasm` and add `wasm_path`, relative to `subpath`, with its `sha256`. Keep the
+entry's `version` the same as the skill's own and bump both on every change: the Skills
+page offers an update when the entry's version differs from the installed copy's, and
+`system.list_catalog_skills` reports both.
+
+Add a skill with a pull request holding its directory and its entry. For a skill you
+manage, the hub opens that pull request for you: `system.publish_external_skill` for an
+instruction skill, with its installed files, and `wasm_skill.publish` for a WASM skill,
+with the source stored when it was built. Each adds or updates the skill's entry, pushes a
+branch named `skill/<name>-v<version>` with your own GitHub token for the catalog
+repository's owner (`skills/github/workspaces/<owner>/token`, else `skills/github/token`)
+rather than the catalog's read token, and opens the pull request. A published instruction
+skill leaves out the `config.toml` at the top of its directory, hidden files and
+directories such as `.git`, any `target/` directory, and symbolic links; everything else in
+the installed directory is published. A version the catalog already holds with different
+content is refused: bump the version, install the skill again, and publish again.
+
+## Limits
+
+Each invocation gets a bounded CPU budget, memory, and a cap on tool calls and HTTP
+fetches. Internal and metadata network addresses are always refused. Declared
+credentials are read-only to skill code and never appear in the agent's context.

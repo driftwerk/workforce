@@ -1,0 +1,7 @@
+{
+  "input": "nope",
+  "result": {
+    "ok": false,
+    "error": "payload must be a JSON object"
+  }
+}

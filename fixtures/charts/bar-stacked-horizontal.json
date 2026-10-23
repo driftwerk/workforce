@@ -1,0 +1,57 @@
+{
+  "input": {
+    "kind": "bar",
+    "stacked": true,
+    "horizontal": true,
+    "unit": "£",
+    "x_label": "Region",
+    "y_label": "Revenue",
+    "labels": [
+      "North",
+      "South"
+    ],
+    "series": [
+      {
+        "data": [
+          1200.5,
+          800
+        ]
+      },
+      {
+        "data": [
+          300,
+          -50
+        ]
+      }
+    ]
+  },
+  "result": {
+    "ok": true,
+    "spec": {
+      "kind": "bar",
+      "labels": [
+        "North",
+        "South"
+      ],
+      "series": [
+        {
+          "data": [
+            1200.5,
+            800
+          ]
+        },
+        {
+          "data": [
+            300,
+            -50
+          ]
+        }
+      ],
+      "stacked": true,
+      "horizontal": true,
+      "x_label": "Region",
+      "y_label": "Revenue",
+      "unit": "£"
+    }
+  }
+}

@@ -1,0 +1,119 @@
+HTTP 200
+x-codex-active-limit: premium
+x-codex-plan-type: prolite
+x-codex-primary-used-percent: 0
+x-codex-secondary-used-percent: 0
+x-codex-primary-window-minutes: 10080
+x-codex-primary-over-secondary-limit-percent: 0
+x-codex-secondary-window-minutes: 0
+x-codex-primary-reset-after-seconds: 603059
+x-codex-secondary-reset-after-seconds: 0
+x-codex-primary-reset-at: 1791270464
+x-codex-secondary-reset-at: 
+x-codex-credits-has-credits: False
+x-codex-credits-balance: 0
+x-codex-credits-unlimited: False
+x-codex-turn-state: gAAAAABqu2qOG5G0a2JrqMwZ_bb8g1bm5KJ0oYEVa3i5xn4GIeSXfB67YMro8OaPnC0FVAmQa8SE8epiQF8VqCVk4e0KNiJhYCbKVyj85dEzJ6g1vys8cAyvcLwnKg2jlFK_NqsOK7yySADGMXufoah-mtqE-3uzEBd2z_PyZleB8EinUr2Z8-KPRpHU_PcLvqPeW1M9MFLNtg0jhekUShstpo6dtQ8YVNJXovfFViAhs8v2VMD9i_OAYU6OaSMIVD-X6vJgeb2SlhUvG6Wf9jb2z5xKEpWml_GiSboDXlDCVmyxomRPKM65jTmD0Zl82to3TfchykIzRXruOTSsqn7b-jFyetNS_z1XyyHkSlZN3llV72-m_qUyLup1FywtT88uuTsmbL27eQ5mHZMxwsbyPNLcy73w8MwsuMep62Uct2zqHE0N5nIngDUk9wwh4-JDV3zrfazMiCLL_l20pok5RhPPv7ylu4C2ei1IebNVocQfqrPVTUCi0QOO_tgQ93aeOXXbjTkBdsojrPXYTQooksx8AM7AhIz6ELEcCbUz_t6p2qmZKF_qv_gNEvh_97pYpRapPf77qGyEQlWakQ_jMslWt935qgGKPbMKYLpNTFOwF1dko_1roO-rfIBO0rENwxWuiJX12ea1kFsg5mC9RK5dDLRWSy8lIWP65uDH3ZuicwRl6YjjJj7I_z9ty89zpE72qLAQGldmuzOrgp4qCWm4-sLnsmmyhllCNxle61V5_9sbkHYlNs9NcnwnK_IE62sc7IUV
+
+event: response.created
+data: {"type":"response.created","response":{"id":"resp_0e7039d7d90c10f8016abb6a8e740087d2b713190230f1c78d","object":"response","created_at":1790667406,"status":"in_progress","access_programs":{"cyber":"daybreak_blue"},"background":false,"completed_at":null,"error":null,"frequency_penalty":0.0,"incomplete_details":null,"instructions":"You are Allan, a concise assistant. Use tools when asked.","max_output_tokens":null,"max_tool_calls":null,"model":"gpt-5.5","moderation":null,"output":[],"parallel_tool_calls":false,"presence_penalty":0.0,"previous_response_id":null,"prompt_cache_key":"00000000-0000-4000-8000-000000000001","prompt_cache_retention":"24h","reasoning":{"context":"current_turn","effort":"medium","mode":"standard","summary":"detailed"},"safety_identifier":"user-000000000000000000000002","service_tier":"auto","store":false,"temperature":1.0,"text":{"format":{"type":"text"},"verbosity":"medium"},"tool_choice":"auto","tool_usage":{"image_gen":{"input_tokens":0,"input_tokens_details":{"image_tokens":0,"text_tokens":0},"output_tokens":0,"output_tokens_details":{"image_tokens":0,"text_tokens":0},"total_tokens":0},"web_search":{"num_requests":0}},"tools":[],"top_logprobs":0,"top_p":0.98,"truncation":"disabled","usage":null,"user":null,"metadata":{}},"sequence_number":0}
+
+event: response.in_progress
+data: {"type":"response.in_progress","response":{"id":"resp_0e7039d7d90c10f8016abb6a8e740087d2b713190230f1c78d","object":"response","created_at":1790667406,"status":"in_progress","access_programs":{"cyber":"daybreak_blue"},"background":false,"completed_at":null,"error":null,"frequency_penalty":0.0,"incomplete_details":null,"instructions":"You are Allan, a concise assistant. Use tools when asked.","max_output_tokens":null,"max_tool_calls":null,"model":"gpt-5.5","moderation":null,"output":[],"parallel_tool_calls":false,"presence_penalty":0.0,"previous_response_id":null,"prompt_cache_key":"00000000-0000-4000-8000-000000000001","prompt_cache_retention":"24h","reasoning":{"context":"current_turn","effort":"medium","mode":"standard","summary":"detailed"},"safety_identifier":"user-000000000000000000000002","service_tier":"auto","store":false,"temperature":1.0,"text":{"format":{"type":"text"},"verbosity":"medium"},"tool_choice":"auto","tool_usage":{"image_gen":{"input_tokens":0,"input_tokens_details":{"image_tokens":0,"text_tokens":0},"output_tokens":0,"output_tokens_details":{"image_tokens":0,"text_tokens":0},"total_tokens":0},"web_search":{"num_requests":0}},"tools":[],"top_logprobs":0,"top_p":0.98,"truncation":"disabled","usage":null,"user":null,"metadata":{}},"sequence_number":1}
+
+event: response.output_item.added
+data: {"type":"response.output_item.added","item":{"id":"msg_0e7039d7d90c10f8016abb6a8f300887d2923e4239d29be566","type":"message","status":"in_progress","content":[],"phase":"final_answer","role":"assistant"},"output_index":0,"sequence_number":2}
+
+event: response.content_part.added
+data: {"type":"response.content_part.added","content_index":0,"item_id":"msg_0e7039d7d90c10f8016abb6a8f300887d2923e4239d29be566","output_index":0,"part":{"type":"output_text","annotations":[],"logprobs":[],"text":""},"sequence_number":3}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"The","item_id":"msg_0e7039d7d90c10f8016abb6a8f300887d2923e4239d29be566","logprobs":[],"obfuscation":"Fl4MDJD5cqc3T","output_index":0,"sequence_number":4}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" sky","item_id":"msg_0e7039d7d90c10f8016abb6a8f300887d2923e4239d29be566","logprobs":[],"obfuscation":"ZrA0MyNVJnGd","output_index":0,"sequence_number":5}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" is","item_id":"msg_0e7039d7d90c10f8016abb6a8f300887d2923e4239d29be566","logprobs":[],"obfuscation":"oKiHTrgFG4BrP","output_index":0,"sequence_number":6}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" blue","item_id":"msg_0e7039d7d90c10f8016abb6a8f300887d2923e4239d29be566","logprobs":[],"obfuscation":"NCbNraJvpIc","output_index":0,"sequence_number":7}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" because","item_id":"msg_0e7039d7d90c10f8016abb6a8f300887d2923e4239d29be566","logprobs":[],"obfuscation":"avLto9Eu","output_index":0,"sequence_number":8}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" air","item_id":"msg_0e7039d7d90c10f8016abb6a8f300887d2923e4239d29be566","logprobs":[],"obfuscation":"MO2yKNfqVX85","output_index":0,"sequence_number":9}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" molecules","item_id":"msg_0e7039d7d90c10f8016abb6a8f300887d2923e4239d29be566","logprobs":[],"obfuscation":"4OiaLP","output_index":0,"sequence_number":10}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" scatter","item_id":"msg_0e7039d7d90c10f8016abb6a8f300887d2923e4239d29be566","logprobs":[],"obfuscation":"II9CFxaR","output_index":0,"sequence_number":11}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" shorter","item_id":"msg_0e7039d7d90c10f8016abb6a8f300887d2923e4239d29be566","logprobs":[],"obfuscation":"IO33w2W0","output_index":0,"sequence_number":12}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"-w","item_id":"msg_0e7039d7d90c10f8016abb6a8f300887d2923e4239d29be566","logprobs":[],"obfuscation":"L2eZQDvnJ0q9IF","output_index":0,"sequence_number":13}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"avelength","item_id":"msg_0e7039d7d90c10f8016abb6a8f300887d2923e4239d29be566","logprobs":[],"obfuscation":"seUh3NI","output_index":0,"sequence_number":14}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" blue","item_id":"msg_0e7039d7d90c10f8016abb6a8f300887d2923e4239d29be566","logprobs":[],"obfuscation":"WVLThd03bS7","output_index":0,"sequence_number":15}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" sunlight","item_id":"msg_0e7039d7d90c10f8016abb6a8f300887d2923e4239d29be566","logprobs":[],"obfuscation":"KZkWRbn","output_index":0,"sequence_number":16}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" more","item_id":"msg_0e7039d7d90c10f8016abb6a8f300887d2923e4239d29be566","logprobs":[],"obfuscation":"wbuT1CToDuQ","output_index":0,"sequence_number":17}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" than","item_id":"msg_0e7039d7d90c10f8016abb6a8f300887d2923e4239d29be566","logprobs":[],"obfuscation":"tnKhS9UWRlT","output_index":0,"sequence_number":18}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" other","item_id":"msg_0e7039d7d90c10f8016abb6a8f300887d2923e4239d29be566","logprobs":[],"obfuscation":"BJs3oFiWPo","output_index":0,"sequence_number":19}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" colors","item_id":"msg_0e7039d7d90c10f8016abb6a8f300887d2923e4239d29be566","logprobs":[],"obfuscation":"VOfVckO99","output_index":0,"sequence_number":20}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":",","item_id":"msg_0e7039d7d90c10f8016abb6a8f300887d2923e4239d29be566","logprobs":[],"obfuscation":"phWUBsceCS1wJM8","output_index":0,"sequence_number":21}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" making","item_id":"msg_0e7039d7d90c10f8016abb6a8f300887d2923e4239d29be566","logprobs":[],"obfuscation":"ucf1Gkw6V","output_index":0,"sequence_number":22}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" blue","item_id":"msg_0e7039d7d90c10f8016abb6a8f300887d2923e4239d29be566","logprobs":[],"obfuscation":"HEYVI0b1jaQ","output_index":0,"sequence_number":23}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" light","item_id":"msg_0e7039d7d90c10f8016abb6a8f300887d2923e4239d29be566","logprobs":[],"obfuscation":"80gPI14mo1","output_index":0,"sequence_number":24}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" come","item_id":"msg_0e7039d7d90c10f8016abb6a8f300887d2923e4239d29be566","logprobs":[],"obfuscation":"MGlNtKnJP9Y","output_index":0,"sequence_number":25}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" from","item_id":"msg_0e7039d7d90c10f8016abb6a8f300887d2923e4239d29be566","logprobs":[],"obfuscation":"OtFRolMw2RE","output_index":0,"sequence_number":26}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" all","item_id":"msg_0e7039d7d90c10f8016abb6a8f300887d2923e4239d29be566","logprobs":[],"obfuscation":"844DdbNhAJQw","output_index":0,"sequence_number":27}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" directions","item_id":"msg_0e7039d7d90c10f8016abb6a8f300887d2923e4239d29be566","logprobs":[],"obfuscation":"FiiW3","output_index":0,"sequence_number":28}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":".","item_id":"msg_0e7039d7d90c10f8016abb6a8f300887d2923e4239d29be566","logprobs":[],"obfuscation":"DXu3F03yTxGTFu7","output_index":0,"sequence_number":29}
+
+event: response.output_text.done
+data: {"type":"response.output_text.done","content_index":0,"item_id":"msg_0e7039d7d90c10f8016abb6a8f300887d2923e4239d29be566","logprobs":[],"output_index":0,"sequence_number":30,"text":"The sky is blue because air molecules scatter shorter-wavelength blue sunlight more than other colors, making blue light come from all directions."}
+
+event: response.content_part.done
+data: {"type":"response.content_part.done","content_index":0,"item_id":"msg_0e7039d7d90c10f8016abb6a8f300887d2923e4239d29be566","output_index":0,"part":{"type":"output_text","annotations":[],"logprobs":[],"text":"The sky is blue because air molecules scatter shorter-wavelength blue sunlight more than other colors, making blue light come from all directions."},"sequence_number":31}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","item":{"id":"msg_0e7039d7d90c10f8016abb6a8f300887d2923e4239d29be566","type":"message","status":"completed","content":[{"type":"output_text","annotations":[],"logprobs":[],"text":"The sky is blue because air molecules scatter shorter-wavelength blue sunlight more than other colors, making blue light come from all directions."}],"phase":"final_answer","role":"assistant"},"output_index":0,"sequence_number":32}
+
+event: response.completed
+data: {"type":"response.completed","response":{"id":"resp_0e7039d7d90c10f8016abb6a8e740087d2b713190230f1c78d","object":"response","created_at":1790667406,"status":"completed","access_programs":{"cyber":"daybreak_blue"},"background":false,"completed_at":1790667407,"error":null,"frequency_penalty":0.0,"incomplete_details":null,"instructions":"You are Allan, a concise assistant. Use tools when asked.","max_output_tokens":null,"max_tool_calls":null,"model":"gpt-5.5","moderation":null,"output":[],"parallel_tool_calls":false,"presence_penalty":0.0,"previous_response_id":null,"prompt_cache_key":"00000000-0000-4000-8000-000000000001","prompt_cache_retention":"24h","reasoning":{"context":"current_turn","effort":"medium","mode":"standard","summary":"detailed"},"safety_identifier":"user-000000000000000000000002","service_tier":"default","store":false,"temperature":1.0,"text":{"format":{"type":"text"},"verbosity":"medium"},"tool_choice":"auto","tool_usage":{"image_gen":{"input_tokens":0,"input_tokens_details":{"image_tokens":0,"text_tokens":0},"output_tokens":0,"output_tokens_details":{"image_tokens":0,"text_tokens":0},"total_tokens":0},"web_search":{"num_requests":0}},"tools":[],"top_logprobs":0,"top_p":0.98,"truncation":"disabled","usage":{"attribution":{"items":{"msg_0e7039d7d90c10f8016abb6a8e7c4c87d2b65bec4dd6e9ad2e":{"cache_write_tokens":0,"cached_tokens":0,"content":[{"cache_write_tokens":0,"cached_tokens":0,"input_tokens":14,"output_tokens":0}],"input_tokens":14,"output_tokens":0},"msg_0e7039d7d90c10f8016abb6a8f300887d2923e4239d29be566":{"cache_write_tokens":0,"cached_tokens":0,"content":[{"cache_write_tokens":0,"cached_tokens":0,"input_tokens":2,"output_tokens":30}],"input_tokens":2,"output_tokens":30}},"request_fields":{"instructions":{"cache_write_tokens":0,"cached_tokens":0,"input_tokens":17,"output_tokens":0}}},"input_tokens":33,"input_tokens_details":{"cache_write_tokens":0,"cached_tokens":0},"output_tokens":30,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":63},"user":null,"metadata":{}},"sequence_number":33}
+

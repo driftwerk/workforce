@@ -1,0 +1,4 @@
+HTTP 400
+Content-Type: application/json
+
+{"detail":"Unsupported parameter: max_output_tokens"}

@@ -1,0 +1,61 @@
+{
+  "input": {
+    "kind": "bar",
+    "title": "Signups by plan",
+    "labels": [
+      "Free",
+      "Pro",
+      "Team"
+    ],
+    "series": [
+      {
+        "name": "March",
+        "data": [
+          420,
+          180,
+          60
+        ]
+      },
+      {
+        "name": "April",
+        "data": [
+          510,
+          220,
+          90
+        ]
+      }
+    ]
+  },
+  "result": {
+    "ok": true,
+    "spec": {
+      "kind": "bar",
+      "title": "Signups by plan",
+      "labels": [
+        "Free",
+        "Pro",
+        "Team"
+      ],
+      "series": [
+        {
+          "name": "March",
+          "data": [
+            420,
+            180,
+            60
+          ]
+        },
+        {
+          "name": "April",
+          "data": [
+            510,
+            220,
+            90
+          ]
+        }
+      ],
+      "stacked": false,
+      "horizontal": false
+    }
+  }
+}

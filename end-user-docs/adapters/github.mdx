@@ -1,0 +1,78 @@
+---
+title: GitHub
+description: Read repositories, open and review pull requests, and drive CI, as a token and as a GitHub App.
+---
+
+# GitHub adapter
+
+Connect Workforce to GitHub to list repositories, read files and diffs, open
+pull requests, comment, review, merge, and read CI runs.
+
+## Authentication
+
+Most tools use a personal access token (PAT) stored in the vault:
+
+```text
+skills/github/token                       # single org
+skills/github/workspaces/<org>/token      # one per org, multi-org mode
+skills/github/default_workspace           # which org wins when the owner names none
+```
+
+Use fine-grained PATs scoped per org. The `owner` parameter on every tool
+selects the matching workspace's token.
+
+## Reviewing as a GitHub App
+
+GitHub refuses a review that approves, or requests changes on, a pull request
+opened by the same account. Every PR the pipeline opens is opened with the
+token above, so the token cannot approve them and a branch protection that
+requires an approving review keeps the merge button locked.
+
+A GitHub App is a second identity. When one is configured, `github.pr_review`
+submits `APPROVE` and `REQUEST_CHANGES` as the App: it signs a short-lived JWT
+with the App's private key, exchanges it for an installation token scoped to
+the repository (cached for the token's hour), and submits the review with
+that. `COMMENT` reviews and everything else still use the token.
+
+Create the App once, at organisation level:
+
+1. Organisation settings → Developer settings → GitHub Apps → New GitHub App.
+   Any name (for example "Workforce Reviewer"); homepage URL can be the hub.
+   Webhook: off.
+2. Permissions: Repository permissions → Pull requests: Read and write,
+   Contents: Read-only, Metadata: Read-only. Nothing else.
+3. Create the App, note its App ID, then generate a private key and download
+   the `.pem`.
+4. Install the App on the repositories whose branch protection requires a
+   review (others are optional).
+
+Then store both values in the vault, shared with the agent that reviews:
+
+```text
+skills/github/app_id                      # the App ID (or client ID)
+skills/github/app_private_key             # the .pem, whole file
+skills/github/workspaces/<org>/app_id     # per-org variants, multi-org mode
+skills/github/workspaces/<org>/app_private_key
+```
+
+Pair it with the branch protection setting *Dismiss stale pull request
+approvals when new commits are pushed*: the pipeline reviews the exact sha it
+checked, and a later push has to be reviewed again before the button opens.
+
+Without an App, or on a repository the App is not installed on, the same
+call posts the review text as a comment and reports `submitted: false,
+fallback: "comment"`, so a workflow can carry on.
+
+## Tools
+
+Read: `github.list_repos`, `github.get_repo`, `github.list_issues`,
+`github.get_issue`, `github.list_pulls`, `github.get_pull`, `github.get_file`,
+`github.pr_diff`, `github.dir_list`, `github.compare`, `github.search_code`,
+`github.search_commits`, `github.branch_list`, `github.branch_protection`,
+`github.ci_status`, `github.workflow_runs`, `github.workflow_run_logs`,
+`github.workflow_run_failed_logs`.
+
+Write: `github.create_issue`, `github.pr_create`, `github.pr_review`,
+`github.pr_comment`, `github.pr_merge`, `github.pr_update`,
+`github.issue_comment`, `github.issue_update`, `github.branch_create`,
+`github.branch_delete`, `github.workflow_rerun`, `github.api`.

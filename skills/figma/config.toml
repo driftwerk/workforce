@@ -1,0 +1,5 @@
+# Figma skill configuration
+# The token is resolved from the encrypted vault at runtime.
+
+token = "${vault:skills/figma/token}"
+base_url = "https://api.figma.com/v1"

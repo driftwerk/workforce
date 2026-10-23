@@ -1,0 +1,47 @@
+{
+  "input": {
+    "kind": "scatter",
+    "labels": [
+      "ignored"
+    ],
+    "stacked": true,
+    "series": [
+      {
+        "name": "A",
+        "data": [
+          [
+            2019,
+            5
+          ],
+          [
+            "2020",
+            "7.5"
+          ]
+        ]
+      }
+    ]
+  },
+  "result": {
+    "ok": true,
+    "spec": {
+      "kind": "scatter",
+      "series": [
+        {
+          "name": "A",
+          "data": [
+            [
+              2019,
+              5
+            ],
+            [
+              2020,
+              7.5
+            ]
+          ]
+        }
+      ],
+      "stacked": false,
+      "horizontal": false
+    }
+  }
+}

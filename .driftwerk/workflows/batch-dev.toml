@@ -1,0 +1,202 @@
+[workflow]
+id = "batch-dev"
+name = "Batch Development"
+description = "Process one or more Linear tickets in parallel batches with dependency ordering"
+
+[workflow.context]
+request = { required = true, description = "The user's original request containing one or more Linear ticket references" }
+
+# =============================================================================
+# Step 1: Triage & Plan Batches
+# =============================================================================
+[[step]]
+id = "triage"
+name = "Triage & Plan Batches"
+agent = "martin"
+max_rounds = 30
+model = "powerful"
+skills = ["linear"]
+preferred_tools = ["linear.issue_get", "code.git", "knowledge.overview", "knowledge.ask", "knowledge.index"]
+outputs = [
+  { name = "execution_plan", description = "Structured execution plan listing batches in order. Each batch lists its tickets with ID, title, and a self-contained request summary." },
+  { name = "total_batches", description = "Total number of batches in the plan", validate = "number" },
+  { name = "total_tickets", description = "Total number of tickets to process", validate = "number" },
+  { name = "target_repo", description = "Target repository in owner/repo format (e.g. contoso/monorepo)" },
+]
+task = """
+Plan execution of one or more Linear tickets for development.
+
+## Request
+{{request}}
+
+## 1. Extract Ticket IDs
+
+Parse the request for all Linear ticket IDs (e.g. DW-101, OPS-243).
+If no specific IDs, treat the entire request as a single item.
+
+## 2. Read All Tickets
+
+For each ticket ID:
+1. Call `linear.issue_get` with identifier="<ticket_id>"
+2. Gather: title, description, requirements, acceptance criteria, dependencies
+
+Determine the target repository from the tickets' team/project context.
+Call `code.git` with repo="<target_repo>" action="pull" to sync.
+
+## 3. Analyze Dependencies
+
+For each ticket determine:
+- Does it depend on changes from another ticket in this set?
+- Does it modify the same files/modules as another ticket? (merge conflict risk)
+- Is there a logical ordering requirement?
+
+Call `knowledge.overview` with path="repos/{owner}/{repo}" and `knowledge.ask` with path="repos/{owner}/{repo}" to identify file/module overlaps.
+
+Rule: In contoso/monorepo, backend service changes also modify packages/ (auto-generated TypeScript clients). Two tickets that both change backend services will BOTH touch packages/ — place them in separate batches.
+
+## 4. Create Batched Execution Plan
+
+Group tickets into ordered batches:
+- **Batch 1**: Tickets with NO dependencies and no file overlap. Run in parallel.
+- **Batch 2**: Tickets depending on Batch 1 or conflicting with Batch 1 tickets.
+- **Batch N**: Continue until all scheduled.
+
+Rules:
+- Same-file tickets go in DIFFERENT batches
+- Independent, non-overlapping tickets go in the SAME batch
+- Single ticket → Batch 1
+- Prefer fewer batches (more parallelism) when safe
+- Cross-repo tickets have no file dependencies and can always be parallelized
+
+## 5. Write Request Summaries
+
+CRITICAL: Each ticket becomes its OWN dev-pipeline instance. Write ONE request_summary PER ticket. NEVER combine multiple tickets into a single request.
+
+Each summary MUST include:
+- The ticket ID (exactly ONE per summary)
+- Ticket title
+- Full description of what to build
+- Requirements and acceptance criteria
+- Target repository
+
+## 6. Output the Plan
+
+Format:
+
+BATCH 1 (parallel):
+  - TICKET_ID: Title
+    REQUEST: <full self-contained request summary for this ONE ticket>
+
+BATCH 2 (after batch 1):
+  - TICKET_ID: Title
+    REQUEST: <full self-contained request summary for this ONE ticket>
+
+Each "- TICKET_ID:" line becomes one dev-pipeline instance. Exactly one entry per ticket.
+
+Output: execution_plan, total_batches, total_tickets, target_repo.
+
+SELF-CHECK: Count "- TICKET_ID:" entries across all batches. Must equal total_tickets. If not, split them.
+
+Do NOT include "OUTCOME:" in your response.
+"""
+
+# =============================================================================
+# Step 2: Launch & Monitor Batch
+# =============================================================================
+[[step]]
+id = "launch-and-monitor"
+name = "Launch & Monitor Batch"
+agent = "martin"
+max_rounds = 50
+model = "standard"
+skills = []
+preferred_tools = ["jobs.chain", "jobs.chain_status", "jobs.result"]
+outputs = [
+  { name = "current_batch", description = "The batch number just processed (1, 2, 3, ...)", validate = "number" },
+  { name = "completed_tickets", description = "Comma-separated ticket IDs that completed successfully so far (cumulative), or 'none'" },
+  { name = "failed_tickets", description = "Comma-separated ticket IDs that failed (cumulative), or 'none'" },
+  { name = "batches_remaining", description = "Number of batches still to process after this one", validate = "number" },
+]
+task = """
+Launch the next batch of dev-pipeline instances and monitor until completion.
+
+## Execution Plan
+{{steps.triage.execution_plan}}
+
+## Total Batches: {{steps.triage.total_batches}}
+
+## 1. Determine Current Batch
+
+Check "Previous steps" for prior "Launch & Monitor Batch" outputs.
+- No prior output → current_batch = 1, no prior results.
+- Prior output → increment current_batch by 1. Carry forward cumulative completed_tickets and failed_tickets.
+- Skip tickets depending on a FAILED ticket (add to failed_tickets with dependency failure note).
+
+## 2. Launch Dev-Pipeline Instances (idempotent)
+
+BEFORE launching, check for existing instances:
+1. Call workflow tool with action="instances" workflow_id="dev-pipeline" to list ALL instances
+2. For each ticket in current batch, check if an instance already exists:
+   - "completed" → record as completed, do NOT re-launch
+   - "running"/"paused" → monitor, do NOT re-launch
+   - "failed"/"exited" → record as failed, do NOT re-launch
+   - "cancelled" → ignore, launch a NEW one
+
+For each ticket needing a NEW instance:
+1. Call `messaging.send` WITHOUT thread_id to create a top-level message: "Starting work on TICKET_ID: TITLE"
+2. Launch dev-pipeline: workflow tool action="start" workflow_id="dev-pipeline" with payload and the returned message_id as thread_id
+3. Record the instance_id
+
+Launch ALL tickets in the batch before monitoring.
+
+## 3. Monitor Until Batch Completes
+
+Poll every 2+ minutes using workflow tool action="status" instance_id="<id>".
+- "completed" → success
+- "failed"/"exited" → failure
+- "running"/"paused" → keep waiting
+
+Wait until ALL instances reach terminal state.
+
+## 4. Assess Results and Route
+
+1. Output current_batch
+2. Output cumulative completed_tickets (previous + this batch successes), or "none"
+3. Output cumulative failed_tickets (previous + this batch failures), or "none"
+4. Calculate batches_remaining = total_batches - current_batch
+
+Routing:
+- batches_remaining > 0: OUTCOME: next-batch
+- batches_remaining = 0: OUTCOME: all-complete
+"""
+branches = [
+  { when = "next-batch", goto = "launch-and-monitor" },
+  { when = "all-complete", goto = "summary" },
+]
+
+# =============================================================================
+# Step 3: Final Summary
+# =============================================================================
+[[step]]
+id = "summary"
+name = "Final Summary"
+agent = "martin"
+max_rounds = 10
+model = "standard"
+exit = true
+task = """
+All batches processed. Provide a final summary.
+
+Read the "Previous steps" section. The LAST "Launch & Monitor Batch" entry has the final cumulative completed_tickets and failed_tickets.
+
+## Include
+
+1. **Overview**: Tickets processed, batches, success rate
+2. **Successful Tickets**: ID, title, what was implemented/merged
+3. **Failed Tickets** (if any): ID, title, what went wrong, whether skipped due to dependency failure, recommended next steps
+4. **Recommendations**: Follow-up work or manual steps needed
+
+Keep it concise but informative.
+
+Do NOT include "OUTCOME:" in your response.
+"""

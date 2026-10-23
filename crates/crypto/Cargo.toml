@@ -1,0 +1,24 @@
+[package]
+name = "workforce-crypto"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+publish = false
+description = "AES-256-GCM sealing under an Argon2id master key that wraps per-entry data keys: the vault key hierarchy and byte layout, shared by every service that reads the vault"
+
+[dependencies]
+# `zeroize` on both so the expanded AES key schedule is wiped on drop, not
+# just the raw key bytes this crate holds itself.
+aes = { version = "0.8", features = ["zeroize"] }
+aes-gcm = { workspace = true, features = ["zeroize"] }
+argon2 = { workspace = true }
+hkdf = "0.12"
+hmac = "0.12"
+rand = { workspace = true }
+sha2 = "0.10"
+thiserror = { workspace = true }
+uuid = { workspace = true }
+zeroize = "1"
+
+[dev-dependencies]
+hex = "0.4"

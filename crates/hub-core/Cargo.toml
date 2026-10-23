@@ -1,0 +1,95 @@
+[package]
+name = "workforce-hub-core"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+publish = false
+
+[lib]
+name = "workforce_hub_core"
+path = "src/lib.rs"
+
+[dependencies]
+aes-gcm = { workspace = true }
+argon2 = { workspace = true }
+async-nats = "0.38"
+async-trait = "0.1"
+base64 = { workspace = true }
+chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10"
+croner = "2"
+deadpool-postgres = { workspace = true, optional = true }
+eyre = "0.6"
+futures = "0.3"
+glob = "0.3"
+hex = "0.4"
+hkdf = "0.12"
+hmac = "0.12"
+metrics = { workspace = true }
+notify = { version = "7.0", default-features = false, features = ["macos_fsevent"] }
+parking_lot = { workspace = true }
+rand = { workspace = true }
+refinery = { workspace = true, optional = true }
+regex = "1.10"
+reqwest = { version = "0.12", features = ["json"] }
+rusqlite = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+subtle = "2.6"
+tempfile = "3"
+thiserror = { workspace = true }
+tokio = { version = "1", features = ["full"] }
+tokio-postgres = { workspace = true, optional = true }
+tokio-util = { version = "0.7", features = ["rt", "io"] }
+tracing = "0.1"
+url = { workspace = true }
+uuid = { version = "1", features = ["v4", "v5"] }
+workforce-agent = { path = "../agent-runtime", features = ["s3"] }
+workforce-common = { path = "../common", features = ["otel", "prometheus", "sentry"] }
+workforce-core = { path = "../core" }
+workforce-crypto = { workspace = true }
+workforce-decide = { path = "../decide" }
+workforce-gateway-client = { path = "../gateway-client" }
+workforce-identity = { path = "../identity" }
+workforce-knowledge-service = { path = "../knowledge-service" }
+workforce-lessons = { path = "../lessons" }
+workforce-memory = { path = "../memory" }
+workforce-nats = { path = "../nats-bus" }
+workforce-orchestrator = { path = "../orchestrator" }
+workforce-permissions = { path = "../permissions" }
+workforce-policy = { path = "../policy-engine" }
+workforce-postgres = { workspace = true }
+workforce-self-learning = { workspace = true }
+workforce-skills = { path = "../skills", features = ["slack"] }
+workforce-training = { workspace = true }
+workforce-wasm-runtime = { path = "../wasm-runtime" }
+zeroize = "1"
+wiremock = { version = "0.6", optional = true }
+
+[features]
+default = []
+postgres = [
+    "dep:tokio-postgres",
+    "dep:deadpool-postgres",
+    "dep:refinery",
+    "workforce-common/postgres",
+    "workforce-postgres/postgres",
+    "workforce-knowledge-service/postgres",
+    "workforce-permissions/postgres",
+    "workforce-training/postgres",
+    "workforce-self-learning/postgres",
+]
+# Test-only constructors and fixtures hub's tests use; never enabled by a production build.
+test-support = ["dep:wiremock"]
+
+[dev-dependencies]
+tempfile = "3"
+toml = { workspace = true }
+wiremock = "0.6"
+workforce-agent = { path = "../agent-runtime", features = ["s3", "test-support"] }
+workforce-oauth-client = { workspace = true }
+workforce-postgres = { workspace = true, features = ["test-support"] }
+
+[build-dependencies]
+workforce-build-support = { path = "../build-support" }

@@ -1,0 +1,268 @@
+---
+title: Knowledge
+description: Indexed codebases that agents can query for grounded answers.
+---
+
+# Knowledge
+
+Knowledge indexes your code repositories so agents can ask natural‑language questions about them. After a repo is indexed, you can ask an agent to:
+
+- Find the definition of a function
+- Understand the relationships between modules
+- Analyze the impact of a change
+- Get a high‑level overview of the architecture
+
+## How It Works
+
+Every indexed repository is stored in a shared hub‑wide knowledge graph. The same upstream repo referenced by multiple projects collapses into a single index — no wasted disk space or duplicate parsing.
+
+### Index Layout
+
+The hub pulls repositories into a private checkout area under `{data_dir}/knowledge/checkouts/repos/{owner}/{repo}`. Agents never read or write this directory, so a partial pull never interrupts an agent, and an agent’s edit never trips up the parser.
+
+### What’s Indexed
+
+- GitHub repositories (`source: {kind: github, owner, repo}`)
+- Standalone repos discovered under `{workspace}/repos/{owner}/{repo}/.git`
+- Every repo referenced by every project across every agent
+
+### Automatic Maintenance
+
+The hub runs periodic maintenance passes (both incremental and full re‑indexes) for all indexed repos. The `knowledge.refresh_index` tool triggers a hub‑wide pass, and `projects.index` triggers a pass scoped to a single project.
+
+### Permissions
+
+Access to knowledge tools can be restricted via the permission cascade. When enabled, the cascade gates calls to tools like `knowledge.ask` and `knowledge.graph` based on the active user’s permissions. System jobs (CLI/system calls) bypass the cascade so maintenance flows keep working.
+
+## Tools
+
+All tools require a repo to be indexed first. Run `knowledge.index` with `action: trigger` to index a codebase.
+
+### `knowledge.ask`
+
+Ask a natural‑language question about the codebase.
+
+```json
+{
+  "question": "How does authentication work in the auth module?"
+}
+```
+
+When the symbol graph returns no matches or low-confidence answers, the tool points you to search the actual file content with `repo.grep` — this is crucial because the symbol graph only sees code symbols (functions, classes, types), not prose, naming conventions, design docs, specs, config, or comments. The answer often lives there.
+
+It also surfaces nearby authoritative docs (READMEs, specs, PDFs) that the symbol index can’t capture — read them with `repo.read` (PDFs are extracted to text).
+
+### `knowledge.symbol`
+
+Find code symbols (functions, classes, structs, modules, …) by exact name. Returns kind-tagged matches with file and line — use this for “where is X defined/used” lookups. For conceptual questions (“how does X work”) use `knowledge.ask` instead.
+
+```json
+{
+  "name": "AuthController",
+  "limit": 20,
+  "repo": "workforce"
+}
+```
+
+### `knowledge.explain`
+
+Get detailed explanation of a specific code entity.
+
+```json
+{
+  "entity": "AuthController",
+  "aspect": "usage"
+}
+```
+
+### `knowledge.impact`
+
+Analyze the impact of a proposed code change.
+
+```json
+{
+  "target": "AuthController",
+  "change_description": "Remove the password reset endpoint",
+  "scope": "direct"
+}
+```
+
+### `knowledge.overview`
+
+Get a codebase architecture overview with statistics and modules.
+
+```json
+{
+  "scope": "full",
+  "detail": "summary"
+}
+```
+
+### `knowledge.graph`
+
+Query the code knowledge graph for entity relationships (callers, callees, imports, implementations, tests, dependencies).
+
+```json
+{
+  "query": "callers_of",
+  "entity": "AuthController",
+  "depth": 2
+}
+```
+
+### `knowledge.index`
+
+Trigger or check indexing status.
+
+```json
+{
+  "action": "status"
+}
+```
+
+Actions:
+
+- `status`: returns index completeness, vector‑store health, active leases, stale rows, and recent failures
+- `trigger`: dispatches the appropriate pipeline (`full`, `incremental`, `ResumeSummaries`, or `Complete`)
+- `trigger_full`: forces a full rebuild
+- `cancel`: releases the indexing lease
+
+### `knowledge.refresh_index`
+
+Trigger a hub‑wide indexing pass (pulls every standalone + project repo and then indexes). Returns `outcome: started` with the initial queue snapshot — the pass is NOT finished on return: poll `knowledge.status` to track progress and confirm completion/failures, and do not report success until status shows the pass has finished. Returns `outcome: already_in_flight` with a live queue snapshot when a pass is already running (this call does not start a second one).
+
+```json
+{
+  "full": false
+}
+```
+
+### `knowledge.delete`
+
+Drop an indexed repo (graph + vector store).
+
+```json
+{
+  "action": "repo",
+  "source": { "kind": "github", "owner": "acme", "repo": "shared" }
+}
+```
+
+Actions:
+
+- `action: repo`: drops one repo by `source` (preferred) or legacy `repo_id`. When the repo is referenced by multiple projects, `force: true` is required.
+- `action: prune`: drops every repo not in `known_repo_ids` — defaults to dry‑run; pass `confirm: true` and (when over 10) `acknowledge_count=<n>` to actually delete. Refuses prune with empty `known_repo_ids`. Use `lineage_filter` to target specific categories (e.g., `["migration_orphan"]` to clean up pre‑DW‑506 leftovers).
+
+### `repo.grep`
+
+Search the actual current file content of an indexed repository by regex — the live‑grep a developer would run. Unlike `knowledge.ask` (which only knows code symbols), this sees everything in the files: prose, READMEs, docs/specs, naming conventions, config, comments, test fixtures. Reach for it whenever the answer is text rather than a named symbol, or whenever `knowledge.ask` comes back empty. Returns `{path, line_number, line}` matches, stamped with the repo’s current commit, plus `docs_nearby`: the authoritative docs/specs/READMEs sitting next to your hits (often where the convention is actually stated — read them with `repo.read`, PDFs included). Follow a hit with `repo.read` to read the file in full.
+
+```json
+{
+  "repo": "app",
+  "pattern": "outbound",
+  "path": "billing"
+}
+```
+
+### `repo.read`
+
+Read a file from an indexed repository’s current checkout, by repo‑relative path (e.g., `path="billing/README.md"`). The natural follow‑up to a `repo.grep` hit: read the file (or a line range via `offset`/`limit`) to get the full answer in context. Reads real current content the symbol index can’t show you, including PDFs — design docs, specs and integration specs (e.g., `docs/specs/*.pdf`) are extracted to text automatically, so the convention/spec the symbol graph can’t see becomes readable. Result is stamped with the repo’s commit. Other binary files are not returned as text.
+
+```json
+{
+  "repo": "app",
+  "path": "billing/docs/specs/Inbound Spec v4.pdf"
+}
+```
+
+### `repo.glob`
+
+List files in an indexed repository’s checkout by filename glob (e.g., `pattern="**/docs/specs/*"` or `"**/*.md"`). Use it to discover where docs, specs, or config live before reading them with `repo.read`. Returns repo‑relative paths stamped with the repo’s commit.
+
+```json
+{
+  "repo": "app",
+  "pattern": "**/*.md"
+}
+```
+
+### `repo.list`
+
+List the indexed repositories you can search with `repo.grep`, read with `repo.read`, or enumerate with `repo.glob`. Call this first if you’re unsure which codebase holds what you’re looking for.
+
+```json
+{}
+```
+
+## Indexing States
+
+Each target in a maintenance pass goes through:
+
+- `Queued`: waiting to be processed
+- `Indexing`: currently indexing (lease snapshot visible)
+- `Done`: successfully indexed
+- `Failed`: pull or index failed
+
+## Vector Store Health
+
+When vector storage is enabled (Weaviate), `knowledge.status` includes a `vector_backend` field with one of:
+
+- `disabled`: vector store not configured
+- `healthy`: recent insert‑errors window is empty
+- `unhealthy`: readiness endpoint failed, timeout, or recent insert‑errors exceed threshold
+
+The health probe caches results for five seconds to avoid spamming the readiness endpoint.
+
+## Permissions Cascade
+
+The permission cascade checks the active `CURRENT_USER_ID` before allowing a knowledge‑tool call. If the cascade returns a `Deny` state, the tool short‑circuits with a structured failure result. `Ask` state is treated as soft‑allow because the runner’s `PolicyEngine` prompt already happened before the tool’s `execute` runs.
+
+## Maintenance Runner
+
+The `MaintenanceRunner` enumerates every repo the hub should index (standalone repos cloned under `{workspace}/repos/`, plus every project repo across every agent), pulls the latest source into the indexer’s private checkout area, then runs the code‑graph index pass against each.
+
+Pull failures are per‑target, not per‑pass: one bad pull or a parser error in one repo never aborts the rest.
+
+## Stale Row Cleanup
+
+Rows tagged `Unknown` in the `repositories.lineage` column are re‑classified at hub startup against the current layout:
+
+- Paths exactly `repos_root(data_dir)/{owner}/{repo}` → `Canonical`
+- Paths under documented pre‑DW‑506 patterns → `MigrationOrphan`
+- Everything else → `Unknown`
+
+This ensures the agent‑facing surface sees typed rows from the first request.
+
+## Summary Generation
+
+LLM‑backed summary generation can be enabled via configuration. When `generate_summaries` is true and a `SummariserBuilder` is wired, the indexing pipeline adds entity summaries to the graph.
+
+## Configuration
+
+- `parse_concurrency`: default `available_parallelism() × 2`
+- `summary_concurrency`: default `16`
+- `generate_summaries`: default `false`
+- `exclude_patterns`: patterns to skip during crawling
+- `max_file_size`: maximum file size to index (bytes)
+- `index_timeout`: overall indexing timeout (seconds)
+- `[codegraph] backend`: `"sqlite"` or `"postgres"` (requires Postgres config)
+- `[weaviate] enabled`: `true` if vector store is used
+
+## Common Workflows
+
+1. **First‑time setup**:
+   - `knowledge.index` with `action: trigger`
+   - Wait for indexing to complete (status shows `status_reason: current`)
+   - Now you can `knowledge.ask` questions
+
+2. **Update after changes**:
+   - `knowledge.index` with `action: trigger` runs incremental updates
+   - `knowledge.refresh_index` triggers a hub‑wide incremental pass
+   - Use `projects.index` to index a single project
+
+3. **Check current state**:
+   - `knowledge.status` gives you everything: targets, active leases, stale rows, vector‑backend health, and recent‑pass failures
+
+4. **Delete orphaned repos**:
+   - `knowledge.delete` with `action: prune lineage_filter: ["migration_orphan"]` cleans up pre‑DW‑506 leftovers

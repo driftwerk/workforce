@@ -1,0 +1,19 @@
+{
+  "input": {
+    "kind": "scatter",
+    "series": [
+      {
+        "data": [
+          [
+            1,
+            "x"
+          ]
+        ]
+      }
+    ]
+  },
+  "result": {
+    "ok": false,
+    "error": "series 1: scatter points must be numeric"
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "input": {
+    "kind": "pie",
+    "labels": [
+      "a",
+      "b"
+    ],
+    "series": [
+      {
+        "data": [
+          1
+        ]
+      }
+    ]
+  },
+  "result": {
+    "ok": false,
+    "error": "pie labels and data must be the same length"
+  }
+}

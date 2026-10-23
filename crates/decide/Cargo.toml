@@ -1,0 +1,22 @@
+[package]
+name = "workforce-decide"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+publish = false
+description = "Typed decisions from a System One model (Kev, Jev, or both): choice, yes/no and score questions with calibrated probabilities"
+
+[dependencies]
+metrics = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+url = { workspace = true }
+
+[dev-dependencies]
+axum = { workspace = true }
+metrics-util = { version = "0.19", default-features = false, features = ["debugging"] }
+parking_lot = { workspace = true }

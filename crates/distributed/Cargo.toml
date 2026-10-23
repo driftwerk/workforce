@@ -1,0 +1,23 @@
+[package]
+name = "workforce-distributed"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+publish = false
+
+[dependencies]
+workforce-core = { path = "../core" }
+workforce-nats = { path = "../nats-bus" }
+workforce-pairing = { path = "../pairing" }
+
+chrono = { version = "0.4", features = ["serde"] }
+eyre = "0.6"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }

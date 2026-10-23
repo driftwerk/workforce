@@ -1,0 +1,13 @@
+-- Fencing token for the turn record.
+--
+-- `end_turn` used to clear whatever record sat on the session, so a stop path
+-- racing its own successor, or a sweep acting on a record that moved on under
+-- it, could delete a live turn's recovery state. The token makes a clear
+-- name the record it means — the discipline `turn_claims.claim_id` already
+-- applies to a superseded claim.
+--
+-- Existing records predate the column and carry NULL, which matches no token,
+-- so they can only be replaced by the next `begin_turn` on that session — the
+-- safe direction (a stale record costs one sweep re-check; clearing a live
+-- one costs a turn its recovery).
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS turn_token TEXT;

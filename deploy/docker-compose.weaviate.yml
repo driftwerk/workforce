@@ -1,0 +1,36 @@
+# Weaviate vector database for Workforce memory system.
+#
+# Usage:
+#   docker compose -f deploy/docker-compose.weaviate.yml up -d
+#
+# This starts Weaviate with a text2vec-transformers vectoriser so
+# agent memories get real semantic vector search.
+#
+# Default URL: http://localhost:8080 (matches workforce.toml default)
+
+services:
+  weaviate:
+    image: cr.weaviate.io/semitechnologies/weaviate:1.28.4
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+      - "50051:50051"  # gRPC
+    volumes:
+      - weaviate_data:/var/lib/weaviate
+    environment:
+      QUERY_DEFAULTS_LIMIT: 25
+      AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED: "true"
+      PERSISTENCE_DATA_PATH: "/var/lib/weaviate"
+      DEFAULT_VECTORIZER_MODULE: "text2vec-transformers"
+      ENABLE_MODULES: "text2vec-transformers"
+      TRANSFORMERS_INFERENCE_API: "http://t2v-transformers:8080"
+      CLUSTER_HOSTNAME: "node1"
+
+  t2v-transformers:
+    image: cr.weaviate.io/semitechnologies/transformers-inference:sentence-transformers-all-MiniLM-L6-v2
+    restart: unless-stopped
+    environment:
+      ENABLE_CUDA: "0"  # Set to 1 if you have a GPU
+
+volumes:
+  weaviate_data:

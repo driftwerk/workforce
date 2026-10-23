@@ -1,0 +1,26 @@
+{
+  "input": {
+    "kind": "line",
+    "labels": [
+      "a",
+      "b"
+    ],
+    "series": [
+      {
+        "data": [
+          1,
+          2
+        ]
+      },
+      {
+        "data": [
+          1
+        ]
+      }
+    ]
+  },
+  "result": {
+    "ok": false,
+    "error": "series 2 length does not match labels"
+  }
+}

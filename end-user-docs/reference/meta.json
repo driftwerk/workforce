@@ -1,0 +1,9 @@
+{
+  "title": "Reference",
+  "pages": [
+    "agent-types",
+    "tools",
+    "remote-mcp",
+    "evals"
+  ]
+}

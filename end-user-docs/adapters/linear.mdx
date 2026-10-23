@@ -1,0 +1,82 @@
+---
+title: Linear
+description: Work with Linear issues, comments, documents, teams, and projects.
+---
+
+# Linear adapter
+
+Manage your Linear workspace directly through agents. This skill provides tools to read, create, update, and search for Linear issues, comments, documents, teams, projects, and workflow states.
+
+## Authentication
+
+Connect to Linear using a Linear API key. You can provide the key in two ways:
+
+1.  **Environment variable**: Set `LINEAR_API_KEY` in your environment.
+2.  **Secrets vault**: Store the key at `skills/linear/api_key` in your vault.
+
+{/* CURATOR: `prefix_map` logic for team key prefixes to workspaces is mentioned in config but not detailed for end users. Leaving out for now. */}
+
+## Multi-workspace support
+
+You can connect to multiple Linear workspaces. Configure them in your skill's `config.toml` under the `workspaces` section. When using a tool, you can optionally specify a `workspace` parameter to target a specific workspace. If you omit the parameter, the default workspace is used.
+
+## Available tools
+
+The Linear skill provides over 20 tools. Here are the key categories:
+
+### Issues & Comments
+- `linear.issue_list`: List issues with filters.
+- `linear.issue_get`: Get a single issue by its identifier (like `ENG-42`).
+- `linear.issue_create`: Create a new issue.
+- `linear.issue_update`: Update an existing issue.
+- `linear.issue_bulk_update`: Update multiple issues at once.
+- `linear.issue_link`: Create a relation between two issues (blocks, blocked_by, related, duplicate).
+- `linear.issue_children`: List child (sub) issues of a parent.
+- `linear.issue_search`: Full-text search for issues.
+- `linear.comment_list`: List comments on an issue.
+- `linear.comment_add`: Add a comment to an issue.
+
+### Documents
+- `linear.document_get`: Get a document by its UUID or URL. The `content` field is returned as Markdown.
+- `linear.document_list`: List documents, optionally filtered by project.
+- `linear.document_create`: Create a new document. Provide content as Markdown.
+- `linear.document_update`: Update an existing document.
+- `linear.document_delete`: Delete a document.
+- `linear.document_search`: Search documents by title.
+
+### Teams, Projects & Metadata
+- `linear.states_list`: List workflow states for a team.
+- `linear.teams_list`: List all teams.
+- `linear.project_list` / `linear.project_get`: List and get projects.
+- `linear.labels_list`: List issue labels.
+- `linear.members_list`: List workspace members.
+
+All tools support an optional `workspace` parameter for multi-workspace setups.
+
+## Webhooks (Event sources)
+
+The Linear adapter can receive webhook events from Linear. These are parsed into structured actions:
+
+- `IssueCreated`
+- `IssueUpdated`
+- `IssueStateChanged`
+- `IssueAssigned`
+- `IssueRemoved`
+- `CommentCreated`
+- `CommentUpdated`
+- `ProjectUpdated`
+- `Ignore` (for unrecognized or filtered events)
+
+To set up a Linear webhook, configure your Linear workspace to send webhooks to your Workforce instance.
+
+## Configuration
+
+Linear uses a skill-level configuration file. Generate a starting config with the CLI:
+
+```bash
+workforce skill init linear-integration
+```
+
+This creates a `config.toml` with sections for single‑workspace (backward‑compatible) and multi‑workspace modes. Use vault references or environment variables for your API keys.
+
+For a detailed reference of each tool's parameters, see the [Tools Reference](/docs/reference/tools).

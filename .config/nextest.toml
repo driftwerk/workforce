@@ -1,0 +1,16 @@
+# cargo-nextest runs every test binary's tests in one shared pool, so the
+# 5.5k-test hub suite no longer runs alone while the other binaries wait their
+# turn.
+#
+# Doctests are not run by nextest; CI runs them separately with
+# `cargo test --doc`.
+
+[profile.ci]
+# Report every failure in one run rather than stopping at the first.
+fail-fast = false
+# Flag anything over 60s as slow, so the tests that dominate the suite show
+# up by name in the log. Slow is reported, never killed.
+slow-timeout = { period = "60s" }
+# Print the slow and failed tests again at the end, where they can be read.
+final-status-level = "slow"
+failure-output = "immediate-final"

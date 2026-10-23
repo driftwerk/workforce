@@ -1,0 +1,251 @@
+---
+title: Slack
+description: Connect Workforce to Slack for messaging, reactions, and workflows.
+---
+
+# Slack adapter
+
+Workforce integrates with your Slack workspace to respond to messages, handle slash commands, and provide agents with tools to manage files, channels, and users.
+
+## Configuration
+
+The Slack skill supports multiple workspaces from a single configuration file. A minimal configuration looks like this:
+
+```toml
+# Top-level defaults applied to any workspace that does not override them.
+response_mode = "mention_only"
+thread_isolation = true
+
+[[workspaces]]
+id = "default"
+bot_token = "${SLACK_BOT_TOKEN}"
+app_token = "${SLACK_APP_TOKEN}"
+channels = ["C_GENERAL", "C_CHANNEL_NAME"]
+```
+
+Generate a fresh configuration with the command:
+```bash
+workforce skill init slack-integration
+```
+
+### Workspace settings
+
+| Setting | Description | Default |
+|---------|-------------|---------|
+| `id` | Unique workspace identifier, such as "acme-corp". | (required) |
+| `bot_token` | Your Slack bot token (xoxb-…). | (required) |
+| `app_token` | Your Slack app token for Socket Mode (xapp-…). | (required) |
+| `channels` | List of channel IDs to listen to. Leave empty to listen to all channels. | `[]` |
+| `response_mode` | When to respond: `"mention_only"`, `"all"`, or `"quiet"`. | inherited from top-level |
+| `thread_isolation` | Whether each thread gets its own session. | inherited from top-level |
+
+### Tuning behaviour
+
+**Response modes**:
+
+* `mention_only`: Reply only when the bot is `@mentioned`, when a configured activation keyword is present, or in direct messages.
+* `all`: Reply to any message in channels where the bot is a member.
+* `quiet`: Reply only in direct messages, or when `@mentioned`. This mode acts as a “do not disturb” for public channels.
+
+**Thread isolation**: when `true`, each Slack thread gets its own conversation context. This isolates messages in different threads within the same channel.
+
+**Activation keywords**: you can override the keywords per workspace or per channel. For example:
+```toml
+activation_keywords = ["deploy", "urgent"]
+```
+
+### Multi-workspace setup
+
+Add a second `[[workspaces]]` block to connect a second Slack workspace. Each workspace can have its own agent binding, channels, and override settings.
+
+```toml
+[agent_bindings]
+default = "allan"
+client = "architect"
+
+[[workspaces]]
+id = "default"
+bot_token = "${SLACK_BOT_TOKEN_1}"
+app_token = "${SLACK_APP_TOKEN_1}"
+
+[[workspaces]]
+id = "client"
+bot_token = "${SLACK_BOT_TOKEN_2}"
+app_token = "${SLACK_APP_TOKEN_2}"
+thread_isolation = false
+```
+
+### Per-channel overrides
+
+You can apply special rules to individual Slack channels:
+
+```toml
+[channel_overrides.C_DEV]
+system_prompt = "This is #dev — focused on development work."
+response_mode = "all"
+display_name = "#dev"
+activation_keywords = ["help", "deploy"]
+```
+
+### Team channels
+
+In a shared channel with multiple agents, you can define team roles. The lead agent receives all inbound messages and can delegate sub‑tasks to other agents.
+
+```toml
+[team_channels.C_TEAM]
+lead_agent = "manager"
+agent_identities = { design = "designer", code = "engineer" }
+workflow = "team_coordination"
+```
+
+The lead agent sees `From: @designer` or `From: @engineer` when a team member replies, and can decide how to route follow‑up work.
+
+### Scope filtering
+
+A per-channel scope filter classifies every inbound message and short-circuits anything off-topic with a canned reply, before the agent runs. Use it to keep a triage, support, or FAQ channel focused on its purpose.
+
+Add a `[channel_overrides.<channel>.scope]` block to enable it. Presence enables; absence (the default) leaves the channel unfiltered.
+
+```toml
+[channel_overrides.C_TRIAGE.scope]
+persona = "triage"
+mode = "reject"  # "reject" (default) | "warn"
+canned_response = "I'm the triage bot. Please file bug reports or feature requests here."
+```
+
+**Preset personas**: built-in topic definitions you can pick from.
+
+| Persona | Handles |
+|---------|---------|
+| `triage` | Bug reports, feature requests, questions about triage |
+| `faq` | Product questions, feature explanations, how-to questions |
+| `qa` | Test failures, regression reports, quality issues |
+| `support` | Customer support tickets, troubleshooting, account issues |
+| `sales` | Product questions, pricing, demo requests |
+
+**Custom prompts**: define an arbitrary topic for channels that don't fit a preset. `custom_prompt` takes precedence over `persona` when both are set.
+
+```toml
+[channel_overrides.C_API_DOCS.scope]
+custom_prompt = """
+On-topic: API usage questions, API bug reports, documentation clarifications.
+Off-topic: general chat, unrelated tech questions, personal questions.
+"""
+mode = "reject"
+```
+
+**Modes**:
+
+* `reject` (default): drop off-topic messages and reply with `canned_response`. If `canned_response` is unset, a per-persona default is used.
+* `warn`: log the off-topic classification (audit-only) but still pass the message to the agent. Useful for tuning a filter before enforcing it.
+
+**Optional fields**:
+
+| Field | Effect |
+|-------|--------|
+| `model` | Overrides the classifier model for this channel (e.g. `"claude-haiku-4-5"`). The classifier runs through the routing-target agent's LLM provider (resolved via DM routing → channel binding → workspace binding → default agent), so `model` must be a name that provider accepts (e.g. an Anthropic model id when the routed agent runs on Anthropic, a Bedrock inference profile when it runs on Bedrock). Falls back to the provider's default model when unset. |
+| `canned_response` | Custom reply on reject. Falls back to a per-persona default. |
+
+**Cost and latency**: each filtered message makes one extra LLM call (typically ~50-100 input tokens + ~30 output tokens, adding ~300‑500 ms). If the LLM call fails, the filter defaults to allowing the message (so your bot isn’t silenced by a transient outage).
+
+### Slash commands
+
+Slack supports slash commands. Configure them in the `slash_commands` array:
+
+```toml
+[[slash_commands]]
+command = "/ask"
+agent_id = "help-desk"
+
+[[slash_commands]]
+command = "/cryptic"
+system_prompt = "You are a secret keeper. Answer cryptically."
+```
+
+## Bot tokens
+
+Workforce communicates with Slack using two tokens:
+
+* **Bot token (xoxb-…)**: Used for sending messages, reading channel history, and reacting. Required for all Slack interactions.
+* **App token (xapp-…)**: Required for Socket Mode, which allows Slack to push events (messages, reactions, slash commands) to the bot.
+
+You can obtain both tokens from the Slack App Dashboard under **OAuth & Permissions** and **App Manifest**.
+
+## Tools for agents
+
+Agents connected to a Slack workspace can call the following tools.
+
+### Interaction tools
+
+* **slack.send** — Send a message to a channel or thread.
+* **slack.react** — Add an emoji reaction to a message.
+* **slack.read** — Read recent messages from a channel (limit capped at 100).
+* **slack.channel_info** — Look up a channel's human‑readable name.
+
+### Discovery and management tools
+
+* **slack.list_channels** — List channels in the workspace.
+  - Optional filters: `filter` (substring on name/topic/purpose), `types` (CSV: `public_channel,private_channel,mpim,im`), `exclude_archived`.
+  - Returns paginated results with `cursor` and `next_cursor`.
+* **slack.list_users** — Find users by name or email.
+  - Optional: `filter` (substring on name/real_name/display_name/email), `email` (substring on email only). When provided, walks pagination up to 25 pages/50 matches.
+  - Default excludes bots and deleted users (override with `include_bots`/`include_deleted`).
+  - May return `truncated: true` if more matches exist beyond budget.
+* **slack.lookup_user_by_email** — Look up a user by an exact email address (requires the `users:read.email` scope).
+* **slack.list_channel_members** — List user IDs in a channel.
+* **slack.list_user_conversations** — See what channels a given user is in.
+* **slack.search_messages** — Search for messages across the workspace (requires a per‑user xoxp-… token on a paid Slack plan). Each user must register their token via `workforce slack.user_token_set workspace_id=<workspace> user_token=<xoxp-…>` before searching.
+
+### Channel management tools
+
+* **slack.create_channel** — Create a new public or private channel. Channel names must be lowercase, ≤80 chars, and contain only letters/numbers/hyphens/underscores.
+* **slack.archive_channel** , **slack.unarchive_channel** — Archive/unarchive a channel. Cannot archive #general channel.
+* **slack.rename_channel** — Rename an existing channel.
+* **slack.set_channel_metadata** — Update a channel’s topic or purpose. Runs serially: topic first, then purpose (if topic fails, purpose not attempted).
+* **slack.invite_to_channel** — Invite one or more users (1-1000) to a channel. Users receive Slack notifications.
+* **slack.kick_from_channel** — Remove a user from a channel (cannot kick self).
+
+### Message management tools
+
+* **slack.update_message** — Edit a message the bot previously sent.
+* **slack.delete_message** — Delete a message the bot previously sent.
+* **slack.pin_message** , **slack.unpin_message** — Pin/unpin a message (channels have a 100-pin limit).
+* **slack.get_message_replies** — Fetch replies in a thread.
+* **slack.user_info** — Fetch full details for a single user ID.
+
+### File management tools
+
+* **slack.upload_file** — Upload a file (up to 1GB) to Slack. Provide exactly one of `content_text` (UTF-8) or `content_base64` (base64-encoded).
+* **slack.list_files** — List files visible to the bot. Optional filters: `channel`, `user`, `types` (CSV: `images,pdfs,snippets,etc.`).
+* **slack.delete_file** — Delete a file by ID (the bot must be the uploader).
+
+## User-scoped search
+
+The `slack.search_messages` tool requires a per‑user (xoxp-…) token, because Slack enforces that search results reflect the caller’s personal view (including private channels they belong to).
+
+To set up search for a user, register their token with the command:
+```bash
+workforce slack.user_token_set workspace_id=<workspace> user_token=<xoxp-…>
+```
+
+Each user’s token is stored separately and never shared. Calls to `slack.search_messages` will automatically use the token belonging to the user making the request.
+
+## Formatting and mentions
+
+When Workforce receives a Slack message, it automatically replaces raw Slack IDs (`<@U123>`, `<#C456>`) with human‑readable names in the text shown to the agent.
+
+When an agent sends a message, `@Kingsley` in the text is automatically turned into a proper Slack mention (`<@U123>`), and `#engineering` becomes a channel link (`<#C456|engineering>`). The bot also rewrites `@here`, `@channel`, and `@everyone` to their correct Slack syntax.
+
+## Code blocks and tables
+
+Slack's `mrkdwn` parser sometimes struggles with large code blocks. To ensure reliable rendering, any message containing a triple‑backtick fence (` ``` `) is sent using Slack’s Block Kit “rich text” format, which handles code correctly.
+
+Markdown tables are converted to aligned code blocks automatically.
+
+## File handling
+
+Workforce can download files attached to Slack messages and present them to the agent as text or base64‑encoded data (for images, PDFs, and other binary files). The bot respects Slack’s file‑size limits and will skip files larger than 20 MB.
+
+## Error messages
+
+If a Slack API call fails, the tool will return a descriptive error that includes the Slack error code and a hint about how to fix it (e.g., missing OAuth scopes, the bot not being a channel member, a channel being archived, etc.).

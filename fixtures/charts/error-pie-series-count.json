@@ -1,0 +1,24 @@
+{
+  "input": {
+    "kind": "pie",
+    "labels": [
+      "a"
+    ],
+    "series": [
+      {
+        "data": [
+          1
+        ]
+      },
+      {
+        "data": [
+          2
+        ]
+      }
+    ]
+  },
+  "result": {
+    "ok": false,
+    "error": "a pie chart takes exactly one series"
+  }
+}

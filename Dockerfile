@@ -1,0 +1,197 @@
+# Multi-stage build for the Workforce system
+# UI build stage
+FROM node:22-bookworm-slim AS ui-builder
+WORKDIR /build/ui
+COPY ui/package.json ui/package-lock.json* ./
+RUN npm ci --ignore-scripts 2>/dev/null || npm install
+COPY ui/ .
+RUN npm run build
+
+FROM rust:1.90-bookworm AS builder
+
+WORKDIR /build
+COPY . .
+COPY --from=ui-builder /build/ui/dist ui/dist/
+
+RUN cargo build --release -p workforce-cli
+
+# Runtime image
+FROM debian:trixie-slim
+
+ARG COMMIT_SHA=unknown
+ARG BUILD_DATE=unknown
+ENV COMMIT_SHA=${COMMIT_SHA} \
+    BUILD_DATE=${BUILD_DATE}
+
+# ─── System packages + dev tools ─────────────────────────────────────────────
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    ca-certificates \
+    clang \
+    curl \
+    fd-find \
+    ffmpeg \
+    git \
+    gnupg \
+    jq \
+    libssl-dev \
+    mold \
+    openssh-client \
+    pkg-config \
+    poppler-utils \
+    postgresql-client \
+    ripgrep \
+    tini \
+    unzip \
+    util-linux \
+    wget \
+    xz-utils \
+    && curl -fsSL https://deb.nodesource.com/setup_24.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && corepack enable \
+    && rm -rf /var/lib/apt/lists/*
+
+# ─── GitHub CLI (for code.pr tool) ───────────────────────────────────────────
+RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | \
+    dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg \
+    && chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | \
+    tee /etc/apt/sources.list.d/github-cli.list > /dev/null \
+    && apt-get update && apt-get install -y --no-install-recommends gh \
+    && rm -rf /var/lib/apt/lists/*
+
+# ─── Typst (for generate_report: PDF reports / PNG infographics) ──────────────
+ARG TYPST_VERSION=v0.14.2
+RUN set -eux; \
+    case "$(dpkg --print-architecture)" in \
+        amd64) target=x86_64-unknown-linux-musl ;; \
+        arm64) target=aarch64-unknown-linux-musl ;; \
+        *) echo "unsupported architecture for typst" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL --retry 3 -o /tmp/typst.tar.xz \
+        "https://github.com/typst/typst/releases/download/${TYPST_VERSION}/typst-${target}.tar.xz"; \
+    tar -xJf /tmp/typst.tar.xz -C /tmp; \
+    install -m 0755 "/tmp/typst-${target}/typst" /usr/local/bin/typst; \
+    rm -rf /tmp/typst.tar.xz "/tmp/typst-${target}"; \
+    typst --version
+
+
+# ─── Rust toolchain (matches CI: 1.90) ───────────────────────────────────────
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH=/usr/local/cargo/bin:$PATH
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+    sh -s -- -y --default-toolchain 1.90.0 --profile minimal \
+    && rustup component add clippy rustfmt rust-analyzer rust-src \
+    && rustup target add wasm32-unknown-unknown \
+    && rm -rf "$CARGO_HOME/registry/cache" /tmp/*
+
+# ─── Git defaults ────────────────────────────────────────────────────────────
+RUN git config --system user.name "Workforce Agent" \
+    && git config --system user.email "agent@workforce.local" \
+    && git config --system init.defaultBranch main \
+    && git config --system --add safe.directory '*'
+
+# ─── Application ─────────────────────────────────────────────────────────────
+COPY --from=builder /build/target/release/workforce /usr/local/bin/
+
+# ─── Privilege-separated entrypoint (root init; drops to workforce + agent) ──
+COPY docker/workforce-init /usr/local/bin/workforce-init
+RUN chmod 0755 /usr/local/bin/workforce-init
+
+# ─── Bundled skills (SKILL.md workflow definitions) ─────────────────────────
+COPY skills/ /app/bundled-skills/skills/
+
+# ─── Chromium (headless browser for the `browser` skill via CDP) ─────────────
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends chromium \
+    && rm -rf /var/lib/apt/lists/*
+
+# ─── Claude Code CLI (used by coding.claude tool + claude-code workflow engine) ─
+# Pinned: an unpinned install silently crossing CC's 2.1.69 schema-deferral
+# boundary inside a frozen cache epoch is what hid the ToolSearch breakage.
+# Bump deliberately, with a deploy you can verify.
+ARG CLAUDE_CODE_VERSION=2.1.284
+RUN npm install -g @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}
+
+# ─── Codex CLI (the `codex` coding engine, `/cx`) ──────────────────────────
+ARG CODEX_VERSION=0.154.0
+RUN npm install -g @openai/codex@${CODEX_VERSION}
+
+# ─── TypeScript language server (code.refactor rename/diagnostics) ──────────
+# Pinned with the TypeScript it falls back to when a repo has none of its own
+# in node_modules; rust-analyzer comes with the Rust toolchain above.
+ARG TYPESCRIPT_LANGUAGE_SERVER_VERSION=4.4.1
+ARG TYPESCRIPT_VERSION=5.9.3
+RUN npm install -g typescript-language-server@${TYPESCRIPT_LANGUAGE_SERVER_VERSION} typescript@${TYPESCRIPT_VERSION}
+
+# ─── Obscura (stdio MCP backend for the `obscura` skill) ─────────────────────
+ARG OBSCURA_VERSION=v0.1.5
+RUN set -eux; \
+    arch="$(dpkg --print-architecture)"; \
+    if [ "$arch" = "amd64" ]; then \
+        curl -fsSL --retry 3 --retry-delay 5 -o /tmp/obscura.tar.gz \
+            "https://github.com/h4ckf0r0day/obscura/releases/download/${OBSCURA_VERSION}/obscura-x86_64-linux.tar.gz"; \
+        tar -xzf /tmp/obscura.tar.gz -C /usr/local/bin/ obscura obscura-worker; \
+        chmod +x /usr/local/bin/obscura /usr/local/bin/obscura-worker; \
+        rm /tmp/obscura.tar.gz; \
+    else \
+        echo "obscura: no release published for arch '$arch'; obscura skill will be unavailable on this image"; \
+    fi
+
+# ─── Privilege-separated users ────
+# Two users share group `workforce` (gid 1000):
+#   - workforce (uid 1000) runs the hub      — owns the vault, reads secrets.
+#   - agent     (uid 1001) runs every shell/build/git command — CANNOT read the
+#     vault, the hub's env, or /proc; collaborates on shared data via the group.
+# The agent has its OWN writable HOME + tool caches; it must never use the hub's
+# read-only /usr/local/cargo as CARGO_HOME (the runner points the agent's
+# CARGO_HOME at /home/agent/.cargo at runtime).
+RUN groupadd -g 1000 workforce \
+    && useradd -u 1000 -g 1000 -d /app -s /bin/bash workforce \
+    && useradd -u 1001 -g 1000 -d /home/agent -s /bin/bash -m agent \
+    && mkdir -p /app/data /app/workspace /home/agent/.cargo /home/agent/.npm \
+    && mkdir -p /usr/local/cargo/registry/cache /usr/local/cargo/registry/src /usr/local/cargo/git \
+    # Tier 1 — toolchains + hub binary: workforce-owned, group r-x but NOT
+    # group-writable (agent runs cargo/rustc, cannot replace a hub-run binary).
+    && chown -R workforce:workforce /usr/local/cargo /usr/local/rustup \
+    && chmod -R u+rwX,g+rX,g-w /usr/local/cargo /usr/local/rustup \
+    # Tier 3 — shared data: workforce-owned, group workforce + g+rwX so both
+    # users collaborate (the init refines the runtime ones, setgid, at boot).
+    && chown -R workforce:workforce /app \
+    && chmod -R g+rwX /app \
+    # Agent-owned, writable HOME + tool caches (CARGO_HOME / npm cache).
+    && chown -R agent:workforce /home/agent
+
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+    CMD curl -f http://localhost:8090/api/dashboard || exit 1
+
+WORKDIR /app
+VOLUME /app/data
+VOLUME /app/workspace
+
+EXPOSE 8090 8091 8092
+
+ENV RUST_LOG=info
+
+# ─── Default entrypoint: single-user, identical to pre-executor ──────────────
+# The privilege-separated executor (audit F7) ships DORMANT: the image carries
+# all its machinery (the `agent` user, `tini`, `setpriv`/util-linux, the
+# `workforce-init` script, the build-time perm tiers) but boots EXACTLY as
+# before — one user `workforce`, no root init, no runner daemon. A plain deploy
+# changes nothing at runtime.
+#
+# To ENABLE privsep at deploy time WITHOUT rebuilding the image, an operator
+# overrides this in the stack/compose:
+#   user: "0"                                      # init must start as root to setuid
+#   entrypoint: ["tini","--","/usr/local/bin/workforce-init"]
+#   environment / config: set `[exec] runner_socket = "/run/workforce/exec.sock"`
+# The init drops root via setpriv to run the hub as `workforce` and the runner as
+# `agent`; with the socket set the hub dispatches commands to that runner. The
+# init self-protects: if it is somehow launched as non-root it execs the hub
+# directly as the current user instead of bricking the container.
+USER workforce
+
+ENTRYPOINT ["workforce"]
+CMD ["serve", "--config", "/app/workforce.toml"]

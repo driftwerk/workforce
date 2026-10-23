@@ -1,0 +1,90 @@
+{
+  "model": "gpt-5.5",
+  "instructions": "You are Allan, a concise assistant. Use tools when asked.",
+  "store": false,
+  "stream": true,
+  "include": [
+    "reasoning.encrypted_content"
+  ],
+  "tool_choice": "auto",
+  "prompt_cache_key": "00000000-0000-4000-8000-000000000001",
+  "reasoning": {
+    "effort": "medium",
+    "summary": "auto"
+  },
+  "parallel_tool_calls": true,
+  "tools": [
+    {
+      "type": "function",
+      "name": "weather_get",
+      "description": "Get the weather for a city",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "city": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "city"
+        ]
+      },
+      "strict": false
+    },
+    {
+      "type": "function",
+      "name": "time_get",
+      "description": "Get the local time for a city",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "city": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "city"
+        ]
+      },
+      "strict": false
+    }
+  ],
+  "input": [
+    {
+      "type": "message",
+      "role": "user",
+      "content": [
+        {
+          "type": "input_text",
+          "text": "What are the weather and the local time in Lisbon? Call both tools."
+        }
+      ]
+    },
+    {
+      "id": "fc_0e006fc8ec974095016abb6a91bd5c87d2ae0ce6eef289e16b",
+      "type": "function_call",
+      "status": "completed",
+      "arguments": "{\"city\":\"Lisbon\"}",
+      "call_id": "call_i0R5QIs1iUydymKO9v7MRxoP",
+      "name": "weather_get"
+    },
+    {
+      "id": "fc_0e006fc8ec974095016abb6a91bd7087d2ba144bc307c1802b",
+      "type": "function_call",
+      "status": "completed",
+      "arguments": "{\"city\":\"Lisbon\"}",
+      "call_id": "call_k94qa7gmcyenx7QAN6oXUVxM",
+      "name": "time_get"
+    },
+    {
+      "type": "function_call_output",
+      "call_id": "call_i0R5QIs1iUydymKO9v7MRxoP",
+      "output": "sunny 21C"
+    },
+    {
+      "type": "function_call_output",
+      "call_id": "call_k94qa7gmcyenx7QAN6oXUVxM",
+      "output": "10:42"
+    }
+  ]
+}

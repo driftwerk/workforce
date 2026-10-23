@@ -1,0 +1,42 @@
+[package]
+name = "workforce-training"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+chrono = { workspace = true }
+eyre = { workspace = true }
+rusqlite = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = "0.10"
+tracing = { workspace = true }
+uuid = { workspace = true }
+workforce-postgres = { workspace = true }
+
+async-trait = { workspace = true, optional = true }
+deadpool-postgres = { workspace = true, optional = true }
+refinery = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+tokio-postgres = { workspace = true, optional = true }
+
+[features]
+default = []
+postgres = [
+    "dep:async-trait",
+    "dep:deadpool-postgres",
+    "dep:refinery",
+    "dep:tokio",
+    "dep:tokio-postgres",
+    "workforce-postgres/postgres",
+]
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { workspace = true }
+workforce-postgres = { workspace = true, features = ["test-support"] }
+
+[build-dependencies]
+workforce-build-support = { path = "../build-support" }

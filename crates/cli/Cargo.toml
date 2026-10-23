@@ -1,0 +1,79 @@
+[package]
+name = "workforce-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "workforce"
+path = "src/main.rs"
+
+[dependencies]
+async-nats = { workspace = true }
+parking_lot = { workspace = true }
+workforce-core = { workspace = true }
+workforce-common = { workspace = true, features = ["postgres"] }
+workforce-nats = { workspace = true }
+workforce-policy = { workspace = true }
+workforce-agent = { workspace = true }
+workforce-decide = { path = "../decide" }
+workforce-distributed = { path = "../distributed" }
+workforce-identity = { path = "../identity", features = ["postgres"] }
+toml = { workspace = true }
+clap = { workspace = true }
+hostname = "0.4"
+dialoguer = { workspace = true }
+indicatif = { workspace = true }
+console = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+eyre = { workspace = true }
+color-eyre = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+workforce-hub = { path = "../hub", features = ["oidc", "postgres"] }
+workforce-pairing = { workspace = true, features = ["postgres"] }
+workforce-permissions = { path = "../permissions", features = ["postgres"] }
+workforce-projects = { workspace = true, features = ["postgres"] }
+workforce-mcp-store = { workspace = true, features = ["postgres"] }
+workforce-oauth-client = { workspace = true }
+reqwest = { workspace = true }
+workforce-skills = { path = "../skills", features = ["slack", "github", "google", "browser", "email"] }
+workforce-gateway-client = { path = "../gateway-client" }
+workforce-memory = { path = "../memory" }
+workforce-training = { workspace = true, features = ["postgres"] }
+workforce-self-learning = { workspace = true, features = ["postgres"] }
+workforce-postgres = { workspace = true }
+workforce-orchestrator = { path = "../orchestrator" }
+workforce-vellev = { workspace = true }
+workforce-worker = { workspace = true }
+workforce-codebase-knowledge = { path = "../codebase-knowledge", features = ["postgres"] }
+csv = { workspace = true }
+axum = { workspace = true }
+tower-http = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+tui-textarea = { workspace = true }
+futures = { workspace = true }
+tokio-tungstenite = { version = "0.28", features = ["native-tls"] }
+pulldown-cmark = { workspace = true }
+unicode-width = { workspace = true }
+base64 = { workspace = true }
+glob = "0.3"
+
+# Global allocator for the `workforce` binary. jemalloc returns freed pages to
+# the OS promptly (background purge threads + short decay), which flattens the
+# RSS ratchet the default glibc malloc produces under this workload — see the
+# `#[global_allocator]` block in `src/main.rs`. Not available on MSVC; the cfg
+# guard there falls back to the system allocator on that target.
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = { version = "0.6", features = ["unprefixed_malloc_on_supported_platforms", "background_threads", "profiling"] }
+
+[dev-dependencies]
+tempfile = "3"
+wiremock = { workspace = true }

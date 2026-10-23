@@ -1,0 +1,40 @@
+[package]
+name = "workforce-knowledge-service"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+name = "workforce_knowledge_service"
+path = "src/lib.rs"
+
+[dependencies]
+workforce-codebase-knowledge = { path = "../codebase-knowledge" }
+workforce-common = { path = "../common" }
+workforce-postgres = { workspace = true }
+
+async-trait = { workspace = true }
+blake3 = { workspace = true }
+dashmap = "6"
+eyre = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+tokio = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+vellev-core = { workspace = true }
+workforce-vellev = { workspace = true, features = ["testing"] }
+tempfile = "3"
+tracing-subscriber = { workspace = true }
+
+[features]
+default = []
+postgres = [
+    "workforce-common/postgres",
+    "workforce-postgres/postgres",
+    "workforce-codebase-knowledge/postgres",
+]

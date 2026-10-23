@@ -1,0 +1,75 @@
+version: "3.8"
+
+services:
+  workforce:
+    build: ..
+    container_name: workforce
+    restart: unless-stopped
+    ports:
+      - "8090:8090"  # Admin API
+      - "8091:8091"  # Gateway (WS + REST)
+    volumes:
+      - ./workforce.toml:/app/workforce.toml:ro
+      - workforce-data:/app/data
+      - workforce-workspace:/app/workspace
+      # Claude Code stores per-session transcripts under $HOME/.claude/projects.
+      # Without this mount, every container redeploy wipes them and any in-flight
+      # `/cc` thread fails its next turn with `No conversation found with session ID`.
+      - workforce-claude:/app/.claude
+    env_file:
+      - .env
+    environment:
+      - RUST_LOG=info
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8090/api/dashboard"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # Optional: NATS server for multi-agent distributed mode
+  nats:
+    image: nats:2.10-alpine
+    container_name: workforce-nats
+    restart: unless-stopped
+    ports:
+      - "4222:4222"
+      - "8222:8222"  # Monitoring
+    volumes:
+      - nats-data:/data
+    command: ["--js", "--sd", "/data"]
+    profiles:
+      - distributed
+
+  # Optional: Weaviate for vector memory
+  weaviate:
+    image: semitechnologies/weaviate:1.28.2
+    container_name: workforce-weaviate
+    restart: unless-stopped
+    ports:
+      - "9080:8080"
+    volumes:
+      - weaviate-data:/var/lib/weaviate
+    environment:
+      PERSISTENCE_DATA_PATH: /var/lib/weaviate
+      DEFAULT_VECTORIZER_MODULE: none
+      CLUSTER_HOSTNAME: node1
+    profiles:
+      - memory
+
+  # Optional: Ollama for local LLM summaries (knowledge engine)
+  ollama:
+    image: ollama/ollama:latest
+    container_name: workforce-ollama
+    restart: unless-stopped
+    volumes:
+      - ollama-data:/root/.ollama
+    profiles:
+      - knowledge
+
+volumes:
+  workforce-data:
+  workforce-workspace:
+  workforce-claude:
+  nats-data:
+  weaviate-data:
+  ollama-data:

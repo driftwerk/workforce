@@ -1,0 +1,182 @@
+.games-root {
+  --g-ink: #1a1033;
+  --g-pop: #ff3d81;
+  --g-pop2: #7c3aed;
+  --g-mint: #22d3a6;
+  --g-sun: #ffd166;
+  min-height: 100dvh;
+  color: var(--g-ink);
+  font-weight: 600;
+  background:
+    radial-gradient(1200px 600px at 10% -10%, #ff9de2 0%, transparent 55%),
+    radial-gradient(1000px 600px at 110% 10%, #7cf3ff 0%, transparent 50%),
+    linear-gradient(160deg, #6d28d9 0%, #b21fbf 45%, #ff5e7e 100%);
+  background-attachment: fixed;
+  font-family:
+    "Baloo 2", "Fredoka", ui-rounded, "Segoe UI", system-ui, -apple-system, sans-serif;
+}
+
+.g-display {
+  font-weight: 800;
+  letter-spacing: -0.02em;
+  line-height: 1.02;
+  text-shadow: 0 3px 0 rgba(0, 0, 0, 0.12);
+}
+
+.g-card {
+  background: rgba(255, 255, 255, 0.92);
+  border: 2px solid rgba(255, 255, 255, 0.7);
+  border-radius: 1.75rem;
+  box-shadow:
+    0 20px 50px -20px rgba(40, 10, 80, 0.55),
+    inset 0 1px 0 rgba(255, 255, 255, 0.8);
+  backdrop-filter: blur(6px);
+}
+
+.g-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  font-weight: 800;
+  color: white;
+  padding: 0.85rem 1.6rem;
+  border-radius: 999px;
+  background: linear-gradient(135deg, var(--g-pop) 0%, var(--g-pop2) 100%);
+  box-shadow: 0 10px 22px -8px rgba(124, 58, 237, 0.7), 0 3px 0 rgba(0, 0, 0, 0.12);
+  transition: transform 0.12s ease, box-shadow 0.12s ease, filter 0.12s ease;
+  cursor: pointer;
+}
+.g-btn:hover:not(:disabled) {
+  transform: translateY(-2px) scale(1.03);
+  filter: saturate(1.1);
+}
+.g-btn:active:not(:disabled) {
+  transform: translateY(1px) scale(0.98);
+}
+.g-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.g-btn-mint {
+  background: linear-gradient(135deg, var(--g-mint) 0%, #18a0fb 100%);
+  box-shadow: 0 10px 22px -8px rgba(24, 160, 251, 0.7), 0 3px 0 rgba(0, 0, 0, 0.12);
+}
+
+.g-btn-ghost {
+  background: rgba(255, 255, 255, 0.16);
+  color: white;
+  border: 2px solid rgba(255, 255, 255, 0.5);
+  box-shadow: none;
+}
+
+.g-tile {
+  border-radius: 1.25rem;
+  background: white;
+  border: 2px solid rgba(124, 58, 237, 0.12);
+  box-shadow: 0 10px 24px -16px rgba(40, 10, 80, 0.5);
+  transition: transform 0.15s ease, box-shadow 0.15s ease, border-color 0.15s ease;
+  animation: g-pop 0.35s cubic-bezier(0.22, 1.2, 0.36, 1) both;
+}
+.g-tile-pick {
+  cursor: pointer;
+}
+.g-tile-pick:hover {
+  transform: translateY(-4px) rotate(-1deg);
+  border-color: var(--g-pop);
+  box-shadow: 0 18px 30px -18px rgba(255, 61, 129, 0.8);
+}
+.g-tile-chosen {
+  border-color: var(--g-mint);
+  box-shadow: 0 0 0 4px rgba(34, 211, 166, 0.35);
+}
+
+.g-avatar {
+  display: grid;
+  place-items: center;
+  border-radius: 999px;
+  background: linear-gradient(135deg, #fde68a, #fca5f1);
+  box-shadow: inset 0 2px 6px rgba(255, 255, 255, 0.8);
+}
+
+.g-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-weight: 800;
+  padding: 0.3rem 0.85rem;
+  border-radius: 999px;
+  background: rgba(26, 16, 51, 0.34);
+  color: white;
+  border: 1.5px solid rgba(255, 255, 255, 0.35);
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.35);
+}
+
+.g-float {
+  animation: g-float 4s ease-in-out infinite;
+}
+.g-pulse {
+  animation: g-pulse 1.1s ease-in-out infinite;
+}
+
+@keyframes g-pop {
+  from {
+    opacity: 0;
+    transform: scale(0.8) translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1) translateY(0);
+  }
+}
+@keyframes g-float {
+  0%, 100% {
+    transform: translateY(0);
+  }
+  50% {
+    transform: translateY(-8px);
+  }
+}
+@keyframes g-pulse {
+  0%, 100% {
+    transform: scale(1);
+  }
+  50% {
+    transform: scale(1.06);
+  }
+}
+
+.g-confetti {
+  pointer-events: none;
+  position: fixed;
+  inset: 0;
+  overflow: hidden;
+  z-index: 50;
+}
+.g-confetti i {
+  position: absolute;
+  top: -5vh;
+  width: 0.7rem;
+  height: 0.95rem;
+  border-radius: 2px;
+  opacity: 0.9;
+  animation: g-fall linear forwards;
+}
+@keyframes g-fall {
+  to {
+    transform: translateY(110vh) rotate(720deg);
+    opacity: 0.7;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .g-tile,
+  .g-float,
+  .g-pulse,
+  .g-confetti i,
+  .g-btn {
+    animation: none !important;
+    transition: none !important;
+  }
+}

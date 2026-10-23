@@ -1,0 +1,1248 @@
+---
+title: CLI
+description: The `workforce` command-line interface for running agent tasks, managing configuration, and connecting to remote hubs.
+---
+
+# CLI
+
+The `workforce` command-line tool lets you control AI agents. You can run tasks, chat interactively, manage agent configurations, schedule automated jobs, handle secrets, connect remote nodes, and more.
+
+## Core Commands
+
+### `workforce run`
+
+Run a single task with an agent.
+
+```sh
+workforce run "Summarize the main points from the team meeting notes"
+```
+
+Options:
+- `--agent <id>` — Which agent to use (default: `"default"`).
+- `--model <name>` — LLM model to use.
+- `--provider <name>` — Choose an LLM provider (`anthropic`, `openrouter`, etc.).
+- `--workdir <path>` — Working directory for any file operations.
+- `--max-rounds <N>` — Limit how many steps of tool execution the agent can take (default `20`).
+
+### `workforce chat`
+
+Start an interactive terminal chat session with an agent through a hub.
+
+```sh
+workforce chat --gateway ws://localhost:8091 --token <your-token>
+```
+
+Options:
+- `--gateway <url>` — The WebSocket address of the Workforce hub (defaults to the `workforce.toml` setting).
+- `--token <token>` — Authentication token (found in `workforce.toml` or as `WORKFORCE_GATEWAY_TOKEN` environment variable).
+- `--agent <id>` — Select a specific agent for the session.
+- `--model <name>` — Override the default model for the session.
+
+The chat provides a full terminal interface with real‑time streaming, file attachments, slash commands, and tab completion. See the [TUI Chat](#tui-chat) section for details.
+
+### `workforce serve`
+
+Start the long-running Workforce hub service.
+
+```sh
+workforce serve --config workforce.toml
+```
+
+This launches:
+- The WebSocket gateway (default port `8091`) for chat clients.
+- The admin API (default port `8090`).
+- Skills like Slack integration.
+- The scheduler for recurring jobs.
+- Background tasks for knowledge maintenance.
+
+### `workforce init`
+
+Set up a new Workforce project.
+
+```sh
+workforce init
+```
+
+Creates:
+- `workforce.toml` — Main configuration file.
+- `policies/default.yaml` — Template for access‑control rules.
+- `data/agents/default/` workspace with agent identity files (`SOUL.md`, `MEMORY.md`, etc.).
+
+### `workforce mcp-serve`
+
+Serve the Model Context Protocol (MCP) over stdin/stdout for a specific agent. This command is typically launched as a subprocess by Claude Code.
+
+```sh
+workforce mcp-serve --agent-id default --config workforce.toml
+```
+
+Options:
+- `--agent-id <id>` — The agent whose tools should be exposed (required).
+- `--exposed-tools <patterns>` — Comma-separated tool patterns to expose (e.g., `knowledge.*,linear.*`). If omitted, exposes all tools.
+- `--preload-skills <names>` — Comma-separated skills to load from the agent's vault at startup.
+- `--user-id <uuid>` — Canonical identity UUID for per‑user vault path resolution.
+
+### `workforce status`
+
+Show system status.
+
+```sh
+workforce status
+```
+
+Output includes NATS connection status, running agents, and registered nodes.
+
+## Agent Management
+
+### `workforce agent list`
+
+Show all configured agents.
+
+```sh
+workforce agent list --config workforce.toml
+```
+
+### `workforce agent show`
+
+Show details for a specific agent.
+
+```sh
+workforce agent show default
+```
+
+### `workforce agent create`
+
+Add a new agent.
+
+```sh
+workforce agent create --id reviewer --name "Code Reviewer" --role reviewer
+```
+
+### `workforce agent update`
+
+Modify an existing agent.
+
+```sh
+workforce agent update --id reviewer --name "Senior Reviewer" --model claude-3-5-sonnet-20241022
+```
+
+### `workforce agent delete`
+
+Remove an agent.
+
+```sh
+workforce agent delete --id reviewer --delete-workspace
+```
+
+Use `--delete-workspace` to also delete the agent's data directory.
+
+### `workforce agents`
+
+List agents available on a remote gateway.
+
+```sh
+workforce agents --gateway ws://server:8091 --token <token>
+```
+
+## Session Management
+
+### `workforce sessions`
+
+Show session history.
+
+```sh
+workforce sessions --history
+```
+
+Options:
+- `--agent <name>` — Filter sessions by agent name.
+- `--days <N>` — Show sessions from the last N days.
+- `--limit <N>` — Maximum number of sessions to show (default `20`).
+- `--redact` — Redact secrets stored across all sessions.
+- `--dry-run` — With `--redact`, report what would change without writing.
+
+## Scheduler Commands
+
+Schedule recurring or one-time automated jobs.
+
+### `workforce cron list`
+
+View all scheduled jobs.
+
+```sh
+workforce cron list
+```
+
+### `workforce cron add`
+
+Create a new scheduled job.
+
+```sh
+workforce cron add --name "Daily standup" --message "What are you working on today?" --cron "0 9 * * *"
+```
+
+Schedule types:
+- `--cron <expr>` — Classic cron expression, e.g., `"0 9 * * *"` for 9 AM daily.
+- `--in <duration>` — Run after a delay, e.g., `"2h"` or `"30m"`.
+- `--every <seconds>` — Repeat every N seconds.
+
+### `workforce cron remove`
+
+Delete a scheduled job.
+
+```sh
+workforce cron remove <job-id>
+```
+
+### `workforce cron run`
+
+Trigger a job immediately.
+
+```sh
+workforce cron run <job-id>
+```
+
+### `workforce cron history`
+
+Show recent execution history.
+
+```sh
+workforce cron history
+```
+
+## Vault Commands
+
+Manage encrypted secrets (API keys, tokens, etc.). These commands use the vault file in `--data-dir` (default `./data`). Add `--config workforce.toml` to use the configured vault instead, whether that is a file or Postgres, and `--agent <id>` for one agent's own vault.
+
+### `workforce vault init`
+
+Create a new encrypted vault.
+
+```sh
+workforce vault init --data-dir ./data
+```
+
+### `workforce vault set`
+
+Store a secret.
+
+```sh
+workforce vault set slack.bot_token xoxb-...
+```
+
+Secrets are stored using dot notation, e.g., `slack.default.bot_token`.
+
+### `workforce vault get`
+
+Retrieve a secret.
+
+```sh
+workforce vault get slack.bot_token
+```
+
+### `workforce vault list`
+
+List all secret paths.
+
+```sh
+workforce vault list
+```
+
+### `workforce vault delete`
+
+Remove a secret.
+
+```sh
+workforce vault delete slack.bot_token
+```
+
+### `workforce vault rotate-key`
+
+Generate a new encryption key for the vault. On a vault file, restart every hub that uses it with the new key; until then they refuse to save credentials. With `--config` on the Postgres backend, every secret is re-sealed under a new key. Add `--new-key-file <file>` to move to a new passphrase as well. While a passphrase change is still rolling out, a rotation that would lock out the other passphrase is refused: run `retire-key` first.
+
+```sh
+workforce vault rotate-key
+workforce vault rotate-key --config workforce.toml --new-key-file new-key.txt
+```
+
+### `workforce vault retire-key`
+
+After every hub runs with the new passphrase, stop the old one opening the Postgres vault.
+
+```sh
+workforce vault retire-key --config workforce.toml
+```
+
+### `workforce vault migrate`
+
+Move every vault file into Postgres. While it runs, credentials can be read but not changed. Use `--dry-run` to check first; running it again skips vaults that are already moved. If a hub on Postgres already started a vault empty and saved secrets in it, that vault is reported as not imported and left as it is on both sides, and the command exits with an error so you can reconcile them.
+
+```sh
+workforce vault migrate --config workforce.toml --dry-run
+workforce vault migrate --config workforce.toml
+```
+
+### `workforce vault export`
+
+Move the vaults back from Postgres to files (rollback).
+
+```sh
+workforce vault export --config workforce.toml
+```
+
+### `workforce vault verify`
+
+Compare each vault file with its Postgres copy, listing paths only, never values.
+
+```sh
+workforce vault verify --config workforce.toml
+```
+
+### `workforce vault audit`
+
+Show who changed which secret and when, never values.
+
+```sh
+workforce vault audit --config workforce.toml --agent sarah --limit 20
+```
+
+## Pairing Commands
+
+Manage device and channel approvals for accessing the hub.
+
+### `workforce pair pending`
+
+Show pending pairing requests (channel, device, or node).
+
+```sh
+workforce pair pending
+```
+
+### `workforce pair approve`
+
+Approve a pairing request.
+
+```sh
+workforce pair approve ABC123DEF
+```
+
+### `workforce pair reject`
+
+Reject a pairing request.
+
+```sh
+workforce pair reject ABC123DEF
+```
+
+### `workforce pair request`
+
+Request a pairing code for a new device.
+
+```sh
+workforce pair request --gateway ws://localhost:8091 --name "My Laptop"
+```
+
+This prints an 8‑character code. An administrator must approve it with `workforce pair approve <code>`.
+
+### `workforce pair devices`
+
+List currently paired devices.
+
+```sh
+workforce pair devices
+```
+
+### `workforce pair config`
+
+View or update pairing configuration.
+
+```sh
+workforce pair config --show
+```
+
+### `workforce pair allowlist`
+
+Show the channel allowlist.
+
+```sh
+workforce pair allowlist
+```
+
+### `workforce pair allow`
+
+Manually add a sender to the channel allowlist.
+
+```sh
+workforce pair allow user@example.com
+```
+
+### `workforce pair revoke`
+
+Remove a sender from the channel allowlist.
+
+```sh
+workforce pair revoke user@example.com
+```
+
+### `workforce pair revoke-device`
+
+Revoke a paired device.
+
+```sh
+workforce pair revoke-device <device-id>
+```
+
+## Workflow Commands
+
+Workflows are defined in TOML files and orchestrate multi‑step processes.
+
+### `workforce workflow list`
+
+List workflow definitions.
+
+```sh
+workforce workflow list --workflows-dir .driftwerk/workflows
+```
+
+### `workforce workflow validate`
+
+Check a workflow TOML file for errors.
+
+```sh
+workforce workflow validate .driftwerk/workflows/onboarding.toml
+```
+
+### `workforce workflow create`
+
+Generate a scaffold for a new workflow.
+
+```sh
+workforce workflow create --id onboarding --workflows-dir .driftwerk/workflows
+```
+
+### `workforce workflow instances`
+
+Show running workflow instances.
+
+```sh
+workforce workflow instances --data-dir ./data
+```
+
+### `workforce workflow show`
+
+Display details of a specific workflow.
+
+```sh
+workforce workflow show onboarding --workflows-dir .driftwerk/workflows
+```
+
+## Node Commands
+
+Set up local nodes that connect to a central hub.
+
+### `workforce node config`
+
+Generate a NATS leaf‑node configuration file.
+
+```sh
+workforce node config --hub-url nats-leaf://localhost:7422 --node-id my-node
+```
+
+### `workforce node start`
+
+Start a local node that connects to the hub.
+
+```sh
+workforce node start --hub-url nats-leaf://localhost:7422 --capabilities filesystem,docker
+```
+
+### `workforce node status`
+
+Check node connection status.
+
+```sh
+workforce node status
+```
+
+### `workforce node info`
+
+Show node details and capabilities.
+
+```sh
+workforce node info
+```
+
+### `workforce node stop`
+
+Shut down the local node.
+
+```sh
+workforce node stop
+```
+
+## Skill Commands
+
+Skills are extensions that add capabilities (e.g., Slack, Google Drive).
+
+### `workforce skill list`
+
+List installed skills.
+
+```sh
+workforce skill list
+```
+
+### `workforce skill install`
+
+Install an instruction skill (a directory with a `SKILL.md`) from a git URL, adding
+`#subpath=<dir>` for a skill inside a larger repository, or from a local directory.
+
+```sh
+workforce skill install https://github.com/acme/skills#subpath=hello-world
+```
+
+The skill is written to `skills/` under `--workdir`, and a hub started from that
+directory picks it up when it next starts. The CLI clones with your own git setup, not a
+token from the vault, and refuses a skill that is already installed. To read a private
+GitHub repository with a vault token, to update an installed skill, or to make a skill
+live at once, use `system.install_external_skill` in chat instead; see
+[Installing skills](/docs/concepts/skills#installing-skills).
+
+### `workforce skill init`
+
+Create a default `config.toml` for a skill.
+
+```sh
+workforce skill init slack-integration
+```
+
+### `workforce skill search`
+
+Search for available skills.
+
+```sh
+workforce skill search slack
+```
+
+### `workforce skill show`
+
+Show details about a skill.
+
+```sh
+workforce skill show slack
+```
+
+### `workforce skill uninstall`
+
+Remove a skill.
+
+```sh
+workforce skill uninstall slack
+```
+
+This removes the skill from `skills/` under `--workdir`, so a hub started from that
+directory stops offering it when it next starts.
+
+### `workforce skill catalog`
+
+List the skills in the catalogs configured under `[[skills.catalogs]]`, marking the ones
+already installed.
+
+```sh
+workforce skill catalog [--source <name>]
+```
+
+`--source` lists only the named catalog.
+
+### `workforce skill catalog-install`
+
+Install a skill from a catalog, or update an installed one to the catalog's version.
+
+```sh
+workforce skill catalog-install example hello-world
+```
+
+The CLI runs outside the hub, so a running hub loads the skill when it next starts. To
+make it live at once, install it from the Skills page or with
+`system.install_catalog_skill` instead.
+
+## Local Agent Commands
+
+Connect your local machine as a worker that can execute commands for agents.
+
+### `workforce local-agent connect`
+
+Register as a local agent with a remote hub.
+
+```sh
+workforce local-agent connect --gateway ws://localhost:8091 --token <token>
+```
+
+This allows the hub to delegate shell commands and file operations to your machine.
+
+## Identity & Permission Commands
+
+Manage multi‑user access and role‑based permissions.
+
+### `workforce permissions migrate`
+
+Convert YAML policy rules into the internal permission store.
+
+```sh
+workforce permissions migrate --config workforce.toml
+```
+
+### `workforce migrate`
+
+Migrate to the new identity system.
+
+```sh
+workforce migrate --config workforce.toml --identity-db data/identities.db
+```
+
+## Tools Commands
+
+### `workforce tools`
+
+List all available tools and their descriptions.
+
+```sh
+workforce tools
+```
+
+Output includes built‑in tools and runtime‑only tools (`memory`, `scheduler`).
+
+## Policy Commands
+
+Review and manage policy proposals from agents.
+
+### `workforce policy list`
+
+List policy proposals.
+
+```sh
+workforce policy list
+```
+
+### `workforce policy show`
+
+Show details of a specific proposal.
+
+```sh
+workforce policy show <proposal-id>
+```
+
+### `workforce policy approve`
+
+Approve a policy proposal.
+
+```sh
+workforce policy approve <proposal-id>
+```
+
+### `workforce policy reject`
+
+Reject a policy proposal.
+
+```sh
+workforce policy reject <proposal-id>
+```
+
+## Role Management
+
+Manage role templates.
+
+### `workforce role list`
+
+List all role templates.
+
+```sh
+workforce role list
+```
+
+### `workforce role show`
+
+Show details of a role template.
+
+```sh
+workforce role show <role-id>
+```
+
+### `workforce role create`
+
+Create a new role template.
+
+```sh
+workforce role create --id editor --name "Editor"
+```
+
+### `workforce role delete`
+
+Delete a role template.
+
+```sh
+workforce role delete <role-id>
+```
+
+### `workforce role init`
+
+Initialize built‑in role templates.
+
+```sh
+workforce role init
+```
+
+## Slack Commands
+
+### `workforce slack scaffold`
+
+Generate a Slack app manifest.
+
+```sh
+workforce slack scaffold --name "My Workforce Bot"
+```
+
+### `workforce slack configure`
+
+Store Slack credentials in the vault, scoped by workspace ID.
+
+```sh
+workforce slack configure --workspace-id T123456
+```
+
+## Google Workspace Commands
+
+### `workforce google login`
+
+Authorize a Google account (opens browser for OAuth consent).
+
+```sh
+workforce google login
+```
+
+### `workforce google logout`
+
+Remove stored tokens for a workspace.
+
+```sh
+workforce google logout <workspace-id>
+```
+
+### `workforce google list`
+
+List authorized Google accounts.
+
+```sh
+workforce google list
+```
+
+## Heartbeat Commands
+
+Manage heartbeat checks for agents.
+
+### `workforce heartbeat list`
+
+List all heartbeat checks for an agent.
+
+```sh
+workforce heartbeat list --agent default
+```
+
+### `workforce heartbeat show`
+
+Show details of a heartbeat check.
+
+```sh
+workforce heartbeat show <check-id>
+```
+
+### `workforce heartbeat create`
+
+Create a new heartbeat check.
+
+```sh
+workforce heartbeat create --agent default --name "Daily check"
+```
+
+### `workforce heartbeat edit`
+
+Edit a heartbeat check.
+
+```sh
+workforce heartbeat edit <check-id> --interval 3600
+```
+
+### `workforce heartbeat enable`
+
+Enable a heartbeat check.
+
+```sh
+workforce heartbeat enable <check-id>
+```
+
+### `workforce heartbeat disable`
+
+Disable a heartbeat check.
+
+```sh
+workforce heartbeat disable <check-id>
+```
+
+### `workforce heartbeat delete`
+
+Delete a heartbeat check.
+
+```sh
+workforce heartbeat delete <check-id>
+```
+
+### `workforce heartbeat init`
+
+Initialize built‑in heartbeat check templates.
+
+```sh
+workforce heartbeat init
+```
+
+## Memory & Knowledge Commands
+
+Operate on the Weaviate‑based memory store.
+
+### `workforce memory doctor`
+
+Diagnose issues with the memory store.
+
+```sh
+workforce memory doctor
+```
+
+### `workforce memory rebuild-schema`
+
+Recreate the Weaviate schema (destructive).
+
+```sh
+workforce memory rebuild-schema --dry-run
+```
+
+Use `--dry-run` to see what would change.
+
+### `workforce memory clean`
+
+Remove orphaned or expired memory entries.
+
+```sh
+workforce memory clean
+```
+
+### `workforce memory backfill`
+
+Ingest historical data into memory.
+
+```sh
+workforce memory backfill
+```
+
+### `workforce memory passive-extract`
+
+Run background extraction of memories from recent sessions.
+
+```sh
+workforce memory passive-extract
+```
+
+## Lessons Commands
+
+Extract reusable knowledge from past sessions.
+
+### `workforce lessons backfill`
+
+Process historical sessions to extract lessons.
+
+```sh
+workforce lessons backfill --config workforce.toml --since 2025-01-01T00:00:00Z
+```
+
+Use `--since` with an ISO‑8601 timestamp to limit scope.
+
+### `workforce lessons cleanup`
+
+Clean up lesson corpus.
+
+```sh
+workforce lessons cleanup --config workforce.toml --agent default
+```
+
+Options:
+- `--commit` — Actually delete the matching lesson entries (default dry-run).
+- `--print` — Print the matched lessons before deletion.
+
+## Training Commands (`workforce training`)
+
+Load and manage training corpora. Can operate in two modes:
+- **Direct mode** (default): Uses local storage and persistent memory backend (Weaviate) from your `workforce.toml`. No hub required.
+- **Remote mode**: Connects to a running hub via `--gateway` flag or `[gateway]` config.
+
+Direct mode requires `[training] enabled = true` and a persistent memory backend (Weaviate) configured in `workforce.toml`.
+
+### `workforce training load`
+
+Ingest a file into an agent's training corpus.
+
+```sh
+workforce training load --agent default --corpus api-docs api-spec.json
+```
+
+Options:
+- `--gateway <url>` — Connect to a hub instead of using direct mode.
+- `--token <token>` — Authentication token for remote hub.
+
+Supported file formats: JSON, PDF, XLSX, ODS, TXT, MD, DOCX. The original file is saved for deduplication.
+
+### `workforce training list`
+
+Show corpora and their document counts for an agent.
+
+```sh
+workforce training list --agent default
+```
+
+Displays each corpus name, number of documents, total chunks, creation time, and processing status.
+
+### `workforce training delete`
+
+Remove a corpus and all its chunks.
+
+```sh
+workforce training delete --agent default --corpus api-docs
+```
+
+The memory store rows are orphaned and require a separate cleanup.
+
+## Database Migration Commands
+
+Move data from SQLite to Postgres (idempotent—safe to run multiple times).
+
+### `workforce migrate-telemetry`
+
+Migrate telemetry data.
+
+```sh
+workforce migrate-telemetry --config workforce.toml
+```
+
+### `workforce migrate-identity`
+
+Migrate identity data.
+
+```sh
+workforce migrate-identity --config workforce.toml
+```
+
+### `workforce migrate-pairing`
+
+Migrate pairing data.
+
+```sh
+workforce migrate-pairing --config workforce.toml
+```
+
+### `workforce migrate-codegraph`
+
+Migrate code‑graph data.
+
+```sh
+workforce migrate-codegraph --config workforce.toml
+```
+
+After migration, update the relevant backend setting in `workforce.toml` (e.g., `[telemetry] backend = "postgres"`) and restart.
+
+## Activity & Audit Commands
+
+### `workforce activity`
+
+View agent activity logs from a gateway.
+
+```sh
+workforce activity --gateway ws://server:8091 --token <token>
+```
+
+### `workforce audit`
+
+Run security audit checks on the configuration.
+
+```sh
+workforce audit --config workforce.toml
+```
+
+## Plugin Commands
+
+Plugins extend the CLI itself.
+
+### `workforce plugin list`
+
+List installed plugins.
+
+```sh
+workforce plugin list
+```
+
+### `workforce plugin install`
+
+Install a plugin.
+
+```sh
+workforce plugin install my-plugin
+```
+
+### `workforce plugin uninstall`
+
+Remove a plugin.
+
+```sh
+workforce plugin uninstall my-plugin
+```
+
+### `workforce plugin status`
+
+Show plugin status and metadata.
+
+```sh
+workforce plugin status my-plugin
+```
+
+## Eval Commands (`workforce eval`)
+
+Score an agent against a fixed set of questions on a running hub, as yourself. See
+[Golden evals](/docs/reference/evals) for the set format, arms and how to read the scores.
+
+### `workforce eval run`
+
+Ask one agent every question of a set and print scores per use case.
+
+```sh
+workforce eval run --set fixtures/evals/example --agent analyst --out ./runs/analyst
+```
+
+### `workforce eval compare`
+
+Run a set against several arms and print each one's paired difference from the first.
+
+```sh
+workforce eval compare --set ./sets/support --arms arms.toml --out ./runs/know-how
+```
+
+Options shared by `run` and `compare`:
+- `--url <url>` — The hub (or `WORKFORCE_GATEWAY_URL`).
+- `--token <token>` — Your own sign-in token (or `WORKFORCE_GATEWAY_TOKEN`). The owner token will not do.
+- `--concurrency <N>` — Turns in flight at once (default `1`).
+- `--limit <N>` — Ask only the first N questions.
+- `--retry` — Ask failed questions again and grade ungraded answers again.
+- `--turn-timeout-secs <N>` — The longest one turn may take (default `1800`).
+- `--grader-agent <id>`, `--grader-model <name>` — Where the judge runs. One judge per run directory.
+- `--allow-missing-credentials` — Run a test copy that lacks credentials its original has.
+- `--keep-sessions` — Leave each turn's session on the hub instead of deleting it once its answer is recorded.
+
+A run that stops carries on when the same command is run again. On Ctrl-C it waits for the turns in
+flight; a second Ctrl-C abandons them.
+
+### `workforce eval report`
+
+Print a run directory's scores again without calling the hub.
+
+```sh
+workforce eval report --set ./sets/support --out ./runs/know-how
+```
+
+### `workforce eval check`
+
+Validate a set and print each question's version.
+
+```sh
+workforce eval check --set fixtures/evals/example
+```
+
+### `workforce eval restore`
+
+Put back the config of a test copy that a run which died left overridden, without running anything.
+Needs a system admin's sign-in.
+
+```sh
+workforce eval restore --out ./runs/know-how
+```
+
+## Documentation Curator Command
+
+Automatically draft end‑user documentation from source code.
+
+```sh
+workforce docs curate --all
+```
+
+Options:
+- `--all` — Curate every page defined in `end-user-docs/docs-watch.toml`.
+- `--changed-since <ref>` — Only curate pages whose source files changed since a Git reference (e.g., `main`).
+- `--pages <path>…` — Curate specific page(s), e.g., `adapters/slack.mdx`.
+- `--dry-run` — Show what would be curated without writing.
+- `--no-pr` — Write changes locally but don't open a pull request.
+- `--bundle` — Combine all updated pages into one PR (default is separate PR per page).
+- `--max-pages <N>` — Limit the number of pages curated in this run (default `5`).
+- `--tier <spec>` — Override the LLM tier, e.g., `openrouter:deepseek:powerful`.
+- `--max-tokens <N>` — Override the maximum response token limit.
+- `--allow-dirty` — Skip the check for a clean working tree.
+- `--config <path>` — Path to `workforce.toml` (default: `workforce.toml`).
+
+The curator reads source globs from `docs-watch.toml`, uses an LLM to draft each page, writes the updated MDX, runs validation (schema and link checks), and opens a pull request (unless `--no‑pr` is used).
+
+## TUI Chat
+
+The `workforce chat` command launches a full‑featured terminal user interface.
+
+### Features
+
+- **Real‑time streaming** — See responses as they are generated.
+- **Markdown rendering** — Headings, code blocks, lists, tables, block quotes, and inline formatting.
+- **File attachments** — Drag‑and‑drop files or use the `/attach` command.
+- **Tab completion** — For slash commands, file paths, session IDs, and agent IDs.
+- **Scrollable history** — Browse past messages with mouse support.
+- **Session switching** — List and switch between active sessions.
+- **Context window indicator** — Visual bar showing how much of the model's context is used.
+
+### Keybindings
+
+**Normal mode (input focus):**
+- `Enter` — Send message (if not currently waiting for a response).
+- `Ctrl+Enter`, `Shift+Enter`, `Option+Enter` — Insert a newline in the input.
+- `Ctrl+U` — Clear the entire input line.
+- `Ctrl+X` — Remove the last pending attachment.
+- `Ctrl+Y` — Toggle mouse capture (enables native text selection outside the TUI).
+- `Esc` while streaming — Cancel the current response.
+- `Esc` — Switch to scroll mode.
+- `Up`/`Down` (single‑line input) — Cycle through input history.
+- `Tab` / `Shift+Tab` — Auto‑complete forward/backward.
+
+**Scroll mode:**
+- `i`, `Enter`, `Esc` — Return to input mode.
+- `Up`/`k`, `Down`/`j` — Scroll up/down.
+- `PageUp`/`PageDown` — Scroll by 20 lines.
+- `Home` — Jump to top.
+- `End` or `G` — Jump to bottom.
+- `q` — Quit the application.
+
+**Global:**
+- `Ctrl+C` — Always quits.
+
+### Slash Commands
+
+**Local (client‑side):**
+- `/quit`, `/exit`, `/q` — Exit the TUI.
+- `/help`, `/h`, `/?` — Toggle the help panel.
+- `/new`, `/n` — Start a new session (clears local history).
+- `/sessions` — List active sessions (updates tab‑completion cache).
+- `/switch <id>` — Switch to a session (supports prefix matching).
+- `/agents` — List available agents.
+- `/agent <id>` — Switch to a different agent (validates against cached list).
+- `/attach <path>` — Attach a file from the local filesystem.
+- `/mode` — Show connection info (gateway URL, agent, model, session).
+
+**Forwarded to the gateway:**
+- `/status`, `/compact`, `/context`, `/model`, `/health`, `/wake`, `/heartbeat`, `/reset`, `/select‑agent`, `/tools`.
+
+### File Attachments
+
+Supported file types and limits:
+- **Images**: PNG, JPEG, GIF, WebP — up to 5 MB.
+- **Text files**: Any extension — up to 1 MB (sent as UTF‑8).
+- **Binary documents**: XLSX, XLS, ODS, PDF, DOCX, DOC, ODT, PPTX, PPT — up to 20 MB.
+
+The attachment bar shows icons (`img`, `txt`, `doc`), filename, and size. Drag‑and‑drop works; on macOS, pasted file paths are automatically cleaned.
+
+## Configuration
+
+The CLI reads settings from `workforce.toml` (or a custom path via `--config`). Major sections include:
+
+- `[hub]` — Data directory, listen addresses.
+- `[llm]` — Default provider, model, and failover chains.
+- `[gateway]` — WebSocket gateway settings.
+- `[agents]` — Per‑agent configurations.
+- `[vault]` — Encryption settings.
+- `[training]` — Training corpus storage (must be enabled for `workforce training` commands).
+- `[curator]` — Documentation curator settings (tier, max tokens).
+
+Environment variables override the config:
+
+- `ANTHROPIC_API_KEY`, `OPENROUTER_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, etc.
+- `WORKFORCE_GATEWAY_URL`, `WORKFORCE_GATEWAY_TOKEN`
+- `WORKFORCE_VAULT_KEY` (optional)
+
+Common global arguments:
+- `--provider <name>` — LLM provider (default `"anthropic"`).
+- `--api-key <key>` — API key (if not set via environment).
+- `--workdir <path>` — Working directory for file operations (default `"."`).
+- `--policy <path>` — Path to a YAML policy file.
+
+## Getting Help
+
+- `workforce --help` — General help and command list.
+- `workforce <command> --help` — Detailed help for a specific command.
+- `/help` inside the TUI chat — Interactive command list.
+
+## Example Workflows
+
+### Start a hub and begin chatting
+
+```sh
+# 1. Initialize a new project
+workforce init
+
+# 2. Start the hub service (runs in foreground)
+workforce serve
+
+# 3. In another terminal, connect and chat with the default agent
+workforce chat --gateway ws://localhost:8091 --token $(grep auth_token workforce.toml | cut -d'"' -f2)
+```
+
+### Run a one‑off task
+
+```sh
+workforce run "Check the system status and report any issues" --workdir ./my-project
+```
+
+### Schedule a daily reminder
+
+```sh
+workforce cron add --name "Daily check" --message "Review open pull requests" --cron "0 10 * * *"
+```
+
+### Store and use secrets
+
+```sh
+# Store a Slack bot token
+workforce vault set slack.default.bot_token xoxb-...
+
+# Verify it's stored
+workforce vault list | grep slack
+
+# Use it in a Slack skill configuration
+# (Reference in config as ${vault:slack.default.bot_token})
+```
+
+### Connect a local machine as a worker
+
+```sh
+# On your laptop, connect to the team's hub
+workforce local-agent connect --gateway ws://team-hub.example.com:8091 --token <your-personal-token>
+```
+
+Now the hub can delegate shell commands and file operations to your machine.
+
+### Load training data
+
+```sh
+# Ensure training is enabled in workforce.toml:
+# [training]
+# enabled = true
+#
+# Also require a persistent memory backend, e.g., Weaviate.
+
+workforce training load --agent default --corpus api-reference api-spec.json
+```

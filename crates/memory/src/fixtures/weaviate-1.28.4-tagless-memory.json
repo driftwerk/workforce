@@ -1,0 +1,25 @@
+{
+  "class": "Probe",
+  "creationTimeUnix": 1791397284645,
+  "id": "b67e9a8b-be04-41b5-8a2a-cffd53e831df",
+  "lastUpdateTimeUnix": 1791397284645,
+  "properties": {
+    "accessCount": 0,
+    "content": "a tagless memory",
+    "createdAt": "2026-07-05T09:30:00.1200005Z",
+    "deleted": false,
+    "eventTime": "2026-07-05T09:30:00.1Z",
+    "identityId": "alice",
+    "importance": 1,
+    "lastAccessed": "2026-07-05T09:31:00Z",
+    "layer": "episodic",
+    "memoryId": "7c0216cf-5136-4920-b18a-2621b491a19a",
+    "owner": "agent",
+    "recurrenceCount": 0,
+    "source": "unknown",
+    "sourceMessageIds": [],
+    "tags": [],
+    "visibility": "private"
+  },
+  "vectorWeights": null
+}

@@ -1,0 +1,26 @@
+diff --git a/node_modules/fumadocs-ui/dist/components/dynamic-codeblock.js b/node_modules/fumadocs-ui/dist/components/dynamic-codeblock.js
+index 276e461..c8eb881 100644
+--- a/node_modules/fumadocs-ui/dist/components/dynamic-codeblock.js
++++ b/node_modules/fumadocs-ui/dist/components/dynamic-codeblock.js
+@@ -21,7 +21,7 @@ export function DynamicCodeBlock({ lang, code, codeblock, options, wrapInSuspens
+     let children = _jsx(Internal, { code: code, options: shikiOptions });
+     if (wrapInSuspense)
+         children = (_jsx(Suspense, { fallback: _jsx(Placeholder, { code: code, components: shikiOptions.components }), children: children }));
+-    return _jsx(PropsContext, { value: codeblock, children: children });
++    return _jsx(PropsContext.Provider, { value: codeblock, children: children });
+ }
+ function Placeholder({ code, components = {}, }) {
+     const { pre: Pre = 'pre', code: Code = 'code' } = components;
+diff --git a/node_modules/fumadocs-ui/dist/components/layout/toc.js b/node_modules/fumadocs-ui/dist/components/layout/toc.js
+index 14aabee..942aa10 100644
+--- a/node_modules/fumadocs-ui/dist/components/layout/toc.js
++++ b/node_modules/fumadocs-ui/dist/components/layout/toc.js
+@@ -11,7 +11,7 @@ export function useTOCItems() {
+     return useContext(TOCContext);
+ }
+ export function TOCProvider({ toc, children, ...props }) {
+-    return (_jsx(TOCContext, { value: toc, children: _jsx(Primitive.AnchorProvider, { toc: toc, ...props, children: children }) }));
++    return (_jsx(TOCContext.Provider, { value: toc, children: _jsx(Primitive.AnchorProvider, { toc: toc, ...props, children: children }) }));
+ }
+ export function TOCScrollArea({ ref, className, ...props }) {
+     const viewRef = useRef(null);

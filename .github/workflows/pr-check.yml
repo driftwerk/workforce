@@ -1,0 +1,279 @@
+name: PR Check
+
+# Runs on every pull request and on main. Everything here runs on
+# GitHub-hosted runners with a read-only token and no repository secrets:
+# a pull request can run its own code here, so nothing here may be able to
+# publish, deploy or read anything private. Building and deploying releases
+# happens elsewhere, from merged commits only.
+
+concurrency:
+  group: pr-check-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions: {}
+
+env:
+  # vite's MDX UI build needs more than Node's ~2GB default old-space.
+  NODE_OPTIONS: --max-old-space-size=6144
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+  POSTGRESQL_VERSION: "=17.9.0"
+  # The vellev node the `vellev-node` job tests against, by digest so a
+  # re-pushed tag can't change what is tested.
+  VELLEV_IMAGE: kingsleyh/vellev:sha-5bbf0e6bdb9653328a759e20e5582951e59f932f@sha256:e112e546216ed82d12945b10356a75afbf7f6661027e531320a0ea88ee23014f
+
+jobs:
+  # A change outside end-user-docs/ is code and runs the full gate; a
+  # docs-only change runs just the tests that read the embedded pages.
+  changes:
+    name: Detect changes
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+      docs: ${{ steps.filter.outputs.docs }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - id: filter
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" != pull_request ]; then
+            echo "code=true" >> "$GITHUB_OUTPUT"; echo "docs=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          changed=$(git diff --name-only "$BASE_SHA...$HEAD_SHA")
+          code=false; docs=false
+          if grep -qvE '^end-user-docs/' <<<"$changed"; then code=true; fi
+          if grep -qE '^end-user-docs/' <<<"$changed"; then docs=true; fi
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          echo "docs=$docs" >> "$GITHUB_OUTPUT"
+
+  ui:
+    name: UI
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+      - name: Type-check, test and build
+        run: |
+          npm --prefix ui ci
+          (cd ui && npx tsc --noEmit)
+          npm --prefix ui test
+          npm --prefix ui run build
+
+  fmt:
+    name: Format
+    needs: [changes]
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+      - run: cargo fmt --all -- --check
+
+  licenses:
+    name: Dependency licences
+    needs: [changes]
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2
+        with:
+          tool: cargo-deny@0.20.2
+      - run: cargo deny check licenses
+
+  clippy:
+    name: Clippy
+    needs: [changes]
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      # The embedded-Postgres build script calls the GitHub API; the job's own
+      # read-only token keeps it off the anonymous rate limit.
+      GITHUB_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          shared-key: clippy
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo clippy --all-targets --all-features --no-deps -- -D warnings
+
+  test:
+    name: Test
+    needs: [changes]
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    env:
+      WORKFORCE_SKIP_POSTGRES_TESTS: "1"
+      GITHUB_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          shared-key: test
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2
+        with:
+          tool: cargo-nextest
+      - run: cargo nextest run --all-features --profile ci
+      - run: cargo test --all-features --doc
+
+  # The tests that need a real vellev node and Postgres. Elsewhere these skip
+  # themselves; VELLEV_TEST_REQUIRED makes a skip a failure here, so a green
+  # job means they ran.
+  vellev-node:
+    name: vellev node tests
+    needs: [changes]
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: vellev
+          POSTGRES_PASSWORD: vellev
+          POSTGRES_DB: vellev
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U vellev" --health-interval 5s
+          --health-timeout 5s --health-retries 20
+    env:
+      GITHUB_TOKEN: ${{ github.token }}
+      VELLEV_TEST_KEY: ci-key
+      VELLEV_TEST_LOCAL_EMBED: "1"
+      VELLEV_TEST_REQUIRED: "1"
+      VELLEV_TEST_URL: http://127.0.0.1:8080
+      WORKFORCE_TEST_POSTGRES_URL: postgres://vellev:vellev@127.0.0.1:5432/vellev
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          shared-key: vellev-node
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/vellev-models
+          key: vellev-models-bge-base-en-v1.5
+      - name: Start a vellev node
+        timeout-minutes: 30
+        run: |
+          set -euo pipefail
+          # The image runs as its own user; let it write the cached models.
+          mkdir -p ~/vellev-models && chmod 0777 ~/vellev-models
+          docker run -d --name vellev --network host \
+            -e VELLEV_LISTEN=127.0.0.1:8080 \
+            -e VELLEV_DATABASE_URL=postgres://vellev:vellev@127.0.0.1:5432/vellev \
+            -e VELLEV_STORE=file:///var/lib/vellev/store \
+            -e VELLEV_MODEL_DIR=/models \
+            -e VELLEV_API_KEYS="$VELLEV_TEST_KEY" \
+            -v "$HOME/vellev-models:/models" \
+            "$VELLEV_IMAGE" serve
+          for _ in $(seq 1 120); do
+            curl -fsS -o /dev/null "$VELLEV_TEST_URL/health/ready" && ready=1 && break
+            sleep 1
+          done
+          if [ "${ready:-}" != 1 ]; then docker logs vellev | tail -n 100; exit 1; fi
+          # Embed once so the model download isn't charged to a test's timeout.
+          call() { curl -sS -H "authorization: Bearer $VELLEV_TEST_KEY" -H 'content-type: application/json' "$@"; }
+          probe="$VELLEV_TEST_URL/v1/tenants/ci-probe"
+          call -f -X PUT "$probe"
+          call -f -X PUT "$probe/collections/Probe" -d '{"name":"Probe","properties":[{"name":"text","data_type":"text"}],"embedding":{"provider":"local","model":"BAAI/bge-base-en-v1.5","dimensions":768,"properties":["text"]}}'
+          for _ in $(seq 1 90); do
+            code=$(call -o /dev/null -w '%{http_code}' -X PUT "$probe/collections/Probe/objects/00000000-0000-0000-0000-000000000001" -d '{"properties":{"text":"warm up"}}')
+            [ "$code" = 200 ] && embeds=1 && break
+            sleep 10
+          done
+          call -X DELETE "$probe" || true
+          if [ "${embeds:-}" != 1 ]; then docker logs vellev | tail -n 100; exit 1; fi
+      - name: Run the tests against the node
+        timeout-minutes: 60
+        run: |
+          set -euo pipefail
+          cargo test --all-features \
+            -p workforce-vellev \
+            -p workforce-memory \
+            -p workforce-codebase-knowledge \
+            -p workforce-knowledge-service
+          crates/hub/vellev-node-tests.sh --all-features
+          cargo test --all-features -p workforce-orchestrator --lib -- artifact_store
+      - name: Node logs
+        if: always()
+        run: docker logs vellev 2>&1 | tail -n 200 || true
+
+  docs-embed:
+    name: Docs embed
+    needs: [changes]
+    if: needs.changes.outputs.docs == 'true' && needs.changes.outputs.code != 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      GITHUB_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          shared-key: test
+          save-if: false
+      - run: cargo test -p workforce-hub --lib -- remote_mcp::help
+
+  # The one check branch protection requires: path- and lane-skipped jobs
+  # never report, so this always does, and fails if anything that ran failed.
+  ci-ok:
+    name: CI OK
+    if: always()
+    needs: [changes, ui, fmt, licenses, clippy, test, vellev-node, docs-embed]
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          for r in $RESULTS; do
+            case "$r" in success|skipped) ;; *) echo "a required job ended: $r"; exit 1 ;; esac
+          done

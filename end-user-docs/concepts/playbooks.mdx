@@ -1,0 +1,122 @@
+---
+title: Playbooks
+description: Guided, step-by-step conversations that you drive and the agent follows.
+---
+
+# Playbooks
+
+A playbook is an ordered list of step prompts fed, one at a time, into your normal
+chat with an agent. You start it, talk with the agent freely at each step, and move
+on when you are ready. The agent does the work; the playbook decides what comes next.
+
+Playbooks differ from [workflows](/docs/concepts/workflows) in one way that matters: a
+workflow runs a fresh agent per step and hands variables between them, while a
+playbook keeps one persistent session, so the whole conversation stays in view.
+Use a workflow for automation that runs on its own. Use a playbook when a person
+should stay in the loop the whole way, such as a design, implement, review cycle or a
+bug triage.
+
+## Running a playbook
+
+```
+cmd: playbook start <id>
+```
+
+The agent posts the first step's prompt and works through it with you. Advance with
+`cmd: continue` or the **Continue** button, and stop at any point with `cmd: exit`.
+`cmd: playbook list` shows the playbooks you can start, and `cmd: playbook status`
+shows where a running one is.
+
+## Writing one
+
+A playbook is a TOML file with a header and one or more steps.
+
+```toml
+[playbook]
+id = "design-impl-review"          # unique, kebab-case; must match the saved id
+name = "Design → Implement → Review"
+description = "What this playbook is for, in one line."
+
+[[step]]
+id = "design"
+title = "Design the implementation"
+artifact = "design.md"             # optional: a file this step should produce
+prompt = """
+Ask the user what they need, propose a design, and talk it through until
+they continue.
+"""
+
+[[step]]
+id = "implement"
+title = "Implement"
+prompt = "Implement the design (read design.md), then summarise what changed."
+```
+
+- `[playbook]` needs `id` and `name`; `description` is optional.
+- Each `[[step]]` needs a unique `id`, a short `title`, and a `prompt`. `artifact` is
+  optional.
+- Validation requires at least one step, unique step ids, and a non-empty prompt on
+  every step.
+
+### Artifacts survive compaction
+
+When a step names an `artifact`, the agent is told to write that file, and on
+Continue the file is pinned: later steps are told to read it and a synopsis stays in
+the agent's context even after the raw discussion has been compacted away. Use
+artifacts for anything a later step depends on, such as a design document or an
+implementation summary.
+
+## Authoring from chat or Claude Code
+
+The `playbook` tool has actions for the whole lifecycle: `schema` returns the format
+above, `validate` checks a draft, `save` persists it under a `playbook_id`, `get`
+reads one back, `list` shows the playbooks you can start — your own, the install-wide
+ones, and any shared with you, or every one on the install for an administrator — and
+`delete` removes one you own. Over [remote MCP](/docs/reference/remote-mcp) the same
+tool is available as `wf_playbook`, so you can draft, validate, and save a playbook
+from Claude Code.
+
+The `start`, `continue`, and `exit` actions only request the change; the chat surface
+applies it after the turn, the same way the buttons do. That makes them chat-only:
+over remote MCP they report success but nothing runs, so start a playbook in chat.
+The person in the conversation normally drives the flow, and an agent should advance
+or stop a playbook only when asked to.
+
+## Sharing
+
+A playbook belongs to the user who saved it and is private by default. Save it with
+`visibility = "global"` to let everyone on the install see and start it. Only its
+owner changes who reaches it — or a system administrator, who can also edit, share,
+re-scope and delete a member's playbook so an install can still be administered when
+its owner is away. Every such change is written to the audit log against the
+administrator; the owner's own work, and a `manage` grantee's, is not.
+
+Name a member's playbook with `owner:<@user|email|id>`.
+
+From chat, the owner changes who reaches it without re-saving it:
+
+- `cmd: playbook shares <playbook-id>` — who it is shared with.
+- `cmd: playbook share <playbook-id> <@user|email|id|team:<name>>` — let someone start
+  it; add `manage` to let them edit it too.
+- `cmd: playbook unshare <playbook-id> <@user|email|id|team:<name>>` — take that back.
+- `cmd: playbook visibility <playbook-id> private|team|everyone` — who else may start
+  it.
+- `cmd: playbook transfer <playbook-id> <@user|email|id>` — hand it to someone else.
+
+Here `everyone` is what `visibility = "global"` means on a save, `team` is what
+`visibility = "team"` means — anyone who shares a team with you, at start-only — and a
+save that names no visibility keeps whatever you last chose. A `manage` grantee edits
+the playbook but never re-shares it, and never transfers it:
+`cmd: playbook transfer <playbook-id> <@user|email|id>`, or **Transfer** on the
+playbooks page, gives it away for good, and only you or a system administrator can.
+The person you name owns it afterwards and you keep nothing — unless you tick **Keep
+manage access** in the dialog, which hands it over and leaves you a `manage` share in
+the same step, so you can still edit it but not re-share it or take it back. Two
+members can each have a playbook of the same name, so add `owner:<@user|email|id>` to
+address one of theirs you may manage.
+
+Workflows and monitors use the same grammar, the same two levels and the same three
+reaches, which are set out in full there — see
+[Sharing and visibility](/docs/concepts/workflows#sharing-and-visibility) and
+[Monitors](/docs/concepts/monitors#sharing-and-visibility), where a share lets someone
+see a monitor rather than start it, because nobody starts a monitor.

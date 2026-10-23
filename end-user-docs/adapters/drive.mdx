@@ -1,0 +1,226 @@
+---
+title: Google Drive
+description: Read and search files via the Google Drive adapter.
+---
+
+# Google Drive adapter
+
+The Google Drive adapter lets agents read, search, and manage files in your Google Drive. You can list files, download content, upload new files, create folders, move or rename files, copy files, and manage sharing permissions.
+
+## Prerequisites
+
+Before using Google Drive tools, you must set up Google OAuth for your workspace. This is a one-time setup per user.
+
+1. **Admin setup** (hub admin only): The hub administrator must create a Google Cloud OAuth client and store the credentials in the vault. If you see an error about "No Google OAuth client configured," provide the full error message to your hub admin — it contains detailed instructions.
+
+2. **User login**: Each user must connect their Google account. Use the `google.setup` tool:
+
+   - Start the login: `google.setup(action='login', no_browser=true)`
+   - Follow the `next_step` instructions in the response.
+   - Poll for completion: `google.setup(action='login_poll')` until status is `authorized`.
+
+Once authorized, you can use any `google.drive.*` tool.
+
+## Tools
+
+### Search and list files
+
+- `google.drive.search` – Search for files using Google Drive query syntax.
+- `google.drive.ls` – Alias for `google.drive.search`.
+
+Both tools accept the same parameters:
+
+- `q` (optional) – Search query (e.g., `"name contains 'report'"`, `"mimeType = 'application/vnd.google-apps.document'"`).
+- `max_results` (optional) – Maximum number of files to return (default 25, max 1000).
+- `order_by` (optional) – Sort order (e.g., `"modifiedTime desc"`).
+- `page_token` (optional) – Token for pagination.
+
+Example:
+
+```json
+{
+  "q": "name contains 'budget' and mimeType = 'application/vnd.google-apps.spreadsheet'",
+  "max_results": 10
+}
+```
+
+### Get file metadata
+
+- `google.drive.get` – Retrieve metadata for a specific file by ID.
+
+Parameters:
+
+- `file_id` (required) – The Drive file ID.
+- `fields` (optional) – Comma-separated list of fields to return (default includes `id`, `name`, `mimeType`, `modifiedTime`, `size`, `webViewLink`, `parents`, `owners`).
+
+### Download files
+
+- `google.drive.download` – Download a file's content.
+
+Parameters:
+
+- `file_id` (required) – The Drive file ID.
+- `as_text` (optional) – If `true`, return the content as UTF‑8 text; otherwise return base64-encoded bytes.
+- `export_mime` (optional) – For Google‑native Docs, Sheets, or Slides, specify an export format (e.g., `"text/plain"`, `"application/pdf"`). Omit to download the binary file as‑is.
+
+### Upload files
+
+- `google.drive.upload` – Upload a new file to Drive.
+
+Parameters:
+
+- `name` (required) – File name.
+- One of `content`, `content_base64`, or `artifact_id` (required):
+  - `content` – Plain text content.
+  - `content_base64` – Base64‑encoded binary data.
+  - `artifact_id` – Handle from a producer tool (e.g., `metabase.dataset_query_native`). Use this for large files to avoid holding the data in context.
+- `mime_type` (optional) – Override the default MIME type (default is `text/plain` for `content`, `application/octet-stream` for `content_base64` or artifacts).
+- `parent_id` (optional) – ID of the parent folder.
+- `convert_to` (optional) – Convert the uploaded file to a native Google format:
+  - `"application/vnd.google-apps.document"` (Word/.docx → Google Docs)
+  - `"application/vnd.google-apps.spreadsheet"` (.xlsx/.csv → Google Sheets)
+  - `"application/vnd.google-apps.presentation"` (PowerPoint/.pptx → Google Slides)
+
+Example:
+
+```json
+{
+  "name": "Report.pdf",
+  "artifact_id": "artifact_abc123",
+  "parent_id": "folder_xyz",
+  "convert_to": "application/vnd.google-apps.document"
+}
+```
+
+### Create folders
+
+- `google.drive.mkdir` – Create a new folder.
+
+Parameters:
+
+- `name` (required) – Folder name.
+- `parent_id` (optional) – Parent folder ID.
+
+### Rename, move, copy, delete
+
+- `google.drive.rename` – Change a file's name.
+  - `file_id` (required)
+  - `new_name` (required)
+
+- `google.drive.move` – Move a file to a different parent folder.
+  - `file_id` (required)
+  - `new_parent_id` (required)
+
+- `google.drive.copy` – Duplicate a file.
+  - `file_id` (required)
+  - `new_name` (optional) – Name for the copy.
+  - `parent_id` (optional) – Destination folder.
+
+- `google.drive.delete` – Permanently delete a file.
+  - `file_id` (required)
+
+### Sharing and permissions
+
+- `google.drive.share` – Grant a permission on a file.
+
+Parameters:
+
+- `file_id` (required)
+- `role` (required) – One of `"reader"`, `"commenter"`, `"writer"`, `"fileOrganizer"`, `"organizer"`, `"owner"`.
+- `type` (optional) – `"user"`, `"group"`, `"domain"`, or `"anyone"` (default `"user"`).
+- `email` (optional) – Email of the grantee (required for `"user"` or `"group"`).
+- `send_notification` (optional) – Whether to send an email notification (default `false`).
+
+- `google.drive.permissions` – List sharing permissions for a file.
+  - `file_id` (required)
+
+### List shared drives
+
+- `google.drive.drives` – List shared drives (Team Drives) accessible to the user.
+
+No parameters.
+
+### List comments
+
+- `google.drive.comments_list` – List comments on a file.
+  - `file_id` (required)
+
+## Multi‑account support
+
+If you have connected multiple Google accounts via `google.setup`, you can specify which account to use with the `account` parameter on any tool. Omit it to use the default workspace.
+
+Example:
+
+```json
+{
+  "account": "work",
+  "file_id": "abc123"
+}
+```
+
+## Error handling
+
+- **401 Unauthorized** – The adapter automatically refreshes the access token and retries once. If the refresh fails, you’ll need to re‑authorize with `google.setup(action='login', no_browser=true)`.
+- **404 Not Found** – The file or folder doesn’t exist or you don’t have access.
+- **Rate limiting** – Google may throttle requests; the adapter will surface the error with a retry‑after hint.
+
+## Examples
+
+### Search for recent spreadsheets
+
+```json
+{
+  "q": "mimeType = 'application/vnd.google-apps.spreadsheet' and modifiedTime > '2024-01-01T00:00:00'",
+  "order_by": "modifiedTime desc",
+  "max_results": 5
+}
+```
+
+### Upload a CSV and convert to Sheets
+
+```json
+{
+  "name": "data.csv",
+  "content": "name,age\nAlice,30\nBob,25",
+  "convert_to": "application/vnd.google-apps.spreadsheet"
+}
+```
+
+### Download a Google Doc as plain text
+
+```json
+{
+  "file_id": "doc_123",
+  "as_text": true,
+  "export_mime": "text/plain"
+}
+```
+
+### Create a folder and upload a file into it
+
+First, create the folder:
+
+```json
+{
+  "name": "Project Reports",
+  "parent_id": "root"
+}
+```
+
+Then upload:
+
+```json
+{
+  "name": "Q1‑summary.docx",
+  "artifact_id": "artifact_xyz",
+  "parent_id": "<folder_id_from_previous_step>",
+  "convert_to": "application/vnd.google-apps.document"
+}
+```
+
+## Related tools
+
+- `google.docs.*` – Read and edit Google Docs.
+- `google.sheets.*` – Read and edit Google Sheets.
+- `google.slides.*` – Read and edit Google Slides.
+- `google.setup` – Manage Google account connections.

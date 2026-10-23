@@ -1,0 +1,58 @@
+# Audio/video transcription tier equivalences across providers.
+#
+# Membership in this registry is the capability predicate: any model listed
+# below is considered transcription-capable. Providers omitted are treated as
+# unsupported and trigger a placeholder text block when audio attachments are
+# routed through them.
+#
+# Two backend shapes are represented:
+#
+#   1. Dedicated Whisper API (multipart upload to /v1/audio/transcriptions).
+#      Used by [openai] and [groq] sections — requires their respective API
+#      key and a `WhisperClient`.
+#
+#   2. Chat-multimodal (audio sent as an `input_audio` content part to an
+#      OpenAI-compatible chat completions endpoint). Used by [gemini] and
+#      [openrouter.google] sections — the existing chat client carries the
+#      audio content; transcription is a single-turn prompt.
+#
+# To override: place a `transcription_tiers.toml` in your workspace root with
+# the sections you want to change. Your file is merged on top of these
+# defaults.
+#
+# Deliberately omitted (provider exists but multimodal wiring not in place):
+#   - grok                 (xAI Grok-4 supports audio on the direct API but
+#                           our GrokClient strips non-text content blocks;
+#                           v2.1 will register grok here once grok.rs handles
+#                           input_audio parts)
+#   - openrouter.openai    (GPT-5.x via OpenRouter exposes only text/image/file
+#                           modalities — no audio passthrough)
+#
+# Deliberately omitted (no audio support):
+#   - anthropic / claude   (Claude does not accept audio input today)
+#   - cerebras             (text-only fast inference)
+
+[openai]
+powerful = "whisper-1"
+standard = "whisper-1"
+cheap    = "whisper-1"
+
+[groq]
+powerful = "whisper-large-v3"
+standard = "whisper-large-v3-turbo"
+cheap    = "distil-whisper-large-v3-en"
+
+[gemini]
+powerful = "gemini-3.1-pro-preview"
+standard = "gemini-3.8-flash"
+cheap    = "gemini-3.5-flash-lite"
+
+[openrouter.google]
+powerful = "google/gemini-3.1-pro-preview"
+standard = "google/gemini-3.8-flash"
+cheap    = "google/gemini-3.5-flash-lite"
+
+[vllm]
+powerful = "openai/whisper-large-v3"
+standard = "openai/whisper-large-v3-turbo"
+cheap    = "openai/whisper-base"

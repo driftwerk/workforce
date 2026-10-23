@@ -1,0 +1,15 @@
+{
+  "title": "Adapters",
+  "pages": [
+    "slack",
+    "github",
+    "jira",
+    "linear",
+    "hubspot",
+    "metabase",
+    "datadog",
+    "gmail",
+    "calendar",
+    "drive"
+  ]
+}

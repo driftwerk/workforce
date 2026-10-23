@@ -1,0 +1,197 @@
+# Model tier equivalences across providers.
+#
+# Each section maps tier names (powerful, standard, cheap) to concrete model IDs
+# for a specific provider or meta-provider upstream.
+#
+# To override: place a `tiers.toml` in your workspace root with the sections
+# you want to change. Your file is merged on top of these defaults.
+
+[anthropic]
+powerful = "claude-opus-5-5"
+standard = "claude-sonnet-5-5"
+cheap = "claude-haiku-5-5"
+
+[openrouter.anthropic]
+powerful = "anthropic/claude-opus-5.5"
+standard = "anthropic/claude-sonnet-5.5"
+cheap = "anthropic/claude-haiku-5.5"
+
+[openrouter.openai]
+powerful = "openai/gpt-6.1-sol"
+standard = "openai/gpt-6-sol"
+cheap = "openai/gpt-6-luna"
+
+[openrouter.deepseek]
+powerful = "deepseek/deepseek-v4-pro"
+standard = "deepseek/deepseek-v4.1-flash"
+cheap = "deepseek/deepseek-v4.1-flash"
+
+[openrouter.google]
+powerful = "google/gemini-3.1-pro-preview"
+standard = "google/gemini-3.8-flash"
+cheap = "google/gemini-3.5-flash-lite"
+
+[openrouter.qwen]
+powerful = "qwen/qwen3.8-max-prime"
+standard = "qwen/qwen3.8-max-0902"
+cheap = "qwen/qwen3.8-flash"
+
+[openrouter.qwen-coder]
+powerful = "qwen/qwen3-coder"
+standard = "qwen/qwen3-coder"
+cheap = "qwen/qwen3-coder-next"
+
+[openrouter.kimi]
+powerful = "moonshotai/kimi-k3"
+standard = "moonshotai/kimi-k3"
+cheap = "moonshotai/kimi-k3"
+
+[openrouter.glm]
+powerful = "z-ai/glm-5.3-prime"
+standard = "z-ai/glm-5.3"
+cheap = "z-ai/glm-5.3-flash"
+
+# xAI lists grok-4.7, 4.6, 4.5 and 4.3 as current (docs.x.ai, 2026-10-19);
+# grok-3 and grok-4 are gone from it. 4.3 is the cheaper 1M-context model.
+[grok]
+powerful = "grok-4.7"
+standard = "grok-4.7"
+cheap = "grok-4.3"
+
+# Each answered a tool call on an image with a thinkingLevel (verified
+# 2026-10-19). 3.1 Pro is still the newest Pro the API lists.
+[gemini]
+powerful = "gemini-3.1-pro-preview"
+standard = "gemini-3.8-flash"
+cheap = "gemini-3.5-flash-lite"
+
+# Cerebras retired qwen-3-235b-a22b-instruct-2507 and llama3.1-8b on
+# 2026-05-27 and zai-glm-4.7 on 2026-08-17, naming gpt-oss-120b as the
+# replacement; its shared inference serves gpt-oss-120b and qwen-3.8-27b
+# only (inference-docs.cerebras.ai, 2026-10-19). The llama and glm families
+# keep their names so configs naming them still resolve, to gpt-oss-120b.
+[cerebras.qwen]
+powerful = "qwen-3.8-27b"
+standard = "qwen-3.8-27b"
+cheap = "qwen-3.8-27b"
+
+[cerebras.gpt]
+powerful = "gpt-oss-120b"
+standard = "gpt-oss-120b"
+cheap = "gpt-oss-120b"
+
+[cerebras.llama]
+powerful = "gpt-oss-120b"
+standard = "gpt-oss-120b"
+cheap = "gpt-oss-120b"
+
+[cerebras.glm]
+powerful = "gpt-oss-120b"
+standard = "gpt-oss-120b"
+cheap = "gpt-oss-120b"
+
+[cerebras.mixed]
+powerful = "qwen-3.8-27b"
+standard = "gpt-oss-120b"
+cheap = "gpt-oss-120b"
+
+# The chat endpoint takes glm-5.3 and glm-5.3-flash as current (docs.z.ai,
+# 2026-10-19); both run thinking always, so a budget of 0 sends none.
+[zai]
+powerful = "glm-5.3"
+standard = "glm-5.3"
+cheap = "glm-5.3-flash"
+
+# Subscription logins: the ChatGPT backend, and the Claude Code and Codex
+# CLIs. Claude Code takes its own model aliases. The ChatGPT backend serves
+# plain function calls on every model it lists for a ChatGPT sign-in
+# (verified 2026-10-16; gpt-5.5 retired from ChatGPT sign-ins 2026-10-14).
+[chatgpt]
+powerful = "gpt-6.1-sol"
+standard = "gpt-6-sol"
+cheap = "gpt-6-luna"
+
+[claude-code]
+powerful = "opus"
+standard = "sonnet"
+cheap = "haiku"
+
+[codex]
+powerful = "gpt-6.1-sol"
+standard = "gpt-6-sol"
+cheap = "gpt-6-luna"
+
+# Bedrock identifiers below are written without a geo prefix so they work
+# across regions: the catalog resolves them at runtime to the correct
+# inference-profile (e.g. eu.anthropic.* in eu-west-2, us.anthropic.* in
+# us-east-1). When no inference profile matches, the catalog falls back to
+# the foundation-model ID. Bad IDs surface as a typed failure with
+# suggestions from the live catalog, not a runtime crash. AWS rotates these
+# as new model versions ship — run `system.list_models` after deployment to
+# confirm what your account has enabled.
+# The catalog resolves bare IDs to inference profiles, preferring the
+# region's own geo profile (`eu.` in eu-*) over `global.` so data-residency
+# installs never route outside their geography. If AWS hasn't shipped the
+# geo profile for a brand-new model yet, `global.` is used until it lands.
+# Anthropic: every id below has an `eu.` profile and answered an image prompt
+# in eu-west-2 (verified 2026-10-19). Fable is `global.`-only there, so it is
+# not a default: data-residency installs would route outside the EU.
+[bedrock.anthropic]
+powerful = "anthropic.claude-opus-5-5"
+standard = "anthropic.claude-sonnet-5-5"
+cheap    = "anthropic.claude-haiku-5-5"
+
+# Non-Anthropic Bedrock families: each is the newest its family serves from
+# eu-west-2 itself (on-demand or an eu. profile; checked 2026-10-19). Newer
+# ones exist there only through global. — zai.glm-5.3, moonshotai.kimi-k3,
+# openai.gpt-6*, xai.grok-4.7 — and stay out of the defaults so
+# data-residency installs never route outside their geography. Each family
+# also needs a probed row in bedrock_capabilities.rs before it is used.
+[bedrock.zai]
+powerful = "zai.glm-5"
+standard = "zai.glm-4.7"
+cheap    = "zai.glm-4.7-flash"
+
+[bedrock.deepseek]
+powerful = "deepseek.v3.2"
+standard = "deepseek.v3.2"
+cheap    = "deepseek.v3.2"
+
+[bedrock.qwen]
+powerful = "qwen.qwen3-coder-480b-a35b-v1:0"
+standard = "qwen.qwen3-235b-a22b-2507-v1:0"
+cheap    = "qwen.qwen3-32b-v1:0"
+
+[bedrock.kimi]
+powerful = "moonshotai.kimi-k2.5"
+standard = "moonshotai.kimi-k2.5"
+cheap    = "moonshotai.kimi-k2.5"
+
+[bedrock.minimax]
+powerful = "minimax.minimax-m2.5"
+standard = "minimax.minimax-m2.1"
+cheap    = "minimax.minimax-m2"
+
+[bedrock.llama]
+powerful = "meta.llama3-70b-instruct-v1:0"
+standard = "meta.llama3-70b-instruct-v1:0"
+cheap    = "meta.llama3-8b-instruct-v1:0"
+
+[bedrock.mistral]
+powerful = "mistral.devstral-2-123b"
+standard = "mistral.devstral-2-123b"
+cheap    = "mistral.devstral-2-123b"
+
+# Vertex AI publishes current-generation Anthropic Claude models unversioned
+# (publisher versionId "default" — e.g. `claude-opus-5-5`, `claude-sonnet-5-5`);
+# older models keep `@YYYYMMDD` snapshots. Verify against the publisher list:
+# GET https://aiplatform.googleapis.com/v1beta1/publishers/anthropic/models.
+# Current-gen Claude is served from the `global` endpoint only (regional
+# locations like us-east5/europe-west1 still list only older snapshots), so
+# set VERTEX_LOCATION=global for the models below. Pricing matches direct
+# Anthropic API rates and is billed through GCP, so the cost row appears
+# alongside [vertex.anthropic] in default_pricing.toml.
+[vertex.anthropic]
+powerful = "claude-opus-5-5"
+standard = "claude-sonnet-5-5"
+cheap    = "claude-haiku-4-5@20251001"

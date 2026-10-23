@@ -1,0 +1,12 @@
+{
+  "title": "Workforce",
+  "pages": [
+    "index",
+    "getting-started",
+    "concepts",
+    "adapters",
+    "configuration",
+    "cli",
+    "reference"
+  ]
+}

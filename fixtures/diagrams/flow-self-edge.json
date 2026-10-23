@@ -1,0 +1,116 @@
+{
+  "spec": {
+    "kind": "flow",
+    "nodes": [
+      {
+        "id": "a",
+        "label": "Poll"
+      },
+      {
+        "id": "b",
+        "label": "Done"
+      }
+    ],
+    "edges": [
+      {
+        "from": "a",
+        "to": "a",
+        "label": "retry"
+      },
+      {
+        "from": "a",
+        "to": "b"
+      }
+    ]
+  },
+  "metrics": {
+    "char_width": 7,
+    "line_height": 16
+  },
+  "layout": {
+    "kind": "flow",
+    "nodes": [
+      {
+        "id": "a",
+        "label": "Poll",
+        "lines": [
+          "Poll"
+        ],
+        "shape": "box",
+        "tone": "default",
+        "x": 14,
+        "y": 14,
+        "w": 76,
+        "h": 32
+      },
+      {
+        "id": "b",
+        "label": "Done",
+        "lines": [
+          "Done"
+        ],
+        "shape": "box",
+        "tone": "default",
+        "x": 14,
+        "y": 92,
+        "w": 76,
+        "h": 32
+      }
+    ],
+    "edges": [
+      {
+        "key": "a|a|0",
+        "from": "a",
+        "to": "a",
+        "points": [
+          [
+            90,
+            22
+          ],
+          [
+            112,
+            22
+          ],
+          [
+            112,
+            38
+          ],
+          [
+            90,
+            38
+          ]
+        ],
+        "label": "retry",
+        "labelAt": [
+          101,
+          22
+        ],
+        "style": "solid",
+        "arrow": "to"
+      },
+      {
+        "key": "a|b|1",
+        "from": "a",
+        "to": "b",
+        "points": [
+          [
+            52,
+            46
+          ],
+          [
+            52,
+            92
+          ]
+        ],
+        "style": "solid",
+        "arrow": "to"
+      }
+    ],
+    "groups": [],
+    "lifelines": [],
+    "notes": [],
+    "width": 126,
+    "height": 138,
+    "dropped": []
+  }
+}

@@ -1,0 +1,337 @@
+{
+  "spec": {
+    "kind": "flow",
+    "title": "Order pipeline",
+    "nodes": [
+      {
+        "id": "in",
+        "label": "Order received",
+        "shape": "round"
+      },
+      {
+        "id": "chk",
+        "label": "Stock available?",
+        "shape": "diamond"
+      },
+      {
+        "id": "pick",
+        "label": "Pick and pack",
+        "group": "Warehouse"
+      },
+      {
+        "id": "bo",
+        "label": "Backorder",
+        "group": "Warehouse",
+        "tone": "warn"
+      },
+      {
+        "id": "inv",
+        "label": "Raise invoice",
+        "group": "Finance"
+      },
+      {
+        "id": "done",
+        "label": "Notify customer",
+        "shape": "round"
+      }
+    ],
+    "edges": [
+      {
+        "from": "in",
+        "to": "chk"
+      },
+      {
+        "from": "chk",
+        "to": "pick",
+        "label": "yes"
+      },
+      {
+        "from": "chk",
+        "to": "bo",
+        "label": "no"
+      },
+      {
+        "from": "pick",
+        "to": "inv"
+      },
+      {
+        "from": "inv",
+        "to": "done"
+      },
+      {
+        "from": "bo",
+        "to": "done"
+      }
+    ]
+  },
+  "metrics": {
+    "char_width": 7,
+    "line_height": 16
+  },
+  "layout": {
+    "kind": "flow",
+    "nodes": [
+      {
+        "id": "in",
+        "label": "Order received",
+        "lines": [
+          "Order received"
+        ],
+        "shape": "round",
+        "tone": "default",
+        "x": 62,
+        "y": 14,
+        "w": 122,
+        "h": 32
+      },
+      {
+        "id": "chk",
+        "label": "Stock available?",
+        "lines": [
+          "Stock available?"
+        ],
+        "shape": "diamond",
+        "tone": "default",
+        "x": 28,
+        "y": 92,
+        "w": 190,
+        "h": 45
+      },
+      {
+        "id": "pick",
+        "label": "Pick and pack",
+        "lines": [
+          "Pick and pack"
+        ],
+        "shape": "box",
+        "tone": "default",
+        "x": 28,
+        "y": 183,
+        "w": 115,
+        "h": 32,
+        "group": "Warehouse",
+        "lane": 1
+      },
+      {
+        "id": "bo",
+        "label": "Backorder",
+        "lines": [
+          "Backorder"
+        ],
+        "shape": "box",
+        "tone": "warn",
+        "x": 165,
+        "y": 183,
+        "w": 87,
+        "h": 32,
+        "group": "Warehouse",
+        "lane": 1
+      },
+      {
+        "id": "inv",
+        "label": "Raise invoice",
+        "lines": [
+          "Raise invoice"
+        ],
+        "shape": "box",
+        "tone": "default",
+        "x": 28,
+        "y": 261,
+        "w": 115,
+        "h": 32,
+        "group": "Finance",
+        "lane": 2
+      },
+      {
+        "id": "done",
+        "label": "Notify customer",
+        "lines": [
+          "Notify customer"
+        ],
+        "shape": "round",
+        "tone": "default",
+        "x": 77.25,
+        "y": 339,
+        "w": 129,
+        "h": 32
+      }
+    ],
+    "edges": [
+      {
+        "key": "in|chk|0",
+        "from": "in",
+        "to": "chk",
+        "points": [
+          [
+            123,
+            46
+          ],
+          [
+            123,
+            92
+          ]
+        ],
+        "style": "solid",
+        "arrow": "to"
+      },
+      {
+        "key": "chk|pick|1",
+        "from": "chk",
+        "to": "pick",
+        "points": [
+          [
+            123,
+            137
+          ],
+          [
+            123,
+            160
+          ],
+          [
+            85.5,
+            160
+          ],
+          [
+            85.5,
+            183
+          ]
+        ],
+        "label": "yes",
+        "labelAt": [
+          104.25,
+          160
+        ],
+        "style": "solid",
+        "arrow": "to"
+      },
+      {
+        "key": "chk|bo|2",
+        "from": "chk",
+        "to": "bo",
+        "points": [
+          [
+            123,
+            137
+          ],
+          [
+            123,
+            160
+          ],
+          [
+            208.5,
+            160
+          ],
+          [
+            208.5,
+            183
+          ]
+        ],
+        "label": "no",
+        "labelAt": [
+          165.75,
+          160
+        ],
+        "style": "solid",
+        "arrow": "to"
+      },
+      {
+        "key": "pick|inv|3",
+        "from": "pick",
+        "to": "inv",
+        "points": [
+          [
+            85.5,
+            215
+          ],
+          [
+            85.5,
+            261
+          ]
+        ],
+        "style": "solid",
+        "arrow": "to"
+      },
+      {
+        "key": "inv|done|4",
+        "from": "inv",
+        "to": "done",
+        "points": [
+          [
+            85.5,
+            293
+          ],
+          [
+            85.5,
+            316
+          ],
+          [
+            141.75,
+            316
+          ],
+          [
+            141.75,
+            339
+          ]
+        ],
+        "style": "solid",
+        "arrow": "to"
+      },
+      {
+        "key": "bo|done|5",
+        "from": "bo",
+        "to": "done",
+        "points": [
+          [
+            208.5,
+            215
+          ],
+          [
+            208.5,
+            243.5
+          ],
+          [
+            198,
+            243.5
+          ],
+          [
+            198,
+            310.5
+          ],
+          [
+            141.75,
+            310.5
+          ],
+          [
+            141.75,
+            339
+          ]
+        ],
+        "style": "solid",
+        "arrow": "to"
+      }
+    ],
+    "groups": [
+      {
+        "label": "Warehouse",
+        "lane": 1,
+        "x": 14,
+        "y": 151,
+        "w": 252,
+        "h": 78
+      },
+      {
+        "label": "Finance",
+        "lane": 2,
+        "x": 14,
+        "y": 229,
+        "w": 143,
+        "h": 78
+      }
+    ],
+    "lifelines": [],
+    "notes": [],
+    "width": 280,
+    "height": 385,
+    "dropped": []
+  }
+}

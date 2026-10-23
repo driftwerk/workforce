@@ -1,0 +1,108 @@
+[package]
+name = "workforce-common"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+workforce-core = { workspace = true }
+workforce-pairing = { workspace = true }
+workforce-postgres = { workspace = true }
+async-trait = { workspace = true }
+base64 = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+toml = { workspace = true }
+eyre = { workspace = true }
+color-eyre = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+config = { workspace = true }
+chrono = { workspace = true }
+chrono-tz = "0.10"
+uuid = { workspace = true }
+tokio = { workspace = true }
+rusqlite = { workspace = true }
+libc = "0.2"
+regex = { workspace = true }
+once_cell = { workspace = true }
+lru = { workspace = true }
+futures = { workspace = true }
+blake3 = { workspace = true }
+sha2 = "0.10"
+hex = "0.4"
+tempfile = "3"
+parking_lot = { workspace = true }
+rand = { workspace = true }
+
+# Optional Postgres backend (Phase 0 of the multi-store migration roadmap).
+# When the `postgres` feature is enabled, individual stores can opt into a
+# Postgres backend in their own config. SQLite remains the default.
+tokio-postgres = { workspace = true, optional = true }
+deadpool-postgres = { workspace = true, optional = true }
+refinery = { workspace = true, optional = true }
+
+# Telemetry — feature-gated so non-hub crates (cli for ad-hoc commands,
+# local-mcp, etc.) don't pay the compile-time cost of pulling in the
+# OpenTelemetry tree. The hub turns these on; everything else gets a
+# plain tracing-subscriber and no /metrics endpoint.
+opentelemetry = { workspace = true, optional = true }
+opentelemetry_sdk = { workspace = true, optional = true }
+opentelemetry-otlp = { workspace = true, optional = true }
+opentelemetry-appender-tracing = { workspace = true, optional = true }
+opentelemetry-semantic-conventions = { workspace = true, optional = true }
+tracing-opentelemetry = { workspace = true, optional = true }
+metrics = { workspace = true, optional = true }
+metrics-exporter-prometheus = { workspace = true, optional = true }
+sentry = { workspace = true, optional = true }
+sentry-tracing = { workspace = true, optional = true }
+
+[features]
+default = []
+postgres = [
+    "dep:tokio-postgres",
+    "dep:deadpool-postgres",
+    "dep:refinery",
+    "workforce-postgres/postgres",
+]
+# Enable OTLP trace + log export. Activates when OTEL_EXPORTER_OTLP_ENDPOINT
+# is set at runtime; otherwise compiled-in but inert.
+otel = [
+    "dep:opentelemetry",
+    "dep:opentelemetry_sdk",
+    "dep:opentelemetry-otlp",
+    "dep:opentelemetry-appender-tracing",
+    "dep:opentelemetry-semantic-conventions",
+    "dep:tracing-opentelemetry",
+]
+# Install the global Prometheus recorder and expose a handle for the
+# /metrics endpoint. Independent of `otel` — Hetzner uses both, but a
+# pure-DD install could enable only `otel`.
+prometheus = [
+    "dep:metrics",
+    "dep:metrics-exporter-prometheus",
+]
+# Wire Sentry tracing layer when SENTRY_DSN is set. Inert when unset.
+sentry = [
+    "dep:sentry",
+    "dep:sentry-tracing",
+]
+# Compile the Postgres-backed stores' test suites. Enables the `postgres`
+# feature (so the `*_postgres` modules build) and runs against the embedded
+# Postgres harness pulled in as a dev-dependency via
+# `workforce-postgres = { features = ["test-support"] }`. Mirrors every other
+# store crate's `--features test-support` gate.
+test-support = ["postgres"]
+
+[dev-dependencies]
+# Shared Postgres test harness — pulls in `postgresql_embedded` and
+# the `with_test_pool` helper. See `workforce_postgres::test_support`.
+workforce-postgres = { workspace = true, features = ["test-support"] }
+# Drives the `deserialize_opt_usize` regression test: the exact format
+# axum's `Query` extractor uses, which is what hit the bug in prod.
+serde_urlencoded = "0.7"
+
+[build-dependencies]
+workforce-build-support = { path = "../build-support" }

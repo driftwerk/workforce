@@ -1,0 +1,74 @@
+---
+title: Connect your plan
+description: Let agents run on your own Claude or ChatGPT plan.
+---
+
+# Connect your plan
+
+Agents whose model is `claude-code`, `chatgpt` or `codex` run on a Claude or ChatGPT plan. Connect yours once in **My Settings** and every such agent uses it for your work. How a plan is chosen is explained in [Subscriptions](/docs/concepts/subscriptions).
+
+## Claude
+
+1. On your own computer, with Claude Code installed and signed in to your plan, run:
+
+   ```bash
+   claude setup-token
+   ```
+
+2. Copy the token it prints. It starts with `sk-ant-oat`.
+3. In **My Settings → Claude**, paste the token and save.
+
+An API key (`sk-ant-api…`) is not a plan login and is refused. Paste the token whole: an abbreviated or wrapped token is refused too.
+
+You can also send the token to an agent in a private conversation and ask it to save it with `claude_code.setup_token`.
+
+## ChatGPT
+
+1. In **My Settings → ChatGPT**, select **Connect ChatGPT**.
+2. A one-time code appears with a link to the ChatGPT sign-in page. Open the link, sign in, and enter the code within 15 minutes. Only enter a code you asked for yourself.
+3. The card shows **Connected** with your account and plan once the sign-in completes. You can cancel a pending sign-in from the card.
+
+You can also ask an agent to run `chatgpt.login`. The agent never sees the code: it appears only to you, under My Settings → ChatGPT, on the connect card in a chat that is yours alone, or in a direct message on Slack. In a shared conversation the card points you to My Settings.
+
+### If device sign-in isn't available
+
+Some ChatGPT accounts can't sign in with a code from the hub. The card then offers **Paste auth.json instead**:
+
+1. On a computer with the Codex CLI, sign in into a throwaway Codex home, so the login is used by nothing else:
+
+   ```bash
+   CODEX_HOME="$(mktemp -d)" codex login --device-auth
+   ```
+
+2. Paste the `auth.json` that command wrote (in that `CODEX_HOME`), then delete the folder.
+
+<Callout type="warn">
+A ChatGPT sign-in works in one place only: each refresh replaces its refresh token, so two copies invalidate each other. Never paste an `auth.json` that your own Codex keeps using, and don't copy a login from one slot to another. Sign in again for each place instead. The hub refuses a login that is already stored elsewhere, and a file that holds an API key rather than a ChatGPT sign-in.
+</Callout>
+
+## Logins for one agent
+
+Your login in My Settings serves you on every agent. To use a different login on one agent, add it from that agent's **Logins** tab, or ask the agent to save it (`claude_code.setup_token` or `chatgpt.login` with the default `user` scope). A login on an agent is used there instead of your My Settings one, and My Settings lists it as set on that agent.
+
+## Shared logins
+
+An agent can also have a shared login that serves everyone who uses it, and the hub can have its own login that serves every agent. The agent's **Logins** tab shows:
+
+- **Which login serves you**, for each plan the agent uses, and why the others were skipped.
+- **Your own login on this agent**, for each plan, when the agent's `[llm.logins]` tries per-agent logins. You can connect, reconnect or disconnect it there.
+- **The shared logins**, with their state. The agent's owner, or an admin who can write shared vault entries, can connect or disconnect them. Everyone else sees who to ask.
+
+Whether a shared login serves you depends on the agent's `[llm.logins]` settings; see [Subscriptions](/docs/concepts/subscriptions#restricting-the-order-with-llmlogins).
+
+## Login states
+
+Each login shows one of:
+
+- **Connected**, with the ChatGPT account and plan.
+- **At limit until 14:00**: the plan has hit its usage limit and is skipped until then.
+- **Signed out: reconnect**: the provider refused the login; connect it again.
+- **Not set**.
+
+## Disconnecting
+
+Select **Disconnect** on the card in My Settings, on your own login or a shared login in the agent's Logins tab, or next to a per-agent login listed in My Settings. The login is deleted from the vault at once; a refresh in progress can't bring it back.

@@ -1,0 +1,94 @@
+# Vision-capable model tier equivalences across providers.
+#
+# Membership in this registry is the capability predicate: any model listed
+# below is considered vision-capable for the purposes of attachment routing.
+# Every Claude model is vision-capable too, listed or not.
+# Providers / upstreams omitted from this file are treated as text-only and
+# images uploaded to those agents will be routed through the configured
+# `[llm.vision]` fallback (or replaced with placeholder text).
+#
+# To override: place a `vision_tiers.toml` in your workspace root with the
+# sections you want to change. Your file is merged on top of these defaults.
+#
+# A section's provider must be one whose requests carry images: a model
+# listed under any other is still sent text alone.
+#
+# Deliberately omitted (no native image input on the listed default model):
+#   - cerebras.*           (Cerebras serves text-only fast inference)
+#   - grok, zai, ollama    (their requests here carry a message's text only,
+#                           so a vision model behind them is shown nothing)
+#   - openrouter.deepseek  (deepseek-v3.2 is text-only)
+#   - openrouter.kimi      (not mapped; k3 takes images on OpenRouter)
+#   - openrouter.qwen-coder (coder, text-only)
+#   - bedrock.zai          (Z.AI on Bedrock — glm-4.7/4.7-flash/5 — reject
+#                           image modality on the model side; rely on the
+#                           `[llm.vision]` describe-with fallback instead)
+
+[anthropic]
+powerful = "claude-opus-5-5"
+standard = "claude-sonnet-5-5"
+cheap    = "claude-haiku-5-5"
+
+[openrouter.anthropic]
+powerful = "anthropic/claude-opus-5.5"
+standard = "anthropic/claude-sonnet-5.5"
+cheap    = "anthropic/claude-haiku-5.5"
+
+[openrouter.google]
+powerful = "google/gemini-3.1-pro-preview"
+standard = "google/gemini-3.8-flash"
+cheap    = "google/gemini-3.5-flash-lite"
+
+[openrouter.openai]
+powerful = "openai/gpt-6.1-sol"
+standard = "openai/gpt-6-sol"
+cheap    = "openai/gpt-6-luna"
+
+[openrouter.qwen]
+powerful = "qwen/qwen3.8-max-prime"
+standard = "qwen/qwen3.8-27b"
+cheap    = "qwen/qwen3.8-flash"
+
+[openrouter.glm]
+powerful = "z-ai/glm-5v-turbo"
+standard = "z-ai/glm-5.3-flashx"
+cheap    = "z-ai/glm-5.3-flash"
+
+[gemini]
+powerful = "gemini-3.1-pro-preview"
+standard = "gemini-3.8-flash"
+cheap    = "gemini-3.5-flash-lite"
+
+[vllm]
+powerful = "Qwen/Qwen2.5-VL-72B-Instruct"
+standard = "Qwen/Qwen2.5-VL-7B-Instruct"
+cheap    = "Qwen/Qwen2.5-VL-7B-Instruct"
+
+# A ChatGPT plan login: the backend's Responses API takes images and PDFs.
+[chatgpt]
+powerful = "gpt-6.1-sol"
+standard = "gpt-6-sol"
+cheap    = "gpt-6-luna"
+
+# AWS Bedrock — only Anthropic Claude families are routed with image input on
+# Bedrock (the 5.5 generation verified live in eu-west-2 with an image,
+# 2026-10-19). Every Claude id reads images whether listed or not (see
+# `is_claude` in vision_tiers.rs), so these sections name the tier models a
+# `[llm.vision]` spec like `bedrock:anthropic_eu:cheap` resolves to, in each
+# id form an agent config may hold: the bare foundation-model id
+# (`anthropic.X`) and the cross-region inference-profile prefixes (`eu.X`,
+# `global.X`).
+[bedrock.anthropic]
+powerful = "anthropic.claude-opus-5-5"
+standard = "anthropic.claude-sonnet-5-5"
+cheap    = "anthropic.claude-haiku-5-5"
+
+[bedrock.anthropic_eu]
+powerful = "eu.anthropic.claude-opus-5-5"
+standard = "eu.anthropic.claude-sonnet-5-5"
+cheap    = "eu.anthropic.claude-haiku-5-5"
+
+[bedrock.anthropic_global]
+powerful = "global.anthropic.claude-opus-5-5"
+standard = "global.anthropic.claude-sonnet-5-5"
+cheap    = "global.anthropic.claude-haiku-5-5"

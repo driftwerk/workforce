@@ -1,0 +1,443 @@
+---
+title: Pipelines
+description: Watch items move through stages — tickets, orders, candidates — on a live board, with every transition recorded and replayable.
+---
+
+# Pipelines
+
+A pipeline is the hub's way of tracking **items moving through stages**: a
+ticket from triage to a verified fix, a new starter from offer to first
+login, an order from placed to delivered. Workflows and skills record each
+move; the hub keeps one record per item; the **Pipelines** page shows every
+pipeline as a live board with a transition feed and a replay.
+
+The hub knows what *a* pipeline is. Which pipelines exist, what their
+stages are called and what each event means is data you declare — so a hub
+running five pipelines and a hub running none use the same code.
+
+## How it fits together
+
+- A **definition** describes the pipeline: its lanes, exits and the rules
+  that put a recorded event on a column. It lives in the document store at
+  `pipelines/<id>` in the scope that owns it (usually the agent that runs
+  the workflow).
+- One **record per item** lives in the definition's `collection`: the
+  current stage, a block per stage holding what that stage last did and
+  which run did it, and a history of events.
+- Workflows and skills call **`pipeline.record`** to say an item moved. The
+  hub folds the event into the record safely, even when two runs record at
+  once.
+- The **Pipelines** page and the `pipeline.*` tools read records *through*
+  the definition, so they never need to know a pipeline's vocabulary.
+
+## Ask the AI
+
+The fastest way to define or change a pipeline is to ask an agent in chat.
+It has the `pipeline.*` tools and a worked example.
+
+- *"Define a pipeline for the `new-starter` workflow."* — the agent reads
+  the workflow's steps and branches, proposes lanes and exits, and defines
+  it. Steps become stages, branch outcomes become events, and each `goto`
+  says which lane or exit an event lands in.
+- *"Rename the Reviewing lane to In review and add an exit for withdrawn."*
+  — the agent reads the definition, edits it, and redefines it at the
+  version it read, so a concurrent edit can't be lost.
+- *"Why is ORD-17 still in Implementing?"* — `pipeline.item` shows its
+  history.
+
+Every definition is validated before it is stored. Errors are refused with
+the reason ("`review/finished` rule 1 sends the item to `blocked`, which is
+neither a lane nor an exit"); warnings ("no event ever lands in lane
+`deployed`") come back with the saved definition.
+
+## The definition
+
+```json
+{
+  "name": "Onboarding",
+  "description": "New starters from offer accepted to first login.",
+  "item_label": "starter",
+  "collection": "onboarding",
+  "lanes": [
+    { "id": "accounts",  "label": "Creating accounts" },
+    { "id": "access",    "label": "Granting access" },
+    { "id": "welcome",   "label": "Welcome sent" },
+    { "id": "logged-in", "label": "Logged in" }
+  ],
+  "exits": [
+    { "id": "withdrawn", "label": "Offer withdrawn" },
+    { "id": "blocked",   "label": "Needs a person" }
+  ],
+  "events": {
+    "accounts/started": [{ "column": "accounts",  "tone": "active" }],
+    "accounts/done":    [{ "column": "access",    "tone": "active" }],
+    "access/failed":    [{ "column": "blocked",   "tone": "bad" }],
+    "access/done":      [{ "column": "welcome",   "tone": "good" }],
+    "welcome/opened":   [{ "column": "logged-in", "tone": "good" }],
+    "offer/withdrawn":  [{ "column": "withdrawn" }]
+  },
+  "summary_field": "stages.accounts.name",
+  "link_fields": [{ "field": "hr_url", "label": "HR record" }],
+  "sources": ["workflow:new-starter"]
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `guide` | How the pipeline works, in markdown: what each lane means, what heals itself, what needs a person. Shown on the board above the definition, up to 64 KiB. |
+| `lanes` | The flow, left to right on the board. Ids are lowercase letters, digits, `-` or `_`. |
+| `exits` | Where an item parks when it leaves the flow (withdrawn, blocked, rejected…). Shown below the board. |
+| `events` | `"stage/event"` → a list of rules. The first rule whose `when` holds wins. `"stage/*"` catches every event of a stage. An event with no rules leaves the item where it is. |
+| rule `when` | Every key must equal the event's `detail[key]`: `{"verdict": "rejected"}`. Omit it for the fallback rule — put that one last. |
+| rule `column` | A lane id (stays in the flow) or an exit id (parks). Every rule names one, except an annotation. |
+| rule `annotation` | `true` notes the event on the item without moving it: a judgement, an escalation, a note from a watcher. The item keeps its column and current stage; the event joins its history and its stage block. Its label shows on the card, on a line under the item's own label, until the item next moves or a later annotation replaces it. An annotation rule names no `column`, `claim`, `lease_field`, `due_field`, `rung_field` or `rung_passed`. |
+| rule `tone` | `active` (in progress, blue), `good` (green), `warn` (waiting on a person, amber), `healing` (the pipeline is still working on it; nothing to do — sky), `bad` (halted, red — pulses), `neutral`. The board counts `warn` as "Needs a person" and `healing` as "Self-healing", so use `healing`, not `warn`, for a retry or a send-back the pipeline resolves itself. A `warn` annotation also counts its item as needing a person. |
+| rule `label` | Shown on the item instead of the column's label — "Merged" while the item sits in the Deploying lane. |
+| rule `label_field` | A detail field whose text, when the event carries any, replaces `label`, as in "merged by a maintainer". The text is read as one line of at most 120 characters, with `<` and `>` removed so it is safe to post in Slack. Without it the item falls back to `label`, then the column's label, and an annotation to its `stage/event`. |
+| `rungs` + rule `rung_field` / `rung_passed` | A ladder (`["1h", "6h", "24h"]`) drawn on items whose rule names the detail field carrying the rung; `rung_passed` lights that rung. For staged verification. |
+| `summary_field` | Dotted path into the record for the item's one line, e.g. `stages.implement.summary`. |
+| `link_fields` | Detail fields worth a link on the item — a PR or record URL. |
+| `sources` | Which workflows or skills feed this pipeline, for people and the AI. |
+| rule `claim` / `lease_field` | `claim: true` means the event is a run taking the item on: while it is the item's latest placement, the item is being worked and leads its column. `lease_field` names the detail field holding the claim's lease in minutes; past it, the claim no longer holds. A claim recorded without a lease under a rule that names one holds for 45 minutes. |
+| rule `due_field` | The detail field holding when the item is next due, as an RFC 3339 time, so the board can put the most overdue first. Not on a `claim` rule. |
+| `timings` | How an item's time is read. `origin` (`{"field": "filed_at", "label": "Filed"}`) names the detail field a source records when the item really began, and what that moment is called; without it, the clock starts when the pipeline first recorded the item. `milestones` lists lane ids timed from the origin, and `ends` the lane or exit ids where the clock stops; each defaults to the last lane. |
+| `board` | How the board lays the pipeline out. `cards` (1 to 50, 10 when absent) is how many cards each column shows before it scrolls. Every column is the same height, sized for that many ordinary cards (with their rung row when the definition has `rungs`), so 10 means at least ten; a card carrying an annotation takes a little more room. |
+| lane or exit `window` | How long a finished item stays on the board after entering the column: `<n>h` or `<n>d`, from 24 hours to 3650 days, or `all`. Without one, the column shows every item. Only a column in `timings.ends`, where an item's clock stops, may have one, and never a column a rule with tone `warn` or `bad` sends an item to. An item enters a column at the latest event a rule places it with: an annotation or an event with no rule does not restart the window, and a second placement into the same column does. An item carrying a `warn` or `bad` annotation since it last moved is shown whatever its age. |
+| `revision` | Your own counter. A skill that ships its definition bumps it when the definition changes and redefines only when the stored revision is older — so a hand edit is never undone silently. |
+
+## Recording a move
+
+From a workflow, a **tool step** — no model call, one write:
+
+```toml
+[[step]]
+id = "record_started"
+name = "Record that account creation started"
+tool = "pipeline.record"
+task = '{"pipeline": "onboarding", "item": "{{steps.pick.starter_id}}", "stage": "accounts", "event": "started", "detail": {"name": "{{steps.pick.name}}", "hr_url": "{{steps.pick.hr_url}}"}}'
+goto = "create_accounts"
+```
+
+The hub adds the workflow instance as the event's `run`, so every move is
+attributable. From an agent step or chat, the same tool. From a WASM skill,
+`workforce_skill_sdk::pipeline` with `pipeline.get`, `pipeline.define` and
+`pipeline.record` in the skill's `[[permissions]]`: a `pipeline::Shipped`
+holds the definition JSON the skill embeds (and the board's guide), `ensure`
+registers it when the hub holds none or an older `revision`, and `record`
+records one move and says where the item landed. The skill's tool step
+receives `_instance_id`, which it passes as the event's `run`.
+
+The reply names the column the definition puts the item in, and its label.
+When the rule is an annotation, the reply says `annotation: true` and names
+no column. When the definition has no rule for that `stage/event`, the record
+is still written and the reply carries a warning — usually a typo, or a rule
+to add. Pass `dry_run: true` to resolve an event without writing it — a
+backtest or a rehearsal records nothing.
+
+To record an event only if something has not happened yet, pass `unless`:
+
+```json
+{
+  "pipeline": "orders", "item": "ORD-17", "stage": "merge", "event": "merged",
+  "detail": { "pr_url": "https://github.com/…/pull/1702", "note": "merged by a maintainer" },
+  "unless": { "events": ["merge/merged", "merge/auto-merged", "deploy/*"], "detail": { "pr_url": "https://github.com/…/pull/1702" } }
+}
+```
+
+The event is written only when the item's history holds none of those
+events. With `detail`, one of them counts only when each of its fields
+equals the same field of that event's detail, compared as text. A matching
+event means nothing is written, and the reply has `recorded: false`,
+`skipped: "unless"` and the `at`, `stage` and `event` it `matched`; a
+`dry_run` replies the same. The check is repeated every time a concurrent
+write makes the recording try again, up to four tries, so a run that
+claimed the deploy a moment earlier is never undone.
+It reads the history, which keeps the latest 200 events, so an event older
+than that no longer counts.
+
+`pipeline.item` and `pipeline.items` give each item's `position` and
+`activity`, read as the board reads them at the hub's current time:
+
+- `position`: the `column`, `tone`, `label` and `at` of the event that last
+  placed the item, and the `annotation` (`tone`, `label`, `at`) noted since.
+  It is `null` until an event places the item.
+- `activity`, which takes one of three forms:
+  - `{kind: "working", since, until}` while a run's claim holds. `until` is
+    `null` when its rule names no lease.
+  - `{kind: "scheduled", due}` when the item is next due, or when its claim's
+    lease has run out, in which case `due` is when it was claimed.
+  - `{kind: "other"}` otherwise.
+
+## Runs and hub facts
+
+Two read-only ops let a workflow or a skill check the machinery behind a
+pipeline, not only its items. Both follow the scope rule every `pipeline.*`
+op follows, and both exist only on a hub that runs workflows.
+
+- **`pipeline.runs`** lists the workflow runs the pipeline may join, newest
+  update first. On an agent's pipeline, that means only the runs that execute
+  as that agent; a run that recorded no agent runs as the agent its workflow
+  names. Filter by:
+  - `runs`: instance ids, at most 200;
+  - `workflows`: a workflow id also matches members' copies of it;
+  - `statuses`;
+  - `since`: an RFC 3339 time;
+  - `limit`: 1 to 200. On an agent's pipeline it is applied before other
+    agents' runs are left out, so fewer runs may come back.
+
+  An empty list matches nothing. Each run has its status, current step,
+  failure reason and lease: `expires_at`, and `live` until the lease runs out.
+  Without `steps`, a run lists none of its steps. With `steps: "coding"`, it
+  lists the steps a coding engine served, each with its outcome, times,
+  engine, model and the attempts its fallback chain handed over, with their
+  errors; `steps: "all"` lists every step. Errors are redacted and cut to 300
+  characters. A step's response and outputs are never included.
+- **`pipeline.facts`** reads what the pipeline's workflows depend on. Those
+  workflows are an agent's own on its pipeline, or the ones `sources` names
+  (`workflow:<id>`) on any other. It returns:
+  - the hub's build: version, commit, image tag and build date;
+  - the runner daemons this hub has heard from, named `local` or `remote` and
+    never by address, each with the protocol it last announced, the protocol
+    this hub needs, its version and capacity, when it was last heard from and
+    its last refusal;
+  - the skills those workflows' tool steps call or their `requires` names,
+    each with its version, source commit, sha256, contract fingerprint, tools,
+    and tools grant (`valid`, `stale` or `missing`, and `null` for a skill
+    that asks for no permissions) for the calling identity (`run_as`) and the
+    org (`shared`);
+  - each workflow with its version, content hash, tools, `requires` and
+    schedules. Each schedule has `last_12`: of its latest 12 runs, how many
+    started, how many were skipped at the workflow's concurrency cap and how
+    many could not start. A run that starts and then fails counts as started.
+
+  Workers and schedule runs are what this hub process has seen since it
+  started, and it keeps only the latest 100 scheduled runs across every
+  schedule. After a restart they begin again, and `last_12.considered` says
+  how many runs were counted.
+
+A skill declares each op it calls by its exact name in `[[permissions]]`,
+such as `pipeline.runs` and `pipeline.facts`.
+
+## Notices
+
+A workflow or skill that watches a pipeline can put one line above its board
+for everyone who can see it, such as a worker on an old protocol or a queue
+left idle:
+
+```json
+{ "pipeline": "orders", "op": "raise", "key": "runner-protocol", "tone": "warn",
+  "title": "The worker speaks runner protocol v2; the hub needs v3",
+  "detail": "Every coding step since 12:02 has failed within a minute.",
+  "link": "/pipelines/agent:example/orders", "ttl_secs": 3600 }
+```
+
+- **Raising and clearing.** `pipeline.notice` raises a notice, and raising the
+  same `key` again replaces it. `{"op": "clear", "key": …}` takes it down, and
+  so does its `ttl_secs` running out.
+- **Fields.**
+  - `key`: a lowercase id.
+  - `tone`: as for rules.
+  - `title`: one line of up to 200 characters.
+  - `detail`: up to 2,000 characters.
+  - `link`: an `http(s)` URL, or a path on the hub starting with `/`.
+  - `ttl_secs`: up to 30 days.
+- **Who sees it.** Notices follow the pipeline's scope rule, and the board
+  shows the newest 50 not yet cleared or expired.
+- **Dismissing.** A viewer can dismiss a notice for themselves, in that
+  browser; everyone else still sees it. The same notice raised again after it
+  was cleared or expired shows again.
+- **Storage.** Notices are documents in the pipeline's scope, in the
+  `pipeline-notices` collection, so no definition may use that collection
+  for its items.
+
+## The board
+
+**Pipelines** in the sidebar lists every pipeline you can see, with counts
+per column and when something last moved. Each has its own page
+(`/pipelines/<scope>/<id>`, a link you can share): lanes as columns, items
+as tokens that move on real transitions and are coloured by tone, a
+transitions feed, and a replay bar that folds every item's history up to
+any moment in the window the records cover. The definition panel shows the
+lanes, exits and rules in plain language.
+
+Within a column, the items a run is working on come first, newest claim
+first; then the items with a next due time, most overdue first; then the
+rest, newest arrival first. Each card says which: **working now** (a claim
+within its lease), **claimed 20m ago** (a claim with no lease), **overdue by
+6h** or **due in 15h 40m**. The replay orders and words the cards as of the
+moment it shows.
+
+Every column, lanes and the containers of items that left the flow alike, is
+the same height and scrolls on its own, as the transitions feed does. The
+count beside a column's name includes the cards scrolled out of view. The
+height fits the definition's `board.cards` ordinary cards, 10 by default;
+**Cards per column**, above the lanes, lets you choose 5, 10 or 20 for
+yourself. On a narrow screen no column is taller than 70% of the screen.
+
+A column with a `window` shows only the items that entered it within that
+window, so finished work does not pile up. Its footer says how many older
+items are hidden and offers 24h, 7d, 30d or all, with the definition's own
+window marked as the default. Both choices are yours alone, kept in this
+browser, and change nobody else's board. A finished item carrying a `warn` or
+`bad` annotation stays shown, because it needs a person. The lane tiles above
+the board count hidden items too, so the last lane's tile stays a total.
+Replay shows every item whatever the windows, over the whole span the records
+cover.
+
+An annotation noted since the item last moved shows as a chip on its own
+line under the card's label, with its tone and how long ago it was noted. The
+feed lists an annotation as `stage/event · label`. Notices raised on the
+pipeline sit above the stats.
+
+Above it, **How this pipeline works** draws the flow from the definition —
+lanes left to right, exits below, every event rule as a labelled arrow — and
+renders the definition's `guide`. The guide is part of the definition, so it
+lives and versions with the lanes: ask the agent to "explain the sent-back
+rule in the orders guide" and it redefines the pipeline with the new text.
+
+## An item's detail, time and cost
+
+Click a card, or tab to it and press Enter or Space, to open the item: its
+summary, its link, the column it is in and its own history of events.
+
+### Time
+
+Everyone who can see the board sees how long the item has taken.
+
+- **Where the clock starts.** The definition's `timings.origin` names a detail
+  field a source records when the item really began: the example orders
+  pipeline records `filed_at`, when the order was filed. The earliest recorded value counts.
+  An item with none yet is timed from when the pipeline first recorded it,
+  shown as **First recorded**.
+- **Visits.** Each stretch the item spends in one column is a visit. Events
+  in a row that land in the same column make one visit, and an event the
+  definition has no rule for never starts or splits one. **By stage** adds up
+  each column's visits; **Timeline** lists them in order.
+- **Milestones.** `timings.milestones` names the lanes timed from the origin,
+  such as Filed → Deployed and Filed → Verified. A milestone is reached when
+  the item enters that lane or a later one. Going back to an earlier lane
+  undoes it until it is reached again, and an exit neither reaches nor undoes
+  one.
+- **Where the clock stops.** `timings.ends` names the lanes and exits where
+  an item is finished. An exit that waits on a person, such as **Needs a
+  person**, is not an end, so its time keeps counting.
+- **Work** is the time the workflow runs the item's record names spent in
+  their steps. Every step counts, tool, report and failed steps included, and
+  the attempts a fallback chain moved on from count once, inside their step.
+  Steps and runs that overlap count once. A run still in progress counts up
+  to now, and a run with no step history counts for its whole run. A run that
+  several items name counts as work on each of them. On an agent's pipeline,
+  only runs that run as that agent count, as for costs.
+- **Waiting** is the rest of the time.
+
+While the clock runs, the figures keep counting and a **so far** badge shows.
+Notes under the totals say what the figures leave out:
+
+- runs that could not be matched to a workflow run the pipeline counts, whose
+  time shows as waiting;
+- no telemetry on this hub, so work and waiting are not shown;
+- no recorded origin yet, or one later than the pipeline's first record;
+- runs with no step history;
+- older history trimmed from a long-lived record, shown as one stretch;
+- times adjusted: events recorded out of order, and run time before the
+  clock started or after it stopped, which is not counted.
+
+### Cost
+
+Admins, and managers on an agent's pipeline, also see what the item has cost
+so far. The figures come from the step history of the workflow runs the
+item's record names:
+
+- **Billed** is spend charged per token: Claude Code on Bedrock, Codex on an
+  API key, and the hub's own agent loop.
+- **Estimated** is use of a subscription (Claude Code on a Claude login, Codex
+  on a ChatGPT login, Claude Pilot) priced at list rates. Nothing is charged
+  per token, so it is shown apart from the billed figure, as the Costs page
+  shows [subscription value](/docs/concepts/subscriptions#seeing-what-paid).
+
+Below the totals, each stage lists its runs and the models and engines they
+used. Open a run to see its steps: the engine and model each step ran on,
+its rounds, tokens and cost, the earlier attempts a fallback chain moved on
+from with the reason it moved on, and failed attempts, whose spend still
+counts. An attempt that ended before reporting its usage shows $0.00, as its
+spend is unknown rather than free. A run still in progress is costed so far.
+
+A run that recorded against several items counts once: on the ticket it
+booked its cost to, otherwise on the first item that recorded it. The other
+items list it as counted on that item, without its cost, so adding up every
+item never counts a run twice.
+
+On an agent's pipeline, a run counts only if its workflow runs as that agent:
+the agent the run recorded when it started or, for a run from before runs
+recorded their agent, the agent its workflow names today. A global pipeline,
+or one in your own user scope, counts every workflow run its records name.
+
+Notes under the totals say what the figures leave out:
+
+- runs that could not be matched to a workflow run the pipeline counts, such
+  as a chat session, a deleted run or, on an agent's pipeline, a run of a
+  workflow that does not run as that agent;
+- steps that ran before step costs were recorded, shown as "not recorded";
+- runs counted on another item;
+- older history trimmed from a long-lived record, whose runs may be missing.
+
+When none of an item's runs can be matched, the totals are hidden and a
+warning says so in their place.
+
+Who sees costs: admins on any pipeline, and managers on an agent's pipeline.
+Everyone else who can see the pipeline sees the item without its cost.
+
+**Stats** shows per-ticket totals too, but from the cost ledger: every coding
+round booked to the ticket id, chat sessions about it included. The figure
+here is the cost of the pipeline's own runs, so the two can differ, and work
+that never records against the pipeline is not included.
+
+## Where the data lives
+
+Definitions and records are documents in the [document store](/docs/concepts/store)
+— `agent:<id>/pipelines/<id>` and `agent:<id>/<collection>/<item>`.
+
+Who sees a pipeline follows who can use its agent. The **Pipelines** page and
+`/api/pipelines` show an agent's pipelines to everyone who sees that agent in
+their agent list: admins, its owner or the members of the team that owns it,
+and anyone the agent's access settings let in. An agent open to everyone
+shares its pipelines with everyone; an agent limited to an allowlist shows
+them only to the people on it, whoever owns it and admins, and to anyone else
+a link to one reads as a pipeline that does not exist. Global pipelines are
+visible to everyone, and pipelines in your own user scope only to you.
+
+Reading the documents directly, with the `store.*` tools or `/api/store`,
+still follows the [store's scopes](/docs/concepts/store#scopes): an agent's
+scope is open only to its own runs and admins.
+
+A script can read a board as the page does with
+`GET /api/pipelines/<scope>/<id>/items?view=board`: every item still in play
+and the finished ones within their column's window, with `windows` (for each
+windowed column, the `window` applied, the definition's `default` and how many
+items it left out as `hidden`) and `span` (the earliest and latest event
+across every item, hidden ones included). Add `&windows=30d` for one window on
+every windowed column, `&windows=verified:30d,not-code:all` for chosen
+columns, or `&windows=all` to hide nothing. Without `view`, `/items` returns
+one page of records, newest movement first, with `limit`, `cursor` and
+`next_cursor`.
+
+Sources can record any detail fields. A definition's `timings.origin` and
+rule `lease_field` and `due_field` name the ones the board reads, such as
+`filed_at`, `lease_minutes` and `due_at`.
+
+The item record shape is:
+
+```json
+{
+  "item": "ORD-17",
+  "stage": "review",
+  "created_at": "…", "updated_at": "…",
+  "stages": {
+    "implement": { "repo": "…", "pr_url": "…", "run": "<instance>", "last_event": "pr-opened", "at": "…" },
+    "review":    { "pr_url": "…", "run": "<instance>", "last_event": "claimed", "at": "…" }
+  },
+  "history": [
+    { "at": "…", "stage": "implement", "event": "claimed", "run": "…", "detail": { "repo": "…", "filed_at": "…" } }
+  ]
+}
+```

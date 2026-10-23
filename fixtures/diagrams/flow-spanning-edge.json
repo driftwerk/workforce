@@ -1,0 +1,216 @@
+{
+  "spec": {
+    "kind": "flow",
+    "nodes": [
+      {
+        "id": "a",
+        "label": "One"
+      },
+      {
+        "id": "b",
+        "label": "Two"
+      },
+      {
+        "id": "c",
+        "label": "Three"
+      },
+      {
+        "id": "d",
+        "label": "Four"
+      }
+    ],
+    "edges": [
+      {
+        "from": "a",
+        "to": "b"
+      },
+      {
+        "from": "b",
+        "to": "c"
+      },
+      {
+        "from": "c",
+        "to": "d"
+      },
+      {
+        "from": "a",
+        "to": "d",
+        "label": "skip"
+      }
+    ]
+  },
+  "metrics": {
+    "char_width": 7,
+    "line_height": 16
+  },
+  "layout": {
+    "kind": "flow",
+    "nodes": [
+      {
+        "id": "a",
+        "label": "One",
+        "lines": [
+          "One"
+        ],
+        "shape": "box",
+        "tone": "default",
+        "x": 46.5,
+        "y": 14,
+        "w": 76,
+        "h": 32
+      },
+      {
+        "id": "b",
+        "label": "Two",
+        "lines": [
+          "Two"
+        ],
+        "shape": "box",
+        "tone": "default",
+        "x": 14,
+        "y": 92,
+        "w": 76,
+        "h": 32
+      },
+      {
+        "id": "c",
+        "label": "Three",
+        "lines": [
+          "Three"
+        ],
+        "shape": "box",
+        "tone": "default",
+        "x": 14,
+        "y": 170,
+        "w": 76,
+        "h": 32
+      },
+      {
+        "id": "d",
+        "label": "Four",
+        "lines": [
+          "Four"
+        ],
+        "shape": "box",
+        "tone": "default",
+        "x": 46.5,
+        "y": 248,
+        "w": 76,
+        "h": 32
+      }
+    ],
+    "edges": [
+      {
+        "key": "a|b|0",
+        "from": "a",
+        "to": "b",
+        "points": [
+          [
+            84.5,
+            46
+          ],
+          [
+            84.5,
+            69
+          ],
+          [
+            52,
+            69
+          ],
+          [
+            52,
+            92
+          ]
+        ],
+        "style": "solid",
+        "arrow": "to"
+      },
+      {
+        "key": "b|c|1",
+        "from": "b",
+        "to": "c",
+        "points": [
+          [
+            52,
+            124
+          ],
+          [
+            52,
+            170
+          ]
+        ],
+        "style": "solid",
+        "arrow": "to"
+      },
+      {
+        "key": "c|d|2",
+        "from": "c",
+        "to": "d",
+        "points": [
+          [
+            52,
+            202
+          ],
+          [
+            52,
+            225
+          ],
+          [
+            84.5,
+            225
+          ],
+          [
+            84.5,
+            248
+          ]
+        ],
+        "style": "solid",
+        "arrow": "to"
+      },
+      {
+        "key": "a|d|3",
+        "from": "a",
+        "to": "d",
+        "points": [
+          [
+            84.5,
+            46
+          ],
+          [
+            84.5,
+            74.5
+          ],
+          [
+            117,
+            74.5
+          ],
+          [
+            117,
+            219.5
+          ],
+          [
+            84.5,
+            219.5
+          ],
+          [
+            84.5,
+            248
+          ]
+        ],
+        "label": "skip",
+        "labelAt": [
+          117,
+          147
+        ],
+        "style": "solid",
+        "arrow": "to"
+      }
+    ],
+    "groups": [],
+    "lifelines": [],
+    "notes": [],
+    "width": 137,
+    "height": 294,
+    "dropped": []
+  }
+}

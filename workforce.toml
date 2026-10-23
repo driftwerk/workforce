@@ -1,0 +1,74 @@
+# Workforce Configuration
+# See https://github.com/driftwerk/workforce for documentation.
+
+[hub]
+listen = "0.0.0.0:8090"
+data_dir = "./data"
+log_level = "info"
+
+[nats]
+url = "nats://localhost:4222"
+
+[weaviate]
+url = "http://localhost:8080"
+enabled = true
+
+[llm]
+provider = "openrouter:google"
+default_model = "standard"
+max_tokens = 8192
+max_rounds = 50
+# Failover models — tried in order when the primary model is rate-limited or unavailable
+failover = ["openrouter:deepseek"]
+
+[llm.retry]
+max_retries = 2
+initial_backoff_ms = 500
+backoff_multiplier = 2.0
+max_backoff_ms = 10000
+
+[llm.health]
+failure_threshold = 3
+window_secs = 300
+recovery_secs = 120
+
+[vault]
+enabled = true
+
+[budget]
+daily_limit = 50.0
+per_agent_limit = 10.0
+
+[workflows]
+# Max concurrent running instances per definition owner — caps abuse from
+# member-authored workflows. System/operator definitions are exempt. Default 25.
+max_concurrent_runs_per_owner = 25
+
+[curator]
+# Doc-curator default tier for `workforce docs curate`.
+# `OPENROUTER_API_KEY` resolves credentials; CLI `--tier <spec>`
+# overrides per invocation. `max_tokens` falls back to 8000 unless
+# overridden; raise via `--max-tokens` for an unusually long page.
+tier = "openrouter:deepseek:powerful"
+
+[[agents]]
+id = "mark"
+name = "Mark"
+workspace = "./data/agents/mark"
+default = true
+
+# ─── Codebase Knowledge Engine ───
+[knowledge]
+enabled = true
+index_on_startup = false
+parse_concurrency = 0              # 0 = auto (num_cpus * 2)
+generate_summaries = false
+maintenance_interval_secs = 14400  # 4 hours
+# exclude_patterns = ["**/vendor/**", "**/generated/**"]
+# max_file_size = 1048576          # 1 MB (default)
+
+[knowledge.summariser]
+provider = "ollama"
+ollama_url = "http://ollama:11434"
+model = "qwen2.5-coder:7b"
+

@@ -1,0 +1,172 @@
+---
+title: Google Calendar
+description: Read and manage calendar events via the Google Calendar adapter.
+---
+
+# Google Calendar adapter
+
+The Google Calendar adapter provides tools to read and manage your Google Calendar events. It is part of the broader Google Workspace skill, which also includes access to Gmail, Drive, Sheets, Docs, Tasks, Contacts, Chat, and Slides.
+
+## Authentication
+
+Before using any Google Calendar tools, you must authorize Workforce to access your Google account.
+
+### One-time admin setup (hub administrator)
+
+Your hub administrator must first configure a Google OAuth client in the Google Cloud Console and store the credentials in the global vault. This is a one-time setup for the entire organization.
+
+If you encounter an error stating "No Google OAuth client configured," provide the full error message to your administrator — it contains step-by-step setup instructions.
+
+### Per-user authorization
+
+Once the admin has configured the OAuth client, each user can connect their Google account using the `google.setup` tool:
+
+1. Start the authorization flow:
+   ```
+   google.setup(action='login', no_browser=true)
+   ```
+
+2. The response will contain either:
+   - A `verification_url` and `user_code` for the device flow
+   - An `authorization_url` for the web flow
+
+3. **Important**: Read the `next_step` field in the response and relay it verbatim to the user. This tells them exactly what to do.
+
+4. Poll for completion:
+   ```
+   google.setup(action='login_poll', workspace='default')
+   ```
+
+5. Continue polling until the status changes from `"pending"` to `"authorized"`.
+
+### Multiple accounts
+
+You can connect multiple Google accounts by specifying different workspace names:
+
+```json
+{
+  "action": "login",
+  "workspace": "work",
+  "no_browser": true
+}
+```
+
+Then use the `account` parameter in any Google tool to specify which workspace to use.
+
+## Available tools
+
+The Google Calendar adapter provides these tools:
+
+### List calendars
+- `google.calendar.calendars` — List all your calendars
+
+### View events
+- `google.calendar.events` — List events in a calendar with optional date filters
+- `google.calendar.event_get` — Get details of a specific event
+- `google.calendar.search` — Search events by text query
+- `google.calendar.freebusy` — Check free/busy status across calendars
+
+### Manage events
+- `google.calendar.create` — Create a new event
+- `google.calendar.update` — Update an existing event
+- `google.calendar.delete` — Delete an event
+
+### Utilities
+- `google.calendar.colors` — Get available calendar colors
+
+## Examples
+
+### List upcoming events
+
+```json
+{
+  "calendar_id": "primary",
+  "time_min": "2024-01-01T00:00:00Z",
+  "time_max": "2024-01-31T23:59:59Z",
+  "max_results": 10
+}
+```
+
+### Create an event
+
+```json
+{
+  "calendar_id": "primary",
+  "summary": "Team Meeting",
+  "description": "Weekly sync",
+  "start": "2024-01-15T14:00:00Z",
+  "end": "2024-01-15T15:00:00Z",
+  "location": "Conference Room A",
+  "attendees": ["colleague@example.com", "manager@example.com"]
+}
+```
+
+### Check free/busy time
+
+```json
+{
+  "time_min": "2024-01-15T09:00:00Z",
+  "time_max": "2024-01-15T17:00:00Z",
+  "calendar_ids": ["primary", "work@company.com"]
+}
+```
+
+## Calendar IDs
+
+By default, tools use your primary calendar (`calendar_id: "primary"`). To use a different calendar, specify its ID. You can get calendar IDs using `google.calendar.calendars`.
+
+## Date and time format
+
+Use RFC3339 format for date-time values: `"2024-01-15T14:00:00Z"` (UTC) or `"2024-01-15T14:00:00-08:00"` (with timezone offset).
+
+For all-day events, use date-only format: `"2024-01-15"`.
+
+## Account selection
+
+When using multiple Google accounts, specify which account to use:
+
+```json
+{
+  "calendar_id": "primary",
+  "account": "work",
+  "time_min": "2024-01-01T00:00:00Z"
+}
+```
+
+Omit the `account` parameter to use your default workspace.
+
+## Related tools
+
+The Google Workspace skill includes many other tools:
+- **Gmail**: Search, send, and manage email
+- **Drive**: Upload, download, and manage files
+- **Sheets**: Read, write, and manage spreadsheets
+- **Docs**: Read and edit documents
+- **Tasks**: Manage to-do lists
+- **Contacts**: Manage address book
+- **Chat**: Send messages and manage spaces
+- **Slides**: Create and manage presentations
+
+## Troubleshooting
+
+### "401 Unauthorized" errors
+If you see authentication errors, your access token may have expired. Try:
+```
+google.setup(action='refresh', workspace='default')
+```
+
+### "No Google OAuth client configured"
+This means your hub administrator hasn't set up the Google OAuth client. Share the full error message with them — it contains detailed setup instructions.
+
+### Multiple accounts not working
+Ensure you're using the same workspace name consistently. List all connected accounts:
+```
+google.setup(action='list')
+```
+
+## See also
+
+- [Google Drive adapter](/docs/adapters/drive)
+- [Google Gmail adapter](/docs/adapters/gmail)
+- [Google Sheets adapter](/docs/adapters/drive) {/* CURATOR: needs verification — check if Sheets has its own page or is part of Drive. */}
+- [Workforce CLI](/docs/cli) for command-line Google authentication

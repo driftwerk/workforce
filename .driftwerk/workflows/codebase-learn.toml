@@ -1,0 +1,87 @@
+[workflow]
+id = "codebase-learn"
+name = "Codebase Knowledge Refresh"
+description = "Switch context to a repo and refresh the agent's understanding of it via the knowledge index"
+
+[workflow.context]
+repo = { required = true, description = "Repository in owner/name format (e.g. driftwerk/workforce)" }
+
+# =============================================================================
+# Step 1: Clone Repo
+# =============================================================================
+[[step]]
+id = "ensure-clone"
+name = "Ensure repo is cloned"
+max_rounds = 5
+model = "standard"
+skills = ["github"]
+preferred_tools = ["github.clone"]
+task = """
+Ensure {{repo}} is on disk at repos/{{repo}}.
+
+## Steps
+
+1. Try `code.find` with path="repos/{{repo}}" to check if it exists.
+2. If not present: call `github.clone` with owner and repo extracted from
+   "{{repo}}" (split on "/").
+3. Confirm repos/{{repo}} now exists.
+
+OUTCOME: repo-on-disk
+"""
+
+# =============================================================================
+# Step 2: Index Repo
+# =============================================================================
+[[step]]
+id = "check-index"
+name = "Verify knowledge index is current"
+max_rounds = 10
+model = "standard"
+skills = []
+preferred_tools = ["knowledge.index"]
+task = """
+Check and update the knowledge index for the target repo. The index — not a
+static project digest — is the agent's source of project understanding, queried
+on demand via the knowledge tools.
+
+## Steps
+
+1. Call `knowledge.index` with action="status" path="repos/{{repo}}"
+2. If the index is stale or has zero entities: call `knowledge.index` with action="trigger" path="repos/{{repo}}"
+
+IMPORTANT: Always pass path="repos/{{repo}}" to every knowledge tool call.
+
+Report the entity count and last index time.
+
+OUTCOME: index-current
+"""
+
+# =============================================================================
+# Step 3: Review Architecture
+# =============================================================================
+[[step]]
+id = "refresh-digest"
+name = "Review current architecture"
+max_rounds = 15
+model = "standard"
+skills = []
+preferred_tools = ["knowledge.overview", "knowledge.ask"]
+task = """
+Surface the repo's current architecture from the freshly-built index and
+sanity-check that the index captured it.
+
+## Steps
+
+1. Call `knowledge.overview` with path="repos/{{repo}}" detail="full".
+2. Sanity-check the index: are the main modules/crates, key types, and entry
+   points present? Is the entity count plausible for the repo's size?
+3. If the index looks thin or stale, re-run `knowledge.index` action="trigger".
+4. Summarise the architecture (modules, key types, conventions) for the user.
+
+The knowledge index is the source of truth — query `knowledge.ask` /
+`knowledge.overview` on demand rather than persisting a static digest.
+
+IMPORTANT: Always pass path="repos/{{repo}}" to knowledge tools.
+
+OUTCOME: understanding-refreshed
+"""

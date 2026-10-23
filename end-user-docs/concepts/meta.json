@@ -1,0 +1,16 @@
+{
+  "title": "Concepts",
+  "pages": [
+    "workflows",
+    "playbooks",
+    "monitors",
+    "schedules",
+    "pipelines",
+    "store",
+    "agents",
+    "subscriptions",
+    "sessions",
+    "knowledge",
+    "skills"
+  ]
+}

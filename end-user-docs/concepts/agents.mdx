@@ -1,0 +1,181 @@
+---
+title: Agents
+description: AI workers that can use tools, remember conversations, and follow rules to accomplish tasks.
+---
+
+# Agents
+
+Agents are persistent, stateful chat sessions that can call tools, run code, and interact with files and systems. They are the core AI workers in your system. You can configure different agents with specific models, system prompts, and capabilities.
+
+## How agents work
+
+When you send a message to an agent, it uses a large language model (LLM) to understand your request, decides which tools to use, executes actions, and maintains context across the conversation.
+
+### Planning and execution
+The agent typically follows this process:
+1.  **Plan**: Understands your request and decides what needs to be done.
+2.  **Tool selection**: Chooses from available tools (like reading files, searching the web, or running code).
+3.  **Execution**: Calls the selected tool with appropriate parameters.
+4.  **Feedback**: Receives the tool's results and decides what to do next.
+
+This loop continues until the task is complete or a limit is reached.
+
+## Configuring agents
+
+Agents are configured in your `workforce.toml` file within `[[agents]]` sections. Each agent has a unique `id`, its own workspace directory, system prompt, and capabilities.
+
+### Basic agent definition
+```toml
+[[agents]]
+id = "assistant"
+name = "General Assistant"
+model = "claude-sonnet-4-5"
+workspace = "./workspace/assistant"
+system_prompt = "You are a helpful assistant."
+capabilities = ["code", "planning"]
+default = true
+```
+
+### Agent management tools
+You can manage agents live without restarting the system using these tools (available via the command line or API):
+
+*   `agent.list` - List all agents defined in the workforce config.
+*   `agent.show` - Show the full details of a single agent by its ID.
+*   `agent.create` - Create a new agent. Requires admin (`AgentsManage`) capability.
+*   `agent.update` - Update an existing agent. Requires admin (`AgentsManage`) capability.
+*   `agent.delete` - Delete an agent from the workforce config by its ID. Requires admin (`AgentsManage`) capability.
+
+Changes made via `agent.create`, `agent.update`, or `agent.delete` are stored in a configuration overlay and take effect within seconds.
+
+## LLM providers and model tiers
+
+Agents support multiple LLM providers, each with different authentication methods and capabilities.
+
+### Supported providers
+- **Anthropic** (Claude): Standard API key (`sk-ant-api*`). A Claude plan runs agents only through the `claude-code` provider.
+- **AWS Bedrock**: Uses AWS credentials via environment variables or credential chain.
+- **Cerebras**, **Gemini**, **OpenAI**, **OpenRouter**, **Grok**, **Z.AI**: Standard API key with Bearer token.
+- **vLLM**, **Ollama**: Local/self-hosted with configurable base URL.
+- **VertexAnthropic**: Anthropic Claude on Google Cloud Vertex AI (uses GCP ADC).
+
+### Model tier system
+Driftwerk uses three capability tiers for easier configuration:
+- **`powerful`** – Highest capability models (e.g., Claude Opus, Gemini 2.5 Pro).
+- **`standard`** – Balanced models (e.g., Claude Sonnet, Gemini Flash).
+- **`cheap`** – Cost-effective models (e.g., Claude Haiku, Gemini Nano).
+
+You can specify tiers directly in configuration:
+```toml
+model = "anthropic:powerful"  # Resolves to Claude Opus
+model = "openrouter:deepseek:standard"  # Routes through OpenRouter
+model = "gemini:cheap"  # Resolves to Gemini Flash
+```
+
+Tier mappings are defined in `default_tiers.toml` but can be overridden in your workspace root.
+
+## LLM failover system
+
+Agents include a resilient LLM system with automatic retries and failover to maintain availability:
+
+*   **Retry logic**: Automatically retries transient errors (like server timeouts) with configurable backoff.
+*   **Failover chain**: Defines an ordered list of fallback models to try when the primary model fails.
+*   **Model aliases**: Map friendly names like `"fast"` or `"smart"` to specific model IDs for easier configuration.
+*   **Health tracking**: Tracks model failures over time and temporarily avoids degraded models, retrying them later.
+
+### Failover configuration example
+```toml
+[llm]
+default_model = "claude-sonnet-4-5"
+failover = ["grok:grok-4", "gemini:gemini-2.5-pro"]
+aliases = { fast = "claude-haiku-4-6", smart = "claude-opus-4-20250514" }
+
+[llm.retry]
+max_retries = 3
+initial_backoff_ms = 1000
+retry_overloaded = true  # Retry 529 "Overloaded" errors on the same model
+
+[llm.health]
+failure_threshold = 3
+window_secs = 300
+recovery_secs = 120
+```
+
+## Multi-modal capabilities
+
+Agents can work with different types of content beyond text:
+
+*   **Images**: Generate new images or understand existing ones using vision-capable models (Anthropic Claude 3.5+, Gemini 3+, Qwen-VL, etc.).
+*   **Documents**: Process PDFs, spreadsheets, Word docs, and other file formats via base64-encoded content blocks.
+*   **Audio**: Transcribe spoken audio into text using dedicated transcription models (OpenAI Whisper, Groq, Gemini via OpenRouter).
+*   **Video**: Generate short video clips using supported providers (Google Veo).
+
+## Context window management
+
+To handle long conversations efficiently, agents automatically manage their context window:
+
+*   **Automatic compaction**: Summarizes or removes older parts of the conversation when approaching token limits.
+*   **Eviction**: Periodically removes stale tool outputs to free up space.
+*   **Spill handling**: Large tabular tool outputs can be automatically "spilled" to external storage.
+*   **Overflow handling**: Classifies overflow causes (like a single large result vs. gradual history growth) and applies appropriate strategies.
+
+## Tool filtering and access control
+
+Agents intelligently select which tools are available based on context and permissions:
+
+*   **Context-aware filtering**: Reduces the number of available tools to stay within request size limits.
+*   **Essential tools**: Core tools (like filesystem, code execution, and memory operations) are always included.
+*   **Keyword triggers**: Automatically injects relevant tools when specific keywords appear in user messages.
+*   **Capability gates**: Administrators can define which tools require special permissions or approvals.
+*   **User-level access**: Tools can be made visible or hidden based on individual user permissions.
+
+### Essential tool prefixes
+Tools with these prefixes are always available:
+- `filesystem_*`, `exec_*`, `code_*`, `messaging_*`, `reactions_*`, `memory`, `notes`, `context_*`
+- `sessions`, `system_*`, `workflow`, `projects`, `knowledge`, `database_*`
+- `wasm_skill*`, `tool_describe`, `tool_retrieve`, `data_*`, `advisor`, `jobs`
+
+## Session context and isolation
+
+Each agent execution runs within a session that provides isolation and context:
+
+*   **User identity**: Tracks which user initiated the request for per-user memory isolation.
+*   **Platform context**: Knows the specific Slack channel, thread, or workspace where the request originated.
+*   **Environment locking**: Prevents mixing production and staging data by pinning skill instances to specific environments (via `cmd: use` command).
+*   **Progress streaming**: Sends live updates during long-running operations.
+
+## Permission system
+
+A comprehensive permission system governs what agents can do:
+
+*   **Capability gates**: Hard restrictions that deny tool access outright (enforced before all other checks).
+*   **Approval routing**: Routes sensitive actions to designated human approvers before execution.
+*   **Permission persistence**: Remembers user choices to "always allow" or "always deny" specific actions.
+*   **Policy engine**: Evaluates each tool call and returns `Allow`, `Deny`, or `RequireApproval` decisions.
+
+## Thinking and reasoning
+
+Some models support extended internal reasoning before producing output:
+
+*   **Anthropic/Bedrock Claude**: Configure via `thinking_budget_tokens` (legacy) or adaptive thinking with `effort` (low, medium, high, xhigh, max) for Opus 4.7+.
+*   **Cerebras**: Uses `reasoning_effort` (none, low, medium, high) derived from token budget.
+*   **OpenRouter (DeepSeek)**, **Z.AI GLM**, **Qwen**: Model-specific thinking toggles.
+*   **Reasoning suppression**: Background utility calls (memory extraction, classifiers) can suppress extended reasoning for direct JSON answers.
+
+## Caching and performance
+
+*   **Prompt caching**: Supported for Claude 3.5+ and Gemini models via `cache_control` blocks.
+*   **Cache break marker**: Use `\n<!-- CACHE_BREAK -->\n` in system prompts to split cache segments. The first two segments are cached; anything after a second marker is not.
+*   **Token usage metrics**: Tracks input, output, and thinking token consumption.
+*   **Round counting**: Monitors how many tool execution rounds occurred.
+*   **Duration timing**: Measures total execution time.
+
+## Edge cases and reliability
+
+The agent system handles various edge cases gracefully:
+
+*   **Model unavailability**: Fails over to alternatives when primary models are unavailable.
+*   **Context overflow**: Escalates to models with larger context windows when possible.
+*   **Empty responses**: Automatically retries when models produce no output.
+*   **Tool timeouts**: Provides structured failure messages when tools exceed soft deadlines.
+*   **Hallucination detection**: Retries when models output tool calls as plain text instead of structured calls (up to 2 retries).
+*   **Tool input sanitization**: Non-object `tool_use.input` values are sanitized to empty objects before API calls.

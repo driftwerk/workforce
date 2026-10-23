@@ -1,0 +1,315 @@
+{
+  "name": "Orders",
+  "description": "Orders from intake to a verified release: picked, implemented, reviewed, merged, deployed and checked for a week.",
+  "item_label": "ticket",
+  "collection": "pipeline",
+  "revision": 9,
+  "sources": [
+    "workflow:order-intake",
+    "workflow:order-review",
+    "workflow:order-release",
+    "workflow:order-verify",
+    "skill:item-picker"
+  ],
+  "lanes": [
+    {
+      "id": "implementing",
+      "label": "Implementing"
+    },
+    {
+      "id": "pr-open",
+      "label": "PR open"
+    },
+    {
+      "id": "reviewing",
+      "label": "Reviewing"
+    },
+    {
+      "id": "reviewed",
+      "label": "Reviewed"
+    },
+    {
+      "id": "merging",
+      "label": "Merging"
+    },
+    {
+      "id": "deploying",
+      "label": "Deploying"
+    },
+    {
+      "id": "deployed",
+      "label": "Deployed"
+    },
+    {
+      "id": "verifying",
+      "label": "Verifying"
+    },
+    {
+      "id": "verified",
+      "label": "Verified"
+    }
+  ],
+  "exits": [
+    {
+      "id": "not-code",
+      "label": "Not a code change"
+    },
+    {
+      "id": "released",
+      "label": "Needs a person"
+    },
+    {
+      "id": "sent-back",
+      "label": "Sent back · self-healing"
+    },
+    {
+      "id": "duplicate",
+      "label": "Duplicate"
+    },
+    {
+      "id": "blocked",
+      "label": "Review blocked"
+    },
+    {
+      "id": "human-merge",
+      "label": "Awaiting a human merge"
+    },
+    {
+      "id": "deploy-blocked",
+      "label": "Deploy blocked · needs a person"
+    },
+    {
+      "id": "not-fixed",
+      "label": "Not fixed"
+    },
+    {
+      "id": "regression",
+      "label": "Regression"
+    },
+    {
+      "id": "inconclusive",
+      "label": "Inconclusive · needs a person"
+    },
+    {
+      "id": "not-live",
+      "label": "Not live · self-healing"
+    }
+  ],
+  "rungs": [
+    "1h",
+    "6h",
+    "24h",
+    "72h",
+    "168h"
+  ],
+  "events": {
+    "implement/claimed": [
+      {
+        "column": "implementing",
+        "tone": "active"
+      }
+    ],
+    "implement/pr-opened": [
+      {
+        "column": "pr-open"
+      }
+    ],
+    "implement/released": [
+      {
+        "when": {
+          "label": "stage-skipped"
+        },
+        "column": "not-code"
+      },
+      {
+        "column": "released",
+        "tone": "warn"
+      }
+    ],
+    "implement/retry": [
+      {
+        "column": "sent-back",
+        "tone": "healing",
+        "label": "another attempt follows"
+      }
+    ],
+    "implement/sent-back": [
+      {
+        "column": "sent-back",
+        "tone": "healing"
+      }
+    ],
+    "review/claimed": [
+      {
+        "column": "reviewing",
+        "tone": "active"
+      }
+    ],
+    "review/resumed": [
+      {
+        "column": "reviewing",
+        "tone": "active",
+        "label": "resumed after the run was interrupted"
+      }
+    ],
+    "review/sent-back": [
+      {
+        "column": "sent-back",
+        "tone": "healing",
+        "label": "sent back for another attempt"
+      }
+    ],
+    "review/finished": [
+      {
+        "when": {
+          "verdict": "stage-review-blocked"
+        },
+        "column": "blocked",
+        "tone": "bad"
+      },
+      {
+        "column": "reviewed",
+        "tone": "good"
+      }
+    ],
+    "merge/gate": [
+      {
+        "when": {
+          "outcome": "human"
+        },
+        "column": "human-merge",
+        "tone": "warn"
+      },
+      {
+        "when": {
+          "outcome": "already-merged"
+        },
+        "column": "deploying"
+      },
+      {
+        "column": "merging",
+        "tone": "active"
+      }
+    ],
+    "merge/auto-merged": [
+      {
+        "column": "deploying",
+        "label": "Merged"
+      }
+    ],
+    "deploy/claimed": [
+      {
+        "column": "deploying",
+        "tone": "active"
+      }
+    ],
+    "deploy/retry": [
+      {
+        "column": "deploying",
+        "tone": "healing",
+        "label": "deploy not confirmed, retrying"
+      }
+    ],
+    "deploy/finished": [
+      {
+        "when": {
+          "label": "stage-deploy-blocked"
+        },
+        "column": "deploy-blocked",
+        "tone": "bad"
+      },
+      {
+        "column": "deployed",
+        "tone": "good"
+      }
+    ],
+    "verify/started": [
+      {
+        "column": "verifying",
+        "tone": "active",
+        "rung_field": "rung",
+        "label": "checking a rung"
+      }
+    ],
+    "verify/rung": [
+      {
+        "when": {
+          "state": "pass"
+        },
+        "column": "verifying",
+        "tone": "active",
+        "rung_field": "rung",
+        "rung_passed": true
+      },
+      {
+        "column": "verifying",
+        "tone": "active",
+        "rung_field": "rung"
+      }
+    ],
+    "verify/verified": [
+      {
+        "column": "verified",
+        "tone": "good",
+        "rung_field": "rung",
+        "rung_passed": true
+      }
+    ],
+    "verify/failed": [
+      {
+        "when": {
+          "state": "regression"
+        },
+        "column": "regression",
+        "tone": "bad"
+      },
+      {
+        "column": "not-fixed",
+        "tone": "bad"
+      }
+    ],
+    "verify/inconclusive": [
+      {
+        "when": {
+          "final": "true"
+        },
+        "column": "inconclusive",
+        "tone": "warn",
+        "rung_field": "rung"
+      },
+      {
+        "column": "verifying",
+        "tone": "healing",
+        "rung_field": "rung",
+        "label": "too rare to judge yet; a later rung judges again"
+      }
+    ],
+    "verify/not-live": [
+      {
+        "column": "not-live",
+        "tone": "healing",
+        "rung_field": "rung"
+      }
+    ],
+    "verify/released": [
+      {
+        "column": "verifying",
+        "tone": "healing",
+        "rung_field": "rung",
+        "label": "not judged this run; the rung waits for a later one"
+      }
+    ],
+    "duplicate/closed": [
+      {
+        "column": "duplicate"
+      }
+    ]
+  },
+  "summary_field": "stages.implement.summary",
+  "link_fields": [
+    {
+      "field": "pr_url",
+      "label": "PR"
+    }
+  ]
+}

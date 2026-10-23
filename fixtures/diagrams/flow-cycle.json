@@ -1,0 +1,154 @@
+{
+  "spec": {
+    "kind": "flow",
+    "nodes": [
+      {
+        "id": "a",
+        "label": "Draft"
+      },
+      {
+        "id": "b",
+        "label": "Review"
+      },
+      {
+        "id": "c",
+        "label": "Publish"
+      }
+    ],
+    "edges": [
+      {
+        "from": "a",
+        "to": "b"
+      },
+      {
+        "from": "b",
+        "to": "c"
+      },
+      {
+        "from": "c",
+        "to": "a",
+        "label": "rework"
+      }
+    ]
+  },
+  "metrics": {
+    "char_width": 7,
+    "line_height": 16
+  },
+  "layout": {
+    "kind": "flow",
+    "nodes": [
+      {
+        "id": "a",
+        "label": "Draft",
+        "lines": [
+          "Draft"
+        ],
+        "shape": "box",
+        "tone": "default",
+        "x": 14,
+        "y": 14,
+        "w": 76,
+        "h": 32
+      },
+      {
+        "id": "b",
+        "label": "Review",
+        "lines": [
+          "Review"
+        ],
+        "shape": "box",
+        "tone": "default",
+        "x": 14,
+        "y": 92,
+        "w": 76,
+        "h": 32
+      },
+      {
+        "id": "c",
+        "label": "Publish",
+        "lines": [
+          "Publish"
+        ],
+        "shape": "box",
+        "tone": "default",
+        "x": 14,
+        "y": 170,
+        "w": 76,
+        "h": 32
+      }
+    ],
+    "edges": [
+      {
+        "key": "a|b|0",
+        "from": "a",
+        "to": "b",
+        "points": [
+          [
+            52,
+            46
+          ],
+          [
+            52,
+            92
+          ]
+        ],
+        "style": "solid",
+        "arrow": "to"
+      },
+      {
+        "key": "b|c|1",
+        "from": "b",
+        "to": "c",
+        "points": [
+          [
+            52,
+            124
+          ],
+          [
+            52,
+            170
+          ]
+        ],
+        "style": "solid",
+        "arrow": "to"
+      },
+      {
+        "key": "c|a|2",
+        "from": "c",
+        "to": "a",
+        "points": [
+          [
+            90,
+            186
+          ],
+          [
+            134,
+            186
+          ],
+          [
+            134,
+            30
+          ],
+          [
+            90,
+            30
+          ]
+        ],
+        "label": "rework",
+        "labelAt": [
+          134,
+          108
+        ],
+        "style": "solid",
+        "arrow": "to"
+      }
+    ],
+    "groups": [],
+    "lifelines": [],
+    "notes": [],
+    "width": 148,
+    "height": 216,
+    "dropped": []
+  }
+}

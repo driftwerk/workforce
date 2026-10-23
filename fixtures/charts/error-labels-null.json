@@ -1,0 +1,17 @@
+{
+  "input": {
+    "kind": "bar",
+    "labels": null,
+    "series": [
+      {
+        "data": [
+          1
+        ]
+      }
+    ]
+  },
+  "result": {
+    "ok": false,
+    "error": "labels must be an array of names"
+  }
+}

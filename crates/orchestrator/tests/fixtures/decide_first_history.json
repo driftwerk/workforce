@@ -1,0 +1,142 @@
+{
+  "below_floor_agent_agreed": [
+    {
+      "agent_response": "Spam.\nOUTPUTS:\ncategory: spam\nreason: a newsletter\nEND_OUTPUTS",
+      "budget_capped": false,
+      "completed_at": "2026-10-04T23:31:49.240159Z",
+      "cost_usd": 0.0,
+      "engine": "claude-code",
+      "input_tokens": 0,
+      "outcome": null,
+      "outcome_by": "default",
+      "output_tokens": 0,
+      "outputs": {
+        "category": "spam",
+        "reason": "a newsletter"
+      },
+      "rounds": 0,
+      "started_at": "2026-10-04T23:31:49.236502Z",
+      "step_id": "classify"
+    },
+    {
+      "agent_response": "",
+      "budget_capped": false,
+      "completed_at": "2026-10-04T23:31:49.240914Z",
+      "cost_usd": 0.0,
+      "engine": "report",
+      "outcome": null,
+      "report": "Closed as spam: a newsletter",
+      "rounds": 0,
+      "started_at": "2026-10-04T23:31:49.240731Z",
+      "step_id": "done"
+    }
+  ],
+  "settled_on_a_branch": [
+    {
+      "agent_response": "The decision model settled this step before its turn ran: bug (p=0.90, kev).\n\nOUTPUTS:\ncategory: bug\nreason: Settled by the decision model (kev) at 0.90\nEND_OUTPUTS",
+      "budget_capped": false,
+      "completed_at": "2026-10-04T23:31:49.723837Z",
+      "cost_usd": 0.0,
+      "decided_first": {
+        "answer": "kev bug p=0.90",
+        "settled": true
+      },
+      "engine": "decision",
+      "model": "kev",
+      "outcome": "bug",
+      "outcome_by": "decision_model",
+      "outputs": {
+        "category": "bug",
+        "reason": "Settled by the decision model (kev) at 0.90"
+      },
+      "rounds": 0,
+      "started_at": "2026-10-04T23:31:49.721127Z",
+      "step_id": "classify"
+    },
+    {
+      "agent_response": "Fixed.",
+      "budget_capped": false,
+      "completed_at": "2026-10-04T23:31:49.725754Z",
+      "cost_usd": 0.0,
+      "engine": "claude-code",
+      "input_tokens": 0,
+      "outcome": null,
+      "output_tokens": 0,
+      "rounds": 0,
+      "started_at": "2026-10-04T23:31:49.724469Z",
+      "step_id": "fix"
+    }
+  ],
+  "settled_on_default_route": [
+    {
+      "agent_response": "The decision model settled this step before its turn ran: ignore (p=0.90, kev).\n\nOUTPUTS:\ncategory: ignore\nreason: Settled by the decision model (kev) at 0.90\nEND_OUTPUTS",
+      "budget_capped": false,
+      "completed_at": "2026-10-04T23:31:48.246917Z",
+      "cost_usd": 0.0,
+      "decided_first": {
+        "answer": "kev ignore p=0.90",
+        "settled": true
+      },
+      "engine": "decision",
+      "model": "kev",
+      "outcome": "ignore",
+      "outcome_by": "decision_model",
+      "outputs": {
+        "category": "ignore",
+        "reason": "Settled by the decision model (kev) at 0.90"
+      },
+      "rounds": 0,
+      "started_at": "2026-10-04T23:31:48.240517Z",
+      "step_id": "classify"
+    },
+    {
+      "agent_response": "",
+      "budget_capped": false,
+      "completed_at": "2026-10-04T23:31:48.248866Z",
+      "cost_usd": 0.0,
+      "engine": "report",
+      "outcome": null,
+      "report": "Closed as ignore: Settled by the decision model (kev) at 0.90",
+      "rounds": 0,
+      "started_at": "2026-10-04T23:31:48.248557Z",
+      "step_id": "done"
+    }
+  ],
+  "shadow_agent_chose_bug": [
+    {
+      "agent_response": "It crashes.\nOUTPUTS:\ncategory: bug\nreason: a crash\nEND_OUTPUTS\nOUTCOME: bug",
+      "budget_capped": false,
+      "completed_at": "2026-10-04T23:31:48.741748Z",
+      "cost_usd": 0.0,
+      "decided_first": {
+        "answer": "kev (shadow) ignore p=0.90, agent chose bug",
+        "settled": false
+      },
+      "engine": "claude-code",
+      "input_tokens": 0,
+      "outcome": "bug",
+      "outcome_by": "outcome_line",
+      "output_tokens": 0,
+      "outputs": {
+        "category": "bug",
+        "reason": "a crash"
+      },
+      "rounds": 0,
+      "started_at": "2026-10-04T23:31:48.737069Z",
+      "step_id": "classify"
+    },
+    {
+      "agent_response": "Fixed.",
+      "budget_capped": false,
+      "completed_at": "2026-10-04T23:31:48.743557Z",
+      "cost_usd": 0.0,
+      "engine": "claude-code",
+      "input_tokens": 0,
+      "outcome": null,
+      "output_tokens": 0,
+      "rounds": 0,
+      "started_at": "2026-10-04T23:31:48.742411Z",
+      "step_id": "fix"
+    }
+  ]
+}

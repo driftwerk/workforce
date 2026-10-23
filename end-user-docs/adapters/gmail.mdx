@@ -1,0 +1,259 @@
+---
+title: Gmail
+description: Read and send mail via the Gmail adapter.
+---
+
+# Gmail adapter
+
+Connect your Gmail account to read, search, send, and manage emails.
+
+## Before you begin
+
+The Google skill requires a one-time admin setup to create an OAuth client in Google Cloud Console. Once the admin has configured the client, you can connect your personal Google account using the `google.setup` tool.
+
+## Connect your account
+
+Use the `google.setup` tool to authorize Workforce to access your Gmail and other Google services.
+
+1. Start the login flow:
+
+   ```json
+   {
+     "action": "login",
+     "workspace": "default",
+     "no_browser": true
+   }
+   ```
+
+2. The response will contain either:
+   - A `verification_url` and `user_code` (device flow) — open the URL on any device and enter the code.
+   - An `authorization_url` (web flow) — open the URL in your browser and grant access.
+
+3. Poll for completion:
+
+   ```json
+   {
+     "action": "login_poll",
+     "workspace": "default"
+   }
+   ```
+
+   Repeat until `status` becomes `"authorized"`.
+
+Once authorized, all `google.gmail.*` tools will use your connected account.
+
+## Tools
+
+The Gmail adapter provides tools for searching, reading, sending, and managing messages.
+
+### Search messages
+
+Search your mailbox with the same query syntax as the Gmail web interface.
+
+**Tool:** `google.gmail.search`
+
+**Example:**
+```json
+{
+  "q": "from:team@example.com subject:meeting",
+  "max_results": 10,
+  "label_ids": ["INBOX", "IMPORTANT"]
+}
+```
+
+**Returns:** A list of messages with metadata (sender, subject, date, snippet).
+
+### Read a message
+
+Fetch a full message by its ID.
+
+**Tool:** `google.gmail.get`
+
+**Example:**
+```json
+{
+  "message_id": "188a1234567890",
+  "format": "full"
+}
+```
+
+**Returns:** The complete message with headers and body, plus an `attachments` list giving each file's `part_id`, filename, MIME type and size.
+
+### Send a message
+
+Compose and send an email.
+
+**Tool:** `google.gmail.send`
+
+**Example:**
+```json
+{
+  "to": "colleague@example.com",
+  "subject": "Meeting notes",
+  "body": "Here are the notes from today's meeting.",
+  "cc": "team@example.com"
+}
+```
+
+**HTML support:** Set `html_body` to send HTML content instead of plain text.
+
+### Manage labels
+
+List, create, update, or delete labels.
+
+**Tools:**
+- `google.gmail.labels_list`
+- `google.gmail.label_create`
+- `google.gmail.label_update`
+- `google.gmail.label_delete`
+
+**Example (create a label):**
+```json
+{
+  "name": "Workforce/Important",
+  "label_list_visibility": "labelShow",
+  "message_list_visibility": "show"
+}
+```
+
+### Manage drafts
+
+Create, list, send, or delete drafts.
+
+**Tools:**
+- `google.gmail.drafts_list`
+- `google.gmail.draft_create`
+- `google.gmail.draft_send`
+- `google.gmail.draft_delete`
+
+**Example (create a draft):**
+```json
+{
+  "to": "team@example.com",
+  "subject": "Weekly update",
+  "body": "Here's what happened this week..."
+}
+```
+
+### Mark messages as read/unread
+
+Change the read status of a message.
+
+**Tools:**
+- `google.gmail.mark_read`
+- `google.gmail.mark_unread`
+
+**Example:**
+```json
+{
+  "message_id": "188a1234567890"
+}
+```
+
+### Archive, trash, or untrash
+
+Move messages between inbox, archive, and trash.
+
+**Tools:**
+- `google.gmail.archive` (remove INBOX label)
+- `google.gmail.trash` (move to Trash)
+- `google.gmail.untrash` (restore from Trash)
+
+**Example:**
+```json
+{
+  "message_id": "188a1234567890"
+}
+```
+
+### Work with threads
+
+Fetch or modify entire conversation threads.
+
+**Tools:**
+- `google.gmail.thread_get`
+- `google.gmail.thread_modify`
+
+**Example (get a thread):**
+```json
+{
+  "thread_id": "188b9876543210",
+  "format": "full"
+}
+```
+
+### Read attachments
+
+Open a file attached to a message so the agent can read it — documents, PDFs, spreadsheets, images, audio or video.
+
+**Tool:** `google.gmail.attachment`
+
+**Example:**
+```json
+{
+  "message_id": "188a1234567890",
+  "part_id": "1"
+}
+```
+
+Use a `part_id` from the `attachments` list returned by `google.gmail.get`.
+
+**Returns:** The file is rendered into the agent's view on its next step (text extracted from documents and spreadsheets, images shown to vision-capable models, audio and video transcribed).
+
+### Batch operations
+
+Apply label changes to multiple messages at once.
+
+**Tool:** `google.gmail.batch_modify`
+
+**Example:**
+```json
+{
+  "ids": ["188a1", "188a2", "188a3"],
+  "add_label_ids": ["Label_1"],
+  "remove_label_ids": ["INBOX"]
+}
+```
+
+### Settings
+
+Manage filters, send-as aliases, and vacation responses.
+
+**Tools:**
+- `google.gmail.filters_list`
+- `google.gmail.filter_create`
+- `google.gmail.filter_delete`
+- `google.gmail.sendas_list`
+- `google.gmail.forwarding_list`
+- `google.gmail.vacation_get`
+- `google.gmail.vacation_set`
+
+**Example (set vacation responder):**
+```json
+{
+  "enable_auto_reply": true,
+  "response_subject": "Out of office",
+  "response_body_plain_text": "I'm away until Monday.",
+  "restrict_to_contacts": false
+}
+```
+
+## Multi-account support
+
+Use the `account` parameter to target a specific workspace when you have multiple Google accounts connected.
+
+**Example:**
+```json
+{
+  "account": "work",
+  "q": "from:boss@company.com"
+}
+```
+
+## Scopes and permissions
+
+The adapter uses the `gmail.modify` and `gmail.settings.basic` scopes, which allow reading, sending, and organizing mail, but not permanent deletion. For full Gmail access (including permanent delete and forwarding address creation), the hub admin must configure a web application OAuth client with the broader `https://mail.google.com/` scope.
+
+## Related tools
+
+The Google skill also includes tools for Calendar, Drive, Sheets, Docs, Tasks, Contacts, Chat, and Slides. See [Calendar](/docs/adapters/calendar) and [Drive](/docs/adapters/drive) for two of them.

@@ -1,0 +1,118 @@
+---
+title: Your First Workflow
+description: Build, run, and inspect a simple workflow from start to finish.
+---
+
+# Your First Workflow
+
+A workflow in Workforce automates a sequence of steps performed by AI agents. This guide walks you through creating, running, and inspecting a basic workflow from scratch.
+
+<Callout type="info">
+  Before you begin, make sure you have installed Workforce and can run its commands. If you haven't, start with the <a href="/docs/getting-started/installation">Installation Guide</a>.
+</Callout>
+
+## 1. Initialize Your Project
+
+Navigate to your project directory and run the initialization command. This creates the configuration file and basic directory structure.
+
+```bash
+workforce init
+```
+
+This creates a `workforce.toml` file for your main configuration.
+
+## 2. Create a Simple Workflow Definition
+
+Workflows are defined in TOML files. You can scaffold a new workflow file with:
+
+```bash
+workforce workflow create hello-world
+```
+
+This creates `workflows/hello-world.toml`. Open it and edit the content. For example:
+
+```toml
+[workflow]
+id = "hello-world"
+name = "Hello World"
+description = "A simple workflow to get started"
+agent = "default"
+
+[workflow.context]
+topic = { required = true, description = "A subject to learn about" }
+
+[[step]]
+id = "research"
+name = "Research the Topic"
+task = "Briefly research the topic: {{topic}}"
+max_rounds = 5
+
+[[step]]
+id = "summarize"
+name = "Write a Summary"
+task = "Write a one-paragraph summary about what you learned about {{topic}}"
+```
+
+This workflow has two steps: the first researches a topic you provide, and the second writes a summary. Context variables are referenced in tasks with `{{variable_name}}` syntax.
+
+## 3. Run Your Workflow
+
+Workflows are triggered via API. First, ensure the Workforce hub service is running.
+
+Open a new terminal window and start the service:
+
+```bash
+workforce serve --config workforce.toml
+```
+
+Keep this service running in the background. It provides the gateway for workflow execution and an admin API.
+
+Then, in another terminal, trigger the workflow. You must provide the required context field: `topic`.
+
+```bash
+curl -X POST http://localhost:8080/api/v1/workflows/hello-world/run \
+  -H "Content-Type: application/json" \
+  -d '{"topic": "Large Language Models"}'
+```
+
+If successful, the response will contain a unique `instance_id` for this workflow run. Copy this ID.
+
+## 4. Check the Workflow Status
+
+You can view the status of your specific workflow instance using the instance ID:
+
+```bash
+curl http://localhost:8080/api/v1/workflows/instances/{instance_id}
+```
+
+You can also list recent workflow instances:
+
+```bash
+curl http://localhost:8080/api/v1/workflows/instances
+```
+
+The service logs in the terminal running `workforce serve` will show each step's execution progress.
+
+## 5. Understand the Workflow Output
+
+As the workflow runs, its state and results are saved. The `workflow get` command (or the API call) will show the detailed status, including the current step and any variables set.
+
+The agent in each step will use available tools and knowledge to complete its task. Once both steps finish, the workflow status changes to `Completed`.
+
+## Next Steps: Expanding Your Workflow
+
+Our simple example is just the beginning. Here are common ways to enhance your workflows:
+
+### Add Conditional Branches
+Use a step's `branches` field to create different paths based on the step's outcome. For example, you could check the quality of a summary and have the agent rewrite it if needed.
+
+### Include a Human Approval Gate
+Add `pause = "awaiting human approval"` to a step. The workflow will stop there until you approve or reject it via the API (`POST /api/v1/workflows/instances/{instance_id}/resume` or `/reject`).
+
+### Route Steps to Different Agents
+If you have multiple agents configured, you can assign a specific agent to a step by adding `agent = "agent-name"` to the `[[step]]` block.
+
+### Use Specialized Engines
+For coding tasks, set `engine = "claude-code"` on a step to run it on the install's Claude Code chain, or `engine = "codex"` to run it on OpenAI's Codex CLI; both take `model`, `effort`, `timeout_secs` and a `fallback` list of `engine[:model]` entries, so a step can start on one family and fall back to the other. A Codex step needs a ChatGPT login: connect your plan under My Settings → ChatGPT, or ask the agent to run `chatgpt.login` (add `scope = agent_shared` for a login every user of the agent runs under); see [Connect your plan](/docs/getting-started/connect-your-plan). For complex, multi-phase tasks, use `engine = "claude-pilot"`.
+
+For more details, explore the concepts of <a href="/docs/concepts/workflows">Workflows</a>, <a href="/docs/concepts/agents">Agents</a>, and <a href="/docs/configuration">Configuration</a>.

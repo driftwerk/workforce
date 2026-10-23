@@ -1,0 +1,14 @@
+{
+  "input": {
+    "kind": "bar",
+    "series": [
+      {
+        "data": []
+      }
+    ]
+  },
+  "result": {
+    "ok": false,
+    "error": "series 1 has no data"
+  }
+}

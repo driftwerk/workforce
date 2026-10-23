@@ -1,0 +1,200 @@
+---
+title: Datadog
+description: Query Datadog logs, metrics, and monitors.
+---
+
+# Datadog adapter
+
+The Datadog adapter lets agents query your Datadog metrics, logs, monitors, dashboards, events, incidents, SLOs, hosts, downtimes, and Synthetic tests.
+
+## Authentication
+
+You need two keys from Datadog:
+
+- **API key** (`DD-API-KEY`) – per‑organization. Find it in your Datadog organization settings.
+- **Application key** (`DD-APPLICATION-KEY`) – per‑user, with your personal API access scopes. Generate it in your personal settings.
+
+Both keys are required for almost every API call. Generate them at:
+
+- API key: https://app.datadoghq.com/organization-settings/api-keys
+- App key: https://app.datadoghq.com/personal-settings/application-keys
+
+## Regions (sites)
+
+Your Datadog account is tied to one region. The adapter uses a short **site key** to map to the correct API base URL:
+
+| Site key | API base URL |
+|---|---|
+| `us1` (default) | `https://api.datadoghq.com` |
+| `us3` | `https://api.us3.datadoghq.com` |
+| `us5` | `https://api.us5.datadoghq.com` |
+| `eu1` | `https://api.datadoghq.eu` |
+| `ap1` | `https://api.ap1.datadoghq.com` |
+
+You can use the short key (`eu1`) or the hostname Datadog shows (`datadoghq.eu`). The adapter also accepts full URLs like `https://api.datadoghq.eu/`. If you enter an unknown site, the skill fails with a clear error message.
+
+For FedRAMP or custom domains, skip the site mapping and provide an explicit `base_url` in your configuration.
+
+## Configuration
+
+### Single account
+
+Add your credentials to the vault:
+
+```text
+vault.set('skills/datadog/api_key', '<your-api-key>')
+vault.set('skills/datadog/app_key', '<your-app-key>')
+vault.set('skills/datadog/site', 'us1')   // optional, default is us1
+```
+
+The API key is a bare hex string. To avoid exposing it in chat, use the `cmd: secret` command first (the `cmd:` prefix works everywhere, including Slack threads, where the `/secret` slash command does not):
+
+```
+cmd: secret datadog_api_key <your-api-key>
+```
+
+Then reference it in the vault command:
+
+```text
+vault.set('skills/datadog/api_key', '[[secret:datadog_api_key]]')
+```
+
+After adding or changing credentials, reload the skill:
+
+```text
+system.enable_skill('datadog')
+```
+
+### Multiple accounts
+
+If you work with multiple Datadog accounts (e.g., `prod‑us` and `prod‑eu`), configure them under named paths:
+
+```text
+vault.set('skills/datadog/accounts/prod-us/api_key', '<us-api-key>')
+vault.set('skills/datadog/accounts/prod-us/app_key', '<us-app-key>')
+vault.set('skills/datadog/accounts/prod-us/site', 'us1')
+
+vault.set('skills/datadog/accounts/prod-eu/api_key', '<eu-api-key>')
+vault.set('skills/datadog/accounts/prod-eu/app_key', '<eu-app-key>')
+vault.set('skills/datadog/accounts/prod-eu/site', 'eu1')
+
+vault.set('skills/datadog/default_account', 'prod-us', scope='agent_specific')
+```
+
+When you call a tool, you can specify which account to use via the `account` parameter. If you omit it, the `default_account` is used; a single configured account is the default automatically, so set `default_account` only when there are several.
+
+## Time ranges
+
+Tools that accept a start or end time (`from`, `to`, `start`, `end`) accept any of these formats:
+
+- Unix epoch seconds – `1700000000`
+- Numeric strings – `"1700000000"`
+- Relative shorthand – `"now"`, `"now-15m"`, `"now-1h"`, `"now-2d"`, `"now-1w"`
+- ISO‑8601 strings – `"2026-01-01T00:00:00Z"` (preserved for logs/events search, converted elsewhere)
+
+Examples:
+
+```json
+{ "from": "now-1h", "to": "now" }
+{ "from": 1704067200, "to": 1704070800 }
+{ "start": "now-30m", "end": "now+15m" }
+```
+
+## Pagination
+
+- **Logs and events search (v2)** use cursor‑based pagination. Pass the `cursor` returned in one response to the next call.
+- **Monitors** use `page` and `page_size`.
+- **Hosts** use `start` and `count`.
+
+## Bulk log export
+
+The `datadog.logs_export` tool fetches every matching log in the window (cursor pagination handled internally) and delivers them as an `.xlsx` spreadsheet or stages them as a tabular artifact (`format` parameter). Use this for bulk export instead of manually paginating `datadog.logs_search`.
+
+- **`format: xlsx`** – generates a spreadsheet and attaches it to the conversation automatically. You won't see the file in your context; just tell the user it's ready.
+- **`format: artifact`** – stages the logs as a tabular artifact for later use with `data.query` or `export_xlsx`.
+
+The tool respects a `max_records` cap (default 50,000, max 250,000) and will stop early if the result would exceed your agent's context size limit.
+
+## Available tools
+
+The Datadog skill provides 32 tools. By default, read‑only tools are `allow`ed, while tools that can change production state (`require_approval`) trigger a review step.
+
+### Metrics
+
+- `datadog.metrics_query` – Run a timeseries query (returns one or more series).
+- `datadog.metrics_scalar` – Run a scalar query (returns one value per group).
+- `datadog.metrics_list` – List metric names that have reported data recently.
+- `datadog.metrics_metadata` – Get metadata (unit, type, description) for a single metric.
+
+### Logs
+
+- `datadog.logs_search` – Search logs (v2) with cursor pagination.
+- `datadog.logs_export` – Bulk‑export every matching Datadog log in a window to an .xlsx or staged tabular artifact.
+- `datadog.logs_aggregate` – Aggregate logs by computed metrics and groupings.
+
+### Monitors
+
+- `datadog.monitors_list` – List monitors.
+- `datadog.monitors_get` – Get full details for one monitor.
+- `datadog.monitors_search` – Search monitors using Datadog’s query language.
+- `datadog.monitors_create` – Create a monitor (requires approval).
+- `datadog.monitors_update` – Update an existing monitor (requires approval).
+- `datadog.monitors_delete` – Delete a monitor (requires approval).
+- `datadog.monitors_mute` – Mute a monitor (requires approval).
+- `datadog.monitors_unmute` – Unmute a monitor (requires approval).
+
+### Dashboards
+
+- `datadog.dashboards_list` – List dashboards accessible to you.
+- `datadog.dashboards_get` – Get a dashboard definition.
+- `datadog.dashboards_create` – Create a dashboard (requires approval).
+
+### Events, incidents, SLOs
+
+- `datadog.events_list` – List events in a time range.
+- `datadog.events_post` – Post a custom event to the event stream (requires approval).
+- `datadog.incidents_list` – List incidents.
+- `datadog.incidents_get` – Get a single incident.
+- `datadog.slos_list` – List SLOs.
+- `datadog.slos_get` – Get a single SLO.
+
+### Hosts, downtimes, synthetics
+
+- `datadog.hosts_list` – List hosts (optionally filtered by tags).
+- `datadog.hosts_mute` – Mute a host (requires approval).
+- `datadog.hosts_unmute` – Unmute a host (requires approval).
+- `datadog.downtimes_list` – List downtimes.
+- `datadog.downtimes_create` – Schedule a downtime (requires approval).
+- `datadog.downtimes_cancel` – Cancel a downtime (requires approval).
+- `datadog.synthetics_list` – List Synthetic tests.
+
+### Escape hatch
+
+- `datadog.api` – Make an arbitrary Datadog REST request (requires approval).
+
+## Policies
+
+The skill ships with a default policy split:
+
+- **`allow`**: All read/query/list/get/search tools.
+- **`require_approval`**: Any tool that can change production state: `monitors_create`, `monitors_update`, `monitors_delete`, `monitors_mute`, `monitors_unmute`, `dashboards_create`, `events_post`, `hosts_mute`, `hosts_unmute`, `downtimes_create`, `downtimes_cancel`, and `datadog.api`.
+
+You can override these policies in your agent configuration.
+
+## Advanced monitor options
+
+`monitors_create` and `monitors_update` accept an `options` object that passes through raw Datadog monitor settings (thresholds, notifications, evaluation delay, etc.). Refer to the [Datadog monitor API reference](https://docs.datadoghq.com/api/latest/monitors/) for available fields.
+
+## Dashboard widgets
+
+`dashboards_create` expects a `widgets` array of raw Datadog widget JSON. The widget schema is large; copy the shape from an existing dashboard or the Datadog widget documentation instead of constructing it from scratch.
+
+## Example agent prompts
+
+- “Query `system.cpu.user` averaged by host over the last hour.”
+- “Search the last 15 minutes of error logs from the `web` service.”
+- “List monitors that are currently in alert in the `prod-eu` account.”
+- “Export the last 24 hours of logs from service `api` as a spreadsheet.”
+- “Mute the host `i‑0abc123` for 30 minutes.” (triggers approval)
+- “Schedule a 1‑hour downtime for monitor 12345 starting now.”
+- “Show me dashboards I have access to.”

@@ -1,0 +1,112 @@
+---
+title: Jira
+description: Read and manage Jira issues, projects, sprints, and worklogs.
+---
+
+# Jira adapter
+
+Connect Workforce to your Jira Cloud instance to search issues, create tickets, add comments, track sprints, and log work.
+
+## Authentication
+
+Jira Cloud uses HTTPS Basic authentication with your email address and an API token.
+
+1. Generate an API token at [https://id.atlassian.com/manage-profile/security/api-tokens](https://id.atlassian.com/manage-profile/security/api-tokens)
+2. Save the token securely — you won't be able to view it again
+
+## Setup
+
+You can connect to a single Jira tenant or multiple tenants (workspaces).
+
+### Single tenant
+
+Set these values in your vault:
+
+```text
+vault.set('skills/jira/email',     '<you@example.com>')
+vault.set('skills/jira/api_token', '<your-api-token>')
+vault.set('skills/jira/site',      'https://<tenant>.atlassian.net')
+vault.set('skills/jira/default_project', 'ENG')   # optional
+```
+
+### Multiple tenants (workspaces)
+
+When you work with multiple Jira instances, configure each as a named workspace:
+
+```text
+# First workspace
+vault.set('skills/jira/workspaces/acme/email',         '<you@acme.com>')
+vault.set('skills/jira/workspaces/acme/api_token',     '<token>')
+vault.set('skills/jira/workspaces/acme/site',          'https://acme.atlassian.net')
+vault.set('skills/jira/workspaces/acme/default_project', 'ENG')          # optional
+vault.set('skills/jira/workspaces/acme/project_keys',  'ENG,INFRA')      # optional, enables auto-routing
+
+# Second workspace
+vault.set('skills/jira/workspaces/client/email',       '<you@client.com>')
+vault.set('skills/jira/workspaces/client/api_token',   '<token>')
+vault.set('skills/jira/workspaces/client/site',        'https://client.atlassian.net')
+vault.set('skills/jira/workspaces/client/project_keys','OPS')
+
+# Set default workspace (only needed when there are several)
+vault.set('skills/jira/default_workspace', 'acme', scope='agent_specific')
+```
+
+If you configure only one workspace, it's used automatically when a tool call doesn't name one.
+
+When you configure `project_keys`, issue keys like `OPS-42` automatically route to the `client` workspace, while `ENG-7` routes to `acme`. You can always override this with an explicit `workspace` parameter on any tool.
+
+After adding or changing credentials, run `system.enable_skill('jira')` to reload.
+
+## Available tools
+
+The Jira skill provides 18 tools for interacting with Jira Cloud:
+
+| Tool | Description |
+|---|---|
+| `jira.search` | Search issues using JQL with cursor pagination |
+| `jira.get_issue` | Get full issue details including comments and rendered description |
+| `jira.create_issue` | Create a new issue |
+| `jira.update_issue` | Update fields on an existing issue |
+| `jira.delete_issue` | Permanently delete an issue (requires permission) |
+| `jira.assign_issue` | Assign an issue to a user by accountId |
+| `jira.add_comment` | Add a comment to an issue |
+| `jira.list_comments` | List comments on an issue |
+| `jira.list_transitions` | List available workflow transitions |
+| `jira.transition_issue` | Move an issue through a workflow transition |
+| `jira.add_attachment` | Upload a local file as an attachment |
+| `jira.list_projects` | List accessible projects |
+| `jira.get_project` | Get project details with issue types |
+| `jira.search_users` | Find users by name or email |
+| `jira.list_boards` | List Jira Software boards |
+| `jira.list_sprints` | List sprints on a board |
+| `jira.add_worklog` | Log time spent on an issue |
+| `jira.api` | Make arbitrary REST calls (escape hatch) |
+
+## Writing descriptions and comments
+
+Jira REST v3 requires `description` and comment `body` fields to be in [Atlassian Document Format](https://developer.atlassian.com/cloud/jira/platform/apis/document/structure/) (JSON), not plain markdown. The skill handles conversion for you:
+
+- **Markdown string** (recommended): Converted to ADF automatically. Supports:
+  - Paragraphs, headings (`#` through `######`)
+  - `**bold**`, `_italic_`, `~~strikethrough~~`, `` `inline code` ``
+  - Fenced code blocks with language hints
+  - `[links](url)`, bullet and ordered lists (including nested)
+  - Blockquotes, hard and soft breaks
+  - Tables degrade to a placeholder; images render as hyperlinked alt-text
+ - `null` or empty string: Creates an empty ADF document
+- **Raw ADF object**: Passed through unchanged if you need special formatting
+
+When reading issues, the skill requests rendered HTML in `description_html` and `body_html` fields.
+
+## Custom fields
+
+Use `jira.create_issue` and `jira.update_issue` with a `fields` object for custom fields like `customfield_10035`. Check `jira.get_issue` first to discover field IDs on your tenant.
+
+## Example prompts
+
+- "Show me open issues assigned to me in the ENG project."
+- "Create a bug in ENG titled 'login button broken' with priority High."
+- "Transition ENG-42 to Done."
+- "Comment on ENG-42: 'rolled out the fix to staging'."
+- "What sprints are active on the Platform board?"
+- "Log 1h 30m on ENG-42 for code review."

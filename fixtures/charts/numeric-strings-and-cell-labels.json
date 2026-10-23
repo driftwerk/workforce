@@ -1,0 +1,50 @@
+{
+  "input": {
+    "kind": "bar",
+    "title": "  ",
+    "labels": [
+      2024,
+      2.5,
+      true,
+      null,
+      "x"
+    ],
+    "series": [
+      {
+        "data": [
+          "42",
+          " 7 ",
+          "1e3",
+          0,
+          -1.25
+        ]
+      }
+    ]
+  },
+  "result": {
+    "ok": true,
+    "spec": {
+      "kind": "bar",
+      "labels": [
+        "2024",
+        "2.5",
+        "true",
+        "",
+        "x"
+      ],
+      "series": [
+        {
+          "data": [
+            42,
+            7,
+            1000,
+            0,
+            -1.25
+          ]
+        }
+      ],
+      "stacked": false,
+      "horizontal": false
+    }
+  }
+}

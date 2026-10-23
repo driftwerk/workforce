@@ -1,0 +1,17 @@
+[package]
+name = "workforce-sift"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+publish = false
+description = "Sift: small checked programs an agent writes to answer a data question in one run instead of many tool rounds"
+
+[dependencies]
+async-trait = { workspace = true }
+futures = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

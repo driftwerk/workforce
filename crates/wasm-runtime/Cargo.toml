@@ -1,0 +1,46 @@
+[package]
+name = "workforce-wasm-runtime"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+publish = false
+description = "WASM skill runtime for workforce — compile, cache, and execute sandboxed WASM skill modules"
+
+[dependencies]
+workforce-core = { path = "../core" }
+workforce-common = { path = "../common" }
+workforce-agent = { path = "../agent-runtime" }
+
+# WASM runtime
+wasmtime = { workspace = true }
+
+# Async
+async-trait = "0.1"
+tokio = { version = "1", features = ["sync", "time", "fs", "rt"] }
+
+# Serialisation
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = { workspace = true }
+
+# Error handling
+eyre = "0.6"
+
+# HTTP client (for host http_fetch)
+reqwest = { workspace = true }
+
+# Utilities
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+tracing = "0.1"
+parking_lot = { workspace = true }
+base64 = { workspace = true }
+semver = "1"
+sha2 = "0.10"
+hex = "0.4"
+
+[dev-dependencies]
+chrono = "0.4"
+eyre = "0.6"
+tempfile = "3"
+tokio = { version = "1", features = ["full", "test-util"] }

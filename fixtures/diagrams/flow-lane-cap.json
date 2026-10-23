@@ -1,0 +1,369 @@
+{
+  "spec": {
+    "kind": "flow",
+    "nodes": [
+      {
+        "id": "n0",
+        "label": "One team",
+        "group": "One"
+      },
+      {
+        "id": "n1",
+        "label": "Two team",
+        "group": "Two"
+      },
+      {
+        "id": "n2",
+        "label": "Three team",
+        "group": "Three"
+      },
+      {
+        "id": "n3",
+        "label": "Four team",
+        "group": "Four"
+      },
+      {
+        "id": "n4",
+        "label": "Five team",
+        "group": "Five"
+      },
+      {
+        "id": "n5",
+        "label": "Six team",
+        "group": "Six"
+      },
+      {
+        "id": "n6",
+        "label": "Seven team",
+        "group": "Seven"
+      }
+    ],
+    "edges": [
+      {
+        "from": "n0",
+        "to": "n1"
+      },
+      {
+        "from": "n1",
+        "to": "n2"
+      },
+      {
+        "from": "n2",
+        "to": "n3"
+      },
+      {
+        "from": "n3",
+        "to": "n4"
+      },
+      {
+        "from": "n4",
+        "to": "n5"
+      },
+      {
+        "from": "n5",
+        "to": "n6"
+      }
+    ]
+  },
+  "metrics": {
+    "char_width": 7,
+    "line_height": 16
+  },
+  "layout": {
+    "kind": "flow",
+    "nodes": [
+      {
+        "id": "n0",
+        "label": "One team",
+        "lines": [
+          "One team"
+        ],
+        "shape": "box",
+        "tone": "default",
+        "x": 35,
+        "y": 46,
+        "w": 80,
+        "h": 32,
+        "group": "One",
+        "lane": 1
+      },
+      {
+        "id": "n1",
+        "label": "Two team",
+        "lines": [
+          "Two team"
+        ],
+        "shape": "box",
+        "tone": "default",
+        "x": 35,
+        "y": 124,
+        "w": 80,
+        "h": 32,
+        "group": "Two",
+        "lane": 2
+      },
+      {
+        "id": "n2",
+        "label": "Three team",
+        "lines": [
+          "Three team"
+        ],
+        "shape": "box",
+        "tone": "default",
+        "x": 28,
+        "y": 202,
+        "w": 94,
+        "h": 32,
+        "group": "Three",
+        "lane": 3
+      },
+      {
+        "id": "n3",
+        "label": "Four team",
+        "lines": [
+          "Four team"
+        ],
+        "shape": "box",
+        "tone": "default",
+        "x": 30.625,
+        "y": 280,
+        "w": 87,
+        "h": 32,
+        "group": "Four",
+        "lane": 4
+      },
+      {
+        "id": "n4",
+        "label": "Five team",
+        "lines": [
+          "Five team"
+        ],
+        "shape": "box",
+        "tone": "default",
+        "x": 31.5,
+        "y": 358,
+        "w": 87,
+        "h": 32,
+        "group": "Five",
+        "lane": 5
+      },
+      {
+        "id": "n5",
+        "label": "Six team",
+        "lines": [
+          "Six team"
+        ],
+        "shape": "box",
+        "tone": "default",
+        "x": 35.4375,
+        "y": 436,
+        "w": 80,
+        "h": 32,
+        "group": "Six"
+      },
+      {
+        "id": "n6",
+        "label": "Seven team",
+        "lines": [
+          "Seven team"
+        ],
+        "shape": "box",
+        "tone": "default",
+        "x": 28.4375,
+        "y": 514,
+        "w": 94,
+        "h": 32,
+        "group": "Seven"
+      }
+    ],
+    "edges": [
+      {
+        "key": "n0|n1|0",
+        "from": "n0",
+        "to": "n1",
+        "points": [
+          [
+            75,
+            78
+          ],
+          [
+            75,
+            124
+          ]
+        ],
+        "style": "solid",
+        "arrow": "to"
+      },
+      {
+        "key": "n1|n2|1",
+        "from": "n1",
+        "to": "n2",
+        "points": [
+          [
+            75,
+            156
+          ],
+          [
+            75,
+            202
+          ]
+        ],
+        "style": "solid",
+        "arrow": "to"
+      },
+      {
+        "key": "n2|n3|2",
+        "from": "n2",
+        "to": "n3",
+        "points": [
+          [
+            75,
+            234
+          ],
+          [
+            75,
+            257
+          ],
+          [
+            74.125,
+            257
+          ],
+          [
+            74.125,
+            280
+          ]
+        ],
+        "style": "solid",
+        "arrow": "to"
+      },
+      {
+        "key": "n3|n4|3",
+        "from": "n3",
+        "to": "n4",
+        "points": [
+          [
+            74.125,
+            312
+          ],
+          [
+            74.125,
+            335
+          ],
+          [
+            75,
+            335
+          ],
+          [
+            75,
+            358
+          ]
+        ],
+        "style": "solid",
+        "arrow": "to"
+      },
+      {
+        "key": "n4|n5|4",
+        "from": "n4",
+        "to": "n5",
+        "points": [
+          [
+            75,
+            390
+          ],
+          [
+            75,
+            413
+          ],
+          [
+            75.4375,
+            413
+          ],
+          [
+            75.4375,
+            436
+          ]
+        ],
+        "style": "solid",
+        "arrow": "to"
+      },
+      {
+        "key": "n5|n6|5",
+        "from": "n5",
+        "to": "n6",
+        "points": [
+          [
+            75.4375,
+            468
+          ],
+          [
+            75.4375,
+            514
+          ]
+        ],
+        "style": "solid",
+        "arrow": "to"
+      }
+    ],
+    "groups": [
+      {
+        "label": "One",
+        "lane": 1,
+        "x": 21,
+        "y": 14,
+        "w": 108,
+        "h": 78
+      },
+      {
+        "label": "Two",
+        "lane": 2,
+        "x": 21,
+        "y": 92,
+        "w": 108,
+        "h": 78
+      },
+      {
+        "label": "Three",
+        "lane": 3,
+        "x": 14,
+        "y": 170,
+        "w": 122,
+        "h": 78
+      },
+      {
+        "label": "Four",
+        "lane": 4,
+        "x": 16.625,
+        "y": 248,
+        "w": 115,
+        "h": 78
+      },
+      {
+        "label": "Five",
+        "lane": 5,
+        "x": 17.5,
+        "y": 326,
+        "w": 115,
+        "h": 78
+      },
+      {
+        "label": "Six",
+        "x": 21.4375,
+        "y": 404,
+        "w": 108,
+        "h": 78
+      },
+      {
+        "label": "Seven",
+        "x": 14.4375,
+        "y": 482,
+        "w": 122,
+        "h": 78
+      }
+    ],
+    "lifelines": [],
+    "notes": [],
+    "width": 150,
+    "height": 574,
+    "dropped": []
+  }
+}

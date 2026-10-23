@@ -1,0 +1,64 @@
+{
+  "model": "gpt-5.5",
+  "instructions": "You are Allan, a concise assistant. Use tools when asked.",
+  "store": false,
+  "stream": true,
+  "include": [
+    "reasoning.encrypted_content"
+  ],
+  "tool_choice": "auto",
+  "prompt_cache_key": "00000000-0000-4000-8000-000000000004",
+  "reasoning": {
+    "effort": "high",
+    "summary": "auto"
+  },
+  "parallel_tool_calls": true,
+  "tools": [
+    {
+      "type": "function",
+      "name": "weather_get",
+      "description": "Get the weather for a city",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "city": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "city"
+        ]
+      },
+      "strict": false
+    },
+    {
+      "type": "function",
+      "name": "time_get",
+      "description": "Get the local time for a city",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "city": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "city"
+        ]
+      },
+      "strict": false
+    }
+  ],
+  "input": [
+    {
+      "type": "message",
+      "role": "user",
+      "content": [
+        {
+          "type": "input_text",
+          "text": "A train leaves at 09:17 and travels 263 km at 71 km/h, then waits 13 minutes, then 118 km at 88 km/h. Work out the arrival time carefully, then call weather_get for the destination city Porto."
+        }
+      ]
+    }
+  ]
+}

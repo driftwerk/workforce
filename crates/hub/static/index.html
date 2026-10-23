@@ -1,0 +1,603 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Workforce Admin</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/lucide@latest"></script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+        body { font-family: 'Inter', sans-serif; }
+        .chat-bubble-user { background: #3b82f6; color: white; border-radius: 18px 18px 4px 18px; }
+        .chat-bubble-agent { background: #f1f5f9; color: #1e293b; border-radius: 18px 18px 18px 4px; }
+        .fade-in { animation: fadeIn 0.3s ease-in; }
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+        .sidebar-item:hover { background: rgba(255,255,255,0.1); }
+        .sidebar-item.active { background: rgba(255,255,255,0.15); border-left: 3px solid #3b82f6; }
+        #chat-messages { scroll-behavior: smooth; }
+        .typing-dot { animation: typingBounce 1.4s infinite ease-in-out; }
+        .typing-dot:nth-child(2) { animation-delay: 0.2s; }
+        .typing-dot:nth-child(3) { animation-delay: 0.4s; }
+        @keyframes typingBounce { 0%, 80%, 100% { transform: translateY(0); } 40% { transform: translateY(-6px); } }
+        pre { background: #1e293b; color: #e2e8f0; padding: 12px; border-radius: 8px; overflow-x: auto; font-size: 13px; }
+        code { font-family: 'JetBrains Mono', monospace; }
+    </style>
+</head>
+<body class="bg-gray-950 text-white min-h-screen">
+    <!-- Auth Gate -->
+    <div id="auth-gate" class="min-h-screen flex items-center justify-center">
+        <div class="bg-gray-900 rounded-2xl p-8 w-96 shadow-2xl border border-gray-800">
+            <div class="text-center mb-6">
+                <div class="text-4xl mb-2">🤖</div>
+                <h1 class="text-2xl font-bold">Workforce Admin</h1>
+                <p class="text-gray-400 text-sm mt-1">Enter your gateway token to continue</p>
+            </div>
+            <input id="auth-token" type="password" placeholder="Gateway token..."
+                   class="w-full bg-gray-800 border border-gray-700 rounded-lg px-4 py-3 text-white placeholder-gray-500 focus:outline-none focus:border-blue-500 mb-4">
+            <button onclick="authenticate()" class="w-full bg-blue-600 hover:bg-blue-700 rounded-lg py-3 font-medium transition">
+                Connect
+            </button>
+            <p id="auth-error" class="text-red-400 text-sm mt-2 hidden">Invalid token</p>
+        </div>
+    </div>
+
+    <!-- Main App -->
+    <div id="app" class="hidden min-h-screen flex">
+        <!-- Sidebar -->
+        <div class="w-64 bg-gray-900 border-r border-gray-800 flex flex-col">
+            <div class="p-4 border-b border-gray-800">
+                <h1 class="text-lg font-bold flex items-center gap-2">
+                    <span>🤖</span> Workforce
+                </h1>
+                <p class="text-xs text-gray-500 mt-1" id="connection-status">Connecting...</p>
+            </div>
+            <nav class="flex-1 p-2 space-y-1">
+                <div class="sidebar-item active rounded-lg px-3 py-2.5 cursor-pointer flex items-center gap-3 text-sm" onclick="showPage('dashboard')" id="nav-dashboard">
+                    <i data-lucide="layout-dashboard" class="w-4 h-4"></i> Dashboard
+                </div>
+                <div class="sidebar-item rounded-lg px-3 py-2.5 cursor-pointer flex items-center gap-3 text-sm" onclick="showPage('chat')" id="nav-chat">
+                    <i data-lucide="message-circle" class="w-4 h-4"></i> Chat
+                </div>
+                <div class="sidebar-item rounded-lg px-3 py-2.5 cursor-pointer flex items-center gap-3 text-sm" onclick="showPage('sessions')" id="nav-sessions">
+                    <i data-lucide="messages-square" class="w-4 h-4"></i> Sessions
+                </div>
+                <div class="sidebar-item rounded-lg px-3 py-2.5 cursor-pointer flex items-center gap-3 text-sm" onclick="showPage('teams')" id="nav-teams">
+                    <i data-lucide="users" class="w-4 h-4"></i> Teams
+                </div>
+                <div class="sidebar-item rounded-lg px-3 py-2.5 cursor-pointer flex items-center gap-3 text-sm" onclick="showPage('scheduler')" id="nav-scheduler">
+                    <i data-lucide="clock" class="w-4 h-4"></i> Scheduler
+                </div>
+                <div class="sidebar-item rounded-lg px-3 py-2.5 cursor-pointer flex items-center gap-3 text-sm" onclick="showPage('audit')" id="nav-audit">
+                    <i data-lucide="scroll-text" class="w-4 h-4"></i> Audit Log
+                </div>
+                <div class="sidebar-item rounded-lg px-3 py-2.5 cursor-pointer flex items-center gap-3 text-sm" onclick="showPage('config')" id="nav-config">
+                    <i data-lucide="settings" class="w-4 h-4"></i> Config
+                </div>
+            </nav>
+            <div class="p-4 border-t border-gray-800 text-xs text-gray-600">
+                <div id="version-info">Workforce v0.1.0</div>
+            </div>
+        </div>
+
+        <!-- Main Content -->
+        <div class="flex-1 flex flex-col overflow-hidden">
+            <!-- Dashboard Page -->
+            <div id="page-dashboard" class="flex-1 overflow-auto p-6">
+                <h2 class="text-2xl font-bold mb-6">Dashboard</h2>
+                <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
+                    <div class="bg-gray-900 rounded-xl p-5 border border-gray-800">
+                        <div class="text-gray-400 text-sm mb-1">Active Sessions</div>
+                        <div class="text-3xl font-bold" id="stat-sessions">-</div>
+                    </div>
+                    <div class="bg-gray-900 rounded-xl p-5 border border-gray-800">
+                        <div class="text-gray-400 text-sm mb-1">Total Messages</div>
+                        <div class="text-3xl font-bold" id="stat-messages">-</div>
+                    </div>
+                    <div class="bg-gray-900 rounded-xl p-5 border border-gray-800">
+                        <div class="text-gray-400 text-sm mb-1">Total Tokens</div>
+                        <div class="text-3xl font-bold" id="stat-tokens">-</div>
+                    </div>
+                    <div class="bg-gray-900 rounded-xl p-5 border border-gray-800">
+                        <div class="text-gray-400 text-sm mb-1">Today's Cost</div>
+                        <div class="text-3xl font-bold" id="stat-cost">-</div>
+                    </div>
+                </div>
+                <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                    <div class="bg-gray-900 rounded-xl p-5 border border-gray-800">
+                        <h3 class="font-semibold mb-4">Recent Sessions</h3>
+                        <div id="recent-sessions" class="space-y-2 text-sm">
+                            <div class="text-gray-500">Loading...</div>
+                        </div>
+                    </div>
+                    <div class="bg-gray-900 rounded-xl p-5 border border-gray-800">
+                        <h3 class="font-semibold mb-4">System Health</h3>
+                        <div id="system-health" class="space-y-3">
+                            <div class="flex items-center justify-between">
+                                <span class="text-gray-400">Agent Service</span>
+                                <span class="text-green-400 text-sm">● Online</span>
+                            </div>
+                            <div class="flex items-center justify-between">
+                                <span class="text-gray-400">Gateway</span>
+                                <span class="text-green-400 text-sm" id="health-gateway">● Online</span>
+                            </div>
+                            <div class="flex items-center justify-between">
+                                <span class="text-gray-400">Slack Bot</span>
+                                <span class="text-gray-500 text-sm" id="health-slack">○ Not configured</span>
+                            </div>
+                            <div class="flex items-center justify-between">
+                                <span class="text-gray-400">Scheduler</span>
+                                <span class="text-green-400 text-sm" id="health-scheduler">● Active</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Chat Page -->
+            <div id="page-chat" class="flex-1 flex flex-col hidden">
+                <div class="border-b border-gray-800 px-6 py-3 flex items-center justify-between bg-gray-900/50">
+                    <div>
+                        <h2 class="font-semibold">Agent Chat</h2>
+                        <p class="text-xs text-gray-500" id="chat-session-info">Web session</p>
+                    </div>
+                    <button onclick="clearChat()" class="text-xs text-gray-500 hover:text-white px-3 py-1 rounded-lg border border-gray-700 hover:border-gray-600 transition">
+                        Clear
+                    </button>
+                </div>
+                <div id="chat-messages" class="flex-1 overflow-auto p-6 space-y-4">
+                    <div class="text-center text-gray-600 text-sm py-8">
+                        Start a conversation with your agent
+                    </div>
+                </div>
+                <div id="typing-indicator" class="hidden px-6 pb-2">
+                    <div class="flex items-center gap-1 text-gray-500 text-sm">
+                        <div class="typing-dot w-1.5 h-1.5 bg-gray-500 rounded-full"></div>
+                        <div class="typing-dot w-1.5 h-1.5 bg-gray-500 rounded-full"></div>
+                        <div class="typing-dot w-1.5 h-1.5 bg-gray-500 rounded-full"></div>
+                        <span class="ml-2">Agent is thinking...</span>
+                    </div>
+                </div>
+                <div class="border-t border-gray-800 p-4 bg-gray-900/50">
+                    <div class="flex gap-3 max-w-4xl mx-auto">
+                        <input id="chat-input" type="text" placeholder="Type a message..."
+                               class="flex-1 bg-gray-800 border border-gray-700 rounded-xl px-4 py-3 text-white placeholder-gray-500 focus:outline-none focus:border-blue-500"
+                               onkeydown="if(event.key==='Enter')sendMessage()">
+                        <button onclick="sendMessage()" class="bg-blue-600 hover:bg-blue-700 rounded-xl px-6 py-3 font-medium transition flex items-center gap-2">
+                            Send
+                        </button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Sessions Page -->
+            <div id="page-sessions" class="flex-1 overflow-auto p-6 hidden">
+                <h2 class="text-2xl font-bold mb-6">Sessions</h2>
+                <div id="sessions-list" class="space-y-3">
+                    <div class="text-gray-500">Loading...</div>
+                </div>
+            </div>
+
+            <!-- Teams Page -->
+            <div id="page-teams" class="flex-1 overflow-auto p-6 hidden">
+                <h2 class="text-2xl font-bold mb-6">Teams</h2>
+                <div id="teams-list" class="space-y-4">
+                    <div class="text-gray-500">Loading...</div>
+                </div>
+            </div>
+
+            <!-- Scheduler Page -->
+            <div id="page-scheduler" class="flex-1 overflow-auto p-6 hidden">
+                <h2 class="text-2xl font-bold mb-6">Scheduled Jobs</h2>
+                <div id="scheduler-list" class="space-y-3">
+                    <div class="text-gray-500">No scheduled jobs</div>
+                </div>
+            </div>
+
+            <!-- Audit Log Page -->
+            <div id="page-audit" class="flex-1 overflow-auto p-6 hidden">
+                <div class="flex items-center justify-between mb-6">
+                    <h2 class="text-2xl font-bold">Audit Log</h2>
+                    <input id="audit-search" type="text" placeholder="Search..."
+                           class="bg-gray-800 border border-gray-700 rounded-lg px-4 py-2 text-sm text-white placeholder-gray-500 focus:outline-none focus:border-blue-500 w-64"
+                           onkeydown="if(event.key==='Enter')loadAudit()">
+                </div>
+                <div id="audit-list" class="space-y-2">
+                    <div class="text-gray-500">Loading...</div>
+                </div>
+            </div>
+
+            <!-- Config Page -->
+            <div id="page-config" class="flex-1 overflow-auto p-6 hidden">
+                <h2 class="text-2xl font-bold mb-6">Configuration</h2>
+                <div class="bg-gray-900 rounded-xl p-5 border border-gray-800">
+                    <pre id="config-content" class="text-sm">Loading...</pre>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+    let token = '';
+    let ws = null;
+    let adminBase = '';
+    let gatewayBase = '';
+    let chatMessages = [];
+
+    function authenticate() {
+        token = document.getElementById('auth-token').value.trim();
+        if (!token) return;
+
+        // Detect admin/gateway ports from current URL
+        const host = window.location.hostname;
+        const port = parseInt(window.location.port) || 8091;
+        gatewayBase = `${window.location.protocol}//${host}:${port}`;
+        adminBase = `${window.location.protocol}//${host}:${port - 1}`;
+
+        // Test connection
+        fetch(`${gatewayBase}/api/sessions`, {
+            headers: { 'Authorization': `Bearer ${token}` }
+        }).then(r => {
+            if (r.ok) {
+                document.getElementById('auth-gate').classList.add('hidden');
+                document.getElementById('app').classList.remove('hidden');
+                localStorage.setItem('workforce-token', token);
+                initApp();
+            } else {
+                document.getElementById('auth-error').classList.remove('hidden');
+            }
+        }).catch(() => {
+            // Try same-port fallback
+            adminBase = gatewayBase;
+            document.getElementById('auth-gate').classList.add('hidden');
+            document.getElementById('app').classList.remove('hidden');
+            localStorage.setItem('workforce-token', token);
+            initApp();
+        });
+    }
+
+    function initApp() {
+        lucide.createIcons();
+        connectWebSocket();
+        loadDashboard();
+    }
+
+    function connectWebSocket() {
+        const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const host = window.location.hostname;
+        const port = parseInt(window.location.port) || 8091;
+        const wsUrl = `${wsProtocol}//${host}:${port}/ws?token=${token}`;
+
+        ws = new WebSocket(wsUrl);
+        ws.onopen = () => {
+            document.getElementById('connection-status').textContent = '● Connected';
+            document.getElementById('connection-status').className = 'text-xs text-green-500 mt-1';
+        };
+        ws.onclose = () => {
+            document.getElementById('connection-status').textContent = '○ Disconnected';
+            document.getElementById('connection-status').className = 'text-xs text-red-500 mt-1';
+            setTimeout(connectWebSocket, 3000);
+        };
+        ws.onmessage = (e) => {
+            try {
+                const msg = JSON.parse(e.data);
+                handleServerMessage(msg);
+            } catch(err) { console.error('WS parse error:', err); }
+        };
+    }
+
+    let streamBuffer = '';
+    let streamBatchTimeout = null;
+
+    function handleServerMessage(msg) {
+        switch(msg.type) {
+            case 'message':
+                document.getElementById('typing-indicator').classList.add('hidden');
+                addChatBubble('agent', msg.content);
+                break;
+            case 'typing':
+                document.getElementById('typing-indicator').classList.remove('hidden');
+                break;
+            case 'stream_start':
+                // Clear any buffered content from previous stream
+                streamBuffer = '';
+                if (streamBatchTimeout) {
+                    clearTimeout(streamBatchTimeout);
+                    streamBatchTimeout = null;
+                }
+                break;
+            case 'stream_delta':
+                // Batch deltas to reduce DOM thrashing
+                streamBuffer += msg.content;
+                
+                if (!streamBatchTimeout) {
+                    streamBatchTimeout = setTimeout(() => {
+                        if (streamBuffer) {
+                            appendToLastBubble(streamBuffer);
+                            streamBuffer = '';
+                        }
+                        streamBatchTimeout = null;
+                    }, 50); // 50ms batching window
+                }
+                break;
+            case 'stream_end':
+                // Flush any remaining buffered content
+                if (streamBatchTimeout) {
+                    clearTimeout(streamBatchTimeout);
+                    streamBatchTimeout = null;
+                }
+                if (streamBuffer) {
+                    appendToLastBubble(streamBuffer);
+                    streamBuffer = '';
+                }
+                document.getElementById('typing-indicator').classList.add('hidden');
+                break;
+            case 'error':
+                addChatBubble('agent', `⚠️ Error: ${msg.content || msg.error}`);
+                break;
+            case 'reminder':
+                // Show reminder in chat and as a notification
+                addChatBubble('agent', msg.content);
+                // Switch to chat page if not already there
+                if (document.getElementById('page-chat').classList.contains('hidden')) {
+                    showPage('chat');
+                }
+                break;
+        }
+    }
+
+    function sendMessage() {
+        const input = document.getElementById('chat-input');
+        const text = input.value.trim();
+        if (!text || !ws || ws.readyState !== 1) return;
+
+        addChatBubble('user', text);
+        ws.send(JSON.stringify({ type: 'chat', content: text, channel: 'web-admin' }));
+        input.value = '';
+        document.getElementById('typing-indicator').classList.remove('hidden');
+    }
+
+    function addChatBubble(role, content) {
+        const container = document.getElementById('chat-messages');
+        // Remove empty state message
+        if (container.children.length === 1 && container.children[0].classList.contains('text-center')) {
+            container.innerHTML = '';
+        }
+
+        const wrapper = document.createElement('div');
+        wrapper.className = `flex ${role === 'user' ? 'justify-end' : 'justify-start'} fade-in`;
+
+        const bubble = document.createElement('div');
+        bubble.className = `${role === 'user' ? 'chat-bubble-user' : 'chat-bubble-agent'} px-4 py-3 max-w-[75%] text-sm whitespace-pre-wrap`;
+        bubble.textContent = content;
+
+        wrapper.appendChild(bubble);
+        container.appendChild(wrapper);
+        container.scrollTop = container.scrollHeight;
+        chatMessages.push({ role, content });
+    }
+
+    function appendToLastBubble(text) {
+        const container = document.getElementById('chat-messages');
+        const lastBubble = container.querySelector('.chat-bubble-agent:last-child');
+        if (lastBubble) {
+            // Request animation frame to batch DOM updates and reduce jank
+            requestAnimationFrame(() => {
+                lastBubble.textContent += text;
+                container.scrollTop = container.scrollHeight;
+            });
+        } else {
+            addChatBubble('agent', text);
+        }
+    }
+
+    function clearChat() {
+        document.getElementById('chat-messages').innerHTML = `
+            <div class="text-center text-gray-600 text-sm py-8">Start a conversation with your agent</div>`;
+        chatMessages = [];
+    }
+
+    function showPage(page) {
+        // Hide all pages
+        document.querySelectorAll('[id^="page-"]').forEach(p => p.classList.add('hidden'));
+        document.querySelectorAll('.sidebar-item').forEach(s => s.classList.remove('active'));
+
+        // Show selected
+        document.getElementById(`page-${page}`).classList.remove('hidden');
+        document.getElementById(`nav-${page}`).classList.add('active');
+
+        // Load data
+        switch(page) {
+            case 'dashboard': loadDashboard(); break;
+            case 'sessions': loadSessions(); break;
+            case 'teams': loadTeams(); break;
+            case 'scheduler': loadScheduler(); break;
+            case 'audit': loadAudit(); break;
+            case 'config': loadConfig(); break;
+        }
+    }
+
+    async function apiFetch(url) {
+        try {
+            const r = await fetch(url, { headers: { 'Authorization': `Bearer ${token}` } });
+            if (r.ok) return await r.json();
+        } catch(e) { console.error('API error:', e); }
+        return null;
+    }
+
+    async function loadDashboard() {
+        const [sessions, dashboard, cost] = await Promise.all([
+            apiFetch(`${gatewayBase}/api/sessions`),
+            apiFetch(`${adminBase}/api/dashboard`),
+            apiFetch(`${adminBase}/api/cost`),
+        ]);
+
+        if (sessions?.sessions) {
+            const s = sessions.sessions;
+            document.getElementById('stat-sessions').textContent = s.length;
+            document.getElementById('stat-messages').textContent = s.reduce((sum, x) => sum + (x.messages || 0), 0);
+            document.getElementById('stat-tokens').textContent = formatNumber(s.reduce((sum, x) => sum + (x.total_tokens || 0), 0));
+
+            document.getElementById('recent-sessions').innerHTML = s.length === 0
+                ? '<div class="text-gray-500">No active sessions</div>'
+                : s.slice(0, 5).map(sess => `
+                    <div class="flex items-center justify-between py-2 border-b border-gray-800 last:border-0">
+                        <div>
+                            <span class="text-white">${sess.label || sess.channel}</span>
+                            <span class="text-gray-500 text-xs ml-2">${sess.owner}</span>
+                        </div>
+                        <div class="text-right">
+                            <div class="text-gray-500 text-xs">${sess.messages} msgs</div>
+                            <div class="text-gray-600 text-xs">${timeAgo(sess.updated_at)}</div>
+                        </div>
+                    </div>
+                `).join('');
+        }
+
+        if (cost) {
+            document.getElementById('stat-cost').textContent = `$${(cost.total_cost || 0).toFixed(2)}`;
+        } else {
+            document.getElementById('stat-cost').textContent = '$0.00';
+        }
+    }
+
+    async function loadSessions() {
+        const data = await apiFetch(`${gatewayBase}/api/sessions`);
+        const container = document.getElementById('sessions-list');
+
+        if (!data?.sessions?.length) {
+            container.innerHTML = '<div class="text-gray-500">No sessions</div>';
+            return;
+        }
+
+        container.innerHTML = data.sessions.map(s => `
+            <div class="bg-gray-900 rounded-xl p-4 border border-gray-800">
+                <div class="flex items-center justify-between mb-2">
+                    <span class="font-medium">${s.label || 'Unnamed'}</span>
+                    <span class="text-xs text-gray-500">Last active: ${timeAgo(s.updated_at)}</span>
+                </div>
+                <div class="flex flex-wrap gap-4 text-sm text-gray-400">
+                    <span>Started: <span class="text-white">${new Date(s.created_at).toLocaleString()}</span></span>
+                    <span>Channel: <span class="text-white">${s.channel}</span></span>
+                    <span>Owner: <span class="text-white">${s.owner}</span></span>
+                    <span>Messages: <span class="text-white">${s.messages}</span></span>
+                    <span>Tokens: <span class="text-white">${formatNumber(s.total_tokens)}</span></span>
+                </div>
+            </div>
+        `).join('');
+    }
+
+    async function loadTeams() {
+        const data = await apiFetch(`${adminBase}/api/teams`);
+        const container = document.getElementById('teams-list');
+
+        if (!data?.teams?.length) {
+            container.innerHTML = '<div class="text-gray-500">No teams configured</div>';
+            return;
+        }
+
+        container.innerHTML = data.teams.map(t => `
+            <div class="bg-gray-900 rounded-xl p-5 border border-gray-800">
+                <h3 class="font-semibold text-lg mb-2">${t.name}</h3>
+                <div class="text-sm text-gray-400 mb-3">
+                    Pattern: ${t.pattern || 'hierarchical'} · Lead: ${t.lead}
+                </div>
+                <div class="space-y-2">
+                    ${(t.members || []).map(m => `
+                        <div class="flex items-center gap-3 text-sm">
+                            <span class="w-2 h-2 rounded-full ${m.id === t.lead ? 'bg-blue-400' : 'bg-gray-600'}"></span>
+                            <span class="font-medium">${m.id}</span>
+                            <span class="text-gray-500">${m.role}</span>
+                            ${m.model ? `<span class="text-xs text-gray-600">${m.model}</span>` : ''}
+                        </div>
+                    `).join('')}
+                </div>
+            </div>
+        `).join('');
+    }
+
+    async function loadScheduler() {
+        const data = await apiFetch(`${adminBase}/api/scheduler`);
+        const container = document.getElementById('scheduler-list');
+
+        if (!data?.jobs?.length) {
+            container.innerHTML = '<div class="text-gray-500">No scheduled jobs</div>';
+            return;
+        }
+
+        container.innerHTML = data.jobs.map(j => `
+            <div class="bg-gray-900 rounded-lg p-4 border border-gray-800">
+                <div class="flex items-center justify-between mb-2">
+                    <span class="font-medium text-white">${j.name}</span>
+                    <span class="text-xs px-2 py-0.5 rounded ${j.enabled ? 'bg-green-900 text-green-300' : 'bg-gray-800 text-gray-500'}">${j.enabled ? 'Active' : 'Disabled'}</span>
+                </div>
+                <div class="grid grid-cols-2 gap-2 text-xs text-gray-400">
+                    <div>Schedule: <span class="text-gray-300">${j.schedule}</span></div>
+                    <div>Runs: <span class="text-gray-300">${j.run_count}</span></div>
+                    <div>Next: <span class="text-gray-300">${j.next_run ? new Date(j.next_run).toLocaleString() : 'N/A'}</span></div>
+                    <div>Last: <span class="text-gray-300">${j.last_run ? new Date(j.last_run).toLocaleString() : 'Never'}</span></div>
+                </div>
+                <div class="mt-2 text-xs text-gray-600">ID: ${j.id}</div>
+            </div>
+        `).join('');
+    }
+
+    async function loadAudit() {
+        const query = document.getElementById('audit-search')?.value || '';
+        const data = await apiFetch(`${adminBase}/api/audit?query=${encodeURIComponent(query)}&limit=50`);
+        const container = document.getElementById('audit-list');
+
+        if (!data?.entries?.length) {
+            container.innerHTML = '<div class="text-gray-500">No audit entries</div>';
+            return;
+        }
+
+        container.innerHTML = data.entries.map(e => `
+            <div class="bg-gray-900 rounded-lg p-3 border border-gray-800 text-sm">
+                <div class="flex items-center justify-between mb-1">
+                    <span class="font-medium">${e.action || e.event_type || 'event'}</span>
+                    <span class="text-xs text-gray-500">${new Date(e.timestamp || e.created_at).toLocaleString()}</span>
+                </div>
+                <div class="text-gray-400 text-xs">${e.details || e.description || JSON.stringify(e).slice(0, 200)}</div>
+            </div>
+        `).join('');
+    }
+
+    async function loadConfig() {
+        // Show the config as JSON from the dashboard endpoint
+        const data = await apiFetch(`${adminBase}/api/dashboard`);
+        document.getElementById('config-content').textContent = data
+            ? JSON.stringify(data, null, 2)
+            : 'Unable to load configuration';
+    }
+
+    function timeAgo(dateStr) {
+        if (!dateStr) return 'unknown';
+        const seconds = Math.floor((Date.now() - new Date(dateStr).getTime()) / 1000);
+        if (seconds < 60) return 'just now';
+        const minutes = Math.floor(seconds / 60);
+        if (minutes < 60) return `${minutes}m ago`;
+        const hours = Math.floor(minutes / 60);
+        if (hours < 24) return `${hours}h ago`;
+        const days = Math.floor(hours / 24);
+        if (days < 30) return `${days}d ago`;
+        return new Date(dateStr).toLocaleDateString();
+    }
+
+    function formatNumber(n) {
+        if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M';
+        if (n >= 1000) return (n / 1000).toFixed(1) + 'K';
+        return String(n);
+    }
+
+    // Auto-login if token saved
+    window.onload = () => {
+        const saved = localStorage.getItem('workforce-token');
+        if (saved) {
+            document.getElementById('auth-token').value = saved;
+            authenticate();
+        }
+    };
+    </script>
+</body>
+</html>

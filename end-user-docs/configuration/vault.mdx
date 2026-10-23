@@ -1,0 +1,175 @@
+---
+title: Vault
+description: Encrypted storage for adapter credentials and other secrets.
+---
+
+# Vault
+
+The vault is an encrypted storage system for secrets like API keys, tokens, and adapter credentials. It protects your secrets at rest with AES‑256‑GCM encryption and provides audit logging for every change.
+
+## Where secrets live
+
+Secrets are organized by dot‑notation paths. For example:
+
+- `slack.bot_token`
+- `skills/jira/api_token`
+- `skills/google/workspaces/default/refresh_token`
+
+The same credential path can be stored in up to **four places** ("tiers"),
+combining *who* it belongs to (everyone, or one person) with *where* it lives
+(an agent's own vault, or the shared hub vault):
+
+| Tier | Belongs to | Lives in | Typically set via |
+|------|------------|----------|-------------------|
+| **Personal (hub)** | just you | the shared hub vault | the My Settings UI |
+| **Personal (agent)** | just you | one agent's vault | a per-user override on that agent |
+| **Agent‑shared** | everyone on that agent | one agent's vault | `vault set` / `vault.set scope='agent_shared'` |
+| **Org‑shared** | the whole organization | the shared hub vault | `vault set` of a bare path |
+
+Some paths, like `skills/google/oauth_client/client_id`, are reserved for the org‑shared hub vault and cannot be set by agents. Routing selectors such as `skills/<skill>/default_workspace` are shared configuration: they shape the client every user of an agent shares, so they can only be set in a shared tier (`scope='agent_specific'` or `scope='global'`), never per user.
+
+## Where the vault is stored
+
+By default each vault is an encrypted file on the hub's disk. Deployments that run more than one hub process keep the vault in the shared Postgres database instead (`[vault] backend = "postgres"`). Every hub then sees every change within about a second. Secrets are encrypted by the hub before they reach the database, so the database never holds a readable path or value.
+
+An existing deployment moves once, with `workforce vault migrate`. For the few minutes that takes, credentials can still be read but not changed. Saving one shows "The vault is read-only while it moves to a new store. Try again in a few minutes."
+
+## How credentials resolve
+
+When a skill needs a credential, it looks through the tiers **most‑specific
+first** and uses the first one it finds. For a credential a skill reads, the
+priority is:
+
+1. **Personal (hub)** — your value from My Settings
+2. **Personal (agent)** — your override on this agent
+3. **Agent‑shared** — the agent's shared value
+4. **Org‑shared** — the organization default
+
+The rule in one line: **a personal credential always beats a shared one, and a value set in My Settings beats one set directly on an agent.** Whatever you set at a higher tier silently wins over the lower tiers — they're never consulted while the higher one exists.
+
+<Callout type="info">
+**Worked example.** Suppose your org sets a shared Jira token (org‑shared) so everyone can read tickets. You then add your own Jira token in My Settings (personal·hub). From then on, *your* requests use your personal token, while teammates without a personal token keep using the org‑shared one. If you later delete your personal token, you fall back to the org‑shared value automatically.
+</Callout>
+
+<Callout type="warn">
+**Per‑user tiers need a signed‑in identity.** Personal credentials only apply to requests made *as you* (e.g. from Slack or the web UI). Background jobs and automations have no identity, so they only ever see the two **shared** tiers (agent‑shared, then org‑shared).
+</Callout>
+
+Workspace‑specific credentials (e.g. `skills/jira/workspaces/acme/api_token`) follow the same rule and take precedence over the single‑workspace form (`skills/jira/api_token`) — but a *personal* credential in either form always wins over a *shared* one, so your override is never masked.
+
+If the wrong credential seems to be in use, ask the agent to run **`vault.inspect`** on the path: it shows which tier won and which lower‑tier values are being shadowed — almost always a higher tier holding a stale value.
+
+## Plan logins
+
+Claude and ChatGPT plan logins are vault entries too, under two keys:
+
+| Key | Holds |
+|-----|-------|
+| `claude_code/oauth_token` | a Claude plan token from `claude setup-token` (`sk-ant-oat…`) |
+| `codex/auth_json` | a ChatGPT sign-in, as the `auth.json` Codex writes; it serves both `chatgpt` and `codex` |
+
+They use the same four tiers but resolve in their own order, set by the agent's `[llm.logins]`: by default your login on this agent, then your login in My Settings, then the agent‑shared one, then the org‑shared one. The tier a login is stored in decides whom it serves, and the `CLAUDE_CODE_OAUTH_TOKEN` environment variable is never used for an agent. See [Subscriptions](/docs/concepts/subscriptions).
+
+Every write of these keys is checked, whichever way it arrives (My Settings, the Vault page, `vault.set`, a move or a copy):
+
+- The value must be a whole login: a Claude token as printed, or a ChatGPT `auth.json` with every token intact.
+- **One sign‑in, one slot.** A ChatGPT sign‑in's refresh token works for one copy only, so a sign‑in already stored in another slot is refused, and copying a ChatGPT login is refused. Sign in again for each place instead; a move keeps exactly one copy.
+- A shared login on an agent can be changed only by the agent's owner or an admin.
+- Removing a login takes effect at once; a refresh in progress can't bring it back.
+
+## Automatic secret protection
+
+When you paste a credential into Slack, the web UI, or a tool result, Workforce automatically replaces the cleartext with a safe marker like `[[secret:8a3f…0c2e type=ANTHROPIC_KEY preview=sk‑an…wXyZ]]`. The LLM sees only the marker, never the actual secret. When a tool needs the secret value, the marker is substituted back just before the tool runs.
+
+You can also store secrets directly with the `cmd: secret` command:
+
+```
+cmd: secret datadog_api_key abc123…
+```
+
+Type the literal `cmd:` prefix. It works on every surface — the web chat, the CLI, and (unlike the `/secret` slash command) inside Slack threads, where Slack intercepts a leading `/` and the slash command never reaches the agent.
+
+Named secrets are referenced as `[[secret:datadog_api_key]]` and are scoped to the conversation channel.
+
+## Managing secrets with the CLI
+
+Use the `workforce vault` commands to manage secrets from the host:
+
+```bash
+# Set a global secret (reserved paths)
+workforce vault set 'skills/google/oauth_client/client_id' 'your‑client‑id'
+
+# Set an agent‑shared secret
+workforce vault set 'slack.T0123ABCD.bot_token' 'xoxb‑secret'
+
+# Get a secret
+workforce vault get 'skills/jira/api_token'
+
+# Delete a secret
+workforce vault delete 'skills/jira/api_token'
+
+# List all secrets (paths only, never values)
+workforce vault list
+
+# Use the configured vault (file or Postgres), or one agent's own vault
+workforce vault list --config workforce.toml --agent sarah
+```
+
+Without `--config`, the commands use the vault file in `--data-dir` (default `./data`).
+
+## Agent‑side vault tools
+
+Agents can use these tools to interact with the vault:
+
+- `vault.get` — retrieve a secret
+- `vault.set` — store a secret
+- `vault.list` — list secret paths
+- `vault.delete` — delete a secret
+- `vault.inspect` — see where a secret lives and what might be shadowing it
+
+By default, `vault.set` writes to your personal user scope when you have an active identity. To store a shared credential, explicitly use `scope='agent_shared'`. Shared-only paths (routing selectors, OAuth app material) are refused in the personal scope.
+
+`vault.inspect` helps diagnose shadowing problems. For example, if you set a user‑scoped `skills/google/oauth_client/client_id`, it would shadow the correct global value used by OAuth callbacks. The inspect tool shows both the resolved entry and any shadowed entries from other tiers.
+
+## Redaction policies
+
+In cloud deployments, secret values returned to the LLM are redacted to `abcd…wxyz` (first four and last four characters). Non‑secret paths like `skills/jira/default_workspace` are returned in cleartext.
+
+Built‑in adapters and WASM skills bypass redaction — they read the raw vault to construct HTTP `Authorization` headers.
+
+## Audit logging
+
+Every `set` and `delete` operation is recorded. Each record holds:
+
+- Timestamp
+- Actor (who made the change)
+- Action (`set` or `delete`)
+- Path
+- Success flag
+- SHA‑256 fingerprint of the value (never the raw secret)
+
+Where the records are kept depends on the storage:
+
+- **Vault files:** an append‑only JSONL log next to each vault file. It rotates when it grows beyond 50 MiB and keeps at most five rotated copies.
+- **Postgres:** each change is recorded, encrypted, in the same transaction as the change, and kept for `audit_retention_days` (default 365).
+
+Read either with `workforce vault audit --config workforce.toml`.
+
+## Security
+
+- Secrets are encrypted with AES‑256‑GCM under keys derived from the master key via Argon2id.
+- On Unix, the vault file and key file are set to mode `0600` (owner‑read‑only).
+- The master key can be provided via the `WORKFORCE_VAULT_KEY` environment variable or a key file.
+- With vault files, a missing key is auto‑generated and saved. With Postgres, a key must be provided before the first start.
+- In Postgres, secrets are looked up by a keyed hash, so neither paths nor values are readable in the database.
+- Legacy v1 vault files are detected and upgraded to v2 with audit metadata.
+
+## Permissions
+
+Agents cannot read:
+
+- `wasm‑skills/*` paths (skill‑private namespace)
+- Other users’ `users/{uid}/…` paths
+- Paths when no user identity is active (system jobs must opt‑in via `with_system_identity`)
+
+The synthetic `system` identity can inspect any per‑user path for audit and sweeper jobs.

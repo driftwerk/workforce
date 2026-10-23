@@ -1,0 +1,453 @@
+[workflow]
+id = "incident-response"
+name = "Incident Response"
+description = "From alert to resolution with escalation paths"
+
+[workflow.context]
+alert_payload = { required = true, description = "The alert payload containing error details, service name, and monitoring data" }
+repo = { required = false, description = "Repository in owner/repo format if known (e.g. driftwerk/workforce). Will be determined during assessment if not provided." }
+
+# =============================================================================
+# Step 1: Assess
+# =============================================================================
+[[step]]
+id = "assess"
+name = "Assess the Alert"
+max_rounds = 20
+model = "powerful"
+preferred_tools = ["code.git", "code.read"]
+outputs = [
+  { name = "severity", description = "Severity level: sev1 (outage), sev2 (degraded), sev3 (minor)" },
+  { name = "affected_service", description = "The service or component that is affected" },
+  { name = "initial_timeline", description = "Timeline of events leading to the alert" },
+  { name = "target_repo", description = "Repository in owner/repo format containing the affected code" },
+  { name = "github_owner", description = "GitHub org/owner (e.g. driftwerk)" },
+  { name = "github_repo", description = "GitHub repo name (e.g. workforce)" },
+  { name = "symptoms", description = "Observable symptoms: error messages, affected endpoints, user impact" },
+]
+task = """
+Assess the incoming alert and determine severity and scope.
+
+## Alert Payload
+{{alert_payload}}
+
+## 1. Parse the Alert
+
+Extract: affected service/component, error condition, start time, error rate/impact.
+
+## 2. Determine the Repository
+
+If repo provided ("{{repo}}"), use it. Otherwise determine from alert payload.
+Extract github_owner (before slash) and github_repo (after slash).
+
+## 3. Check Recent Deploys
+
+1. Call `code.git` with repo="<target_repo>" action="log" to check recent commits
+2. Look for deployments in the last 24 hours that could have caused this
+3. Determine blast radius — how many users/services affected
+
+## 4. Determine Severity
+
+- **SEV1 (outage)**: Service completely down, all users affected → OUTCOME: sev1
+- **SEV2 (degraded)**: Partially working, subset affected → continue to diagnosis
+- **SEV3 (minor)**: Edge case errors, low impact → continue to diagnosis
+
+## 5. Check for False Alarms
+
+If metrics are normal, spike resolved, or condition is known benign: OUTCOME: false-alarm
+
+## 6. Output
+
+Emit ALL outputs: severity, affected_service, initial_timeline, symptoms, target_repo, github_owner, github_repo.
+
+Do NOT include "OUTCOME:" unless routing to sev1 or false-alarm.
+"""
+goto = "diagnose"
+branches = [
+  { when = "false-alarm", goto = "close-alert" },
+  { when = "sev1", goto = "page-humans" },
+]
+
+# =============================================================================
+# Step 2: Diagnose
+# =============================================================================
+[[step]]
+id = "diagnose"
+name = "Diagnose Root Cause"
+max_rounds = 30
+model = "powerful"
+skills = []
+preferred_tools = ["code.git", "code.read", "code.find", "knowledge.overview", "knowledge.ask", "knowledge.index"]
+outputs = [
+  { name = "root_cause", description = "The identified root cause of the incident" },
+  { name = "affected_files", description = "Files involved in the root cause, one per line" },
+  { name = "fix_approach", description = "Recommended fix — either code fix, config change, or rollback" },
+  { name = "timeline", description = "Full timeline from first symptom to diagnosis" },
+]
+task = """
+Diagnose the root cause of the incident.
+
+## Assessment
+- Severity: {{steps.assess.severity}}
+- Service: {{steps.assess.affected_service}}
+- Symptoms: {{steps.assess.symptoms}}
+- Timeline: {{steps.assess.initial_timeline}}
+- Repo: {{steps.assess.target_repo}}
+
+## 1. Sync and Index
+
+1. Call `code.git` with repo="{{steps.assess.target_repo}}" action="pull"
+2. Call `knowledge.index` with action="status" path="repos/{{steps.assess.target_repo}}"
+   — if stale, call `knowledge.index` with action="trigger" path="repos/{{steps.assess.target_repo}}"
+
+IMPORTANT: Always pass path="repos/{{steps.assess.target_repo}}" to ALL knowledge tool calls.
+
+## 2. Trace Recent Changes
+
+1. Call `code.git` with repo="{{steps.assess.target_repo}}" action="log"
+2. Identify commits touching the affected service/component
+3. Correlate commit timestamps with issue start time
+4. Read changed files from suspicious commits with `code.read`
+
+## 3. Understand Affected Code
+
+1. Call `knowledge.overview` with path="repos/{{steps.assess.target_repo}}"
+2. Call `knowledge.ask` with path="repos/{{steps.assess.target_repo}}" for module dependencies and error handling
+3. Read source files to trace the error path
+
+## 4. Identify Root Cause
+
+Determine: code change, configuration change, infrastructure issue, or data issue.
+
+## 5. Determine Fix Strategy
+
+- **Code fix**: continue to fix-code (default)
+- **Config fix**: OUTCOME: config-issue
+- **Rollback**: OUTCOME: needs-rollback
+
+Emit ALL outputs: root_cause, affected_files, fix_approach, timeline.
+
+Do NOT include "OUTCOME:" unless routing to config-issue or needs-rollback.
+"""
+goto = "fix-code"
+branches = [
+  { when = "needs-rollback", goto = "rollback" },
+  { when = "config-issue", goto = "fix-config" },
+]
+
+# =============================================================================
+# Step 3: Apply Code Fix
+# =============================================================================
+[[step]]
+id = "fix-code"
+name = "Apply Code Fix"
+max_rounds = 50
+model = "powerful"
+skills = ["github"]
+preferred_tools = ["code.git", "code.read", "code.edit", "code.find", "github.pr_create", "github.ci_status", "jobs.chain", "jobs.chain_status", "jobs.result", "exec.run"]
+outputs = [
+  { name = "pr_number", description = "Hotfix PR number", validate = "number" },
+  { name = "branch_name", description = "Hotfix branch name" },
+  { name = "summary", description = "Brief summary of the hotfix" },
+]
+task = """
+Apply a targeted code fix. This is a HOTFIX — keep changes minimal and focused.
+
+## Context
+- **Root Cause:** {{steps.diagnose.root_cause}}
+- **Fix Approach:** {{steps.diagnose.fix_approach}}
+- **Files:** {{steps.diagnose.affected_files}}
+
+## Rules
+- Fix ONLY the root cause. Do NOT refactor or "improve" adjacent code.
+- Write a test that reproduces the incident condition if possible.
+- Handle error paths properly — no silent swallowing, no panics.
+- Follow project conventions.
+
+## Steps
+
+### 1. Sync and prepare
+1. Call `code.git` with repo="{{steps.assess.target_repo}}" action="pull"
+2. Create a hotfix branch from main
+
+### 2. Implement the targeted fix
+
+### 3. Run quality gates
+1. Your worktree is at `{{_worktree_path}}`. Use it for all file operations.
+2. Call `jobs.chain` with steps:
+   - id="fmt", command="cd {{_worktree_path}} && cargo fmt -- --check"
+   - id="clippy", command="cd {{_worktree_path}} && cargo clippy --all-targets --no-deps -- -D warnings", depends_on=["fmt"]
+   - id="test", command="cd {{_worktree_path}} && cargo test --workspace", depends_on=["clippy"]
+3. Check with `jobs.chain_status`. If fmt fails: run `cargo fmt`, re-run chain.
+4. Repeat until ALL gates pass.
+
+### 4. Create hotfix PR
+1. Call `github.pr_create` with owner="{{steps.assess.github_owner}}" repo="{{steps.assess.github_repo}}"
+   - Title: "fix: resolve X causing Y incident"
+2. Call `jobs.watch_ci` with owner="{{steps.assess.github_owner}}" repo="{{steps.assess.github_repo}}" ref="<branch>"
+3. Check CI with `jobs.result`. If CI fails: fix and push again.
+
+Do NOT finish until ALL quality gates AND CI pass.
+Do NOT include "OUTCOME:" in your response.
+"""
+
+# =============================================================================
+# Step 4a: Request Deploy Approval
+# =============================================================================
+[[step]]
+id = "request-deploy"
+name = "Request Deploy Approval"
+max_rounds = 5
+model = "standard"
+pause = "awaiting-deploy-approval"
+report = "One-line summary of the hotfix, PR number, and CI status. Keep under 300 characters."
+task = """
+Hotfix PR #{{steps.fix-code.pr_number}} on branch {{steps.fix-code.branch_name}} is ready.
+
+## Summary
+- **Service:** {{steps.assess.affected_service}}
+- **Fix:** {{steps.fix-code.summary}}
+- **PR:** #{{steps.fix-code.pr_number}}
+
+Present for human approval before merging.
+
+Do NOT include "OUTCOME:" — this step pauses for human input.
+"""
+branches = [
+  { when = "approved", goto = "deploy-fix" },
+  { when = "rejected", goto = "fix-code" },
+]
+
+# =============================================================================
+# Step 4b: Deploy the Fix
+# =============================================================================
+[[step]]
+id = "deploy-fix"
+name = "Deploy the Fix"
+max_rounds = 15
+model = "standard"
+skills = ["github"]
+preferred_tools = ["github.pr_merge", "code.git"]
+pause = "awaiting-deploy-verification"
+task = """
+Merge the hotfix and verify in production.
+
+## Steps
+
+### 1. Merge
+Call `github.pr_merge` with:
+- owner="{{steps.assess.github_owner}}"
+- repo="{{steps.assess.github_repo}}"
+- pr_number={{steps.fix-code.pr_number}}
+- merge_method="squash"
+
+### 2. If merge succeeds
+Delete the hotfix branch {{steps.fix-code.branch_name}}.
+
+### 3. If merge fails (conflicts)
+1. Call `code.git` with repo="{{steps.assess.target_repo}}" action="pull"
+2. Merge main into hotfix branch, resolve conflicts (keep hotfix changes)
+3. Run quality gates again
+4. Push and retry `github.pr_merge`
+
+### 4. Post-merge verification
+1. Monitor deployment
+2. Verify original symptoms resolved (error rates, endpoints)
+3. If fix works → continue to postmortem
+4. If fix does NOT work → OUTCOME: fix-failed
+
+Present merge and verification results. Human will confirm.
+
+Do NOT include "OUTCOME:" unless the fix failed.
+"""
+branches = [
+  { when = "fix-failed", goto = "rollback" },
+]
+goto = "postmortem"
+
+# =============================================================================
+# Rollback
+# =============================================================================
+[[step]]
+id = "rollback"
+name = "Rollback to Last Known Good"
+max_rounds = 20
+model = "powerful"
+skills = ["github"]
+preferred_tools = ["code.git", "github.pr_create", "github.pr_merge", "github.ci_status"]
+task = """
+Rollback: code fix failed or rollback was determined fastest resolution.
+
+## Context
+- Service: {{steps.assess.affected_service}}
+- Severity: {{steps.assess.severity}}
+- Root Cause: {{steps.diagnose.root_cause}}
+
+## Steps
+
+### 1. Identify the bad deployment
+Call `code.git` with repo="{{steps.assess.target_repo}}" action="log" to find the problematic commit.
+
+### 2. Create a revert
+1. Create revert commit(s) in reverse chronological order
+2. Create a branch and PR
+
+### 3. Verify the revert
+1. Run quality gates (fmt, clippy, test)
+2. Call `github.pr_create` with owner="{{steps.assess.github_owner}}" repo="{{steps.assess.github_repo}}"
+3. Wait for CI to pass
+
+### 4. Merge the revert
+Call `github.pr_merge` with squash strategy.
+
+### 5. Verify stability
+- Error rates returning to normal
+- Affected endpoints working
+- No new issues from the revert
+
+Document what was reverted and why for the postmortem.
+
+Do NOT include "OUTCOME:" in your response.
+"""
+goto = "postmortem"
+
+# =============================================================================
+# Fix Configuration
+# =============================================================================
+[[step]]
+id = "fix-config"
+name = "Fix Configuration"
+max_rounds = 15
+model = "standard"
+skills = ["github"]
+preferred_tools = ["code.git", "code.read", "code.edit", "github.pr_create", "github.pr_merge"]
+task = """
+Fix a configuration issue causing the incident.
+
+## Context
+- **Root Cause:** {{steps.diagnose.root_cause}}
+- **Fix Approach:** {{steps.diagnose.fix_approach}}
+
+## Steps
+
+### 1. Identify the misconfiguration
+What value is wrong? Where is it set? What should it be?
+
+### 2. Apply the correction
+If config file in repo:
+1. Call `code.git` with repo="{{steps.assess.target_repo}}" action="pull"
+2. Make the change, commit, push
+3. Call `github.pr_create` with owner="{{steps.assess.github_owner}}" repo="{{steps.assess.github_repo}}"
+4. Call `github.pr_merge` with squash strategy
+
+If environment variable or external config: document what needs to change for the human to apply.
+
+### 3. Verify
+Monitor that the config change resolves the issue.
+
+Document what was misconfigured and the correct value for the postmortem.
+
+Do NOT include "OUTCOME:" in your response.
+"""
+goto = "postmortem"
+
+# =============================================================================
+# Postmortem
+# =============================================================================
+[[step]]
+id = "postmortem"
+name = "Write Postmortem"
+max_rounds = 15
+model = "standard"
+exit = true
+task = """
+Write a structured postmortem for the resolved incident.
+
+## Context
+- Severity: {{steps.assess.severity}}
+- Service: {{steps.assess.affected_service}}
+- Root Cause: {{steps.diagnose.root_cause}}
+
+## Postmortem Template
+
+### Timeline
+- **Detection**: When alert fired and what triggered it
+- **Assessment**: When severity determined
+- **Diagnosis**: When root cause identified
+- **Mitigation**: When fix/rollback/config applied
+- **Resolution**: When issue confirmed resolved
+
+Use timestamps from {{steps.assess.initial_timeline}} and {{steps.diagnose.timeline}}.
+
+### Root Cause
+Specific file, function, commit, or configuration at fault. Explain WHY it caused the issue.
+
+### Impact
+- Which users/services affected, for how long
+- User experience during incident
+- Any data loss or corruption
+
+### Resolution
+What was done (code fix, rollback, config change). Include PR number if applicable.
+
+### Action Items
+- [ ] Specific, actionable prevention measures
+- [ ] Each with clear owner or team
+- [ ] Both immediate fixes and longer-term improvements
+
+### Lessons Learned
+- What went well
+- What could improve
+- Near-misses or lucky breaks
+
+Do NOT include "OUTCOME:" in your response.
+"""
+
+# =============================================================================
+# Page Humans (SEV1)
+# =============================================================================
+[[step]]
+id = "page-humans"
+name = "Page On-Call Engineer"
+max_rounds = 5
+model = "standard"
+exit = true
+handoff = "escalation_to_product"
+task = """
+SEV1 incident — page the on-call engineer immediately.
+
+## Package for on-call:
+
+1. **Alert Summary**: What triggered the alert
+2. **Severity**: SEV1 — full outage / major impact
+3. **Affected Service**: {{steps.assess.affected_service}}
+4. **Symptoms**: {{steps.assess.symptoms}}
+5. **Timeline**: {{steps.assess.initial_timeline}}
+6. **Initial Assessment**: Scope and impact determination
+7. **Repository**: {{steps.assess.target_repo}}
+
+Include relevant error messages, log snippets, or monitoring data from the alert payload.
+
+Do NOT include "OUTCOME:" in your response.
+"""
+
+# =============================================================================
+# Close False Alarm
+# =============================================================================
+[[step]]
+id = "close-alert"
+name = "Close as False Alarm"
+max_rounds = 5
+model = "standard"
+exit = true
+task = """
+Alert was a false alarm. Document and close.
+
+## Steps
+
+1. **Document why false alarm**: What triggered it? Why is the condition benign/resolved?
+2. **Evaluate the alert rule**: Too sensitive? Right metric? Happened before?
+3. **Recommend alert improvements**: Threshold changes, additional conditions, better signals
+
+Do NOT include "OUTCOME:" in your response.
+"""

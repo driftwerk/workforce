@@ -1,0 +1,27 @@
+{
+  "model": "gpt-5.4-mini",
+  "instructions": "You are Allan, a concise assistant. Use tools when asked.",
+  "store": false,
+  "stream": true,
+  "include": [
+    "reasoning.encrypted_content"
+  ],
+  "tool_choice": "auto",
+  "prompt_cache_key": "00000000-0000-4000-8000-000000000003",
+  "reasoning": {
+    "effort": "low"
+  },
+  "parallel_tool_calls": false,
+  "input": [
+    {
+      "type": "message",
+      "role": "user",
+      "content": [
+        {
+          "type": "input_text",
+          "text": "Summarise in one sentence: the meeting moved to Thursday at 3pm."
+        }
+      ]
+    }
+  ]
+}

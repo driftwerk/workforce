@@ -1,0 +1,146 @@
+---
+title: Remote MCP
+description: Connect Claude Code or workforce-local-mcp to a workforce install as yourself.
+---
+
+# Remote MCP
+
+Every workforce install can serve the Model Context Protocol at `https://<hub>/mcp`.
+An MCP client such as Claude Code connects with a personal token and acts **as you**:
+it sees the tools your role allows, every call runs through the same permission
+checks as an agent turn, and it can talk to the install's agents.
+
+<Callout type="info">
+This is separate from the MCP servers workforce *connects to* (Settings → MCP Servers)
+and from the private MCP the hub gives to Claude Code sessions it starts itself.
+</Callout>
+
+## Enable it
+
+An admin turns the endpoint on in `workforce.toml`:
+
+```toml
+[hub]
+public_url = "https://workforce.example.com"   # printed in the connect commands
+
+[remote_mcp]
+enabled = true
+# token_ttl_days = 90
+# max_tokens_per_user = 10
+# tools_allow = ["workflow", "playbook", "scheduler", "reminder", "wasm_skill.*",
+#                "vault.*", "secret.list", "identity.whoami", "system.list_skills",
+#                "system.enable_skill", "system.install_external_skill",
+#                "system.uninstall_external_skill", "system.list_external_skills",
+#                "system.publish_external_skill", "skills.*", "agent.*"]
+```
+
+`tools_allow` is the surface offered to MCP clients. `["*"]` offers the whole tool
+registry. Whatever is offered, your role's capability matrix still decides what
+actually runs.
+
+## Get a token
+
+A token belongs to you, lasts 90 days by default, and is shown exactly once.
+
+- **My Settings → Remote MCP tokens**: create a token with a label and copy the
+  connect commands from the dialog. Revoke tokens from the same card.
+- **In chat** (Slack thread, web, CLI): `cmd: remote-mcp token laptop`. On Slack the
+  token is sent to you by direct message, never into the channel. `cmd: remote-mcp
+  tokens` lists yours; `cmd: remote-mcp token revoke laptop` revokes one.
+
+Suspending a user or revoking a token takes effect on the next request. Changing a
+user's role applies immediately too, because the hub looks your role up on every call.
+
+## Connect Claude Code directly
+
+```bash
+claude mcp add --transport http workforce-<install> https://<hub>/mcp \
+  --header "Authorization: Bearer wfr_…"
+```
+
+Use `https://<hub>/mcp/agents/<agent_id>` to work with a specific agent; `/mcp` is the
+install's default agent. Tool names arrive underscore-separated (`vault_set`,
+`wasm_skill_build`, `agent_chat`).
+
+## Connect through workforce-local-mcp
+
+If you use several installs, register each one once and switch between them:
+
+```bash
+workforce-local-mcp config workforce add myhub --url https://hub.example.com
+workforce-local-mcp config workforce add acme --url https://workforce.acme.example
+workforce-local-mcp config workforce use acme
+```
+
+The active install's tools appear as `wf.<tool>`; `wf.hubs` lists installs and
+`wf.use` switches the active one during a session without restarting Claude Code.
+
+## Learning the surface
+
+The `help` tool returns this documentation as markdown. Call it with no topic to
+list the pages, or with a topic such as `workflow`, `playbook`, `wasm_skill`,
+`vault`, `scheduler`, or `approval` to read the page that explains those tools.
+Claude Code is told to read the relevant page before authoring a workflow, playbook,
+or skill, granting a skill, or handling an approval, so the guidance people read is
+the guidance the model follows.
+
+## What you can build from here
+
+| Tools | What they do | Page |
+|-------|--------------|------|
+| `workflow` | Design, validate, save, start, and steer workflows | [Workflows](/docs/concepts/workflows) |
+| `playbook` | Design, validate, and save guided playbooks; starting one is chat-only | [Playbooks](/docs/concepts/playbooks) |
+| `wasm_skill.*` | Scaffold, build, test, install, and share WASM skills | [Skills](/docs/concepts/skills) |
+| `system.install_external_skill`, `system.list_external_skills`, `system.uninstall_external_skill`, `system.publish_external_skill` | Install external (SKILL.md) skills from GitHub, and list, remove, and publish them | [Skills](/docs/concepts/skills#writing-an-instruction-skill) |
+| `scheduler`, `reminder` | Schedule agent work and set reminders | [Schedules](/docs/concepts/schedules) |
+| `vault.*`, `secret.list` | Manage your credentials | [Vault](/docs/configuration/vault) |
+| `skill.*` | Grant and revoke WASM skills, and share skills of either kind, as yourself | [Skills](/docs/concepts/skills#from-claude-code) |
+| `pipeline.*` | Define pipelines and read or record where items sit | [Pipelines](/docs/concepts/pipelines) |
+| `hubspot.*` | HubSpot records, tickets, notes and associations, with your access | [HubSpot](/docs/adapters/hubspot) |
+
+Skill grants are a person's consent, so they exist only where a person is acting:
+the `cmd: skill` chat commands, and these `skill.*` tools on your own connection.
+No agent has them.
+
+## Talking to agents
+
+| Tool | What it does |
+|------|--------------|
+| `agent.list` | Agents on this install |
+| `agent.chat` | Send a message to an agent and wait for the reply; long turns return a `turn_id` |
+| `agent.poll` | Progress and the final reply for a running turn |
+| `agent.history` | Recent messages of your MCP conversation with an agent |
+
+Each MCP conversation is its own session per user and agent, so the agent keeps
+context across calls. Pass `session: "new"` to start over.
+
+## When a call needs approval
+
+Your workforce permissions decide which actions need a human's say-so, and the
+bridge brings that prompt to you instead of stalling. Nobody is asked about a call
+that is missing input its tool requires: it is refused at once so it can be
+corrected.
+
+| Tool | What it does |
+|------|--------------|
+| `approval.decide` | Answer a prompt with `allow_once`, `deny_once`, `allow_always` or `deny_always` |
+| `approval.status` | Where a request stands: pending on you, pending on approvers, or resolved |
+
+- **A direct call** that needs approval comes back with status `approval_pending`,
+  a `request_id`, the call's detail and the reason. Nothing has run. Once you decide,
+  `approval.decide` runs the call and returns its result (or refuses it). A parked
+  call is forgotten after ten minutes.
+- **An agent turn** that needs approval returns status `approval_required` with the
+  prompts and a `turn_id`. `approval.decide` resumes the turn and reports its
+  progress like `agent.poll`. A prompt nobody answers within five minutes is
+  refused. Once you deny a call, leave it unanswered, or allow it and it fails, the
+  agent's repeats of that same call are refused for the rest of the turn without
+  asking you again.
+- **Routed approvals**, where a permission rule names designated approvers, go to
+  them in Slack. The call returns `route: "routed"` and `approval.status` reports
+  their decision. Once approved, the call runs inside your session with that agent,
+  so its outcome is read back with `agent.history`.
+
+The tool tells the model to ask you before calling `approval.decide`. For a hard
+guarantee, keep `approval.decide` out of any auto-allow list in your MCP client so
+it prompts you on every call.

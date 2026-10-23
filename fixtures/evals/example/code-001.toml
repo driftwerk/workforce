@@ -1,0 +1,28 @@
+id = "code-001"
+use_case = "code"
+question = "Where is the free-shipping threshold decided, and what is it?"
+expected = "In shop/pricing/shipping.py, function shipping_cost: orders of 50.00 or more ship free. The threshold is the constant FREE_SHIPPING_MIN in the same file."
+trap = "The README says 40.00; it is out of date and the code is what runs."
+ideal_evidence = """
+shop/pricing/shipping.py:
+    FREE_SHIPPING_MIN = Decimal("50.00")
+    def shipping_cost(order): ...
+"""
+
+[[evidence]]
+kind = "file"
+name = "shop/pricing/shipping.py"
+
+[rubric]
+correct = "Both points are met."
+partly = "The file is right and the amount is not, or the amount is right with no place named."
+wrong = "Gives 40.00 from the README, or names neither the place nor the amount."
+cited = "The answer names the file."
+
+[[rubric.points]]
+id = "place"
+text = "Names shop/pricing/shipping.py (the function or the constant)."
+
+[[rubric.points]]
+id = "amount"
+text = "Gives 50.00 as the threshold."

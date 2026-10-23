@@ -1,0 +1,219 @@
+# docs-watch.toml
+#
+# Maps source-code path globs to end-user-docs pages. Consumed by
+# `workforce docs curate` (CLI) and `.github/workflows/docs-curator.yml`
+# (on push to main). For each matched glob, the doc-curator agent opens
+# a PR drafting an update to the listed page(s).
+#
+# Schema:
+#   [[watch]]
+#   paths = ["crates/skills/src/adapters/slack/**/*"]
+#   pages = ["adapters/slack.mdx"]
+#
+# Multiple [[watch]] entries are allowed; pages may overlap.
+#
+# Use `**/*` (not just `**`) for recursive directory matching. The
+# `glob` crate's `glob()` walker treats trailing `**` as
+# "directories only" — files at any depth are excluded — even though
+# `glob::Pattern::matches` accepts the same pattern against file paths.
+# `**/*` works consistently across both APIs.
+
+# ─── Concepts ────────────────────────────────────────────────────────
+
+[[watch]]
+paths = [
+  "crates/hub/src/workflow_runtime.rs",
+  "crates/hub/src/workflow_tool.rs",
+  "crates/hub/src/def_cmd.rs",
+  "crates/agent-runtime/src/runner.rs",
+]
+pages = ["concepts/workflows.mdx"]
+
+[[watch]]
+paths = [
+  "crates/hub/src/agent_registry.rs",
+  "crates/hub/src/agent_tool.rs",
+  "crates/agent-runtime/src/llm/**/*",
+  "crates/agent-runtime/src/runner.rs",
+]
+pages = ["concepts/agents.mdx", "reference/agent-types.mdx"]
+
+[[watch]]
+paths = [
+  "crates/hub/src/api_handlers/subscriptions.rs",
+  "crates/hub/src/subscription/**/*",
+  "crates/common/src/subscription.rs",
+  "crates/core/src/subscription.rs",
+  "ui/src/components/subscriptions/**/*",
+]
+pages = ["concepts/subscriptions.mdx", "getting-started/connect-your-plan.mdx"]
+
+[[watch]]
+paths = [
+  "crates/hub/src/session_tool.rs",
+  "crates/hub/src/session_lifecycle.rs",
+  "crates/hub/src/session_scan.rs",
+  "crates/common/src/session.rs",
+]
+pages = ["concepts/sessions.mdx"]
+
+[[watch]]
+paths = [
+  "crates/knowledge-service/src/lib.rs",
+  "crates/knowledge-service/src/project.rs",
+  "crates/knowledge-service/src/schedule.rs",
+  "crates/hub/src/knowledge/**/*",
+]
+pages = ["concepts/knowledge.mdx"]
+
+[[watch]]
+paths = [
+  "crates/wasm-runtime/src/**/*",
+  "crates/hub/src/wasm_skill_tools.rs",
+  "crates/hub/src/wasm_skill_access.rs",
+  "crates/hub/src/skill_cmd.rs",
+  "crates/hub/src/skill_consent.rs",
+  "crates/hub/src/remote_mcp/skill_tools.rs",
+  "crates/hub/src/system_tool.rs",
+  "crates/hub/src/skill_catalog.rs",
+  "crates/skills/src/installer.rs",
+  "crates/skills/src/catalog.rs",
+]
+pages = ["concepts/skills.mdx"]
+
+[[watch]]
+paths = [
+  "crates/hub/src/playbook_tool.rs",
+  "crates/hub/src/playbook_runtime.rs",
+  "crates/hub/src/def_cmd.rs",
+]
+pages = ["concepts/playbooks.mdx"]
+
+[[watch]]
+paths = [
+  "crates/hub/src/monitor/**/*",
+  "crates/orchestrator/src/monitor/**/*",
+  "crates/hub/src/def_cmd.rs",
+]
+pages = ["concepts/monitors.mdx"]
+
+[[watch]]
+paths = [
+  "crates/hub/src/scheduler_tool.rs",
+  "crates/hub/src/scheduler.rs",
+  "crates/hub/src/reminder_tool.rs",
+]
+pages = ["concepts/schedules.mdx"]
+
+# ─── Adapters ────────────────────────────────────────────────────────
+
+[[watch]]
+paths = ["crates/skills/src/adapters/slack/**/*"]
+pages = ["adapters/slack.mdx"]
+
+[[watch]]
+paths = [
+  "crates/skills/src/adapters/jira/**/*",
+  "crates/local-mcp/src/tools/jira*.rs",
+]
+pages = ["adapters/jira.mdx"]
+
+[[watch]]
+paths = [
+  "crates/skills/src/adapters/linear/**/*",
+  "crates/local-mcp/src/tools/linear*.rs",
+]
+pages = ["adapters/linear.mdx"]
+
+[[watch]]
+paths = ["crates/skills/src/adapters/hubspot/**/*"]
+pages = ["adapters/hubspot.mdx"]
+
+[[watch]]
+paths = [
+  "crates/skills/src/adapters/metabase/**/*",
+  "crates/local-mcp/src/tools/metabase*.rs",
+]
+pages = ["adapters/metabase.mdx"]
+
+[[watch]]
+paths = ["crates/skills/src/adapters/datadog/**/*"]
+pages = ["adapters/datadog.mdx"]
+
+[[watch]]
+paths = ["crates/skills/src/adapters/google/**/*"]
+pages = ["adapters/gmail.mdx", "adapters/calendar.mdx", "adapters/drive.mdx"]
+
+# ─── Configuration ───────────────────────────────────────────────────
+
+[[watch]]
+paths = [
+  "crates/common/src/settings.rs",
+  "workforce.toml",
+]
+pages = ["configuration/index.mdx", "configuration/tiers.mdx"]
+
+[[watch]]
+paths = [
+  "crates/hub/src/vault.rs",
+  "crates/hub/src/vault_audit.rs",
+  "crates/hub/src/vault_policy.rs",
+  "crates/hub/src/vault_tool.rs",
+  "crates/common/src/secret_marker.rs",
+]
+pages = ["configuration/vault.mdx"]
+
+[[watch]]
+paths = ["crates/policy-engine/**/*"]
+pages = ["configuration/policies.mdx"]
+
+# ─── CLI ─────────────────────────────────────────────────────────────
+
+[[watch]]
+paths = ["crates/cli/src/**/*"]
+pages = ["cli.mdx"]
+
+# ─── Reference ───────────────────────────────────────────────────────
+
+[[watch]]
+paths = [
+  "crates/agent-runtime/src/llm/tool_filter.rs",
+  "crates/hub/src/agent_tool.rs",
+  "crates/local-mcp/src/tools/**/*",
+  "crates/local-mcp/src/remote.rs",
+]
+pages = ["reference/tools.mdx"]
+
+# ─── Getting started ─────────────────────────────────────────────────
+
+[[watch]]
+paths = [
+  "crates/cli/src/main.rs",
+  "workforce.toml",
+  "README.md",
+]
+pages = ["getting-started/installation.mdx"]
+
+[[watch]]
+paths = [
+  "crates/hub/src/workflow_runtime.rs",
+  "crates/cli/src/main.rs",
+]
+pages = ["getting-started/first-workflow.mdx"]
+
+[[watch]]
+paths = [
+  "crates/hub/src/remote_mcp/**/*",
+  "crates/hub/src/api_handlers/remote_mcp_tokens.rs",
+  "crates/identity/src/remote_mcp_token.rs",
+  "crates/local-mcp/src/remote.rs",
+]
+pages = ["reference/remote-mcp.mdx"]
+
+[[watch]]
+paths = [
+  "crates/cli/src/evals/**/*",
+  "crates/hub/src/eval_grader.rs",
+  "fixtures/evals/example/**/*",
+]
+pages = ["reference/evals.mdx", "cli.mdx"]

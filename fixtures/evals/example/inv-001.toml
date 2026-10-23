@@ -1,0 +1,36 @@
+id = "inv-001"
+use_case = "investigation"
+question = "Why did checkout fail for some customers on the evening of 4 March 2026?"
+expected = "The payment provider's API key expired at 18:00 UTC, so every card payment was refused with a 401 until the key was rotated at 19:20 UTC. Ticket SHOP-812 records the rotation."
+assumptions = ["Times are UTC."]
+trap = "A deploy went out at 17:45 UTC and is the obvious suspect; the logs show checkouts succeeding for fifteen minutes after it."
+ideal_evidence = """
+logs: service:checkout status:error 2026-03-04T18:00Z..19:20Z -> "payment provider returned 401"
+ticket: SHOP-812 "Rotate payment API key"
+"""
+
+[[evidence]]
+kind = "log"
+name = "service:checkout errors, 4 March 2026 18:00-19:20 UTC"
+
+[[evidence]]
+kind = "ticket"
+name = "SHOP-812"
+
+[rubric]
+correct = "Cause and window are both right."
+partly = "Names the payment provider's refusals without the expired key, or gets the cause right and the window wrong."
+wrong = "Blames the 17:45 deploy, or gives no cause."
+cited = "The answer points at the checkout error logs or the ticket."
+
+[[rubric.points]]
+id = "cause"
+text = "Says the payment provider's API key had expired."
+
+[[rubric.points]]
+id = "window"
+text = "Places the failures between about 18:00 and 19:20 UTC."
+
+[[rubric.points]]
+id = "ruled-out"
+text = "Says why the 17:45 deploy is not the cause."

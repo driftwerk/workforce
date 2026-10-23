@@ -1,0 +1,60 @@
+/target
+**/*.rs.bk
+*.pdb
+.env
+.env.local
+*.log
+
+# Credentials and keys — never commit
+aws-creds.txt
+*.env
+!deploy/.env.example
+hub.env
+*.pem
+!crates/skills/src/adapters/github/test_app_key*.pem
+*.key
+*.p8
+*.mobileprovision
+credentials.json
+service-account*.json
+secrets.toml
+id_rsa*
+
+# Throwaway scripts and local worktrees
+/scratch/
+/.worktrees/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Xcode
+*.xcuserstate
+xcuserdata/
+
+# OS
+.DS_Store
+Thumbs.db
+.connect
+.local-connect
+.local/
+
+# fastembed downloads the ONNX model to this cache on first use. The model
+# is ~130 MB and is fetched on demand by the local-mcp binary.
+.fastembed_cache/
+
+# Doc-curator state — per-machine cache of hashes/sessions for `workforce docs curate`
+.curator-state/
+
+# UI
+ui/node_modules/
+ui/dist/
+.claude/worktrees/
+.claude
+certs/
+*.p12
+*.p12.b64
+.cache-meta
+data/

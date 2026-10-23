@@ -1,0 +1,55 @@
+# Image-generation model tier equivalences across providers.
+#
+# Mirrors default_vision_tiers.toml but for text->image generation. The
+# `[llm.image].model` spec is resolved against this table via the same
+# `provider:upstream:tier` shorthand grammar used everywhere else.
+#
+# To override: place an `image_tiers.toml` in your workspace root with the
+# sections you want to change. Your file is merged on top of these defaults.
+#
+# NOTE: model ids and (for Bedrock) regional availability MUST be verified per
+# install before relying on them — Bedrock image models require per-model
+# access opt-in and are not offered in every region (eu-west-2 in particular).
+
+# Google — direct Gemini API (AI Studio, generativelanguage endpoint, API key).
+# Mirrors the openrouter.google lineup. The `gemini-*-image*` models generate
+# via :generateContent; an `imagen-*` id would route via :predict instead.
+# The GA ids; each generated an image (verified 2026-10-19).
+[gemini]
+powerful = "gemini-3-pro-image"
+standard = "gemini-3.1-flash-image"
+cheap    = "gemini-3.1-flash-lite-image"
+
+# Google via OpenRouter — conversational image models (Imagen is not an
+# OpenRouter route). 2.5-flash-image is the stable baseline; the 3.x previews
+# are the newer, higher-quality generation.
+[openrouter.google]
+powerful = "google/gemini-3-pro-image"
+standard = "google/gemini-3.1-flash-image"
+cheap    = "google/gemini-3.1-flash-lite-image"
+
+# AWS Bedrock — Stability models (highest quality ceiling on Bedrock).
+[bedrock.stability]
+powerful = "stability.stable-image-ultra-v1:1"
+standard = "stability.stable-image-ultra-v1:1"
+cheap    = "stability.stable-image-core-v1:1"
+
+# AWS Bedrock — Amazon Nova Canvas (well-integrated, lower cost).
+[bedrock.nova]
+powerful = "amazon.nova-canvas-v1:0"
+standard = "amazon.nova-canvas-v1:0"
+cheap    = "amazon.nova-canvas-v1:0"
+
+# AWS Bedrock — Amazon Titan Image Generator. Fallback for when Nova Canvas is
+# marked legacy in the target region; uses the same TEXT_IMAGE payload.
+[bedrock.titan]
+powerful = "amazon.titan-image-generator-v2:0"
+standard = "amazon.titan-image-generator-v2:0"
+cheap    = "amazon.titan-image-generator-v2:0"
+
+# Self-hosted FLUX / SD via an OpenAI-compatible (or custom) endpoint. Set
+# `[llm.image].url` to the deployment. FLUX.1-dev runs comfortably on an A100.
+[vllm]
+powerful = "black-forest-labs/FLUX.1-dev"
+standard = "black-forest-labs/FLUX.1-dev"
+cheap    = "stabilityai/stable-diffusion-3.5-large"

@@ -1,0 +1,158 @@
+---
+title: Sessions
+description: Persistent conversation context with automatic compaction, thread rollover, and long-term storage.
+---
+
+A session is the persistent history of a conversation between you and an agent. It stores the full transcript, tracks usage, and manages the LLM’s context window to keep conversations flowing indefinitely.
+
+## Session basics
+
+A session belongs to a specific channel (like Slack, the CLI, or the mobile app), a specific owner (like your user ID), and a specific agent. It records every message exchanged, including system instructions, your requests, the agent's replies, and tool calls.
+
+Each session is a **thread**, meaning a long-running conversation you can return to. Sessions automatically maintain the conversation’s context, preserve the full transcript for you to review, and handle the technical limits of the LLMs used.
+
+### Message types
+
+A session holds messages with different roles:
+
+- **System**: The agent's instructions—what it is and how it should behave.
+- **User**: Your requests and messages.
+- **Assistant**: The agent's responses.
+- **Tool**: The record when the agent uses a tool, like reading a file or creating a calendar event.
+
+## Long conversations and context management
+
+LLMs have a maximum context window (a limit on how much text can be included in a single request). When a session's history gets too large to fit, Workforce automatically compacts it to stay within the limit while preserving the conversation's intent. This happens in the background and doesn’t interrupt your workflow.
+
+### Automatic compaction
+
+When a session’s history approaches the context limit, several things can happen automatically:
+
+- **Summarisation**: The oldest parts of the conversation are replaced with a brief summary, leaving recent messages intact.
+- **Output pruning**: Large tool outputs (like long file contents) can be truncated in older messages to save space.
+- **Selective eviction**: Tool outputs that are no longer needed can be replaced with a placeholder so the agent can re-fetch them if necessary.
+- **Tool input pruning**: Tool input parameters in older messages are automatically trimmed to save space, ensuring the key information (like file paths) is retained while reducing bulk.
+
+You control this behavior through the [`CompactionConfig`](#compaction-configuration) options.
+
+### Session rollover
+
+For very long-running conversations, a session can “roll over.” The current session is sealed (marked as complete), and a fresh session is started that carries forward a summary of the important context and the most recent messages. This keeps the active conversation lightweight while preserving the entire history across the chain of sessions.
+
+For example, a thread in Slack that has been going for weeks might be split across several rolled-over sessions. You can still view the entire thread history seamlessly.
+
+### Viewing the full history
+
+The full, uncompressed transcript of a session is preserved in an archive, separate from the context used by the LLM. This means you can always drill down into the original details of past conversations, even after compaction or rollover has occurred.
+
+## Session storage and lifecycle
+
+Sessions are stored persistently using JSONL files (one line per message) along with a metadata file. They are loaded lazily into memory for performance.
+
+### Lifecycle and cleanup
+
+You can configure policies for automatic session cleanup or reset:
+
+- **Daily reset**: Clear the messages of a session at a specific hour each day (e.g., at 4 AM local time).
+- **Idle expiry**: Delete sessions that have been inactive for a configured duration (e.g., 60 minutes).
+
+Policies can be set globally, per channel (e.g., different rules for Slack vs. CLI), or per conversation type (direct message vs. group channel vs. thread). Empty sessions (with no messages) are never deleted automatically.
+
+### Searching and exporting
+
+You can search across all session transcripts, view paginated history, and export a complete session (with statistics) as a single JSON file for backup or analysis.
+
+## Session tool
+
+Agents have a built-in `session.set_label` tool to set a human-readable name on the current session (e.g., “Linear triage” or “May bug review”). This makes it easier to identify sessions in logs and UI listings.
+
+## Compaction configuration
+
+The default compaction settings are designed for long conversations with Claude, but you can adjust them per-agent if needed.
+
+<Callout type="info">
+The defaults are tuned for a 200,000-token context window and aim to keep usage below 80% of that limit.
+</Callout>
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `max_context_tokens` | 200,000 | The maximum context window size for the LLM. |
+| `compaction_threshold` | 0.8 | The fraction of the max tokens at which compaction is triggered (80%). |
+| `keep_recent_messages` | 20 | The number of recent messages to always keep intact during compaction. |
+| `urgent_compaction_threshold` | 0.95 | When usage passes this fraction, compaction must run immediately before the agent replies (95%). |
+| `rollover_warning_ratio` | 0.70 | When usage reaches this fraction of the compaction threshold, a rollover is suggested (70% of 80% = 56% of max). |
+| `prune_tool_outputs` | `true` | Enable lightweight truncation of large tool outputs as an alternative to full summarisation. |
+| `prune_tool_output_max_chars` | 2000 | Maximum characters in a tool output before it's truncated. |
+| `prune_tool_input_max_chars` | 1024 | Maximum characters in a tool input before it's truncated in older messages. |
+| `enable_memory_flush` | `true` | Extract important context to long-term memory files before compacting. |
+| `compaction_model` | `None` | Use the agent's default model for summarisation tasks. Can be set to a faster model (like Claude Haiku) for speed. |
+| `max_compaction_passes` | 3 | Maximum compaction iterations per cycle — safety valve. |
+| `min_messages_to_compact` | 5 | Minimum messages to compact — skip if fewer non-system messages would be replaced. |
+| `rollover_keep_recent` | 4 | Recent turns carried verbatim into a rolled-over session, on top of the carry-over summary. |
+| `flush_prompt` | `None` | Custom system prompt for memory flush (what to persist before compaction). |
+| `summary_prompt` | `None` | Custom system prompt for conversation summarisation. |
+
+## Thread rollover explained
+
+When a session grows very long, it may become more efficient to start a fresh session rather than continually compacting the same one. Thread rollover works like this:
+
+1. The current session is sealed and becomes read-only.
+2. A new session is created with the same channel, owner, and agent.
+3. A summary of the old conversation is carried over as a system message in the new session.
+4. The most recent few messages are copied verbatim to provide immediate context.
+5. The chain of sessions is linked together so the full thread history can be read seamlessly.
+
+Rollovers preserve the entire original transcript in the archive. You can view the entire thread as one continuous conversation, even though it spans multiple session files.
+
+## Automatic cleanup policies
+
+Sessions can be automatically cleaned up based on daily reset times and idle expiry. Policies can be set globally, per channel (like Slack or CLI), or per conversation type (direct message, group channel, or thread).
+
+### Daily reset
+- Sessions are cleared (messages removed) at a specific hour each day in your local time zone.
+- You can disable this for certain channels (e.g., Slack sessions never reset daily).
+
+### Idle expiry
+- Sessions that have been inactive for a configured duration are deleted.
+- You can set different expiry times per channel or conversation type.
+- Empty sessions (with no messages) are never deleted.
+
+### Example configuration
+
+Session lifecycle policies are defined in your agent or workspace configuration. Here’s an example that sets different rules for Slack channels:
+
+```yaml
+session_lifecycle:
+  daily_reset_hour: 4          # Clear sessions at 4 AM local time
+  idle_expiry_minutes: 1440    # Delete sessions inactive for 24 hours
+  archive_expired: true        # Save a transcript backup before deletion
+  check_interval_secs: 300     # Run cleanup every 5 minutes
+
+session_policies:
+  channels:
+    slack:
+      daily_reset: false       # Slack sessions never reset daily
+      idle_expiry_minutes: 0   # Slack sessions never expire due to inactivity
+```
+
+<Callout type="warn">
+Only sessions that contain messages are subject to cleanup. Empty sessions are always preserved.
+</Callout>
+
+## Session secrets protection
+
+Sessions automatically redact secrets (like API tokens) stored in message content and tool data. This happens in the background and is idempotent—already redacted values stay safe.
+
+<Callout type="info">
+Redaction uses the same pattern catalogue as the rest of Workforce, so `[[secret:...]]` markers remain untouched.
+</Callout>
+
+## Claude Code sessions
+
+When using Claude Code, Workforce maintains a persistent session UUID so Claude can resume the conversation across multiple turns. If Claude reports the session is missing (the on‑disk transcript was deleted), Workforce automatically clears the UUID and starts a fresh session without prior context.
+
+You can also pin a specific agent for Claude Code conversations, ensuring thread continuations route to the same vault.
+
+## Voice mode
+
+For conversations happening via voice (iOS client), sessions can be marked with `voice_mode: true`. This influences summarisation and memory flush to preserve conversational substance and emotional context, rather than just focusing on task state.

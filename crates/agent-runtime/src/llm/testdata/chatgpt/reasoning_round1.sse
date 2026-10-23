@@ -1,0 +1,83 @@
+HTTP 200
+x-codex-active-limit: premium
+x-codex-plan-type: prolite
+x-codex-primary-used-percent: 0
+x-codex-secondary-used-percent: 0
+x-codex-primary-window-minutes: 10080
+x-codex-primary-over-secondary-limit-percent: 0
+x-codex-secondary-window-minutes: 0
+x-codex-primary-reset-after-seconds: 603023
+x-codex-secondary-reset-after-seconds: 0
+x-codex-primary-reset-at: 1791270464
+x-codex-secondary-reset-at: 
+x-codex-credits-has-credits: False
+x-codex-credits-balance: 0
+x-codex-credits-unlimited: False
+x-codex-turn-state: gAAAAABqu2qymdis-r2tt9roB8-BJeYMZHmdzInQk1l3UWOkyoqO6rZS4pNqcPz_AxJ8KgdlNuU6P1ucOy696PbLWk2PpyVZRuwpGnFss64AVVlbi9e7KSR4zMWT_9JSwEGnyftRpusvBvNDQJfoixveqw_iPwOK7gbWZAM-LRX6CDSZ0YzygdgMRXxh0fwPjNA9fKQv4mkNNx8qKFTKAe518ffOBVO_ugLhgVjbr0ik42sWxwg3Vvj1U7dbqkiLYqzkZNiLpFKhvw_HJls5XgypMiI2piKUPfDPx5h6YaHj0Gmy9eNAnU7_uxUCuieSSgwpRJGBbqelbpbvLxegJcyk-k3j661T54BBwkZc9Zv7QBqhpXVfggRUB1TtuBlDs672drh5qCRinR_4GVu998bKC_DjN-2AQu_beeuSHEHSXkl9_Td6_RJ69XWzDloFKwYPejJcFmMh6QmsMo98l4Ut1XGUkKzN1nJQvD0jJ2cqNRdn3yGMHgoSJTZYiwXZS0Pv_OaHFehWOJuYiU2L0ZWfXLxUJ5MBV8-z4GFPvANqmxbuzlq1rmu35z7gwo9J-jQH-qX1x3oAzDleWP5fOv9HFyNi_OjL8Ui2T2ct1gOPnSlMcUO-bj4fInLg_JMC1BKFRImrd8Jk3yOtDjzQcG_i09Mv_aYLqozh19duPYl9EFYDiRI3p4r2i3tBhrQw72jlxz-fAT73a7zueCKwBMlXq9ejipfgBykVOPRph9xxZBzYPOZd7ornyy5uy8N4wFEBM3zOSo6u
+
+event: response.created
+data: {"type":"response.created","response":{"id":"resp_05d7ba13acf1d7e5016abb6ab2506887d281bf9715ec64a878","object":"response","created_at":1790667442,"status":"in_progress","access_programs":{"cyber":"daybreak_blue"},"background":false,"completed_at":null,"error":null,"frequency_penalty":0.0,"incomplete_details":null,"instructions":"You are Allan, a concise assistant. Use tools when asked.","max_output_tokens":null,"max_tool_calls":null,"model":"gpt-5.5","moderation":null,"output":[],"parallel_tool_calls":true,"presence_penalty":0.0,"previous_response_id":null,"prompt_cache_key":"00000000-0000-4000-8000-000000000004","prompt_cache_retention":"24h","reasoning":{"context":"current_turn","effort":"high","mode":"standard","summary":"detailed"},"safety_identifier":"user-000000000000000000000002","service_tier":"auto","store":false,"temperature":1.0,"text":{"format":{"type":"text"},"verbosity":"medium"},"tool_choice":"auto","tool_usage":{"image_gen":{"input_tokens":0,"input_tokens_details":{"image_tokens":0,"text_tokens":0},"output_tokens":0,"output_tokens_details":{"image_tokens":0,"text_tokens":0},"total_tokens":0},"web_search":{"num_requests":0}},"tools":[{"type":"function","description":"Get the weather for a city","name":"weather_get","output_schema":null,"parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]},"strict":false},{"type":"function","description":"Get the local time for a city","name":"time_get","output_schema":null,"parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]},"strict":false}],"top_logprobs":0,"top_p":0.98,"truncation":"disabled","usage":null,"user":null,"metadata":{}},"sequence_number":0}
+
+event: response.in_progress
+data: {"type":"response.in_progress","response":{"id":"resp_05d7ba13acf1d7e5016abb6ab2506887d281bf9715ec64a878","object":"response","created_at":1790667442,"status":"in_progress","access_programs":{"cyber":"daybreak_blue"},"background":false,"completed_at":null,"error":null,"frequency_penalty":0.0,"incomplete_details":null,"instructions":"You are Allan, a concise assistant. Use tools when asked.","max_output_tokens":null,"max_tool_calls":null,"model":"gpt-5.5","moderation":null,"output":[],"parallel_tool_calls":true,"presence_penalty":0.0,"previous_response_id":null,"prompt_cache_key":"00000000-0000-4000-8000-000000000004","prompt_cache_retention":"24h","reasoning":{"context":"current_turn","effort":"high","mode":"standard","summary":"detailed"},"safety_identifier":"user-000000000000000000000002","service_tier":"auto","store":false,"temperature":1.0,"text":{"format":{"type":"text"},"verbosity":"medium"},"tool_choice":"auto","tool_usage":{"image_gen":{"input_tokens":0,"input_tokens_details":{"image_tokens":0,"text_tokens":0},"output_tokens":0,"output_tokens_details":{"image_tokens":0,"text_tokens":0},"total_tokens":0},"web_search":{"num_requests":0}},"tools":[{"type":"function","description":"Get the weather for a city","name":"weather_get","output_schema":null,"parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]},"strict":false},{"type":"function","description":"Get the local time for a city","name":"time_get","output_schema":null,"parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]},"strict":false}],"top_logprobs":0,"top_p":0.98,"truncation":"disabled","usage":null,"user":null,"metadata":{}},"sequence_number":1}
+
+event: response.output_item.added
+data: {"type":"response.output_item.added","item":{"id":"rs_05d7ba13acf1d7e5016abb6ab3096c87d2b2a8209bff5281ea","type":"reasoning","content":[],"encrypted_content":"gAAAAABqu2qzC8KnGAxxhr1Or3v5migvy1PEpdETcvUlCslnp8goiV3rgMmtgXHiY1DjIX0LVfL_BtMtIE9Td-eoF6BSE4eBt-bHtxBldZ_OOOgnYdgCH9IGpTS5Di_9428nK40JHwGZ96fZyri_ABymsy3bYshNcGqYEGth5_aWfdM6BS2-G-dQK0vl2sT9Qr2UIdqDOW4nXeSQsL7d07gEiwFLGSRF0H3XYcMbSOVBWzNW2kbKF5aAtikMqzuAQRK472DiFdECYBnW5LHqyTOpjKbZs4p2yjeUBoaPjgQJx-qSGsdgXDgay3bQy1UOXzvXb9Gh8MKoKnCKtDeJNZ-QT1tKzJLIMhwC3LtTUuPhZClKbgMmyyHYBXZGmkW5-ST2AiNmQhFAiIo6HHRndhkYxvxfArbKHOZZm1lvHhqM9DYWtsunBK2Jh-JHi7UUzblw3MGkou-w7ZnWEqmIcJD2x6HI0lU8PUEqNdK_7VleQ5Of-1Liif1s4opXiCjCamNs_sEl51h9x7_0Ean9J18-6JBhM8zBEJ049ecdcy_Yw7F797gYNeVGPCuC1m74QOSO_jG3JdxMvrWrqfCERdoBSiojLpOESp0qzuutv3Wn-LUw-0qFvF5Td2qriisthsyYiCKJl3WYxY6Khgyoldl6o5Xzxw_HudX4ktLsJ-R4CNSUTGJTo85eDLLivHIpxKeDLDypgoUoi_wQPT7Uip9O4rk8DB4ipeozBZlRuXWkxqnbrDhjE4CV7USsxWXg1zGp7AlE3VAMkk1-tFOIBcgg5zZUlNGJ73T73detT8GGdCd68Rl8AOzysubhP6k6WM7FGuRSS81SWjVjqTe4taN7sXlxCdS8fd-PSiKvS8lflOX7LxgE7M9p_7sesPUpiIYmlHww9jKxfHZIu71Q_dJPzwNbdZZ_CQVBXsEIgMmBFom5vMKYhUPPvuAmb7xQLhHDqgbk7T6hoUdx46PHuNG2dNKgOmzxxKz2NmCq5Iu_bkgBm6DK0dSjJPUitjOJjHqY8xqG7tA7LsrvEQNYmi9yePmBHy4S-Zk9d6D-ddHTrNQfBZyvAhWCsoLZGNgbvIMmmd2QIJZA67RJTSACHrdgcHl_v_FlTdWOBUFm3UUzSjsIfJRyJbfoYYP0klBSPiHsc-Gp6kO3V-A_2hpX6Ut8JvFVgRF8WzepNte150TJE0vVJsO-BXlho4Lc5ksxbZ__nMp7oDhyqZNYorKcT1_decthcxCOHoPwc-vDaQx0jy9oB-R4bp4T_-AXzIkP4a3XN--lj16s","summary":[]},"output_index":0,"sequence_number":2}
+
+event: response.reasoning_summary_part.added
+data: {"type":"response.reasoning_summary_part.added","item_id":"rs_05d7ba13acf1d7e5016abb6ab3096c87d2b2a8209bff5281ea","output_index":0,"part":{"type":"summary_text","text":""},"sequence_number":3,"summary_index":0}
+
+event: response.reasoning_summary_text.delta
+data: {"type":"response.reasoning_summary_text.delta","delta":"**Calculating precise arrival time**","item_id":"rs_05d7ba13acf1d7e5016abb6ab3096c87d2b2a8209bff5281ea","obfuscation":"22BmBi87R3Oy","output_index":0,"sequence_number":4,"summary_index":0}
+
+event: response.reasoning_summary_text.done
+data: {"type":"response.reasoning_summary_text.done","item_id":"rs_05d7ba13acf1d7e5016abb6ab3096c87d2b2a8209bff5281ea","output_index":0,"sequence_number":5,"summary_index":0,"text":"**Calculating precise arrival time**"}
+
+event: response.reasoning_summary_part.done
+data: {"type":"response.reasoning_summary_part.done","item_id":"rs_05d7ba13acf1d7e5016abb6ab3096c87d2b2a8209bff5281ea","output_index":0,"part":{"type":"summary_text","text":"**Calculating precise arrival time**"},"sequence_number":6,"summary_index":0}
+
+event: response.reasoning_summary_part.added
+data: {"type":"response.reasoning_summary_part.added","item_id":"rs_05d7ba13acf1d7e5016abb6ab3096c87d2b2a8209bff5281ea","output_index":0,"part":{"type":"summary_text","text":""},"sequence_number":7,"summary_index":1}
+
+event: response.reasoning_summary_text.delta
+data: {"type":"response.reasoning_summary_text.delta","delta":"**Planning to retrieve weather data**","item_id":"rs_05d7ba13acf1d7e5016abb6ab3096c87d2b2a8209bff5281ea","obfuscation":"vpxyPv7jD8L","output_index":0,"sequence_number":8,"summary_index":1}
+
+event: response.reasoning_summary_text.done
+data: {"type":"response.reasoning_summary_text.done","item_id":"rs_05d7ba13acf1d7e5016abb6ab3096c87d2b2a8209bff5281ea","output_index":0,"sequence_number":9,"summary_index":1,"text":"**Planning to retrieve weather data**"}
+
+event: response.reasoning_summary_part.done
+data: {"type":"response.reasoning_summary_part.done","item_id":"rs_05d7ba13acf1d7e5016abb6ab3096c87d2b2a8209bff5281ea","output_index":0,"part":{"type":"summary_text","text":"**Planning to retrieve weather data**"},"sequence_number":10,"summary_index":1}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","item":{"id":"rs_05d7ba13acf1d7e5016abb6ab3096c87d2b2a8209bff5281ea","type":"reasoning","content":[],"encrypted_content":"gAAAAABqu2q5gPykw7cY4RRGc5TPI23oXuKG-GIymiFt4sEBgofm8-GPr00ZKu-_MsO8yT_k6pqQt8k-PB6hSFrPlIa5qyCGeHazdNhOKZDvzXqdXvzYGFOhAWNcaDwqv-wQmh5PQ-AxYNaTe5o_CjZWKea6TdHLtzkagHgLBZEcENn5KrYHFtq5tsY87_dg-N0BziVFRz-c54gh-CYtl9l_q11vno36o1gAYH-yqTwT7cjhE8JzVM1UzJxMEExcioVwbAP4ymk6qIGOaNvaxQiWwt0p9c1GSQOBuWV8HAovq9LopwM9hGHy6umClSTPG0227bU-_QOeaYpTSvw3YizpnumBYhjsMBLwybPmj1xnVXRBNetlKpyV5q3cZvOAxRGJ7jy6pcnlACZmj_EfHkAVxufWfrVghJzvtsDu5kbmcnagN1_ZRh8iL0WoC2NL8uTaXasJCa1oI0BD_RF5hPXfr4d_EcOXfp00IG1ptbRBaWuyL_ZE2Th3MF0zhi9KwanXApQPSJzJXfMkJChzIoD0GZHW5qKS5myf30HzGuHjYtMB2b4medzHCkiiPVcPn1AwV0Lpd763jm-R0p7MOafk9SvGuGQnwvfNnVM4cZmh7JxECjT2MlN4q4ZvH-ou8OMFV_Wq_g4xw_e3z_xvCL5YAz75WEXeTSJAMr3V4ki05wJdZUzWy0cb1hNOUSnNUGXTVsU11caofWQBcFZzMb01HXAZj2a4YNICiC8sKcIg8AvvT0P0dyEiPUwN7okL0nRSopo8PNkkPJbQw3FMJadRy9x5XfSD4VKzVyOzah1i4waEJqheiAE0zhNa6qNd9V3VukuRxe7KLZKeP4SvbsGLCF2e68CK3_t3aWRPRsSDc-2eIIb9aE7_9G_B5a5lEdOeesIN4qfK_OzFBToAUCTDg3P3yG6HD_JYUmuxPltns7IqmzT3VREAcV7MHvRE9IhLxEs8HRtZjePjHqbRr_17KkfXfIbjwmbrKbQt95xA4snN-sqtTDZgZpkGIUwSg9N6zKluopZ7G3hikxinTfpz1_NkUGBN6jBmJqRQ_2IrZSpCefpFfAhJ2eibL8Q4IZ4Ac8DWvbLCx6K3njEGZttJAkWfwSSknAqCjlf7mAnVi6TXUZHMsYZf7e3ngKGm4UmWX2C2CVJ4m85w_WzsiwYX_A2VOwve3j5Bwo7vetl-wxZ6-xY0fOdU3FkPJcmdx2wObudX8OfIVXBr8y-iW2ClWuY6ZZ74bbCgcHeJvcU2RQTAa9UEK5kn55F4mfiTYGuu-PJ55gcRb1hnXW-uj-IGONxAagJVKWQMgUciZ6RbKE2xqSbsAfZmb6mOCiX-9LkoCS7h49AulvVqEihoXG-Go5if2DCtTT0MmbCRJJSMbLLCl12SMbNI9iWahEGfZZ0TMPL7BFWHT7p300hKy_cR_4RnRoDB0Nj4_KzXIpMzWpKyLH1BXHE1D-dh-Csx9ibQ1HI5s4dNwLvVgKJYBNAoa-fz7efROXA5xzf8caU3XzbIthvBk9AOAS51alDOjA77qmnyuHj4oBuU8rrmdMulPFntu5hQ3_aRNrnielIuegknyt6fGi6y4eK0HhkhYM-p0ugpva35vS4bP4NGezg0XNtyjXfRfauZQwIQyRUYbX1tFiIFJyiKhMbdzli-EcD1SOTth9djzKhK57VeEQ-SKlnx3Me8Kwx4OuIEWBnxyupw90vhqKwuKktXtdvql2a9n2GmXspcv7sZ7-A5IZV8pILSJBx4csJDLM71lDlzIiWgLPMVW86rBMM0qLA1gyRX61latci6kfr4i9nFWVSEhTaC3ZCPKmpD6To9CUfbSLRsS6kzz64wHAXZydmvlA3CaKWxwDwn03W46ezulvesF5s2qE-hRhReWo8OX189zCMEJijNwsTyHFVN0lPwWouNjBh0qre0TmxRYRGcjaR3xRvRy-2uD5FZFke1I7Gk9UMloFL--kxUUH2kVC0IDpKIymUmnpd_eXPGqkQe1VPVMlhBM5gTEk1obAd1DQXqDMwuJiv82JlAIa86flzp8AhWhVuGeI6UcTIX3KUj2f1-mdqhKxgnqRYPMgVk-ddEgwuLWsTaluVD_2h6VyUye0MfoIIGfMMb_u5AhLWxYAlKkJjUaLrnQXsmqmy1S569sUKP-rOJyVoUDkP7qQYP7tKgH3LjEaXTMdod0Hf7M68hpEFlHDgH_Yf2S5Vbn_BTO_RVqXEYcv0vYkygJhofAevBQ8CTza0kswmJ_jeA_KPSqvXG7MVlZx1oabec08f8SNvOKkQqIBvFN9z40N2svxgwSO1bnyE7X0eoo1utl7ycutZwO9w5pQ==","summary":[{"type":"summary_text","text":"**Calculating precise arrival time**"},{"type":"summary_text","text":"**Planning to retrieve weather data**"}]},"output_index":0,"sequence_number":11}
+
+event: response.output_item.added
+data: {"type":"response.output_item.added","item":{"id":"fc_05d7ba13acf1d7e5016abb6ab907cc87d299677fcc25110978","type":"function_call","status":"in_progress","arguments":"","call_id":"call_6JPb4dhlUdE5VixNMYxOcxX3","name":"weather_get"},"output_index":1,"sequence_number":12}
+
+event: response.function_call_arguments.delta
+data: {"type":"response.function_call_arguments.delta","delta":"{\"","item_id":"fc_05d7ba13acf1d7e5016abb6ab907cc87d299677fcc25110978","obfuscation":"SXaQfg7iPoLRKc","output_index":1,"sequence_number":13}
+
+event: response.function_call_arguments.delta
+data: {"type":"response.function_call_arguments.delta","delta":"city","item_id":"fc_05d7ba13acf1d7e5016abb6ab907cc87d299677fcc25110978","obfuscation":"mb8SfjvUUoE1","output_index":1,"sequence_number":14}
+
+event: response.function_call_arguments.delta
+data: {"type":"response.function_call_arguments.delta","delta":"\":\"","item_id":"fc_05d7ba13acf1d7e5016abb6ab907cc87d299677fcc25110978","obfuscation":"Xmi0Ce1oG0v1w","output_index":1,"sequence_number":15}
+
+event: response.function_call_arguments.delta
+data: {"type":"response.function_call_arguments.delta","delta":"Port","item_id":"fc_05d7ba13acf1d7e5016abb6ab907cc87d299677fcc25110978","obfuscation":"rVWCFdQZYfJp","output_index":1,"sequence_number":16}
+
+event: response.function_call_arguments.delta
+data: {"type":"response.function_call_arguments.delta","delta":"o","item_id":"fc_05d7ba13acf1d7e5016abb6ab907cc87d299677fcc25110978","obfuscation":"UJLeon7C1vtiIKZ","output_index":1,"sequence_number":17}
+
+event: response.function_call_arguments.delta
+data: {"type":"response.function_call_arguments.delta","delta":"\"}","item_id":"fc_05d7ba13acf1d7e5016abb6ab907cc87d299677fcc25110978","obfuscation":"H5wwHDms30qCwG","output_index":1,"sequence_number":18}
+
+event: response.function_call_arguments.done
+data: {"type":"response.function_call_arguments.done","arguments":"{\"city\":\"Porto\"}","item_id":"fc_05d7ba13acf1d7e5016abb6ab907cc87d299677fcc25110978","output_index":1,"sequence_number":19}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","item":{"id":"fc_05d7ba13acf1d7e5016abb6ab907cc87d299677fcc25110978","type":"function_call","status":"completed","arguments":"{\"city\":\"Porto\"}","call_id":"call_6JPb4dhlUdE5VixNMYxOcxX3","name":"weather_get"},"output_index":1,"sequence_number":20}
+
+event: response.completed
+data: {"type":"response.completed","response":{"id":"resp_05d7ba13acf1d7e5016abb6ab2506887d281bf9715ec64a878","object":"response","created_at":1790667442,"status":"completed","access_programs":{"cyber":"daybreak_blue"},"background":false,"completed_at":1790667449,"error":null,"frequency_penalty":0.0,"incomplete_details":null,"instructions":"You are Allan, a concise assistant. Use tools when asked.","max_output_tokens":null,"max_tool_calls":null,"model":"gpt-5.5","moderation":null,"output":[],"parallel_tool_calls":true,"presence_penalty":0.0,"previous_response_id":null,"prompt_cache_key":"00000000-0000-4000-8000-000000000004","prompt_cache_retention":"24h","reasoning":{"context":"current_turn","effort":"high","mode":"standard","summary":"detailed"},"safety_identifier":"user-000000000000000000000002","service_tier":"default","store":false,"temperature":1.0,"text":{"format":{"type":"text"},"verbosity":"medium"},"tool_choice":"auto","tool_usage":{"image_gen":{"input_tokens":0,"input_tokens_details":{"image_tokens":0,"text_tokens":0},"output_tokens":0,"output_tokens_details":{"image_tokens":0,"text_tokens":0},"total_tokens":0},"web_search":{"num_requests":0}},"tools":[{"type":"function","description":"Get the weather for a city","name":"weather_get","output_schema":null,"parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]},"strict":false},{"type":"function","description":"Get the local time for a city","name":"time_get","output_schema":null,"parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]},"strict":false}],"top_logprobs":0,"top_p":0.98,"truncation":"disabled","usage":{"attribution":{"items":{"msg_05d7ba13acf1d7e5016abb6ab25b8887d2ba7c877dbca967e4":{"cache_write_tokens":0,"cached_tokens":0,"content":[{"cache_write_tokens":0,"cached_tokens":0,"input_tokens":56,"output_tokens":0}],"input_tokens":56,"output_tokens":0},"rs_05d7ba13acf1d7e5016abb6ab3096c87d2b2a8209bff5281ea":{"cache_write_tokens":0,"cached_tokens":0,"input_tokens":2,"output_tokens":286},"fc_05d7ba13acf1d7e5016abb6ab907cc87d299677fcc25110978":{"cache_write_tokens":0,"cached_tokens":0,"input_tokens":0,"output_tokens":21}},"request_fields":{"tools":{"cache_write_tokens":0,"cached_tokens":0,"input_tokens":59,"output_tokens":0},"instructions":{"cache_write_tokens":0,"cached_tokens":0,"input_tokens":17,"output_tokens":0}}},"input_tokens":134,"input_tokens_details":{"cache_write_tokens":0,"cached_tokens":0},"output_tokens":307,"output_tokens_details":{"reasoning_tokens":286},"total_tokens":441},"user":null,"metadata":{}},"sequence_number":21}
+

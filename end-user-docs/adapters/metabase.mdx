@@ -1,0 +1,127 @@
+---
+title: Metabase
+description: Query cards, dashboards, and run native SQL via Metabase.
+---
+
+# Metabase adapter
+
+This skill lets agents interact with your Metabase instance. Agents can query saved questions (cards), dashboards, collections, databases, and run raw SQL. It supports multiple Metabase instances with a single `instance` parameter.
+
+## Authentication
+
+You need an API key from Metabase (v0.49+). Generate one at `/admin/settings/authentication/api-keys` in your Metabase instance. The skill sends it as the `X-API-KEY` header.
+
+Configure credentials in vault:
+
+* **Single instance**: Set `skills/metabase/api_key` and `skills/metabase/site_url`
+* **Multiple instances**: Set `skills/metabase/instances/<name>/api_key` and `skills/metabase/instances/<name>/site_url` for each instance
+* **Default instance**: a single configured instance is the default automatically; with several, set `skills/metabase/default_instance` (in a shared tier, `scope='agent_specific'`) to pick which instance is used when no `instance` parameter is provided
+
+### Row cap
+
+All query tools (`metabase.card_query`, `metabase.dashboard_query`, `metabase.dataset_query_native`) enforce a row cap to prevent huge result sets from overwhelming the agent's context window. The default cap is **2000 rows**. You can set a lower per-instance limit via `skills/metabase/instances/<name>/max_query_rows`. Every query response includes the applied `row_cap`.
+
+Large explicit `limit` requests (up to 50,000 rows) are allowed — results exceeding the inline threshold are staged as `tabular_artifact`s and never enter the agent's context.
+
+## Multi-instance support
+
+Every tool accepts an optional `instance` parameter. Resolution:
+
+1. Explicit `instance: "<name>"` → that instance.
+2. Otherwise → `default_instance` if it names a configured instance, else the instance named `default`, else the sole instance.
+
+There is no prefix auto-routing (Metabase has no natural routing keys).
+
+If you have multiple instances and no default, you must specify `instance` on every call.
+
+## Tools
+
+### Cards (Saved questions)
+
+* `metabase.card_list` – List saved questions (cards)
+* `metabase.card_get` – Get a card by ID
+* `metabase.card_query` – Execute a saved question (card)
+* `metabase.card_create` – Create a new card (mutating)
+* `metabase.card_update` – Update a card (mutating)
+* `metabase.card_archive` – Archive or restore a card (mutating)
+
+### Dashboards
+
+* `metabase.dashboard_list` – List dashboards
+* `metabase.dashboard_get` – Get a dashboard by ID
+* `metabase.dashboard_query` – Execute every card in a dashboard
+* `metabase.dashboard_create` – Create a dashboard, optionally with cards/filters/tabs (mutating)
+* `metabase.dashboard_update` – Update a dashboard (mutating)
+* `metabase.dashboard_archive` – Archive or restore a dashboard (mutating)
+* `metabase.dashboard_add_cards` – Append cards to a dashboard, preserving the layout (mutating)
+* `metabase.dashboard_remove_card` – Remove one card from a dashboard by dashcard id (mutating)
+
+### Collections
+
+* `metabase.collection_list` – List collections
+* `metabase.collection_get` – Get a collection by ID (or 'root')
+* `metabase.collection_items` – List items inside a collection
+* `metabase.collection_create` – Create a collection (mutating)
+* `metabase.collection_update` – Update a collection (mutating)
+
+### Databases and schema
+
+* `metabase.database_list` – List databases
+* `metabase.database_tables` – List tables in a database
+* `metabase.table_fields` – List fields (columns) for a table
+
+### Native query
+
+* `metabase.dataset_query_native` – Run raw SQL against a database (mutating execute; row-capped)
+
+### Search
+
+* `metabase.search` – Global search across cards, dashboards, collections, etc.
+
+## Security
+
+* **External content wrapping**: Card/dashboard descriptions and query result rows are wrapped with prompt-injection markers before being returned to the agent.
+* **Policies**: All tools default to `allow` in `SkillPolicy`. Operators who want a confirmation gate on mutating tools (`*_create`, `*_update`, `*_archive`, `dataset_query_native`) should downgrade those to `require_approval` in their deployment config.
+* **Row cap**: Hard ceiling of 50,000 rows on all query tools. Per-instance overrides may lower but not raise the cap.
+
+## Reloading
+
+After changing vault credentials, run `system.enable_skill('metabase')` to reload.
+
+## Configuration
+
+The skill supports both single-instance and multi-instance configurations. Here's a sample `config.toml` you can place at `{skills_dir}/metabase-integration/config.toml`:
+
+```toml
+# ── Single-instance mode (backward compatible) ──
+site_url = "${METABASE_URL}"
+api_key  = "${METABASE_API_KEY}"
+
+# Hard row cap for card_query / dataset_query_native (default 2000, max 50000)
+# max_query_rows = 2000
+
+# ── Multi-instance mode ──
+# Uncomment to configure multiple Metabase instances. Tools accept an optional
+# `instance` parameter to target a specific one.
+#
+# default_instance = "prod"
+#
+# [instances.prod]
+# site_url       = "https://mb.prod.example.com"
+# api_key        = "${METABASE_API_KEY_PROD}"
+# # max_query_rows = dic2000
+#
+# [instances.staging]
+# site_url       = "https://mb.staging.example.com"
+# api_key        = "${METABASE_API_KEY_STAGING}"
+# # max_query_rows = 500
+```
+
+Credentials use vault references (`${vault:metabase.api_key}`) or environment variables (`${METABASE_API_KEY}`).
+
+### Single-instance vs multi-instance setup
+
+* **Single-instance**: Set `api_key` and `site_url` at the top level.
+* **Multi-instance**: Set `[instances.<name>]` sections and, with several, `default_instance`. When you have multiple instances and no default, you must specify `instance` on every tool call.
+
+The row cap logic respects both the polite default (2000 rows for queries without an explicit limit) and the hard ceiling (50,000 rows). Large explicit `limit` requests are allowed up to the instance cap — results exceeding the inline threshold stage as artifacts and never enter the agent's context.

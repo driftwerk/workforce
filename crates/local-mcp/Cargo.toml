@@ -1,0 +1,58 @@
+[package]
+name = "workforce-local-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "workforce-local-mcp"
+path = "src/main.rs"
+
+[dependencies]
+workforce-codebase-knowledge = { path = "../codebase-knowledge" }
+workforce-knowledge-service = { path = "../knowledge-service" }
+workforce-memory = { path = "../memory" }
+workforce-common = { path = "../common" }
+workforce-core = { path = "../core" }
+workforce-agent = { path = "../agent-runtime" }
+workforce-mcp-client = { workspace = true }
+workforce-skills = { path = "../skills", features = ["jira", "linear", "datadog", "metabase", "postmark", "sendgrid", "xero"] }
+
+rmcp = { version = "1.5", features = ["server", "macros", "transport-io", "schemars"] }
+schemars = "0.8"
+fastembed = "5"
+
+tokio = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+eyre = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+dirs = "5"
+clap = { workspace = true }
+rpassword = "7"
+chrono = { workspace = true }
+dashmap = "6"
+reqwest = { workspace = true }
+url = { workspace = true }
+tokio-util = { workspace = true }
+
+# Secret storage backend per platform.
+#   * macOS / Windows  → OS keychain via the `keyring` crate (native features).
+#   * Linux (incl. WSL) → mode-0600 TOML file. D-Bus Secret Service isn't
+#     reliably present on WSL or headless Linux; the file backend removes
+#     the `gnome-keyring-daemon` prerequisite entirely. See secret_store.rs.
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3", features = ["apple-native"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { version = "3", features = ["windows-native"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+toml = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

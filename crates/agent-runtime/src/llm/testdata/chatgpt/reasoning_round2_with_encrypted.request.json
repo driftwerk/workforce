@@ -1,0 +1,93 @@
+{
+  "model": "gpt-5.5",
+  "instructions": "You are Allan, a concise assistant. Use tools when asked.",
+  "store": false,
+  "stream": true,
+  "include": [
+    "reasoning.encrypted_content"
+  ],
+  "tool_choice": "auto",
+  "prompt_cache_key": "00000000-0000-4000-8000-000000000004",
+  "reasoning": {
+    "effort": "high",
+    "summary": "auto"
+  },
+  "parallel_tool_calls": true,
+  "tools": [
+    {
+      "type": "function",
+      "name": "weather_get",
+      "description": "Get the weather for a city",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "city": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "city"
+        ]
+      },
+      "strict": false
+    },
+    {
+      "type": "function",
+      "name": "time_get",
+      "description": "Get the local time for a city",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "city": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "city"
+        ]
+      },
+      "strict": false
+    }
+  ],
+  "input": [
+    {
+      "type": "message",
+      "role": "user",
+      "content": [
+        {
+          "type": "input_text",
+          "text": "A train leaves at 09:17 and travels 263 km at 71 km/h, then waits 13 minutes, then 118 km at 88 km/h. Work out the arrival time carefully, then call weather_get for the destination city Porto."
+        }
+      ]
+    },
+    {
+      "id": "rs_05d7ba13acf1d7e5016abb6ab3096c87d2b2a8209bff5281ea",
+      "type": "reasoning",
+      "content": [],
+      "encrypted_content": "gAAAAABqu2q5gPykw7cY4RRGc5TPI23oXuKG-GIymiFt4sEBgofm8-GPr00ZKu-_MsO8yT_k6pqQt8k-PB6hSFrPlIa5qyCGeHazdNhOKZDvzXqdXvzYGFOhAWNcaDwqv-wQmh5PQ-AxYNaTe5o_CjZWKea6TdHLtzkagHgLBZEcENn5KrYHFtq5tsY87_dg-N0BziVFRz-c54gh-CYtl9l_q11vno36o1gAYH-yqTwT7cjhE8JzVM1UzJxMEExcioVwbAP4ymk6qIGOaNvaxQiWwt0p9c1GSQOBuWV8HAovq9LopwM9hGHy6umClSTPG0227bU-_QOeaYpTSvw3YizpnumBYhjsMBLwybPmj1xnVXRBNetlKpyV5q3cZvOAxRGJ7jy6pcnlACZmj_EfHkAVxufWfrVghJzvtsDu5kbmcnagN1_ZRh8iL0WoC2NL8uTaXasJCa1oI0BD_RF5hPXfr4d_EcOXfp00IG1ptbRBaWuyL_ZE2Th3MF0zhi9KwanXApQPSJzJXfMkJChzIoD0GZHW5qKS5myf30HzGuHjYtMB2b4medzHCkiiPVcPn1AwV0Lpd763jm-R0p7MOafk9SvGuGQnwvfNnVM4cZmh7JxECjT2MlN4q4ZvH-ou8OMFV_Wq_g4xw_e3z_xvCL5YAz75WEXeTSJAMr3V4ki05wJdZUzWy0cb1hNOUSnNUGXTVsU11caofWQBcFZzMb01HXAZj2a4YNICiC8sKcIg8AvvT0P0dyEiPUwN7okL0nRSopo8PNkkPJbQw3FMJadRy9x5XfSD4VKzVyOzah1i4waEJqheiAE0zhNa6qNd9V3VukuRxe7KLZKeP4SvbsGLCF2e68CK3_t3aWRPRsSDc-2eIIb9aE7_9G_B5a5lEdOeesIN4qfK_OzFBToAUCTDg3P3yG6HD_JYUmuxPltns7IqmzT3VREAcV7MHvRE9IhLxEs8HRtZjePjHqbRr_17KkfXfIbjwmbrKbQt95xA4snN-sqtTDZgZpkGIUwSg9N6zKluopZ7G3hikxinTfpz1_NkUGBN6jBmJqRQ_2IrZSpCefpFfAhJ2eibL8Q4IZ4Ac8DWvbLCx6K3njEGZttJAkWfwSSknAqCjlf7mAnVi6TXUZHMsYZf7e3ngKGm4UmWX2C2CVJ4m85w_WzsiwYX_A2VOwve3j5Bwo7vetl-wxZ6-xY0fOdU3FkPJcmdx2wObudX8OfIVXBr8y-iW2ClWuY6ZZ74bbCgcHeJvcU2RQTAa9UEK5kn55F4mfiTYGuu-PJ55gcRb1hnXW-uj-IGONxAagJVKWQMgUciZ6RbKE2xqSbsAfZmb6mOCiX-9LkoCS7h49AulvVqEihoXG-Go5if2DCtTT0MmbCRJJSMbLLCl12SMbNI9iWahEGfZZ0TMPL7BFWHT7p300hKy_cR_4RnRoDB0Nj4_KzXIpMzWpKyLH1BXHE1D-dh-Csx9ibQ1HI5s4dNwLvVgKJYBNAoa-fz7efROXA5xzf8caU3XzbIthvBk9AOAS51alDOjA77qmnyuHj4oBuU8rrmdMulPFntu5hQ3_aRNrnielIuegknyt6fGi6y4eK0HhkhYM-p0ugpva35vS4bP4NGezg0XNtyjXfRfauZQwIQyRUYbX1tFiIFJyiKhMbdzli-EcD1SOTth9djzKhK57VeEQ-SKlnx3Me8Kwx4OuIEWBnxyupw90vhqKwuKktXtdvql2a9n2GmXspcv7sZ7-A5IZV8pILSJBx4csJDLM71lDlzIiWgLPMVW86rBMM0qLA1gyRX61latci6kfr4i9nFWVSEhTaC3ZCPKmpD6To9CUfbSLRsS6kzz64wHAXZydmvlA3CaKWxwDwn03W46ezulvesF5s2qE-hRhReWo8OX189zCMEJijNwsTyHFVN0lPwWouNjBh0qre0TmxRYRGcjaR3xRvRy-2uD5FZFke1I7Gk9UMloFL--kxUUH2kVC0IDpKIymUmnpd_eXPGqkQe1VPVMlhBM5gTEk1obAd1DQXqDMwuJiv82JlAIa86flzp8AhWhVuGeI6UcTIX3KUj2f1-mdqhKxgnqRYPMgVk-ddEgwuLWsTaluVD_2h6VyUye0MfoIIGfMMb_u5AhLWxYAlKkJjUaLrnQXsmqmy1S569sUKP-rOJyVoUDkP7qQYP7tKgH3LjEaXTMdod0Hf7M68hpEFlHDgH_Yf2S5Vbn_BTO_RVqXEYcv0vYkygJhofAevBQ8CTza0kswmJ_jeA_KPSqvXG7MVlZx1oabec08f8SNvOKkQqIBvFN9z40N2svxgwSO1bnyE7X0eoo1utl7ycutZwO9w5pQ==",
+      "summary": [
+        {
+          "type": "summary_text",
+          "text": "**Calculating precise arrival time**"
+        },
+        {
+          "type": "summary_text",
+          "text": "**Planning to retrieve weather data**"
+        }
+      ]
+    },
+    {
+      "id": "fc_05d7ba13acf1d7e5016abb6ab907cc87d299677fcc25110978",
+      "type": "function_call",
+      "status": "completed",
+      "arguments": "{\"city\":\"Porto\"}",
+      "call_id": "call_6JPb4dhlUdE5VixNMYxOcxX3",
+      "name": "weather_get"
+    },
+    {
+      "type": "function_call_output",
+      "call_id": "call_6JPb4dhlUdE5VixNMYxOcxX3",
+      "output": "cloudy 18C"
+    }
+  ]
+}

@@ -1,0 +1,126 @@
+[workflow]
+id = "feature-brainstorm"
+name = "Feature Brainstorm"
+description = "Brainstorm a feature idea, synthesize into a spec, and create Linear tickets"
+
+[workflow.context]
+request = { required = true, description = "The feature idea or problem to brainstorm" }
+
+# =============================================================================
+# Step 1: Brainstorm Kickoff
+# =============================================================================
+[[step]]
+id = "kickoff"
+name = "Brainstorm Kickoff"
+max_rounds = 30
+model = "powerful"
+skills = []
+preferred_tools = ["code.read", "code.find", "knowledge.overview", "knowledge.ask"]
+pause = "brainstorming"
+task = """
+Start a feature brainstorming session with the user.
+
+## The Feature Idea
+{{request}}
+
+## Approach
+
+1. **Understand the vision** — What problem? Who benefits? What does success look like?
+2. **Ask probing questions** (2-3 at a time, not a wall):
+   - Specific use cases?
+   - Edge cases and failure modes?
+   - Constraints (time, complexity, dependencies)?
+   - Simpler alternatives?
+3. **Consider the codebase** — Use `knowledge.overview` or `code.read` if relevant to the discussion.
+4. **Surface risks early** — Implementation complexity, breaking changes, security concerns.
+5. **Guide toward clarity** — Help narrow scope to something well-defined and achievable.
+
+Build on the user's answers — this is a conversation, not an interview.
+
+When the brainstorm has covered enough ground, suggest: "I think we have a solid picture now. Type **resume** when you're ready and I'll synthesize this into a spec with tickets."
+"""
+
+# =============================================================================
+# Step 2: Synthesize Spec
+# =============================================================================
+[[step]]
+id = "synthesize"
+name = "Synthesize Spec"
+max_rounds = 20
+model = "powerful"
+pause = "review-spec"
+outputs = [
+  { name = "spec", description = "The full structured feature specification" },
+  { name = "ticket_count", description = "Number of tickets to create", validate = "number" },
+]
+task = """
+Brainstorming complete. Synthesize the conversation into a structured feature spec.
+
+## 1. Read the Conversation
+
+Call `messaging.read_thread` with channel="{{_channel_id}}" thread_id="{{_thread_id}}" limit=100.
+
+## 2. Write the Spec
+
+### Problem
+What problem are we solving and why?
+
+### Solution
+What are we building? High-level approach.
+
+### Scope
+In scope vs explicitly out of scope.
+
+### Edge Cases & Risks
+What could go wrong? What edge cases need handling?
+
+### Acceptance Criteria
+Specific, testable criteria for completion.
+
+### Technical Notes
+Architecture decisions, dependencies, implementation considerations.
+
+### Tickets
+Break into discrete, actionable tickets. For each:
+- **Title**: Clear, concise
+- **Description**: What needs to be done
+- **Priority**: urgent / high / medium / low
+- **Dependencies**: Which tickets must be done first
+- **Estimate**: small / medium / large
+
+Present the full spec and tickets for user review. They will approve, request changes, or provide feedback.
+
+Do NOT include "OUTCOME:" in your response.
+"""
+branches = [
+  { when = "approved", goto = "create-tickets" },
+  { when = "changes-requested", goto = "synthesize" },
+]
+
+# =============================================================================
+# Step 3: Create Linear Tickets
+# =============================================================================
+[[step]]
+id = "create-tickets"
+name = "Create Linear Tickets"
+max_rounds = 20
+model = "standard"
+skills = ["linear"]
+preferred_tools = ["linear.create_issue"]
+exit = true
+task = """
+Create Linear tickets from the approved spec.
+
+## Approved Spec
+{{steps.synthesize.spec}}
+
+## Steps
+
+For each ticket in the spec:
+1. Call `linear.create_issue` with title, description (including acceptance criteria), and priority
+2. Note any dependencies in the description
+
+After creating all tickets, summarize what was created with issue IDs/links.
+
+Do NOT include "OUTCOME:" in your response.
+"""

@@ -1,0 +1,25 @@
+[package]
+name = "workforce-nats"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+workforce-core = { workspace = true }
+async-nats = { workspace = true }
+bytes = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+eyre = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+parking_lot = { workspace = true }
+tokio-util = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+dashmap = "6"
+
+[dev-dependencies]
+tokio = { workspace = true }

@@ -1,0 +1,57 @@
+---
+title: Document store
+description: Where workflows, skills and agents keep the state they need between runs — scoped like the vault, queryable, safe to share between runs.
+---
+
+# Document store
+
+The document store is the hub's persistence for anything a workflow, a
+skill or an agent needs to remember between runs: a register, a queue, a
+pipeline's records, a small app's data. It is one place with one API,
+instead of state scattered across ticket labels, spreadsheets and workflow
+variables.
+
+## Scopes
+
+A document lives in a **scope**, the same way a secret lives in a vault
+tier:
+
+| Scope | Who can read | Who can write |
+|---|---|---|
+| `user` | that person only | that person |
+| `agent` | every run of that agent; admins | the same |
+| `global` | everyone | admins and system runs |
+
+Inside a scope, a document is addressed by `collection/doc_id` — say
+`registers/on-call` or `pipeline/ORD-17`. An agent's runs share its
+scope, so a workflow that writes on Monday and another that reads on
+Tuesday see the same document.
+
+## What a document can do
+
+- **Versions.** Every write bumps the document's version. Pass the version
+  you read to write only if nothing changed since — two runs never
+  overwrite each other without noticing.
+- **Claims.** A run can claim a document for a while (`store.claim`), so no
+  other run acts on it until it is released or the claim lapses. This is
+  how a pipeline hands one ticket to one worker.
+- **Queries.** Filter a collection by fields inside the documents, order,
+  page.
+- **Expiry.** A document can carry a time to live.
+
+Secrets do not belong here: a document that looks like it holds one is
+refused, with the vault named as the right place.
+
+## Using it
+
+- In chat or an agent step: the `store.*` tools (`store.get`, `store.set`,
+  `store.update`, `store.query`, `store.claim`, …).
+- In a workflow: the same tools as tool steps (`tool = "store.set"`).
+- In a WASM skill: `workforce_skill_sdk::store` with the `store`
+  capability.
+- Over HTTP: `/api/store/{scope}/{collection}[/{doc_id}]`.
+
+[Pipelines](/docs/concepts/pipelines) are built on the store: a
+pipeline's definition and its item records are ordinary documents in the
+agent's scope, readable and exportable like any other. The **Pipelines** page
+goes further: it shows an agent's pipelines to everyone who can use that agent.

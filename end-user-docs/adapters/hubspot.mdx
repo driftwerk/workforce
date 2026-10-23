@@ -1,0 +1,119 @@
+---
+title: HubSpot
+description: Read and manage HubSpot CRM records, tickets, notes and other engagements, and associations.
+---
+
+# HubSpot adapter
+
+Work with a HubSpot portal directly through agents: contacts, companies, deals,
+tickets and custom objects; the notes, tasks, calls, emails and meetings logged on
+them; the associations between records; pipelines, owners and property definitions.
+Anything the named tools do not reach is a `hubspot.api` call away.
+
+## Authentication
+
+The adapter uses a HubSpot **Private App** access token (Settings → Integrations →
+Private Apps). Store it in the vault:
+
+- One portal: `skills/hubspot/access_token`.
+- Several portals: `skills/hubspot/portals/<name>/access_token`, and
+  `skills/hubspot/default_portal` naming the one to use when a call does not say.
+
+By default the token is stored per user. An administrator can store one shared token
+for an agent instead, so every user of that agent works through the same HubSpot
+identity. The token's scopes decide what the tools can do; reading and writing an
+object type needs that type's read and write scopes, and engagements on a record need
+the record type's write scope.
+
+Every tool takes an optional `portal` parameter for multi-portal setups. Text that
+comes back from HubSpot (ticket content, note bodies, contact names) is marked as
+untrusted content, so a ticket cannot instruct the agent.
+
+## Tickets and the notes on them
+
+- `hubspot.ticket_get`, `hubspot.ticket_list`, `hubspot.ticket_create`,
+  `hubspot.ticket_update`: a ticket's properties; `hubspot.crm_search` with
+  `object_type: "tickets"` to filter by pipeline stage, priority, owner or date.
+- `hubspot.note_list`: the notes on a ticket (or a contact, company or deal), newest
+  first, with their bodies. Every note on the record is read before the newest are
+  picked, so `limit` is how many come back, not a page.
+- `hubspot.note_create`: add a note to a ticket. The body may be plain text or simple
+  HTML (`p`, `br`, `strong`, `em`, `ul`/`ol`/`li`, `a`, `code`, `blockquote`).
+- `hubspot.note_get`, `hubspot.note_update`, `hubspot.note_delete`: read, edit and
+  archive one note.
+- `hubspot.object_delete` with `object_type: "tickets"` archives a ticket.
+
+```
+hubspot.note_list   object_type="tickets" object_id="48558109562"
+hubspot.note_update id="116861675391" body="<p><strong>Resolved:</strong> password reset sent.</p>"
+```
+
+## Other engagements
+
+Tasks, calls, emails and meetings are records like any other, created with
+`hubspot.object_create` and attached to the record they belong to:
+
+```
+hubspot.object_create object_type="tasks"
+  properties={"hs_task_subject": "Call back", "hs_task_body": "…", "hs_task_status": "NOT_STARTED"}
+  associations=[{"to_type": "tickets", "to_id": "48558109562"}]
+```
+
+An engagement gets `hs_timestamp` set to now unless you give one. The record is created
+before it is associated, so a failed association is reported on the result rather than
+failing the call; link it with `hubspot.association_create` instead of creating it
+again. Read them back with
+`hubspot.association_list` (which records of a type hang off a record) followed by
+`hubspot.object_batch_read`, or search them with `hubspot.crm_search` filtered on
+`associations.ticket`.
+
+## Any record
+
+The generic tools take an `object_type`: `contacts`, `companies`, `deals`, `tickets`,
+`notes`, `tasks`, `calls`, `emails`, `meetings`, `communications`, or a custom object's
+fully qualified name (`p<portalId>_<name>`, such as `p24111421_cars`) or numeric type id.
+
+- `hubspot.object_get` (optionally with `associations` to include linked record ids),
+  `hubspot.object_list`, `hubspot.object_batch_read` (up to 100 ids in one call).
+- `hubspot.object_create`, `hubspot.object_update`, `hubspot.object_delete`.
+- `hubspot.crm_search`: filter groups, sorts and pagination over any object type.
+
+The typed `hubspot.contact_*`, `hubspot.company_*` and `hubspot.deal_*` tools remain
+for the common cases.
+
+## Associations
+
+- `hubspot.association_list`: the records of one type linked to a record, with the
+  association types (for example the contacts on a ticket).
+- `hubspot.association_create`: link two records. HubSpot's default association type
+  between the two object types is used unless you pass `association_type_id`.
+- `hubspot.association_delete`: unlink two records; neither is deleted.
+
+## Pipelines, owners and properties
+
+- `hubspot.pipeline_list`: pipelines and their stages for deals or tickets.
+- `hubspot.owner_list`, `hubspot.owner_get`: users who can own records.
+- `hubspot.property_list`, `hubspot.property_get`: property definitions, including the
+  allowed values of enumerations such as `hs_pipeline_stage`.
+
+## Everything else
+
+`hubspot.api` calls any endpoint under `/crm`, `/conversations`, `/files`,
+`/marketing`, `/automation`, `/cms`, `/communication-preferences` or `/events` with the
+portal's credentials: `method` (GET, POST, PATCH or PUT), `path`, optional `query` and
+`body`. Use a named tool when one exists; reach for this for the rest, such as timeline
+events or conversation threads. Deletes are not available this way; the `*_delete` tools
+cover every kind of record. A response that is not a CRM record comes back as one block
+of untrusted content.
+
+## Deletes
+
+Every delete is a HubSpot archive: the record moves to the recycle bin for 90 days and
+can be restored in HubSpot. The delete tools are named `*_delete`, so an install's
+approval rules can ask a person before one runs.
+
+## Webhooks
+
+HubSpot can call the hub when records change. A workflow with a `webhook` trigger,
+`source = "hubspot"` and an `event_type` such as `ticket.creation` starts for each
+event; see [Workflows](/docs/concepts/workflows).

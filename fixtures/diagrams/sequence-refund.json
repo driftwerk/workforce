@@ -1,0 +1,239 @@
+{
+  "spec": {
+    "kind": "sequence",
+    "title": "Refund request",
+    "participants": [
+      {
+        "id": "c",
+        "label": "Customer"
+      },
+      {
+        "id": "a",
+        "label": "Agent"
+      },
+      {
+        "id": "p",
+        "label": "Payments"
+      }
+    ],
+    "steps": [
+      {
+        "from": "c",
+        "to": "a",
+        "label": "Requests refund"
+      },
+      {
+        "from": "a",
+        "to": "p",
+        "label": "Check eligibility"
+      },
+      {
+        "from": "p",
+        "to": "a",
+        "label": "Eligible",
+        "style": "dashed"
+      },
+      {
+        "from": "a",
+        "to": "a",
+        "label": "Records note",
+        "note": "Logged against the account for audit"
+      },
+      {
+        "from": "a",
+        "to": "c",
+        "label": "Refund confirmed"
+      },
+      {
+        "from": "a",
+        "to": "nobody"
+      }
+    ]
+  },
+  "metrics": {
+    "char_width": 7,
+    "line_height": 16
+  },
+  "layout": {
+    "kind": "sequence",
+    "nodes": [],
+    "edges": [
+      {
+        "key": "c|a|0",
+        "from": "c",
+        "to": "a",
+        "points": [
+          [
+            60,
+            88
+          ],
+          [
+            186,
+            88
+          ]
+        ],
+        "label": "Requests refund",
+        "labelAt": [
+          123,
+          88
+        ],
+        "style": "solid",
+        "arrow": "to"
+      },
+      {
+        "key": "a|p|1",
+        "from": "a",
+        "to": "p",
+        "points": [
+          [
+            186,
+            132
+          ],
+          [
+            312,
+            132
+          ]
+        ],
+        "label": "Check eligibility",
+        "labelAt": [
+          249,
+          132
+        ],
+        "style": "solid",
+        "arrow": "to"
+      },
+      {
+        "key": "p|a|2",
+        "from": "p",
+        "to": "a",
+        "points": [
+          [
+            312,
+            176
+          ],
+          [
+            186,
+            176
+          ]
+        ],
+        "label": "Eligible",
+        "labelAt": [
+          249,
+          176
+        ],
+        "style": "dashed",
+        "arrow": "to"
+      },
+      {
+        "key": "a|a|3",
+        "from": "a",
+        "to": "a",
+        "points": [
+          [
+            186,
+            220
+          ],
+          [
+            208,
+            220
+          ],
+          [
+            208,
+            242
+          ],
+          [
+            186,
+            242
+          ]
+        ],
+        "label": "Records note",
+        "labelAt": [
+          197,
+          220
+        ],
+        "style": "solid",
+        "arrow": "to"
+      },
+      {
+        "key": "a|c|4",
+        "from": "a",
+        "to": "c",
+        "points": [
+          [
+            186,
+            329.33333333333337
+          ],
+          [
+            60,
+            329.33333333333337
+          ]
+        ],
+        "label": "Refund confirmed",
+        "labelAt": [
+          123,
+          329.33333333333337
+        ],
+        "style": "solid",
+        "arrow": "to"
+      }
+    ],
+    "groups": [],
+    "lifelines": [
+      {
+        "id": "c",
+        "lane": 1,
+        "label": "Customer",
+        "lines": [
+          "Customer"
+        ],
+        "x": 14,
+        "y": 14,
+        "w": 92,
+        "h": 30,
+        "bottom": 347.33333333333337
+      },
+      {
+        "id": "a",
+        "lane": 2,
+        "label": "Agent",
+        "lines": [
+          "Agent"
+        ],
+        "x": 140,
+        "y": 14,
+        "w": 92,
+        "h": 30,
+        "bottom": 347.33333333333337
+      },
+      {
+        "id": "p",
+        "lane": 3,
+        "label": "Payments",
+        "lines": [
+          "Payments"
+        ],
+        "x": 266,
+        "y": 14,
+        "w": 92,
+        "h": 30,
+        "bottom": 347.33333333333337
+      }
+    ],
+    "notes": [
+      {
+        "lines": [
+          "Logged against the account for audit"
+        ],
+        "x": 186,
+        "y": 253.33333333333334,
+        "w": 268,
+        "h": 32
+      }
+    ],
+    "width": 468,
+    "height": 361,
+    "dropped": [
+      "a → nobody"
+    ]
+  }
+}

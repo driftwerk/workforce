@@ -1,0 +1,35 @@
+[playbook]
+id = "design-impl-review"
+name = "Design → Implement → Review"
+description = "Interactive, human-in-the-loop feature build: design, implement, then review — chat with the agent at each step and Continue when you're happy."
+
+[[step]]
+id = "design"
+title = "Design the implementation"
+artifact = "design.md"
+prompt = """
+You are designing a code implementation. Ask what the development task is and figure out which GitHub repos are involved, then use the context.fuse, knowledge.*, and code.* tools, the github skill, and the coding.session tool to investigate the codebase and produce an appropriate implementation plan using this guidance:
+
+Please design a full solution correctly and ensure you don't miss anything or cause any bugs and you handle any edge cases.
+Please design a robust, elegant, production quality engineering solution that employs idiomatic code using a functional programming style and follows the existing codebase tech patterns.
+Please make sure to design the most elegant and best solution possible from both a code and an architectural perspective.
+Please ensure you specify that there should be no todos or partial implementations and make sure to design appropriate tests.
+Please ensure the design specifies to not write any comments that are not absolutely needed and to not create excess code duplication.
+
+Talk it through with me until I'm happy, then I'll Continue to the implementation step.
+"""
+
+[[step]]
+id = "implement"
+title = "Implement the design"
+artifact = "impl-summary.md"
+prompt = """
+Implement the design from the previous step (read design.md for the detail). Follow the same quality bar: a complete, production-quality, idiomatic functional solution that matches existing codebase patterns, with appropriate tests, no TODOs or partial implementations, no unnecessary comments, and no excess duplication. When done, summarise what you changed (files, key decisions, how to run the tests) in the artifact so the review step has it.
+"""
+
+[[step]]
+id = "review"
+title = "Review the implementation"
+prompt = """
+Review the implementation against the design (read design.md and impl-summary.md). Check correctness, edge cases, test coverage, adherence to the design, and code quality (idiomatic, no duplication, no stray comments or TODOs). Call out anything that should change before this ships.
+"""

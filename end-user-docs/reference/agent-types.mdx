@@ -1,0 +1,328 @@
+---
+title: Agent types
+description: Reference for the built-in agent types and their capabilities.
+---
+
+# Agent types
+
+Workforce connects to a wide range of LLM providers, each offering different models, capabilities, and configuration methods. This page explains the supported providers and how to configure them.
+
+## Provider overview
+
+Workforce supports multiple AI providers, each with its own API, billing model, and unique features.
+
+| Provider | Authentication | Key Features |
+|----------|----------------|--------------|
+| **Anthropic** | `ANTHROPIC_API_KEY` environment variable | Thinking budgets, prompt caching, tool calling. |
+| **AWS Bedrock** | AWS credential chain (access key/secret or IAM role) | Hosts Claude, Amazon Titan, Llama, and other models via Bedrock's unified APIs. |
+| **Gemini (Google)** | `GEMINI_API_KEY` environment variable (falls back to `GOOGLE_API_KEY`) | Thinking budgets, vision, and image generation via OpenAI-compatible API. |
+| **Vertex AI (Google Cloud)** | Google Cloud Application Default Credentials (`GOOGLE_APPLICATION_CREDENTIALS`) and `VERTEX_LOCATION` environment variable | Hosted Claude models on GCP; billed against GCP credits. |
+| **OpenRouter** | `OPENROUTER_API_KEY` environment variable | Single API for many upstream providers (Anthropic, OpenAI, DeepSeek, etc.). |
+| **Grok (xAI)** | `XAI_API_KEY` environment variable | Two‑phase tool filtering for large tool sets. |
+| **Cerebras** | `CEREBRAS_API_KEY` environment variable | High‑performance inference for models from Z.AI, GPT‑OSS, Qwen, and Llama. |
+| **Z.ai** | `ZAI_API_KEY` environment variable | Direct GLM models with specialized coding endpoint. |
+| **vLLM** | `VLLM_URL` environment variable (default: `http://localhost:8000`) | Self‑hosted OpenAI‑compatible inference (e.g., Qwen, Llama). |
+| **Ollama** | `OLLAMA_URL` environment variable (default: `http://localhost:11434`) | Local LLM inference, primarily used by the Codebase Knowledge Engine for free summaries. |
+
+## Configuration basics
+
+You can configure agents individually in your `workforce.toml` file using `[[agents]]` sections. Each agent can specify its own model.
+
+```toml
+[[agents]]
+id = "developer"
+model = "claude-sonnet-5-5"
+system_prompt = "You are a senior software engineer."
+capabilities = ["code", "debug"]
+default = true
+
+[[agents]]
+id = "researcher"
+model = "gemini:standard"
+system_prompt = "You search the web and synthesize findings."
+capabilities = ["web", "writing"]
+```
+
+Global LLM settings can be set in the `[llm]` section:
+
+```toml
+[llm]
+provider = "anthropic"
+model = "powerful" # Uses the tier system
+api_key = "${ANTHROPIC_API_KEY}"
+```
+
+## Using model tiers
+
+Workforce classifies models into three capability tiers for consistent selection across providers.
+
+| Tier | Use case | Example models |
+|------|----------|----------------|
+| `cheap` | Simple, fast tasks | `claude-haiku-5-5`, `gemini-3.5-flash-lite` |
+| `standard` | Balanced everyday tasks | `claude-sonnet-5-5`, `gemini-3.8-flash` |
+| `powerful` | Complex reasoning, long‑context tasks | `claude-opus-5-5`, `grok-4.7` |
+
+You can refer to models by tier in configuration. For example, `model = "powerful"` selects the best available model for the configured provider.
+
+### Overriding tier mappings
+
+Default tier‑to‑model mappings are compiled into Workforce. You can override them by creating a `tiers.toml` file in your workspace root:
+
+```toml
+[anthropic]
+cheap = "claude-haiku-5-5"
+standard = "claude-sonnet-5-5"
+powerful = "claude-opus-5-5"
+
+[gemini]
+cheap = "gemini-3.5-flash-lite"
+standard = "gemini-3.8-flash"
+powerful = "gemini-3.1-pro-preview"
+
+[grok]
+standard = "grok-4.7"
+powerful = "grok-4.7"
+
+[bedrock.anthropic]
+cheap = "anthropic.claude-haiku-5-5"
+standard = "anthropic.claude-sonnet-5-5"
+powerful = "anthropic.claude-opus-5-5"
+```
+
+You can also override tier mappings programmatically via the `[llm.equivalences]` configuration block.
+
+## Provider‑specific details
+
+### Anthropic
+*   **Authentication:** Standard API keys (starting with `sk-ant-api`). A Claude plan's token (`sk-ant-oat…`) is refused; agents use a Claude plan through the `claude-code` provider.
+*   **Thinking budget:** Configured via `thinking_budget_tokens`. For Claude Opus 4.7+ and Sonnet 5, uses *adaptive thinking* with `output_config.effort`. Older models use a fixed `budget_tokens`.
+*   **Prompt caching:** Enabled by default. Use `<!-- CACHE_BREAK -->` in system prompts to split cache segments: the first two are cached and anything after a second marker is not. Controlled by the `enable_cache` parameter.
+
+### AWS Bedrock
+*   **Authentication:** Uses the standard AWS credential chain. Set `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` environment variables, an IAM role, or an `AWS_PROFILE`. You can also provide static credentials as a packed string `ACCESS_KEY:SECRET[:SESSION_TOKEN]` or use the sentinel `"none"` to trigger the default credential chain.
+*   **Model format:** Specify the family, e.g., `bedrock:anthropic`. The system resolves bare model IDs (like `claude-sonnet-5-5`) to region‑specific inference profiles (like `eu.anthropic.claude-sonnet-5-5`) using a live catalog. The region's own geo profile is preferred over `global.` so inference stays within your geography; `global.` is used only when no geo profile exists yet.
+*   **Wire formats:** Uses different Bedrock APIs depending on the model family:
+    *   `Invoke` for Anthropic Claude models.
+    *   `Converse` for native Bedrock models (Amazon Titan, Llama).
+    *   `OpenAI` for marketplace models (Z.AI GLM, DeepSeek, Qwen).
+*   **Region Resolution:** Region defaults to `us-east-1` but can be set via `BEDROCK_REGION`, `AWS_REGION`, or `AWS_DEFAULT_REGION` environment variables.
+*   **Prompt Caching:** Supported for Anthropic models and Amazon Nova; most OpenAI‑format marketplace models do not support caching.
+*   **Thinking Support:** Varies by model family. Some support `ThinkingMode::ToggleWithBudget`, `Toggle` (with `ToggleShape::AnthropicLike` or `EnableThinkingBool`), `AlwaysOn`, or `None`.
+
+### Gemini (Google)
+*   **Endpoint:** Uses the OpenAI‑compatible API at `generativelanguage.googleapis.com`.
+*   **Thinking:** Configure `thinking_budget_tokens`. For Gemini 2.5, this sets a `thinking_budget`. For Gemini 3.x, it maps to `thinking_level` (`"minimal"`, `"low"`, `"medium"`, `"high"`).
+*   **Streaming quirks:** Thought signatures may arrive on different chunks than tool names. `<thought>` blocks are stripped from the final response. The `function.name` field may repeat across delta events.
+
+### Vertex AI (Google Cloud)
+*   **Requirements:** The `GOOGLE_CLOUD_PROJECT` and `VERTEX_LOCATION` environment variables must be set.
+*   **Authentication:** Uses Google Cloud Application Default Credentials (ADC) or a service‑account JSON file.
+*   **Quota:** Default projects have low queries‑per‑second limits; increase quotas in the GCP console.
+*   **Model format:** Current‑generation models use bare IDs served from the `global` location, e.g., `claude-opus-5-5`, `claude-sonnet-5-5`; older snapshots include a date suffix, e.g., `claude-haiku-4-5@20251001`.
+
+### OpenRouter
+*   **Model specification:** Must include an upstream provider, e.g., `openrouter:deepseek` or `openrouter:anthropic`. Bare `openrouter` will cause an error.
+*   **Thinking effort:** Maps `thinking_budget_tokens` to `reasoning.effort` (`low`/`medium`/`high`).
+*   **Route Handling:** Anthropic‑targeted requests are routed to the Anthropic API, requiring tool schema sanitization (removing `oneOf`/`anyOf`/`allOf`).
+
+### Grok (xAI)
+*   **Tool filtering:** Limits tools to 40 by default. If more tools are available, a two‑phase selection activates:
+    1.  Essential tools (with prefixes like `filesystem_`, `exec_`, `code_`, `messaging_`, `reactions_`, `memory`, `notes`, `context_`) are always included.
+    2.  If still over the limit, a pre‑flight LLM call selects the most relevant tools from a catalogue. If selection fails, tools are filtered alphabetically.
+
+### Cerebras
+*   **Models:** Serves GPT‑OSS and Qwen models. Specify with a provider prefix, e.g., `cerebras:gpt-oss-120b`.
+*   **Thinking support:** Maps `thinking_budget_tokens` to `reasoning_effort` (`"none"`, `"low"`, `"medium"`, `"high"`) for supported models (GPT‑OSS, GLM).
+*   **GLM‑specific tuning:** Automatically sets `temperature: 0.8`, `top_p: 0.95`, `clear_thinking = false` and adds a strict instruction prefix to system prompts. Described tools must be in the declared tool list for subsequent calls.
+
+### Z.ai
+*   **Endpoints:** Offers a regular chat endpoint and a separate coding‑specific endpoint.
+*   **Thinking configuration:** Uses `{"type": "enabled", "clear_thinking": false}` to preserve reasoning across conversation turns.
+*   **Token usage:** Reports `cached_tokens` separately from fresh input tokens.
+*   **System Prefix:** A specific prefix is automatically prepended to system prompts for GLM models.
+
+### vLLM
+*   **OpenAI‑compatible:** Works with models like Qwen3‑32B‑AWQ (text) and Qwen2.5‑VL‑7B‑Instruct (vision).
+*   **Vision routing:** Can route image‑containing messages to a separate vision endpoint (`VLLM_VISION_URL`).
+*   **Qwen3 thinking mode:** Automatically adds a `/no_think` prefix to disable internal monologue tokens.
+*   **Authentication:** Optional `VLLM_API_KEY` for authentication.
+
+### Ollama
+*   **Primary use:** Codebase Knowledge Engine for free summary generation.
+*   **Default model:** `"qwen2.5-coder:32b"`.
+
+## Provider pools and failover
+
+Workforce wraps LLM providers with two layers of resilience: a **provider pool** for token-level failover and a **failover provider** with model‑switching chains.
+
+### Provider Pool
+The pool (`PooledProvider`) manages multiple LLM providers (e.g., different API tokens). It automatically rotates providers when encountering rate limits (429) or authentication failures (401/403).
+
+- **Cooldown:** Rate‑limited providers are marked with a cooldown (default 60s, max 300s).
+- **Proactive Pacing:** Uses a token‑per‑minute (TPM) rolling window to pace requests and avoid hitting limits.
+- **Credential Probing:** Verifies all credentials in parallel on startup, marking failed entries as cooldown.
+- **Tier Resolution:** Acts as a last‑line defense, rewriting tier names (`powerful`, `standard`, `cheap`) to concrete model IDs.
+
+### Failover Provider
+The `FailoverProvider` wraps a pool (or any provider) with a configurable failover chain and health tracking.
+
+**Failover Chain:** An ordered list of models to try when the primary fails. Models are attempted in sequence before giving up. You can specify models with provider prefixes, e.g., `"grok:grok-4.7"`, `"openrouter:deepseek/deepseek-v4-pro"`.
+
+**Health Tracking:** Marks models as degraded after repeated failures within a time window, pushing them to the end of the chain. Degraded models can recover after a configurable period.
+
+**Configuration Example:**
+```toml
+[llm]
+failover = [
+    "claude-sonnet-4-5",
+    "grok:grok-4", 
+    "gemini:gemini-2.5-pro"
+]
+aliases = { fast = "claude-3-5-haiku-20241022", smart = "claude-opus-4-20250514" }
+
+[llm.retry]
+max_retries = 3
+initial_backoff_ms = 1000
+backoff_multiplier = 2.0
+max_backoff_ms = 30000
+retry_overloaded = true   # Whether to retry on 529 (Overloaded) errors
+retry_rate_limited = true # Whether to retry on 429 (RateLimited) with short retry-after hints
+max_rate_limit_wait_secs = 45
+
+[llm.health]
+failure_threshold = 3    # Number of failures within window to mark degraded
+window_secs = 300        # Time window in seconds for failure counting
+recovery_secs = 120      # Seconds before retrying a degraded model
+```
+
+## Tool filtering
+
+To manage context window limits, Workforce filters tools based on the model's known token capacity.
+
+*   **Tier 1 (≥200K tokens):** All available tools are sent to the model.
+*   **Tier 2 (&lt;200K tokens):** Only essential tools, context‑triggered tools, and enabled skills are sent.
+
+Essential tool prefixes (always included for Tier 2 models):
+
+- `filesystem_`, `exec_run`, `code_`, `messaging_`, `reactions_`, `memory`, `notes`, `context_`
+- `sessions`, `session_set_label`, `system_`, `workflow`, `projects`, `knowledge`
+- `wasm_skill`, `tool_describe`, `advisor`
+
+Context‑triggered tools are injected when specific keywords appear in any user message of the conversation, so a tool group stays available on later turns once it has been mentioned; the twelve most recently triggered groups are remembered, and a skill enabled with `system.enable_skill` counts as triggered.
+
+| Keywords | Injected tools |
+|----------|----------------|
+| `github`, `pull request`, `pr`, `merge` | GitHub tools |
+| `linear`, `ticket`, `issue`, `dw‑`, `bug` | Linear tools |
+| `schedule`, `cron`, `reminder`, `recurring` | Scheduler tools |
+| `browse`, `web page`, `fetch url`, `scrape` | Browser tools |
+| `email`, `send email`, `mail` | Email tools |
+| `google`, `search the web`, `look up` | Google search tools |
+| `sub‑agent`, `subagent`, `delegate`, `spawn agent` | Subagent tools |
+| `policy`, `policies`, `approval policy` | Policy tools |
+| `cost`, `spending`, `budget`, `token usage`, `usage` | Usage tools |
+| `image`, `picture`, `photo`, `drawing`, `illustration`, `logo`, `icon`, `artwork`, `sketch`, `wallpaper`, `avatar`, `photorealistic` | `generate_image` tool |
+
+When tools are filtered out, a catalogue text is appended to the system prompt, explaining how to fetch schemas for unavailable tools.
+
+## Thinking and reasoning
+
+Different providers implement extended reasoning modes differently.
+
+| Provider | Parameter | Notes |
+|----------|-----------|-------|
+| **Anthropic** | `thinking_budget_tokens` | For Opus 4.7+, uses `thinking.type: "adaptive"` with `output_config.effort`. Older models use `thinking.type: "enabled"`. Budget is clamped to `max_tokens - 1024` (output headroom) for legacy `enabled` thinking. |
+| **Gemini** | `thinking_budget_tokens` | Maps to `thinking_budget` (Gemini 2.5) or `thinking_level` (`"minimal"`, `"low"`, `"medium"`, `"high"` for Gemini 3.x). |
+| **OpenRouter** | `thinking_budget_tokens` | Maps to `reasoning.effort` (`low`/`medium`/`high`). |
+| **Cerebras** | `thinking_budget_tokens` | Maps to discrete `reasoning_effort` levels (`"none"`, `"low"`, `"medium"`, `"high"`) for GPT‑OSS and GLM models. |
+| **Z.ai** | `thinking_budget_tokens` | Uses `{"type": "enabled", "clear_thinking": false}`. Budget `0` disables reasoning; `>0` enables it. |
+| **Bedrock** | Varies by model family | Supports `ThinkingMode::ToggleWithBudget`, `Toggle` (with different `ToggleShape`), `AlwaysOn`, or `None`. |
+
+Thought signatures (where provided by the model) must be echoed back in subsequent requests to maintain prompt caching.
+
+## Error handling and classification
+
+Workforce classifies errors and applies appropriate recovery actions.
+
+| Error type | Action | Example |
+|------------|--------|---------|
+| **Billing errors (402)** | `Abort` | No retry or failover. |
+| **Context overflow** | `Compact` | Caller should compact the conversation history. Limits are parsed from error messages or static registries. |
+| **Transient errors (500s, timeouts)** | `Retry` | Uses exponential backoff (configurable via `[llm.retry]`). |
+| **Authentication errors (401/403)** | `Failover` | Immediate switch to the next model in the failover chain (or next token in pool). |
+| **Rate limits (429)** | `Failover` (or `RetryAfter`) | Immediate switch unless `retry_rate_limited = true` and the `retry-after` hint is short (`≤ max_rate_limit_wait_secs`). |
+| **Overloaded (529)** | `Failover` (or `Retry`) | Immediate switch unless `retry_overloaded = true`. |
+| **Other 4xx (ClientError)** | `Abort` | Don't retry. |
+| **Unknown errors** | `Retry` once then `Failover` | |
+
+### Context Limit Detection
+Context limits are detected from provider error messages (multiple extractor patterns) or from static registries. The effective limit is the minimum of the model's reported limit and any configured ceiling.
+
+## Image generation
+
+Image generation is configured separately from text models, using the `ImageProvider` trait. Supported providers include Bedrock Stability, Bedrock Nova, Gemini, OpenRouter, and vLLM.
+
+```toml
+[llm.image]
+model = "gemini:standard"  # Resolves to gemini-3.1-flash-image-preview
+api_key = "${GEMINI_API_KEY}"
+enabled = true
+```
+
+*   **Aspect ratios:** Automatically converted to the nearest standard ratio (1:1, 16:9, 9:16, 4:3, 3:4, 3:2, 2:3).
+*   **Reference images:** Only Gemini and OpenRouter support editing/composition with reference images.
+*   **Negative prompts:** Supported by Stability and FLUX, silently ignored by others.
+*   **Video generation:** Gemini supports image‑to‑video generation with Veo (requires `person_generation: "allow_adult"` for real‑face animation).
+
+## Multimodal support (vision, audio, video)
+
+Workforce maintains separate capability registries for vision, transcription (audio), and video generation.
+
+- **Vision:** `VisionTierRegistry` determines which models can process images. If the primary model lacks vision capability, attachments are routed to a configured `[llm.vision]` fallback or replaced with placeholders.
+- **Transcription:** Audio attachments use the `TranscriptionTierRegistry` to find capable models (e.g., Gemini or OpenRouter multimodal endpoints via `input_audio` content parts).
+- **Video:** video attachments are shown as timestamped still frames through the vision route (`[attachments.video]`), with their audio transcribed alongside. `VideoTierRegistry` covers video generation models; it uses a separate provider interface for long‑running tasks.
+
+Models not listed in these registries are considered text‑only.
+
+## Streaming
+
+All providers support streaming with a unified event model.
+
+Common stream events:
+- `ContentStart`, `TextDelta`, `ThinkingDelta`
+- `ToolUseStart`, `InputJsonDelta`
+- `ContentStop`, `MessageDone`, `Error`
+- `RateLimitWait` (emitted before a retry so the runner can surface progress)
+
+Provider‑specific streaming differences:
+- **Bedrock:** Uses AWS event‑stream wire format with a custom `FrameDecoder`.
+- **Vertex AI:** Plain Server‑Sent Events (SSE).
+- **vLLM:** OpenAI‑compatible SSE, handles multi‑line pretty‑printed formats.
+- **Z.ai:** Standard OpenAI SSE with optional `tool_stream: true` parameter.
+
+**Stream Collection:** The `StreamCollector` accumulates events into content blocks with proper state management, handling edge cases like duplicate `ToolUseStart` events and empty completions.
+
+## Health checks and credential verification
+
+*   **vLLM:** `GET /health` endpoint.
+*   **Z.ai:** `GET /api/paas/v4/models` with authentication.
+*   **Anthropic/Gemini/Grok:** Use auth‑only endpoints (e.g., `/models`) for credential probes.
+*   **Bedrock/Vertex AI:** No explicit health check; errors surface on first request.
+
+## Schema sanitization and tool handling
+
+- **Tool Schema Sanitization:** For APIs that reject `oneOf`/`allOf`/`anyOf` constraints (Anthropic, Bedrock), these are stripped from tool schemas before sending.
+- **Tool Input Sanitization:** Ensures `tool_use.input` is always a JSON object (replaces null, string, or array values with an empty object `{}`).
+- **Tool Name Conversion:** Dots in tool names are converted to underscores for LLM API compatibility (`messaging.send` → `messaging_send`). The reverse mapping scans the registry since conversion is ambiguous.
+
+## Agent runtime integration
+
+Agents execute in a plan→policy→tool→feedback loop using `AgentRunner`. Key runtime behaviors:
+
+- **Round‑based execution:** Configurable max rounds (default: 50) with automatic context compaction and emergency/nuclear compaction strategies.
+- **Tool execution:** Tools run with optional soft deadlines; timeouts return structured failures.
+- **Progress events:** Real‑time status updates (`LlmCall`, `ToolStart`, `StreamDelta`, `RateLimited`, `ApprovalRequired`, etc.).
+- **Session context:** Task‑local variables (`CURRENT_SESSION_KEY`, `CURRENT_USER_ID`) propagate through spawned tasks via `SessionContext`.
+- **Security:** Secret marker substitution at tool boundaries, parameter scanning for critical findings, and human‑in‑the‑loop approval workflows with Always‑Allow/Always‑Deny persistence.
+
+The **Agent Registry** holds one `AgentService` per configured agent, supporting multi‑agent scenarios and runtime insertion/removal.

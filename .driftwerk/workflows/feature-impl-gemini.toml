@@ -1,0 +1,185 @@
+[workflow]
+id = "feature-impl-gemini"
+name = "Feature Implementation (Gemini)"
+description = "Gemini-optimised workflow with restricted tool sets per step"
+
+[workflow.context]
+ticket_id = { required = true, description = "The Linear ticket ID (e.g. DW-123)" }
+repo = { required = true, description = "The repository in owner/repo format (e.g. driftwerk/workforce)" }
+
+# =============================================================================
+# Step 1: Understand & Design
+# =============================================================================
+[[step]]
+id = "understand"
+max_rounds = 25
+model = "powerful"
+name = "Understand & Design"
+skills = ["linear"]
+exclusive_tools = true
+preferred_tools = ["code.git", "code.read", "knowledge.overview", "knowledge.ask", "knowledge.graph", "knowledge.index"]
+outputs = [
+  { name = "ticket_summary", description = "What the ticket is asking for (1-2 paragraphs)" },
+  { name = "requirements", description = "Specific requirements and constraints" },
+  { name = "acceptance_criteria", description = "How to verify the implementation is correct" },
+  { name = "implementation_plan", description = "Numbered step-by-step implementation plan with specific file paths and changes" },
+  { name = "key_files", description = "Files to create or modify, one per line" },
+  { name = "github_owner", description = "GitHub org/owner extracted from repo context (e.g. driftwerk)" },
+  { name = "github_repo", description = "GitHub repo name extracted from repo context (e.g. workforce)" },
+  { name = "target_repo", description = "Target repository in owner/repo format — triggers per-instance worktree isolation" },
+]
+pause = "awaiting-design-review"
+report = "Summarise in 3-5 bullet points: what will change, key files, and any risks. Keep it under 500 characters."
+task = """
+Analyze ticket {{ticket_id}} and create an implementation plan.
+
+## Steps (follow in order)
+
+1. Call `linear.issue_get` with identifier="{{ticket_id}}"
+2. Call `code.git` with repo="{{repo}}" action="pull"
+3. Call `knowledge.overview` with path="repos/{{repo}}"
+4. Call `knowledge.ask` with path="repos/{{repo}}" and a query about the areas relevant to the ticket
+5. Read key files with `code.read` to understand the current code
+6. Create a numbered implementation plan
+
+## Outputs (ALL required)
+
+- ticket_summary, requirements, acceptance_criteria, implementation_plan, key_files
+- github_owner = part before "/" in "{{repo}}"
+- github_repo = part after "/" in "{{repo}}"
+- target_repo = "{{repo}}"
+
+If the ticket is too unclear: OUTCOME: ticket-unclear
+Otherwise do NOT include "OUTCOME:" — this step pauses for human review.
+"""
+branches = [
+  { when = "approved", goto = "implement" },
+  { when = "rejected", goto = "understand" },
+  { when = "ticket-unclear", goto = "escalate" },
+]
+
+# =============================================================================
+# Step 2: Implement
+# =============================================================================
+[[step]]
+id = "implement"
+max_rounds = 30
+model = "powerful"
+name = "Implement"
+skills = ["github"]
+exclusive_tools = true
+preferred_tools = ["code.git", "code.read", "code.edit", "code.diff"]
+outputs = [
+  { name = "pr_number", description = "PR number that was created", validate = "number" },
+  { name = "branch_name", description = "Feature branch name" },
+  { name = "summary", description = "Brief summary of changes made" },
+]
+task = """
+Implement the plan and push changes.
+
+## Working Directory
+Your worktree: `{{_worktree_path}}`
+Use absolute paths starting with this for ALL file operations.
+
+## Steps (follow exactly)
+
+1. `code.git` repo="{{repo}}" action="branch" branch="feat/{{ticket_id}}"
+2. `code.read` the files you need to modify (use absolute worktree paths)
+3. `code.edit` to make ALL planned changes
+4. `code.diff` repo="{{repo}}" to verify your changes
+5. `code.git` repo="{{repo}}" action="commit" message="feat: <description> ({{ticket_id}})"
+6. `code.git` repo="{{repo}}" action="push"
+7. `github.pr_create` with owner="{{steps.understand.github_owner}}" repo="{{steps.understand.github_repo}}" head="feat/{{ticket_id}}" base="main" title="{{ticket_id}}: <summary>"
+
+Do NOT run tests — CI handles testing.
+Do NOT create duplicate PRs — create exactly ONE.
+Do NOT poll CI status — the next step handles review.
+Do NOT include "OUTCOME:" in your response.
+
+## Context
+- **Plan:** {{steps.understand.implementation_plan}}
+- **Files:** {{steps.understand.key_files}}
+"""
+
+# =============================================================================
+# Step 3: Code Review
+# =============================================================================
+[[step]]
+id = "review"
+max_rounds = 15
+model = "powerful"
+name = "Code Review"
+skills = ["github"]
+exclusive_tools = true
+preferred_tools = ["code.git", "code.read", "code.diff"]
+task = """
+Review PR #{{steps.implement.pr_number}}.
+
+## Steps
+
+1. `github.get_pull` owner="{{steps.understand.github_owner}}" repo="{{steps.understand.github_repo}}" pr_number={{steps.implement.pr_number}}
+2. `github.pr_diff` owner="{{steps.understand.github_owner}}" repo="{{steps.understand.github_repo}}" pr_number={{steps.implement.pr_number}}
+3. `github.ci_status` owner="{{steps.understand.github_owner}}" repo="{{steps.understand.github_repo}}" ref="{{steps.implement.branch_name}}"
+4. Verify ALL items in the plan have code changes
+5. If ALL checks pass: OUTCOME: approved
+6. If ANY check fails: OUTCOME: changes-requested
+"""
+branches = [
+  { when = "changes-requested", goto = "implement" },
+  { when = "approved", goto = "request-merge" },
+]
+
+# =============================================================================
+# Step 4a: Request Merge
+# =============================================================================
+[[step]]
+id = "request-merge"
+max_rounds = 3
+model = "standard"
+name = "Request Merge"
+exclusive_tools = true
+preferred_tools = []
+pause = "awaiting-merge-approval"
+report = "PR #{{steps.implement.pr_number}} ready for merge. {{steps.implement.summary}}"
+task = """
+PR #{{steps.implement.pr_number}} passed review. Present summary for human approval.
+Do NOT include "OUTCOME:".
+"""
+branches = [
+  { when = "approved", goto = "merge" },
+  { when = "rejected", goto = "implement" },
+]
+
+# =============================================================================
+# Step 4b: Merge
+# =============================================================================
+[[step]]
+id = "merge"
+max_rounds = 5
+model = "standard"
+name = "Merge & Close"
+skills = ["linear", "github"]
+exclusive_tools = true
+preferred_tools = ["code.git"]
+exit = true
+task = """
+1. `github.pr_merge` owner="{{steps.understand.github_owner}}" repo="{{steps.understand.github_repo}}" pr_number={{steps.implement.pr_number}} merge_method="squash"
+2. `linear.states_list` to find "Done" state ID
+3. `linear.issue_update` identifier="{{ticket_id}}" with the Done state_id
+"""
+
+# =============================================================================
+# Escalate
+# =============================================================================
+[[step]]
+id = "escalate"
+max_rounds = 3
+model = "standard"
+name = "Escalate"
+exclusive_tools = true
+preferred_tools = []
+exit = true
+handoff = "escalation_to_product"
+task = """
+The ticket is unclear. List what you understand and what questions remain.
+"""

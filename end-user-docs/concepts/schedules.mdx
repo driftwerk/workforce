@@ -1,0 +1,109 @@
+---
+title: Schedules and reminders
+description: Run an instruction later or on a cadence, and get personal reminders.
+---
+
+# Schedules and reminders
+
+Two tools cover time-based work. The `scheduler` tool creates jobs that run an
+instruction as a full agent turn, once at a set time or on a recurring cadence.
+The `reminder` tool sets personal reminders that simply notify you. Both are
+available in chat and over [remote MCP](/docs/reference/remote-mcp) as `wf_scheduler`
+and `wf_reminder`.
+
+## Scheduled jobs
+
+Ask the agent to schedule something, or call the tool directly. A job carries:
+
+- **Timing:** `in_time` for a relative delay such as `2h`, `at` for an absolute ISO
+  8601 time, or `every_secs` or `cron` for a recurring cadence, with an optional
+  `timezone` (default UTC).
+- **Instruction:** the `message` the agent receives when the job fires.
+- **Delivery:** a Slack `channel_id` and optional `thread_id` for the result. Set
+  `agent_owns_delivery` when the instruction tells the agent to post the result
+  itself, so the scheduler does not post a duplicate.
+- **Session:** every run starts in a fresh session by default, so no run carries
+  another's transcript. `context = "conversation"` gives the job one session of its
+  own to keep across runs: every run then replays all the runs before it, so each
+  run costs more than the last. A recurring job asked to keep a session always asks
+  for confirmation first. Where the result is delivered never decides the session.
+- **Limits:** `max_runs` and `expires_in` switch a recurring job off automatically.
+  Use them for anything that waits for a condition.
+
+Actions: `create`, `list` (each job with its session, run count and spend so far),
+`update`, `remove`, `run` (fire it now), `history` (recent runs and their cost), and
+`set_bill_to` for administrators to charge a job to a system lane instead of the
+owner's budget.
+
+### Changing a job
+
+`update` changes a job in place: its name, schedule, whether it is enabled, its
+visibility, the tools its runs are offered, and its session. The owner of a job and
+administrators can change it; nobody else can. The same edit is on the **Schedules**
+page, where each job shows whether its session is **Fresh** or **Pinned**, how many
+times it has run and what it has spent.
+
+Switching a pinned job to fresh stops the growth at once: its next run starts in a
+new session and none of its later runs can read the old one. Delivery, the owner,
+and whose access and budget the job uses stay as they were. Pinning a job gives it
+a new, empty session that belongs to that job alone, so it never joins a
+conversation or another job's session.
+
+A pinned session is also kept bounded. Once it holds as many messages as
+`[compaction] chat_rollover_max_messages` (200 by default), the next run starts in
+a successor session that carries a short dated tail of the last runs, not the
+whole history.
+
+A job created before sessions were minted per job may have been stored with the
+name of the conversation it was created in, which other people's jobs could share.
+Such a job keeps a session of that name apart for the person it runs as, so no one
+else's runs reach it; switch it to fresh and pin it again to give it a new, empty
+session of its own. Where its result is delivered does not change.
+
+Changing a job asks for your confirmation, with the same cost estimate the tool
+gives when creating one, when the change pins a recurring job or makes it run more
+often at a projected cost over the confirmation threshold. The agent asks you in
+the conversation; the **Schedules** page shows the estimate and a **Confirm and
+save** button. A job's spend is shown to its owner and to administrators.
+
+An administrator can stop an agent's recurring jobs keeping a session at all with
+`pinned_sessions = false` under `[scheduler]`, in `workforce.toml` for every agent
+or in one agent's own `config.toml`. A job that was pinned then runs fresh, and
+its run history says so.
+
+### Cost guardrails
+
+Every fire of a recurring job is a full agent turn, so recurring jobs cost real
+money. Recurring intervals have a configured minimum, and a job whose projected
+daily cost exceeds the configured ceiling returns a `needs_confirmation` estimate.
+The person has to approve it before the create is retried with `confirmed = true`.
+Prefer, in order: an event-driven monitor over polling, the coarsest interval that
+works, and an explicit `max_runs` or `expires_in`.
+
+### Who a job runs as
+
+A job runs as the identity that created it and uses that person's access to tools,
+credentials, and data. A job is visible to its owner, or to everyone when saved as
+global; administrators can see and manage every job.
+
+A job you created runs like your own conversation with the agent: its prompt
+knows your profile, notes, pins, preferences and memories, whatever tools it uses,
+wherever it posts and whether you made it global. A job's prompt leaves that out
+when someone else is in charge of it:
+
+- an administrator created it to run as you;
+- someone else last changed its schedule, its session, its tools or who may see
+  it (an administrator's edit), until you open it and save it yourself; renaming,
+  pausing or re-billing a job is not such a change;
+- a heartbeat, monitor, workflow step or another job created it, or a sub-agent one
+  of them started, until you save it yourself;
+- the scheduler posts its reply into a shared channel, where it speaks to the room.
+
+Charging a job to another budget changes nothing here.
+
+## Reminders
+
+Reminders are lighter: `set` with a message and a time, once or on a cadence,
+`list`, and `cancel`. A reminder arrives as a direct message to you wherever it was
+set. Use a reminder when you want a nudge, and a scheduled job when you want the
+agent to do work.

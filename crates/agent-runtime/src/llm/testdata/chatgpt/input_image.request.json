@@ -1,0 +1,31 @@
+{
+  "model": "gpt-5.5",
+  "instructions": "You are Allan, a concise assistant. Use tools when asked.",
+  "store": false,
+  "stream": true,
+  "include": [
+    "reasoning.encrypted_content"
+  ],
+  "tool_choice": "auto",
+  "prompt_cache_key": "00000000-0000-4000-8000-000000000001",
+  "reasoning": {
+    "effort": "low"
+  },
+  "parallel_tool_calls": false,
+  "input": [
+    {
+      "type": "message",
+      "role": "user",
+      "content": [
+        {
+          "type": "input_image",
+          "image_url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAMgAAABQCAIAAADTD63nAAAFj0lEQVR4nO3dW0hUWxgH8G/05KQRaiNoiF3sECQ9yCRpGNRDF4oiosJAQmgqCl+C6EYklA/R5VF8Kgi7mEnQHaypHhKNFEtqUiqylLALMTla4SX34SNoz5pzTs3smW+7bP4/9sNeu73XjPBn7TVrr7VzGIZBALGWEPMaARAskIIWC0QgWCACwQIRCBaIQLBABIIFIhAsEIFggYi/ZKoFAX4/3b5Nd+/Ss2f06hX19dG3bzRxIk2aRDk5NGsWzZ9PixfTvHmkAyNMzc0GkblVVhoWeDxKJT09/31adrZyWjRbS0to5bW1ygn19Vb+EKHa/k97u1FaajidYf3Jf/9tHDli9PcbYwq3Qr19/Url5eR207lzNDgY1iUvX9L+/ZSbSzU1NHYQLI11dVFREVVX0/fvEV/78SOVlVFpKQ0N0VhAH0tXXV3cYeruVg46HFRYSGvW8D9NnUqZmdzNeveOT755k65epZ4e5fzz5+nDB7p+nZxOm7++9i1WSQkZhvWtoIDGo4EBWrkyNFVFRfTgATU30759vD99Ovfc09Npzhw+uaqK41VVxUeCeb20bZvNX388BCs+bd9OnZ3KkUOHqKmJf/f9QmIid8g6Oig/XzleU0N1dWQvBEs/9+9zVz1YdTVVVPB9MByZmTwkEdJU79rFraCNECzNjI7Szp3KkR07eItIejpdukSTJ5tH3r6lY8fIRgiWZq5do7Y2szh7Np04YaWeadNCLzx50sqvS6sQLM2cPq0UKyooJcViVVu20MyZZrG3lxoayC4Ilk4+faIbN8xiRgatX2+9toSE0HtofX0UXy7CD7ftk+D3GhpoeNgslpZGO/60aZNSfPiQ7IJg6aSlRSkWF0dbYVYWP9v5qbPTtt+GCJZOWluV4q9HrcK0YIG5PzpKPh9pHayDB3lYJdLt1KkYf/0/TEeHuZ+ezmPr0QtusX5042yhfYtVV2clwQ4HbdxI44th0OfPZjEjIzbVhjzhCf6IuA5W/OjvV8aZ0tJEgtXXR7ZAsLQRCCjF1NTYVBvy0pcJE0jrYFVWWplr4PHE+Ov/SRITlWKs3gIU0kTFqiEc9/OxSkrowgWKBykpIp2hkGCF3BnF4FaojdRUSk42i35/bKp9/lwpulxkCwRLJzk55n53N094j96jR+Z+UhLPCrQFgqWTuXPN/ZERJRPWBAJKi5Wfb9scZQRLJ4WFSrGxMdoKr1xRhjBiMpQfHgRLJ0uWKMUzZ6Kt8OJFpbh6NdkFwdKJ2608gfH5opqP0NWlTMCaMSM0uJIQLM2UlSnFAwesV3X4sDIJx+PhGVp2QbA0U16uDGh5vTx73QKfj86eNYtTpvDKHxshWJpxuWj3buXI1q305ElklXz5wpMER0bMI0ePxuypdngQLP3s3ctrKH7y+2npUnr6NNzLAwFeKt3ebh4pLrb/YRqCpZ/kZKqtVUbh37/nfv2ePb+f/+n18orCO3fMI1lZXFuYaxLjKFiW52P92ELW6P3bhg0R17lwoXhtbjd3rZKSzCPDw3T8OL+vYe1ani/Z2kpv3vCLG4aG+P0fTU28bLCggNu2Fy/Mq1wuXp0RPKBvF+0fQsetFSvo1i1at06Z8zkwQJcv8xaO3FxepZiXR2NB+xYrni1axF2lVasivjAhgTZvpsePxypVCJb2srO51bl3j5YvD2sUyunkOdltbXy7DF5ibzsH/lu5caO3l1+C1djIay5ev+Zff4OD3MdPS+O7Xl4evzRr2TIestIAggUi0McCEQgWiECwQASCBSIQLBCBYIEIBAtEIFggAsECEQgWiECwQASCBSIQLBCBYIEIBAtEIFggAsECEQgWiECwQASCBSIQLBCBYIEIBAtEIFggAsECEQgWiECwQASCBSIQLBCBYIEIBAtIwj+ioHl4Gr+IewAAAABJRU5ErkJggg=="
+        },
+        {
+          "type": "input_text",
+          "text": "What word is in this image and what colour is it?"
+        }
+      ]
+    }
+  ]
+}

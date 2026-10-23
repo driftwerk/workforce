@@ -1,0 +1,61 @@
+[package]
+name = "workforce-postgres"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+name = "workforce_postgres"
+path = "src/lib.rs"
+
+# Shared Postgres infrastructure for every workforce store that opts
+# into Postgres. Lives in its own crate so per-store crates
+# (`workforce-identity`, `workforce-pairing`, etc.) can depend on it
+# without creating a cycle through `workforce-common`, which itself
+# depends on `workforce-pairing` for `PairingConfig`. `PostgresConfig`
+# (data + serde) is always available; runtime types are gated behind
+# the `postgres` feature so default builds stay slim.
+
+[dependencies]
+serde = { workspace = true }
+async-trait = { workspace = true }
+eyre = { workspace = true }
+tracing = { workspace = true }
+
+tokio-postgres = { workspace = true, optional = true }
+deadpool-postgres = { workspace = true, optional = true }
+refinery = { workspace = true, optional = true }
+# TLS for `sslmode = "require"` (e.g. an RDS Proxy endpoint). Pure-Rust via
+# rustls + ring; only built with the `postgres` feature.
+tokio-postgres-rustls = { version = "0.13", optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
+
+# Test-support dependencies — only pulled in when the `test-support`
+# feature is enabled, which downstream test crates do via
+# `[dev-dependencies] workforce-postgres = { features = ["test-support"] }`.
+tokio = { workspace = true, optional = true }
+uuid = { workspace = true, optional = true }
+postgresql_embedded = { version = "0.20", default-features = false, features = ["bundled", "tokio", "theseus", "rustls"], optional = true }
+chrono = { workspace = true, optional = true }
+libc = { version = "0.2", optional = true }
+
+[features]
+default = []
+postgres = ["dep:tokio-postgres", "dep:deadpool-postgres", "dep:refinery", "dep:tokio-postgres-rustls", "dep:rustls"]
+# Shared parity-test harness used by every store crate's tests. Spins
+# up an embedded Postgres (via `postgresql_embedded`) the first time a
+# test asks for it, or honours `WORKFORCE_TEST_POSTGRES_URL` for an
+# external server. See `test_support::with_test_pool`.
+test-support = [
+    "postgres",
+    "dep:tokio",
+    "dep:uuid",
+    "dep:postgresql_embedded",
+    "dep:chrono",
+    "dep:libc",
+]
+
+[dev-dependencies]
+toml = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

@@ -1,0 +1,52 @@
+@import "tailwindcss";
+@import "fumadocs-ui/css/neutral.css";
+@import "fumadocs-ui/css/preset.css";
+@custom-variant dark (&:where(.dark, .dark *));
+
+@theme {
+  --color-background: oklch(0.145 0 0);
+  --color-foreground: oklch(0.985 0 0);
+  --color-card: oklch(0.205 0 0);
+  --color-card-foreground: oklch(0.985 0 0);
+  --color-popover: oklch(0.205 0 0);
+  --color-popover-foreground: oklch(0.985 0 0);
+  --color-primary: oklch(0.488 0.243 264.376);
+  --color-primary-foreground: oklch(0.985 0 0);
+  --color-secondary: oklch(0.269 0 0);
+  --color-secondary-foreground: oklch(0.985 0 0);
+  --color-muted: oklch(0.269 0 0);
+  --color-muted-foreground: oklch(0.708 0 0);
+  --color-accent: oklch(0.269 0 0);
+  --color-accent-foreground: oklch(0.985 0 0);
+  --color-destructive: oklch(0.396 0.141 25.723);
+  --color-destructive-foreground: oklch(0.637 0.237 25.331);
+  --color-border: oklch(0.269 0 0);
+  --color-input: oklch(0.269 0 0);
+  --color-ring: oklch(0.488 0.243 264.376);
+  --color-success: oklch(0.517 0.174 142.495);
+  --color-warning: oklch(0.681 0.162 75.834);
+  --radius-sm: 0.25rem; --radius-md: 0.375rem; --radius-lg: 0.5rem; --radius-xl: 0.75rem;
+}
+
+:root:where(:not(.dark)) {
+  --color-background: oklch(1 0 0); --color-foreground: oklch(0.145 0 0);
+  --color-card: oklch(1 0 0); --color-card-foreground: oklch(0.145 0 0);
+  --color-popover: oklch(1 0 0); --color-popover-foreground: oklch(0.145 0 0);
+  --color-primary: oklch(0.488 0.243 264.376); --color-primary-foreground: oklch(0.985 0 0);
+  --color-secondary: oklch(0.965 0 0); --color-secondary-foreground: oklch(0.205 0 0);
+  --color-muted: oklch(0.965 0 0); --color-muted-foreground: oklch(0.556 0 0);
+  --color-accent: oklch(0.965 0 0); --color-accent-foreground: oklch(0.205 0 0);
+  --color-destructive: oklch(0.577 0.245 27.325); --color-destructive-foreground: oklch(0.985 0 0);
+  --color-border: oklch(0.922 0 0); --color-input: oklch(0.922 0 0);
+  --color-ring: oklch(0.488 0.243 264.376);
+  --color-success: oklch(0.517 0.174 142.495); --color-warning: oklch(0.681 0.162 75.834);
+}
+
+@layer base { * { @apply border-border; } body { @apply bg-background text-foreground; } }
+
+/* Pipeline board: a token that just changed column arrives with a lift. */
+@keyframes wf-arrive {
+  0% { transform: translateY(-6px) scale(0.98); opacity: 0.4; box-shadow: 0 0 0 4px color-mix(in oklch, var(--color-primary) 35%, transparent); }
+  60% { transform: translateY(0) scale(1.01); opacity: 1; }
+  100% { transform: none; box-shadow: none; }
+}

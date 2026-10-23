@@ -1,0 +1,35 @@
+{
+  "input": {
+    "kind": "pie",
+    "labels": [
+      "a"
+    ],
+    "series": [
+      {
+        "data": [
+          1
+        ]
+      }
+    ],
+    "stacked": true,
+    "horizontal": true
+  },
+  "result": {
+    "ok": true,
+    "spec": {
+      "kind": "pie",
+      "labels": [
+        "a"
+      ],
+      "series": [
+        {
+          "data": [
+            1
+          ]
+        }
+      ],
+      "stacked": false,
+      "horizontal": false
+    }
+  }
+}

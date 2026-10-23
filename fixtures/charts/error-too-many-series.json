@@ -1,0 +1,56 @@
+{
+  "input": {
+    "kind": "bar",
+    "series": [
+      {
+        "data": [
+          1
+        ]
+      },
+      {
+        "data": [
+          1
+        ]
+      },
+      {
+        "data": [
+          1
+        ]
+      },
+      {
+        "data": [
+          1
+        ]
+      },
+      {
+        "data": [
+          1
+        ]
+      },
+      {
+        "data": [
+          1
+        ]
+      },
+      {
+        "data": [
+          1
+        ]
+      },
+      {
+        "data": [
+          1
+        ]
+      },
+      {
+        "data": [
+          1
+        ]
+      }
+    ]
+  },
+  "result": {
+    "ok": false,
+    "error": "too many series (max 8)"
+  }
+}

@@ -1,0 +1,423 @@
+---
+title: Golden evals
+description: Score an agent against a fixed set of questions, and compare configurations question by question.
+---
+
+# Golden evals
+
+`workforce eval` asks an agent a fixed, versioned set of questions and scores the answers, so a change
+(know-how injection, a cheaper model, adversarial research) is judged by the same yardstick each time
+instead of by feel.
+
+- Every question is asked **as you**, through the ordinary chat turn, in a session of its own. Your
+  credentials, know-how, memory scope and budgets apply exactly as when you ask the agent yourself.
+- Every answer is graded against the question's rubric by a model call on the install's own model
+  routes. No third party is involved that the install does not already use.
+- The result is two files: **scores** (numbers only, safe to take off the host) and a **full** report
+  (names, questions, answers and the judge's reasons, which stay on the host).
+- Nothing a question or an answer said is printed to the terminal. Progress lines name question ids.
+
+<Callout type="warn">
+A real set holds your organisation's questions and expected answers. Keep it, and the run directory, on
+the install's own host or storage. Only `scores.json` is meant to leave.
+</Callout>
+
+## Write a set
+
+A set is a directory: `set.toml`, and one TOML file per question, named after the question's `id`.
+The repository ships a synthetic example in `fixtures/evals/example`.
+
+```toml
+# set.toml
+name = "example"
+description = "A synthetic set about a made-up shop."
+```
+
+```toml
+# db-001.toml
+id = "db-001"
+use_case = "database"            # database | code | investigation
+question = "How many orders shipped in the week of 2 March 2026?"
+expected = "42 orders shipped that week, counting orders whose status is shipped and leaving cancelled ones out."
+assumptions = ["The week runs Monday to Sunday.", "Times are UTC."]
+trap = "Counting every order created that week, cancelled ones included, gives 47."
+ideal_evidence = """
+SELECT count(*)
+FROM orders
+WHERE status = 'shipped'
+  AND shipped_at >= '2026-03-02' AND shipped_at < '2026-03-09';
+"""
+
+[[evidence]]                     # what a good answer rests on
+kind = "table"                   # table | file | ticket | log
+name = "orders"
+
+[rubric]
+correct = "Both points are met."
+partly = "The filter is right and the number is not, or the number is 47 with the cancelled orders named as included."
+wrong = "Any other number, or no number."
+cited = "The answer names the orders table or shows the query it ran."
+
+[[rubric.points]]
+id = "count"
+text = "Gives 42 as the number of orders."
+
+[[rubric.points]]
+id = "filter"
+text = "Counts shipped orders only, by their ship date."
+```
+
+| Field | Meaning |
+|---|---|
+| `id` | The file's name. Letters, digits, `-` and `_`. |
+| `use_case` | Scores are reported per use case. |
+| `question` | What the agent is asked, word for word. |
+| `expected` | The right answer. |
+| `evidence` | The tables, files, tickets and logs a good answer rests on. At least one. |
+| `assumptions` | What the answer may assume without being marked down. |
+| `trap` | The mistake answers commonly make. The judge reports whether the answer made it. |
+| `ideal_evidence` | The SQL or code a good answer would have run or read. |
+| `rubric.points` | The things the answer must get right. The judge reports which were met. |
+| `rubric.correct` / `partly` / `wrong` | What each verdict means for this question. |
+| `rubric.cited` | What counts as the answer citing its evidence. |
+
+A misspelt field is an error, not a silent default.
+
+### Versions
+
+A question's version is a hash of its content. Comments, layout, Windows or Unix line ends and spaces at
+the end of a line do not change it; any change to what is asked or how it is scored (a rubric point, a
+verdict's description) does. Results carry the version they were produced under, and results of
+another version are left out of the scores (and counted, so you can see that it happened). **A changed
+question is a new question**: it is asked again, and its old scores are never compared with its new ones.
+
+```sh
+workforce eval check --set /srv/evals/sets/support
+```
+
+validates a set and prints each question's version. With `--know-how <agent>` (and `--url` and `--token`,
+as for a run) it also counts, for each question, how many of the agent's know-how entries your eval turn
+would be shown with it, using the hub's own matching and no model turn. See
+[comparing know-how](#comparing-know-how).
+
+## Run a set
+
+```sh
+export WORKFORCE_GATEWAY_URL=https://workforce.example.com
+export WORKFORCE_GATEWAY_TOKEN=<your own sign-in token>
+
+workforce eval run --set fixtures/evals/example --agent analyst --out /srv/evals/runs/analyst-2026-10
+```
+
+The token is a person's sign-in, the same one `workforce chat` takes. The install's owner token will
+not do: it signs in nobody, and an eval turn needs a person.
+
+The command prints the scores per use case and writes, in the run directory:
+
+| File | Holds | Leaves the host? |
+|---|---|---|
+| `scores.json` | Numbers under field names and use-case labels: counts, shares, medians, paired differences, costs. No question, answer, reason or question id, and no name of a set, arm, agent or model. Arms are listed by position, the first being the baseline. | Yes |
+| `full.json` | The names of the set, the arms, their agents and the judge, and every question with each arm's answer, grade and the judge's reason. | No |
+| `turns.jsonl`, `grades.jsonl`, `run.json` | The run's record, appended as it happens. | No |
+
+The files that stay are readable by their owner only.
+
+| Column | Meaning |
+|---|---|
+| `n` | Questions asked. |
+| `correct`, `partly`, `wrong`, `ungraded`, `failed` | Shares of `n`. They add up to 100%. |
+| `capped` | Share of `n` whose turn stopped at the agent's round cap. The answer is the turn's wind-down ("here is what I have so far"); it is graded like any other and counted here as well, so a config that runs out of rounds shows. |
+| `cited`, `trap` | Shares of the graded answers that cited their evidence, and that fell for the trap. |
+| `cost $`, `rounds`, `secs` | Medians over the answered turns. Cost is the turn's own model calls. Seconds are the hub's time on the turn, waits for the rate limit aside. |
+| `judge agrees` | See [the judge](#the-judge). |
+
+Under the table the report gives two totals: what the turns cost in all, and what the grading cost.
+
+### What a run costs
+
+A run spends on three things, all billed to you and all counted against your budget:
+
+- **Turns.** One per question per arm, at whatever the agent's turns cost. This is the figure in `cost $`.
+- **Reviews.** The checks the hub runs after an answer (claim grounding, data grounding, commitments), when
+  the agent has them on. They are billed as for any of your turns and are **not** in `cost $` or in the
+  turns total: find them in your usage for the period.
+- **Grading.** Two judge calls per answer. Each is one model call that reads the rubric and the answer and
+  writes a line: small next to a turn.
+
+So a run costs about `questions × arms × (a turn + its reviews) + 2 × answers × a judge call`. Ask one
+question first (`--limit 1`) and read the two totals to size the rest.
+
+Useful flags:
+
+- `--limit N` asks only the first N questions. **Ask one question first** and read its answer in
+  `full.json`: an agent that cannot reach its data fails every question, and you want to learn that for
+  the price of one.
+- `--concurrency N` lets N turns run at once. The default is 1. With more than one, cost per turn is
+  unaffected and seconds per turn can rise, since the turns share the hub.
+- `--retry` asks again the questions whose turn failed and grades again the answers that went ungraded.
+- `--turn-timeout-secs` is the longest one turn may take (default 1800).
+
+The hub must be at least as new as the `workforce` binary you run this with. An older hub is refused
+before anything is asked.
+
+### Stopping and carrying on
+
+A run can stop at any point: your budget is reached, the hub restarts, you press Ctrl-C. Everything up
+to then is recorded. Run **the same command again** and it carries on, asking only what is still
+missing. A turn the budget refuses is never recorded as an answer.
+
+When the budget refuses a turn, or you press Ctrl-C, the run starts nothing new and waits for the turns
+already in flight, because the hub finishes and bills a turn whether or not anyone waits for it. Pressing
+Ctrl-C a second time abandons them: they may still be billed, and are asked again next time. The same
+holds for a turn that outlasts `--turn-timeout-secs`: it is recorded as failed, and the hub may still
+finish it.
+
+A run has one judge. Carrying on in the same directory with another `--grader-agent` or `--grader-model`
+is refused; use a new directory.
+
+`workforce eval report --set <set> --out <run directory>` prints the scores again without calling the hub.
+
+### What an eval turn leaves behind
+
+An eval turn is answered exactly like your own turn, and then deliberately forgotten: no memory is
+extracted from it, no lesson, no know-how, and the lessons and know-how it was shown are not counted in
+their statistics. Its session is deleted as soon as the answer is recorded in the run directory, and
+while it exists the agent's session search does not find it. Otherwise a later question could be
+answered from an earlier one, the second arm of a comparison from the first, and next month's run from
+this month's. Pass `--keep-sessions` to leave the sessions on the hub and read their transcripts; they
+still stay out of the digest of your recent conversations and out of session search.
+
+A question the agent's scope filter turns away is recorded as failed, with the filter's reply as the
+reason, and the run carries on. An agent whose access policy does not admit you stops the run at once.
+
+Everything else about the turn is an ordinary turn's: it is admitted by your budget, billed to you,
+recorded in usage and the audit trail, and bound by the agent's access policy, tool permissions and
+approvals. Asking on an eval channel switches off what the agent would learn from the turn, and nothing
+else.
+
+A turn that fails or is cut off names no session. The run looks for it by the turn's channel and deletes
+it, straight away and again at the start of the next run; the hub only lists such sessions for a system
+admin, so for anyone else that one stays.
+
+What the agent does during the turn still happens, with one exception: it cannot add know-how (the
+`know_how` tool refuses on an eval's turn). If it decides to save a memory or file a ticket, it does. Do
+not put questions in a set that ask for a change.
+
+## Compare configurations
+
+A comparison runs the same set against several **arms** and reports, for each arm after the first, the
+difference from the first, question by question.
+
+Keep it small: the agent as it is, against **one test copy** with one change, on the model you use in
+production. Every extra arm multiplies cost and makes the result harder to read.
+
+```toml
+# arms.toml
+[[arm]]
+name = "current"
+agent = "analyst"
+
+[[arm]]
+name = "know-how-on"
+agent = "analyst-eval"
+copy_of = "analyst"
+
+[arm.overrides.know_how]
+enabled = true
+inject = "on"
+```
+
+```sh
+workforce eval compare --set /srv/evals/sets/support --arms arms.toml --out /srv/evals/runs/know-how
+```
+
+### The test copy
+
+An arm's `overrides` are laid over its agent's `config.toml` while that arm runs and removed afterwards.
+They are only ever laid over a **test copy**, so nobody else's conversations run with them:
+
+- the agent's own `config.toml` must say it is one, with `[evals] copy = true`. What the arms file claims
+  is not enough: an agent that does not carry the marker is never written to, and an arm cannot set the
+  marker itself;
+- the arm must name the original in `copy_of`. A copy that reads another agent's know-how
+  (`[know_how] source_agent`) must read the original's, or the comparison is refused;
+- the copy cannot be an agent the run also uses as a real one, nor the install's default agent.
+
+Applying overrides needs a system admin's sign-in. Without one, set the copy up by hand and leave
+`overrides` out.
+
+Make the copy once, as an admin:
+
+1. Create it (`workforce agent create`, or the Agents page).
+2. Give it the original's identity files and this `config.toml`: the original's, plus the three blocks
+   below, with your own identity id in `allow`.
+
+   ```toml
+   [evals]
+   copy = true            # this agent is a test copy; an eval arm may change its settings
+
+   [access]
+   mode = "allowlist"     # nobody but you can talk to it, on any surface
+   allow = ["<your identity id>"]
+
+   [memory]
+   agent_recall_scope = "isolated"   # it recalls nothing you told other agents
+
+   [know_how]
+   source_agent = "analyst"          # read the original's know-how; never write to it
+   ```
+
+   The access list is what keeps other people's conversations off the copy; the run cannot check it for
+   you. `GET /api/me` with your sign-in token returns your identity id.
+
+   Know-how belongs to the agent that learned it, so a new copy has none of its own: without
+   `source_agent`, know-how "on" and "off" send the copy the same prompts. `source_agent` is read only on
+   an agent carrying `[evals] copy = true`; on any other agent it is ignored, saving the config says so,
+   and the agent's settings report shows it as not in effect.
+3. Give it the original's credentials. **A new agent starts with an empty vault**, and an agent without
+   its data source answers every question from guesswork. The comparison refuses to start when the copy
+   lacks a credential the original has; if your sign-in may not list the two vaults, it says it could
+   not check.
+
+#### If a run dies with the overrides on
+
+The copy's config as it was is written to the run directory (`config-backups/`) before the overrides are,
+and removed once it is back. A run that dies in between leaves the copy overridden. The next
+`eval run` or `eval compare` **in the same run directory** puts it back before doing anything else, and
+
+```sh
+workforce eval restore --out /srv/evals/runs/know-how
+```
+
+does only that. A config that someone has edited since is not overwritten: the command says so and leaves
+the original in the backup file for you. If the run directory is lost, or the next run happens somewhere
+else, the overrides stay on the copy until you remove them by hand (on installs with config history, the
+Agents page lists the revision from before the run). That is why they are only ever laid over a copy
+nobody else uses.
+
+#### More than one hub replica
+
+The replica that takes the config change applies it at once. Whether, and how soon, the other replicas
+apply it depends on how the install shares agent workspaces between them, which the run cannot see. So
+the run does not rely on it: it waits five seconds after laying the overrides, and every answer says which
+config its whole turn ran under. An answer that ran under anything but the arm's config is recorded as
+**failed** ("answered under a config other than the arm's"), never graded as the arm's; `--retry` asks it
+again. If every answer of an arm fails that way, the replicas are not picking up the change: configure the
+copy by hand and leave `overrides` out.
+
+For an arm without overrides the report counts how many different configs its answers ran under, and says
+so when it is more than one (someone changed the agent mid-run).
+
+### Comparing know-how
+
+A copy with `source_agent` reads the original's know-how as the original would for the same person, and
+writes nothing to it: no turn on the copy, an eval's or anyone's, learns an entry, confirms one, counts a
+match or a use, or adds one through the `know_how` tool. Who may see what, the copy's own `[know_how]`
+settings (`inject`, `min_users`, `min_score`) and its access policy stay the copy's, and the copy shows the
+original's know-how only to people the original's own access policy admits.
+
+A know-how comparison measures know-how **for the person the run is signed in as**. An entry fewer than
+`min_users` people confirmed is shown only to the people who produced it, so your run sees what everyone
+shares plus what you produced yourself; someone else's run of the same set may see more or less.
+
+Before anything is spent, a run counts the entries each arm that shows know-how (`inject = "on"`) would
+see for you, prints that number, and refuses a copy that would see none ("this copy sees no know-how; set
+`[know_how] source_agent`", or "none of the source's entries are visible to you"), or that runs on a hub
+without an embedder to match requests by.
+
+Whether a comparison can show anything depends on how many questions know-how changes. The sign test
+needs **at least six questions the arms score differently**, and a question know-how is never shown with
+cannot be one of them. Count them first, for the price of an embedding per question:
+
+```sh
+workforce eval check --set /srv/evals/sets/support --know-how analyst-eval
+```
+
+prints, after each question's version, how many entries it would be shown, and how many questions would
+be shown any. The count is made as if know-how were on, so it works on a copy whose own config leaves it
+off for the arm to turn on.
+
+An arm's results are kept for its agent and overrides, not for the copy's own `config.toml`. After adding
+`source_agent` to a copy that was already compared without it, use a **new run directory**: in the old
+one, the turns the copy answered without know-how would be read back as the arm's.
+
+### What can be an arm
+
+| Question | Overrides |
+|---|---|
+| Know-how on or off | `[know_how]` `enabled = true`, `inject = "on"` against `inject = "off"` |
+| Adversarial research | `[research]` `adversarial = true` |
+| A cheaper or different model | `[llm]` `default_model = "cheap"`, or `[llm.model_preferences]` per task type |
+
+Three things to know:
+
+- An override must be a setting an agent's `config.toml` has. A misspelt one is refused, because the
+  config would ignore it and the comparison would measure nothing.
+- Some sections replace the install's block whole rather than key by key (`[claim_grounding]`,
+  `[self_learning]`, `[code_context]`). Restate every field you rely on.
+- A setting that needs a restart (a model on a provider the agent does not already use, the memory
+  backend) cannot be an override: the run undoes it and stops.
+
+Settings that belong to the whole install, such as routing playbooks through `[decision.uses]`, are not
+per-agent and cannot be an arm. Run the set before and after the change into two run directories and
+read the two score tables side by side; there is no paired test across run directories.
+
+### Reading the difference
+
+For each arm against the first, per use case and overall:
+
+- how many questions both were graded on, and on how many the arm did better, worse and the same;
+- the median difference in cost, rounds and seconds;
+- an **exact two-sided sign test** on the questions scored differently (correct above partly above
+  wrong; questions scored the same, and questions either arm failed or went ungraded on, are left out and
+  counted), with a plain statement of whether the difference is distinguishable from noise at this number
+  of questions (p below 0.05);
+- how many of the pairs rest on an answer the judge graded differently on its second reading, and the
+  test again without those. A difference is only called distinguishable if it holds both ways.
+
+How to read it:
+
+- **The line for all questions is the result.** The lines per use case are tests of their own and are not
+  corrected for being several: with three use cases and a couple of arms, one of them will look
+  distinguishable by chance now and then. Read them as pointers to where to look.
+- **"Not distinguishable" is not "the same".** Fewer than six differently-scored questions can never be
+  distinguishable, whatever the split. With 15 to 20 questions per use case, only a large difference
+  (roughly: one arm better on nine or ten of the questions they differ on, for every one it is worse on)
+  can show; a small one cannot, in either direction.
+- The sign test counts which arm did better on a question, not by how much.
+
+## The judge
+
+Each answer is read by a judge: one model call, with no tools, on the model routes of one agent
+(`--grader-agent`, by default the first arm's agent; `--grader-model` picks a tier or model). The same
+judge reads every arm's answers. It always runs on the install's own providers: nothing is sent anywhere
+the install does not already send its turns.
+
+A judge of the same model family as the agent it grades tends to score that family's answers a little
+higher. Where the install has a model of another family, point the judge at it: `--grader-model` with
+that model's tier or routed name, or `--grader-agent` with an agent that runs on it. Where the install has
+one family only, the judge is same-family; it still grades every arm alike, so differences between arms
+remain comparable, while the absolute shares may flatter.
+
+- **It does not know whose answer it reads.** It is sent the question, the rubric and the answer, and
+  nothing about arms, agents or models. Answers are judged in a shuffled order that follows neither arms
+  nor questions; the shuffle is seeded by the run's id, recorded in `run.json`. It reads the answer as you
+  would see it, including any review footer the hub appended, so an arm that changes the reviews changes
+  what the judge reads.
+- **The answer is data to it.** The answer is fenced off as untrusted text, and the judge's instructions
+  come before and after it. An answer that tells the judge how to grade it is graded on what it says
+  about the question. No instruction makes a model immune to being talked round, which is one reason every
+  answer is graded twice and the reasons are kept in `full.json`.
+- **It fails closed.** A judge that writes nothing, something that is not a grade, a verdict other than
+  correct, partly or wrong, or a rubric point the question does not have, leaves the answer `ungraded`.
+  An ungraded answer is never counted as correct.
+- **It is measured.** Every answer is graded twice. `judge agrees` is the share of answers that got the
+  same verdict both times. The first reading is the grade, a rule fixed before anything is read and the
+  same for every arm; an answer the two readings disagree on is not dropped, because that would drop the
+  borderline answers and not evenly across arms. Disagreements are counted instead, per arm and per
+  comparison, and `full.json` shows both readings. If agreement is low, the rubric is too loose to carry a
+  comparison: tighten its points before trusting the scores.
+
+Grading is billed to you and counts against your budget, like the turns. Anyone signed in who may talk to
+the judge's agent can ask for a grade; the install's owner token cannot. A request is a rubric and an
+answer, capped in size, and the reply is a verdict and a one-line reason.

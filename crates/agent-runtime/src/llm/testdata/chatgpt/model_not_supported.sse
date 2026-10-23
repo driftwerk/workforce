@@ -1,0 +1,4 @@
+HTTP 400
+Content-Type: application/json
+
+{"detail":"The 'gpt-4o' model is not supported when using Codex with a ChatGPT account."}

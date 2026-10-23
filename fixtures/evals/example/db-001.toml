@@ -1,0 +1,30 @@
+id = "db-001"
+use_case = "database"
+question = "How many orders shipped in the week of 2 March 2026?"
+expected = "42 orders shipped that week, counting orders whose status is shipped and leaving cancelled ones out."
+assumptions = ["The week runs Monday to Sunday.", "Times are UTC."]
+trap = "Counting every order created that week, cancelled ones included, gives 47."
+ideal_evidence = """
+SELECT count(*)
+FROM orders
+WHERE status = 'shipped'
+  AND shipped_at >= '2026-03-02' AND shipped_at < '2026-03-09';
+"""
+
+[[evidence]]
+kind = "table"
+name = "orders"
+
+[rubric]
+correct = "Both points are met."
+partly = "The filter is right and the number is not, or the number is 47 with the cancelled orders named as included."
+wrong = "Any other number, or no number."
+cited = "The answer names the orders table or shows the query it ran."
+
+[[rubric.points]]
+id = "count"
+text = "Gives 42 as the number of orders."
+
+[[rubric.points]]
+id = "filter"
+text = "Counts shipped orders only, by their ship date."

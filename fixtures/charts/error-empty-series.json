@@ -1,0 +1,10 @@
+{
+  "input": {
+    "kind": "bar",
+    "series": []
+  },
+  "result": {
+    "ok": false,
+    "error": "series must be a non-empty array"
+  }
+}

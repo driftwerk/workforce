@@ -1,0 +1,186 @@
+#!/bin/bash
+# Privilege-separated entrypoint (audit finding F7).
+#
+# PID 1 (under tini) starts as ROOT — the one thing only root can do is spawn a
+# process as a *different* Unix user, which is how we run the agent's shell/build
+# commands as `agent` (uid 1001) instead of as the hub `workforce` (uid 1000).
+# After the narrow perm step below, root only supervises: no app logic, secrets,
+# or network runs as root.
+#
+# Three permission tiers:
+#   - vault files  -> 0600 workforce, NO group  (agent cannot read key/ciphertext)
+#   - toolchains   -> group r-x, not writable    (set at image build, not here)
+#   - shared dirs  -> setgid group workforce, g+rwX (both users collaborate)
+#
+# The perm step is deliberately NARROW and NON-RECURSIVE: /app/data is a large
+# host bind mount, so a per-boot recursive chown/chmod is slow and fights host
+# ownership. We touch only the vault files by exact path and the TOP LEVEL of the
+# shared dirs (setgid makes new descendants inherit the group without a sweep).
+set -eu
+
+DATA_DIR=/app/data
+WORKSPACE_DIR=/app/workspace
+RUN_DIR=/run/workforce
+SOCKET="${RUN_DIR}/exec.sock"
+WORKFORCE_BIN=/usr/local/bin/workforce
+
+# ─── Non-root guard: degrade safely, never brick the container ───────────────
+# Privilege separation needs root: only root can chown the vault and `setpriv`
+# into a second user. This script is the entrypoint ONLY when an operator opts
+# in (stack sets `user: "0"` + this entrypoint); the default image runs the hub
+# directly as `workforce` and never touches this file. But if it is somehow
+# launched as a non-root user (a misconfigured enable: entrypoint overridden but
+# `user:` left non-zero), it CANNOT do any of the privileged setup — so rather
+# than failing the first `chown` under `set -e` and crash-looping, exec the hub
+# directly as the current user. That degrades to today's single-user behaviour
+# instead of bricking the container.
+if [ "$(id -u)" != "0" ]; then
+    echo "workforce-init: not running as root; starting hub directly (no privsep)" >&2
+    exec "${WORKFORCE_BIN}" serve --config /app/workforce.toml
+fi
+
+# ─── Narrow, non-recursive perm normalisation (root) ─────────────────────────
+# Vault: owned by the hub user, 0600, no group bit — agent can read neither the
+# key nor the ciphertext.
+#
+# There is more than one vault. Besides the hub's own pair at the top level,
+# every agent keeps its own under `{data}/agents/<name>/`, and a relocated
+# `--data-dir` nests another tree inside this one. Re-locking two fixed paths
+# left the rest at whatever mode they were created with — observed in the wild
+# at 0644, i.e. readable by the agent uid the moment privsep starts. So sweep
+# for them by name instead of naming them, and let a fresh volume match nothing.
+#
+# The sweep is bounded twice over, because it runs at every boot and the data
+# dir may be a network mount. `-maxdepth` stops it before the deep trees: the
+# hub's own vaults live at `{data}/vault.enc`, `{data}/agents/<id>/vault.enc`
+# and one nested `data/` below that, so four levels reaches all of them.
+# `-prune` then skips the code and build trees that would otherwise dominate the
+# walk. Measured on an NFS-backed install, an unbounded sweep did not finish in
+# ten minutes — long enough to fail a container health check and roll the deploy
+# back. Copies of a vault inside a coding session's scratch workspace sit far
+# deeper than four levels and are deliberately out of scope: they belong to that
+# workspace, and the tree they live in is not one the runner is given.
+find "${DATA_DIR}" -maxdepth 4 \
+    \( -type d \( -name repos -o -name worktrees -o -name worktree-bases \
+                 -o -name projects -o -name target -o -name node_modules \
+                 -o -name .git -o -name .cargo -o -name .npm \) -prune \) -o \
+    \( -type f \( -name vault.enc -o -name vault-key.txt \) \
+       -exec sh -c '
+           for vault; do
+               # chmod carries the security property, so it goes first and is
+               # attempted independently of the chown: chaining them would let a
+               # failed chown skip the lock entirely. Neither is fatal — this
+               # script is PID 1, and exiting here would leave the container
+               # dead, which a Swarm service with failure_action: rollback
+               # reports as a successful deploy.
+               chmod 0600 "$vault" ||
+                   echo "workforce-init: WARNING: could not chmod $vault" >&2
+               chown workforce:workforce "$vault" ||
+                   echo "workforce-init: WARNING: could not chown $vault" >&2
+           done
+       ' _ {} + \)
+
+# Shared data: top level only. setgid (2775) so files created later inherit the
+# `workforce` group; g+rwX lets both users collaborate. Never recurse /app/data.
+#
+# We perm DATA_DIR itself (not a hardcoded `worktrees` child): the hub resolves
+# the real worktrees path from `[hub] worktree_root_path` and creates it with the
+# same setgid+g+rwX perms in Rust (crate::code::worktree::ensure_shared_dir), so
+# a custom worktree_root is covered without this script guessing the path (audit
+# S1). DATA_DIR's setgid means any child the hub or runner makes still inherits
+# the `workforce` group.
+#
+# The data dir and the agents dir are sticky as well (3775): both users still
+# create entries there, but only an entry's owner can rename or remove it, so
+# the agent can no longer swap out a file or an agent workspace the hub keeps
+# there — its configuration, its databases, its vault.
+for d in "${DATA_DIR}" "${DATA_DIR}/agents"; do
+    mkdir -p "$d"
+    chgrp workforce "$d"
+    chmod 3775 "$d"
+done
+mkdir -p "${WORKSPACE_DIR}"
+chgrp workforce "${WORKSPACE_DIR}"
+chmod 2775 "${WORKSPACE_DIR}"
+
+# Socket dir: group-only access (0770), owned by the workforce group so the hub
+# (workforce) can connect and the runner (agent, group workforce) can bind.
+mkdir -p "${RUN_DIR}"
+chgrp workforce "${RUN_DIR}"
+chmod 0770 "${RUN_DIR}"
+rm -f "${SOCKET}"
+
+# ─── Supervise: hub as `workforce`, exec-runner as `agent` ───────────────────
+# The hub keeps the inherited env (it needs WORKFORCE_VAULT_KEY etc.). The runner
+# gets --reset-env so the agent's process inherits NO secrets — its own
+# /proc/<pid>/environ carries nothing, and it does not inherit the hub's
+# read-only CARGO_HOME (the runner sets the agent child's HOME/CARGO_HOME/PATH).
+hub_pid=
+runner_pid=
+shutting_down=
+
+start_runner() {
+    # umask 002 → files the runner creates in shared trees are 0664 / dirs 0775
+    # (group-writable), so the hub (also group `workforce`) can write the same
+    # `.git/index`/`target/` the agent does. Complements the dirs' setgid bit,
+    # which only fixes the *group*, not the write permission.
+    setpriv --reuid agent --regid workforce --init-groups --reset-env \
+        sh -c 'umask 002; exec "$0" exec-runner --socket "$1" --accept-uid 1000' \
+        "${WORKFORCE_BIN}" "${SOCKET}" &
+    runner_pid=$!
+}
+
+shutdown() {
+    shutting_down=1
+    trap - TERM INT
+    [ -n "$hub_pid" ] && kill -TERM "$hub_pid" 2>/dev/null || true
+    [ -n "$runner_pid" ] && kill -TERM "$runner_pid" 2>/dev/null || true
+}
+trap shutdown TERM INT
+
+# umask 002 for the hub too: files the hub creates in shared trees (worktree
+# `.git` objects, workspace files) stay group-writable so the agent runner can
+# edit/build them. The vault writer forces 0600 explicitly regardless of umask,
+# so widening the umask does NOT loosen the vault (audit F7 stays closed).
+#
+# HOME must be set explicitly. The hub deliberately does NOT get --reset-env —
+# it needs WORKFORCE_VAULT_KEY and friends — but that also means it inherits
+# root's HOME=/root rather than picking up its own from the passwd entry, which
+# is what `USER workforce` used to give it. Several paths hang off $HOME: the
+# Claude Code session store ($HOME/.claude, whose mount is at /app/.claude) and
+# the Anthropic proxy dir ($HOME/.workforce/...). Left at /root the hub cannot
+# create them as uid 1000, and /cc fails every turn with "session store
+# unwritable". Read the home from passwd rather than hardcoding /app so this
+# tracks the image's own useradd.
+#
+# WORKFORCE_RUNNER_USER tells the hub whom the runner runs as, so it never
+# reads configuration that user's commands planted in the agent's tree.
+hub_home=$(getent passwd workforce | cut -d: -f6)
+setpriv --reuid workforce --regid workforce --init-groups \
+    sh -c 'export HOME="$2" WORKFORCE_RUNNER_USER=agent; umask 002; exec "$0" serve --config /app/workforce.toml' \
+    "${WORKFORCE_BIN}" "" "${hub_home:-/app}" &
+hub_pid=$!
+
+start_runner
+
+# Wait for whichever child exits first, then decide by probing liveness with
+# `kill -0`. `|| status=$?` keeps `set -e` from killing the supervisor when a
+# child exits non-zero (the crash case the restart exists for). If the hub is
+# gone, propagate its code and stop — losing the hub means the container has no
+# purpose. If only the runner is gone (and we are not shutting down), restart it
+# (the hub fails closed in the gap).
+while :; do
+    status=0
+    wait -n "$hub_pid" "$runner_pid" || status=$?
+
+    if ! kill -0 "$hub_pid" 2>/dev/null; then
+        shutdown
+        wait "$runner_pid" 2>/dev/null || true
+        exit "$status"
+    fi
+
+    if [ -z "$shutting_down" ] && ! kill -0 "$runner_pid" 2>/dev/null; then
+        sleep 1
+        start_runner
+    fi
+done

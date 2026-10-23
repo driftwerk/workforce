@@ -1,0 +1,43 @@
+{
+  "input": {
+    "kind": "pie",
+    "title": "Ticket status",
+    "labels": [
+      "Open",
+      "Pending",
+      "Closed"
+    ],
+    "series": [
+      {
+        "data": [
+          14,
+          8,
+          52
+        ]
+      }
+    ]
+  },
+  "result": {
+    "ok": true,
+    "spec": {
+      "kind": "pie",
+      "title": "Ticket status",
+      "labels": [
+        "Open",
+        "Pending",
+        "Closed"
+      ],
+      "series": [
+        {
+          "data": [
+            14,
+            8,
+            52
+          ]
+        }
+      ],
+      "stacked": false,
+      "horizontal": false
+    }
+  }
+}

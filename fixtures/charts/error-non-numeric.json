@@ -1,0 +1,17 @@
+{
+  "input": {
+    "kind": "bar",
+    "series": [
+      {
+        "data": [
+          1,
+          "nope"
+        ]
+      }
+    ]
+  },
+  "result": {
+    "ok": false,
+    "error": "series 1: data must be numbers"
+  }
+}

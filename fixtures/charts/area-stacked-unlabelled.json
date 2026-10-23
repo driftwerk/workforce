@@ -1,0 +1,44 @@
+{
+  "input": {
+    "kind": "area",
+    "stacked": true,
+    "series": [
+      {
+        "data": [
+          1,
+          2
+        ]
+      },
+      {
+        "data": [
+          2,
+          3,
+          4
+        ]
+      }
+    ]
+  },
+  "result": {
+    "ok": true,
+    "spec": {
+      "kind": "area",
+      "series": [
+        {
+          "data": [
+            1,
+            2
+          ]
+        },
+        {
+          "data": [
+            2,
+            3,
+            4
+          ]
+        }
+      ],
+      "stacked": true,
+      "horizontal": false
+    }
+  }
+}

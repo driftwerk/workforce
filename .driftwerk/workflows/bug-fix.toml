@@ -1,0 +1,325 @@
+[workflow]
+id = "bug-fix"
+name = "Bug Fix"
+description = "Standard bug fix workflow: investigate, implement, review, merge"
+
+[workflow.context]
+ticket_id = { required = true, description = "Linear ticket identifier (e.g. DW-123)" }
+repo = { required = true, description = "Repository in owner/repo format (e.g. driftwerk/workforce)" }
+
+# =============================================================================
+# Step 1: Investigate
+# =============================================================================
+[[step]]
+id = "investigate"
+name = "Investigate the Issue"
+max_rounds = 40
+model = "powerful"
+skills = ["linear"]
+preferred_tools = ["linear.issue_get", "code.git", "code.read", "code.find", "knowledge.overview", "knowledge.ask", "knowledge.graph", "knowledge.index"]
+outputs = [
+  { name = "ticket_summary", description = "What the bug is and how it manifests (1-2 paragraphs)" },
+  { name = "root_cause", description = "The identified root cause of the bug" },
+  { name = "affected_files", description = "Files involved in the bug and fix, one per line" },
+  { name = "fix_approach", description = "How the bug should be fixed — step-by-step plan with specific file paths and changes" },
+  { name = "acceptance_criteria", description = "How to verify the fix is correct and the bug is resolved" },
+  { name = "github_owner", description = "GitHub org/owner extracted from repo context (e.g. driftwerk)" },
+  { name = "github_repo", description = "GitHub repo name extracted from repo context (e.g. workforce)" },
+]
+task = """
+Investigate the reported bug and identify the root cause.
+
+## 1. Parse Repository
+
+Extract from "{{repo}}":
+- github_owner = part before the slash
+- github_repo = part after the slash
+
+## 2. Sync Repo
+
+1. Call `code.git` with repo="{{repo}}" action="pull"
+2. Call `knowledge.index` with action="status" path="repos/{{repo}}"
+3. If index is stale or missing: call `knowledge.index` with action="trigger" path="repos/{{repo}}"
+4. If no index at all: call `knowledge.index` with action="trigger_full" path="repos/{{repo}}"
+
+## 3. Read Ticket
+
+Call `linear.issue_get` with identifier="{{ticket_id}}".
+Gather: title, description, reproduction steps, expected vs actual behavior, severity, logs/screenshots.
+
+## 4. Search the Codebase
+
+1. Call `knowledge.overview` with path="repos/{{repo}}"
+2. Call `knowledge.ask` with path="repos/{{repo}}" to find affected code areas
+3. Call `knowledge.graph` with path="repos/{{repo}}" for dependency analysis
+4. Read relevant source files with `code.read`
+
+IMPORTANT: Always pass path="repos/{{repo}}" to ALL knowledge tool calls.
+
+## 5. Identify Root Cause
+
+- Trace the code path described in the bug report
+- Determine: code bug, configuration issue, or design issue
+- Check git history for recent changes to the affected area
+
+## 6. Check if Already Fixed
+
+If the bug is already fixed in main: OUTCOME: already-fixed
+
+## 7. Check for Design Issues
+
+If the root cause is a fundamental design issue requiring product input: OUTCOME: design-issue
+
+## 8. Plan the Fix
+
+Emit ALL outputs: ticket_summary, root_cause, affected_files, fix_approach, acceptance_criteria, github_owner, github_repo.
+
+Do NOT include "OUTCOME:" unless routing to already-fixed or design-issue.
+"""
+goto = "implement"
+branches = [
+  { when = "already-fixed", goto = "close" },
+  { when = "design-issue", goto = "escalate" },
+]
+
+# =============================================================================
+# Step 2: Implement
+# =============================================================================
+[[step]]
+id = "implement"
+name = "Implement the Fix"
+max_rounds = 60
+model = "powerful"
+skills = ["linear", "github"]
+preferred_tools = ["code.git", "code.read", "code.edit", "code.find", "github.pr_create", "github.list_pulls", "github.branch_list", "github.ci_status", "linear.issue_update", "linear.states_list", "jobs.chain", "jobs.chain_status", "jobs.result", "exec.run"]
+outputs = [
+  { name = "pr_number", description = "PR number that was created", validate = "number" },
+  { name = "branch_name", description = "Feature branch name" },
+  { name = "summary", description = "Brief summary of changes made" },
+]
+task = """
+Implement the bug fix and open a PR.
+
+## Context
+- **Bug:** {{steps.investigate.ticket_summary}}
+- **Root Cause:** {{steps.investigate.root_cause}}
+- **Fix Approach:** {{steps.investigate.fix_approach}}
+- **Files:** {{steps.investigate.affected_files}}
+- **Acceptance Criteria:** {{steps.investigate.acceptance_criteria}}
+
+## Rules
+- Start coding immediately — do NOT re-explore the codebase.
+- Use `code.read` (not `github.get_file`) for reading files in cloned repos.
+- Use `code.find` to verify paths before reading.
+- Implement EVERY item in the fix approach. No placeholders, no TODOs.
+- If returning after code review: address ALL feedback points.
+
+## Steps
+
+### 0. Update ticket status
+1. Call `linear.states_list` to find "In Progress" state ID
+2. Call `linear.issue_update` with identifier="{{ticket_id}}" and the state_id
+
+### 1. Check for existing work
+1. Call `github.list_pulls` with owner="{{steps.investigate.github_owner}}" repo="{{steps.investigate.github_repo}}"
+2. Call `github.branch_list` with owner="{{steps.investigate.github_owner}}" repo="{{steps.investigate.github_repo}}"
+3. If existing PR/branch found for this ticket: check it out and continue
+4. Otherwise: create a new feature branch
+
+### 2. Sync and implement
+1. Call `code.git` with repo="{{repo}}" action="pull"
+2. Write a failing test that reproduces the bug, then implement the fix
+3. Address the actual root cause, not just symptoms
+
+### 3. Run quality gates
+1. Your worktree is at `{{_worktree_path}}`. Use it for all file operations.
+2. Call `jobs.chain` with steps:
+   - id="fmt", command="cd {{_worktree_path}} && cargo fmt -- --check"
+   - id="clippy", command="cd {{_worktree_path}} && cargo clippy --all-targets --no-deps -- -D warnings", depends_on=["fmt"]
+   - id="test", command="cd {{_worktree_path}} && cargo test --workspace", depends_on=["clippy"]
+3. Check with `jobs.chain_status`. If fmt fails: run `cargo fmt`, then re-run chain.
+4. Repeat until ALL gates pass.
+
+### 4. Create/update PR
+1. Call `github.pr_create` with owner="{{steps.investigate.github_owner}}" repo="{{steps.investigate.github_repo}}"
+   - Link ticket {{ticket_id}} in the description
+2. Call `jobs.watch_ci` with owner="{{steps.investigate.github_owner}}" repo="{{steps.investigate.github_repo}}" ref="<branch>"
+3. Check CI with `jobs.result`. If CI fails: fix and push again.
+
+IMPORTANT: If you need knowledge tools, pass path="repos/{{repo}}".
+
+Do NOT finish until ALL quality gates AND CI pass.
+Do NOT include "OUTCOME:" in your response.
+"""
+
+# =============================================================================
+# Step 3: Code Review
+# =============================================================================
+[[step]]
+id = "review"
+name = "Code Review"
+max_rounds = 20
+model = "powerful"
+skills = ["github"]
+preferred_tools = ["github.get_pull", "github.pr_diff", "github.ci_status", "code.git", "code.read"]
+task = """
+Review PR #{{steps.implement.pr_number}} on branch {{steps.implement.branch_name}}.
+
+- **Repo:** {{steps.investigate.github_owner}}/{{steps.investigate.github_repo}}
+- **Changes:** {{steps.implement.summary}}
+- **Fix Approach:** {{steps.investigate.fix_approach}}
+- **Files:** {{steps.investigate.affected_files}}
+- **Acceptance Criteria:** {{steps.investigate.acceptance_criteria}}
+- **Root Cause:** {{steps.investigate.root_cause}}
+
+IMPORTANT: Review ONLY PR #{{steps.implement.pr_number}}. Ignore all other PRs.
+
+## Steps
+
+### 1. Setup
+1. Call `code.git` with repo="{{repo}}" action="pull"
+2. Call `code.git` with repo="{{repo}}" action="branch" branch="{{steps.implement.branch_name}}"
+
+### 2. Get the diff
+1. Call `github.get_pull` with owner="{{steps.investigate.github_owner}}" repo="{{steps.investigate.github_repo}}" pr_number={{steps.implement.pr_number}}
+2. Call `github.pr_diff` with owner="{{steps.investigate.github_owner}}" repo="{{steps.investigate.github_repo}}" pr_number={{steps.implement.pr_number}}
+3. If PR not found → OUTCOME: changes-requested
+
+### 3. Completeness check (do this FIRST)
+- Verify EVERY item in the fix approach has corresponding code changes
+- Verify EVERY file in the planned files list was created or modified
+- Verify the fix addresses the ROOT CAUSE, not just symptoms
+- If anything is missing → OUTCOME: changes-requested
+
+### 4. Regression check
+- Does the fix include tests that reproduce the original bug?
+- Could this fix introduce new bugs in adjacent code paths?
+- Are edge cases around the bug properly handled?
+
+### 5. Quality check
+Read changed files with `code.read`:
+- All error paths handled? No silent failures?
+- No TODO comments or placeholder code?
+- Follows project conventions?
+- Fix is minimal and targeted — no unrelated refactoring?
+
+### 6. CI check
+Call `github.ci_status` with owner="{{steps.investigate.github_owner}}" repo="{{steps.investigate.github_repo}}" ref="{{steps.implement.branch_name}}"
+- CI must be green. If failing → OUTCOME: changes-requested
+
+### 7. Verdict
+- ALL checks pass: OUTCOME: approved
+- ANY check fails: list issues by severity (Blocker/Important/Nit) then OUTCOME: changes-requested
+- Do NOT fix issues yourself — only report them.
+"""
+branches = [
+  { when = "changes-requested", goto = "implement" },
+  { when = "approved", goto = "request-merge" },
+]
+
+# =============================================================================
+# Step 4a: Request Merge Approval
+# =============================================================================
+[[step]]
+id = "request-merge"
+name = "Request Merge Approval"
+max_rounds = 5
+model = "standard"
+pause = "awaiting-merge-approval"
+report = "One-line summary of the bug fix, PR number, branch, and CI status. Keep under 300 characters."
+task = """
+PR #{{steps.implement.pr_number}} on branch {{steps.implement.branch_name}} has passed code review.
+
+## Summary
+- **Repo:** {{steps.investigate.github_owner}}/{{steps.investigate.github_repo}}
+- **Bug:** {{steps.investigate.ticket_summary}}
+- **Fix:** {{steps.implement.summary}}
+- **Ticket:** {{ticket_id}}
+
+Present this summary for human review. The human will approve or reject.
+
+Do NOT include "OUTCOME:" — this step pauses for human input.
+"""
+branches = [
+  { when = "approved", goto = "merge" },
+  { when = "rejected", goto = "implement" },
+]
+
+# =============================================================================
+# Step 4b: Execute Merge
+# =============================================================================
+[[step]]
+id = "merge"
+name = "Merge & Close"
+max_rounds = 8
+model = "standard"
+skills = ["linear", "github"]
+preferred_tools = ["github.pr_merge", "linear.issue_update", "linear.states_list", "code.git"]
+exit = true
+task = """
+Merge PR #{{steps.implement.pr_number}} and close ticket {{ticket_id}}.
+
+## Steps
+
+### 1. Merge the PR
+Call `github.pr_merge` with:
+- owner="{{steps.investigate.github_owner}}"
+- repo="{{steps.investigate.github_repo}}"
+- pr_number={{steps.implement.pr_number}}
+- merge_method="squash"
+
+### 2. If merge succeeds
+1. Delete branch {{steps.implement.branch_name}} if appropriate
+2. Call `linear.states_list` to find the "Done" state ID
+3. Call `linear.issue_update` with identifier="{{ticket_id}}" and the state_id
+
+### 3. If merge fails (conflicts)
+1. Call `code.git` with repo="{{repo}}" action="pull"
+2. Merge main into {{steps.implement.branch_name}}, resolve conflicts
+3. Run quality gates (cargo fmt, clippy, test)
+4. Push and retry `github.pr_merge`
+"""
+
+# =============================================================================
+# Escalate
+# =============================================================================
+[[step]]
+id = "escalate"
+name = "Escalate to Product"
+max_rounds = 5
+model = "standard"
+exit = true
+handoff = "escalation_to_product"
+task = """
+The bug is caused by a design issue requiring product input.
+
+Include:
+- What the bug is and how it manifests
+- The root cause identified
+- Why this requires a design decision (not just a code fix)
+- Options and trade-offs
+- Questions that need answering before a fix can proceed
+"""
+
+# =============================================================================
+# Close as Already Fixed
+# =============================================================================
+[[step]]
+id = "close"
+name = "Close as Already Fixed"
+max_rounds = 5
+model = "standard"
+skills = ["linear"]
+preferred_tools = ["linear.issue_update", "linear.states_list", "code.git"]
+exit = true
+task = """
+The bug has already been fixed in the codebase.
+
+## Steps
+
+1. Document WHERE the fix exists: commit(s), what the fix was, when merged
+2. Verify the fix is deployed or will be deployed soon
+3. Call `linear.states_list` to find the "Done" state ID
+4. Call `linear.issue_update` with identifier="{{ticket_id}}" and the state_id
+5. Add a comment to the ticket explaining the bug was already fixed, referencing relevant commit(s)
+"""

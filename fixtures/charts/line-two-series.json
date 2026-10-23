@@ -1,0 +1,59 @@
+{
+  "input": {
+    "kind": "line",
+    "labels": [
+      "Jan",
+      "Feb",
+      "Mar"
+    ],
+    "series": [
+      {
+        "name": "Leads",
+        "data": [
+          12,
+          18,
+          25
+        ]
+      },
+      {
+        "name": "Won",
+        "data": [
+          3,
+          5,
+          9
+        ]
+      }
+    ]
+  },
+  "result": {
+    "ok": true,
+    "spec": {
+      "kind": "line",
+      "labels": [
+        "Jan",
+        "Feb",
+        "Mar"
+      ],
+      "series": [
+        {
+          "name": "Leads",
+          "data": [
+            12,
+            18,
+            25
+          ]
+        },
+        {
+          "name": "Won",
+          "data": [
+            3,
+            5,
+            9
+          ]
+        }
+      ],
+      "stacked": false,
+      "horizontal": false
+    }
+  }
+}

@@ -1,0 +1,884 @@
+//! Gateway protocol message types.
+//!
+//! Shared between the gateway server and clients.
+
+use serde::{Deserialize, Serialize};
+
+/// A file or image attachment sent with a chat message.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Attachment {
+    /// Original filename (e.g. "screenshot.png").
+    pub filename: String,
+    /// MIME type (e.g. "image/png", "text/plain").
+    pub mime_type: String,
+    /// File data — base64-encoded for images, raw UTF-8 for text files.
+    /// Empty when `artifact_id` carries the payload by reference.
+    #[serde(default)]
+    pub data: String,
+    /// Artifact-store id of a payload carried by reference: a large upload
+    /// (via `POST /api/sessions/{id}/upload`), or a non-image file a tool
+    /// delivered, which the web UI fetches from the session file route.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_id: Option<String>,
+}
+
+/// Client → Server message format.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClientMessage {
+    /// Message type: "chat", "ping", "status".
+    #[serde(rename = "type")]
+    pub msg_type: String,
+    /// Chat message content.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    /// Session ID (optional, auto-created if missing).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    /// Channel identifier.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub channel: Option<String>,
+    /// File/image attachments.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attachments: Option<Vec<Attachment>>,
+    /// Target agent identifier (routes to specific agent; uses default if omitted).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    /// Target team identifier (routes to team instead of single agent).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team_id: Option<String>,
+    /// Whether the client is in voice mode (TTS active).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub voice_mode: Option<bool>,
+    /// Active TTS provider (e.g. "fish_audio", "elevenlabs", "system").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tts_provider: Option<String>,
+    /// Approval request id this message is responding to (for
+    /// `msg_type = "permission_response"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    /// The user's typed choice at a permission prompt — pairs with
+    /// `request_id`. Surfaces that don't render the typed prompt
+    /// continue to send free-text via the existing chat path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub choice: Option<workforce_core::policy::PermissionChoice>,
+    /// Set by a client that renders permission prompts, so its turns may raise
+    /// self-serve approvals. Absent means such calls are refused at once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answers_approvals: Option<bool>,
+}
+
+impl ClientMessage {
+    /// Create a chat message.
+    pub fn chat(content: &str) -> Self {
+        Self {
+            msg_type: "chat".to_string(),
+            content: Some(content.to_string()),
+            session_id: None,
+            channel: Some("terminal".to_string()),
+            attachments: None,
+            agent_id: None,
+            team_id: None,
+            voice_mode: None,
+            tts_provider: None,
+            request_id: None,
+            choice: None,
+            answers_approvals: None,
+        }
+    }
+
+    /// Respond to a `permission_prompt` ServerMessage. Carries the
+    /// typed user choice the runner reads to decide whether to
+    /// persist a User-scope rule.
+    pub fn permission_response(
+        request_id: &str,
+        choice: workforce_core::policy::PermissionChoice,
+    ) -> Self {
+        Self {
+            msg_type: "permission_response".to_string(),
+            content: None,
+            session_id: None,
+            channel: None,
+            attachments: None,
+            agent_id: None,
+            team_id: None,
+            voice_mode: None,
+            tts_provider: None,
+            request_id: Some(request_id.to_string()),
+            choice: Some(choice),
+            answers_approvals: None,
+        }
+    }
+
+    /// Create a chat message with a session ID.
+    pub fn chat_with_session(content: &str, session_id: &str) -> Self {
+        Self {
+            msg_type: "chat".to_string(),
+            content: Some(content.to_string()),
+            session_id: Some(session_id.to_string()),
+            channel: Some("terminal".to_string()),
+            attachments: None,
+            agent_id: None,
+            team_id: None,
+            voice_mode: None,
+            tts_provider: None,
+            request_id: None,
+            choice: None,
+            answers_approvals: None,
+        }
+    }
+
+    /// Create a chat message with attachments and an optional session ID.
+    pub fn chat_with_attachments(
+        content: &str,
+        attachments: Vec<Attachment>,
+        session_id: Option<&str>,
+    ) -> Self {
+        Self {
+            msg_type: "chat".to_string(),
+            content: Some(content.to_string()),
+            session_id: session_id.map(String::from),
+            channel: Some("terminal".to_string()),
+            attachments: if attachments.is_empty() {
+                None
+            } else {
+                Some(attachments)
+            },
+            agent_id: None,
+            team_id: None,
+            voice_mode: None,
+            tts_provider: None,
+            request_id: None,
+            choice: None,
+            answers_approvals: None,
+        }
+    }
+
+    /// Create a ping message.
+    pub fn ping() -> Self {
+        Self {
+            msg_type: "ping".to_string(),
+            content: None,
+            session_id: None,
+            channel: None,
+            attachments: None,
+            agent_id: None,
+            team_id: None,
+            voice_mode: None,
+            tts_provider: None,
+            request_id: None,
+            choice: None,
+            answers_approvals: None,
+        }
+    }
+
+    /// Create a cancel message to abort the current stream for a session.
+    pub fn cancel(session_id: &str) -> Self {
+        Self {
+            msg_type: "cancel".to_string(),
+            content: None,
+            session_id: Some(session_id.to_string()),
+            channel: None,
+            attachments: None,
+            agent_id: None,
+            team_id: None,
+            voice_mode: None,
+            tts_provider: None,
+            request_id: None,
+            choice: None,
+            answers_approvals: None,
+        }
+    }
+
+    /// Set the target agent for this message.
+    pub fn with_agent(mut self, agent_id: &str) -> Self {
+        self.agent_id = Some(agent_id.to_string());
+        self
+    }
+
+    /// Set the target team for this message.
+    pub fn with_team(mut self, team_id: &str) -> Self {
+        self.team_id = Some(team_id.to_string());
+        self
+    }
+}
+
+/// Server → Client message format.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerMessage {
+    /// Message type.
+    #[serde(rename = "type")]
+    pub msg_type: String,
+    /// Message content.
+    #[serde(default)]
+    pub content: Option<String>,
+    /// Session ID.
+    #[serde(default)]
+    pub session_id: Option<String>,
+    /// Error message (if any).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// Which agent sent this message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    /// Estimated context tokens used (sent with `context_update` messages).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_tokens: Option<u32>,
+    /// Maximum context window size (sent with `context_update` messages).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_max: Option<u32>,
+    /// Which team this message belongs to (present for team conversations).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team_id: Option<String>,
+    /// Role of the responding agent within the team.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender_role: Option<String>,
+    /// Turn-taking indicator: which agent(s) should respond next.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_speaker: Option<String>,
+    /// Whether the client should read this message aloud in voice/audio mode.
+    /// Tool events and markers are `false`; response text is `true`.
+    /// Defaults to `true` and is omitted from JSON when `true` to save bandwidth.
+    #[serde(default = "default_speakable", skip_serializing_if = "is_speakable")]
+    pub speakable: bool,
+    /// Which device-token slot authenticated the WS handshake — `"current"`
+    /// or `"previous"`. Only set on the `connected` event for device-paired
+    /// clients. `"previous"` means the presented token sits in the one-deep
+    /// grace slot: some holder already rotated past it. Clients should skip
+    /// their scheduled token rotation for the session — the server refuses
+    /// (409) to advance the chain off a previous-slot match — and realign
+    /// from persisted credentials on next launch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_match: Option<String>,
+    /// Approval request id for `msg_type = "permission_prompt"` — the
+    /// client echoes this back in the [`ClientMessage::permission_response`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    /// Tool the runner wants to invoke (e.g. `vault.delete`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
+    /// Which of the four buttons to render. Carries the
+    /// `ask` vs `always_ask` distinction by hiding Always-Allow when
+    /// the parent state forbids it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_options: Option<workforce_core::policy::PermissionPromptOptions>,
+    /// Outbound attachments — e.g. images generated by the `generate_image`
+    /// tool. Carried inline (base64 in [`Attachment::data`]) for immediate
+    /// client rendering. Present on `msg_type = "image"` and may also ride a
+    /// normal `"message"`; clients render these whenever the array is
+    /// non-empty, regardless of `msg_type`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attachments: Option<Vec<Attachment>>,
+    /// Deterministic code citations — present on `msg_type = "code_citations"`
+    /// (one per turn, delivered after the answer). The client renders these as
+    /// clickable source chips under the just-completed answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code_citations: Option<Vec<workforce_core::code_citation::CodeCitation>>,
+    /// Present on `msg_type = "connect_prompt"`: the turn found no login to
+    /// run on, and asks the person to connect one. Never carries a sign-in
+    /// code.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connect_prompt: Option<workforce_core::subscription::ConnectPrompt>,
+    /// Present on `msg_type = "route"`: what ran the just-completed answer
+    /// ("Claude Code · sonnet · Alice's plan"), shown beneath it. `content`
+    /// stays empty, so a client that does not know the type shows nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route: Option<String>,
+}
+
+fn default_speakable() -> bool {
+    true
+}
+
+fn is_speakable(v: &bool) -> bool {
+    *v
+}
+
+impl ServerMessage {
+    /// Check if this is a text message with content.
+    pub fn is_message(&self) -> bool {
+        self.msg_type == "message"
+    }
+
+    /// Check if this is a streaming delta.
+    pub fn is_stream_delta(&self) -> bool {
+        self.msg_type == "stream_delta"
+    }
+
+    /// Check if this is the start of a stream.
+    pub fn is_stream_start(&self) -> bool {
+        self.msg_type == "stream_start"
+    }
+
+    /// Check if this is the end of a stream.
+    pub fn is_stream_end(&self) -> bool {
+        self.msg_type == "stream_end"
+    }
+
+    /// Check if this is a typing indicator.
+    pub fn is_typing(&self) -> bool {
+        self.msg_type == "typing"
+    }
+
+    /// Check if this is a connection acknowledgement.
+    pub fn is_connected(&self) -> bool {
+        self.msg_type == "connected"
+    }
+
+    /// Check if this is an error.
+    pub fn is_error(&self) -> bool {
+        self.msg_type == "error"
+    }
+
+    /// Check if this is a pong.
+    pub fn is_pong(&self) -> bool {
+        self.msg_type == "pong"
+    }
+
+    /// Check if this is an emoji reaction event.
+    pub fn is_reaction(&self) -> bool {
+        self.msg_type == "reaction"
+    }
+
+    /// Get the content text, if any.
+    pub fn text(&self) -> Option<&str> {
+        self.content.as_deref()
+    }
+
+    /// The message type as a parsed enum (for pattern matching).
+    pub fn kind(&self) -> ServerMessageKind {
+        match self.msg_type.as_str() {
+            "connected" => ServerMessageKind::Connected,
+            "message" => ServerMessageKind::Message,
+            "typing" => ServerMessageKind::Typing,
+            "stream_start" => ServerMessageKind::StreamStart,
+            "stream_delta" => ServerMessageKind::StreamDelta,
+            "stream_end" => ServerMessageKind::StreamEnd,
+            "pong" => ServerMessageKind::Pong,
+            "error" => ServerMessageKind::Error,
+            "reminder" => ServerMessageKind::Reminder,
+            "tool_start" => ServerMessageKind::ToolStart,
+            "tool_end" => ServerMessageKind::ToolEnd,
+            "compact_start" => ServerMessageKind::CompactStart,
+            "compact_end" => ServerMessageKind::CompactEnd,
+            "reaction" => ServerMessageKind::Reaction,
+            "context_update" => ServerMessageKind::ContextUpdate,
+            "node_invoke" => ServerMessageKind::NodeInvoke,
+            "team_update" => ServerMessageKind::TeamUpdate,
+            "turn_indicator" => ServerMessageKind::TurnIndicator,
+            "local_exec" => ServerMessageKind::LocalExec,
+            "local_exec_result" => ServerMessageKind::LocalExecResult,
+            "permission_prompt" => ServerMessageKind::PermissionPrompt,
+            "image" => ServerMessageKind::Image,
+            "connect_prompt" => ServerMessageKind::ConnectPrompt,
+            "route" => ServerMessageKind::Route,
+            _ => ServerMessageKind::Unknown,
+        }
+    }
+
+    /// Check if this is a permission-prompt request that should be
+    /// rendered as typed buttons.
+    pub fn is_permission_prompt(&self) -> bool {
+        self.msg_type == "permission_prompt"
+    }
+
+    /// Build a `permission_prompt` server message. Used by the gateway
+    /// when forwarding a `ProgressEvent::ApprovalRequired` to the client.
+    pub fn permission_prompt(
+        request_id: &str,
+        agent_id: Option<&str>,
+        session_id: Option<&str>,
+        tool_name: &str,
+        reason: &str,
+        options: workforce_core::policy::PermissionPromptOptions,
+    ) -> Self {
+        Self {
+            msg_type: "permission_prompt".to_string(),
+            content: Some(reason.to_string()),
+            session_id: session_id.map(String::from),
+            error: None,
+            agent_id: agent_id.map(String::from),
+            context_tokens: None,
+            context_max: None,
+            team_id: None,
+            sender_role: None,
+            next_speaker: None,
+            speakable: false,
+            token_match: None,
+            request_id: Some(request_id.to_string()),
+            tool_name: Some(tool_name.to_string()),
+            prompt_options: Some(options),
+            attachments: None,
+            code_citations: None,
+            connect_prompt: None,
+            route: None,
+        }
+    }
+}
+
+/// Parsed server message type for pattern matching.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServerMessageKind {
+    /// Initial connection acknowledgement.
+    Connected,
+    /// Complete agent response.
+    Message,
+    /// Agent is processing (typing indicator).
+    Typing,
+    /// Start of streamed response.
+    StreamStart,
+    /// Chunk of streamed response.
+    StreamDelta,
+    /// End of streamed response.
+    StreamEnd,
+    /// Response to ping.
+    Pong,
+    /// Error occurred.
+    Error,
+    /// Scheduler reminder/delivery.
+    Reminder,
+    /// Tool execution started.
+    ToolStart,
+    /// Tool execution finished.
+    ToolEnd,
+    /// Session compaction started.
+    CompactStart,
+    /// Session compaction finished.
+    CompactEnd,
+    /// Emoji reaction added to a message.
+    Reaction,
+    /// Context window usage update.
+    ContextUpdate,
+    /// Node invoke request (server asking client to execute a device capability).
+    NodeInvoke,
+    /// Team membership/status update.
+    TeamUpdate,
+    /// Turn-taking indicator (next speaker).
+    TurnIndicator,
+    /// Local exec request (gateway asking local agent to execute a command).
+    LocalExec,
+    /// Local exec result (local agent returning command result).
+    LocalExecResult,
+    /// Permission prompt — server is asking the user to approve a tool call.
+    PermissionPrompt,
+    /// Image attachment(s) for the client to render inline.
+    Image,
+    /// The turn found no login to run on and asks the person to connect one.
+    ConnectPrompt,
+    /// What ran the just-completed answer.
+    Route,
+    /// Unknown message type.
+    Unknown,
+}
+
+/// REST chat request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatRequest {
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub channel: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    /// Optional agent ID to select which agent to chat with.
+    /// Defaults to the primary/default agent if not specified.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    /// The caller's own name for this turn (letters, digits, `-`, `_`, `.`;
+    /// at most 64). The turn's cost and telemetry are then filed under the
+    /// `task_id` the response carries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
+}
+
+/// REST chat response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatResponse {
+    pub response: String,
+    pub session_id: String,
+    /// What a turn sent with a `turn_id` is filed under: the key of
+    /// `GET /api/stats/tasks/{task_id}`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    #[serde(default)]
+    pub outcome: ChatOutcome,
+    /// The turn stopped at its round cap: `response` is the wind-down, not
+    /// a finished answer.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub capped: bool,
+    /// The content hash of the agent's `config.toml` the whole turn ran
+    /// under, when it has one and no reload landed mid-turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config: Option<String>,
+}
+
+/// Whether a REST chat turn ran.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChatOutcome {
+    /// It ran; `response` is the agent's reply.
+    #[default]
+    Answered,
+    /// It did not run (the budget refused it, say); `response` says why.
+    Refused,
+}
+
+/// Session info returned by the sessions endpoint.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionInfo {
+    pub id: String,
+    #[serde(default)]
+    pub label: Option<String>,
+    #[serde(default)]
+    pub channel: Option<String>,
+    #[serde(default)]
+    pub owner: Option<String>,
+    #[serde(default)]
+    pub messages: u64,
+    #[serde(default)]
+    pub total_tokens: u64,
+    #[serde(default)]
+    pub created_at: Option<String>,
+    #[serde(default)]
+    pub updated_at: Option<String>,
+}
+
+/// Sessions list response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionsResponse {
+    pub sessions: Vec<SessionInfo>,
+}
+
+/// Session transcript response from `/api/sessions/{id}/transcript`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct TranscriptResponse {
+    pub session_id: String,
+    pub entries: Vec<TranscriptEntryDto>,
+}
+
+/// A single transcript entry (client-side mirror of the server's `TranscriptEntry`).
+#[derive(Debug, Clone, Deserialize)]
+pub struct TranscriptEntryDto {
+    /// Role: "user", "assistant", "system", or "tool".
+    pub role: String,
+    /// Text content.
+    #[serde(default)]
+    pub content: String,
+    /// Tool metadata (present for tool entries).
+    #[serde(default)]
+    pub tool_metadata: Option<ToolMetadataDto>,
+}
+
+/// Lightweight tool metadata for transcript entries.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ToolMetadataDto {
+    pub name: String,
+    #[serde(default)]
+    pub success: bool,
+}
+
+/// Agent info returned by the agents endpoint.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentInfo {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    #[serde(default)]
+    pub default: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_type: Option<String>,
+}
+
+/// Agents list response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentsResponse {
+    pub agents: Vec<AgentInfo>,
+}
+
+// ── Agent CRUD & Detail Protocol (DW-421) ──────────────────────────────────
+
+/// Full agent detail response from `GET /api/agents/{id}`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentDetailResponse {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    #[serde(default)]
+    pub default: bool,
+    /// List of identity file names present in the agent's workspace.
+    #[serde(default)]
+    pub identity_files: Vec<String>,
+    /// Number of tools loaded for this agent.
+    pub tool_count: usize,
+    /// Active session count (from the session store).
+    pub session_count: usize,
+    /// Workspace path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_type: Option<String>,
+}
+
+/// Tool with full JSON schema from `GET /api/agents/{id}/tools`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentToolInfo {
+    pub name: String,
+    pub description: String,
+    pub input_schema: serde_json::Value,
+}
+
+/// Per-agent stats response from `GET /api/agents/{id}/stats`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentStatsResponse {
+    pub agent_id: String,
+    pub period: String,
+    pub total_cost_usd: f64,
+    pub total_input_tokens: u64,
+    pub total_output_tokens: u64,
+    pub record_count: usize,
+    /// Cost breakdown by model.
+    #[serde(default)]
+    pub by_model: std::collections::HashMap<String, f64>,
+}
+
+/// Request body for `POST /api/agents` (create agent).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateAgentRequest {
+    pub id: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub system_prompt: Option<String>,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    #[serde(default)]
+    pub default: bool,
+    #[serde(default)]
+    pub owner_id: Option<String>,
+    #[serde(default)]
+    pub owner_type: Option<String>,
+    /// `shared` (default) — automatic recall admits the user's memories
+    /// captured with their other agents — or `isolated` — recall confined to
+    /// what this agent learns itself. Persisted as the agent entry's
+    /// `[agents.memory] agent_recall_scope`.
+    #[serde(default)]
+    pub agent_recall_scope: Option<String>,
+}
+
+/// Request body for `PUT /api/agents/{id}` (update agent).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateAgentRequest {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub system_prompt: Option<String>,
+    #[serde(default)]
+    pub capabilities: Option<Vec<String>>,
+    #[serde(default)]
+    pub default: Option<bool>,
+    #[serde(default)]
+    pub owner_id: Option<String>,
+    #[serde(default)]
+    pub owner_type: Option<String>,
+}
+
+// ── Node Invoke Protocol (DW-159) ──────────────────────────────────────────
+
+/// Server → Client: request to invoke a node capability on a connected device.
+///
+/// The gateway sends this when an agent tool requests access to a device
+/// capability (camera, location, notifications, etc.). The client executes
+/// the command and responds with a [`NodeInvokeResult`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeInvokeRequest {
+    /// Always "node_invoke".
+    #[serde(rename = "type")]
+    pub msg_type: String,
+    /// Unique ID for correlating request with result.
+    pub invoke_id: String,
+    /// Capability command (e.g. "camera.snap", "location.get", "system.notify").
+    pub command: String,
+    /// Command parameters (JSON value, schema depends on command).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub params: Option<serde_json::Value>,
+    /// Timeout in milliseconds (default: 15000).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+}
+
+impl NodeInvokeRequest {
+    pub fn new(invoke_id: &str, command: &str, params: Option<serde_json::Value>) -> Self {
+        Self {
+            msg_type: "node_invoke".to_string(),
+            invoke_id: invoke_id.to_string(),
+            command: command.to_string(),
+            params,
+            timeout_ms: None,
+        }
+    }
+}
+
+/// Client → Server: result of a node invoke execution.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeInvokeResult {
+    /// Always "node_invoke_result".
+    #[serde(rename = "type")]
+    pub msg_type: String,
+    /// Matches the `invoke_id` from the corresponding [`NodeInvokeRequest`].
+    pub invoke_id: String,
+    /// Whether the invocation succeeded.
+    pub ok: bool,
+    /// Result payload (present on success, schema depends on command).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload: Option<serde_json::Value>,
+    /// Error message (present on failure).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+// ── Local Agent Protocol (DW-324) ──────────────────────────────────────────
+
+/// Local Agent → Gateway: registration handshake sent immediately after connecting.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalAgentHello {
+    #[serde(rename = "type")]
+    pub msg_type: String,
+    /// Unique identifier for this local agent instance.
+    pub agent_node_id: String,
+    /// Human-readable name (e.g. hostname).
+    pub name: String,
+    /// Capabilities this agent supports.
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    /// Filesystem paths this agent allows access to.
+    #[serde(default)]
+    pub allowed_paths: Vec<String>,
+}
+
+/// Gateway → Local Agent: execute a shell command on the local machine.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalExecRequest {
+    #[serde(rename = "type")]
+    pub msg_type: String,
+    /// Unique ID for correlating request with result.
+    pub request_id: String,
+    /// Shell command to execute.
+    pub command: String,
+    /// Working directory (optional).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workdir: Option<String>,
+    /// Timeout in seconds (optional, default: 300).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_secs: Option<u64>,
+}
+
+/// Gateway → Local Agent: cancel a running command.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalExecCancel {
+    #[serde(rename = "type")]
+    pub msg_type: String,
+    /// Matches the request_id of the command to cancel.
+    pub request_id: String,
+}
+
+/// Local Agent → Gateway: streaming output chunk during execution.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalExecProgress {
+    #[serde(rename = "type")]
+    pub msg_type: String,
+    pub request_id: String,
+    /// Which stream: "stdout" or "stderr".
+    pub stream: String,
+    /// Output data chunk.
+    pub data: String,
+}
+
+/// Local Agent → Gateway: final result of command execution.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalExecResult {
+    #[serde(rename = "type")]
+    pub msg_type: String,
+    pub request_id: String,
+    pub ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stdout: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stderr: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use workforce_core::policy::{PermissionChoice, PermissionPromptOptions};
+
+    #[test]
+    fn permission_prompt_constructor_carries_typed_payload() {
+        let opts = PermissionPromptOptions::ask(false);
+        let msg = ServerMessage::permission_prompt(
+            "req-1",
+            Some("agent-x"),
+            Some("sess-1"),
+            "vault.delete",
+            "delete secret",
+            opts,
+        );
+        assert_eq!(msg.kind(), ServerMessageKind::PermissionPrompt);
+        assert!(msg.is_permission_prompt());
+        assert_eq!(msg.request_id.as_deref(), Some("req-1"));
+        assert_eq!(msg.tool_name.as_deref(), Some("vault.delete"));
+        let prompt = msg.prompt_options.expect("prompt options present");
+        assert!(prompt.allow_once);
+        assert!(prompt.deny_once);
+        assert!(!prompt.allow_always);
+        assert!(prompt.deny_always);
+    }
+
+    #[test]
+    fn permission_response_serialises_typed_choice() {
+        let msg = ClientMessage::permission_response("req-9", PermissionChoice::AllowAlways);
+        let s = serde_json::to_string(&msg).unwrap();
+        assert!(s.contains("\"type\":\"permission_response\""));
+        assert!(s.contains("\"request_id\":\"req-9\""));
+        assert!(s.contains("\"choice\":\"allow_always\""));
+        let back: ClientMessage = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.choice, Some(PermissionChoice::AllowAlways));
+        assert_eq!(back.request_id.as_deref(), Some("req-9"));
+    }
+
+    #[test]
+    fn permission_prompt_roundtrip_keeps_payload() {
+        let opts = PermissionPromptOptions::default();
+        let original = ServerMessage::permission_prompt(
+            "r1",
+            None,
+            Some("sess-7"),
+            "memory.write",
+            "save fact?",
+            opts,
+        );
+        let json = serde_json::to_string(&original).unwrap();
+        let back: ServerMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.kind(), ServerMessageKind::PermissionPrompt);
+        assert_eq!(back.request_id.as_deref(), Some("r1"));
+        assert_eq!(back.tool_name.as_deref(), Some("memory.write"));
+        assert!(back.prompt_options.unwrap().allow_always);
+    }
+}

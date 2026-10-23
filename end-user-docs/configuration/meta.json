@@ -1,0 +1,9 @@
+{
+  "title": "Configuration",
+  "pages": [
+    "index",
+    "tiers",
+    "vault",
+    "policies"
+  ]
+}

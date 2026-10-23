@@ -1,0 +1,530 @@
+{
+  "name": "Orders",
+  "description": "Orders from intake to a verified release: picked, implemented, reviewed, merged, deployed and checked for a week.",
+  "item_label": "ticket",
+  "collection": "pipeline",
+  "revision": 11,
+  "sources": [
+    "workflow:order-intake",
+    "workflow:order-review",
+    "workflow:order-release",
+    "workflow:order-verify",
+    "skill:item-picker"
+  ],
+  "lanes": [
+    {
+      "id": "implementing",
+      "label": "Implementing"
+    },
+    {
+      "id": "pr-open",
+      "label": "PR open"
+    },
+    {
+      "id": "reviewing",
+      "label": "Reviewing"
+    },
+    {
+      "id": "reviewed",
+      "label": "Reviewed"
+    },
+    {
+      "id": "merging",
+      "label": "Merging"
+    },
+    {
+      "id": "deploying",
+      "label": "Deploying"
+    },
+    {
+      "id": "deployed",
+      "label": "Deployed"
+    },
+    {
+      "id": "verifying",
+      "label": "Verifying"
+    },
+    {
+      "id": "verified",
+      "label": "Verified",
+      "window": "7d"
+    }
+  ],
+  "exits": [
+    {
+      "id": "not-code",
+      "label": "Not a code change",
+      "window": "7d"
+    },
+    {
+      "id": "released",
+      "label": "Needs a person"
+    },
+    {
+      "id": "sent-back",
+      "label": "Sent back · self-healing"
+    },
+    {
+      "id": "duplicate",
+      "label": "Duplicate",
+      "window": "7d"
+    },
+    {
+      "id": "blocked",
+      "label": "Review blocked"
+    },
+    {
+      "id": "human-merge",
+      "label": "Awaiting a human merge"
+    },
+    {
+      "id": "deploy-blocked",
+      "label": "Deploy blocked · needs a person"
+    },
+    {
+      "id": "not-fixed",
+      "label": "Not fixed"
+    },
+    {
+      "id": "regression",
+      "label": "Regression"
+    },
+    {
+      "id": "inconclusive",
+      "label": "Inconclusive · needs a person"
+    },
+    {
+      "id": "not-live",
+      "label": "Not live · self-healing"
+    },
+    {
+      "id": "overlap-wait",
+      "label": "Waiting on another PR · self-healing"
+    },
+    {
+      "id": "closed-review",
+      "label": "PR closed · checking for a merged fix"
+    },
+    {
+      "id": "superseded",
+      "label": "Superseded by another PR",
+      "window": "7d"
+    }
+  ],
+  "rungs": [
+    "1h",
+    "6h",
+    "24h",
+    "72h",
+    "168h"
+  ],
+  "timings": {
+    "origin": {
+      "field": "filed_at",
+      "label": "Filed"
+    },
+    "milestones": [
+      "deployed",
+      "verified"
+    ],
+    "ends": [
+      "verified",
+      "not-code",
+      "duplicate",
+      "superseded"
+    ]
+  },
+  "events": {
+    "implement/claimed": [
+      {
+        "column": "implementing",
+        "tone": "active"
+      }
+    ],
+    "implement/pr-opened": [
+      {
+        "column": "pr-open"
+      }
+    ],
+    "implement/released": [
+      {
+        "when": {
+          "label": "stage-skipped"
+        },
+        "column": "not-code"
+      },
+      {
+        "column": "released",
+        "tone": "warn"
+      }
+    ],
+    "implement/retry": [
+      {
+        "column": "sent-back",
+        "tone": "healing",
+        "label": "another attempt follows"
+      }
+    ],
+    "implement/sent-back": [
+      {
+        "column": "sent-back",
+        "tone": "healing"
+      }
+    ],
+    "review/claimed": [
+      {
+        "column": "reviewing",
+        "tone": "active"
+      }
+    ],
+    "review/resumed": [
+      {
+        "column": "reviewing",
+        "tone": "active",
+        "label": "resumed after the run was interrupted"
+      }
+    ],
+    "review/sent-back": [
+      {
+        "column": "sent-back",
+        "tone": "healing",
+        "label": "sent back for another attempt"
+      }
+    ],
+    "review/finished": [
+      {
+        "when": {
+          "verdict": "stage-review-blocked"
+        },
+        "column": "blocked",
+        "tone": "bad"
+      },
+      {
+        "column": "reviewed",
+        "tone": "good"
+      }
+    ],
+    "merge/gate": [
+      {
+        "when": {
+          "outcome": "human"
+        },
+        "column": "human-merge",
+        "tone": "warn"
+      },
+      {
+        "when": {
+          "outcome": "already-merged"
+        },
+        "column": "merging",
+        "tone": "active",
+        "label": "merged by a person, waiting for the deploy to start"
+      },
+      {
+        "column": "merging",
+        "tone": "active",
+        "label": "auto-merging"
+      }
+    ],
+    "merge/auto-merged": [
+      {
+        "column": "merging",
+        "tone": "active",
+        "label": "auto-merged, waiting for the deploy to start"
+      }
+    ],
+    "deploy/claimed": [
+      {
+        "column": "deploying",
+        "tone": "active"
+      }
+    ],
+    "deploy/retry": [
+      {
+        "column": "deploying",
+        "tone": "healing",
+        "label": "deploy not confirmed, retrying"
+      }
+    ],
+    "deploy/finished": [
+      {
+        "when": {
+          "label": "stage-deploy-blocked"
+        },
+        "column": "deploy-blocked",
+        "tone": "bad"
+      },
+      {
+        "column": "deployed",
+        "tone": "good"
+      }
+    ],
+    "verify/started": [
+      {
+        "column": "verifying",
+        "tone": "active",
+        "rung_field": "rung",
+        "label": "checking a rung"
+      }
+    ],
+    "verify/rung": [
+      {
+        "when": {
+          "state": "pass"
+        },
+        "column": "verifying",
+        "tone": "active",
+        "rung_field": "rung",
+        "rung_passed": true
+      },
+      {
+        "column": "verifying",
+        "tone": "active",
+        "rung_field": "rung"
+      }
+    ],
+    "verify/verified": [
+      {
+        "column": "verified",
+        "tone": "good",
+        "rung_field": "rung",
+        "rung_passed": true
+      }
+    ],
+    "verify/failed": [
+      {
+        "when": {
+          "state": "regression"
+        },
+        "column": "regression",
+        "tone": "bad"
+      },
+      {
+        "column": "not-fixed",
+        "tone": "bad"
+      }
+    ],
+    "verify/inconclusive": [
+      {
+        "when": {
+          "final": "true"
+        },
+        "column": "inconclusive",
+        "tone": "warn",
+        "rung_field": "rung"
+      },
+      {
+        "column": "verifying",
+        "tone": "healing",
+        "rung_field": "rung",
+        "label": "too rare to judge yet; a later rung judges again"
+      }
+    ],
+    "verify/not-live": [
+      {
+        "column": "not-live",
+        "tone": "healing",
+        "rung_field": "rung"
+      }
+    ],
+    "verify/released": [
+      {
+        "column": "verifying",
+        "tone": "healing",
+        "rung_field": "rung",
+        "label": "not judged this run; the rung waits for a later one"
+      }
+    ],
+    "duplicate/closed": [
+      {
+        "column": "duplicate"
+      }
+    ],
+    "merge/merged": [
+      {
+        "when": {
+          "how": "pipeline"
+        },
+        "column": "merging",
+        "tone": "active",
+        "label": "auto-merged, waiting for the deploy to start",
+        "due_field": "due_at"
+      },
+      {
+        "column": "merging",
+        "tone": "active",
+        "label": "merged, waiting for the deploy to start",
+        "label_field": "note",
+        "due_field": "due_at"
+      }
+    ],
+    "merge/superseded": [
+      {
+        "when": {
+          "merged": "true"
+        },
+        "column": "duplicate",
+        "label_field": "note"
+      },
+      {
+        "column": "superseded",
+        "tone": "healing",
+        "label_field": "note"
+      }
+    ],
+    "implement/claim-expired": [
+      {
+        "column": "sent-back",
+        "tone": "healing",
+        "label": "claim expired, back in the queue"
+      }
+    ],
+    "implement/overlap-wait": [
+      {
+        "column": "overlap-wait",
+        "tone": "healing",
+        "label_field": "note"
+      }
+    ],
+    "implement/overlap-released": [
+      {
+        "column": "sent-back",
+        "tone": "healing",
+        "label": "the PR it waited on moved on, back in the queue"
+      }
+    ],
+    "implement/pr-closed": [
+      {
+        "column": "closed-review",
+        "tone": "healing",
+        "label_field": "note"
+      }
+    ],
+    "review/claim-expired": [
+      {
+        "column": "pr-open",
+        "tone": "healing",
+        "label": "review claim expired, requeued"
+      }
+    ],
+    "review/requeued": [
+      {
+        "when": {
+          "why": "conflicts"
+        },
+        "column": "pr-open",
+        "tone": "healing",
+        "label": "main moved under it, re-review"
+      },
+      {
+        "when": {
+          "why": "ci-red"
+        },
+        "column": "pr-open",
+        "tone": "healing",
+        "label": "CI red on the approved head, re-review"
+      },
+      {
+        "when": {
+          "why": "head-moved"
+        },
+        "column": "pr-open",
+        "tone": "healing",
+        "label": "changed after approval, re-review"
+      }
+    ],
+    "review/overlap-judged": [
+      {
+        "when": {
+          "relation": "conflicting"
+        },
+        "annotation": true,
+        "tone": "warn",
+        "label_field": "headline"
+      },
+      {
+        "when": {
+          "relation": "subsumes"
+        },
+        "annotation": true,
+        "tone": "healing",
+        "label_field": "headline"
+      },
+      {
+        "annotation": true,
+        "tone": "neutral",
+        "label_field": "headline"
+      }
+    ],
+    "review/waiting-ticket": [
+      {
+        "annotation": true,
+        "tone": "neutral",
+        "label_field": "note"
+      }
+    ],
+    "review/absorbed": [
+      {
+        "annotation": true,
+        "tone": "neutral",
+        "label": "absorbed another ticket's PR"
+      }
+    ],
+    "review/ci-rerun": [
+      {
+        "annotation": true,
+        "tone": "healing",
+        "label": "CI rerun after an infrastructure failure"
+      }
+    ],
+    "review/follow-ups": [
+      {
+        "annotation": true,
+        "tone": "neutral",
+        "label": "filed follow-ups"
+      }
+    ],
+    "watch/escalated": [
+      {
+        "annotation": true,
+        "tone": "warn",
+        "label_field": "note"
+      }
+    ],
+    "watch/realigned": [
+      {
+        "annotation": true,
+        "tone": "healing",
+        "label": "board and labels realigned"
+      }
+    ],
+    "watch/resolved": [
+      {
+        "annotation": true,
+        "tone": "good",
+        "label_field": "note"
+      }
+    ],
+    "watch/stale": [
+      {
+        "annotation": true,
+        "tone": "neutral",
+        "label": "watch stood down: the ticket moved on"
+      }
+    ],
+    "watch/human": [
+      {
+        "annotation": true,
+        "tone": "neutral",
+        "label": "watch stood down: a person is involved"
+      }
+    ]
+  },
+  "summary_field": "stages.implement.summary",
+  "link_fields": [
+    {
+      "field": "pr_url",
+      "label": "PR"
+    }
+  ]
+}

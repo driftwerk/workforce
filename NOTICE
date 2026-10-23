@@ -1,0 +1,20 @@
+Workforce
+Copyright (c) 2026 Kingsley Hendrickse
+
+Licensed under the Elastic License 2.0 (see LICENSE), except:
+
+- crates/wasm-skill-sdk — MIT License (see crates/wasm-skill-sdk/LICENSE).
+
+This product bundles the following third-party assets, each under its own
+licence:
+
+- IBM Plex Serif — SIL Open Font License 1.1
+  (crates/agent-runtime/assets/fonts/LICENSE-IBMPlexSerif.txt)
+- Lato — SIL Open Font License 1.1
+  (crates/agent-runtime/assets/fonts/LICENSE-Lato.txt)
+- Noto Emoji — SIL Open Font License 1.1
+  (crates/agent-runtime/assets/fonts/LICENSE-NotoEmoji.txt)
+
+Rust and npm dependencies are used under their own licences, recorded in
+Cargo.lock and ui/package-lock.json; the accepted licences are listed in
+deny.toml, and `cargo deny list` prints the licence of every Rust dependency.

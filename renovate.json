@@ -1,0 +1,89 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "description": "One grouped PR a week for everything non-major, automerged once the required checks pass; majors wait in the Dependency Dashboard until ticked and are merged by hand.",
+  "extends": [
+    "config:recommended",
+    "group:allNonMajor",
+    "helpers:pinGitHubActionDigests"
+  ],
+  "timezone": "Europe/London",
+  "schedule": [
+    "before 6am on monday"
+  ],
+  "labels": [
+    "dependencies"
+  ],
+  "prConcurrentLimit": 5,
+  "minimumReleaseAge": "3 days",
+  "platformAutomerge": true,
+  "automergeStrategy": "squash",
+  "lockFileMaintenance": {
+    "enabled": true,
+    "schedule": [
+      "before 6am on the first day of the month"
+    ],
+    "automerge": true
+  },
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "The runtime image's rustup install, so it moves with rust-toolchain.toml instead of drifting (it was 1.90.0 against a 1.93.1 toolchain).",
+      "managerFilePatterns": [
+        "/^Dockerfile$/"
+      ],
+      "matchStrings": [
+        "--default-toolchain (?<currentValue>\\d+\\.\\d+\\.\\d+)"
+      ],
+      "depNameTemplate": "rust",
+      "datasourceTemplate": "rust-version"
+    }
+  ],
+  "packageRules": [
+    {
+      "description": "In-range npm minors only reach the weekly PR if the lockfile is updated for them; the default would wait for lockFileMaintenance.",
+      "matchManagers": [
+        "npm"
+      ],
+      "rangeStrategy": "update-lockfile"
+    },
+    {
+      "description": "Rust toolchain in its own PR: rust-toolchain.toml, the builder image and the runtime rustup install together. A new clippy lint set must not block the weekly group.",
+      "matchManagers": [
+        "rust-toolchain",
+        "dockerfile",
+        "custom.regex"
+      ],
+      "matchPackageNames": [
+        "rust"
+      ],
+      "groupName": "rust toolchain",
+      "groupSlug": "rust-toolchain"
+    },
+    {
+      "description": "Majors open one PR per package, only once ticked in the Dependency Dashboard issue, and are never automerged.",
+      "matchUpdateTypes": [
+        "major"
+      ],
+      "dependencyDashboardApproval": true
+    },
+    {
+      "description": "Automerge non-major updates through GitHub's auto-merge, which waits for main's required checks (CI OK, the CLA) and review rules.",
+      "matchUpdateTypes": [
+        "minor",
+        "patch",
+        "pin",
+        "pinDigest",
+        "digest"
+      ],
+      "automerge": true
+    },
+    {
+      "description": "CI and build-image updates change what runs on every pull request: always reviewed by hand.",
+      "matchManagers": [
+        "github-actions",
+        "dockerfile"
+      ],
+      "automerge": false
+    }
+  ]
+}

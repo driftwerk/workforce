@@ -1,0 +1,102 @@
+{
+  "spec": {
+    "kind": "flow",
+    "nodes": [
+      {
+        "id": "a",
+        "label": "Alpha"
+      },
+      {
+        "id": "b",
+        "label": "Beta"
+      },
+      {
+        "id": "c",
+        "label": "Gamma",
+        "at": [
+          0,
+          3
+        ]
+      }
+    ],
+    "edges": [
+      {
+        "from": "a",
+        "to": "b"
+      }
+    ]
+  },
+  "metrics": {
+    "char_width": 7,
+    "line_height": 16
+  },
+  "layout": {
+    "kind": "flow",
+    "nodes": [
+      {
+        "id": "a",
+        "label": "Alpha",
+        "lines": [
+          "Alpha"
+        ],
+        "shape": "box",
+        "tone": "default",
+        "x": 14,
+        "y": 14,
+        "w": 76,
+        "h": 32
+      },
+      {
+        "id": "b",
+        "label": "Beta",
+        "lines": [
+          "Beta"
+        ],
+        "shape": "box",
+        "tone": "default",
+        "x": 14,
+        "y": 92,
+        "w": 76,
+        "h": 32
+      },
+      {
+        "id": "c",
+        "label": "Gamma",
+        "lines": [
+          "Gamma"
+        ],
+        "shape": "box",
+        "tone": "default",
+        "x": 14,
+        "y": 170,
+        "w": 76,
+        "h": 32
+      }
+    ],
+    "edges": [
+      {
+        "key": "a|b|0",
+        "from": "a",
+        "to": "b",
+        "points": [
+          [
+            52,
+            46
+          ],
+          [
+            52,
+            92
+          ]
+        ],
+        "style": "solid",
+        "arrow": "to"
+      }
+    ],
+    "groups": [],
+    "lifelines": [],
+    "notes": [],
+    "width": 104,
+    "height": 216,
+    "dropped": []
+  }
+}

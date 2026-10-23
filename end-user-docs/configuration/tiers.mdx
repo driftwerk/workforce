@@ -1,0 +1,374 @@
+---
+title: Tiers
+description: Model tiers, routing rules, and per-agent overrides.
+---
+
+# Tiers
+
+The LLM tier system routes your requests to the optimal model based on your task and budget. Configurable globally or per agent, it supports failover chains, adaptive routing, and specialized backends for vision, audio, and image generation.
+
+<Callout type="info">
+Tiers work with any provider (OpenRouter, Anthropic, Google, etc.) and support friendly names like `cheap`, `standard`, and `powerful` alongside concrete model IDs.
+</Callout>
+
+## Global Tier Configuration
+
+Configure the primary model and fallback chain in `[llm]`. Example from the default config:
+
+```toml
+[llm]
+provider = "openrouter:google"
+default_model = "standard"
+max_tokens = 8192
+max_rounds = 50
+# Failover models — tried in order when the primary model is unavailable
+failover = ["openrouter:deepseek"]
+```
+
+### Retry Configuration
+
+```toml
+[llm.retry]
+max_retries = 2
+initial_backoff_ms = 500
+backoff_multiplier = 2.0
+max_backoff_ms = 10000
+
+# Retry `Overloaded` (529) on the same model with backoff before failing
+# over, instead of failing over immediately. Keeps transient provider
+# overload (e.g. Bedrock) from spilling onto a metered fallback account.
+retry_overloaded = false
+
+# Retry `RateLimited` (429) on the same model when the provider's
+# retry-after hint is short, instead of failing over immediately.
+# Built for per-minute token quotas (e.g. Cerebras TPM).
+retry_rate_limited = false
+```
+
+### Health Tracking
+
+```toml
+[llm.health]
+# Number of failures within `window_secs` to mark a model degraded.
+failure_threshold = 3
+# Time window in seconds for failure counting.
+window_secs = 300
+# Seconds before retrying a degraded model.
+recovery_secs = 120
+```
+
+### Pacing Configuration
+
+Proactively pace requests to stay under token-per-minute quotas before hitting a 429 error.
+
+```toml
+[llm.pacing]
+enabled = false
+# Provider tokens-per-minute quota (e.g. Cerebras PAYG GLM-4.7: 500000)
+tpm_limit = 500000
+# Fraction of quota to admit against; slack absorbs estimate error
+headroom = 0.85
+# Pace (sleep) up to this many seconds; longer projected waits fail over
+max_wait_secs = 30
+# Tokens reserved per request for the completion
+output_allowance = 1024
+```
+
+### Vision and Audio Specialized Tiers
+
+When an agent's primary model lacks vision or audio capabilities, attachments are routed through specialized tier configurations.
+
+#### Vision Configuration
+
+```toml
+[llm.vision]
+enabled = true
+model = "openrouter:anthropic:cheap"  # tier shorthand resolves Haiku via OpenRouter
+# api_key resolved from OPENROUTER_API_KEY env
+cache_size = 256  # Cache image descriptions
+
+# PDF handling
+pdf_text_min_chars = 200   # Text-extraction threshold
+pdf_max_pages = 20         # Max pages to process via vision
+```
+
+`model` names its provider: a tier (`openrouter:anthropic:cheap`, `gemini:standard`) or a model on a route (`chatgpt:gpt-6.1-sol`, `gemini:gemini-3.8-flash`). A bare model or tier needs `provider` set beside it; without one it is refused, never sent to a provider it did not name.
+
+The describer must be on a provider whose requests carry images: Anthropic, OpenRouter, Gemini, vLLM, Bedrock, Vertex, `chatgpt` or `claude-code`. Grok, Ollama, Cerebras, Z.AI and `codex` completions send text only and are refused.
+
+A subscription route such as `chatgpt:` describes on the plan login of the person the turn is for, so it describes nothing for a turn with no person, and no other provider is called instead.
+
+A model that names no known provider, or one that cannot be shown an image, is reported in the log at startup and nothing is described until it is fixed and the agent restarted. Until then the model is told that vision is misconfigured, so it can tell the person; the turn itself still runs.
+
+A model is shown images itself, without the describer, when it is listed as vision-capable and is called on a provider whose requests carry images. Models on the `chatgpt:` route read images and PDFs themselves. A vision model behind Ollama, Z.AI, Grok or Cerebras is sent text only, so its images go to the describer.
+
+#### Audio Transcription
+
+```toml
+[llm.transcription]
+enabled = true
+model = "groq:cheap"      # Or "openrouter:google:cheap"
+language = "en"           # Optional language hint
+max_audio_minutes = 30    # Refuse longer audio
+cache_size = 256
+transcribe_video_audio = true  # Extract audio from videos
+```
+
+`model` is read as `[llm.vision]`'s is: it names its provider (`groq:cheap`, `openrouter:google:cheap`, `openai:whisper-1`), or `provider` is set beside a bare model or tier. The providers that transcribe are OpenAI, Groq, Gemini, OpenRouter, vLLM and `custom` (a Whisper-shaped endpoint at `url`). A model that names none of them is reported in the log at startup; until it is fixed and the agent restarted, audio and video are saved to the workspace untranscribed and the model is told why.
+
+#### Video Frames
+
+Video attachments (and videos opened with `view_attachment`) are also shown to the model as still frames, each labelled with its timestamp, so it can describe what the video shows and point to the moment. Frames go through the same route as images: natively for a vision-capable model, described one by one by the `[llm.vision]` model otherwise. Frame extraction needs `ffmpeg` and `ffprobe` on the agent host; when they are missing or the file cannot be read, the model is told why.
+
+```toml
+[attachments.video]
+enabled = true          # Install-wide kill switch
+max_frames = 8          # Frames per video at most (hard ceiling 20)
+min_interval_secs = 2.0 # Short clips get fewer, distinct frames
+max_minutes = 10        # Longer videos get a note instead of frames
+max_long_edge = 1024    # Frame size in pixels (no upscaling; ceiling 1568)
+detail_long_edge = 1568 # Frame size for a closer look with `detail` (ceiling 1568)
+jpeg_quality = 80       # 1–100
+scene_threshold = 0.3   # Spread frames across detected shots; 0 disables
+```
+
+Every field can also be set in an agent's own `config.toml` under `[attachments.video]`, which takes effect on the next turn; `enabled = false` there turns frames off for that agent. Turning frames off at the install level turns them off everywhere.
+
+##### A closer look
+
+The first sample is spread over the whole video. When you ask about a particular moment or a small detail ("show me 0:10 to 0:16 in more detail", "what does the label say at 0:13?"), the agent opens the video again with `view_attachment` and picks the frames it needs:
+
+| Parameter | What it does |
+|-----------|--------------|
+| `from`, `to` | Sample a time range instead of the whole video. Either may be left out. Times are seconds (`13.5`), `m:ss` (`0:13.5`) or `h:mm:ss`. |
+| `at` | Take one frame at each exact timestamp, instead of a sample. |
+| `frames` | How many frames to sample from the range, in place of what `min_interval_secs` allows. |
+| `detail` | Larger frames (`detail_long_edge`), for a few timestamps or a short range. |
+
+A closer look shows frames only. The transcript is not repeated; when the audio is transcribed, the agent is told to open the video without these parameters for what is said.
+
+The same limits apply as for the first sample: at most `max_frames` frames or timestamps per view, `max_minutes`, and the image limits below. A detailed view never costs more than a full sample: `detail` enlarges only as many frames as hold the pixels of `max_frames` ordinary ones (3 with the defaults), and a view with more frames than that shows them at the usual size and says so. Files opened in one step render one after another within five minutes; any left over are named as not rendered, and the agent can open them again.
+
+The line introducing the frames says what was sampled ("4 still frame(s) sampled from 0:10.0 to 0:16.0"), and anything that had to give is said there too: a range that runs past the end stops at the end, a timestamp past the end shows the last frame, a repeated timestamp is shown once. A range that starts past the end, or a time that cannot be read, gets a one-sentence explanation rather than frames. Parameters given for a file that is not a video are said to be ignored, and the file is shown whole.
+
+Images stay in the conversation for the rest of the turn, and a request to a Claude model (direct, on Bedrock, on Vertex, through a router or the `claude` CLI) or through Bedrock Converse carries at most 20 images and documents together; a request on the `chatgpt:` route carries at most 50. Past that, the oldest video frames are replaced with a note first, then the oldest other images; the model can open a video again with `view_attachment` to see it.
+
+<Callout type="warn">
+Vision and audio configurations use whole-block inheritance: if an agent provides its own `[llm.vision]` or `[llm.transcription]` section, none of the global fields leak through.
+</Callout>
+
+#### Image Generation
+
+Image generation is strictly opt-in; the tool is only registered when this block is present.
+
+```toml
+[llm.image]
+model = "bedrock:stability:standard"   # tier shorthand → Stable Image Ultra
+# api_key resolved from provider-specific env var
+size = "1024x1024"  # Default output resolution
+n = 1               # Default images per request
+```
+
+`model` names its provider (`gemini:standard`, `bedrock:stability:standard`, `openrouter:google:cheap`), or `provider` is set beside a bare model or tier. A model that names no provider is refused and the tool is not registered.
+
+<Callout type="warn">
+Image generation also uses whole-block inheritance. If an agent provides its own `[llm.image]` section, none of the global fields leak through.
+</Callout>
+
+#### Video Generation
+
+Video generation is strictly opt-in; the tool is only registered when this block is present.
+
+```toml
+[llm.video]
+model = "veo:cheap"           # tier shorthand → veo-3.1-lite-generate-preview
+aspect_ratio = "16:9"
+person_generation = "allow_adult"   # required to animate a real person's face
+```
+
+<Callout type="warn">
+Video generation uses whole-block inheritance like image generation.
+</Callout>
+
+## Per-Agent Overrides
+
+Each agent can override the global `[llm]` settings. Unset fields inherit from global config.
+
+```toml
+[[agents]]
+id = "architect"
+name = "Architect"
+
+# Agent-specific LLM config
+[agents.llm]
+default_model = "openrouter:deepseek:powerful"
+max_tokens = 32000
+
+# Failover chain for this agent
+[agents.llm.failover]
+- "anthropic:standard"
+- "openrouter:deepseek:cheap"
+
+# Vision fallback (for non-vision-capable primary models)
+[agents.llm.vision]
+model = "openrouter:anthropic:cheap"
+enabled = true
+
+# Audio transcription fallback
+[agents.llm.transcription]
+model = "openrouter:google:cheap"
+enabled = true
+language = "en"
+
+# Image generation override
+[agents.llm.image]
+model = "gemini:standard"
+enabled = true
+
+# Video generation override
+[agents.llm.video]
+model = "veo:standard"
+enabled = true
+
+# Per-agent pacing override (fully replaces global policy)
+[agents.llm.pacing]
+enabled = false
+```
+
+### Resolution Order
+
+Tier resolution follows this priority:
+
+1. **Workspace config** (`{workspace}/config.toml`) — agent-driven runtime changes
+2. **Agent section** (`[[agents]]` in `workforce.toml`)
+3. **Global LLM config** (`[llm]` in `workforce.toml`)
+
+Workspace config survives CI deploys and is updated by agent tools like `system.set_model`.
+
+## Workspace Runtime Configuration
+
+Each agent's workspace has its own `config.toml` for runtime adjustments. This file persists across deploys and is managed by agent tools or manual edits.
+
+<Callout type="info">
+The `{workspace}/config.toml` file lets you change models without editing the main `workforce.toml` (which is managed by CI/deployments).
+</Callout>
+
+Example workspace config:
+
+```toml
+# Per-agent configuration — managed by agent tools or human edit.
+# Overrides global defaults from workforce.toml.
+# This file survives CI deploys.
+
+[llm]
+default_model = "anthropic:standard"
+failover = ["openrouter:deepseek:cheap"]
+
+# Override pacing for this workspace
+[llm.pacing]
+enabled = true
+tpm_limit = 2000000
+```
+
+## Advisor Tier Configuration
+
+The advisor system (second-opinion tool) has its own tier settings:
+
+```toml
+[advisor]
+# Enable the advisor tool for agents that inherit this config.
+enabled = false
+# Which backend to call: "model", "claude_code", "agent".
+source = "claude_code"  # Spawn the Claude Code CLI as a one-shot read-only advisor
+# Payload shape forwarded to the advisor: "transcript" or "summary".
+payload = "transcript"  # Ship the full conversation
+# Token cap on the forwarded payload; excess is tail‑truncated.
+payload_max_tokens = 200000
+# Max conversational rounds the advisor's tool loop may take, across all sources.
+max_rounds = 7
+# `--effort` passed to CC. Default `"high"` — advisor benefits from reasoning headroom.
+cc_effort = "high"
+# `source = "agent"` target agent ID. The target must have `advisor_mode = true`.
+agent_id = "reviewer"
+```
+
+### Per-Agent Advisor Overrides
+
+```toml
+[[agents]]
+id = "reviewer"
+# This agent may be invoked as another agent's advisor.
+advisor_mode = true
+
+[agents.advisor]
+source = "agent"
+# Unset fields inherit from global [advisor]
+```
+
+## Doc-Curator Tiers
+
+The documentation curator uses its own tier specification:
+
+```toml
+[curator]
+tier = "openrouter:deepseek:powerful"
+max_tokens = 16000
+```
+
+<Callout type="info">
+Every installation must configure the `[curator]` tier — there's no default because the right model depends on available providers. Set it globally or use the CLI `--tier` flag.
+</Callout>
+
+Run the curator with:
+
+```bash
+workforce docs curate  # Uses config.toml tier
+workforce docs curate --tier "anthropic:powerful"  # Override per run
+```
+
+## Failover Chains
+
+When a model fails (rate limit, downtime, etc.), the system tries each model in the failover chain:
+
+```toml
+[llm]
+default_model = "anthropic:powerful"
+failover = [
+  "openrouter:deepseek:powerful",
+  "anthropic:standard",
+  "openrouter:deepseek:cheap"
+]
+```
+
+A chain runs exactly the entries listed. An agent on a [subscription](/docs/concepts/subscriptions) never falls back to a metered model unless one is in its chain.
+
+## Subscription Provider Tiers
+
+The subscription providers resolve tiers like any other provider (`chatgpt:cheap`, `claude-code:powerful`):
+
+| Tier | `chatgpt` | `claude-code` | `codex` |
+|------|-----------|---------------|---------|
+| `powerful` | `gpt-6.1-sol` | `opus` | `gpt-6.1-sol` |
+| `standard` | `gpt-6-sol` | `sonnet` | `gpt-6-sol` |
+| `cheap` | `gpt-6-luna` | `haiku` | `gpt-6-luna` |
+
+- `chatgpt` and `codex` take any model Codex lists for a ChatGPT sign-in (`gpt-6.1-sol`, `gpt-6-astra`, `gpt-6-sol`, `gpt-6-luna`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`); `gpt-5.5` retired from ChatGPT sign-ins on 14 October 2026.
+- `claude-code` takes Claude Code's own model aliases.
+- A `codex` turn on a model the backend doesn't serve is refused when the config is saved.
+
+## Model-Specific Overrides
+
+Override settings for specific models:
+
+```toml
+# Token limits per model
+[llm.model_max_tokens]
+"claude-opus-4-6" = 128000
+"claude-haiku-4-5-20251001" = 32000
+
+# Agent-specific version
+[[agents]]
+id = "coder"
+[agents.llm.model_max_tokens]
+"openrouter:deepseek:powerful" = 64000
+```

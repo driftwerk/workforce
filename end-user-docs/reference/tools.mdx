@@ -1,0 +1,120 @@
+---
+title: Tool catalogue
+description: Which tools agents can call, and how they're automatically added to conversations.
+---
+
+# Tool catalogue
+
+When you work with an agent, it can call various tools to get things done. The system automatically chooses which tool details the agent sees based on the AI model's capabilities and what you're talking about.
+
+## How tools are selected
+
+- **Large-context models** (200K+ tokens) see every tool at once.
+- **Smaller models** get only the essential tools, plus any tools that fit the current conversation. The rest are listed by name only, so the agent can still ask for them if needed.
+- The system watches your chat and automatically adds tools when you mention related topics (like "PR," "issue," or "email").
+- **Skill tools** (like `linear.*`, `jira.*`, `datadog.*`, etc.) become available when you enable the corresponding service skill.
+
+### Essential tools
+
+These tools are always available to all agents:
+
+- **File operations** (`filesystem_*`)
+- **Shell execution** (`exec_run`)
+- **Code editing** (`code_*`)
+- **Messaging** (`messaging_*`)
+- **Reactions** (`reactions_*`)
+- **Memory and notes** (`memory`, `notes`)
+- **Code context tools** (`context_*`)
+- **Session management** (`sessions`, `session_set_label`)
+- **System control** (`system_*`, `advisor`)
+- **Workflows** (`workflow`)
+- **Projects** (`projects`)
+- **Knowledge base** (`knowledge`)
+- **WASM skill management** (`wasm_skill_*`)
+- **Data-plane tools** (`data_*`)
+- **Background job tools** (`jobs`, `subagent`, `investigate`, `watch`)
+- **Tool description** (`tool_describe`)
+- **Tool output retrieval** (`tool_retrieve`)
+
+### Context‑aware tool injection
+
+When you mention certain topics, the system adds the relevant tools and keeps them available for the rest of the conversation:
+
+| Topic keywords | Tools added |
+|----------------|-------------|
+| github, pull request, PR, merge, commit, branch, repo | `github_*` |
+| linear, ticket, issue, dw‑, bug, feature request | `linear_*` |
+| schedule, cron, reminder, remind me, every day, recurring | `scheduler_*` |
+| browse, web page, fetch URL, scrape, website | `browser_*` |
+| email, send email, mail | `email_*` |
+| google, search the web, look up | `google_*` |
+| sub‑agent, subagent, delegate, spawn agent | `subagent_*` |
+| policy, policies, approval policy | `policy_*` |
+| cost, spending, budget, token usage, usage | `usage_*` |
+| image, picture, photo, drawing, illustration, logo, icon, artwork, sketch, wallpaper, avatar, photorealistic, edit, compose, add him, add her, add them, profile photo, video, animate, clip, dancing | `generate_image`, `view_attachment`, `get_user_photo`, `generate_video`, `compose_video`, `trim_video` |
+| stitch, montage, slideshow, compilation, combine videos, concatenate, video presentation, splice | `compose_video`, `generate_video`, `generate_image` |
+| trim, fade in, fade out, split, shorten, cut the, first few seconds, last few seconds | `trim_video`, `compose_video` |
+| gif, giphy, meme, reaction | `video_to_gif`, `generate_video`, `view_attachment` |
+| file, attachment, document, pdf, spreadsheet, csv, transcript, audio, video | `view_attachment` |
+| excel, xlsx, .xls, spreadsheet, workbook, export, csv, dataset, join, consolidate, cross‑reference, dedupe, pivot | `export_xlsx` |
+| prefer, from now on, going forward, in future, always use, always show, always include, always give, never show, stop showing, i like my, remember that i | `remember_preference` |
+| coding.session, coding session, claude code, code session, coding_session | `coding_session` |
+
+### Agent management
+
+Agents can manage other agents with:
+
+- **List agents** (`agent.list`) — Show all configured agents
+- **Show agent details** (`agent.show`) — View details for a specific agent
+- **Create new agent** (`agent.create`) — Add a new agent to the configuration
+- **Update agent** (`agent.update`) — Modify an existing agent's settings
+- **Delete agent** (`agent.delete`) — Remove an agent from the configuration
+
+### External service adapters
+
+When you enable skills for services like Jira, Linear, Datadog, or Gmail, the corresponding tools become available. Tools from these adapters follow naming patterns such as `jira.*`, `linear.*`, `datadog.*`, etc.
+
+### Code and knowledge tools
+
+For working with codebases and knowledge graphs:
+
+- **Index repositories** (`codegraph.index_repo`) — Add a repository to the code graph
+- **Find symbols** (`codegraph.find_symbol`) — Search for functions, classes, and other code entities
+- **Explore callers/callees** (`codegraph.callers`, `codegraph.callees`) — Navigate code relationships
+- **File structure** (`codegraph.file_graph`) — List all entities in a file
+- **Cross‑repo impact analysis** (`impact.cross_repo`) — See what breaks across repositories
+- **Fused context query** (`context.fuse`) — Combine code graph and memory search
+
+### Remote workforce hubs (Claude Code)
+
+`workforce-local-mcp` can proxy a workforce install's remote MCP endpoint as the connected user:
+
+- **List hubs** (`wf.hubs`) — Registered hubs, the active one, and its connection state
+- **Switch hub** (`wf.use`) — Make another registered hub the target of the `wf.*` tools
+- **Remote tools** (`wf.*`) — The active hub's tools (workflows, playbooks, WASM skills, vault, schedules, `wf.agent_chat`) under stable names
+
+### Memory tools
+
+For persistent note‑taking and recall:
+
+- **Remember** (`memory.remember`) — Save information for future sessions
+- **Recall** (`memory.recall`) — Search stored memories by keyword
+- **Forget** (`memory.forget`) — Soft‑delete a memory
+- **List memories** (`memory.list`) — Browse all stored notes
+
+### Project management
+
+For multi‑repository projects:
+
+- **List projects** (`project.list`) — Show all defined projects
+- **Index project** (`project.index`) — Index all repos in a project into the shared code graph
+- **Sync project** (`project.sync`) — Clone and update mirror repositories
+
+## Using catalogued tools
+
+If a tool isn't automatically included in the current context, the agent will see it listed by name only. To use it:
+
+1. First call `tool_describe` with `{"names": ["tool_name"]}` to get the tool's full details
+2. Then call the tool normally with the required parameters
+
+For service skills (like `linear_*`, `github_*`, etc.), you can use `system_enable_skill` to load all tools for that skill at once.

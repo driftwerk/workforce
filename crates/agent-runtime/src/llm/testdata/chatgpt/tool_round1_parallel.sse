@@ -1,0 +1,50 @@
+HTTP 200
+x-codex-active-limit: premium
+x-codex-plan-type: prolite
+x-codex-primary-used-percent: 0
+x-codex-secondary-used-percent: 0
+x-codex-primary-window-minutes: 10080
+x-codex-primary-over-secondary-limit-percent: 0
+x-codex-secondary-window-minutes: 0
+x-codex-primary-reset-after-seconds: 603057
+x-codex-secondary-reset-after-seconds: 0
+x-codex-primary-reset-at: 1791270464
+x-codex-secondary-reset-at: 
+x-codex-credits-has-credits: False
+x-codex-credits-balance: 0
+x-codex-credits-unlimited: False
+x-codex-turn-state: gAAAAABqu2qQ3y5qOmzsGz11HdwzmpCR73mS_KcwwamX4kmkicxFyB16E62L3ZYMo036Xwq9_Sqcz9ZCYMK7qMcElfGfevq-vIMkjhJV5yJqa_jipaqDiaRRSN_0dwat1ov2rSw9OoB8tlyh8u5nUj5JTgYhoIOVNkGsq876NFFVM4j4pnCqk6fYRlmmqzsJA7BermI3-JnWLhhqIv1MYQx7cNpIPoZvWZzFatJhpDLi2ELWZkEPEn0bHefEgdc4c8CXXt_TqfUkYLtpVh-3t5YrLdsLepgVc1fP3aXieZqTEbAl28JcRUxrWNcGHbRTuwJx5Y89Q6-lUSFYZ0iVWDa7aRKZXOaiq1qtu-2PPwx5hOjb4hidRdRjkPgYJuR1-_YtZJZKyCIVtj3frJwG8VTlOOuI-fMjaMZvn5-GlvmJK84r1Kns6gwRWFGPPLxwWE71Um-jzvKu5ZA5dJmM_L4Z3s1s6NMfKaZeOPO0woUd87NjxJN3EF92BH2YC6166m0gIbMQEZixBRjwfVrA50YZkG-jDnZg-_WNPNF6OwGwjRpjsgnPCGwmGEEm0dOS7c2Ph8MHjnRcOZ-CWlSV-2ekBWYqKcqfj15VZqk9i6TId-SR9-diEdReXYPkofrJj1-S6BBE8PIh6swrF2oErurMe4zfNQd9waWkFJq_fMfsBE1xuenmXSVawWT3WM_ZA9NUMJQYGfDt3_LySPQUoUILiOJRfA-qH8yBlOKRidmKZOZHQTAyXKatMCnos7gOdHQF9-CLRs8H
+
+event: response.created
+data: {"type":"response.created","response":{"id":"resp_0e006fc8ec974095016abb6a9017e487d2ac953f5a12b8bb81","object":"response","created_at":1790667408,"status":"in_progress","access_programs":{"cyber":"daybreak_blue"},"background":false,"completed_at":null,"error":null,"frequency_penalty":0.0,"incomplete_details":null,"instructions":"You are Allan, a concise assistant. Use tools when asked.","max_output_tokens":null,"max_tool_calls":null,"model":"gpt-5.5","moderation":null,"output":[],"parallel_tool_calls":true,"presence_penalty":0.0,"previous_response_id":null,"prompt_cache_key":"00000000-0000-4000-8000-000000000001","prompt_cache_retention":"24h","reasoning":{"context":"current_turn","effort":"medium","mode":"standard","summary":"detailed"},"safety_identifier":"user-000000000000000000000002","service_tier":"auto","store":false,"temperature":1.0,"text":{"format":{"type":"text"},"verbosity":"medium"},"tool_choice":"auto","tool_usage":{"image_gen":{"input_tokens":0,"input_tokens_details":{"image_tokens":0,"text_tokens":0},"output_tokens":0,"output_tokens_details":{"image_tokens":0,"text_tokens":0},"total_tokens":0},"web_search":{"num_requests":0}},"tools":[{"type":"function","description":"Get the weather for a city","name":"weather_get","output_schema":null,"parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]},"strict":false},{"type":"function","description":"Get the local time for a city","name":"time_get","output_schema":null,"parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]},"strict":false}],"top_logprobs":0,"top_p":0.98,"truncation":"disabled","usage":null,"user":null,"metadata":{}},"sequence_number":0}
+
+event: response.in_progress
+data: {"type":"response.in_progress","response":{"id":"resp_0e006fc8ec974095016abb6a9017e487d2ac953f5a12b8bb81","object":"response","created_at":1790667408,"status":"in_progress","access_programs":{"cyber":"daybreak_blue"},"background":false,"completed_at":null,"error":null,"frequency_penalty":0.0,"incomplete_details":null,"instructions":"You are Allan, a concise assistant. Use tools when asked.","max_output_tokens":null,"max_tool_calls":null,"model":"gpt-5.5","moderation":null,"output":[],"parallel_tool_calls":true,"presence_penalty":0.0,"previous_response_id":null,"prompt_cache_key":"00000000-0000-4000-8000-000000000001","prompt_cache_retention":"24h","reasoning":{"context":"current_turn","effort":"medium","mode":"standard","summary":"detailed"},"safety_identifier":"user-000000000000000000000002","service_tier":"auto","store":false,"temperature":1.0,"text":{"format":{"type":"text"},"verbosity":"medium"},"tool_choice":"auto","tool_usage":{"image_gen":{"input_tokens":0,"input_tokens_details":{"image_tokens":0,"text_tokens":0},"output_tokens":0,"output_tokens_details":{"image_tokens":0,"text_tokens":0},"total_tokens":0},"web_search":{"num_requests":0}},"tools":[{"type":"function","description":"Get the weather for a city","name":"weather_get","output_schema":null,"parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]},"strict":false},{"type":"function","description":"Get the local time for a city","name":"time_get","output_schema":null,"parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]},"strict":false}],"top_logprobs":0,"top_p":0.98,"truncation":"disabled","usage":null,"user":null,"metadata":{}},"sequence_number":1}
+
+event: response.output_item.added
+data: {"type":"response.output_item.added","item":{"id":"fc_0e006fc8ec974095016abb6a91bd5c87d2ae0ce6eef289e16b","type":"function_call","status":"in_progress","arguments":"","call_id":"call_i0R5QIs1iUydymKO9v7MRxoP","name":"weather_get"},"output_index":0,"sequence_number":2}
+
+event: response.function_call_arguments.delta
+data: {"type":"response.function_call_arguments.delta","delta":"{\"city\":\"Lisbon\"}","item_id":"fc_0e006fc8ec974095016abb6a91bd5c87d2ae0ce6eef289e16b","obfuscation":"kdoQl0mg4GS4iOx","output_index":0,"sequence_number":3}
+
+event: response.function_call_arguments.done
+data: {"type":"response.function_call_arguments.done","arguments":"{\"city\":\"Lisbon\"}","item_id":"fc_0e006fc8ec974095016abb6a91bd5c87d2ae0ce6eef289e16b","output_index":0,"sequence_number":4}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","item":{"id":"fc_0e006fc8ec974095016abb6a91bd5c87d2ae0ce6eef289e16b","type":"function_call","status":"completed","arguments":"{\"city\":\"Lisbon\"}","call_id":"call_i0R5QIs1iUydymKO9v7MRxoP","name":"weather_get"},"output_index":0,"sequence_number":5}
+
+event: response.output_item.added
+data: {"type":"response.output_item.added","item":{"id":"fc_0e006fc8ec974095016abb6a91bd7087d2ba144bc307c1802b","type":"function_call","status":"in_progress","arguments":"","call_id":"call_k94qa7gmcyenx7QAN6oXUVxM","name":"time_get"},"output_index":1,"sequence_number":6}
+
+event: response.function_call_arguments.delta
+data: {"type":"response.function_call_arguments.delta","delta":"{\"city\":\"Lisbon\"}","item_id":"fc_0e006fc8ec974095016abb6a91bd7087d2ba144bc307c1802b","obfuscation":"uZtmmW7hJWoBHNu","output_index":1,"sequence_number":7}
+
+event: response.function_call_arguments.done
+data: {"type":"response.function_call_arguments.done","arguments":"{\"city\":\"Lisbon\"}","item_id":"fc_0e006fc8ec974095016abb6a91bd7087d2ba144bc307c1802b","output_index":1,"sequence_number":8}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","item":{"id":"fc_0e006fc8ec974095016abb6a91bd7087d2ba144bc307c1802b","type":"function_call","status":"completed","arguments":"{\"city\":\"Lisbon\"}","call_id":"call_k94qa7gmcyenx7QAN6oXUVxM","name":"time_get"},"output_index":1,"sequence_number":9}
+
+event: response.completed
+data: {"type":"response.completed","response":{"id":"resp_0e006fc8ec974095016abb6a9017e487d2ac953f5a12b8bb81","object":"response","created_at":1790667408,"status":"completed","access_programs":{"cyber":"daybreak_blue"},"background":false,"completed_at":1790667409,"error":null,"frequency_penalty":0.0,"incomplete_details":null,"instructions":"You are Allan, a concise assistant. Use tools when asked.","max_output_tokens":null,"max_tool_calls":null,"model":"gpt-5.5","moderation":null,"output":[],"parallel_tool_calls":true,"presence_penalty":0.0,"previous_response_id":null,"prompt_cache_key":"00000000-0000-4000-8000-000000000001","prompt_cache_retention":"24h","reasoning":{"context":"current_turn","effort":"medium","mode":"standard","summary":"detailed"},"safety_identifier":"user-000000000000000000000002","service_tier":"default","store":false,"temperature":1.0,"text":{"format":{"type":"text"},"verbosity":"medium"},"tool_choice":"auto","tool_usage":{"image_gen":{"input_tokens":0,"input_tokens_details":{"image_tokens":0,"text_tokens":0},"output_tokens":0,"output_tokens_details":{"image_tokens":0,"text_tokens":0},"total_tokens":0},"web_search":{"num_requests":0}},"tools":[{"type":"function","description":"Get the weather for a city","name":"weather_get","output_schema":null,"parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]},"strict":false},{"type":"function","description":"Get the local time for a city","name":"time_get","output_schema":null,"parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]},"strict":false}],"top_logprobs":0,"top_p":0.98,"truncation":"disabled","usage":{"attribution":{"items":{"msg_0e006fc8ec974095016abb6a9024c887d28906aabe1775e800":{"cache_write_tokens":0,"cached_tokens":0,"content":[{"cache_write_tokens":0,"cached_tokens":0,"input_tokens":19,"output_tokens":0}],"input_tokens":19,"output_tokens":0},"fc_0e006fc8ec974095016abb6a91bd5c87d2ae0ce6eef289e16b":{"cache_write_tokens":0,"cached_tokens":0,"input_tokens":2,"output_tokens":34},"fc_0e006fc8ec974095016abb6a91bd7087d2ba144bc307c1802b":{"cache_write_tokens":0,"cached_tokens":0,"input_tokens":0,"output_tokens":16}},"request_fields":{"tools":{"cache_write_tokens":0,"cached_tokens":0,"input_tokens":59,"output_tokens":0},"instructions":{"cache_write_tokens":0,"cached_tokens":0,"input_tokens":17,"output_tokens":0}}},"input_tokens":97,"input_tokens_details":{"cache_write_tokens":0,"cached_tokens":0},"output_tokens":50,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":147},"user":null,"metadata":{}},"sequence_number":10}
+

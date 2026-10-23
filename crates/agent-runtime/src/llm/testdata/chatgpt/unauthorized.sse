@@ -1,0 +1,4 @@
+HTTP 401
+Content-Type: application/json
+
+{"detail":"Could not parse your authentication token. Please try signing in again."}

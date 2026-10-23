@@ -1,0 +1,104 @@
+HTTP 200
+x-codex-active-limit: premium
+x-codex-plan-type: prolite
+x-codex-primary-used-percent: 0
+x-codex-secondary-used-percent: 0
+x-codex-primary-window-minutes: 10080
+x-codex-primary-over-secondary-limit-percent: 0
+x-codex-secondary-window-minutes: 0
+x-codex-primary-reset-after-seconds: 603055
+x-codex-secondary-reset-after-seconds: 0
+x-codex-primary-reset-at: 1791270464
+x-codex-secondary-reset-at: 
+x-codex-credits-has-credits: False
+x-codex-credits-balance: 0
+x-codex-credits-unlimited: False
+x-codex-turn-state: gAAAAABqu2qSTtWRGO31jOAKa6Q9OyJJ6dmkVs0iG-ynS0KyrzWggOP9C9H_LoMbyHwraP8gmZAYylJFiYm_m7b68_O7UF0epgYGZv4ZCr1637kANh8bIsVxr44OLq_xBGew13e91QVO5QDTqOs3nOhcL9VWgH4UHOJ-6N1M3F8MxcGxcyS7R5clDYDoK5N-Z_f04n6UvRNAsbEwBFuS0aZCtxOm3JEhyTHUhWqnzWT7KphCQqiOFZln9F76LnHL3Ek3L6_wvbxeMmMrQLeD_d8uu08zNAzfp7KVcBZ6AMZR2OlTZAKtCXM5WxwdvH-BSN3bmwK1iXmYpel6Nb3n9wBaoORZ02OzM6TNmYf-fNpKCgT5pfuJufAwqNCW-NfOWA1MGGp91S1_Ig2t4Kj6QuyqxIgu5tujDjG1cv6F0-lFOPpLcIMoWXSCaN24zeQXGxxwSCrpAGcOLY7setLnYUCBVlXdWolhqPmKaqaaJRWVRmqC1S0_wXX713_HBLqu0RqXBRoEorFfLvYHLG3DZhwc-t6UL9KtNCbT-43B7y0Za2Fqy_P58I5FBiaMDBvX270cM9R7XOa_6RhdQbuQANf-YTU9iSsTH2ZViY0GSpu4z-WbsQUrvguWveRMiR-kZ_YiSAsWa9fnOGBl8oZnmngNFdu1pfHk8e7gpLDQRQuV44IyxkZyPJ6-ilOulx7WUJWE__fI1hvga8ckO7qs9A--KZb9CXIq-FgN-bkqmZmDoozX-QhEEH3QfbZiTLz7EnqlInKKy1hW
+
+event: response.created
+data: {"type":"response.created","response":{"id":"resp_0e006fc8ec974095016abb6a92630087d2b8549a9f1a6c4d5b","object":"response","created_at":1790667410,"status":"in_progress","access_programs":{"cyber":"daybreak_blue"},"background":false,"completed_at":null,"error":null,"frequency_penalty":0.0,"incomplete_details":null,"instructions":"You are Allan, a concise assistant. Use tools when asked.","max_output_tokens":null,"max_tool_calls":null,"model":"gpt-5.5","moderation":null,"output":[],"parallel_tool_calls":true,"presence_penalty":0.0,"previous_response_id":null,"prompt_cache_key":"00000000-0000-4000-8000-000000000001","prompt_cache_retention":"24h","reasoning":{"context":"current_turn","effort":"medium","mode":"standard","summary":"detailed"},"safety_identifier":"user-000000000000000000000002","service_tier":"auto","store":false,"temperature":1.0,"text":{"format":{"type":"text"},"verbosity":"medium"},"tool_choice":"auto","tool_usage":{"image_gen":{"input_tokens":0,"input_tokens_details":{"image_tokens":0,"text_tokens":0},"output_tokens":0,"output_tokens_details":{"image_tokens":0,"text_tokens":0},"total_tokens":0},"web_search":{"num_requests":0}},"tools":[{"type":"function","description":"Get the weather for a city","name":"weather_get","output_schema":null,"parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]},"strict":false},{"type":"function","description":"Get the local time for a city","name":"time_get","output_schema":null,"parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]},"strict":false}],"top_logprobs":0,"top_p":0.98,"truncation":"disabled","usage":null,"user":null,"metadata":{}},"sequence_number":0}
+
+event: response.in_progress
+data: {"type":"response.in_progress","response":{"id":"resp_0e006fc8ec974095016abb6a92630087d2b8549a9f1a6c4d5b","object":"response","created_at":1790667410,"status":"in_progress","access_programs":{"cyber":"daybreak_blue"},"background":false,"completed_at":null,"error":null,"frequency_penalty":0.0,"incomplete_details":null,"instructions":"You are Allan, a concise assistant. Use tools when asked.","max_output_tokens":null,"max_tool_calls":null,"model":"gpt-5.5","moderation":null,"output":[],"parallel_tool_calls":true,"presence_penalty":0.0,"previous_response_id":null,"prompt_cache_key":"00000000-0000-4000-8000-000000000001","prompt_cache_retention":"24h","reasoning":{"context":"current_turn","effort":"medium","mode":"standard","summary":"detailed"},"safety_identifier":"user-000000000000000000000002","service_tier":"auto","store":false,"temperature":1.0,"text":{"format":{"type":"text"},"verbosity":"medium"},"tool_choice":"auto","tool_usage":{"image_gen":{"input_tokens":0,"input_tokens_details":{"image_tokens":0,"text_tokens":0},"output_tokens":0,"output_tokens_details":{"image_tokens":0,"text_tokens":0},"total_tokens":0},"web_search":{"num_requests":0}},"tools":[{"type":"function","description":"Get the weather for a city","name":"weather_get","output_schema":null,"parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]},"strict":false},{"type":"function","description":"Get the local time for a city","name":"time_get","output_schema":null,"parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]},"strict":false}],"top_logprobs":0,"top_p":0.98,"truncation":"disabled","usage":null,"user":null,"metadata":{}},"sequence_number":1}
+
+event: response.output_item.added
+data: {"type":"response.output_item.added","item":{"id":"msg_0e006fc8ec974095016abb6a931ec887d2ac2e4ef63081a125","type":"message","status":"in_progress","content":[],"phase":"final_answer","role":"assistant"},"output_index":0,"sequence_number":2}
+
+event: response.content_part.added
+data: {"type":"response.content_part.added","content_index":0,"item_id":"msg_0e006fc8ec974095016abb6a931ec887d2ac2e4ef63081a125","output_index":0,"part":{"type":"output_text","annotations":[],"logprobs":[],"text":""},"sequence_number":3}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"Lis","item_id":"msg_0e006fc8ec974095016abb6a931ec887d2ac2e4ef63081a125","logprobs":[],"obfuscation":"csZ2mJ6Cs5iU1","output_index":0,"sequence_number":4}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"bon","item_id":"msg_0e006fc8ec974095016abb6a931ec887d2ac2e4ef63081a125","logprobs":[],"obfuscation":"oxVFtkmaqeSlZ","output_index":0,"sequence_number":5}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" weather","item_id":"msg_0e006fc8ec974095016abb6a931ec887d2ac2e4ef63081a125","logprobs":[],"obfuscation":"Wy3vAiTv","output_index":0,"sequence_number":6}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":":","item_id":"msg_0e006fc8ec974095016abb6a931ec887d2ac2e4ef63081a125","logprobs":[],"obfuscation":"yKHd198oNyTS0ox","output_index":0,"sequence_number":7}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" sunny","item_id":"msg_0e006fc8ec974095016abb6a931ec887d2ac2e4ef63081a125","logprobs":[],"obfuscation":"oBsjnWCUnA","output_index":0,"sequence_number":8}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":",","item_id":"msg_0e006fc8ec974095016abb6a931ec887d2ac2e4ef63081a125","logprobs":[],"obfuscation":"jnOTKmwRJh7AWVy","output_index":0,"sequence_number":9}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" ","item_id":"msg_0e006fc8ec974095016abb6a931ec887d2ac2e4ef63081a125","logprobs":[],"obfuscation":"jpEttoPyxDnx1cE","output_index":0,"sequence_number":10}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"21","item_id":"msg_0e006fc8ec974095016abb6a931ec887d2ac2e4ef63081a125","logprobs":[],"obfuscation":"kmqWZX89Lu53Mo","output_index":0,"sequence_number":11}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"°C","item_id":"msg_0e006fc8ec974095016abb6a931ec887d2ac2e4ef63081a125","logprobs":[],"obfuscation":"xAPshVsr9DTvK1","output_index":0,"sequence_number":12}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":".","item_id":"msg_0e006fc8ec974095016abb6a931ec887d2ac2e4ef63081a125","logprobs":[],"obfuscation":"wK5Je5XyoEzxTql","output_index":0,"sequence_number":13}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"  \n","item_id":"msg_0e006fc8ec974095016abb6a931ec887d2ac2e4ef63081a125","logprobs":[],"obfuscation":"dO4ARokFp6Bfr","output_index":0,"sequence_number":14}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"Local","item_id":"msg_0e006fc8ec974095016abb6a931ec887d2ac2e4ef63081a125","logprobs":[],"obfuscation":"qd9qV6gtyGJ","output_index":0,"sequence_number":15}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" time","item_id":"msg_0e006fc8ec974095016abb6a931ec887d2ac2e4ef63081a125","logprobs":[],"obfuscation":"9e2QUDDULAk","output_index":0,"sequence_number":16}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" in","item_id":"msg_0e006fc8ec974095016abb6a931ec887d2ac2e4ef63081a125","logprobs":[],"obfuscation":"TqQUlG2JNlzeJ","output_index":0,"sequence_number":17}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" Lisbon","item_id":"msg_0e006fc8ec974095016abb6a931ec887d2ac2e4ef63081a125","logprobs":[],"obfuscation":"sS8QWUy5O","output_index":0,"sequence_number":18}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":":","item_id":"msg_0e006fc8ec974095016abb6a931ec887d2ac2e4ef63081a125","logprobs":[],"obfuscation":"kmH8TPmbIBc69w8","output_index":0,"sequence_number":19}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":" ","item_id":"msg_0e006fc8ec974095016abb6a931ec887d2ac2e4ef63081a125","logprobs":[],"obfuscation":"HSajUYB22BaO5DP","output_index":0,"sequence_number":20}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"10","item_id":"msg_0e006fc8ec974095016abb6a931ec887d2ac2e4ef63081a125","logprobs":[],"obfuscation":"f3i1y1gjmBBCzb","output_index":0,"sequence_number":21}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":":","item_id":"msg_0e006fc8ec974095016abb6a931ec887d2ac2e4ef63081a125","logprobs":[],"obfuscation":"06OVo1EcHDhULic","output_index":0,"sequence_number":22}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"42","item_id":"msg_0e006fc8ec974095016abb6a931ec887d2ac2e4ef63081a125","logprobs":[],"obfuscation":"x6UJU4pByyEojC","output_index":0,"sequence_number":23}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":".","item_id":"msg_0e006fc8ec974095016abb6a931ec887d2ac2e4ef63081a125","logprobs":[],"obfuscation":"SK3ycPQJdzvfNlo","output_index":0,"sequence_number":24}
+
+event: response.output_text.done
+data: {"type":"response.output_text.done","content_index":0,"item_id":"msg_0e006fc8ec974095016abb6a931ec887d2ac2e4ef63081a125","logprobs":[],"output_index":0,"sequence_number":25,"text":"Lisbon weather: sunny, 21°C.  \nLocal time in Lisbon: 10:42."}
+
+event: response.content_part.done
+data: {"type":"response.content_part.done","content_index":0,"item_id":"msg_0e006fc8ec974095016abb6a931ec887d2ac2e4ef63081a125","output_index":0,"part":{"type":"output_text","annotations":[],"logprobs":[],"text":"Lisbon weather: sunny, 21°C.  \nLocal time in Lisbon: 10:42."},"sequence_number":26}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","item":{"id":"msg_0e006fc8ec974095016abb6a931ec887d2ac2e4ef63081a125","type":"message","status":"completed","content":[{"type":"output_text","annotations":[],"logprobs":[],"text":"Lisbon weather: sunny, 21°C.  \nLocal time in Lisbon: 10:42."}],"phase":"final_answer","role":"assistant"},"output_index":0,"sequence_number":27}
+
+event: response.completed
+data: {"type":"response.completed","response":{"id":"resp_0e006fc8ec974095016abb6a92630087d2b8549a9f1a6c4d5b","object":"response","created_at":1790667410,"status":"completed","access_programs":{"cyber":"daybreak_blue"},"background":false,"completed_at":1790667411,"error":null,"frequency_penalty":0.0,"incomplete_details":null,"instructions":"You are Allan, a concise assistant. Use tools when asked.","max_output_tokens":null,"max_tool_calls":null,"model":"gpt-5.5","moderation":null,"output":[],"parallel_tool_calls":true,"presence_penalty":0.0,"previous_response_id":null,"prompt_cache_key":"00000000-0000-4000-8000-000000000001","prompt_cache_retention":"24h","reasoning":{"context":"current_turn","effort":"medium","mode":"standard","summary":"detailed"},"safety_identifier":"user-000000000000000000000002","service_tier":"default","store":false,"temperature":1.0,"text":{"format":{"type":"text"},"verbosity":"medium"},"tool_choice":"auto","tool_usage":{"image_gen":{"input_tokens":0,"input_tokens_details":{"image_tokens":0,"text_tokens":0},"output_tokens":0,"output_tokens_details":{"image_tokens":0,"text_tokens":0},"total_tokens":0},"web_search":{"num_requests":0}},"tools":[{"type":"function","description":"Get the weather for a city","name":"weather_get","output_schema":null,"parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]},"strict":false},{"type":"function","description":"Get the local time for a city","name":"time_get","output_schema":null,"parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]},"strict":false}],"top_logprobs":0,"top_p":0.98,"truncation":"disabled","usage":{"attribution":{"items":{"msg_0e006fc8ec974095016abb6a92703087d2aa563caab808f6ac":{"cache_write_tokens":0,"cached_tokens":0,"content":[{"cache_write_tokens":0,"cached_tokens":0,"input_tokens":19,"output_tokens":0}],"input_tokens":19,"output_tokens":0},"fc_0e006fc8ec974095016abb6a91bd5c87d2ae0ce6eef289e16b":{"cache_write_tokens":0,"cached_tokens":0,"input_tokens":36,"output_tokens":0},"fc_0e006fc8ec974095016abb6a91bd7087d2ba144bc307c1802b":{"cache_write_tokens":0,"cached_tokens":0,"input_tokens":16,"output_tokens":0},"fc_0e006fc8ec974095016abb6a926ffc87d2978e6b311e3cce7c":{"cache_write_tokens":0,"cached_tokens":0,"content":[{"cache_write_tokens":0,"cached_tokens":0,"input_tokens":14,"output_tokens":0}],"input_tokens":14,"output_tokens":0},"fc_0e006fc8ec974095016abb6a92701887d2b2d7398469a4f481":{"cache_write_tokens":0,"cached_tokens":0,"content":[{"cache_write_tokens":0,"cached_tokens":0,"input_tokens":12,"output_tokens":0}],"input_tokens":12,"output_tokens":0},"msg_0e006fc8ec974095016abb6a931ec887d2ac2e4ef63081a125":{"cache_write_tokens":0,"cached_tokens":0,"content":[{"cache_write_tokens":0,"cached_tokens":0,"input_tokens":2,"output_tokens":25}],"input_tokens":2,"output_tokens":25}},"request_fields":{"tools":{"cache_write_tokens":0,"cached_tokens":0,"input_tokens":59,"output_tokens":0},"instructions":{"cache_write_tokens":0,"cached_tokens":0,"input_tokens":17,"output_tokens":0}}},"input_tokens":175,"input_tokens_details":{"cache_write_tokens":0,"cached_tokens":0},"output_tokens":25,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":200},"user":null,"metadata":{}},"sequence_number":28}
+

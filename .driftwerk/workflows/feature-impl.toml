@@ -1,0 +1,524 @@
+[workflow]
+id = "feature-impl"
+name = "Feature Implementation"
+description = "From ticket pickup through implementation to merged PR — optimised for cost and speed"
+
+[workflow.context]
+ticket_id = { required = true, description = "The Linear ticket ID (e.g. DW-123)" }
+repo = { required = true, description = "The repository in owner/repo format (e.g. driftwerk/workforce)" }
+
+# =============================================================================
+# Step 1: Understand & Design
+# =============================================================================
+[[step]]
+id = "understand"
+engine = "claude-pilot"
+model = "sonnet"
+effort = "medium"
+name = "Understand & Design"
+skills = ["linear", "github"]
+outputs = [
+  { name = "ticket_summary", description = "What the ticket is asking for (1-2 paragraphs)" },
+  { name = "requirements", description = "Specific requirements and constraints" },
+  { name = "acceptance_criteria", description = "How to verify the implementation is correct" },
+  { name = "affected_areas", description = "Key modules, files, and functions that will be affected" },
+  { name = "implementation_plan", description = "Numbered step-by-step implementation plan with specific file paths and changes" },
+  { name = "key_files", description = "Files to create or modify, one per line" },
+  { name = "github_owner", description = "GitHub org/owner extracted from repo context (e.g. driftwerk)" },
+  { name = "github_repo", description = "GitHub repo name extracted from repo context (e.g. workforce)" },
+  { name = "target_repo", description = "Target repository in owner/repo format — triggers per-instance worktree isolation" },
+]
+pause = "awaiting-design-review"
+report = "Summarise in 3-5 bullet points: what will change, key files, and any risks. Keep it under 500 characters."
+task = "Orchestrated by phases below."
+branches = [
+  { when = "approved", goto = "implement" },
+  { when = "rejected", goto = "understand" },
+  { when = "ticket-unclear", goto = "escalate" },
+]
+
+[[step.phases]]
+name = "sync"
+max_turns = 5
+mcp = true
+allowed_tools = ["mcp__workforce__code_git", "mcp__workforce__knowledge_index"]
+task = """
+You MUST call tools to complete this phase. Do NOT reply with text — use the tools.
+
+Step 1: Call the `mcp__workforce__code_git` tool with this exact input:
+  {"repo": "{{repo}}", "action": "pull"}
+
+Step 2: Call the `mcp__workforce__knowledge_index` tool with this exact input:
+  {"action": "status", "path": "repos/{{repo}}"}
+
+Step 3: If the status shows the index is stale or missing, call `mcp__workforce__knowledge_index` again with:
+  {"action": "trigger", "path": "repos/{{repo}}"}
+
+Step 4: If the status shows NO index at all, call `mcp__workforce__knowledge_index` with:
+  {"action": "trigger_full", "path": "repos/{{repo}}"}
+
+After all tool calls complete, summarise in one sentence what happened (e.g. "Repo synced, index is fresh").
+"""
+
+[[step.phases]]
+name = "ticket"
+max_turns = 2
+allowed_tools = []
+task = """
+The Linear ticket {{ticket_id}} has already been fetched for you. Read the
+details below and summarise in plain text:
+- The ticket title
+- The ticket description (verbatim — quote it)
+- Any requirements, acceptance criteria, and dependencies mentioned
+
+## Ticket data
+{{ticket_data}}
+"""
+
+[[step.phases]]
+name = "explore"
+max_turns = 20
+mcp = true
+allowed_tools = [
+  "mcp__workforce__knowledge_overview",
+  "mcp__workforce__context_fuse",
+  "mcp__workforce__knowledge_ask",
+  "mcp__workforce__knowledge_graph",
+  "Read",
+  "Grep",
+  "Glob",
+]
+task = """
+You MUST call the knowledge tools to explore the codebase. Do NOT rely on general knowledge — use the tools.
+
+Recall what the ticket (fetched in the previous phase) is asking for, then:
+
+Step 1: Call `mcp__workforce__knowledge_overview` with:
+  {"path": "repos/{{repo}}"}
+
+Step 2: Call `mcp__workforce__context_fuse` at least once (more if needed) with:
+  {"query": "<a specific question about where in the codebase the ticket's changes belong>", "path": "repos/{{repo}}"}
+
+Step 3: Call `mcp__workforce__knowledge_ask` for deeper follow-ups with:
+  {"question": "<specific question>", "path": "repos/{{repo}}"}
+
+Step 4: If you need to trace relationships for a specific entity (function/module/type), call `mcp__workforce__knowledge_graph` with:
+  {"query": "<one of: callers_of, callees_of, imports_of, implementations_of, tests_for, depends_on, affected_by>", "entity": "<entity name>", "path": "repos/{{repo}}"}
+Both `query` and `entity` are required. Skip this step if you don't need entity-relationship info.
+
+Step 5: Only if the knowledge tools leave gaps, use `Read`, `Grep`, `Glob` to inspect specific files.
+
+After all tool calls, produce a clear written summary of:
+- Which modules and files are affected
+- What architectural patterns already exist that the implementation should follow
+- Data model / migration concerns (if any)
+"""
+
+[[step.phases]]
+name = "plan"
+max_turns = 3
+allowed_tools = []
+task = """
+Using the ticket details and codebase analysis from the previous phases, produce the final structured plan.
+
+You MUST wrap ALL fields inside an `OUTPUTS:` ... `END_OUTPUTS` block, exactly like this template (replace each `<...>` with your actual content; multi-line values are allowed):
+
+OUTPUTS:
+ticket_summary: <1-2 paragraphs summarising the ticket>
+requirements: <specific requirements and constraints>
+acceptance_criteria: <how to verify the implementation is correct>
+affected_areas: <key modules, files, and functions that will be affected>
+implementation_plan: <numbered steps with specific file paths, function changes, data model changes, patterns to reuse>
+key_files: <files to create or modify, one per line>
+github_owner: <the part of "{{repo}}" before the slash>
+github_repo: <the part of "{{repo}}" after the slash>
+target_repo: {{repo}}
+END_OUTPUTS
+
+If the ticket is too unclear to plan, replace the OUTPUTS block with a single line: OUTCOME: ticket-unclear
+Otherwise include the OUTPUTS block exactly as shown. Do not add any OUTCOME line — this step pauses for human review.
+"""
+
+# =============================================================================
+# Step 2: Implement
+# =============================================================================
+[[step]]
+id = "implement"
+engine = "claude-pilot"
+model = "sonnet"
+effort = "medium"
+name = "Implement the Feature"
+skills = ["github"]
+outputs = [
+  { name = "pr_number", description = "PR number that was created", validate = "number" },
+  { name = "branch_name", description = "Feature branch name" },
+  { name = "summary", description = "Brief summary of changes made" },
+]
+task = "Orchestrated by phases below."
+goto = "review"
+branches = [
+  { when = "git-auth-broken", goto = "escalate" },
+  { when = "ticket-unclear", goto = "escalate" },
+]
+
+[[step.phases]]
+name = "setup"
+max_turns = 12
+allowed_tools = ["Bash"]
+task = """
+Set up the workspace for implementing {{ticket_id}} and scrub it of any
+pollution files before the implementer starts editing code.
+
+## Branch setup — fail loudly if git auth is broken
+1. `git fetch origin 2>&1 | tee /tmp/fetch.log; FETCH_RC=${PIPESTATUS[0]}`
+   - If `/tmp/fetch.log` contains `Authentication failed`, `Invalid username`, or `could not read Username`, OR if `$FETCH_RC` is non-zero, the local clone's git auth is broken. Emit as your final message:
+       `OUTCOME: git-auth-broken — git fetch origin failed: <first line of /tmp/fetch.log>`
+     Do NOT proceed.
+2. `git checkout main && git pull --ff-only origin main`
+   - If this fails (non-zero exit), same OUTCOME and STOP.
+3. Check if branch `feat/{{ticket_id}}` exists: `git branch -a | grep feat/{{ticket_id}}`
+4. If it exists: `git checkout feat/{{ticket_id}} && git merge --no-edit main`
+5. If not: `git checkout -b feat/{{ticket_id}}` from updated main
+
+## Hygiene (CRITICAL — do NOT skip)
+These file classes are NEVER supposed to be committed. Remove from the
+working tree AND from git history on this branch if they appear:
+  - `.npmrc`, `.npmrc.tmp`, `.npmrc.*` — may contain auth tokens
+  - `.env`, `.env.*` (except `.env.example`) — secrets
+  - `mcp_config.json` — local agent config, not repo content
+  - `.DS_Store`, `Thumbs.db` — OS cruft
+
+Run:
+  6. `git ls-files | grep -E '^(\\.npmrc|\\.env($|\\.)|mcp_config\\.json|\\.DS_Store)' || true`
+  7. For each match (if any): `git rm --cached <file>` AND `rm -f <file>`
+  8. Ensure `.gitignore` contains: `.env`, `.env.*`, `!.env.example`, `.npmrc*`, `mcp_config.json`, `.DS_Store`
+     Append missing entries with `echo` and `git add .gitignore`.
+  9. If anything was removed or .gitignore changed, commit: `git commit -m "{{ticket_id}}: hygiene — remove sensitive files"`
+
+## Secret scan
+  10. `git diff main...HEAD | grep -E 'ghp_|github_pat_|sk-ant-|sk-proj-|AKIA[0-9A-Z]{16}|glpat-|xox[baprs]-' || true`
+      If this matches, STOP and emit a final message:
+        `OUTCOME: ticket-unclear — secret detected on branch; human review required`
+      Do NOT proceed to the code phase.
+
+11. `git status` to confirm clean state.
+"""
+
+[[step.phases]]
+name = "code"
+max_turns = 25
+allowed_tools = ["Read", "Edit", "Write", "Glob", "Grep"]
+task = """
+Implement the approved plan. Do NOT use Bash — only read and edit files.
+
+## Plan
+{{steps.understand.implementation_plan}}
+
+## Files to modify
+{{steps.understand.key_files}}
+
+## Review Feedback (if returning after code review)
+{{?steps.review.review_feedback}}
+
+Rules:
+- Implement EVERY item in the plan. No placeholders, no TODOs.
+- If there is review feedback, address ALL feedback points first.
+- Do NOT re-read files you just edited.
+- Do NOT explore or investigate — the plan has everything you need.
+"""
+
+[[step.phases]]
+name = "quality"
+max_turns = 15
+allowed_tools = ["Bash"]
+task = """
+Run quality gates and fix any failures.
+
+1. `cargo fmt`
+2. `cargo clippy --all-targets --no-deps -- -D warnings`
+3. Run tests ONLY for affected crates (e.g. `cargo test -p leads-service`). Do NOT run `cargo test --workspace`.
+4. If any gate fails, fix the issue and re-run only the failing gate.
+"""
+
+[[step.phases]]
+name = "push"
+max_turns = 8
+allowed_tools = ["Bash"]
+task = """
+Commit, push, and create/update the PR for {{ticket_id}}, then emit structured outputs.
+
+1. `git add -A && git commit -m "{{ticket_id}}: <concise summary of changes>"`
+2. `git push -u origin feat/{{ticket_id}}`
+3. Check if PR exists: `gh pr list --head feat/{{ticket_id}} --json number --jq '.[0].number'`
+4. If no PR: `gh pr create --title "{{ticket_id}}: <title>" --body "Implements {{ticket_id}}" --base main`
+5. If PR exists: just report the PR number — the push is sufficient.
+
+Then, AS YOUR FINAL MESSAGE, emit an OUTPUTS block — the workflow runtime
+parses it to extract the step's declared outputs:
+
+OUTPUTS:
+pr_number: <the numeric PR number, e.g. 42>
+branch_name: feat/{{ticket_id}}
+summary: <one-sentence summary of what you changed>
+END_OUTPUTS
+"""
+
+# =============================================================================
+# Step 3: Code Review
+# =============================================================================
+[[step]]
+id = "review"
+engine = "claude-pilot"
+model = "sonnet"
+effort = "medium"
+name = "Code Review"
+skills = ["github"]
+outputs = [
+  { name = "review_feedback", description = "List of issues found, by severity (Blocker/Important/Nit), or 'No issues' if approved" },
+]
+task = "Orchestrated by phases below."
+max_iterations = 2
+branches = [
+  { when = "changes-requested", goto = "implement" },
+  { when = "approved", goto = "request-merge" },
+  { when = "stuck", goto = "escalate" },
+]
+
+[[step.phases]]
+name = "diff"
+max_turns = 8
+allowed_tools = ["Bash"]
+task = """
+Get the diff for PR #{{steps.implement.pr_number}} on branch {{steps.implement.branch_name}}.
+
+1. `git fetch origin && git checkout {{steps.implement.branch_name}} && git pull`
+2. `git diff main...HEAD --stat` to see changed files
+3. `git diff main...HEAD` to get the full diff
+"""
+
+[[step.phases]]
+name = "review"
+max_turns = 12
+allowed_tools = ["Read", "Grep", "Glob"]
+task = """
+Review the code changes against the plan. Check in ONE pass:
+- **Completeness**: every item in the plan has corresponding changes
+- **Correctness**: error paths handled, no silent failures, no TODOs/placeholders
+- **Conventions**: follows project patterns
+
+Plan: {{steps.understand.implementation_plan}}
+Files: {{steps.understand.key_files}}
+Acceptance criteria: {{steps.understand.acceptance_criteria}}
+
+## Previous review feedback (if any)
+{{?steps.review.review_feedback}}
+
+If previous feedback exists: verify each item. Mark items as RESOLVED,
+STILL PRESENT, or NEW — do NOT re-flag issues that are now addressed,
+and do NOT flip-flop on judgement calls (if you asked for approach A
+last round and the implementer did A, don't now demand approach B).
+
+Only read files if the diff from the previous phase doesn't provide enough context.
+Report any issues found by severity (Blocker/Important). Skip nits.
+"""
+
+[[step.phases]]
+name = "gates"
+max_turns = 15
+allowed_tools = ["Bash"]
+task = """
+Run quality gates on the branch.
+
+1. `cargo fmt --check`
+2. `cargo clippy --all-targets --no-deps -- -D warnings`
+3. `cargo test -p <affected-crate>` for each crate with changes. Do NOT run `cargo test --workspace`.
+
+Report pass/fail for each gate.
+"""
+
+[[step.phases]]
+name = "verdict"
+max_turns = 2
+allowed_tools = []
+task = """
+Based on the review and quality gate results from the previous phases, emit:
+
+1. An OUTPUTS block so the workflow runtime can extract `review_feedback`:
+
+OUTPUTS:
+review_feedback: <one of: "No issues" if everything passed, OR a concise bullet list of Blocker/Important issues found>
+END_OUTPUTS
+
+2. On a separate line AFTER END_OUTPUTS, exactly one OUTCOME line:
+   - If ALL quality gates pass and no blockers found: `OUTCOME: approved`
+   - If ANY blocker or quality gate failure: `OUTCOME: changes-requested`
+   - If this is the 3rd+ review and same issues keep recurring: `OUTCOME: stuck`
+"""
+
+# =============================================================================
+# Step 4a: Request Merge Approval
+# =============================================================================
+[[step]]
+id = "request-merge"
+max_rounds = 5
+model = "cerebras:glm:powerful"
+name = "Request Merge Approval"
+pause = "awaiting-merge-approval"
+report = "One-line summary of what was implemented, the PR number and branch, and CI status. Keep it under 300 characters."
+task = """
+PR #{{steps.implement.pr_number}} on branch {{steps.implement.branch_name}} has passed code review.
+
+## Summary
+- **Repo:** {{steps.understand.github_owner}}/{{steps.understand.github_repo}}
+- **Changes:** {{steps.implement.summary}}
+- **Ticket:** {{ticket_id}}
+
+Present this summary for human review. The human will approve or reject.
+
+Do NOT include "OUTCOME:" — this step pauses for human input.
+"""
+branches = [
+  { when = "approved", goto = "merge" },
+  { when = "rejected", goto = "implement" },
+]
+
+# =============================================================================
+# Step 4b: Execute Merge
+# =============================================================================
+[[step]]
+id = "merge"
+engine = "claude-pilot"
+model = "sonnet"
+effort = "low"
+name = "Merge PR"
+skills = ["github"]
+outputs = [
+  { name = "merged_at", description = "ISO8601 timestamp from gh pr view; only set if the merge actually happened" },
+]
+task = "Orchestrated by phases below."
+goto = "verify-merged"
+branches = [
+  { when = "merge-failed", goto = "escalate" },
+]
+
+[[step.phases]]
+name = "merge"
+max_turns = 20
+allowed_tools = ["Bash", "Read", "Edit", "Write", "Grep", "Glob"]
+task = """
+Merge PR #{{steps.implement.pr_number}}, then verify it actually happened.
+
+## Step 1: Attempt the merge
+Run: `gh pr merge {{steps.implement.pr_number}} --repo {{steps.understand.github_owner}}/{{steps.understand.github_repo}} --squash --delete-branch`
+
+If it fails due to conflicts:
+1. `git fetch origin main && git merge origin/main`
+2. Resolve EVERY conflict by editing the affected files (use Read/Edit/Write). Look for `<<<<<<<`, `=======`, `>>>>>>>` markers and produce a coherent merged result. Prefer keeping both sides' changes when non-overlapping; for true conflicts apply judgement.
+3. `git add -A && git commit --no-edit`
+4. Run the project's formatter if applicable (e.g. `cargo fmt` for Rust, `pnpm format` for Node).
+5. `git push`
+6. Retry: `gh pr merge {{steps.implement.pr_number}} --repo {{steps.understand.github_owner}}/{{steps.understand.github_repo}} --squash --delete-branch`
+
+## Step 2: VERIFY the merge actually happened (mandatory — do NOT skip)
+Run:
+  `gh pr view {{steps.implement.pr_number}} --repo {{steps.understand.github_owner}}/{{steps.understand.github_repo}} --json state,mergedAt --jq '.state + " " + (.mergedAt // "null")'`
+
+Expected output: `MERGED <iso-timestamp>`. Anything else (`OPEN null`, `CLOSED null`, `MERGED null`) means the merge did NOT happen.
+
+## Step 3: Emit final OUTPUTS — REQUIRED as your final message
+
+If verification returned `MERGED <timestamp>`:
+OUTPUTS:
+merged_at: <the timestamp>
+END_OUTPUTS
+
+If verification did NOT return MERGED:
+OUTPUTS:
+merged_at:
+END_OUTPUTS
+OUTCOME: merge-failed — gh pr view returned: <verbatim output from Step 2>
+"""
+
+# =============================================================================
+# Step 4c: Close Ticket
+# =============================================================================
+[[step]]
+id = "verify-merged"
+engine = "claude-pilot"
+model = "sonnet"
+effort = "low"
+name = "Verify PR Merged"
+task = "Orchestrated by phases below."
+goto = "close-ticket"
+branches = [
+  { when = "pr-not-merged", goto = "escalate" },
+]
+
+[[step.phases]]
+name = "verify"
+max_turns = 4
+allowed_tools = ["Bash"]
+task = """
+Independently verify PR #{{steps.implement.pr_number}} is actually merged on GitHub before Linear is touched. Defence in depth — even if the merge step claimed success, double-check.
+
+Run:
+  `gh pr view {{steps.implement.pr_number}} --repo {{steps.understand.github_owner}}/{{steps.understand.github_repo}} --json state --jq '.state'`
+
+If the output is exactly `MERGED`, write a single confirmation line and STOP — do NOT emit OUTCOME.
+
+If the output is anything else (e.g. `OPEN`, `CLOSED`), write as your final message:
+  OUTCOME: pr-not-merged — gh pr view returned: <verbatim output>
+"""
+
+[[step]]
+id = "close-ticket"
+max_rounds = 5
+model = "zai:powerful"
+name = "Close Ticket"
+skills = ["linear"]
+preferred_tools = ["linear.states_list", "linear.issue_update"]
+exit = true
+task = """
+Close ticket {{ticket_id}} now that PR #{{steps.implement.pr_number}} has been merged.
+
+1. Call `linear.states_list` to find the "Done" state ID
+2. Call `linear.issue_update` with identifier="{{ticket_id}}" and the state_id
+"""
+
+# =============================================================================
+# Escalate
+# =============================================================================
+[[step]]
+id = "escalate"
+max_rounds = 5
+model = "cerebras:glm:powerful"
+name = "Escalate to Human"
+pause = "awaiting-human-clarification"
+report = "Summarise what is unclear about the ticket, list specific questions, and flag any risky assumptions. Keep it under 500 characters."
+task = """
+The ticket requirements are unclear. Package your questions for human review.
+
+Include:
+- What you DO understand about the ticket
+- Specific questions that need answering
+- Any risky assumptions
+
+Do NOT include "OUTCOME:" — this step pauses for human input.
+"""
+branches = [
+  { when = "approved", goto = "understand" },
+  { when = "rejected", goto = "cancel" },
+]
+
+# =============================================================================
+# Cancel
+# =============================================================================
+[[step]]
+id = "cancel"
+max_rounds = 3
+model = "cerebras:glm:powerful"
+name = "Cancel Workflow"
+exit = true
+task = """
+The workflow has been cancelled by the human reviewer. No further action needed.
+"""

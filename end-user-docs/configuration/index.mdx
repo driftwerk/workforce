@@ -1,0 +1,141 @@
+---
+title: Configuration
+description: Overview of workforce system configuration and available sections.
+---
+
+# Configuration
+
+The workforce system is configured via a `workforce.toml` file. This page introduces the main sections you can configure.
+
+<Callout type="info">
+The configuration is hierarchical: global settings apply to all agents, but you can override them per-agent or per-team.
+</Callout>
+
+## Sections
+
+<Cards>
+<Card title="Hub Settings" href="/docs/configuration/hub" description="Server address, data directory, logging, and lifecycle settings." />
+<Card title="LLM Provider" href="/docs/configuration/llm" description="Configure AI models, providers, failover chains, and retry policies." />
+<Card title="Agents" href="/docs/configuration/agents" description="Define individual AI assistants with their own workspaces and capabilities." />
+<Card title="Memory & Knowledge" href="/docs/configuration/memory-knowledge" description="Set up persistent memory, embeddings, and codebase knowledge indexing." />
+<Card title="Vault" href="/docs/configuration/vault" description="Secure encrypted storage for secrets like API keys and tokens." />
+<Card title="Gateway & API" href="/docs/configuration/gateway" description="Configure the web gateway, authentication, and CORS settings." />
+<Card title="Skills & Integrations" href="/docs/configuration/skills" description="Add external integrations like GitHub, Slack, and MCP servers." />
+<Card title="Teams" href="/docs/configuration/teams" description="Define multi-agent teams with roles, expertise, and collaboration patterns." />
+<Card title="Session Policies" href="/docs/configuration/policies" description="Manage session lifecycle, daily resets, and idle expiration." />
+<Card title="Heartbeat" href="/docs/configuration/heartbeat" description="Configure periodic agent check-ins and automated monitoring." />
+<Card title="Advisor" href="/docs/configuration/advisor" description="Set up a second-opinion advisor for review and validation." />
+<Card title="Claude Code Chat" href="/docs/configuration/claude-chat" description="Configure `/cc` chat with Claude Code and exposed tools." />
+<Card title="Doc Curator" href="/docs/configuration/curator" description="Configure `workforce docs curate` for documentation maintenance." />
+<Card title="Training" href="/docs/configuration/training" description="Configure per-agent training corpora and file uploads." />
+<Card title="Tracing" href="/docs/configuration/tracing" description="Configure LLM fine-tuning trace capture." />
+<Card title="Vision & Transcription" href="/docs/configuration/vision-transcription" description="Configure separate AI models for image description and audio transcription." />
+<Card title="Image Generation" href="/docs/configuration/image-generation" description="Opt-in image generation capabilities." />
+<Card title="Local Agents" href="/docs/configuration/local-agents" description="Enable local agent support." />
+<Card title="Agent Communications" href="/docs/configuration/agent-comms" description="Oversight for agent-to-agent messages." />
+<Card title="Daily Briefing" href="/docs/configuration/briefing" description="Scheduled daily summaries." />
+<Card title="Workflows" href="/docs/configuration/workflows" description="Execution limits for workflows and playbooks." />
+<Card title="AWS S3 Tool" href="/docs/configuration/aws-s3" description="Configure read-only AWS S3 access." />
+<Card title="AWS Infrastructure Tools" href="/docs/configuration/aws-infra" description="Configure read-only AWS ECS/ECR/ELB/RDS/STS tools." />
+<Card title="Team-Building Games" href="/docs/configuration/games" description="Setup for the `/games` AI player arena." />
+</Cards>
+
+## Quick Start
+
+A minimal configuration file looks like this:
+
+```toml
+[hub]
+listen = "0.0.0.0:8090"
+data_dir = "./data"
+
+[nats]
+url = "nats://localhost:4222"
+
+[llm]
+provider = "anthropic"
+default_model = "claude-sonnet-4-20250514"
+max_tokens = 8192
+
+[[agents]]
+id = "default"
+workspace = "./data/agents/default"
+default = true
+```
+
+Place this file in your project root and run:
+
+```bash
+workforce start
+```
+
+## Subscription providers
+
+Besides API-key providers, an agent can run on a Claude or ChatGPT plan through three provider kinds, usable anywhere a model spec goes (`provider`, `default_model`, `failover`, `model_preferences` and the other model settings):
+
+- `chatgpt` — the ChatGPT backend, driven by the hub's own agent loop (`chatgpt:gpt-6.1-sol`).
+- `claude-code` (alias `claude_code`) — the `claude` CLI on a Claude plan (`claude-code:sonnet`).
+- `codex` — the `codex` CLI on a ChatGPT plan, on the remote worker only (`codex:gpt-6.1-sol`).
+
+Two settings belong to them:
+
+```toml
+[llm.logins]                      # optional; also per agent in [agents.llm.logins]
+tiers = ["agent_user", "global_user", "agent_shared", "system_shared"]   # default
+shared_serves = "anyone"          # owner | agent_users | anyone (default)
+
+[subscription]                    # install-wide; read at start-up
+chatgpt_direct = false            # allow the chatgpt provider (off by default)
+operator = "<identity uuid>"      # whose plan pays for the hub's own work
+max_concurrent_cli_turns = 4      # CLI agent turns at once; 0 = unbounded
+max_concurrent_completions = 4    # one-shot CLI calls at once; 0 = unbounded
+```
+
+`[llm.logins]` only narrows which logins an agent uses: by default every tier is tried and a shared login serves anyone. See [Subscriptions](/docs/concepts/subscriptions) for what each tier and setting means.
+
+## Environment Variables
+
+Many settings can be overridden via environment variables:
+
+- `WORKFORCE_NATS_URL` – NATS server URL
+- `ANTHROPIC_API_KEY` – Anthropic API key (or `OPENROUTER_API_KEY` for OpenRouter)
+- `WORKFORCE_LISTEN` – Hub listen address
+- `WORKFORCE_LOG_LEVEL` – Log verbosity
+- `WORKFORCE_TIMEZONE` – User timezone (IANA name)
+
+## Seeing what is in effect
+
+A setting can come from a built-in default, `workforce.toml`, an agent's own `config.toml` or a change made at runtime, and what is written is not always what is in effect. To find out, ask the agent ("what is your vision model, and where is it set?") or open the agent's **Effective settings** tab.
+
+Each setting is shown with its value, where the value comes from, and a status where it matters:
+
+- **Active** – in effect.
+- **Off** – switched off for this agent.
+- **Off by install** – the install has it off for every agent.
+- **Shadow** – worked out and logged, changing nothing.
+- **Inert** – configured but not taking effect, with the reason. For example, an agent that enables know-how while the install has it off, or a vision model that cannot be reached.
+
+Keys and tokens are never shown, only whether one is set and at which vault level. Install-wide settings are shown to admins.
+
+## Additional Configuration Areas
+
+The system includes several advanced configuration areas:
+
+- **Postgres Backend**: Optional shared database for stores like telemetry, identity, and pairing data.
+- **Permissions Cascade**: Role-based access control with per-user overrides.
+- **MCP Servers**: Connect to external Model Context Protocol servers.
+- **OAuth Identity**: Single sign-on with OIDC/OAuth2 providers.
+- **Vision & Transcription**: Configure separate AI models for image description and audio transcription.
+- **Image Generation**: Opt-in image generation capabilities.
+- **Local Agents**: Enable local agent support.
+- **Agent Communications**: Oversight for agent-to-agent messages.
+- **Daily Briefing**: Scheduled daily summaries.
+- **Slack Channel Overrides**: Per-channel customization.
+- **AWS S3**: Read-only AWS S3 tool with allowlist and role assumption.
+- **Workflows**: Per-owner concurrency limits for workflow execution.
+- **Team-Building Games**: Multi-agent games arena (`/games`).
+- **AWS Infrastructure Tools**: Read-only tools for ECS, ECR, ELB, RDS and STS.
+
+## Next Steps
+
+Click any section card above to learn detailed configuration options. The default `workforce.toml` generated by the system includes examples for each section.

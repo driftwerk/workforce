@@ -1,0 +1,229 @@
+---
+title: Policies
+description: Control agent and tool access with global, team, and individual rules.
+---
+
+# Policies
+
+Policies define which actions agents are allowed to take. You can set rules globally, for specific teams, roles, or individual agents. When an agent tries to use a tool, the policy engine checks the rules and decides whether to allow, deny, or require approval for the action.
+
+## How Rules Work
+
+The policy engine evaluates rules in a specific order:
+
+1. **Constitutional rules** (loaded from configuration) are checked first — these cannot be overridden by agents.
+2. **Mutable rules** (added later) are checked if no constitutional rule matches.
+3. **Default deny** — if no rule matches the request, the action is denied.
+
+Within each group, rules are sorted by:
+- **Priority** (higher number = evaluated first)
+- **Specificity** (more specific scope = higher priority)
+
+Scope specificity from least to most specific: `global` → `team` → `role` → `agent`.
+
+## Writing Policy Rules
+
+Policy rules are defined in YAML format. Here's a basic example:
+
+```yaml
+rules:
+  - name: "allow-filesystem-read"
+    scope: global
+    tool: "filesystem.read"
+    action: allow
+  - name: "approve-email-send"
+    scope: global
+    tool: "email.send"
+    action: require_approval
+```
+
+Each rule has these fields:
+
+- `name`: A descriptive name for the rule
+- `scope`: Where the rule applies (see below)
+- `tool`: Which tool(s) the rule affects (supports wildcards)
+- `action`: What happens when the rule matches (`allow`, `deny`, `ask`, or `always_ask`)
+- `priority`: Optional priority number (higher = evaluated first, default: 0)
+- `conditions`: Optional list of conditions for finer control
+
+### Scope Options
+
+The `scope` field determines who the rule applies to:
+
+```yaml
+# Global rule for everyone
+scope: global
+
+# Rule for a specific team
+scope:
+  team: "backend-dev"
+
+# Rule for a specific role
+scope:
+  role: "developer"
+
+# Rule for a specific agent
+scope:
+  agent: "dev-1"
+```
+
+### Tool Patterns
+
+The `tool` field supports patterns to match multiple tools:
+
+- `"filesystem.read"` — exact match only
+- `"filesystem.*"` — matches all filesystem tools (must have something after the dot)
+- `"*"` — matches all tools
+- `"@destructive"` — special pattern that matches tools with destructive verbs (delete, remove, destroy, etc.)
+
+### Actions
+
+- `allow`: The action is permitted without approval
+- `deny`: The action is blocked
+- `ask` (alias: `require_approval`): Requires human approval, with option to "Always Allow" future similar actions
+- `always_ask`: Requires human approval every time (no "Always Allow" option)
+
+### Conditions
+
+Conditions let you make decisions based on the tool's parameters:
+
+```yaml
+rules:
+  - name: "restrict-email-recipients"
+    scope: global
+    tool: "email.send"
+    action: require_approval
+    conditions:
+      - field: "recipient"
+        operator: in
+        value: ["alice@example.com", "bob@example.com"]
+        action: allow
+```
+
+Available operators:
+- `equals`, `not_equals`
+- `starts_with`, `contains`
+- `in`, `not_in`
+- `less_than`, `greater_than`
+
+Use dot notation for nested fields: `"target.domain"`.
+
+## Example Configurations
+
+### Basic Security Rules
+
+```yaml
+rules:
+  # Allow reading files globally
+  - name: "allow-read-access"
+    scope: global
+    tool: "filesystem.read"
+    action: allow
+
+  # Require approval for destructive actions
+  - name: "confirm-destructive"
+    scope: global
+    tool: "@destructive"
+    action: ask
+    priority: 10
+
+  # Block execution outside workspace
+  - name: "block-exec-dangerous"
+    scope: global
+    tool: "exec.*"
+    action: deny
+```
+
+### Team-Based Permissions
+
+```yaml
+rules:
+  # Development team can use git tools
+  - name: "dev-team-git"
+    scope:
+      team: "engineering"
+    tool: "git.*"
+    action: allow
+
+  # Only senior developers can deploy
+  - name: "senior-deploy"
+    scope:
+      role: "senior-developer"
+    tool: "deploy.*"
+    action: allow
+
+  # Finance team can approve expenses
+  - name: "finance-expense-approval"
+    scope:
+      team: "finance"
+    tool: "expenses.approve"
+    action: allow
+```
+
+### Conditional Rules
+
+```yaml
+rules:
+  # Auto-approve small expenses, require approval for large ones
+  - name: "expense-amount-check"
+    scope: global
+    tool: "expenses.submit"
+    action: require_approval
+    conditions:
+      - field: "amount"
+        operator: less_than
+        value: 100
+        action: allow
+
+  # Only allow API calls to internal domains
+  - name: "api-call-restrictions"
+    scope: global
+    tool: "api.call"
+    action: deny
+    conditions:
+      - field: "target.domain"
+        operator: equals
+        value: "internal.example.com"
+        action: allow
+```
+
+## Loading Policies
+
+Policies are typically loaded from a configuration file at startup. The system distinguishes between:
+
+- **Constitutional rules**: Loaded from config files, immutable, always checked first
+- **Mutable rules**: Added at runtime (e.g., from approved policy proposals), can be modified
+
+Agents cannot create constitutional rules — any attempt to add rules with `constitutional: true` is filtered out.
+
+## Priority and Specificity
+
+When multiple rules could apply:
+
+```yaml
+rules:
+  - name: "high-priority-global-deny"
+    scope: global
+    tool: "dangerous.*"
+    action: deny
+    priority: 100  # High priority wins
+
+  - name: "agent-specific-allow"
+    scope:
+      agent: "admin"
+    tool: "dangerous.*"
+    action: allow
+    priority: 0   # Lower priority
+```
+
+In this example, the global deny rule wins because it has higher priority, even though the agent-specific rule is more specific.
+
+## Best Practices
+
+1. **Start restrictive**: Default deny, then add specific allow rules
+2. **Use constitutional rules for safety**: Critical security rules should be constitutional
+3. **Test with specific agents first**: Use agent-scoped rules for testing before applying globally
+4. **Use `@destructive` pattern**: Catch dangerous actions across all tools
+5. **Monitor rule counts**: Too many rules can impact performance
+
+The policy engine logs each evaluation with the decision, matched rule, and timing, making it easy to audit and debug policy decisions.

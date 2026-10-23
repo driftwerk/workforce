@@ -1,0 +1,543 @@
+---
+title: Monitors
+description: Watch a channel, or anything a tool can read, and act on every change without anyone starting a run.
+---
+
+# Monitors
+
+A monitor watches one thing and runs an action each time it sees something that
+matters. The thing is either a chat channel, where every matching message counts, or a
+*source* — anything a tool can read: a Gmail search, a Jira query, a GitHub run, a
+HubSpot search, a Metabase card, a web page through `http.request`, or a WASM skill of
+your own — where every new or changed observation counts. Nobody starts a monitor: once
+it is saved and enabled it watches by itself, survives a restart, and catches up on what
+happened while the hub was offline — as far back as the
+[catch-up window](#enabling-and-disabling) allows for a channel, and from where it
+left off for a source.
+
+Almost all of a monitor is code. Reading, comparing, filtering and acting cost an API
+call and nothing more. A model is asked only where you ask for one: through the
+optional [decide gate](#the-decide-gate), or an `agent_task` action.
+
+That is the one difference that matters against the other two kinds of definition you
+own. A [workflow](/docs/concepts/workflows) is run — by hand, on a schedule, or from a
+trigger — and each run is a fresh instance. A [playbook](/docs/concepts/playbooks) is
+worked through step by step with you in the conversation. A monitor is bound once and
+left alone; what sets the work going is a message arriving in the channel it watches,
+or a change in the source it polls. A monitor whose action is `run_workflow` is the
+usual way to join the two. A monitor is not a webhook, either: a webhook is an outside
+system telling the hub something happened, and is already a workflow trigger; a
+monitor is the hub looking for itself.
+
+## Writing one
+
+A monitor is a TOML file with four parts: who it is, what it watches, which messages or
+observations it cares about, and what it does with them. This section writes one that
+watches a channel; [Watching a source](#watching-a-source) writes the other kind.
+
+```toml
+[monitor]
+id = "ops-releases"            # unique, kebab-case; must match the id you save it under
+name = "Release forwarder"
+description = "Start the release-note workflow for releases announced in #ops."
+enabled = true
+# agent = "scout"              # optional: the agent whose bot watches the channel
+
+[monitor.binding]
+surface = "slack"              # "slack" | "teams" | "any"
+channel = "C0OPS"              # the channel id to watch
+# exclude_thread_replies = true  # optional (default false): top-level messages only
+
+[monitor.filter]
+type = "contains_any"          # all | contains_any | regex | from_user | from_bot | from_human | has_file
+values = ["released", "shipped"]
+
+[monitor.action]
+type = "run_workflow"          # run_workflow | notify | agent_task | persona
+workflow = "release-note"
+```
+
+- `[monitor]` needs `id` and `name`. `description` is optional, `enabled` defaults to
+  true, and `agent` names the agent whose engine runs the monitor — its bot watches a
+  channel, its tools read a source — omit it and the action's agent runs it, or the
+  hub's default agent when the action names none. `once = true` stops the monitor
+  after its first dispatch completes, and `expires_at` (a quoted RFC 3339 instant)
+  stops it then whether or not it fired, telling you so; both are how an agent answers
+  "tell me when the build goes green" with a monitor that cleans itself up. A save is
+  refused if the TOML's `id` is not the id you are saving it under, or if `agent` names
+  an agent this hub does not run.
+- `[monitor.binding]` needs a `surface` (`slack`, `teams`, or `any` for every
+  connected surface) and a non-empty `channel`, which is the platform's channel id
+  rather than its display name. Set `exclude_thread_replies = true` to act only on
+  top-level channel messages and never on replies inside a thread; the thread's first
+  message still counts. A Teams channel cannot be watched yet: the Teams surface can
+  post but not read, so a `teams` binding never fires. A monitor has either a binding
+  or a [source](#watching-a-source), never both.
+- `[monitor.filter]` picks the messages to act on, and may be left out to take every
+  one. `all` takes every message; `contains_any` needs at least one value and matches
+  without regard to case; `regex` takes a `pattern`, which is compiled when you save so
+  a bad pattern is refused there rather than at dispatch; `from_user` takes a `user`
+  id; `from_bot` and `from_human` split by who posted; `has_file` matches messages
+  with an attachment.
+- `[monitor.action]` is one of five, described below.
+
+### Actions
+
+- **`run_workflow`** starts the workflow named by `workflow`, with the message or
+  observation as its trigger payload — in the channel and thread a message came from,
+  with no channel context for an observation. The workflow runs as the monitor's
+  owner, and one of your own workflows of that id is used in preference to an
+  install-wide one. If no workflow of that id exists, the dispatch fails and is not
+  retried.
+- **`run_skill`** makes one direct call to the tool named by `tool`, with `input` as
+  its arguments, and no model turn at all. Every string in `input` is rendered with the
+  [placeholders](#placeholders) first. The call runs as the monitor's owner through the
+  same gates an agent's call would face, so a tool the owner may not use, or one that
+  needs a human's approval, is refused and the dispatch is not retried. A call the
+  upstream refused for rate limiting is retried, since nothing ran.
+- **`notify`** posts a fixed message. `target` is a channel id, or `@` and a user to
+  send a direct message, and `template` is rendered with the placeholders. On a source
+  monitor, `surface` says which messaging surface to post on; it may be left out when
+  the hub has exactly one.
+- **`agent_task`** runs a one-shot agent turn per matching message or observation and
+  has the agent post its own result to `deliver_to` (a channel id or an `@user` DM).
+  `prompt` is your instruction, with the placeholders filled in it, and `agent` and
+  (on a source monitor) `surface` are optional. Unless your prompt already inlines the
+  content with `{{text}}`, it is appended in a fenced block labelled as data to process
+  rather than as instructions — so an agent will still refuse content that reads as an
+  attempt to redirect it.
+- **`persona`** is not a per-message action at all: it binds `agent` to converse in
+  the watched channel with `prompt` as a channel-scoped system prompt, for as long as
+  the monitor is enabled. `mode` is `all` (the default), `mention_only` or `quiet`. A
+  channel can carry only one persona, and with `exclude_thread_replies = true` the
+  persona also stops answering inside threads — including a direct mention there. A
+  source monitor cannot carry a persona.
+
+### Placeholders
+
+`notify` templates, `agent_task` prompts and `run_skill` inputs render the same set,
+by plain substitution:
+
+| placeholder | for a message | for an observation |
+|---|---|---|
+| `{{text}}` | the message text | the observation's text (`source.text`, else the watched part as JSON) |
+| `{{id}}` | the message ts | the item id (`value` when a whole value is watched) |
+| `{{channel}}` | the channel id | the tool |
+| `{{user}}` | the poster's id | empty |
+| `{{ts}}` | the message ts | when it was observed |
+| `{{value}}` | the message text | the watched part |
+| `{{previous}}` | empty | the watched part as it was at the previous poll, when kept |
+| `{{json:/a/b}}` | a pointer into the message | a pointer into the whole item |
+
+A string renders as itself; anything else renders as compact JSON.
+
+## Watching a source
+
+A source monitor polls a tool on a cadence, as you, with your credentials, and lets
+code decide what changed. Anything a tool can read is a source.
+
+```toml
+[monitor]
+id = "invoice-watch"
+name = "Invoices from Acme"
+
+[monitor.source]
+tool = "google.gmail.search"      # any tool you may call: an adapter, http.request, a WASM skill
+input = { query = "from:billing@acme.com newer_than:7d", max_results = 20 }
+every_secs = 300                  # poll cadence; default 300, and the hub sets a minimum
+items = "/messages"               # JSON pointer to the output's array → watch items by id
+item_id = "/id"                   # pointer within each item (default "/id")
+# path = "/snippet"               # pointer to the watched part of each item (default: all of it)
+# text = "/snippet"               # pointer to what {{text}} renders
+
+[monitor.condition]
+type = "contains"
+path = "/snippet"
+values = ["invoice", "statement"]
+
+[monitor.action]
+type = "run_skill"
+tool = "acme-books.file_invoice"
+input = { gmail_id = "{{id}}", subject = "{{json:/snippet}}" }
+```
+
+- `[monitor.source]` needs a `tool`; `input` is the tool's own arguments as a table.
+  The tool runs through the same gates an agent's call would — the capability matrix
+  scored against you, the policy engine, argument checks — so a monitor can only read
+  what you can read yourself, and a tool that needs a human's approval, or one from a
+  family no monitor may call (vault, secret, execution, orchestration and the monitor
+  tool itself), is refused when you save. The tool must exist on the hub.
+- **Two ways of watching.** With `items`, the tool's output holds a list, each
+  element has an id, and the monitor watches the list item by item: a new id is a new
+  item, an item whose watched part changed is a changed item, and an item that drops
+  out of the list is forgotten. Without `items`, the whole output is one value — a
+  page's body, one run's status, a single number — and the monitor watches that.
+- `path` points at the part of each item (or of the output) that is watched and
+  rendered as `{{value}}`; `text` points at what `{{text}}` renders. Both are JSON
+  pointers: empty for the whole thing, otherwise starting with `/`.
+- One poll observes at most `[monitor] max_items` items (500 by default); more is a
+  misconfigured query, and the rest are cut with a warning in the hub's log. An item
+  without a usable id is skipped and counted there too.
+
+### Conditions
+
+`[monitor.condition]` says which observations fire. Leave it out and every new item
+fires, or every change of a value. A leaf condition is tested against the watched part,
+at `path` within it when set:
+
+| type | holds when |
+|---|---|
+| `always` | every observation |
+| `changed` | the watched part differs from the previous poll's |
+| `equals` | the JSON at `path` equals `value`; numbers compare numerically, so `1` equals `1.0` |
+| `contains` | the string at `path` contains any of `values`, case-insensitive; a non-string is searched as its JSON |
+| `regex` | `pattern` matches the string at `path`; compiled when you save |
+| `gt` `lt` `gte` `lte` | the number at `path` (a numeric string counts) compares so with `value` |
+| `exists` | `path` resolves to something other than `null` |
+| `all` / `any` | every / at least one of the conditions in `of` holds |
+
+`negate = true` inverts any leaf, and `all`/`any` nest.
+
+**A level fires once; an event fires every time.** A condition with no `changed` in it
+is a *level*: it fires when it starts to hold and stays quiet while it keeps holding, so
+a build stuck at `failed` fires once, not every poll, and fires again only after it
+stopped holding and started again. A condition that contains `changed` is an *event*:
+it fires each time it holds, because each change is a new fact.
+
+**The first poll.** A source watched by items only records what is there — a monitor
+starts from the moment you save it, exactly as a channel monitor does — so items that
+already match do not fire, and a new or changed item fires from the second poll on. A
+source watched as a value is evaluated at once: a level that already holds fires
+("tell me when the page says sold out" — it does), and `changed` has nothing to compare
+with yet. The first poll is the first *successful* one: a poll that fails — a
+credential not yet in place, say — is followed by a baseline once it succeeds, never by
+a flood of everything the query returns.
+
+### The decide gate
+
+`[monitor.decide]` asks the install's decision model one yes/no question about the
+observation's text (or the message's) after the condition held and before the action
+runs. It works on both kinds of monitor and needs no agent turn.
+
+```toml
+[monitor.decide]
+question = "Is this an invoice that needs paying, rather than a receipt or a reminder?"
+yes = "a bill with an amount due and a due date"
+no = "a receipt, a payment confirmation, or marketing"
+# min_probability = 0.7
+```
+
+`yes` proceeds; `no` records the dispatch as skipped under **Recent activity**; a
+backend that is only busy leaves the dispatch to be retried; a backend that cannot
+answer for good closes it with that reason. A save is refused when the install has no
+decision backend, so the gate can never silently become a pass-through.
+
+## Creating and editing one
+
+There are two ways in, and they write the same row.
+
+- **From chat**, ask your agent. It has a `monitor` tool whose actions are `list`,
+  `get`, `schema`, `validate`, `save`, `set_enabled` and `delete`. The intended order
+  is `schema` for the format, then `validate` on the draft, then `save` — `validate`
+  checks a draft without storing it. `list` shows the monitors you reach: your own,
+  the install-wide ones, and any shared with you, or every one on the install for an
+  administrator.
+- **From the web UI**, the **Monitors** page and the monitor's own page, described
+  under [In the web UI](#in-the-web-ui).
+
+`save` and `set_enabled` answer with the watching agent, the monitor's status, and a
+note about the channel read, or the first poll of the source — how many observations
+it saw and how many it dispatched, or why the poll failed — so you learn immediately
+whether it is actually watching.
+
+### Addressing someone else's monitor
+
+Every action that names a monitor also takes an `owner` input: "Identity id of the
+monitor's owner, to read, change or delete another member's monitor that was shared
+with you (for 'get', 'save', 'set_enabled' and 'delete'). Omit for your own — or, as
+an administrator, the shared system monitor."
+
+Without it, a save lands on your own row. Saving the id of a monitor that was shared
+with you, without naming its owner, therefore gives you a copy of your own and leaves
+theirs as it was. With `owner`, the save lands on their row — if they granted you
+`manage`.
+
+A save never changes who reaches a monitor: the tool sends no visibility of its own,
+so a reach you chose with `cmd: monitor visibility` or the page's visibility control
+survives the next edit.
+
+## The channel binding
+
+One agent watches each monitor, and that agent's bot must be a member of the channel —
+[Slack](/docs/adapters/slack) only shows a channel to apps that have joined it. This is
+the step people miss, so the hub tells you about it rather than failing quietly.
+
+- A save or a resume reports the read back to you: `@scout can read channel C0OPS —
+  watching.` when it worked, and otherwise either the invite notice below or
+  `Reading channel C0OPS failed (…); the sweep retries every two minutes.`
+- When the bot is not a member, the monitor's status becomes `awaiting_invite` and its
+  owner is sent a direct message saying what to do: `Invite it with /invite @scout in
+  that channel — watching starts automatically within two minutes, nothing to
+  re-enable.` The owner is told once, not on every sweep, and told again when the
+  channel becomes readable. A monitor the install owns has no owner to tell, so its
+  notice only reaches the hub's logs.
+- The monitor stays blocked, and out of action, until a sweep reads the channel
+  successfully. It then picks up what was posted in the meantime, from where it left
+  off, so a short wait loses nothing; a longer one loses whatever is older than the
+  catch-up window.
+
+Two further rules apply to every save, so that a monitor cannot be used to read or
+deliver somewhere you cannot reach yourself:
+
+- It may only bind to a channel you are a member of. Otherwise: `you can only bind a
+  monitor to a channel you're a member of (C0OPS)`.
+- A `notify` or `agent_task` whose delivery target is somewhere other than the watched
+  channel must go to a channel you are a member of, or to your own direct messages.
+  Otherwise: `you can only deliver a monitor to a channel you're a member of or to your
+  own DM`.
+
+Both rules apply wherever a monitor is written — from chat, from the web UI, or through
+the REST API, including a revision you restore — and both are answered by the surface
+the binding names. Off Slack the hub has no platform identity to hand, so it asks with
+the account you have linked to that platform instead.
+
+Both still fail closed, and when the hub cannot answer it says which of the two reasons
+it is: `this hub cannot check your membership of C0OPS: your account has no linked slack
+id — link it, or ask an administrator to save this monitor`, or `this hub cannot check
+membership of C0OPS on teams — only an administrator may point a monitor there` — which
+an administrator may indeed do, though a `teams` binding still cannot watch.
+
+A source monitor has no channel to be a member of: what it reads, it reads with your
+own credentials, which is the whole of that rule. Only where its `notify` or
+`agent_task` delivers is checked, on the surface the action names.
+
+Only a change to the channel a monitor watches, or to where its action delivers, is
+checked. An edit that leaves both alone — a filter, a prompt, **Pause** or **Resume** —
+is not re-checked, so you can still tend a monitor on a channel you have since left.
+Administrators bind and deliver anywhere.
+
+## Enabling and disabling
+
+`enabled` in the TOML is the switch. An agent flips it with the `monitor` tool's
+`set_enabled` action; in the web UI it is the **Pause**/**Resume** button.
+
+Watching is forward-only, and **each monitor keeps its own place** in the channel. A
+monitor starts from the moment you save it, never from the channel's history, so adding
+one to a channel that is already watched does not reach back before you created it.
+
+A pause is a decision; a block is an obstruction. Resuming a paused monitor moves **its
+own** place to now: the gap while it was paused is not replayed, and no other monitor on
+that channel is affected. A monitor stopped by something other than a pause — its bot
+not in the channel, an edit awaiting its owner — keeps its place instead, and catches up
+when it starts again, as far back as the catch-up window allows (24 hours by default,
+`catch_up_window_hours` in the `[monitor]` configuration section). Setting it to `0`
+removes the bound, though a sweep never reaches further back than the record of what has
+already fired, which is kept for about a week.
+
+A source keeps its place as what it saw at its last poll. Resuming a paused source
+monitor forgets that, so its next poll records what is there and fires from the one
+after; so does a save that changes what it reads — the `tool`, `input`, `items`,
+`item_id` or `path` — since observations under a different query are not comparable. An
+edit that leaves the reading alone (a template, a cadence, the condition) keeps the
+place, and a source stopped by a failing tool or an edit awaiting its owner reports
+everything that changed meanwhile when it runs again.
+
+A monitor's status is one of:
+
+| Status | What it means |
+|---|---|
+| `active` | Enabled and watching. |
+| `paused` | `enabled = false`. |
+| `awaiting_invite` | The watching agent's bot cannot read the channel. |
+| `awaiting_owner` | Someone other than the owner last edited it (see below). |
+| `unknown_agent` | It names an agent this hub does not run. |
+| `failing` | Its source's last poll failed; the error is shown with it. |
+
+A channel that keeps failing to read for some reason other than a missing invite — a
+channel that has been deleted, say — is eventually given up on: after 30 consecutive
+failed sweeps (`auto_disable_after_failures` in the `[monitor]` configuration section;
+`0` turns this off) every enabled monitor bound to that channel is disabled and each
+owner is sent a message naming the channel, the last error and the command to re-enable
+it. The streak is counted in memory, so a hub restart starts the count again, and a
+missing invite does not count towards it at all. A source that keeps failing to read —
+a credential that is gone, a query the tool refuses — is given up on the same way after
+the same number of consecutive failed polls, and its count is kept in the database, so
+a restart does not let it earn its thirty again.
+
+A monitor with an `expires_at` is disabled by the sweep once that instant passes, and
+its owner is told whether it ever fired.
+
+## How a monitor fires
+
+Two paths feed a channel monitor: the live stream of messages as they arrive, and a
+catch-up sweep every two minutes over the channels its agent watches. One path feeds a
+source monitor: a poll on its own cadence, checked every `poll_tick_secs` (15 by
+default, in the `[monitor]` configuration section), which may never be shorter than
+`min_poll_secs` (60). All of them end up in the same place, and that is what makes the
+behaviour you see predictable:
+
+- **Each message is acted on once per monitor.** The first path to reach a message
+  claims it; the other finds it already handled and skips it. A message posted while
+  the hub was offline is therefore acted on once — when the sweep catches it, if it is
+  still inside the catch-up window — and not again when the hub reconnects.
+- **A dispatch that never finished is retried.** If the hub stops mid-action, or the
+  action fails in a way that might succeed later (a channel that is briefly
+  unreachable), a sweep re-runs it from the stored message once it has been in flight
+  for five minutes, without re-reading the channel. A failure that cannot get better —
+  the target workflow is gone, for instance — is recorded and not retried.
+- **A monitor never acts on a message its own bot posted.** The same guard runs on
+  both paths, so a `notify` into a channel the same bot watches cannot feed itself.
+- **A persona never dispatches at all.** It is applied as a standing binding when the
+  monitor is enabled and dropped when it is disabled.
+- **A source's place is written before its actions run.** A poll claims each
+  observation that fires, records what it saw, and only then acts, so a hub that stops
+  between the two finishes the work from the stored observation rather than observing
+  it again — and a `once` monitor stops itself after its first action completes.
+
+Every dispatch appears under **Recent activity** on the monitor's page, with the
+message text, when it was claimed, and whether it is done, pending, retrying or failed.
+Finished dispatches are cleaned up after about a week; unfinished ones are kept however
+old they are, because they are still work to do.
+
+## Sharing and visibility
+
+A monitor belongs to the user who saved it and is private by default. A monitor the
+install itself owns — one an operator keeps on disk, or an administrator saved — belongs
+to nobody and is visible to everyone.
+
+Who else reaches your monitor is your call, from chat:
+
+- `cmd: monitor shares <monitor-id>` — who it is shared with, each marked `run` or
+  `manage`.
+- `cmd: monitor share <monitor-id> <@user|email|id|team:<name>>` — let someone see it;
+  add `manage` to let them edit it too.
+- `cmd: monitor unshare <monitor-id> <@user|email|id|team:<name>>` — take that back.
+- `cmd: monitor visibility <monitor-id> private|team|everyone` — who else may see it.
+- `cmd: monitor transfer <monitor-id> <@user|email|id>` — hand it to someone else.
+
+Name a person with an @-mention, their email address, or their Workforce user id, and
+a whole team with `team:<name>`. `private` keeps the monitor to you and the people you
+shared it with; `team` lets anyone who shares a team with you see it, resolved every
+time someone asks and never letting them edit it; `everyone` lets every user on the
+install see it. If you are in no team yet, `team` reaches nobody but you, and the reply
+says so — the model is the same for every kind, and
+[Workflows](/docs/concepts/workflows#sharing-and-visibility) sets it out in full. Each
+line can be typed as `cmd: monitor …` or `/monitor …`, and the commands are for people
+to type: no agent tool can widen who reaches a monitor.
+
+The two levels are a workflow's two levels, but nobody ever starts a monitor, so the
+lower one amounts to seeing it:
+
+```
+Shared `ops-releases` with Bob — they can see it.
+Shared `ops-releases` with Bob — they can see and edit it (not re-share it).
+`ops-releases` is visible to everyone on this install.
+`ops-releases` is visible to your teams — anyone in a team with you can see it.
+`ops-releases` is private — only you and the people you shared it with can see it.
+```
+
+Only the owner decides who reaches a monitor: a `manage` grantee edits it but cannot
+pass it on. A system administrator sees every monitor on the install, manages the
+install's own, and can edit, share, re-scope, transfer and delete a member's — naming
+it with `owner:<@user|email|id>` — so an install can still be administered when a
+monitor's owner is away. Every change they make to someone else's monitor is written
+to the audit log against them; an owner's own work, and a `manage` grantee's, is not.
+
+`cmd: monitor transfer <monitor-id> <@user|email|id>`, or **Transfer** on the monitors
+page, hands a monitor to another active member for good — only its owner or an
+administrator can, never a `manage` grantee. Everything the monitor has already
+handled goes with it, so nothing it has seen is delivered twice, and its watching
+pauses until the new owner saves it once.
+
+Two members can each own a monitor of the same name. A bare id means your own if you
+have one; otherwise add `owner:<@user|email|id>` to name whose you mean. Where it is
+still ambiguous, or lands on nothing you can manage, you are told which it was:
+
+```
+More than one monitor is called `ops-releases`: Alice's and Bob's. Name one with `owner:<@user|email|id>`.
+No monitor called `ops-releases` that you can manage.
+`ops-releases` belongs to the whole install rather than to a member, so there is nobody to share it with.
+```
+
+The last one is not a refusal you can work around: an install-wide monitor has no
+owner to share it on anyone's behalf, and the web UI refuses it for the same reason —
+which is why a card for one has no **Share** item.
+
+One gap to know about: a share granted to a **team** through the web UI is listed by
+`cmd: monitor shares`, but chat can only name people, so you cannot revoke a team's
+share from chat. Use the **Share** dialog for that.
+
+Workflows and playbooks use the same grammar and the same two levels — see
+[Sharing and visibility](/docs/concepts/workflows#sharing-and-visibility) and
+[Sharing](/docs/concepts/playbooks#sharing).
+
+### An edit by a grantee stops it until you re-save
+
+A monitor always acts as its owner, so content someone else wrote must not run as the
+owner unnoticed. When a `manage` grantee saves your monitor, it stops firing and its
+status becomes `awaiting_owner` (**Awaiting owner** in the UI) until you save it
+yourself, which is how you approve what they changed. The hub's own edits — the
+auto-disable above, for instance — do not do this.
+
+## In the web UI
+
+The **Monitors** page lists every monitor you reach as a card, with **New Monitor**
+(which offers **Watch a channel** and **Watch a source**, each starting from a worked
+example), an **All** / **Mine** / **Global** filter, and a menu on each card offering
+**Edit**, **Duplicate**, **Export**, **Share** and **Delete**. **Share** appears only
+on a member's monitor, since an install-wide one has nobody to share it. Each card
+shows the status, the surface and channel or the tool and condition, the action, the
+watching agent, and a **Global** or **My teams** badge where the monitor reaches past
+its owner. The status badge reads **On** for `active`, and otherwise **Paused**,
+**Awaiting invite**, **Awaiting owner**, **Unknown agent** or **Failing**, the last
+with the poll's error beside it.
+
+A monitor's own page is a TOML editor with **Diff** against the saved version,
+**History** for earlier revisions, **Pause**/**Resume**, a **Private** / **My teams** /
+**Global** visibility control, **Save**, a delete button, and **Recent activity**
+underneath. **Pause**/**Resume** takes effect at once, but the visibility control only
+marks your choice: it is applied when you press **Save**. From chat,
+`cmd: monitor visibility` applies immediately and needs no save.
+
+The UI and chat name the same things differently:
+
+- The control's **Global** is what `cmd: monitor visibility … everyone` sets, **My
+  teams** what `team` sets, and **Private** what `private` sets. An install-wide
+  monitor has no owner whose teams could be resolved, so it is offered only **Private**
+  and **Global**.
+- The **Share** dialog's two levels are labelled **Run** ("lets them run and view it")
+  and **Manage** ("also lets them edit and delete it") — the same `run` and `manage`
+  that chat reports, where `run` on a monitor amounts to seeing it.
+
+## Limits and gotchas
+
+- **Member-owned monitors need the database store.** On an install that keeps its
+  definitions on the filesystem, only install-wide monitors exist: a save for a member
+  answers `member-owned monitors require a database store; this deployment uses the
+  filesystem`, and sharing answers `Sharing needs a database store; this hub keeps its
+  monitors on the filesystem.`
+- **One persona per channel.** A second one is refused with `channel C0OPS already has
+  a persona monitor 'ops-greeter'`.
+- **The watching agent must exist when you save.** Naming an agent the hub does not run
+  is refused at save; if the hub later stops running that agent, the monitor reads
+  `unknown_agent` instead.
+- **Catching up has a limit.** A monitor that has been unable to watch for longer than
+  the catch-up window — 24 hours by default — picks up from the window's edge rather
+  than from where it stopped. A single sweep also reads at most 4,000 messages, and says
+  so in the hub's log when it hits that.
+- **Re-saving a monitor shared with you, without naming its owner, forks it.** You get
+  a copy of your own — private, unshared and watching the same channel — and theirs is
+  left as it was.
+- **Recent activity is recent.** Finished dispatches are pruned after about a week, so
+  an empty list is not evidence that nothing ever fired. A dispatch the decide gate
+  turned away is listed as **Skipped**.
+- **A source's "new" is what the query shows.** An item that leaves the tool's result
+  and comes back later is new again, and under `always` fires again. A query that
+  returns a stable window — "newer than 7 days" — behaves as you expect; one that
+  reorders freely may not.
+- **Placeholders substitute, nothing more.** `{{text}}` in a `run_skill` input is the
+  text as it is, with no escaping; a value that must be JSON belongs under
+  `{{json:…}}` or in the tool's own hands.
+- **A system monitor reads with the hub's shared credentials.** Only an administrator
+  may save one on a source, and it polls as no person.
+- **A hub that runs no monitors says so.** `Monitors are not available on this hub.`

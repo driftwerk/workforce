@@ -1,0 +1,40 @@
+[package]
+name = "workforce-orchestrator"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+publish = false
+
+[dependencies]
+workforce-core = { path = "../core" }
+# `postgres` feature pulls in the shared pool + telemetry migrations that
+# back the DB artifact store (`artifact_store::KnowledgeStore`, DW-549).
+workforce-common = { path = "../common", features = ["postgres"] }
+workforce-agent = { path = "../agent-runtime" }
+workforce-policy = { path = "../policy-engine" }
+workforce-nats = { path = "../nats-bus" }
+workforce-playbook = { path = "../playbook" }
+workforce-decide = { path = "../decide" }
+
+async-trait = "0.1"
+blake3 = { workspace = true }
+chrono = { version = "0.4", features = ["serde"] }
+eyre = "0.6"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+tokio = { version = "1", features = ["full"] }
+deadpool-postgres = { workspace = true }
+tokio-postgres = { workspace = true }
+tracing = "0.1"
+toml = { workspace = true }
+thiserror = { workspace = true }
+uuid = { version = "1", features = ["v4", "serde"] }
+regex = { workspace = true }
+minijinja = { version = "2", features = ["json", "fuel"] }
+semver = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["full", "test-util"] }
+workforce-postgres = { workspace = true, features = ["test-support"] }

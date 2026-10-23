@@ -1,0 +1,199 @@
+//! NATS message types for interactive chat routing.
+//!
+//! These types flow between the gateway (WebSocket bridge) and agent chat workers
+//! via NATS subjects defined in [`super::subjects`].
+
+use serde::{Deserialize, Serialize};
+
+/// A chat request published to `workforce.agents.{agent_id}.chat.{session_id}`.
+///
+/// The gateway publishes one of these when a WebSocket client sends a message.
+/// An agent chat worker picks it up and calls `process_message_with_progress`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NatsChatRequest {
+    /// Session ID (existing or newly created).
+    pub session_id: String,
+    /// Channel identifier (e.g., "terminal", "web").
+    pub channel: String,
+    /// User identifier.
+    pub user: String,
+    /// Message content (may include sentinel wrapper tags for LLM security).
+    pub content: String,
+    /// Original unwrapped content for display/storage.
+    /// When absent, `content` is already clean and should be used directly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_content: Option<String>,
+    /// Base64-encoded file/image attachments.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<NatsChatAttachment>,
+    /// Voice-bridge channel this turn was spoken on, when it came from a
+    /// satellite. Carried per request because the worker executing the turn
+    /// is a different process from the gateway holding the bridge's socket,
+    /// and the session record cannot answer "was THIS turn spoken" — one
+    /// session is shared by every surface a person uses with an agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub voice_channel: Option<String>,
+    /// Whether the client can answer a self-serve approval prompt. A client
+    /// that cannot gets such calls refused at once rather than left waiting.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub answers_approvals: bool,
+}
+
+/// A control message for a live turn, sent as a request on
+/// [`crate::subjects::turn_control`] to whichever instance runs it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TurnControl {
+    /// Stop the turn. Acknowledged once the turn has settled and its claim is
+    /// released.
+    Cancel,
+    /// A follow-up message to absorb into the running turn.
+    FollowUp { text: String, user: String },
+    /// An answer to one of the turn's approval prompts.
+    Approval {
+        request_id: String,
+        approved: bool,
+        user: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        choice: Option<workforce_core::policy::PermissionChoice>,
+    },
+}
+
+/// The owning instance's answer to a [`TurnControl`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnControlReply {
+    pub applied: bool,
+}
+
+/// An attachment within a chat request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NatsChatAttachment {
+    pub filename: String,
+    pub mime_type: String,
+    /// Inline payload; empty when `artifact_id` is set.
+    #[serde(default)]
+    pub data: String,
+    /// Artifact-store id when the payload was uploaded out-of-band. Keeps
+    /// large files out of the NATS message (whose server-side payload cap is
+    /// far below any video).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_id: Option<String>,
+}
+
+/// A progress event published by an agent worker to
+/// `workforce.agents.{agent_id}.progress.{session_id}`.
+///
+/// The gateway subscribes to this subject and forwards events to the WebSocket client.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ChatProgress {
+    /// Agent is processing (typing indicator).
+    Typing,
+    /// Start of a streamed response.
+    StreamStart,
+    /// A chunk of streamed text.
+    StreamDelta { text: String },
+    /// End of a streamed response.
+    StreamEnd,
+    /// Complete (non-streamed) response.
+    Message { text: String },
+    /// Tool execution started.
+    ToolStart { name: String, detail: String },
+    /// Tool execution finished.
+    ToolEnd {
+        name: String,
+        success: bool,
+        duration_ms: u64,
+        detail: String,
+    },
+    /// Session compaction started.
+    CompactStart,
+    /// Session compaction finished.
+    CompactEnd,
+    /// Context window usage update.
+    ContextUpdate {
+        estimated_tokens: u32,
+        context_max: u32,
+    },
+    /// Deterministic code citations for the turn — the files/line-ranges the
+    /// answer-ready `code_context` injector grounded the answer in. Published
+    /// once, AFTER the answer (stream_end / message), so the client attaches the
+    /// clickable source chips to the just-completed answer. Absent when the turn
+    /// grounded no code.
+    CodeCitations {
+        citations: Vec<workforce_core::code_citation::CodeCitation>,
+    },
+    /// The turn found no login to run on: asks the person to connect one.
+    /// Never carries a sign-in code.
+    ConnectPrompt {
+        prompt: workforce_core::subscription::ConnectPrompt,
+    },
+    /// What ran the turn ("Claude Code · sonnet · Alice's plan"), published
+    /// once after the answer when one is shown.
+    Route { line: String },
+    /// Agent processing complete.
+    Done { session_id: String },
+    /// A tool call requires human approval.
+    ApprovalRequired {
+        request_id: String,
+        agent_id: String,
+        tool_name: String,
+        detail: String,
+        reason: String,
+        /// Typed prompt payload — surfaces that render the four-button
+        /// permission prompt read this. Older surfaces ignore it and
+        /// fall back to the free-text `approve <id>` flow.
+        #[serde(default = "default_prompt_options")]
+        options: workforce_core::policy::PermissionPromptOptions,
+    },
+    /// An error occurred.
+    Error { message: String },
+}
+
+fn default_prompt_options() -> workforce_core::policy::PermissionPromptOptions {
+    workforce_core::policy::PermissionPromptOptions::default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use workforce_core::policy::PermissionChoice;
+
+    #[test]
+    fn turn_control_round_trips() {
+        [
+            TurnControl::Cancel,
+            TurnControl::FollowUp {
+                text: "also check main".into(),
+                user: "u1".into(),
+            },
+            TurnControl::Approval {
+                request_id: "r1".into(),
+                approved: true,
+                user: "u1".into(),
+                choice: Some(PermissionChoice::AllowAlways),
+            },
+        ]
+        .into_iter()
+        .for_each(|control| {
+            let bytes = serde_json::to_vec(&control).unwrap();
+            assert_eq!(
+                serde_json::from_slice::<TurnControl>(&bytes).unwrap(),
+                control
+            );
+        });
+        assert_eq!(
+            serde_json::to_value(TurnControl::Cancel).unwrap(),
+            serde_json::json!({"kind": "cancel"})
+        );
+    }
+
+    #[test]
+    fn chat_request_without_answers_approvals_defaults_to_unanswerable() {
+        let request: NatsChatRequest = serde_json::from_value(serde_json::json!({
+            "session_id": "s", "channel": "ios", "user": "u", "content": "hi"
+        }))
+        .unwrap();
+        assert!(!request.answers_approvals);
+    }
+}

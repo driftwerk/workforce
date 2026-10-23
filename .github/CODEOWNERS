@@ -1,0 +1,10 @@
+# Changes to CI, build and supply-chain files need a maintainer's review.
+*                     @kingsleyh
+/.github/             @kingsleyh
+/Dockerfile*          @kingsleyh
+/docker/              @kingsleyh
+/.cargo/              @kingsleyh
+/rust-toolchain.toml  @kingsleyh
+/renovate.json        @kingsleyh
+/deny.toml            @kingsleyh
+**/build.rs           @kingsleyh

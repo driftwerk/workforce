@@ -1,0 +1,42 @@
+[package]
+name = "workforce-pairing"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+workforce-postgres = { workspace = true }
+async-trait = { workspace = true }
+eyre = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+rand = { workspace = true }
+blake3 = { workspace = true }
+rusqlite = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+
+# Optional Postgres backend (Phase 4 of the multi-store migration roadmap).
+tokio-postgres = { workspace = true, optional = true }
+deadpool-postgres = { workspace = true, optional = true }
+refinery = { workspace = true, optional = true }
+
+[features]
+default = []
+postgres = [
+    "dep:tokio-postgres",
+    "dep:deadpool-postgres",
+    "dep:refinery",
+    "workforce-postgres/postgres",
+]
+
+[dev-dependencies]
+tokio-test = { workspace = true }
+workforce-postgres = { workspace = true, features = ["test-support"] }
+tempfile = "3"
+
+[build-dependencies]
+workforce-build-support = { path = "../build-support" }

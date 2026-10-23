@@ -1,0 +1,16 @@
+{
+  "input": {
+    "kind": "pie",
+    "series": [
+      {
+        "data": [
+          1
+        ]
+      }
+    ]
+  },
+  "result": {
+    "ok": false,
+    "error": "a pie chart needs labels for its slices"
+  }
+}

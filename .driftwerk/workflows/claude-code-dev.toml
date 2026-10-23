@@ -1,0 +1,160 @@
+[workflow]
+id = "claude-code-dev"
+name = "Claude Code dev — Jira ticket → PR"
+description = "One Claude Code step driven by a Jira (or Linear) ticket. The agent kicks this off with a ticket id and a target repo; the workflow syncs, designs, implements, self-reviews, and opens a PR. Refuses to run if the ticket can't be pre-fetched or repo is missing."
+
+[workflow.context]
+ticket_id = { required = true, description = "Ticket key (Jira, e.g. ENG-1234, or Linear, e.g. DW-99)" }
+repo = { required = true, description = "Target repository in owner/name form (e.g. harborlabs/core-api)" }
+
+# =============================================================================
+# Single step — fully delegated to `claude -p`.
+# =============================================================================
+[[step]]
+id = "execute"
+engine = "claude-code"
+model = "sonnet"
+effort = "medium"
+name = "Design, implement, self-review, open PR"
+skills = ["github"]
+max_rounds = 80
+exit = true
+outputs = [
+  { name = "pr_url", description = "Full URL of the opened PR" },
+  { name = "pr_number", description = "PR number", validate = "number" },
+  { name = "branch_name", description = "Feature branch name pushed to origin" },
+]
+task = """
+You are an autonomous engineer driving ticket `{{ticket_id}}` in `{{repo}}` to
+a merged-ready PR. Complete the entire job — sync, design, implement,
+self-review, open PR — in this one step. If you cannot finish cleanly, halt
+with a clear failure message rather than producing a partial implementation.
+
+## Phase 0 — Repo-format guard (do this BEFORE anything else)
+If `{{repo}}` does not match `<owner>/<name>` (a single `/`, no spaces), halt
+with: `OUTCOME: bad-repo — repo='{{repo}}' must be owner/name`. Ticket
+prefetch is enforced by the runtime before this step starts.
+
+## Ticket
+```
+{{ticket_data}}
+```
+
+## Working directory
+You start in `<workspace>/repos`. The target clone lives at `{{repo}}` under
+that directory. After Phase 1 you `cd` into it and stay there for every Bash
+command.
+
+## Phase 1 — Sync the repo
+1. `ls -la {{repo}}/.git` to check whether the clone exists.
+2. If it does not, split `{{repo}}` on `/` into `<owner>` and `<name>` and call
+   `mcp__workforce__github_clone` with `{"owner": "<owner>", "repo": "<name>"}`.
+3. `cd {{repo}} && git fetch origin && git checkout main && git pull --ff-only origin main`.
+   If git fetch fails or stderr contains `Authentication failed`,
+   `Invalid username`, or `could not read Username`, halt with
+   `OUTCOME: git-auth-broken — <first line of error>`.
+4. Create the branch from the ticket key plus a short kebab-case slug derived
+   from the ticket title:
+     `git checkout -b feat/{{ticket_id}}-<slug>` from updated main.
+   If it already exists locally, `git checkout feat/{{ticket_id}}-<slug> && git merge --no-edit main`.
+
+## Phase 2 — Investigate & design
+Use the knowledge tools below — do NOT rely on prior assumptions. Pass
+`"path": "repos/{{repo}}"` to every knowledge tool call.
+
+1. `mcp__workforce__knowledge_index` with `{"action": "status", "path": "repos/{{repo}}"}`.
+   If the index is stale or missing, call again with `{"action": "trigger", "path": "repos/{{repo}}"}`.
+   If there is no index at all, call with `{"action": "trigger_full", "path": "repos/{{repo}}"}`.
+2. `mcp__workforce__knowledge_overview` with `{"path": "repos/{{repo}}"}`.
+3. `mcp__workforce__context_fuse` one or more times with concrete questions
+   about where the change belongs.
+4. `mcp__workforce__knowledge_ask` for deeper follow-ups.
+5. `mcp__workforce__knowledge_graph` when you need to trace callers / callees /
+   imports / implementations / tests / dependencies of a named entity.
+6. Use `Read` / `Grep` / `Glob` only to fill gaps the knowledge tools leave.
+
+Produce a written design covering: affected modules and files, architectural
+patterns already used that you will follow, data-model / migration concerns,
+test strategy, and edge cases.
+
+### Design principles (apply to the design above)
+- Design a full solution correctly. Do not miss anything; handle every edge case.
+- Robust, elegant, production-quality engineering using idiomatic code in a
+  functional style; follow the existing codebase tech patterns.
+- The most elegant and best solution possible from both a code and an
+  architectural perspective.
+- No TODOs and no partial implementations. Design appropriate tests up front.
+- No unnecessary comments. No excess code duplication.
+
+## Phase 3 — Implement
+Carry out the design using `Read` / `Edit` / `Write`. Implement every item — no
+placeholders, no TODOs. Do NOT re-explore once you start editing.
+
+### Implementation principles
+- Implement every change correctly. Handle every edge case.
+- Robust, elegant, production-quality idiomatic code in a functional style;
+  follow the existing codebase tech patterns.
+- The most elegant and best solution possible from both a code and an
+  architectural perspective.
+- No TODOs and no partial implementations. Tests must exist and pass; the code
+  must compile with no fmt / lint / format / build issues.
+- No unnecessary comments. No excess code duplication.
+
+## Phase 4 — Self-review (backend + frontend)
+Review your own diff in one pass against the design. Fix every Blocker /
+Important issue you find before pushing. Apply BOTH reviews below.
+
+### Backend review
+- All changes implemented correctly. Nothing missed. All edge cases handled.
+- Production-quality idiomatic code in a functional style; follows existing patterns.
+- The most elegant and best solution possible from both a code and an
+  architectural perspective.
+- No TODOs and no partial implementations. Tests exist, all pass, the code
+  compiles, and there are no fmt / lint / format / build issues.
+- No unnecessary comments. No excess code duplication.
+
+### Frontend review (apply to any UI / web / app changes in the diff)
+- All frontend changes implemented correctly. Nothing missed. Edge cases handled.
+- Production-quality idiomatic code in a functional style; follows existing patterns.
+- The most elegant and best solution possible from both a code and an
+  architectural perspective.
+- No TODOs and no partial implementations. Tests exist, all pass, and there
+  are no linting / format / build issues.
+- No unnecessary comments. No excess code duplication.
+
+Then run the project's quality gates from inside the repo. Detect the package
+manager and language from the repo's lockfiles / scripts (`package.json`,
+`Cargo.toml`, `go.mod`, `Gemfile`, etc.); do NOT hard-code commands from
+unrelated stacks. Fix any failure and re-run only the failing gate.
+
+## Phase 5 — Push & open PR
+1. `git add -A && git commit -m "{{ticket_id}}: <concise present-tense summary>"`.
+2. `git push -u origin feat/{{ticket_id}}-<slug>`.
+3. `gh pr list --head <branch> --repo {{repo}} --json number --jq '.[0].number // empty'`
+   — empty output means no PR exists yet for this branch.
+4. If no PR exists, create one:
+   `gh pr create --repo {{repo}} --base main --title "{{ticket_id}}: <title>" --body "<body>"`.
+   The body must reference `{{ticket_id}}` verbatim and describe what changed and why.
+   `gh pr create` prints the PR URL on success — capture it.
+5. If a PR already existed, resolve its URL with
+   `gh pr view <number> --repo {{repo}} --json url --jq .url`.
+
+## Final output — REQUIRED as your last message
+Emit exactly this block as your final message, substituting the actual branch
+you created in Phase 1 and the URL / number from `gh`:
+
+OUTPUTS:
+pr_url: <full URL of the PR>
+pr_number: <numeric PR number>
+branch_name: <the exact branch name you created in Phase 1>
+END_OUTPUTS
+
+Then print one human-readable line stating that the PR is ready and quoting the
+URL. Do NOT emit any `OUTCOME:` line — `exit = true` finishes the workflow on
+success.
+
+Halt with a clear `OUTCOME:` line (and no OUTPUTS block) if any of these
+happen: repo malformed (Phase 0), git auth fails, the knowledge index cannot
+be built, the same quality gate fails twice after a fix attempt, or
+`gh pr create` fails.
+"""

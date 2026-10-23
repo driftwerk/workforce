@@ -1,0 +1,173 @@
+---
+title: Installation
+description: Install the Workforce hub and pair your first device.
+---
+
+# Installation
+
+Get Workforce up and running on your system. Choose the method that fits your use case.
+
+## Quick Start
+
+### Download and Build
+
+First, clone the repository and build the binary:
+
+```bash
+# Clone the repository
+git clone https://github.com/driftwerk/workforce.git
+cd workforce
+
+# Build in release mode
+cargo build --release
+```
+
+This creates the `workforce` binary at `./target/release/workforce`.
+
+### Set Up Your LLM Provider
+
+You'll need an API key for your chosen AI provider. A Claude plan is used only through the `claude` CLI: agents on a hub run on it with `provider = "claude-code"`, and the plan's token never goes in as an API key. See [Connect your plan](/docs/getting-started/connect-your-plan) for running agents on a Claude or ChatGPT plan.
+
+**Anthropic API** (pay-per-token):
+
+```bash
+export ANTHROPIC_API_KEY=sk-ant-api03-...
+```
+
+**OpenRouter** (multi-provider gateway):
+
+```bash
+export OPENROUTER_API_KEY=sk-or-v1-...
+```
+
+**Gemini** (Google AI):
+
+```bash
+export GOOGLE_API_KEY=...
+```
+
+### Try a Simple Chat
+
+Test your setup with a one-on-one chat:
+
+```bash
+# With standard Anthropic API (default)
+./target/release/workforce chat
+```
+
+This starts an interactive session where you can ask questions and get help.
+
+## Initialise Your Project
+
+Before running as a service, initialise a project. This creates the configuration and workspace structure.
+
+```bash
+./target/release/workforce init
+```
+
+This command creates:
+- A default `workforce.toml` configuration file.
+- A `policies/default.yaml` file with default access rules.
+- Workspace directories for your agents (`data/agents/{id}/`) with identity template files (SOUL.md, AGENTS.md, etc.).
+- It will warn you if older identity files exist in the project root and suggest moving them to the workspace.
+
+Edit the `workforce.toml` file to set your provider, API keys, and other settings before starting the service.
+
+## Running as a Service
+
+For production use, run Workforce as a long‑running service that can handle Slack messages, scheduled tasks, and multi‑agent workflows.
+
+### 1. Start the Service
+
+```bash
+./target/release/workforce serve --config workforce.toml
+```
+
+The service starts several components:
+
+- **Admin API**: Dashboard and system management at `http://localhost:8090`
+- **Gateway**: WebSocket and REST endpoints for clients at `http://localhost:8091`
+- **Slack bot** (if configured): Connects to your Slack workspace
+- **Scheduler**: Runs scheduled jobs and reminders
+- **Heartbeat**: Periodic agent check‑ins
+
+### 2. Docker Deployment
+
+For a complete stack with optional components like Weaviate for memory storage:
+
+```bash
+cd deploy
+cp ../workforce.toml .
+cp .env.example .env  # Add your secrets here
+
+# Basic service only
+docker compose -f docker-compose.prod.yml up -d
+
+# With NATS for multi‑agent coordination
+docker compose -f docker-compose.prod.yml --profile distributed up -d
+
+# With Weaviate vector memory
+docker compose -f docker-compose.prod.yml --profile memory up -d
+```
+
+### 3. Systemd Service (Linux)
+
+For bare‑metal deployments:
+
+```bash
+# Copy the service file
+sudo cp deploy/workforce.service /etc/systemd/system/
+
+# Create a dedicated user
+sudo useradd -r -s /bin/false workforce
+
+# Set up directories
+sudo mkdir -p /opt/workforce/{data,workspace}
+sudo chown workforce:workforce /opt/workforce -R
+
+# Copy the binary
+sudo cp target/release/workforce /usr/local/bin/
+
+# Enable and start
+sudo systemctl enable --now workforce
+```
+
+## Pair Your First Device
+
+After the service is running, you can connect additional clients.
+
+### From the Command Line
+
+Request a pairing code:
+
+```bash
+./target/release/workforce pair request --name "my-laptop" --gateway ws://localhost:8091
+```
+
+The command displays an 8‑character code. Share this with your admin, who approves it with:
+
+```bash
+./target/release/workforce pair approve <code> --gateway ws://localhost:8091 --token $WORKFORCE_GATEWAY_TOKEN
+```
+
+Once approved, you'll receive an authentication token to use with the gateway.
+
+### Connect as a Local Agent
+
+With your token, connect a local agent to the hub:
+
+```bash
+export WORKFORCE_GATEWAY_URL=ws://localhost:8091
+export WORKFORCE_GATEWAY_TOKEN=<your-token>
+
+./target/release/workforce chat --agent default --gateway $WORKFORCE_GATEWAY_URL --token $WORKFORCE_GATEWAY_TOKEN
+```
+
+The local agent can now execute commands on behalf of the hub, with tools and memory available.
+
+## Next Steps
+
+- Learn how to [create your first workflow](/docs/getting-started/first-workflow)
+- Configure [policies and permissions](/docs/configuration/policies)
+- Set up [Slack integration](/docs/adapters/slack)
+- Explore [available tools](/docs/reference/tools)

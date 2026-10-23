@@ -1,0 +1,32 @@
+[Unit]
+Description=Workforce AI Agent Service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=workforce
+Group=workforce
+WorkingDirectory=/opt/workforce
+ExecStart=/usr/local/bin/workforce serve --config /opt/workforce/workforce.toml
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+
+# Environment
+Environment=RUST_LOG=info
+EnvironmentFile=-/opt/workforce/.env
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/workforce/data /opt/workforce/workspace
+PrivateTmp=true
+
+# Resource limits
+LimitNOFILE=65536
+MemoryMax=2G
+
+[Install]
+WantedBy=multi-user.target

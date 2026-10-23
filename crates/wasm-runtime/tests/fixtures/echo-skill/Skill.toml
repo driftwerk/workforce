@@ -1,0 +1,75 @@
+[skill]
+name = "echo-skill"
+version = "0.1.0"
+description = "Test skill that echoes input and adds numbers"
+author = "workforce-tests"
+license = "MIT"
+min_workforce_version = "0.1.0"
+
+[capabilities]
+http = true
+config = true
+vault = true
+tools = true
+
+[[tools]]
+name = "echo"
+description = "Echo back the input parameters"
+input_schema = { type = "object", properties = { message = { type = "string", description = "Message to echo" } }, required = ["message"] }
+
+[[tools]]
+name = "add"
+description = "Add two numbers together"
+input_schema = { type = "object", properties = { a = { type = "number" }, b = { type = "number" } }, required = ["a", "b"] }
+
+[[tools]]
+name = "fail"
+description = "Always returns an error (for testing error handling)"
+input_schema = { type = "object", properties = {} }
+
+[[tools]]
+name = "log_test"
+description = "Tests logging at all levels"
+input_schema = { type = "object", properties = {} }
+
+[[tools]]
+name = "get_time"
+description = "Returns the current time and a UUID"
+input_schema = { type = "object", properties = {} }
+
+[[tools]]
+name = "infinite_loop"
+description = "Spins forever — for testing timeout enforcement"
+input_schema = { type = "object", properties = {} }
+
+[[tools]]
+name = "vault_read"
+description = "Read a secret from the vault and return it"
+input_schema = { type = "object", properties = { key = { type = "string" } }, required = ["key"] }
+
+[[tools]]
+name = "config_read"
+description = "Read a config value and return it"
+input_schema = { type = "object", properties = { key = { type = "string" } }, required = ["key"] }
+
+[[tools]]
+name = "invoke_many_test"
+description = "Fan out platform tool calls via tools::invoke_many"
+input_schema = { type = "object", properties = { calls = { type = "array" } } }
+
+[[tools]]
+name = "fetch_burst"
+description = "Issue N HTTP fetches to exercise the per-invocation budget"
+input_schema = { type = "object", properties = { count = { type = "number" }, url = { type = "string" } } }
+
+[[permissions]]
+tool = "echo.say"
+description = "Test invoke target"
+
+[[permissions]]
+tool = "flaky.call"
+description = "Second test invoke target"
+
+[[permissions]]
+tool = "big.rows"
+description = "Invoke target whose result is over the inline limit"

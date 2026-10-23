@@ -1,0 +1,28 @@
+[package]
+name = "workforce-vellev"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+async-trait = { workspace = true }
+eyre = { workspace = true }
+futures = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["sync", "net", "io-util", "rt"] }
+tracing = { workspace = true }
+uuid = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+vellev-client = { workspace = true }
+vellev-core = { workspace = true }
+vellev-index = { workspace = true }
+
+[dev-dependencies]
+axum = { workspace = true }
+workforce-vellev = { path = ".", features = ["testing"] }
+
+[features]
+# Fresh tenants on a real node, for other crates' tests.
+testing = []

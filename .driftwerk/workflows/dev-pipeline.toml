@@ -1,0 +1,279 @@
+[workflow]
+id = "dev-pipeline"
+name = "Development Pipeline"
+description = "Autonomous develop → review → merge pipeline for team channels"
+
+[workflow.context]
+request = { required = true, description = "The user's original request" }
+
+# =============================================================================
+# Step 1: Analyze & Plan
+# =============================================================================
+[[step]]
+id = "analyze"
+name = "Analyze & Plan"
+agent = "martin"
+max_rounds = 40
+model = "powerful"
+skills = ["linear"]
+preferred_tools = ["linear.issue_get", "code.git", "code.read", "knowledge.overview", "knowledge.ask", "knowledge.graph", "knowledge.index"]
+outputs = [
+  { name = "ticket_id", description = "Linear ticket identifier (e.g. DW-107, OPS-243) or 'none' if no ticket referenced" },
+  { name = "target_repo", description = "Target repository in owner/repo format for code.* tools (e.g. contoso/monorepo, driftwerk/workforce)" },
+  { name = "github_owner", description = "GitHub org/owner (e.g. contoso, driftwerk)" },
+  { name = "github_repo", description = "GitHub repo name only (e.g. monorepo, workforce)" },
+  { name = "feature_summary", description = "What needs to be built and why (1-2 paragraphs)" },
+  { name = "implementation_plan", description = "Numbered step-by-step implementation plan with specific file paths and changes" },
+  { name = "key_files", description = "Files to create or modify, one per line" },
+  { name = "acceptance_criteria", description = "How to verify the implementation is correct" },
+]
+pause = "awaiting-plan-review"
+report = "Summarise in 3-5 bullet points: what will change, key files, and any risks. Keep under 500 characters."
+task = """
+Analyze the request and create a detailed implementation plan.
+
+## 1. Determine Target Repository & Ticket
+
+1. Parse the request for ticket IDs, repo names, or project references
+2. If a Linear ticket is mentioned: call `linear.issue_get` with identifier="<ticket_id>"
+3. Output ticket_id (e.g. "DW-107") or "none"
+4. Determine the target GitHub repo from the ticket's team/project context
+5. Output target_repo, github_owner, github_repo
+
+## 2. Sync Repo
+
+1. Call `code.git` with repo="<target_repo>" action="pull"
+2. Call `knowledge.index` with action="status" path="repos/{owner}/{repo}"
+3. If index is stale or missing: call `knowledge.index` with action="trigger" path="repos/{owner}/{repo}"
+4. If no index at all: call `knowledge.index` with action="trigger_full" path="repos/{owner}/{repo}"
+
+## 3. Analyze Codebase
+
+1. Call `knowledge.overview` with path="repos/{owner}/{repo}"
+2. Call `knowledge.ask` with path="repos/{owner}/{repo}" to find affected code areas
+3. Call `knowledge.graph` with path="repos/{owner}/{repo}" for dependency analysis
+4. Read relevant source files with `code.read`
+
+IMPORTANT: Always pass path="repos/{owner}/{repo}" to ALL knowledge tool calls.
+
+## 4. Create Implementation Plan
+
+Break down what needs to be done with specific file paths and changes. Be specific enough that a developer can execute without ambiguity.
+
+## 5. Output
+
+Emit ALL outputs: ticket_id, target_repo, github_owner, github_repo, feature_summary, implementation_plan, key_files, acceptance_criteria.
+
+Present the plan for human review. The human will approve or reject.
+
+Do NOT include "OUTCOME:" — this step pauses for human review.
+"""
+branches = [
+  { when = "approved", goto = "implement" },
+  { when = "rejected", goto = "analyze" },
+]
+
+# =============================================================================
+# Step 2: Implement
+# =============================================================================
+[[step]]
+id = "implement"
+name = "Implement"
+agent = "brian"
+max_rounds = 75
+model = "powerful"
+skills = ["linear", "github"]
+preferred_tools = ["code.git", "code.read", "code.edit", "code.find", "github.pr_create", "github.list_pulls", "github.branch_list", "github.ci_status", "linear.issue_update", "linear.states_list", "jobs.chain", "jobs.chain_status", "jobs.watch_ci", "jobs.result", "exec.run"]
+outputs = [
+  { name = "pr_number", description = "PR number that was created", validate = "number" },
+  { name = "branch_name", description = "Feature branch name" },
+  { name = "summary", description = "Brief summary of changes made" },
+]
+task = """
+Implement the approved plan and open a PR.
+
+## Context
+- **Repo:** {{steps.analyze.target_repo}} ({{steps.analyze.github_owner}}/{{steps.analyze.github_repo}})
+- **Plan:** {{steps.analyze.implementation_plan}}
+- **Files:** {{steps.analyze.key_files}}
+- **Acceptance Criteria:** {{steps.analyze.acceptance_criteria}}
+
+## Rules
+- Start coding immediately — do NOT re-explore the codebase.
+- Use `code.read` (not `github.get_file`) for reading files in cloned repos.
+- Use `code.find` to verify paths before reading.
+- Implement EVERY item in the plan. No placeholders, no TODOs.
+- If returning after code review: address ALL feedback points.
+
+## Steps
+
+### 0. Update ticket status
+If "{{steps.analyze.ticket_id}}" is not "none":
+1. Call `linear.states_list` to find "In Progress" state ID
+2. Call `linear.issue_update` with identifier="{{steps.analyze.ticket_id}}" and the state_id
+
+### 1. Check for existing work
+1. Call `github.list_pulls` with owner="{{steps.analyze.github_owner}}" repo="{{steps.analyze.github_repo}}"
+2. Call `github.branch_list` with owner="{{steps.analyze.github_owner}}" repo="{{steps.analyze.github_repo}}"
+3. If existing PR/branch found for this ticket: check it out and continue
+4. Otherwise: create a new feature branch
+
+### 2. Sync and implement
+1. Call `code.git` with repo="{{steps.analyze.target_repo}}" action="pull"
+2. Implement ALL planned changes — every single item, no skipping
+
+### 2b. Regenerate TypeScript clients (contoso/monorepo only)
+If you modified ANY files under backend/:
+1. Run: scripts/generate-clients.sh
+2. Include changed files in packages/ in your commit
+
+### 3. Run quality gates
+1. Your worktree is at `{{_worktree_path}}`. Use it for all file operations.
+2. Call `jobs.chain` with steps:
+   - id="fmt", command="cd {{_worktree_path}} && cargo fmt -- --check"
+   - id="clippy", command="cd {{_worktree_path}} && cargo clippy --all-targets --no-deps -- -D warnings", depends_on=["fmt"]
+   - id="test", command="cd {{_worktree_path}} && cargo test --workspace", depends_on=["clippy"]
+3. Check with `jobs.chain_status`. If fmt fails: run `cargo fmt`, then re-run chain.
+4. Repeat until ALL gates pass.
+
+### 4. Create/update PR
+1. Call `github.pr_create` with owner="{{steps.analyze.github_owner}}" repo="{{steps.analyze.github_repo}}"
+   - Link ticket {{steps.analyze.ticket_id}} in the description
+2. Call `jobs.watch_ci` with owner="{{steps.analyze.github_owner}}" repo="{{steps.analyze.github_repo}}" ref="<branch>"
+3. Check CI with `jobs.result`. If CI fails: fix and push again.
+
+IMPORTANT: Always pass path="repos/{{steps.analyze.github_owner}}/{{steps.analyze.github_repo}}" to ALL knowledge.* tool calls.
+
+Do NOT finish until ALL quality gates AND CI pass.
+Do NOT include "OUTCOME:" in your response.
+"""
+
+# =============================================================================
+# Step 3: Code Review
+# =============================================================================
+[[step]]
+id = "review"
+name = "Code Review"
+agent = "sarah"
+max_rounds = 20
+model = "powerful"
+skills = ["github"]
+preferred_tools = ["github.get_pull", "github.pr_diff", "github.ci_status", "code.git", "code.read", "knowledge.overview"]
+task = """
+Review PR #{{steps.implement.pr_number}} on branch {{steps.implement.branch_name}}.
+
+- **Repo:** {{steps.analyze.github_owner}}/{{steps.analyze.github_repo}}
+- **Changes:** {{steps.implement.summary}}
+- **Plan:** {{steps.analyze.implementation_plan}}
+- **Files:** {{steps.analyze.key_files}}
+- **Acceptance Criteria:** {{steps.analyze.acceptance_criteria}}
+
+IMPORTANT: Review ONLY PR #{{steps.implement.pr_number}}. Ignore all other PRs.
+
+## Steps
+
+### 1. Setup
+1. Call `code.git` with repo="{{steps.analyze.target_repo}}" action="pull"
+2. Call `code.git` with repo="{{steps.analyze.target_repo}}" action="branch" branch="{{steps.implement.branch_name}}"
+
+### 2. Get the diff
+1. Call `github.get_pull` with owner="{{steps.analyze.github_owner}}" repo="{{steps.analyze.github_repo}}" pr_number={{steps.implement.pr_number}}
+2. Call `github.pr_diff` with owner="{{steps.analyze.github_owner}}" repo="{{steps.analyze.github_repo}}" pr_number={{steps.implement.pr_number}}
+3. If PR not found → OUTCOME: changes-requested
+
+### 3. Completeness check (do this FIRST)
+- Verify EVERY numbered item in the plan has corresponding code changes
+- Verify EVERY file in Planned Files was created or modified
+- If ANY item is missing, has placeholder/stub content, or was skipped → OUTCOME: changes-requested
+- An incomplete implementation is NEVER approvable
+
+### 4. Quality check
+Read changed files with `code.read`:
+- All error paths handled? No silent failures?
+- Edge cases covered? No TODOs or placeholders?
+- Follows project conventions?
+- No hardcoded values, no introduced bugs or security issues?
+
+### 5. CI check
+Call `github.ci_status` with owner="{{steps.analyze.github_owner}}" repo="{{steps.analyze.github_repo}}" pr_number={{steps.implement.pr_number}}
+- CI must be green. If failing → OUTCOME: changes-requested
+
+### 6. Verdict
+- ALL checks pass: OUTCOME: approved
+- ANY check fails: list issues then OUTCOME: changes-requested
+- Do NOT fix issues yourself — only report them.
+- Do NOT echo raw tool output or JSON. Summarize in plain English.
+"""
+branches = [
+  { when = "changes-requested", goto = "implement" },
+  { when = "approved", goto = "request-merge" },
+]
+
+# =============================================================================
+# Step 4a: Request Merge Approval
+# =============================================================================
+[[step]]
+id = "request-merge"
+name = "Request Merge Approval"
+agent = "martin"
+max_rounds = 5
+model = "standard"
+pause = "awaiting-merge-review"
+report = "One-line summary of what was implemented, PR number, and CI status. Keep under 300 characters."
+task = """
+PR #{{steps.implement.pr_number}} on branch {{steps.implement.branch_name}} has passed code review.
+
+## Summary
+- **Repo:** {{steps.analyze.github_owner}}/{{steps.analyze.github_repo}}
+- **Changes:** {{steps.implement.summary}}
+- **PR:** #{{steps.implement.pr_number}}
+
+Present this summary for human review. The human will approve or reject.
+
+Do NOT include "OUTCOME:" — this step pauses for human input.
+"""
+branches = [
+  { when = "approved", goto = "merge" },
+  { when = "rejected", goto = "implement" },
+]
+
+# =============================================================================
+# Step 4b: Execute Merge
+# =============================================================================
+[[step]]
+id = "merge"
+name = "Merge PR"
+agent = "brian"
+max_rounds = 8
+model = "standard"
+skills = ["linear", "github"]
+preferred_tools = ["github.pr_merge", "linear.issue_update", "linear.states_list", "code.git"]
+exit = true
+task = """
+Merge PR #{{steps.implement.pr_number}} and close the ticket if applicable.
+
+NOTE: If this PR is part of a parallel batch, merge conflicts are possible.
+
+## Steps
+
+### 1. Merge the PR
+Call `github.pr_merge` with:
+- owner="{{steps.analyze.github_owner}}"
+- repo="{{steps.analyze.github_repo}}"
+- pr_number={{steps.implement.pr_number}}
+- merge_method="squash"
+
+### 2. If merge succeeds
+1. Delete branch {{steps.implement.branch_name}} if appropriate
+2. If "{{steps.analyze.ticket_id}}" is not "none":
+   a. Call `linear.states_list` to find the "Done" state ID
+   b. Call `linear.issue_update` with identifier="{{steps.analyze.ticket_id}}" and the state_id
+
+### 3. If merge fails (conflicts)
+1. Call `code.git` with repo="{{steps.analyze.target_repo}}" action="pull"
+2. Merge main into {{steps.implement.branch_name}}, resolve conflicts
+3. Run quality gates (cargo fmt, clippy, test)
+4. Push and retry `github.pr_merge`
+
+Do NOT include "OUTCOME:" in your response.
+"""

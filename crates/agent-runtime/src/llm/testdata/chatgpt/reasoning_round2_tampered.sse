@@ -1,0 +1,25 @@
+HTTP 400
+x-codex-active-limit: premium
+x-codex-plan-type: prolite
+x-codex-primary-used-percent: 0
+x-codex-secondary-used-percent: 0
+x-codex-primary-window-minutes: 10080
+x-codex-primary-over-secondary-limit-percent: 0
+x-codex-secondary-window-minutes: 0
+x-codex-primary-reset-after-seconds: 603012
+x-codex-secondary-reset-after-seconds: 0
+x-codex-primary-reset-at: 1791270464
+x-codex-secondary-reset-at: 
+x-codex-credits-has-credits: False
+x-codex-credits-balance: 0
+x-codex-credits-unlimited: False
+x-codex-turn-state: gAAAAABqu2q8CIsJQR9ywHGghNGuVEhbceIx_HTGsyPd7uZdo2OMTp78DWT5Vc9oseTcOJyyiyXPWAvqAhyfMhmen96ve1C8KXRL7lasvUEesAlHuzA27bPV4O5G0wSlymt2i5ZZvqwe5MKl-ElBouf5qv0giieu8Nc_MsetoyLiFnJIDNrklcnn1JXDMIOYl__bmMj16AsHBrJW2Lzj8e41ab6GuxQ2Ymu9iYjcR7_umITrUV_iO9WHRfrtPFILBBl9OWFa0herwPS35TlnSc3bB2jv2x6GNREJ1UVNb4duqYS7wXLX-3D0LTCoNFpbZwX2p4oEaVNB7AiT-x8fYugQNSj1WsIiyeiWeM8e8DlsVX27DdG38MU3d66jGeDP28Eb8ke2LhTh1PpyHTDI1wcTvVoBynoQkDG1lkmrt18wZeyzl_CXbYParD2efJeNn3mJi72WVN1hKfldE6cUhbTGuouBiMnHy0Apix8OPWeJvdBpqT4-Hn36t6TncQRogW6bTRn72WDwEZcThf3PXQdGz_gK7WOd2ZR7xNzIK6sUnoxTd5UNDloQO-rdKZk1u82wdirTO7J0bVg82YWNVLZQoCZIG5HYt-KHG8AnIONNDQOxgYbfZd2qbkBSlyLpBnA88eKUw0IzY43a9IE6CZxQQEVfz5sfdQHg9fO46ZNfK38FEANkUghsTBVsI52O5uVgW5vlVbpqjVJ2Vw9gUEl4V1qiPuEC0ccB9E8ddjCiEWHzwbvMqin7tnZ-h_sKl9bkZiOQfH5k
+
+{
+  "error": {
+    "message": "The encrypted content for item rs_05d7ba13acf1d7e5016abb6ab3096c87d2b2a8209bff5281ea could not be verified. Reason: Encrypted content could not be decrypted or parsed.",
+    "type": "invalid_request_error",
+    "param": null,
+    "code": "invalid_encrypted_content"
+  }
+}

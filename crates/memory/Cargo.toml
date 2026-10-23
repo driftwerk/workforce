@@ -1,0 +1,42 @@
+[package]
+name = "workforce-memory"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+publish = false
+
+[dependencies]
+workforce-core = { path = "../core" }
+workforce-common = { path = "../common" }
+
+async-trait = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+eyre = "0.6"
+futures = { workspace = true }
+reqwest = { version = "0.12", features = ["json"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = { workspace = true }
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+uuid = { version = "1", features = ["v4", "serde"] }
+vellev-client = { workspace = true }
+vellev-core = { workspace = true }
+vellev-index = { workspace = true }
+workforce-vellev = { workspace = true }
+
+parking_lot = { workspace = true }
+rand = { workspace = true }
+once_cell = { workspace = true }
+regex = { workspace = true }
+
+[dev-dependencies]
+workforce-vellev = { workspace = true, features = ["testing"] }
+axum = { workspace = true }
+tempfile = "3"
+tokio = { version = "1", features = ["full", "test-util"] }
+
+[features]
+# The in-memory sync store (`admin::testing`), for crates whose tests drive a sync.
+testing = []

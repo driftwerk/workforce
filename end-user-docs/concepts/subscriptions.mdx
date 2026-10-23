@@ -1,0 +1,142 @@
+---
+title: Subscriptions
+description: Run agents on a Claude or ChatGPT plan instead of a per-token API key, and see whose plan paid.
+---
+
+# Subscriptions
+
+An agent can run on a person's Claude or ChatGPT plan instead of an API key that bills per token. The plan's login is stored in the vault, and each call is paid by the login that serves it. Nothing about the agent changes apart from the model spec: subscriptions are ordinary providers.
+
+To connect your own plan, see [Connect your plan](/docs/getting-started/connect-your-plan).
+
+## Three providers
+
+Every place that takes a model spec takes these providers: `[llm] provider` and `default_model`, `failover`, `model_preferences`, `voice_model`, `compaction_model`, the memory models and vision.
+
+| Provider | Plan | Example specs | How an agent turn runs |
+|---|---|---|---|
+| `chatgpt` | ChatGPT | `chatgpt:gpt-6.1-sol` | the hub's own agent loop, talking to ChatGPT directly |
+| `claude-code` (alias `claude_code`) | Claude | `claude-code:sonnet`, `claude-code:powerful` | the `claude` CLI drives the turn, with the agent's tools over MCP |
+| `codex` | ChatGPT | `codex:gpt-6.1-sol` | the `codex` CLI drives the turn on the remote worker, with the agent's tools over MCP |
+
+```toml
+[[agents]]
+id = "allan"
+
+[agents.llm]
+default_model = "claude-code:sonnet"
+failover = ["chatgpt:gpt-6.1-sol", "codex:gpt-6.1-sol"]
+
+[agents.llm.model_preferences]
+research = "claude-code:opus"
+```
+
+- **The ChatGPT models are the ones Codex lists for a ChatGPT sign-in:** `gpt-6.1-sol`, `gpt-6-astra`, `gpt-6-sol`, `gpt-6-luna`, `gpt-5.6-sol`, `gpt-5.6-terra` and `gpt-5.6-luna`. Each serves plain function calling, so any of them runs agent turns. `gpt-5.5` retired from ChatGPT sign-ins on 14 October 2026; a config still naming it gets a warning, and its calls move on down the chain.
+- **Codex runs only on the remote worker.** A spec naming `codex` is refused unless `[coding_session.executor] kind = "remote"`. Codex agent turns run the same models; a turn on a model the backend doesn't serve is refused when the config is saved.
+- **Tool-less internal calls** (compaction, memory, summaries) on `claude-code` or `codex` run as one-shot CLI calls with no tools.
+- The tier tables for these providers are in [Tiers](/docs/configuration/tiers).
+
+### The chain is exactly what you configure
+
+A subscription agent never falls back to a metered model on its own. A metered entry such as `openrouter:anthropic:standard` runs only if you list it in `failover`. When no route can serve a turn, the turn stops and says why, for example that you have no ChatGPT login on this agent.
+
+A `claude-code` or `codex` entry owns a whole turn. The agent moves on to the next entry only before the current one has produced any output.
+
+## Which login pays
+
+A login can sit in four places in the vault, and where it sits decides whom it serves:
+
+| Tier | Stored in | Serves |
+|---|---|---|
+| `agent_user` | your personal tier on one agent | you, on that agent |
+| `global_user` | your personal tier in the hub vault | you, on any agent |
+| `agent_shared` | the agent's shared tier | everyone on that agent |
+| `system_shared` | the hub's shared vault | everyone on every agent |
+
+For each call the agent tries the tiers in that order and uses the first login that is stored, may serve the person, and is usable now. It skips a login that is at its usage limit or that the provider refused, and moves on.
+
+The Claude login is stored under `claude_code/oauth_token` and the ChatGPT login under `codex/auth_json`. One ChatGPT login serves both `chatgpt` and `codex`.
+
+### Restricting the order with `[llm.logins]`
+
+By default every tier is tried and a shared login serves anyone. `[llm.logins]` narrows that, globally in `[llm]` or for one agent:
+
+```toml
+[agents.llm.logins]
+tiers = ["agent_user", "global_user", "agent_shared"]   # never the hub's own login
+shared_serves = "owner"                                 # owner | agent_users | anyone
+```
+
+- **`tiers`** lists the tiers tried, in order. It must name at least one tier, and each only once.
+- **`shared_serves`** decides whom the two shared tiers may pay for:
+  - `owner`: the agent's own background work and its owner (or the owning team's members).
+  - `agent_users`: also every signed-in person who talks to the agent.
+  - `anyone` (default): also callers with no identity.
+
+An `[llm.logins]` block replaces the inherited one as a whole: a block with only `shared_serves` resets `tiers` to the default. Outside callers, such as edge customers and game players, are never served by a shared login.
+
+<Callout type="warn">
+A Claude plan belongs to one person. Anthropic's Consumer Terms don't allow a personal plan to serve other people, so keep a Claude login in a personal tier, or set `shared_serves = "owner"` on agents with a shared Claude login.
+</Callout>
+
+## Whose plan pays for background work
+
+A person's own turn is always paid from their own logins, never from someone else's. Background work keeps running as what it runs as today (its permissions and credentials don't change); only the plan that pays is chosen:
+
+1. **The person it runs as**, when there is one: a scheduled job's creator or `run_as`, a monitor's owner, a workflow run's starter.
+2. **Else the person it is for**: the agent's owner for heartbeats, agent-level memory consolidation and ownerless jobs.
+3. **Else the install's operator** (`[subscription] operator`) for the hub's own work, such as the knowledge summariser and global consolidation, and for agents owned by a team or by no one.
+4. **Else** only the shared tiers, as `shared_serves` allows.
+
+Heartbeat checks run as the person who created or last edited them, else as the agent's owner. Memory consolidation runs once per person, over their own memories, on their own login. A person with no usable login is skipped and the hub logs it.
+
+## When you need to connect a plan
+
+When a turn finds no login of yours that could serve it, the agent tells you how to connect one instead of answering:
+
+- **ChatGPT:** the hub starts a sign-in for you. The one-time code goes only to you. In Slack it is posted inline in a direct message; in a channel or shared thread you get a direct message with the code and the thread gets a note. On the web it shows on a card in your own private conversation and under My Settings → ChatGPT, whichever login it signs in to. You have one sign-in at a time, so starting another replaces it; My Settings warns you before it does. A conversation other people can see shows the instructions and a link to My Settings, never the code. Enter the code within 15 minutes; once you are signed in, the agent answers your message.
+- **Claude:** the agent tells you to run `claude setup-token` and paste the token in [My Settings](/docs/getting-started/connect-your-plan), then send your message again. Only My Settings works at this point: the agent cannot save a token sent to it until it has a plan to run on.
+
+The message starts with what happened to the plans you do have a login for. When your ChatGPT login is stored but its model was refused, the message says so before asking you to connect Claude, and when a stored login of yours was refused for good, it says to sign in again rather than asking for a login as if none existed.
+
+When a login is only cooling, no code is offered: the message says when it frees up.
+
+### Asking the agent what it runs on
+
+Ask the agent whether your Claude or ChatGPT login is set up and it reads the answer from `system.llm_status`, the same resolver its turns use. For every provider its settings route to, the report says which of your plan logins serves it and at which tier, or per tier why none does; for a metered provider it says whether an API key is held and where (an environment variable, an account in the agent's vault or the shared vault), never the key itself.
+
+## Limits and cooldowns
+
+When a plan reaches its usage limit, its login is skipped until the limit resets, and the next tier or route serves the call. A login the provider refuses for good (a revoked or replaced sign-in) is skipped until it is signed in again. These marks are kept by each hub process, so on a hub with several processes each learns them on its own.
+
+## Install settings
+
+`[subscription]` in `workforce.toml` applies to the whole install and is read at start-up:
+
+```toml
+[subscription]
+chatgpt_direct = false            # allow the chatgpt provider
+operator = "<identity uuid>"      # whose plan pays for the hub's own work
+max_concurrent_cli_turns = 4      # claude-code / codex agent turns generating at once; 0 = unbounded
+max_concurrent_completions = 4    # one-shot CLI calls at once; 0 = unbounded
+```
+
+`chatgpt_direct` is the kill switch for the `chatgpt` provider and is off by default. While it is off, a config with a `chatgpt` route still loads, with a warning, and every call on that route is refused with a reason; the ChatGPT login keeps serving `codex`.
+
+## Seeing what paid
+
+**The route line.** On the web and in Slack, a finished answer carries a short line saying what served it:
+
+- `Claude Code · sonnet · Alice's plan`: a subscription turn. The last part names the login: "Alice's plan (this agent)", "Alice's plan", "the agent's shared login" or "the install login".
+- `Metered · gemini-3.1-pro`: a metered turn on an agent whose default model is a subscription, so a fallback to per-token billing is never silent.
+
+A metered turn on a metered agent shows no line.
+
+**Usage.** The Costs page and Stats split spend by billing:
+
+- **Metered spend** is charged per token.
+- **Subscription value (est.)** is subscription use priced at list rates. It is not billed, and is shown as `~$0.12`.
+
+Both can be broken down by agent, by origin (interactive, heartbeat, scheduled, and so on; calls recorded before origins were kept show as unrecorded) and, on an agent's Usage tab, by whose plan paid.
+
+An agent's Usage tab shows its Billing card once a plan has served the agent. The card counts every billable call on the agent, including vision, transcription and workflow steps, so its figures are a total of their own beside the task costs above it.

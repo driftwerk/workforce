@@ -1,0 +1,681 @@
+---
+title: Workflows
+description: Automate complex, multi-step agent processes with state, branching, and human approval.
+---
+
+# Workflows
+
+Workflows are automated sequences of tasks, called steps, performed by AI agents. You define a workflow in a TOML configuration file, specifying the steps, the agent responsible for each, and rules for how to proceed, pause, or branch based on the results. Workflows can start automatically on a schedule, be triggered by a webhook or HTTP request, or be triggered manually. Each workflow run is a separate instance that maintains its own state and execution history.
+
+Think of a workflow as a robot checklist: it executes a series of defined actions, decides what to do next based on the outcome, and can wait for a human to review or approve its work before continuing.
+
+## Core Concepts
+
+### Workflow Definition
+A workflow is defined in a `TOML` file. These files are loaded from your configured `workflows_dir` and describe the workflow's identity, the steps it contains, and any triggers for automatically starting it.
+
+Key sections of a definition:
+- **`[workflow]`**: Metadata like the workflow's name, description, version, and the default agent for its steps. It also declares required or optional context fields that must be provided when the workflow starts. Each run records this agent when it starts, and an agent's [pipelines](/docs/concepts/pipelines) count only the cost of runs whose workflow runs as that agent.
+- **`[[step]]`**: The ordered list of individual tasks. Each step has an instruction for the agent, can define structured outputs, and can include conditions for pausing or branching to other steps.
+- **`[[trigger]]`** (optional): Rules for starting the workflow automatically, either on a schedule, from an external webhook, or via an HTTP endpoint.
+- **`[[variable]]`** (optional): References to secrets stored in the vault.
+
+### Workflow Instance
+When a workflow starts running, it becomes a **workflow instance**. Each instance has a unique ID, tracks its current step and status (`running`, `paused`, `completed`, `failed`, `exited`, `cancelled`), and stores all the data (`context`) that flows between steps. Instance state is persisted so workflows can survive restarts.
+
+### Steps
+A **step** is a single task performed by an agent. It includes:
+- **`task`**: The natural language instruction (e.g., "Review the pull request for security issues").
+- **`branches`**: Rules for what step to run next based on the agent's self-declared outcome (e.g., if the agent says "approved", go to step `"deploy"`).
+- **`pause`**: A step can be configured to stop and wait for human approval before proceeding.
+- **`exit`**: A step can end the entire workflow, optionally creating a handoff package.
+- **`outputs`**: Structured data the agent is instructed to produce (like a `summary` string or a `risk_score` number), which becomes available for later steps via `{{steps.step_id.field}}`. Together a step's outputs are its **state package**.
+- **`receives`**: The steps whose packages this step is handed, in place of everything earlier steps said.
+- **`verify`**: Have a verifier check the step's output before the workflow moves on.
+- **`agent`**: You can specify a different agent for a particular step, overriding the workflow's default.
+- **`skills`**: A list of skills (like access to GitHub or a security scanner) to pre-load for the agent before the step runs.
+- **`preferred_tools`** and **`exclusive_tools`**: Fine-grained control over which tools the agent is allowed to use during the step.
+- **`phases`**: For complex steps, you can break the work into multiple phases, each with its own task, turn budget, and allowed tools.
+- **`engine`**: Optionally use a specialized execution engine like `claude-code` or `claude-pilot` for the step.
+- **`report`**: A template using `{{variable}}` syntax to generate a human-facing summary when the step is paused.
+- **`context_eviction_interval`** and **`context_eviction_keep_last`**: Manage memory usage during long steps by automatically cleaning old tool outputs.
+
+### Context Variables
+Data flows through a workflow using `{{variable}}` syntax. You provide initial data in the `payload` when starting a workflow. Steps can produce outputs, which become variables for later steps. Runtime-managed keys like `_channel_id`, `_thread_id`, `_worktree_path`, `_cancellation_reason`, and `_human_feedback` are also available. Every completed step also exposes `{{steps.step_id._engine}}` and `{{steps.step_id._model}}`, the engine and model that served it, when the engine reports them; write `{{?steps.step_id._model}}` unless you know the engine names one.
+
+Example: If step `"analyze"` has an output named `"risk"`, a later step's task could be `"If the risk is high ({{steps.analyze.risk}} > 7), escalate to the security team."`
+
+## Creating a Workflow
+
+Workflow definition files are stored in your configured workflows directory. The simplest workflow has a name, a description, and at least one step.
+
+```toml
+[workflow]
+id = "weekly-report"
+name = "Generate Weekly Summary"
+description = "Compile metrics and create a summary Slack post."
+version = "1.0"
+agent = "claude" # Default agent for all steps
+
+# Declare what information this workflow needs to start.
+[workflow.context]
+  # This field is required when starting the workflow.
+  team = { required = true, description = "Team name (e.g., 'backend')" }
+  # This field is optional.
+  week_offset = { required = false, description = "Weeks ago (0=current week)" }
+
+[[step]]
+id = "gather"
+name = "Gather Metrics"
+task = "Fetch last week's key performance indicators for the {{team}} team from our data dashboard."
+
+[[step]]
+id = "draft"
+name = "Draft Summary"
+task = "Write a concise, positive Slack post summarizing the metrics from the previous step."
+pause = "awaiting-review" # Stop here for a human to approve the draft.
+
+[[step]]
+id = "post"
+name = "Post to Slack"
+task = "Post the approved summary to the #{{team}}-updates channel."
+```
+
+### Adding Variables (Secrets)
+You can reference secrets from the vault in your workflow definition using `[[vault:scope:key]]` syntax.
+
+```toml
+[[variable]]
+name = "api_key"
+value = "[[vault:workflows:api_key]]"
+allowed_hosts = ["api.example.com"] # Optional restriction
+```
+
+### Adding a Schedule Trigger
+To run the workflow automatically, add a schedule trigger.
+
+```toml
+[[trigger]]
+type = "schedule"
+cron = "0 9 * * 1" # Every Monday at و9:00 AM (UTC)
+tz = "America/New_York"
+run_as = "user-alice"
+payload = { team = "backend" } # Provides the 'team' context value automatically
+```
+
+### Adding a Webhook Trigger
+Workflows can be triggered by external events, like a new Linear issue, a GitHub pull request, or a HubSpot contact. Point the sender at `{public_url}/webhooks/{source}` and store its signing secret in the vault so every delivery is verified before the workflow starts.
+
+```toml
+[[trigger]]
+type = "webhook"
+source = "linear" # Or "github", "hubspot"
+event_type = "Issue.create"
+secret = "[[vault:linear/webhook]]" # Vault key workflows/linear/webhook
+# The webhook payload becomes the workflow's trigger payload.
+```
+
+### Adding an HTTP Trigger
+You can expose a workflow as an HTTP endpoint. Requests must include authentication (Bearer token, HMAC, or OIDC).
+
+```toml
+[[trigger]]
+type = "http"
+id = "feature-request" # Unique across your own workflows
+response = "streaming" # Server-Sent Events stream
+[trigger.auth]
+mode = "hmac"
+secret = "[[vault:workflows/hmac-secret]]"
+```
+
+The hub mints a permanent public path for each HTTP trigger and shows it on the workflow's **Triggers** tab (and in the `workflow` tool's `save`, `get` and `list` results):
+
+```
+POST https://your-hub.example.com/triggers/t.3f2c1e4088ab4d6f9c7e1b5a2d0f8e31
+```
+
+That address is not derived from who owns the workflow, so it keeps working if the workflow is handed to someone else. This is the one to give to whatever will call the workflow.
+
+The older addresses keep answering indefinitely, so nothing you configured before needs changing: `POST /triggers/{id}` for a system definition, `POST /triggers/{owner}/{id}` for a member-owned one. Where both answer, the Triggers tab shows the older one beneath the minted one, labelled *also answers*.
+
+The minted path belongs to the workflow's `id` and the trigger's `id` — not to the workflow's display `name`. Change either id and you have a different trigger: the hub mints it a fresh path and the old one stops answering, so plan to repoint your callers. Setting the ids back brings the old path back, and deleting a workflow and recreating it yourself also revives its path. The owner-derived address does not include the workflow id, so a change of workflow id leaves that one answering.
+
+Trigger ids must be unique across all system definitions, and across each member's own workflows. A collision disables the owner-derived address for both workflows; each keeps its minted one.
+
+Authentication modes for HTTP triggers include:
+- **Bearer token**: `mode = "bearer"`, `token = "[[vault:...]]"`
+- **HMAC**: `mode = "hmac"`, `secret = "[[vault:...]]"`
+- **OIDC**: `mode = "oidc"`, `issuer`, `audience`, `allowed_principals`
+
+## Starting and Managing Workflows
+
+You can start a workflow manually using the `workflow` tool from an agent conversation, or it can start automatically via its triggers.
+
+### Starting Manually
+In an agent chat (like Slack), use the `workflow` tool.
+
+```json
+{
+  "action": "start",
+  "workflow_id": "weekly-report",
+  "payload": {
+    "team": "frontend",
+    "week_offset": 1
+  }
+}
+```
+
+The system will automatically resolve the `channel_id` and `thread_id` from your current conversation to post status updates. You can also provide them explicitly:
+
+```json
+{
+  "action": "start",
+  "workflow_id": "weekly-report",
+  "payload": {
+    "team": "frontend",
+    "week_offset": 1
+  },
+  "channel_id": "C123456",
+  "thread_id": "1234567890.123456"
+}
+```
+
+### Validation on Start
+Before a workflow starts, the system validates your `payload` against the `[workflow.context]` schema:
+- Required fields must be present and non-empty.
+- Unknown fields are rejected with "did you mean" suggestions (Levenshtein distance ≤3).
+- Runtime-managed keys (like `_channel_id`) are always allowed.
+
+### Required Skills
+A workflow whose tool steps call WASM skills can name the skill versions it needs in `[workflow]`:
+
+```toml
+[workflow]
+id = "order-review"
+name = "PR review"
+requires = { "order-router" = ">=1.2.0", "order-watch" = ">=0.1.0" }
+```
+
+- **Requirements.** Each value is a semver requirement.
+  - `>=1.2.0` accepts 1.2.0 and every later release, but not a pre-release such as 1.3.0-beta.1 unless the requirement names one.
+  - A bare `1.2.0` means `^1.2.0`, which stops short of 2.0.0.
+  - A skill name that is not lowercase letters, digits and hyphens, or a requirement that is not a semver requirement, is refused when the definition is saved.
+- **Checked before the first step.** Every run checks its requirements before its first step, however it started: by hand, on a schedule, from a trigger, or when a queued run takes a free slot.
+  - A skill that is not installed, or is installed at a version the requirement does not accept, fails the run before any step runs.
+  - The failure names each unmet requirement, such as `requires order-router >=1.2.0; installed 1.1.0` or `requires order-watch >=0.1.0; not installed`, and the halt card in the channel carries the same text under its usual header.
+  - A later run passes once the skill is installed.
+- **Saving.** A definition whose requirements the installed skills do not yet meet is still saved, and the save returns a warning naming them, because the skill install usually follows within minutes.
+- **Checking the facts.** `pipeline.facts` lists each workflow's `requires` beside the installed skills' versions, so a watcher can spot a mismatch before the next run.
+
+### Ticket Pre-fetch
+If the workflow expects `ticket_data`, and your payload contains a `ticket_id`, the runtime will automatically attempt to fetch the ticket from Jira, then Linear, using the configured adapters. If this pre-fetch fails, the workflow refuses to start rather than running with missing data.
+
+### Checking Status and Managing Instances
+The `workflow` tool also lets you check on running workflows and interact with them.
+
+- **List the workflow definitions you can run**: `{ "action": "list" }` (your own, the install-wide ones, and any shared with you; an administrator sees every one on the install)
+- **Check an instance's status**: `{ "action": "status", "instance_id": "uuid-here" }`
+- **List running instances**: `{ "action": "instances", "status_filter": "running" }` (filter can be `running`, `paused`, `completed`, `failed`, `exited`, `cancelled`)
+- **Approve a paused step**: `{ "action": "resume", "instance_id": "uuid-here", "outcome": "approved" }`
+- **Press a decision's button**: `{ "action": "resume", "instance_id": "uuid-here", "outcome": "send", "gate": "gate-from-status" }` — `status` shows the open decision and its `gate`; a gate from a decision the run has moved past is refused (see [Decisions](#decisions)).
+- **Reject a paused step and give feedback**: `{ "action": "reject", "instance_id": "uuid-here", "reason": "Tone is too casual", "feedback": "Please make the summary more professional." }` The feedback is stored in a `_human_feedback` variable for the workflow.
+- **Cancel a workflow**: `{ "action": "abort", "instance_id": "uuid-here" }` This will also recursively abort any active child instances.
+- **Jump to a step, retry a failed one, or skip one**: type `goto <step_id>`, `retry` or `skip` in the run's Slack thread (see [Human Interaction](#human-interaction)); the `workflow` tool has no actions for these.
+
+## Sharing and visibility
+
+A workflow belongs to the user who saved it and is private by default. Who else
+reaches it is the owner's call, from chat:
+
+- `cmd: workflow shares <workflow-id>` — who it is shared with.
+- `cmd: workflow share <workflow-id> <@user|email|id|team:<name>>` — let someone run
+  it; add `manage` to let them edit it too.
+- `cmd: workflow unshare <workflow-id> <@user|email|id|team:<name>>` — take that back.
+- `cmd: workflow visibility <workflow-id> private|team|everyone` — who else may run it.
+- `cmd: workflow transfer <workflow-id> <@user|email|id>` — hand it to someone else.
+
+Name a person with an @-mention, their email address, or their Workforce user id, and
+a whole team with `team:<name>`. The three reaches are:
+
+| Visibility | Who else may run it |
+|---|---|
+| `private` | nobody but the people you shared it with |
+| `team` | anyone who shares a team with you |
+| `everyone` | every user on the install |
+
+A system administrator is outside the table: they see every workflow on the install
+whatever its reach, and they can change who else reaches yours — see below.
+
+`team` is resolved every time someone asks, so joining or leaving a team takes effect
+at once, and it only ever lets a teammate **run** the workflow — a teammate who should
+edit it needs a `manage` share of their own. If you are in no team yet, `team` reaches
+nobody but you, and the reply says so.
+
+A `manage` grantee edits the workflow but never re-shares it: only the owner decides
+who reaches it — or a system administrator, who can edit, share, re-scope and delete a
+member's workflow in place so an install can still be administered when its owner is
+away. Every change they make to someone else's workflow is written to the audit log
+against them; your own work, and a `manage` grantee's, is not.
+
+**Transferring one** gives it away for good:
+`cmd: workflow transfer <workflow-id> <@user|email|id>`, or **Transfer** on the
+workflows page. The person you name owns it
+afterwards, and you keep nothing — you cannot edit it, re-share it or take it back,
+only ask them to share it with you. Tick **Keep manage access** in the dialog and the
+handover leaves you a `manage` share instead, written in the same step as the
+transfer: you can still edit it, but not re-share it and not take it back. They must
+be an active member of the install; a team cannot own a workflow. Three things change with it: automated runs pause until the new owner
+saves it once, so nothing fires on their credentials that they have not approved; a
+trigger's stable address is unchanged, while an older address that names you stops
+working and needs repointing; and the run history stays with the runs that happened,
+so theirs begins at the transfer. Only you, or a system administrator, can transfer
+your workflow — a `manage` grantee never can. Two members can each
+have a workflow of the same name, so add
+`owner:<@user|email|id>` to address one of theirs you may manage. An install-wide
+workflow belongs to nobody rather than to a member, so there is no owner to share it
+on anyone's behalf — and it has no team either, so it can only be `private` or
+`everyone`.
+
+A later save that names no visibility keeps the one you last chose, so publishing a
+workflow with `everyone` and then having an agent edit it does not quietly make it
+private again.
+
+Sharing a workflow also decides who may steer the runs others start of it — approve,
+reject, resume or stop them — unless its definition says only the starter may; see
+[Who may steer a run](#who-may-steer-a-run).
+
+Playbooks and monitors use the same grammar — `cmd: playbook …` and `cmd: monitor …`
+(see [Playbooks](/docs/concepts/playbooks#sharing) and
+[Monitors](/docs/concepts/monitors#sharing-and-visibility)). The web UI does the same
+two things: **Share** on the Workflows page, and a **Private** / **My teams** /
+**Global** control on a workflow's own page, where **Global** is what `everyone` means
+and **My teams** what `team` means. Unlike chat, that control only marks your choice —
+it is applied when you press **Save** — and an install-wide workflow, having no owner,
+is offered only **Private** and **Global**.
+
+## Advanced Step Configuration
+
+Steps can be finely tuned for complex tasks.
+
+```toml
+[[step]]
+id = "complex-review"
+name = "Deep Code Review"
+task = "Review the pull request {{pr_url}} focusing on security and performance."
+
+# Use a different agent just for this step.
+agent = "claude-sonnet"
+
+# Pre-load specific skills (like access to GitHub or Linear) for the agent.
+skills = ["github", "security-scanner"]
+
+# Define the exact tools the agent is allowed to use.
+preferred_tools = ["code.git.diff", "github.pull_request_get"]
+exclusive_tools = true # Agent can ONLY use the tools listed above.
+
+# Limit the conversation to 10 back-and-forth turns.
+max_rounds = 10
+
+# Clean up old tool outputs every 5 turns to save context space.
+context_eviction_interval = 5
+context_eviction_keep_last = 3
+
+# Define the structured data we expect the agent to produce.
+outputs = [
+  { name = "security_issues", description = "List of potential security flaws", validate = "not_empty" },
+  { name = "performance_impact", description = "Estimated performance score (1-10)", validate = "number" }
+]
+
+# After finishing, decide what step to run next based on the agent's final statement.
+branches = [
+  { when = "approved", goto = "merge" },
+  { when = "needs-changes", goto = "comment" },
+  { when = "blocked", goto = "escalate" }
+]
+
+# If none of the above branches match, pause for human review.
+pause = "unclear-outcome"
+```
+
+### Step Execution Engines
+Most steps use the default engine, which runs a standard agent loop. For specialized tasks, you can use alternative engines:
+
+- **`claude-code` engine**: Delegates entire step to Claude Code CLI via MCP tools. Runs on a Claude login of the person the workflow runs for (connect one under My Settings → Claude), or the agent's shared login. Errors halt the workflow immediately.
+- **`claude-pilot` engine**: For multi-phase orchestrated execution similar to Claude Code but with explicit phases. Requires `[[step.phases]]`.
+
+To use a specialized engine, set `agent = "claude-code"` or `agent = "claude-pilot"` on the step. You can also specify a different agent name to route the step to a specific agent service configured in your system.
+
+### Repositories for Coding Steps
+When the install's coding executor is remote (`[coding_session.executor]` `kind = "remote"`), coding steps run in one scope on the coding worker that every step of the instance shares. This is separate from the local worktree described under [Worktree Isolation](#worktree-isolation). A prior step chooses what the scope holds with two outputs:
+
+- **`target_repo`**: The repository the run works on, as `owner/repo`. It is checked out at `/work/<repo>` and every coding round starts there. Without it the scope holds no repository.
+- **`workspace_repos`**: Further repositories to check out beside the target, each at `/work/<repo>`, as `owner/repo` entries separated by whitespace or commas. The target always comes first whether or not it is listed, and repeats (compared case-insensitively) are dropped. It has no effect without `target_repo`. Two repositories with the same name under different owners are refused, because they would share one checkout directory.
+
+```toml
+outputs = [
+  { name = "target_repo", description = "owner/repo this run changes" },
+  { name = "workspace_repos", description = "Every owner/repo to check out, e.g. acme/api acme/web" },
+]
+```
+
+Output both before the first coding step: that step creates the scope, and later steps reuse it unchanged, so repositories named afterwards are never checked out. Each repository is cloned with the GitHub token for its owner (see [GitHub](/docs/adapters/github)), so a list that spans owners needs a token for each. With the local executor, coding steps use the target repository alone and ignore `workspace_repos`, so a prompt that reads another repository should fall back to the GitHub tools when its `/work/<repo>` directory is absent.
+
+### Phased Steps
+For complex work, you can break a step into multiple phases using `[[step.phases]]`. Each phase runs in the same agent session, but you can control the task and tools per phase.
+
+```toml
+[[step]]
+id = "implement-feature"
+name = "Implement Feature"
+agent = "claude-code"
+
+[[step.phases]]
+name = "plan"
+task = "Read the ticket {{ticket_id}} and plan the implementation."
+max_turns = 5
+allowed_tools = ["code.git.diff", "linear.issue_get"]
+
+[[step.phases]]
+name = "code"
+task = "Write the necessary code changes."
+max_turns = 15
+allowed_tools = ["code.git.diff", "code.git.apply", "bash.run"]
+
+[[step.phases]]
+name = "test"
+task = "Run tests to verify the changes work."
+max_turns = 10
+allowed_tools = ["bash.run"]
+```
+
+### State Packages
+A step's `outputs` are its state package: the structured data it hands to the steps after it. Each output can declare a type and whether it is required.
+
+```toml
+[[step]]
+id = "extract"
+name = "Extract schema"
+task = "Read the migration files and extract the schema."
+outputs = [
+  { name = "tables", type = "list", description = "Table names" },
+  { name = "table_count", type = "integer" },
+  { name = "notes", required = false },
+]
+```
+
+- **`type`**: `string` (the default), `number`, `integer`, `boolean`, `list` or `object`. A `list` is a JSON array or one `- item` per line; an `object` is JSON.
+- **`required`**: `true` by default. Set `false` for an output the step may leave out.
+- **`validate`**: `"number"` (digits only) or `"not_empty"`, checked against the text the agent wrote.
+
+The system reads the package from the agent's final response. If a required output is missing, or a value does not fit its type or its `validate` rule, the step is sent back with exactly what was wrong (up to 2 times) before the workflow stops. An attempt that was sent back shows in the run's history as a failed attempt with the reason, and does not count toward the step's `max_iterations`. A step that takes one of its `branches` owes no missing output. Tool, decision and child-workflow steps are never run again.
+
+#### Choosing what a step receives
+By default a step is shown every earlier step: its package, or the end of its response if it declares no outputs. Set `receives` to hand a step only the packages it needs, plus the workflow's inputs:
+
+```toml
+[[step]]
+id = "write-tests"
+name = "Write tests"
+task = "Write a test for each endpoint."
+receives = ["endpoints"]
+```
+
+This step sees the workflow's inputs and the `endpoints` package, and nothing else: no other step's outputs and none of what earlier agents wrote on the way. `receives = []` gives it the inputs alone. Each named step must declare outputs and be able to run before this one. If a named step did not run this time (its branch was not taken), the step is told that it handed over nothing. A `{{steps.step_id.field}}` reference in the task still works for any step. A step with `phases` cannot use `receives`: write the values it needs into its phase tasks.
+
+#### Verifying a step
+`verify` has a second, lightweight model check the step's output against its task, its outputs and any criteria you give, before the workflow moves on:
+
+```toml
+[[step]]
+id = "endpoints"
+name = "Write endpoints"
+task = "Write an endpoint for each table in {{steps.extract.tables}}."
+outputs = [{ name = "routes", type = "list" }]
+verify = { criteria = ["There is a route for every table"], corrections = 2 }
+```
+
+- `verify = true` checks the output against the task and the outputs alone.
+- A rejected output sends the step back with the checks that failed. It gets one correction round unless `corrections` says otherwise (0 to 3).
+- If the output is still rejected, or the verifier's answer cannot be read, the workflow stops and says why. An unread verdict is never treated as a pass.
+- `verify = false` turns verification off for a step whose agent verifies by default.
+- A step that takes one of its `branches` is not verified.
+
+The verifier has no tools. It sees the step's task, its outputs and your criteria, and nothing else: not the repository, not the ticket, not what earlier steps said. It checks that the output answers the task and agrees with itself, and takes the step's word for what it did. So write each criterion as something the output itself can settle, and declare the outputs the criterion needs to look at. A criterion the verifier cannot settle counts as a failed check, and a step that can never pass stops the workflow every time.
+
+| Criterion | Works? |
+|---|---|
+| `There is a route for every table in the task` | Yes: the tables are in the task and the routes are an output. |
+| `Every route starts with /api/` | Yes: it reads the `routes` output. |
+| `risk is "high" whenever findings lists a data-loss issue` | Yes: both are outputs. |
+| `The tests pass` | No: the verifier cannot run them. Have the step run them and declare `tests_passed` (boolean) and `test_summary`, then require `tests_passed is true`. |
+| `The PR was opened against main` | No: the verifier cannot see the PR. Declare `base_branch` and require `base_branch is main`. |
+| `The code is good` | No: there is nothing in the output to judge it by. |
+
+An agent can verify every step that declares outputs by default. In the agent's `config.toml`:
+
+```toml
+[handoff]
+verify = true         # off unless set
+max_corrections = 1   # 0 to 3
+model = "cheap"       # the verifier's model; the cheap tier when unset
+```
+
+An administrator can turn verification off for the whole install with `[handoff] allow_verify = false` in `workforce.toml`. Verification works on steps the agent runs itself, not on tool, decision or child-workflow steps.
+
+### Deciding First
+Many classification steps end in the same outcome almost every time: a triage step that finds nine tickets in ten need nothing done still pays for a full agent turn on each. If your install runs a decision model, a `decide_first` block on an agent step asks it which outcome the step should end in *before* the turn. When the model is sure enough, the step completes with that outcome and the turn never runs. Otherwise the turn runs exactly as it would without the block.
+
+A ticket triage that lets the model close the obvious noise, and leaves everything that might matter to the agent:
+
+```toml
+[workflow]
+id = "ticket-triage"
+name = "Ticket triage"
+context = { subject = { required = true }, body = { required = true } }
+
+[[step]]
+id = "classify"
+name = "Classify the ticket"
+task = """
+Read the ticket below and decide what it needs.
+Subject: {{subject}}
+Body: {{body}}
+A crash, an error or a wrong result: OUTCOME: bug
+A customer who cannot work at all: OUTCOME: urgent
+Anything else needs no action.
+"""
+outputs = [{ name = "category" }, { name = "reason" }]
+branches = [{ when = "bug", goto = "file-bug" }, { when = "urgent", goto = "page" }]
+goto = "close"
+
+[step.decide_first]
+state = '{ "subject": "{{subject}}", "body": "{{body}}" }'
+options = { ignore = "A newsletter, an auto-reply, spam or a thank-you: nothing to do" }
+min_probability = 0.9
+floors = { urgent = "never", bug = 0.97 }
+outputs = { category = "{{decision.label}}", reason = "Closed by the decision model ({{decision.probability}})" }
+
+[[step]]
+id = "file-bug"
+name = "File a bug"
+task = "File a bug for: {{subject}}"
+exit = true
+
+[[step]]
+id = "page"
+name = "Page the on-call engineer"
+task = "Page on-call about: {{subject}}"
+exit = true
+
+[[step]]
+id = "close"
+name = "Close the ticket"
+exit = true
+report_render = "template"
+report = "Closed as {{ steps.classify.category }}: {{ steps.classify.reason }}"
+```
+
+- **`state`** is what the model reads: the few fields the outcome depends on, not the agent's task, which is instructions. Keep it short (about 1,500 characters together with the question). JSON is passed as structure.
+- **The options** are the step's branch labels, each meaning what the task says about it, plus any you describe in `options`. Every option needs a meaning: a branch that no line of the task mentions must be described in `options`, or the workflow will not save. An option that is not a branch (`ignore` here) settles onto the step's `goto`. The model can always answer "none of these", which leaves the step to the agent.
+- **Floors** decide when the model may settle the step. `min_probability` applies to every option; `floors` sets an option's own, or `"never"` for an outcome only the agent may choose. Make them lopsided: let the model settle the common, harmless outcome when it is very sure, and never the rare, costly one. In the example a confident "ignore" closes the ticket, a "bug" must be even surer, and "urgent" always goes to the agent.
+- **Outputs** fill the step's declared outputs when the model settles it, from `{{decision.label}}`, `{{decision.probability}}`, `{{decision.backend}}`, `{{decision.model}}` and the run's variables. Every required output needs one, or the workflow will not save. Later steps see a normal completed step.
+- **When the model cannot help**, the agent runs: the answer is below its floor, it chose "none of these" or a `"never"` option, the model is busy or slow, you have no key for it, or the feature is switched off. A workflow never fails because of the decision model.
+
+In the run's history a settled step shows its engine as `decision`, a cost of 0 and **Settled first (no turn ran)** with the model's answer. A step settled this way writes no model report: use `report_render = "template"` if it should post one.
+
+**Try it in shadow first.** `mode = "shadow"` in the block asks the model and records its answer, but always runs the agent. Each run's history then shows **Decided first** with what the model would have settled and whether the agent agreed (`kev (shadow) ignore p=0.93, agent agreed`). When it has agreed on enough real tickets, remove `mode` (it defaults to `on`).
+
+An administrator turns the feature on for the install with `[decision.uses.decide_first] mode = "shadow"` or `"on"` in `workforce.toml`. It is off by default, and nothing changes for any workflow until it is turned on. An agent's own `config.toml` can hold it back (`[decision.uses.decide_first] mode = "shadow"` or `"off"`), and a step's `mode` can only go as far as both allow.
+
+### Handoffs and Exits
+When a step ends the workflow (by setting `exit = true`), you can optionally create a handoff package. It holds the exit step's own outputs, with the handoff type and a short summary, and is stored with the run: `workflow status` returns it as `handoff`.
+
+```toml
+[[step]]
+id = "final"
+name = "Finalize"
+task = "Create final report."
+exit = true
+handoff = "review" # Leaves a handoff package of this type on the run
+outputs = [{ name = "verdict" }]
+```
+
+## Lifecycle and States
+
+A workflow instance moves through specific states:
+
+1. **`running`**: Actively executing a step.
+2. **`paused`**: Stopped at a step configured with a `pause` condition, waiting for human `resume` or `reject`.
+3. **`completed`**: Finished all steps successfully.
+4. **`failed`**: A step encountered an unrecoverable error.
+5. **`exited`**: A step ended with an `exit` directive.
+6. **`cancelled`**: Was manually aborted.
+
+Orphaned `running` instances (those without an active execution loop) are automatically recovered when the service starts up or during periodic maintenance. You can filter for instances in any of these states using the `instances` action.
+
+## Worktree Isolation
+
+Each workflow instance gets its own isolated directory (a "worktree") for file operations. This path is injected as the `{{_worktree_path}}` variable. If a worktree is destroyed, it is automatically recreated when the instance resumes. Stale worktrees are periodically cleaned up (after a 1-hour grace period for terminal workflows).
+
+## Human Interaction
+
+When a workflow is paused, you can interact with it directly in Slack (or other chat surfaces) using commands.
+
+- **`approve`**: Resume the workflow with an "approved" outcome.
+- **`reject <feedback>`**: Reject the current step, providing feedback that will be stored in `_human_feedback`. The step can be retried.
+- **`status`**: Show the current status of the workflow instance.
+- **`stop`**: Abort the workflow instance.
+
+Workflow instances are anchored to a Slack thread, so commands must be sent in the same thread where the workflow is posting updates.
+
+### Who may steer a run
+
+Approving, rejecting (with feedback), resuming, pausing, stopping, and moving a run between steps all *steer* it, wherever you do it: in the run's Slack thread, through the `workflow` tool, or (for an administrator) on the instance page. A run always acts as the person who started it, whoever steers it, so steering never lets anyone act as someone else — but what they approve, reject or write as feedback decides what the run does next with its starter's access.
+
+- **The person who started the run** may always steer it.
+- **A system administrator** may always steer it.
+- **Anyone else** may steer it when the workflow reaches them — it is `everyone`'s, their team's, or shared with them — and its definition lets others steer its runs. That is the default:
+
+```toml
+[workflow]
+id = "release"
+name = "Release"
+# Only the starter and administrators may steer a run. Defaults to true.
+steerable_by_others = false
+```
+
+The workflow's page has the same switch (**Others can steer runs** / **Only the starter steers runs**), saved with the definition, so whoever may edit the workflow may change it. Someone who may not steer a run is told why in one sentence — for example, "Only the person who started this run, or an administrator, can steer it, because `release` does not let others steer its runs; start your own run of `release` instead." — and nothing about the run changes. Anyone in the thread may still ask for `status` or `help`. Someone other than the starter steers the run where it already reports: only the starter and administrators can send its results somewhere new.
+
+A run is held to the terms it started under unless today's are stricter: switching the flag off, or making the workflow private, applies to runs already under way, while widening a workflow does not open runs that started before. Every steer, and every refusal, is recorded against the person who asked. Stopping a run also stops any child runs it started.
+
+## Decisions
+
+A **decision** step stops the run and asks named people to choose what happens next. The run posts a Slack card with one button per choice; the first press settles it, and the run carries on along the route that button names.
+
+```toml
+[workflow]
+id = "daily-digest-email"
+name = "Daily digest email"
+
+[[variables]]
+id = "approvers"
+value = "approver.one@example.com, team:reviewers"
+
+[[step]]
+id = "draft"
+name = "Draft the digest"
+task = "Draft today's digest from yesterday's figures."
+outputs = [{ name = "recipient" }, { name = "subject" }, { name = "body" }]
+
+[[step]]
+id = "review"
+name = "Review the digest"
+report_render = "template"
+report = "To: {{ steps.draft.recipient }}\nSubject: {{ steps.draft.subject }}\n\n{{ steps.draft.body }}"
+pause = "awaiting-approval"
+branches = [{ when = "send", goto = "send_email" }]
+
+[step.decision]
+title = "Send today's digest to {{ steps.draft.recipient }}?"
+deciders = ["{{ approvers }}", "<@U0123ABCD>"]
+allow_self_decision = false
+expires_after = "20h"
+on_expiry = "cancel"
+
+[[step.decision.buttons]]
+label = "Send"
+outcome = "send"
+style = "primary"
+confirm = "Send this email now?"
+
+[[step.decision.buttons]]
+label = "Redraft"
+outcome = "redraft"
+goto = "draft"
+
+[[step.decision.buttons]]
+label = "Cancel"
+outcome = "cancel"
+style = "danger"
+end = "cancel"
+
+[[step]]
+id = "send_email"
+name = "Send"
+task = "{}"
+tool = "mailer.send"
+exit = true
+```
+
+- **The step.** A decision step pauses and delivers a report, which becomes the card's body. It has no `goto` of its own and never falls through to the next step.
+- **Buttons.** One to 25, each with a `label` and an `outcome`, and optionally a `style` (`primary` or `danger`), a `confirm` question and the `done` wording the closed card shows. Each button has exactly one route: a branch whose `when` is its outcome, its own `goto`, or `end = "complete"` / `end = "cancel"`. A button can also start another workflow before its route (`workflow = { id = "…", payload = { … } }`, never waited on) and write literal variables (`set = { escalated = "yes" }`).
+- **Deciders.** Identity ids, emails, `team:<name>` and Slack mentions, separated by commas or newlines. An entry may read the workflow's own non-secret `[[variables]]`, and nothing else, so no payload can choose who decides. They are looked up when the step pauses: a team is its active members, and someone suspended is left out.
+- **Where the card goes.**
+  - No `channel`: into the run's thread, or by direct message to each decider when the run has no channel.
+  - `channel = "C…"`: in that channel, with a pointer in the run's thread. Naming the run's own channel posts into its thread.
+  - `channel = "dm"`: one card to each decider Slack can reach.
+- **Who can decide.** Only the named deciders, on every surface: the buttons, a reply typed in the run's thread (the button's label, so `cancel` there means the Cancel button), the instance page (for a decider who is also an administrator) and the `workflow` tool. The person who started the run and administrators cannot decide unless they are named, and with `allow_self_decision = false` the starter cannot decide even when named. An agent with nobody behind it cannot decide, and nor can an agent working a workflow step.
+- **While it waits.** Nobody may resume, approve, reject, skip, retry, pause or move the run; only its starter or an administrator may stop it, which closes the card.
+- **Expiry.** With `expires_after` (1m to 30d) and `on_expiry`, the hub presses the `on_expiry` button within about a minute of the deadline.
+
+Exactly one press settles a decision. A later press, or one on an old card after the run moved on, is told what happened, and its card is updated. Once settled, every card loses its buttons and says who chose what, and when.
+
+## Design Support
+
+The `workflow` tool includes actions to help you write and validate definitions.
+
+- **`validate`**: Check your TOML content for errors. `{ "action": "validate", "toml_content": "..." }`
+- **`schema`**: Get the full JSON schema reference with examples. `{ "action": "schema" }`
+- **`save`**: Write a TOML definition to disk and trigger a reload. `{ "action": "save", "workflow_id": "my-workflow", "toml_content": "..." }`
+- **`get`**: Retrieve the TOML content of a workflow definition. `{ "action": "get", "workflow_id": "my-workflow" }`
+
+## Best Practices
+
+- **Start Simple**: Begin with a linear workflow (no branches) to test the basic task flow.
+- **Use Descriptive IDs**: Step IDs like `"draft-summary"` are clearer than `"step1"`.
+- **Validate Inputs**: Use the `required` flag in `[workflow.context]` to ensure necessary data is provided.
+- **Monitor with Status**: Use the `status` action or list `running` instances to keep track of long-running workflows.
+- **Use Human Feedback**: When rejecting a paused step, provide clear `feedback` that the agent can use if the step is retried.
+- **Isolate File Work**: Use the `{{_worktree_path}}` variable for any file operations to avoid conflicts between workflow instances.
+- **Respect Concurrency Limits**: Be aware of the per-owner concurrent run limit (`max_concurrent_runs_per_owner` in configuration). System definitions have no limit.
+- **Secure Secrets**: Reference vault secrets via `[[vault:scope:key]]`; member-owned definitions can only access shared secrets under the `workflow_shared/` prefix.

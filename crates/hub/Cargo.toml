@@ -1,0 +1,198 @@
+[package]
+name = "workforce-hub"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+publish = false
+
+[lib]
+name = "workforce_hub"
+path = "src/lib.rs"
+
+[dependencies]
+workforce-hub-core = { path = "../hub-core" }
+workforce-core = { path = "../core" }
+workforce-common = { path = "../common", features = ["otel", "prometheus", "sentry"] }
+workforce-crypto = { workspace = true }
+workforce-nats = { path = "../nats-bus" }
+workforce-policy = { path = "../policy-engine" }
+workforce-agent = { path = "../agent-runtime", features = ["s3"] }
+workforce-decide = { path = "../decide" }
+workforce-orchestrator = { path = "../orchestrator" }
+workforce-memory = { path = "../memory" }
+workforce-lessons = { path = "../lessons" }
+workforce-skills = { path = "../skills", features = ["slack", "teams", "github", "google", "linear", "jira", "datadog", "metabase", "hubspot", "notion", "browser", "obscura", "email", "postmark", "sendgrid", "xero", "freeagent", "spotify"] }
+workforce-distributed = { path = "../distributed" }
+workforce-games = { path = "../games" }
+workforce-gateway-client = { path = "../gateway-client" }
+workforce-pairing = { path = "../pairing" }
+workforce-identity = { path = "../identity" }
+workforce-permissions = { path = "../permissions" }
+workforce-projects = { workspace = true }
+workforce-oauth-client = { workspace = true }
+workforce-mcp-client = { workspace = true }
+workforce-mcp-store = { workspace = true }
+workforce-training = { workspace = true }
+workforce-self-learning = { workspace = true }
+workforce-codebase-knowledge = { path = "../codebase-knowledge" }
+workforce-knowledge-service = { path = "../knowledge-service" }
+workforce-wasm-runtime = { path = "../wasm-runtime" }
+workforce-postgres = { workspace = true }
+
+async-nats = "0.38"
+async-trait = "0.1"
+futures = "0.3"
+axum = { version = "0.8", features = ["ws", "multipart"] }
+chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10"
+croner = "2"
+color-eyre = "0.6"
+eyre = "0.6"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = { workspace = true }
+toml_edit = { workspace = true }
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt", "io"] }
+tower-http = { version = "0.6", features = ["cors"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+metrics = { workspace = true }
+uuid = { version = "1", features = ["v4", "v5"] }
+vellev-client = { workspace = true }
+vellev-core = { workspace = true }
+workforce-vellev = { workspace = true }
+libc = "0.2"
+reqwest = { version = "0.12", features = ["json"] }
+blake3 = { workspace = true }
+base64 = { workspace = true }
+aes-gcm = { workspace = true }
+argon2 = { workspace = true }
+rand = { workspace = true }
+hex = "0.4"
+hkdf = "0.12"
+hmac = "0.12"
+sha2 = "0.10"
+subtle = "2.6"
+zeroize = "1"
+jsonwebtoken = "9"
+dashmap = "6"
+notify = { version = "7.0", default-features = false, features = ["macos_fsevent"] }
+glob = "0.3"
+ignore = { workspace = true }
+regex = "1.10"
+once_cell = { workspace = true }
+ipnetwork = "0.20"
+rust-embed = { version = "8", features = ["interpolate-folder-path", "include-exclude"] }
+mime_guess = "2"
+
+csv = { workspace = true }
+calamine = { workspace = true }
+flate2 = "1"
+zip = { workspace = true }
+quick-xml = { workspace = true }
+pulldown-cmark = { workspace = true }
+pdf-extract = "0.10"
+parking_lot = { workspace = true }
+semver = { workspace = true }
+tempfile = "3"
+bytes = { workspace = true }
+thiserror = { workspace = true }
+lru = { workspace = true }
+
+# Durable pending-approval store (crates/hub/src/approvals). SQLite is the
+# default backend (always compiled); the Postgres backend mirrors the
+# permissions store and is gated by the hub `postgres` feature.
+rusqlite = { workspace = true }
+tokio-postgres = { workspace = true, optional = true }
+deadpool-postgres = { workspace = true, optional = true }
+refinery = { workspace = true, optional = true }
+
+aws-credential-types = "1"
+aws-config = { version = "1", default-features = false, features = [
+    "rt-tokio",
+    "behavior-version-latest",
+    "credentials-process",
+    "client-hyper",
+    "rustls",
+] }
+aws-sdk-s3 = { version = "1", default-features = false, features = [
+    "rt-tokio",
+    "rustls",
+    "behavior-version-latest",
+] }
+# Read-only infra-diagnosis tools (aws.ecs/ecr/elbv2/rds/sts.*). Same feature
+# shape as aws-sdk-s3; the tools are gated at runtime by [aws_infra], not a
+# cargo feature, matching the S3 surface.
+aws-sdk-ecs = { version = "1", default-features = false, features = [
+    "rt-tokio",
+    "rustls",
+    "behavior-version-latest",
+] }
+aws-sdk-ecr = { version = "1", default-features = false, features = [
+    "rt-tokio",
+    "rustls",
+    "behavior-version-latest",
+] }
+aws-sdk-elasticloadbalancingv2 = { version = "1", default-features = false, features = [
+    "rt-tokio",
+    "rustls",
+    "behavior-version-latest",
+] }
+aws-sdk-rds = { version = "1", default-features = false, features = [
+    "rt-tokio",
+    "rustls",
+    "behavior-version-latest",
+] }
+aws-sdk-sts = { version = "1", default-features = false, features = [
+    "rt-tokio",
+    "rustls",
+    "behavior-version-latest",
+] }
+aws-sdk-cloudwatchlogs = { version = "1", default-features = false, features = [
+    "rt-tokio",
+    "rustls",
+    "behavior-version-latest",
+] }
+aws-sdk-cloudwatch = { version = "1", default-features = false, features = [
+    "rt-tokio",
+    "rustls",
+    "behavior-version-latest",
+] }
+
+# OIDC / SSO login (behind the `oidc` feature). Handles PKCE, JWKS,
+# id_token validation, and discovery for any compliant OpenID Connect IdP.
+openidconnect = { version = "3", optional = true }
+url = { workspace = true }
+
+[features]
+default = []
+oidc = ["dep:openidconnect"]
+postgres = [
+    "dep:tokio-postgres",
+    "dep:deadpool-postgres",
+    "dep:refinery",
+    "workforce-common/postgres",
+    "workforce-hub-core/postgres",
+    "workforce-postgres/postgres",
+    "workforce-codebase-knowledge/postgres",
+    "workforce-knowledge-service/postgres",
+    "workforce-permissions/postgres",
+    "workforce-training/postgres",
+    "workforce-self-learning/postgres",
+]
+
+[dev-dependencies]
+workforce-hub-core = { path = "../hub-core", features = ["test-support"] }
+workforce-agent = { path = "../agent-runtime", features = ["s3", "test-support"] }
+tempfile = "3"
+tower = "0.5"
+wiremock = "0.6"
+serde_yaml = { workspace = true }
+rust_xlsxwriter = { workspace = true }
+workforce-postgres = { workspace = true, features = ["test-support"] }
+workforce-vellev = { workspace = true, features = ["testing"] }
+workforce-memory = { path = "../memory", features = ["testing"] }
+
+[build-dependencies]
+workforce-build-support = { path = "../build-support" }

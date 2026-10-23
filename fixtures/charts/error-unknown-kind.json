@@ -1,0 +1,16 @@
+{
+  "input": {
+    "kind": "donut",
+    "series": [
+      {
+        "data": [
+          1
+        ]
+      }
+    ]
+  },
+  "result": {
+    "ok": false,
+    "error": "kind must be one of pie, bar, line, area, scatter"
+  }
+}

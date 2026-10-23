@@ -1,0 +1,125 @@
+{
+  "spec": {
+    "kind": "flow",
+    "direction": "right",
+    "nodes": [
+      {
+        "id": "a",
+        "label": "Intake",
+        "shape": "round"
+      },
+      {
+        "id": "b",
+        "label": "Assess",
+        "shape": "diamond"
+      },
+      {
+        "id": "c",
+        "label": "Store",
+        "shape": "cylinder"
+      }
+    ],
+    "edges": [
+      {
+        "from": "a",
+        "to": "b"
+      },
+      {
+        "from": "b",
+        "to": "c",
+        "style": "dashed",
+        "arrow": "both"
+      }
+    ]
+  },
+  "metrics": {
+    "char_width": 7,
+    "line_height": 16
+  },
+  "layout": {
+    "kind": "flow",
+    "nodes": [
+      {
+        "id": "a",
+        "label": "Intake",
+        "lines": [
+          "Intake"
+        ],
+        "shape": "round",
+        "tone": "default",
+        "x": 14,
+        "y": 20.5,
+        "w": 76,
+        "h": 32
+      },
+      {
+        "id": "b",
+        "label": "Assess",
+        "lines": [
+          "Assess"
+        ],
+        "shape": "diamond",
+        "tone": "default",
+        "x": 136,
+        "y": 14,
+        "w": 106,
+        "h": 45
+      },
+      {
+        "id": "c",
+        "label": "Store",
+        "lines": [
+          "Store"
+        ],
+        "shape": "cylinder",
+        "tone": "default",
+        "x": 288,
+        "y": 14.5,
+        "w": 76,
+        "h": 44
+      }
+    ],
+    "edges": [
+      {
+        "key": "a|b|0",
+        "from": "a",
+        "to": "b",
+        "points": [
+          [
+            90,
+            36.5
+          ],
+          [
+            136,
+            36.5
+          ]
+        ],
+        "style": "solid",
+        "arrow": "to"
+      },
+      {
+        "key": "b|c|1",
+        "from": "b",
+        "to": "c",
+        "points": [
+          [
+            242,
+            36.5
+          ],
+          [
+            288,
+            36.5
+          ]
+        ],
+        "style": "dashed",
+        "arrow": "both"
+      }
+    ],
+    "groups": [],
+    "lifelines": [],
+    "notes": [],
+    "width": 378,
+    "height": 73,
+    "dropped": []
+  }
+}
