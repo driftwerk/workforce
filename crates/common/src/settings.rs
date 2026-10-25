@@ -1698,6 +1698,12 @@ pub struct VellevShadowConfig {
     /// How often the leader brings vellev's replica of memories in line
     /// with Weaviate, in seconds (default 900; 60 to 86400).
     pub memory_reconcile_secs: Option<u64>,
+    /// The leader's nightly known-item runs of memories.
+    #[serde(default)]
+    pub known_items: KnownItemsConfig,
+    /// The opt-in LLM judge of artifacts' known items.
+    #[serde(default)]
+    pub judge: JudgeConfig,
     /// Keys this hub does not know: kept so they can be warned of by name,
     /// never refused, so that a rollback to an older hub still starts.
     #[serde(flatten, default, skip_serializing)]
@@ -1729,6 +1735,67 @@ pub struct ShadowStoreConfig {
     pub unknown: std::collections::BTreeMap<String, toml::Value>,
 }
 
+/// `[vellev.shadow.known_items]`: the leader's nightly runs of known
+/// items, memories drawn from Weaviate by a seed, each asked of both
+/// stores by a query made from it, to see whether it comes back first.
+/// Each value left out is the default ([`VellevShadowConfig::known_items`]).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct KnownItemsConfig {
+    /// Memories drawn a night (default 1000; 0 runs none; at most 5000).
+    pub items: Option<usize>,
+    /// Memories filed under no identity drawn a night, recalled as system
+    /// jobs recall them, unscoped (default 250; 0 draws none; at most
+    /// 5000).
+    pub unscoped_items: Option<usize>,
+    /// The seed each night's draw is made from, with its date (default 0).
+    pub seed: Option<u64>,
+    /// The UTC hour from which a night's run may start (default 2).
+    pub hour_utc: Option<u32>,
+    /// The UTC hour before which it must start (default 6; up to 24):
+    /// past it, the run waits for the next day.
+    pub until_hour_utc: Option<u32>,
+    /// The pause between two items, in milliseconds (default 250; at most
+    /// 10000).
+    pub pace_ms: Option<u64>,
+    /// Keys this hub does not know (see [`VellevShadowConfig::unknown`]).
+    #[serde(flatten, default, skip_serializing)]
+    pub unknown: std::collections::BTreeMap<String, toml::Value>,
+}
+
+/// `[vellev.shadow.judge]`: an LLM grading what each side found for the
+/// artifacts' known-item queries (design r2 section 6.5). Off unless set:
+/// it reads artifacts whatever their access rules, and its calls cost.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct JudgeConfig {
+    /// Whether the judge runs (default false).
+    #[serde(default)]
+    pub enabled: bool,
+    /// Queries judged a UTC day at most (default 200; 1 to 1000).
+    pub daily_cap: Option<usize>,
+    /// Keys this hub does not know (see [`VellevShadowConfig::unknown`]).
+    #[serde(flatten, default, skip_serializing)]
+    pub unknown: std::collections::BTreeMap<String, toml::Value>,
+}
+
+/// [`KnownItemsConfig`] with its defaults applied and checked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KnownItemSettings {
+    /// Memories drawn a night; 0 runs none.
+    pub items: usize,
+    /// Memories filed under no identity drawn a night.
+    pub unscoped_items: usize,
+    pub seed: u64,
+    /// A run starts from this UTC hour and before `until_hour_utc`.
+    pub hour_utc: u32,
+    pub until_hour_utc: u32,
+    pub pace: std::time::Duration,
+}
+
+/// How long a known-item run may be found still running before it is
+/// taken for abandoned and its day freed: past the longest run settings
+/// allow ([`VellevShadowConfig::known_items`] refuses longer).
+pub const KNOWN_ITEM_STALE: std::time::Duration = std::time::Duration::from_secs(6 * 3600);
+
 impl VellevShadowConfig {
     /// Every key under `[vellev.shadow]` this hub does not know, each with
     /// the table it is in: `("[vellev.shadow.memories]", "sample_rate")`,
@@ -1745,7 +1812,88 @@ impl VellevShadowConfig {
         ] {
             keys.extend(config.unknown.keys().map(|k| (table, k.clone())));
         }
+        keys.extend(
+            self.known_items
+                .unknown
+                .keys()
+                .map(|k| ("[vellev.shadow.known_items]", k.clone())),
+        );
+        keys.extend(
+            self.judge
+                .unknown
+                .keys()
+                .map(|k| ("[vellev.shadow.judge]", k.clone())),
+        );
         keys
+    }
+
+    /// The judge's daily cap when it is on, `None` when off; `Err` naming
+    /// a cap that cannot be used.
+    pub fn judge_cap(&self) -> eyre::Result<Option<usize>> {
+        let cap = self.judge.daily_cap.unwrap_or(200);
+        if !(1..=1000).contains(&cap) {
+            eyre::bail!(
+                "[vellev.shadow.judge] daily_cap must be from 1 to 1000, not {cap}: the artifact known-item queries an LLM judges a UTC day"
+            );
+        }
+        Ok(self.judge.enabled.then_some(cap))
+    }
+
+    /// The known-item runs' settings, or `Err` naming the value that cannot
+    /// be used.
+    ///
+    /// Each pool at most 5,000 items. A run takes at least its items times
+    /// `pace` (each item also costs its embedding and recalls), so settings
+    /// whose items times `pace` reach [`KNOWN_ITEM_STALE`] are refused: such
+    /// a run would be taken for abandoned while still under way.
+    pub fn known_items(&self) -> eyre::Result<KnownItemSettings> {
+        let c = &self.known_items;
+        let table = "[vellev.shadow.known_items]";
+        let items = c.items.unwrap_or(1000);
+        if items > 5_000 {
+            eyre::bail!(
+                "{table} items must be from 0 to 5000, not {items}: the memories each night's known-item run draws (0 runs none)"
+            );
+        }
+        let unscoped_items = c.unscoped_items.unwrap_or(250);
+        if unscoped_items > 5_000 {
+            eyre::bail!(
+                "{table} unscoped_items must be from 0 to 5000, not {unscoped_items}: the memories filed under no identity each night's run draws"
+            );
+        }
+        let hour_utc = c.hour_utc.unwrap_or(2);
+        if hour_utc > 23 {
+            eyre::bail!(
+                "{table} hour_utc must be from 0 to 23, not {hour_utc}: the UTC hour from which the night's known-item run may start"
+            );
+        }
+        let until_hour_utc = c.until_hour_utc.unwrap_or(6);
+        if until_hour_utc > 24 || until_hour_utc <= hour_utc {
+            eyre::bail!(
+                "{table} until_hour_utc must be after hour_utc ({hour_utc}) and at most 24, not {until_hour_utc}: the UTC hour before which the night's run must start"
+            );
+        }
+        let pace_ms = c.pace_ms.unwrap_or(250);
+        if pace_ms > 10_000 {
+            eyre::bail!(
+                "{table} pace_ms must be from 0 to 10000, not {pace_ms}: the pause between two known items"
+            );
+        }
+        let pace = std::time::Duration::from_millis(pace_ms);
+        let least = pace.saturating_mul(u32::try_from(items + unscoped_items).unwrap_or(u32::MAX));
+        if least >= KNOWN_ITEM_STALE {
+            eyre::bail!(
+                "{table} pace_ms of {pace_ms} with {items} and {unscoped_items} items makes a run of at least {least:?}, past the {KNOWN_ITEM_STALE:?} after which a run is taken for abandoned: lower pace_ms or the items"
+            );
+        }
+        Ok(KnownItemSettings {
+            items,
+            unscoped_items,
+            seed: c.seed.unwrap_or(0),
+            hour_utc,
+            until_hour_utc,
+            pace,
+        })
     }
 
     /// How often memories' replica is reconciled, or `Err` naming the
@@ -10509,6 +10657,8 @@ impl WorkforceConfig {
             self.vellev.shadow.settings(store)?;
         }
         self.vellev.shadow.memory_reconcile()?;
+        self.vellev.shadow.known_items()?;
+        self.vellev.shadow.judge_cap()?;
         for (table, key) in self.vellev.shadow.unknown_keys() {
             tracing::warn!(
                 table,

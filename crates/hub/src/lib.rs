@@ -200,6 +200,9 @@ pub mod store_tool;
 
 /// Re-export parse_relative_time for CLI use.
 pub use scheduler_tool::parse_relative_time as scheduler_tool_parse_relative_time;
+pub mod artifact_known_items;
+pub mod known_item_judge;
+pub mod known_items;
 pub mod memory_erasure;
 pub mod memory_mirror;
 pub mod memory_shadow;
