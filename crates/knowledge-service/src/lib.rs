@@ -12,14 +12,14 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use dashmap::DashSet;
-use eyre::Result;
+use eyre::{Result, WrapErr};
 use futures::StreamExt;
 use tracing::{info, warn};
 use uuid::Uuid;
 
 use workforce_codebase_knowledge::completeness::{IndexCompleteness, NextAction};
 use workforce_codebase_knowledge::graph::vectors::{FillStage, VectorFill};
-use workforce_codebase_knowledge::graph::{CodeGraph, RepositoryRow};
+use workforce_codebase_knowledge::graph::{CodeGraph, RepositoryRow, VectorKeys};
 use workforce_codebase_knowledge::indexer::crawler::CrawlerConfig;
 use workforce_codebase_knowledge::indexer::fill::{VectorFiller, Verified, Verifying, FILL_PAGE};
 use workforce_codebase_knowledge::indexer::summary_generator::{SummaryGenerator, SummaryLlm};
@@ -316,6 +316,17 @@ impl<'a> VectorBackend<'a> {
         }
     }
 
+    /// The database's name, as `[knowledge] vector_backend` gives it and
+    /// the graph keeps its vector state under (see [`VectorKeys`]).
+    fn key(&self) -> &'static str {
+        match self {
+            Self::Weaviate(_) => VectorKeys::WEAVIATE,
+            Self::Vellev(_) => VectorKeys::VELLEV,
+            // A given store says which database it is.
+            Self::Given(store) => store.backend(),
+        }
+    }
+
     /// The database's name, as logs give it.
     fn label(&self) -> &'static str {
         match self {
@@ -418,7 +429,13 @@ impl KnowledgeService {
         let knowledge_dir = data_dir.join(".workforce").join("knowledge");
         std::fs::create_dir_all(&knowledge_dir)?;
         let db_path = knowledge_dir.join("codegraph.db");
-        let graph = build_code_graph(&db_path, codegraph_config, postgres_config)?;
+        // Its vector state is kept as the database in use's, with the
+        // standby told of every file changed: a standby that is no
+        // database, or the one in use, is refused.
+        let standby = Some(config.vector_standby.trim()).filter(|standby| !standby.is_empty());
+        let keys =
+            VectorKeys::new(vectors.key(), standby).wrap_err("[knowledge] vector_standby")?;
+        let graph = build_code_graph(&db_path, codegraph_config, postgres_config)?.keyed(keys);
         let graph = Arc::new(graph);
 
         // A vector store that cannot be made leaves the code graph and its
@@ -968,7 +985,7 @@ impl KnowledgeService {
     ) -> Result<VectorBackfill> {
         let mut pass = VectorBackfill::default();
         let Some(filler) = self.filler(run.pace) else {
-            return Ok(pass);
+            return self.drain(only, run.pace).await;
         };
         let mut jobs: Vec<Job> = Vec::new();
         let mut scanned: Option<Instant> = None;
@@ -1063,7 +1080,10 @@ impl KnowledgeService {
     /// As [`Self::spawn_vector_backfill`], waiting `retry` at first after
     /// a pass that failed and `watch` after one that did not.
     pub fn spawn_vector_backfill_paced(self: &Arc<Self>, retry: Duration, watch: Duration) {
-        if self.filler(self.fill_pace).is_none() {
+        // A store that keeps no track is not filled, but has the files
+        // noted for it while it was the standby put right (see
+        // [`Self::drain`]).
+        if self.vector_store.is_none() {
             return;
         }
         self.keeping
@@ -1099,6 +1119,70 @@ impl KnowledgeService {
                 }
             }
         });
+    }
+
+    /// For a store that keeps no track of its vectors' completeness, as
+    /// Weaviate's: put right, file by file, the files noted pending for it
+    /// (of every repo, or of `only`), as they were noted while it was the
+    /// standby ([`VectorKeys::standby`]); nothing else, for it is never
+    /// filled. A repo being indexed is left for the next pass, as is one
+    /// whose files are noted again as fast as they are put right; each
+    /// takes [`FILL_TURN`] a page at a time, as a fill does.
+    async fn drain(&self, only: Option<&str>, pace: FillPace) -> Result<VectorBackfill> {
+        let mut pass = VectorBackfill::default();
+        let Some(store) = self.vector_store.as_ref() else {
+            return Ok(pass);
+        };
+        let filler = VectorFiller::new(Arc::clone(&self.graph), Arc::clone(store));
+        for repo in self.graph.list_repositories().await? {
+            if only.is_some_and(|only| only != repo.id) {
+                continue;
+            }
+            let mut left = self.graph.count_vectors_pending(&repo.id).await?;
+            if left == 0 {
+                continue;
+            }
+            if let Some(lease) = self.graph.get_lease(&repo.id).await? {
+                if lease.is_fresh(now_ms()) {
+                    pass.failed.push(repo.id);
+                    continue;
+                }
+            }
+            let settled = loop {
+                let _turn = FILL_TURN.lock().await;
+                let page = tokio::time::timeout(pace.page_timeout, filler.settle_pending(&repo.id));
+                match page.await {
+                    Ok(Ok(0)) => break Ok(()),
+                    Ok(Ok(now)) if now < left => left = now,
+                    Ok(Ok(now)) => {
+                        break Err(eyre::eyre!(
+                            "{now} files of '{}' are noted again as fast as they are put right",
+                            repo.id
+                        ))
+                    }
+                    Ok(Err(e)) => break Err(e),
+                    Err(_) => {
+                        break Err(eyre::eyre!(
+                            "a page of the pending files of '{}' was not put right within {:?}",
+                            repo.id,
+                            pace.page_timeout
+                        ))
+                    }
+                }
+            };
+            match settled {
+                Ok(()) => {
+                    self.fill_errors.remove(&repo.id);
+                    pass.filled.push(repo.id);
+                }
+                Err(e) => {
+                    warn!(repo_id = %repo.id, "code vectors noted pending not put right: {e:#}");
+                    self.fill_errors.insert(repo.id.clone(), format!("{e:#}"));
+                    pass.failed.push(repo.id);
+                }
+            }
+        }
+        Ok(pass)
     }
 
     /// Trigger a full index of a specific path. Acquires a persistent
@@ -1557,6 +1641,221 @@ mod tests {
         )
         .unwrap();
         (root, service)
+    }
+
+    /// A store like Weaviate's, keeping no track of its vectors'
+    /// completeness, that records what is put right in it, file by file.
+    #[derive(Default)]
+    struct Untracked {
+        dropped: std::sync::Mutex<Vec<String>>,
+        indexed: std::sync::atomic::AtomicUsize,
+        /// Said to be another database than Weaviate.
+        named: Option<&'static str>,
+    }
+
+    #[async_trait::async_trait]
+    impl CodeVectorStore for Untracked {
+        fn backend(&self) -> &'static str {
+            self.named.unwrap_or(VectorKeys::WEAVIATE)
+        }
+        async fn ensure_collections(&self) -> Result<()> {
+            Ok(())
+        }
+        async fn health_check(&self) -> Result<bool> {
+            Ok(true)
+        }
+        fn base_url(&self) -> &str {
+            "http://weaviate"
+        }
+        fn set_insert_error_sink(
+            &self,
+            _: Arc<dyn workforce_codebase_knowledge::vector::health::InsertErrorSink>,
+        ) {
+        }
+        async fn index_entities(
+            &self,
+            entities: &[workforce_codebase_knowledge::vector::VectorCodeEntity],
+        ) -> Result<usize> {
+            self.indexed
+                .fetch_add(entities.len(), std::sync::atomic::Ordering::SeqCst);
+            Ok(entities.len())
+        }
+        async fn search_entities(
+            &self,
+            _: &str,
+            _: Option<&str>,
+            _: Option<workforce_codebase_knowledge::graph::entities::EntityKind>,
+            _: usize,
+        ) -> Result<Vec<workforce_codebase_knowledge::vector::VectorSearchResult>> {
+            Ok(Vec::new())
+        }
+        async fn delete_repo_entities(
+            &self,
+            _: &str,
+        ) -> Result<workforce_codebase_knowledge::vector::DeleteOutcome> {
+            Ok(Default::default())
+        }
+        async fn delete_entities_by_file(
+            &self,
+            _: &str,
+            file: &str,
+        ) -> Result<workforce_codebase_knowledge::vector::DeleteOutcome> {
+            self.dropped.lock().unwrap().push(file.to_string());
+            Ok(Default::default())
+        }
+        async fn index_summaries(
+            &self,
+            summaries: &[workforce_codebase_knowledge::vector::VectorCodeSummary],
+        ) -> Result<usize> {
+            Ok(summaries.len())
+        }
+        async fn delete_repo_summaries(
+            &self,
+            _: &str,
+        ) -> Result<workforce_codebase_knowledge::vector::DeleteOutcome> {
+            Ok(Default::default())
+        }
+        async fn delete_summaries_by_file(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<workforce_codebase_knowledge::vector::DeleteOutcome> {
+            Ok(Default::default())
+        }
+        async fn entity_count(&self, _: &str) -> Result<usize> {
+            Ok(0)
+        }
+    }
+
+    /// A repo of one file, on a service keeping its code vectors in
+    /// `store`, with `standby` as `[knowledge] vector_standby`.
+    fn service_on(
+        dir: &Path,
+        store: Arc<dyn CodeVectorStore>,
+        standby: &str,
+    ) -> Result<(PathBuf, KnowledgeService)> {
+        let root = dir.join("repo");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src/config.rs"),
+            "/// Reads the configuration.\npub fn parse_config(path: &str) -> String {\n    path.to_string()\n}\n\n/// Sends a message.\npub fn send_email(to: &str) -> bool {\n    !to.is_empty()\n}\n",
+        )
+        .unwrap();
+        let config = KnowledgeConfig {
+            vector_backfill_per_sec: 0,
+            vector_standby: standby.into(),
+            ..KnowledgeConfig::default()
+        };
+        let service = KnowledgeService::new_with_backend(
+            root.clone(),
+            dir.join("data"),
+            &config,
+            VectorBackend::Given(store),
+            &CodegraphConfig::default(),
+            None,
+            None,
+        )?;
+        Ok((root, service))
+    }
+
+    /// The graph keeps its vector state as the database in use's, with the
+    /// standby named in `[knowledge] vector_standby`; one that is no
+    /// database, or the one in use, is refused.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_graph_keeps_vector_state_for_the_database_in_use_and_its_standby() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, service) =
+            service_on(dir.path(), Arc::new(Untracked::default()), "vellev").unwrap();
+        let keys = service.graph().vector_keys();
+        assert_eq!(
+            (keys.active(), keys.standby()),
+            ("weaviate", Some("vellev"))
+        );
+        let (_, service) = service_on(dir.path(), Arc::new(Untracked::default()), " ").unwrap();
+        assert_eq!(service.graph().vector_keys().standby(), None);
+        for refused in ["weaviate", "qdrant"] {
+            let made = service_on(dir.path(), Arc::new(Untracked::default()), refused);
+            let error = format!("{:#}", made.err().expect("refused"));
+            assert!(error.contains("vector_standby"), "{error}");
+        }
+    }
+
+    /// A given store's database is the one it names, not one told from how
+    /// it behaves: a store keeping no track that says it is vellev's is
+    /// keyed as vellev's.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_given_store_is_keyed_as_the_database_it_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let named = Untracked {
+            named: Some(VectorKeys::VELLEV),
+            ..Untracked::default()
+        };
+        assert!(!named.tracks_completeness());
+        let (_, service) = service_on(dir.path(), Arc::new(named), "weaviate").unwrap();
+        let keys = service.graph().vector_keys();
+        assert_eq!(
+            (keys.active(), keys.standby()),
+            ("vellev", Some("weaviate"))
+        );
+    }
+
+    /// With Weaviate in use again, the files noted for it while it was the
+    /// standby are put right in it, file by file, by the backfill, and
+    /// taken off; what is noted for vellev, now the standby, is left.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_files_noted_for_a_store_that_keeps_no_track_are_put_right_in_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Untracked::default());
+        let (root, service) = service_on(
+            dir.path(),
+            Arc::clone(&store) as Arc<dyn CodeVectorStore>,
+            "vellev",
+        )
+        .unwrap();
+        service.trigger_full_index_for(&root).await.unwrap();
+        let repo = KnowledgeService::repo_id_for(&root);
+        // As the switch back finds them: noted for Weaviate while vellev
+        // was in use, and for vellev since.
+        let files = ["src/config.rs".to_string()];
+        service
+            .graph()
+            .note_vectors_pending_in(&["weaviate", "vellev"], &repo, &files)
+            .await
+            .unwrap();
+        store.dropped.lock().unwrap().clear();
+        let before = store.indexed.load(std::sync::atomic::Ordering::SeqCst);
+
+        let pass = service.backfill_vectors().await.unwrap();
+        assert_eq!(pass.filled, std::slice::from_ref(&repo));
+        assert!(pass.failed.is_empty());
+        assert_eq!(*store.dropped.lock().unwrap(), files);
+        let entities = service
+            .graph()
+            .find_entities_in_file(&repo, "src/config.rs")
+            .await
+            .unwrap()
+            .len();
+        assert!(entities >= 2);
+        assert_eq!(
+            store.indexed.load(std::sync::atomic::Ordering::SeqCst) - before,
+            entities
+        );
+        assert_eq!(
+            service.graph().count_vectors_pending(&repo).await.unwrap(),
+            0
+        );
+        assert_eq!(
+            service
+                .graph()
+                .count_vectors_pending_in("vellev", &repo)
+                .await
+                .unwrap(),
+            1,
+            "the standby's are left"
+        );
+        // Nothing noted: nothing done.
+        let pass = service.backfill_vectors().await.unwrap();
+        assert!(pass.filled.is_empty() && pass.failed.is_empty());
     }
 
     /// With a node that does not answer, a full index still indexes the
