@@ -5,14 +5,25 @@
 //! `pause` and `resume` change nothing: `[vellev.shadow] paused` is read
 //! once at start-up, so they print the config change and the restart it
 //! needs (a live switch would be a mechanism of its own, not built).
+//!
+//! `promote` and `rollback` (DW-676, PR 11) hand a shadowed store to
+//! vellev, or back to Weaviate, with every hub stopped.
 
 use std::path::Path;
+use std::sync::Arc;
 
 use chrono::{NaiveDate, Utc};
 use clap::Subcommand;
 use eyre::{eyre, Result};
 use workforce_common::settings::WorkforceConfig;
 use workforce_hub::{shadow_admin, shadow_report, shadow_status};
+
+/// A store shadow mode compares on vellev.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum ShadowedStore {
+    Memories,
+    Artifacts,
+}
 
 #[derive(Subcommand)]
 pub enum ShadowCommand {
@@ -55,6 +66,31 @@ pub enum ShadowCommand {
     },
     /// Print how to resume shadow mode: nothing is changed.
     Resume {
+        #[arg(short, long, default_value = "workforce.toml")]
+        config: std::path::PathBuf,
+    },
+    /// Make vellev serve a shadowed store, with every hub stopped: refused
+    /// unless no hub runs, the week's verdict passed, and a last reconcile
+    /// and a second, clean pass leave nothing to fix. Run on the shadow
+    /// config, then switch the store's backend to "vellev" and start the
+    /// hubs. See docs/vellev.md, "Promoting vellev".
+    Promote {
+        store: ShadowedStore,
+        /// Workforce config file: the shadow config the hubs ran on.
+        #[arg(short, long, default_value = "workforce.toml")]
+        config: std::path::PathBuf,
+        /// Promote the artifact index on a "too few to judge" verdict: the
+        /// owner's sign-off under A14 (design r2 section 6.5). Never for
+        /// memories.
+        #[arg(long)]
+        accept_too_few: bool,
+    },
+    /// Hand a promoted store back to Weaviate, with every hub stopped:
+    /// memories written on vellev since the promotion are carried back
+    /// first. Run on the shadow config the hubs start on again.
+    Rollback {
+        store: ShadowedStore,
+        /// Workforce config file.
         #[arg(short, long, default_value = "workforce.toml")]
         config: std::path::PathBuf,
     },
@@ -125,6 +161,49 @@ pub async fn handle(command: ShadowCommand) -> Result<()> {
             } else {
                 print!("{}", shadow_report::to_text(&report));
             }
+        }
+        ShadowCommand::Promote {
+            store,
+            config,
+            accept_too_few,
+        } => promote(store, &config, accept_too_few).await?,
+        ShadowCommand::Rollback { store, config } => {
+            use workforce_hub::promotion;
+            let say = |done: &str| println!("  {done}");
+            let wf_config = WorkforceConfig::load(&config)?;
+            match store {
+                ShadowedStore::Memories => promotion::rollback_memories(&wf_config, &say).await?,
+                ShadowedStore::Artifacts => promotion::rollback_artifacts(&wf_config, &say).await?,
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn promote(store: ShadowedStore, config: &Path, accept_too_few: bool) -> Result<()> {
+    use workforce_hub::promotion;
+    let say = |done: &str| println!("  {done}");
+    let wf_config = WorkforceConfig::load(config)?;
+    let verdicts: Arc<dyn promotion::VerdictSource> = Arc::new(promotion::Unrecorded);
+    match store {
+        ShadowedStore::Memories if accept_too_few => {
+            eyre::bail!(
+                "--accept-too-few is for the artifact index only: memories are promoted on a pass"
+            )
+        }
+        ShadowedStore::Memories => {
+            promotion::promote_memories(&wf_config, verdicts, &say).await?;
+            println!(
+                "Next: set [memory] backend = \"vellev\" in {} and start the hubs.",
+                config.display()
+            );
+        }
+        ShadowedStore::Artifacts => {
+            promotion::promote_artifacts(&wf_config, verdicts, accept_too_few, &say).await?;
+            println!(
+                "Next: set [artifacts] index_backend = \"vellev\" in {} and start the hubs.",
+                config.display()
+            );
         }
     }
     Ok(())

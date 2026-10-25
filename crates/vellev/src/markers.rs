@@ -210,6 +210,12 @@ pub async fn mark_promoted(tenant: &Tenant, name: &str) -> Result<()> {
     INDEXES.mark(tenant, &promotion(name)).await
 }
 
+/// Take away the mark of memories' promotion to `name`, if it has one: a
+/// rollback, once everything written there since is carried back.
+pub async fn unmark_promoted(tenant: &Tenant, name: &str) -> Result<()> {
+    INDEXES.unmark(tenant, &promotion(name)).await
+}
+
 /// Whether the index `name` is marked complete in `tenant`.
 pub async fn index_marked(tenant: &Tenant, name: &str) -> Result<bool> {
     INDEXES.marked(tenant, name).await

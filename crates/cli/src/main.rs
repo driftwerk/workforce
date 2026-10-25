@@ -512,7 +512,8 @@ enum Commands {
         command: MemoryCommand,
     },
     /// Shadow mode (Weaviate serving, vellev compared): status, the weekly
-    /// report against the exit criteria, and how to pause or resume.
+    /// report against the exit criteria, how to pause or resume, and
+    /// promoting vellev to serve a shadowed store or rolling it back.
     Shadow {
         #[command(subcommand)]
         command: shadow::ShadowCommand,
@@ -3659,6 +3660,11 @@ rules:
 
             // Before anything can dispatch a command as the agent uid.
             workforce_hub::private_state::close_hub_state(&wf_config);
+
+            // Never serve the artifact index from vellev while a shadow of
+            // it is kept or not promoted (DW-676). Memories are guarded
+            // where they are opened.
+            guard_before_serving(&wf_config).await?;
 
             // Install the process-wide secret cache before any agent is
             // built. The cache backs `tokenize_secrets` at every ingress
@@ -12283,6 +12289,13 @@ fn memory_store_url(config: &workforce_common::settings::WorkforceConfig) -> &st
     }
 }
 
+/// What `serve` refuses before it starts anything: the artifact index
+/// served from vellev while a shadow of it is kept or not promoted
+/// (DW-676). Memories are guarded where they are opened.
+async fn guard_before_serving(config: &workforce_common::settings::WorkforceConfig) -> Result<()> {
+    workforce_hub::promotion::guard_artifacts(config).await
+}
+
 async fn handle_memory_command(command: MemoryCommand) -> Result<()> {
     use workforce_common::settings::WorkforceConfig;
 
@@ -12800,6 +12813,32 @@ where
         config.display()
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod serve_guard_tests {
+    /// `serve` refuses the artifact index from vellev when whether it was
+    /// promoted cannot be read: never served on facts unread.
+    #[tokio::test]
+    async fn serve_refuses_vellev_artifacts_on_facts_it_cannot_read() {
+        let mut config = workforce_common::settings::WorkforceConfig::default();
+        config.artifacts.index_backend = "vellev".into();
+        config.postgres = Some(workforce_common::postgres::PostgresConfig {
+            enabled: true,
+            url: Some("postgres://nobody@127.0.0.1:1/none".into()),
+            connect_timeout_secs: 1,
+            ..Default::default()
+        });
+        let refused = super::guard_before_serving(&config)
+            .await
+            .expect_err("refused");
+        assert!(
+            format!("{refused:#}").contains("is not served from vellev"),
+            "{refused:#}"
+        );
+        config.artifacts.index_backend = "weaviate".into();
+        super::guard_before_serving(&config).await.unwrap();
+    }
 }
 
 #[cfg(test)]
