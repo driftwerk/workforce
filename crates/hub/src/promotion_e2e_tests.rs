@@ -153,7 +153,7 @@ async fn memories_promoted_are_served_from_vellev_alone_and_rolled_back_whole() 
         config.postgres = Some(pg);
         config.check_memory_backend().expect("accepted");
 
-        // Weaviate serving, switched long ago, as in production; written
+        // Weaviate serving, switched long ago, as on a long-running install; written
         // to as a CLI write is, which the reconcile alone carries over.
         let (_, serving) = crate::embeddings::shadow_stores(&config).await.unwrap();
         serving.ensure_collection().await.unwrap();
