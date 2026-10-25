@@ -1,4 +1,4 @@
--- Decision records: what each
+-- Decision records (docs/decision-backends-design.md, decision 14): what each
 -- decision was asked and what came back, for training and judging an
 -- install's own decision model. One table for every use. `input` holds what a
 -- person or a step said, so nothing but the offline export reads it.

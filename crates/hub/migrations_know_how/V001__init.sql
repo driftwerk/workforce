@@ -1,4 +1,4 @@
--- Agent know-how. Entries hold only names
+-- Agent know-how (docs/agent-know-how-design.md). Entries hold only names
 -- checked against something real; people are stored as per-agent hashes.
 
 CREATE TABLE IF NOT EXISTS entries (
