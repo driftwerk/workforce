@@ -10,4 +10,4 @@
 
 - [ ] `cargo fmt`, `cargo clippy -D warnings` and the tests pass locally
 - [ ] No credentials, customer data or real names in code or fixtures
-- [ ] I have signed the [CLA](https://github.com/driftwerk/workforce/blob/main/CLA.md) (the bot will ask on your first PR)
+- [ ] I agree to the contribution terms in [CONTRIBUTING.md](https://github.com/driftwerk/workforce/blob/main/CONTRIBUTING.md#licence)
