@@ -293,6 +293,13 @@ pub trait CodeVectorStore: Send + Sync {
         false
     }
 
+    /// Which vector database this is, as `[knowledge] vector_backend`
+    /// names it ([`crate::graph::VectorKeys::WEAVIATE`] or
+    /// [`crate::graph::VectorKeys::VELLEV`]): what the graph keeps its fills
+    /// and pending files under while the store is in use. Each store says
+    /// so itself; it is never told from how the store behaves.
+    fn backend(&self) -> &'static str;
+
     /// Which making of its entity collection the store now has: another
     /// once the collection was dropped, or left out of a restored backup,
     /// and made again, empty. What the graph records as complete is
@@ -757,6 +764,10 @@ impl WeaviateCodeVectorStore {
 
 #[async_trait]
 impl CodeVectorStore for WeaviateCodeVectorStore {
+    fn backend(&self) -> &'static str {
+        crate::graph::VectorKeys::WEAVIATE
+    }
+
     /// Ensure both CodeEntity and CodeSummary collections exist.
     async fn ensure_collections(&self) -> Result<()> {
         self.ensure_code_entity_collection().await?;
