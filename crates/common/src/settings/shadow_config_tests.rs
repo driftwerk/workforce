@@ -372,6 +372,16 @@ fn an_unknown_shadow_key_is_warned_of_by_name_and_the_config_still_loads() {
             "[vellev.shadow.artifacts]",
             "watch_secs",
         ),
+        (
+            "[vellev.shadow.judge]\nenable = true\n",
+            "[vellev.shadow.judge]",
+            "enable",
+        ),
+        (
+            "[vellev.shadow.known_items]\nitem = 10\n",
+            "[vellev.shadow.known_items]",
+            "item",
+        ),
         // A misspelled table is as loud as a misspelled key.
         (
             "[vellev.shadow.memory]\nsample = 0.5\n",
@@ -507,6 +517,102 @@ fn the_memory_reconcile_interval_is_15_minutes_unless_set_within_bounds() {
             refused.contains("[vellev.shadow] memory_reconcile_secs")
                 && refused.contains("60 to 86400"),
             "{secs}: {refused}"
+        );
+    }
+}
+
+/// The known-item runs draw 1,000 memories a night, and 250 filed under no
+/// identity, from 02:00 to 06:00 UTC, a quarter second apart, from seed 0,
+/// unless set; 0 items runs none; a value out of bounds, a window that is
+/// none, or a run so long that it would be taken for abandoned is refused
+/// by name, when the config is read.
+#[test]
+fn known_item_runs_have_the_plans_defaults_and_refuse_values_out_of_bounds() {
+    let read = |toml: &str| {
+        WorkforceConfig::from_toml(toml)
+            .unwrap()
+            .vellev
+            .shadow
+            .known_items()
+    };
+    assert_eq!(
+        read("").unwrap(),
+        KnownItemSettings {
+            items: 1000,
+            unscoped_items: 250,
+            seed: 0,
+            hour_utc: 2,
+            until_hour_utc: 6,
+            pace: std::time::Duration::from_millis(250),
+        }
+    );
+    assert_eq!(
+        read("[vellev.shadow.known_items]\nitems = 0\nunscoped_items = 0\nseed = 42\nhour_utc = 22\nuntil_hour_utc = 24\npace_ms = 0\n")
+            .unwrap(),
+        KnownItemSettings {
+            items: 0,
+            unscoped_items: 0,
+            seed: 42,
+            hour_utc: 22,
+            until_hour_utc: 24,
+            pace: std::time::Duration::ZERO,
+        }
+    );
+    for (toml, named) in [
+        ("items = 5001", "items"),
+        ("unscoped_items = 5001", "unscoped_items"),
+        ("hour_utc = 24", "hour_utc"),
+        ("until_hour_utc = 25", "until_hour_utc"),
+        ("hour_utc = 6\nuntil_hour_utc = 6", "until_hour_utc"),
+        ("pace_ms = 10001", "pace_ms"),
+        // 5,000 and 5,000 items, 2.2 s apart, past six hours.
+        (
+            "items = 5000\nunscoped_items = 5000\npace_ms = 2200",
+            "pace_ms",
+        ),
+    ] {
+        let refused = refused(&format!("[vellev.shadow.known_items]\n{toml}\n"));
+        assert!(
+            refused.contains(&format!("[vellev.shadow.known_items] {named}")),
+            "{toml}: {refused}"
+        );
+    }
+    // Just within: 4,000 items 5.3 s apart is 5.9 hours.
+    assert!(read(
+        "[vellev.shadow.known_items]\nitems = 4000\nunscoped_items = 0\npace_ms = 5300\n"
+    )
+    .is_ok());
+}
+
+/// The judge is off unless set; on, it judges 200 queries a day unless
+/// set; a cap outside 1 to 1000 is refused by name, on or off.
+#[test]
+fn the_judge_is_off_unless_set_and_its_cap_is_bounded() {
+    let read = |toml: &str| {
+        WorkforceConfig::from_toml(toml)
+            .unwrap()
+            .vellev
+            .shadow
+            .judge_cap()
+    };
+    assert_eq!(read("").unwrap(), None);
+    assert_eq!(
+        read("[vellev.shadow.judge]\ndaily_cap = 50\n").unwrap(),
+        None
+    );
+    assert_eq!(
+        read("[vellev.shadow.judge]\nenabled = true\n").unwrap(),
+        Some(200)
+    );
+    assert_eq!(
+        read("[vellev.shadow.judge]\nenabled = true\ndaily_cap = 1000\n").unwrap(),
+        Some(1000)
+    );
+    for cap in [0, 1001] {
+        let refused = refused(&format!("[vellev.shadow.judge]\ndaily_cap = {cap}\n"));
+        assert!(
+            refused.contains("[vellev.shadow.judge] daily_cap") && refused.contains("1 to 1000"),
+            "{cap}: {refused}"
         );
     }
 }

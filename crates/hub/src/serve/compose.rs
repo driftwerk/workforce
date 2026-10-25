@@ -4952,6 +4952,9 @@ pub async fn open_artifact_mirror(
             // to go: the mirror is kept either way.
             match artifact_read_shadow(config).await {
                 Ok((reader, shadow)) => {
+                    // Shared with the known-item runs, whose items take
+                    // its permits.
+                    let _ = ARTIFACT_SHADOW.set(Arc::clone(&shadow));
                     if let Err(e) = store.shadow_reads(&mirror, reader, shadow) {
                         error!(error = ?e, "Artifact searches are not shadowed");
                     }
@@ -5044,6 +5047,24 @@ pub(super) fn artifact_shadow_kernel(
     let shadow = workforce_common::shadow::Shadow::new("artifacts", settings, sink)?;
     shadow.set_enabled(!config.vellev.shadow.paused);
     Ok(shadow)
+}
+
+/// The kernel that shadows this hub's artifact searches, once made.
+static ARTIFACT_SHADOW: std::sync::OnceLock<Arc<workforce_common::shadow::Shadow>> =
+    std::sync::OnceLock::new();
+
+/// The kernel that shadows this hub's artifact searches, once the mirror
+/// is open and its reads shadowed: what the artifacts' known-item runs
+/// take their permits from.
+pub fn artifact_shadow() -> Option<Arc<workforce_common::shadow::Shadow>> {
+    ARTIFACT_SHADOW.get().cloned()
+}
+
+/// Whether the artifact mirror is in step, as the read shadow judges it
+/// (`search == "index"` and not found out of step): `false` with none.
+pub fn artifact_mirror_in_step() -> bool {
+    artifact_mirror_state()
+        .is_some_and(|(state, _)| state.search == Some("index") && state.in_step != Some(false))
 }
 
 /// The mirror's state as its keeper last knew it, and its lease; `None`

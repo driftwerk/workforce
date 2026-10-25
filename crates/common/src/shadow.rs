@@ -144,7 +144,19 @@ pub enum Outcome {
 pub struct Comparison {
     pub store: &'static str,
     pub primary: Observed,
+    /// From the shadow's task starting to its ending: the asking, under
+    /// the deadline. Its wait to be scheduled is in `queued`, not here.
     pub shadow_latency: Duration,
+    /// From the shadow being admitted, in [`Shadow::observe`], to its task
+    /// starting: the wait for the runtime, outside `shadow_latency`.
+    pub queued: Duration,
+    /// Of `shadow_latency`, the time spent in the index's own calls
+    /// ([`index_call`]) when the shadow answered; `None` when it made none,
+    /// or did not answer.
+    pub index: Option<Duration>,
+    /// Shadows of this store running when this one was admitted, itself
+    /// included: 1 when it ran alone.
+    pub concurrent: usize,
     pub outcome: Outcome,
     /// Whether this was the breaker's one probe after a rest.
     pub probe: bool,
@@ -174,6 +186,9 @@ impl ShadowSink for TracingSink {
                 shadow_count = ranked.ids.len(),
                 primary_ms = c.primary.latency.as_millis() as u64,
                 shadow_ms = c.shadow_latency.as_millis() as u64,
+                index_ms = c.index.map(|index| index.as_millis() as u64),
+                queue_ms = c.queued.as_millis() as u64,
+                concurrent = c.concurrent,
                 "shadow compared"
             ),
             other => tracing::debug!(
@@ -253,6 +268,8 @@ pub struct Shadow {
     enabled: AtomicBool,
     sample: f64,
     permits: Arc<Semaphore>,
+    /// How many permits there are, to tell how many are held.
+    permit_count: usize,
     deadline: Duration,
     breaker: Arc<Breaker>,
     k: usize,
@@ -287,6 +304,7 @@ impl Shadow {
             enabled: AtomicBool::new(true),
             sample: s.sample,
             permits: Arc::new(Semaphore::new(s.permits)),
+            permit_count: s.permits,
             deadline: s.deadline,
             breaker: Arc::new(Breaker::new(s.trip_after, s.rest)),
             k: s.k,
@@ -303,6 +321,25 @@ impl Shadow {
 
     pub fn enabled(&self) -> bool {
         self.enabled.load(Ordering::Relaxed)
+    }
+
+    /// One of the permits [`Self::observe`] draws on, waited for: for work
+    /// asked of both stores in the background, outside any request (the
+    /// known-item runs), which so shares with the live samples the bound
+    /// on how much is asked of vellev at once. `None` while the shadow is
+    /// paused. Neither the breaker nor the counts are touched: such work
+    /// is not a sample, and is recorded by whoever does it.
+    pub async fn permit(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        if !self.enabled() {
+            return None;
+        }
+        // The semaphore is never closed.
+        Arc::clone(&self.permits).acquire_owned().await.ok()
+    }
+
+    /// How long a shadow may take.
+    pub fn deadline(&self) -> Duration {
+        self.deadline
     }
 
     /// The breaker's state, for status reports.
@@ -359,6 +396,8 @@ impl Shadow {
             counts.busy.fetch_add(1, Ordering::Relaxed);
             return;
         };
+        // Taken after the permit, so this shadow is among them.
+        let concurrent = self.permit_count - self.permits.available_permits();
         let Some(ticket) = self.breaker.admit() else {
             counts.breaker_open.fetch_add(1, Ordering::Relaxed);
             return;
@@ -372,10 +411,16 @@ impl Shadow {
         let sink = Arc::clone(&self.sink);
         let counts = Arc::clone(&self.counts);
         let (k, rbo_p) = (self.k, self.rbo_p);
+        let admitted = Instant::now();
         runtime.spawn(async move {
             let _permit = permit;
             let began = Instant::now();
-            let asked = AssertUnwindSafe(async move { shadow().await }).catch_unwind();
+            let queued = began - admitted;
+            let timed = Arc::new(IndexTime::default());
+            let asked = AssertUnwindSafe(
+                INDEX_TIME.scope(Arc::clone(&timed), async move { shadow().await }),
+            )
+            .catch_unwind();
             let answered = tokio::time::timeout(deadline, asked).await;
             let shadow_latency = began.elapsed();
             let outcome = match answered {
@@ -408,15 +453,60 @@ impl Shadow {
                 }
             };
             tally.fetch_add(1, Ordering::Relaxed);
+            let index = match outcome {
+                Outcome::Answered { .. } => timed.total(),
+                _ => None,
+            };
             sink.record(Comparison {
                 store,
                 primary,
                 shadow_latency,
+                queued,
+                index,
+                concurrent,
                 outcome,
                 probe,
             });
         });
     }
+}
+
+/// The time a shadow's task spent in [`index_call`]s, summed: `None` until
+/// one ends.
+#[derive(Debug, Default)]
+struct IndexTime(parking_lot::Mutex<Option<Duration>>);
+
+impl IndexTime {
+    fn add(&self, took: Duration) {
+        let mut total = self.0.lock();
+        *total = Some(total.unwrap_or_default() + took);
+    }
+
+    fn total(&self) -> Option<Duration> {
+        *self.0.lock()
+    }
+}
+
+tokio::task_local! {
+    /// Set for the run of each shadow's future, and nowhere else.
+    static INDEX_TIME: Arc<IndexTime>;
+}
+
+/// Await `call`, a call to an index (a search, say), timing it when it is
+/// made by a shadow: the shadow's [`Comparison::index`] is the sum of the
+/// calls its task made, so that the rest of its time (embedding, decoding,
+/// waiting on anything else) can be told from the index's.
+///
+/// Elsewhere, the primary's calls included, it is `call` alone. A call
+/// made on a task the shadow spawned is not counted: the timing is the
+/// shadow's own task's.
+pub async fn index_call<F: Future>(call: F) -> F::Output {
+    let began = Instant::now();
+    let out = call.await;
+    let took = began.elapsed();
+    // Not in a shadow: nothing to add it to.
+    let _ = INDEX_TIME.try_with(|timed| timed.add(took));
+    out
 }
 
 /// How two rankings of ids agree to a depth `k`.

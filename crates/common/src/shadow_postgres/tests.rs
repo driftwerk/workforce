@@ -44,6 +44,9 @@ fn answered(store: &'static str, primary: &[&str], shadow: &[&str]) -> Compariso
             labels: vec![("same_model", "true".into())],
         },
         shadow_latency: Duration::from_millis(20),
+        queued: Duration::from_micros(1500),
+        index: Some(Duration::from_millis(14)),
+        concurrent: 3,
         outcome: Outcome::Answered { ranked: s, metrics },
         probe: false,
     }
@@ -63,6 +66,7 @@ fn unanswered(outcome: Outcome) -> Comparison {
     Comparison {
         outcome,
         probe: true,
+        index: None,
         ..answered("memories", &["a"], &["a"])
     }
 }
@@ -89,6 +93,41 @@ async fn until(what: &str, mut done: impl FnMut() -> bool) {
 }
 
 // ---- The sink ----------------------------------------------------------------
+
+/// Where the shadow's time went is kept in `labels`, beside the caller's
+/// own: the wait to be scheduled and the shadows running with it on every
+/// row, and the index's part of an answer's time when it was timed. A row
+/// without an index time has no `shadow_index_ms`, never a 0.
+#[test]
+fn a_rows_labels_say_where_the_shadows_time_went() {
+    let row = Row::of(&answered("memories", &["a"], &["a"]));
+    assert_eq!(
+        row.labels,
+        serde_json::json!({
+            "same_model": "true",
+            "shadow_queue_ms": 1.5,
+            "shadow_index_ms": 14.0,
+            "concurrent": 3,
+        })
+    );
+    for c in [
+        unanswered(Outcome::TimedOut),
+        Comparison {
+            index: None,
+            ..answered("memories", &["a"], &["a"])
+        },
+    ] {
+        let row = Row::of(&c);
+        assert_eq!(row.labels["shadow_queue_ms"], 1.5);
+        assert_eq!(row.labels["concurrent"], 3);
+        assert!(
+            row.labels.get("shadow_index_ms").is_none(),
+            "{:?}: {}",
+            c.outcome,
+            row.labels
+        );
+    }
+}
 
 /// What is recorded is written, each outcome as it went, and every sample
 /// is accounted for.

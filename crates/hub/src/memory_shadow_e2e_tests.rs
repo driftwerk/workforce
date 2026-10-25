@@ -24,6 +24,16 @@ use workforce_common::telemetry_postgres::PostgresTelemetryStore;
 use workforce_core::types::AgentId;
 use workforce_memory::types::{Memory, MemoryFilter, MemoryLayer};
 
+/// A known item's row as read back: item, alpha, both ranks, both errors.
+type KnownItemCells = (
+    String,
+    f32,
+    Option<i32>,
+    Option<i32>,
+    Option<String>,
+    Option<String>,
+);
+
 /// The Weaviate to use, or `None` to skip.
 fn weaviate() -> Option<String> {
     match std::env::var("WORKFORCE_TEST_WEAVIATE_URL") {
@@ -165,7 +175,11 @@ async fn a_hub_shadowing_memories_keeps_the_replica_compares_recalls_and_erases(
             let drain = CancellationToken::new();
             let shadow = crate::shadow::shared_store(&config).await.unwrap();
             let tasks = crate::memory_shadow::start(&config, shadow, None, drain.clone()).await;
-            assert_eq!(tasks.len(), 2, "the reconcile and the applier");
+            assert_eq!(
+                tasks.len(),
+                3,
+                "the reconcile, the applier and the known-item runs"
+            );
 
             // A write is noted, and the leader's applier copies it.
             let id = store
@@ -308,6 +322,108 @@ async fn a_hub_shadowing_memories_keeps_the_replica_compares_recalls_and_erases(
                 row.get::<_, Option<bool>>(1),
             );
             drop(conn);
+
+            // A known-item run, made by the runner the leader is given
+            // (`memory_shadow::known_items`), over these real stores: the
+            // memory long enough to draw comes back first on both, at
+            // both alphas, and the live shadow's record is untouched.
+            let long = store
+                .remember(
+                    Memory::new(
+                        "badgers dig wide tunnels beneath the orchard every autumn evening quietly",
+                        MemoryLayer::Episodic,
+                        AgentId::new("agent"),
+                    )
+                    .with_identity_id("bob"),
+                )
+                .await
+                .unwrap();
+            until(
+                Duration::from_secs(90),
+                "the long memory in the replica",
+                || {
+                    let (replica, id) = (Arc::clone(&replica), long.0.clone());
+                    async move {
+                        matches!(
+                            replica.objects_of_memory(&id, false).await,
+                            Ok(objects) if !objects.is_empty()
+                        )
+                    }
+                },
+            )
+            .await;
+            let compared = |pool: workforce_common::postgres::PostgresPool| async move {
+                let conn = pool.get().await.unwrap();
+                conn.query_one("SELECT count(*) FROM shadow_comparisons", &[])
+                    .await
+                    .unwrap()
+                    .get::<_, i64>(0)
+            };
+            let comparisons = compared(pool.clone()).await;
+            let tables = crate::shadow::shared_store(&config).await.unwrap().unwrap();
+            let (replica_store, serving_store) =
+                crate::embeddings::shadow_stores(&config).await.unwrap();
+            let runner = crate::memory_shadow::known_items(
+                &config,
+                replica_store,
+                serving_store,
+                tables,
+                config.vellev.shadow.memory_reconcile().unwrap(),
+            )
+            .await
+            .unwrap()
+            .expect("on by default");
+            let live = runner.kernel.counts();
+            // A day on, so both memories have settled; and another day
+            // than today's, which the leader's own run (started above, a
+            // hub alone leads) may have claimed already.
+            let later = chrono::Utc::now() + chrono::Duration::days(1);
+            let ran = runner
+                .run(later.date_naive(), later, &|| true)
+                .await
+                .unwrap()
+                .expect("the day claimed");
+            assert_eq!(
+                ran.outcome,
+                workforce_common::shadow_postgres::KnownItemOutcome::Ok,
+                "{ran:?}"
+            );
+            assert_eq!(ran.drawn.drawn, 1, "{ran:?}");
+            assert_eq!(ran.drawn.excluded.get("too_short"), Some(&1), "{ran:?}");
+            let conn = pool.get().await.unwrap();
+            let rows = conn
+                .query(
+                    "SELECT item_id, alpha, primary_rank, shadow_rank, primary_error, shadow_error
+                     FROM shadow_known_items WHERE run_id = $1 ORDER BY mode DESC, alpha",
+                    &[&ran.run],
+                )
+                .await
+                .unwrap();
+            let got: Vec<KnownItemCells> = rows
+                .iter()
+                .map(|r| (r.get(0), r.get(1), r.get(2), r.get(3), r.get(4), r.get(5)))
+                .collect();
+            assert_eq!(
+                got,
+                // The window mode, then the hard one, each at both alphas.
+                vec![
+                    (long.0.clone(), 0.6, Some(1), Some(1), None, None),
+                    (long.0.clone(), 1.0, Some(1), Some(1), None, None),
+                    (long.0.clone(), 0.6, Some(1), Some(1), None, None),
+                    (long.0.clone(), 1.0, Some(1), Some(1), None, None),
+                ]
+            );
+            drop(conn);
+            assert_eq!(
+                compared(pool.clone()).await,
+                comparisons,
+                "a known-item run recorded as a live sample"
+            );
+            assert_eq!(
+                runner.kernel.counts(),
+                live,
+                "a known-item run counted as a live sample"
+            );
 
             // A purge reaches the replica in the same call.
             store
