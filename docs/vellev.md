@@ -81,3 +81,106 @@ default).
   most `daily_cap` queries a UTC day (200 unless set).
 - **Off, it does nothing.** It is never made: no LLM is looked up and no
   artifact is read for it.
+
+**Operating the shadow week** (DW-676, PR 9c).
+
+- **`[vellev.shadow] paused` is read once, at start-up.** Changing it needs
+  a restart of **every** hub replica: a replica not
+  restarted keeps what it read. `workforce shadow pause` and `resume`
+  change nothing; they print the config change and the restart.
+  - Paused stops: the read comparisons, the memory mirror's noter and
+    applier, the reconcile, and the known-item runs.
+  - Paused does **not** stop erasure: a purge still reaches vellev's
+    replica, in the same call (D1 (a)).
+  - Paused does **not** stop the artifact mirror (its keeper and its
+    noting of writes): vellev's artifact index is kept in step whether
+    paused or not. Only the artifacts' read comparisons and known-item
+    runs stop.
+- **The CLI never builds or migrates the tables it reads.** `workforce
+  shadow status` and `report` open them read only, and decline when no hub
+  of this version has built them. A metrics scrape and the admin routes
+  read only what their hub process already opened.
+- **`workforce shadow status`** (or `GET /api/admin/shadow/status`) shows
+  what is shadowed, whether paused, the memory mirror's backlog, and the
+  weekly verdicts recorded. With `--hub URL` (and the gateway token, `--token`
+  or `WORKFORCE_GATEWAY_TOKEN`) it adds that hub's `/api/health` shadow
+  block. Those counts are **one process's**: where several replicas
+  run, each counts only what it did.
+- **`workforce shadow report --store memories|artifacts [--week
+  YYYY-MM-DD]`** (or `GET /api/admin/shadow/report?store=&week=`) judges
+  seven UTC days from Postgres alone, so any replica gives the same
+  report. Every gate says `pass`, `fail`, `too few to judge` or
+  `thresholds not set`; the last two are never a pass.
+  - **Each day** is judged on M2's thresholds for that day's memory
+    agreement, once it has at least 100 live recalls (or 100 items both
+    answered in each gating group); below that the day's figures are
+    information, and the day neither passes nor restarts the count. A day
+    that fails restarts the count. A day's errors and empty answers are
+    shown, for information.
+  - **The week** is judged on:
+    - volume;
+    - L1: vellev's p50 and p99 at or under Weaviate's, over the week's raw
+      comparisons, the timed out counted at their time;
+    - errors and timeouts, and empty on vellev only: each passes when the
+      one-sided 95 % Wilson upper bound of the week's rate is at most
+      0.5 %. Too few comparisons for even none to show that (about 540)
+      is too few to judge;
+    - agreement (M2 thresholds, and on the known-item runs a self@1 test);
+    - for artifacts, known-item recall@10 at most 2 points under
+      Weaviate's, in window mode at alpha 1.0 over at least 300 items a
+      week (other groups, overlap and RBO shown, not judged). With the
+      judge off, nDCG@5 is "not judged".
+  - **Memories' agreement** rests on the live recalls at 1,000 or more a
+    week. Below that it rests on the known-item runs, and the report says
+    so; with neither, it is too few to judge. Only a run that ran to its
+    end counts, one a store and day.
+    - **Two groups gate:** scoped memories and the `unscoped` population
+      (the memories filed under no identity), each in window mode at the
+      serving alpha, which is `[embeddings] alpha` as configured. A week
+      whose runs were asked at another alpha (it changed mid-week) is too
+      few to judge. Each group meets M2's thresholds and, over the week, a
+      paired non-inferiority test of self@1. Take b, the items found first
+      by Weaviate alone, and c, those found first by vellev alone, of the n
+      pairs. The exact one-sided 95 % lower bound of (c - b) / n must be
+      above minus the margin. That bound is Clopper-Pearson on c of b + c
+      and on b + c of n, each at 97.5 %.
+      - Fewer distinct memories than the minimum is too few to judge. A
+        memory drawn on several nights counts once.
+      - So is a week of pairs too few to show the margin even with none
+        discordant: 736 at half a point.
+    - **Reported, not judged:** the hard mode and alpha 1.0.
+    - A find by a duplicate of the same content counts as found, and is
+      shown apart.
+  - **`[vellev.shadow.gates]`** holds M2's thresholds (`overlap`, `top1`,
+    `rbo`: all three, each at or above its floor of 0.85, 0.85 and 0.80;
+    unset, agreement says "thresholds not set"), and the self@1 test's
+    `self_first_margin` (0.005, half a point, unless set; at most 0.05),
+    `self_first_min` and `unscoped_min` (600 distinct memories a week each
+    unless set).
+  - **R1** is **not judged** for now. A fix is unexplained until a cause is
+    recorded for it, and the reconcile records what it fixed, not why. The
+    report shows the fixes of the week's last three days.
+  - **Where vellev's time went.** Where rows carry PR 9b's labels, the
+    report shows the queue and index-call p50 and p99, and vellev's time
+    alone against in a burst. This is information, not a gate.
+  - **Not judged here**, and listed as such in every report: the restore
+    drill, the consistency checks, the backlog's history and the mirror's
+    lag, and the kernel's busy and breaker drops (in `/api/metrics` only).
+- **Weekly verdicts are kept.** Before the leader's retention pass deletes
+  any comparison (after 14 days), it records the verdict of every whole
+  ISO week (Monday to Sunday, UTC) in `shadow_verdicts`, kept 180 days. If
+  it cannot, it deletes nothing that pass.
+- **Metrics**, per hub process, to be summed across replicas:
+  `workforce_shadow_kernel{store,count}` (offered, paused, unsampled,
+  no_runtime, busy, breaker_open, started, ok, failed, panicked,
+  timed_out), `workforce_shadow_enabled{store}`,
+  `workforce_shadow_breaker_open{store}`,
+  `workforce_shadow_memory_deferred_dropped` (memories' comparisons dropped
+  before their sink was open), `workforce_shadow_sink{count}`, and the
+  noter's `workforce_shadow_memory_notes_*` and
+  `workforce_shadow_memory_noter_failed`. The backlog,
+  `workforce_shadow_memory_backlog_pending` and `_oldest_secs`, is
+  Postgres's, the same from any replica, read on the shadow tables'
+  pool the hub already holds; when it cannot be read within 2 s, only `workforce_shadow_memory_backlog_unknown 1` is given, never 0.
+  `/api/health` carries the same process counts under `shadow`, but not
+  the backlog: health asks nothing of Postgres.

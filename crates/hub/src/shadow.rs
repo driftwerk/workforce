@@ -53,6 +53,30 @@ pub async fn shared_store(config: &WorkforceConfig) -> Result<Option<Arc<ShadowS
     Ok(Some(Arc::clone(store)))
 }
 
+/// The shadow tables as this process already opened them, if it has:
+/// what a metrics scrape or an admin route reads, never opening them.
+pub fn opened_store() -> Option<Arc<ShadowStore>> {
+    SHARED.get().cloned()
+}
+
+/// The shadow tables for a reader outside the hub (the CLI): a pool of
+/// its own, and nothing migrated or created ([`ShadowStore::read_only`]).
+/// `None` when nothing is shadowed.
+pub async fn read_only_store(config: &WorkforceConfig) -> Result<Option<Arc<ShadowStore>>> {
+    let shadowed = config.shadowed();
+    let Some(setting) = shadowed.first() else {
+        return Ok(None);
+    };
+    let pg = config
+        .postgres
+        .as_ref()
+        .filter(|p| p.enabled)
+        .ok_or_else(|| eyre!("{setting} = \"shadow\" needs [postgres] enabled = true"))?;
+    let pool = PostgresTelemetryStore::build_pool(&pool_config(pg))
+        .context("building the shadow tables' pool")?;
+    Ok(Some(ShadowStore::read_only(pool).await?))
+}
+
 /// The sink every shadow of this hub writes its comparisons through, made
 /// once: `Err` when nothing is shadowed or the shadow tables cannot be
 /// opened.
@@ -66,6 +90,11 @@ pub async fn sink(config: &WorkforceConfig) -> Result<Arc<PostgresShadowSink>> {
         })
         .await?;
     Ok(Arc::clone(sink))
+}
+
+/// The sink's counts, once this process has opened it.
+pub fn sink_counts() -> Option<workforce_common::shadow_postgres::SinkCounts> {
+    SINK.get().map(|sink| sink.counts())
 }
 
 /// [`sink`] opened on its own, for a caller that must not wait for it.

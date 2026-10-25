@@ -580,12 +580,30 @@ where
         .await?
         .ok_or_else(|| eyre::eyre!("[memory] backend = \"shadow\" needs [embeddings]"))?;
     let sink = Deferred::opening(opening, crate::memory_mirror::NOTE_SETUP_LIMIT);
-    let shadow = memory_shadow_kernel(config, sink)?;
+    let shadow = memory_shadow_kernel(config, Arc::clone(&sink) as _)?;
+    // The first made is the process's (READS holds one): its drops are
+    // what status and metrics tell. Set once the kernel is, so that a
+    // first attempt that failed leaves no sink that is never used.
+    let _ = DEFERRED.set(sink);
     Ok(Reads {
         embedder,
         replica,
         shadow: Arc::new(shadow),
     })
+}
+
+/// The sink of this process's read shadow of memories, once made.
+static DEFERRED: std::sync::OnceLock<Arc<Deferred>> = std::sync::OnceLock::new();
+
+/// This process's read-shadow kernel of memories, once made.
+pub fn memory_read_kernel() -> Option<Arc<Shadow>> {
+    READS.get().map(|reads| Arc::clone(&reads.shadow))
+}
+
+/// Comparisons this process's read shadow of memories dropped for want of
+/// an open sink; `None` before it is made.
+pub fn deferred_dropped() -> Option<u64> {
+    DEFERRED.get().map(|d| d.dropped())
 }
 
 /// The kernel that shadows recalls of memories: `[vellev.shadow.memories]`'s

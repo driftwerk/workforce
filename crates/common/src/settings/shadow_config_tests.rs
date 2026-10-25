@@ -616,3 +616,78 @@ fn the_judge_is_off_unless_set_and_its_cap_is_bounded() {
         );
     }
 }
+
+/// M2's thresholds: none set reads as none (the report then says
+/// "thresholds not set"); a set is all three, each from its floor to 1.
+#[test]
+fn the_agreement_gates_are_a_set_at_or_above_their_floors() {
+    let read = |toml: &str| {
+        WorkforceConfig::from_toml(toml)
+            .unwrap()
+            .vellev
+            .shadow
+            .gates()
+    };
+    assert_eq!(read("").unwrap(), None);
+    assert_eq!(
+        read("[vellev.shadow.gates]\noverlap = 0.9\ntop1 = 0.88\nrbo = 0.8\n").unwrap(),
+        Some(crate::settings::AgreementGates {
+            overlap: 0.9,
+            top1: 0.88,
+            rbo: 0.8
+        })
+    );
+    let partial = refused("[vellev.shadow.gates]\noverlap = 0.9\n");
+    assert!(
+        partial.contains("all of overlap, top1 and rbo"),
+        "{partial}"
+    );
+    for (key, value) in [
+        ("overlap", 0.84),
+        ("top1", 0.84),
+        ("rbo", 0.79),
+        ("rbo", 1.01),
+    ] {
+        let toml = "[vellev.shadow.gates]\noverlap = 0.9\ntop1 = 0.9\nrbo = 0.9\n"
+            .replace(&format!("{key} = 0.9"), &format!("{key} = {value}"));
+        let refused = refused(&toml);
+        assert!(
+            refused.contains(&format!("[vellev.shadow.gates] {key}")),
+            "{key} {value}: {refused}"
+        );
+    }
+}
+
+/// The self@1 test's margin and minimums: half a point and 600 unless set;
+/// a margin past 5 points or a minimum of 0 is refused by name.
+#[test]
+fn the_self_first_gate_has_a_bounded_margin_and_minimums() {
+    let read = |toml: &str| {
+        WorkforceConfig::from_toml(toml)
+            .unwrap()
+            .vellev
+            .shadow
+            .self_first_gate()
+    };
+    assert_eq!(
+        read("").unwrap(),
+        crate::settings::SelfFirstGate {
+            margin: 0.005,
+            min: 600,
+            unscoped_min: 600
+        }
+    );
+    let set = read("[vellev.shadow.gates]\nself_first_margin = 0.01\nself_first_min = 500\nunscoped_min = 100\n").unwrap();
+    assert_eq!((set.margin, set.min, set.unscoped_min), (0.01, 500, 100));
+    for (toml, key) in [
+        ("self_first_margin = 0.06", "self_first_margin"),
+        ("self_first_min = 0", "self_first_min"),
+        ("unscoped_min = 0", "unscoped_min"),
+    ] {
+        let refused = refused(&format!("[vellev.shadow.gates]\n{toml}\n"));
+        assert!(
+            refused.contains(&format!("[vellev.shadow.gates] {key}")),
+            "{toml}: {refused}"
+        );
+    }
+}
