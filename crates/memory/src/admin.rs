@@ -860,7 +860,7 @@ pub(crate) fn imported(stored: usize, failed: Vec<(String, String)>) -> Result<u
 /// rows have, made null, so that a memory is scoped to no person rather
 /// than to one with an empty id; or nothing, if its content cannot be
 /// embedded.
-pub(crate) fn normalised(object: &Value) -> Option<Value> {
+pub fn normalised(object: &Value) -> Option<Value> {
     let content = object["properties"]["content"].as_str()?;
     VectorizableText::try_new(content).ok()?;
     let mut object = object.clone();
@@ -946,7 +946,7 @@ async fn vectored(target: &dyn SyncTarget, objects: &[Value]) -> Result<Vec<Valu
 /// Property maps equal, ignoring keys that are null on either side (an
 /// export omits them), and taking RFC 3339 dates as the instants they
 /// name, however a store writes them.
-pub(crate) fn same_properties(a: &Value, b: &Value) -> bool {
+pub fn same_properties(a: &Value, b: &Value) -> bool {
     let set = |v: &Value| -> std::collections::BTreeMap<String, Value> {
         v.as_object()
             .map(|m| {

@@ -35,7 +35,7 @@ type KnownItemCells = (
 );
 
 /// The Weaviate to use, or `None` to skip.
-fn weaviate() -> Option<String> {
+pub(crate) fn weaviate() -> Option<String> {
     match std::env::var("WORKFORCE_TEST_WEAVIATE_URL") {
         Ok(url) => Some(url),
         Err(_) if std::env::var("WORKFORCE_TEST_WEAVIATE_REQUIRED").as_deref() == Ok("1") => {
@@ -50,7 +50,7 @@ fn weaviate() -> Option<String> {
 
 /// A text-embeddings-inference server's `/embed`, embedding each text by
 /// its words; counting the texts it embeds.
-async fn embedder() -> (String, Arc<AtomicUsize>) {
+pub(crate) async fn embedder() -> (String, Arc<AtomicUsize>) {
     use axum::{routing::post, Json, Router};
     let embedded = Arc::new(AtomicUsize::new(0));
     let counting = Arc::clone(&embedded);

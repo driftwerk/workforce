@@ -427,3 +427,125 @@ restore point. Before restoring a promoted tenant, either:
     and its keeper go on.
   - It never stops erasure.
   - It does nothing once a store is promoted.
+
+## The edge's own memory store (DW-676 (b))
+
+The customer-facing edge once kept its memories in the hub's Weaviate
+class, `WorkforceMemory`. The hub's switch to its own embeddings copied
+them into the hub's bge class, and the shadow into vellev's replica of
+that. An edge customer's erasure purged `WorkforceMemory` alone, so the
+copies outlived it; and the hub's carry-back (bge class into
+`WorkforceMemory`, every 2 minutes while `[embeddings] keep_previous` is
+on) could put some of those erased memories back into `WorkforceMemory`
+itself. The edge now keeps its memories in a vellev tenant of its own, on
+the node that holds the hub's memories, and its erasure purges there.
+
+**The edge's config refuses to share again.** A `[weaviate]` section must
+name `collection`, and never the hub's (`WorkforceMemory`, or any name
+starting so). The edge does not start otherwise. `[vellev]` gains
+`query_prefix`, for a model that wants one (bge's), and `score_map`,
+required with a bge model (the edge refuses to start without it): knots
+putting the node's certainty on the scale the edge's recall floors
+(memories 0.45, lessons, knowledge 0.7) were tuned on, MiniLM's, as the
+hub's own `[embeddings] score_map` does for bge.
+
+**The edge's tenant** embeds with the node's own model,
+`BAAI/bge-base-en-v1.5` (768 dimensions, query prefix
+`Represent this sentence for searching relevant passages: `), so that the
+node loads no second model, with the same `score_map` knots as the hub's.
+
+**`workforce memory move-edge`** moves what the edge left in the hub's
+stores, in two steps, each a dry run without `--apply` and safe to run
+again. Both refuse unless the config it is run with has `[embeddings]
+keep_previous = false`; that must also be true of every running hub
+replica, or a carry-back brings erased memories back and races the purge.
+
+- `copy`, with the edge stopped: every object of `WorkforceMemory` whose
+  owner is one of `--agent` and whose identity is one the edge writes
+  under (a customer's `ext:` key, `edge:lessons`, `edge:knowledge`) is
+  copied into the edge's tenant under its own id, except a customer's
+  memory whose customer is not in `--known-customers` (the edge erased
+  them: it is purged, never copied). Every copy is read back and checked,
+  and only then is `edge-memories-moved-from-weaviate` marked there. Once
+  marked, `copy` is refused: the edge then writes there, and copying again
+  would bring back what a customer erased.
+- `purge`, refused until the copy is marked: every memory an edge object
+  holds in any of the three stores is purged from all of them; vellev's
+  replica and the bge class together under the replica's lock, as any of
+  the hub's erasures, then `WorkforceMemory`. It then looks again, and
+  fails if any is still held.
+
+An edge object found only in the bge class or the replica is a copy whose
+original the edge erased: it is purged, never copied. A purge is by memory
+id, so a memory also held by an object that is not the edge's refuses the
+whole step before anything is written. The command prints counts and ids,
+never content. It refuses an `--agent` the hub runs (`[[agents]]`, a team
+member, or a workspace under `data_dir/agents`, so wherever it runs must
+see the hub's data directory), an edge tenant that is the hub's (compared
+ignoring case), a promoted replica, and any `[memory] backend` but
+`"shadow"`.
+
+### Deploy order
+
+1. **Turn off the hub's previous store**: `[embeddings] keep_previous =
+   false` on every hub, and every hub replica restarted on it (each logs
+   that it no longer keeps the previous collection). Nothing below starts
+   before that.
+2. **Make the edge's tenant** with the node's admin key:
+   `PUT /v1/tenants/<edge tenant>`, then
+   `POST /v1/tenants/<edge tenant>/keys`. Keep the key it returns in the
+   edge's secrets as `EDGE_VELLEV_API_KEY`. If the node restricts its
+   tenants (`VELLEV_TENANTS`), add the edge's tenant to the list first.
+3. **Stop the edge**, in a way the next deploy does not undo. The new
+   release would not start on an `edge.toml` that names no collection
+   anyway.
+4. **Deploy** the release with this change (hub and edge).
+5. **List the customers the edge still knows**, from its database:
+
+   ```text
+   psql "$EDGE_PG_URL" -At -c 'SELECT owner FROM edge_analytics.chat_identities' > known.txt
+   ```
+
+   An erasure deletes a customer's row there; a customer with memories and
+   no row was erased, and their memories are purged, never copied. The
+   file holds customers' identifiers: keep it where the edge's data is
+   kept, and delete it after step 9.
+6. **Copy**, with the hub's config, the hub's data directory visible (for
+   the agent check), `known.txt`, and the edge's tenant key in the
+   environment:
+
+   ```text
+   workforce memory move-edge copy --config workforce.toml \
+     --agent <edge agent id> --edge-url <node URL> --edge-tenant <edge tenant> \
+     --edge-model BAAI/bge-base-en-v1.5 --edge-dimensions 768 \
+     --edge-query-prefix 'Represent this sentence for searching relevant passages: ' \
+     --known-customers known.txt
+   ```
+
+   Read the counts, then run it again with `--apply`. If the dry run shows
+   customer memories of customers the edge no longer knows, find out why
+   before `--apply`: such a customer may predate `chat_identities`, and
+   their memories would be purged, never copied.
+7. **Switch the edge's config**: replace `[weaviate]` in `edge.toml` with
+
+   ```toml
+   [vellev]
+   url = "<node URL>"
+   api_key = "${EDGE_VELLEV_API_KEY}"
+   tenant = "<edge tenant>"
+   model = "BAAI/bge-base-en-v1.5"
+   dimensions = 768
+   query_prefix = "Represent this sentence for searching relevant passages: "
+   # The same knots as the hub's [embeddings] score_map for bge-base.
+   score_map = [[0.0, 0.0], [0.72, 0.60], [0.77, 0.65], [0.80, 0.70], [0.83, 0.80], [0.935, 0.92], [0.98, 0.97], [1.0, 1.0]]
+   connect_budget_secs = 300
+   ```
+
+   and give the edge `EDGE_VELLEV_API_KEY`.
+8. **Start the edge** again, and check that a known customer's memory is
+   recalled.
+9. **Purge**: the same command with `purge` (no `--known-customers`),
+   dry, then `--apply`. Then run `purge` once more without `--apply`: it
+   must find nothing.
+
+`WorkforceMemory` may be dropped only after step 9.
