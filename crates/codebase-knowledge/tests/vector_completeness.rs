@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use eyre::{eyre, Result};
 use workforce_codebase_knowledge::graph::entities::{EntityId, EntityKind};
 use workforce_codebase_knowledge::graph::vectors::FillStage;
-use workforce_codebase_knowledge::graph::CodeGraph;
+use workforce_codebase_knowledge::graph::{CodeGraph, VectorKeys};
 use workforce_codebase_knowledge::indexer::crawler::CrawlerConfig;
 use workforce_codebase_knowledge::indexer::fill::{VectorFiller, Verified, Verifying};
 use workforce_codebase_knowledge::indexer::summary_generator::{SummaryGenerator, SummaryLlm};
@@ -191,6 +191,9 @@ impl Held {
 
 #[async_trait]
 impl CodeVectorStore for Held {
+    fn backend(&self) -> &'static str {
+        VectorKeys::VELLEV
+    }
     async fn ensure_collections(&self) -> Result<()> {
         Ok(())
     }
@@ -429,6 +432,9 @@ struct Untracked;
 
 #[async_trait]
 impl CodeVectorStore for Untracked {
+    fn backend(&self) -> &'static str {
+        VectorKeys::WEAVIATE
+    }
     async fn ensure_collections(&self) -> Result<()> {
         Ok(())
     }
@@ -901,24 +907,35 @@ async fn a_renamed_files_vectors_follow_it() {
     );
 }
 
-/// An incremental index that writes to another store, or to none, as a
-/// hub moved back to another vector store does, or one still on the old
-/// store while the new is seeded: the files it changes are noted for the
-/// tracked store, whose vectors stay complete but for them, and are put
-/// right there file by file. A full index elsewhere rebuilds the graph,
-/// and the tracked store is then to be filled again.
+/// A graph over the same database as `repo`'s, keeping its vector state
+/// as `keys` say.
+fn keyed(repo: &Repo, active: &str, standby: Option<&str>) -> Arc<CodeGraph> {
+    Arc::new(
+        CodeGraph::from_backend(Arc::clone(repo.graph.backend()))
+            .keyed(VectorKeys::new(active, standby).unwrap()),
+    )
+}
+
+/// An index run that writes to another store, or to none, with the
+/// tracked store (vellev's) configured as the standby: as a hub moved back
+/// to Weaviate does, or one still on Weaviate while vellev is seeded. The
+/// files it changes are noted for the standby, whose vectors stay complete
+/// but for them, and are put right there file by file. A full index there
+/// rebuilds the graph: the standby is told of every file the repo had and
+/// has, and the tracked store is to be filled again.
 #[tokio::test]
-async fn an_index_run_on_another_store_notes_its_files_for_the_tracked_one() {
+async fn an_index_run_on_another_store_notes_its_files_for_the_standby() {
     for elsewhere in [None, Some(Arc::new(Untracked) as Arc<dyn CodeVectorStore>)] {
         let repo = Repo::filled().await;
         let embedded = repo.held.embedded();
+        let on_weaviate = keyed(&repo, "weaviate", Some("vellev"));
         let other = |repo: &Repo| match &elsewhere {
             Some(store) => IndexingPipeline::with_vector_store(
                 repo.config(),
-                Arc::clone(&repo.graph),
+                Arc::clone(&on_weaviate),
                 Arc::clone(store),
             ),
-            None => IndexingPipeline::new(repo.config(), Arc::clone(&repo.graph)),
+            None => IndexingPipeline::new(repo.config(), Arc::clone(&on_weaviate)),
         };
         repo.change_mail();
         repo.incremental(&other(&repo), 1).await;
@@ -926,6 +943,11 @@ async fn an_index_run_on_another_store_notes_its_files_for_the_tracked_one() {
         commit(repo.dir.path());
         repo.incremental(&other(&repo), 0).await;
         assert_eq!(repo.pending().await, ["src/config.rs", "src/mail.rs"]);
+        assert_eq!(
+            on_weaviate.count_vectors_pending(REPO).await.unwrap(),
+            0,
+            "nothing noted for the store in use, which keeps no track"
+        );
         assert!(repo.complete().await, "but for the files noted");
         assert!(!repo.agrees().await);
         assert_eq!(
@@ -945,13 +967,144 @@ async fn an_index_run_on_another_store_notes_its_files_for_the_tracked_one() {
             .len();
         assert_eq!(repo.held.embedded() - embedded, in_mail);
 
+        // A full index there: every file the repo had, and has, noted. One
+        // it had is gone by then, never indexed as gone, so only what the
+        // repo had says the standby holds it.
+        write(repo.dir.path(), "post.rs", MAIL_RS);
+        std::fs::remove_file(repo.dir.path().join("src/many.rs")).unwrap();
+        commit(repo.dir.path());
+        let had = repo.graph.get_file_paths(REPO).await.unwrap();
+        assert!(had.contains(&"src/many.rs".to_string()), "{had:?}");
+        assert!(!repo.pending().await.contains(&"src/many.rs".to_string()));
         other(&repo)
             .run_full_index(RunOptions::default())
             .await
             .unwrap();
         assert!(!repo.complete().await, "a full index elsewhere");
         assert_eq!(repo.graph.vector_fill(REPO).await.unwrap(), None);
+        let mut expected: Vec<String> = had;
+        expected.push("src/post.rs".to_string());
+        expected.sort();
+        expected.dedup();
+        assert_eq!(repo.pending().await, expected);
     }
+}
+
+/// The files whose summaries a run makes are noted for the standby, with
+/// the store in use keeping track or not: those of the files the run
+/// changed, and those of files it did not change at all, as the summaries
+/// a resumed summary phase makes across the repo are. For a store that
+/// keeps track, before a fill of it has begun too, when it leaves the
+/// summaries to the fill.
+#[tokio::test]
+async fn the_files_whose_summaries_a_run_makes_are_noted_for_the_standby() {
+    for in_use in ["weaviate", "vellev"] {
+        let repo = Repo::new();
+        let (store, standby): (Arc<dyn CodeVectorStore>, &str) = match in_use {
+            "weaviate" => (Arc::new(Untracked), "vellev"),
+            _ => (repo.store(), "weaviate"),
+        };
+        let graph = keyed(&repo, in_use, Some(standby));
+        let pipeline = || {
+            IndexingPipeline::with_vector_store(
+                repo.config(),
+                Arc::clone(&graph),
+                Arc::clone(&store),
+            )
+        };
+        let summarising =
+            || pipeline().with_summary_generator(SummaryGenerator::new(Box::new(Terse), 64));
+        let noted = || async {
+            let noted = graph
+                .backend()
+                .vectors_pending(standby, REPO, 100)
+                .await
+                .unwrap();
+            noted.into_iter().map(|(file, _)| file).collect::<Vec<_>>()
+        };
+        let forget = || async {
+            for (file, seq) in graph
+                .backend()
+                .vectors_pending(standby, REPO, 100)
+                .await
+                .unwrap()
+            {
+                graph
+                    .backend()
+                    .clear_vectors_pending(standby, REPO, &file, seq)
+                    .await
+                    .unwrap();
+            }
+        };
+        pipeline()
+            .run_full_index(RunOptions::default())
+            .await
+            .unwrap();
+        forget().await;
+
+        // A changed file, summarised as it is indexed: its own summaries.
+        repo.change_mail();
+        let made = summarising()
+            .run_incremental_index(RunOptions::default())
+            .await
+            .unwrap();
+        assert!(made.summaries_generated > 0, "{in_use}: {made:?}");
+        assert_eq!(noted().await, ["src/mail.rs"], "{in_use}");
+        forget().await;
+
+        // Summaries of the files no run changed, made as the summary phase
+        // is resumed: noted, file by file.
+        let made = summarising()
+            .run_summaries_only(RunOptions::default())
+            .await
+            .unwrap();
+        assert!(made.summaries_generated > 0, "{in_use}: {made:?}");
+        // `mail.rs`'s summaries, fresh already, are written again too (a
+        // resumed phase heals ones never stored), and so noted again.
+        assert_eq!(
+            noted().await,
+            ["src/config.rs", "src/mail.rs", "src/many.rs"],
+            "{in_use}: the files outside any change"
+        );
+    }
+}
+
+/// With no standby configured, a run on another store notes nothing for
+/// the tracked one: the standby is how one is kept in step, and a hub
+/// moved off vellev without naming it as the standby leaves it to fall
+/// behind (to be found by the next comparison).
+#[tokio::test]
+async fn an_index_run_on_another_store_notes_nothing_without_a_standby() {
+    let repo = Repo::filled().await;
+    let on_weaviate = keyed(&repo, "weaviate", None);
+    repo.change_mail();
+    let other =
+        IndexingPipeline::with_vector_store(repo.config(), on_weaviate, Arc::new(Untracked));
+    repo.incremental(&other, 1).await;
+    assert!(repo.pending().await.is_empty());
+}
+
+/// A run on the tracked store, with Weaviate as the standby (vellev in
+/// use, Weaviate kept for a rollback): the run takes off its own notes of
+/// the files it stored, and leaves the standby's, so that Weaviate is put
+/// right from them if it is switched back to.
+#[tokio::test]
+async fn a_run_on_the_tracked_store_leaves_the_standbys_notes() {
+    let repo = Repo::filled().await;
+    let with_standby = keyed(&repo, "vellev", Some("weaviate"));
+    let pipeline =
+        IndexingPipeline::with_vector_store(repo.config(), Arc::clone(&with_standby), repo.store());
+    repo.change_mail();
+    repo.incremental(&pipeline, 1).await;
+    assert!(repo.pending().await.is_empty(), "its own taken off");
+    assert!(repo.complete().await && repo.agrees().await);
+    let standby = repo
+        .graph
+        .backend()
+        .vectors_pending("weaviate", REPO, 10)
+        .await
+        .unwrap();
+    assert_eq!(standby, [("src/mail.rs".to_string(), 1)]);
 }
 
 /// A store that keeps no track of a repo no store keeps track of notes
