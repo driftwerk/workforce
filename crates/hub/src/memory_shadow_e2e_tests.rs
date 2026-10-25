@@ -9,6 +9,9 @@
 //! must have the `text2vec-transformers` module, for the collection
 //! memories are moved from (its inference service need only answer
 //! `/.well-known/ready`: nothing is vectorized by Weaviate here).
+//!
+//! CI's `vellev-node` job runs it against Weaviate's own binary, at a
+//! pinned version, with `WORKFORCE_TEST_WEAVIATE_REQUIRED=1`.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -89,6 +92,16 @@ fn words(text: &str) -> Vec<f32> {
         vector[(hash % 16) as usize] += 1.0;
     }
     vector
+}
+
+/// A word that is not `word` but that [`words`]
+/// embeds as it embeds `word`.
+fn alike(word: &str) -> String {
+    let want = words(word);
+    (0..)
+        .map(|n| format!("zq{n}"))
+        .find(|other| words(other) == want)
+        .expect("some word lands where it does")
 }
 
 /// Wait up to `limit` for `done`, asking every half second.
@@ -258,6 +271,56 @@ async fn a_hub_shadowing_memories_keeps_the_replica_compares_recalls_and_erases(
                 "the same memory first"
             );
             assert!(row.get::<_, bool>(1), "the replica was handed the vector");
+            drop(conn);
+
+            // The replica searched by that vector, not by keywords alone: a
+            // question sharing no word with the memory, but embedded (by
+            // `words`) as its words are, is found by meaning or not at all.
+            // A replica not handed the vector, falling back to keywords,
+            // finds nothing, and the comparison says so.
+            let by_meaning = format!("{} {}", alike("otters"), alike("asleep"));
+            let hits = store.recall(&by_meaning, bob.clone()).await.unwrap();
+            assert_eq!(hits[0].memory.id, id, "Weaviate found it by meaning");
+            until(
+                Duration::from_secs(30),
+                "the second recall compared",
+                || {
+                    let pool = pool.clone();
+                    async move {
+                        let conn = pool.get().await.unwrap();
+                        let row = conn
+                            .query_one(
+                                "SELECT count(*) FROM shadow_comparisons \
+                             WHERE store = 'memories' AND outcome = 'answered'",
+                                &[],
+                            )
+                            .await
+                            .unwrap();
+                        row.get::<_, i64>(0) > 1
+                    }
+                },
+            )
+            .await;
+            let conn = pool.get().await.unwrap();
+            let row = conn
+                .query_one(
+                    "SELECT shadow_count, top1, shadow_embed_ms IS NULL \
+                     FROM shadow_comparisons \
+                     WHERE store = 'memories' AND outcome = 'answered' \
+                     ORDER BY id DESC LIMIT 1",
+                    &[],
+                )
+                .await
+                .unwrap();
+            assert!(
+                row.get::<_, Option<i32>>(0).unwrap_or(0) >= 1
+                    && row.get::<_, Option<bool>>(1) == Some(true)
+                    && row.get::<_, bool>(2),
+                "the replica found by meaning, with the hub's vector, what shares no word \
+                 with the question (shadow_count {:?}, top1 {:?})",
+                row.get::<_, Option<i32>>(0),
+                row.get::<_, Option<bool>>(1),
+            );
             drop(conn);
 
             // A known-item run, made by the runner the leader is given
