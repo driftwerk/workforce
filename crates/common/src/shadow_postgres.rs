@@ -438,8 +438,37 @@ impl ReplicaLock {
         bounded(
             &self.pool,
             RECORD_LIMIT,
-            "INSERT INTO shadow_memory_promotion (collection) VALUES ($1) ON CONFLICT DO NOTHING",
+            "WITH ever AS (
+                 INSERT INTO shadow_memory_history (event) VALUES ('promoted')
+                 ON CONFLICT (event) DO UPDATE SET last_at = now()
+             )
+             INSERT INTO shadow_memory_promotion (collection) VALUES ($1) ON CONFLICT DO NOTHING",
             &[&collection],
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Whether Postgres records memories as promoted.
+    pub async fn promotion_recorded(&self) -> Result<bool> {
+        let rows = bounded_query(
+            &self.pool,
+            RECORD_LIMIT,
+            "SELECT EXISTS (SELECT 1 FROM shadow_memory_promotion)",
+            &[],
+        )
+        .await?;
+        Ok(rows.first().is_some_and(|row| row.get(0)))
+    }
+
+    /// Take the record of memories' promotion away: a rollback, once what
+    /// was written to vellev since is carried back. Idempotent.
+    pub async fn withdraw_promotion(&self) -> Result<()> {
+        bounded(
+            &self.pool,
+            RECORD_LIMIT,
+            "DELETE FROM shadow_memory_promotion",
+            &[],
         )
         .await?;
         Ok(())
@@ -642,6 +671,34 @@ impl MirrorNotes {
         Ok(())
     }
 
+    /// The number the latest noting took, if anything is noted: what a
+    /// whole sync begun after this read covers, for [`Self::drain_through`].
+    pub async fn last_seq(&self) -> Result<Option<i64>> {
+        let rows = bounded_query(
+            &self.pool,
+            MIRROR_NOTE_LIMIT,
+            "SELECT max(noted_seq) FROM memory_mirror_pending",
+            &[],
+        )
+        .await?;
+        Ok(rows.first().and_then(|row| row.get(0)))
+    }
+
+    /// Take away every note numbered `seq` or lower: each is covered by a
+    /// whole sync of the replica begun after `seq` was read, as the applier
+    /// takes a note away only at the number it read before applying. A
+    /// noting made since keeps its row. Returns how many went.
+    pub async fn drain_through(&self, seq: i64) -> Result<u64> {
+        bounded(
+            &self.pool,
+            MIRROR_NOTE_LIMIT,
+            "DELETE FROM memory_mirror_pending WHERE noted_seq <= $1",
+            &[&seq],
+        )
+        .await
+        .context("taking away the notes a whole sync covered")
+    }
+
     /// How many memories are noted, and since when the oldest.
     pub async fn backlog(&self) -> Result<Backlog> {
         let rows = bounded_query(
@@ -659,6 +716,240 @@ impl MirrorNotes {
             oldest: row.get(1),
         })
     }
+}
+
+/// How long one of promotion's reads or writes may run, or wait for a
+/// lock (DW-676, PR 11).
+pub const PROMOTION_LIMIT: Duration = Duration::from_secs(10);
+
+/// What Postgres says of memories' shadow, for promotion's guards. Tables
+/// not made yet (a database the telemetry migrations have not reached)
+/// count as empty.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MemoryShadowFacts {
+    /// A reconcile of memories' replica was ever recorded here: memories
+    /// were shadowed on this database.
+    pub reconciled: bool,
+    /// Memories are recorded as promoted.
+    pub promoted: bool,
+    /// Memories noted for the replica and not yet applied.
+    pub backlog: i64,
+    /// The store memories switched from has missed erasures, for good:
+    /// memories were once promoted, or a hub once left it alone
+    /// (`shadow_memory_history`, never deleted).
+    pub previous_frozen: bool,
+    /// The latest reconcile recorded, its outcome and how many objects it
+    /// had to copy, update or drop: of all, while memories are not
+    /// promoted; once they are, of those finished after the promotion was
+    /// recorded, `None` if there are none. The promotion is recorded only
+    /// after a clean pass, so it stands for that check: the reconciles'
+    /// own rows are pruned after 180 days.
+    pub last_run: Option<(String, i64)>,
+}
+
+/// [`MemoryShadowFacts`], read from `pool` (whose `search_path` holds the
+/// telemetry schema), each statement bounded by [`PROMOTION_LIMIT`].
+pub async fn memory_shadow_facts(pool: &PostgresPool, store: &str) -> Result<MemoryShadowFacts> {
+    let made = bounded_query(
+        pool,
+        PROMOTION_LIMIT,
+        "SELECT to_regclass('shadow_reconciles') IS NOT NULL,
+                to_regclass('shadow_memory_promotion') IS NOT NULL,
+                to_regclass('memory_mirror_pending') IS NOT NULL,
+                to_regclass('shadow_memory_history') IS NOT NULL",
+        &[],
+    )
+    .await?;
+    let made = made.first().ok_or_else(|| eyre::eyre!("no row"))?;
+    let (reconciles, promotion, pending, history): (bool, bool, bool, bool) =
+        (made.get(0), made.get(1), made.get(2), made.get(3));
+    let mut facts = MemoryShadowFacts::default();
+    if history {
+        let rows = bounded_query(
+            pool,
+            PROMOTION_LIMIT,
+            "SELECT EXISTS (SELECT 1 FROM shadow_memory_history)",
+            &[],
+        )
+        .await?;
+        facts.previous_frozen = rows.first().is_some_and(|row| row.get(0));
+    }
+    let mut promoted_at: Option<DateTime<Utc>> = None;
+    if promotion {
+        let rows = bounded_query(
+            pool,
+            PROMOTION_LIMIT,
+            "SELECT min(promoted_at) FROM shadow_memory_promotion",
+            &[],
+        )
+        .await?;
+        promoted_at = rows.first().and_then(|row| row.get(0));
+        facts.promoted = promoted_at.is_some();
+    }
+    if reconciles {
+        let rows = bounded_query(
+            pool,
+            PROMOTION_LIMIT,
+            "SELECT outcome, (copied + updated + dropped)::BIGINT
+               FROM shadow_reconciles WHERE store = $1 ORDER BY id DESC LIMIT 1",
+            &[&store],
+        )
+        .await?;
+        facts.reconciled = !rows.is_empty();
+        let rows = match promoted_at {
+            None => rows,
+            Some(at) => {
+                bounded_query(
+                    pool,
+                    PROMOTION_LIMIT,
+                    "SELECT outcome, (copied + updated + dropped)::BIGINT
+                       FROM shadow_reconciles WHERE store = $1 AND finished_at > $2
+                      ORDER BY id DESC LIMIT 1",
+                    &[&store, &at],
+                )
+                .await?
+            }
+        };
+        facts.last_run = rows.first().map(|row| (row.get(0), row.get(1)));
+    }
+    if pending {
+        let rows = bounded_query(
+            pool,
+            PROMOTION_LIMIT,
+            "SELECT count(*) FROM memory_mirror_pending",
+            &[],
+        )
+        .await?;
+        facts.backlog = rows.first().map(|row| row.get(0)).unwrap_or_default();
+    }
+    Ok(facts)
+}
+
+/// Record, for good, that a hub left the store memories switched from
+/// alone (`[embeddings] keep_previous = false`): from now on it misses
+/// erasures, and no hub may keep it again.
+pub async fn record_previous_left(pool: &PostgresPool) -> Result<()> {
+    bounded(
+        pool,
+        PROMOTION_LIMIT,
+        "INSERT INTO shadow_memory_history (event) VALUES ('previous_left')
+         ON CONFLICT (event) DO UPDATE SET last_at = now()",
+        &[],
+    )
+    .await
+    .context("recording that the store memories switched from is left alone")?;
+    Ok(())
+}
+
+/// What Postgres says of the artifact mirror's noting (V029), for
+/// promotion's guards. Tables not made yet count as empty.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ArtifactMirrorFacts {
+    /// The lease was ever renewed and not since ended: a shadow of the
+    /// artifact index has been kept here.
+    pub lease_set: bool,
+    /// The lease holds now: a hub keeping a mirror renewed it lately.
+    pub lease_held: bool,
+    /// Artifacts noted for the mirror and not yet taken.
+    pub pending: i64,
+    /// The lease was ended by the index's promotion ([`end_artifact_mirror`]
+    /// sets it to `-infinity`, which no renewal of a shadow hub leaves be).
+    pub promoted: bool,
+}
+
+/// [`ArtifactMirrorFacts`], read from `pool`, the artifact tables' pool.
+pub async fn artifact_mirror_facts(pool: &PostgresPool) -> Result<ArtifactMirrorFacts> {
+    let made = bounded_query(
+        pool,
+        PROMOTION_LIMIT,
+        "SELECT to_regclass('shadow_control') IS NOT NULL,
+                to_regclass('artifact_index_pending_mirror') IS NOT NULL",
+        &[],
+    )
+    .await?;
+    let made = made.first().ok_or_else(|| eyre::eyre!("no row"))?;
+    let (control, pending): (bool, bool) = (made.get(0), made.get(1));
+    let mut facts = ArtifactMirrorFacts::default();
+    if control {
+        let rows = bounded_query(
+            pool,
+            PROMOTION_LIMIT,
+            "SELECT mirrored_until IS NOT NULL, coalesce(mirrored_until > now(), false),
+                    coalesce(mirrored_until = '-infinity', false)
+               FROM shadow_control",
+            &[],
+        )
+        .await?;
+        if let Some(row) = rows.first() {
+            facts.lease_set = row.get(0);
+            facts.lease_held = row.get(1);
+            facts.promoted = row.get(2);
+        }
+    }
+    if pending {
+        let rows = bounded_query(
+            pool,
+            PROMOTION_LIMIT,
+            "SELECT count(*) FROM artifact_index_pending_mirror",
+            &[],
+        )
+        .await?;
+        facts.pending = rows.first().map(|row| row.get(0)).unwrap_or_default();
+    }
+    Ok(facts)
+}
+
+/// End the artifact mirror's noting for good, at its promotion: the lease
+/// ended first, so that nothing is noted after, at `-infinity`, which says
+/// it was ended by a promotion; then every note taken away, in one
+/// transaction bounded by [`PROMOTION_LIMIT`]. Returns how many notes
+/// went.
+///
+/// `-infinity` is a promotion flag held in the lease's own column, so no
+/// migration is needed for it. Any renewal clears it: `artifact_mirror_renew`
+/// sets the lease to `GREATEST(-infinity, now() + span)`. A hub still (or
+/// again) keeping a shadow of the index after its promotion therefore takes
+/// the flag away, and a hub serving the index from vellev is then refused
+/// until the index is promoted again or rolled back. That is meant: a
+/// shadow kept again means the promotion no longer stands.
+pub async fn end_artifact_mirror(pool: &PostgresPool) -> Result<u64> {
+    let ms = PROMOTION_LIMIT.as_millis().max(1);
+    let run = async {
+        let mut conn = pool.get().await?;
+        let tx = conn.transaction().await?;
+        tx.batch_execute(&format!(
+            "SET LOCAL statement_timeout = {ms}; SET LOCAL lock_timeout = {ms}"
+        ))
+        .await?;
+        tx.execute(
+            "UPDATE shadow_control SET mirrored_until = '-infinity'",
+            &[],
+        )
+        .await?;
+        let dropped = tx
+            .execute("DELETE FROM artifact_index_pending_mirror", &[])
+            .await?;
+        tx.commit().await?;
+        eyre::Ok(dropped)
+    };
+    tokio::time::timeout(PROMOTION_LIMIT * 2 + Duration::from_secs(1), run)
+        .await
+        .map_err(|_| eyre::eyre!("Postgres did not answer within {:?}", PROMOTION_LIMIT * 2))?
+        .context("ending the artifact mirror's noting")
+}
+
+/// Take the artifact index's promotion back in Postgres: the lease left
+/// unset, as before any shadow, unless a hub renewed it since.
+pub async fn unend_artifact_mirror(pool: &PostgresPool) -> Result<()> {
+    bounded(
+        pool,
+        PROMOTION_LIMIT,
+        "UPDATE shadow_control SET mirrored_until = NULL WHERE mirrored_until = '-infinity'",
+        &[],
+    )
+    .await
+    .context("taking the artifact index's promotion back")?;
+    Ok(())
 }
 
 fn midnight(day: NaiveDate) -> DateTime<Utc> {

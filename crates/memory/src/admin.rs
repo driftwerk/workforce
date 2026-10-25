@@ -60,6 +60,14 @@ pub enum SyncMode {
     /// [`SyncTarget::promoted`]): memories are then written there, and a
     /// replica would drop each written since.
     Replica,
+    /// Back into the store memories were promoted from, once the target
+    /// they were promoted to is to be given up (DW-676, `workforce shadow
+    /// rollback`): as a replica, carrying every change made since the
+    /// promotion, new memories, changed ones and those erased, and never
+    /// turned into a catch-up by the target's switch marker. The target is
+    /// not asked whether it is promoted, Weaviate refusing the question;
+    /// the caller has checked that the source is.
+    Rollback,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -311,7 +319,7 @@ pub async fn sync_recorded(
     // one is one whose embedding failed when it was written: read with its
     // vector, to find those.
     let vectors_due = target.vectors(&[]).await?.is_some();
-    let lean = mode == SyncMode::Replica && copying_vectors;
+    let lean = matches!(mode, SyncMode::Replica | SyncMode::Rollback) && copying_vectors;
     let mut walk = Walk {
         target,
         source,
@@ -392,7 +400,7 @@ impl Walk<'_> {
                 Ordering::Less => {
                     let object = self.ours.next().await?.expect("peeked");
                     let dropped = match self.mode {
-                        SyncMode::Mirror | SyncMode::Replica => true,
+                        SyncMode::Mirror | SyncMode::Replica | SyncMode::Rollback => true,
                         SyncMode::CatchUp => false,
                         SyncMode::Back { since } => created(&object).is_some_and(|at| at >= since),
                     };
@@ -519,7 +527,7 @@ fn step(mode: SyncMode, held: &Value, object: Value, vectors_due: bool) -> Step 
     let unvectored = vectors_due && !held["vector"].is_array();
     let mine = &held["properties"];
     match mode {
-        SyncMode::Mirror | SyncMode::Replica => {
+        SyncMode::Mirror | SyncMode::Replica | SyncMode::Rollback => {
             let other = &object["properties"];
             if unvectored {
                 Step::Copy(object)
@@ -1892,6 +1900,27 @@ pub(crate) mod tests {
             .unwrap_err();
         assert!(refused.downcast_ref::<Promoted>().is_some(), "{refused}");
         assert!(target.get(ID1).is_some());
+    }
+
+    /// A rollback from the promoted store carries every change back:
+    /// copies, updates, content rewritten, a memory erased, duplicates
+    /// dropped. The target's switch marker (Weaviate's is there) does not
+    /// make it a catch-up, nor does it say it is promoted; and a second
+    /// pass has nothing left to do.
+    #[tokio::test]
+    async fn a_rollback_carries_back_every_change_made_since_the_promotion() {
+        let (source, target) = replica_case();
+        assert!(*target.switched.lock().unwrap());
+        // As a store that must not be asked: a replica would stop here.
+        *target.promoted.lock().unwrap() = true;
+        sync(&target, &source, SyncMode::Rollback).await.unwrap();
+        assert_eq!(sorted(&target), sorted(&source));
+        let again = sync(&target, &source, SyncMode::Rollback).await.unwrap();
+        assert_eq!(
+            (again.copied, again.updated, again.dropped),
+            (0, 0, 0),
+            "{again:?}"
+        );
     }
 
     /// The memories, and the replica's copies of them, the next test syncs

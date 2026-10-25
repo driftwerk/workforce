@@ -128,6 +128,7 @@ pub async fn memory_store(
     budget: Duration,
 ) -> Result<Arc<dyn MemoryStore>> {
     config.check_memory_backend()?;
+    crate::promotion::guard_memories(config).await?;
     let Some((embedder, reranker)) = from_config(config).await? else {
         return Ok(v1);
     };
@@ -168,9 +169,7 @@ async fn open_switching(
     };
     crate::state::ensure_memory_store_ready(v2.as_ref(), recovery_dir, budget, label).await?;
     if v2.switched().await? {
-        let previous: Arc<dyn MemoryStore> = v1.clone();
-        v2.keep_previous(previous);
-        spawn_catch_up(Arc::clone(&v2), v1);
+        keep(config.embeddings.keep_previous, &v2, v1);
         let current: Arc<dyn MemoryStore> = v2;
         return Ok(current);
     }
@@ -179,6 +178,7 @@ async fn open_switching(
     )));
     let switching = Arc::clone(&store);
     let collection = e.collection_name();
+    let keep_previous = e.keep_previous;
     tokio::spawn(async move {
         // Only the fleet's leader copies (several replicas copying would
         // embed every memory several times over); the others switch when
@@ -212,12 +212,10 @@ async fn open_switching(
             }
             tokio::time::sleep(SWITCH_POLL).await;
         }
-        let previous: Arc<dyn MemoryStore> = v1.clone();
-        v2.keep_previous(previous);
         let current: Arc<dyn MemoryStore> = v2.clone();
         *switching.0.write() = current;
         tracing::info!(target: "embeddings", %collection, "memories switched to the hub's embeddings");
-        spawn_catch_up(v2, v1);
+        keep(keep_previous, &v2, v1);
     });
     Ok(store)
 }
@@ -346,6 +344,38 @@ fn embedded_store(
     })
 }
 
+/// Keep `previous`, the store memories switched from, beside `current`
+/// (forgetting and erasure reaching it, a catch-up from and back into
+/// it), unless `[embeddings] keep_previous` is off: then nothing of the
+/// hub's reads or writes it again (DW-676).
+fn keep(keep_previous: bool, current: &Arc<dyn Switchable>, previous: Arc<dyn Switchable>) {
+    if !keep_previous {
+        tracing::info!(target: "embeddings", collection = previous.collection(), "the collection memories switched from is left alone ([embeddings] keep_previous = false)");
+        return;
+    }
+    let kept: Arc<dyn MemoryStore> = previous.clone();
+    current.keep_previous(kept);
+    spawn_catch_up(Arc::clone(current), previous);
+}
+
+/// How often a catch-up runs: [`CATCH_UP_EVERY`], or, in tests, what
+/// [`CATCH_UP_EVERY_IN_TESTS`] says (milliseconds, when not zero).
+fn catch_up_every() -> Duration {
+    #[cfg(test)]
+    {
+        let ms = CATCH_UP_EVERY_IN_TESTS.load(std::sync::atomic::Ordering::SeqCst);
+        if ms > 0 {
+            return Duration::from_millis(ms);
+        }
+    }
+    CATCH_UP_EVERY
+}
+
+/// [`catch_up_every`] for tests that watch a catch-up happen.
+#[cfg(test)]
+pub(crate) static CATCH_UP_EVERY_IN_TESTS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// Carry new memories and forgetting from `previous` into `current` while
 /// replicas may still write to `previous`, then from `current` back into
 /// `previous` for as long as `previous` is kept, so that switching back
@@ -355,7 +385,7 @@ fn spawn_catch_up(current: Arc<dyn Switchable>, previous: Arc<dyn Switchable>) {
         let since = chrono::Utc::now();
         let forward_until = tokio::time::Instant::now() + CATCH_UP_FOR;
         loop {
-            tokio::time::sleep(CATCH_UP_EVERY).await;
+            tokio::time::sleep(catch_up_every()).await;
             if !crate::health_gauges::is_leader() {
                 continue;
             }
@@ -495,13 +525,16 @@ pub async fn switched_memory_store(
     v1: Arc<dyn Switchable>,
 ) -> Result<Arc<dyn Switchable>> {
     config.check_memory_backend()?;
+    crate::promotion::guard_memories(config).await?;
     let Some((embedder, reranker)) = from_config(config).await? else {
         return Ok(v1);
     };
     let v2 = embedded_store(config, Backend::of(config), embedder, reranker)?;
     Ok(if v2.switched().await.unwrap_or(false) {
-        let previous: Arc<dyn MemoryStore> = v1;
-        v2.keep_previous(previous);
+        if config.embeddings.keep_previous {
+            let previous: Arc<dyn MemoryStore> = v1;
+            v2.keep_previous(previous);
+        }
         v2
     } else {
         v1

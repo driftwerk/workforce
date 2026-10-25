@@ -311,6 +311,41 @@ impl VellevStore {
         }
     }
 
+    /// Mark memories as promoted to this collection: served from it, no
+    /// longer a replica of Weaviate (DW-676, `workforce shadow promote`).
+    /// Idempotent.
+    pub async fn mark_promoted(&self) -> Result<()> {
+        workforce_vellev::mark_promoted(&self.tenant, self.collection.as_str()).await
+    }
+
+    /// Take the promotion's mark away (`workforce shadow rollback`).
+    pub async fn unmark_promoted(&self) -> Result<()> {
+        workforce_vellev::unmark_promoted(&self.tenant, self.collection.as_str()).await
+    }
+
+    /// Drop the collection if it holds nothing at all, deleted memories
+    /// included; `Ok(true)` once it is gone, or was never made, and
+    /// `Ok(false)` if it holds anything, which is never dropped.
+    pub async fn drop_if_empty(&self) -> Result<bool> {
+        if !self.exists().await? {
+            return Ok(true);
+        }
+        if !self.holds_nothing().await? {
+            return Ok(false);
+        }
+        self.delete_collection().await?;
+        Ok(true)
+    }
+
+    /// Whether the collection holds no object at all, deleted memories
+    /// included, or is not there.
+    pub async fn holds_nothing(&self) -> Result<bool> {
+        if !self.exists().await? {
+            return Ok(true);
+        }
+        Ok(self.answered(self.records.count(None).await).await? == 0)
+    }
+
     /// Whether the collection exists in the tenant.
     pub async fn exists(&self) -> Result<bool> {
         Ok(self.answered(self.records.schema().await).await?.is_some())

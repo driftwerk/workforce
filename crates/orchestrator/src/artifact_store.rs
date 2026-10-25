@@ -379,7 +379,7 @@ const MIRROR_COMPARE_LOCK: i64 = 0x6172_7469_6d69_7272;
 
 /// The session lock the hubs serving an index of this kind hold, shared,
 /// and a seeding of it asks for alone ([`KnowledgeStore::seed_index`]).
-fn serving_lock(backend: &str) -> i64 {
+pub fn serving_lock(backend: &str) -> i64 {
     // FNV-1a of the name, under a prefix no other lock of the hub's has.
     let hash = backend
         .bytes()
@@ -387,6 +387,39 @@ fn serving_lock(backend: &str) -> i64 {
             (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
         });
     0x7366_0000_0000_0000 | (hash & 0xffff_ffff_ffff) as i64
+}
+
+/// A connection holding a session lock until it is dropped.
+pub type HeldLock = deadpool_postgres::ClientWrapper;
+
+/// Hold the serving locks of `backends`' artifact indexes alone, each on
+/// a connection of its own, for as long as the returned connections are
+/// kept (dropped, each is closed, and its lock goes with the session).
+/// Returns those held and the kinds some hub serves now, whose keeper
+/// holds the lock shared, as Postgres says. Promotion's proof that no hub
+/// is running, kept to its end so that no hub's keeper takes the lock
+/// meanwhile (DW-676). Like seeding's refusal, it proves nothing behind
+/// PgBouncer in transaction mode, nor of a process that keeps no artifact
+/// index.
+pub async fn hold_unserved(
+    pool: &PostgresPool,
+    backends: &[&'static str],
+) -> Result<(Vec<HeldLock>, Vec<&'static str>)> {
+    let mut held = Vec::new();
+    let mut served = Vec::new();
+    for backend in backends {
+        // Never handed back to the pool: closed when dropped.
+        let alone = deadpool_postgres::Object::take(pool.get().await?);
+        let free: bool = alone
+            .query_one("SELECT pg_try_advisory_lock($1)", &[&serving_lock(backend)])
+            .await?
+            .get(0);
+        match free {
+            true => held.push(alone),
+            false => served.push(*backend),
+        }
+    }
+    Ok((held, served))
 }
 
 /// A hub is serving the index a seeding was asked for.

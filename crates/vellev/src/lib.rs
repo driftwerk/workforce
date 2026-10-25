@@ -32,7 +32,7 @@ pub use ensure::{
 };
 pub use markers::{
     index_claim, index_mark, index_marked, index_unmark, mark, mark_promoted, marked, marker_id,
-    promoted, unmark, INDEX_MARKERS, MARKERS,
+    promoted, unmark, unmark_promoted, INDEX_MARKERS, MARKERS,
 };
 pub use matching::{unmatched, Unmatched};
 pub use shape::{checked, mismatches, Refused};
