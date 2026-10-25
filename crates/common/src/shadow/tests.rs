@@ -613,3 +613,136 @@ async fn a_late_success_from_before_the_trip_leaves_the_breaker_open() {
     until("the late success", || sink.len() == 2).await;
     assert_eq!(shadow.breaker_told(), "open", "a late success closed it");
 }
+
+// ---- Where a shadow's time goes ---------------------------------------------
+
+/// The wait for the runtime to start a shadow's task is `queued`, and is
+/// not in `shadow_latency`: here the one thread the runtime has is held
+/// past the shadow being admitted, and the shadow itself answers at once.
+#[tokio::test(flavor = "current_thread")]
+async fn the_wait_to_be_scheduled_is_queued_not_shadow_latency() {
+    const HELD: Duration = Duration::from_millis(80);
+    let (shadow, sink) = shadow(settings());
+    shadow.observe(observed(&["a"]), answers(&["a"]));
+    // The shadow's task cannot start until this one yields.
+    std::thread::sleep(HELD);
+    until("the shadow ended", || sink.len() == 1).await;
+    let c = sink.taken().remove(0);
+    assert!(c.queued >= HELD, "queued {:?}", c.queued);
+    assert!(
+        c.shadow_latency < HELD,
+        "shadow_latency {:?} counts the wait to be scheduled",
+        c.shadow_latency
+    );
+}
+
+/// `concurrent` is the shadows running when one was admitted, itself
+/// among them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_is_the_shadows_running_when_one_was_admitted() {
+    let (alone, sink) = shadow(settings());
+    alone.observe(observed(&["a"]), answers(&["a"]));
+    until("the lone shadow ended", || sink.len() == 1).await;
+    assert_eq!(sink.taken()[0].concurrent, 1, "alone");
+
+    // A shadow of its own: a permit is given back only after its holder
+    // records, so the lone one's may not be back yet.
+    let (shadow, sink) = shadow(settings());
+    let mut holds = Vec::new();
+    for _ in 0..2 {
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        holds.push(tx);
+        shadow.observe(observed(&["a"]), move || {
+            async move {
+                let _ = rx.await;
+                Ok(Ranked::default())
+            }
+            .boxed()
+        });
+    }
+    shadow.observe(observed(&["a"]), answers(&["a"]));
+    until("the third shadow ended", || sink.len() == 1).await;
+    assert_eq!(sink.taken()[0].concurrent, 3, "two held, and itself");
+    drop(holds);
+    until("the held shadows ended", || sink.len() == 2).await;
+    let held: Vec<usize> = sink.taken().iter().map(|c| c.concurrent).collect();
+    assert_eq!(held, vec![1, 2], "each counted the ones before it");
+}
+
+/// `index` is the sum of the shadow's index calls, and nothing else of
+/// its time: here 2 calls of `CALL` each, after `ELSE` of other work.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn index_is_the_sum_of_the_shadows_index_calls_alone() {
+    const CALL: Duration = Duration::from_millis(30);
+    const ELSE: Duration = Duration::from_millis(60);
+    let (shadow, sink) = shadow(settings());
+    shadow.observe(observed(&["a"]), || {
+        async {
+            tokio::time::sleep(ELSE).await;
+            index_call(tokio::time::sleep(CALL)).await;
+            index_call(tokio::time::sleep(CALL)).await;
+            Ok(Ranked::default())
+        }
+        .boxed()
+    });
+    until("the shadow ended", || sink.len() == 1).await;
+    let c = sink.taken().remove(0);
+    let index = c.index.expect("index calls were made");
+    assert!(index >= 2 * CALL, "both calls: {index:?}");
+    assert!(
+        index + ELSE <= c.shadow_latency,
+        "index {index:?} counts the other work (shadow {:?})",
+        c.shadow_latency
+    );
+}
+
+/// No index call, no index time; one that did not answer has none either;
+/// and outside a shadow, an index call is the call alone.
+#[tokio::test]
+async fn index_is_none_without_index_calls_or_an_answer() {
+    let (shadow, sink) = shadow(settings());
+    shadow.observe(observed(&["a"]), answers(&["a"]));
+    shadow.observe(observed(&["a"]), || {
+        async {
+            index_call(async {}).await;
+            Err(eyre::eyre!("vellev said no"))
+        }
+        .boxed()
+    });
+    until("both ended", || sink.len() == 2).await;
+    for c in sink.taken() {
+        assert_eq!(c.index, None, "{:?}", c.outcome);
+    }
+    assert_eq!(index_call(async { 7 }).await, 7);
+}
+
+/// `queued` ends when the shadow's task starts: the shadow's own run is
+/// not in it. Here the shadow takes `RUN`, far longer than the wait.
+#[tokio::test(flavor = "current_thread")]
+async fn queued_stops_when_the_shadow_starts() {
+    const HELD: Duration = Duration::from_millis(50);
+    const RUN: Duration = Duration::from_millis(300);
+    let (shadow, sink) = shadow(settings());
+    shadow.observe(observed(&["a"]), || {
+        async {
+            tokio::time::sleep(RUN).await;
+            Ok(Ranked::default())
+        }
+        .boxed()
+    });
+    std::thread::sleep(HELD);
+    until("the shadow ended", || sink.len() == 1).await;
+    let c = sink.taken().remove(0);
+    assert!(c.queued >= HELD, "queued {:?}", c.queued);
+    assert!(
+        c.queued < HELD + RUN / 2,
+        "queued {:?} counts the shadow's own run ({:?})",
+        c.queued,
+        c.shadow_latency
+    );
+    assert!(
+        c.shadow_latency >= RUN,
+        "shadow_latency {:?}",
+        c.shadow_latency
+    );
+}
