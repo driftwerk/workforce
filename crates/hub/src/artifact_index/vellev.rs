@@ -145,6 +145,22 @@ impl VellevArtifacts {
         })
     }
 
+    /// Whether the artifact index is marked promoted: served from vellev,
+    /// no longer a mirror of Weaviate's (DW-676, PR 11).
+    pub async fn promoted(&self) -> eyre::Result<bool> {
+        workforce_vellev::promoted(&self.tenant, artifacts_collection()?.name.as_str()).await
+    }
+
+    /// Mark the artifact index promoted; idempotent.
+    pub async fn mark_promoted(&self) -> eyre::Result<()> {
+        workforce_vellev::mark_promoted(&self.tenant, artifacts_collection()?.name.as_str()).await
+    }
+
+    /// Take the promotion's mark away (`workforce shadow rollback`).
+    pub async fn unmark_promoted(&self) -> eyre::Result<()> {
+        workforce_vellev::unmark_promoted(&self.tenant, artifacts_collection()?.name.as_str()).await
+    }
+
     /// Have each artifact's vector made by `seeding`'s embedder and sent
     /// with it, rather than made by the node. Only for an embedder checked
     /// to embed as the node does (see

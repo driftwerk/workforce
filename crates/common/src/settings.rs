@@ -2946,6 +2946,16 @@ pub struct EmbeddingsConfig {
     /// Empty reports raw certainty.
     #[serde(default)]
     pub score_map: Vec<[f32; 2]>,
+    /// Whether the store memories switched from (the collection Weaviate
+    /// or vellev embeds for itself, `WorkforceMemory`) is kept beside the
+    /// one the hub embeds for: forgetting and erasure reaching it, new
+    /// memories caught up from it for half an hour after each start and
+    /// carried back to it after, so that switching back loses nothing.
+    /// `false` leaves it alone entirely, read and written by nothing of
+    /// the hub's: what promoting vellev needs (DW-676), since a previous
+    /// store nothing erases from would bring an erased memory back.
+    #[serde(default = "default_true")]
+    pub keep_previous: bool,
 }
 
 impl Default for EmbeddingsConfig {
@@ -2963,6 +2973,7 @@ impl Default for EmbeddingsConfig {
             rerank_url: None,
             rerank_candidates: default_rerank_candidates(),
             score_map: Vec::new(),
+            keep_previous: true,
         }
     }
 }

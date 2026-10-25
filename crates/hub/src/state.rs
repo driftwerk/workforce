@@ -486,6 +486,9 @@ async fn resolve_memory_store_as(
     // Checked here, where memories are opened, rather than when the config
     // is read: a process that never opens them is not stopped by it.
     config.check_memory_backend()?;
+    // Before any store is made: opening vellev's makes its first
+    // collection, which a shadow refuses its tenant to hold (DW-676).
+    crate::promotion::guard_memories(config).await?;
     let backend = config.memory.backend.as_str();
     let effective_backend = if config.weaviate.enabled && backend == "sqlite" {
         "weaviate"
@@ -1042,7 +1045,16 @@ mod tests {
                 .expect("no Weaviate to reach")
         );
         assert!(!failed.contains("[memory] backend"), "{failed}");
-        assert!(failed.contains("Weaviate"), "{failed}");
+        // Postgres is not there either: promotion's guard (DW-676, PR 11)
+        // asks it first, and refuses rather than open on facts unread. The
+        // Weaviate branch, with Postgres there, is
+        // `promotion::tests::postgres::a_shadow_with_postgres_there_fails_on_weaviate_alone`.
+        assert!(
+            failed.contains(
+                "whether memories were promoted to vellev cannot be read, so they are not opened from \"shadow\""
+            ),
+            "{failed}"
+        );
     }
 
     #[tokio::test]

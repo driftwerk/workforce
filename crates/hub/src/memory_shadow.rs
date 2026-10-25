@@ -309,6 +309,48 @@ pub fn replica_lock(config: &WorkforceConfig) -> Result<Arc<ReplicaLock>> {
     Ok(Arc::new(ReplicaLock::new(pool)))
 }
 
+/// A reconcile of memories' replica as the hub runs it, ready to run, and
+/// what it is made of.
+pub struct Reconciling {
+    pub reconcile: Reconcile,
+    /// The replica's lock, on a pool of its own.
+    pub lock: Arc<ReplicaLock>,
+    /// vellev's replica.
+    pub replica: Arc<dyn Switchable>,
+    /// The Weaviate collection that serves.
+    pub serving: Arc<dyn Switchable>,
+}
+
+/// The reconcile `[memory] backend = "shadow"` runs, recorded in `shadow`:
+/// what the hub's leader runs at its interval, and promotion runs to its
+/// end (DW-676, PR 11).
+pub async fn reconciling(
+    config: &WorkforceConfig,
+    shadow: Arc<dyn Recorder>,
+) -> Result<Reconciling> {
+    let (replica, serving) = crate::embeddings::shadow_stores(config).await?;
+    let ready = VellevReady {
+        replica: Arc::clone(&replica),
+        imported: crate::embeddings::shadow_v1_store(config)?,
+    };
+    let lock = replica_lock(config)?;
+    let turns = ReplicaTurns::new(Arc::clone(&lock), PAGE_PACE, LOCK_WAIT, LOCK_HOLD);
+    let reconcile = Reconcile {
+        serving_name: serving.collection().to_string(),
+        replica: Arc::clone(&replica) as Arc<dyn SyncTarget>,
+        serving: Arc::clone(&serving) as Arc<dyn SyncTarget>,
+        ready: Arc::new(ready),
+        turns: Arc::new(turns),
+        recorder: shadow,
+    };
+    Ok(Reconciling {
+        reconcile,
+        lock,
+        replica,
+        serving,
+    })
+}
+
 /// Start reconciling memories' replica, and applying the memories noted
 /// for it ([`crate::memory_mirror`]), on the leader, when `[memory]
 /// backend` shadows them; `shadow` is the hub's shadow tables. Both hold
@@ -328,21 +370,12 @@ pub async fn start(
         let shadow = shadow.ok_or_else(|| eyre!("the shadow tables are not open"))?;
         let tables = Arc::clone(&shadow);
         let every = config.vellev.shadow.memory_reconcile()?;
-        let (replica, serving) = crate::embeddings::shadow_stores(config).await?;
-        let ready = VellevReady {
-            replica: Arc::clone(&replica),
-            imported: crate::embeddings::shadow_v1_store(config)?,
-        };
-        let lock = replica_lock(config)?;
-        let turns = ReplicaTurns::new(Arc::clone(&lock), PAGE_PACE, LOCK_WAIT, LOCK_HOLD);
-        let reconcile = Reconcile {
-            serving_name: serving.collection().to_string(),
-            replica: Arc::clone(&replica) as Arc<dyn SyncTarget>,
-            serving: Arc::clone(&serving) as Arc<dyn SyncTarget>,
-            ready: Arc::new(ready),
-            turns: Arc::new(turns),
-            recorder: shadow,
-        };
+        let Reconciling {
+            reconcile,
+            lock,
+            replica,
+            serving,
+        } = reconciling(config, shadow).await?;
         let known_items = known_items(
             config,
             Arc::clone(&replica),
