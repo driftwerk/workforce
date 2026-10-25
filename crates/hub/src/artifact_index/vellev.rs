@@ -22,6 +22,7 @@ use tracing::warn;
 use vellev_client::api::{Content, Nearest, Page};
 use vellev_client::{Records, Tenant};
 use vellev_core::{Collection, CollectionName, DataType, ObjectId, Property};
+use workforce_common::shadow::index_call;
 use workforce_common::vectorizable::VectorizableText;
 use workforce_vellev::{
     collection, local_embedding, Cap, Ensured, Timeouts, Unusable, RECHECK_AFTER,
@@ -272,7 +273,7 @@ impl ArtifactVectors for VellevArtifacts {
                         oversample: None,
                         vectors: false,
                     };
-                    async move { self.artifacts.collection().nearest(&nearest).await }
+                    async move { index_call(self.artifacts.collection().nearest(&nearest)).await }
                 })
             })
             .await?;
@@ -445,6 +446,74 @@ mod tests {
         artifacts.remove("spec-1").await.unwrap();
         let found = artifacts.search("baking bread", 5).await.unwrap();
         assert!(found.iter().all(|(id, _)| id != "spec-1"), "{found:?}");
+    }
+
+    /// A shadow's search of artifacts times the node's search as its index
+    /// call (DW-676, PR 9b): the count that follows it is not in it.
+    /// Needs a node that runs the local model.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_shadows_artifact_search_times_the_nodes_search_as_its_index_call() {
+        use std::sync::Arc;
+
+        use workforce_common::shadow::{
+            MemorySink, Observed, Outcome, Ranked, Shadow, ShadowSettings, ShadowSink,
+        };
+        let Some(node) = Node::embedding().await else {
+            return;
+        };
+        let artifacts = Arc::new(VellevArtifacts::new(&node.url, &node.key, &node.tenant).unwrap());
+        artifacts.ensure_collection().await.unwrap();
+        artifacts
+            .upsert(
+                "spec-1",
+                "Deploy runbook\n\nHow to roll back a release",
+                "h",
+            )
+            .await
+            .unwrap();
+        let sink = Arc::new(MemorySink::default());
+        let settings = ShadowSettings {
+            sample: 1.0,
+            permits: 1,
+            deadline: Duration::from_secs(30),
+            trip_after: 3,
+            rest: Duration::from_secs(60),
+            k: 10,
+            rbo_p: 0.9,
+        };
+        let shadow = Shadow::new(
+            "artifacts",
+            settings,
+            Arc::clone(&sink) as Arc<dyn ShadowSink>,
+        )
+        .unwrap();
+        let reader = Arc::clone(&artifacts);
+        shadow.observe(Observed::default(), move || async move {
+            let (found, _) = reader.search_counted("rolling back a deploy", 5).await?;
+            Ok(Ranked {
+                ids: found.into_iter().map(|(id, _)| id).collect(),
+                ..Ranked::default()
+            })
+        });
+        let began = std::time::Instant::now();
+        while sink.is_empty() {
+            assert!(
+                began.elapsed() < Duration::from_secs(30),
+                "the shadow ended"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let c = sink.taken().remove(0);
+        let Outcome::Answered { ranked, .. } = &c.outcome else {
+            panic!("{:?}", c.outcome);
+        };
+        assert_eq!(ranked.ids, vec!["spec-1".to_string()]);
+        let index = c.index.expect("the search was timed");
+        assert!(
+            !index.is_zero() && index <= c.shadow_latency,
+            "{index:?} of {:?}",
+            c.shadow_latency
+        );
     }
 
     #[tokio::test]

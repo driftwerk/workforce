@@ -847,13 +847,21 @@ fn count(n: usize) -> i32 {
 
 impl Row {
     fn of(c: &Comparison) -> Self {
-        let labels = serde_json::Value::Object(
-            c.primary
-                .labels
-                .iter()
-                .map(|(k, v)| (k.to_string(), serde_json::Value::String(v.clone())))
-                .collect(),
-        );
+        let mut labels: serde_json::Map<String, serde_json::Value> = c
+            .primary
+            .labels
+            .iter()
+            .map(|(k, v)| (k.to_string(), serde_json::Value::String(v.clone())))
+            .collect();
+        // Where the shadow's time went (DW-676, PR 9b), kept in `labels`
+        // rather than columns of their own: numbers, not strings. An index
+        // time is left out, never written as 0, when there is none.
+        labels.insert("shadow_queue_ms".into(), ms(c.queued).into());
+        labels.insert("concurrent".into(), c.concurrent.into());
+        if let Some(index) = c.index {
+            labels.insert("shadow_index_ms".into(), ms(index).into());
+        }
+        let labels = serde_json::Value::Object(labels);
         let mut row = Self {
             store: c.store,
             outcome: "answered",
