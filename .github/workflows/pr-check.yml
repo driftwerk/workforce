@@ -28,6 +28,11 @@ env:
   # The vellev node the `vellev-node` job tests against, by digest so a
   # re-pushed tag can't change what is tested.
   VELLEV_IMAGE: kingsleyh/vellev:sha-5bbf0e6bdb9653328a759e20e5582951e59f932f@sha256:e112e546216ed82d12945b10356a75afbf7f6661027e531320a0ea88ee23014f
+  # The Weaviate the `vellev-node` job runs the memory shadow's end-to-end
+  # test against, as Weaviate's release archive for linux-amd64, pinned by
+  # the sha256 Weaviate publishes beside it. Moving it is these two lines.
+  WEAVIATE_VERSION: "1.28.4"
+  WEAVIATE_SHA256: 0892f23d1802872ddca3a7c489fe9eab17c76de3dc1058d21d51d3f741aa9a18
 
 jobs:
   # A change outside end-user-docs/ is code and runs the full gate; a
@@ -209,6 +214,10 @@ jobs:
       VELLEV_TEST_KEY: ci-key
       VELLEV_TEST_LOCAL_EMBED: "1"
       VELLEV_TEST_REQUIRED: "1"
+      # The tests that need a Weaviate fail without one rather than skip:
+      # a skipped test passes, and would count among the node tests that
+      # `vellev-node-tests.sh` requires to have run and passed.
+      WORKFORCE_TEST_WEAVIATE_REQUIRED: "1"
       VELLEV_TEST_URL: http://127.0.0.1:8080
       WORKFORCE_TEST_POSTGRES_URL: postgres://vellev:vellev@127.0.0.1:5432/vellev
     steps:
@@ -258,6 +267,109 @@ jobs:
           done
           call -X DELETE "$probe" || true
           if [ "${embeds:-}" != 1 ]; then docker logs vellev | tail -n 100; exit 1; fi
+      # A Weaviate, for the memory shadow's end-to-end test, which moves
+      # memories from one. Its release binary, pinned by sha256 (see
+      # WEAVIATE_SHA256). The collection memories are moved from names the
+      # `text2vec-transformers` module, so the module
+      # is on; nothing is vectorized by Weaviate here, so its inference
+      # service is a stand-in that answers only what Weaviate asks of it at
+      # start: `/.well-known/ready`, and `/meta`.
+      - name: Start Weaviate
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          work="$RUNNER_TEMP/weaviate"
+          mkdir -p "$work"
+          free_port() {
+            python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()'
+          }
+          # Two free ports in a row: Weaviate's cluster data port must be
+          # the one after its gossip port. Prints the first.
+          free_pair() {
+            python3 -c '
+          import socket
+          for _ in range(100):
+              a = socket.socket(); a.bind(("127.0.0.1", 0)); port = a.getsockname()[1]
+              b = socket.socket()
+              try:
+                  b.bind(("127.0.0.1", port + 1))
+              except OSError:
+                  continue
+              finally:
+                  a.close(); b.close()
+              print(port); break
+          else:
+              raise SystemExit("no two free ports in a row")
+          '
+          }
+          weaviate="$(.github/scripts/fetch-weaviate-binary.sh "$WEAVIATE_VERSION" "$WEAVIATE_SHA256" "$work/weaviate-bin")"
+
+          stub="$work/inference"
+          mkdir -p "$stub/.well-known"
+          : > "$stub/.well-known/ready"
+          echo '{}' > "$stub/meta"
+          stubport="$(free_port)"
+          nohup python3 -m http.server "$stubport" --bind 127.0.0.1 --directory "$stub" \
+            > "$work/inference.log" 2>&1 &
+          echo $! > "$work/inference.pid"
+          for _ in $(seq 1 30); do
+            curl -fsS -o /dev/null "http://127.0.0.1:$stubport/.well-known/ready" && stubbed=1 && break
+            sleep 1
+          done
+          if [ "${stubbed:-}" != 1 ]; then
+            cat "$work/inference.log"
+            echo "::error::the inference stand-in never answered"
+            exit 1
+          fi
+
+          port="$(free_port)"
+          gossip="$(free_pair)"
+          env \
+            PERSISTENCE_DATA_PATH="$work/weaviate-data" \
+            AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED=true \
+            DEFAULT_VECTORIZER_MODULE=none \
+            ENABLE_MODULES=text2vec-transformers \
+            TRANSFORMERS_INFERENCE_API="http://127.0.0.1:$stubport" \
+            DISABLE_TELEMETRY=true \
+            CLUSTER_HOSTNAME=node1 \
+            CLUSTER_ADVERTISE_ADDR=127.0.0.1 \
+            CLUSTER_GOSSIP_BIND_PORT="$gossip" \
+            CLUSTER_DATA_BIND_PORT="$((gossip + 1))" \
+            RAFT_PORT="$(free_port)" \
+            RAFT_INTERNAL_RPC_PORT="$(free_port)" \
+            RAFT_BOOTSTRAP_EXPECT=1 \
+            GRPC_PORT="$(free_port)" \
+            nohup "$weaviate" --host 127.0.0.1 --port "$port" --scheme http \
+            > "$work/weaviate.log" 2>&1 &
+          echo $! > "$work/weaviate.pid"
+          url="http://127.0.0.1:$port"
+          for _ in $(seq 1 120); do
+            curl -fsS -o /dev/null "$url/v1/.well-known/ready" && ready=1 && break
+            kill -0 "$(cat "$work/weaviate.pid")" 2>/dev/null || break
+            sleep 1
+          done
+          if [ "${ready:-}" != 1 ]; then
+            tail -n 100 "$work/weaviate.log"
+            echo "::error::Weaviate never became ready"
+            exit 1
+          fi
+          # The version asked for, with the module on.
+          meta="$(curl -fsS "$url/v1/meta")"
+          python3 - "$meta" "$WEAVIATE_VERSION" <<'PY'
+          import json, sys
+          meta, want = json.loads(sys.argv[1]), sys.argv[2]
+          if meta.get("version") != want:
+              sys.exit(f"::error::Weaviate says it is {meta.get('version')}, not {want}")
+          module = meta.get("modules", {}).get("text2vec-transformers")
+          if module is None:
+              sys.exit("::error::Weaviate has no text2vec-transformers module")
+          # Weaviate starts with a module whose inference service it could
+          # not ask, and says so only here.
+          if "error" in module:
+              sys.exit(f"::error::Weaviate's text2vec-transformers module: {module['error']}")
+          PY
+          echo "Weaviate $WEAVIATE_VERSION at $url"
+          echo "WORKFORCE_TEST_WEAVIATE_URL=$url" >> "$GITHUB_ENV"
       - name: Run the tests against the node
         timeout-minutes: 60
         run: |
@@ -272,6 +384,14 @@ jobs:
       - name: Node logs
         if: always()
         run: docker logs vellev 2>&1 | tail -n 200 || true
+      - name: Stop Weaviate
+        if: always()
+        run: |
+          work="$RUNNER_TEMP/weaviate"
+          for name in weaviate inference; do
+            [ -f "$work/$name.pid" ] && kill "$(cat "$work/$name.pid")" 2>/dev/null || true
+          done
+          [ -f "$work/weaviate.log" ] && tail -n 50 "$work/weaviate.log" || true
 
   docs-embed:
     name: Docs embed

@@ -4651,6 +4651,15 @@ pub struct KnowledgeConfig {
     /// that memories can move to vellev while code search stays where it is.
     #[serde(default = "default_vector_backend")]
     pub vector_backend: String,
+    /// A vector database kept in step with `vector_backend` as a standby:
+    /// `""` (none, the default), `"weaviate"` or `"vellev"`, and not the
+    /// one in use. It is never filled nor searched: every file an index run
+    /// changes is noted pending for it, so that once it is switched to, it
+    /// is brought up to date file by file rather than filled again whole.
+    /// Set it while moving code vectors from one database to the other,
+    /// and clear it once the old one is retired.
+    #[serde(default)]
+    pub vector_standby: String,
     /// The most code entities and summaries per second the hub's own
     /// backfill of code vectors has the vector database embed; `0` for no
     /// limit. A vellev node runs its model on one batch at a time and a
@@ -4702,6 +4711,7 @@ impl Default for KnowledgeConfig {
             index_timeout_secs: default_index_timeout(),
             summariser: KnowledgeSummariserConfig::default(),
             vector_backend: default_vector_backend(),
+            vector_standby: String::new(),
             vector_backfill_per_sec: default_vector_backfill_per_sec(),
             vector_search_timeout_ms: default_search_timeout_ms(),
             vector_reconcile_secs: default_vector_reconcile_secs(),
@@ -6577,6 +6587,7 @@ impl AgentConfig {
                 index_timeout_secs: global.index_timeout_secs,
                 summariser: global.summariser.clone(),
                 vector_backend: global.vector_backend.clone(),
+                vector_standby: global.vector_standby.clone(),
                 vector_backfill_per_sec: global.vector_backfill_per_sec,
                 vector_search_timeout_ms: global.vector_search_timeout_ms,
                 vector_reconcile_secs: global.vector_reconcile_secs,
@@ -10480,6 +10491,9 @@ impl WorkforceConfig {
         if let Ok(v) = var("WORKFORCE_KNOWLEDGE_VECTOR_BACKEND") {
             self.knowledge.vector_backend = v;
         }
+        if let Ok(v) = var("WORKFORCE_KNOWLEDGE_VECTOR_STANDBY") {
+            self.knowledge.vector_standby = v;
+        }
         if let Ok(v) = var("WORKFORCE_MEMORY_DB_PATH") {
             self.memory.db_path = v;
         }
@@ -12630,6 +12644,22 @@ role = "dev"
             let named = setting.replace('\n', " ");
             assert!(refused.contains(&named), "{refused}");
         }
+    }
+
+    /// `[knowledge] vector_standby`: none unless set, in the file or by
+    /// its own variable.
+    #[test]
+    fn the_code_vector_standby_is_none_unless_set() {
+        assert_eq!(WorkforceConfig::default().knowledge.vector_standby, "");
+        let parsed: KnowledgeConfig = toml::from_str("vector_standby = \"vellev\"").unwrap();
+        assert_eq!(parsed.vector_standby, "vellev");
+        let environment = |name: &str| match name {
+            "WORKFORCE_KNOWLEDGE_VECTOR_STANDBY" => Ok("weaviate".to_string()),
+            _ => Err(std::env::VarError::NotPresent),
+        };
+        let mut config = WorkforceConfig::default();
+        config.apply_env_overrides_from(&environment);
+        assert_eq!(config.knowledge.vector_standby, "weaviate");
     }
 
     #[test]
