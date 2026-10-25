@@ -69,6 +69,7 @@ pub use hub_core::decision_records;
 pub mod decision_store;
 pub mod def_cmd;
 pub use workforce_hub_core::def_write_auth;
+pub mod edge_memory_move;
 pub mod effective_settings;
 pub mod embeddings;
 pub mod endpoint_cmd;

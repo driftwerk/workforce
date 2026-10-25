@@ -675,7 +675,7 @@ impl workforce_common::shadow::ShadowSink for Deferred {
 }
 
 /// vellev's replica as a purge erases from it.
-struct Replica(Arc<dyn MemoryStore>);
+pub(crate) struct Replica(pub(crate) Arc<dyn MemoryStore>);
 
 #[async_trait]
 impl Erases for Replica {
@@ -1133,4 +1133,4 @@ mod reads_tests;
 
 #[cfg(test)]
 #[path = "memory_shadow_e2e_tests.rs"]
-mod e2e_tests;
+pub(crate) mod e2e_tests;
