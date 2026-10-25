@@ -1,4 +1,4 @@
--- Remote MCP bearer tokens.
+-- Remote MCP bearer tokens (see docs/workforce-mcp-design.md §4).
 --
 -- Translation of the `remote_mcp_tokens` table in
 -- `crates/identity/src/sqlite.rs::SqliteIdentityStore::init_schema`.
