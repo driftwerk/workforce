@@ -626,7 +626,14 @@ impl VellevStore {
                             .await,
                     )
                     .await?;
-                (scored(found.results, |found| found.certainty), true)
+                // The model's certainty, on the scale the caller's floors
+                // were tuned on.
+                let mut scored: Vec<MemorySearchResult> =
+                    scored(found.results, |found| found.certainty);
+                for hit in &mut scored {
+                    hit.score = map_score(&self.score_map, hit.score);
+                }
+                (scored, true)
             }
             Some(alpha) => {
                 let found = self

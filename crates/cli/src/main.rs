@@ -1971,6 +1971,48 @@ enum MemoryCommand {
         #[arg(short, long, default_value = "workforce.toml")]
         config: PathBuf,
     },
+    /// Move the customer-facing edge's memories out of the hub's stores
+    /// into the edge's own vellev tenant (DW-676 (b)), in two steps run in
+    /// this order: `copy`, with the edge stopped, then `purge`, once the
+    /// edge runs on its tenant. Each is a dry run without `--apply`, and
+    /// safe to run again. Needs `[memory] backend = "shadow"` and
+    /// `[embeddings] keep_previous = false` on every hub. The edge's
+    /// tenant key is read from EDGE_VELLEV_API_KEY, never the command line.
+    MoveEdge {
+        /// `copy` or `purge`.
+        #[arg(value_enum)]
+        step: MoveEdgeStep,
+        /// Write; without it nothing is changed and counts are printed.
+        #[arg(long)]
+        apply: bool,
+        /// The edge's agent ids, as its `[[agents]] id`; repeat for each.
+        #[arg(long = "agent", required = true)]
+        agents: Vec<String>,
+        /// The edge's `[vellev] url`.
+        #[arg(long)]
+        edge_url: String,
+        /// The edge's `[vellev] tenant`.
+        #[arg(long)]
+        edge_tenant: String,
+        /// The edge's `[vellev] model`.
+        #[arg(long)]
+        edge_model: String,
+        /// The edge's `[vellev] dimensions`.
+        #[arg(long)]
+        edge_dimensions: u32,
+        /// The edge's `[vellev] query_prefix`, if it sets one.
+        #[arg(long)]
+        edge_query_prefix: Option<String>,
+        /// For `copy`: a file of every customer the edge still knows, one
+        /// owner key a line, from the edge's database
+        /// (`SELECT owner FROM edge_analytics.chat_identities`). A customer's
+        /// memory of anyone else is taken as erased: purged, never copied.
+        #[arg(long)]
+        known_customers: Option<PathBuf>,
+        /// Workforce config file.
+        #[arg(short, long, default_value = "workforce.toml")]
+        config: PathBuf,
+    },
     /// Code-only relationship scan over historical DM transcripts.
     ///
     /// Scores any human DM turns past each session's cursor and records them as
@@ -1992,6 +2034,13 @@ enum MemoryCommand {
         #[arg(short, long, default_value = "workforce.toml")]
         config: PathBuf,
     },
+}
+
+/// A step of `memory move-edge`.
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum MoveEdgeStep {
+    Copy,
+    Purge,
 }
 
 /// Write identity template files into a workspace directory.
@@ -12300,6 +12349,87 @@ async fn handle_memory_command(command: MemoryCommand) -> Result<()> {
     use workforce_common::settings::WorkforceConfig;
 
     match command {
+        MemoryCommand::MoveEdge {
+            step,
+            apply,
+            agents,
+            edge_url,
+            edge_tenant,
+            edge_model,
+            edge_dimensions,
+            edge_query_prefix,
+            known_customers,
+            config,
+        } => {
+            use workforce_hub::edge_memory_move as moving;
+            let wf_config = WorkforceConfig::load(&config)?;
+            let api_key = std::env::var("EDGE_VELLEV_API_KEY")
+                .ok()
+                .filter(|k| !k.trim().is_empty())
+                .ok_or_else(|| eyre::eyre!("set EDGE_VELLEV_API_KEY to the edge tenant's key"))?;
+            let edge = moving::EdgeTenant {
+                url: edge_url,
+                api_key,
+                tenant: edge_tenant,
+                model: edge_model,
+                dimensions: edge_dimensions,
+                query_prefix: edge_query_prefix,
+            };
+            let stores = moving::open(&wf_config, &edge, &agents).await?;
+            let survey = match step {
+                MoveEdgeStep::Copy => {
+                    let path = known_customers.ok_or_else(|| {
+                        eyre::eyre!("copy needs --known-customers: the customers the edge still knows, so that no erased customer's memory is copied")
+                    })?;
+                    let known: std::collections::BTreeSet<String> = std::fs::read_to_string(&path)?
+                        .lines()
+                        .map(str::trim)
+                        .filter(|line| !line.is_empty())
+                        .map(str::to_string)
+                        .collect();
+                    let copied = moving::copy(&stores, &agents, &known, apply).await?;
+                    println!(
+                        "  {} customer memories of customers the edge no longer knows (purged, never copied)",
+                        copied.survey.erased.len()
+                    );
+                    println!(
+                        "copy: {} edge objects of WorkforceMemory to copy, {} already in the edge's tenant, {} sent",
+                        copied.survey.to_copy.len(),
+                        copied.already,
+                        copied.sent
+                    );
+                    copied.survey
+                }
+                MoveEdgeStep::Purge => {
+                    let purged = moving::purge(&stores, &agents, apply).await?;
+                    println!(
+                        "purge: {} edge memories to purge, {} purged",
+                        purged.survey.to_purge.len(),
+                        purged.purged
+                    );
+                    purged.survey
+                }
+            };
+            for which in moving::HubStore::ALL {
+                println!(
+                    "  {}: {} edge objects",
+                    which.label(),
+                    survey.held.get(&which).copied().unwrap_or(0)
+                );
+            }
+            println!(
+                "  {} memories only in the hub's copies (erased on the edge; purged, never copied)",
+                survey.survivors.len()
+            );
+            println!(
+                "  {} objects of the edge's agents under other identities (left alone)",
+                survey.unclassified
+            );
+            if !apply {
+                println!("dry run: nothing was changed; add --apply");
+            }
+            Ok(())
+        }
         MemoryCommand::Doctor { config } => {
             let wf_config = WorkforceConfig::load(&config)?;
             let url = memory_store_url(&wf_config);

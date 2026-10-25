@@ -360,6 +360,13 @@ impl WeaviateStore {
         }
     }
 
+    /// Keep memories in `collection`, vectorized by Weaviate as the default
+    /// class is: for a store of its own beside the hub's (the edge's).
+    pub fn in_collection(mut self, collection: &str) -> Self {
+        self.collection = collection.to_string();
+        self
+    }
+
     /// Embed with the hub's model: memories move to `collection`, which holds
     /// the hub's vectors and no vectorizer; recall is hybrid at `alpha`,
     /// optionally reranked.
