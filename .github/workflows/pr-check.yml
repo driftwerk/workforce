@@ -62,6 +62,32 @@ jobs:
           echo "code=$code" >> "$GITHUB_OUTPUT"
           echo "docs=$docs" >> "$GITHUB_OUTPUT"
 
+  # Known secret formats in what a pull request or push adds. A required
+  # check through CI OK.
+  secrets:
+    name: Secrets
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      GITLEAKS_VERSION: 8.30.1
+      GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - env:
+          RANGE: ${{ github.event_name == 'pull_request' && format('{0}..{1}', github.event.pull_request.base.sha, github.event.pull_request.head.sha) || format('{0}..{1}', github.event.before, github.sha) }}
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/gitleaks.tar.gz"
+          curl -fsSL -o "$archive" "https://github.com/gitleaks/gitleaks/releases/download/v$GITLEAKS_VERSION/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "$GITLEAKS_SHA256  $archive" | sha256sum -c -
+          tar -xzf "$archive" -C "$RUNNER_TEMP" gitleaks
+          case "$RANGE" in 0000000000000000000000000000000000000000..*) RANGE=${RANGE#*..} ;; esac
+          "$RUNNER_TEMP/gitleaks" git --no-banner --redact --config .gitleaks.toml --log-opts="$RANGE" .
+
   ui:
     name: UI
     runs-on: ubuntu-latest
@@ -271,7 +297,7 @@ jobs:
   ci-ok:
     name: CI OK
     if: always()
-    needs: [changes, ui, fmt, licenses, clippy, test, vellev-node, docs-embed]
+    needs: [changes, secrets, ui, fmt, licenses, clippy, test, vellev-node, docs-embed]
     runs-on: ubuntu-latest
     permissions: {}
     steps:
