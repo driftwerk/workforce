@@ -323,6 +323,25 @@ impl Shadow {
         self.enabled.load(Ordering::Relaxed)
     }
 
+    /// One of the permits [`Self::observe`] draws on, waited for: for work
+    /// asked of both stores in the background, outside any request (the
+    /// known-item runs), which so shares with the live samples the bound
+    /// on how much is asked of vellev at once. `None` while the shadow is
+    /// paused. Neither the breaker nor the counts are touched: such work
+    /// is not a sample, and is recorded by whoever does it.
+    pub async fn permit(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        if !self.enabled() {
+            return None;
+        }
+        // The semaphore is never closed.
+        Arc::clone(&self.permits).acquire_owned().await.ok()
+    }
+
+    /// How long a shadow may take.
+    pub fn deadline(&self) -> Duration {
+        self.deadline
+    }
+
     /// The breaker's state, for status reports.
     pub fn breaker_told(&self) -> &'static str {
         self.breaker.told()
