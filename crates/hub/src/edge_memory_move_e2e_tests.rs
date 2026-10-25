@@ -93,8 +93,11 @@ async fn the_edge_s_memories_move_to_its_tenant_and_leave_every_hub_store() {
             config.hub.data_dir = "/nonexistent-edge-move-e2e".into();
 
             // The shadow's tables, which hold the replica's lock, as the
-            // hub has made them.
-            crate::shadow::shared_store(&config).await.unwrap();
+            // hub has made them. Opened apart (`shadow::store`), not as
+            // the process's one shared store: that is opened once per
+            // process, and the shadow end-to-end test in this binary must
+            // find it on its own Postgres, where it reads the comparisons.
+            crate::shadow::store(&config).await.unwrap();
 
             // Agents and memories of this run alone: WorkforceMemory is one
             // class for every test against this Weaviate.
