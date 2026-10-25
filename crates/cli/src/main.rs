@@ -20,6 +20,7 @@ mod decide;
 mod docs;
 mod evals;
 mod local_agent;
+mod shadow;
 mod training;
 mod tui;
 
@@ -509,6 +510,12 @@ enum Commands {
     Memory {
         #[command(subcommand)]
         command: MemoryCommand,
+    },
+    /// Shadow mode (Weaviate serving, vellev compared): status, the weekly
+    /// report against the exit criteria, and how to pause or resume.
+    Shadow {
+        #[command(subcommand)]
+        command: shadow::ShadowCommand,
     },
     /// Artifact knowledge-base operations.
     Artifacts {
@@ -11571,6 +11578,9 @@ Describe what you should do in this step and what to discuss with the user.
         }
         Commands::Memory { command } => {
             handle_memory_command(command).await?;
+        }
+        Commands::Shadow { command } => {
+            shadow::handle(command).await?;
         }
         Commands::Artifacts {
             command:

@@ -1704,6 +1704,11 @@ pub struct VellevShadowConfig {
     /// The opt-in LLM judge of artifacts' known items.
     #[serde(default)]
     pub judge: JudgeConfig,
+    /// The memory agreement gate's thresholds (exit criterion M2), as the
+    /// owner signed them before day 1. Left out, the report judges no
+    /// agreement: it says "thresholds not set", never pass.
+    #[serde(default)]
+    pub gates: GatesConfig,
     /// Keys this hub does not know: kept so they can be warned of by name,
     /// never refused, so that a rollback to an older hub still starts.
     #[serde(flatten, default, skip_serializing)]
@@ -1777,6 +1782,55 @@ pub struct JudgeConfig {
     pub unknown: std::collections::BTreeMap<String, toml::Value>,
 }
 
+/// `[vellev.shadow.gates]`: M2's thresholds for memories, each the
+/// pre-week replay's mean less 0.03, never below its floor (overlap@10
+/// 0.85, top-1 0.85, RBO 0.80). All three or none.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct GatesConfig {
+    pub overlap: Option<f64>,
+    pub top1: Option<f64>,
+    pub rbo: Option<f64>,
+    /// The non-inferiority margin of the self@1 test, as a share (default
+    /// 0.005, half a point; 0 to 0.05).
+    pub self_first_margin: Option<f64>,
+    /// Distinct memories both stores answered a week the scoped group needs
+    /// before self@1 is judged (default 600; at least 1). Fewer than can
+    /// show the margin with no discordant pair is too few as well.
+    pub self_first_min: Option<usize>,
+    /// The same for the unscoped population (default 600; at least 1).
+    pub unscoped_min: Option<usize>,
+    /// Keys this hub does not know (see [`VellevShadowConfig::unknown`]).
+    #[serde(flatten, default, skip_serializing)]
+    pub unknown: std::collections::BTreeMap<String, toml::Value>,
+}
+
+/// The self@1 gate's settings, checked: a paired McNemar non-inferiority
+/// test, one-sided at 95 %.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SelfFirstGate {
+    pub margin: f64,
+    pub min: usize,
+    pub unscoped_min: usize,
+}
+
+impl Default for SelfFirstGate {
+    fn default() -> Self {
+        Self {
+            margin: 0.005,
+            min: 600,
+            unscoped_min: 600,
+        }
+    }
+}
+
+/// M2's thresholds, checked: each at or above its floor and at most 1.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AgreementGates {
+    pub overlap: f64,
+    pub top1: f64,
+    pub rbo: f64,
+}
+
 /// [`KnownItemsConfig`] with its defaults applied and checked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KnownItemSettings {
@@ -1824,7 +1878,68 @@ impl VellevShadowConfig {
                 .keys()
                 .map(|k| ("[vellev.shadow.judge]", k.clone())),
         );
+        keys.extend(
+            self.gates
+                .unknown
+                .keys()
+                .map(|k| ("[vellev.shadow.gates]", k.clone())),
+        );
         keys
+    }
+
+    /// M2's thresholds, `None` when none is set; `Err` naming a value that
+    /// cannot be used: one below its floor or above 1, or a set of fewer
+    /// than all three.
+    pub fn gates(&self) -> eyre::Result<Option<AgreementGates>> {
+        let g = &self.gates;
+        let table = "[vellev.shadow.gates]";
+        let (overlap, top1, rbo) = match (g.overlap, g.top1, g.rbo) {
+            (None, None, None) => return Ok(None),
+            (Some(overlap), Some(top1), Some(rbo)) => (overlap, top1, rbo),
+            _ => eyre::bail!(
+                "{table} needs all of overlap, top1 and rbo, or none: M2's thresholds are signed as a set"
+            ),
+        };
+        for (name, value, floor) in [
+            ("overlap", overlap, 0.85),
+            ("top1", top1, 0.85),
+            ("rbo", rbo, 0.80),
+        ] {
+            if !(floor..=1.0).contains(&value) {
+                eyre::bail!(
+                    "{table} {name} must be from its floor {floor} to 1, not {value}: M2's threshold is the replay's mean less 0.03, never below the floor"
+                );
+            }
+        }
+        Ok(Some(AgreementGates { overlap, top1, rbo }))
+    }
+
+    /// The self@1 gate's margin and minimum sizes, or `Err` naming a value
+    /// that cannot be used.
+    pub fn self_first_gate(&self) -> eyre::Result<SelfFirstGate> {
+        let g = &self.gates;
+        let table = "[vellev.shadow.gates]";
+        let d = SelfFirstGate::default();
+        let margin = g.self_first_margin.unwrap_or(d.margin);
+        if !(0.0..=0.05).contains(&margin) {
+            eyre::bail!(
+                "{table} self_first_margin must be from 0 to 0.05, not {margin}: how far below Weaviate's self@1 vellev's may be, as a share"
+            );
+        }
+        let min = g.self_first_min.unwrap_or(d.min);
+        let unscoped_min = g.unscoped_min.unwrap_or(d.unscoped_min);
+        for (name, value) in [("self_first_min", min), ("unscoped_min", unscoped_min)] {
+            if value == 0 {
+                eyre::bail!(
+                    "{table} {name} must be at least 1: the items both stores answered a week before self@1 is judged"
+                );
+            }
+        }
+        Ok(SelfFirstGate {
+            margin,
+            min,
+            unscoped_min,
+        })
     }
 
     /// The judge's daily cap when it is on, `None` when off; `Err` naming
@@ -10659,6 +10774,8 @@ impl WorkforceConfig {
         self.vellev.shadow.memory_reconcile()?;
         self.vellev.shadow.known_items()?;
         self.vellev.shadow.judge_cap()?;
+        self.vellev.shadow.gates()?;
+        self.vellev.shadow.self_first_gate()?;
         for (table, key) in self.vellev.shadow.unknown_keys() {
             tracing::warn!(
                 table,

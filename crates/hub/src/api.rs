@@ -115,6 +115,9 @@ fn administrators_only() -> Router<Arc<HubState>> {
         .route("/scheduler/{id}/history", get(get_job_history))
         .route("/sessions/history", get(session_history))
         .route("/sessions/redact", post(redact_sessions))
+        // Shadow mode's operator surface (DW-676).
+        .route("/shadow/status", get(crate::shadow_admin::status))
+        .route("/shadow/report", get(crate::shadow_admin::report))
         .route_layer(axum::middleware::from_fn(admit_administrator))
 }
 
@@ -184,7 +187,7 @@ async fn retry_index() -> Option<eyre::Result<u64>> {
 /// so it only reads what the hub last saw, asking nothing of Postgres or
 /// the vector database. The whole is an administrator's, at
 /// `/artifacts/index` and `/knowledge/vectors`.
-async fn health() -> Json<serde_json::Value> {
+async fn health(State(state): State<Arc<HubState>>) -> Json<serde_json::Value> {
     let index = artifact_index_state();
     let code = crate::knowledge::code_vector_status();
     Json(serde_json::json!({
@@ -198,6 +201,13 @@ async fn health() -> Json<serde_json::Value> {
             .map(|(index, lease)| mirror_outline(&index, &lease)),
         "code_vectors": code_vectors_outline(&code),
         "code_vector_search_breaker": crate::knowledge::code_vector_breaker(),
+        // Shadow mode's counts in this hub process (DW-676): null when it
+        // shadows nothing. The mirror's backlog is not here: health asks
+        // nothing of Postgres. It is in /metrics and the admin status.
+        "shadow": crate::shadow_status::health_json(
+            &crate::shadow_status::process_state(),
+            state.config.vellev.shadow.paused,
+        ),
     }))
 }
 
@@ -403,7 +413,13 @@ async fn metrics(
     if !body.ends_with('\n') {
         body.push('\n');
     }
-    body.push_str(&crate::health_gauges::render(nats_connected));
+    // The mirror's backlog is asked of Postgres here, bounded, so that the
+    // rendering stays synchronous; not read in time, it is told unknown.
+    let backlog = crate::shadow_status::backlog(&state.config).await;
+    body.push_str(&crate::health_gauges::render(
+        nats_connected,
+        backlog.as_ref(),
+    ));
     (
         StatusCode::OK,
         [("content-type", "text/plain; version=0.0.4")],
@@ -3175,7 +3191,11 @@ mod code_vectors_tests {
         let mut config = workforce_common::settings::WorkforceConfig::default();
         config.memory.backend = "vellev".into();
         super::note_store_backends(&config);
-        let axum::Json(health) = super::health().await;
+        let axum::Json(health) = super::health(axum::extract::State(std::sync::Arc::new(
+            crate::state::HubState::for_tests(config.clone()),
+        )))
+        .await;
+        assert!(health.get("shadow").is_some(), "{health}");
         let stores = health["stores"].as_object().expect("the stores");
         let mut named: Vec<&str> = stores.keys().map(String::as_str).collect();
         named.sort();

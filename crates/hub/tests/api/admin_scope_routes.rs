@@ -298,6 +298,12 @@ async fn a_wildcard_member_is_refused_the_routes_over_everyones_data() {
             "/api/admin/knowledge/index/cancel".to_string(),
             Some(serde_json::json!({})),
         ),
+        ("GET", "/api/admin/shadow/status".to_string(), None),
+        (
+            "GET",
+            "/api/admin/shadow/report?store=memories".to_string(),
+            None,
+        ),
     ];
     let jobs = fx.scheduler.list_jobs().await.len();
 
@@ -332,6 +338,7 @@ async fn a_wildcard_member_is_refused_the_routes_over_everyones_data() {
         "/api/admin/events/sources".to_string(),
         "/api/admin/artifacts/index".to_string(),
         "/api/admin/knowledge/vectors".to_string(),
+        "/api/admin/shadow/status".to_string(),
     ] {
         let (status, body) = fx.get(&path, &admin).await;
         assert_eq!(status, StatusCode::OK, "{path}: {body}");
@@ -341,6 +348,14 @@ async fn a_wildcard_member_is_refused_the_routes_over_everyones_data() {
         status,
         StatusCode::SERVICE_UNAVAILABLE,
         "let through to a hub with no knowledge service"
+    );
+    let (status, _) = fx
+        .get("/api/admin/shadow/report?store=memories", &admin)
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "let through to a hub that shadows nothing"
     );
     let (status, body) = fx
         .call(
