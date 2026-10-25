@@ -459,6 +459,10 @@ fn upsert(records: &str, id: ObjectId, properties: Value) -> Result<Change> {
 
 #[async_trait]
 impl CodeVectorStore for VellevCodeVectorStore {
+    fn backend(&self) -> &'static str {
+        crate::graph::VectorKeys::VELLEV
+    }
+
     async fn ensure_collections(&self) -> Result<()> {
         self.entities.records().await?;
         self.summaries.records().await?;
@@ -1490,6 +1494,16 @@ mod tests {
         let heard = heard.0.lock().unwrap();
         assert_eq!(heard.len(), 2, "{heard:?}");
         assert!(heard[0].contains("entities") && heard[1].contains("summaries"));
+    }
+
+    /// Each store names its own database, as `[knowledge] vector_backend`
+    /// does: the graph keeps its fills and pending files under that name.
+    #[test]
+    fn each_store_names_its_own_database() {
+        let vellev = VellevCodeVectorStore::new("http://127.0.0.1:1", "key", "workforce").unwrap();
+        assert_eq!(vellev.backend(), "vellev");
+        let weaviate = crate::vector::WeaviateCodeVectorStore::new("http://127.0.0.1:1", None);
+        assert_eq!(weaviate.backend(), "weaviate");
     }
 
     /// Code vectors are found by meaning only: nothing asks the node a
