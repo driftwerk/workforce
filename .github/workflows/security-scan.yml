@@ -1,0 +1,64 @@
+name: Security scan
+
+# Daily: known vulnerabilities (Trivy) and end-of-life software (xeol) in the
+# released hub image and in the repository's dependency lockfiles. Findings
+# land in one GitHub issue, closed again once a scan comes back clean.
+
+on:
+  schedule:
+    - cron: '30 6 * * *'
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/scripts/security_scan.py'
+      - '.github/scripts/security-scan-issue.sh'
+      - '.github/workflows/security-scan.yml'
+
+permissions: {}
+
+concurrency:
+  group: security-scan
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    name: Scan the image and dependencies
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    # The hub image is private on Docker Hub; its credentials live here.
+    environment: dockerhub
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+      - name: Pull the released image
+        run: docker pull --platform linux/amd64 kingsleyh/driftwerk-hub:latest
+      - name: Scan
+        id: scan
+        run: |
+          python3 .github/scripts/security_scan.py \
+            --title "Security scan: Workforce" \
+            --image kingsleyh/driftwerk-hub:latest \
+            --tree . \
+            --report /tmp/security-report.md \
+            && echo "action=false" >> "$GITHUB_OUTPUT" \
+            || echo "action=true" >> "$GITHUB_OUTPUT"
+          cat /tmp/security-report.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Update the findings issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ACTION: ${{ steps.scan.outputs.action }}
+        run: .github/scripts/security-scan-issue.sh /tmp/security-report.md
+      - name: Fail when something needs action
+        if: steps.scan.outputs.action == 'true'
+        run: |
+          echo "::error::The security scan found CRITICAL vulnerabilities with fixes, or end-of-life software. See the job summary."
+          exit 1
