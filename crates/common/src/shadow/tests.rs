@@ -613,3 +613,50 @@ async fn a_late_success_from_before_the_trip_leaves_the_breaker_open() {
     until("the late success", || sink.len() == 2).await;
     assert_eq!(shadow.breaker_told(), "open", "a late success closed it");
 }
+
+/// A background permit is one of the kernel's own: waited for rather than
+/// dropped, and, while held, one fewer for the live samples, which find
+/// the kernel busy as they would with as many shadows in flight.
+#[tokio::test]
+async fn a_background_permit_is_one_of_the_kernels_and_is_waited_for() {
+    let (shadow, sink) = shadow(ShadowSettings {
+        permits: 2,
+        ..settings()
+    });
+    let first = shadow.permit().await.expect("a permit while not paused");
+    let second = shadow.permit().await.expect("a second of two");
+    shadow.observe(observed(&["a"]), answers(&["a"]));
+    let counts = shadow.counts();
+    assert_eq!(
+        (counts.busy, counts.started),
+        (1, 0),
+        "a live sample found a free permit while both were held"
+    );
+    let third = tokio::time::timeout(Duration::from_millis(200), shadow.permit()).await;
+    assert!(third.is_err(), "a third permit of two was had at once");
+    drop(first);
+    let third = tokio::time::timeout(Duration::from_secs(5), shadow.permit())
+        .await
+        .expect("a permit given back is had by the one waiting")
+        .expect("not paused");
+    drop((second, third));
+    shadow.observe(observed(&["a"]), answers(&["a"]));
+    until("the live sample", || sink.len() == 1).await;
+    let counts = shadow.counts();
+    assert_eq!(
+        (counts.offered, counts.started),
+        (2, 1),
+        "background permits are counted as samples"
+    );
+}
+
+/// Paused, the kernel lends no permit for background work either.
+#[tokio::test]
+async fn no_background_permit_while_paused() {
+    let (shadow, _sink) = shadow(settings());
+    shadow.set_enabled(false);
+    assert!(shadow.permit().await.is_none());
+    shadow.set_enabled(true);
+    assert!(shadow.permit().await.is_some());
+    assert_eq!(shadow.counts(), ShadowCounts::default());
+}

@@ -913,5 +913,8 @@ async fn insert(pool: &PostgresPool, batch: &[Comparison], limit: Duration) -> R
     Ok(())
 }
 
+mod known_items;
+pub use known_items::*;
+
 #[cfg(test)]
 mod tests;

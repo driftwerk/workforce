@@ -4744,6 +4744,14 @@ rules:
                 drain_token.clone(),
             )
             .await;
+            // Artifacts' nightly known-item runs, on the leader, when the
+            // artifact index is shadowed (DW-676).
+            workforce_hub::artifact_known_items::start(
+                &wf_config,
+                shadow_store.clone(),
+                leader_flag.clone(),
+                drain_token.clone(),
+            );
             workforce_hub::retention::spawn(
                 workforce_hub::retention::prunes(
                     &wf_config,

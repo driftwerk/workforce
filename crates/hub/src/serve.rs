@@ -18,7 +18,10 @@ pub use compose::{
     load_policy, open_artifact_store, reindex_artifacts, shared_artifact_store,
     sweep_identity_revisions,
 };
-pub use compose::{artifact_mirror_state, mirror_index_pace, open_artifact_mirror};
+pub use compose::{
+    artifact_mirror_in_step, artifact_mirror_state, artifact_shadow, mirror_index_pace,
+    open_artifact_mirror,
+};
 pub use compose::{
     register_advisor_tool, register_chatgpt_login_tool, register_claude_code_setup_token_tool,
     register_claude_code_tool, register_codex_setup_auth_tool, register_coding_session_tool,

@@ -61,6 +61,47 @@ pub fn offer_agent_tagger(primary: ProviderKind, llm: Arc<dyn LlmProvider>) -> b
     !primary.is_subscription() && TAGGER_LLM.set(llm).is_ok()
 }
 
+/// The LLM the artifact tagger uses, if one was installed: what shadow
+/// mode's opt-in judge grades with ([`crate::known_item_judge`]).
+pub fn tagger_llm() -> Option<Arc<dyn LlmProvider>> {
+    TAGGER_LLM.get().cloned()
+}
+
+/// Ask `llm` once, as the tagger does, its call costed where the tagger's
+/// are, under `task_type`; the text of its answer.
+pub(crate) async fn ask_costed(
+    llm: &dyn LlmProvider,
+    system: &str,
+    user: String,
+    max_tokens: u32,
+    task_type: &'static str,
+) -> eyre::Result<String> {
+    let (asked, served) = with_served_log(llm.create_message(
+        Some(system),
+        &[LlmMessage::user(user)],
+        &[],
+        None,
+        Some(max_tokens),
+        false,
+    ))
+    .await;
+    let resp = asked?;
+    if let Some(costs) = TAGGER_COSTS.get() {
+        costs.record(CostEntry {
+            task_type: Some(task_type),
+            description: Some(task_type),
+            served,
+            ..CostEntry::new(
+                TAGGER_AGENT,
+                &resp.model,
+                TokenCounts::from(&resp.usage),
+                Origin::Knowledge,
+            )
+        });
+    }
+    Ok(extract_text(&resp.content))
+}
+
 /// Cost the tagger's calls to `costs` (idempotent — first wins).
 pub fn cost_tagging_to(costs: Arc<CostTracker>) {
     let _ = TAGGER_COSTS.set(costs);
