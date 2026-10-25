@@ -1,6 +1,7 @@
 -- Turn lifecycle record, promoted out of `metadata`.
 --
--- These are columns, not JSON keys, and never bump `revision`. Note the promotion covers the three
+-- Why these are columns and not JSON keys, and why they never bump `revision`:
+-- docs/turn-lifecycle-record-design.md §2. Note the promotion covers the three
 -- columns only — the transitional legacy drain in `end_turn` still writes
 -- `metadata`, which IS inside the versioned set.
 ALTER TABLE sessions
