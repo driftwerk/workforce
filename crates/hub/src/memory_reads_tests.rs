@@ -536,6 +536,9 @@ async fn the_read_shadow_is_made_without_waiting_for_postgres() {
             labels: Vec::new(),
         },
         shadow_latency: Duration::ZERO,
+        queued: Duration::ZERO,
+        index: None,
+        concurrent: 1,
         outcome: Outcome::Failed("unopened".into()),
         probe: false,
     });
