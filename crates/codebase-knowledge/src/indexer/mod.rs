@@ -325,6 +325,15 @@ impl IndexingPipeline {
             }
             None => None,
         };
+        // The standby is told of every file the repo had, before they go:
+        // its notes outlast the purge (see `CodeGraph::delete_repo_data`),
+        // and those of the files the run makes are added once they are
+        // stored (6).
+        // With no standby, nothing is read: the run is as it was.
+        if self.graph.vector_keys().standby().is_some() {
+            let had = self.graph.get_file_paths(&self.config.repo_id).await?;
+            self.note_for_standby(&had).await?;
+        }
         self.graph.delete_repo_data(&self.config.repo_id).await?;
 
         // 1b. Also purge vector store data for this repo, in a store that
@@ -433,6 +442,13 @@ impl IndexingPipeline {
         // 6. Store entities and relationships
         let entity_count = self.graph.upsert_entities(&all_entities).await?;
         let rel_count = self.graph.upsert_relationships(&all_relationships).await?;
+        let mut made: Vec<String> = all_entities
+            .iter()
+            .map(|entity| entity.file_path.clone())
+            .collect();
+        made.sort();
+        made.dedup();
+        self.note_for_standby(&made).await?;
         report_progress(
             &lease,
             LeaseProgress {
@@ -975,20 +991,44 @@ impl IndexingPipeline {
         })
     }
 
-    /// Note every file `delta` touches as pending, and return each note, to
-    /// be taken off once the store that keeps track has the file. Noted
-    /// when this run's store keeps track, and also when the repo's vectors
-    /// are recorded complete, or being filled, in a store this run does not
-    /// write to: as when the hub is moved back to another vector store for
-    /// a while, or indexes on while a new one is seeded.
+    /// The vector databases a file this run changes is to be noted pending
+    /// in: the one in use if its store keeps track of its vectors (it is
+    /// put right from the note if the run does not store the file, and the
+    /// note is taken off if it does), and the standby always, which nothing
+    /// here writes to and which is brought up to date from its notes when
+    /// it is switched to (see [`crate::graph::VectorKeys`]).
+    async fn noted_in(&self) -> Result<Vec<&str>> {
+        let keys = self.graph.vector_keys();
+        let mut backends = Vec::new();
+        if self.tracked_store().is_some() {
+            backends.push(keys.active());
+        } else if keys.standby().is_none() {
+            // A repo whose vectors were kept track of in another store,
+            // with that store not configured as the standby, falls behind
+            // there unseen until its vectors are next compared.
+            let repo_id = &self.config.repo_id;
+            if self.graph.vectors_complete_in(repo_id).await?.is_some() {
+                warn!(
+                    repo_id = %repo_id,
+                    "the repo's code vectors are kept track of in another vector database, which is not [knowledge] vector_standby: what this run changes is not noted for it"
+                );
+            }
+        }
+        backends.extend(keys.standby());
+        Ok(backends)
+    }
+
+    /// Note every file `delta` touches as pending (see [`Self::noted_in`]),
+    /// and return the notes of the vector database in use, to be taken off
+    /// once its store, keeping track, has the file. A standby's are never
+    /// taken off here.
     async fn note_pending(
         &self,
         delta: &incremental::IndexDelta,
     ) -> Result<Vec<crate::graph::vectors::PendingFile>> {
         let repo_id = &self.config.repo_id;
-        let tracked_somewhere = self.graph.vectors_complete_in(repo_id).await?.is_some()
-            || self.graph.vector_fill(repo_id).await?.is_some();
-        if self.tracked_store().is_none() && !tracked_somewhere {
+        let backends = self.noted_in().await?;
+        if backends.is_empty() {
             return Ok(Vec::new());
         }
         let renamed = delta.renamed_files.iter().flat_map(|(old, new)| [old, new]);
@@ -1000,12 +1040,27 @@ impl IndexingPipeline {
             .chain(renamed)
             .cloned()
             .collect();
-        self.graph.note_vectors_pending(repo_id, &files).await?;
+        self.graph
+            .note_vectors_pending_in(&backends, repo_id, &files)
+            .await?;
+        if !backends.contains(&self.graph.vector_keys().active()) {
+            return Ok(Vec::new());
+        }
         let pending = self.graph.vectors_pending(repo_id, usize::MAX >> 1).await?;
         Ok(pending
             .into_iter()
             .filter(|(file_path, _)| files.contains(file_path))
             .collect())
+    }
+
+    /// Note `files` pending for the standby, if there is one.
+    async fn note_for_standby(&self, files: &[String]) -> Result<()> {
+        let Some(standby) = self.graph.vector_keys().standby() else {
+            return Ok(());
+        };
+        self.graph
+            .note_vectors_pending_in(&[standby], &self.config.repo_id, files)
+            .await
     }
 
     /// Drop vector store entries for one file. Non-fatal: the graph is
@@ -1238,16 +1293,32 @@ impl IndexingPipeline {
     ) {
         let repo_id = &self.config.repo_id;
         let tracked = vs.tracks_completeness();
-        // Whether the repo's vectors are kept track of somewhere: recorded
-        // complete, or being filled. If that cannot be told they are taken
-        // to be.
-        let kept_track = match (
-            self.graph.vectors_complete_in(repo_id).await,
-            self.graph.vector_fill(repo_id).await,
-        ) {
-            (Ok(complete_in), Ok(fill)) => complete_in.is_some() || fill.is_some(),
-            _ => true,
-        };
+        // The standby is written to by nothing here: the files of these
+        // summaries are noted for it, whatever the store in use does.
+        let mut standby_files: Vec<String> = entities
+            .iter()
+            .filter(|entity| fresh_ids.contains(&entity.id))
+            .map(|entity| entity.file_path.clone())
+            .collect();
+        standby_files.sort();
+        standby_files.dedup();
+        if let Err(e) = self.note_for_standby(&standby_files).await {
+            warn!(
+                "noting files whose summaries changed for the standby failed: {}",
+                e
+            );
+        }
+        // Whether the repo's vectors are kept track of in the store in
+        // use: recorded complete, or being filled. If that cannot be told
+        // they are taken to be.
+        let kept_track = tracked
+            && match (
+                self.graph.vectors_complete_in(repo_id).await,
+                self.graph.vector_fill(repo_id).await,
+            ) {
+                (Ok(complete_in), Ok(fill)) => complete_in.is_some() || fill.is_some(),
+                _ => true,
+            };
         // In a store that keeps track, a repo no fill of which has begun
         // gets its summaries with the rest, from the fill: these are in the
         // graph already, and it reads the graph after it begins. One being
@@ -1288,8 +1359,8 @@ impl IndexingPipeline {
         if vec_summaries.is_empty() {
             return;
         }
-        // Their files are put right later, one by one, in the store that
-        // keeps track.
+        // Their files are put right later, one by one, in the store in use,
+        // which keeps track.
         let pending = || async {
             let mut files: Vec<String> = vec_summaries
                 .iter()
@@ -1301,7 +1372,8 @@ impl IndexingPipeline {
                 warn!("noting files whose summaries were not stored failed: {}", e);
             }
         };
-        // Kept track of in a store this run does not write to.
+        // Kept track of in another collection than the one this run writes
+        // to.
         let elsewhere = kept_track && !self.writes_where_tracked().await.unwrap_or(false);
         if elsewhere {
             pending().await;
