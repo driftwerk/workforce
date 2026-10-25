@@ -24,7 +24,7 @@ use tokio_util::sync::CancellationToken;
 use workforce_common::settings::WorkforceConfig;
 use workforce_common::shadow_postgres::{
     ShadowStore, COMPARISONS_RETENTION_DAYS, DAILY_RETENTION_DAYS, KNOWN_ITEMS_RETENTION_DAYS,
-    RECONCILES_RETENTION_DAYS,
+    RECONCILES_RETENTION_DAYS, VERDICTS_RETENTION_DAYS,
 };
 use workforce_common::telemetry::TelemetryStore;
 
@@ -89,11 +89,35 @@ pub fn prunes(
     }));
     if let Some(shadow) = shadow {
         let daily = Arc::clone(&shadow);
-        // A day is rolled up before its comparisons go.
+        let verdicts = Arc::clone(&shadow);
+        let judged = config.clone();
+        // Each whole week's verdict is recorded, and each day rolled up,
+        // before their comparisons go: a week's p99 cannot be worked out
+        // once they have.
         prunes.push(Prune::new(
             "shadow comparisons",
             COMPARISONS_RETENTION_DAYS,
-            move |before| shadow.roll_up_and_prune_comparisons(before),
+            move |before| {
+                crate::shadow_report::verdicts_first(
+                    || {
+                        tokio::task::block_in_place(|| {
+                            tokio::runtime::Handle::current().block_on(
+                                crate::shadow_report::record_due_verdicts(
+                                    &shadow,
+                                    &judged,
+                                    Utc::now().date_naive(),
+                                ),
+                            )
+                        })
+                    },
+                    || shadow.roll_up_and_prune_comparisons(before),
+                )
+            },
+        ));
+        prunes.push(Prune::new(
+            "shadow verdicts",
+            VERDICTS_RETENTION_DAYS,
+            move |before| verdicts.prune_verdicts(before),
         ));
         let reconciles = Arc::clone(&daily);
         prunes.push(Prune::new(
@@ -260,6 +284,7 @@ mod tests {
                     windows(Some(Arc::clone(&shadow)))[2..],
                     [
                         ("shadow comparisons", 14),
+                        ("shadow verdicts", 180),
                         ("shadow daily", 180),
                         ("shadow reconciles", 180),
                         ("shadow known items", 180)
@@ -306,6 +331,22 @@ mod tests {
                     days,
                     [("memories".to_string(), 1)],
                     "its day rolled up before it went; the 200-day-old day gone"
+                );
+                let weeks: Vec<(String, chrono::NaiveDate, String)> = conn
+                    .query("SELECT store, week_start, verdict FROM shadow_verdicts", &[])
+                    .await
+                    .unwrap()
+                    .iter()
+                    .map(|r| (r.get(0), r.get(1), r.get(2)))
+                    .collect();
+                assert_eq!(
+                    weeks,
+                    [(
+                        "memories".to_string(),
+                        crate::shadow_report::week_of(old.date_naive()),
+                        "too_few".to_string()
+                    )],
+                    "its week judged before it went (one comparison is too few); the week still running not"
                 );
                 reached.store(true, Ordering::SeqCst);
             },

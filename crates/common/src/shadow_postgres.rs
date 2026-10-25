@@ -64,6 +64,39 @@ impl ShadowStore {
         Self::with_limit(pool, RETENTION_STATEMENT_LIMIT).await
     }
 
+    /// The shadow tables on `pool` for reading alone: nothing is migrated
+    /// or created. `Err` when they are not all there yet (no hub has built
+    /// them, or this binary is newer than the hub that did): a reader
+    /// declines rather than build them.
+    pub async fn read_only(pool: PostgresPool) -> Result<Arc<Self>> {
+        let rows = bounded_query(
+            &pool,
+            RECORD_LIMIT,
+            "SELECT t FROM unnest($1::text[]) AS t WHERE to_regclass(t) IS NULL",
+            &[&vec![
+                "shadow_comparisons",
+                "shadow_reconciles",
+                "memory_mirror_pending",
+                "shadow_known_item_runs",
+                "shadow_known_items",
+                "shadow_verdicts",
+            ]],
+        )
+        .await
+        .context("looking for the shadow tables")?;
+        let missing: Vec<String> = rows.iter().map(|r| r.get(0)).collect();
+        if !missing.is_empty() {
+            eyre::bail!(
+                "the shadow tables are not built yet ({} missing): a hub running this version builds them at start-up; this reader never does",
+                missing.join(", ")
+            );
+        }
+        Ok(Arc::new(Self {
+            pool,
+            retention_limit: RETENTION_STATEMENT_LIMIT,
+        }))
+    }
+
     /// As [`Self::with_pool`], retention's statements given up after
     /// `retention_limit`.
     pub async fn with_limit(pool: PostgresPool, retention_limit: Duration) -> Result<Arc<Self>> {
@@ -923,6 +956,8 @@ async fn insert(pool: &PostgresPool, batch: &[Comparison], limit: Duration) -> R
 
 mod known_items;
 pub use known_items::*;
+mod report;
+pub use report::*;
 
 #[cfg(test)]
 mod tests;

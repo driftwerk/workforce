@@ -36,7 +36,14 @@ pub fn is_leader() -> bool {
 /// Render the health gauges as Prometheus exposition lines. Appended to
 /// the recorder's snapshot by the `/api/metrics` handler. Names must keep
 /// the `workforce` prefix — the Datadog OpenMetrics check filters on it.
-pub fn render(nats_connected: Option<bool>) -> String {
+///
+/// `backlog` is the memory mirror's, read by the async handler before this
+/// is called (`None` when memories are not shadowed); shadow mode's
+/// process counts are read here ([`crate::shadow_status`]).
+pub fn render(
+    nats_connected: Option<bool>,
+    backlog: Option<&crate::shadow_status::BacklogSeen>,
+) -> String {
     let mut out = String::new();
     let flag = |v: bool| if v { 1 } else { 0 };
     out.push_str("# TYPE workforce_hub_is_leader gauge\n");
@@ -53,6 +60,7 @@ pub fn render(nats_connected: Option<bool>) -> String {
     if let Some(counts) = crate::memory_erasure::noter_counts() {
         render_noter(&mut out, &counts);
     }
+    crate::shadow_status::render_metrics(&mut out, &crate::shadow_status::process_state(), backlog);
     out
 }
 
@@ -85,7 +93,7 @@ mod tests {
     #[test]
     fn renders_all_three_when_nats_configured() {
         SLACK_INGRESS_UP.store(true, Ordering::Relaxed);
-        let out = render(Some(true));
+        let out = render(Some(true), None);
         assert!(out.contains("workforce_hub_is_leader 1\n"));
         assert!(out.contains("workforce_slack_ingress_up 1\n"));
         assert!(out.contains("workforce_nats_connected 1\n"));
@@ -114,9 +122,22 @@ mod tests {
         );
     }
 
+    /// Shadow mode's lines reach `/api/metrics` through here: the backlog
+    /// the handler read, told unknown when it could not.
+    #[test]
+    fn renders_shadow_mode_s_lines() {
+        let unknown = crate::shadow_status::BacklogSeen::Unknown("timed out".into());
+        let out = render(None, Some(&unknown));
+        assert!(
+            out.contains("workforce_shadow_memory_backlog_unknown 1\n"),
+            "{out}"
+        );
+        assert!(!out.contains("backlog_pending"), "{out}");
+    }
+
     #[test]
     fn omits_nats_when_not_configured() {
-        let out = render(None);
+        let out = render(None, None);
         assert!(!out.contains("workforce_nats_connected"));
         assert!(out.contains("workforce_hub_is_leader"));
     }
