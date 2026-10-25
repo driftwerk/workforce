@@ -665,7 +665,10 @@ async fn concurrent_is_the_shadows_running_when_one_was_admitted() {
     assert_eq!(sink.taken()[0].concurrent, 3, "two held, and itself");
     drop(holds);
     until("the held shadows ended", || sink.len() == 2).await;
-    let held: Vec<usize> = sink.taken().iter().map(|c| c.concurrent).collect();
+    // The two held shadows are released together, so either may record
+    // first: what each counted is checked, not the order they ended in.
+    let mut held: Vec<usize> = sink.taken().iter().map(|c| c.concurrent).collect();
+    held.sort_unstable();
     assert_eq!(held, vec![1, 2], "each counted the ones before it");
 }
 
