@@ -1,4 +1,4 @@
--- Run identity for member-owned definitions.
+-- Run identity for member-owned definitions (docs/workflow-run-identity-design.md).
 --
 -- An automated run (webhook, schedule, HTTP trigger) executes as this identity
 -- when set, else as the owner. Only the saving identity may name itself here,
