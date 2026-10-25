@@ -27,6 +27,7 @@ use vellev_core::{
     Collection, CollectionName, DataType, Embedding, EmbeddingProvider, ObjectId, Property,
 };
 use vellev_index::filter::Filter;
+use workforce_common::shadow::index_call;
 use workforce_common::vectorizable::VectorizableText;
 use workforce_core::types::AgentId;
 
@@ -562,7 +563,7 @@ impl VellevStore {
                                 filter: Some(where_filter.clone()),
                                 vectors: false,
                             };
-                            async move { self.records.keyword(&keyword).await }
+                            async move { index_call(self.records.keyword(&keyword)).await }
                         })
                         .await,
                 )
@@ -621,7 +622,7 @@ impl VellevStore {
                                     oversample: None,
                                     vectors: false,
                                 };
-                                async move { self.records.nearest(&nearest).await }
+                                async move { index_call(self.records.nearest(&nearest)).await }
                             })
                             .await,
                     )
@@ -669,7 +670,7 @@ impl VellevStore {
                     filter: Some(where_filter.clone()),
                     oversample: None,
                 };
-                async move { self.records.hybrid(&hybrid).await }
+                async move { index_call(self.records.hybrid(&hybrid)).await }
             })
             .await
     }
@@ -2991,6 +2992,127 @@ mod failure_tests {
                 AgentId::new("a"),
             );
             assert!(store.remember(memory).await.is_err());
+        }
+    }
+}
+
+#[cfg(test)]
+mod index_time_tests {
+    //! A shadow's recall times the node's search as its index call
+    //! (DW-676, PR 9b): each way a recall searches, against a fake node
+    //! whose every search takes [`SEARCH`].
+    use std::sync::Arc;
+
+    use workforce_common::shadow::{
+        MemorySink, Observed, Ranked, Shadow, ShadowSettings, ShadowSink,
+    };
+
+    use super::*;
+    use crate::types::MemoryFilter;
+
+    const SEARCH: Duration = Duration::from_millis(60);
+
+    /// A node whose searches answer, with nothing found, after [`SEARCH`].
+    async fn node() -> String {
+        let app = axum::Router::new().fallback(|uri: axum::http::Uri| async move {
+            let path = uri.path();
+            if ["/nearest", "/hybrid", "/keyword"]
+                .iter()
+                .any(|search| path.ends_with(search))
+            {
+                tokio::time::sleep(SEARCH).await;
+                return axum::Json(json!({ "results": [] }));
+            }
+            panic!("a recall asked the node for {path}");
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        url
+    }
+
+    struct Embeds(bool);
+
+    #[async_trait]
+    impl EmbeddingBackend for Embeds {
+        async fn embed(&self, _text: &str) -> Result<Vec<f32>> {
+            if self.0 {
+                Ok(vec![1.0, 0.0, 0.0, 0.0])
+            } else {
+                Err(eyre!("the embedder is down"))
+            }
+        }
+    }
+
+    /// `recall` run as a shadow; its comparison.
+    async fn shadowed(
+        store: VellevStore,
+        alpha: Option<f32>,
+    ) -> workforce_common::shadow::Comparison {
+        let sink = Arc::new(MemorySink::default());
+        let settings = ShadowSettings {
+            sample: 1.0,
+            permits: 1,
+            deadline: Duration::from_secs(10),
+            trip_after: 3,
+            rest: Duration::from_secs(60),
+            k: 10,
+            rbo_p: 0.9,
+        };
+        let shadow = Shadow::new(
+            "memories",
+            settings,
+            Arc::clone(&sink) as Arc<dyn ShadowSink>,
+        )
+        .unwrap();
+        let filter = MemoryFilter {
+            identity_id: Some("bob".into()),
+            hybrid_alpha: alpha,
+            ..MemoryFilter::default()
+        };
+        shadow.observe(Observed::default(), move || async move {
+            store.recall("otters asleep", filter).await?;
+            Ok(Ranked::default())
+        });
+        let began = std::time::Instant::now();
+        while sink.is_empty() {
+            assert!(
+                began.elapsed() < Duration::from_secs(10),
+                "the shadow ended"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        sink.taken().remove(0)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_shadows_recall_times_each_kind_of_search_as_its_index_call() {
+        let url = node().await;
+        let plain = || VellevStore::new(&url, "key", "workforce", "Memories").unwrap();
+        let embedded =
+            |works: bool| plain().with_embeddings(Arc::new(Embeds(works)), None, 0.5, 10);
+        for (how, store, alpha) in [
+            ("nearest, the node embedding", plain(), None),
+            ("hybrid, the node embedding", plain(), Some(0.5)),
+            ("hybrid, the hub embedding", embedded(true), None),
+            ("by keywords, the embedder down", embedded(false), None),
+        ] {
+            let c = shadowed(store, alpha).await;
+            assert!(
+                matches!(
+                    c.outcome,
+                    workforce_common::shadow::Outcome::Answered { .. }
+                ),
+                "{how}: {:?}",
+                c.outcome
+            );
+            let index = c.index.unwrap_or_else(|| panic!("{how}: no index time"));
+            assert!(index >= SEARCH, "{how}: {index:?}");
+            assert!(
+                index <= c.shadow_latency,
+                "{how}: {index:?} of {:?}",
+                c.shadow_latency
+            );
         }
     }
 }
