@@ -1,0 +1,32 @@
+title = "workforce"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Secret-detection and redaction tests: their fixtures are fabricated tokens in every vendor's format"
+paths = [
+  '''^crates/common/src/(redact|security_scanner|secret|session|settings)\.rs$''',
+  '''^crates/hub/src/(redact|session_redaction|llm_tool|codex_setup_auth_tool|claude_code|secret_cache)\.rs$''',
+  '''^crates/agent-runtime/src/security/secret_(sinks|egress)\.rs$''',
+  '''^crates/agent-runtime/src/llm/bedrock_credentials\.rs$''',
+  '''^crates/hub-core/src/hub_core/logins/(chatgpt_auth|resolve)\.rs$''',
+  '''^crates/skills/src/adapters/linear/config\.rs$''',
+  '''^crates/hub/tests/api/login_store_routes\.rs$''',
+]
+
+[[allowlists]]
+description = "Test-only RSA keypairs used to sign fixture tokens"
+paths = [
+  '''^crates/skills/src/adapters/github/test_app_key(\.pub)?\.pem$''',
+  '''^crates/skills/src/adapters/teams/auth\.rs$''',
+  '''^crates/hub/src/trigger_oidc\.rs$''',
+]
+
+[[allowlists]]
+description = "Recorded LLM responses: prompt cache keys and response ids, not credentials"
+paths = ['''^crates/agent-runtime/src/llm/testdata/''']
+
+[[allowlists]]
+description = "Configuration docs: placeholder keys"
+paths = ['''^docs/(CONFIGURATION|FAILOVER)\.md$''']

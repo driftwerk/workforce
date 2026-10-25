@@ -1,4 +1,4 @@
--- Identity lifecycle operations.
+-- Identity lifecycle operations (see docs/identity-lifecycle-design.md).
 --
 -- Translation of the `identity_lifecycle_ops` table in
 -- `crates/identity/src/sqlite.rs::SqliteIdentityStore::init_schema`. One row
