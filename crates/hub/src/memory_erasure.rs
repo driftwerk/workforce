@@ -547,12 +547,16 @@ pub async fn shadowed(
 /// permits bound the shadow reads of the whole hub, not of each agent.
 static READS: tokio::sync::OnceCell<Reads> = tokio::sync::OnceCell::const_new();
 
-/// The read shadow of memories, with the hub's embedder, `replica` (when
-/// first made), and the kernel at `[vellev.shadow.memories]`'s settings,
+/// The read shadow of memories (shared with the known-item runs, which
+/// take its permits and embed with its embedder), with the hub's embedder,
+/// `replica` (when first made), and the kernel at `[vellev.shadow.memories]`'s settings,
 /// asking nothing while `[vellev.shadow] paused`. Making it never waits on
 /// Postgres: the comparisons go to the hub's one sink once it is open
 /// ([`Deferred`]), and until then are dropped and counted.
-async fn reads(config: &WorkforceConfig, replica: Arc<dyn MemoryStore>) -> Result<Reads> {
+pub(crate) async fn reads(
+    config: &WorkforceConfig,
+    replica: Arc<dyn MemoryStore>,
+) -> Result<Reads> {
     let reads = READS
         .get_or_try_init(|| made_reads(config, replica, crate::shadow::sink_for(config)))
         .await?;

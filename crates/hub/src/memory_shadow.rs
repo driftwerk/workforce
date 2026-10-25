@@ -326,6 +326,7 @@ pub async fn start(
     let paused = Arc::new(AtomicBool::new(config.vellev.shadow.paused));
     let started = async {
         let shadow = shadow.ok_or_else(|| eyre!("the shadow tables are not open"))?;
+        let tables = Arc::clone(&shadow);
         let every = config.vellev.shadow.memory_reconcile()?;
         let (replica, serving) = crate::embeddings::shadow_stores(config).await?;
         let ready = VellevReady {
@@ -342,6 +343,13 @@ pub async fn start(
             turns: Arc::new(turns),
             recorder: shadow,
         };
+        let known_items = known_items(
+            config,
+            Arc::clone(&replica),
+            Arc::clone(&serving),
+            tables,
+            every,
+        );
         let reconciling = spawn(
             Arc::new(reconcile),
             every,
@@ -349,13 +357,26 @@ pub async fn start(
             leader.clone(),
             drain.clone(),
         );
-        eyre::Ok((reconciling, lock, replica, serving))
+        eyre::Ok((reconciling, lock, replica, serving, known_items))
     };
-    let (reconciling, lock, replica, serving) = match started.await {
+    let (reconciling, lock, replica, serving, known_items) = match started.await {
         Ok(started) => started,
         Err(e) => {
             tracing::error!(target: "shadow", error = %format!("{e:#}"), "memories' replica is not reconciled, nor are memories written applied to it");
             return Vec::new();
+        }
+    };
+    let known_items = match known_items.await {
+        Ok(Some(runner)) => Some(crate::known_items::spawn(
+            Arc::new(runner) as Arc<dyn crate::known_items::Nightly>,
+            Arc::clone(&paused),
+            leader.clone(),
+            drain.clone(),
+        )),
+        Ok(None) => None,
+        Err(e) => {
+            tracing::error!(target: "shadow", error = %format!("{e:#}"), "memories' known-item runs are not made: the memory verdict has none to rest on");
+            None
         }
     };
     let applying = async {
@@ -376,13 +397,54 @@ pub async fn start(
             drain,
         ))
     };
+    let mut tasks = vec![reconciling];
     match applying.await {
-        Ok(applying) => vec![reconciling, applying],
+        Ok(applying) => tasks.push(applying),
         Err(e) => {
             tracing::error!(target: "shadow", error = %format!("{e:#}"), "memories written are not applied to vellev's replica: the reconcile alone keeps it");
-            vec![reconciling]
         }
     }
+    tasks.extend(known_items);
+    tasks
+}
+
+/// The nightly known-item runs of memories ([`crate::known_items`]), or
+/// `None` when `[vellev.shadow.known_items] items` is 0. They share the
+/// read shadow's kernel and embedder, and leave out memories written
+/// within two reconciles (`every`), which the replica may not hold yet.
+pub(crate) async fn known_items(
+    config: &WorkforceConfig,
+    replica: Arc<dyn Switchable>,
+    serving: Arc<dyn Switchable>,
+    tables: Arc<ShadowStore>,
+    every: Duration,
+) -> Result<Option<crate::known_items::Runner>> {
+    use workforce_common::settings::ShadowedStore;
+    let settings = config.vellev.shadow.known_items()?;
+    if settings.items == 0 {
+        tracing::info!(target: "shadow", "memories' known-item runs are off: [vellev.shadow.known_items] items = 0");
+        return Ok(None);
+    }
+    let memories = config.vellev.shadow.settings(ShadowedStore::Memories)?;
+    let reads = crate::memory_erasure::reads(
+        config,
+        Arc::clone(&replica) as Arc<dyn workforce_memory::store::MemoryStore>,
+    )
+    .await?;
+    Ok(Some(crate::known_items::Runner {
+        source: Arc::clone(&serving) as Arc<dyn workforce_memory::admin::SyncSource>,
+        serving: serving as Arc<dyn workforce_memory::store::MemoryStore>,
+        replica: replica as Arc<dyn workforce_memory::store::MemoryStore>,
+        embedder: reads.embedder,
+        kernel: reads.shadow,
+        recorder: tables,
+        settings,
+        k: memories.k,
+        rbo_p: memories.rbo_p,
+        settle: every * 2,
+        permit_wait: crate::known_items::PERMIT_WAIT,
+        page_pace: crate::known_items::DRAW_PAGE_PACE,
+    }))
 }
 
 #[cfg(test)]

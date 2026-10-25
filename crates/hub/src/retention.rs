@@ -23,7 +23,8 @@ use eyre::Result;
 use tokio_util::sync::CancellationToken;
 use workforce_common::settings::WorkforceConfig;
 use workforce_common::shadow_postgres::{
-    ShadowStore, COMPARISONS_RETENTION_DAYS, DAILY_RETENTION_DAYS, RECONCILES_RETENTION_DAYS,
+    ShadowStore, COMPARISONS_RETENTION_DAYS, DAILY_RETENTION_DAYS, KNOWN_ITEMS_RETENTION_DAYS,
+    RECONCILES_RETENTION_DAYS,
 };
 use workforce_common::telemetry::TelemetryStore;
 
@@ -100,10 +101,16 @@ pub fn prunes(
             DAILY_RETENTION_DAYS,
             move |before| daily.prune_daily(before),
         ));
+        let known_items = Arc::clone(&reconciles);
         prunes.push(Prune::new(
             "shadow reconciles",
             RECONCILES_RETENTION_DAYS,
             move |before| reconciles.prune_reconciles(before),
+        ));
+        prunes.push(Prune::new(
+            "shadow known items",
+            KNOWN_ITEMS_RETENTION_DAYS,
+            move |before| known_items.prune_known_item_runs(before),
         ));
     }
     prunes
@@ -254,7 +261,8 @@ mod tests {
                     [
                         ("shadow comparisons", 14),
                         ("shadow daily", 180),
-                        ("shadow reconciles", 180)
+                        ("shadow reconciles", 180),
+                        ("shadow known items", 180)
                     ]
                 );
                 assert_eq!(windows(None).len(), 2, "nothing shadowed, nothing to prune");
