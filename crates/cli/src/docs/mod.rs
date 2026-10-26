@@ -9,6 +9,7 @@
 //!
 //! `gh` and `git` are invoked via subprocess.
 
+mod check;
 mod edit;
 mod llm;
 mod pr;
@@ -41,6 +42,16 @@ const SYSTEM_PROMPT: &str = include_str!("../../curator/system-prompt.md");
 pub enum DocsCommand {
     /// Curate one or more pages with the doc-curator agent.
     Curate(CurateArgs),
+    /// Check pages' examples: every `workforce` command must parse with the
+    /// real command line, and every `workforce.toml` block must load into
+    /// the real config. Exits non-zero when any example fails.
+    Check(CheckArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct CheckArgs {
+    /// Page paths relative to `end-user-docs/`; every page when omitted.
+    pub pages: Vec<String>,
 }
 
 #[derive(Args, Debug)]
@@ -93,6 +104,7 @@ pub struct CurateArgs {
 pub async fn run(command: DocsCommand) -> Result<()> {
     match command {
         DocsCommand::Curate(args) => curate(args).await,
+        DocsCommand::Check(args) => check_pages(args),
     }
 }
 
@@ -189,6 +201,59 @@ async fn curate(args: CurateArgs) -> Result<()> {
     .await?;
 
     Ok(())
+}
+
+fn check_pages(args: CheckArgs) -> Result<()> {
+    let repo_root = std::env::current_dir().wrap_err("cwd")?;
+    let docs_root = repo_root.join("end-user-docs");
+    let cfg = load_watch_config(&docs_root.join("docs-watch.toml"))?;
+    let pages = if args.pages.is_empty() {
+        all_mdx_pages(&docs_root)?
+    } else {
+        args.pages
+    };
+    let mut failed = 0;
+    let (mut commands, mut configs, mut unchecked) = (0, 0, 0);
+    for page in &pages {
+        let text = std::fs::read_to_string(docs_root.join(page))
+            .wrap_err_with(|| format!("read end-user-docs/{page}"))?;
+        let report = check::check_page(&text, cfg.toml_schema(page));
+        commands += report.commands_checked;
+        configs += report.config_blocks_checked;
+        unchecked += report.config_blocks_unchecked;
+        for finding in &report.findings {
+            println!("end-user-docs/{page}: {finding}");
+        }
+        failed += report.findings.len();
+    }
+    println!(
+        "{} pages: {commands} commands and {configs} config blocks checked, \
+         {unchecked} config blocks for files without a checker, {failed} failing",
+        pages.len()
+    );
+    if failed > 0 {
+        return Err(eyre!("{failed} examples fail their check"));
+    }
+    Ok(())
+}
+
+fn all_mdx_pages(docs_root: &Path) -> Result<Vec<String>> {
+    fn walk(root: &Path, dir: &Path, out: &mut Vec<String>) -> Result<()> {
+        for entry in std::fs::read_dir(dir).wrap_err_with(|| format!("read {}", dir.display()))? {
+            let path = entry?.path();
+            if path.is_dir() {
+                walk(root, &path, out)?;
+            } else if path.extension().is_some_and(|e| e == "mdx") {
+                let rel = path.strip_prefix(root).unwrap_or(&path);
+                out.push(rel.to_string_lossy().replace('\\', "/"));
+            }
+        }
+        Ok(())
+    }
+    let mut out = Vec::new();
+    walk(docs_root, docs_root, &mut out)?;
+    out.sort();
+    Ok(out)
 }
 
 /// What happened to a page during a run, used to decide whether it gets a PR.
