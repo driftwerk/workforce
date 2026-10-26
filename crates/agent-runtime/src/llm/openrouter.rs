@@ -485,15 +485,20 @@ impl OpenRouterClient {
     }
 }
 
-/// The request's `reasoning` field. A suppressed call asks for no reasoning
-/// outright: leaving the field out lets a model that reasons by default
-/// (DeepSeek v4 Pro) spend the whole token budget thinking anyway.
+/// The request's `reasoning` field. A suppressed call, or a thinking budget
+/// of zero, asks for `minimal` effort outright: leaving the field out lets a
+/// model that reasons by default (DeepSeek v4 Pro) spend the whole token
+/// budget thinking, and `none` is refused outright by every model whose
+/// reasoning is mandatory (Claude Sonnet and Opus, Gemini, GLM, Qwen Max,
+/// GPT-6.1). `minimal` is accepted by every OpenRouter tier model and keeps
+/// reasoning near zero.
 fn reasoning_for(suppressed: bool, thinking_budget: Option<u32>) -> Option<ReasoningConfig> {
-    if suppressed {
-        build_reasoning_config(Some(0))
-    } else {
-        build_reasoning_config(thinking_budget)
+    if suppressed || thinking_budget == Some(0) {
+        return Some(ReasoningConfig {
+            effort: "minimal".to_string(),
+        });
     }
+    build_reasoning_config(thinking_budget)
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
@@ -518,16 +523,16 @@ mod tests {
     // OAI conversion, cache control, and build_messages tests live in oai_common.rs.
 
     #[tokio::test]
-    async fn a_suppressed_call_asks_for_no_reasoning_outright() {
+    async fn a_suppressed_call_asks_for_minimal_reasoning_outright() {
         use crate::llm::types::{ContentBlock, Role};
 
-        // DeepSeek v4 Pro reasons when the field is absent, so suppression
-        // must say "none" rather than leave it out.
+        // DeepSeek v4 Pro reasons when the field is absent, and models with
+        // mandatory reasoning refuse "none", so suppression says "minimal".
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/api/v1/chat/completions"))
             .and(body_partial_json(
-                serde_json::json!({"reasoning": {"effort": "none"}}),
+                serde_json::json!({"reasoning": {"effort": "minimal"}}),
             ))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "choices": [{"message": {"role": "assistant", "content": "notes"},
@@ -553,7 +558,7 @@ mod tests {
             false,
         ))
         .await
-        .expect("the mock only answers a request that asks for no reasoning");
+        .expect("the mock only answers a request that asks for minimal reasoning");
         assert_eq!(response.text().as_deref(), Some("notes"));
     }
 
@@ -561,7 +566,30 @@ mod tests {
     fn reasoning_is_left_to_the_model_unless_asked_for_or_suppressed() {
         assert!(reasoning_for(false, None).is_none());
         assert_eq!(reasoning_for(false, Some(5_000)).unwrap().effort, "medium");
-        assert_eq!(reasoning_for(true, Some(20_000)).unwrap().effort, "none");
+        assert_eq!(reasoning_for(true, Some(20_000)).unwrap().effort, "minimal");
+        assert_eq!(reasoning_for(false, Some(0)).unwrap().effort, "minimal");
+    }
+
+    #[test]
+    fn no_openrouter_request_ever_asks_for_no_reasoning() {
+        // "none" is a 400 on every model whose reasoning is mandatory.
+        for suppressed in [false, true] {
+            for budget in [
+                None,
+                Some(0),
+                Some(1),
+                Some(2_000),
+                Some(8_000),
+                Some(50_000),
+            ] {
+                if let Some(config) = reasoning_for(suppressed, budget) {
+                    assert_ne!(
+                        config.effort, "none",
+                        "suppressed={suppressed} budget={budget:?}"
+                    );
+                }
+            }
+        }
     }
 
     use wiremock::matchers::{bearer_token, body_partial_json, method, path};
