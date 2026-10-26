@@ -61,6 +61,9 @@ pub enum Curation {
         /// Examples that already failed their check before this edit and
         /// still do, for the reviewer.
         still_failing: Vec<String>,
+        /// Where the applied changes' evidence stands (`path lines a–b`),
+        /// for the reviewer.
+        citations: Vec<String>,
     },
     /// The model judged the page accurate as it stands.
     Unchanged { reason: String },
@@ -375,6 +378,8 @@ pub struct EditContext<'a> {
     sources: &'a SourceIndex,
     /// `None` only in tests of the loop itself: `curate_page` always sets it.
     verifier: Option<&'a Verifier<'a>>,
+    /// The cited ranges of the changes applied so far.
+    citations: std::sync::Mutex<Vec<String>>,
 }
 
 /// Checks one change against the sources it cites. A second model sees the
@@ -392,10 +397,11 @@ const VERIFIER_PROMPT: &str = "You check edits to end-user documentation against
      source code they cite. You see the passage before the edit, the passage after it, and \
      excerpts from the cited sources. List every statement the edit adds or changes that the \
      excerpts don't support: a command, subcommand, flag, argument, key, section, default, \
-     value, name, limit or behaviour that the excerpts don't show, or show differently. Text \
-     identical in both passages is not yours to judge, and neither are wording, tone or \
-     formatting. Answer by calling `verdict` once; an empty list means everything added is \
-     supported.";
+     value, name, limit or behaviour that the excerpts don't show, or show differently. Also \
+     list anything the edit removes or weakens that the excerpts show is still true (for \
+     example, dropping that an action needs an admin). Text identical in both passages is not \
+     yours to judge, and neither are wording, tone or formatting. Answer by calling `verdict` \
+     once; an empty list means the edit stands on the excerpts.";
 
 impl Verifier<'_> {
     /// The statements in `after` that `excerpts` don't support.
@@ -472,6 +478,7 @@ async fn edit_page(
         gate: ExampleGate::new(schema, current),
         sources,
         verifier,
+        citations: std::sync::Mutex::new(Vec::new()),
     };
     let mut draft = PageDraft::new(current);
     let mut messages = vec![user_text(user_prompt.to_string())];
@@ -563,7 +570,15 @@ async fn edit_page(
         match verdict {
             Some(Verdict::Finish(summary)) => {
                 let (_, still) = context.gate.split(draft.text());
+                let mut citations = context
+                    .citations
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
+                citations.sort();
+                citations.dedup();
                 return Ok(Curation::Edited {
+                    citations,
                     text: draft.text().to_string(),
                     summary,
                     edits: draft.applied().len(),
@@ -692,13 +707,15 @@ async fn edit_call(
     if let Err(e) = draft.locate(&args[0]) {
         return Ok(Err(e.to_string()));
     }
-    if let Err(refusal) = vouched_for(&args[0], &args[1], input, context).await? {
-        return Ok(Err(refusal));
+    let cited = match vouched_for(&args[0], &args[1], input, context).await? {
+        Ok(cited) => cited,
+        Err(refusal) => return Ok(Err(refusal)),
+    };
+    if let Err(e) = draft.replace(&args[0], &args[1]) {
+        return Ok(Err(e.to_string()));
     }
-    Ok(draft
-        .replace(&args[0], &args[1])
-        .map(|()| "applied".to_string())
-        .map_err(|e| e.to_string()))
+    record(context, cited);
+    Ok(Ok("applied".to_string()))
 }
 
 async fn append_call(
@@ -710,33 +727,51 @@ async fn append_call(
         Ok(args) => args,
         Err(e) => return Ok(Err(e)),
     };
-    if let Err(refusal) = vouched_for("", &args[0], input, context).await? {
-        return Ok(Err(refusal));
-    }
+    let cited = match vouched_for("", &args[0], input, context).await? {
+        Ok(cited) => cited,
+        Err(refusal) => return Ok(Err(refusal)),
+    };
     draft.append(&args[0]);
+    record(context, cited);
     Ok(Ok("appended".to_string()))
+}
+
+/// The cited ranges of an applied change, logged and kept for the PR.
+fn record(context: &EditContext<'_>, cited: Vec<String>) {
+    info!(cited = ?cited, "curator: change applied");
+    context
+        .citations
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .extend(cited);
 }
 
 /// Whether the change from `before` to `after` stands on its evidence: every
 /// cited quote is in its source word for word, and the verifier finds no
-/// statement the excerpts don't support. `Err` inside is the refusal the
-/// model sees; the outer error is a verifier that couldn't be asked.
+/// statement the excerpts don't support. `Ok` inside holds the cited ranges;
+/// `Err` inside is the refusal the model sees; the outer error is a
+/// verifier that couldn't be asked.
 async fn vouched_for(
     before: &str,
     after: &str,
     input: &Value,
     context: &EditContext<'_>,
-) -> Result<Result<(), String>> {
+) -> Result<Result<Vec<String>, String>> {
     let excerpts = match cited_excerpts(input, context.sources) {
         Ok(excerpts) => excerpts,
         Err(e) => return Ok(Err(e)),
     };
+    let ranges: Vec<String> = excerpts
+        .iter()
+        .filter_map(|e| e.lines().next())
+        .map(|header| header.trim_end_matches(':').to_string())
+        .collect();
     let Some(verifier) = context.verifier else {
-        return Ok(Ok(()));
+        return Ok(Ok(ranges));
     };
     let unsupported = verifier.unsupported(before, after, &excerpts).await?;
     if unsupported.is_empty() {
-        return Ok(Ok(()));
+        return Ok(Ok(ranges));
     }
     let list: Vec<String> = unsupported.iter().map(|u| format!("- {u}")).collect();
     Ok(Err(format!(
@@ -914,13 +949,15 @@ async fn invoke(
 ) -> Result<LlmResponse> {
     // The curator wants edits or notes, not a chain of thought: a model
     // that reasons by default would otherwise spend the budget on it.
+    // Cached where the route supports it (Claude models): the edit loop
+    // resends the sources every turn.
     with_reasoning_suppressed(provider.create_message(
         system_prompt,
         messages,
         tools,
         Some(model),
         Some(max_tokens),
-        false,
+        true,
     ))
     .await
 }
@@ -1369,6 +1406,15 @@ mod tests {
         };
         assert_eq!(edits, 1);
         assert_eq!(summary, "Documented --dry-run.");
+        let Curation::Edited { citations, .. } = run(
+            &Scripted::new(vec![calls(&[add_dry_run(), finish()])]),
+            Some(PAGE),
+        )
+        .await
+        .unwrap() else {
+            unreachable!()
+        };
+        assert_eq!(citations, vec!["spec lines 1–2".to_string()]);
         let inserted = "- `--dry-run` — print the plan.\n";
         assert_eq!(text.replacen(inserted, "", 1), PAGE);
     }
