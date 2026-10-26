@@ -1096,6 +1096,11 @@ pub struct CuratorConfig {
     /// `"bedrock.anthropic:powerful"`.
     #[serde(default)]
     pub tier: Option<String>,
+    /// Tier spec of the model that checks each change against the sources
+    /// it cites, before the change is applied. Required to curate; use a
+    /// different model from `tier`, so the two don't share blind spots.
+    #[serde(default)]
+    pub verifier_tier: Option<String>,
     /// Cap on each reply while editing a page. The curator edits a page
     /// passage by passage, so a reply holds edits, never the whole page; a
     /// reply that reaches this cap is discarded rather than applied.
@@ -1123,6 +1128,7 @@ impl Default for CuratorConfig {
     fn default() -> Self {
         Self {
             tier: None,
+            verifier_tier: None,
             max_tokens: default_curator_max_tokens(),
             notes_max_tokens: default_curator_notes_max_tokens(),
             max_turns: default_curator_max_turns(),
@@ -1140,7 +1146,7 @@ fn default_curator_notes_max_tokens() -> u32 {
 }
 
 fn default_curator_max_turns() -> u32 {
-    30
+    60
 }
 
 fn default_curator_context_safety_tokens() -> u32 {

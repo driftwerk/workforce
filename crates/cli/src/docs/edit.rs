@@ -74,8 +74,8 @@ impl PageDraft {
         self.current != self.original
     }
 
-    /// Replace the one occurrence of `old_text` with `new_text`.
-    pub fn replace(&mut self, old_text: &str, new_text: &str) -> Result<(), EditError> {
+    /// Where the one occurrence of `old_text` starts, or why there isn't one.
+    pub fn locate(&self, old_text: &str) -> Result<usize, EditError> {
         if old_text.is_empty() {
             return Err(EditError::EmptyPassage);
         }
@@ -83,10 +83,15 @@ impl PageDraft {
         let Some((at, _)) = found.next() else {
             return Err(EditError::NotFound);
         };
-        let extra = found.count();
-        if extra > 0 {
-            return Err(EditError::Ambiguous(extra + 1));
+        match found.count() {
+            0 => Ok(at),
+            extra => Err(EditError::Ambiguous(extra + 1)),
         }
+    }
+
+    /// Replace the one occurrence of `old_text` with `new_text`.
+    pub fn replace(&mut self, old_text: &str, new_text: &str) -> Result<(), EditError> {
+        let at = self.locate(old_text)?;
         self.current
             .replace_range(at..at + old_text.len(), new_text);
         self.applied.push(AppliedEdit::Replaced {
