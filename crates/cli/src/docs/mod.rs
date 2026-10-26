@@ -175,6 +175,7 @@ async fn curate(args: CurateArgs) -> Result<()> {
                     page: page.clone(),
                     sources: Vec::new(),
                     summary: String::new(),
+                    still_failing: Vec::new(),
                     status: PageStatus::Skipped,
                 }
             }
@@ -273,6 +274,8 @@ struct PageOutcome {
     sources: Vec<String>,
     /// The curator's account of what changed, for the PR.
     summary: String,
+    /// Examples that failed their check before the edit and still do.
+    still_failing: Vec<String>,
     status: PageStatus,
 }
 
@@ -329,6 +332,7 @@ async fn curate_single_page(
             page: page.to_string(),
             sources: Vec::new(),
             summary: String::new(),
+            still_failing: Vec::new(),
             status: PageStatus::Skipped,
         });
     }
@@ -348,8 +352,16 @@ async fn curate_single_page(
     };
 
     info!(page, tier = tier_spec, "curating page");
-    let curation =
-        curate_page(page, tier_spec, limits, SYSTEM_PROMPT, &prompt_input, vault).await?;
+    let curation = curate_page(
+        page,
+        tier_spec,
+        limits,
+        SYSTEM_PROMPT,
+        &prompt_input,
+        cfg.toml_schema(page),
+        vault,
+    )
+    .await?;
     let Curation::Edited {
         text,
         summary,
@@ -357,6 +369,7 @@ async fn curate_single_page(
         model,
         input_tokens,
         output_tokens,
+        still_failing,
     } = curation
     else {
         if let Curation::Unchanged { reason } = curation {
@@ -377,6 +390,7 @@ async fn curate_single_page(
         edits,
         input_tokens,
         output_tokens,
+        still_failing = still_failing.len(),
         "page edited"
     );
 
@@ -384,6 +398,7 @@ async fn curate_single_page(
         page: page.to_string(),
         sources: source_summary,
         summary,
+        still_failing,
         status: PageStatus::Edited,
     })
 }
@@ -393,6 +408,7 @@ fn unchanged(page: &str, sources: Vec<String>) -> PageOutcome {
         page: page.to_string(),
         sources,
         summary: String::new(),
+        still_failing: Vec::new(),
         status: PageStatus::Unchanged,
     }
 }
@@ -452,6 +468,7 @@ fn page_reports(outcomes: &[&PageOutcome]) -> Vec<PageReport> {
             page: o.page.clone(),
             sources: o.sources.clone(),
             summary: o.summary.clone(),
+            still_failing: o.still_failing.clone(),
         })
         .collect()
 }

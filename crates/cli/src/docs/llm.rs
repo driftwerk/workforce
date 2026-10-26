@@ -31,6 +31,7 @@ use workforce_agent::llm::types::{
 use workforce_common::settings::CuratorConfig;
 use workforce_hub::vault::Vault;
 
+use super::check::{check_page, Finding, TomlSchema};
 use super::edit::PageDraft;
 use super::prompt::{
     build_notes_prompt, build_prompt, build_reduce_prompt, PromptInput, SourceFile,
@@ -56,6 +57,9 @@ pub enum Curation {
         model: String,
         input_tokens: u64,
         output_tokens: u64,
+        /// Examples that already failed their check before this edit and
+        /// still do, for the reviewer.
+        still_failing: Vec<String>,
     },
     /// The model judged the page accurate as it stands.
     Unchanged { reason: String },
@@ -70,6 +74,7 @@ pub async fn curate_page(
     limits: &CuratorConfig,
     system_prompt: &str,
     input: &PromptInput,
+    schema: TomlSchema,
     vault: Option<&Arc<Vault>>,
 ) -> Result<Curation> {
     let (kind, model) = resolve_tier(tier_spec)?;
@@ -82,7 +87,16 @@ pub async fn curate_page(
         )
     })?;
     let provider = create_provider_async(kind, &api_key, Some(&model), None, false).await?;
-    curate_with(&*provider, &model, page, limits, system_prompt, input).await
+    curate_with(
+        &*provider,
+        &model,
+        page,
+        limits,
+        system_prompt,
+        input,
+        schema,
+    )
+    .await
 }
 
 async fn curate_with(
@@ -92,6 +106,7 @@ async fn curate_with(
     limits: &CuratorConfig,
     system_prompt: &str,
     input: &PromptInput,
+    schema: TomlSchema,
 ) -> Result<Curation> {
     let single_pass = build_prompt(input);
     let estimated =
@@ -118,6 +133,7 @@ async fn curate_with(
         system_prompt,
         &user_prompt,
         input.current_content.as_deref(),
+        schema,
     )
     .await
     .wrap_err_with(|| context_overflow_hint(page))
@@ -260,6 +276,60 @@ const CUT_OFF_NOTE: &str = "Your last reply was cut off before it ended, so none
 const TOOLS_ONLY_NOTE: &str = "Reply with tool calls only: `edit` or `append` to change the \
      page, then `finish`; or `keep_page` if it needs no change.";
 
+/// The page's examples, checked against the real CLI and config (see
+/// `check`). `finish` is refused while the draft has a failing example the
+/// original page didn't; failures the page already had don't block it, and
+/// are reported.
+struct ExampleGate {
+    schema: TomlSchema,
+    baseline: Vec<Finding>,
+}
+
+impl ExampleGate {
+    fn new(schema: TomlSchema, original: Option<&str>) -> Self {
+        let baseline = check_page(original.unwrap_or_default(), schema).findings;
+        Self { schema, baseline }
+    }
+
+    /// The draft's failing examples, split into those the original page
+    /// didn't have and those it did. Lines move as the page is edited, so
+    /// failures are matched by example and problem, not by line.
+    fn split(&self, draft: &str) -> (Vec<Finding>, Vec<Finding>) {
+        let mut known: Vec<(&str, &str)> = self
+            .baseline
+            .iter()
+            .map(|f| (f.example.as_str(), f.problem.as_str()))
+            .collect();
+        let mut new = Vec::new();
+        let mut old = Vec::new();
+        for finding in check_page(draft, self.schema).findings {
+            let key = (finding.example.as_str(), finding.problem.as_str());
+            match known.iter().position(|k| *k == key) {
+                Some(at) => {
+                    known.swap_remove(at);
+                    old.push(finding);
+                }
+                None => new.push(finding),
+            }
+        }
+        (new, old)
+    }
+
+    /// The note that tells the model which examples already fail.
+    fn baseline_note(&self) -> Option<String> {
+        (!self.baseline.is_empty()).then(|| {
+            let list: Vec<String> = self.baseline.iter().map(|f| format!("- {f}")).collect();
+            format!(
+                "## Examples on this page that already fail their check\n\
+                 Each `workforce` command is parsed with the real command line and each \
+                 workforce.toml block loaded into the real config. These fail now; fix any \
+                 your sources show the correct form of.\n{}\n",
+                list.join("\n")
+            )
+        })
+    }
+}
+
 /// What ends the edit of a page.
 enum Verdict {
     Finish(String),
@@ -274,10 +344,15 @@ async fn edit_page(
     system_prompt: &str,
     user_prompt: &str,
     current: Option<&str>,
+    schema: TomlSchema,
 ) -> Result<Curation> {
     let tools = edit_tools();
+    let gate = ExampleGate::new(schema, current);
     let mut draft = PageDraft::new(current);
     let mut messages = vec![user_text(user_prompt.to_string())];
+    if let Some(note) = gate.baseline_note() {
+        push_user_text(&mut messages, &note);
+    }
     let (mut input_tokens, mut output_tokens) = (0u64, 0u64);
     let mut cut_off_in_a_row = 0;
 
@@ -328,7 +403,7 @@ async fn edit_page(
             continue;
         }
 
-        let (results, verdict) = apply_calls(&mut draft, &calls);
+        let (results, verdict) = apply_calls(&mut draft, &calls, &gate);
         info!(
             page,
             turn,
@@ -355,6 +430,7 @@ async fn edit_page(
 
         match verdict {
             Some(Verdict::Finish(summary)) => {
+                let (_, still) = gate.split(draft.text());
                 return Ok(Curation::Edited {
                     text: draft.text().to_string(),
                     summary,
@@ -362,7 +438,8 @@ async fn edit_page(
                     model: response.model,
                     input_tokens,
                     output_tokens,
-                })
+                    still_failing: still.iter().map(ToString::to_string).collect(),
+                });
             }
             Some(Verdict::Keep(reason)) => return Ok(Curation::Unchanged { reason }),
             None => {}
@@ -376,10 +453,12 @@ async fn edit_page(
 
 /// Apply one reply's tool calls. Changes apply in order; `finish` and
 /// `keep_page` are judged after them, and stand only when every other call
-/// in the reply succeeded.
+/// in the reply succeeded. `finish` also needs every example the edit
+/// touched to pass its check.
 fn apply_calls(
     draft: &mut PageDraft,
     calls: &[(String, String, Value)],
+    gate: &ExampleGate,
 ) -> (Vec<(String, Result<String, String>)>, Option<Verdict>) {
     let mut results: BTreeMap<usize, (String, Result<String, String>)> = BTreeMap::new();
     let mut verdicts = Vec::new();
@@ -416,12 +495,25 @@ fn apply_calls(
             Err("a change in this reply was refused; fix it before ending the edit".to_string())
         } else if name == "finish" {
             string_args(input, &["summary"]).and_then(|args| {
-                if draft.is_changed() {
-                    verdict = Some(Verdict::Finish(args[0].clone()));
-                    Ok("finished".to_string())
-                } else {
-                    Err("the page is unchanged; call keep_page if it needs no change".to_string())
+                if !draft.is_changed() {
+                    return Err(
+                        "the page is unchanged; call keep_page if it needs no change".to_string(),
+                    );
                 }
+                let (new, _) = gate.split(draft.text());
+                if !new.is_empty() {
+                    let list: Vec<String> = new.iter().map(|f| format!("- {f}")).collect();
+                    return Err(format!(
+                        "not finished: your edits leave {} example(s) that fail their check \
+                         (each `workforce` command is parsed with the real command line, each \
+                         workforce.toml block loaded into the real config). Fix them, then \
+                         finish:\n{}",
+                        new.len(),
+                        list.join("\n")
+                    ));
+                }
+                verdict = Some(Verdict::Finish(args[0].clone()));
+                Ok("finished".to_string())
             })
         } else {
             string_args(input, &["reason"]).and_then(|args| {
@@ -752,8 +844,68 @@ mod tests {
             "system",
             "curate",
             current,
+            TomlSchema::Workforce,
         )
         .await
+    }
+
+    // ── The example gate ───────────────────────────────────────────────────
+
+    const CLI_PAGE: &str = "---\ntitle: CLI\n---\n\n## Agents\n\n```sh\nworkforce agent list\n```\n\n## Delete\n\n```sh\nworkforce agent delete --id reviewer\n```\n";
+
+    #[tokio::test]
+    async fn finish_is_refused_while_an_edit_breaks_an_example() {
+        let breaks = (
+            "edit",
+            json!({"old_text": "workforce agent list\n", "new_text": "workforce agent list --verbose\n"}),
+        );
+        let repairs = (
+            "edit",
+            json!({"old_text": "workforce agent list --verbose\n", "new_text": "workforce agent list --workdir ./team\n"}),
+        );
+        let provider = Scripted::new(vec![
+            calls(&[breaks, finish()]),
+            calls(&[repairs, finish()]),
+        ]);
+        let Curation::Edited { text, .. } = run(&provider, Some(CLI_PAGE)).await.unwrap() else {
+            panic!("expected an edit");
+        };
+        let refusal = serde_json::to_string(&provider.seen.lock().unwrap()[1]).unwrap();
+        assert!(refusal.contains("not finished"), "{refusal}");
+        assert!(refusal.contains("--verbose"), "{refusal}");
+        assert!(text.contains("agent list --workdir ./team"));
+    }
+
+    #[tokio::test]
+    async fn an_example_already_broken_does_not_block_finish_and_is_reported() {
+        let unrelated = (
+            "edit",
+            json!({"old_text": "## Agents\n", "new_text": "## Agents\n\nList the agents.\n"}),
+        );
+        let provider = Scripted::new(vec![calls(&[unrelated, finish()])]);
+        let Curation::Edited { still_failing, .. } = run(&provider, Some(CLI_PAGE)).await.unwrap()
+        else {
+            panic!("expected an edit");
+        };
+        assert_eq!(still_failing.len(), 1, "{still_failing:?}");
+        assert!(still_failing[0].contains("agent delete --id reviewer"));
+        // The model was told about it before it started.
+        let first = serde_json::to_string(&provider.seen.lock().unwrap()[0]).unwrap();
+        assert!(first.contains("already fail their check"), "{first}");
+    }
+
+    #[tokio::test]
+    async fn fixing_a_broken_example_clears_it_from_the_report() {
+        let fix = (
+            "edit",
+            json!({"old_text": "workforce agent delete --id reviewer", "new_text": "workforce agent delete reviewer"}),
+        );
+        let provider = Scripted::new(vec![calls(&[fix, finish()])]);
+        let Curation::Edited { still_failing, .. } = run(&provider, Some(CLI_PAGE)).await.unwrap()
+        else {
+            panic!("expected an edit");
+        };
+        assert!(still_failing.is_empty(), "{still_failing:?}");
     }
 
     fn add_dry_run() -> (&'static str, Value) {
