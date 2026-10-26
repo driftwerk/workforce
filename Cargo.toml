@@ -210,7 +210,7 @@ rust_xlsxwriter = "0.79"
 # with `lzma-sys` that ends up in the tree through other deps such as
 # `postgresql_embedded`'s archive extractor in the test build. The hub
 # only uses `zip` to read .docx attachments, which are deflate-only.
-zip = { version = "2.4", default-features = false, features = ["deflate"] }
+zip = { version = "9.0", default-features = false, features = ["deflate"] }
 quick-xml = "0.31"
 
 # Email (for workforce-skills email feature)
