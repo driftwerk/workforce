@@ -765,7 +765,7 @@ dependencies = [
  "http 0.2.12",
  "http 1.4.0",
  "http-body 0.4.6",
- "lru",
+ "lru 0.12.5",
  "percent-encoding",
  "regex-lite",
  "sha2 0.10.9",
@@ -4864,6 +4864,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "lru"
+version = "0.18.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ef9ac18847474e638e3702b76c65d4eb93428471a74778ef0f1be711717f89b5"
+dependencies = [
+ "hashbrown 0.17.1",
+]
+
+[[package]]
 name = "lru-slab"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5229,7 +5238,7 @@ dependencies = [
  "futures-sink",
  "futures-util",
  "keyed_priority_queue",
- "lru",
+ "lru 0.12.5",
  "mysql_common",
  "pem",
  "percent-encoding",
@@ -7011,7 +7020,7 @@ dependencies = [
  "indoc",
  "instability",
  "itertools 0.13.0",
- "lru",
+ "lru 0.12.5",
  "paste",
  "strum 0.26.3",
  "unicode-segmentation",
@@ -11506,7 +11515,7 @@ dependencies = [
  "ignore",
  "jsonschema",
  "libc",
- "lru",
+ "lru 0.18.5",
  "metrics",
  "mysql_async",
  "once_cell",
@@ -11679,7 +11688,7 @@ dependencies = [
  "futures",
  "hex",
  "libc",
- "lru",
+ "lru 0.18.5",
  "metrics",
  "metrics-exporter-prometheus",
  "once_cell",
@@ -11858,7 +11867,7 @@ dependencies = [
  "ipnetwork",
  "jsonwebtoken",
  "libc",
- "lru",
+ "lru 0.18.5",
  "metrics",
  "mime_guess",
  "notify",
@@ -12277,7 +12286,7 @@ dependencies = [
  "chrono",
  "deadpool-postgres",
  "eyre",
- "lru",
+ "lru 0.18.5",
  "parking_lot",
  "refinery",
  "rusqlite",
@@ -12423,7 +12432,7 @@ dependencies = [
  "http 1.4.0",
  "jsonwebtoken",
  "lettre",
- "lru",
+ "lru 0.18.5",
  "mailparse",
  "open",
  "parking_lot",
