@@ -19,7 +19,8 @@ pub struct PrSpec {
 pub enum PrSync {
     /// No PR existed (or the last one merged); opened a fresh PR.
     Created(String),
-    /// An open PR already existed; force-pushed the new content to it.
+    /// An open PR already existed; force-pushed the new content to it and
+    /// brought its title, body and draft state up to this run.
     Updated(u64),
     /// A human closed the PR without merging — treated as "leave this
     /// page alone". Nothing pushed; requires human action to revive.
@@ -39,6 +40,7 @@ enum PrLifecycle {
 struct ExistingPr {
     number: u64,
     state: PrLifecycle,
+    draft: bool,
 }
 
 /// Reconcile one page against its stable branch `docs/curator/{slug}`:
@@ -64,7 +66,19 @@ pub async fn sync_pr(repo_root: &Path, spec: &PrSpec) -> Result<PrSync> {
     force_push(repo_root, &spec.branch).await?;
 
     match existing {
-        Some(pr) if pr.state == PrLifecycle::Open => Ok(PrSync::Updated(pr.number)),
+        Some(pr) if pr.state == PrLifecycle::Open => {
+            // The PR describes this run, not the first one: a stale body
+            // misreports what changed and whether verification passed, and a
+            // stale ready state lets a page that now breaks the build merge.
+            edit_gh_pr(repo_root, pr.number, spec).await?;
+            if let Some(args) = draft_change(pr.draft, spec.draft) {
+                let number = pr.number.to_string();
+                let mut ready = vec!["pr", "ready", number.as_str()];
+                ready.extend_from_slice(args);
+                run_gh(repo_root, &ready).await?;
+            }
+            Ok(PrSync::Updated(pr.number))
+        }
         // None, or a previously-merged PR on this branch: open a new one.
         _ => Ok(PrSync::Created(create_gh_pr(repo_root, spec).await?)),
     }
@@ -97,12 +111,12 @@ async fn latest_pr_for_branch(repo_root: &Path, branch: &str) -> Result<Option<E
             "--state",
             "all",
             "--json",
-            "number,state",
+            "number,state,isDraft",
             "--limit",
             "30",
             "--jq",
             // Highest number == most recent PR; emit nothing when there is none.
-            "sort_by(.number) | last | select(. != null) | \"\\(.number) \\(.state)\"",
+            "sort_by(.number) | last | select(. != null) | \"\\(.number) \\(.state) \\(.isDraft)\"",
         ])
         .current_dir(repo_root)
         .output()
@@ -118,22 +132,68 @@ async fn latest_pr_for_branch(repo_root: &Path, branch: &str) -> Result<Option<E
     Ok(parse_pr_list_line(&String::from_utf8_lossy(&out.stdout)))
 }
 
-/// Parse one `"<number> <STATE>"` line from the `gh pr list --jq` output.
-/// Empty (no PR on the branch) yields None.
+/// Parse one `"<number> <STATE> <isDraft>"` line from the `gh pr list --jq`
+/// output. Empty (no PR on the branch) yields None.
 fn parse_pr_list_line(stdout: &str) -> Option<ExistingPr> {
-    let line = stdout.trim();
-    if line.is_empty() {
-        return None;
-    }
-    let (num, state) = line.split_once(' ')?;
-    let number: u64 = num.trim().parse().ok()?;
-    let state = match state.trim() {
+    let mut fields = stdout.split_whitespace();
+    let number: u64 = fields.next()?.parse().ok()?;
+    let state = match fields.next()? {
         "OPEN" => PrLifecycle::Open,
         "MERGED" => PrLifecycle::Merged,
         "CLOSED" => PrLifecycle::ClosedUnmerged,
         _ => return None,
     };
-    Some(ExistingPr { number, state })
+    let draft = fields.next()? == "true";
+    Some(ExistingPr {
+        number,
+        state,
+        draft,
+    })
+}
+
+/// The `gh pr ready` arguments that move a PR from draft state `current` to
+/// `wanted`, or None when it is already there.
+fn draft_change(current: bool, wanted: bool) -> Option<&'static [&'static str]> {
+    match (current, wanted) {
+        (true, false) => Some(&[]),
+        (false, true) => Some(&["--undo"]),
+        _ => None,
+    }
+}
+
+async fn edit_gh_pr(repo_root: &Path, number: u64, spec: &PrSpec) -> Result<()> {
+    let number = number.to_string();
+    run_gh(
+        repo_root,
+        &[
+            "pr",
+            "edit",
+            number.as_str(),
+            "--title",
+            &spec.title,
+            "--body",
+            &spec.body,
+        ],
+    )
+    .await
+}
+
+async fn run_gh(repo_root: &Path, args: &[&str]) -> Result<()> {
+    let out = Command::new("gh")
+        .args(args)
+        .current_dir(repo_root)
+        .output()
+        .await
+        .wrap_err_with(|| format!("spawn gh {}", args.join(" ")))?;
+    if !out.status.success() {
+        return Err(eyre!(
+            "gh {} failed (exit {}): {}",
+            args.iter().take(2).copied().collect::<Vec<_>>().join(" "),
+            out.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&out.stderr),
+        ));
+    }
+    Ok(())
 }
 
 async fn stage_paths(repo_root: &Path, paths: &[String]) -> Result<()> {
@@ -382,18 +442,38 @@ mod tests {
     #[test]
     fn parse_pr_list_line_maps_each_state() {
         assert_eq!(
-            parse_pr_list_line("160 OPEN").unwrap().state,
+            parse_pr_list_line("160 OPEN false").unwrap().state,
             PrLifecycle::Open
         );
         assert_eq!(
-            parse_pr_list_line("144 MERGED").unwrap().state,
+            parse_pr_list_line("144 MERGED false").unwrap().state,
             PrLifecycle::Merged
         );
         assert_eq!(
-            parse_pr_list_line("99 CLOSED").unwrap().state,
+            parse_pr_list_line("99 CLOSED true").unwrap().state,
             PrLifecycle::ClosedUnmerged
         );
-        assert_eq!(parse_pr_list_line("160 OPEN").unwrap().number, 160);
+        assert_eq!(parse_pr_list_line("160 OPEN false").unwrap().number, 160);
+    }
+
+    #[test]
+    fn parse_pr_list_line_reads_the_draft_state() {
+        assert!(parse_pr_list_line("21 OPEN true").unwrap().draft);
+        assert!(!parse_pr_list_line("21 OPEN false").unwrap().draft);
+        assert!(
+            parse_pr_list_line("21 OPEN").is_none(),
+            "a line without the draft state is not trusted"
+        );
+    }
+
+    #[test]
+    fn an_updated_pr_takes_the_draft_state_of_this_run() {
+        // A page that now breaks the build turns a ready PR back into a draft.
+        assert_eq!(draft_change(false, true), Some(&["--undo"][..]));
+        // A page fixed since an earlier failing run becomes ready again.
+        assert_eq!(draft_change(true, false), Some(&[][..]));
+        assert_eq!(draft_change(true, true), None);
+        assert_eq!(draft_change(false, false), None);
     }
 
     #[test]
@@ -404,7 +484,7 @@ mod tests {
 
     #[test]
     fn parse_pr_list_line_unknown_state_is_none() {
-        assert!(parse_pr_list_line("12 LOCKED").is_none());
+        assert!(parse_pr_list_line("12 LOCKED false").is_none());
     }
 
     #[test]
