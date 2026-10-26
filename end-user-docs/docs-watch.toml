@@ -12,6 +12,14 @@
 #
 # Multiple [[watch]] entries are allowed; pages may overlap.
 #
+# A page whose TOML examples show workforce.toml declares it, and
+# `workforce docs check` (and the curator) load every untitled TOML block on
+# it into the real config:
+#   [pages."configuration/index.mdx"]
+#   toml = "workforce.toml"
+# A block for another file names it (```toml title="tiers.toml"```) and
+# isn't checked as workforce.toml.
+#
 # Use `**/*` (not just `**`) for recursive directory matching. The
 # `glob` crate's `glob()` walker treats trailing `**` as
 # "directories only" — files at any depth are excluded — even though
@@ -217,3 +225,26 @@ paths = [
   "fixtures/evals/example/**/*",
 ]
 pages = ["reference/evals.mdx", "cli.mdx"]
+
+# ─── Pages whose TOML examples show workforce.toml ───────────────────
+
+[pages."concepts/agents.mdx"]
+toml = "workforce.toml"
+
+[pages."concepts/skills.mdx"]
+toml = "workforce.toml"
+
+[pages."concepts/subscriptions.mdx"]
+toml = "workforce.toml"
+
+[pages."configuration/index.mdx"]
+toml = "workforce.toml"
+
+[pages."configuration/tiers.mdx"]
+toml = "workforce.toml"
+
+[pages."reference/agent-types.mdx"]
+toml = "workforce.toml"
+
+[pages."reference/remote-mcp.mdx"]
+toml = "workforce.toml"

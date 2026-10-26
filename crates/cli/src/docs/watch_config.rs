@@ -21,6 +21,30 @@ use serde::Deserialize;
 pub struct WatchConfig {
     #[serde(default, rename = "watch")]
     pub entries: Vec<WatchEntry>,
+    /// Per-page settings, keyed by page path (`configuration/index.mdx`).
+    #[serde(default)]
+    pub pages: std::collections::BTreeMap<String, PageSettings>,
+}
+
+/// How a page's examples are checked.
+#[derive(Debug, Default, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct PageSettings {
+    /// The file the page's untitled TOML blocks show, e.g.
+    /// `"workforce.toml"`. A block titled with a file name is that file.
+    /// Unset: untitled blocks aren't checked.
+    #[serde(default)]
+    pub toml: Option<String>,
+}
+
+impl WatchConfig {
+    /// The schema a page's untitled TOML blocks are checked against.
+    pub fn toml_schema(&self, page: &str) -> super::check::TomlSchema {
+        match self.pages.get(page).and_then(|p| p.toml.as_deref()) {
+            Some("workforce.toml") => super::check::TomlSchema::Workforce,
+            _ => super::check::TomlSchema::Unchecked,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -97,6 +121,7 @@ mod tests {
                     pages: pages.iter().map(|s| s.to_string()).collect(),
                 })
                 .collect(),
+            ..WatchConfig::default()
         }
     }
 
