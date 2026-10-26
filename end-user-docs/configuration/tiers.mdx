@@ -11,6 +11,75 @@ The LLM tier system routes your requests to the optimal model based on your task
 Tiers work with any provider (OpenRouter, Anthropic, Google, etc.) and support friendly names like `cheap`, `standard`, and `powerful` alongside concrete model IDs.
 </Callout>
 
+## Defining Tiers
+
+Tiers map a friendly name to an ordered list of provider/model pairs. Define them in your `workforce.toml` under a `[[tiers]]` array:
+
+```toml
+[[tiers]]
+name = "cheap"
+label = "Budget models"
+providers = [
+  { provider = "anthropic", model = "claude-haiku-4-5-20251001" },
+  { provider = "openrouter", model = "deepseek/deepseek-chat" },
+]
+
+[[tiers]]
+name = "powerful"
+providers = [
+  { provider = "anthropic", model = "claude-opus-4-6" },
+]
+```
+
+Each tier has a `name` (e.g. `cheap`, `standard`, `powerful`, or a custom one like `embedding`) and a `providers` list. At request time the framework walks the list in order and uses the **first entry whose credentials are available** — so a tier can rotate providers as API keys come and go, without touching the code that references it.
+
+A tier entry accepts:
+
+| Field | Meaning |
+|-------|---------|
+| `name` | The name other settings reference (`"cheap"`, `"embedding"`, …). |
+| `label` | Human-readable name shown in logs and debugging output. |
+| `description` | Free-form notes. |
+| `providers` | Ordered array of provider/model pairs (below). |
+
+Each provider pair takes `provider` (the backend) and `model` (a provider-native model id), or `model_id` which wins when both are set. Bedrock entries use the full model id including the inference-profile prefix, and must be quoted:
+
+```toml
+{ provider = "bedrock", model = "us.anthropic.claude-3-5-haiku-20241022-v2:0", region = "us-west-2" }
+```
+
+### Tier Credentials
+
+By default a provider resolves its credentials through its usual environment variable (e.g. `ANTHROPIC_API_KEY`, `OPENROUTER_API_KEY`) or the vault. Set `auth` to control it explicitly:
+
+```toml
+{ provider = "openrouter", model = "deepseek/deepseek-chat",
+  auth = { source = "api_key", key = "${OPENROUTER_API_KEY}" } }
+```
+
+- `source = "vault"` reads `key` as a dot-notation vault path (`"openrouter/api_key"`), falling back to env vars when the vault returns nothing.
+- `source = "api_key"` treats `key` as a literal key, or an env var when written as `${VAR}`.
+- `source = "login"` uses the subscription login for `claude-code` / `codex` routes.
+- `source = "aws"` uses ambient AWS credentials (or an explicit role ARN) for Bedrock.
+
+You can also set `account_index` to pick a specific key slot when several are available, and `region` to override the Bedrock region.
+
+An entry whose credentials cannot be satisfied is skipped. If none of a tier's entries resolve, the system logs a warning and falls back to the agent's ordinary `[llm]` model and failover chain.
+
+<Callout type="warn">
+Old provider names — `claude-max`, `claudemax`, `max`, `pro-max`, `promax`, `subscription`, `oauth` — are rejected at startup with a pointer to use `claude-code` instead.
+</Callout>
+
+### Where Tiers Are Referenced
+
+Any model field that accepts a tier can name it three ways: a bare name (`"cheap"`), a `provider:tier` shorthand (`"openrouter:anthropic:cheap"`, which resolves that provider's entry directly), or a concrete model id. Tier-aware settings include the vision, transcription, image, and video blocks below, the advisor's `model`, memory consolidation, claim grounding, the doc curator's `tier`, and `/cc` session defaults.
+
+Tiers hot-reload when a new turn resolves one; a syntax error logs a warning and falls back to the agent's default model.
+
+<Callout type="info">
+Built-in defaults ship with the binary, and files under `tiers/*.toml` in the data directory extend them; for a given `name`, the last file loaded wins.
+</Callout>
+
 ## Global Tier Configuration
 
 Configure the primary model and fallback chain in `[llm]`. Example from the default config:
@@ -312,7 +381,9 @@ The documentation curator uses its own tier specification:
 ```toml
 [curator]
 tier = "openrouter:deepseek:powerful"
-max_tokens = 16000
+max_tokens = 8000        # Reply cap; default 8000
+notes_max_tokens = 4000  # Notes reply cap; default 4000
+max_turns = 30           # Replies per page; default 30
 ```
 
 <Callout type="info">
