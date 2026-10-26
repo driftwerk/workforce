@@ -1089,27 +1089,58 @@ impl Default for SelfLearningConfig {
 /// available providers (driftwerk: OpenRouter, Harbor: Bedrock,
 /// etc.). The curator errors with a clear message if neither this
 /// section nor the CLI `--tier` override is set.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CuratorConfig {
     /// Tier spec passed straight to `TierRegistry::resolve_routed_model`.
     /// Examples: `"openrouter:deepseek:powerful"`, `"anthropic:powerful"`,
     /// `"bedrock.anthropic:powerful"`.
     #[serde(default)]
     pub tier: Option<String>,
-    /// Cap on response length per page draft.
+    /// Cap on each reply while editing a page. The curator edits a page
+    /// passage by passage, so a reply holds edits, never the whole page; a
+    /// reply that reaches this cap is discarded rather than applied.
     #[serde(default = "default_curator_max_tokens")]
     pub max_tokens: u32,
+    /// Cap on each notes reply when a page's sources are read in chunks. A
+    /// reply that reaches it is never used: its chunk is halved and read
+    /// again.
+    #[serde(default = "default_curator_notes_max_tokens")]
+    pub notes_max_tokens: u32,
+    /// Replies the curator may take to edit one page before it gives the
+    /// page up, unchanged.
+    #[serde(default = "default_curator_max_turns")]
+    pub max_turns: u32,
     /// Safe-input budget for the configured tier (rough token estimate
     /// via chars/3). When a page's prompt would exceed this, the
     /// curator switches to chunked map-reduce: extract notes per
-    /// source-file chunk, then write the page from the combined notes.
+    /// source-file chunk, then edit the page from the combined notes.
     /// Default sized conservatively for DeepSeek's 163,840-token window.
     #[serde(default = "default_curator_context_safety_tokens")]
     pub context_safety_tokens: u32,
 }
 
+impl Default for CuratorConfig {
+    fn default() -> Self {
+        Self {
+            tier: None,
+            max_tokens: default_curator_max_tokens(),
+            notes_max_tokens: default_curator_notes_max_tokens(),
+            max_turns: default_curator_max_turns(),
+            context_safety_tokens: default_curator_context_safety_tokens(),
+        }
+    }
+}
+
 fn default_curator_max_tokens() -> u32 {
     8_000
+}
+
+fn default_curator_notes_max_tokens() -> u32 {
+    4_000
+}
+
+fn default_curator_max_turns() -> u32 {
+    30
 }
 
 fn default_curator_context_safety_tokens() -> u32 {
@@ -11150,6 +11181,19 @@ fn default_true() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn curator_defaults_apply_without_a_config_file() {
+        // Without a workforce.toml the curator uses `CuratorConfig::default()`;
+        // it must match what an empty `[curator]` section parses to.
+        let parsed: CuratorConfig = toml::from_str("").unwrap();
+        let default = CuratorConfig::default();
+        assert_eq!(default.max_tokens, parsed.max_tokens);
+        assert_eq!(default.notes_max_tokens, parsed.notes_max_tokens);
+        assert_eq!(default.max_turns, parsed.max_turns);
+        assert_eq!(default.context_safety_tokens, parsed.context_safety_tokens);
+        assert!(default.max_tokens > 0 && default.notes_max_tokens > 0 && default.max_turns > 0);
+    }
 
     #[test]
     fn trace_retention_defaults_to_a_bounded_window() {
