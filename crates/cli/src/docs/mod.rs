@@ -15,6 +15,7 @@ mod edit;
 mod llm;
 mod pr;
 mod prompt;
+mod sources;
 mod verify;
 mod watch_config;
 
@@ -89,6 +90,10 @@ pub struct CurateArgs {
     #[arg(long)]
     pub tier: Option<String>,
 
+    /// Override the verifier's tier spec from `[curator] verifier_tier`.
+    #[arg(long)]
+    pub verifier_tier: Option<String>,
+
     /// Cap on each edit reply (overrides `[curator] max_tokens`).
     #[arg(long)]
     pub max_tokens: Option<u32>,
@@ -151,6 +156,18 @@ async fn curate(args: CurateArgs) -> Result<()> {
                  in workforce.toml (e.g. `openrouter:deepseek:powerful`) or pass --tier",
             )
         })?;
+    let verifier_tier = args
+        .verifier_tier
+        .clone()
+        .or(curator_config.verifier_tier.clone())
+        .ok_or_else(|| {
+            eyre!(
+                "no verifier configured: every change is checked against its sources by a \
+                 second model before it is applied. Set `[curator] verifier_tier` in \
+                 workforce.toml (a different model from `tier`, e.g. \
+                 `openrouter:anthropic:standard`) or pass --verifier-tier",
+            )
+        })?;
     if let Some(max_tokens) = args.max_tokens {
         curator_config.max_tokens = max_tokens;
     }
@@ -163,6 +180,7 @@ async fn curate(args: CurateArgs) -> Result<()> {
             &repo_root,
             &cfg,
             &tier_spec,
+            &verifier_tier,
             &curator_config,
             &valid_doc_paths,
             vault.as_ref(),
@@ -321,6 +339,7 @@ async fn curate_single_page(
     repo_root: &Path,
     cfg: &watch_config::WatchConfig,
     tier_spec: &str,
+    verifier_tier: &str,
     limits: &workforce_common::settings::CuratorConfig,
     valid_doc_paths: &[String],
     vault: Option<&Arc<Vault>>,
@@ -338,13 +357,25 @@ async fn curate_single_page(
         });
     }
 
-    let sources = match cfg.page_source(page) {
-        Some(watch_config::PageSource::CliHelp) => vec![prompt::SourceFile {
-            repo_relative: PathBuf::from("workforce --help, every subcommand"),
-            content: cli_help::cli_help_reference(),
-        }],
-        None => read_source_files(&source_paths, repo_root)?,
+    let generated: Vec<(String, String)> = match cfg.page_source(page) {
+        Some(watch_config::PageSource::CliHelp) => vec![(
+            "workforce --help".to_string(),
+            cli_help::cli_help_reference(),
+        )],
+        None => Vec::new(),
     };
+    let sources = if generated.is_empty() {
+        read_source_files(&source_paths, repo_root)?
+    } else {
+        generated
+            .iter()
+            .map(|(name, content)| prompt::SourceFile {
+                repo_relative: PathBuf::from(name),
+                content: content.clone(),
+            })
+            .collect()
+    };
+    let lookups = sources::SourceIndex::new(repo_root, generated);
     let current_content = read_page(&page_full_path)?;
     let source_summary: Vec<String> = sources
         .iter()
@@ -362,10 +393,12 @@ async fn curate_single_page(
     let curation = curate_page(
         page,
         tier_spec,
+        verifier_tier,
         limits,
         SYSTEM_PROMPT,
         &prompt_input,
         cfg.toml_schema(page),
+        &lookups,
         vault,
     )
     .await?;

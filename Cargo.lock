@@ -11598,6 +11598,7 @@ dependencies = [
  "parking_lot",
  "pulldown-cmark",
  "ratatui",
+ "regex",
  "reqwest 0.12.28",
  "serde",
  "serde_ignored",
