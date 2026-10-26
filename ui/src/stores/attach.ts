@@ -40,6 +40,7 @@ const TURN_EVENTS = new Set([
   "stream_start",
   "stream_delta",
   "stream_end",
+  "stream_discard",
   "tool_start",
   "tool_end",
   "compact_start",
@@ -108,6 +109,11 @@ export function attachmentMessage(
   sessionId: string | undefined,
 ): ChatMessage {
   return { ...assistantMessage(id, caption), attachments, sessionId };
+}
+
+/** `messages` without the answers a discarded model call streamed. */
+export function discardCall(messages: ChatMessage[], streamed: readonly string[]): ChatMessage[] {
+  return messages.filter((m) => !streamed.includes(m.id));
 }
 
 /** `messages` with `message` appended — ahead of an answer still streaming,

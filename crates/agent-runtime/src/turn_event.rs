@@ -49,6 +49,8 @@ pub struct TurnTelemetry {
     /// first LLM call — user-perceived time-to-first-token. `None` when the
     /// turn never streamed (emitted as 0).
     ttft_ms: Option<u64>,
+    /// LLM calls regenerated after the provider failed part-way through.
+    stream_restarts: u32,
     cancelled: bool,
 }
 
@@ -77,6 +79,7 @@ impl TurnTelemetry {
             tool_names: BTreeSet::new(),
             tool_output_tokens: 0,
             ttft_ms: None,
+            stream_restarts: 0,
             cancelled: false,
         }
     }
@@ -131,6 +134,11 @@ impl TurnTelemetry {
         if self.ttft_ms.is_none() {
             self.ttft_ms = Some(self.started.elapsed().as_millis() as u64);
         }
+    }
+
+    /// Record an LLM call the failover layer regenerated mid-stream.
+    pub fn observe_stream_restart(&mut self) {
+        self.stream_restarts += 1;
     }
 
     /// Mark the turn as user-cancelled (distinguishes it from a clean stop).
@@ -202,6 +210,7 @@ impl TurnTelemetry {
             tools = %tool_names,
             tool_failures = tool_failures,
             model_switches = model_switches,
+            stream_restarts = self.stream_restarts,
             ttft_ms = self.ttft_ms.unwrap_or(0),
             duration_ms = self.started.elapsed().as_millis() as u64,
             outcome = outcome,
@@ -307,6 +316,14 @@ mod tests {
 
     fn telemetry() -> TurnTelemetry {
         TurnTelemetry::start(&RunnerConfig::default())
+    }
+
+    #[test]
+    fn stream_restarts_are_counted_on_the_turn_event() {
+        let mut t = telemetry();
+        t.observe_stream_restart();
+        t.observe_stream_restart();
+        assert_eq!(t.stream_restarts, 2);
     }
 
     #[test]

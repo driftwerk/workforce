@@ -84,6 +84,7 @@ client finalizes it locally.
 | `stream_start` | Beginning of streamed response |
 | `stream_delta` | Chunk of streamed response |
 | `stream_end` | End of streamed response |
+| `stream_discard` | The current model call's streamed text is void (`content`: `retry` or `interrupted`) |
 | `injected` | A `chat` was absorbed into the running turn |
 | `permission_prompt` | A tool call awaits the person's approval |
 | `pong` | Response to ping |
@@ -98,6 +99,23 @@ When streaming is enabled, responses arrive as chunks:
 {"type": "stream_delta", "content": "I'm ", "session_id": "abc-123"}
 {"type": "stream_delta", "content": "doing ", "session_id": "abc-123"}
 {"type": "stream_delta", "content": "well!", "session_id": "abc-123"}
+{"type": "stream_end", "session_id": "abc-123"}
+```
+
+Each model call opens with a `typing`. A `stream_discard` voids everything
+streamed since the last `typing` — remove it; a replacement stream may follow.
+`interrupted` means the provider broke off and the reply is being regenerated;
+`retry` means the text was a malformed tool call. The discard itself ends the
+voided text, whether or not a `stream_end` closed it first; a `stream_end`
+arriving right after it closes nothing:
+
+```json
+{"type": "typing", "session_id": "abc-123"}
+{"type": "stream_start", "session_id": "abc-123"}
+{"type": "stream_delta", "content": "I'm do", "session_id": "abc-123"}
+{"type": "stream_discard", "content": "interrupted", "session_id": "abc-123"}
+{"type": "stream_start", "session_id": "abc-123"}
+{"type": "stream_delta", "content": "I'm doing well!", "session_id": "abc-123"}
 {"type": "stream_end", "session_id": "abc-123"}
 ```
 

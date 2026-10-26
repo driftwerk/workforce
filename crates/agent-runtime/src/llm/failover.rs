@@ -20,7 +20,7 @@ use tracing::{info, warn};
 
 use super::provider::{LlmProvider, ProviderKind};
 use super::streaming::{
-    call_with_request_cap, watchdogged_stream, StreamEvent, StreamTimeouts,
+    call_with_request_cap, relay_stream, watchdogged_stream, StreamEvent, StreamTimeouts,
     FIRST_TOKEN_TIMEOUT_MARKER, STREAM_STALL_MARKER,
 };
 use super::types::{LlmMessage, LlmResponse, LlmToolDef};
@@ -117,8 +117,8 @@ pub struct LlmTimeouts {
     #[serde(default = "default_first_token_timeout_secs")]
     pub first_token_timeout_secs: u64,
     /// Max seconds between stream events once streaming has begun. Firing
-    /// after partial content was surfaced, this aborts the turn instead of
-    /// failing over.
+    /// after partial content was surfaced, the chain retracts it and moves to
+    /// the next model.
     #[serde(default = "default_stall_timeout_secs")]
     pub stall_timeout_secs: u64,
     /// Max seconds for a whole non-streaming request.
@@ -302,9 +302,9 @@ pub enum ErrorKind {
     /// another attempt would burn a full watchdog window against a
     /// provider already known to be hanging.
     FirstTokenTimeout,
-    /// Streaming watchdog fired after events were forwarded — partial
-    /// content already reached the consumer, so abort rather than fail
-    /// over (a silent model switch would duplicate surfaced output).
+    /// Streaming watchdog fired after events were forwarded — the model is
+    /// hanging mid-answer, so like `FirstTokenTimeout` it skips same-model
+    /// retries; the chain retracts the partial content and moves on.
     StreamStalled,
     /// Overloaded (529) — failover immediately.
     Overloaded,
@@ -351,18 +351,15 @@ impl ErrorKind {
                 | Self::RateLimited
                 | Self::Auth
                 | Self::FirstTokenTimeout
+                | Self::StreamStalled
                 | Self::SubscriptionUnavailable
         )
     }
 
     /// Should we abort entirely (no retry, no failover)?
-    /// Billing issues affect all tokens on the same account; a stalled
-    /// stream has already surfaced partial content.
+    /// Billing issues affect all tokens on the same account.
     pub fn should_abort(&self) -> bool {
-        matches!(
-            self,
-            Self::Billing | Self::StreamStalled | Self::Unsupported
-        )
+        matches!(self, Self::Billing | Self::Unsupported)
     }
 
     /// Whether the failure says something about the model itself, so it
@@ -441,25 +438,18 @@ fn failure_action(
     }
 }
 
-/// Run one streaming attempt through a relay to `tx`, and report whether
-/// any content reached it.
-async fn relay_stream<F, Fut>(tx: &mpsc::Sender<StreamEvent>, call: F) -> (Result<()>, bool)
-where
-    F: FnOnce(mpsc::Sender<StreamEvent>) -> Fut,
-    Fut: std::future::Future<Output = Result<()>>,
-{
-    let (relay_tx, mut relay_rx) = mpsc::channel::<StreamEvent>(32);
-    let relay = async {
-        let mut forwarded = false;
-        while let Some(event) = relay_rx.recv().await {
-            forwarded |= event.carries_content();
-            if tx.send(event).await.is_err() {
-                break;
-            }
-        }
-        forwarded
+/// Void what the `abandoned` model streamed before `next` starts over.
+/// False when the consumer has gone, leaving nobody to stream for.
+async fn retract(
+    tx: &mpsc::Sender<StreamEvent>,
+    abandoned: &mut Option<String>,
+    next: &str,
+) -> bool {
+    let Some(model) = abandoned.take() else {
+        return true;
     };
-    tokio::join!(call(relay_tx), relay)
+    warn!(model, next, "Streaming restarting after partial output");
+    tx.send(StreamEvent::Restart).await.is_ok()
 }
 
 /// Marker carried by every error a subscription provider raises when the
@@ -1450,10 +1440,9 @@ impl FailoverProvider {
     }
 
     /// Stream a request with retry and failover logic across `chain`, then
-    /// on `hub_default` as a last resort.
-    /// 429s happen before streaming starts, so the chain moves on on initial
-    /// connection errors and retries with backoff; once streaming has begun
-    /// and events are flowing, it can't retry mid-stream.
+    /// on `hub_default` as a last resort. A failure after content reached
+    /// `tx` is retried or failed over like any other, behind a
+    /// [`StreamEvent::Restart`] that voids what the abandoned attempt streamed.
     #[allow(clippy::too_many_arguments)]
     async fn stream_with_failover(
         &self,
@@ -1472,6 +1461,7 @@ impl FailoverProvider {
         };
 
         let mut last_error: Option<eyre::Error> = None;
+        let mut abandoned: Option<String> = None;
 
         for (model_idx, entry) in chain.iter().enumerate() {
             let (provider, is_external) = match self.provider_for_entry(entry).await {
@@ -1490,6 +1480,9 @@ impl FailoverProvider {
             let mut backoff_ms = retry_config.initial_backoff_ms;
 
             for attempt in 0..=max_retries {
+                if !retract(&tx, &mut abandoned, &entry.raw).await {
+                    return Ok(());
+                }
                 let provider = &provider;
                 let timeouts = retry_config.timeouts.stream_timeouts_for(&entry.model);
                 let (result, forwarded) = relay_stream(&tx, |attempt_tx| async move {
@@ -1548,18 +1541,15 @@ impl FailoverProvider {
                             "Streaming call failed"
                         );
 
-                        // Content already reached `tx`: a retry or another
-                        // model would append a second answer to it.
-                        let action = if forwarded {
-                            FailureAction::Abort
-                        } else {
-                            failure_action(
-                                &kind,
-                                &retry_config,
-                                attempt,
-                                super::pool::parse_retry_after(&error_str),
-                            )
-                        };
+                        let action = failure_action(
+                            &kind,
+                            &retry_config,
+                            attempt,
+                            super::pool::parse_retry_after(&error_str),
+                        );
+                        if forwarded {
+                            abandoned = Some(entry.raw.clone());
+                        }
                         // One health failure per model abandonment, not per retry,
                         // so an internal retry burst doesn't prematurely degrade it.
                         if kind.is_model_fault()
@@ -1659,6 +1649,9 @@ impl FailoverProvider {
 
         if let Some((provider, entry)) = self.hub_default_route(hub_default).await {
             let hub_default = entry.raw.as_str();
+            if !retract(&tx, &mut abandoned, hub_default).await {
+                return Ok(());
+            }
             warn!(
                 chain = ?chain.iter().map(|e| e.raw.as_str()).collect::<Vec<_>>(),
                 hub_default,
@@ -3158,7 +3151,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_stream_failing_after_content_aborts_instead_of_failing_over() {
+    async fn a_stream_failing_after_content_fails_over_with_a_restart() {
         let (recorder, calls) = MockModelRecorder::new();
         let provider = FailoverProvider::new(
             Arc::new(recorder),
@@ -3172,25 +3165,248 @@ mod tests {
             .await;
 
         let (tx, mut rx) = mpsc::channel(32);
-        let err = provider
+        provider
             .create_message_stream(None, &[], &[], Some("chatgpt:gpt-6.1-sol"), None, true, tx)
             .await
-            .expect_err("the partial answer can't be completed elsewhere");
-        assert_eq!(
-            classify_error(&err.to_string()),
-            ErrorKind::SubscriptionUnavailable
-        );
-        assert!(
-            calls.read().await.is_empty(),
-            "no second stream on the same channel"
-        );
-        let mut texts = Vec::new();
-        while let Ok(event) = rx.try_recv() {
-            if let StreamEvent::TextDelta { text, .. } = event {
-                texts.push(text);
-            }
+            .unwrap();
+        assert_eq!(*calls.read().await, ["backup-model"]);
+        assert_eq!(received(&mut rx), ["partial", RESTART, "ok"]);
+    }
+
+    /// Streams each call's script in turn — its events, then its outcome —
+    /// recording the model every call asked for.
+    struct ScriptedStream {
+        scripts: std::sync::Mutex<std::collections::VecDeque<(Vec<StreamEvent>, Result<()>)>>,
+        models: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl ScriptedStream {
+        fn new(scripts: Vec<(Vec<StreamEvent>, Result<()>)>) -> Arc<Self> {
+            Arc::new(Self {
+                scripts: std::sync::Mutex::new(scripts.into()),
+                models: std::sync::Mutex::default(),
+            })
         }
-        assert_eq!(texts, ["partial"]);
+
+        fn models(&self) -> Vec<String> {
+            self.models.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for ScriptedStream {
+        async fn create_message(
+            &self,
+            _system_prompt: Option<&str>,
+            _messages: &[LlmMessage],
+            _tools: &[LlmToolDef],
+            _model: Option<&str>,
+            _max_tokens: Option<u32>,
+            _enable_cache: bool,
+        ) -> Result<LlmResponse> {
+            unreachable!("streamed only")
+        }
+
+        async fn create_message_stream(
+            &self,
+            _system_prompt: Option<&str>,
+            _messages: &[LlmMessage],
+            _tools: &[LlmToolDef],
+            model: Option<&str>,
+            _max_tokens: Option<u32>,
+            _enable_cache: bool,
+            tx: mpsc::Sender<StreamEvent>,
+        ) -> Result<()> {
+            self.models
+                .lock()
+                .unwrap()
+                .push(model.unwrap_or_default().to_string());
+            let (events, outcome) = self
+                .scripts
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("streamed past the script");
+            for event in events {
+                let _ = tx.send(event).await;
+            }
+            outcome
+        }
+    }
+
+    const RESTART: &str = "<restart>";
+
+    fn partial(text: &str) -> Vec<StreamEvent> {
+        vec![
+            StreamEvent::ContentStart { index: 0 },
+            StreamEvent::TextDelta {
+                index: 0,
+                text: text.to_string(),
+            },
+        ]
+    }
+
+    fn answer(text: &str) -> Vec<StreamEvent> {
+        [
+            partial(text),
+            vec![
+                StreamEvent::ContentStop { index: 0 },
+                StreamEvent::MessageDone {
+                    stop_reason: StopReason::EndTurn,
+                    usage: TokenUsage::default(),
+                },
+            ],
+        ]
+        .concat()
+    }
+
+    fn overloaded() -> Result<()> {
+        Err(eyre::eyre!("Bedrock streaming error: Overloaded"))
+    }
+
+    /// The text and restarts that reached the consumer, in order.
+    fn received(rx: &mut mpsc::Receiver<StreamEvent>) -> Vec<String> {
+        std::iter::from_fn(|| rx.try_recv().ok())
+            .filter_map(|event| match event {
+                StreamEvent::TextDelta { text, .. } => Some(text),
+                StreamEvent::Restart => Some(RESTART.to_string()),
+                StreamEvent::Error { message } => Some(format!("<error: {message}>")),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn scripted_chain(scripted: &Arc<ScriptedStream>, retry_overloaded: bool) -> FailoverProvider {
+        FailoverProvider::new(
+            Arc::clone(scripted) as Arc<dyn LlmProvider>,
+            FailoverConfig {
+                failover: vec!["backup".to_string()],
+                retry: RetryConfig {
+                    max_retries: 2,
+                    initial_backoff_ms: 1,
+                    retry_overloaded,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn a_stream_failing_after_content_restarts_and_retries() {
+        let scripted = ScriptedStream::new(vec![
+            (partial("half"), overloaded()),
+            (answer("whole"), Ok(())),
+        ]);
+        let (tx, mut rx) = mpsc::channel(32);
+        scripted_chain(&scripted, true)
+            .create_message_stream(None, &[], &[], Some("primary"), None, false, tx)
+            .await
+            .unwrap();
+        assert_eq!(received(&mut rx), ["half", RESTART, "whole"]);
+        assert_eq!(scripted.models(), ["primary", "primary"]);
+    }
+
+    #[tokio::test]
+    async fn a_restart_precedes_the_hub_default_last_resort() {
+        let scripted = ScriptedStream::new(vec![
+            (vec![], overloaded()),
+            (partial("half"), overloaded()),
+            (answer("whole"), Ok(())),
+        ]);
+        let (tx, mut rx) = mpsc::channel(32);
+        scripted_chain(&scripted, false)
+            .with_hub_default_model("fallback")
+            .create_message_stream(None, &[], &[], Some("primary"), None, false, tx)
+            .await
+            .unwrap();
+        assert_eq!(received(&mut rx), ["half", RESTART, "whole"]);
+        assert_eq!(scripted.models(), ["primary", "backup", "fallback"]);
+    }
+
+    #[tokio::test]
+    async fn an_exhausted_chain_after_content_sends_no_restart() {
+        let scripted = ScriptedStream::new(vec![
+            (partial("one"), overloaded()),
+            (partial("two"), overloaded()),
+        ]);
+        let (tx, mut rx) = mpsc::channel(32);
+        let err = scripted_chain(&scripted, false)
+            .create_message_stream(None, &[], &[], Some("primary"), None, false, tx)
+            .await
+            .unwrap_err();
+        assert_eq!(classify_error(&err.to_string()), ErrorKind::Overloaded);
+        assert_eq!(received(&mut rx), ["one", RESTART, "two"]);
+    }
+
+    #[tokio::test]
+    async fn billing_after_content_still_aborts() {
+        let scripted = ScriptedStream::new(vec![(
+            partial("half"),
+            Err(eyre::eyre!("Anthropic API error (402): Payment Required")),
+        )]);
+        let (tx, mut rx) = mpsc::channel(32);
+        let err = scripted_chain(&scripted, true)
+            .create_message_stream(None, &[], &[], Some("primary"), None, false, tx)
+            .await
+            .unwrap_err();
+        assert_eq!(classify_error(&err.to_string()), ErrorKind::Billing);
+        assert_eq!(received(&mut rx), ["half"]);
+        assert_eq!(scripted.models(), ["primary"]);
+    }
+
+    #[tokio::test]
+    async fn a_restart_to_a_departed_consumer_ends_the_stream() {
+        let scripted = ScriptedStream::new(vec![(partial("half"), overloaded())]);
+        let (tx, rx) = mpsc::channel(32);
+        drop(rx);
+        scripted_chain(&scripted, true)
+            .create_message_stream(None, &[], &[], Some("primary"), None, false, tx)
+            .await
+            .unwrap();
+        assert_eq!(scripted.models(), ["primary"]);
+    }
+
+    #[tokio::test]
+    async fn an_in_stream_error_event_is_retried_not_surfaced() {
+        let scripted = ScriptedStream::new(vec![
+            (
+                [
+                    partial("half"),
+                    vec![StreamEvent::Error {
+                        message: "Overloaded".to_string(),
+                    }],
+                ]
+                .concat(),
+                Ok(()),
+            ),
+            (answer("whole"), Ok(())),
+        ]);
+        let (tx, mut rx) = mpsc::channel(32);
+        scripted_chain(&scripted, true)
+            .create_message_stream(None, &[], &[], Some("primary"), None, false, tx)
+            .await
+            .unwrap();
+        assert_eq!(received(&mut rx), ["half", RESTART, "whole"]);
+        assert_eq!(scripted.models(), ["primary", "primary"]);
+    }
+
+    #[tokio::test]
+    async fn a_slice_that_restarted_then_failed_is_unanswered() {
+        let scripted = ScriptedStream::new(vec![
+            (partial("half"), overloaded()),
+            (vec![], overloaded()),
+        ]);
+        let slice = Arc::new(scripted_chain(&scripted, false))
+            .slice(vec!["primary".to_string(), "backup".to_string()]);
+        let (tx, mut rx) = mpsc::channel(32);
+        let err = slice
+            .create_message_stream(None, &[], &[], Some("primary"), None, false, tx)
+            .await
+            .unwrap_err();
+        assert_eq!(classify_error(&err.to_string()), ErrorKind::Overloaded);
+        assert!(!slice.answered(), "nothing it streamed is still standing");
+        assert_eq!(received(&mut rx), ["half", RESTART]);
     }
 
     #[tokio::test]
@@ -3677,7 +3893,9 @@ mod tests {
         );
         assert!(ErrorKind::FirstTokenTimeout.should_failover_immediately());
         assert!(!ErrorKind::FirstTokenTimeout.is_retryable());
-        assert!(ErrorKind::StreamStalled.should_abort());
+        assert!(ErrorKind::StreamStalled.should_failover_immediately());
+        assert!(!ErrorKind::StreamStalled.is_retryable());
+        assert!(!ErrorKind::StreamStalled.should_abort());
     }
 
     #[test]
@@ -3909,10 +4127,10 @@ mod tests {
     }
 
     /// The common production shape: the stall fires inside the pool (the
-    /// chain entry has no provider prefix), and the marker error must
-    /// bubble through the failover walk as an abort, not a model switch.
+    /// chain entry has no provider prefix), and the failover walk retracts
+    /// the partial event before moving on — here to a model that stalls too.
     #[tokio::test(start_paused = true)]
-    async fn pool_stall_bubbles_through_failover_as_abort() {
+    async fn pool_stall_fails_over_behind_a_restart() {
         let pool = Arc::new(crate::llm::pool::PooledProvider::new());
         pool.add("default", Arc::new(MockStreamStall)).await;
         let provider = FailoverProvider::new(pool, watchdog_chain_config());
@@ -3924,10 +4142,7 @@ mod tests {
             .unwrap_err();
 
         assert!(err.to_string().contains(STREAM_STALL_MARKER));
-        assert!(
-            matches!(rx.try_recv(), Ok(StreamEvent::ContentStart { .. })),
-            "the partial event reached the consumer before the stall"
-        );
+        assert_eq!(received(&mut rx), [RESTART]);
     }
 
     #[test]
@@ -3954,7 +4169,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn external_stall_after_first_event_aborts_chain() {
+    async fn a_stall_after_content_fails_over_instead_of_aborting() {
         let inner = Arc::new(MockStreamOk {
             calls: AtomicU32::new(0),
         });
@@ -3964,21 +4179,17 @@ mod tests {
             .await;
 
         let (tx, mut rx) = mpsc::channel(32);
-        let err = provider
+        provider
             .create_message_stream(None, &[], &[], Some("grok:stall-model"), None, false, tx)
             .await
-            .unwrap_err();
+            .unwrap();
 
-        assert!(err.to_string().contains(STREAM_STALL_MARKER));
-        assert_eq!(
-            inner.calls.load(Ordering::SeqCst),
-            0,
-            "a stalled stream already surfaced content — no silent failover"
-        );
-        assert!(
-            matches!(rx.try_recv(), Ok(StreamEvent::ContentStart { .. })),
-            "the partial event reached the consumer before the stall"
-        );
+        assert_eq!(inner.calls.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(StreamEvent::ContentStart { .. })
+        ));
+        assert_eq!(received(&mut rx), [RESTART, "ok"]);
     }
 
     /// Non-streaming externals get the request cap instead of the stream
