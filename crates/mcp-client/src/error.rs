@@ -4,7 +4,16 @@ use thiserror::Error;
 /// at the boundaries so vendor-side cleartext credentials never end up in logs.
 #[derive(Debug, Error)]
 pub enum McpError {
-    /// HTTP/network failure: DNS, TLS, timeout, malformed body.
+    /// The server could not be reached: the connection was refused or
+    /// timed out, DNS or the TLS handshake failed, or the request timed
+    /// out before any response arrived. A caller may treat the server as
+    /// down for a while, but a request that timed out may still have run.
+    #[error("server unreachable: {0}")]
+    Unreachable(String),
+
+    /// HTTP/network failure after the server was reached: a non-2xx
+    /// status, a broken or malformed body, or an SSE stream that ended
+    /// early.
     #[error("transport error: {0}")]
     Transport(String),
 
@@ -67,9 +76,16 @@ pub enum McpError {
 }
 
 impl McpError {
-    /// Whether the error is retryable in principle (transport-level).
+    /// Whether the error is retryable in principle (transport-level),
+    /// including an unreachable server.
     pub fn is_transport(&self) -> bool {
-        matches!(self, Self::Transport(_))
+        matches!(self, Self::Transport(_) | Self::Unreachable(_))
+    }
+
+    /// Whether the server could not be reached at all, as opposed to
+    /// answering with an HTTP or protocol failure.
+    pub fn is_unreachable(&self) -> bool {
+        matches!(self, Self::Unreachable(_))
     }
 
     /// Whether the caller should refresh credentials and retry.
@@ -88,5 +104,15 @@ mod tests {
         assert!(!McpError::AuthExpired("401".into()).is_transport());
         assert!(McpError::Transport("boom".into()).is_transport());
         assert!(!McpError::Transport("boom".into()).is_auth());
+        assert!(!McpError::Transport("boom".into()).is_unreachable());
+    }
+
+    #[test]
+    fn unreachable_is_a_transport_error_but_not_the_reverse() {
+        let unreachable = McpError::Unreachable("refused".into());
+        assert!(unreachable.is_unreachable());
+        assert!(unreachable.is_transport());
+        assert!(!unreachable.is_auth());
+        assert!(!McpError::AuthExpired("401".into()).is_unreachable());
     }
 }

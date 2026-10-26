@@ -104,6 +104,7 @@ impl Tool for McpTool {
             Err(McpError::ToolCountExceeded { .. }) => "tool_count_exceeded",
             Err(McpError::RawToolLimitExceeded { .. }) => "raw_tool_limit_exceeded",
             Err(McpError::ServerError { .. }) => "server_error",
+            Err(McpError::Unreachable(_)) => "unreachable",
             Err(McpError::Transport(_)) => "transport_error",
             Err(McpError::Protocol(_)) => "protocol_error",
         };

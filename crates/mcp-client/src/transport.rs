@@ -70,7 +70,7 @@ impl Transport {
             .json(request)
             .send()
             .await
-            .map_err(|e| McpError::Transport(scrub(e.to_string())))?;
+            .map_err(send_failed)?;
 
         let status = resp.status();
         let new_session = resp
@@ -150,7 +150,7 @@ impl Transport {
             .json(notification)
             .send()
             .await
-            .map_err(|e| McpError::Transport(scrub(e.to_string())))?;
+            .map_err(send_failed)?;
         let status = resp.status();
         if !status.is_success() && status != StatusCode::ACCEPTED {
             warn!(
@@ -210,7 +210,7 @@ impl Transport {
         let mut total = 0usize;
         let mut stream = resp.bytes_stream();
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|e| McpError::Transport(scrub(e.to_string())))?;
+            let chunk = chunk.map_err(|e| McpError::Transport(describe(&e)))?;
             total = total.saturating_add(chunk.len());
             if total > self.max_content_bytes {
                 return Err(McpError::BodyTooLarge {
@@ -259,13 +259,35 @@ async fn read_capped(resp: reqwest::Response, limit: usize) -> Result<Vec<u8>, M
     let mut buf = Vec::new();
     let mut stream = resp.bytes_stream();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| McpError::Transport(scrub(e.to_string())))?;
+        let chunk = chunk.map_err(|e| McpError::Transport(describe(&e)))?;
         if buf.len() + chunk.len() > limit {
             return Err(McpError::BodyTooLarge { limit });
         }
         buf.extend_from_slice(&chunk);
     }
     Ok(buf)
+}
+
+/// Classify a failed `send`: a connect or timeout failure means no
+/// response ever arrived, so the server is unreachable; anything else
+/// failed after the connection was made. reqwest reports a failed TLS
+/// handshake as a connect error.
+fn send_failed(e: reqwest::Error) -> McpError {
+    if e.is_connect() || e.is_timeout() {
+        McpError::Unreachable(describe(&e))
+    } else {
+        McpError::Transport(describe(&e))
+    }
+}
+
+/// The scrubbed error with its whole source chain: reqwest's own text
+/// omits the cause (refused, DNS, TLS, early EOF).
+fn describe(e: &reqwest::Error) -> String {
+    let chain = std::iter::successors(Some(e as &dyn std::error::Error), |e| e.source())
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(": ");
+    scrub(chain)
 }
 
 fn scrub(input: String) -> String {
