@@ -10,6 +10,7 @@
 //! `gh` and `git` are invoked via subprocess.
 
 mod check;
+mod cli_help;
 mod edit;
 mod llm;
 mod pr;
@@ -337,7 +338,13 @@ async fn curate_single_page(
         });
     }
 
-    let sources = read_source_files(&source_paths, repo_root)?;
+    let sources = match cfg.page_source(page) {
+        Some(watch_config::PageSource::CliHelp) => vec![prompt::SourceFile {
+            repo_relative: PathBuf::from("workforce --help, every subcommand"),
+            content: cli_help::cli_help_reference(),
+        }],
+        None => read_source_files(&source_paths, repo_root)?,
+    };
     let current_content = read_page(&page_full_path)?;
     let source_summary: Vec<String> = sources
         .iter()

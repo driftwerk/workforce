@@ -35,9 +35,26 @@ pub struct PageSettings {
     /// Unset: untitled blocks aren't checked.
     #[serde(default)]
     pub toml: Option<String>,
+    /// Where the curator reads the page's facts from, in place of the files
+    /// its `[[watch]]` paths match (which still decide when it is curated).
+    /// `"cli-help"`: the command line's own help, every subcommand's.
+    #[serde(default)]
+    pub source: Option<PageSource>,
+}
+
+/// A generated source for a page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PageSource {
+    CliHelp,
 }
 
 impl WatchConfig {
+    /// The generated source a page reads its facts from, if any.
+    pub fn page_source(&self, page: &str) -> Option<PageSource> {
+        self.pages.get(page).and_then(|p| p.source)
+    }
+
     /// The schema a page's untitled TOML blocks are checked against.
     pub fn toml_schema(&self, page: &str) -> super::check::TomlSchema {
         match self.pages.get(page).and_then(|p| p.toml.as_deref()) {
