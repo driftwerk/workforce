@@ -11,9 +11,10 @@ pub enum McpError {
     #[error("server unreachable: {0}")]
     Unreachable(String),
 
-    /// HTTP/network failure after the server was reached: a non-2xx
-    /// status, a broken or malformed body, or an SSE stream that ended
-    /// early.
+    /// Any other HTTP/network failure: a non-2xx status, a broken or
+    /// malformed body, an SSE stream that ended early, a request that
+    /// could not be built, or an auth provider that could not fetch a
+    /// credential.
     #[error("transport error: {0}")]
     Transport(String),
 
