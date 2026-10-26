@@ -254,6 +254,7 @@ impl OpenRouterClient {
                 )
             })
             .unwrap_or_default();
+        let stop_reason = cut_off_if_spent(stop_reason, usage.output_tokens, max_tokens);
 
         tracing::info!(
             model = %api_response.model.as_deref().unwrap_or(model),
@@ -507,7 +508,11 @@ impl OpenRouterClient {
 
         let _ = tx
             .send(StreamEvent::MessageDone {
-                stop_reason: final_stop_reason,
+                stop_reason: cut_off_if_spent(
+                    final_stop_reason,
+                    total_usage.output_tokens,
+                    max_tokens,
+                ),
                 usage: total_usage,
             })
             .await;
@@ -577,6 +582,17 @@ fn learn_reasoning_required(model: &str) {
 fn least_reasoning(effort: &str) -> ReasoningConfig {
     ReasoningConfig {
         effort: effort.to_string(),
+    }
+}
+
+/// A reply that used its whole token allowance was cut off, whatever the
+/// route reports: OpenRouter says `tool_calls`, not `length`, for a tool call
+/// cut off mid-arguments, whose arguments then don't parse.
+fn cut_off_if_spent(stop_reason: StopReason, output_tokens: u32, max_tokens: u32) -> StopReason {
+    if output_tokens >= max_tokens {
+        StopReason::MaxTokens
+    } else {
+        stop_reason
     }
 }
 
@@ -849,6 +865,50 @@ mod tests {
             }
         }
         assert!(failures.is_empty(), "{failures:#?}");
+    }
+
+    #[tokio::test]
+    async fn a_tool_call_cut_off_at_the_cap_is_reported_as_cut_off() {
+        use crate::llm::types::{ContentBlock, Role};
+
+        // What OpenRouter returned for a tool call cut off at 300 tokens.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"role": "assistant", "content": "",
+                    "tool_calls": [{"id": "c1", "type": "function", "function":
+                        {"name": "edit", "arguments": "{\"old_text\": \"## Flags\\n- `--al"}}]},
+                    "finish_reason": "tool_calls"}],
+                "usage": {"prompt_tokens": 900, "completion_tokens": 300},
+                "model": "deepseek/deepseek-v4-pro"
+            })))
+            .mount(&server)
+            .await;
+        let client = OpenRouterClient::new("sk-or-v1-test").with_base_url(server.uri());
+        let messages = [LlmMessage {
+            role: Role::User,
+            content: vec![ContentBlock::Text {
+                text: "edit".into(),
+            }],
+        }];
+        let response = client
+            .create_message(None, &messages, &[], None, Some(300), false)
+            .await
+            .unwrap();
+        assert_eq!(response.stop_reason, StopReason::MaxTokens);
+    }
+
+    #[test]
+    fn a_reply_under_its_cap_keeps_its_stop_reason() {
+        assert_eq!(
+            cut_off_if_spent(StopReason::ToolUse, 299, 300),
+            StopReason::ToolUse
+        );
+        assert_eq!(
+            cut_off_if_spent(StopReason::EndTurn, 300, 300),
+            StopReason::MaxTokens
+        );
     }
 
     #[test]
