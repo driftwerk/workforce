@@ -31,7 +31,7 @@ const MARKER_MAX_BYTES: usize = 256;
 /// Offsets captured at a round boundary so a retry can rewind both halves of
 /// the redactor consistently. A `sent` offset is not a valid `raw` offset —
 /// redaction changes lengths — so both are recorded together.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RoundMark {
     raw: usize,
     sent: usize,

@@ -373,6 +373,10 @@ pub struct App {
     pub stream_cancelled: bool,
     /// True after user sends a new message — allows next StreamStart to clear cancelled state.
     pub pending_new_request: bool,
+    /// Where the current model call began: the message count then, and
+    /// whether the last message was an empty assistant one its stream reuses.
+    /// `None` until a call begins, so a discard never reaches older messages.
+    call_anchor: Option<(usize, bool)>,
 
     // Input
     pub input: TextArea<'static>,
@@ -438,6 +442,7 @@ impl App {
             waiting_for_response: false,
             stream_cancelled: false,
             pending_new_request: false,
+            call_anchor: None,
 
             input,
             input_mode: InputMode::Normal,
@@ -923,10 +928,30 @@ impl App {
                             last.rendered = None;
                         }
                     }
+                    ServerMessageKind::StreamDiscard if !self.stream_cancelled => {
+                        if let Some((len, reused)) = self.call_anchor {
+                            self.messages.truncate(len);
+                            if let Some(last) = self.messages.last_mut().filter(|_| reused) {
+                                last.content.clear();
+                                last.rendered = None;
+                            }
+                        }
+                        self.stream_buffer.clear();
+                        self.streaming = false;
+                        self.waiting_for_response = true;
+                    }
                     // Ignore stream events after cancellation
-                    ServerMessageKind::StreamDelta | ServerMessageKind::StreamEnd => {}
+                    ServerMessageKind::StreamDelta
+                    | ServerMessageKind::StreamEnd
+                    | ServerMessageKind::StreamDiscard => {}
+                    // Typing is implied by waiting_for_response; it opens a model call.
                     ServerMessageKind::Typing => {
-                        // Typing is implied by waiting_for_response
+                        self.call_anchor = Some((
+                            self.messages.len(),
+                            self.messages.last().is_some_and(|m| {
+                                m.role == MessageRole::Assistant && m.content.is_empty()
+                            }),
+                        ));
                     }
                     ServerMessageKind::ToolStart if !self.stream_cancelled => {
                         if let Some(text) = msg.text() {
@@ -1103,6 +1128,7 @@ impl App {
     /// as completed tool indicators on the preceding assistant message.
     pub fn load_transcript(&mut self, entries: &[TranscriptEntryDto]) {
         self.messages.clear();
+        self.call_anchor = None;
         self.message_count = 0;
 
         for entry in entries {
@@ -1157,5 +1183,55 @@ impl App {
         if self.auto_scroll {
             self.scroll_offset = 0;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn server(msg_type: &str, content: &str) -> GatewayEvent {
+        GatewayEvent::Message(
+            serde_json::from_value(serde_json::json!({"type": msg_type, "content": content}))
+                .unwrap(),
+        )
+    }
+
+    fn contents(app: &App) -> Vec<&str> {
+        app.messages.iter().map(|m| m.content.as_str()).collect()
+    }
+
+    #[test]
+    fn a_discard_clears_the_live_message() {
+        let mut app = App::new("m".into(), None, "ws://localhost".into());
+        app.push_message(MessageRole::Assistant, "an earlier answer".into());
+        [
+            server("typing", ""),
+            server("stream_start", ""),
+            server("stream_delta", "Let me check."),
+            server("stream_end", ""),
+            server("stream_start", ""),
+            server("stream_delta", "The abandoned"),
+            server("stream_discard", "interrupted"),
+            server("stream_start", ""),
+            server("stream_delta", "The real answer."),
+            server("stream_end", ""),
+        ]
+        .into_iter()
+        .for_each(|event| {
+            app.handle_gateway_event(event);
+        });
+        assert_eq!(contents(&app), ["an earlier answer", "The real answer."]);
+        assert!(!app.waiting_for_response, "the real answer ended the turn");
+    }
+
+    #[test]
+    fn a_discard_with_no_call_begun_keeps_the_history() {
+        let mut app = App::new("m".into(), None, "ws://localhost".into());
+        app.push_message(MessageRole::User, "a question".into());
+        app.push_message(MessageRole::Assistant, "an earlier answer".into());
+        app.handle_gateway_event(server("stream_discard", "interrupted"));
+        assert_eq!(contents(&app), ["a question", "an earlier answer"]);
+        assert!(app.waiting_for_response);
     }
 }

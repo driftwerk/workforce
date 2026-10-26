@@ -132,3 +132,62 @@ impl std::fmt::Display for SkillId {
         write!(f, "{}", self.0)
     }
 }
+
+/// Why a round's streamed text is dropped from the result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StreamDiscardReason {
+    /// The round's text was a tool call hallucinated as text: the runner is
+    /// retrying and the streamed text is garbage nobody should keep seeing.
+    Retry,
+    /// The round's text was a real draft answer superseded by a further round
+    /// (a follow-up was absorbed): dropped from the result, but legitimate
+    /// content worth keeping visible.
+    Superseded,
+    /// The provider failed part-way through the call and it is being
+    /// regenerated: everything the call previewed is void.
+    Interrupted,
+}
+
+impl StreamDiscardReason {
+    /// The word the wire carries.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            StreamDiscardReason::Retry => "retry",
+            StreamDiscardReason::Superseded => "superseded",
+            StreamDiscardReason::Interrupted => "interrupted",
+        }
+    }
+
+    /// Whether the dropped text must come off screen; a superseded draft is
+    /// a real answer the reader keeps.
+    pub const fn retracts(self) -> bool {
+        !matches!(self, StreamDiscardReason::Superseded)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stream_discard_reason_names_match_serde() {
+        for reason in [
+            StreamDiscardReason::Retry,
+            StreamDiscardReason::Superseded,
+            StreamDiscardReason::Interrupted,
+        ] {
+            assert_eq!(
+                serde_json::to_value(reason).unwrap(),
+                serde_json::Value::from(reason.as_str())
+            );
+        }
+    }
+
+    #[test]
+    fn only_a_superseded_draft_stays_on_screen() {
+        assert!(StreamDiscardReason::Retry.retracts());
+        assert!(StreamDiscardReason::Interrupted.retracts());
+        assert!(!StreamDiscardReason::Superseded.retracts());
+    }
+}

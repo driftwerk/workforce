@@ -2631,6 +2631,10 @@ async fn run_gateway_chat(gateway_url: &str, token: &str) -> Result<()> {
                             println!("\n");
                             waiting_for_response = false;
                         }
+                        ServerMessageKind::StreamDiscard => {
+                            println!();
+                            eprintln!("  {}", style("↻ reply restarted").dim());
+                        }
                         ServerMessageKind::Typing => {}
                         ServerMessageKind::ToolStart => {
                             if let Some(text) = msg.text() {

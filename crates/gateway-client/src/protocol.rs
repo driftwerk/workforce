@@ -353,6 +353,7 @@ impl ServerMessage {
             "stream_start" => ServerMessageKind::StreamStart,
             "stream_delta" => ServerMessageKind::StreamDelta,
             "stream_end" => ServerMessageKind::StreamEnd,
+            "stream_discard" => ServerMessageKind::StreamDiscard,
             "pong" => ServerMessageKind::Pong,
             "error" => ServerMessageKind::Error,
             "reminder" => ServerMessageKind::Reminder,
@@ -430,6 +431,9 @@ pub enum ServerMessageKind {
     StreamDelta,
     /// End of streamed response.
     StreamEnd,
+    /// The current model call's streamed text is void; a replacement stream
+    /// may follow.
+    StreamDiscard,
     /// Response to ping.
     Pong,
     /// Error occurred.
@@ -880,5 +884,18 @@ mod tests {
         assert_eq!(back.request_id.as_deref(), Some("r1"));
         assert_eq!(back.tool_name.as_deref(), Some("memory.write"));
         assert!(back.prompt_options.unwrap().allow_always);
+    }
+
+    #[test]
+    fn stream_discard_maps_to_its_kind() {
+        let msg: ServerMessage = serde_json::from_value(serde_json::json!({
+            "type": "stream_discard",
+            "content": "interrupted",
+            "session_id": "sess-1",
+            "speakable": false,
+        }))
+        .unwrap();
+        assert_eq!(msg.kind(), ServerMessageKind::StreamDiscard);
+        assert_eq!(msg.text(), Some("interrupted"));
     }
 }

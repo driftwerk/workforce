@@ -57,6 +57,9 @@ pub enum StreamEvent {
     /// way, and will say so again within `within_secs`. Carries nothing and
     /// is never shown; it only keeps the liveness watchdog waiting.
     KeepAlive { within_secs: u64 },
+    /// Everything the call streamed so far is void: the failover layer is
+    /// regenerating it, and the replacement attempt's events follow.
+    Restart,
     /// Error.
     Error { message: String },
 }
@@ -67,7 +70,10 @@ impl StreamEvent {
     pub fn carries_content(&self) -> bool {
         !matches!(
             self,
-            Self::RateLimitWait { .. } | Self::SlowModelFailover { .. } | Self::KeepAlive { .. }
+            Self::RateLimitWait { .. }
+                | Self::SlowModelFailover { .. }
+                | Self::KeepAlive { .. }
+                | Self::Restart
         )
     }
 }
@@ -78,8 +84,8 @@ impl StreamEvent {
 pub const FIRST_TOKEN_TIMEOUT_MARKER: &str = "llm first-token timeout";
 
 /// Marker embedded in errors returned when a stream went silent after events
-/// were already forwarded. `classify_error` keys on it; partial content has
-/// reached the consumer, so the turn must abort rather than fail over.
+/// were already forwarded. `classify_error` keys on it; the failover layer
+/// retracts the partial content and moves to the next model.
 pub const STREAM_STALL_MARKER: &str = "llm stream stalled";
 
 /// Resolved watchdog windows for one streaming call. `Duration::ZERO`
@@ -107,8 +113,8 @@ pub struct StreamTimeouts {
 /// A `first_token` timeout returns an error carrying
 /// [`FIRST_TOKEN_TIMEOUT_MARKER`] with nothing forwarded — the failover
 /// chain can silently move to the next model. A `stall` timeout returns
-/// [`STREAM_STALL_MARKER`] after partial content was forwarded — callers
-/// must treat it as fatal for the attempt chain.
+/// [`STREAM_STALL_MARKER`] after partial content was forwarded — the
+/// failover layer retracts it and moves to the next model.
 pub async fn stream_with_watchdog(
     call: impl std::future::Future<Output = Result<()>>,
     mut inner_rx: mpsc::Receiver<StreamEvent>,
@@ -204,6 +210,50 @@ where
 {
     let (inner_tx, inner_rx) = mpsc::channel(32);
     stream_with_watchdog(make_call(inner_tx), inner_rx, tx, limits, model).await
+}
+
+/// Run one streaming attempt through a relay to `tx`, and report whether
+/// content it has not since retracted reached it. An in-stream `Error` is the
+/// attempt failing, not content: it is withheld from `tx`, nothing after it is
+/// forwarded, and it fails the attempt even when the call itself returns `Ok`.
+pub(crate) async fn relay_stream<F, Fut>(
+    tx: &mpsc::Sender<StreamEvent>,
+    call: F,
+) -> (Result<()>, bool)
+where
+    F: FnOnce(mpsc::Sender<StreamEvent>) -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    let (relay_tx, mut relay_rx) = mpsc::channel::<StreamEvent>(32);
+    // Owns the receiver, so a departed consumer drops it and the call's next
+    // send fails instead of blocking the attempt forever.
+    let relay = async move {
+        let mut forwarded = false;
+        let mut failure: Option<String> = None;
+        while let Some(event) = relay_rx.recv().await {
+            match event {
+                StreamEvent::Error { message } => {
+                    failure.get_or_insert(message);
+                }
+                event if failure.is_none() => {
+                    forwarded = !matches!(event, StreamEvent::Restart)
+                        && (forwarded || event.carries_content());
+                    if tx.send(event).await.is_err() {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        (forwarded, failure)
+    };
+    let (outcome, (forwarded, failure)) = tokio::join!(call(relay_tx), relay);
+    let outcome = outcome.and_then(|()| {
+        failure.map_or(Ok(()), |message| {
+            Err(eyre::eyre!("Stream error: {message}"))
+        })
+    });
+    (outcome, forwarded)
 }
 
 /// Cap a non-streaming call at `limit`; `None` runs uncapped. A timeout
@@ -585,6 +635,7 @@ impl StreamCollector {
             StreamEvent::RateLimitWait { .. }
             | StreamEvent::SlowModelFailover { .. }
             | StreamEvent::KeepAlive { .. } => {}
+            StreamEvent::Restart => *self = Self::new(),
             StreamEvent::Error { message } => {
                 return Err(eyre::eyre!("Stream error: {}", message));
             }
@@ -935,6 +986,134 @@ mod tests {
             matches!(&blocks[0], ContentBlock::Text { text } if text == "hello"),
             "collected text must be unaffected by SlowModelFailover"
         );
+    }
+
+    async fn relayed(
+        events: Vec<StreamEvent>,
+        outcome: Result<()>,
+    ) -> (Result<()>, bool, Vec<StreamEvent>) {
+        let (tx, mut rx) = mpsc::channel(32);
+        let (outcome, forwarded) = relay_stream(&tx, |relay_tx| async move {
+            for event in events {
+                let _ = relay_tx.send(event).await;
+            }
+            outcome
+        })
+        .await;
+        drop(tx);
+        let reached = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        (outcome, forwarded, reached)
+    }
+
+    fn delta(text: &str) -> StreamEvent {
+        StreamEvent::TextDelta {
+            index: 0,
+            text: text.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_restart_clears_forwarded() {
+        let (_, forwarded, _) = relayed(vec![delta("void"), StreamEvent::Restart], Ok(())).await;
+        assert!(!forwarded);
+        let (_, forwarded, _) = relayed(
+            vec![delta("void"), StreamEvent::Restart, delta("kept")],
+            Ok(()),
+        )
+        .await;
+        assert!(forwarded);
+    }
+
+    #[tokio::test]
+    async fn an_in_stream_error_event_fails_an_attempt_that_returned_ok() {
+        let (outcome, forwarded, reached) = relayed(
+            vec![
+                delta("half"),
+                StreamEvent::Error {
+                    message: "Overloaded".to_string(),
+                },
+                delta("after"),
+            ],
+            Ok(()),
+        )
+        .await;
+        assert_eq!(outcome.unwrap_err().to_string(), "Stream error: Overloaded");
+        assert!(forwarded);
+        assert!(matches!(&reached[..], [StreamEvent::TextDelta { text, .. }] if text == "half"));
+    }
+
+    #[tokio::test]
+    async fn a_providers_own_error_outranks_its_error_event() {
+        let (outcome, _, _) = relayed(
+            vec![StreamEvent::Error {
+                message: "incomplete".to_string(),
+            }],
+            Err(eyre::eyre!("Vertex stream ended without message_delta")),
+        )
+        .await;
+        assert!(outcome.unwrap_err().to_string().starts_with("Vertex"));
+    }
+
+    #[tokio::test]
+    async fn a_departed_consumer_releases_the_relayed_call() {
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+        let relayed = relay_stream(&tx, |relay_tx| async move {
+            for _ in 0..100 {
+                if relay_tx.send(delta("unread")).await.is_err() {
+                    return Ok(());
+                }
+            }
+            Err(eyre::eyre!("every send was taken"))
+        });
+        let (outcome, _) = tokio::time::timeout(Duration::from_secs(5), relayed)
+            .await
+            .expect("the call must not block on a relay nobody reads");
+        outcome.unwrap();
+    }
+
+    #[test]
+    fn a_restart_resets_the_collector() {
+        let mut collector = StreamCollector::new();
+        [
+            StreamEvent::ContentStart { index: 0 },
+            StreamEvent::TextDelta {
+                index: 0,
+                text: "abandoned".to_string(),
+            },
+            StreamEvent::ContentStop { index: 0 },
+            StreamEvent::ToolUseStart {
+                index: 1,
+                id: "toolu_1".to_string(),
+                name: "search".to_string(),
+                signature: None,
+            },
+            StreamEvent::InputJsonDelta {
+                index: 1,
+                partial: "{\"q\":".to_string(),
+            },
+            StreamEvent::Restart,
+            StreamEvent::ContentStart { index: 0 },
+            StreamEvent::TextDelta {
+                index: 0,
+                text: "kept".to_string(),
+            },
+            StreamEvent::ContentStop { index: 0 },
+            StreamEvent::MessageDone {
+                stop_reason: StopReason::EndTurn,
+                usage: TokenUsage {
+                    output_tokens: 3,
+                    ..TokenUsage::default()
+                },
+            },
+        ]
+        .into_iter()
+        .try_for_each(|event| collector.process(event))
+        .unwrap();
+        let (blocks, stop_reason, usage) = collector.finish();
+        assert!(matches!(&blocks[..], [ContentBlock::Text { text }] if text == "kept"));
+        assert_eq!(stop_reason, StopReason::EndTurn);
+        assert_eq!(usage.output_tokens, 3);
     }
 
     /// Pure UI signal: the accumulator must pass it through without

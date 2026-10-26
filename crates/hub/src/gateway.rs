@@ -1861,13 +1861,6 @@ async fn handle_ws(
                                 }
                             }
 
-                            // Send typing indicator scoped to this session
-                            let _ = broadcast_tx.send(BroadcastMessage::new(
-                                effective_session_id.clone(),
-                                "typing",
-                                String::new(),
-                            ));
-
                             let answers_approvals = client_msg.answers_approvals.unwrap_or(false);
                             let has_attachments = client_msg
                                 .attachments
@@ -1892,6 +1885,14 @@ async fn handle_ws(
                                 ));
                                 continue;
                             }
+
+                            // A `typing` opens a model call on clients, so a
+                            // follow-up steered into a live call must not send one.
+                            let _ = broadcast_tx.send(BroadcastMessage::new(
+                                effective_session_id.clone(),
+                                "typing",
+                                String::new(),
+                            ));
 
                             if let Some(ref nats) = nats {
                                 // ── NATS mode: publish request, subscribe to progress ──
@@ -2360,12 +2361,6 @@ async fn forward_local_progress(
                 "stream_end",
                 String::new(),
             )),
-            // A round's streamed text is
-            // being dropped upstream; the
-            // hub stream isn't reconciled
-            // here, so no broadcast is
-            // serialized and the reason
-            // is deliberately ignored.
             // Answer complete; the
             // annotations after it stream
             // as ordinary text and this
@@ -2373,7 +2368,9 @@ async fn forward_local_progress(
             // against a final answer, so
             // there is nothing to settle.
             ProgressEvent::AnswerSettled => None,
-            ProgressEvent::StreamDiscard { .. } => None,
+            ProgressEvent::StreamDiscard { reason } => reason
+                .retracts()
+                .then(|| BroadcastMessage::silent(sid.clone(), "stream_discard", reason.as_str())),
             ProgressEvent::Response { ref text } => {
                 if !delivery.delivers_response() {
                     // Response was already delivered via
@@ -2762,6 +2759,11 @@ fn chat_progress_to_broadcast(
             session_id,
             "stream_end",
             String::new(),
+        )),
+        ChatProgress::StreamDiscard { reason } => Some(BroadcastMessage::silent(
+            session_id,
+            "stream_discard",
+            reason.as_str(),
         )),
         ChatProgress::Message { text } => {
             let rendered = workforce_common::secret_marker::render_markers_as_preview(&text);
@@ -12902,6 +12904,56 @@ mod schedule_auth_tests {
 #[cfg(test)]
 mod chat_progress_tests {
     use super::*;
+
+    /// The `stream_discard` broadcasts a local run's discard for `reason` makes.
+    async fn local_discards(
+        reason: workforce_agent::runner::StreamDiscardReason,
+    ) -> Vec<BroadcastMessage> {
+        let (progress_tx, progress_rx) = tokio::sync::mpsc::channel(8);
+        let (tx, mut rx) = broadcast::channel(16);
+        progress_tx
+            .send(ProgressEvent::StreamDiscard { reason })
+            .await
+            .unwrap();
+        drop(progress_tx);
+        forward_local_progress(progress_rx, tx, "s-1".into(), false).await;
+        std::iter::from_fn(|| rx.try_recv().ok())
+            .filter(|message| message.msg_type == "stream_discard")
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_discard_broadcasts_stream_discard() {
+        let discards =
+            local_discards(workforce_agent::runner::StreamDiscardReason::Interrupted).await;
+        assert_eq!(discards.len(), 1);
+        assert_eq!(discards[0].content, "interrupted");
+        assert!(!discards[0].speakable);
+    }
+
+    #[tokio::test]
+    async fn a_superseded_discard_broadcasts_nothing() {
+        assert!(
+            local_discards(workforce_agent::runner::StreamDiscardReason::Superseded)
+                .await
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_nats_discard_broadcasts_stream_discard() {
+        let message = chat_progress_to_broadcast(
+            ChatProgress::StreamDiscard {
+                reason: workforce_agent::runner::StreamDiscardReason::Retry,
+            },
+            "s-1",
+            true,
+        )
+        .unwrap();
+        assert_eq!(message.msg_type, "stream_discard");
+        assert_eq!(message.content, "retry");
+        assert!(!message.speakable);
+    }
 
     #[test]
     fn route_broadcast_follows_answer_and_is_silent() {

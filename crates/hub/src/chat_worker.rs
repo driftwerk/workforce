@@ -311,10 +311,13 @@ fn chat_progress(
             delta_tail.clear();
             Some(ChatProgress::StreamEnd)
         }
-        // This stream is not reconciled against a final answer, so neither a
-        // settled answer nor a dropped draft has anything to retire here.
+        // This stream is not reconciled against a final answer, so a settled
+        // answer has nothing to retire here.
         ProgressEvent::AnswerSettled => None,
-        ProgressEvent::StreamDiscard { .. } => None,
+        ProgressEvent::StreamDiscard { reason } => reason.retracts().then(|| {
+            delta_tail.clear();
+            ChatProgress::StreamDiscard { reason }
+        }),
         ProgressEvent::Response { ref text } => {
             delivery.delivers_response().then(|| ChatProgress::Message {
                 text: scrub_text(text),
@@ -370,8 +373,9 @@ fn chat_progress(
 
 /// Publish a ChatProgress event to a NATS subject.
 /// Whether a turn's `Response` still needs delivering: not when its answer
-/// streamed, which the `Response` restates, but again for a notice a turn
-/// ends on after asking to connect a login, which no stream carried.
+/// streamed, which the `Response` restates, but again once what streamed was
+/// taken back off screen, or for a notice a turn ends on after asking to
+/// connect a login, which no stream carried.
 #[derive(Debug, Default)]
 pub(crate) struct AnswerDelivery {
     streamed: bool,
@@ -382,6 +386,7 @@ impl AnswerDelivery {
         match event {
             ProgressEvent::StreamDelta { .. } => self.streamed = true,
             ProgressEvent::ConnectRequired { .. } => self.streamed = false,
+            ProgressEvent::StreamDiscard { reason } if reason.retracts() => self.streamed = false,
             _ => {}
         }
     }
@@ -517,6 +522,47 @@ mod redaction_tests {
 }
 
 #[cfg(test)]
+mod stream_discard_tests {
+    use super::*;
+    use workforce_agent::runner::StreamDiscardReason;
+
+    #[test]
+    fn a_discard_maps_to_chat_progress_and_clears_the_delta_tail() {
+        let delivery = AnswerDelivery::default();
+        let mut tail = "an unfinished credential".to_string();
+        let progress = chat_progress(
+            ProgressEvent::StreamDiscard {
+                reason: StreamDiscardReason::Interrupted,
+            },
+            &delivery,
+            &mut tail,
+        );
+        assert!(matches!(
+            progress,
+            Some(ChatProgress::StreamDiscard {
+                reason: StreamDiscardReason::Interrupted
+            })
+        ));
+        assert!(tail.is_empty());
+    }
+
+    #[test]
+    fn a_superseded_discard_publishes_nothing() {
+        let delivery = AnswerDelivery::default();
+        let mut tail = "kept".to_string();
+        let progress = chat_progress(
+            ProgressEvent::StreamDiscard {
+                reason: StreamDiscardReason::Superseded,
+            },
+            &delivery,
+            &mut tail,
+        );
+        assert!(progress.is_none());
+        assert_eq!(tail, "kept");
+    }
+}
+
+#[cfg(test)]
 mod after_answer_tests {
     use super::*;
 
@@ -595,6 +641,25 @@ mod answer_delivery_tests {
             delta(),
             ProgressEvent::ConnectRequired { prompt }
         ]));
+    }
+
+    #[test]
+    fn a_response_after_a_retracted_stream_is_delivered() {
+        use workforce_agent::runner::StreamDiscardReason;
+        let delta = || ProgressEvent::StreamDelta {
+            text: "partial".into(),
+        };
+        let discard = |reason| ProgressEvent::StreamDiscard { reason };
+        assert!(delivers(vec![delta(), discard(StreamDiscardReason::Retry)]));
+        assert!(!delivers(vec![
+            delta(),
+            discard(StreamDiscardReason::Interrupted),
+            delta()
+        ]));
+        assert!(
+            !delivers(vec![delta(), discard(StreamDiscardReason::Superseded)]),
+            "a superseded draft stays on screen"
+        );
     }
 }
 

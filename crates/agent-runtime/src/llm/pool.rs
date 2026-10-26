@@ -21,7 +21,7 @@ use super::failover::classify_error;
 use super::failover::ErrorKind;
 use super::failover::LlmTimeouts;
 use super::provider::LlmProvider;
-use super::streaming::{call_with_request_cap, watchdogged_stream, StreamEvent};
+use super::streaming::{call_with_request_cap, relay_stream, watchdogged_stream, StreamEvent};
 use super::tiers::{EquivalencesCell, TierRegistry};
 use super::types::{LlmMessage, LlmResponse, LlmToolDef};
 use workforce_common::session::estimate_tokens;
@@ -853,9 +853,8 @@ impl LlmProvider for PooledProvider {
         let normalized = self.normalize_model(model);
         let effective_model = normalized.as_deref().or(model);
         let model_key = effective_model.unwrap_or("");
-        // Iterate all tokens in the pool, same as create_message().
-        // 429 errors happen at the HTTP level before any streaming response,
-        // so rotating to the next token is safe — no partial events have been sent.
+        // Iterate all tokens in the pool, same as create_message(), while
+        // nothing has streamed yet.
         let order = self.try_order(model_key).await;
         if order.is_empty() {
             return Err(eyre::eyre!("No providers in pool"));
@@ -905,24 +904,29 @@ impl LlmProvider for PooledProvider {
             };
 
             let limits = self.timeouts.read().stream_timeouts_for(model_key);
-            let watched = watchdogged_stream(limits, model_key, tx.clone(), |inner_tx| {
-                provider.create_message_stream(
-                    system_prompt,
-                    messages,
-                    tools,
-                    effective_model,
-                    max_tokens,
-                    enable_cache,
-                    inner_tx,
-                )
-            });
-            match watched.await {
+            let (watched, forwarded) = relay_stream(&tx, |attempt_tx| {
+                watchdogged_stream(limits, model_key, attempt_tx, |inner_tx| {
+                    provider.create_message_stream(
+                        system_prompt,
+                        messages,
+                        tools,
+                        effective_model,
+                        max_tokens,
+                        enable_cache,
+                        inner_tx,
+                    )
+                })
+            })
+            .await;
+            match watched {
                 Ok(()) => {
                     self.clear_cooldowns(idx, model_key).await;
                     return Ok(());
                 }
                 Err(e) => {
-                    if self.absorb_failure(idx, model_key, &format!("{e}")).await {
+                    // After content only the failover layer may start over:
+                    // it retracts what reached `tx` first.
+                    if self.absorb_failure(idx, model_key, &format!("{e}")).await && !forwarded {
                         last_error = Some(e);
                         continue;
                     }
@@ -1385,6 +1389,98 @@ mod tests {
         let statuses = pool.list().await;
         assert!(statuses[0].is_rate_limited);
         assert!(!statuses[1].is_rate_limited);
+    }
+
+    /// Streams the start of an answer, then hits the rate limit.
+    struct PartialThenRateLimited;
+
+    #[async_trait]
+    impl LlmProvider for PartialThenRateLimited {
+        async fn create_message(
+            &self,
+            _system_prompt: Option<&str>,
+            _messages: &[LlmMessage],
+            _tools: &[LlmToolDef],
+            _model: Option<&str>,
+            _max_tokens: Option<u32>,
+            _enable_cache: bool,
+        ) -> Result<LlmResponse> {
+            unreachable!("streamed only")
+        }
+
+        async fn create_message_stream(
+            &self,
+            _system_prompt: Option<&str>,
+            _messages: &[LlmMessage],
+            _tools: &[LlmToolDef],
+            _model: Option<&str>,
+            _max_tokens: Option<u32>,
+            _enable_cache: bool,
+            tx: mpsc::Sender<StreamEvent>,
+        ) -> Result<()> {
+            let _ = tx
+                .send(StreamEvent::TextDelta {
+                    index: 0,
+                    text: "partial".to_string(),
+                })
+                .await;
+            Err(eyre::eyre!(
+                "Anthropic API error (429): rate limit exceeded"
+            ))
+        }
+    }
+
+    fn streamed_text(rx: &mut mpsc::Receiver<StreamEvent>) -> Vec<String> {
+        std::iter::from_fn(|| rx.try_recv().ok())
+            .filter_map(|event| match event {
+                StreamEvent::TextDelta { text, .. } => Some(text),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_pool_still_rotates_a_stream_before_content() {
+        let pool = PooledProvider::new();
+        pool.add("primary", Arc::new(MockRateLimited)).await;
+        pool.add(
+            "backup",
+            Arc::new(MockOk {
+                label: "backup-response".to_string(),
+            }),
+        )
+        .await;
+
+        let (tx, mut rx) = mpsc::channel(32);
+        pool.create_message_stream(None, &[], &[], Some("test"), None, true, tx)
+            .await
+            .unwrap();
+        assert_eq!(streamed_text(&mut rx), ["backup-response"]);
+    }
+
+    #[tokio::test]
+    async fn a_pool_never_rotates_after_content() {
+        let pool = PooledProvider::new();
+        pool.add("primary", Arc::new(PartialThenRateLimited)).await;
+        pool.add(
+            "backup",
+            Arc::new(MockOk {
+                label: "backup-response".to_string(),
+            }),
+        )
+        .await;
+
+        let (tx, mut rx) = mpsc::channel(32);
+        let err = pool
+            .create_message_stream(None, &[], &[], Some("test"), None, true, tx)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("429"));
+        assert_eq!(streamed_text(&mut rx), ["partial"]);
+        assert!(
+            pool.list().await[0].is_rate_limited,
+            "the limit still cools the entry down"
+        );
     }
 
     #[tokio::test]
