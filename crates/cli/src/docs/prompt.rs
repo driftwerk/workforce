@@ -109,8 +109,9 @@ pub fn build_prompt(input: &PromptInput) -> String {
 /// call. No `valid_doc_paths` (not needed for notes), no
 /// `current_content` (not needed either), no MDX-output rules — the
 /// caller sends `None` as the system prompt so the model isn't pushed
-/// to write a full page.
-pub fn build_notes_prompt(page: &str, sources: &[SourceFile]) -> String {
+/// to write a full page. `max_words` keeps the asked length inside the
+/// reply's token cap.
+pub fn build_notes_prompt(page: &str, sources: &[SourceFile], max_words: u32) -> String {
     let mut p = String::with_capacity(4096);
     p.push_str(&format!(
         "# Notes for `end-user-docs/{page}`\n\n\
@@ -119,8 +120,8 @@ pub fn build_notes_prompt(page: &str, sources: &[SourceFile]) -> String {
          concepts the reader should know, configuration surfaces, example \
          commands or code snippets, behaviours, edge cases. Bullet points \
          only. Quote identifiers verbatim. Do NOT write the MDX page \
-         itself — that happens in a later step. Limit your response to ~1500 \
-         words.\n\n",
+         itself — that happens in a later step. Keep your response under \
+         {max_words} words.\n\n",
     ));
     p.push_str("## Source files\n");
     append_source_blocks(&mut p, sources);
@@ -152,9 +153,10 @@ fn build_prompt_header(input: &PromptInput) -> String {
     let mut p = String::with_capacity(4096);
     p.push_str(&format!("# Curate `end-user-docs/{}`\n\n", input.page));
     p.push_str(
-        "Respond with the complete MDX page contents verbatim — no preamble,\n\
-         no surrounding fences, no trailing commentary. Start with the\n\
-         frontmatter `---` line. Apply every rule in the system prompt.\n\n",
+        "Change the page with the tools, never by writing it out: `edit`\n\
+         replaces one exact passage, `append` adds to the end. End with\n\
+         `finish`, or call `keep_page` alone if the page is already\n\
+         accurate. Apply every rule in the system prompt.\n\n",
     );
     p.push_str(&format!(
         "## Target page\n`end-user-docs/{}`\n\n",
@@ -162,12 +164,24 @@ fn build_prompt_header(input: &PromptInput) -> String {
     ));
     match &input.current_content {
         Some(curr) => {
-            p.push_str("## Current content of the target page\n\n```mdx\n");
+            // Markers, not a fence: the page has fences of its own, and
+            // `edit` quotes it byte for byte.
+            p.push_str(
+                "## Current content of the target page\n\
+                 Everything between the two marker lines, exactly as it is on disk.\n\n\
+                 <<<PAGE\n",
+            );
             p.push_str(curr);
-            p.push_str("\n```\n\n");
+            if !curr.ends_with('\n') {
+                p.push('\n');
+            }
+            p.push_str("PAGE>>>\n\n");
         }
         None => {
-            p.push_str("## Current content\n(file does not exist yet — create it)\n\n");
+            p.push_str(
+                "## Current content\n(file does not exist yet — write it with `append`, \
+                 a section at a time, starting with the frontmatter)\n\n",
+            );
         }
     }
     p.push_str(
@@ -236,6 +250,25 @@ mod tests {
     }
 
     #[test]
+    fn current_page_is_quoted_between_markers_exactly() {
+        let mut input = input_with_sources(vec![]);
+        input.current_content = Some("# Slack\n\n```sh\nworkforce serve\n```\n".to_string());
+        let prompt = build_prompt(&input);
+        assert!(prompt.contains("<<<PAGE\n# Slack\n\n```sh\nworkforce serve\n```\nPAGE>>>\n"));
+        assert!(
+            !prompt.contains("```mdx"),
+            "the page must not be wrapped in a fence"
+        );
+    }
+
+    #[test]
+    fn the_prompt_asks_for_edits_not_the_whole_page() {
+        let prompt = build_prompt(&input_with_sources(vec![]));
+        assert!(prompt.contains("never by writing it out"));
+        assert!(!prompt.contains("complete MDX page"));
+    }
+
+    #[test]
     fn missing_target_file_says_does_not_exist() {
         let mut input = input_with_sources(vec![]);
         input.current_content = None;
@@ -265,8 +298,9 @@ mod tests {
             repo_relative: PathBuf::from("crates/skills/src/adapters/slack/lib.rs"),
             content: "fn main() {}".to_string(),
         }];
-        let p = build_notes_prompt("adapters/slack.mdx", &sources);
+        let p = build_notes_prompt("adapters/slack.mdx", &sources, 1_600);
         assert!(p.contains("Notes for `end-user-docs/adapters/slack.mdx`"));
+        assert!(p.contains("under 1600 words"));
         assert!(p.contains("Bullet points only"));
         assert!(p.contains("crates/skills/src/adapters/slack/lib.rs"));
         assert!(p.contains("fn main() {}"));

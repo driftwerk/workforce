@@ -1,13 +1,15 @@
 //! `workforce docs curate` — doc-curator entrypoint.
 //!
-//! One-shot LLM call per page: the prompt embeds the source files and
-//! the response is the complete MDX page. The dispatcher is workforce's
-//! existing LLM provider abstraction (`workforce_agent::llm`); pick the
-//! provider via the `[curator]` section of `workforce.toml` or the
-//! per-invocation `--tier` flag.
+//! Per page, the prompt embeds the source files (or notes read from them)
+//! and the current page, and the model changes the page through edit tools
+//! (see `llm`). The dispatcher is workforce's existing LLM provider
+//! abstraction (`workforce_agent::llm`); pick the provider via the
+//! `[curator]` section of `workforce.toml` or the per-invocation `--tier`
+//! flag.
 //!
 //! `gh` and `git` are invoked via subprocess.
 
+mod edit;
 mod llm;
 mod pr;
 mod prompt;
@@ -26,8 +28,8 @@ use tracing::{info, warn};
 use workforce_common::settings::WorkforceConfig;
 use workforce_hub::vault::Vault;
 
-use self::llm::{draft_page, extract_mdx, keep_existing_reason};
-use self::pr::{branch_name_for, pr_body, pr_title, sync_pr, PrSpec, PrSync};
+use self::llm::{curate_page, Curation};
+use self::pr::{branch_name_for, pr_body, pr_title, sync_pr, PageReport, PrSpec, PrSync};
 use self::prompt::{collect_valid_doc_paths, read_page, read_source_files, PromptInput};
 use self::verify::{verify, VerificationOutcome};
 use self::watch_config::{all_pages, load_watch_config, pages_for_changed_files, sources_for_page};
@@ -75,7 +77,7 @@ pub struct CurateArgs {
     #[arg(long)]
     pub tier: Option<String>,
 
-    /// Cap on response tokens per page (overrides `[curator] max_tokens`).
+    /// Cap on each edit reply (overrides `[curator] max_tokens`).
     #[arg(long)]
     pub max_tokens: Option<u32>,
 
@@ -125,15 +127,20 @@ async fn curate(args: CurateArgs) -> Result<()> {
         ensure_clean(&repo_root).await?;
     }
 
-    let (curator_config, vault) = load_curator_config(&args.config).await?;
-    let tier_spec = args.tier.clone().or(curator_config.tier).ok_or_else(|| {
-        eyre!(
-            "no curator tier configured: set `[curator] tier = \"<provider:tier>\"` \
+    let (mut curator_config, vault) = load_curator_config(&args.config).await?;
+    let tier_spec = args
+        .tier
+        .clone()
+        .or(curator_config.tier.clone())
+        .ok_or_else(|| {
+            eyre!(
+                "no curator tier configured: set `[curator] tier = \"<provider:tier>\"` \
                  in workforce.toml (e.g. `openrouter:deepseek:powerful`) or pass --tier",
-        )
-    })?;
-    let max_tokens = args.max_tokens.unwrap_or(curator_config.max_tokens);
-    let context_safety_tokens = curator_config.context_safety_tokens;
+            )
+        })?;
+    if let Some(max_tokens) = args.max_tokens {
+        curator_config.max_tokens = max_tokens;
+    }
     let valid_doc_paths = collect_valid_doc_paths(&repo_root.join("end-user-docs"))?;
 
     let mut pages_touched: Vec<PageOutcome> = Vec::with_capacity(targets.len());
@@ -143,8 +150,7 @@ async fn curate(args: CurateArgs) -> Result<()> {
             &repo_root,
             &cfg,
             &tier_spec,
-            max_tokens,
-            context_safety_tokens,
+            &curator_config,
             &valid_doc_paths,
             vault.as_ref(),
         )
@@ -156,6 +162,7 @@ async fn curate(args: CurateArgs) -> Result<()> {
                 PageOutcome {
                     page: page.clone(),
                     sources: Vec::new(),
+                    summary: String::new(),
                     status: PageStatus::Skipped,
                 }
             }
@@ -187,18 +194,20 @@ async fn curate(args: CurateArgs) -> Result<()> {
 /// What happened to a page during a run, used to decide whether it gets a PR.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PageStatus {
-    /// New content was written to the page.
+    /// The curator finished an edit and the page was written.
     Edited,
-    /// The curator judged the page already accurate, or it re-drafted
-    /// identical content — no PR.
+    /// The curator judged the page already accurate — no PR.
     Unchanged,
-    /// No mapped sources, or the page's draft failed — no PR.
+    /// No mapped sources, or the curation failed and nothing was written —
+    /// no PR.
     Skipped,
 }
 
 struct PageOutcome {
     page: String,
     sources: Vec<String>,
+    /// The curator's account of what changed, for the PR.
+    summary: String,
     status: PageStatus,
 }
 
@@ -243,8 +252,7 @@ async fn curate_single_page(
     repo_root: &Path,
     cfg: &watch_config::WatchConfig,
     tier_spec: &str,
-    max_tokens: u32,
-    context_safety_tokens: u32,
+    limits: &workforce_common::settings::CuratorConfig,
     valid_doc_paths: &[String],
     vault: Option<&Arc<Vault>>,
 ) -> Result<PageOutcome> {
@@ -255,6 +263,7 @@ async fn curate_single_page(
         return Ok(PageOutcome {
             page: page.to_string(),
             sources: Vec::new(),
+            summary: String::new(),
             status: PageStatus::Skipped,
         });
     }
@@ -274,52 +283,42 @@ async fn curate_single_page(
     };
 
     info!(page, tier = tier_spec, "curating page");
-    let draft = draft_page(
-        page,
-        tier_spec,
-        max_tokens,
-        context_safety_tokens,
-        SYSTEM_PROMPT,
-        &prompt_input,
-        vault,
-    )
-    .await?;
-
-    if let Some(reason) = keep_existing_reason(&draft.text) {
-        info!(page, %reason, "curator judged page already accurate; skipping");
+    let curation =
+        curate_page(page, tier_spec, limits, SYSTEM_PROMPT, &prompt_input, vault).await?;
+    let Curation::Edited {
+        text,
+        summary,
+        edits,
+        model,
+        input_tokens,
+        output_tokens,
+    } = curation
+    else {
+        if let Curation::Unchanged { reason } = curation {
+            info!(page, %reason, "curator judged page already accurate; skipping");
+        }
         return Ok(unchanged(page, source_summary));
-    }
-
-    let mdx = extract_mdx(&draft.text);
-    if mdx.is_empty() {
-        return Err(eyre!("empty draft for {page}"));
-    }
-    if prompt_input
-        .current_content
-        .as_deref()
-        .is_some_and(|current| current.trim() == mdx.trim())
-    {
-        info!(page, "curator re-drafted identical content; skipping");
-        return Ok(unchanged(page, source_summary));
-    }
+    };
 
     if let Some(parent) = page_full_path.parent() {
         std::fs::create_dir_all(parent).wrap_err_with(|| format!("create {}", parent.display()))?;
     }
-    std::fs::write(&page_full_path, mdx)
+    std::fs::write(&page_full_path, &text)
         .wrap_err_with(|| format!("write {}", page_full_path.display()))?;
 
     info!(
         page,
-        model = %draft.model,
-        input_tokens = draft.input_tokens,
-        output_tokens = draft.output_tokens,
-        "page drafted"
+        %model,
+        edits,
+        input_tokens,
+        output_tokens,
+        "page edited"
     );
 
     Ok(PageOutcome {
         page: page.to_string(),
         sources: source_summary,
+        summary,
         status: PageStatus::Edited,
     })
 }
@@ -328,6 +327,7 @@ fn unchanged(page: &str, sources: Vec<String>) -> PageOutcome {
     PageOutcome {
         page: page.to_string(),
         sources,
+        summary: String::new(),
         status: PageStatus::Unchanged,
     }
 }
@@ -355,7 +355,7 @@ async fn open_pull_requests(
         let note = verification.failure_summary(&page_refs);
         let spec = build_pr_spec(
             &pages,
-            &sources_by_page(&edited),
+            &page_reports(&edited),
             head_sha,
             note.as_deref(),
             verification.build_failed,
@@ -368,7 +368,7 @@ async fn open_pull_requests(
             let note = verification.page_failure(&outcome.page);
             let spec = build_pr_spec(
                 &pages,
-                &sources_by_page(&[outcome]),
+                &page_reports(&[outcome]),
                 head_sha,
                 note.as_deref(),
                 verification.build_failed,
@@ -380,10 +380,14 @@ async fn open_pull_requests(
     checkout_main(repo_root).await
 }
 
-fn sources_by_page(outcomes: &[&PageOutcome]) -> Vec<(String, Vec<String>)> {
+fn page_reports(outcomes: &[&PageOutcome]) -> Vec<PageReport> {
     outcomes
         .iter()
-        .map(|o| (o.page.clone(), o.sources.clone()))
+        .map(|o| PageReport {
+            page: o.page.clone(),
+            sources: o.sources.clone(),
+            summary: o.summary.clone(),
+        })
         .collect()
 }
 
@@ -403,7 +407,7 @@ fn report_sync(label: &str, sync: PrSync) {
 
 fn build_pr_spec(
     pages: &[String],
-    sources_by_page: &[(String, Vec<String>)],
+    reports: &[PageReport],
     head_sha: &str,
     verification_note: Option<&str>,
     build_failed: bool,
@@ -424,7 +428,7 @@ fn build_pr_spec(
     };
     PrSpec {
         branch: branch_name_for(pages),
-        body: pr_body(pages, sources_by_page, head_sha, effective_note.as_deref()),
+        body: pr_body(pages, reports, head_sha, effective_note.as_deref()),
         draft: effective_note.is_some(),
         paths: pages.iter().map(|p| format!("end-user-docs/{p}")).collect(),
         commit_message: title.clone(),

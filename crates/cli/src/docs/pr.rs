@@ -241,9 +241,17 @@ pub fn pr_title(pages: &[String]) -> String {
     }
 }
 
+/// What the curator did to one page, for the pull request.
+pub struct PageReport {
+    pub page: String,
+    pub sources: Vec<String>,
+    /// The curator's own account of what changed and why.
+    pub summary: String,
+}
+
 pub fn pr_body(
     pages: &[String],
-    sources_by_page: &[(String, Vec<String>)],
+    reports: &[PageReport],
     head_sha: &str,
     verification_note: Option<&str>,
 ) -> String {
@@ -259,13 +267,23 @@ pub fn pr_body(
     }
     body.push('\n');
 
+    body.push_str("## What changed\n");
+    for report in reports {
+        body.push_str(&format!(
+            "\n### `end-user-docs/{}`\n{}\n",
+            report.page,
+            report.summary.trim()
+        ));
+    }
+    body.push('\n');
+
     body.push_str("## Sources referenced\n");
-    for (page, sources) in sources_by_page {
-        body.push_str(&format!("\n### `end-user-docs/{page}`\n"));
-        if sources.is_empty() {
+    for report in reports {
+        body.push_str(&format!("\n### `end-user-docs/{}`\n", report.page));
+        if report.sources.is_empty() {
             body.push_str("- (none)\n");
         } else {
-            for src in sources {
+            for src in &report.sources {
                 body.push_str(&format!("- `{src}`\n"));
             }
         }
@@ -322,14 +340,17 @@ mod tests {
     fn body_lists_pages_and_sources_and_marks_verification() {
         let body = pr_body(
             &["adapters/slack.mdx".into()],
-            &[(
-                "adapters/slack.mdx".into(),
-                vec!["crates/skills/src/adapters/slack/lib.rs".into()],
-            )],
+            &[PageReport {
+                page: "adapters/slack.mdx".into(),
+                sources: vec!["crates/skills/src/adapters/slack/lib.rs".into()],
+                summary: "Documented the new `--thread` flag.".into(),
+            }],
             "abc123",
             None,
         );
         assert!(body.contains("end-user-docs/adapters/slack.mdx"));
+        assert!(body.contains("## What changed"));
+        assert!(body.contains("Documented the new `--thread` flag."));
         assert!(body.contains("crates/skills/src/adapters/slack/lib.rs"));
         assert!(body.contains("`npm run build` and `docs:verify-links` passed"));
         assert!(body.contains("abc123"));
@@ -339,7 +360,11 @@ mod tests {
     fn body_marks_draft_when_verification_failed() {
         let body = pr_body(
             &["x.mdx".into()],
-            &[("x.mdx".into(), vec![])],
+            &[PageReport {
+                page: "x.mdx".into(),
+                sources: vec![],
+                summary: "Fixed the title.".into(),
+            }],
             "deadbee",
             Some("error: title missing"),
         );
