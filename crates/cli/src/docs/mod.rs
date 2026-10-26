@@ -152,7 +152,7 @@ async fn curate(args: CurateArgs) -> Result<()> {
         {
             Ok(outcome) => outcome,
             Err(err) => {
-                warn!(page, error = %err, "curate failed; skipping this page, continuing batch");
+                warn!(page, error = %format_args!("{err:#}"), "curate failed; skipping this page, continuing batch");
                 PageOutcome {
                     page: page.clone(),
                     sources: Vec::new(),
