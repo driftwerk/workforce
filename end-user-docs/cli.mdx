@@ -55,6 +55,8 @@ This launches:
 - The scheduler for recurring jobs.
 - Background tasks for knowledge maintenance.
 
+Agent changes written to the config overlay (`workforce.overlay.toml`) are picked up live for non‑default agents; default agent changes require a restart.
+
 ### `workforce init`
 
 Set up a new Workforce project.
@@ -81,6 +83,8 @@ Options:
 - `--exposed-tools <patterns>` — Comma-separated tool patterns to expose (e.g., `knowledge.*,linear.*`). If omitted, exposes all tools.
 - `--preload-skills <names>` — Comma-separated skills to load from the agent's vault at startup.
 - `--user-id <uuid>` — Canonical identity UUID for per‑user vault path resolution.
+- `--listen <addr>` — Serve over HTTP instead of stdio. Must be paired with `--auth-token-file`.
+- `--auth-token-file <path>` — File whose contents are used as the bearer token for HTTP mode. The token is read from a file rather than a flag to avoid leaking it in `ps` output.
 
 ### `workforce status`
 
@@ -90,7 +94,7 @@ Show system status.
 workforce status
 ```
 
-Output includes NATS connection status, running agents, and registered nodes.
+Output shows basic connectivity information. Most status lines report "not connected" stubs when the CLI is run outside a hub process.
 
 ## Agent Management
 
@@ -112,7 +116,7 @@ workforce agent show default
 
 ### `workforce agent create`
 
-Add a new agent.
+Add a new agent. The agent is written to the config overlay (`workforce.overlay.toml` in the data directory), not `workforce.toml`. A running hub picks up the new agent via its overlay watcher; for default agent changes a restart is needed.
 
 ```sh
 workforce agent create --id reviewer --name "Code Reviewer" --role reviewer
@@ -120,7 +124,7 @@ workforce agent create --id reviewer --name "Code Reviewer" --role reviewer
 
 ### `workforce agent update`
 
-Modify an existing agent.
+Modify an existing agent. Changes go to the config overlay (`workforce.overlay.toml`), not `workforce.toml`. A running hub picks up the change for non-default agents via its overlay watcher; restart the hub to load changes for the default agent.
 
 ```sh
 workforce agent update --id reviewer --name "Senior Reviewer" --model claude-3-5-sonnet-20241022
@@ -128,7 +132,7 @@ workforce agent update --id reviewer --name "Senior Reviewer" --model claude-3-5
 
 ### `workforce agent delete`
 
-Remove an agent.
+Remove an agent. The deletion is recorded as a tombstone in the config overlay so it survives infrastructure redeploys.
 
 ```sh
 workforce agent delete --id reviewer --delete-workspace
@@ -185,6 +189,8 @@ Schedule types:
 - `--cron <expr>` — Classic cron expression, e.g., `"0 9 * * *"` for 9 AM daily.
 - `--in <duration>` — Run after a delay, e.g., `"2h"` or `"30m"`.
 - `--every <seconds>` — Repeat every N seconds.
+- `--channel` — Deliver the message as an agent turn (a message in the agent's channel).
+- `--model <name>` — Override the default model for this job.
 
 ### `workforce cron remove`
 
@@ -213,6 +219,8 @@ workforce cron history
 ## Vault Commands
 
 Manage encrypted secrets (API keys, tokens, etc.). These commands use the vault file in `--data-dir` (default `./data`). Add `--config workforce.toml` to use the configured vault instead, whether that is a file or Postgres, and `--agent <id>` for one agent's own vault.
+
+Local mutations (`set`, `delete`, `copy`) require `WORKFORCE_ALLOW_LOCAL_VAULT_WRITE=1` in the environment; this prevents a silent no‑op when a hub is already running against the same vault. Remote operations use `--gateway` and `--token`.
 
 ### `workforce vault init`
 
@@ -247,6 +255,8 @@ List all secret paths.
 ```sh
 workforce vault list
 ```
+
+Add `--show-source` to see the origin of each path: `global_user_scoped`, `global_shared_bare`, or `agent_*`.
 
 ### `workforce vault delete`
 
@@ -304,6 +314,14 @@ Show who changed which secret and when, never values.
 
 ```sh
 workforce vault audit --config workforce.toml --agent sarah --limit 20
+```
+
+### `workforce vault copy`
+
+Copy a credential from one user's vault path to another within the same agent. Requires a SystemAdmin token (`--token`); a shared gateway token is rejected.
+
+```sh
+workforce vault copy --config workforce.toml --agent default --from alice/slack.token --to bob/slack.token --token <admin-token>
 ```
 
 ## Pairing Commands
@@ -434,6 +452,90 @@ Display details of a specific workflow.
 
 ```sh
 workforce workflow show onboarding --workflows-dir .driftwerk/workflows
+```
+
+### `workforce workflow push`
+
+Push a workflow definition to a remote hub.
+
+```sh
+workforce workflow push onboarding --gateway ws://localhost:8091 --token <token>
+```
+
+### `workforce workflow pull`
+
+Pull a workflow definition from a remote hub.
+
+```sh
+workforce workflow pull onboarding --gateway ws://localhost:8091 --token <token>
+```
+
+### `workforce workflow delete`
+
+Delete a workflow definition.
+
+```sh
+workforce workflow delete onboarding --workflows-dir .driftwerk/workflows
+```
+
+## Playbook Commands
+
+Playbooks are defined in TOML files under `.driftwerk/playbooks` and work like workflows but support member‑owned configurations.
+
+### `workforce playbook list`
+
+List playbook definitions.
+
+```sh
+workforce playbook list
+```
+
+### `workforce playbook validate`
+
+Check a playbook TOML file for errors.
+
+```sh
+workforce playbook validate .driftwerk/playbooks/incident-response.toml
+```
+
+### `workforce playbook show`
+
+Display details of a specific playbook.
+
+```sh
+workforce playbook show incident-response
+```
+
+### `workforce playbook create`
+
+Generate a scaffold for a new playbook.
+
+```sh
+workforce playbook create --id incident-response
+```
+
+### `workforce playbook push`
+
+Push a playbook to a remote hub.
+
+```sh
+workforce playbook push incident-response --gateway ws://localhost:8091 --token <token>
+```
+
+### `workforce playbook pull`
+
+Pull a playbook from a remote hub.
+
+```sh
+workforce playbook pull incident-response --gateway ws://localhost:8091 --token <token>
+```
+
+### `workforce playbook delete`
+
+Delete a playbook definition.
+
+```sh
+workforce playbook delete incident-response
 ```
 
 ## Node Commands
@@ -580,17 +682,115 @@ workforce local-agent connect --gateway ws://localhost:8091 --token <token>
 
 This allows the hub to delegate shell commands and file operations to your machine.
 
+## Worker Commands
+
+Manage execution hosts that run golden datasets and other background work.
+
+### `workforce worker serve`
+
+Start a worker process.
+
+```sh
+workforce worker serve --config workforce.toml
+```
+
+### `workforce worker refresh`
+
+Refresh the worker's dataset cache.
+
+```sh
+workforce worker refresh
+```
+
+### `workforce worker backup`
+
+Back up worker state.
+
+```sh
+workforce worker backup
+```
+
+### `workforce worker doctor`
+
+Diagnose worker health and connectivity.
+
+```sh
+workforce worker doctor
+```
+
+## Reindex Commands
+
+Rebuild vector indexes from stored data.
+
+### `workforce artifacts reindex`
+
+Reindex the artifact vector store from Postgres or graph.
+
+```sh
+workforce artifacts reindex --config workforce.toml
+```
+
+Options:
+- `--embed-url <url>` — Embedding endpoint URL.
+- `--embed-api <name>` — Embedding API type.
+- `--embed-model <name>` — Model name for embeddings.
+- `--embed-key-env <var>` — Environment variable holding the API key.
+- `--embed-batch <N>` — Batch size for embedding requests.
+- `--embed-concurrency <N>` — Concurrent embedding requests.
+- `--embed-inputs-in-flight <N>` — Maximum inputs in flight.
+
+### `workforce code reindex-vectors`
+
+Reindex the code vector store.
+
+```sh
+workforce code reindex-vectors --config workforce.toml --repo my-repo
+```
+
+Options:
+- `--repo <name>` — Repository to reindex.
+- `--rate <N>` — Rate limit for embedding requests.
+- `--force` — Reindex even if already indexed.
+- `--take-over` — Take over in‑progress reindex jobs.
+- `--repos-at-once <N>` — Repositories to process concurrently.
+- Plus the shared embedding flags from `artifacts reindex`.
+
 ## Identity & Permission Commands
 
 Manage multi‑user access and role‑based permissions.
 
 ### `workforce permissions migrate`
 
-Convert YAML policy rules into the internal permission store.
+Convert YAML policy rules into the internal permission store. Dry‑run by default; use `--apply` to write. A role‑scope CSV is written to `{data_dir}/permissions-role-migration.csv` when content exists.
 
 ```sh
-workforce permissions migrate --config workforce.toml
+workforce permissions migrate --config workforce.toml --apply
 ```
+
+### `workforce permissions import-roles`
+
+Read an edited role CSV (`name,role,team_id,tool_pattern,action,priority`) into the permission store. Dry‑run by default; use `--apply` to write. Rows with an empty `team_id` are skipped.
+
+```sh
+workforce permissions import-roles --config workforce.toml --apply
+```
+
+### `workforce permissions matrix`
+
+Manage capability matrix overrides. Requires `WORKFORCE_ALLOW_LOCAL_MATRIX_WRITE=1` in the environment.
+
+```sh
+# Show current matrix overrides
+workforce permissions matrix show
+
+# Set an override (roles: member, manager, system_admin, or custom)
+workforce permissions matrix set --capability approve_pairing --role manager --decision deny
+
+# Reset an override to its default
+workforce permissions matrix reset --capability approve_pairing
+```
+
+Protected admin capabilities cannot be overridden. Decisions are `allow`, `ask`, or `deny`.
 
 ### `workforce migrate`
 
@@ -850,6 +1050,22 @@ Run background extraction of memories from recent sessions.
 workforce memory passive-extract
 ```
 
+### `workforce memory relationship-scan`
+
+Scan for cross-entity relationships in the memory store.
+
+```sh
+workforce memory relationship-scan
+```
+
+### `workforce memory move-edge`
+
+Migrate edge-memory entries to a new format. Dry‑run by default; use `--apply` to write.
+
+```sh
+workforce memory move-edge --apply
+```
+
 ## Lessons Commands
 
 Extract reusable knowledge from past sessions.
@@ -918,13 +1134,31 @@ workforce training delete --agent default --corpus api-docs
 
 The memory store rows are orphaned and require a separate cleanup.
 
+### `workforce training docs`
+
+List documents within a corpus for an agent.
+
+```sh
+workforce training docs --agent default --corpus api-docs
+```
+
+Without `--json`, renders a table with columns: short ID, filename, size, chunks, status, and upload time. Use `--json` for machine‑readable output.
+
+### `workforce training doc-delete`
+
+Remove a single document from a corpus by its short ID or full UUID.
+
+```sh
+workforce training doc-delete --agent default --corpus api-docs --doc a1b2c3d4
+```
+
+In direct mode, resolves 8‑character short IDs. In remote mode (`--gateway`), the full UUID is required.
+
 ## Database Migration Commands
 
-Move data from SQLite to Postgres (idempotent—safe to run multiple times).
+Move data from SQLite to Postgres. All are idempotent — safe to run multiple times. Recommended: stop the hub, run the migration, set the backend flag in `workforce.toml`, then restart.
 
 ### `workforce migrate-telemetry`
-
-Migrate telemetry data.
 
 ```sh
 workforce migrate-telemetry --config workforce.toml
@@ -932,15 +1166,11 @@ workforce migrate-telemetry --config workforce.toml
 
 ### `workforce migrate-identity`
 
-Migrate identity data.
-
 ```sh
 workforce migrate-identity --config workforce.toml
 ```
 
 ### `workforce migrate-pairing`
-
-Migrate pairing data.
 
 ```sh
 workforce migrate-pairing --config workforce.toml
@@ -948,10 +1178,58 @@ workforce migrate-pairing --config workforce.toml
 
 ### `workforce migrate-codegraph`
 
-Migrate code‑graph data.
-
 ```sh
 workforce migrate-codegraph --config workforce.toml
+```
+
+### `workforce migrate-mcp-store`
+
+```sh
+workforce migrate-mcp-store --config workforce.toml
+```
+
+### `workforce migrate-projects`
+
+```sh
+workforce migrate-projects --config workforce.toml
+```
+
+### `workforce migrate-permissions`
+
+```sh
+workforce migrate-permissions --config workforce.toml
+```
+
+### `workforce migrate-training`
+
+```sh
+workforce migrate-training --config workforce.toml
+```
+
+### `workforce migrate-self-learning`
+
+```sh
+workforce migrate-self-learning --config workforce.toml
+```
+
+### `workforce migrate-approvals`
+
+```sh
+workforce migrate-approvals --config workforce.toml
+```
+
+### `workforce migrate-sessions`
+
+Loads each agent workspace into memory during migration.
+
+```sh
+workforce migrate-sessions --config workforce.toml
+```
+
+### `workforce migrate-scheduler`
+
+```sh
+workforce migrate-scheduler --config workforce.toml
 ```
 
 After migration, update the relevant backend setting in `workforce.toml` (e.g., `[telemetry] backend = "postgres"`) and restart.
@@ -974,13 +1252,76 @@ Run security audit checks on the configuration.
 workforce audit --config workforce.toml
 ```
 
+## Shadow Commands
+
+Manage a shadow deployment for validating a new storage backend (Vellev) before cutting over. Shadow mode runs reads against both the current and new backends, compares results, and reports discrepancies.
+
+### `workforce shadow status`
+
+Show shadow‑mode status. Reports what is shadowed, whether shadowing is paused, the memory‑mirror backlog (when `[memory] backend == "shadow"`), and weekly verdicts.
+
+```sh
+workforce shadow status --config workforce.toml
+```
+
+Add `--hub <url>` and `--token <token>` to see per‑process counts from a running hub's `/api/health` shadow block.
+
+### `workforce shadow report`
+
+Print a weekly shadow comparison report for a store.
+
+```sh
+workforce shadow report --store memories --week 2026-03-09
+workforce shadow report --store artifacts --json
+```
+
+Options:
+- `--store <memories|artifacts>` — Which store to report on.
+- `--week <YYYY-MM-DD>` — Week start date (defaults to seven days before today).
+- `--json` — Machine‑readable output.
+
+### `workforce shadow pause`
+
+Print instructions for pausing shadow mode. Shadow mode is controlled by `[vellev.shadow] paused` in `workforce.toml` and is read once at hub start‑up; to pause, set it to `true` on every host and restart every hub replica.
+
+```sh
+workforce shadow pause
+```
+
+Pausing stops read comparisons, the memory mirror's noter and applier, reconcile runs, and known‑item scans. Erasure still reaches Vellev's replica; the artifact mirror keeps Vellev's artifact index in step.
+
+### `workforce shadow resume`
+
+Print instructions for resuming shadow mode. Set `[vellev.shadow] paused = false` on every host and restart every hub replica.
+
+```sh
+workforce shadow resume
+```
+
+### `workforce shadow promote`
+
+Promote Vellev to the primary backend for a store. Requires that every hub is stopped, the most recent weekly verdict passed, and a final reconcile plus a second clean pass leave nothing to fix.
+
+```sh
+workforce shadow promote --store memories --config workforce.toml
+workforce shadow promote --store artifacts --config workforce.toml --accept-too-few
+```
+
+`--accept-too-few` is only valid for artifacts, not memories. After promotion, update the backend setting in `workforce.toml` (e.g., `[memory] backend = "vellev"`) and restart the hubs.
+
+### `workforce shadow rollback`
+
+Roll back from Vellev to the previous backend. Memories written on Vellev since promotion are carried back first. Requires every hub stopped.
+
+```sh
+workforce shadow rollback --store memories --config workforce.toml
+```
+
 ## Plugin Commands
 
-Plugins extend the CLI itself.
+Plugin commands are not yet connected. They print placeholder output.
 
 ### `workforce plugin list`
-
-List installed plugins.
 
 ```sh
 workforce plugin list
@@ -988,23 +1329,17 @@ workforce plugin list
 
 ### `workforce plugin install`
 
-Install a plugin.
-
 ```sh
 workforce plugin install my-plugin
 ```
 
 ### `workforce plugin uninstall`
 
-Remove a plugin.
-
 ```sh
 workforce plugin uninstall my-plugin
 ```
 
 ### `workforce plugin status`
-
-Show plugin status and metadata.
 
 ```sh
 workforce plugin status my-plugin
@@ -1069,6 +1404,57 @@ Needs a system admin's sign-in.
 ```sh
 workforce eval restore --out ./runs/know-how
 ```
+
+## Decision Commands (`workforce decide`)
+
+Collect examples of agent decision points, turn them into training records, and query decision backends. These commands are hidden from `--help` output.
+
+### `workforce decide gather`
+
+Read install stores (workflow runs, decision records, turn traces) read‑only and write recorded examples as JSONL to stdout or an `--out` file.
+
+```sh
+workforce decide gather --config workforce.toml --use routing,branch --since 30d --out examples.jsonl
+```
+
+Options:
+- `--use <types>` — Comma‑separated example types: `routing`, `branch`, `scope`, `decide_first`.
+- `--since <span|moment>` — Time range, e.g., `30d` or `2026-09-01T00:00:00Z`.
+- `--limit <N>` — Maximum examples to gather.
+- `--workflows-dir <path>` — Path to workflow definitions.
+- `--out <path>` — Write JSONL to a file instead of stdout.
+
+Counts go to stderr: `X examples; Y left out: reason`. Each example carries `id`, `source`, `weight`, `day`, and `meta`.
+
+### `workforce decide export-states`
+
+Turn gathered examples into `{state, questions, label}` training records.
+
+```sh
+workforce decide export-states --input examples.jsonl --out records.jsonl
+```
+
+Options:
+- `--input <path>` — Examples JSONL (defaults to stdin).
+- `--out <path>` — Records JSONL (defaults to stdout).
+- `--state_chars <N>` — Character budget for state + questions.
+
+Records carry through `id`, `source`, `weight`, `day`, and `meta` from each example. Some examples produce no record ("nothing to decide about", "no label"); counts go to stderr.
+
+### `workforce decide ask`
+
+Send records to configured decision backends (`[decision]` in `workforce.toml`) and write each pick with probability and latency.
+
+```sh
+workforce decide ask --config workforce.toml --input records.jsonl --out picks.jsonl
+```
+
+Options:
+- `--agent <id>` — Agent whose vault provides API keys.
+- `--input <path>` — Records JSONL.
+- `--out <path>` — Picks JSONL.
+
+Uses the same tier keys as hub‑side work with no person behind it. Answered and empty counts go to stderr. On "busy" mid‑stream, the command stops and the remaining lines are not processed; rerun when free.
 
 ## Documentation Curator Command
 
