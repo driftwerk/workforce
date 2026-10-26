@@ -273,11 +273,12 @@ async fn read_capped(resp: reqwest::Response, limit: usize) -> Result<Vec<u8>, M
 /// failed after the connection was made. reqwest reports a failed TLS
 /// handshake as a connect error.
 fn send_failed(e: reqwest::Error) -> McpError {
-    if e.is_connect() || e.is_timeout() {
-        McpError::Unreachable(describe(&e))
+    let error = if e.is_connect() || e.is_timeout() {
+        McpError::Unreachable
     } else {
-        McpError::Transport(describe(&e))
-    }
+        McpError::Transport
+    };
+    error(describe(&e))
 }
 
 /// The scrubbed error with its whole source chain: reqwest's own text
