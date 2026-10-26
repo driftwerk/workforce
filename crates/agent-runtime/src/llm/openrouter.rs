@@ -1,6 +1,9 @@
+use std::collections::HashSet;
+use std::sync::{LazyLock, Mutex};
+
 use eyre::Result;
 use futures::StreamExt;
-use reqwest::Client;
+use reqwest::{Client, StatusCode};
 use tokio::sync::mpsc;
 
 use super::oai_common::{
@@ -111,6 +114,53 @@ impl OpenRouterClient {
         ))
     }
 
+    /// Post a chat request. A request that asked for no reasoning and was
+    /// refused (a 400) is sent once more asking for `minimal`; if that one
+    /// succeeds the model is remembered as needing reasoning, and if it
+    /// doesn't, the first refusal is what the caller sees. Every model with
+    /// mandatory reasoning refuses `none`, not always in the same words.
+    async fn send_chat(
+        &self,
+        request: &mut OaiRequest,
+        model: &str,
+    ) -> std::result::Result<std::result::Result<reqwest::Response, ApiFailure>, reqwest::Error>
+    {
+        let response = self.post_chat(request).await?;
+        if response.status().is_success() {
+            return Ok(Ok(response));
+        }
+        let failure = ApiFailure::read(response).await;
+        let asked_for_none = request
+            .reasoning
+            .as_ref()
+            .is_some_and(|r| r.effort == NO_REASONING);
+        if !asked_for_none || failure.status != StatusCode::BAD_REQUEST {
+            return Ok(Err(failure));
+        }
+        request.reasoning = Some(least_reasoning(LEAST_MANDATORY_REASONING));
+        let retry = self.post_chat(request).await?;
+        if !retry.status().is_success() {
+            return Ok(Err(failure));
+        }
+        learn_reasoning_required(model);
+        Ok(Ok(retry))
+    }
+
+    async fn post_chat(
+        &self,
+        request: &OaiRequest,
+    ) -> std::result::Result<reqwest::Response, reqwest::Error> {
+        self.client
+            .post(self.chat_url())
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .header("Content-Type", "application/json")
+            .header("HTTP-Referer", "https://github.com/driftwerk/workforce")
+            .header("X-Title", "Workforce AI Framework")
+            .json(request)
+            .send()
+            .await
+    }
+
     /// Send a message and get a response (non-streaming).
     pub async fn create_message(
         &self,
@@ -144,12 +194,12 @@ impl OpenRouterClient {
         // dropping the extraction. See `provider::with_reasoning_suppressed`
         // and `reasoning_for`.
         let suppress_reasoning = super::provider::reasoning_suppressed();
-        let request = OaiRequest {
+        let mut request = OaiRequest {
             model: Some(model.to_string()),
             messages: oai_messages,
             max_tokens: Some(max_tokens),
             tools: oai_tools,
-            reasoning: reasoning_for(suppress_reasoning, self.effective_thinking_budget()),
+            reasoning: reasoning_for(suppress_reasoning, self.effective_thinking_budget(), model),
             stream: Some(false),
         };
 
@@ -161,35 +211,23 @@ impl OpenRouterClient {
             "Sending request to OpenRouter"
         );
 
-        let response = self
-            .client
-            .post(self.chat_url())
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .header("Content-Type", "application/json")
-            .header("HTTP-Referer", "https://github.com/driftwerk/workforce")
-            .header("X-Title", "Workforce AI Framework")
-            .json(&request)
-            .send()
+        let response = match self
+            .send_chat(&mut request, model)
             .await
-            .map_err(|e| eyre::eyre!("OpenRouter HTTP request failed: {}", e))?;
-
-        let status = response.status();
-        if !status.is_success() {
-            let retry_after = response
-                .headers()
-                .get("retry-after")
-                .and_then(|v| v.to_str().ok())
-                .map(|v| v.to_string());
-            let error_body = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "unknown error".to_string());
-            let mut err_msg = format!("OpenRouter API error ({}): {}", status, error_body);
-            if let Some(retry) = retry_after {
-                err_msg.push_str(&format!(" (retry-after: {}s)", retry));
+            .map_err(|e| eyre::eyre!("OpenRouter HTTP request failed: {}", e))?
+        {
+            Ok(response) => response,
+            Err(failure) => {
+                let mut err_msg = format!(
+                    "OpenRouter API error ({}): {}",
+                    failure.status, failure.body
+                );
+                if let Some(retry) = failure.retry_after {
+                    err_msg.push_str(&format!(" (retry-after: {}s)", retry));
+                }
+                return Err(eyre::eyre!(err_msg));
             }
-            return Err(eyre::eyre!(err_msg));
-        }
+        };
 
         let api_response: OaiResponse = response
             .json()
@@ -264,12 +302,12 @@ impl OpenRouterClient {
         let oai_tools = build_tool_defs(tools);
 
         let suppress_reasoning = super::provider::reasoning_suppressed();
-        let request = OaiRequest {
+        let mut request = OaiRequest {
             model: Some(model.to_string()),
             messages: oai_messages,
             max_tokens: Some(max_tokens),
             tools: oai_tools,
-            reasoning: reasoning_for(suppress_reasoning, self.effective_thinking_budget()),
+            reasoning: reasoning_for(suppress_reasoning, self.effective_thinking_budget(), model),
             stream: Some(true),
         };
 
@@ -281,27 +319,20 @@ impl OpenRouterClient {
             "Sending streaming request to OpenRouter"
         );
 
-        let response = self
-            .client
-            .post(self.chat_url())
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .header("Content-Type", "application/json")
-            .header("HTTP-Referer", "https://github.com/driftwerk/workforce")
-            .header("X-Title", "Workforce AI Framework")
-            .json(&request)
-            .send()
+        let response = match self
+            .send_chat(&mut request, model)
             .await
-            .map_err(|e| eyre::eyre!("OpenRouter streaming request failed: {}", e))?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let error_body = response.text().await.unwrap_or_default();
-            return Err(eyre::eyre!(
-                "OpenRouter streaming API error ({}): {}",
-                status,
-                error_body
-            ));
-        }
+            .map_err(|e| eyre::eyre!("OpenRouter streaming request failed: {}", e))?
+        {
+            Ok(response) => response,
+            Err(failure) => {
+                return Err(eyre::eyre!(
+                    "OpenRouter streaming API error ({}): {}",
+                    failure.status,
+                    failure.body
+                ));
+            }
+        };
 
         // Parse SSE stream (standard OpenAI format: data: {json}\n\n)
         let mut stream = response.bytes_stream();
@@ -485,18 +516,86 @@ impl OpenRouterClient {
     }
 }
 
+/// A non-success reply from the chat endpoint.
+struct ApiFailure {
+    status: StatusCode,
+    retry_after: Option<String>,
+    body: String,
+}
+
+impl ApiFailure {
+    async fn read(response: reqwest::Response) -> Self {
+        let status = response.status();
+        let retry_after = response
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.to_string());
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "unknown error".to_string());
+        Self {
+            status,
+            retry_after,
+            body,
+        }
+    }
+}
+
+const NO_REASONING: &str = "none";
+/// The least reasoning a model with mandatory reasoning accepts. Not used
+/// for models that allow `none`: DeepSeek v4 Pro reasons more on `minimal`
+/// than with no `reasoning` field at all.
+const LEAST_MANDATORY_REASONING: &str = "minimal";
+
+/// Models that refused `reasoning: none` and then accepted `minimal`,
+/// learned from the API: OpenRouter's model catalogue doesn't say which
+/// models' reasoning is mandatory.
+static REASONING_REQUIRED: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(Default::default);
+
+fn reasoning_required(model: &str) -> bool {
+    REASONING_REQUIRED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(model)
+}
+
+fn learn_reasoning_required(model: &str) {
+    let learned = REASONING_REQUIRED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(model.to_string());
+    if learned {
+        tracing::info!(
+            model,
+            "OpenRouter: model refuses reasoning `none`; asking it for `minimal` from now on"
+        );
+    }
+}
+
+fn least_reasoning(effort: &str) -> ReasoningConfig {
+    ReasoningConfig {
+        effort: effort.to_string(),
+    }
+}
+
 /// The request's `reasoning` field. A suppressed call, or a thinking budget
-/// of zero, asks for `minimal` effort outright: leaving the field out lets a
-/// model that reasons by default (DeepSeek v4 Pro) spend the whole token
-/// budget thinking, and `none` is refused outright by every model whose
-/// reasoning is mandatory (Claude Sonnet and Opus, Gemini, GLM, Qwen Max,
-/// GPT-6.1). `minimal` is accepted by every OpenRouter tier model and keeps
-/// reasoning near zero.
-fn reasoning_for(suppressed: bool, thinking_budget: Option<u32>) -> Option<ReasoningConfig> {
+/// of zero, asks for the least reasoning the model allows: `none`, or
+/// `minimal` for a model known to refuse `none` (see `send_chat`). Leaving
+/// the field out isn't suppression: a model that reasons by default spends
+/// the budget thinking anyway.
+fn reasoning_for(
+    suppressed: bool,
+    thinking_budget: Option<u32>,
+    model: &str,
+) -> Option<ReasoningConfig> {
     if suppressed || thinking_budget == Some(0) {
-        return Some(ReasoningConfig {
-            effort: "minimal".to_string(),
-        });
+        return Some(least_reasoning(if reasoning_required(model) {
+            LEAST_MANDATORY_REASONING
+        } else {
+            NO_REASONING
+        }));
     }
     build_reasoning_config(thinking_budget)
 }
@@ -522,74 +621,255 @@ mod tests {
 
     // OAI conversion, cache control, and build_messages tests live in oai_common.rs.
 
-    #[tokio::test]
-    async fn a_suppressed_call_asks_for_minimal_reasoning_outright() {
+    fn ok_body() -> serde_json::Value {
+        serde_json::json!({
+            "choices": [{"message": {"role": "assistant", "content": "notes"},
+                         "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+            "model": "m"
+        })
+    }
+
+    fn effort(effort: &str) -> wiremock::matchers::BodyPartialJsonMatcher {
+        body_partial_json(serde_json::json!({"reasoning": {"effort": effort}}))
+    }
+
+    async fn suppressed_call(client: &OpenRouterClient, model: &str) -> Result<LlmResponse> {
         use crate::llm::types::{ContentBlock, Role};
 
-        // DeepSeek v4 Pro reasons when the field is absent, and models with
-        // mandatory reasoning refuse "none", so suppression says "minimal".
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/api/v1/chat/completions"))
-            .and(body_partial_json(
-                serde_json::json!({"reasoning": {"effort": "minimal"}}),
-            ))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "choices": [{"message": {"role": "assistant", "content": "notes"},
-                             "finish_reason": "stop"}],
-                "model": "deepseek/deepseek-v4-pro"
-            })))
-            .expect(1)
-            .mount(&server)
-            .await;
-        let client = OpenRouterClient::new("sk-or-v1-test").with_base_url(server.uri());
         let messages = [LlmMessage {
             role: Role::User,
             content: vec![ContentBlock::Text {
                 text: "summarise".into(),
             }],
         }];
-        let response = crate::llm::provider::with_reasoning_suppressed(client.create_message(
+        crate::llm::provider::with_reasoning_suppressed(client.create_message(
             None,
             &messages,
             &[],
-            None,
+            Some(model),
             Some(2_000),
             false,
         ))
         .await
-        .expect("the mock only answers a request that asks for minimal reasoning");
+    }
+
+    #[tokio::test]
+    async fn a_model_that_allows_no_reasoning_gets_none_first_time() {
+        // DeepSeek v4 Pro: no `reasoning` field reasons by default, and
+        // `minimal` reasons more still; only `none` stops it.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(effort("none"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ok_body()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(effort("minimal"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ok_body()))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let client = OpenRouterClient::new("k").with_base_url(server.uri());
+        let response = suppressed_call(&client, "test/allows-none").await.unwrap();
         assert_eq!(response.text().as_deref(), Some("notes"));
+    }
+
+    #[tokio::test]
+    async fn a_model_that_refuses_none_is_asked_for_minimal_and_remembered() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(effort("none"))
+            .respond_with(ResponseTemplate::new(400).set_body_string(
+                r#"{"error":{"message":"Reasoning is mandatory for this endpoint and cannot be disabled."}}"#,
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(effort("minimal"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ok_body()))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let client = OpenRouterClient::new("k").with_base_url(server.uri());
+        let model = "test/needs-reasoning";
+        assert_eq!(
+            suppressed_call(&client, model)
+                .await
+                .unwrap()
+                .text()
+                .as_deref(),
+            Some("notes")
+        );
+        // The second call goes straight to `minimal`: `none` is asked once.
+        suppressed_call(&client, model).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_refusal_the_retry_does_not_fix_surfaces_the_first_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(effort("none"))
+            .respond_with(ResponseTemplate::new(400).set_body_string("the first refusal"))
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(effort("minimal"))
+            .respond_with(ResponseTemplate::new(400).set_body_string("the retry's refusal"))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let client = OpenRouterClient::new("k").with_base_url(server.uri());
+        let model = "test/broken-request";
+        let err = suppressed_call(&client, model).await.unwrap_err();
+        assert!(err.to_string().contains("the first refusal"), "{err}");
+        // Not remembered: the next call asks for `none` again.
+        let again = suppressed_call(&client, model).await.unwrap_err();
+        assert!(again.to_string().contains("the first refusal"), "{again}");
+    }
+
+    #[tokio::test]
+    async fn a_streaming_call_is_asked_again_before_anything_is_streamed() {
+        use crate::llm::types::{ContentBlock, Role};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(effort("none"))
+            .respond_with(ResponseTemplate::new(400).set_body_string("Provider returned error"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"notes\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5}}\n\ndata: [DONE]\n\n";
+        Mock::given(method("POST"))
+            .and(effort("minimal"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = OpenRouterClient::new("k").with_base_url(server.uri());
+        let messages = [LlmMessage {
+            role: Role::User,
+            content: vec![ContentBlock::Text { text: "hi".into() }],
+        }];
+        let (tx, mut rx) = mpsc::channel(64);
+        crate::llm::provider::with_reasoning_suppressed(client.create_message_stream(
+            None,
+            &messages,
+            &[],
+            Some("test/streams-needs-reasoning"),
+            Some(2_000),
+            false,
+            tx,
+        ))
+        .await
+        .unwrap();
+        let mut text = String::new();
+        while let Some(event) = rx.recv().await {
+            if let StreamEvent::TextDelta { text: t, .. } = event {
+                text.push_str(&t);
+            }
+        }
+        assert_eq!(text, "notes");
+    }
+
+    /// Every OpenRouter tier model, asked with reasoning suppressed, ends
+    /// with text well inside its cap. Run against the live API with a
+    /// realistic prompt — a toy prompt hides how much a model reasons:
+    ///
+    /// `OPENROUTER_API_KEY=… OPENROUTER_LIVE_PROMPT=<file> cargo test -p
+    /// workforce-agent --lib live_suppressed -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore = "calls OpenRouter; needs OPENROUTER_API_KEY and OPENROUTER_LIVE_PROMPT"]
+    async fn live_suppressed_calls_end_with_text_on_every_tier_model() {
+        use crate::llm::types::{ContentBlock, Role};
+
+        const CAP: u32 = 4_000;
+        let key = std::env::var("OPENROUTER_API_KEY").expect("OPENROUTER_API_KEY");
+        let prompt = std::fs::read_to_string(
+            std::env::var("OPENROUTER_LIVE_PROMPT").expect("OPENROUTER_LIVE_PROMPT"),
+        )
+        .expect("read the prompt file");
+        let tiers: toml::Table = include_str!("default_tiers.toml").parse().unwrap();
+        let mut models: Vec<String> = tiers["openrouter"]
+            .as_table()
+            .unwrap()
+            .values()
+            .filter_map(toml::Value::as_table)
+            .flat_map(|t| {
+                t.values()
+                    .filter_map(toml::Value::as_str)
+                    .map(str::to_string)
+            })
+            .collect();
+        models.sort();
+        models.dedup();
+
+        let client = OpenRouterClient::new(&key);
+        let messages = [LlmMessage {
+            role: Role::User,
+            content: vec![ContentBlock::Text { text: prompt }],
+        }];
+        let mut failures = Vec::new();
+        for model in &models {
+            for attempt in 1..=2 {
+                let outcome = crate::llm::provider::with_reasoning_suppressed(
+                    client.create_message(None, &messages, &[], Some(model), Some(CAP), false),
+                )
+                .await;
+                let line = match &outcome {
+                    Ok(r) => {
+                        let text = r.text().unwrap_or_default();
+                        let ok = r.stop_reason == StopReason::EndTurn
+                            && !text.trim().is_empty()
+                            && r.usage.output_tokens < CAP;
+                        format!(
+                            "{} {model} #{attempt}: stop={:?} output_tokens={} text_chars={}",
+                            if ok { "PASS" } else { "FAIL" },
+                            r.stop_reason,
+                            r.usage.output_tokens,
+                            text.len()
+                        )
+                    }
+                    Err(e) => format!(
+                        "FAIL {model} #{attempt}: {}",
+                        e.to_string().chars().take(160).collect::<String>()
+                    ),
+                };
+                println!("LIVE {line}");
+                if line.starts_with("FAIL") {
+                    failures.push(line);
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{failures:#?}");
     }
 
     #[test]
     fn reasoning_is_left_to_the_model_unless_asked_for_or_suppressed() {
-        assert!(reasoning_for(false, None).is_none());
-        assert_eq!(reasoning_for(false, Some(5_000)).unwrap().effort, "medium");
-        assert_eq!(reasoning_for(true, Some(20_000)).unwrap().effort, "minimal");
-        assert_eq!(reasoning_for(false, Some(0)).unwrap().effort, "minimal");
-    }
-
-    #[test]
-    fn no_openrouter_request_ever_asks_for_no_reasoning() {
-        // "none" is a 400 on every model whose reasoning is mandatory.
-        for suppressed in [false, true] {
-            for budget in [
-                None,
-                Some(0),
-                Some(1),
-                Some(2_000),
-                Some(8_000),
-                Some(50_000),
-            ] {
-                if let Some(config) = reasoning_for(suppressed, budget) {
-                    assert_ne!(
-                        config.effort, "none",
-                        "suppressed={suppressed} budget={budget:?}"
-                    );
-                }
-            }
-        }
+        assert!(reasoning_for(false, None, "m").is_none());
+        assert_eq!(
+            reasoning_for(false, Some(5_000), "m").unwrap().effort,
+            "medium"
+        );
+        assert_eq!(
+            reasoning_for(true, Some(20_000), "m").unwrap().effort,
+            "none"
+        );
+        assert_eq!(reasoning_for(false, Some(0), "m").unwrap().effort, "none");
+        learn_reasoning_required("test/known-mandatory");
+        assert_eq!(
+            reasoning_for(true, None, "test/known-mandatory")
+                .unwrap()
+                .effort,
+            "minimal"
+        );
     }
 
     use wiremock::matchers::{bearer_token, body_partial_json, method, path};
