@@ -710,10 +710,18 @@ async fn an_http_500_is_a_transport_error_not_unreachable() {
     assert!(!err.is_unreachable());
 }
 
+/// What a raw server does after sending a 200 that promises more body than
+/// it writes.
+#[derive(Clone, Copy)]
+enum AfterHeaders {
+    HangUp,
+    Stall,
+}
+
 /// A server that reads the whole request, then sends a 200 promising more
-/// body than it writes and hangs up, so the failure comes from reading the
-/// body after the response headers arrived.
-async fn serve_truncated_body() -> std::net::SocketAddr {
+/// body than it writes, so the failure comes from reading the body after
+/// the response headers arrived.
+async fn serve_truncated_body(after: AfterHeaders) -> std::net::SocketAddr {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -733,7 +741,10 @@ async fn serve_truncated_body() -> std::net::SocketAddr {
             )
             .await
             .unwrap();
-        socket.shutdown().await.unwrap();
+        match after {
+            AfterHeaders::HangUp => socket.shutdown().await.unwrap(),
+            AfterHeaders::Stall => std::future::pending().await,
+        }
     });
     addr
 }
@@ -753,11 +764,27 @@ fn request_complete(request: &[u8]) -> bool {
 
 #[tokio::test]
 async fn a_body_cut_off_after_the_headers_is_a_transport_error() {
-    let addr = serve_truncated_body().await;
+    let addr = serve_truncated_body(AfterHeaders::HangUp).await;
 
     let err = initialize_err(&format!("http://{addr}/"), reqwest::Client::new()).await;
     assert!(
         matches!(err, McpError::Transport(ref m) if m.contains("response body")),
+        "got {err:?}"
+    );
+    assert!(!err.is_unreachable());
+}
+
+#[tokio::test]
+async fn a_timeout_after_the_headers_is_a_transport_error_not_unreachable() {
+    let addr = serve_truncated_body(AfterHeaders::Stall).await;
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_millis(200))
+        .build()
+        .unwrap();
+
+    let err = initialize_err(&format!("http://{addr}/"), http).await;
+    assert!(
+        matches!(err, McpError::Transport(ref m) if m.contains("timed out")),
         "got {err:?}"
     );
     assert!(!err.is_unreachable());
