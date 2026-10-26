@@ -1,6 +1,6 @@
 ---
 title: Configuration
-description: Overview of workforce system configuration and available sections.
+description: Overview of workforce system configuration — the workforce.toml file, its top-level sections, and the three-layer config cascade.
 ---
 
 # Configuration
@@ -11,38 +11,81 @@ The workforce system is configured via a `workforce.toml` file. This page introd
 The configuration is hierarchical: global settings apply to all agents, but you can override them per-agent or per-team.
 </Callout>
 
-## Sections
+## Available sections
+
+The following top-level sections can appear in `workforce.toml`. Sections marked **off by default** must be explicitly enabled.
+
+| Section | Purpose | Default |
+|---|---|---|
+| `[hub]` | Listen address, data directory, logging, lifecycle | — |
+| `[nats]` | Messaging backbone URL, credentials, TLS | — |
+| `[cluster]` | Multi-instance guard | — |
+| `[postgres]` | Shared database for stores (telemetry, identity, codegraph, etc.) | disabled |
+| `[weaviate]` | Vector database for memory and knowledge | disabled |
+| `[vellev]` | Alternative vector database backend | — |
+| `[memory]` | Persistent agent memory, consolidation, lesson extraction | off by default |
+| `[embeddings]` | Embedding model for vector operations | provider `"none"` |
+| `[llm]` | AI provider, model, failover chain, retry, pacing, modality blocks | — |
+| `[subscription]` | Claude Code / ChatGPT / Codex CLI plan settings | — |
+| `[budget]` | Per-day and per-agent spending caps | enabled |
+| `[tools]` | Tool validation, loading, programs, compile gate, refactor | — |
+| `[code_context]` | Answer-ready code-context injection | **off by default** |
+| `[claim_grounding]` | Data-claim and commitment review | **off by default** |
+| `[scheduler]` | Pinned session configuration | — |
+| `[research]` | Adversarial research kill switch | — |
+| `[handoff]` | Agent handoff verification kill switch | — |
+| `[know_how]` | Learned knowledge extraction and injection | opt-in |
+| `[attachments]` | Video frame sampling for attachments | — |
+| `[monitor]` | Poll-based monitors for external triggers | — |
+| `[heartbeat]` | Periodic agent check-ins and monitoring | **off by default** |
+| `[session_lifecycle]` | Daily reset, idle expiry, archival | — |
+| `[session_policies]` | Per-type and per-channel session policies | — |
+| `[gateway]` | Web gateway, auth, CORS, OIDC | — |
+| `[github]` | GitHub token and default owner | — |
+| `[vault]` | Encrypted secrets backend | — |
+| `[skills]` | External integrations (GitHub, Slack, MCP servers, etc.) | — |
+| `[environments]` | Install kill switch for environments | — |
+| `[dm_routing]` | DM routing rules and default agent | — |
+| `[briefing]` | Scheduled daily summaries | **off by default** |
+| `[agent_comms]` | Agent-to-agent message oversight | — |
+| `[groups]` | Group channel configuration | — |
+| `[shared_channels]` | Multi-agent channel entries | — |
+| `[mcp]` | Model Context Protocol servers | — |
+| `[remote_mcp]` | Remote MCP access tokens and limits | — |
+| `[claude_chat]` | `/cc` chat with Claude Code | — |
+| `[codex_chat]` | `/cc` chat with Codex (ChatGPT plan) | — |
+| `[coding_session]` | Coding session engine, model, and limits | — |
+| `[exec]` | Code execution runner and sandbox | — |
+| `[decision]` | Decision backends, branch fallback, scope gate | — |
+| `[privacy]` | Privacy gateway settings | — |
+| `[advisor]` | Second-opinion advisor for review | **off by default** |
+| `[self_learning]` | Agent self-improvement from interactions | **off by default** |
+| `[worker_read_sources]` | Read-source tools gate | **off by default** |
+| `[training]` | Per-agent training corpora and file uploads | enabled |
+| `[workflows]` | Concurrent run limit per owner | — |
+| `[curator]` | `workforce docs curate` defaults | — |
+| `[tracing]` | LLM fine-tuning trace capture | enabled |
+| `[artifacts]` | Artifact storage backend (filesystem or S3) | — |
+| `[knowledge]` | Codebase indexing and search | — |
+| `[aws_s3]` | Read-only AWS S3 access | — |
+| `[aws_infra]` | Read-only AWS ECS/ECR/ELB/RDS/STS tools | — |
+| `[games]` | `/games` AI player arena | — |
+| `[local_agents]` | Local agent support | — |
+| `[telemetry]` | Activity and cost retention | — |
+| `[permissions]` | Role-based access control | **off by default** |
+| `[approvals]` | Destructive-action approval workflow | **off by default** |
+| `[projects]` | Project session TTL and concurrency | — |
+| `timezone` | IANA timezone name (root key, before first section) | UTC |
 
 <Cards>
-<Card title="Hub Settings" href="/docs/configuration/hub" description="Server address, data directory, logging, and lifecycle settings." />
-<Card title="LLM Provider" href="/docs/configuration/llm" description="Configure AI models, providers, failover chains, and retry policies." />
-<Card title="Agents" href="/docs/configuration/agents" description="Define individual AI assistants with their own workspaces and capabilities." />
-<Card title="Memory & Knowledge" href="/docs/configuration/memory-knowledge" description="Set up persistent memory, embeddings, and codebase knowledge indexing." />
 <Card title="Vault" href="/docs/configuration/vault" description="Secure encrypted storage for secrets like API keys and tokens." />
-<Card title="Gateway & API" href="/docs/configuration/gateway" description="Configure the web gateway, authentication, and CORS settings." />
-<Card title="Skills & Integrations" href="/docs/configuration/skills" description="Add external integrations like GitHub, Slack, and MCP servers." />
-<Card title="Teams" href="/docs/configuration/teams" description="Define multi-agent teams with roles, expertise, and collaboration patterns." />
 <Card title="Session Policies" href="/docs/configuration/policies" description="Manage session lifecycle, daily resets, and idle expiration." />
-<Card title="Heartbeat" href="/docs/configuration/heartbeat" description="Configure periodic agent check-ins and automated monitoring." />
-<Card title="Advisor" href="/docs/configuration/advisor" description="Set up a second-opinion advisor for review and validation." />
-<Card title="Claude Code Chat" href="/docs/configuration/claude-chat" description="Configure `/cc` chat with Claude Code and exposed tools." />
-<Card title="Doc Curator" href="/docs/configuration/curator" description="Configure `workforce docs curate` for documentation maintenance." />
-<Card title="Training" href="/docs/configuration/training" description="Configure per-agent training corpora and file uploads." />
-<Card title="Tracing" href="/docs/configuration/tracing" description="Configure LLM fine-tuning trace capture." />
-<Card title="Vision & Transcription" href="/docs/configuration/vision-transcription" description="Configure separate AI models for image description and audio transcription." />
-<Card title="Image Generation" href="/docs/configuration/image-generation" description="Opt-in image generation capabilities." />
-<Card title="Local Agents" href="/docs/configuration/local-agents" description="Enable local agent support." />
-<Card title="Agent Communications" href="/docs/configuration/agent-comms" description="Oversight for agent-to-agent messages." />
-<Card title="Daily Briefing" href="/docs/configuration/briefing" description="Scheduled daily summaries." />
-<Card title="Workflows" href="/docs/configuration/workflows" description="Execution limits for workflows and playbooks." />
-<Card title="AWS S3 Tool" href="/docs/configuration/aws-s3" description="Configure read-only AWS S3 access." />
-<Card title="AWS Infrastructure Tools" href="/docs/configuration/aws-infra" description="Configure read-only AWS ECS/ECR/ELB/RDS/STS tools." />
-<Card title="Team-Building Games" href="/docs/configuration/games" description="Setup for the `/games` AI player arena." />
+<Card title="Subscription Tiers" href="/docs/configuration/tiers" description="Configure LLM login tiers and shared-login access rules." />
 </Cards>
 
 ## Quick Start
 
-A minimal configuration file looks like this:
+A minimal `workforce.toml` at your project root:
 
 ```toml
 [hub]
@@ -56,6 +99,8 @@ url = "nats://localhost:4222"
 provider = "anthropic"
 default_model = "claude-sonnet-4-20250514"
 max_tokens = 8192
+max_rounds = 50
+failover = ["openrouter:deepseek"]
 
 [[agents]]
 id = "default"
@@ -63,11 +108,13 @@ workspace = "./data/agents/default"
 default = true
 ```
 
-Place this file in your project root and run:
+Then run:
 
 ```bash
 workforce start
 ```
+
+Provider specs use the `<provider>:<model>` format (e.g. `openrouter:google:standard` or `claude-code:sonnet`). The `failover` list is tried in order when the primary provider is rate-limited or unhealthy.
 
 ## Subscription providers
 
@@ -117,25 +164,31 @@ Each setting is shown with its value, where the value comes from, and a status w
 
 Keys and tokens are never shown, only whether one is set and at which vault level. Install-wide settings are shown to admins.
 
-## Additional Configuration Areas
+## Config cascade
 
-The system includes several advanced configuration areas:
+Settings are resolved from three layers:
 
-- **Postgres Backend**: Optional shared database for stores like telemetry, identity, and pairing data.
-- **Permissions Cascade**: Role-based access control with per-user overrides.
-- **MCP Servers**: Connect to external Model Context Protocol servers.
-- **OAuth Identity**: Single sign-on with OIDC/OAuth2 providers.
-- **Vision & Transcription**: Configure separate AI models for image description and audio transcription.
-- **Image Generation**: Opt-in image generation capabilities.
-- **Local Agents**: Enable local agent support.
-- **Agent Communications**: Oversight for agent-to-agent messages.
-- **Daily Briefing**: Scheduled daily summaries.
-- **Slack Channel Overrides**: Per-channel customization.
-- **AWS S3**: Read-only AWS S3 tool with allowlist and role assumption.
-- **Workflows**: Per-owner concurrency limits for workflow execution.
-- **Team-Building Games**: Multi-agent games arena (`/games`).
-- **AWS Infrastructure Tools**: Read-only tools for ECS, ECR, ELB, RDS and STS.
+1. **`workforce.toml`** — global defaults for all agents.
+2. **`{workspace}/config.toml`** — per-agent overrides. Unset fields inherit from global; some sections (like `[llm.vision]`, `[llm.transcription]`, `[llm.image]`, `[llm.pacing]`) use whole-block override. Changes are hot-reloaded per-turn for many sections.
+3. **Vault** — secrets only, resolved via `${vault:path}` references at access time.
+
+You can also use **`${VAR}`** and **`${VAR:-default}`** syntax for environment variable expansion in `workforce.toml`. Relative paths in `data_dir`, `vault.path`, and `vault.key_file` anchor to the config file directory, not the process working directory.
+
+An optional **`{data_dir}/workforce.overlay.toml`** merges over the base config at the raw-table level (before env expansion). If the overlay is unparseable, the system boots with the base config only and logs the error.
+
+### Per-agent configuration
+
+Agent definitions go in the `[[agents]]` array. The agent marked `default = true` (or the first in the list if none is marked) is used when no explicit agent is specified. Each agent can override:
+
+- `llm`, `vault`, `compaction`, `memory`, `knowledge`, `access`, `scope`, `user_map`
+- `owner_id`, `owner_type`, `advisor`, `advisor_mode`
+
+Duplicate agent IDs are rejected; only one agent may be `default`.
 
 ## Next Steps
 
-Click any section card above to learn detailed configuration options. The default `workforce.toml` generated by the system includes examples for each section.
+- See [Vault](/docs/configuration/vault) to set up encrypted secrets storage.
+- See [Session Policies](/docs/configuration/policies) to configure session lifecycle and idle expiry.
+- See [Subscription Tiers](/docs/configuration/tiers) for login tier configuration.
+- Read about [Subscriptions](/docs/concepts/subscriptions) to understand how Claude Code and ChatGPT plans connect.
+- Browse the table above for the section you need — the default `workforce.toml` generated by the system includes commented examples for most sections.
