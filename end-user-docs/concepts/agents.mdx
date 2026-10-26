@@ -41,9 +41,9 @@ You can manage agents live without restarting the system using these tools (avai
 
 *   `agent.list` - List all agents defined in the workforce config.
 *   `agent.show` - Show the full details of a single agent by its ID.
-*   `agent.create` - Create a new agent. Requires admin (`AgentsManage`) capability.
-*   `agent.update` - Update an existing agent. Requires admin (`AgentsManage`) capability.
-*   `agent.delete` - Delete an agent from the workforce config by its ID. Requires admin (`AgentsManage`) capability.
+*   `agent.create` - Create a new agent. Requires the `Agent.manage` capability.
+*   `agent.update` - Update an existing agent. Requires the `Agent.manage` capability.
+*   `agent.delete` - Delete an agent from the workforce config by its ID. Requires the `Agent.manage` capability.
 
 Changes made via `agent.create`, `agent.update`, or `agent.delete` are stored in a configuration overlay and take effect within seconds.
 
