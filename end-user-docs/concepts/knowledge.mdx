@@ -25,6 +25,7 @@ The hub pulls repositories into a private checkout area under `{data_dir}/knowle
 - GitHub repositories (`source: {kind: github, owner, repo}`)
 - Standalone repos discovered under `{workspace}/repos/{owner}/{repo}/.git`
 - Every repo referenced by every project across every agent
+- Git repositories defined by direct URL (`source: {kind: git, url}`)
 
 ### Automatic Maintenance
 
@@ -47,6 +48,8 @@ Ask a natural‑language question about the codebase.
   "question": "How does authentication work in the auth module?"
 }
 ```
+
+Optional inputs include `scope` (a directory to narrow the search), `depth` (`"quick"` or `"thorough"`), and `repo` (a specific indexed repo name).
 
 When the symbol graph returns no matches or low-confidence answers, the tool points you to search the actual file content with `repo.grep` — this is crucial because the symbol graph only sees code symbols (functions, classes, types), not prose, naming conventions, design docs, specs, config, or comments. The answer often lives there.
 
@@ -75,6 +78,8 @@ Get detailed explanation of a specific code entity.
 }
 ```
 
+`entity` can be an entity ID or a name. `aspect` is optional and can be one of `"full"`, `"flow"`, `"dependencies"`, `"usage"`, or `"testing"`.
+
 ### `knowledge.impact`
 
 Analyze the impact of a proposed code change.
@@ -87,6 +92,8 @@ Analyze the impact of a proposed code change.
 }
 ```
 
+`scope` is `"direct"` (one hop) or `"full"` (three hops).
+
 ### `knowledge.overview`
 
 Get a codebase architecture overview with statistics and modules.
@@ -98,9 +105,11 @@ Get a codebase architecture overview with statistics and modules.
 }
 ```
 
+`detail` can be `"summary"` or `"full"`.
+
 ### `knowledge.graph`
 
-Query the code knowledge graph for entity relationships (callers, callees, imports, implementations, tests, dependencies).
+Query the code knowledge graph for entity relationships. Supported queries: `callers_of`, `callees_of`, `imports_of`, `implementations_of`, `tests_for`, `depends_on`, and `affected_by`.
 
 ```json
 {
@@ -122,8 +131,8 @@ Trigger or check indexing status.
 
 Actions:
 
-- `status`: returns index completeness, vector‑store health, active leases, stale rows, and recent failures
-- `trigger`: dispatches the appropriate pipeline (`full`, `incremental`, `ResumeSummaries`, or `Complete`)
+- `status`: returns index completeness, vector‑store health, active leases, stale rows, recent failures, and the next recommended action
+- `trigger`: dispatches the appropriate pipeline based on the repo’s current state (`full`, `incremental`, `ResumeSummaries`, or reports the index is already current)
 - `trigger_full`: forces a full rebuild
 - `cancel`: releases the indexing lease
 
@@ -150,7 +159,7 @@ Drop an indexed repo (graph + vector store).
 
 Actions:
 
-- `action: repo`: drops one repo by `source` (preferred) or legacy `repo_id`. When the repo is referenced by multiple projects, `force: true` is required.
+- `action: repo`: drops one repo by `source` (preferred) or legacy `repo_id`. Use `check_only: true` to inspect multi‑project usage before deleting. When the repo is referenced by multiple projects, `force: true` is required.
 - `action: prune`: drops every repo not in `known_repo_ids` — defaults to dry‑run; pass `confirm: true` and (when over 10) `acknowledge_count=<n>` to actually delete. Refuses prune with empty `known_repo_ids`. Use `lineage_filter` to target specific categories (e.g., `["migration_orphan"]` to clean up pre‑DW‑506 leftovers).
 
 ### `repo.grep`
@@ -164,6 +173,8 @@ Search the actual current file content of an indexed repository by regex — the
   "path": "billing"
 }
 ```
+
+Optional inputs include `glob`, `case_insensitive`, and `max_matches`.
 
 ### `repo.read`
 
@@ -206,7 +217,7 @@ Each target in a maintenance pass goes through:
 
 ## Vector Store Health
 
-When vector storage is enabled (Weaviate), `knowledge.status` includes a `vector_backend` field with one of:
+When vector storage is enabled, `knowledge.status` includes a `vector_backend` field with one of:
 
 - `disabled`: vector store not configured
 - `healthy`: recent insert‑errors window is empty
