@@ -1,0 +1,35 @@
+name: Deploy signal
+
+# When CI and the image for a push to main have both passed, asks the deploy
+# side to move its pin now rather than at its next scheduled check, which
+# GitHub can drop under load. Whichever of the two finishes second finds both
+# done; the deploy side checks CI and the image again itself, so an early or
+# repeated signal does no harm. The token and its target live in the
+# `deploy-signal` environment, which only main may use, and the token can do
+# nothing but start workflows there.
+
+on:
+  workflow_run:
+    workflows: [Image, PR Check]
+    types: [completed]
+    branches: [main]
+
+permissions: {}
+
+jobs:
+  signal:
+    name: Signal the deploy side
+    if: github.event.workflow_run.event == 'push' && github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    environment: deploy-signal
+    steps:
+      - env:
+          GH_TOKEN: ${{ secrets.DEPLOY_SIGNAL_TOKEN }}
+          TARGET_REPO: ${{ vars.DEPLOY_SIGNAL_REPO }}
+          TARGET_WORKFLOW: ${{ vars.DEPLOY_SIGNAL_WORKFLOW }}
+        run: |
+          if [ -z "$GH_TOKEN" ] || [ -z "$TARGET_REPO" ] || [ -z "$TARGET_WORKFLOW" ]; then
+            echo "::notice::deploy-signal isn't configured; the deploy side's schedule picks this push up"
+            exit 0
+          fi
+          gh workflow run "$TARGET_WORKFLOW" -R "$TARGET_REPO" --ref main
