@@ -195,6 +195,7 @@ async fn curate(args: CurateArgs) -> Result<()> {
                     sources: Vec::new(),
                     summary: String::new(),
                     still_failing: Vec::new(),
+                    citations: Vec::new(),
                     status: PageStatus::Skipped,
                 }
             }
@@ -295,6 +296,8 @@ struct PageOutcome {
     summary: String,
     /// Examples that failed their check before the edit and still do.
     still_failing: Vec<String>,
+    /// Where the applied changes' evidence stands.
+    citations: Vec<String>,
     status: PageStatus,
 }
 
@@ -353,6 +356,7 @@ async fn curate_single_page(
             sources: Vec::new(),
             summary: String::new(),
             still_failing: Vec::new(),
+            citations: Vec::new(),
             status: PageStatus::Skipped,
         });
     }
@@ -410,6 +414,7 @@ async fn curate_single_page(
         input_tokens,
         output_tokens,
         still_failing,
+        citations,
     } = curation
     else {
         if let Curation::Unchanged { reason } = curation {
@@ -439,6 +444,7 @@ async fn curate_single_page(
         sources: source_summary,
         summary,
         still_failing,
+        citations,
         status: PageStatus::Edited,
     })
 }
@@ -449,6 +455,7 @@ fn unchanged(page: &str, sources: Vec<String>) -> PageOutcome {
         sources,
         summary: String::new(),
         still_failing: Vec::new(),
+        citations: Vec::new(),
         status: PageStatus::Unchanged,
     }
 }
@@ -509,6 +516,7 @@ fn page_reports(outcomes: &[&PageOutcome]) -> Vec<PageReport> {
             sources: o.sources.clone(),
             summary: o.summary.clone(),
             still_failing: o.still_failing.clone(),
+            citations: o.citations.clone(),
         })
         .collect()
 }

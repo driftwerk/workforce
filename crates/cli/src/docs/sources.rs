@@ -13,6 +13,11 @@ const MAX_READ_LINES: usize = 300;
 const MAX_SEARCH_LINES: usize = 80;
 /// Lines of the real file shown either side of a cited quote.
 const QUOTE_CONTEXT_LINES: usize = 12;
+/// Top-level folders that are never a source: build output, version
+/// control, and the documentation itself. Docs can't be evidence for docs
+/// (the pages hold the very mistakes the curator is there to fix), and
+/// `docs/` holds design notes about plans, not behaviour.
+const NOT_SOURCES: &[&str] = &[".git", "target", "node_modules", "end-user-docs", "docs"];
 
 pub struct SourceIndex {
     repo_root: PathBuf,
@@ -53,8 +58,11 @@ impl SourceIndex {
             .components()
             .next()
             .map(|c| c.as_os_str().to_string_lossy());
-        if escapes || matches!(first.as_deref(), Some(".git" | "target" | "node_modules")) {
-            return Err(format!("`{path}` is outside the sources you may read"));
+        if escapes || first.is_some_and(|f| NOT_SOURCES.contains(&f.as_ref())) {
+            return Err(format!(
+                "`{path}` is outside the sources you may read (the documentation itself, \
+                 design notes and build output are never evidence)"
+            ));
         }
         std::fs::read_to_string(self.repo_root.join(relative))
             .map_err(|e| format!("can't read `{path}`: {e}"))
@@ -101,10 +109,13 @@ impl SourceIndex {
                 }
             }
         }
+        let excludes: Vec<String> = NOT_SOURCES
+            .iter()
+            .map(|dir| format!(":(exclude){dir}"))
+            .collect();
         let mut args = vec!["grep", "-n", "-I", "-E", "-e", pattern, "--"];
-        if let Some(glob) = path_glob {
-            args.push(glob);
-        }
+        args.push(path_glob.unwrap_or("."));
+        args.extend(excludes.iter().map(String::as_str));
         let out = Command::new("git")
             .args(&args)
             .current_dir(&self.repo_root)
@@ -206,6 +217,12 @@ mod tests {
     fn index() -> (tempfile::TempDir, SourceIndex) {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::create_dir_all(dir.path().join("end-user-docs")).unwrap();
+        std::fs::write(
+            dir.path().join("end-user-docs/cli.mdx"),
+            "workforce agent create --id reviewer\nAgentsManage\n",
+        )
+        .unwrap();
         std::fs::write(
             dir.path().join("src/authz.rs"),
             "pub enum Capability {\n    /// Manage agents.\n    AgentsManage,\n    AgentsRead,\n}\n",
@@ -262,15 +279,32 @@ mod tests {
                 .unwrap()
         };
         git(&["init", "-q"]);
-        git(&["add", "src/authz.rs"]);
+        git(&["add", "src/authz.rs", "end-user-docs/cli.mdx"]);
         let found = index
             .search("AgentsManage|shadow promote", None)
             .await
             .unwrap();
         assert!(found.contains("src/authz.rs:3:"), "{found}");
         assert!(found.contains("workforce --help:3:"), "{found}");
+        assert!(
+            !found.contains("end-user-docs"),
+            "docs aren't sources: {found}"
+        );
         let none = index.search("Agent\\.manage", None).await.unwrap();
         assert!(none.starts_with("no line matches"), "{none}");
+    }
+
+    #[test]
+    fn the_documentation_is_never_evidence() {
+        let (_dir, index) = index();
+        let refused = index
+            .cited(
+                "end-user-docs/cli.mdx",
+                "workforce agent create --id reviewer",
+            )
+            .unwrap_err();
+        assert!(refused.contains("never evidence"), "{refused}");
+        assert!(index.read("docs/DESIGN.md", None, None).is_err());
     }
 
     #[test]
