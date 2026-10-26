@@ -3997,10 +3997,13 @@ pub fn spawn_slack_dispatch_loop(
                                 };
 
                                 let (new_phase, status_text) = match &event {
-                                    ProgressEvent::LlmCall { round } => (
-                                        Some(channels::indicator::THINKING),
-                                        format!("_Thinking (round {})..._", round),
-                                    ),
+                                    ProgressEvent::LlmCall { round } => {
+                                        answer.begin_call();
+                                        (
+                                            Some(channels::indicator::THINKING),
+                                            format!("_Thinking (round {})..._", round),
+                                        )
+                                    }
                                     ProgressEvent::ToolStart { name, detail, .. } => {
                                         last_activity = None;
                                         (
@@ -4320,13 +4323,14 @@ pub fn spawn_slack_dispatch_loop(
                                     }
                                     // The runner dropped the round's text.
                                     // Superseded: a real answer the reader has
-                                    // already read, so it stays put. Retry: the
-                                    // text was a tool call emitted as prose —
-                                    // rewind that round alone.
+                                    // already read, so it stays put. Retry or
+                                    // Interrupted: the call's text is void —
+                                    // rewind that call alone.
                                     ProgressEvent::StreamDiscard { reason } => {
                                         let changed = match reason {
                                             StreamDiscardReason::Superseded => answer.supersede(),
-                                            StreamDiscardReason::Retry => answer.retry(),
+                                            StreamDiscardReason::Retry
+                                            | StreamDiscardReason::Interrupted => answer.rewind_call(),
                                         };
                                         if changed {
                                             emit_answer(
@@ -4343,7 +4347,13 @@ pub fn spawn_slack_dispatch_loop(
                                             .await;
                                             last_update = tokio::time::Instant::now();
                                         }
-                                        continue;
+                                        if *reason != StreamDiscardReason::Interrupted {
+                                            continue;
+                                        }
+                                        (
+                                            Some(channels::indicator::THINKING),
+                                            "_Model interrupted — restarting the reply..._".to_string(),
+                                        )
                                     }
                                     _ => continue,
                                 };
@@ -7159,9 +7169,10 @@ pub(crate) fn reconcile<'a>(shown: &str, response: &'a str) -> Reconciled<'a> {
     }
 }
 
-/// Everything a retry must put back: where the round's text began, and the
-/// paragraph-gap state it consumed on the way in.
-struct Round {
+/// Everything a rewind must put back: where the LLM call's text began, and
+/// the paragraph-gap state it consumed on the way in.
+#[derive(Clone, Copy)]
+struct CallMark {
     mark: RoundMark,
     wrote_any: bool,
     pending_break: bool,
@@ -7174,11 +7185,15 @@ struct Round {
 /// accumulates through a [`StreamRedactor`], which emits only what it will never
 /// need to rewrite, so committed prose is immutable by construction. A chunk
 /// boundary freezes the moment it is crossed; a superseded round is kept (the
-/// reader read it); only a retry — a tool call the model emitted as prose —
-/// rewinds, and only as far as the round that produced it.
+/// reader read it); only a discarded LLM call — a tool call the model emitted
+/// as prose, or a reply the provider broke off and is regenerating — rewinds,
+/// and only as far as where that call's text began.
 pub(crate) struct AnswerStream {
     redactor: StreamRedactor<fn(&str) -> String>,
-    round: Option<Round>,
+    /// Where the current LLM call's text began: set by its first push, kept
+    /// across its segments, cleared when the next call begins. A rewind can
+    /// never reach text an earlier call wrote.
+    call: Option<CallMark>,
     round_had_text: bool,
     pending_break: bool,
     /// Whether any text has been accumulated — not the same as whether any has
@@ -7188,13 +7203,6 @@ pub(crate) struct AnswerStream {
     boundaries: Vec<usize>,
     /// The identity's emoji lead on the first message, measured with it.
     lead: String,
-    /// The round most recently ended, kept one slot deep so a
-    /// `StreamDiscard{Retry}` arriving after `StreamEnd` — the repaired
-    /// text-tool-call path streams the bogus JSON fully before the runner
-    /// decides — can still rewind it. Cleared by the next round's first push
-    /// AND by any further `end_round`, so a retry can never reach anything
-    /// but the round whose `StreamEnd` immediately precedes it.
-    last_round: Option<Round>,
     /// How many leading chunks have already been written out at their final
     /// length, without the writing suffix.
     ///
@@ -7214,13 +7222,12 @@ impl AnswerStream {
     pub(crate) fn new() -> Self {
         Self {
             redactor: StreamRedactor::new(sanitize_outbound as fn(&str) -> String),
-            round: None,
+            call: None,
             round_had_text: false,
             pending_break: false,
             wrote_any: false,
             boundaries: Vec::new(),
             lead: String::new(),
-            last_round: None,
             settled_chunks: 0,
             closing: String::new(),
         }
@@ -7249,9 +7256,8 @@ impl AnswerStream {
         if text.is_empty() {
             return false;
         }
-        if self.round.is_none() {
-            self.last_round = None;
-            self.round = Some(Round {
+        if self.call.is_none() {
+            self.call = Some(CallMark {
                 mark: self.redactor.mark(),
                 wrote_any: self.wrote_any,
                 pending_break: self.pending_break,
@@ -7282,7 +7288,6 @@ impl AnswerStream {
     pub(crate) fn end_round(&mut self) -> bool {
         let changed = self.redactor.finish().is_some();
         self.reflow();
-        self.last_round = self.round.take();
         self.pending_break |= self.round_had_text;
         self.round_had_text = false;
         changed
@@ -7292,20 +7297,27 @@ impl AnswerStream {
     /// reader has already read, so it stays exactly where it is. Returns
     /// whether the visible text changed.
     pub(crate) fn supersede(&mut self) -> bool {
+        self.call = None;
         self.end_round()
     }
 
-    /// The round's text was a tool call emitted as prose. Rewind just that
-    /// round — live, or the one that just ended — everything before it is
-    /// text a human read and keeps.
-    pub(crate) fn retry(&mut self) -> bool {
+    /// A new LLM call begins: nothing written before it can be rewound.
+    pub(crate) fn begin_call(&mut self) {
+        self.call = None;
+    }
+
+    /// The current call's text is void — a tool call emitted as prose, or a
+    /// reply the provider broke off and is regenerating. Rewind to where the
+    /// call began, across segments it already ended; everything before is
+    /// text a human read and keeps. Returns whether the visible text changed.
+    pub(crate) fn rewind_call(&mut self) -> bool {
         self.round_had_text = false;
-        let Some(round) = self.round.take().or_else(|| self.last_round.take()) else {
+        let Some(call) = self.call.filter(|call| call.mark != self.redactor.mark()) else {
             return false;
         };
-        self.redactor.rewind(round.mark);
-        self.wrote_any = round.wrote_any;
-        self.pending_break = round.pending_break;
+        self.redactor.rewind(call.mark);
+        self.wrote_any = call.wrote_any;
+        self.pending_break = call.pending_break;
         // Strictly less: a boundary landing exactly at the end would leave a
         // trailing empty chunk, and so an empty message.
         self.boundaries
@@ -8619,77 +8631,109 @@ mod progress_indicator_tests {
         );
     }
 
-    /// A retry means the round's text was a tool call emitted as prose. It goes
-    /// — but nothing before it does.
+    /// A rewind means the call's text was void — a tool call emitted as prose,
+    /// or a reply broken off. It goes, but nothing an earlier call wrote does.
     #[test]
-    fn retrying_a_round_rewinds_only_that_round() {
+    fn a_rewind_reaches_only_the_current_call() {
         let mut a = AnswerStream::new();
-        drain(&mut a, "kept prose from an earlier round");
+        drain(&mut a, "kept prose from an earlier call");
         a.end_round();
+        a.begin_call();
         a.push(&format!("{{\"tool\": \"{}\"}}", "x".repeat(200)));
-        a.retry();
+        a.rewind_call();
         a.finish();
-        assert_eq!(a.shown(), "kept prose from an earlier round");
+        assert_eq!(a.shown(), "kept prose from an earlier call");
     }
 
     #[test]
-    fn retrying_the_first_round_leaves_nothing() {
+    fn rewinding_the_first_call_leaves_nothing() {
         let mut a = AnswerStream::new();
         a.push(&"garbage".repeat(50));
-        a.retry();
+        a.rewind_call();
         a.finish();
         assert!(a.is_empty());
     }
 
     /// The repaired-text-tool-call path streams the bogus JSON fully, so its
-    /// `Retry` arrives after `StreamEnd`. The just-ended round must still
-    /// rewind — and nothing before it.
+    /// `Retry` arrives after `StreamEnd`. The ended segment must still
+    /// rewind — and nothing before its call.
     #[test]
-    fn retrying_after_stream_end_rewinds_the_ended_round() {
+    fn rewinding_after_stream_end_rewinds_the_ended_segment() {
         let mut a = AnswerStream::new();
         a.push("kept prose");
         a.end_round();
+        a.begin_call();
         a.push(&format!("{{\"tool\": \"{}\"}}", "x".repeat(200)));
         a.end_round();
-        assert!(a.retry());
+        assert!(a.rewind_call());
         a.finish();
         assert_eq!(a.shown(), "kept prose");
 
         let mut first = AnswerStream::new();
         first.push(&"garbage".repeat(50));
         first.end_round();
-        assert!(first.retry());
+        assert!(first.rewind_call());
         first.finish();
         assert!(first.is_empty());
     }
 
-    /// A retry can never reach further back than the round that just ended:
-    /// the fallback clears the moment a new round pushes text, and a second
-    /// retry finds nothing.
+    /// A call can narrate, start a tool call (ending the segment) and break
+    /// off before resuming text: the rewind takes every segment it wrote.
     #[test]
-    fn retry_cannot_reach_past_the_round_that_just_ended() {
+    fn an_interrupted_call_rewinds_across_its_segments() {
         let mut a = AnswerStream::new();
-        a.push("first");
+        a.push("an earlier call's answer");
         a.end_round();
-        a.push("second");
-        assert!(a.retry());
-        assert!(!a.retry());
+        a.begin_call();
+        a.push("Let me check that.");
+        a.end_round();
+        a.push("And another thing");
+        assert!(a.rewind_call());
+        a.push("The regenerated reply.");
         a.finish();
-        assert_eq!(a.shown(), "first");
+        assert_eq!(
+            a.shown(),
+            "an earlier call's answer\n\nThe regenerated reply."
+        );
     }
 
-    /// The fallback serves only the round whose `StreamEnd` immediately
-    /// precedes the retry — a further round-less `end_round` clears it, so a
-    /// stray later discard cannot rewind older, real prose.
     #[test]
-    fn a_further_end_round_clears_the_retry_fallback() {
+    fn a_second_restart_rewinds_to_the_same_call_start() {
+        let mut a = AnswerStream::new();
+        a.push("kept");
+        a.end_round();
+        a.begin_call();
+        a.push("first draft");
+        assert!(a.rewind_call());
+        a.push("second draft");
+        assert!(a.rewind_call());
+        assert!(!a.rewind_call(), "nothing new to take back");
+        a.push("final");
+        a.finish();
+        assert_eq!(a.shown(), "kept\n\nfinal");
+    }
+
+    /// A call that has written nothing yet has nothing to rewind — older,
+    /// real prose is out of reach.
+    #[test]
+    fn a_retry_never_reaches_an_earlier_call() {
         let mut a = AnswerStream::new();
         a.push("real prose the reader keeps");
         a.end_round();
-        a.end_round();
-        assert!(!a.retry());
+        a.begin_call();
+        assert!(!a.rewind_call());
         a.finish();
         assert_eq!(a.shown(), "real prose the reader keeps");
+    }
+
+    #[test]
+    fn a_rewind_after_supersede_keeps_the_superseded_text() {
+        let mut a = AnswerStream::new();
+        a.push("a draft the reader read");
+        a.supersede();
+        assert!(!a.rewind_call());
+        a.finish();
+        assert_eq!(a.shown(), "a draft the reader read");
     }
 
     /// The redactor's ~64-byte holdback flushes at the round boundary — the
@@ -9482,11 +9526,12 @@ mod progress_indicator_tests {
 
         drain(&mut a, "real prose");
         a.end_round();
+        a.begin_call();
         a.push(&"x".repeat(ANSWER_CHUNK_CAP * 2));
         emit_answer(&surfaces, "C1", &None, &mut ids, &mut a, None, None).await;
         assert!(ids.len() > 1, "the garbage spilled into further messages");
 
-        a.retry();
+        a.rewind_call();
         emit_answer(&surfaces, "C1", &None, &mut ids, &mut a, None, None).await;
 
         assert_eq!(ids.len(), 1);

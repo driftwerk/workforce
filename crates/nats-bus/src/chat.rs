@@ -95,6 +95,11 @@ pub enum ChatProgress {
     StreamDelta { text: String },
     /// End of a streamed response.
     StreamEnd,
+    /// The streamed text of the current model call is void; a replacement
+    /// stream may follow.
+    StreamDiscard {
+        reason: workforce_core::types::StreamDiscardReason,
+    },
     /// Complete (non-streamed) response.
     Message { text: String },
     /// Tool execution started.
@@ -186,6 +191,24 @@ mod tests {
             serde_json::to_value(TurnControl::Cancel).unwrap(),
             serde_json::json!({"kind": "cancel"})
         );
+    }
+
+    #[test]
+    fn stream_discard_round_trips() {
+        let wire = serde_json::to_value(ChatProgress::StreamDiscard {
+            reason: workforce_core::types::StreamDiscardReason::Interrupted,
+        })
+        .unwrap();
+        assert_eq!(
+            wire,
+            serde_json::json!({"type": "stream_discard", "reason": "interrupted"})
+        );
+        assert!(matches!(
+            serde_json::from_value::<ChatProgress>(wire).unwrap(),
+            ChatProgress::StreamDiscard {
+                reason: workforce_core::types::StreamDiscardReason::Interrupted
+            }
+        ));
     }
 
     #[test]

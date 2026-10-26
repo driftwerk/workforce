@@ -232,7 +232,9 @@ This means the pool knows exactly when an account will be available again, inste
 
 ### Streaming
 
-Streaming calls (`create_message_stream`) also walk the failover chain. Since 429 errors occur *before* streaming starts (during the initial HTTP connection), the system can failover to the next model transparently. Once streaming has begun and events are flowing, mid-stream failover is not possible.
+Streaming calls (`create_message_stream`) also walk the failover chain, under the same retry and failover rules whether a call fails before its first event or part-way through. Most failures (429s, connection errors) happen before streaming starts, so moving on is invisible. When a provider breaks off after content has been streamed — an overloaded model, a 5xx, a stalled stream — the chain first sends a `Restart` event that voids everything the abandoned attempt streamed, then retries or fails over. Every surface takes the abandoned text back: the runner reports a `StreamDiscard { reason: Interrupted }` and clients rewind to where the model call began (`stream_discard` on the WebSocket protocol). If the chain is exhausted, no `Restart` is sent and the turn fails with the last error.
+
+Nothing acts on a call's output until its stream completes — tools run only on the finished response — so regenerating a call, even on a different model, can never repeat a side effect. Only the failover layer starts over after content: the account pool rotates to its next account only while nothing has streamed, and otherwise hands the error up.
 
 ## Agent Tools
 

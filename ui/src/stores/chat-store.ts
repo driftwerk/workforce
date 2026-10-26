@@ -9,6 +9,7 @@ import {
   attachmentMessage,
   closeStopped,
   closeStreaming,
+  discardCall,
   insertBeforeStreaming,
   isStoppedTail,
   toolEnded,
@@ -128,6 +129,9 @@ let collected: { sessionId: string; content: string } | null = null;
 // The session whose turn the user stopped, until they send again: what that
 // turn still had on the wire must not reopen what the stop closed.
 let stopped: string | null = null;
+/** The answers the current model call has streamed: what a `stream_discard`
+ *  takes back. Each call opens with a `typing`. */
+let callStream: string[] = [];
 
 function nextId(): string {
   return `msg-${Date.now()}-${++msgCounter}`;
@@ -301,6 +305,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
     ws.send(JSON.stringify({ type: "cancel", session_id: sessionId }));
     pending = null;
     stopped = sessionId;
+    callStream = [];
     set((s) => ({
       messages: closeStopped(s.messages),
       isStreaming: false,
@@ -313,6 +318,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
     pending = null;
     collected = null;
     stopped = null;
+    callStream = [];
     set({ messages: [], sessionId: null, isStreaming: false, isTyping: false, isCompacting: false });
   },
 }));
@@ -404,6 +410,7 @@ function handleServerMessage(msg: ServerMessage) {
     }
 
     case "typing":
+      callStream = [];
       store.setState({ isTyping: true });
       break;
 
@@ -434,6 +441,7 @@ function handleServerMessage(msg: ServerMessage) {
         status: "streaming",
         toolCalls: [],
       };
+      callStream = [...callStream, streamMsg.id];
       store.setState((s) => ({
         messages: [...s.messages, streamMsg],
         sessionId: msg.session_id ?? s.sessionId,
@@ -453,6 +461,18 @@ function handleServerMessage(msg: ServerMessage) {
         return { messages: msgs };
       });
       break;
+
+    // The model call's streamed text is void; a replacement stream may follow.
+    case "stream_discard": {
+      const discarded = callStream;
+      callStream = [];
+      store.setState((s) => ({
+        messages: discardCall(s.messages, discarded),
+        isStreaming: false,
+        isTyping: true,
+      }));
+      break;
+    }
 
     // A stream that outlived a dropped socket reached this page with a gap;
     // the answer saved to the session replaces what arrived of it.

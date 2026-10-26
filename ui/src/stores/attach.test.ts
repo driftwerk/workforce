@@ -5,6 +5,7 @@ import {
   attachmentMessage,
   closeStopped,
   closeStreaming,
+  discardCall,
   insertBeforeStreaming,
   isStoppedTail,
   toolEnded,
@@ -77,6 +78,7 @@ describe("isStoppedTail", () => {
   it("drops the stopped turn's events but lets pushes and errors through", () => {
     expect(isStoppedTail("s1", { type: "stream_delta", session_id: "s1" })).toBe(true);
     expect(isStoppedTail("s1", { type: "tool_start", session_id: "s1" })).toBe(true);
+    expect(isStoppedTail("s1", { type: "stream_discard", session_id: "s1" })).toBe(true);
     expect(isStoppedTail("s1", { type: "message", session_id: "s1" })).toBe(false);
     expect(isStoppedTail("s1", { type: "error", session_id: "s1" })).toBe(false);
     expect(isStoppedTail("s1", { type: "image", session_id: "s1" })).toBe(false);
@@ -138,5 +140,22 @@ describe("insertBeforeStreaming", () => {
   it("keeps a streaming answer last so its deltas still reach it", () => {
     const messages = [msg("q", "user", "complete"), msg("a", "assistant", "streaming")];
     expect(insertBeforeStreaming(messages, delivered).map((m) => m.id)).toEqual(["q", "file", "a"]);
+  });
+});
+
+describe("discardCall", () => {
+  it("stream_discard removes the call's bubbles only", () => {
+    const messages = [
+      msg("earlier", "assistant", "complete"),
+      msg("q", "user", "complete"),
+      msg("narration", "assistant", "complete"),
+      msg("draft", "assistant", "streaming"),
+    ];
+    expect(discardCall(messages, ["narration", "draft"]).map((m) => m.id)).toEqual(["earlier", "q"]);
+  });
+
+  it("leaves everything when the call streamed nothing", () => {
+    const messages = [msg("q", "user", "complete"), msg("a", "assistant", "complete")];
+    expect(discardCall(messages, [])).toEqual(messages);
   });
 });

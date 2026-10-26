@@ -7,6 +7,7 @@ use eyre::Result;
 use tracing::{debug, info, warn};
 use workforce_core::policy::{PolicyContext, PolicyRequest};
 use workforce_core::types::AgentId;
+pub use workforce_core::types::StreamDiscardReason;
 use workforce_policy::engine::PolicyEngine;
 
 use workforce_common::secret::{fixed_key, ApiKeySource};
@@ -1405,19 +1406,6 @@ pub enum ProgressEvent {
     ConnectRequired {
         prompt: workforce_common::subscription::ConnectPrompt,
     },
-}
-
-/// Why a round's streamed text is dropped from the result
-/// ([`ProgressEvent::StreamDiscard`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StreamDiscardReason {
-    /// The round's text was a tool call hallucinated as text: the runner is
-    /// retrying and the streamed text is garbage nobody should keep seeing.
-    Retry,
-    /// The round's text was a real draft answer superseded by a further round
-    /// (a follow-up was absorbed): dropped from the result, but legitimate
-    /// content worth keeping visible.
-    Superseded,
 }
 
 /// A follow-up user message absorbed into a run, reported on [`RunResult`]
@@ -6182,20 +6170,15 @@ impl AgentRunner {
             .await
             .map_err(|e| eyre::eyre!("LLM stream task panicked: {}", e))?;
 
-        // When both producer and consumer fail, prefer the producer's error
-        // because it contains the actual cause (e.g., "all providers rate-limited")
-        // while the consumer's error is just a symptom ("empty response").
-        match (response, producer_result) {
-            (Ok(resp), Ok(())) => Ok(resp),
-            (Ok(resp), Err(_)) => Ok(resp),
-            (Err(_consumer_err), Err(producer_err)) => Err(producer_err),
-            (Err(consumer_err), Ok(())) => Err(consumer_err),
-        }
+        // The producer's error is authoritative: it names the cause where the
+        // consumer's is a symptom ("empty response"), and a stream that failed
+        // after a block closed leaves a collected response that is truncated.
+        producer_result.and(response)
     }
 
     /// Open a stream segment if needed and forward one delta to the preview.
     /// `forwarded_any` records that this LLM call put text on screen — the
-    /// signal that makes a later `StreamDiscard{Retry}` meaningful.
+    /// signal that makes a later `StreamDiscard` meaningful.
     async fn forward_stream_delta(
         progress_tx: &tokio::sync::mpsc::Sender<ProgressEvent>,
         streaming_text: &mut bool,
@@ -6241,6 +6224,7 @@ impl AgentRunner {
                 StreamEvent::RateLimitWait { .. }
                     | StreamEvent::SlowModelFailover { .. }
                     | StreamEvent::KeepAlive { .. }
+                    | StreamEvent::Restart
                     | StreamEvent::Error { .. }
             ) {
                 tel.observe_first_stream_event();
@@ -6282,6 +6266,22 @@ impl AgentRunner {
                 StreamEvent::Error { .. } if streaming_text => {
                     streaming_text = false;
                     let _ = progress_tx.send(ProgressEvent::StreamEnd).await;
+                }
+                // The call starts over: void what it previewed, and leave the
+                // segment unclosed so the replacement opens a fresh one — a
+                // `StreamEnd` here would read as the answer ending.
+                StreamEvent::Restart => {
+                    if forwarded_any {
+                        let _ = progress_tx
+                            .send(ProgressEvent::StreamDiscard {
+                                reason: StreamDiscardReason::Interrupted,
+                            })
+                            .await;
+                    }
+                    gate = StreamGate::new(&self.tools);
+                    forwarded_any = false;
+                    streaming_text = false;
+                    tel.observe_stream_restart();
                 }
                 StreamEvent::RateLimitWait { wait_secs, attempt } => {
                     let _ = progress_tx
@@ -10263,6 +10263,234 @@ mod tests {
             })
             .collect();
         assert_eq!(deltas, vec!["Hello", ", ", "world", "!"]);
+    }
+
+    /// Replays one scripted event sequence per LLM call, then its outcome —
+    /// the raw stream a failover layer hands the runner.
+    struct EventScriptProvider {
+        calls: std::sync::Mutex<std::collections::VecDeque<(Vec<StreamEvent>, Result<()>)>>,
+    }
+
+    impl EventScriptProvider {
+        fn new(calls: Vec<(Vec<StreamEvent>, Result<()>)>) -> Arc<Self> {
+            Arc::new(Self {
+                calls: std::sync::Mutex::new(calls.into()),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for EventScriptProvider {
+        async fn create_message(
+            &self,
+            _system_prompt: Option<&str>,
+            _messages: &[LlmMessage],
+            _tools: &[LlmToolDef],
+            _model: Option<&str>,
+            _max_tokens: Option<u32>,
+            _enable_cache: bool,
+        ) -> Result<LlmResponse> {
+            unreachable!("streamed only")
+        }
+
+        async fn create_message_stream(
+            &self,
+            _system_prompt: Option<&str>,
+            _messages: &[LlmMessage],
+            _tools: &[LlmToolDef],
+            _model: Option<&str>,
+            _max_tokens: Option<u32>,
+            _enable_cache: bool,
+            tx: mpsc::Sender<StreamEvent>,
+        ) -> Result<()> {
+            let (events, outcome) = self
+                .calls
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("streamed past the script");
+            for event in events {
+                let _ = tx.send(event).await;
+            }
+            outcome
+        }
+    }
+
+    fn text_block(index: usize, text: &str) -> Vec<StreamEvent> {
+        vec![
+            StreamEvent::ContentStart { index },
+            StreamEvent::TextDelta {
+                index,
+                text: text.to_string(),
+            },
+            StreamEvent::ContentStop { index },
+        ]
+    }
+
+    fn message_done() -> StreamEvent {
+        StreamEvent::MessageDone {
+            stop_reason: StopReason::EndTurn,
+            usage: TokenUsage {
+                input_tokens: 10,
+                output_tokens: 20,
+                ..Default::default()
+            },
+        }
+    }
+
+    /// The previewed draft, a restart, then the real answer.
+    fn restarted_answer() -> Vec<StreamEvent> {
+        [
+            vec![
+                StreamEvent::ContentStart { index: 0 },
+                StreamEvent::TextDelta {
+                    index: 0,
+                    text: "The abandoned draft".to_string(),
+                },
+                StreamEvent::Restart,
+            ],
+            text_block(0, "The real answer."),
+            vec![message_done()],
+        ]
+        .concat()
+    }
+
+    fn drain(rx: &mut mpsc::Receiver<ProgressEvent>) -> Vec<ProgressEvent> {
+        std::iter::from_fn(|| rx.try_recv().ok()).collect()
+    }
+
+    #[tokio::test]
+    async fn a_restart_discards_the_preview_as_interrupted() {
+        let runner = make_runner(EventScriptProvider::new(vec![(restarted_answer(), Ok(()))]));
+        let (tx, mut rx) = mpsc::channel(256);
+
+        let result = runner.run_with_progress("Go", tx).await.unwrap();
+
+        assert_eq!(result.response, "The real answer.");
+        let reasons: Vec<StreamDiscardReason> = drain(&mut rx)
+            .into_iter()
+            .filter_map(|event| match event {
+                ProgressEvent::StreamDiscard { reason } => Some(reason),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reasons, [StreamDiscardReason::Interrupted]);
+    }
+
+    #[tokio::test]
+    async fn a_restart_reopens_the_stream_without_a_stream_end() {
+        let runner = make_runner(EventScriptProvider::new(vec![(restarted_answer(), Ok(()))]));
+        let (tx, mut rx) = mpsc::channel(256);
+
+        runner.run_with_progress("Go", tx).await.unwrap();
+
+        let stream: Vec<String> = drain(&mut rx)
+            .into_iter()
+            .filter_map(|event| match event {
+                ProgressEvent::StreamStart => Some("start".to_string()),
+                ProgressEvent::StreamDelta { text } => Some(text),
+                ProgressEvent::StreamEnd => Some("end".to_string()),
+                ProgressEvent::StreamDiscard { .. } => Some("discard".to_string()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            stream[..6],
+            [
+                "start",
+                "The abandoned draft",
+                "discard",
+                "start",
+                "The real answer.",
+                "end"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_restart_with_nothing_previewed_sends_no_discard() {
+        let events = [
+            vec![
+                StreamEvent::ContentStart { index: 0 },
+                StreamEvent::ThinkingDelta {
+                    index: 0,
+                    thinking: "considering".to_string(),
+                },
+                StreamEvent::Restart,
+            ],
+            text_block(0, "The real answer."),
+            vec![message_done()],
+        ]
+        .concat();
+        let runner = make_runner(EventScriptProvider::new(vec![(events, Ok(()))]));
+        let (tx, mut rx) = mpsc::channel(256);
+
+        let result = runner.run_with_progress("Go", tx).await.unwrap();
+
+        assert_eq!(result.response, "The real answer.");
+        assert!(!drain(&mut rx)
+            .iter()
+            .any(|event| matches!(event, ProgressEvent::StreamDiscard { .. })));
+    }
+
+    #[tokio::test]
+    async fn a_tool_call_streamed_by_an_abandoned_attempt_never_runs() {
+        let tools = Arc::new(ToolRegistry::new());
+        tools.register(Arc::new(EchoTool));
+        let events = [
+            text_block(0, "Deleting it now."),
+            vec![
+                StreamEvent::ToolUseStart {
+                    index: 1,
+                    id: "toolu_abandoned".to_string(),
+                    name: "vault.delete".to_string(),
+                    signature: None,
+                },
+                StreamEvent::InputJsonDelta {
+                    index: 1,
+                    partial: r#"{"id": 7}"#.to_string(),
+                },
+                StreamEvent::ContentStop { index: 1 },
+                StreamEvent::Restart,
+            ],
+            text_block(0, "The real answer."),
+            vec![message_done()],
+        ]
+        .concat();
+        let runner =
+            make_runner_with_tools(EventScriptProvider::new(vec![(events, Ok(()))]), tools);
+        let (tx, mut rx) = mpsc::channel(256);
+
+        let result = runner.run_with_progress("Go", tx).await.unwrap();
+
+        assert_eq!(result.response, "The real answer.");
+        assert!(result.tool_invocations.is_empty());
+        assert!(drain(&mut rx)
+            .iter()
+            .all(|event| !matches!(event, ProgressEvent::ToolStart { .. })));
+    }
+
+    #[tokio::test]
+    async fn a_stream_failing_after_a_closed_block_is_an_error_not_an_answer() {
+        let events = [
+            text_block(0, "Let me look that up."),
+            vec![StreamEvent::ToolUseStart {
+                index: 1,
+                id: "toolu_cut".to_string(),
+                name: "vault.delete".to_string(),
+                signature: None,
+            }],
+        ]
+        .concat();
+        let runner = make_runner(EventScriptProvider::new(vec![(
+            events,
+            Err(eyre::eyre!("Bedrock streaming error: Overloaded")),
+        )]));
+        let (tx, _rx) = mpsc::channel(256);
+
+        let err = runner.run_with_progress("Go", tx).await.unwrap_err();
+
+        assert!(err.to_string().contains("Overloaded"));
     }
 
     #[tokio::test]
