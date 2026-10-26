@@ -190,7 +190,7 @@ workforce-training = { path = "crates/training" }
 workforce-self-learning = { path = "crates/self-learning" }
 
 # WASM runtime
-wasmtime = "29"
+wasmtime = "36.0.19"
 semver = "1"
 
 # Dev / testing
