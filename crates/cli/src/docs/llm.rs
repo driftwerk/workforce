@@ -12,7 +12,8 @@ use futures::future::try_join_all;
 use tracing::{info, warn};
 
 use workforce_agent::llm::provider::{
-    create_provider_async, provider_env_key, provider_env_var_hint, LlmProvider, ProviderKind,
+    create_provider_async, provider_env_key, provider_env_var_hint, with_reasoning_suppressed,
+    LlmProvider, ProviderKind,
 };
 use workforce_agent::llm::tiers::TierRegistry;
 use workforce_agent::llm::types::{ContentBlock, LlmMessage, LlmResponse, Role, StopReason};
@@ -191,16 +192,17 @@ async fn invoke(
             text: user_prompt.to_string(),
         }],
     }];
-    provider
-        .create_message(
-            system_prompt,
-            &messages,
-            &[],
-            Some(model),
-            Some(max_tokens),
-            false,
-        )
-        .await
+    // The curator wants the page or the notes, not a chain of thought: a
+    // model that reasons by default would otherwise spend the budget on it.
+    with_reasoning_suppressed(provider.create_message(
+        system_prompt,
+        &messages,
+        &[],
+        Some(model),
+        Some(max_tokens),
+        false,
+    ))
+    .await
 }
 
 fn response_into_draft(response: LlmResponse) -> Result<CuratorDraft> {

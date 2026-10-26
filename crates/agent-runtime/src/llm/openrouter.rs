@@ -5,7 +5,7 @@ use tokio::sync::mpsc;
 
 use super::oai_common::{
     build_messages, build_reasoning_config, build_tool_defs, convert_from_oai_choice, OaiRequest,
-    OaiResponse,
+    OaiResponse, ReasoningConfig,
 };
 use super::streaming::StreamEvent;
 use super::types::{LlmMessage, LlmResponse, LlmToolDef, StopReason, TokenUsage};
@@ -141,18 +141,15 @@ impl OpenRouterClient {
         // Background utility callers (memory/lesson extraction, summaries) scope
         // this on: reasoning models otherwise spend the whole token budget on
         // hidden reasoning and return empty/truncated `content`, silently
-        // dropping the extraction. See `provider::with_reasoning_suppressed`.
+        // dropping the extraction. See `provider::with_reasoning_suppressed`
+        // and `reasoning_for`.
         let suppress_reasoning = super::provider::reasoning_suppressed();
         let request = OaiRequest {
             model: Some(model.to_string()),
             messages: oai_messages,
             max_tokens: Some(max_tokens),
             tools: oai_tools,
-            reasoning: if suppress_reasoning {
-                None
-            } else {
-                build_reasoning_config(self.effective_thinking_budget())
-            },
+            reasoning: reasoning_for(suppress_reasoning, self.effective_thinking_budget()),
             stream: Some(false),
         };
 
@@ -272,11 +269,7 @@ impl OpenRouterClient {
             messages: oai_messages,
             max_tokens: Some(max_tokens),
             tools: oai_tools,
-            reasoning: if suppress_reasoning {
-                None
-            } else {
-                build_reasoning_config(self.effective_thinking_budget())
-            },
+            reasoning: reasoning_for(suppress_reasoning, self.effective_thinking_budget()),
             stream: Some(true),
         };
 
@@ -492,6 +485,17 @@ impl OpenRouterClient {
     }
 }
 
+/// The request's `reasoning` field. A suppressed call asks for no reasoning
+/// outright: leaving the field out lets a model that reasons by default
+/// (DeepSeek v4 Pro) spend the whole token budget thinking anyway.
+fn reasoning_for(suppressed: bool, thinking_budget: Option<u32>) -> Option<ReasoningConfig> {
+    if suppressed {
+        build_reasoning_config(Some(0))
+    } else {
+        build_reasoning_config(thinking_budget)
+    }
+}
+
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -513,7 +517,54 @@ mod tests {
 
     // OAI conversion, cache control, and build_messages tests live in oai_common.rs.
 
-    use wiremock::matchers::{bearer_token, method, path};
+    #[tokio::test]
+    async fn a_suppressed_call_asks_for_no_reasoning_outright() {
+        use crate::llm::types::{ContentBlock, Role};
+
+        // DeepSeek v4 Pro reasons when the field is absent, so suppression
+        // must say "none" rather than leave it out.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/chat/completions"))
+            .and(body_partial_json(
+                serde_json::json!({"reasoning": {"effort": "none"}}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"role": "assistant", "content": "notes"},
+                             "finish_reason": "stop"}],
+                "model": "deepseek/deepseek-v4-pro"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = OpenRouterClient::new("sk-or-v1-test").with_base_url(server.uri());
+        let messages = [LlmMessage {
+            role: Role::User,
+            content: vec![ContentBlock::Text {
+                text: "summarise".into(),
+            }],
+        }];
+        let response = crate::llm::provider::with_reasoning_suppressed(client.create_message(
+            None,
+            &messages,
+            &[],
+            None,
+            Some(2_000),
+            false,
+        ))
+        .await
+        .expect("the mock only answers a request that asks for no reasoning");
+        assert_eq!(response.text().as_deref(), Some("notes"));
+    }
+
+    #[test]
+    fn reasoning_is_left_to_the_model_unless_asked_for_or_suppressed() {
+        assert!(reasoning_for(false, None).is_none());
+        assert_eq!(reasoning_for(false, Some(5_000)).unwrap().effort, "medium");
+        assert_eq!(reasoning_for(true, Some(20_000)).unwrap().effort, "none");
+    }
+
+    use wiremock::matchers::{bearer_token, body_partial_json, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[tokio::test]
