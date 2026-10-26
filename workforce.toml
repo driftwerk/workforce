@@ -48,8 +48,8 @@ max_concurrent_runs_per_owner = 25
 # Doc-curator default tier for `workforce docs curate`.
 # `OPENROUTER_API_KEY` resolves credentials; CLI `--tier <spec>`
 # overrides per invocation. The curator edits a page passage by passage;
-# `max_tokens` (default 8000) caps each reply, `notes_max_tokens` (4000)
-# each notes reply, `max_turns` (60) the replies per page. Every change
+# `max_tokens` (default 8000) caps each reply,
+# `max_turns` (60) the replies per page. Every change
 # cites its sources and is checked against them by `verifier_tier`, a
 # different model from `tier`, before it is applied.
 tier = "openrouter:deepseek:powerful"

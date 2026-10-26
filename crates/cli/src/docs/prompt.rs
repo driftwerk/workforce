@@ -105,46 +105,22 @@ pub fn build_prompt(input: &PromptInput) -> String {
     p
 }
 
-/// User prompt for a map-step "extract notes from these source files"
-/// call. No `valid_doc_paths` (not needed for notes), no
-/// `current_content` (not needed either), no MDX-output rules — the
-/// caller sends `None` as the system prompt so the model isn't pushed
-/// to write a full page. `max_words` keeps the asked length inside the
-/// reply's token cap.
-pub fn build_notes_prompt(page: &str, sources: &[SourceFile], max_words: u32) -> String {
-    let mut p = String::with_capacity(4096);
-    p.push_str(&format!(
-        "# Notes for `end-user-docs/{page}`\n\n\
-         You are reading one batch of source files. Extract a concise list \
-         of notes that a docs author would need to write the page `{page}`: \
-         concepts the reader should know, configuration surfaces, example \
-         commands or code snippets, behaviours, edge cases. Bullet points \
-         only. Quote identifiers verbatim. Do NOT write the MDX page \
-         itself — that happens in a later step. Keep your response under \
-         {max_words} words.\n\n",
-    ));
-    p.push_str("## Source files\n");
-    append_source_blocks(&mut p, sources);
-    p
-}
-
-/// User prompt for the reduce step — writes the page from combined
-/// notes instead of raw source dumps. Same header / current-content /
-/// valid-doc-paths sections as the single-pass prompt; only the body
-/// differs.
-pub fn build_reduce_prompt(input: &PromptInput, notes: &str) -> String {
+/// User prompt for a page whose sources are too large to include: the page
+/// and the list of its source files, which the curator looks up with its
+/// tools as it needs them.
+pub fn build_lookup_prompt(input: &PromptInput) -> String {
     let mut p = build_prompt_header(input);
     p.push_str(
-        "## Notes from source files\n\
-         These notes were extracted from the page's source-file set in a \
-         previous pass. Treat them as authoritative. If notes from different \
-         batches conflict, prefer the more specific or more recent-looking \
-         claim and flag the conflict with `{/* CURATOR: needs verification — \
-         <what> */}`.\n\n",
+        "## Source files\n\
+         These are the page's sources. They are too large to include here: look up what \
+         you need with `search_sources` and `read_source` before you write it.\n\n",
     );
-    p.push_str(notes);
-    if !notes.ends_with('\n') {
-        p.push('\n');
+    for s in &input.sources {
+        p.push_str(&format!(
+            "- `{}` ({} lines)\n",
+            s.repo_relative.display(),
+            s.content.lines().count()
+        ));
     }
     p
 }
@@ -293,39 +269,19 @@ mod tests {
     }
 
     #[test]
-    fn build_notes_prompt_targets_page_and_omits_link_targets() {
-        let sources = vec![SourceFile {
-            repo_relative: PathBuf::from("crates/skills/src/adapters/slack/lib.rs"),
-            content: "fn main() {}".to_string(),
-        }];
-        let p = build_notes_prompt("adapters/slack.mdx", &sources, 1_600);
-        assert!(p.contains("Notes for `end-user-docs/adapters/slack.mdx`"));
-        assert!(p.contains("under 1600 words"));
-        assert!(p.contains("Bullet points only"));
-        assert!(p.contains("crates/skills/src/adapters/slack/lib.rs"));
-        assert!(p.contains("fn main() {}"));
-        assert!(
-            !p.contains("Valid `/docs/`"),
-            "notes prompt should NOT include the docs link allowlist",
-        );
-    }
-
-    #[test]
-    fn build_reduce_prompt_swaps_sources_for_notes() {
+    fn a_lookup_prompt_lists_the_sources_instead_of_including_them() {
         let input = input_with_sources(vec![(
             "crates/skills/src/adapters/slack/lib.rs",
-            "fn main() {}",
+            "fn main() {}\nfn other() {}\n",
         )]);
-        let p = build_reduce_prompt(&input, "- Slack sends messages\n- OAuth is required");
-        assert!(p.contains("Notes from source files"));
-        assert!(p.contains("- Slack sends messages"));
-        assert!(p.contains("- OAuth is required"));
+        let p = build_lookup_prompt(&input);
+        assert!(p.contains("- `crates/skills/src/adapters/slack/lib.rs` (2 lines)"));
+        assert!(!p.contains("fn main() {}"), "sources must not be inlined");
+        assert!(p.contains("search_sources"));
         assert!(
-            !p.contains("fn main() {}"),
-            "reduce prompt must replace raw source dumps with notes",
+            p.contains("# Slack adapter"),
+            "the page itself is still included"
         );
-        assert!(p.contains("Valid `/docs/`"));
-        assert!(p.contains("# Slack adapter"));
     }
 
     #[test]
