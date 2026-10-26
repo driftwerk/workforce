@@ -1,22 +1,22 @@
 //! LLM dispatch for the curator. The model edits the page through tools —
-//! exact-passage replacements, appends, then `finish` or `keep_page` — so a
-//! reply carries changes, never the whole page, and text no edit names is
-//! never re-typed. Single-pass when the sources fit the configured context
-//! budget; otherwise the sources are first read in chunks into notes, and
-//! the page is edited from those.
+//! lookups in the repository, exact-passage replacements and appends that
+//! cite their evidence, then `finish` or `keep_page` — so a reply carries
+//! changes, never the whole page, and text no edit names is never re-typed.
+//! A page's sources are included in the prompt when they fit the context
+//! budget; otherwise the prompt lists them and the model looks up what it
+//! needs.
 //!
 //! Every stage fails closed. A reply that reaches its token cap is never
-//! used: a cut-off edit reply is discarded and the model is told to make
-//! smaller edits; a cut-off notes reply has its chunk halved and read again.
-//! A page's edits take effect only when the model calls `finish`; a page
-//! that runs out of replies is left as it was.
+//! used: it is discarded and the model is told to make smaller edits. A
+//! change applies only when its evidence is in the sources word for word
+//! and the verifier finds it supported. A page's edits take effect only
+//! when the model calls `finish`; a page that runs out of replies is left
+//! as it was.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use eyre::{eyre, Context, Result};
-use futures::future::{try_join_all, BoxFuture};
-use futures::FutureExt;
 use serde_json::{json, Value};
 use tracing::{info, warn};
 
@@ -33,17 +33,10 @@ use workforce_hub::vault::Vault;
 
 use super::check::{check_page, Finding, TomlSchema};
 use super::edit::PageDraft;
-use super::prompt::{
-    build_notes_prompt, build_prompt, build_reduce_prompt, PromptInput, SourceFile,
-};
+use super::prompt::{build_lookup_prompt, build_prompt, PromptInput};
 use super::sources::SourceIndex;
 
 const DEFAULT_TIER_KEY: &str = "anthropic";
-const MAX_MAP_CHUNKS: usize = 10;
-const OVERHEAD_TOKEN_RESERVE: u32 = 15_000;
-/// A notes chunk this small that still overflows its cap is not split
-/// further; the page fails instead.
-const MIN_SPLIT_CHARS: usize = 4_000;
 /// Consecutive cut-off edit replies tolerated before the page is given up.
 const MAX_CUT_OFF_REPLIES: u32 = 3;
 
@@ -70,9 +63,9 @@ pub enum Curation {
 }
 
 /// Curate one page with the configured tiers: resolve the editor and the
-/// verifier, then read the sources (in chunks when they overflow the
-/// context budget) and let the editor change the page, each change checked
-/// by the verifier against the sources it cites.
+/// verifier, then give the editor the sources (listed for lookup when they
+/// overflow the context budget) and let it change the page, each change
+/// checked by the verifier against the sources it cites.
 #[allow(clippy::too_many_arguments)]
 pub async fn curate_page(
     page: &str,
@@ -145,7 +138,7 @@ async fn curate_with(
     let estimated =
         estimate_tokens(system_prompt) + estimate_tokens(&single_pass) + limits.max_tokens as usize;
     let user_prompt = if estimated <= limits.context_safety_tokens as usize {
-        info!(page, %model, estimated, "curator: single-pass");
+        info!(page, %model, estimated, "curator: sources included");
         single_pass
     } else {
         info!(
@@ -153,10 +146,9 @@ async fn curate_with(
             %model,
             estimated,
             threshold = limits.context_safety_tokens,
-            "curator: reading sources in chunks (input exceeds budget)"
+            "curator: sources too large to include; listed for lookup"
         );
-        let notes = gather_notes(page, &input.sources, limits, provider, model).await?;
-        build_reduce_prompt(input, &notes)
+        build_lookup_prompt(input)
     };
     edit_page(
         provider,
@@ -172,136 +164,6 @@ async fn curate_with(
     )
     .await
     .wrap_err_with(|| context_overflow_hint(page))
-}
-
-// ─── Notes (sources that overflow the context budget) ──────────────────────
-
-async fn gather_notes(
-    page: &str,
-    sources: &[SourceFile],
-    limits: &CuratorConfig,
-    provider: &dyn LlmProvider,
-    model: &str,
-) -> Result<String> {
-    let chunk_budget_chars = (limits
-        .context_safety_tokens
-        .saturating_sub(OVERHEAD_TOKEN_RESERVE)) as usize
-        * 3;
-    let chunks = split_into_chunks(sources, chunk_budget_chars);
-    if chunks.len() > MAX_MAP_CHUNKS {
-        return Err(eyre!(
-            "page `{page}` would need {} map-passes (limit {}) — scope this \
-             page's sources in docs-watch.toml or switch to a longer-context tier",
-            chunks.len(),
-            MAX_MAP_CHUNKS,
-        ));
-    }
-    info!(
-        page,
-        chunk_count = chunks.len(),
-        "curator: extracting notes per chunk"
-    );
-    let parts = try_join_all(
-        chunks
-            .into_iter()
-            .map(|chunk| notes_for_chunk(page, chunk, limits.notes_max_tokens, provider, model)),
-    )
-    .await?;
-    Ok(parts.into_iter().flatten().collect::<Vec<_>>().join("\n\n"))
-}
-
-/// Notes for one chunk of sources. A reply that reaches the cap is never
-/// used: the chunk is halved and each half read again, until a chunk too
-/// small to halve still overflows, which fails the page.
-fn notes_for_chunk<'a>(
-    page: &'a str,
-    chunk: Vec<SourceFile>,
-    cap: u32,
-    provider: &'a dyn LlmProvider,
-    model: &'a str,
-) -> BoxFuture<'a, Result<Vec<String>>> {
-    async move {
-        let label = chunk_label(&chunk);
-        let prompt = build_notes_prompt(page, &chunk, notes_word_budget(cap));
-        let messages = [user_text(prompt)];
-        let response = invoke(provider, model, None, &messages, &[], cap)
-            .await
-            .wrap_err_with(|| format!("notes extraction failed for `{page}` ({label})"))?;
-        if !is_cut_off(&response, cap) {
-            let notes = response.text().ok_or_else(|| {
-                eyre!(
-                    "notes call for `{page}` ({label}) returned no text (stop reason {:?})",
-                    response.stop_reason
-                )
-            })?;
-            return Ok(vec![notes]);
-        }
-        let Some((first, second)) = halve(&chunk) else {
-            return Err(eyre!(
-                "notes for `{page}` ({label}) overflow {cap} tokens even for a chunk of \
-                 {} characters; raise `[curator] notes_max_tokens` or scope this page's \
-                 sources in docs-watch.toml",
-                chunk_chars(&chunk)
-            ));
-        };
-        warn!(page, %label, cap, "notes reply reached its cap; halving the chunk");
-        let (a, b) = futures::try_join!(
-            notes_for_chunk(page, first, cap, provider, model),
-            notes_for_chunk(page, second, cap, provider, model),
-        )?;
-        Ok(a.into_iter().chain(b).collect())
-    }
-    .boxed()
-}
-
-/// The length asked of a notes reply: well inside its token cap, so the
-/// prompt never invites a reply the cap would cut off.
-fn notes_word_budget(cap: u32) -> u32 {
-    cap * 2 / 5
-}
-
-fn chunk_chars(chunk: &[SourceFile]) -> usize {
-    chunk.iter().map(|s| s.content.len()).sum()
-}
-
-fn chunk_label(chunk: &[SourceFile]) -> String {
-    match chunk {
-        [one] => one.repo_relative.display().to_string(),
-        many => format!(
-            "{} files from {}",
-            many.len(),
-            many[0].repo_relative.display()
-        ),
-    }
-}
-
-/// Split a chunk in two: between its files when it has several, else
-/// between the lines of its one file. `None` when it is too small to split.
-fn halve(chunk: &[SourceFile]) -> Option<(Vec<SourceFile>, Vec<SourceFile>)> {
-    if chunk_chars(chunk) < MIN_SPLIT_CHARS * 2 {
-        return None;
-    }
-    if chunk.len() > 1 {
-        let (a, b) = chunk.split_at(chunk.len() / 2);
-        return Some((a.to_vec(), b.to_vec()));
-    }
-    let file = &chunk[0];
-    let lines: Vec<&str> = file.content.split_inclusive('\n').collect();
-    if lines.len() < 2 {
-        return None;
-    }
-    let mid = lines.len() / 2;
-    let part = |range: std::ops::Range<usize>| SourceFile {
-        repo_relative: format!(
-            "{} (lines {}–{})",
-            file.repo_relative.display(),
-            range.start + 1,
-            range.end
-        )
-        .into(),
-        content: lines[range].concat(),
-    };
-    Some((vec![part(0..mid)], vec![part(mid..lines.len())]))
 }
 
 // ─── Editing the page ──────────────────────────────────────────────────────
@@ -947,7 +809,7 @@ async fn invoke(
     tools: &[LlmToolDef],
     max_tokens: u32,
 ) -> Result<LlmResponse> {
-    // The curator wants edits or notes, not a chain of thought: a model
+    // The curator wants edits and verdicts, not a chain of thought: a model
     // that reasons by default would otherwise spend the budget on it.
     // Cached where the route supports it (Claude models): the edit loop
     // resends the sources every turn.
@@ -966,32 +828,10 @@ fn context_overflow_hint(page: &str) -> String {
     format!(
         "curating page `{page}` failed \
          (if the underlying error mentions context length, lower \
-         `[curator] context_safety_tokens` so chunked reading starts sooner, \
-         or scope this page's sources in docs-watch.toml)"
+         `[curator] context_safety_tokens` so large sources are listed for \
+         lookup instead of included, or scope this page's sources in \
+         docs-watch.toml)"
     )
-}
-
-/// Greedy in-order bin-packing of source files into chunks whose
-/// content sizes sum to no more than `budget_chars`. A file larger
-/// than the budget gets its own chunk; the provider's own context
-/// error will catch it if it still doesn't fit.
-pub fn split_into_chunks(sources: &[SourceFile], budget_chars: usize) -> Vec<Vec<SourceFile>> {
-    let mut chunks: Vec<Vec<SourceFile>> = Vec::new();
-    let mut current: Vec<SourceFile> = Vec::new();
-    let mut current_size: usize = 0;
-    for s in sources {
-        let file_size = s.content.len();
-        if !current.is_empty() && current_size + file_size > budget_chars {
-            chunks.push(std::mem::take(&mut current));
-            current_size = 0;
-        }
-        current.push(s.clone());
-        current_size += file_size;
-    }
-    if !current.is_empty() {
-        chunks.push(current);
-    }
-    chunks
 }
 
 /// Rough token estimate via chars / 3. Conservative (real tokenizers
@@ -1581,59 +1421,6 @@ mod tests {
         assert_eq!(text, "---\ntitle: New\n---\n## Usage\n\nRun it.\n");
     }
 
-    // ── Notes ──────────────────────────────────────────────────────────────
-
-    fn notes(text: &str, output_tokens: u32) -> LlmResponse {
-        reply(
-            vec![ContentBlock::Text { text: text.into() }],
-            StopReason::EndTurn,
-            output_tokens,
-        )
-    }
-
-    #[tokio::test]
-    async fn an_overflowing_notes_chunk_is_halved_and_read_again() {
-        let chunk = vec![src("a.rs", MIN_SPLIT_CHARS), src("b.rs", MIN_SPLIT_CHARS)];
-        let cap = 4_000;
-        let provider = Scripted::new(vec![notes("cut", cap), notes("- a", 10), notes("- b", 10)]);
-        let parts = notes_for_chunk("cli.mdx", chunk, cap, &provider, "m")
-            .await
-            .unwrap();
-        assert_eq!(parts, vec!["- a".to_string(), "- b".to_string()]);
-        assert_eq!(provider.seen.lock().unwrap().len(), 3);
-    }
-
-    #[tokio::test]
-    async fn a_chunk_too_small_to_halve_fails_the_page() {
-        let cap = 4_000;
-        let provider = Scripted::new(vec![notes("cut", cap)]);
-        let err = notes_for_chunk("cli.mdx", vec![src("a.rs", 100)], cap, &provider, "m")
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("overflow 4000 tokens"), "{err}");
-    }
-
-    #[test]
-    fn a_single_file_halves_between_its_lines() {
-        let file = SourceFile {
-            repo_relative: "big.rs".into(),
-            content: "x\n".repeat(MIN_SPLIT_CHARS),
-        };
-        let (a, b) = halve(std::slice::from_ref(&file)).unwrap();
-        assert_eq!(a[0].content.clone() + &b[0].content, file.content);
-        assert!(a[0]
-            .repo_relative
-            .display()
-            .to_string()
-            .starts_with("big.rs (lines 1–"));
-    }
-
-    #[test]
-    fn the_notes_prompt_asks_for_less_than_its_cap_allows() {
-        // ~1.3 tokens a word: the asked length must leave the cap headroom.
-        assert!(notes_word_budget(4_000) as f64 * 1.3 < 4_000.0 * 0.6);
-    }
-
     #[test]
     fn resolves_openrouter_deepseek_powerful() {
         let (kind, model) = resolve_tier("openrouter:deepseek:powerful").unwrap();
@@ -1661,62 +1448,11 @@ mod tests {
         );
     }
 
-    fn src(name: &str, size: usize) -> SourceFile {
-        SourceFile {
-            repo_relative: std::path::PathBuf::from(name),
-            content: "x".repeat(size),
-        }
-    }
-
     #[test]
     fn estimate_tokens_uses_chars_over_3() {
         assert_eq!(estimate_tokens(""), 0);
         assert_eq!(estimate_tokens("abc"), 1);
         assert_eq!(estimate_tokens("abcd"), 2);
         assert_eq!(estimate_tokens("a".repeat(300).as_str()), 100);
-    }
-
-    #[test]
-    fn split_into_chunks_returns_single_chunk_when_under_budget() {
-        let sources = vec![src("a", 100), src("b", 200)];
-        let chunks = split_into_chunks(&sources, 1000);
-        assert_eq!(chunks.len(), 1);
-        assert_eq!(chunks[0].len(), 2);
-    }
-
-    #[test]
-    fn split_into_chunks_packs_greedily_in_order() {
-        let sources = vec![src("a", 40), src("b", 80), src("c", 60)];
-        let chunks = split_into_chunks(&sources, 100);
-        assert_eq!(chunks.len(), 3);
-        let names: Vec<String> = chunks
-            .iter()
-            .flatten()
-            .map(|s| s.repo_relative.to_string_lossy().into_owned())
-            .collect();
-        assert_eq!(names, vec!["a", "b", "c"]);
-    }
-
-    #[test]
-    fn split_into_chunks_packs_multiple_files_when_combined_fits() {
-        let sources = vec![src("a", 30), src("b", 50), src("c", 90)];
-        let chunks = split_into_chunks(&sources, 100);
-        assert_eq!(chunks.len(), 2);
-        assert_eq!(chunks[0].len(), 2);
-        assert_eq!(chunks[1].len(), 1);
-    }
-
-    #[test]
-    fn split_into_chunks_oversize_single_file_stands_alone() {
-        let sources = vec![src("a", 200), src("b", 50)];
-        let chunks = split_into_chunks(&sources, 100);
-        assert_eq!(chunks.len(), 2);
-        assert_eq!(chunks[0][0].content.len(), 200);
-        assert_eq!(chunks[1][0].content.len(), 50);
-    }
-
-    #[test]
-    fn split_into_chunks_empty_input_yields_no_chunks() {
-        assert!(split_into_chunks(&[], 100).is_empty());
     }
 }
