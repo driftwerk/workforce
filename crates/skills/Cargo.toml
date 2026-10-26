@@ -32,7 +32,7 @@ futures = { version = "0.3", optional = true }
 lru = { workspace = true, optional = true }
 
 # Microsoft Teams (Bot Framework — behind feature flag)
-jsonwebtoken = { version = "9", optional = true }
+jsonwebtoken = { version = "10", optional = true }
 
 # Email (behind feature flag)
 async-imap = { workspace = true, optional = true }

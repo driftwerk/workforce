@@ -75,7 +75,7 @@ hmac = "0.12"
 sha2 = "0.10"
 subtle = "2.6"
 zeroize = "1"
-jsonwebtoken = "9"
+jsonwebtoken = "10"
 dashmap = "6"
 notify = { version = "7.0", default-features = false, features = ["macos_fsevent"] }
 glob = "0.3"
