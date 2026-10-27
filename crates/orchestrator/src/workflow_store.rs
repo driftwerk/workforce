@@ -124,9 +124,10 @@ fn row_to_revision(r: &tokio_postgres::Row, with_content: bool) -> DefRevision {
 
 /// Insert a revision row (deduping byte-identical saves) and prune old
 /// non-tombstone rows past `max_revisions` (0 = unlimited). Generic over
-/// client so it runs both inside the def-save transaction and standalone
-/// (identity-file / config-overlay capture). Returns the new revision
-/// number, or `None` when deduped.
+/// client, but must run inside a transaction: concurrent saves of one ref
+/// are serialised on a transaction-scoped advisory lock, so two writers
+/// never both read the same newest `rev` and collide on the next one.
+/// Returns the new revision number, or `None` when deduped.
 async fn record_revision_in<C>(
     client: &C,
     kind: &str,
@@ -142,6 +143,12 @@ where
     C: deadpool_postgres::GenericClient,
 {
     let owner_col = owner_column(owner);
+    client
+        .execute(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1 || chr(31) || $2 || chr(31) || $3, 0))",
+            &[&kind, &ref_id, &owner_col],
+        )
+        .await?;
     let latest = client
         .query_opt(
             "SELECT rev, content_hash, deleted FROM def_revisions \
@@ -920,9 +927,10 @@ impl WorkflowStore {
         edit: EditContext<'_>,
         detail: Option<&str>,
     ) -> Result<Option<i32>> {
-        let conn = self.pool.get().await?;
-        record_revision_in(
-            &conn,
+        let mut conn = self.pool.get().await?;
+        let tx = conn.transaction().await?;
+        let rev = record_revision_in(
+            &tx,
             kind,
             ref_id,
             owner,
@@ -932,7 +940,9 @@ impl WorkflowStore {
             detail,
             self.max_revisions,
         )
-        .await
+        .await?;
+        tx.commit().await?;
+        Ok(rev)
     }
 
     /// Revision metadata, newest first (content omitted — fetch one via
@@ -2088,6 +2098,44 @@ mod tests {
             let tombstones: Vec<_> = revs.iter().filter(|r| r.deleted).collect();
             assert_eq!(tombstones.len(), 1, "tombstone survives pruning");
             assert_eq!(revs.iter().filter(|r| !r.deleted).count(), 2);
+        })
+        .await;
+    }
+
+    /// Two saves of one file at the same moment — Desk applying a setting
+    /// twice — each get their own revision instead of one losing to a
+    /// duplicate `rev`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_revisions_of_one_ref_all_land() {
+        with_store(|s| async move {
+            let saves: Vec<_> = (0..8)
+                .map(|n| {
+                    let s = s.clone();
+                    tokio::spawn(async move {
+                        s.record_revision(
+                            KIND_IDENTITY_FILE,
+                            "desk/config.toml",
+                            None,
+                            &format!("# v{n}"),
+                            false,
+                            edit("web", Some("kingsley")),
+                            None,
+                        )
+                        .await
+                    })
+                })
+                .collect();
+            let mut revs = Vec::new();
+            for save in saves {
+                revs.push(
+                    save.await
+                        .expect("task")
+                        .expect("revision")
+                        .expect("not deduped"),
+                );
+            }
+            revs.sort_unstable();
+            assert_eq!(revs, (1..=8).collect::<Vec<_>>());
         })
         .await;
     }
