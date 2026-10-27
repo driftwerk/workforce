@@ -168,17 +168,30 @@ pub const SUBSCRIPTION_PROVIDERS: [ProviderKind; 3] = [
     ProviderKind::Codex,
 ];
 
-/// The models `kind`'s tiers name, most capable first, once each.
-pub fn tier_models(kind: ProviderKind, tiers: &TierRegistry) -> Vec<String> {
+/// The models `kind`'s tiers name, most capable first, each once at the
+/// highest tier that names it.
+pub fn tiered_models(kind: ProviderKind, tiers: &TierRegistry) -> Vec<(ModelTier, String)> {
     ModelTier::ALL
         .into_iter()
-        .filter_map(|tier| tiers.resolve_for_tier(tier, kind.canonical_name()))
-        .fold(Vec::new(), |mut models, model| {
-            if !models.contains(&model) {
-                models.push(model);
+        .filter_map(|tier| {
+            tiers
+                .resolve_for_tier(tier, kind.canonical_name())
+                .map(|model| (tier, model))
+        })
+        .fold(Vec::new(), |mut models, (tier, model)| {
+            if !models.iter().any(|(_, seen)| *seen == model) {
+                models.push((tier, model));
             }
             models
         })
+}
+
+/// The models `kind`'s tiers name, most capable first, once each.
+pub fn tier_models(kind: ProviderKind, tiers: &TierRegistry) -> Vec<String> {
+    tiered_models(kind, tiers)
+        .into_iter()
+        .map(|(_, model)| model)
+        .collect()
 }
 
 /// Every spec routing to a subscription provider on one of its tier models,
@@ -618,5 +631,30 @@ impl SharedSubscriptions {
     /// The hub's ChatGPT device-code sign-ins.
     pub fn device_logins(&self) -> &DeviceLogins {
         &self.device_logins
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tiered_models_keep_each_model_once_at_its_highest_tier() {
+        let tiers = TierRegistry::from_toml(
+            "[claude-code]\npowerful = \"opus\"\nstandard = \"opus\"\ncheap = \"haiku\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            tiered_models(ProviderKind::ClaudeCode, &tiers),
+            [
+                (ModelTier::Powerful, "opus".to_string()),
+                (ModelTier::Cheap, "haiku".to_string()),
+            ]
+        );
+        assert_eq!(
+            tier_models(ProviderKind::ClaudeCode, &tiers),
+            ["opus", "haiku"]
+        );
+        assert!(tiered_models(ProviderKind::ChatGpt, &tiers).is_empty());
     }
 }

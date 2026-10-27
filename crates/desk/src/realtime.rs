@@ -302,8 +302,8 @@ fn to_app(m: WsMessage) -> Step<AxumMessage> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::{voice_router, Authorize};
-    use async_trait::async_trait;
+    use crate::api::voice_router;
+    use crate::testing::{Bearer, Mute};
     use axum::body::{to_bytes, Body};
     use axum::http::{HeaderMap, Request, StatusCode};
     use axum::routing::post;
@@ -319,18 +319,6 @@ mod tests {
         }
         fn how_to_add(&self, provider: Provider) -> String {
             format!("add speech/{}/api_key", provider.name())
-        }
-    }
-
-    struct Bearer;
-
-    #[async_trait]
-    impl Authorize for Bearer {
-        async fn authorize(&self, h: &HeaderMap, _: Option<&str>) -> Result<(), StatusCode> {
-            match h.get("authorization").and_then(|v| v.to_str().ok()) {
-                Some("Bearer hub-token") => Ok(()),
-                _ => Err(StatusCode::UNAUTHORIZED),
-            }
         }
     }
 
@@ -355,13 +343,13 @@ mod tests {
     }
 
     fn router(realtime: Realtime) -> Router {
-        voice_router(Arc::new(Bearer), Arc::new(realtime))
+        voice_router(Arc::new(Bearer), Arc::new(realtime), Arc::new(Mute))
     }
 
     #[tokio::test]
     async fn gpt_live_gets_a_relay_ticket_not_the_key() {
         let realtime = Arc::new(Realtime::new(Arc::new(Keys(Some("sk-vault")))));
-        let app = voice_router(Arc::new(Bearer), Arc::clone(&realtime));
+        let app = voice_router(Arc::new(Bearer), Arc::clone(&realtime), Arc::new(Mute));
         let (status, grant) = ask(app, "gpt-live", "hub-token").await;
         assert_eq!(status, StatusCode::OK);
         let token = grant["token"].as_str().unwrap();
@@ -503,7 +491,12 @@ mod tests {
             Arc::new(Keys(Some("sk-vault"))),
             endpoints,
         ));
-        let hub = serve(voice_router(Arc::new(Bearer), Arc::clone(&realtime))).await;
+        let hub = serve(voice_router(
+            Arc::new(Bearer),
+            Arc::clone(&realtime),
+            Arc::new(Mute),
+        ))
+        .await;
         let grant = realtime.grant(Engine::GptLive, &hub).await.unwrap();
 
         let (mut app, _) = tokio_tungstenite::connect_async(grant.url.as_str())
