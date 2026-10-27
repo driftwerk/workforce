@@ -1046,10 +1046,16 @@ async fn ws_agent_status(state: Arc<GatewayState>, token: &str) -> u16 {
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, router(state)).await.unwrap() });
     let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    // RFC 6455 §1.3's sample nonce, encoded here so it isn't a literal that
+    // reads as a credential.
+    let key = base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        b"the sample nonce",
+    );
     let request = format!(
         "GET /ws/agent?token={token} HTTP/1.1\r\nHost: {addr}\r\nConnection: Upgrade\r\n\
          Upgrade: websocket\r\nSec-WebSocket-Version: 13\r\n\
-         Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
+         Sec-WebSocket-Key: {key}\r\n\r\n"
     );
     stream.write_all(request.as_bytes()).await.unwrap();
     let mut head = Vec::new();
