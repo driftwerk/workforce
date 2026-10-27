@@ -1177,6 +1177,16 @@ fn decode_attachment_base64(att: &SessionAttachment) -> Result<Vec<u8>> {
         .map_err(|e| eyre::eyre!("base64 decode failed: {e}"))
 }
 
+/// The text an XML entity reference stands for: a character reference
+/// (`&#38;`) or one of XML's predefined entities (`&amp;`). Others, which
+/// a DOCX never declares, stand for nothing.
+pub(crate) fn entity_text(reference: &quick_xml::events::BytesRef<'_>) -> Option<String> {
+    if let Ok(Some(c)) = reference.resolve_char_ref() {
+        return Some(c.to_string());
+    }
+    let name = reference.decode().ok()?;
+    quick_xml::escape::resolve_predefined_entity(&name).map(str::to_string)
+}
 /// Extract paragraph text from a docx (ZIP + XML) attachment.
 fn convert_docx_attachment(att: &SessionAttachment) -> Result<String> {
     use quick_xml::events::Event;
@@ -1195,7 +1205,7 @@ fn convert_docx_attachment(att: &SessionAttachment) -> Result<String> {
         .map_err(|e| eyre::eyre!("failed to read document.xml: {e}"))?;
 
     let mut reader = Reader::from_str(&xml_content);
-    reader.trim_text(true);
+    reader.config_mut().trim_text(true);
 
     let mut output = String::new();
     let mut in_paragraph = false;
@@ -1216,7 +1226,13 @@ fn convert_docx_attachment(att: &SessionAttachment) -> Result<String> {
                 }
             }
             Ok(Event::Text(ref e)) if in_paragraph => {
-                if let Ok(text) = e.unescape() {
+                if let Ok(text) = e.decode() {
+                    paragraph_text.push_str(&text);
+                }
+            }
+            // Entity references (`&amp;`, `&#38;`) arrive as their own events.
+            Ok(Event::GeneralRef(ref e)) if in_paragraph => {
+                if let Some(text) = entity_text(e) {
                     paragraph_text.push_str(&text);
                 }
             }

@@ -108,10 +108,12 @@ impl<R: Read + Seek> BundleReader<R> {
     }
 
     pub fn entries_with_prefix(&self, prefix: &str) -> Vec<String> {
+        // A name that doesn't decode can't be read back by name either.
         self.zip
             .file_names()
+            .filter_map(|name| name.ok())
             .filter(|name| name.starts_with(prefix))
-            .map(str::to_string)
+            .map(|name| name.into_owned())
             .collect()
     }
 
