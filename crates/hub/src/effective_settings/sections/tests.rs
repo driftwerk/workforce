@@ -68,6 +68,7 @@ const NOT_REPORTED: &[(&str, &[&str])] = &[
             "codex_chat",
             "coding_session",
             "curator",
+            "desk",
             "environments",
             "exec",
             "games",

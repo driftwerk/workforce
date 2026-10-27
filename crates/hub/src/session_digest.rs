@@ -76,6 +76,11 @@ pub fn surface_label(s: &Session) -> &'static str {
         "ios" => "iOS chat",
         "web" => "web chat",
         "terminal" | "cli" => "terminal chat",
+        c if c == workforce_common::channels::DESK_CHANNEL
+            || workforce_common::channels::is_desk_room(c) =>
+        {
+            "desktop chat"
+        }
         c if workforce_common::channels::is_platform(c, "slack") => "Slack DM",
         _ => "direct chat",
     }
@@ -638,6 +643,7 @@ mod tests {
             "iOS chat",
             "web chat",
             "terminal chat",
+            "desktop chat",
             "voice chat",
             "direct chat",
         ];
@@ -648,6 +654,8 @@ mod tests {
             "web",
             "terminal",
             "cli",
+            "desk",
+            "desk:release",
             "whatsapp:441234",
         ] {
             let s = Session::new(channel, "alice", AGENT);

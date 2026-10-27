@@ -244,6 +244,9 @@ const STORAGE_INPUT_FIELD_MAX_CHARS: usize = 1024;
 /// bounded and its generated tsvector far below Postgres' 1 MiB limit.
 const DELIVERED_TEXT_MAX_BYTES: usize = 32_768;
 
+/// Session metadata key holding the rich blocks the speaking client renders.
+const RICH_RENDERED_KEY: &str = "rich";
+
 fn default_max_compaction_passes() -> u32 {
     3
 }
@@ -1094,13 +1097,52 @@ impl Session {
             .unwrap_or(false)
     }
 
+    /// The rich blocks the client now speaking on this session renders, as
+    /// it declared them. Rewritten by the gateway on every inbound message,
+    /// like [`Self::is_voice_turn`], since one session can be reached from
+    /// more than one client.
+    pub fn rendered_rich(&self) -> crate::rich::RichFeatures {
+        crate::rich::RichFeatures::from_names(
+            self.metadata
+                .get(RICH_RENDERED_KEY)
+                .and_then(|v| v.as_array())
+                .into_iter()
+                .flatten()
+                .filter_map(|v| v.as_str()),
+        )
+    }
+
+    /// Record what the client now speaking renders; `false` when that is
+    /// what the session already held.
+    pub fn set_rendered_rich(&mut self, rendered: crate::rich::RichFeatures) -> bool {
+        if self.rendered_rich() == rendered {
+            return false;
+        }
+        let metadata = self.metadata_object_mut();
+        if rendered.is_empty() {
+            metadata.remove(RICH_RENDERED_KEY);
+        } else {
+            metadata.insert(
+                RICH_RENDERED_KEY.to_string(),
+                serde_json::json!(rendered.names()),
+            );
+        }
+        true
+    }
+
     /// Copy the client-facing conversation-mode keys (voice mode, TTS
-    /// provider) from `from` — a rollover successor must keep speaking the
-    /// way its predecessor did. Selective by design: seq/prev/rollover state
-    /// also lives in metadata and must not transfer. `voice_turn` rides along
-    /// so a rollover landing mid-turn doesn't strand that turn's mode.
+    /// provider, the rich blocks rendered) from `from` — a rollover
+    /// successor must keep speaking the way its predecessor did. Selective
+    /// by design: seq/prev/rollover state also lives in metadata and must
+    /// not transfer. `voice_turn` rides along so a rollover landing mid-turn
+    /// doesn't strand that turn's mode.
     pub fn adopt_conversation_mode(&mut self, from: &Session) {
-        for key in ["voice_mode", "voice_turn", "tts_provider"] {
+        for key in [
+            "voice_mode",
+            "voice_turn",
+            "tts_provider",
+            RICH_RENDERED_KEY,
+        ] {
             if let Some(v) = from.metadata.get(key) {
                 self.metadata_object_mut()
                     .insert(key.to_string(), v.clone());
@@ -6509,6 +6551,33 @@ mod tests {
         s.metadata = serde_json::json!({ "voice_mode": true, "voice_turn": false });
         assert!(s.is_voice());
         assert!(!s.is_voice_turn());
+    }
+
+    #[test]
+    fn the_rich_blocks_rendered_are_rewritten_only_when_they_change() {
+        use crate::rich::RichFeatures;
+        let mut s = Session::new("desk", "u", "agent");
+        assert!(s.rendered_rich().is_empty());
+        assert!(!s.set_rendered_rich(RichFeatures::default()));
+
+        let desk = RichFeatures::from_names(["tables,forms"]);
+        assert!(s.set_rendered_rich(desk));
+        assert_eq!(s.rendered_rich(), desk);
+        assert!(!s.set_rendered_rich(desk), "unchanged");
+
+        assert!(s.set_rendered_rich(RichFeatures::default()));
+        assert!(s.rendered_rich().is_empty());
+        assert!(s.metadata.get(RICH_RENDERED_KEY).is_none());
+    }
+
+    #[test]
+    fn a_rollover_successor_keeps_rendering_the_rich_blocks() {
+        use crate::rich::RichFeatures;
+        let mut from = Session::new("desk", "u", "agent");
+        from.set_rendered_rich(RichFeatures::ALL);
+        let mut successor = Session::new("desk", "u", "agent");
+        successor.adopt_conversation_mode(&from);
+        assert_eq!(successor.rendered_rich(), RichFeatures::ALL);
     }
 
     #[test]

@@ -38,7 +38,7 @@ pub const RUNNER_ONLY_TOOLS: &[&str] = &["context.status", "context.suggest", "c
 
 /// Tools that start a coding round of their own. A coding round holds a slot
 /// of the pool they wait on, so it is never offered them.
-pub const NESTED_ROUND_TOOLS: &[&str] = &["coding.session", "coding.fanout"];
+pub const NESTED_ROUND_TOOLS: &[&str] = &["coding.session", "coding.fanout", "desk.start"];
 
 /// How long Claude Code waits for one MCP call when `MCP_TOOL_TIMEOUT` is
 /// unset: its default of 100,000,000 ms, about 28 hours.

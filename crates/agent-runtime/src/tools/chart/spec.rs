@@ -290,6 +290,27 @@ mod tests {
         validate(&v).expect("valid")
     }
 
+    /// The charts a model is taught to write in a rich-block reply are ones
+    /// this validator, held to the renderer's by the golden corpus, accepts.
+    #[test]
+    fn the_charts_the_rich_prompt_teaches_validate() {
+        let features = workforce_common::rich::RichFeatures {
+            charts: true,
+            ..Default::default()
+        };
+        let block = features.system_block().unwrap();
+        let charts: Vec<Value> = workforce_common::rich::fenced_examples(&block)
+            .map(|(lang, json)| {
+                assert_eq!(lang, "wf-chart");
+                serde_json::from_str(json).unwrap()
+            })
+            .collect();
+        assert_eq!(charts.len(), 2);
+        for chart in &charts {
+            validate(chart).unwrap_or_else(|e| panic!("{e}: {chart}"));
+        }
+    }
+
     #[test]
     fn coerces_numeric_strings_and_rejects_non_numeric() {
         let s = spec(json!({ "kind": "bar", "series": [{ "data": ["42", 7, " 1e3 "] }] }));

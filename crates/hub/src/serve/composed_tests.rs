@@ -766,6 +766,91 @@ fn connected_skills_lists_oauth_and_what_only_this_user_holds() {
     );
 }
 
+/// Rich blocks are taught for what both the agent has on (`[rich]`, read
+/// live from its `config.toml`) and the client speaking renders, below the
+/// shared static segment, and never on a spoken turn.
+#[tokio::test]
+async fn rich_blocks_are_taught_where_the_agent_and_the_client_both_have_them() {
+    use workforce_agent::llm::anthropic::CACHE_BREAK_MARKER;
+    use workforce_common::rich::RichFeatures;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let service = plain_service(tmp.path()).await;
+    let mut session = service
+        .sessions
+        .get_or_create("desk", "alice", service.agent_id.as_str())
+        .unwrap();
+    session.set_rendered_rich(RichFeatures::from_names(["tables,charts"]));
+    service.sessions.save(&session).unwrap();
+    let prompt = || async {
+        crate::turn_loop::build_enhanced_prompt_with_context(
+            &service,
+            Some(&session.id),
+            Some("alice"),
+            false,
+            Some("hello"),
+            None,
+            PromptPrivacy::Private,
+            false,
+            PromptSurface::Full,
+        )
+        .await
+        .stable
+    };
+
+    assert!(
+        !prompt().await.contains("## Rich output"),
+        "the agent has none on"
+    );
+
+    std::fs::write(
+        service.workspace.join("config.toml"),
+        "[rich]\ncharts = true\nforms = true\n",
+    )
+    .unwrap();
+    service.reload_config().await.unwrap();
+    let taught = prompt().await;
+    let (shared, own) = taught.split_once(CACHE_BREAK_MARKER).unwrap();
+    assert!(!shared.contains("## Rich output"));
+    assert!(own.contains("```wf-chart"), "both have charts");
+    assert!(!own.contains("wf-table"), "only the client renders tables");
+    assert!(!own.contains("wf-form"), "only the agent has forms on");
+
+    let automated = crate::turn_loop::build_enhanced_prompt_with_context(
+        &service,
+        Some(&session.id),
+        Some("alice"),
+        false,
+        Some("hello"),
+        None,
+        PromptPrivacy::Withheld {
+            source: "heartbeat",
+        },
+        false,
+        PromptSurface::Full,
+    )
+    .await
+    .stable;
+    assert!(
+        !automated.contains("## Rich output"),
+        "an automated run on the session"
+    );
+
+    let mut spoken = service.sessions.get(&session.id).unwrap().unwrap();
+    spoken.metadata["voice_turn"] = serde_json::json!(true);
+    service.sessions.save(&spoken).unwrap();
+    assert!(!prompt().await.contains("## Rich output"), "a spoken turn");
+
+    let mut plain = service.sessions.get(&session.id).unwrap().unwrap();
+    plain.metadata["voice_turn"] = serde_json::json!(false);
+    plain.set_rendered_rich(RichFeatures::default());
+    service.sessions.save(&plain).unwrap();
+    assert!(
+        !prompt().await.contains("## Rich output"),
+        "a client that renders none"
+    );
+}
+
 #[tokio::test]
 async fn full_surface_prompt_equals_exclusive_surface_over_full_registry() {
     let tmp = tempfile::tempdir().unwrap();

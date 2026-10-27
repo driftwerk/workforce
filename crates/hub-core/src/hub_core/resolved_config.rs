@@ -93,6 +93,9 @@ pub struct ResolvedConfig {
     /// `[decision]` from the agent's `config.toml`, over the install's kill
     /// switch. Read each time a decision is recorded.
     pub decision: Option<workforce_common::settings::AgentDecisionConfig>,
+    /// `[rich]` from the agent's `config.toml`: the rich blocks it may be
+    /// taught. Read each turn, so an edit takes effect on the next one.
+    pub rich: workforce_common::rich::RichFeatures,
     /// `[scheduler]` from the agent's `config.toml`, over the install's kill
     /// switch. Read each time a job runs.
     pub scheduler: Option<workforce_common::settings::AgentSchedulerConfig>,
@@ -246,6 +249,7 @@ impl ResolvedConfig {
                 .cloned(),
             know_how: workspace_config.and_then(|w| w.know_how.clone()),
             decision: workspace_config.and_then(|w| w.decision),
+            rich: workspace_config.and_then(|w| w.rich).unwrap_or_default(),
             scheduler: workspace_config.and_then(|w| w.scheduler),
             research: workspace_config.and_then(|w| w.research.clone()),
             handoff: workspace_config.and_then(|w| w.handoff.clone()),
@@ -367,6 +371,7 @@ mod tests {
             refactor: None,
             know_how: None,
             decision: None,
+            rich: Default::default(),
             scheduler: None,
             research: None,
             handoff: None,

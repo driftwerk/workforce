@@ -6,7 +6,13 @@
 //! `local_exec_progress` messages. Upon completion (or timeout / cancellation),
 //! a `local_exec_result` message is sent.
 //!
-//! The agent auto-reconnects with exponential back-off if the connection drops.
+//! With `--mcp`, it also tunnels an MCP server on this machine: the tools that
+//! server lists (those `--mcp-tools` names) are offered to the remote hub in
+//! the hello, re-offered when they change, and each `node_tool_call` is run on
+//! that server and answered with a `node_tool_result`.
+//!
+//! The agent auto-reconnects with exponential back-off if the connection drops,
+//! and stops when the gateway refuses it.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -19,10 +25,145 @@ use tokio::io::AsyncBufReadExt;
 use tokio::process::Command;
 use tokio::sync::{mpsc, RwLock};
 use tokio_tungstenite::tungstenite::Message;
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
+use workforce_gateway_client::protocol::{
+    LocalAgentHello, LocalAgentRefused, NodeToolCall, NodeToolCancel, NodeToolResult, NodeToolSpec,
+    NodeTools,
+};
+use workforce_mcp_client::{McpClient, McpLimits, McpToolDef, StaticBearer};
 
 /// Maximum reconnect back-off delay.
 const MAX_BACKOFF_SECS: u64 = 30;
+
+/// Where `--mcp`'s bearer is read from, so it never appears on a command line.
+pub const MCP_TOKEN_ENV: &str = "WORKFORCE_NODE_MCP_TOKEN";
+
+/// How often a tunnelled MCP server's tools are listed again, to offer the
+/// hub what changed.
+const TOOLS_REFRESH: Duration = Duration::from_secs(60);
+
+/// The tools a tunnel never offers: the approval bridge of a workforce hub's
+/// MCP endpoint, which answers the prompts that endpoint's own calls raise.
+/// A remote agent holding it could approve its own calls on this machine;
+/// those prompts are the person's, in Desk.
+const NEVER_OFFERED: &str = "approval_";
+
+/// The gateway refused this agent; connecting again would be refused too.
+#[derive(Debug)]
+struct Refused(String);
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the gateway refused this local agent: {}", self.0)
+    }
+}
+
+impl std::error::Error for Refused {}
+
+/// An MCP server on this machine whose tools the agent offers the hub.
+pub struct McpTunnel {
+    client: McpClient,
+    /// Whether the server has been initialised, which it is before the first
+    /// listing that reaches it.
+    initialized: std::sync::atomic::AtomicBool,
+    /// Which of the server's tools to offer: exact names, or prefixes ending
+    /// in `*`.
+    patterns: Vec<String>,
+}
+
+impl McpTunnel {
+    /// A tunnel to the streamable-HTTP MCP endpoint `url`, authenticated
+    /// with `bearer`, offering the tools `patterns` name.
+    pub fn new(url: &str, bearer: String, patterns: Vec<String>) -> Result<Self> {
+        let client = McpClient::new(
+            reqwest::Url::parse(url)?,
+            Arc::new(reqwest::Client::new()),
+            Arc::new(StaticBearer::new(bearer)),
+            McpLimits::default(),
+        );
+        Ok(Self {
+            client,
+            initialized: Default::default(),
+            patterns,
+        })
+    }
+
+    /// The tools to offer now, as the server lists them.
+    async fn tools(&self) -> Result<Vec<NodeToolSpec>> {
+        use std::sync::atomic::Ordering;
+        if !self.initialized.load(Ordering::Acquire) {
+            self.client.initialize().await?;
+            self.initialized.store(true, Ordering::Release);
+        }
+        let listed = self
+            .client
+            .tools_list_filtered(|name| offers(&self.patterns, name))
+            .await?;
+        Ok(listed.into_iter().map(spec).collect())
+    }
+
+    /// Run `call` on the server; `cancel` abandons it.
+    async fn call(&self, call: NodeToolCall, cancel: CancellationToken) -> NodeToolResult {
+        let outcome = self
+            .client
+            .tools_call(&call.name, call.arguments, cancel)
+            .await;
+        NodeToolResult {
+            msg_type: "node_tool_result".to_string(),
+            request_id: call.request_id,
+            error: outcome.as_ref().err().map(ToString::to_string),
+            result: outcome.ok(),
+        }
+    }
+}
+
+/// Whether a tool named `name` is offered under `patterns`.
+fn offers(patterns: &[String], name: &str) -> bool {
+    !name.starts_with(NEVER_OFFERED)
+        && patterns
+            .iter()
+            .any(|pattern| match pattern.strip_suffix('*') {
+                Some(prefix) => name.starts_with(prefix),
+                None => pattern == name,
+            })
+}
+
+fn spec(tool: McpToolDef) -> NodeToolSpec {
+    NodeToolSpec {
+        name: tool.name,
+        description: tool.description,
+        input_schema: tool.input_schema,
+        read_only: tool.annotations.read_only_hint,
+    }
+}
+
+/// The node id this machine goes by when none is given: its host name's
+/// first label, as a hub accepts a node id.
+pub fn default_node_id() -> String {
+    let host = hostname::get()
+        .map(|h| h.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    node_id_from(&host)
+}
+
+fn node_id_from(host: &str) -> String {
+    let label: String = host
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .chars()
+        .map(|c| match c {
+            'a'..='z' | '0'..='9' => c,
+            _ => '-',
+        })
+        .take(workforce_hub::local_agent_registry::MAX_NODE_ID_LEN)
+        .collect();
+    match label.trim_matches('-') {
+        "" => "local-agent".to_string(),
+        id => id.to_string(),
+    }
+}
 
 /// Run the local agent, reconnecting on failure with exponential back-off.
 pub async fn run_local_agent(
@@ -31,8 +172,10 @@ pub async fn run_local_agent(
     agent_id: &str,
     name: &str,
     workdir: Option<PathBuf>,
+    mcp: Option<McpTunnel>,
 ) -> Result<()> {
     let effective_workdir = workdir.unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    let mcp = mcp.map(Arc::new);
     let mut backoff_secs: u64 = 1;
 
     loop {
@@ -43,11 +186,21 @@ pub async fn run_local_agent(
             "Connecting to gateway..."
         );
 
-        match connect_and_run(gateway_url, token, agent_id, name, &effective_workdir).await {
+        match connect_and_run(
+            gateway_url,
+            token,
+            agent_id,
+            name,
+            &effective_workdir,
+            mcp.as_ref(),
+        )
+        .await
+        {
             Ok(()) => {
                 info!("Disconnected cleanly");
                 break;
             }
+            Err(e) if e.downcast_ref::<Refused>().is_some() => return Err(e),
             Err(e) => {
                 warn!(error = %e, backoff_secs, "Connection lost — reconnecting");
                 tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
@@ -68,6 +221,7 @@ async fn connect_and_run(
     agent_id: &str,
     name: &str,
     workdir: &Path,
+    mcp: Option<&Arc<McpTunnel>>,
 ) -> Result<()> {
     let ws_url = build_ws_url(gateway_url, token)?;
 
@@ -77,13 +231,24 @@ async fn connect_and_run(
     info!("WebSocket connected — sending hello");
 
     // ── Registration ────────────────────────────────────────────────────
-    let hello = serde_json::json!({
-        "type": "local_agent_hello",
-        "agent_node_id": agent_id,
-        "name": name,
-        "capabilities": ["shell", "filesystem"],
-        "allowed_paths": [workdir.to_string_lossy()],
-    });
+    // A server not answering yet leaves `exec.run` working: its tools are
+    // offered by the next refresh that reaches it.
+    let mut offered = match mcp {
+        Some(mcp) => mcp.tools().await.unwrap_or_else(|e| {
+            warn!(error = %e, "Could not list the tunnelled MCP server's tools");
+            Vec::new()
+        }),
+        None => Vec::new(),
+    };
+    info!(tools = offered.len(), "Offering tools");
+    let hello = LocalAgentHello {
+        msg_type: "local_agent_hello".to_string(),
+        agent_node_id: agent_id.to_string(),
+        name: name.to_string(),
+        capabilities: vec!["shell".into(), "filesystem".into()],
+        allowed_paths: vec![workdir.to_string_lossy().into_owned()],
+        tools: offered.clone(),
+    };
     ws_sink
         .send(Message::Text(serde_json::to_string(&hello)?.into()))
         .await?;
@@ -92,6 +257,8 @@ async fn connect_and_run(
     // Map of request_id -> cancel sender, for in-flight processes.
     let running: Arc<RwLock<HashMap<String, tokio::sync::oneshot::Sender<()>>>> =
         Arc::new(RwLock::new(HashMap::new()));
+    // Map of request_id -> cancellation, for in-flight tool calls.
+    let calls: Arc<parking_lot::Mutex<HashMap<String, CancellationToken>>> = Arc::default();
 
     // Outbound message channel — all tasks send through here.
     let (send_tx, mut send_rx) = mpsc::channel::<String>(64);
@@ -105,9 +272,34 @@ async fn connect_and_run(
         }
     });
 
+    let mut refresh =
+        tokio::time::interval_at(tokio::time::Instant::now() + TOOLS_REFRESH, TOOLS_REFRESH);
+
     // ── Read loop (WebSocket -> dispatch) ───────────────────────────────
-    while let Some(msg_result) = ws_stream.next().await {
-        let msg = msg_result?;
+    loop {
+        let msg = tokio::select! {
+            msg = ws_stream.next() => match msg {
+                Some(msg) => msg?,
+                None => break,
+            },
+            _ = refresh.tick(), if mcp.is_some() => {
+                let mcp = mcp.expect("refreshes only with a tunnel");
+                match mcp.tools().await {
+                    Ok(tools) if tools != offered => {
+                        info!(tools = tools.len(), "Offering changed tools");
+                        let update = NodeTools {
+                            msg_type: "node_tools".to_string(),
+                            tools: tools.clone(),
+                        };
+                        let _ = send_tx.send(serde_json::to_string(&update)?).await;
+                        offered = tools;
+                    }
+                    Ok(_) => {}
+                    Err(e) => warn!(error = %e, "Could not list the tunnelled MCP server's tools"),
+                }
+                continue;
+            }
+        };
         match msg {
             Message::Text(text) => {
                 let value: serde_json::Value = match serde_json::from_str(&text) {
@@ -118,9 +310,13 @@ async fn connect_and_run(
                     }
                 };
 
-                let msg_type = value.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                let msg_type = value
+                    .get("type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
 
-                match msg_type {
+                match msg_type.as_str() {
                     // ── Execute a command ────────────────────────────
                     "local_exec" => {
                         let request_id = value["request_id"].as_str().unwrap_or("").to_string();
@@ -173,6 +369,55 @@ async fn connect_and_run(
                                 "Cancel requested but no running process found"
                             );
                         }
+                    }
+
+                    // ── Run a tunnelled MCP tool ─────────────────────
+                    "node_tool_call" => {
+                        let call: NodeToolCall = match serde_json::from_value(value) {
+                            Ok(call) => call,
+                            Err(e) => {
+                                warn!(error = %e, "Malformed node_tool_call — ignoring");
+                                continue;
+                            }
+                        };
+                        let Some(mcp) = mcp.cloned() else {
+                            let refused = NodeToolResult {
+                                msg_type: "node_tool_result".to_string(),
+                                request_id: call.request_id,
+                                result: None,
+                                error: Some("this local agent tunnels no MCP server".into()),
+                            };
+                            let _ = send_tx.send(serde_json::to_string(&refused)?).await;
+                            continue;
+                        };
+                        info!(request_id = %call.request_id, tool = %call.name, "Running tool");
+                        let cancel = CancellationToken::new();
+                        calls.lock().insert(call.request_id.clone(), cancel.clone());
+                        let (send_tx, calls) = (send_tx.clone(), Arc::clone(&calls));
+                        tokio::spawn(async move {
+                            let request_id = call.request_id.clone();
+                            let result = mcp.call(call, cancel).await;
+                            calls.lock().remove(&request_id);
+                            if let Ok(json) = serde_json::to_string(&result) {
+                                let _ = send_tx.send(json).await;
+                            }
+                        });
+                    }
+
+                    // ── Abandon a tool call ──────────────────────────
+                    "node_tool_cancel" => {
+                        if let Ok(cancel) = serde_json::from_value::<NodeToolCancel>(value) {
+                            if let Some(token) = calls.lock().remove(&cancel.request_id) {
+                                token.cancel();
+                            }
+                        }
+                    }
+
+                    // ── Refused: connecting again is refused too ─────
+                    "local_agent_refused" => {
+                        let refused: LocalAgentRefused = serde_json::from_value(value)?;
+                        write_handle.abort();
+                        return Err(Refused(refused.message).into());
                     }
 
                     // ── Keepalive ────────────────────────────────────
@@ -419,6 +664,55 @@ fn build_ws_url(gateway_url: &str, token: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_tunnel_offers_what_its_patterns_name_and_never_the_approval_bridge() {
+        let patterns = ["desk_*".to_string(), "filesystem_read".to_string()];
+        for offered in ["desk_sessions", "desk_start", "filesystem_read"] {
+            assert!(offers(&patterns, offered), "{offered}");
+        }
+        for withheld in ["filesystem_write", "vault_get", "desk"] {
+            assert!(!offers(&patterns, withheld), "{withheld}");
+        }
+        let everything = ["*".to_string()];
+        assert!(offers(&everything, "agent_chat"));
+        assert!(!offers(&everything, "approval_decide"));
+        assert!(!offers(&everything, "approval_status"));
+    }
+
+    #[test]
+    fn a_read_only_hint_marks_the_offered_tool() {
+        let listed: McpToolDef = serde_json::from_value(serde_json::json!({
+            "name": "desk_sessions",
+            "description": "List sessions",
+            "inputSchema": {"type": "object"},
+            "annotations": {"readOnlyHint": true},
+        }))
+        .unwrap();
+        let offered = spec(listed);
+        assert!(offered.read_only);
+        assert_eq!(offered.name, "desk_sessions");
+        let unmarked: McpToolDef =
+            serde_json::from_value(serde_json::json!({"name": "desk_start"})).unwrap();
+        assert!(!spec(unmarked).read_only);
+    }
+
+    #[test]
+    fn the_default_node_id_is_the_host_names_first_label_as_a_hub_accepts_it() {
+        for (host, id) in [
+            ("kingsleys-macbook-pro.local", "kingsleys-macbook-pro"),
+            ("Studio_2", "studio-2"),
+            (
+                "a-very-long-host-name-for-a-mac-mini",
+                "a-very-long-host-name-fo",
+            ),
+            ("...", "local-agent"),
+        ] {
+            let derived = node_id_from(&host.to_lowercase());
+            assert_eq!(derived, id, "{host}");
+            assert!(workforce_hub::local_agent_registry::valid_node_id(&derived));
+        }
+    }
 
     #[test]
     fn test_build_ws_url_http() {

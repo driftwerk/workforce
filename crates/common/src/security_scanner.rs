@@ -357,6 +357,8 @@ const PROSE_FIELDS: &[(&str, &[&str])] = &[
     ("coding.session", &["message"]),
     ("coding.fanout", &["subtasks"]),
     ("coding.claude", &["task", "context"]),
+    ("desk.start", &["prompt", "goal"]),
+    ("desk.prompt", &["prompt"]),
 ];
 
 /// Whether `field_path` (as [`walk_json`] names it) lies inside one of

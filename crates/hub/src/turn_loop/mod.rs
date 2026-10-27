@@ -1363,6 +1363,27 @@ pub(crate) async fn build_enhanced_prompt_with_context(
         prompt.push_str(&note);
     }
 
+    // ── Rich blocks ──────────────────────────────────────────────────
+    // The fences both the agent has on and the client speaking renders.
+    // Channel state, so pre-gate like the notes above; never on a spoken
+    // turn, whose directive forbids code blocks and tables, nor on an
+    // automated one, whose output can be delivered where nothing renders
+    // them.
+    if let Some(block) = session_id
+        .filter(|_| !matches!(privacy, PromptPrivacy::Withheld { .. }))
+        .and_then(|sid| service.sessions.get(sid).ok().flatten())
+        .filter(|session| !session.is_voice_turn())
+        .and_then(|session| {
+            service
+                .resolved_snapshot()
+                .rich
+                .intersect(session.rendered_rich())
+                .system_block()
+        })
+    {
+        prompt.push_str(&block);
+    }
+
     // ── Loaded Skills (process-wide, non-OAuth) ─────────────────────
     // Semi-stable: moves only when a skill is enabled or installed, so it
     // lives below the first break rather than in the cached catalogue.

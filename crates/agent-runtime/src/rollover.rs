@@ -67,9 +67,9 @@ pub fn rollover_pressure(
 /// Conversational-channel turns are tiny, so a chat thread degrades on
 /// message volume long before the token watermark is reachable. Voice
 /// sessions roll at `voice_rollover_max_messages` (spoken context decays
-/// fastest); text sessions on conversational channels (ios/web/terminal) at
-/// the looser `chat_rollover_max_messages`. 0 disables either ceiling;
-/// platform-scoped channels (Slack threads etc.) have no count ceiling.
+/// fastest); text sessions on conversational channels at the looser
+/// `chat_rollover_max_messages`. 0 disables either ceiling; platform-scoped
+/// channels (Slack threads etc.) have no count ceiling.
 pub fn count_pressure(session: &Session, config: &CompactionConfig) -> bool {
     let ceiling = if session.is_voice() {
         config.voice_rollover_max_messages

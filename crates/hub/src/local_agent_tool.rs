@@ -1,9 +1,10 @@
-//! Local Agent Exec Tool — routes `exec.run` calls to a connected local agent.
+//! Tools that run on a person's own machine over the node uplink.
 //!
-//! When a session has a `selected_local_agent` in its metadata, this tool replaces
-//! the default `exec.run` implementation. Commands are sent to the local agent's
-//! machine via WebSocket, with identity-file safety (DW-327) enforced: any command
-//! touching protected paths is routed to the gateway instead.
+//! [`LocalAgentExecTool`] stands in for `exec.run` when a session selected a
+//! local agent; [`NodeTool`] is one tool of an MCP server a node tunnels,
+//! offered to its person's sessions as `node.<node id>.<tool>`. Each call
+//! checks that the turn runs as the node's person: a session naming a node
+//! is never enough to reach it.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -16,7 +17,7 @@ use tracing::{info, warn};
 use workforce_agent::tools::{Tool, ToolResult};
 use workforce_gateway_client::protocol::LocalExecRequest;
 
-use crate::local_agent_registry::LocalAgentRegistry;
+use crate::local_agent_registry::{LocalAgentRegistry, OfferedTool};
 
 /// Protected paths that must always execute on the gateway (DW-327).
 ///
@@ -34,14 +35,23 @@ const PROTECTED_PATTERNS: &[&str] = &[
     "/.local/",
 ];
 
+/// How long a node tool call may take before it is given up on.
+const NODE_TOOL_TIMEOUT: Duration = Duration::from_secs(300);
+
 /// Check whether a command references a protected path.
 fn is_protected_path(command: &str) -> bool {
     PROTECTED_PATTERNS.iter().any(|p| command.contains(p))
 }
 
-/// Tool implementation that routes `exec.run` to a connected local agent,
-/// falling back to the gateway's own exec tool when the agent is unavailable
-/// or the command touches protected identity files.
+/// The person this turn runs as, whom a node must act for.
+fn caller() -> Option<String> {
+    crate::user_config::current_identity_id()
+}
+
+/// Tool implementation that routes `exec.run` to a connected local agent.
+/// Commands touching protected identity files run on the gateway's own exec
+/// tool; a node that is gone or acts for someone else fails the call rather
+/// than running it on the hub instead.
 pub struct LocalAgentExecTool {
     local_agents: Arc<LocalAgentRegistry>,
     target_agent_id: String,
@@ -107,7 +117,13 @@ impl Tool for LocalAgentExecTool {
             return self.fallback_exec.execute(input).await;
         }
 
-        // Build the request for the local agent
+        let elapsed = || start.elapsed().as_millis() as u64;
+        let Some(caller) = caller() else {
+            return Ok(ToolResult::failure(
+                "A local agent runs commands only for its own person's turns.",
+                elapsed(),
+            ));
+        };
         let request_id = uuid::Uuid::new_v4().to_string();
         let request = LocalExecRequest {
             msg_type: "local_exec".to_string(),
@@ -116,100 +132,196 @@ impl Tool for LocalAgentExecTool {
             workdir: exec_input.workdir.clone(),
             timeout_secs: exec_input.timeout_secs,
         };
-
-        // Route to local agent
-        match self
+        let rx = match self
             .local_agents
-            .send_exec(&self.target_agent_id, request)
+            .send_exec(&self.target_agent_id, &caller, request)
             .await
         {
-            Ok(rx) => {
-                let timeout = Duration::from_secs(exec_input.timeout_secs.unwrap_or(300));
-                match tokio::time::timeout(timeout, rx).await {
-                    Ok(Ok(result)) => {
-                        let elapsed = start.elapsed().as_millis() as u64;
-                        if result.ok {
-                            info!(
-                                agent = %self.target_agent_id,
-                                request_id = %request_id,
-                                duration_ms = elapsed,
-                                "Local exec succeeded"
-                            );
-                            // Build output matching the standard exec.run format
-                            let output = serde_json::json!({
-                                "stdout": result.stdout.unwrap_or_default(),
-                                "stderr": result.stderr.unwrap_or_default(),
-                                "exit_code": result.exit_code.unwrap_or(0),
-                                "source": "local_agent",
-                                "agent_id": self.target_agent_id,
-                            });
-                            Ok(ToolResult::success(output, elapsed))
-                        } else {
-                            let error = result
-                                .error
-                                .unwrap_or_else(|| "Unknown local agent error".to_string());
-                            warn!(
-                                agent = %self.target_agent_id,
-                                request_id = %request_id,
-                                error = %error,
-                                "Local exec failed"
-                            );
-                            // Include stdout/stderr so the agent can see what
-                            // went wrong, not just the error summary.
-                            let stdout = result.stdout.unwrap_or_default();
-                            let stderr = result.stderr.unwrap_or_default();
-                            let detail = if stdout.is_empty() && stderr.is_empty() {
-                                error
-                            } else {
-                                let mut parts = vec![error];
-                                if !stdout.is_empty() {
-                                    parts.push(format!("\n--- stdout ---\n{stdout}"));
-                                }
-                                if !stderr.is_empty() {
-                                    parts.push(format!("\n--- stderr ---\n{stderr}"));
-                                }
-                                parts.join("")
-                            };
-                            Ok(ToolResult::failure(detail, elapsed))
-                        }
-                    }
-                    Ok(Err(_)) => {
-                        // Agent disconnected — oneshot sender was dropped
-                        warn!(
-                            agent = %self.target_agent_id,
-                            "Local agent disconnected during exec — falling back to gateway"
-                        );
-                        self.fallback_exec.execute(input).await
-                    }
-                    Err(_) => {
-                        // Timeout
-                        let elapsed = start.elapsed().as_millis() as u64;
-                        warn!(
-                            agent = %self.target_agent_id,
-                            request_id = %request_id,
-                            timeout_secs = timeout.as_secs(),
-                            "Local exec timed out"
-                        );
-                        Ok(ToolResult::failure(
-                            format!(
-                                "Local agent did not respond within {} seconds.",
-                                timeout.as_secs()
-                            ),
-                            elapsed,
-                        ))
-                    }
-                }
-            }
+            Ok(rx) => rx,
             Err(e) => {
-                // Agent not connected — fall back to gateway
+                warn!(agent = %self.target_agent_id, error = %e, "Local exec not sent");
+                return Ok(ToolResult::failure(
+                    format!("Not run: {e}. Nothing ran anywhere."),
+                    elapsed(),
+                ));
+            }
+        };
+        let timeout = Duration::from_secs(exec_input.timeout_secs.unwrap_or(300));
+        match tokio::time::timeout(timeout, rx).await {
+            Ok(Ok(result)) if result.ok => {
+                info!(
+                    agent = %self.target_agent_id,
+                    request_id = %request_id,
+                    duration_ms = elapsed(),
+                    "Local exec succeeded"
+                );
+                let output = serde_json::json!({
+                    "stdout": result.stdout.unwrap_or_default(),
+                    "stderr": result.stderr.unwrap_or_default(),
+                    "exit_code": result.exit_code.unwrap_or(0),
+                    "source": "local_agent",
+                    "agent_id": self.target_agent_id,
+                });
+                Ok(ToolResult::success(output, elapsed()))
+            }
+            Ok(Ok(result)) => {
+                let error = result
+                    .error
+                    .unwrap_or_else(|| "Unknown local agent error".to_string());
                 warn!(
                     agent = %self.target_agent_id,
-                    error = %e,
-                    "Local agent not available — falling back to gateway"
+                    request_id = %request_id,
+                    error = %error,
+                    "Local exec failed"
                 );
-                self.fallback_exec.execute(input).await
+                // Include stdout/stderr so the agent can see what went
+                // wrong, not just the error summary.
+                let stdout = result.stdout.unwrap_or_default();
+                let stderr = result.stderr.unwrap_or_default();
+                let mut detail = error;
+                if !stdout.is_empty() {
+                    detail.push_str(&format!("\n--- stdout ---\n{stdout}"));
+                }
+                if !stderr.is_empty() {
+                    detail.push_str(&format!("\n--- stderr ---\n{stderr}"));
+                }
+                Ok(ToolResult::failure(detail, elapsed()))
+            }
+            Ok(Err(_)) => {
+                warn!(agent = %self.target_agent_id, "Local agent disconnected during exec");
+                Ok(ToolResult::failure(
+                    "The local agent disconnected before the command finished; it may have run \
+                     in part.",
+                    elapsed(),
+                ))
+            }
+            Err(_) => {
+                warn!(
+                    agent = %self.target_agent_id,
+                    request_id = %request_id,
+                    timeout_secs = timeout.as_secs(),
+                    "Local exec timed out"
+                );
+                self.local_agents
+                    .cancel_exec(&self.target_agent_id, &request_id)
+                    .await;
+                Ok(ToolResult::failure(
+                    format!(
+                        "Local agent did not respond within {} seconds.",
+                        timeout.as_secs()
+                    ),
+                    elapsed(),
+                ))
             }
         }
+    }
+}
+
+/// One tool a node offers its person's sessions, run on that node.
+pub struct NodeTool {
+    local_agents: Arc<LocalAgentRegistry>,
+    offered: OfferedTool,
+    description: String,
+}
+
+impl NodeTool {
+    pub fn new(local_agents: Arc<LocalAgentRegistry>, offered: OfferedTool) -> Self {
+        let description = format!(
+            "On {} (the user's own machine): {}",
+            offered.node_name, offered.spec.description
+        );
+        Self {
+            local_agents,
+            offered,
+            description,
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for NodeTool {
+    fn name(&self) -> &str {
+        &self.offered.name
+    }
+
+    fn description(&self) -> &str {
+        &self.description
+    }
+
+    fn input_schema(&self) -> serde_json::Value {
+        self.offered.spec.input_schema.clone()
+    }
+
+    async fn execute(&self, input: serde_json::Value) -> Result<ToolResult> {
+        let start = Instant::now();
+        let elapsed = || start.elapsed().as_millis() as u64;
+        let name = &self.offered.name;
+        let Some(caller) = caller() else {
+            return Ok(ToolResult::failure(
+                format!("{name} runs only for its own person's turns."),
+                elapsed(),
+            ));
+        };
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let rx = match self
+            .local_agents
+            .call_tool(name, &caller, &request_id, input)
+            .await
+        {
+            Ok(rx) => rx,
+            Err(e) => return Ok(ToolResult::failure(format!("Not run: {e}."), elapsed())),
+        };
+        match tokio::time::timeout(NODE_TOOL_TIMEOUT, rx).await {
+            Ok(Ok(reply)) => Ok(match (reply.result, reply.error) {
+                (Some(result), None) if !is_error(&result) => {
+                    ToolResult::success(result, elapsed())
+                }
+                (Some(result), None) => ToolResult::failure(error_text(&result), elapsed()),
+                (_, Some(error)) => ToolResult::failure(error, elapsed()),
+                (None, None) => ToolResult::failure(
+                    format!("{} answered without a result", self.offered.node_name),
+                    elapsed(),
+                ),
+            }),
+            Ok(Err(_)) => Ok(ToolResult::failure(
+                format!(
+                    "{} disconnected before {name} finished; it may have run in part.",
+                    self.offered.node_name
+                ),
+                elapsed(),
+            )),
+            Err(_) => {
+                self.local_agents.cancel_tool_call(name, &request_id).await;
+                Ok(ToolResult::failure(
+                    format!(
+                        "{} did not answer {name} within {} seconds.",
+                        self.offered.node_name,
+                        NODE_TOOL_TIMEOUT.as_secs()
+                    ),
+                    elapsed(),
+                ))
+            }
+        }
+    }
+}
+
+/// Whether an MCP `tools/call` result reports the tool failed.
+fn is_error(result: &serde_json::Value) -> bool {
+    result.get("isError").and_then(|v| v.as_bool()) == Some(true)
+}
+
+/// A failed MCP `tools/call` result's text items, or the result itself
+/// when it carries none.
+fn error_text(result: &serde_json::Value) -> String {
+    let text: Vec<&str> = result["content"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|item| item["text"].as_str())
+        .collect();
+    match text.is_empty() {
+        true => result.to_string(),
+        false => text.join("\n"),
     }
 }
 

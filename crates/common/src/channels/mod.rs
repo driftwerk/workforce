@@ -40,12 +40,36 @@ pub fn channel_id(channel: &str) -> &str {
     parse_channel(channel).1
 }
 
-/// True for channels representing a direct human-driven conversation — the
-/// gateway's persistent one-chat-per-user channels, as opposed to
+/// The desktop app's channel. Each of its rooms is a conversation of its own,
+/// on `desk:<slug>` (see [`is_desk_room`]).
+pub const DESK_CHANNEL: &str = "desk";
+
+/// The gateway's persistent one-chat-per-user channels: the iOS app, the web
+/// UI, the terminal and the desktop app, each a screen the reply is read on.
+pub const CONVERSATIONAL_CHANNELS: &[&str] = &["ios", "web", "terminal", DESK_CHANNEL];
+
+const DESK_ROOM_SLUG_MAX: usize = 64;
+
+/// True for a desktop app room's channel: `desk:<slug>`, the slug 1–64 of
+/// `[a-z0-9-]`.
+pub fn is_desk_room(channel: &str) -> bool {
+    channel
+        .strip_prefix(DESK_CHANNEL)
+        .and_then(|rest| rest.strip_prefix(':'))
+        .is_some_and(|slug| {
+            (1..=DESK_ROOM_SLUG_MAX).contains(&slug.len())
+                && slug
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        })
+}
+
+/// True for channels representing a direct human-driven conversation — one of
+/// [`CONVERSATIONAL_CHANNELS`] or a desktop app room, as opposed to
 /// platform-scoped (`slack:…`) or internal (`workflow:…`, `scheduler:…`)
 /// sessions. These are the channels where stale-resume rollover applies.
 pub fn is_conversational(channel: &str) -> bool {
-    matches!(channel, "ios" | "web" | "terminal")
+    CONVERSATIONAL_CHANNELS.contains(&channel) || is_desk_room(channel)
 }
 
 // ── Channel surface trait ───────────────────────────────────────────────────
@@ -1114,6 +1138,33 @@ mod tests {
         assert!(is_platform("slack:C123", "slack"));
         assert!(!is_platform("slack:C123", "ws"));
         assert!(!is_platform("bare", "slack"));
+    }
+
+    #[test]
+    fn a_desk_room_is_a_conversation_of_its_own() {
+        for room in [
+            "desk:release",
+            "desk:a",
+            "desk:q3-plan-2",
+            &format!("desk:{}", "x".repeat(64)),
+        ] {
+            assert!(is_desk_room(room), "{room}");
+            assert!(is_conversational(room), "{room}");
+        }
+        for not_a_room in [
+            "desk",
+            "desk:",
+            "desk:Release",
+            "desk:two words",
+            "desk:a/b",
+            "desk:a:b",
+            "desktop:release",
+            &format!("desk:{}", "x".repeat(65)),
+        ] {
+            assert!(!is_desk_room(not_a_room), "{not_a_room}");
+        }
+        assert!(is_conversational(DESK_CHANNEL));
+        assert!(!is_conversational("desk:Release"));
     }
 
     #[test]

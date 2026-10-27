@@ -16,6 +16,7 @@ pub mod resolve;
 pub mod s3_store;
 pub mod store;
 pub mod stream;
+pub mod table_page;
 pub mod tabular;
 pub mod types;
 

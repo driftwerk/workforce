@@ -1,0 +1,39 @@
+[package]
+name = "workforce-desk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "Desk sessions: real Claude Code and Codex terminals the hub owns, tracks and restores"
+
+[dependencies]
+async-trait = { workspace = true }
+axum = { workspace = true }
+bytes = { workspace = true }
+chrono = { workspace = true }
+deadpool-postgres = { workspace = true }
+eyre = { workspace = true }
+futures = { workspace = true }
+parking_lot = { workspace = true }
+portable-pty = "0.9"
+refinery = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-postgres = { workspace = true }
+tokio-tungstenite = { version = "0.28", features = ["native-tls"] }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+workforce-postgres = { path = "../postgres", features = ["postgres"] }
+
+[build-dependencies]
+workforce-build-support = { path = "../build-support" }
+
+[dev-dependencies]
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
+workforce-postgres = { path = "../postgres", features = ["test-support"] }

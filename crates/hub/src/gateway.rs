@@ -191,6 +191,15 @@ impl GatewayState {
 pub struct WsQuery {
     pub token: Option<String>,
     pub agent_id: Option<String>,
+    /// The conversational channel a `/ws` connection anchors its session on,
+    /// so each of a person's apps (and each desktop app room) keeps its own
+    /// conversation. iOS when omitted.
+    pub channel: Option<String>,
+    /// The rich blocks a `/ws` client renders, as comma-separated `[rich]`
+    /// flag names (`tables,charts,forms,maps,diagrams,images`). Its turns
+    /// are taught the ones its agent also has on; a name this hub does not
+    /// know is ignored.
+    pub rich: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -608,6 +617,10 @@ pub fn router(state: Arc<GatewayState>) -> Router {
         .route(
             "/api/artifacts/runtime/{id}",
             get(artifacts_runtime_get),
+        )
+        .route(
+            "/api/artifacts/runtime/{id}/table",
+            get(artifacts_runtime_table),
         )
         // Workflow CRUD endpoints
         .route("/api/workflows/export", get(workflow_export))
@@ -1106,6 +1119,16 @@ async fn ws_handler(
     Query(query): Query<WsQuery>,
     State(state): State<Arc<GatewayState>>,
 ) -> impl IntoResponse {
+    // The conversation this connection anchors on: iOS when the client names
+    // no channel, otherwise the conversational channel it names.
+    let anchor_channel = match query.channel.as_deref() {
+        None => IOS_CHANNEL.to_string(),
+        Some(channel) if workforce_common::channels::is_conversational(channel) => {
+            channel.to_string()
+        }
+        Some(channel) => return invalid_ws_channel(channel),
+    };
+    let rich = workforce_common::rich::RichFeatures::from_names(query.rich.as_deref());
     let token = query.token.unwrap_or_default();
 
     // Strategy 1 (admin token) removed — no identity context for per-user scoping.
@@ -1142,6 +1165,8 @@ async fn ws_handler(
                         handle_ws(
                             socket,
                             state,
+                            anchor_channel,
+                            rich,
                             agent_id,
                             device_id,
                             device_scopes,
@@ -1185,6 +1210,8 @@ async fn ws_handler(
                     handle_ws(
                         socket,
                         state,
+                        anchor_channel,
+                        rich,
                         agent_id,
                         claims.device_id,
                         scopes,
@@ -1392,11 +1419,45 @@ mod voice_forward_tests {
     }
 }
 
+/// The refusal of a `/ws` handshake naming a channel that is not
+/// conversational: a 400 — not a 401, which the iOS client counts as an auth
+/// strike — rather than quietly joining the iOS conversation.
+fn invalid_ws_channel(channel: &str) -> axum::response::Response {
+    (
+        StatusCode::BAD_REQUEST,
+        axum::Json(serde_json::json!({
+            "error": "invalid_channel",
+            "message": format!(
+                "Unknown channel '{channel}'. A WebSocket anchors on one of: {}, \
+                 or a desk room as desk:<slug> (1-64 of a-z, 0-9 and -).",
+                workforce_common::channels::CONVERSATIONAL_CHANNELS.join(", ")
+            ),
+        })),
+    )
+        .into_response()
+}
+
+/// The session a connection on `channel` anchors on for `owner` and
+/// `agent_id`. A dormant conversation rolls over at resume, so the client is
+/// handed a fresh session instead of one whose history would replay
+/// weeks-old exchanges.
+fn anchor_session(
+    service: &AgentService,
+    channel: &str,
+    owner: &str,
+    agent_id: &str,
+) -> eyre::Result<workforce_common::session::Session> {
+    let session = service.sessions.get_or_create(channel, owner, agent_id)?;
+    service.roll_stale_for_resume(channel, session)
+}
+
 /// Handle an authenticated WebSocket connection.
 #[allow(clippy::too_many_arguments)]
 async fn handle_ws(
     socket: WebSocket,
     state: Arc<GatewayState>,
+    anchor_channel: String,
+    rich: workforce_common::rich::RichFeatures,
     agent_id: Option<String>,
     device_id: Option<String>,
     device_scopes: Option<Vec<String>>,
@@ -1437,15 +1498,9 @@ async fn handle_ws(
     let session_owner_ref = identity_id.as_deref().or(device_id.as_deref());
     let initial_session_id = session_owner_ref.and_then(|owner| {
         state.registry.get(resolved_id).and_then(|service| {
-            service
-                .sessions
-                .get_or_create(IOS_CHANNEL, owner, resolved_id)
-                // A dormant conversation rolls over at resume, so the
-                // handshake hands the client a fresh session id instead of
-                // one whose history would replay weeks-old exchanges.
-                .and_then(|s| service.roll_stale_for_resume(IOS_CHANNEL, s))
+            anchor_session(&service, &anchor_channel, owner, resolved_id)
                 .ok()
-                .map(|s| s.id.clone())
+                .map(|s| s.id)
         })
     });
     if let Some(ref sid) = initial_session_id {
@@ -1598,7 +1653,7 @@ async fn handle_ws(
                             let channel = client_msg
                                 .channel
                                 .as_deref()
-                                .unwrap_or(IOS_CHANNEL)
+                                .unwrap_or(&anchor_channel)
                                 .to_string();
 
                             // Sentinel: trust-aware content wrapping
@@ -1766,12 +1821,12 @@ async fn handle_ws(
                             let fallback_session_id = match anchored_session_id.as_deref() {
                                 Some(anchor) => anchor.to_string(),
                                 None => {
-                                    let resolved = service
-                                        .sessions
-                                        .get_or_create(IOS_CHANNEL, session_owner, &agent_id_str)
-                                        .and_then(|s| {
-                                            service.roll_stale_for_resume(IOS_CHANNEL, s)
-                                        });
+                                    let resolved = anchor_session(
+                                        &service,
+                                        &anchor_channel,
+                                        session_owner,
+                                        &agent_id_str,
+                                    );
                                     match resolved {
                                         Ok(s) => s.id.clone(),
                                         Err(e) => {
@@ -1826,13 +1881,19 @@ async fn handle_ws(
                             // with an agent, so its voice flag says "one of my
                             // turns was spoken", not "this one was". A
                             // scheduled job stamped off the latter would be
-                            // permanently mis-addressed. iOS is excluded — it
-                            // is a screen the reply already reaches.
-                            let voice_channel =
-                                (voice_turn && channel != IOS_CHANNEL).then(|| channel.clone());
+                            // permanently mis-addressed. The conversational
+                            // channels are excluded — each is a screen the
+                            // reply already reaches.
+                            let voice_channel = (voice_turn
+                                && !workforce_common::channels::is_conversational(&channel))
+                            .then(|| channel.clone());
                             if let Ok(Some(mut session)) =
                                 service.sessions.get(&effective_session_id)
                             {
+                                // What this connection renders, rewritten
+                                // per message like `voice_turn`: the session
+                                // may last have been spoken to elsewhere.
+                                let mut changed = session.set_rendered_rich(rich);
                                 let turn_changed = session.is_voice_turn() != voice_turn;
                                 if turn_changed
                                     || client_msg.voice_mode.is_some()
@@ -1856,8 +1917,11 @@ async fn handle_ws(
                                                 serde_json::json!(tp),
                                             );
                                         }
-                                        let _ = service.sessions.save(&session);
+                                        changed = true;
                                     }
+                                }
+                                if changed {
+                                    let _ = service.sessions.save(&session);
                                 }
                             }
 
@@ -2850,64 +2914,100 @@ fn chat_progress_to_broadcast(
 // ── Local Agent WebSocket (DW-324) ─────────────────────────────────────────
 
 /// WebSocket upgrade handler for local agent connections.
+///
+/// A node acts for one person, so it authenticates as their paired device:
+/// the device's linked identity is who it is bound to. The gateway token
+/// names nobody and is refused, as on `/ws`; so is a device without the
+/// `agents` scope, one linked to no one, or one whose person is suspended.
 async fn ws_local_agent_handler(
     ws: WebSocketUpgrade,
     Query(query): Query<WsQuery>,
     State(state): State<Arc<GatewayState>>,
 ) -> impl IntoResponse {
     let token = query.token.unwrap_or_default();
+    let refused = |status: StatusCode, error: &str, message: &str| {
+        (
+            status,
+            axum::Json(serde_json::json!({ "error": error, "message": message })),
+        )
+            .into_response()
+    };
 
-    // Auth: same as ws_handler — admin token or device pairing token
     if crate::auth::constant_time_token_eq(&token, &state.auth_token) {
-        return ws
-            .on_upgrade(move |socket| handle_local_agent_ws(socket, state))
-            .into_response();
+        return refused(
+            StatusCode::FORBIDDEN,
+            "unbound",
+            "A local agent acts for one person: connect with a device token paired to them, \
+             not the gateway token.",
+        );
     }
-
-    if let Some(ref pairing) = state.device_pairing {
+    let Some(ref pairing) = state.device_pairing else {
+        return refused(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "Device pairing is not configured on this hub.",
+        );
+    };
+    let device =
         match pairing.validate_token_async(token.to_string()).await {
-            Ok(Some(_)) => {
-                return ws
-                    .on_upgrade(move |socket| handle_local_agent_ws(socket, state))
-                    .into_response();
-            }
-            Ok(None) => {}
+            Ok(Some(device)) => device,
+            Ok(None) => return refused(
+                StatusCode::UNAUTHORIZED,
+                "unauthorized",
+                "Authentication required. Provide a valid device token (?token=...) or pair your \
+                 device via /api/pair/device/request.",
+            ),
             Err(e) => {
                 warn!(
                     error = %e,
                     "Pairing store error during local agent WebSocket auth — failing closed"
                 );
-                return (
+                return refused(
                     StatusCode::SERVICE_UNAVAILABLE,
-                    axum::Json(serde_json::json!({
-                        "error": "service_unavailable",
-                        "message": "Authentication backend unavailable — retry shortly."
-                    })),
-                )
-                    .into_response();
+                    "service_unavailable",
+                    "Authentication backend unavailable — retry shortly.",
+                );
             }
-        }
+        };
+    if !crate::jwt::has_scope(&device.scopes, crate::jwt::SCOPE_AGENTS) {
+        return refused(
+            StatusCode::FORBIDDEN,
+            "forbidden",
+            "This device was paired without the 'agents' scope, which a local agent needs.",
+        );
     }
-
-    (
-        StatusCode::UNAUTHORIZED,
-        axum::Json(serde_json::json!({
-            "error": "unauthorized",
-            "message": "Authentication required. Provide a valid gateway token (?token=...) or pair your device via /api/pair/device/request."
-        })),
-    )
+    let Some(identity_id) = state
+        .identity_store
+        .as_ref()
+        .and_then(|store| identity_for_device(store.as_ref(), &device.id))
+    else {
+        return refused(
+            StatusCode::FORBIDDEN,
+            "unbound",
+            "This device is linked to no person, so no one's turns could use it. Pair it to a \
+             person first.",
+        );
+    };
+    if let Some(refused) = suspended_refusal(&state, Some(&identity_id)) {
+        return refused;
+    }
+    ws.on_upgrade(move |socket| handle_local_agent_ws(socket, state, identity_id))
         .into_response()
 }
 
-/// Handle a local agent WebSocket connection.
+/// Handle a local agent WebSocket connection, bound to `identity_id`.
 ///
 /// Protocol:
-/// 1. Agent sends `local_agent_hello` as its first message
-/// 2. Gateway registers the agent in `LocalAgentRegistry`
+/// 1. Agent sends `local_agent_hello` as its first message, with the tools
+///    it offers
+/// 2. Gateway registers the agent for its person — or answers
+///    `local_agent_refused` and closes, for an unusable id or one another
+///    person's node holds
 /// 3. Write loop: forwards serialized JSON messages from the registry to the WS
-/// 4. Read loop: receives `local_exec_result` / `local_exec_progress` / `pong`
-/// 5. On disconnect: deregisters the agent
-async fn handle_local_agent_ws(socket: WebSocket, state: Arc<GatewayState>) {
+/// 4. Read loop: receives `local_exec_result` / `local_exec_progress` /
+///    `node_tool_result` / `node_tools` / `pong`
+/// 5. On disconnect: deregisters this connection, failing its waiting calls
+async fn handle_local_agent_ws(socket: WebSocket, state: Arc<GatewayState>, identity_id: String) {
     let (mut ws_sender, mut ws_receiver) = socket.split();
 
     // Step 1: Wait for the local_agent_hello handshake
@@ -2936,7 +3036,9 @@ async fn handle_local_agent_ws(socket: WebSocket, state: Arc<GatewayState>) {
     info!(
         agent_id = %agent_id,
         name = %hello.name,
+        identity = %identity_id,
         capabilities = ?hello.capabilities,
+        tools = hello.tools.len(),
         "Local agent connected"
     );
 
@@ -2944,15 +3046,36 @@ async fn handle_local_agent_ws(socket: WebSocket, state: Arc<GatewayState>) {
     let (request_tx, mut request_rx) = tokio::sync::mpsc::channel::<String>(64);
 
     // Step 3: Register in the local agent registry
-    state
+    let registered = state
         .local_agents
         .register(
-            agent_id.clone(),
-            hello.name.clone(),
-            hello.capabilities.clone(),
+            crate::local_agent_registry::NodeHello {
+                id: hello.agent_node_id,
+                name: hello.name,
+                capabilities: hello.capabilities,
+                tools: hello.tools,
+            },
+            identity_id,
             request_tx,
         )
         .await;
+    let connection = match registered {
+        Ok(connection) => connection,
+        Err(refusal) => {
+            warn!(agent_id = %agent_id, %refusal, "Local agent refused");
+            let refused = workforce_gateway_client::protocol::LocalAgentRefused {
+                msg_type: "local_agent_refused".to_string(),
+                message: refusal.to_string(),
+            };
+            let _ = ws_sender
+                .send(Message::Text(
+                    serde_json::to_string(&refused).unwrap().into(),
+                ))
+                .await;
+            let _ = ws_sender.send(Message::Close(None)).await;
+            return;
+        }
+    };
 
     // Send acknowledgement
     let ack = serde_json::json!({
@@ -2981,7 +3104,6 @@ async fn handle_local_agent_ws(socket: WebSocket, state: Arc<GatewayState>) {
         while let Some(Ok(msg)) = ws_receiver.next().await {
             match msg {
                 Message::Text(text) => {
-                    // Try to determine the message type
                     let parsed: serde_json::Value = match serde_json::from_str(&text) {
                         Ok(v) => v,
                         Err(e) => {
@@ -2989,48 +3111,7 @@ async fn handle_local_agent_ws(socket: WebSocket, state: Arc<GatewayState>) {
                             continue;
                         }
                     };
-
-                    match parsed.get("type").and_then(|t| t.as_str()) {
-                        Some("local_exec_result") => {
-                            match serde_json::from_value::<LocalExecResult>(parsed) {
-                                Ok(result) => {
-                                    local_agents_read
-                                        .fulfill_result(&agent_id_read, result)
-                                        .await;
-                                }
-                                Err(e) => {
-                                    warn!(
-                                        agent_id = %agent_id_read,
-                                        "Failed to parse local_exec_result: {}", e
-                                    );
-                                }
-                            }
-                        }
-                        Some("local_exec_progress") => {
-                            // Progress messages are informational — log for now.
-                            // Future: could stream to the client via broadcast.
-                            tracing::trace!(
-                                agent_id = %agent_id_read,
-                                "Received exec progress from local agent"
-                            );
-                        }
-                        Some("pong") => {
-                            // Keepalive response — nothing to do
-                        }
-                        Some(other) => {
-                            tracing::debug!(
-                                agent_id = %agent_id_read,
-                                msg_type = %other,
-                                "Unknown message type from local agent"
-                            );
-                        }
-                        None => {
-                            warn!(
-                                agent_id = %agent_id_read,
-                                "Local agent message missing 'type' field"
-                            );
-                        }
-                    }
+                    receive_from_node(&local_agents_read, &agent_id_read, connection, parsed).await;
                 }
                 Message::Close(_) => break,
                 _ => {}
@@ -3049,8 +3130,56 @@ async fn handle_local_agent_ws(socket: WebSocket, state: Arc<GatewayState>) {
     }
 
     // Step 6: Deregister on disconnect
-    state.local_agents.deregister(&agent_id).await;
+    state.local_agents.deregister(&agent_id, connection).await;
     info!(agent_id = %agent_id, "Local agent disconnected");
+}
+
+/// Act on one message from node `agent_id`'s `connection`.
+async fn receive_from_node(
+    registry: &crate::local_agent_registry::LocalAgentRegistry,
+    agent_id: &str,
+    connection: u64,
+    message: serde_json::Value,
+) {
+    use workforce_gateway_client::protocol::{NodeToolResult, NodeTools};
+    fn parsed<T: serde::de::DeserializeOwned>(
+        agent_id: &str,
+        kind: &str,
+        message: serde_json::Value,
+    ) -> Option<T> {
+        serde_json::from_value(message)
+            .inspect_err(|e| warn!(agent_id, kind, "Failed to parse a local agent message: {e}"))
+            .ok()
+    }
+    let kind = message
+        .get("type")
+        .and_then(|t| t.as_str())
+        .map(str::to_owned);
+    match kind.as_deref() {
+        Some(kind @ "local_exec_result") => {
+            if let Some(result) = parsed::<LocalExecResult>(agent_id, kind, message) {
+                registry.fulfill_result(agent_id, connection, result).await;
+            }
+        }
+        Some(kind @ "node_tool_result") => {
+            if let Some(result) = parsed::<NodeToolResult>(agent_id, kind, message) {
+                registry
+                    .fulfill_tool_result(agent_id, connection, result)
+                    .await;
+            }
+        }
+        Some(kind @ "node_tools") => {
+            if let Some(update) = parsed::<NodeTools>(agent_id, kind, message) {
+                registry.set_tools(agent_id, connection, update.tools).await;
+            }
+        }
+        // Progress is informational, and a pong is a keepalive.
+        Some("local_exec_progress" | "pong") => {}
+        Some(other) => {
+            tracing::debug!(agent_id, msg_type = %other, "Unknown message type from local agent");
+        }
+        None => warn!(agent_id, "Local agent message missing 'type' field"),
+    }
 }
 
 /// List connected local agents (REST API).
@@ -3059,14 +3188,18 @@ async fn list_local_agents(
     headers: axum::http::HeaderMap,
     State(state): State<Arc<GatewayState>>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let _caller = require_scope(
+    let caller = require_scope(
         &state,
         &headers,
         query.token.as_deref(),
         crate::jwt::SCOPE_AGENTS,
     )
     .await?;
-    let agents = state.local_agents.list().await;
+    let agents = match (caller.is_admin, caller.identity_id.as_deref()) {
+        (true, _) => state.local_agents.list().await,
+        (false, Some(person)) => state.local_agents.list_for(person).await,
+        (false, None) => Vec::new(),
+    };
     Ok(Json(serde_json::json!({ "local_agents": agents })))
 }
 
@@ -3499,10 +3632,13 @@ async fn list_agents(
                 (None, None)
             };
 
+            let model = svc.current_default_model.read().clone();
+            let provider = svc.provider_kind.read().canonical_name().to_string();
             Some(workforce_gateway_client::AgentInfo {
                 id: id_str.clone(),
                 name: agent_config.and_then(|a| a.name.clone()),
-                model: agent_config.and_then(|a| a.model.clone()),
+                model: Some(model).filter(|m| !m.is_empty()),
+                provider: Some(provider),
                 capabilities: agent_config
                     .map(|a| a.capabilities.clone())
                     .unwrap_or_default(),
@@ -3734,6 +3870,48 @@ async fn artifacts_runtime_get(
         &descriptor,
         std::time::Duration::from_secs(300),
     )
+}
+
+/// `GET /api/artifacts/runtime/{id}/table` — one filtered, sorted page of a
+/// staged table, which a rich-block client pages an artifact-backed
+/// `wf-table` and a `wf-form` typeahead through. Authorised exactly like the
+/// artifact's bytes ([`artifacts_runtime_get`]).
+async fn artifacts_runtime_table(
+    State(state): State<Arc<GatewayState>>,
+    Path(id): Path<String>,
+    Query(q): Query<RuntimeArtifactQuery>,
+    Query(page): Query<workforce_agent::artifacts::table_page::PageRequest>,
+    headers: axum::http::HeaderMap,
+) -> Result<axum::response::Response, StatusCode> {
+    use workforce_agent::artifacts::table_page::{table_page, PageRefusal};
+    let caller = resolve_caller_context(&state, &headers, q.token.as_deref()).await;
+    if !caller.is_authenticated() {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    let store =
+        workforce_agent::artifacts::global_store().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    let agent_id = q.agent_id.as_deref().ok_or(StatusCode::BAD_REQUEST)?;
+    let art_id =
+        workforce_agent::artifacts::ArtifactId::parse(&id).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let descriptor = store
+        .metadata(agent_id, &art_id)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    authorize_runtime_read(&caller, &descriptor)?;
+    let body =
+        table_page(store.as_ref(), agent_id, &art_id, &descriptor, &page).map_err(|refusal| {
+            match refusal {
+                PageRefusal::NotFound => StatusCode::NOT_FOUND,
+                PageRefusal::TooLarge => StatusCode::PAYLOAD_TOO_LARGE,
+                PageRefusal::Unavailable => StatusCode::INTERNAL_SERVER_ERROR,
+            }
+        })?;
+    let mut response = Json(body).into_response();
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store"),
+    );
+    Ok(response)
 }
 
 /// Resolve the calling principal from request context. Honours all three
@@ -4077,7 +4255,8 @@ fn token_prefix_hint(token: &str) -> String {
     token.chars().take(8).collect()
 }
 
-/// Canonical channel name for iOS / paired-device chat conversations.
+/// Canonical channel name for iOS / paired-device chat conversations, and the
+/// channel a `/ws` connection anchors on when it names none.
 pub const IOS_CHANNEL: &str = "ios";
 
 /// `GET /api/me` — return the calling principal's identity summary.
@@ -6698,14 +6877,14 @@ fn auto_link_device_to_identity(
         .with_email(hint)
         .with_status(IdentityStatus::AutoProvisioned)
         .with_provisioning_source(ProvisioningSource::IosAuto)
-        .with_linked_id("ios_device", device_id);
+        .with_linked_id(device_kind, device_id);
     let id_str = identity.id.to_string();
     store.create(&identity)?;
     info!(
         identity_id = %id_str,
         email = hint,
         device_id = device_id,
-        "Auto-provisioned identity for iOS pairing by email"
+        "Auto-provisioned identity for device pairing by email"
     );
     Ok(Some((id_str, "auto_provisioned")))
 }
@@ -13194,6 +13373,8 @@ mod session_visibility_tests {
         assert!(is_conversational_channel("ios"));
         assert!(is_conversational_channel("web"));
         assert!(is_conversational_channel("terminal"));
+        assert!(is_conversational_channel("desk"));
+        assert!(is_conversational_channel("desk:release"));
         assert!(!is_conversational_channel("slack:DM:U0FAKEUSER1"));
         assert!(!is_conversational_channel("slack:allan:D0FAKEDMAA1"));
         assert!(!is_conversational_channel("workflow:abc:design"));
@@ -13520,6 +13701,8 @@ mod session_visibility_tests {
         let anyone = Query(WsQuery {
             token: None,
             agent_id: None,
+            channel: None,
+            rich: None,
         });
         chat_handler(
             headers.clone(),
@@ -13580,6 +13763,90 @@ mod session_visibility_tests {
         bob.status = IdentityStatus::Active;
         store.update(&bob).unwrap();
         assert!(suspended_refusal(&state, Some(&bob.id.to_string())).is_none());
+    }
+
+    /// A client's `rich` declaration is recorded on the session its message
+    /// runs on (names this hub does not know dropped), and a submitted form
+    /// — its summary and fenced values, as Desk sends it — is the turn's user
+    /// message byte for byte.
+    #[tokio::test]
+    async fn a_rich_clients_turn_carries_its_declaration_and_a_form_submission_arrives_intact() {
+        use futures::{SinkExt, StreamExt};
+        use workforce_common::session::MessageRole;
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, service, [(_, as_alice), _]) = rest_chat(tmp.path()).await;
+        let token = as_alice["authorization"]
+            .to_str()
+            .unwrap()
+            .strip_prefix("Bearer ")
+            .unwrap()
+            .to_string();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                router(state).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await
+        });
+        let (mut socket, _) = tokio_tungstenite::connect_async(format!(
+            "ws://{addr}/ws?token={token}&channel=desk&rich=tables,forms,video"
+        ))
+        .await
+        .unwrap();
+        async fn next_frame(
+            socket: &mut (impl futures::Stream<
+                Item = Result<
+                    tokio_tungstenite::tungstenite::Message,
+                    tokio_tungstenite::tungstenite::Error,
+                >,
+            > + Unpin),
+        ) -> serde_json::Value {
+            loop {
+                let frame = socket.next().await.unwrap().unwrap();
+                if let Ok(text) = frame.to_text() {
+                    return serde_json::from_str(text).unwrap();
+                }
+            }
+        }
+        let connected = next_frame(&mut socket).await;
+        let session_id = connected["session_id"].as_str().unwrap().to_string();
+
+        let submission = "Submitted \"New lead\"\n- Company: Acme Ltd\n- Status: Open\n\n\
+                          ```json\n{\"company\":\"Acme Ltd\",\"status\":\"open\",\"value\":1000,\
+                          \"tags\":[\"warm\",\"q3\"],\"consent\":true}\n```";
+        socket
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                serde_json::json!({"type": "chat", "content": submission})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            while next_frame(&mut socket).await["type"] != "stream_end" {}
+        })
+        .await
+        .expect("the turn answers");
+
+        let asked = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let session = service.sessions.get(&session_id).unwrap().unwrap();
+                if let Some(asked) = session
+                    .messages
+                    .iter()
+                    .find(|m| m.role == MessageRole::User)
+                {
+                    return (session.rendered_rich(), asked.content.clone());
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the question is kept");
+        assert_eq!(asked.0.names(), ["tables", "forms"]);
+        assert_eq!(asked.1, submission);
     }
 
     /// A token minted while its person was an administrator claims only
@@ -14338,6 +14605,35 @@ mod pairing_auto_link_tests {
         assert_eq!(
             created.linked_ids.get("ios_device").map(String::as_str),
             Some("device-3")
+        );
+    }
+
+    /// A person provisioned by a device's pairing has it linked under its own
+    /// kind, so the phone they pair next does not replace it.
+    #[test]
+    fn auto_link_provisions_under_the_devices_own_kind() {
+        let store = store();
+        let (id_str, _) =
+            auto_link_device_to_identity(&store, "fresh@example.com", "desk-1", "desktop_device")
+                .unwrap()
+                .expect("link succeeded");
+        auto_link_device_to_identity(&store, "fresh@example.com", "phone-1", "ios_device").unwrap();
+
+        let created = store
+            .get_by_id(uuid::Uuid::parse_str(&id_str).unwrap())
+            .unwrap()
+            .expect("identity created");
+        assert_eq!(
+            created.linked_ids.get("desktop_device").map(String::as_str),
+            Some("desk-1")
+        );
+        assert_eq!(
+            created.linked_ids.get("ios_device").map(String::as_str),
+            Some("phone-1")
+        );
+        assert_eq!(
+            identity_for_device(&store, "desk-1").as_deref(),
+            Some(id_str.as_str())
         );
     }
 

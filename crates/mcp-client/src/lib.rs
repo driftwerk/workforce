@@ -47,6 +47,6 @@ pub use limits::{
 };
 pub use session::McpClient;
 pub use types::{
-    InitializeResult, McpToolDef, ServerCapabilities, ServerInfo, ToolNameInfo, ToolNameSurvey,
-    PROTOCOL_VERSION,
+    InitializeResult, McpToolDef, ServerCapabilities, ServerInfo, ToolAnnotations, ToolNameInfo,
+    ToolNameSurvey, PROTOCOL_VERSION,
 };

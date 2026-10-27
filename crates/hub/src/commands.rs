@@ -1804,7 +1804,7 @@ async fn execute_select_agent(
 
     match target {
         "list" => {
-            let agents = local_agents.list().await;
+            let agents = local_agents.list_for(user).await;
             if agents.is_empty() {
                 CommandResult::info(
                     "No local agents connected.\n\n\
@@ -1836,8 +1836,10 @@ async fn execute_select_agent(
                 );
             };
 
-            if !local_agents.is_connected(node_id).await {
-                return CommandResult::info(format!("Local agent '{}' is not connected.", node_id));
+            if !local_agents.is_bound_to(node_id, user).await {
+                return CommandResult::info(format!(
+                    "None of your local agents is connected as '{node_id}'."
+                ));
             }
 
             // Store selected_local_agent in session metadata

@@ -546,6 +546,11 @@ pub struct WorkforceConfig {
     /// the hub mounts the games router and seats the listed game-player agents.
     #[serde(default)]
     pub games: GamesConfig,
+    /// Desk sessions (`[desk]`): real Claude Code / Codex terminals this hub
+    /// runs for the person at the machine, tracked and restored after a
+    /// restart. Off by default; needs `[postgres]`.
+    #[serde(default)]
+    pub desk: DeskConfig,
     /// Privilege-separated command executor (`exec.run` / `code.*`). When a
     /// runner socket is set the hub dispatches commands to the unprivileged
     /// runner daemon instead of executing them in-process (audit F7).
@@ -646,6 +651,77 @@ pub struct GamesConfig {
     /// and knowledge, and point `workspace` at the real persona to keep its voice.
     #[serde(default)]
     pub agent_players: Vec<String>,
+}
+
+/// `[desk]` — Desk sessions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeskConfig {
+    /// Mount `/api/desk` and host sessions. Default: disabled.
+    #[serde(default)]
+    pub enabled: bool,
+    /// The Claude Code CLI, as a path or a name looked up on `PATH`.
+    #[serde(default = "default_desk_claude")]
+    pub claude: String,
+    /// The Codex CLI, as a path or a name looked up on `PATH`.
+    #[serde(default = "default_desk_codex")]
+    pub codex: String,
+    /// What happens to sessions that were running when the hub stopped:
+    /// offer them back (`ask`), resume them (`auto`), or neither (`off`).
+    #[serde(default)]
+    pub restore: DeskRestore,
+    /// How long an approval waits in Desk before the terminal asks instead.
+    #[serde(default = "default_desk_approval_timeout_secs")]
+    pub approval_timeout_secs: u64,
+    /// Terminal history kept per session for viewers that attach later.
+    #[serde(default = "default_desk_scrollback_kb")]
+    pub scrollback_kb: usize,
+    /// How often Claude Code sessions in other terminals are looked for;
+    /// 0 turns that off.
+    #[serde(default = "default_desk_adopt_interval_secs")]
+    pub adopt_interval_secs: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DeskRestore {
+    #[default]
+    Ask,
+    Auto,
+    Off,
+}
+
+impl Default for DeskConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            claude: default_desk_claude(),
+            codex: default_desk_codex(),
+            restore: DeskRestore::default(),
+            approval_timeout_secs: default_desk_approval_timeout_secs(),
+            scrollback_kb: default_desk_scrollback_kb(),
+            adopt_interval_secs: default_desk_adopt_interval_secs(),
+        }
+    }
+}
+
+fn default_desk_claude() -> String {
+    "claude".into()
+}
+
+fn default_desk_codex() -> String {
+    "codex".into()
+}
+
+fn default_desk_approval_timeout_secs() -> u64 {
+    3600
+}
+
+fn default_desk_scrollback_kb() -> usize {
+    2048
+}
+
+fn default_desk_adopt_interval_secs() -> u64 {
+    5
 }
 
 /// `[workflows]` — execution limits for workflows and playbooks.
@@ -7179,6 +7255,11 @@ pub struct AgentWorkspaceConfig {
     /// This agent's own environments; hot-reloaded. Only a human changes them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub environments: Option<AgentEnvironmentsConfig>,
+    /// Per-agent `[rich]`: the rich blocks (tables, charts, forms, maps,
+    /// diagrams, images) this agent is taught, on a channel that renders
+    /// them; all off by default, hot-reloaded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rich: Option<crate::rich::RichFeatures>,
 }
 
 impl AgentWorkspaceConfig {
@@ -11100,6 +11181,16 @@ default = true
 # model = "claude-sonnet-4-20250514"
 # workspace = "./data/agents/architect"
 # capabilities = ["design", "code-review", "planning"]
+
+# Desk — real Claude Code / Codex terminals this hub runs for you, tracked
+# and restored after a restart (needs [postgres]).
+# [desk]
+# enabled = true
+# claude = "claude"            # Path or name on PATH
+# codex = "codex"
+# restore = "ask"              # "ask", "auto" or "off"
+# approval_timeout_secs = 3600 # Then the terminal asks instead
+# adopt_interval_secs = 5      # Look for sessions in other terminals (0 = off)
 
 # Heartbeat — periodic agent check-ins.
 # [heartbeat]

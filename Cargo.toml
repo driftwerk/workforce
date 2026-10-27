@@ -25,6 +25,7 @@ members = [
     "crates/hub",
     "crates/hub-core",
     "crates/games",
+    "crates/desk",
     "crates/gateway-client",
     "crates/cli",
     "crates/codebase-knowledge",

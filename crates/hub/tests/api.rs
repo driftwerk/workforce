@@ -48,3 +48,9 @@ mod lifecycle_routes;
 
 #[path = "api/decision_routes.rs"]
 mod decision_routes;
+
+#[path = "api/ws_routes.rs"]
+mod ws_routes;
+
+#[path = "api/node_routes.rs"]
+mod node_routes;

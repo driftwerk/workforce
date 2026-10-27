@@ -477,9 +477,10 @@ impl VoiceSurface {
     /// they cannot recover, while one that wrongly assumes a speaker is merely
     /// a little plainer than it needed to be.
     pub(crate) fn of(channel: &str) -> Self {
-        match channel {
-            "ios" | "web" | "terminal" => Self::Screen,
-            _ => Self::Speaker,
+        if workforce_common::channels::is_conversational(channel) {
+            Self::Screen
+        } else {
+            Self::Speaker
         }
     }
 

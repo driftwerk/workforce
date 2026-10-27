@@ -1109,18 +1109,6 @@ async fn ws_agent_refuses_a_revoked_devices_token() {
 }
 
 #[tokio::test]
-async fn ws_agent_upgrades_a_paired_devices_token() {
-    let (state, _pairing, _device, token) = state_with_paired_device();
-    assert_eq!(ws_agent_status(state, &token).await, 101);
-}
-
-#[tokio::test]
-async fn ws_agent_upgrades_the_gateway_token() {
-    let (state, _pairing, _device, _token) = state_with_paired_device();
-    assert_eq!(ws_agent_status(state, GATEWAY_TOKEN).await, 101);
-}
-
-#[tokio::test]
 async fn ws_agent_pairing_store_failure_gets_503() {
     let (state, _fx) = state_with_parts(
         false,

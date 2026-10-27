@@ -1531,7 +1531,9 @@ enum LocalAgentCommand {
         /// Authentication token (or set WORKFORCE_GATEWAY_TOKEN env var).
         #[arg(long, env = "WORKFORCE_GATEWAY_TOKEN")]
         token: String,
-        /// Unique ID for this local agent (defaults to hostname).
+        /// Unique ID for this local agent: 1-24 lowercase letters, digits and
+        /// dashes (defaults to the host name's first label). Its tools reach
+        /// the hub as `node.<id>.<tool>`.
         #[arg(long)]
         id: Option<String>,
         /// Human-readable name for this agent.
@@ -1540,6 +1542,19 @@ enum LocalAgentCommand {
         /// Working directory for command execution.
         #[arg(long)]
         workdir: Option<PathBuf>,
+        /// A streamable-HTTP MCP endpoint on this machine whose tools to offer
+        /// the hub, e.g. a local hub's `http://127.0.0.1:8091/mcp/agents/<id>`.
+        /// Its bearer is read from WORKFORCE_NODE_MCP_TOKEN or `--mcp-token-file`.
+        #[arg(long, requires = "mcp_tools")]
+        mcp: Option<String>,
+        /// Which of the MCP server's tools to offer, comma-separated: exact names
+        /// or prefixes ending in `*` (e.g. `desk_*,filesystem_read`).
+        #[arg(long, value_delimiter = ',', requires = "mcp")]
+        mcp_tools: Vec<String>,
+        /// A file holding the MCP endpoint's bearer token, when
+        /// WORKFORCE_NODE_MCP_TOKEN is not set.
+        #[arg(long, requires = "mcp")]
+        mcp_token_file: Option<PathBuf>,
     },
 }
 
@@ -3287,6 +3302,7 @@ async fn spawn_and_wire_agent(
         &ctx.engagement_overrides,
         ctx.global_vault.clone(),
     );
+    workforce_hub::desk_driver::register_tools(&service);
     workforce_hub::agent_registry::AgentRegistry::wire_coding_session_tools_for(
         &service,
         Arc::clone(&ctx.project_store),
@@ -5197,7 +5213,14 @@ rules:
                 &gateway_state,
                 &wf_config.games,
                 std::path::Path::new(&wf_config.hub.data_dir),
+            );
+            let gateway_app = workforce_hub::desk_driver::mount(
+                gateway_app,
+                &gateway_state,
+                &wf_config,
+                background_cancel.clone(),
             )
+            .await?
             .layer(workforce_hub::gateway::build_cors_layer(
                 wf_config.gateway.cors,
                 &wf_config.gateway.cors_allowed_origins,
@@ -10077,15 +10100,44 @@ rules:
                 id,
                 name,
                 workdir,
+                mcp,
+                mcp_tools,
+                mcp_token_file,
             } => {
-                let agent_id = id.unwrap_or_else(|| {
-                    hostname::get()
-                        .map(|h| h.to_string_lossy().to_string())
-                        .unwrap_or_else(|_| "local-agent".to_string())
-                });
+                let agent_id = id.unwrap_or_else(local_agent::default_node_id);
                 let agent_name = name.unwrap_or_else(|| agent_id.clone());
-                local_agent::run_local_agent(&gateway, &token, &agent_id, &agent_name, workdir)
-                    .await?;
+                let tunnel = match mcp {
+                    Some(url) => {
+                        let bearer = match std::env::var(local_agent::MCP_TOKEN_ENV) {
+                            Ok(bearer) => bearer,
+                            Err(_) => {
+                                let path = mcp_token_file.ok_or_else(|| {
+                                    eyre::eyre!(
+                                        "--mcp needs its bearer in {} or --mcp-token-file",
+                                        local_agent::MCP_TOKEN_ENV
+                                    )
+                                })?;
+                                std::fs::read_to_string(&path)
+                                    .map_err(|e| eyre::eyre!("reading {}: {e}", path.display()))?
+                            }
+                        };
+                        Some(local_agent::McpTunnel::new(
+                            &url,
+                            bearer.trim().to_string(),
+                            mcp_tools,
+                        )?)
+                    }
+                    None => None,
+                };
+                local_agent::run_local_agent(
+                    &gateway,
+                    &token,
+                    &agent_id,
+                    &agent_name,
+                    workdir,
+                    tunnel,
+                )
+                .await?;
             }
         },
         Commands::Workflow {

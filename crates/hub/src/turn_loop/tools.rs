@@ -196,31 +196,62 @@ fn without_disabled_tools(
     Arc::new(without)
 }
 
-/// The agent's registry, with `exec.run` routed to the local agent the
-/// session selected when that agent is connected (DW-324).
+/// Whether `session` is its person's own conversation with the agent: one
+/// of their screens, or a Slack DM. Nowhere else may reach their machine —
+/// in a channel, a thread, a desk room or a shared conversation, what others
+/// write would act on it, and an automated run's output can leave them.
+fn is_own_conversation(session: &Session) -> bool {
+    use workforce_common::channels::{is_platform, CONVERSATIONAL_CHANNELS};
+    !session.is_shared_conversation()
+        && (CONVERSATIONAL_CHANNELS.contains(&session.channel.as_str())
+            || (is_platform(&session.channel, "slack")
+                && session.context_type == Some(workforce_common::session::SessionContextType::Dm)))
+}
+
+/// The agent's registry for `session`'s turn: with `exec.run` routed to the
+/// local agent the session selected (DW-324), and the tools of the nodes the
+/// turn's person has connected, when the node acts for them and the session
+/// is [their own conversation](is_own_conversation).
 async fn session_registry(
     service: &AgentService,
     session: &Session,
 ) -> Arc<workforce_agent::tools::registry::ToolRegistry> {
-    let local = session
+    let (Some(agents), Some(person)) = (
+        service.local_agents.as_ref(),
+        crate::user_config::current_identity_id(),
+    ) else {
+        return Arc::clone(&service.tools);
+    };
+    if !is_own_conversation(session) {
+        return Arc::clone(&service.tools);
+    }
+    let selected = match session
         .metadata
         .get("selected_local_agent")
         .and_then(|v| v.as_str())
-        .zip(service.local_agents.as_ref());
-    match local {
-        Some((local_id, agents)) if agents.is_connected(local_id).await => {
-            let registry = service.tools.clone_all();
-            if let Some(original_exec) = service.tools.get("exec.run") {
-                registry.register(Arc::new(crate::local_agent_tool::LocalAgentExecTool::new(
-                    Arc::clone(agents),
-                    local_id.to_string(),
-                    original_exec,
-                )));
-            }
-            Arc::new(registry)
-        }
-        _ => Arc::clone(&service.tools),
+    {
+        Some(node) if agents.is_bound_to(node, &person).await => Some(node),
+        _ => None,
+    };
+    let node_tools = agents.tools_for(&person).await;
+    if selected.is_none() && node_tools.is_empty() {
+        return Arc::clone(&service.tools);
     }
+    let registry = service.tools.clone_all();
+    if let Some((node, original_exec)) = selected.zip(service.tools.get("exec.run")) {
+        registry.register(Arc::new(crate::local_agent_tool::LocalAgentExecTool::new(
+            Arc::clone(agents),
+            node.to_string(),
+            original_exec,
+        )));
+    }
+    for offered in node_tools {
+        registry.register(Arc::new(crate::local_agent_tool::NodeTool::new(
+            Arc::clone(agents),
+            offered,
+        )));
+    }
+    Arc::new(registry)
 }
 
 #[cfg(test)]
@@ -359,6 +390,78 @@ pub(crate) mod tests {
         names.iter().all(|name| {
             whitelist.iter().any(|entry| names_tool(entry, name)) || survives_exclusive_filter(name)
         })
+    }
+
+    /// A node's tools reach its own person's conversations, and nobody
+    /// else's, nor a conversation others read; a session naming another
+    /// person's node runs `exec.run` on the hub as before.
+    #[tokio::test]
+    async fn a_persons_node_tools_reach_only_their_own_conversations() {
+        use crate::local_agent_registry::NodeHello;
+        use workforce_agent::runner::CURRENT_USER_ID;
+        use workforce_gateway_client::protocol::NodeToolSpec;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (service, _llm) = crate::serve::testing::service_on_mock_llm_with(tmp.path(), |c| {
+            c.local_agents.enabled = true
+        })
+        .await;
+        let agents = service.local_agents.clone().expect("local agents are on");
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        agents
+            .register(
+                NodeHello {
+                    id: "studio".into(),
+                    name: "Studio".into(),
+                    capabilities: vec![],
+                    tools: vec![NodeToolSpec {
+                        name: "desk_sessions".into(),
+                        description: "List desk sessions".into(),
+                        input_schema: serde_json::json!({"type": "object"}),
+                        read_only: false,
+                    }],
+                },
+                "alice".into(),
+                tx,
+            )
+            .await
+            .unwrap();
+        let agent = service.agent_id.as_str();
+        let offered = |person: &str, channel: &str, owner: &str| {
+            let mut session = Session::new(channel, owner, agent);
+            session.metadata = serde_json::json!({"selected_local_agent": "studio"});
+            let service = &service;
+            CURRENT_USER_ID.scope(person.to_string(), async move {
+                turn_tools(service, &session, None).await.registry
+            })
+        };
+
+        let alices = offered("alice", "desk", "alice").await;
+        let tool = alices.get("node.studio.desk_sessions").expect("offered");
+        assert!(tool.description().contains("Studio"));
+        assert!(tool.description().contains("List desk sessions"));
+        assert_eq!(
+            alices.get("exec.run").unwrap().description(),
+            "Manage local agent processes",
+            "her selected node runs her commands"
+        );
+
+        let bobs = offered("bob", "desk", "bob").await;
+        assert!(!bobs.has("node.studio.desk_sessions"));
+        assert_ne!(
+            bobs.get("exec.run").unwrap().description(),
+            "Manage local agent processes",
+            "naming her node routes nothing to it"
+        );
+        for (channel, owner) in [
+            ("desk:release", "alice"),
+            ("slack:C1", "shared:1700000000.0001"),
+            ("slack:C1:1700000000.0001", "alice"),
+            ("scheduler:job-1", "alice"),
+        ] {
+            let elsewhere = offered("alice", channel, owner).await;
+            assert!(!elsewhere.has("node.studio.desk_sessions"), "{channel}");
+        }
     }
 
     #[tokio::test]

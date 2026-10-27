@@ -120,6 +120,22 @@ impl GatewayParts {
     }
 }
 
+/// `state`'s gateway on a loopback port, as `workforce serve` runs it.
+pub async fn serve(state: Arc<GatewayState>) -> std::net::SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            workforce_hub::gateway::router(state)
+                .into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+    addr
+}
+
 /// A JWT for `identity`, as a real sign-in mints it.
 pub fn token_for(identity: &Identity) -> String {
     generate_token_with_identity(

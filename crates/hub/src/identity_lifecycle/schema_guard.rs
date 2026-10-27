@@ -149,6 +149,18 @@ const CLAIMS: &[(&str, &str, &str, Claim)] = &[
         NotPersonal(INSTANCE),
     ),
     (
+        "desk",
+        "rooms",
+        "default_member",
+        NotPersonal("an agent, as its hub/agent key"),
+    ),
+    (
+        "desk",
+        "rooms",
+        "members",
+        NotPersonal("the room's agents, as hub/agent keys"),
+    ),
+    (
         "hub-core",
         "budget_overrides",
         "scope",
