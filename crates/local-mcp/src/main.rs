@@ -12,7 +12,7 @@ use eyre::Result;
 use rmcp::{
     handler::server::{router::tool::ToolRouter, tool::ToolCallContext, wrapper::Parameters},
     model::{
-        CallToolRequestParams, CallToolResult, Content, ErrorData, ListToolsResult,
+        CallToolRequestParams, CallToolResult, ContentBlock, ErrorData, ListToolsResult,
         PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool,
     },
     schemars,
@@ -164,8 +164,8 @@ impl ServerHandler for LocalMcpServer {
                 .call(&request.name, arguments, context.ct)
                 .await
             {
-                Ok(text) => CallToolResult::success(vec![Content::text(text)]),
-                Err(error) => CallToolResult::error(vec![Content::text(error)]),
+                Ok(text) => CallToolResult::success(vec![ContentBlock::text(text)]),
+                Err(error) => CallToolResult::error(vec![ContentBlock::text(error)]),
             },
         )
     }
