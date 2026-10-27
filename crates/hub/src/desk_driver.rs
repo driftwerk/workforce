@@ -267,7 +267,7 @@ mod tests {
             let e = keys.speak(&speak(provider)).await.unwrap_err();
             assert_eq!(e, SpeakError::NoKey(provider));
             assert!(e.to_string().contains(&format!(
-                "add a {} key under Plans in Desk",
+                "add a {} key under Voices in Desk Settings",
                 provider.label()
             )));
             assert_eq!(e.into_response().status(), StatusCode::SERVICE_UNAVAILABLE);
