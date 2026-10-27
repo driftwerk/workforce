@@ -14,9 +14,13 @@ use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 use workforce_mcp_client::{McpClient, McpError, McpLimits, StaticBearer};
 
 fn client(server: &MockServer, limits: McpLimits) -> McpClient {
+    client_at(&server.uri(), reqwest::Client::new(), limits)
+}
+
+fn client_at(endpoint: &str, http: reqwest::Client, limits: McpLimits) -> McpClient {
     McpClient::new(
-        Url::parse(&server.uri()).unwrap(),
-        Arc::new(reqwest::Client::new()),
+        Url::parse(endpoint).unwrap(),
+        Arc::new(http),
         Arc::new(StaticBearer::new("test-token")),
         limits,
     )
@@ -645,4 +649,143 @@ async fn server_jsonrpc_error_maps_to_server_error() {
         }
         other => panic!("expected ServerError, got {other:?}"),
     }
+}
+
+async fn initialize_err(endpoint: &str, http: reqwest::Client) -> McpError {
+    client_at(endpoint, http, McpLimits::default())
+        .initialize()
+        .await
+        .unwrap_err()
+}
+
+#[tokio::test]
+async fn a_refused_connection_is_unreachable() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+
+    let err = initialize_err(&format!("http://{addr}/"), reqwest::Client::new()).await;
+    assert!(matches!(err, McpError::Unreachable(_)), "got {err:?}");
+    assert!(err.is_transport());
+}
+
+#[tokio::test]
+async fn a_failed_tls_handshake_is_unreachable() {
+    let server = MockServer::start().await;
+    let endpoint = server.uri().replacen("http://", "https://", 1);
+
+    let err = initialize_err(&endpoint, reqwest::Client::new()).await;
+    assert!(matches!(err, McpError::Unreachable(_)), "got {err:?}");
+}
+
+#[tokio::test]
+async fn a_request_timing_out_before_any_response_is_unreachable() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(5)))
+        .mount(&server)
+        .await;
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_millis(200))
+        .build()
+        .unwrap();
+
+    let err = initialize_err(&server.uri(), http).await;
+    assert!(matches!(err, McpError::Unreachable(_)), "got {err:?}");
+}
+
+#[tokio::test]
+async fn an_http_500_is_a_transport_error_not_unreachable() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("internal"))
+        .mount(&server)
+        .await;
+
+    let err = initialize_err(&server.uri(), reqwest::Client::new()).await;
+    assert!(
+        matches!(err, McpError::Transport(ref m) if m.contains("HTTP 500")),
+        "got {err:?}"
+    );
+    assert!(!err.is_unreachable());
+}
+
+/// What a raw server does after sending a 200 that promises more body than
+/// it writes.
+#[derive(Clone, Copy)]
+enum AfterHeaders {
+    HangUp,
+    Stall,
+}
+
+/// A server that reads the whole request, then sends a 200 promising more
+/// body than it writes, so the failure comes from reading the body after
+/// the response headers arrived.
+async fn serve_truncated_body(after: AfterHeaders) -> std::net::SocketAddr {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        let mut buf = [0u8; 4096];
+        while !request_complete(&request) {
+            let n = socket.read(&mut buf).await.unwrap();
+            assert!(n > 0, "client closed before sending the whole request");
+            request.extend_from_slice(&buf[..n]);
+        }
+        socket
+            .write_all(
+                b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                  content-length: 100\r\n\r\n{\"jsonrpc\":",
+            )
+            .await
+            .unwrap();
+        match after {
+            AfterHeaders::HangUp => socket.shutdown().await.unwrap(),
+            AfterHeaders::Stall => std::future::pending().await,
+        }
+    });
+    addr
+}
+
+fn request_complete(request: &[u8]) -> bool {
+    let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") else {
+        return false;
+    };
+    let head = String::from_utf8_lossy(&request[..end]).to_ascii_lowercase();
+    let body_len = head
+        .lines()
+        .find_map(|line| line.strip_prefix("content-length:"))
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(0);
+    request.len() >= end + 4 + body_len
+}
+
+#[tokio::test]
+async fn a_body_cut_off_after_the_headers_is_a_transport_error() {
+    let addr = serve_truncated_body(AfterHeaders::HangUp).await;
+
+    let err = initialize_err(&format!("http://{addr}/"), reqwest::Client::new()).await;
+    assert!(
+        matches!(err, McpError::Transport(ref m) if m.contains("response body")),
+        "got {err:?}"
+    );
+    assert!(!err.is_unreachable());
+}
+
+#[tokio::test]
+async fn a_timeout_after_the_headers_is_a_transport_error_not_unreachable() {
+    let addr = serve_truncated_body(AfterHeaders::Stall).await;
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_millis(200))
+        .build()
+        .unwrap();
+
+    let err = initialize_err(&format!("http://{addr}/"), http).await;
+    assert!(
+        matches!(err, McpError::Transport(ref m) if m.contains("timed out")),
+        "got {err:?}"
+    );
+    assert!(!err.is_unreachable());
 }
