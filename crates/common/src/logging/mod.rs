@@ -203,7 +203,7 @@ impl<S: Subscriber> tracing_subscriber::Layer<S> for BufferLayer {
 
 // ─── Setup ───────────────────────────────────────────────────────────────────
 
-const DEFAULT_FILTER: &str = "workforce_core=info,workforce_common=info,workforce_nats=info,workforce_policy=info,workforce_agent=info,warn";
+const DEFAULT_FILTER: &str = "workforce_core=info,workforce_common=info,workforce_nats=info,workforce_policy=info,workforce_agent=info,workforce::docs=info,warn";
 
 /// Targets pinned below their natural level regardless of the global filter.
 /// These are high-volume diagnostic streams whose data lives elsewhere (e.g.

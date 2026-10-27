@@ -9,10 +9,13 @@
 //!
 //! `gh` and `git` are invoked via subprocess.
 
+mod check;
+mod cli_help;
 mod edit;
 mod llm;
 mod pr;
 mod prompt;
+mod sources;
 mod verify;
 mod watch_config;
 
@@ -41,6 +44,16 @@ const SYSTEM_PROMPT: &str = include_str!("../../curator/system-prompt.md");
 pub enum DocsCommand {
     /// Curate one or more pages with the doc-curator agent.
     Curate(CurateArgs),
+    /// Check pages' examples: every `workforce` command must parse with the
+    /// real command line, and every `workforce.toml` block must load into
+    /// the real config. Exits non-zero when any example fails.
+    Check(CheckArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct CheckArgs {
+    /// Page paths relative to `end-user-docs/`; every page when omitted.
+    pub pages: Vec<String>,
 }
 
 #[derive(Args, Debug)]
@@ -77,6 +90,10 @@ pub struct CurateArgs {
     #[arg(long)]
     pub tier: Option<String>,
 
+    /// Override the verifier's tier spec from `[curator] verifier_tier`.
+    #[arg(long)]
+    pub verifier_tier: Option<String>,
+
     /// Cap on each edit reply (overrides `[curator] max_tokens`).
     #[arg(long)]
     pub max_tokens: Option<u32>,
@@ -93,6 +110,7 @@ pub struct CurateArgs {
 pub async fn run(command: DocsCommand) -> Result<()> {
     match command {
         DocsCommand::Curate(args) => curate(args).await,
+        DocsCommand::Check(args) => check_pages(args),
     }
 }
 
@@ -138,6 +156,18 @@ async fn curate(args: CurateArgs) -> Result<()> {
                  in workforce.toml (e.g. `openrouter:deepseek:powerful`) or pass --tier",
             )
         })?;
+    let verifier_tier = args
+        .verifier_tier
+        .clone()
+        .or(curator_config.verifier_tier.clone())
+        .ok_or_else(|| {
+            eyre!(
+                "no verifier configured: every change is checked against its sources by a \
+                 second model before it is applied. Set `[curator] verifier_tier` in \
+                 workforce.toml (a different model from `tier`, e.g. \
+                 `openrouter:anthropic:standard`) or pass --verifier-tier",
+            )
+        })?;
     if let Some(max_tokens) = args.max_tokens {
         curator_config.max_tokens = max_tokens;
     }
@@ -150,6 +180,7 @@ async fn curate(args: CurateArgs) -> Result<()> {
             &repo_root,
             &cfg,
             &tier_spec,
+            &verifier_tier,
             &curator_config,
             &valid_doc_paths,
             vault.as_ref(),
@@ -163,6 +194,8 @@ async fn curate(args: CurateArgs) -> Result<()> {
                     page: page.clone(),
                     sources: Vec::new(),
                     summary: String::new(),
+                    still_failing: Vec::new(),
+                    citations: Vec::new(),
                     status: PageStatus::Skipped,
                 }
             }
@@ -191,6 +224,59 @@ async fn curate(args: CurateArgs) -> Result<()> {
     Ok(())
 }
 
+fn check_pages(args: CheckArgs) -> Result<()> {
+    let repo_root = std::env::current_dir().wrap_err("cwd")?;
+    let docs_root = repo_root.join("end-user-docs");
+    let cfg = load_watch_config(&docs_root.join("docs-watch.toml"))?;
+    let pages = if args.pages.is_empty() {
+        all_mdx_pages(&docs_root)?
+    } else {
+        args.pages
+    };
+    let mut failed = 0;
+    let (mut commands, mut configs, mut unchecked) = (0, 0, 0);
+    for page in &pages {
+        let text = std::fs::read_to_string(docs_root.join(page))
+            .wrap_err_with(|| format!("read end-user-docs/{page}"))?;
+        let report = check::check_page(&text, cfg.toml_schema(page));
+        commands += report.commands_checked;
+        configs += report.config_blocks_checked;
+        unchecked += report.config_blocks_unchecked;
+        for finding in &report.findings {
+            println!("end-user-docs/{page}: {finding}");
+        }
+        failed += report.findings.len();
+    }
+    println!(
+        "{} pages: {commands} commands and {configs} config blocks checked, \
+         {unchecked} config blocks for files without a checker, {failed} failing",
+        pages.len()
+    );
+    if failed > 0 {
+        return Err(eyre!("{failed} examples fail their check"));
+    }
+    Ok(())
+}
+
+fn all_mdx_pages(docs_root: &Path) -> Result<Vec<String>> {
+    fn walk(root: &Path, dir: &Path, out: &mut Vec<String>) -> Result<()> {
+        for entry in std::fs::read_dir(dir).wrap_err_with(|| format!("read {}", dir.display()))? {
+            let path = entry?.path();
+            if path.is_dir() {
+                walk(root, &path, out)?;
+            } else if path.extension().is_some_and(|e| e == "mdx") {
+                let rel = path.strip_prefix(root).unwrap_or(&path);
+                out.push(rel.to_string_lossy().replace('\\', "/"));
+            }
+        }
+        Ok(())
+    }
+    let mut out = Vec::new();
+    walk(docs_root, docs_root, &mut out)?;
+    out.sort();
+    Ok(out)
+}
+
 /// What happened to a page during a run, used to decide whether it gets a PR.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PageStatus {
@@ -208,6 +294,10 @@ struct PageOutcome {
     sources: Vec<String>,
     /// The curator's account of what changed, for the PR.
     summary: String,
+    /// Examples that failed their check before the edit and still do.
+    still_failing: Vec<String>,
+    /// Where the applied changes' evidence stands.
+    citations: Vec<String>,
     status: PageStatus,
 }
 
@@ -252,6 +342,7 @@ async fn curate_single_page(
     repo_root: &Path,
     cfg: &watch_config::WatchConfig,
     tier_spec: &str,
+    verifier_tier: &str,
     limits: &workforce_common::settings::CuratorConfig,
     valid_doc_paths: &[String],
     vault: Option<&Arc<Vault>>,
@@ -264,11 +355,31 @@ async fn curate_single_page(
             page: page.to_string(),
             sources: Vec::new(),
             summary: String::new(),
+            still_failing: Vec::new(),
+            citations: Vec::new(),
             status: PageStatus::Skipped,
         });
     }
 
-    let sources = read_source_files(&source_paths, repo_root)?;
+    let generated: Vec<(String, String)> = match cfg.page_source(page) {
+        Some(watch_config::PageSource::CliHelp) => vec![(
+            "workforce --help".to_string(),
+            cli_help::cli_help_reference(),
+        )],
+        None => Vec::new(),
+    };
+    let sources = if generated.is_empty() {
+        read_source_files(&source_paths, repo_root)?
+    } else {
+        generated
+            .iter()
+            .map(|(name, content)| prompt::SourceFile {
+                repo_relative: PathBuf::from(name),
+                content: content.clone(),
+            })
+            .collect()
+    };
+    let lookups = sources::SourceIndex::new(repo_root, generated);
     let current_content = read_page(&page_full_path)?;
     let source_summary: Vec<String> = sources
         .iter()
@@ -283,8 +394,18 @@ async fn curate_single_page(
     };
 
     info!(page, tier = tier_spec, "curating page");
-    let curation =
-        curate_page(page, tier_spec, limits, SYSTEM_PROMPT, &prompt_input, vault).await?;
+    let curation = curate_page(
+        page,
+        tier_spec,
+        verifier_tier,
+        limits,
+        SYSTEM_PROMPT,
+        &prompt_input,
+        cfg.toml_schema(page),
+        &lookups,
+        vault,
+    )
+    .await?;
     let Curation::Edited {
         text,
         summary,
@@ -292,6 +413,8 @@ async fn curate_single_page(
         model,
         input_tokens,
         output_tokens,
+        still_failing,
+        citations,
     } = curation
     else {
         if let Curation::Unchanged { reason } = curation {
@@ -312,6 +435,7 @@ async fn curate_single_page(
         edits,
         input_tokens,
         output_tokens,
+        still_failing = still_failing.len(),
         "page edited"
     );
 
@@ -319,6 +443,8 @@ async fn curate_single_page(
         page: page.to_string(),
         sources: source_summary,
         summary,
+        still_failing,
+        citations,
         status: PageStatus::Edited,
     })
 }
@@ -328,6 +454,8 @@ fn unchanged(page: &str, sources: Vec<String>) -> PageOutcome {
         page: page.to_string(),
         sources,
         summary: String::new(),
+        still_failing: Vec::new(),
+        citations: Vec::new(),
         status: PageStatus::Unchanged,
     }
 }
@@ -387,6 +515,8 @@ fn page_reports(outcomes: &[&PageOutcome]) -> Vec<PageReport> {
             page: o.page.clone(),
             sources: o.sources.clone(),
             summary: o.summary.clone(),
+            still_failing: o.still_failing.clone(),
+            citations: o.citations.clone(),
         })
         .collect()
 }

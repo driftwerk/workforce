@@ -307,6 +307,10 @@ pub struct PageReport {
     pub sources: Vec<String>,
     /// The curator's own account of what changed and why.
     pub summary: String,
+    /// Examples that failed their check before this edit and still do.
+    pub still_failing: Vec<String>,
+    /// Where the evidence for the changes stands (`path lines a–b`).
+    pub citations: Vec<String>,
 }
 
 pub fn pr_body(
@@ -334,8 +338,32 @@ pub fn pr_body(
             report.page,
             report.summary.trim()
         ));
+        if !report.citations.is_empty() {
+            body.push_str("\nEvidence cited, each change checked against it:\n");
+            for citation in &report.citations {
+                body.push_str(&format!("- `{citation}`\n"));
+            }
+        }
     }
     body.push('\n');
+
+    let still: Vec<&PageReport> = reports
+        .iter()
+        .filter(|r| !r.still_failing.is_empty())
+        .collect();
+    if !still.is_empty() {
+        body.push_str(
+            "## Examples that still fail their check\n\
+             These failed before this edit too (`workforce docs check`):\n",
+        );
+        for report in still {
+            body.push_str(&format!("\n### `end-user-docs/{}`\n", report.page));
+            for finding in &report.still_failing {
+                body.push_str(&format!("- {finding}\n"));
+            }
+        }
+        body.push('\n');
+    }
 
     body.push_str("## Sources referenced\n");
     for report in reports {
@@ -404,6 +432,11 @@ mod tests {
                 page: "adapters/slack.mdx".into(),
                 sources: vec!["crates/skills/src/adapters/slack/lib.rs".into()],
                 summary: "Documented the new `--thread` flag.".into(),
+                still_failing: vec![
+                    "line 9: `workforce agent delete --id x` — unexpected argument '--id' found"
+                        .into(),
+                ],
+                citations: vec!["crates/cli/src/main.rs lines 1200–1224".into()],
             }],
             "abc123",
             None,
@@ -411,6 +444,9 @@ mod tests {
         assert!(body.contains("end-user-docs/adapters/slack.mdx"));
         assert!(body.contains("## What changed"));
         assert!(body.contains("Documented the new `--thread` flag."));
+        assert!(body.contains("## Examples that still fail their check"));
+        assert!(body.contains("agent delete --id x"));
+        assert!(body.contains("`crates/cli/src/main.rs lines 1200–1224`"));
         assert!(body.contains("crates/skills/src/adapters/slack/lib.rs"));
         assert!(body.contains("`npm run build` and `docs:verify-links` passed"));
         assert!(body.contains("abc123"));
@@ -424,6 +460,8 @@ mod tests {
                 page: "x.mdx".into(),
                 sources: vec![],
                 summary: "Fixed the title.".into(),
+                still_failing: vec![],
+                citations: vec![],
             }],
             "deadbee",
             Some("error: title missing"),
