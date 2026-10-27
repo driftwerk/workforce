@@ -22,8 +22,9 @@ pub enum PrSync {
     /// An open PR already existed; force-pushed the new content to it and
     /// brought its title, body and draft state up to this run.
     Updated(u64),
-    /// A human closed the PR without merging — treated as "leave this
-    /// page alone". Nothing pushed; requires human action to revive.
+    /// A human closed the PR without merging and kept its branch — treated
+    /// as "leave this page alone". Nothing pushed; deleting the branch lets
+    /// the curator propose the page again.
     SkippedClosed(u64),
     /// The curated content is identical to the current base; nothing to do.
     NoChange,
@@ -50,7 +51,9 @@ struct ExistingPr {
 pub async fn sync_pr(repo_root: &Path, spec: &PrSpec) -> Result<PrSync> {
     let existing = latest_pr_for_branch(repo_root, &spec.branch).await?;
     if let Some(pr) = &existing {
-        if pr.state == PrLifecycle::ClosedUnmerged {
+        let branch_kept = pr.state == PrLifecycle::ClosedUnmerged
+            && remote_branch_exists(repo_root, &spec.branch).await?;
+        if closed_pr_blocks(pr.state, branch_kept) {
             return Ok(PrSync::SkippedClosed(pr.number));
         }
     }
@@ -81,6 +84,38 @@ pub async fn sync_pr(repo_root: &Path, spec: &PrSpec) -> Result<PrSync> {
         }
         // None, or a previously-merged PR on this branch: open a new one.
         _ => Ok(PrSync::Created(create_gh_pr(repo_root, spec).await?)),
+    }
+}
+
+/// A PR a human closed without merging keeps the curator off its page while
+/// its branch is kept; deleting the branch says the curator may propose the
+/// page again.
+fn closed_pr_blocks(state: PrLifecycle, branch_kept: bool) -> bool {
+    state == PrLifecycle::ClosedUnmerged && branch_kept
+}
+
+async fn remote_branch_exists(repo_root: &Path, name: &str) -> Result<bool> {
+    let out = Command::new("git")
+        .args([
+            "ls-remote",
+            "--exit-code",
+            "--heads",
+            "origin",
+            &format!("refs/heads/{name}"),
+        ])
+        .current_dir(repo_root)
+        .output()
+        .await
+        .wrap_err("git ls-remote")?;
+    // `--exit-code`: 0 when the branch exists, 2 when it doesn't.
+    match out.status.code() {
+        Some(0) => Ok(true),
+        Some(2) => Ok(false),
+        _ => Err(eyre!(
+            "git ls-remote failed (exit {}): {}",
+            out.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&out.stderr),
+        )),
     }
 }
 
@@ -502,6 +537,17 @@ mod tests {
             parse_pr_list_line("21 OPEN").is_none(),
             "a line without the draft state is not trusted"
         );
+    }
+
+    #[test]
+    fn a_closed_pr_blocks_its_page_only_while_its_branch_is_kept() {
+        assert!(closed_pr_blocks(PrLifecycle::ClosedUnmerged, true));
+        assert!(
+            !closed_pr_blocks(PrLifecycle::ClosedUnmerged, false),
+            "deleting the branch lets the curator propose the page again"
+        );
+        assert!(!closed_pr_blocks(PrLifecycle::Merged, false));
+        assert!(!closed_pr_blocks(PrLifecycle::Open, true));
     }
 
     #[test]
