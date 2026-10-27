@@ -458,8 +458,8 @@ async fn without_reads_a_recall_is_weaviate_s_alone() {
 async fn while_memories_are_moved_the_store_in_use_takes_the_vector() {
     let embedder = Arc::new(Counting::default());
     let held = Arc::new(Vectored::new("hub", Arc::clone(&embedder)));
-    let switching = crate::embeddings::Switching(parking_lot::RwLock::new(
-        Arc::clone(&held) as Arc<dyn MemoryStore>
+    let switching = workforce_memory::switch::Switching(parking_lot::RwLock::new(
+        Arc::clone(&held) as Arc<dyn MemoryStore>,
     ));
     assert_eq!(switching.query_model().as_deref(), Some("hub"));
     switching
