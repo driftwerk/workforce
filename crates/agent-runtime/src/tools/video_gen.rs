@@ -73,7 +73,9 @@ impl Tool for VideoGenerationTool {
     fn description(&self) -> &str {
         "Generate a short video clip (with sound) from a text `prompt`, optionally from `images`: \
          one image is animated; two become the first and last frame; more are subject \
-         references, named in the prompt as <IMAGE_REF_0>, <IMAGE_REF_1>, … This takes a while \
+         references, named in the prompt as <IMAGE_REF_0>, <IMAGE_REF_1>, … A person's photo \
+         (e.g. from get_user_photo) animates as them — 'make a video of Tom dancing'; a fuller-body \
+         photo moves better than a tight headshot. This takes a while \
          (~15–60s) and BLOCKS until done, then the system delivers the clip to the user \
          automatically. IMPORTANT: you will NOT see the video and the artifact is internal — that \
          is expected, not a failure. Do not re-upload, attach, verify, or claim it failed. Briefly \
