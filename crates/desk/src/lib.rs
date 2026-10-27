@@ -4,6 +4,7 @@
 
 mod adopt;
 pub mod api;
+pub mod catalog;
 mod claude;
 mod codex;
 pub mod model;
@@ -11,11 +12,16 @@ mod pty;
 pub mod realtime;
 pub mod rooms;
 mod service;
+pub mod speech;
 pub mod store;
+#[cfg(test)]
+mod testing;
 mod transcript;
 mod worktree;
 
 pub use api::{router, Authorize};
+pub use catalog::{Models, TierModel};
 pub use realtime::{KeySource, Provider, Realtime};
 pub use service::{Desk, DeskError, Options, RestorePolicy};
+pub use speech::{Audio, Speak, SpeakError, Speech, SpeechProvider};
 pub use store::DeskStore;

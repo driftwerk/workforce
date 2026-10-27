@@ -5,9 +5,10 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use axum::body::Bytes;
+use axum::extract::rejection::JsonRejection;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, patch, post};
 use axum::{Json, Router};
@@ -17,10 +18,12 @@ use serde_json::json;
 use tokio::sync::broadcast::error::RecvError;
 use uuid::Uuid;
 
+use crate::catalog::{Catalog, Models};
 use crate::model::{Decision, NewSession, SessionPatch};
 use crate::realtime::{Engine, Realtime, RealtimeError};
 use crate::rooms::{NewMessage, NewRoom, RoomPatch};
 use crate::service::{Desk, DeskError};
+use crate::speech::{Speak, SpeakError, Speech};
 
 /// Decides whether a request may use the desk. Implemented by the hub.
 #[async_trait]
@@ -57,16 +60,15 @@ impl IntoResponse for DeskError {
     }
 }
 
-async fn guard(s: &ApiState, headers: &HeaderMap, q: &TokenQuery) -> Result<(), Response> {
-    s.auth
-        .authorize(headers, q.token.as_deref())
+async fn guard(auth: &dyn Authorize, headers: &HeaderMap, q: &TokenQuery) -> Result<(), Response> {
+    auth.authorize(headers, q.token.as_deref())
         .await
         .map_err(|status| (status, Json(json!({ "error": "not allowed" }))).into_response())
 }
 
 macro_rules! guarded {
     ($s:expr, $h:expr, $q:expr) => {
-        if let Err(r) = guard(&$s, &$h, &$q).await {
+        if let Err(r) = guard(&*$s.auth, &$h, &$q).await {
             return r;
         }
     };
@@ -335,7 +337,13 @@ async fn search(State(s): S, h: HeaderMap, Query(sq): Query<SearchQuery>) -> Res
     s.desk.search(&sq.q).await.map(Json).into_response()
 }
 
-pub fn router(desk: Desk, auth: Arc<dyn Authorize>, realtime: Arc<Realtime>) -> Router {
+pub fn router(
+    desk: Desk,
+    auth: Arc<dyn Authorize>,
+    realtime: Arc<Realtime>,
+    speech: Arc<dyn Speech>,
+    models: Arc<dyn Models>,
+) -> Router {
     Router::new()
         .route("/api/desk/sessions", get(list).post(create))
         .route("/api/desk/sessions/{id}", patch(update).delete(forget))
@@ -360,12 +368,30 @@ pub fn router(desk: Desk, auth: Arc<dyn Authorize>, realtime: Arc<Realtime>) -> 
             desk,
             auth: Arc::clone(&auth),
         }))
-        .merge(voice_router(auth, realtime))
+        .merge(voice_router(Arc::clone(&auth), realtime, speech))
+        .merge(models_router(auth, models))
+}
+
+struct ModelsApi {
+    auth: Arc<dyn Authorize>,
+    models: Arc<dyn Models>,
+}
+
+async fn models(State(s): State<Arc<ModelsApi>>, h: HeaderMap, Query(q): Q) -> Response {
+    guarded!(s, h, q);
+    Json(Catalog::of(&*s.models)).into_response()
+}
+
+pub(crate) fn models_router(auth: Arc<dyn Authorize>, models: Arc<dyn Models>) -> Router {
+    Router::new()
+        .route("/api/desk/models", get(self::models))
+        .with_state(Arc::new(ModelsApi { auth, models }))
 }
 
 struct VoiceApi {
     auth: Arc<dyn Authorize>,
     realtime: Arc<Realtime>,
+    speech: Arc<dyn Speech>,
 }
 
 #[derive(Deserialize)]
@@ -381,9 +407,7 @@ async fn voice_session(
     Query(q): Q,
     Json(b): Json<SessionBody>,
 ) -> Response {
-    if let Err(status) = s.auth.authorize(&h, q.token.as_deref()).await {
-        return (status, Json(json!({ "error": "not allowed" }))).into_response();
-    }
+    guarded!(s, h, q);
     let host = h
         .get(axum::http::header::HOST)
         .and_then(|v| v.to_str().ok())
@@ -419,11 +443,55 @@ async fn voice_relay(
     ws.on_upgrade(move |socket| async move { realtime.relay(socket).await })
 }
 
-pub(crate) fn voice_router(auth: Arc<dyn Authorize>, realtime: Arc<Realtime>) -> Router {
+impl IntoResponse for SpeakError {
+    fn into_response(self) -> Response {
+        let status = match &self {
+            SpeakError::Invalid(_) => StatusCode::BAD_REQUEST,
+            SpeakError::NoKey(_) => StatusCode::SERVICE_UNAVAILABLE,
+            SpeakError::Upstream(e) => {
+                tracing::warn!(error = %e, "desk speech synthesis failed");
+                StatusCode::BAD_GATEWAY
+            }
+        };
+        (status, Json(json!({ "error": self.to_string() }))).into_response()
+    }
+}
+
+/// Speaks `text` with a vault key; answers the audio itself.
+async fn voice_speak(
+    State(s): State<Arc<VoiceApi>>,
+    h: HeaderMap,
+    Query(q): Q,
+    body: Result<Json<Speak>, JsonRejection>,
+) -> Response {
+    guarded!(s, h, q);
+    let speak = body
+        .map_err(|e| SpeakError::Invalid(e.body_text()))
+        .and_then(|Json(speak)| speak.validated());
+    let speak = match speak {
+        Ok(speak) => speak,
+        Err(e) => return e.into_response(),
+    };
+    match s.speech.speak(&speak).await {
+        Ok(audio) => ([(header::CONTENT_TYPE, audio.media_type)], audio.bytes).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+pub(crate) fn voice_router(
+    auth: Arc<dyn Authorize>,
+    realtime: Arc<Realtime>,
+    speech: Arc<dyn Speech>,
+) -> Router {
     Router::new()
         .route("/api/desk/voice/session", post(voice_session))
         .route("/api/desk/voice/relay", get(voice_relay))
-        .with_state(Arc::new(VoiceApi { auth, realtime }))
+        .route("/api/desk/voice/speak", post(voice_speak))
+        .with_state(Arc::new(VoiceApi {
+            auth,
+            realtime,
+            speech,
+        }))
 }
 
 async fn hook(
