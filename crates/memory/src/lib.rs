@@ -11,6 +11,7 @@ pub mod schema;
 pub(crate) mod shape;
 pub mod sqlite;
 pub mod store;
+pub mod switch;
 pub mod types;
 pub mod vellev;
 pub mod visibility;

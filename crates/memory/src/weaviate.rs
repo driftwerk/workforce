@@ -367,6 +367,20 @@ impl WeaviateStore {
         self
     }
 
+    /// Whether the collection exists, whatever its shape.
+    pub async fn collection_exists(&self) -> Result<bool> {
+        let url = format!("{}/v1/schema/{}", self.base_url, self.collection);
+        let resp = self.client.get(&url).send().await?;
+        match resp.status().as_u16() {
+            200 => Ok(true),
+            404 => Ok(false),
+            status => Err(eyre::eyre!(
+                "Weaviate schema read of '{}' returned {status}",
+                self.collection
+            )),
+        }
+    }
+
     /// Embed with the hub's model: memories move to `collection`, which holds
     /// the hub's vectors and no vectorizer; recall is hybrid at `alpha`,
     /// optionally reranked.
@@ -2466,6 +2480,31 @@ mod tests {
             .await
             .expect("import filters bad records, returns Ok(0)");
         assert_eq!(imported, 0);
+    }
+
+    /// A collection exists when its schema reads, does not when Weaviate
+    /// says it has none, and anything else is an error, never a "no".
+    #[tokio::test]
+    async fn a_collection_exists_when_its_schema_reads() {
+        let app = axum::Router::new().route(
+            "/v1/schema/{class}",
+            axum::routing::get(
+                |axum::extract::Path(class): axum::extract::Path<String>| async move {
+                    match class.as_str() {
+                        "Here" => axum::http::StatusCode::OK,
+                        "Gone" => axum::http::StatusCode::NOT_FOUND,
+                        _ => axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let store = |class: &str| WeaviateStore::new(&url, None).in_collection(class);
+        assert!(store("Here").collection_exists().await.unwrap());
+        assert!(!store("Gone").collection_exists().await.unwrap());
+        assert!(store("Broken").collection_exists().await.is_err());
     }
 
     /// An import that cannot store one object stores the others, each on
