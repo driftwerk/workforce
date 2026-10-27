@@ -1,0 +1,354 @@
+/* @workforce/rich — every colour the blocks paint is one of these tokens.
+
+   Defaults sit on <html> at zero specificity (`:where`), so a host's own
+   declaration on :root wins regardless of stylesheet order; a host theming only
+   a subtree declares its tokens on that subtree's element. `data-theme="dark"`
+   on <html> selects the dark defaults. Charts and maps read the tokens when they
+   draw; call
+   `refreshRichTheme()` after changing them in a way the renderer cannot observe
+   (it watches class, style and data-theme on <html> and <body>).
+
+   Neutrals
+     --rich-font          font stack for controls
+     --rich-bg            the ground a block draws on: diagram shapes, zoom
+                          buttons, image frames, chart gaps, exported PNGs
+     --rich-surface       recessed areas: table headers, skeletons, notes,
+                          disabled inputs
+     --rich-field         inputs, buttons, menus
+     --rich-text          primary text
+     --rich-muted         secondary text, axes, connectors
+     --rich-border        borders, grid lines, the map's no-data fill
+     --rich-accent        links, focus, primary actions, accent-toned nodes
+     --rich-accent-text   text on --rich-accent
+     --rich-code-bg       fenced code background (RichMarkdown)
+     --rich-code-text     fenced code text (RichMarkdown)
+   Status (diagram node tones; --rich-bad also marks form errors)
+     --rich-good  --rich-warn  --rich-bad
+   Data
+     --rich-series-1..8   categorical chart palette. The slot order is what keeps
+                          adjacent series distinguishable under colour-vision
+                          deficiency: replace values, never reorder or cycle.
+     --rich-seq-1..7      sequential ramp, low → high, for choropleths
+     --rich-lane-1..5     diagram group identity
+
+   ECharts parses colours itself, so chart and map tokens in any syntax other
+   than hex/rgb/hsl (oklch, color-mix, …) are resolved to sRGB when drawn. */
+
+:where(:root) {
+  --rich-font: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --rich-bg: #ffffff;
+  --rich-surface: #f7f9fc;
+  --rich-field: #ffffff;
+  --rich-text: #0f172a;
+  --rich-muted: #64748b;
+  --rich-border: #e6eaf0;
+  --rich-accent: #05405c;
+  --rich-accent-text: #ffffff;
+  --rich-code-bg: #0f172a;
+  --rich-code-text: #e2e8f0;
+  --rich-good: #1baf7a;
+  --rich-warn: #eda100;
+  --rich-bad: #e34948;
+  --rich-series-1: #2a78d6;
+  --rich-series-2: #1baf7a;
+  --rich-series-3: #eda100;
+  --rich-series-4: #008300;
+  --rich-series-5: #4a3aa7;
+  --rich-series-6: #e34948;
+  --rich-series-7: #e87ba4;
+  --rich-series-8: #eb6834;
+  --rich-seq-1: #cde2fb;
+  --rich-seq-2: #9ec5f4;
+  --rich-seq-3: #6da7ec;
+  --rich-seq-4: #3987e5;
+  --rich-seq-5: #256abf;
+  --rich-seq-6: #184f95;
+  --rich-seq-7: #0d366b;
+  /* Lane hues encode WHICH GROUP owns a step, nothing else. Kept in sync with
+     LANE_HUES (palette.ts) by a test: the Excalidraw export needs literal hex. */
+  --rich-lane-1: #2a78d6;
+  --rich-lane-2: #1baf7a;
+  --rich-lane-3: #eda100;
+  --rich-lane-4: #4a3aa7;
+  --rich-lane-5: #e34948;
+}
+
+/* The dark lane steps are selected, not derived — the dark lightness band is
+   narrower and lower, so blue/yellow/violet are all different values. */
+:where(:root[data-theme="dark"]) {
+  --rich-bg: #171a1f;
+  --rich-surface: #111317;
+  --rich-field: #1d2127;
+  --rich-text: #e6e8eb;
+  --rich-muted: #9aa3ae;
+  --rich-border: #2c323a;
+  --rich-accent: #6aa7ff;
+  --rich-accent-text: #0b1220;
+  --rich-code-bg: #0b0d10;
+  --rich-code-text: #e2e8f0;
+  --rich-lane-1: #3d86e0;
+  --rich-lane-2: #1baf7a;
+  --rich-lane-3: #b87a00;
+  --rich-lane-4: #7a68dd;
+  --rich-lane-5: #e34948;
+}
+
+/* ---- markdown (RichMarkdown) ------------------------------------------- */
+.wf-md > :first-child { margin-top: 0; }
+.wf-md > :last-child { margin-bottom: 0; }
+.wf-md p { margin: 0 0 8px; }
+.wf-md ul, .wf-md ol { margin: 6px 0; padding-left: 20px; }
+.wf-md li { margin: 3px 0; }
+.wf-md h1, .wf-md h2, .wf-md h3, .wf-md h4 { margin: 12px 0 6px; line-height: 1.25; font-weight: 650; }
+.wf-md h1 { font-size: 18px; } .wf-md h2 { font-size: 16px; } .wf-md h3 { font-size: 15px; }
+.wf-md a { color: var(--rich-accent); font-weight: 500; text-decoration: underline; }
+.wf-md hr { border: 0; border-top: 1px solid var(--rich-border); margin: 12px 0; }
+.wf-md blockquote { margin: 8px 0; padding: 2px 0 2px 12px; border-left: 3px solid var(--rich-border); color: var(--rich-muted); }
+
+/* inline code + fenced code blocks (scroll, never clip) */
+.wf-md :not(pre) > code {
+  background: color-mix(in srgb, var(--rich-accent) 9%, var(--rich-field));
+  color: var(--rich-text); padding: 1px 5px; border-radius: 5px;
+  font-size: 12.5px; font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+}
+.wf-md pre {
+  margin: 8px 0; padding: 12px 14px; border-radius: 10px; overflow-x: auto;
+  background: var(--rich-code-bg); color: var(--rich-code-text);
+}
+.wf-md pre code {
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 12px; line-height: 1.5; white-space: pre; background: none; color: inherit; padding: 0;
+}
+
+/* tables — markdown and wf-table alike: wrapped so wide ones scroll, with
+   header + zebra */
+.wf-tablewrap { margin: 8px 0; overflow-x: auto; border: 1px solid var(--rich-border); border-radius: 10px; }
+:is(.wf-md, .wf-rt) table { border-collapse: collapse; width: 100%; font-size: 13px; }
+:is(.wf-md, .wf-rt) :is(th, td) { padding: 7px 12px; text-align: left; border-bottom: 1px solid var(--rich-border); white-space: nowrap; }
+:is(.wf-md, .wf-rt) :is(th + th, td + td) { border-left: 1px solid var(--rich-border); }
+:is(.wf-md, .wf-rt) thead th { background: var(--rich-surface); font-weight: 650; }
+:is(.wf-md, .wf-rt) tbody tr:last-child td { border-bottom: 0; }
+:is(.wf-md, .wf-rt) tbody tr:nth-child(even) { background: color-mix(in srgb, var(--rich-surface) 55%, var(--rich-field)); }
+
+/* ---- skeleton, table controls, chart ----------------------------------- */
+.wf-skel {
+  margin: 8px 0; border: 1px solid var(--rich-border); border-radius: 10px;
+  background: linear-gradient(100deg, var(--rich-surface) 40%, color-mix(in srgb, var(--rich-surface) 40%, var(--rich-field)) 50%, var(--rich-surface) 60%);
+  background-size: 200% 100%;
+  animation: wf-shimmer 1.4s linear infinite;
+  display: flex; align-items: center; justify-content: center;
+}
+.wf-skel-table { height: 180px; }
+.wf-skel-chart { height: 280px; }
+.wf-skel-form { height: 200px; }
+.wf-skel-map { height: 420px; }
+.wf-skel-diagram { height: 260px; }
+.wf-skel-label { font-size: 13px; color: var(--rich-muted); }
+@keyframes wf-shimmer { from { background-position: 200% 0; } to { background-position: -200% 0; } }
+
+.wf-rt { margin: 8px 0; min-width: 0; }
+.wf-rt-title, .wf-chart-title, .wf-map-title, .wf-dg-title { font-size: 13.5px; font-weight: 650; margin-bottom: 6px; }
+.wf-rt .wf-tablewrap { margin: 0; }
+.wf-rt-bar { display: flex; gap: 6px; margin-bottom: 6px; }
+.wf-rt-search {
+  flex: 1; min-width: 0; border: 1px solid var(--rich-border); border-radius: 8px;
+  padding: 5px 9px; font: 12.5px var(--rich-font); color: var(--rich-text); background: var(--rich-field); outline: none;
+}
+.wf-rt-search:focus { border-color: var(--rich-accent); }
+.wf-rt-btn {
+  border: 1px solid var(--rich-border); background: var(--rich-field); color: var(--rich-accent);
+  cursor: pointer; border-radius: 8px; padding: 4px 9px; font: 12.5px var(--rich-font);
+  flex-shrink: 0; transition: background 0.12s, border-color 0.12s;
+}
+.wf-rt-btn:hover:not(:disabled) { background: color-mix(in srgb, var(--rich-accent) 8%, var(--rich-field)); border-color: var(--rich-accent); }
+.wf-rt-btn:disabled { opacity: 0.45; cursor: default; }
+.wf-rt-btn.wf-rt-on { background: color-mix(in srgb, var(--rich-accent) 12%, var(--rich-field)); border-color: var(--rich-accent); }
+.wf-rt-sort {
+  border: 0; background: none; padding: 0; cursor: pointer;
+  font: inherit; font-weight: 650; color: inherit; display: inline-flex; gap: 4px; align-items: center;
+}
+.wf-rt-dir { font-size: 9px; color: var(--rich-accent); min-width: 10px; }
+.wf-rt-filters th { background: var(--rich-surface); padding: 4px 8px; }
+.wf-rt-range { display: flex; gap: 4px; }
+.wf-rt-filter {
+  width: 100%; min-width: 64px; border: 1px solid var(--rich-border); border-radius: 6px;
+  padding: 3px 7px; font: 12px var(--rich-font); color: var(--rich-text); background: var(--rich-field); outline: none;
+}
+.wf-rt-filter:focus { border-color: var(--rich-accent); }
+.wf-rt-foot {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  margin-top: 6px; font-size: 12px; color: var(--rich-muted);
+}
+.wf-rt-count { flex: 1; }
+.wf-rt-pager { display: inline-flex; align-items: center; gap: 5px; }
+.wf-rt-page { min-width: 44px; text-align: center; }
+.wf-rt-size {
+  border: 1px solid var(--rich-border); border-radius: 8px; padding: 3px 6px;
+  font: 12px var(--rich-font); color: var(--rich-text); background: var(--rich-field);
+}
+.wf-rt-empty { text-align: center; color: var(--rich-muted); padding: 14px; }
+.wf-rt-msg, .wf-map-msg { margin: 8px 0; padding: 12px 14px; border: 1px solid var(--rich-border); border-radius: 10px; font-size: 13px; color: var(--rich-muted); }
+.wf-rt-msg .wf-rt-btn, .wf-map-msg .wf-rt-btn { margin-left: 6px; }
+
+.wf-chart { margin: 8px 0; min-width: 0; }
+.wf-chart-plot { width: 100%; height: 280px; min-width: 220px; }
+
+/* ---- wf-form ----------------------------------------------------------- */
+.wf-form { margin: 8px 0; min-width: 0; display: flex; flex-direction: column; gap: 11px; }
+.wf-form-title { font-size: 13.5px; font-weight: 650; }
+.wf-form-note { font-size: 12.5px; color: var(--rich-muted); }
+.wf-form-field { display: flex; flex-direction: column; gap: 4px; }
+.wf-form-label { font-size: 12.5px; font-weight: 600; color: var(--rich-text); }
+.wf-form-req { color: var(--rich-bad); }
+.wf-form-input {
+  width: 100%; box-sizing: border-box; border: 1px solid var(--rich-border); border-radius: 8px;
+  padding: 7px 10px; font: 13px var(--rich-font); color: var(--rich-text); background: var(--rich-field); outline: none;
+}
+.wf-form-input:focus {
+  border-color: var(--rich-accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--rich-accent) 14%, transparent);
+}
+.wf-form-input:disabled { background: var(--rich-surface); color: var(--rich-muted); cursor: default; }
+textarea.wf-form-input { resize: vertical; min-height: 60px; line-height: 1.45; }
+select.wf-form-select { appearance: none; cursor: pointer; }
+.wf-form-group { display: flex; flex-direction: column; gap: 6px; padding: 2px 0; }
+.wf-form-check {
+  display: flex; align-items: center; gap: 8px; font: 13px var(--rich-font); color: var(--rich-text); cursor: pointer;
+}
+.wf-form-check input { accent-color: var(--rich-accent); }
+.wf-form-help { font-size: 12px; color: var(--rich-muted); }
+.wf-form-error { font-size: 12px; color: var(--rich-bad); }
+.wf-form-combo { position: relative; }
+.wf-form-options {
+  position: absolute; z-index: 5; left: 0; right: 0; top: calc(100% + 3px); margin: 0; padding: 4px;
+  list-style: none; background: var(--rich-field); border: 1px solid var(--rich-border); border-radius: 8px;
+  box-shadow: 0 6px 20px color-mix(in srgb, var(--rich-text) 12%, transparent); max-height: 200px; overflow-y: auto;
+}
+.wf-form-option {
+  display: block; width: 100%; text-align: left; border: 0; background: none; cursor: pointer;
+  border-radius: 6px; padding: 6px 8px; font: 13px var(--rich-font); color: var(--rich-text);
+}
+.wf-form-option:hover { background: color-mix(in srgb, var(--rich-accent) 10%, var(--rich-field)); }
+.wf-form-opt-msg { padding: 6px 8px; cursor: default; }
+.wf-form-actions { display: flex; }
+.wf-form-submit {
+  border: 0; background: var(--rich-accent); color: var(--rich-accent-text); cursor: pointer;
+  border-radius: 10px; padding: 8px 16px; font: 600 13px var(--rich-font);
+  transition: opacity 0.12s;
+}
+.wf-form-submit:hover:not(:disabled) { opacity: 0.92; }
+.wf-form-submit:disabled { opacity: 0.5; cursor: default; }
+.wf-form-submit:focus-visible { outline: 3px solid color-mix(in srgb, var(--rich-accent) 40%, var(--rich-field)); outline-offset: 2px; }
+
+/* ---- wf-map ------------------------------------------------------------ */
+.wf-map { margin: 8px 0; min-width: 0; }
+.wf-map-canvas { position: relative; }
+.wf-map-plot { width: 100%; height: 420px; min-width: 220px; }
+.wf-map-zoom, .wf-dg-zoom { position: absolute; top: 8px; right: 8px; display: flex; flex-direction: column; gap: 4px; }
+.wf-map-zoom button, .wf-dg-zoom button {
+  width: 28px; height: 28px; display: flex; align-items: center; justify-content: center;
+  border: 1px solid var(--rich-border); border-radius: 7px; background: var(--rich-bg);
+  color: var(--rich-text); font: 600 17px/1 var(--rich-font); cursor: pointer;
+  box-shadow: 0 1px 3px color-mix(in srgb, var(--rich-text) 12%, transparent); transition: background 0.12s;
+}
+.wf-map-zoom button:hover, .wf-dg-zoom button:hover { background: color-mix(in srgb, var(--rich-accent) 10%, var(--rich-bg)); }
+.wf-map-note { margin-top: 6px; font-size: 12px; color: var(--rich-muted); }
+.wf-map-credit { margin-top: 4px; font-size: 11px; color: var(--rich-muted); opacity: 0.75; }
+
+/* ---- wf-diagram -------------------------------------------------------- */
+/* The SVG is drawn by us, so every colour is a token rather than a value baked
+   in at render time — light/dark follows the host with no re-render, which the
+   echarts-backed blocks cannot do. */
+/* `position: relative` is load-bearing, not decoration: it contains the
+   absolutely positioned screen-reader outline below. Without it the outline
+   resolves against whatever positioned ancestor the host has, at a static
+   position far down the page, and silently makes that container over-scrollable. */
+.wf-dg { position: relative; margin: 8px 0; min-width: 0; font-size: 13px; }
+/* The frame anchors the zoom control; the canvas inside it is what scrolls, so
+   the buttons stay put instead of scrolling away with the diagram. Most
+   diagrams fit under the cap and never scroll at all. */
+.wf-dg-frame { position: relative; }
+.wf-dg-canvas { overflow: auto; max-height: min(70vh, 560px); }
+.wf-dg-svg { display: block; margin-inline: auto; }
+.wf-dg-shape { fill: var(--rich-bg); stroke: var(--rich-border); stroke-width: 1.4; stroke-linejoin: round; }
+.wf-dg-text { fill: var(--rich-text); font-size: 13px; }
+
+.wf-dg-node.lane-1 .wf-dg-shape { stroke: var(--rich-lane-1); fill: color-mix(in srgb, var(--rich-lane-1) 12%, var(--rich-bg)); }
+.wf-dg-node.lane-2 .wf-dg-shape { stroke: var(--rich-lane-2); fill: color-mix(in srgb, var(--rich-lane-2) 12%, var(--rich-bg)); }
+.wf-dg-node.lane-3 .wf-dg-shape { stroke: var(--rich-lane-3); fill: color-mix(in srgb, var(--rich-lane-3) 12%, var(--rich-bg)); }
+.wf-dg-node.lane-4 .wf-dg-shape { stroke: var(--rich-lane-4); fill: color-mix(in srgb, var(--rich-lane-4) 12%, var(--rich-bg)); }
+.wf-dg-node.lane-5 .wf-dg-shape { stroke: var(--rich-lane-5); fill: color-mix(in srgb, var(--rich-lane-5) 12%, var(--rich-bg)); }
+.wf-dg-group.lane-1 rect { stroke: var(--rich-lane-1); } .wf-dg-group.lane-1 text { fill: var(--rich-lane-1); }
+.wf-dg-group.lane-2 rect { stroke: var(--rich-lane-2); } .wf-dg-group.lane-2 text { fill: var(--rich-lane-2); }
+.wf-dg-group.lane-3 rect { stroke: var(--rich-lane-3); } .wf-dg-group.lane-3 text { fill: var(--rich-lane-3); }
+.wf-dg-group.lane-4 rect { stroke: var(--rich-lane-4); } .wf-dg-group.lane-4 text { fill: var(--rich-lane-4); }
+.wf-dg-group.lane-5 rect { stroke: var(--rich-lane-5); } .wf-dg-group.lane-5 text { fill: var(--rich-lane-5); }
+.wf-dg-lifeline.lane-1 line { stroke: var(--rich-lane-1); } .wf-dg-lifeline.lane-1 .wf-dg-shape { stroke: var(--rich-lane-1); fill: color-mix(in srgb, var(--rich-lane-1) 12%, var(--rich-bg)); }
+.wf-dg-lifeline.lane-2 line { stroke: var(--rich-lane-2); } .wf-dg-lifeline.lane-2 .wf-dg-shape { stroke: var(--rich-lane-2); fill: color-mix(in srgb, var(--rich-lane-2) 12%, var(--rich-bg)); }
+.wf-dg-lifeline.lane-3 line { stroke: var(--rich-lane-3); } .wf-dg-lifeline.lane-3 .wf-dg-shape { stroke: var(--rich-lane-3); fill: color-mix(in srgb, var(--rich-lane-3) 12%, var(--rich-bg)); }
+.wf-dg-lifeline.lane-4 line { stroke: var(--rich-lane-4); } .wf-dg-lifeline.lane-4 .wf-dg-shape { stroke: var(--rich-lane-4); fill: color-mix(in srgb, var(--rich-lane-4) 12%, var(--rich-bg)); }
+.wf-dg-lifeline.lane-5 line { stroke: var(--rich-lane-5); } .wf-dg-lifeline.lane-5 .wf-dg-shape { stroke: var(--rich-lane-5); fill: color-mix(in srgb, var(--rich-lane-5) 12%, var(--rich-bg)); }
+
+/* Status outranks identity — these follow the lane rules so equal specificity
+   resolves in their favour. A reserved status hue must never read as a lane. */
+.wf-dg-node.tone-accent .wf-dg-shape { stroke: var(--rich-accent); fill: color-mix(in srgb, var(--rich-accent) 10%, var(--rich-bg)); }
+.wf-dg-node.tone-good .wf-dg-shape { stroke: var(--rich-good); fill: color-mix(in srgb, var(--rich-good) 12%, var(--rich-bg)); }
+.wf-dg-node.tone-warn .wf-dg-shape { stroke: var(--rich-warn); fill: color-mix(in srgb, var(--rich-warn) 14%, var(--rich-bg)); }
+.wf-dg-node.tone-bad .wf-dg-shape { stroke: var(--rich-bad); fill: color-mix(in srgb, var(--rich-bad) 12%, var(--rich-bg)); }
+.wf-dg-line { fill: none; stroke: var(--rich-muted); stroke-width: 1.4; stroke-linecap: round; }
+.wf-dg-edge.style-dashed .wf-dg-line { stroke-dasharray: 5 4; }
+.wf-dg-head { fill: var(--rich-muted); stroke: none; }
+.wf-dg-chip { fill: var(--rich-bg); stroke: none; }
+.wf-dg-edge-text { fill: var(--rich-muted); font-size: 12px; }
+.wf-dg-group rect { fill: none; stroke: var(--rich-border); stroke-dasharray: 4 4; }
+.wf-dg-group text { fill: var(--rich-muted); font-size: 12px; }
+.wf-dg-lifeline line { stroke: var(--rich-border); stroke-dasharray: 4 4; }
+.wf-dg-note .wf-dg-shape { fill: var(--rich-surface); stroke: var(--rich-border); }
+.wf-dg-note-text { margin-top: 6px; font-size: 12px; color: var(--rich-muted); }
+.wf-dg-actions { margin-top: 6px; display: flex; gap: 6px; }
+
+/* Screen-reader-only: kept in the layout tree (not display:none) so assistive
+   tech still reads it. */
+.wf-sr-only {
+  position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0;
+  overflow: hidden; clip-path: inset(50%); white-space: nowrap; border: 0;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .wf-skel { animation: none; }
+}
+
+/* ---- wf-image: pictures the agent chose to show ------------------------ */
+/* Bytes arrive through the host's authenticated fetch, so these render from an
+   object URL rather than a src the browser can resolve on its own. Several
+   images in one block is the common case ("show me the photos for this item"),
+   so the container is a grid that collapses to one column in a narrow column —
+   `auto-fill` rather than a fixed count, because the width is not known. */
+.wf-img-btn {
+  padding: 0; border: 1px solid var(--rich-border); border-radius: 10px; background: var(--rich-bg);
+  cursor: zoom-in; overflow: hidden; line-height: 0; max-width: 100%;
+}
+.wf-img-btn:focus-visible { outline: 2px solid var(--rich-accent); outline-offset: 2px; }
+.wf-img-btn img { display: block; max-width: 100%; height: auto; max-height: 240px; object-fit: contain; }
+.wf-img-skel {
+  margin: 6px 0 0; height: 120px; border-radius: 10px; border: 1px solid var(--rich-border);
+  display: flex; align-items: center; justify-content: center; background: var(--rich-surface);
+}
+.wf-rimgs { display: flex; flex-direction: column; gap: 8px; margin: 6px 0 0; max-width: 100%; }
+.wf-rimgs-grid {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 8px;
+}
+.wf-rimg { margin: 0; display: flex; flex-direction: column; gap: 4px; min-width: 0; max-width: 100%; }
+.wf-rimg figcaption { font-size: 12px; color: var(--rich-muted); }
+/* One picture on its own gets the taller cap; in a grid they are thumbnails
+   until expanded, or one long image would set the row height for every sibling. */
+.wf-rimgs-grid .wf-img-btn img { max-height: 160px; width: 100%; }
+.wf-rimg-expanded { grid-column: 1 / -1; }
+.wf-rimg-expanded .wf-img-btn { cursor: zoom-out; }
+.wf-rimg-expanded .wf-img-btn img { max-height: none; }
+/* A named file that will not load is the EXPECTED outcome of a hallucinated id
+   or a TTL-swept artifact — it has to read as a stated fact, not a broken page. */
+.wf-rimg-missing {
+  padding: 16px 12px; border: 1px dashed var(--rich-border); border-radius: 10px;
+  background: var(--rich-surface); color: var(--rich-muted); font-size: 12px; text-align: center;
+}
