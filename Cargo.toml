@@ -105,7 +105,7 @@ tracing-subscriber = { version = "0.3.19", features = ["fmt", "json", "env-filte
 # only the hub binary pays the compile-time cost. Versions match orbit
 # for consistency across the driftwerk fleet.
 opentelemetry = "0.28"
-opentelemetry_sdk = { version = "0.28", features = ["rt-tokio", "logs"] }
+opentelemetry_sdk = { version = "0.32", features = ["rt-tokio", "logs"] }
 opentelemetry-otlp = { version = "0.28", features = ["logs", "grpc-tonic"] }
 opentelemetry-appender-tracing = "0.28"
 opentelemetry-semantic-conventions = "0.28"
