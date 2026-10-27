@@ -62,7 +62,10 @@ pub struct PageCheck {
 
 /// Check every example on a page.
 pub fn check_page(page: &str, untitled_toml: TomlSchema) -> PageCheck {
-    let mut report = PageCheck::default();
+    let mut report = PageCheck {
+        findings: fence_problems(page),
+        ..PageCheck::default()
+    };
     for block in code_blocks(page) {
         match block.lang.as_str() {
             "sh" | "bash" | "shell" | "console" | "zsh" => {
@@ -163,6 +166,80 @@ pub fn code_blocks(page: &str) -> Vec<CodeBlock> {
         }
     }
     blocks
+}
+
+/// Code fences that leave the page's structure broken: a block that never
+/// closes (the rest of the page renders as code), a fence joined onto the
+/// end of a line (so it closes nothing), a fence with a language opening
+/// inside another block (the usual sign the block's closing fence went
+/// missing), and an empty block. None of these fail the docs build.
+pub fn fence_problems(page: &str) -> Vec<Finding> {
+    let mut problems = Vec::new();
+    let mut open: Option<(char, usize, usize, bool)> = None; // char, len, line, has content
+    let finding = |line: usize, text: &str, problem: &str| Finding {
+        line,
+        example: text.trim().chars().take(80).collect(),
+        problem: problem.to_string(),
+    };
+    for (index, line) in page.lines().enumerate() {
+        let number = index + 1;
+        let trimmed = line.trim_start();
+        let fence_char = trimmed.chars().next().filter(|c| *c == '`' || *c == '~');
+        let fence_len = fence_char.map_or(0, |c| trimmed.chars().take_while(|x| *x == c).count());
+        let info = if fence_len >= 3 {
+            trimmed[fence_len..].trim()
+        } else {
+            ""
+        };
+        match &mut open {
+            None => {
+                if fence_len >= 3 {
+                    open = Some((fence_char.unwrap(), fence_len, number, false));
+                }
+            }
+            Some((ch, len, start, has_content)) => {
+                if fence_char == Some(*ch) && fence_len >= *len {
+                    if info.is_empty() {
+                        if !*has_content {
+                            problems.push(finding(*start, "```", "empty code block"));
+                        }
+                        open = None;
+                    } else {
+                        problems.push(finding(
+                            number,
+                            line,
+                            &format!(
+                                "a code fence with a language opens inside the code block from \
+                                 line {start}; is that block's closing fence missing or joined \
+                                 to a line?"
+                            ),
+                        ));
+                    }
+                    continue;
+                }
+                let end = line.trim_end();
+                if end.ends_with(&ch.to_string().repeat(3)) && fence_len < 3 {
+                    problems.push(finding(
+                        number,
+                        line,
+                        "a code fence is joined to the end of this line, so it closes nothing; \
+                         put it on a line of its own",
+                    ));
+                }
+                if !line.trim().is_empty() {
+                    *has_content = true;
+                }
+            }
+        }
+    }
+    if let Some((_, _, start, _)) = open {
+        problems.push(finding(
+            start,
+            "```",
+            "this code block never closes, so the rest of the page renders as code",
+        ));
+    }
+    problems
 }
 
 fn meta_title(meta: &str) -> Option<String> {
@@ -545,6 +622,49 @@ mod tests {
         assert_eq!(blocks[1].title.as_deref(), Some("tiers.toml"));
         assert_eq!(blocks[1].line, 8);
         assert_eq!(blocks[1].body, "[anthropic]");
+    }
+
+    #[test]
+    fn a_fence_joined_to_a_line_is_found() {
+        // What the curator wrote in the final acceptance run.
+        let page = "## Memory\n\n```sh\nworkforce memory backfill --since 30d --agent default```\n\n## Lessons\n\n```sh\nworkforce lessons list\n```\n";
+        let problems: Vec<String> = fence_problems(page)
+            .into_iter()
+            .map(|f| f.problem)
+            .collect();
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("joined to the end of this line")),
+            "{problems:?}"
+        );
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("opens inside the code block")),
+            "{problems:?}"
+        );
+    }
+
+    #[test]
+    fn an_unclosed_and_an_empty_block_are_found() {
+        let unclosed = fence_problems("intro\n\n```sh\nworkforce status\n");
+        assert_eq!(unclosed.len(), 1);
+        assert!(unclosed[0].problem.contains("never closes"));
+        assert_eq!(unclosed[0].line, 3);
+        let empty = fence_problems("```text\n```\n");
+        assert_eq!(empty.len(), 1);
+        assert_eq!(empty[0].problem, "empty code block");
+    }
+
+    #[test]
+    fn well_formed_fences_have_no_problems() {
+        let page = "````mdx\n```sh\nworkforce status\n```\n````\n\n~~~toml\n[x]\n~~~\n";
+        assert!(
+            fence_problems(page).is_empty(),
+            "{:?}",
+            fence_problems(page)
+        );
     }
 
     #[test]
