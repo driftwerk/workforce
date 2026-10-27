@@ -46,14 +46,15 @@ max_concurrent_runs_per_owner = 25
 
 [curator]
 # Doc-curator default tier for `workforce docs curate`.
-# `OPENROUTER_API_KEY` resolves credentials; CLI `--tier <spec>`
-# overrides per invocation. The curator edits a page passage by passage;
-# `max_tokens` (default 8000) caps each reply,
-# `max_turns` (60) the replies per page. Every change
-# cites its sources and is checked against them by `verifier_tier`, a
-# different model from `tier`, before it is applied.
-tier = "openrouter:deepseek:powerful"
-verifier_tier = "openrouter:anthropic:standard"
+# `OPENROUTER_API_KEY` resolves credentials; CLI `--tier <spec>` overrides
+# per invocation. The curator edits a page passage by passage;
+# `max_tokens` (default 8000) caps each reply, `max_turns` (60) the
+# replies per page. Every change cites its sources and is checked against
+# them by `verifier_tier`, a different model from `tier`, before it is
+# applied. Acceptance runs on 2026-10-27: Sonnet edits most productively,
+# Opus checks reliably (DeepSeek refused correct edits as a verifier).
+tier = "openrouter:anthropic:standard"
+verifier_tier = "openrouter:anthropic:powerful"
 
 [[agents]]
 id = "mark"
