@@ -16,18 +16,18 @@ use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
 use eyre::{eyre, Result};
-use parking_lot::{Mutex, RwLock};
+use parking_lot::Mutex;
 use tokio::sync::Semaphore;
 use workforce_agent::llm::bedrock::{resolve_region, sign_v4};
 use workforce_agent::llm::bedrock_credentials::{CredentialResolver, CHAIN_SENTINEL};
 use workforce_common::secret::ApiKeySource;
 use workforce_common::settings::{EmbeddingsConfig, EmbeddingsProvider, WorkforceConfig};
-use workforce_memory::admin::{self, Switchable, SyncMode};
+use workforce_memory::admin::{NoTurns, Switchable, Turn};
 use workforce_memory::embedding::{
     EmbedKind, EmbeddingBackend, OpenAiEmbeddingBackend, Reranker, TeiEmbeddingBackend, TeiReranker,
 };
 use workforce_memory::store::MemoryStore;
-use workforce_memory::types::{Memory, MemoryFilter, MemoryId, MemorySearchResult, Visibility};
+use workforce_memory::switch::{Copier, Switch, Timing};
 use workforce_memory::vellev::{self, VellevStore};
 use workforce_memory::weaviate::WeaviateStore;
 
@@ -101,17 +101,6 @@ pub async fn from_config(config: &WorkforceConfig) -> Result<Option<Backends>> {
     build(&config.embeddings, global_vault)
 }
 
-/// After the switch, replicas still on the old release keep writing to the
-/// old collection; new memories and forgetting are carried over this often,
-/// and, once that is over, carried back to the old collection this often
-/// too, for as long as it is kept, so that it can be switched back to...
-const CATCH_UP_EVERY: Duration = Duration::from_secs(120);
-/// ...the former for this long after each switch or start.
-const CATCH_UP_FOR: Duration = Duration::from_secs(30 * 60);
-/// A failed sync is retried after this long.
-const SYNC_RETRY: Duration = Duration::from_secs(600);
-/// How often a replica that is not copying looks for the switch marker.
-const SWITCH_POLL: Duration = Duration::from_secs(30);
 /// Time for the leader election to be wired before the first leadership check.
 const LEADER_WIRING: Duration = Duration::from_secs(20);
 
@@ -168,57 +157,56 @@ async fn open_switching(
         "Weaviate"
     };
     crate::state::ensure_memory_store_ready(v2.as_ref(), recovery_dir, budget, label).await?;
-    if v2.switched().await? {
-        keep(config.embeddings.keep_previous, &v2, v1);
-        let current: Arc<dyn MemoryStore> = v2;
-        return Ok(current);
+    // Only the fleet's leader copies: several replicas copying would embed
+    // every memory several times over. The others switch when they see its
+    // marker.
+    Switch {
+        current: v2,
+        previous: v1,
+        keep_previous: e.keep_previous,
+        copier: Arc::new(LeaderCopier),
+        timing: switch_timing(),
     }
-    let store = Arc::new(Switching(RwLock::new(
-        Arc::clone(&v1) as Arc<dyn MemoryStore>
-    )));
-    let switching = Arc::clone(&store);
-    let collection = e.collection_name();
-    let keep_previous = e.keep_previous;
-    tokio::spawn(async move {
-        // Only the fleet's leader copies (several replicas copying would
-        // embed every memory several times over); the others switch when
-        // they see its marker. The leadership flag is wired shortly after
-        // the store opens, so the first look waits for it.
-        tokio::time::sleep(LEADER_WIRING).await;
-        let mut last_attempt: Option<tokio::time::Instant> = None;
-        loop {
-            match v2.switched().await {
-                Ok(true) => break,
-                Ok(false) => {}
-                Err(err) => {
-                    tracing::warn!(target: "embeddings", error = %err, "reading the memory switch marker failed")
-                }
-            }
-            let due = last_attempt.is_none_or(|at| at.elapsed() >= SYNC_RETRY);
-            if due && crate::health_gauges::is_leader() {
-                last_attempt = Some(tokio::time::Instant::now());
-                tracing::info!(target: "embeddings", %collection, "memory sync starting on the leader");
-                match admin::sync(v2.as_ref(), v1.as_ref(), SyncMode::Mirror).await {
-                    Ok(_) => match v2.mark_switched().await {
-                        Ok(()) => break,
-                        Err(err) => {
-                            tracing::warn!(target: "embeddings", error = %err, "recording the memory switch failed")
-                        }
-                    },
-                    Err(err) => {
-                        tracing::warn!(target: "embeddings", error = %err, %collection, "memory sync failed; still on the previous collection")
-                    }
-                }
-            }
-            tokio::time::sleep(SWITCH_POLL).await;
-        }
-        let current: Arc<dyn MemoryStore> = v2.clone();
-        *switching.0.write() = current;
-        tracing::info!(target: "embeddings", %collection, "memories switched to the hub's embeddings");
-        keep(keep_previous, &v2, v1);
-    });
-    Ok(store)
+    .open()
+    .await
 }
+
+/// Copies only while this replica leads the fleet.
+struct LeaderCopier;
+
+#[async_trait]
+impl Copier for LeaderCopier {
+    async fn take(&self) -> Result<Option<Box<dyn Turn>>> {
+        Ok(crate::health_gauges::is_leader().then(|| Box::new(NoTurns) as Box<dyn Turn>))
+    }
+}
+
+/// The switch's timing: the leadership flag is wired shortly after the
+/// store opens, so the first look waits for it. In tests, catch-ups run as
+/// often as [`CATCH_UP_EVERY_IN_TESTS`] says (milliseconds, when not zero).
+fn switch_timing() -> Timing {
+    let timing = Timing {
+        first_look_after: LEADER_WIRING,
+        ..Timing::default()
+    };
+    #[cfg(test)]
+    {
+        let ms = CATCH_UP_EVERY_IN_TESTS.load(std::sync::atomic::Ordering::SeqCst);
+        if ms > 0 {
+            return Timing {
+                catch_up_every: Duration::from_millis(ms),
+                ..timing
+            };
+        }
+    }
+    timing
+}
+
+/// [`switch_timing`]'s catch-up interval, for tests that watch a catch-up
+/// happen.
+#[cfg(test)]
+pub(crate) static CATCH_UP_EVERY_IN_TESTS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 /// The store memories switch from: the configured backend's collection
 /// that embeds for itself, `[vellev]`'s when `[memory] backend = "vellev"`,
@@ -342,180 +330,6 @@ fn embedded_store(
                 .with_score_map(score_map),
         )
     })
-}
-
-/// Keep `previous`, the store memories switched from, beside `current`
-/// (forgetting and erasure reaching it, a catch-up from and back into
-/// it), unless `[embeddings] keep_previous` is off: then nothing of the
-/// hub's reads or writes it again (DW-676).
-fn keep(keep_previous: bool, current: &Arc<dyn Switchable>, previous: Arc<dyn Switchable>) {
-    if !keep_previous {
-        tracing::info!(target: "embeddings", collection = previous.collection(), "the collection memories switched from is left alone ([embeddings] keep_previous = false)");
-        return;
-    }
-    let kept: Arc<dyn MemoryStore> = previous.clone();
-    current.keep_previous(kept);
-    spawn_catch_up(Arc::clone(current), previous);
-}
-
-/// How often a catch-up runs: [`CATCH_UP_EVERY`], or, in tests, what
-/// [`CATCH_UP_EVERY_IN_TESTS`] says (milliseconds, when not zero).
-fn catch_up_every() -> Duration {
-    #[cfg(test)]
-    {
-        let ms = CATCH_UP_EVERY_IN_TESTS.load(std::sync::atomic::Ordering::SeqCst);
-        if ms > 0 {
-            return Duration::from_millis(ms);
-        }
-    }
-    CATCH_UP_EVERY
-}
-
-/// [`catch_up_every`] for tests that watch a catch-up happen.
-#[cfg(test)]
-pub(crate) static CATCH_UP_EVERY_IN_TESTS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-
-/// Carry new memories and forgetting from `previous` into `current` while
-/// replicas may still write to `previous`, then from `current` back into
-/// `previous` for as long as `previous` is kept, so that switching back
-/// loses nothing. Only the leader copies.
-fn spawn_catch_up(current: Arc<dyn Switchable>, previous: Arc<dyn Switchable>) {
-    tokio::spawn(async move {
-        let since = chrono::Utc::now();
-        let forward_until = tokio::time::Instant::now() + CATCH_UP_FOR;
-        loop {
-            tokio::time::sleep(catch_up_every()).await;
-            if !crate::health_gauges::is_leader() {
-                continue;
-            }
-            if tokio::time::Instant::now() < forward_until {
-                if let Err(err) =
-                    admin::sync(current.as_ref(), previous.as_ref(), SyncMode::CatchUp).await
-                {
-                    tracing::warn!(target: "embeddings", error = %err, "memory catch-up failed");
-                }
-                continue;
-            }
-            if let Err(err) = previous.doctor().await {
-                tracing::info!(target: "embeddings", collection = previous.collection(), error = %err, "the previous collection is gone; no longer carrying memories back");
-                return;
-            }
-            let back = SyncMode::Back { since };
-            if let Err(err) = admin::sync(previous.as_ref(), current.as_ref(), back).await {
-                tracing::warn!(target: "embeddings", error = %err, "carrying memories back to the previous collection failed");
-            }
-        }
-    });
-}
-
-/// The store in use while a sync runs: the previous collection, replaced by
-/// the new one once it holds every memory.
-pub(crate) struct Switching(pub(crate) RwLock<Arc<dyn MemoryStore>>);
-
-impl Switching {
-    fn current(&self) -> Arc<dyn MemoryStore> {
-        Arc::clone(&self.0.read())
-    }
-}
-
-#[async_trait]
-impl MemoryStore for Switching {
-    async fn remember(&self, memory: Memory) -> Result<MemoryId> {
-        self.current().remember(memory).await
-    }
-    async fn recall(&self, query: &str, filter: MemoryFilter) -> Result<Vec<MemorySearchResult>> {
-        self.current().recall(query, filter).await
-    }
-    /// The store in use's: until the switch, the collection memories are
-    /// moved from, which may take no vector or another model's.
-    fn query_model(&self) -> Option<String> {
-        self.current().query_model()
-    }
-    fn recall_settings(&self) -> Option<workforce_memory::store::RecallSettings> {
-        self.current().recall_settings()
-    }
-    async fn recall_with_vector(
-        &self,
-        query: &str,
-        vector: Option<Vec<f32>>,
-        filter: MemoryFilter,
-    ) -> Result<Vec<MemorySearchResult>> {
-        self.current()
-            .recall_with_vector(query, vector, filter)
-            .await
-    }
-    async fn get(&self, id: &MemoryId) -> Result<Option<Memory>> {
-        self.current().get(id).await
-    }
-    async fn forget(&self, id: &MemoryId) -> Result<()> {
-        self.current().forget(id).await
-    }
-    async fn share(&self, id: &MemoryId, visibility: Visibility) -> Result<()> {
-        self.current().share(id, visibility).await
-    }
-    async fn count(&self, filter: MemoryFilter) -> Result<usize> {
-        self.current().count(filter).await
-    }
-    async fn list(&self, filter: MemoryFilter) -> Result<Vec<Memory>> {
-        self.current().list(filter).await
-    }
-    async fn update_tags(&self, id: &MemoryId, tags: Vec<String>) -> Result<()> {
-        self.current().update_tags(id, tags).await
-    }
-    async fn adjust_importance(&self, id: &MemoryId, delta: f32) -> Result<f32> {
-        self.current().adjust_importance(id, delta).await
-    }
-    async fn identity_memories(
-        &self,
-        owner: &workforce_core::types::AgentId,
-        identity: &str,
-    ) -> Result<Vec<MemoryId>> {
-        self.current().identity_memories(owner, identity).await
-    }
-    async fn identity_counts(
-        &self,
-        owner: &workforce_core::types::AgentId,
-    ) -> Result<std::collections::BTreeMap<String, usize>> {
-        self.current().identity_counts(owner).await
-    }
-    async fn reassign_identity(
-        &self,
-        owner: &workforce_core::types::AgentId,
-        from: &str,
-        to: &str,
-    ) -> Result<usize> {
-        self.current().reassign_identity(owner, from, to).await
-    }
-    async fn purge_identity(
-        &self,
-        owner: &workforce_core::types::AgentId,
-        identity: &str,
-    ) -> Result<usize> {
-        self.current().purge_identity(owner, identity).await
-    }
-    async fn purge_memories(&self, ids: &[MemoryId]) -> Result<usize> {
-        self.current().purge_memories(ids).await
-    }
-    async fn find_near_duplicate(
-        &self,
-        content: &str,
-        filter: MemoryFilter,
-        min_similarity: f32,
-    ) -> Result<Option<MemorySearchResult>> {
-        self.current()
-            .find_near_duplicate(content, filter, min_similarity)
-            .await
-    }
-    async fn record_recurrence(
-        &self,
-        id: &MemoryId,
-        additional_message_ids: Vec<String>,
-    ) -> Result<u32> {
-        self.current()
-            .record_recurrence(id, additional_message_ids)
-            .await
-    }
 }
 
 /// The store a side process (no startup sync) reads: the new collection
@@ -765,6 +579,7 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use workforce_memory::admin::{MemoryAdmin, SyncSource, SyncTarget};
+    use workforce_memory::types::{Memory, MemoryFilter};
 
     struct Counting(AtomicUsize);
 
