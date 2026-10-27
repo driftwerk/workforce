@@ -74,13 +74,14 @@ Google prices 720p at 5,792 tokens/s ≈ **$0.10 per second**, so a default
 
 Documented (not probed) and load-bearing:
 
-- **Recognizable people in uploaded images are not supported**, and images
-  containing minors are refused in the EEA, Switzerland and the UK. Taken at
-  its word, this ends the shipped "make a video of Tom dancing" flow
-  (`get_user_photo` → image→video), which Veo did with
-  `personGeneration: allow_adult`. **Not yet probed** — the §8 live check
-  settles it before the tool description or `get_user_photo` change.
-  Generic people generated from text are unaffected.
+- Google's docs say **recognizable people in uploaded images are not
+  supported**, and that images containing minors are refused in the EEA,
+  Switzerland and the UK. **Probed 2026-10-27 and not what happens:** a
+  consenting adult's own headshot (the operator's), prompt "smiles, then
+  laughs and dances", came back as a 3s clip in 21s that keeps him
+  recognizable — face, shirt, setting. So the shipped "make a video of Tom
+  dancing" flow (`get_user_photo` → image→video) survives the move off Veo;
+  the tool description says so. The minors rule was not probed.
 - Editing or extending an **uploaded** video is unavailable in the EEA,
   Switzerland and the UK. Editing/extending a video Omni itself generated
   (`previous_interaction_id`) works everywhere.
@@ -347,11 +348,10 @@ model lookup can't stand in for one: retired Veo models still answer `200`
 - Description rewritten for Omni: ~15–60s and blocks; one image animates it,
   two set first and last frame, more are references by `<IMAGE_REF_N>`. The
   "you will NOT see the video" delivery note stays.
-- If the §8 face probe is refused: the description adds "Omni refuses
-  recognizable real people from photos — don't fetch someone's profile photo
-  to animate them", and `get_user_photo`
-  (`crates/skills/src/adapters/user_photo.rs:65`) drops "make a video of
-  Tom" from its description. If it is accepted, both stay as they are.
+- The §8 face probe was accepted, so the description keeps the person
+  example ("a person's photo, e.g. from get_user_photo, animates as them";
+  a fuller-body photo moves better), and `get_user_photo`'s "make a video of
+  Tom" stays.
 - Delivery is unchanged: the MP4 is staged and returned under the
   `generated_images` marker for `HubImageSink`.
 
@@ -440,9 +440,9 @@ Live (manual, before merge), through the built provider against a real key:
 - one 360p text→video and one 360p image→video — **done 2026-10-27**, from
   a `veo:standard` config (Allan's exact value): 3s clips in 15.2s and
   14.0s, 640×360 H.264 + AAC;
-- **face probe**: one 3s 360p image→video from a photo of a consenting
-  person (the operator's own). It decides §5.3's description change and
-  records the refusal shape as a test fixture (~$0.10);
+- **face probe** — **done 2026-10-27**: a 3s 360p image→video from the
+  operator's own photo was generated, not refused (§2). No refusal has been
+  observed, so the refusal handling in §5.2 stays defensive;
 - a turn stopped mid-generation is cancelled (covered against a mock server;
   not yet seen against Google).
 
