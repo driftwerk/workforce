@@ -139,8 +139,20 @@ fn extract_paragraphs(xml: &str) -> Result<Vec<Para>> {
                 current_text.push('\n');
             }
             Ok(Event::Text(t)) if in_text => {
-                let s = t.unescape().map_err(|e| eyre!("unescape DOCX text: {e}"))?;
+                let s = t.decode().map_err(|e| eyre!("decode DOCX text: {e}"))?;
                 current_text.push_str(&s);
+            }
+            // Entity references (`&amp;`, `&#38;`) arrive as their own events.
+            Ok(Event::GeneralRef(r)) if in_text => {
+                if let Ok(Some(c)) = r.resolve_char_ref() {
+                    current_text.push(c);
+                } else if let Some(text) = r
+                    .decode()
+                    .ok()
+                    .and_then(|name| quick_xml::escape::resolve_predefined_entity(&name))
+                {
+                    current_text.push_str(text);
+                }
             }
             Ok(Event::Eof) => break,
             Err(e) => return Err(eyre!("DOCX XML parse error: {e}")),
@@ -275,6 +287,14 @@ mod tests {
             .map(|s| format!(r#"<w:pPr><w:pStyle w:val="{s}"/></w:pPr>"#))
             .unwrap_or_default();
         format!(r#"<w:p>{style}<w:r><w:t>{text}</w:t></w:r></w:p>"#)
+    }
+
+    #[test]
+    fn entity_references_keep_their_characters() {
+        // quick-xml reports `&amp;` and `&#38;` as events of their own.
+        let xml = xml_doc(&para(None, "Fish &amp; chips &#38; peas &lt;3"));
+        let paragraphs = extract_paragraphs(&xml).unwrap();
+        assert_eq!(paragraphs[0].text, "Fish & chips & peas <3");
     }
 
     #[test]
