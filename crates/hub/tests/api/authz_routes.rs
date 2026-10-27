@@ -1035,6 +1035,97 @@ async fn agents_route_pairing_store_failure_gets_503_not_empty_roster() {
     );
 }
 
+// ── /ws/agent: only the gateway token or a live paired device connects ──────
+
+/// The status a WebSocket upgrade of `/ws/agent?token=…` is answered with,
+/// over a real connection: `oneshot` carries no upgradable connection, so the
+/// upgrade extractor would refuse before the handler's auth ran.
+async fn ws_agent_status(state: Arc<GatewayState>, token: &str) -> u16 {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, router(state)).await.unwrap() });
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let request = format!(
+        "GET /ws/agent?token={token} HTTP/1.1\r\nHost: {addr}\r\nConnection: Upgrade\r\n\
+         Upgrade: websocket\r\nSec-WebSocket-Version: 13\r\n\
+         Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
+    );
+    stream.write_all(request.as_bytes()).await.unwrap();
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    while !head.ends_with(b"\r\n") {
+        stream.read_exact(&mut byte).await.unwrap();
+        head.push(byte[0]);
+    }
+    let line = String::from_utf8(head).unwrap();
+    line.split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse().ok())
+        .unwrap_or_else(|| panic!("no status in {line:?}"))
+}
+
+/// A gateway whose device pairing holds one approved device, and its token.
+fn state_with_paired_device() -> (
+    Arc<GatewayState>,
+    Arc<workforce_pairing::DevicePairingService>,
+    workforce_pairing::ApprovedDevice,
+    String,
+) {
+    let pairing = pairing_service(Arc::new(
+        workforce_pairing::SqlitePairingStore::in_memory().unwrap(),
+    ));
+    let request = pairing
+        .initiate("laptop", vec![], None, None, None, None)
+        .unwrap();
+    let (device, token) = pairing.approve(&request.code, "admin").unwrap();
+    let (state, _fx) = state_with_parts(
+        false,
+        Some(Arc::clone(&pairing)),
+        None,
+        None,
+        shared_skills_dir(),
+    );
+    (state, pairing, device, token)
+}
+
+#[tokio::test]
+async fn ws_agent_refuses_an_unknown_token_when_pairing_is_configured() {
+    let (state, _pairing, _device, _token) = state_with_paired_device();
+    assert_eq!(ws_agent_status(state, "wfp_unknown").await, 401);
+}
+
+#[tokio::test]
+async fn ws_agent_refuses_a_revoked_devices_token() {
+    let (state, pairing, device, token) = state_with_paired_device();
+    pairing.revoke(&device.id).unwrap();
+    assert_eq!(ws_agent_status(state, &token).await, 401);
+}
+
+#[tokio::test]
+async fn ws_agent_upgrades_a_paired_devices_token() {
+    let (state, _pairing, _device, token) = state_with_paired_device();
+    assert_eq!(ws_agent_status(state, &token).await, 101);
+}
+
+#[tokio::test]
+async fn ws_agent_upgrades_the_gateway_token() {
+    let (state, _pairing, _device, _token) = state_with_paired_device();
+    assert_eq!(ws_agent_status(state, GATEWAY_TOKEN).await, 101);
+}
+
+#[tokio::test]
+async fn ws_agent_pairing_store_failure_gets_503() {
+    let (state, _fx) = state_with_parts(
+        false,
+        Some(pairing_service(Arc::new(FailingPairingStore))),
+        None,
+        None,
+        shared_skills_dir(),
+    );
+    assert_eq!(ws_agent_status(state, "wfp_unverifiable").await, 503);
+}
+
 // ── /api/pipelines/{scope}/{id}/items/{item}/costs ─────────────────────────
 
 /// A pipeline `id` in `scope`, in a collection of its own so tests never

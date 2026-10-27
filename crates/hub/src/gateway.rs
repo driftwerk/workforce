@@ -2865,14 +2865,27 @@ async fn ws_local_agent_handler(
     }
 
     if let Some(ref pairing) = state.device_pairing {
-        if pairing
-            .validate_token_async(token.to_string())
-            .await
-            .is_ok()
-        {
-            return ws
-                .on_upgrade(move |socket| handle_local_agent_ws(socket, state))
-                .into_response();
+        match pairing.validate_token_async(token.to_string()).await {
+            Ok(Some(_)) => {
+                return ws
+                    .on_upgrade(move |socket| handle_local_agent_ws(socket, state))
+                    .into_response();
+            }
+            Ok(None) => {}
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "Pairing store error during local agent WebSocket auth — failing closed"
+                );
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    axum::Json(serde_json::json!({
+                        "error": "service_unavailable",
+                        "message": "Authentication backend unavailable — retry shortly."
+                    })),
+                )
+                    .into_response();
+            }
         }
     }
 
