@@ -28,6 +28,9 @@ indicatif = { workspace = true }
 console = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+regex = { workspace = true }
+serde_ignored = { workspace = true }
+shlex = { workspace = true }
 eyre = { workspace = true }
 color-eyre = { workspace = true }
 tracing = { workspace = true }

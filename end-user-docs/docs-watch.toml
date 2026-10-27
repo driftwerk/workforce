@@ -12,6 +12,14 @@
 #
 # Multiple [[watch]] entries are allowed; pages may overlap.
 #
+# A page whose TOML examples show workforce.toml declares it, and
+# `workforce docs check` (and the curator) load every untitled TOML block on
+# it into the real config:
+#   [pages."configuration/index.mdx"]
+#   toml = "workforce.toml"
+# A block for another file names it (```toml title="tiers.toml"```) and
+# isn't checked as workforce.toml.
+#
 # Use `**/*` (not just `**`) for recursive directory matching. The
 # `glob` crate's `glob()` walker treats trailing `**` as
 # "directories only" — files at any depth are excluded — even though
@@ -153,6 +161,15 @@ paths = [
 ]
 pages = ["configuration/index.mdx", "configuration/tiers.mdx"]
 
+# Tiers resolve through the compiled-in table and the resolver, not only
+# through settings.rs; without these the page had no source for them.
+[[watch]]
+paths = [
+  "crates/agent-runtime/src/llm/default_tiers.toml",
+  "crates/agent-runtime/src/llm/tiers.rs",
+]
+pages = ["configuration/tiers.mdx"]
+
 [[watch]]
 paths = [
   "crates/hub/src/vault.rs",
@@ -172,6 +189,12 @@ pages = ["configuration/policies.mdx"]
 [[watch]]
 paths = ["crates/cli/src/**/*"]
 pages = ["cli.mdx"]
+
+# The CLI page is written from the command line's own help, every
+# subcommand's, rendered from the definitions that parse the commands; the
+# paths above only decide when it is curated.
+[pages."cli.mdx"]
+source = "cli-help"
 
 # ─── Reference ───────────────────────────────────────────────────────
 
@@ -217,3 +240,26 @@ paths = [
   "fixtures/evals/example/**/*",
 ]
 pages = ["reference/evals.mdx", "cli.mdx"]
+
+# ─── Pages whose TOML examples show workforce.toml ───────────────────
+
+[pages."concepts/agents.mdx"]
+toml = "workforce.toml"
+
+[pages."concepts/skills.mdx"]
+toml = "workforce.toml"
+
+[pages."concepts/subscriptions.mdx"]
+toml = "workforce.toml"
+
+[pages."configuration/index.mdx"]
+toml = "workforce.toml"
+
+[pages."configuration/tiers.mdx"]
+toml = "workforce.toml"
+
+[pages."reference/agent-types.mdx"]
+toml = "workforce.toml"
+
+[pages."reference/remote-mcp.mdx"]
+toml = "workforce.toml"

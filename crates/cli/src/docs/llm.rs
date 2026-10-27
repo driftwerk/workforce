@@ -1,25 +1,26 @@
 //! LLM dispatch for the curator. The model edits the page through tools —
-//! exact-passage replacements, appends, then `finish` or `keep_page` — so a
-//! reply carries changes, never the whole page, and text no edit names is
-//! never re-typed. Single-pass when the sources fit the configured context
-//! budget; otherwise the sources are first read in chunks into notes, and
-//! the page is edited from those.
+//! lookups in the repository, exact-passage replacements and appends that
+//! cite their evidence, then `finish` or `keep_page` — so a reply carries
+//! changes, never the whole page, and text no edit names is never re-typed.
+//! A page's sources are included in the prompt when they fit the context
+//! budget; otherwise the prompt lists them and the model looks up what it
+//! needs.
 //!
 //! Every stage fails closed. A reply that reaches its token cap is never
-//! used: a cut-off edit reply is discarded and the model is told to make
-//! smaller edits; a cut-off notes reply has its chunk halved and read again.
-//! A page's edits take effect only when the model calls `finish`; a page
-//! that runs out of replies is left as it was.
+//! used: it is discarded and the model is told to make smaller edits. A
+//! change applies only when its evidence is in the sources word for word
+//! and the verifier finds it supported. A page's edits take effect only
+//! when the model calls `finish`; a page that runs out of replies is left
+//! as it was.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use eyre::{eyre, Context, Result};
-use futures::future::{try_join_all, BoxFuture};
-use futures::FutureExt;
 use serde_json::{json, Value};
 use tracing::{info, warn};
 
+use workforce_agent::llm::failover::{FailoverConfig, FailoverProvider, RetryConfig};
 use workforce_agent::llm::provider::{
     create_provider_async, provider_env_key, provider_env_var_hint, with_reasoning_suppressed,
     LlmProvider, ProviderKind,
@@ -31,17 +32,12 @@ use workforce_agent::llm::types::{
 use workforce_common::settings::CuratorConfig;
 use workforce_hub::vault::Vault;
 
+use super::check::{check_page, Finding, TomlSchema};
 use super::edit::PageDraft;
-use super::prompt::{
-    build_notes_prompt, build_prompt, build_reduce_prompt, PromptInput, SourceFile,
-};
+use super::prompt::{build_lookup_prompt, build_prompt, PromptInput};
+use super::sources::SourceIndex;
 
 const DEFAULT_TIER_KEY: &str = "anthropic";
-const MAX_MAP_CHUNKS: usize = 10;
-const OVERHEAD_TOKEN_RESERVE: u32 = 15_000;
-/// A notes chunk this small that still overflows its cap is not split
-/// further; the page fails instead.
-const MIN_SPLIT_CHARS: usize = 4_000;
 /// Consecutive cut-off edit replies tolerated before the page is given up.
 const MAX_CUT_OFF_REPLIES: u32 = 3;
 
@@ -56,22 +52,69 @@ pub enum Curation {
         model: String,
         input_tokens: u64,
         output_tokens: u64,
+        /// Examples that already failed their check before this edit and
+        /// still do, for the reviewer.
+        still_failing: Vec<String>,
+        /// Where the applied changes' evidence stands (`path lines a–b`),
+        /// for the reviewer.
+        citations: Vec<String>,
     },
     /// The model judged the page accurate as it stands.
     Unchanged { reason: String },
 }
 
-/// Curate one page with the configured tier: resolve the provider, then
-/// read the sources (in chunks when they overflow the context budget) and
-/// let the model edit the page.
+/// Curate one page with the configured tiers: resolve the editor and the
+/// verifier, then give the editor the sources (listed for lookup when they
+/// overflow the context budget) and let it change the page, each change
+/// checked by the verifier against the sources it cites.
+#[allow(clippy::too_many_arguments)]
 pub async fn curate_page(
     page: &str,
     tier_spec: &str,
+    verifier_tier: &str,
     limits: &CuratorConfig,
     system_prompt: &str,
     input: &PromptInput,
+    schema: TomlSchema,
+    sources: &SourceIndex,
     vault: Option<&Arc<Vault>>,
 ) -> Result<Curation> {
+    let (provider, model) = provider_for(tier_spec, vault).await?;
+    let (verifier_provider, verifier_model) = provider_for(verifier_tier, vault).await?;
+    if verifier_model == model {
+        warn!(
+            %model,
+            "the verifier runs on the editor's model; a different model catches more"
+        );
+    }
+    let verifier = Verifier {
+        provider: &*verifier_provider,
+        model: verifier_model,
+        max_tokens: limits.max_tokens,
+    };
+    curate_with(
+        &*provider,
+        &model,
+        page,
+        limits,
+        system_prompt,
+        input,
+        schema,
+        sources,
+        Some(&verifier),
+    )
+    .await
+}
+
+/// The provider for a tier, behind the hub's own retry policy: transient
+/// errors are retried with backoff, and a rate limit that names when to come
+/// back (OpenRouter: "could not verify available credits in time", with
+/// `Retry-After`) is waited out on the same model. No failover chain: the
+/// curator's models are chosen, not interchangeable.
+async fn provider_for(
+    tier_spec: &str,
+    vault: Option<&Arc<Vault>>,
+) -> Result<(Box<dyn LlmProvider>, String)> {
     let (kind, model) = resolve_tier(tier_spec)?;
     let api_key = resolve_api_key(kind, vault).ok_or_else(|| {
         eyre!(
@@ -82,9 +125,23 @@ pub async fn curate_page(
         )
     })?;
     let provider = create_provider_async(kind, &api_key, Some(&model), None, false).await?;
-    curate_with(&*provider, &model, page, limits, system_prompt, input).await
+    Ok((Box::new(with_retries(Arc::from(provider))), model))
 }
 
+fn with_retries(provider: Arc<dyn LlmProvider>) -> FailoverProvider {
+    FailoverProvider::new(
+        provider,
+        FailoverConfig {
+            retry: RetryConfig {
+                retry_rate_limited: true,
+                ..RetryConfig::default()
+            },
+            ..FailoverConfig::default()
+        },
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn curate_with(
     provider: &dyn LlmProvider,
     model: &str,
@@ -92,12 +149,15 @@ async fn curate_with(
     limits: &CuratorConfig,
     system_prompt: &str,
     input: &PromptInput,
+    schema: TomlSchema,
+    sources: &SourceIndex,
+    verifier: Option<&Verifier<'_>>,
 ) -> Result<Curation> {
     let single_pass = build_prompt(input);
     let estimated =
         estimate_tokens(system_prompt) + estimate_tokens(&single_pass) + limits.max_tokens as usize;
     let user_prompt = if estimated <= limits.context_safety_tokens as usize {
-        info!(page, %model, estimated, "curator: single-pass");
+        info!(page, %model, estimated, "curator: sources included");
         single_pass
     } else {
         info!(
@@ -105,10 +165,9 @@ async fn curate_with(
             %model,
             estimated,
             threshold = limits.context_safety_tokens,
-            "curator: reading sources in chunks (input exceeds budget)"
+            "curator: sources too large to include; listed for lookup"
         );
-        let notes = gather_notes(page, &input.sources, limits, provider, model).await?;
-        build_reduce_prompt(input, &notes)
+        build_lookup_prompt(input)
     };
     edit_page(
         provider,
@@ -118,147 +177,75 @@ async fn curate_with(
         system_prompt,
         &user_prompt,
         input.current_content.as_deref(),
+        schema,
+        sources,
+        verifier,
     )
     .await
     .wrap_err_with(|| context_overflow_hint(page))
-}
-
-// ─── Notes (sources that overflow the context budget) ──────────────────────
-
-async fn gather_notes(
-    page: &str,
-    sources: &[SourceFile],
-    limits: &CuratorConfig,
-    provider: &dyn LlmProvider,
-    model: &str,
-) -> Result<String> {
-    let chunk_budget_chars = (limits
-        .context_safety_tokens
-        .saturating_sub(OVERHEAD_TOKEN_RESERVE)) as usize
-        * 3;
-    let chunks = split_into_chunks(sources, chunk_budget_chars);
-    if chunks.len() > MAX_MAP_CHUNKS {
-        return Err(eyre!(
-            "page `{page}` would need {} map-passes (limit {}) — scope this \
-             page's sources in docs-watch.toml or switch to a longer-context tier",
-            chunks.len(),
-            MAX_MAP_CHUNKS,
-        ));
-    }
-    info!(
-        page,
-        chunk_count = chunks.len(),
-        "curator: extracting notes per chunk"
-    );
-    let parts = try_join_all(
-        chunks
-            .into_iter()
-            .map(|chunk| notes_for_chunk(page, chunk, limits.notes_max_tokens, provider, model)),
-    )
-    .await?;
-    Ok(parts.into_iter().flatten().collect::<Vec<_>>().join("\n\n"))
-}
-
-/// Notes for one chunk of sources. A reply that reaches the cap is never
-/// used: the chunk is halved and each half read again, until a chunk too
-/// small to halve still overflows, which fails the page.
-fn notes_for_chunk<'a>(
-    page: &'a str,
-    chunk: Vec<SourceFile>,
-    cap: u32,
-    provider: &'a dyn LlmProvider,
-    model: &'a str,
-) -> BoxFuture<'a, Result<Vec<String>>> {
-    async move {
-        let label = chunk_label(&chunk);
-        let prompt = build_notes_prompt(page, &chunk, notes_word_budget(cap));
-        let messages = [user_text(prompt)];
-        let response = invoke(provider, model, None, &messages, &[], cap)
-            .await
-            .wrap_err_with(|| format!("notes extraction failed for `{page}` ({label})"))?;
-        if !is_cut_off(&response, cap) {
-            let notes = response.text().ok_or_else(|| {
-                eyre!(
-                    "notes call for `{page}` ({label}) returned no text (stop reason {:?})",
-                    response.stop_reason
-                )
-            })?;
-            return Ok(vec![notes]);
-        }
-        let Some((first, second)) = halve(&chunk) else {
-            return Err(eyre!(
-                "notes for `{page}` ({label}) overflow {cap} tokens even for a chunk of \
-                 {} characters; raise `[curator] notes_max_tokens` or scope this page's \
-                 sources in docs-watch.toml",
-                chunk_chars(&chunk)
-            ));
-        };
-        warn!(page, %label, cap, "notes reply reached its cap; halving the chunk");
-        let (a, b) = futures::try_join!(
-            notes_for_chunk(page, first, cap, provider, model),
-            notes_for_chunk(page, second, cap, provider, model),
-        )?;
-        Ok(a.into_iter().chain(b).collect())
-    }
-    .boxed()
-}
-
-/// The length asked of a notes reply: well inside its token cap, so the
-/// prompt never invites a reply the cap would cut off.
-fn notes_word_budget(cap: u32) -> u32 {
-    cap * 2 / 5
-}
-
-fn chunk_chars(chunk: &[SourceFile]) -> usize {
-    chunk.iter().map(|s| s.content.len()).sum()
-}
-
-fn chunk_label(chunk: &[SourceFile]) -> String {
-    match chunk {
-        [one] => one.repo_relative.display().to_string(),
-        many => format!(
-            "{} files from {}",
-            many.len(),
-            many[0].repo_relative.display()
-        ),
-    }
-}
-
-/// Split a chunk in two: between its files when it has several, else
-/// between the lines of its one file. `None` when it is too small to split.
-fn halve(chunk: &[SourceFile]) -> Option<(Vec<SourceFile>, Vec<SourceFile>)> {
-    if chunk_chars(chunk) < MIN_SPLIT_CHARS * 2 {
-        return None;
-    }
-    if chunk.len() > 1 {
-        let (a, b) = chunk.split_at(chunk.len() / 2);
-        return Some((a.to_vec(), b.to_vec()));
-    }
-    let file = &chunk[0];
-    let lines: Vec<&str> = file.content.split_inclusive('\n').collect();
-    if lines.len() < 2 {
-        return None;
-    }
-    let mid = lines.len() / 2;
-    let part = |range: std::ops::Range<usize>| SourceFile {
-        repo_relative: format!(
-            "{} (lines {}–{})",
-            file.repo_relative.display(),
-            range.start + 1,
-            range.end
-        )
-        .into(),
-        content: lines[range].concat(),
-    };
-    Some((vec![part(0..mid)], vec![part(mid..lines.len())]))
 }
 
 // ─── Editing the page ──────────────────────────────────────────────────────
 
 const CUT_OFF_NOTE: &str = "Your last reply was cut off before it ended, so none of it was \
      applied. Make smaller changes: one passage per edit call, and fewer calls per reply.";
-const TOOLS_ONLY_NOTE: &str = "Reply with tool calls only: `edit` or `append` to change the \
-     page, then `finish`; or `keep_page` if it needs no change.";
+const TOOLS_ONLY_NOTE: &str = "Reply with tool calls only: `search_sources` or `read_source` \
+     to look a fact up, `edit` or `append` to change the page, then `finish`; or `keep_page` if \
+     it needs no change.";
+
+/// The page's examples, checked against the real CLI and config (see
+/// `check`). `finish` is refused while the draft has a failing example the
+/// original page didn't; failures the page already had don't block it, and
+/// are reported.
+struct ExampleGate {
+    schema: TomlSchema,
+    baseline: Vec<Finding>,
+}
+
+impl ExampleGate {
+    fn new(schema: TomlSchema, original: Option<&str>) -> Self {
+        let baseline = check_page(original.unwrap_or_default(), schema).findings;
+        Self { schema, baseline }
+    }
+
+    /// The draft's failing examples, split into those the original page
+    /// didn't have and those it did. Lines move as the page is edited, so
+    /// failures are matched by example and problem, not by line.
+    fn split(&self, draft: &str) -> (Vec<Finding>, Vec<Finding>) {
+        let mut known: Vec<(&str, &str)> = self
+            .baseline
+            .iter()
+            .map(|f| (f.example.as_str(), f.problem.as_str()))
+            .collect();
+        let mut new = Vec::new();
+        let mut old = Vec::new();
+        for finding in check_page(draft, self.schema).findings {
+            let key = (finding.example.as_str(), finding.problem.as_str());
+            match known.iter().position(|k| *k == key) {
+                Some(at) => {
+                    known.swap_remove(at);
+                    old.push(finding);
+                }
+                None => new.push(finding),
+            }
+        }
+        (new, old)
+    }
+
+    /// The note that tells the model which examples already fail.
+    fn baseline_note(&self) -> Option<String> {
+        (!self.baseline.is_empty()).then(|| {
+            let list: Vec<String> = self.baseline.iter().map(|f| format!("- {f}")).collect();
+            format!(
+                "## Examples on this page that already fail their check\n\
+                 Each `workforce` command is parsed with the real command line and each \
+                 workforce.toml block loaded into the real config. These fail now; fix any \
+                 your sources show the correct form of.\n{}\n",
+                list.join("\n")
+            )
+        })
+    }
+}
 
 /// What ends the edit of a page.
 enum Verdict {
@@ -266,6 +253,102 @@ enum Verdict {
     Keep(String),
 }
 
+/// What an edit is checked against beyond its own text.
+pub struct EditContext<'a> {
+    gate: ExampleGate,
+    sources: &'a SourceIndex,
+    /// `None` only in tests of the loop itself: `curate_page` always sets it.
+    verifier: Option<&'a Verifier<'a>>,
+    /// The cited ranges of the changes applied so far.
+    citations: std::sync::Mutex<Vec<String>>,
+}
+
+/// Checks one change against the sources it cites. A second model sees the
+/// passage before and after the change and only the cited excerpts, and
+/// lists each statement the change adds that they don't support. It runs
+/// on a different model from the editor, so the two don't share blind
+/// spots.
+pub struct Verifier<'a> {
+    pub provider: &'a dyn LlmProvider,
+    pub model: String,
+    pub max_tokens: u32,
+}
+
+const VERIFIER_PROMPT: &str = "You check edits to end-user documentation against the \
+     source code they cite. You see the passage before the edit, the passage after it, the \
+     page section the edit sits in, and excerpts from the cited sources. List every statement \
+     the edit adds or changes that the excerpts don't support: a command, subcommand, flag, \
+     argument, key, section, default, value, name, limit or behaviour that the excerpts don't \
+     show, or show differently. Also list anything the edit removes or weakens that the \
+     excerpts show is still true (for example, dropping that an action needs an admin), and \
+     any statement elsewhere in the section that the excerpts show is wrong, which the edit \
+     should fix too. Code, data and argument definitions outrank comments: where an \
+     excerpt's comment disagrees with its code, the code is right, and a claim resting on \
+     the comment alone is unsupported. Text the edit leaves alone is not yours to judge unless \
+     the excerpts show it is wrong, and neither are wording, tone or formatting. Answer by \
+     calling `verdict` once; an empty list means the edit stands on the excerpts.";
+
+impl Verifier<'_> {
+    /// The statements in `after`, or left standing in `section`, that
+    /// `excerpts` don't support.
+    async fn unsupported(
+        &self,
+        before: &str,
+        after: &str,
+        section: &str,
+        excerpts: &[String],
+    ) -> Result<Vec<String>> {
+        let prompt = format!(
+            "## Passage before the edit\n<<<\n{before}\n>>>\n\n\
+             ## Passage after the edit\n<<<\n{after}\n>>>\n\n\
+             ## The page section the edit sits in, before the edit\n<<<\n{section}\n>>>\n\n\
+             ## Excerpts from the cited sources\n{}",
+            excerpts.join("\n")
+        );
+        let tools = [LlmToolDef {
+            name: "verdict".to_string(),
+            description: "Report the statements the excerpts don't support; empty when all are."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {"unsupported": {"type": "array", "items": {"type": "string"}}},
+                "required": ["unsupported"],
+            }),
+        }];
+        let messages = [user_text(prompt)];
+        for _ in 0..2 {
+            let response = invoke(
+                self.provider,
+                &self.model,
+                Some(VERIFIER_PROMPT),
+                &messages,
+                &tools,
+                self.max_tokens,
+            )
+            .await?;
+            if is_cut_off(&response, self.max_tokens) {
+                continue;
+            }
+            let verdict = response
+                .tool_uses()
+                .into_iter()
+                .find(|(_, name, _)| *name == "verdict")
+                .and_then(|(_, _, input)| {
+                    input.get("unsupported").and_then(Value::as_array).cloned()
+                });
+            if let Some(list) = verdict {
+                return Ok(list
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect());
+            }
+        }
+        Err(eyre!("the verifier gave no verdict; nothing was applied"))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn edit_page(
     provider: &dyn LlmProvider,
     model: &str,
@@ -274,10 +357,22 @@ async fn edit_page(
     system_prompt: &str,
     user_prompt: &str,
     current: Option<&str>,
+    schema: TomlSchema,
+    sources: &SourceIndex,
+    verifier: Option<&Verifier<'_>>,
 ) -> Result<Curation> {
     let tools = edit_tools();
+    let context = EditContext {
+        gate: ExampleGate::new(schema, current),
+        sources,
+        verifier,
+        citations: std::sync::Mutex::new(Vec::new()),
+    };
     let mut draft = PageDraft::new(current);
     let mut messages = vec![user_text(user_prompt.to_string())];
+    if let Some(note) = context.gate.baseline_note() {
+        push_user_text(&mut messages, &note);
+    }
     let (mut input_tokens, mut output_tokens) = (0u64, 0u64);
     let mut cut_off_in_a_row = 0;
 
@@ -324,16 +419,23 @@ async fn edit_page(
             content: response.content,
         });
         if calls.is_empty() {
+            info!(
+                page,
+                turn, "curator: reply without tool calls; asked for tools"
+            );
             push_user_text(&mut messages, TOOLS_ONLY_NOTE);
             continue;
         }
 
-        let (results, verdict) = apply_calls(&mut draft, &calls);
+        let (results, verdict) = apply_calls(&mut draft, &calls, &context).await?;
         info!(
             page,
             turn,
-            calls = calls.len(),
-            refused = results.iter().filter(|r| r.1.is_err()).count(),
+            calls = ?calls.iter().map(|c| c.1.as_str()).collect::<Vec<_>>(),
+            refused = ?results
+                .iter()
+                .filter_map(|r| r.1.as_ref().err().map(|e| e.chars().take(120).collect::<String>()))
+                .collect::<Vec<_>>(),
             edits_so_far = draft.applied().len(),
             "curator: edit reply"
         );
@@ -355,14 +457,24 @@ async fn edit_page(
 
         match verdict {
             Some(Verdict::Finish(summary)) => {
+                let (_, still) = context.gate.split(draft.text());
+                let mut citations = context
+                    .citations
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
+                citations.sort();
+                citations.dedup();
                 return Ok(Curation::Edited {
+                    citations,
                     text: draft.text().to_string(),
                     summary,
                     edits: draft.applied().len(),
                     model: response.model,
                     input_tokens,
                     output_tokens,
-                })
+                    still_failing: still.iter().map(ToString::to_string).collect(),
+                });
             }
             Some(Verdict::Keep(reason)) => return Ok(Curation::Unchanged { reason }),
             None => {}
@@ -374,54 +486,87 @@ async fn edit_page(
     ))
 }
 
-/// Apply one reply's tool calls. Changes apply in order; `finish` and
-/// `keep_page` are judged after them, and stand only when every other call
-/// in the reply succeeded.
-fn apply_calls(
+/// Apply one reply's tool calls in order. Lookups answer without touching
+/// the page. A change applies only when its passage matches, its evidence
+/// is in the sources word for word, and the verifier finds nothing in it
+/// the evidence doesn't support. `finish` and `keep_page` are judged after
+/// the rest, and stand only when no change in the reply was refused;
+/// `finish` also needs the page's examples to pass their check.
+async fn apply_calls(
     draft: &mut PageDraft,
     calls: &[(String, String, Value)],
-) -> (Vec<(String, Result<String, String>)>, Option<Verdict>) {
+    context: &EditContext<'_>,
+) -> Result<(Vec<(String, Result<String, String>)>, Option<Verdict>)> {
     let mut results: BTreeMap<usize, (String, Result<String, String>)> = BTreeMap::new();
     let mut verdicts = Vec::new();
+    let mut refused_change = false;
     for (index, (id, name, input)) in calls.iter().enumerate() {
         let result = match name.as_str() {
-            "edit" => string_args(input, &["old_text", "new_text"]).and_then(|args| {
-                draft
-                    .replace(&args[0], &args[1])
-                    .map(|()| "applied".to_string())
-                    .map_err(|e| e.to_string())
-            }),
-            "append" => string_args(input, &["text"]).map(|args| {
-                draft.append(&args[0]);
-                "appended".to_string()
-            }),
+            "read_source" => match string_args(input, &["path"]) {
+                Ok(args) => context.sources.read(
+                    &args[0],
+                    line_arg(input, "start_line"),
+                    line_arg(input, "end_line"),
+                ),
+                Err(e) => Err(e),
+            },
+            "search_sources" => match string_args(input, &["pattern"]) {
+                Ok(args) => {
+                    let path = input.get("path").and_then(Value::as_str);
+                    context.sources.search(&args[0], path).await
+                }
+                Err(e) => Err(e),
+            },
+            "edit" => {
+                let result = edit_call(draft, input, context).await?;
+                refused_change |= result.is_err();
+                result
+            }
+            "append" => {
+                let result = append_call(draft, input, context).await?;
+                refused_change |= result.is_err();
+                result
+            }
             "finish" | "keep_page" => {
                 verdicts.push(index);
                 continue;
             }
             other => Err(format!(
-                "unknown tool `{other}`; use edit, append, finish or keep_page"
+                "unknown tool `{other}`; use read_source, search_sources, edit, append, finish \
+                 or keep_page"
             )),
         };
         results.insert(index, (id.clone(), result));
     }
 
-    let failed = results.values().any(|(_, r)| r.is_err());
     let mut verdict = None;
     for index in verdicts {
         let (id, name, input) = &calls[index];
         let result = if verdict.is_some() {
             Err("this reply already ended the edit".to_string())
-        } else if failed {
+        } else if refused_change {
             Err("a change in this reply was refused; fix it before ending the edit".to_string())
         } else if name == "finish" {
             string_args(input, &["summary"]).and_then(|args| {
-                if draft.is_changed() {
-                    verdict = Some(Verdict::Finish(args[0].clone()));
-                    Ok("finished".to_string())
-                } else {
-                    Err("the page is unchanged; call keep_page if it needs no change".to_string())
+                if !draft.is_changed() {
+                    return Err(
+                        "the page is unchanged; call keep_page if it needs no change".to_string(),
+                    );
                 }
+                let (new, _) = context.gate.split(draft.text());
+                if !new.is_empty() {
+                    let list: Vec<String> = new.iter().map(|f| format!("- {f}")).collect();
+                    return Err(format!(
+                        "not finished: your edits leave {} example(s) that fail their check \
+                         (each `workforce` command is parsed with the real command line, each \
+                         workforce.toml block loaded into the real config). Fix them, then \
+                         finish:\n{}",
+                        new.len(),
+                        list.join("\n")
+                    ));
+                }
+                verdict = Some(Verdict::Finish(args[0].clone()));
+                Ok("finished".to_string())
             })
         } else {
             string_args(input, &["reason"]).and_then(|args| {
@@ -435,7 +580,129 @@ fn apply_calls(
         };
         results.insert(index, (id.clone(), result));
     }
-    (results.into_values().collect(), verdict)
+    Ok((results.into_values().collect(), verdict))
+}
+
+async fn edit_call(
+    draft: &mut PageDraft,
+    input: &Value,
+    context: &EditContext<'_>,
+) -> Result<Result<String, String>> {
+    let args = match string_args(input, &["old_text", "new_text"]) {
+        Ok(args) => args,
+        Err(e) => return Ok(Err(e)),
+    };
+    let at = match draft.locate(&args[0]) {
+        Ok(at) => at,
+        Err(e) => return Ok(Err(e.to_string())),
+    };
+    let section = draft.section_around(at).to_string();
+    let cited = match vouched_for(&args[0], &args[1], &section, input, context).await? {
+        Ok(cited) => cited,
+        Err(refusal) => return Ok(Err(refusal)),
+    };
+    if let Err(e) = draft.replace(&args[0], &args[1]) {
+        return Ok(Err(e.to_string()));
+    }
+    record(context, cited);
+    Ok(Ok("applied".to_string()))
+}
+
+async fn append_call(
+    draft: &mut PageDraft,
+    input: &Value,
+    context: &EditContext<'_>,
+) -> Result<Result<String, String>> {
+    let args = match string_args(input, &["text"]) {
+        Ok(args) => args,
+        Err(e) => return Ok(Err(e)),
+    };
+    let cited = match vouched_for("", &args[0], "", input, context).await? {
+        Ok(cited) => cited,
+        Err(refusal) => return Ok(Err(refusal)),
+    };
+    draft.append(&args[0]);
+    record(context, cited);
+    Ok(Ok("appended".to_string()))
+}
+
+/// The cited ranges of an applied change, logged and kept for the PR.
+fn record(context: &EditContext<'_>, cited: Vec<String>) {
+    info!(cited = ?cited, "curator: change applied");
+    context
+        .citations
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .extend(cited);
+}
+
+/// Whether the change from `before` to `after` stands on its evidence: every
+/// cited quote is in its source word for word, and the verifier finds no
+/// statement the excerpts don't support. `Ok` inside holds the cited ranges;
+/// `Err` inside is the refusal the model sees; the outer error is a
+/// verifier that couldn't be asked.
+async fn vouched_for(
+    before: &str,
+    after: &str,
+    section: &str,
+    input: &Value,
+    context: &EditContext<'_>,
+) -> Result<Result<Vec<String>, String>> {
+    let excerpts = match cited_excerpts(input, context.sources) {
+        Ok(excerpts) => excerpts,
+        Err(e) => return Ok(Err(e)),
+    };
+    let ranges: Vec<String> = excerpts
+        .iter()
+        .filter_map(|e| e.lines().next())
+        .map(|header| header.trim_end_matches(':').to_string())
+        .collect();
+    let Some(verifier) = context.verifier else {
+        return Ok(Ok(ranges));
+    };
+    let unsupported = verifier
+        .unsupported(before, after, section, &excerpts)
+        .await?;
+    if unsupported.is_empty() {
+        return Ok(Ok(ranges));
+    }
+    let list: Vec<String> = unsupported.iter().map(|u| format!("- {u}")).collect();
+    Ok(Err(format!(
+        "refused: the sources you cited don't support:\n{}\nLook these up with \
+         search_sources / read_source and cite what supports them, or leave them out.",
+        list.join("\n")
+    )))
+}
+
+/// The excerpt around each cited quote, or why a citation doesn't hold.
+fn cited_excerpts(input: &Value, sources: &SourceIndex) -> Result<Vec<String>, String> {
+    let items = input
+        .get("evidence")
+        .and_then(Value::as_array)
+        .filter(|items| !items.is_empty())
+        .ok_or_else(|| {
+            "missing `evidence`: cite at least one source the change rests on, as \
+             {\"path\": …, \"quote\": …} with the quote copied from that source"
+                .to_string()
+        })?;
+    items
+        .iter()
+        .map(|item| {
+            let path = item.get("path").and_then(Value::as_str);
+            let quote = item.get("quote").and_then(Value::as_str);
+            match (path, quote) {
+                (Some(path), Some(quote)) => sources.cited(path, quote),
+                _ => Err("each evidence item needs a `path` and a `quote`".to_string()),
+            }
+        })
+        .collect()
+}
+
+fn line_arg(input: &Value, name: &str) -> Option<usize> {
+    input
+        .get(name)
+        .and_then(Value::as_u64)
+        .and_then(|n| usize::try_from(n).ok())
 }
 
 /// The named string arguments of a call, in order. An argument that is
@@ -469,25 +736,59 @@ fn edit_tools() -> Vec<LlmToolDef> {
             "required": required,
         }),
     };
+    let evidence = json!({
+        "type": "array",
+        "minItems": 1,
+        "description": "The sources the change rests on: each a repo-relative `path` (or a \
+            generated source's name) and a `quote` copied word for word from it. A verifier \
+            checks the change against these excerpts alone.",
+        "items": {
+            "type": "object",
+            "properties": {"path": {"type": "string"}, "quote": {"type": "string"}},
+            "required": ["path", "quote"],
+        },
+    });
     vec![
+        tool(
+            "search_sources",
+            "Search the repository's files and the generated sources for lines matching a \
+             regular expression. Look a fact up before you write it.",
+            json!({
+                "pattern": {"type": "string"},
+                "path": {"type": "string", "description": "Limit to paths matching this git pathspec, e.g. `crates/cli/**`."},
+            }),
+            &["pattern"],
+        ),
+        tool(
+            "read_source",
+            "Read numbered lines of a repository file or a generated source, up to 300 at a \
+             time.",
+            json!({
+                "path": {"type": "string"},
+                "start_line": {"type": "integer"},
+                "end_line": {"type": "integer"},
+            }),
+            &["path"],
+        ),
         tool(
             "edit",
             "Replace one passage of the page. `old_text` is copied exactly from the page as \
              it stands now (your earlier edits included) and must occur exactly once; quote \
              enough surrounding text to make it unique. `new_text` replaces it; empty deletes \
-             it. Keep each edit to one passage.",
+             it. Keep each edit to one passage, and cite the evidence for what it says.",
             json!({
                 "old_text": {"type": "string"},
                 "new_text": {"type": "string"},
+                "evidence": evidence.clone(),
             }),
-            &["old_text", "new_text"],
+            &["old_text", "new_text", "evidence"],
         ),
         tool(
             "append",
             "Add text to the end of the page. Use it to write a page that doesn't exist yet, \
-             a section at a time.",
-            json!({"text": {"type": "string"}}),
-            &["text"],
+             a section at a time, citing the evidence for each.",
+            json!({"text": {"type": "string"}, "evidence": evidence}),
+            &["text", "evidence"],
         ),
         tool(
             "finish",
@@ -539,15 +840,17 @@ async fn invoke(
     tools: &[LlmToolDef],
     max_tokens: u32,
 ) -> Result<LlmResponse> {
-    // The curator wants edits or notes, not a chain of thought: a model
+    // The curator wants edits and verdicts, not a chain of thought: a model
     // that reasons by default would otherwise spend the budget on it.
+    // Cached where the route supports it (Claude models): the edit loop
+    // resends the sources every turn.
     with_reasoning_suppressed(provider.create_message(
         system_prompt,
         messages,
         tools,
         Some(model),
         Some(max_tokens),
-        false,
+        true,
     ))
     .await
 }
@@ -556,32 +859,10 @@ fn context_overflow_hint(page: &str) -> String {
     format!(
         "curating page `{page}` failed \
          (if the underlying error mentions context length, lower \
-         `[curator] context_safety_tokens` so chunked reading starts sooner, \
-         or scope this page's sources in docs-watch.toml)"
+         `[curator] context_safety_tokens` so large sources are listed for \
+         lookup instead of included, or scope this page's sources in \
+         docs-watch.toml)"
     )
-}
-
-/// Greedy in-order bin-packing of source files into chunks whose
-/// content sizes sum to no more than `budget_chars`. A file larger
-/// than the budget gets its own chunk; the provider's own context
-/// error will catch it if it still doesn't fit.
-pub fn split_into_chunks(sources: &[SourceFile], budget_chars: usize) -> Vec<Vec<SourceFile>> {
-    let mut chunks: Vec<Vec<SourceFile>> = Vec::new();
-    let mut current: Vec<SourceFile> = Vec::new();
-    let mut current_size: usize = 0;
-    for s in sources {
-        let file_size = s.content.len();
-        if !current.is_empty() && current_size + file_size > budget_chars {
-            chunks.push(std::mem::take(&mut current));
-            current_size = 0;
-        }
-        current.push(s.clone());
-        current_size += file_size;
-    }
-    if !current.is_empty() {
-        chunks.push(current);
-    }
-    chunks
 }
 
 /// Rough token estimate via chars / 3. Conservative (real tokenizers
@@ -706,12 +987,40 @@ mod tests {
         }
     }
 
+    /// The source the loop tests cite.
+    const SPEC: &str = "The curator documents its flags, shortcuts and commands.\nIt prints the plan with --dry-run.\n";
+
+    fn spec_sources() -> SourceIndex {
+        SourceIndex::new(
+            std::path::Path::new("/nonexistent"),
+            vec![("spec".to_string(), SPEC.to_string())],
+        )
+    }
+
+    /// Tool calls as a reply. A change without `evidence` cites the spec;
+    /// `"evidence": null` sends it with none.
     fn calls(list: &[(&str, Value)]) -> LlmResponse {
         reply(
             list.iter()
                 .enumerate()
                 .map(|(i, (name, input))| {
-                    ContentBlock::tool_use(format!("c{i}"), name.to_string(), input.clone())
+                    let mut input = input.clone();
+                    if matches!(*name, "edit" | "append") {
+                        let object = input.as_object_mut().unwrap();
+                        match object.get("evidence") {
+                            None => {
+                                object.insert(
+                                    "evidence".into(),
+                                    json!([{"path": "spec", "quote": "documents its flags"}]),
+                                );
+                            }
+                            Some(Value::Null) => {
+                                object.remove("evidence");
+                            }
+                            Some(_) => {}
+                        }
+                    }
+                    ContentBlock::tool_use(format!("c{i}"), name.to_string(), input)
                 })
                 .collect(),
             StopReason::ToolUse,
@@ -744,6 +1053,20 @@ mod tests {
     }
 
     async fn run(provider: &Scripted, current: Option<&str>) -> Result<Curation> {
+        run_checked(provider, None, current).await
+    }
+
+    async fn run_checked(
+        provider: &Scripted,
+        verifier: Option<&Scripted>,
+        current: Option<&str>,
+    ) -> Result<Curation> {
+        let sources = spec_sources();
+        let verifier = verifier.map(|v| Verifier {
+            provider: v,
+            model: "verifier".into(),
+            max_tokens: 2_000,
+        });
         edit_page(
             provider,
             "m",
@@ -752,8 +1075,244 @@ mod tests {
             "system",
             "curate",
             current,
+            TomlSchema::Workforce,
+            &sources,
+            verifier.as_ref(),
         )
         .await
+    }
+
+    fn verdict(unsupported: &[&str]) -> LlmResponse {
+        calls(&[("verdict", json!({ "unsupported": unsupported }))])
+    }
+
+    // ── Retries ────────────────────────────────────────────────────────────
+
+    /// Refuses its first call the way OpenRouter does when it can't check
+    /// credits in time, then answers.
+    struct RateLimitedOnce {
+        calls: Mutex<u32>,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for RateLimitedOnce {
+        async fn create_message(
+            &self,
+            _system_prompt: Option<&str>,
+            _messages: &[LlmMessage],
+            _tools: &[LlmToolDef],
+            _model: Option<&str>,
+            _max_tokens: Option<u32>,
+            _enable_cache: bool,
+        ) -> Result<LlmResponse> {
+            let mut calls = self.calls.lock().unwrap();
+            *calls += 1;
+            if *calls == 1 {
+                return Err(eyre!(
+                    "OpenRouter API error (429 Too Many Requests): {{\"error\":{{\"message\":\"OpenRouter could not verify available credits for this request in time. Retry shortly.\"}}}} (retry-after: 0s)"
+                ));
+            }
+            Ok(reply(
+                vec![ContentBlock::Text { text: "ok".into() }],
+                StopReason::EndTurn,
+                5,
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_rate_limited_call_is_retried_after_its_retry_after() {
+        let inner = Arc::new(RateLimitedOnce {
+            calls: Mutex::new(0),
+        });
+        let provider = with_retries(inner.clone());
+        let messages = [user_text("hi".into())];
+        let response = invoke(
+            &provider,
+            "deepseek/deepseek-v4-pro",
+            None,
+            &messages,
+            &[],
+            100,
+        )
+        .await
+        .expect("the 429 is waited out, not returned");
+        assert_eq!(response.text().as_deref(), Some("ok"));
+        assert_eq!(*inner.calls.lock().unwrap(), 2);
+    }
+
+    // ── Evidence and the verifier ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn a_change_without_evidence_is_refused() {
+        let bare = (
+            "edit",
+            json!({"old_text": "`--all`", "new_text": "`--every`", "evidence": null}),
+        );
+        let provider = Scripted::new(vec![calls(&[bare]), calls(&[add_dry_run(), finish()])]);
+        let Curation::Edited { text, .. } = run(&provider, Some(PAGE)).await.unwrap() else {
+            panic!("expected an edit");
+        };
+        assert!(text.contains("`--all`"), "an uncited edit was applied");
+        let sent = serde_json::to_string(&provider.seen.lock().unwrap()[1]).unwrap();
+        assert!(sent.contains("missing `evidence`"), "{sent}");
+    }
+
+    #[tokio::test]
+    async fn evidence_not_in_its_source_is_refused() {
+        let invented = (
+            "edit",
+            json!({"old_text": "`--all`", "new_text": "`--every`",
+                   "evidence": [{"path": "spec", "quote": "the flag is called --every"}]}),
+        );
+        let provider = Scripted::new(vec![calls(&[invented]), calls(&[add_dry_run(), finish()])]);
+        let Curation::Edited { text, .. } = run(&provider, Some(PAGE)).await.unwrap() else {
+            panic!("expected an edit");
+        };
+        assert!(text.contains("`--all`"));
+        let sent = serde_json::to_string(&provider.seen.lock().unwrap()[1]).unwrap();
+        assert!(sent.contains("doesn't contain the quote"), "{sent}");
+    }
+
+    #[tokio::test]
+    async fn the_verifier_refuses_what_the_evidence_does_not_support() {
+        let provider = Scripted::new(vec![
+            calls(&[add_dry_run(), finish()]),
+            calls(&[add_dry_run(), finish()]),
+        ]);
+        let verifier = Scripted::new(vec![
+            verdict(&["that `--dry-run` prints the plan"]),
+            verdict(&[]),
+        ]);
+        let Curation::Edited { text, edits, .. } =
+            run_checked(&provider, Some(&verifier), Some(PAGE))
+                .await
+                .unwrap()
+        else {
+            panic!("expected an edit");
+        };
+        assert_eq!(edits, 1, "the refused edit was applied");
+        assert!(text.contains("--dry-run"));
+        let refusal = serde_json::to_string(&provider.seen.lock().unwrap()[1]).unwrap();
+        assert!(refusal.contains("don't support"), "{refusal}");
+        assert!(refusal.contains("fix it before ending"), "{refusal}");
+        // The verifier saw the change and the cited excerpt.
+        let asked = serde_json::to_string(&verifier.seen.lock().unwrap()[0]).unwrap();
+        assert!(asked.contains("Passage after the edit"), "{asked}");
+        assert!(
+            asked.contains("The page section the edit sits in"),
+            "{asked}"
+        );
+        assert!(
+            asked.contains("## Flags"),
+            "the section heading is shown: {asked}"
+        );
+        assert!(asked.contains("documents its flags"), "{asked}");
+    }
+
+    #[tokio::test]
+    async fn a_verifier_that_gives_no_verdict_stops_the_page() {
+        let provider = Scripted::new(vec![calls(&[add_dry_run(), finish()])]);
+        let prose = || {
+            reply(
+                vec![ContentBlock::Text {
+                    text: "Looks fine.".into(),
+                }],
+                StopReason::EndTurn,
+                10,
+            )
+        };
+        let verifier = Scripted::new(vec![prose(), prose()]);
+        let err = run_checked(&provider, Some(&verifier), Some(PAGE))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("no verdict"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn lookups_answer_without_changing_the_page() {
+        let provider = Scripted::new(vec![
+            calls(&[
+                ("read_source", json!({"path": "spec", "start_line": 2})),
+                ("read_source", json!({"path": "../secrets"})),
+            ]),
+            calls(&[("keep_page", json!({"reason": "accurate"}))]),
+        ]);
+        let outcome = run(&provider, Some(PAGE)).await.unwrap();
+        assert_eq!(
+            outcome,
+            Curation::Unchanged {
+                reason: "accurate".into()
+            }
+        );
+        let answers = serde_json::to_string(&provider.seen.lock().unwrap()[1]).unwrap();
+        assert!(
+            answers.contains("It prints the plan with --dry-run."),
+            "{answers}"
+        );
+        assert!(
+            answers.contains("outside the sources you may read"),
+            "{answers}"
+        );
+    }
+
+    // ── The example gate ───────────────────────────────────────────────────
+
+    const CLI_PAGE: &str = "---\ntitle: CLI\n---\n\n## Agents\n\n```sh\nworkforce agent list\n```\n\n## Delete\n\n```sh\nworkforce agent delete --id reviewer\n```\n";
+
+    #[tokio::test]
+    async fn finish_is_refused_while_an_edit_breaks_an_example() {
+        let breaks = (
+            "edit",
+            json!({"old_text": "workforce agent list\n", "new_text": "workforce agent list --verbose\n"}),
+        );
+        let repairs = (
+            "edit",
+            json!({"old_text": "workforce agent list --verbose\n", "new_text": "workforce agent list --workdir ./team\n"}),
+        );
+        let provider = Scripted::new(vec![
+            calls(&[breaks, finish()]),
+            calls(&[repairs, finish()]),
+        ]);
+        let Curation::Edited { text, .. } = run(&provider, Some(CLI_PAGE)).await.unwrap() else {
+            panic!("expected an edit");
+        };
+        let refusal = serde_json::to_string(&provider.seen.lock().unwrap()[1]).unwrap();
+        assert!(refusal.contains("not finished"), "{refusal}");
+        assert!(refusal.contains("--verbose"), "{refusal}");
+        assert!(text.contains("agent list --workdir ./team"));
+    }
+
+    #[tokio::test]
+    async fn an_example_already_broken_does_not_block_finish_and_is_reported() {
+        let unrelated = (
+            "edit",
+            json!({"old_text": "## Agents\n", "new_text": "## Agents\n\nList the agents.\n"}),
+        );
+        let provider = Scripted::new(vec![calls(&[unrelated, finish()])]);
+        let Curation::Edited { still_failing, .. } = run(&provider, Some(CLI_PAGE)).await.unwrap()
+        else {
+            panic!("expected an edit");
+        };
+        assert_eq!(still_failing.len(), 1, "{still_failing:?}");
+        assert!(still_failing[0].contains("agent delete --id reviewer"));
+        // The model was told about it before it started.
+        let first = serde_json::to_string(&provider.seen.lock().unwrap()[0]).unwrap();
+        assert!(first.contains("already fail their check"), "{first}");
+    }
+
+    #[tokio::test]
+    async fn fixing_a_broken_example_clears_it_from_the_report() {
+        let fix = (
+            "edit",
+            json!({"old_text": "workforce agent delete --id reviewer", "new_text": "workforce agent delete reviewer"}),
+        );
+        let provider = Scripted::new(vec![calls(&[fix, finish()])]);
+        let Curation::Edited { still_failing, .. } = run(&provider, Some(CLI_PAGE)).await.unwrap()
+        else {
+            panic!("expected an edit");
+        };
+        assert!(still_failing.is_empty(), "{still_failing:?}");
     }
 
     fn add_dry_run() -> (&'static str, Value) {
@@ -781,6 +1340,15 @@ mod tests {
         };
         assert_eq!(edits, 1);
         assert_eq!(summary, "Documented --dry-run.");
+        let Curation::Edited { citations, .. } = run(
+            &Scripted::new(vec![calls(&[add_dry_run(), finish()])]),
+            Some(PAGE),
+        )
+        .await
+        .unwrap() else {
+            unreachable!()
+        };
+        assert_eq!(citations, vec!["spec lines 1–2".to_string()]);
         let inserted = "- `--dry-run` — print the plan.\n";
         assert_eq!(text.replacen(inserted, "", 1), PAGE);
     }
@@ -947,59 +1515,6 @@ mod tests {
         assert_eq!(text, "---\ntitle: New\n---\n## Usage\n\nRun it.\n");
     }
 
-    // ── Notes ──────────────────────────────────────────────────────────────
-
-    fn notes(text: &str, output_tokens: u32) -> LlmResponse {
-        reply(
-            vec![ContentBlock::Text { text: text.into() }],
-            StopReason::EndTurn,
-            output_tokens,
-        )
-    }
-
-    #[tokio::test]
-    async fn an_overflowing_notes_chunk_is_halved_and_read_again() {
-        let chunk = vec![src("a.rs", MIN_SPLIT_CHARS), src("b.rs", MIN_SPLIT_CHARS)];
-        let cap = 4_000;
-        let provider = Scripted::new(vec![notes("cut", cap), notes("- a", 10), notes("- b", 10)]);
-        let parts = notes_for_chunk("cli.mdx", chunk, cap, &provider, "m")
-            .await
-            .unwrap();
-        assert_eq!(parts, vec!["- a".to_string(), "- b".to_string()]);
-        assert_eq!(provider.seen.lock().unwrap().len(), 3);
-    }
-
-    #[tokio::test]
-    async fn a_chunk_too_small_to_halve_fails_the_page() {
-        let cap = 4_000;
-        let provider = Scripted::new(vec![notes("cut", cap)]);
-        let err = notes_for_chunk("cli.mdx", vec![src("a.rs", 100)], cap, &provider, "m")
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("overflow 4000 tokens"), "{err}");
-    }
-
-    #[test]
-    fn a_single_file_halves_between_its_lines() {
-        let file = SourceFile {
-            repo_relative: "big.rs".into(),
-            content: "x\n".repeat(MIN_SPLIT_CHARS),
-        };
-        let (a, b) = halve(std::slice::from_ref(&file)).unwrap();
-        assert_eq!(a[0].content.clone() + &b[0].content, file.content);
-        assert!(a[0]
-            .repo_relative
-            .display()
-            .to_string()
-            .starts_with("big.rs (lines 1–"));
-    }
-
-    #[test]
-    fn the_notes_prompt_asks_for_less_than_its_cap_allows() {
-        // ~1.3 tokens a word: the asked length must leave the cap headroom.
-        assert!(notes_word_budget(4_000) as f64 * 1.3 < 4_000.0 * 0.6);
-    }
-
     #[test]
     fn resolves_openrouter_deepseek_powerful() {
         let (kind, model) = resolve_tier("openrouter:deepseek:powerful").unwrap();
@@ -1027,62 +1542,11 @@ mod tests {
         );
     }
 
-    fn src(name: &str, size: usize) -> SourceFile {
-        SourceFile {
-            repo_relative: std::path::PathBuf::from(name),
-            content: "x".repeat(size),
-        }
-    }
-
     #[test]
     fn estimate_tokens_uses_chars_over_3() {
         assert_eq!(estimate_tokens(""), 0);
         assert_eq!(estimate_tokens("abc"), 1);
         assert_eq!(estimate_tokens("abcd"), 2);
         assert_eq!(estimate_tokens("a".repeat(300).as_str()), 100);
-    }
-
-    #[test]
-    fn split_into_chunks_returns_single_chunk_when_under_budget() {
-        let sources = vec![src("a", 100), src("b", 200)];
-        let chunks = split_into_chunks(&sources, 1000);
-        assert_eq!(chunks.len(), 1);
-        assert_eq!(chunks[0].len(), 2);
-    }
-
-    #[test]
-    fn split_into_chunks_packs_greedily_in_order() {
-        let sources = vec![src("a", 40), src("b", 80), src("c", 60)];
-        let chunks = split_into_chunks(&sources, 100);
-        assert_eq!(chunks.len(), 3);
-        let names: Vec<String> = chunks
-            .iter()
-            .flatten()
-            .map(|s| s.repo_relative.to_string_lossy().into_owned())
-            .collect();
-        assert_eq!(names, vec!["a", "b", "c"]);
-    }
-
-    #[test]
-    fn split_into_chunks_packs_multiple_files_when_combined_fits() {
-        let sources = vec![src("a", 30), src("b", 50), src("c", 90)];
-        let chunks = split_into_chunks(&sources, 100);
-        assert_eq!(chunks.len(), 2);
-        assert_eq!(chunks[0].len(), 2);
-        assert_eq!(chunks[1].len(), 1);
-    }
-
-    #[test]
-    fn split_into_chunks_oversize_single_file_stands_alone() {
-        let sources = vec![src("a", 200), src("b", 50)];
-        let chunks = split_into_chunks(&sources, 100);
-        assert_eq!(chunks.len(), 2);
-        assert_eq!(chunks[0][0].content.len(), 200);
-        assert_eq!(chunks[1][0].content.len(), 50);
-    }
-
-    #[test]
-    fn split_into_chunks_empty_input_yields_no_chunks() {
-        assert!(split_into_chunks(&[], 100).is_empty());
     }
 }
