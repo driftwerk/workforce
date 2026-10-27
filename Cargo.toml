@@ -213,7 +213,7 @@ rust_xlsxwriter = "0.79"
 # `postgresql_embedded`'s archive extractor in the test build. The hub
 # only uses `zip` to read .docx attachments, which are deflate-only.
 zip = { version = "2.4", default-features = false, features = ["deflate"] }
-quick-xml = "0.31"
+quick-xml = "0.41"
 
 # Email (for workforce-skills email feature)
 async-imap = { version = "0.10", default-features = false, features = ["runtime-tokio"] }

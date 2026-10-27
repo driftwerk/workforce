@@ -1563,7 +1563,7 @@ dependencies = [
  "codepage",
  "encoding_rs",
  "log",
- "quick-xml",
+ "quick-xml 0.31.0",
  "serde",
  "zip",
 ]
@@ -6820,6 +6820,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "quick-xml"
+version = "0.41.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e660451e55124f798a69a5af3f49ccfbefbd41910eefd25caf2393e1f3473ec1"
+dependencies = [
+ "memchr",
+]
+
+[[package]]
 name = "quinn"
 version = "0.11.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -11533,7 +11542,7 @@ dependencies = [
  "parking_lot",
  "pdf-extract",
  "percent-encoding",
- "quick-xml",
+ "quick-xml 0.41.0",
  "rand 0.8.5",
  "rcgen",
  "regex",
@@ -11891,7 +11900,7 @@ dependencies = [
  "parking_lot",
  "pdf-extract",
  "pulldown-cmark",
- "quick-xml",
+ "quick-xml 0.41.0",
  "rand 0.8.5",
  "refinery",
  "regex",
