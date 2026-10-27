@@ -2,17 +2,16 @@
 #
 # Mirrors default_image_tiers.toml but for text/image->video generation. The
 # `[llm.video].model` spec resolves against this table via the same
-# `provider:tier` shorthand grammar (e.g. `veo:standard`).
+# `provider:tier` shorthand grammar (e.g. `gemini:standard`).
 #
 # To override: place a `video_tiers.toml` in your workspace root with the
 # sections you want to change; it is merged on top of these defaults.
 #
-# Google Veo via the Gemini API (generativelanguage, predictLongRunning). All
-# tiers support text->video and image->video (a starting frame / subject ref).
-# `standard` is the fast, verified default (~40s for an 8s 720p clip);
-# `powerful` is the newest, highest-quality line (Veo 3.1, subject references).
-# The Gemini API lists only the 3.1 family (2026-10-19); veo-3.0-fast is gone.
-[veo]
-powerful = "veo-3.1-generate-preview"
-standard = "veo-3.1-fast-generate-preview"
-cheap    = "veo-3.1-lite-generate-preview"
+# Gemini API video generation through the Interactions endpoint. Google
+# withdrew every Veo model from the Gemini API in October 2026; Gemini Omni is
+# the only video line it serves, so every tier names its one GA model until
+# Google ships another. All tiers take text->video and image->video.
+[gemini]
+powerful = "gemini-omni-1.1-flash"
+standard = "gemini-omni-1.1-flash"
+cheap    = "gemini-omni-1.1-flash"

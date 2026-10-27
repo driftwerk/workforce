@@ -177,14 +177,17 @@ Image generation also uses whole-block inheritance. If an agent provides its own
 
 #### Video Generation
 
-Video generation is strictly opt-in; the tool is only registered when this block is present.
+Video generation is strictly opt-in; the tool is only registered when this block is present. It runs on Gemini Omni through the Gemini API, with the same key as Gemini image generation.
 
 ```toml
 [llm.video]
-model = "veo:cheap"           # tier shorthand → veo-3.1-lite-generate-preview
-aspect_ratio = "16:9"
-person_generation = "allow_adult"   # required to animate a real person's face
+model = "gemini:standard"     # tier shorthand → gemini-omni-1.1-flash
+aspect_ratio = "16:9"         # or "9:16"
+resolution = "720p"           # 360p, 720p, 1080p or 4k; cost scales with it
+duration_secs = 6             # 3–10; unset ⇒ 10
 ```
+
+`veo:` is a legacy spelling of `gemini:` and resolves the same way. Google withdrew every Veo model from the Gemini API in October 2026, so a concrete `veo-…` model id is refused and the tool is not registered; saving such a config reports why.
 
 <Callout type="warn">
 Video generation uses whole-block inheritance like image generation.
@@ -227,7 +230,7 @@ enabled = true
 
 # Video generation override
 [agents.llm.video]
-model = "veo:standard"
+model = "gemini:standard"
 enabled = true
 
 # Per-agent pacing override (fully replaces global policy)

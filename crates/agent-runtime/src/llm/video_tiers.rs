@@ -41,16 +41,17 @@ impl VideoTierRegistry {
         Ok(())
     }
 
-    /// The Veo model an `[llm.video]` spec names:
-    ///   - `"veo:standard"` → `"veo-3.1-fast-generate-preview"`
-    ///   - `"veo:veo-3.1-generate-preview"` → `"veo-3.1-generate-preview"`
-    ///   - a bare tier or model is `default_provider`'s, which must be Veo
+    /// The Gemini video model an `[llm.video]` spec names:
+    ///   - `"gemini:standard"` → `"gemini-omni-1.1-flash"`
+    ///   - `"veo:standard"` → the same (`veo` is a legacy spelling)
+    ///   - `"gemini:gemini-omni-1.1-flash"` → `"gemini-omni-1.1-flash"`
+    ///   - a bare tier or model is `default_provider`'s, which must be Gemini
     pub fn resolve_video_model(
         &self,
         spec: &str,
         default_provider: Option<&str>,
     ) -> Result<String, ModelSpecError> {
-        if let Some(Err(reason)) = default_provider.map(veo_tier_key) {
+        if let Some(Err(reason)) = default_provider.map(video_tier_key) {
             return Err(ModelSpecError::Provider {
                 spec: spec.to_string(),
                 reason: reason.to_string(),
@@ -62,7 +63,7 @@ impl VideoTierRegistry {
             default_provider,
             SpecRoutes {
                 split: split_route,
-                tier_key: veo_tier_key,
+                tier_key: video_tier_key,
             },
         )
         .map(|(_, model)| model)
@@ -82,34 +83,36 @@ impl VideoTierRegistry {
 }
 
 /// The one video backend, and the tier key its models are listed under.
-pub const VEO: &str = "veo";
+pub const GEMINI: &str = "gemini";
 
-/// Veo answers to its own name and to Gemini's, whose API and key it is
-/// called with.
-fn is_veo(provider: &str) -> bool {
-    ["veo", "gemini", "google"]
+/// The Gemini API's video backend answers to Gemini's and Google's names, and
+/// to `veo`, the model family it served before Omni.
+fn is_gemini(provider: &str) -> bool {
+    ["gemini", "google", "veo"]
         .iter()
         .any(|name| provider.eq_ignore_ascii_case(name))
 }
 
 fn split_route(spec: &str) -> (Option<&str>, &str) {
     match spec.split_once(':') {
-        Some((prefix, model)) if is_veo(prefix) => (Some(prefix), model),
+        Some((prefix, model)) if is_gemini(prefix) => (Some(prefix), model),
         _ => (None, spec),
     }
 }
 
-fn veo_tier_key(provider: &str) -> Result<(String, String)> {
-    if is_veo(provider) {
-        Ok((VEO.to_string(), VEO.to_string()))
+fn video_tier_key(provider: &str) -> Result<(String, String)> {
+    if is_gemini(provider) {
+        Ok((GEMINI.to_string(), GEMINI.to_string()))
     } else {
-        eyre::bail!("'{provider}' generates no video; the video provider is veo")
+        eyre::bail!("'{provider}' generates no video; the video provider is gemini")
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const OMNI: &str = "gemini-omni-1.1-flash";
 
     fn reg() -> VideoTierRegistry {
         VideoTierRegistry::from_defaults().unwrap()
@@ -121,47 +124,40 @@ mod tests {
 
     #[test]
     fn loads_defaults() {
-        assert!(reg().providers.contains_key(VEO));
+        assert!(reg().providers.contains_key(GEMINI));
     }
 
     #[test]
-    fn a_veo_spec_resolves_under_any_of_its_names() {
-        assert_eq!(model("veo:standard", None), "veo-3.1-fast-generate-preview");
-        assert_eq!(model("veo:powerful", None), "veo-3.1-generate-preview");
-        assert_eq!(model("gemini:powerful", None), "veo-3.1-generate-preview");
-        assert_eq!(
-            model("veo:veo-3.1-generate-preview", None),
-            "veo-3.1-generate-preview"
-        );
+    fn a_gemini_spec_resolves_under_any_of_its_names() {
+        for spec in [
+            "gemini:standard",
+            "google:powerful",
+            "veo:standard",
+            "veo:cheap",
+            "gemini:gemini-omni-1.1-flash",
+        ] {
+            assert_eq!(model(spec, None), OMNI, "{spec}");
+        }
     }
 
     #[test]
     fn a_bare_tier_or_model_is_the_default_providers() {
-        assert_eq!(
-            model("standard", Some("veo")),
-            "veo-3.1-fast-generate-preview"
-        );
-        assert_eq!(
-            model("cheap", Some("gemini")),
-            "veo-3.1-lite-generate-preview"
-        );
-        assert_eq!(
-            model("veo-3.1-generate-preview", Some("veo")),
-            "veo-3.1-generate-preview"
-        );
+        assert_eq!(model("standard", Some("gemini")), OMNI);
+        assert_eq!(model("cheap", Some("veo")), OMNI);
+        assert_eq!(model(OMNI, Some("google")), OMNI);
     }
 
     #[test]
     fn a_spec_naming_no_provider_is_refused_not_given_one() {
         let r = reg();
-        for spec in ["standard", "veo-3.1-generate-preview", "nonesuch:standard"] {
+        for spec in ["standard", OMNI, "nonesuch:standard"] {
             assert_eq!(
                 r.resolve_video_model(spec, None),
                 Err(ModelSpecError::NoProvider { spec: spec.into() }),
                 "{spec}"
             );
         }
-        for spec in ["standard", "veo-3.1-generate-preview"] {
+        for spec in ["standard", OMNI] {
             assert!(
                 matches!(
                     r.resolve_video_model(spec, Some("anthropic")),

@@ -8,7 +8,7 @@ use std::collections::BTreeSet;
 
 use workforce_agent::llm::image_tiers::ImageTierRegistry;
 use workforce_agent::llm::transcription_tiers::TranscriptionTierRegistry;
-use workforce_agent::llm::video_tiers::{VideoTierRegistry, VEO};
+use workforce_agent::llm::video_tiers::{VideoTierRegistry, GEMINI};
 use workforce_agent::llm::vision_tiers::VisionTierRegistry;
 
 const DOCUMENTS: [&str; 3] = [
@@ -50,7 +50,7 @@ fn the_documents_are_read() {
         ("vision", "openrouter:anthropic:cheap"),
         ("transcription", "openrouter:google:cheap"),
         ("image", "bedrock:stability:standard"),
-        ("video", "veo:standard"),
+        ("video", "gemini:standard"),
     ] {
         let documented = documented(section);
         assert!(documented.contains(example), "{section}: {documented:?}");
@@ -104,12 +104,12 @@ fn every_image_default_and_documented_example_names_a_generator() {
 }
 
 #[test]
-fn every_video_default_and_documented_example_names_a_veo_model() {
+fn every_video_default_and_documented_example_names_a_gemini_model() {
     let tiers = VideoTierRegistry::from_defaults().unwrap();
     let specs: BTreeSet<String> = tiers.tier_specs().chain(documented("video")).collect();
     for spec in specs {
         let model = tiers
-            .resolve_video_model(&spec, Some(VEO))
+            .resolve_video_model(&spec, Some(GEMINI))
             .unwrap_or_else(|e| panic!("{e}"));
         assert!(tiers.lists(&model), "{spec} names {model}");
     }

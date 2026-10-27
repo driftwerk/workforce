@@ -556,7 +556,7 @@ pub fn speech_legacy(
         .env(env)
 }
 
-/// The provider Veo's key belongs to.
+/// The provider Omni's key belongs to.
 pub const VIDEO_PROVIDER: &str = "gemini";
 
 /// The environment variables a bearer-key provider's key is read from; none
@@ -601,7 +601,7 @@ pub fn image_keys(
     }
 }
 
-/// The key source `generate_video` hands Veo.
+/// The key source `generate_video` hands Omni.
 pub fn video_keys(
     cfg: Option<&LlmVideoGenerationConfig>,
     agent_vault: &Option<Arc<Vault>>,

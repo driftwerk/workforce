@@ -1512,7 +1512,7 @@ pub struct AgentService {
     pub image_config: Arc<parking_lot::RwLock<Option<LlmImageGenerationConfig>>>,
     /// Live `[llm.video]` config the `generate_video` tool was last built from.
     /// Same role as `image_config`: the shared vault-reload callback reads it to
-    /// rebuild the Veo provider after a write to `llm/accounts/*`.
+    /// rebuild the Omni provider after a write to `llm/accounts/*`.
     pub video_config: Arc<parking_lot::RwLock<Option<LlmVideoGenerationConfig>>>,
     /// Live `[llm.speech]` config the `generate_speech` tool was last built
     /// from. Same role as `image_config` for the TTS provider.

@@ -12,6 +12,11 @@ use workforce_agent::llm::responses::{ChatGptModel, UnsupportedModel};
 use workforce_agent::llm::tiers::{
     parse_provider_spec, split_routing_prefix, ModelTier, TierRegistry,
 };
+use workforce_agent::llm::{image, speech, video};
+use workforce_agent::tools::image_gen::IMAGE_TOOL_NAME;
+use workforce_agent::tools::speech_gen::SPEECH_TOOL_NAME;
+use workforce_agent::tools::video_gen::VIDEO_TOOL_NAME;
+use workforce_common::secret::KeySlot;
 use workforce_common::settings::{
     is_removed_provider, AgentWorkspaceConfig, CodingCodexConfig, CodingEngineKind, ExecutorKind,
     LlmConfig, WorkforceConfig, REMOVED_PROVIDER_POINTER,
@@ -441,6 +446,7 @@ pub fn review_agent_llm(
         .chain(codex_vision)
         .chain(models)
         .chain(direct_off)
+        .chain(media_findings(llm))
         .chain(
             resolved
                 .workspace
@@ -449,6 +455,38 @@ pub fn review_agent_llm(
         )
         .partition(Finding::is_refused);
     refused.into_iter().chain(warnings).collect()
+}
+
+/// Each enabled media block its tool cannot be built from, checked with the
+/// builder its install runs; keys are read per request, never at build, so
+/// none is needed. A warning, not a refusal: the agent runs, without that
+/// tool, and whoever saved the config learns why instead of finding it gone.
+fn media_findings(llm: &LlmConfig) -> impl Iterator<Item = Finding> {
+    let no_key = || KeySlot::fixed("");
+    let image = llm
+        .image
+        .as_ref()
+        .filter(|cfg| cfg.enabled)
+        .and_then(|cfg| image::provider_from_config(cfg, |_| no_key()).err())
+        .map(|e| ("[llm.image]", IMAGE_TOOL_NAME, e));
+    let video = llm
+        .video
+        .as_ref()
+        .filter(|cfg| cfg.enabled)
+        .and_then(|cfg| video::route(cfg).err())
+        .map(|e| ("[llm.video]", VIDEO_TOOL_NAME, e));
+    let speech = llm
+        .speech
+        .as_ref()
+        .filter(|cfg| cfg.enabled)
+        .and_then(|cfg| speech::provider_from_config(cfg, Path::new(""), |_| no_key()).err())
+        .map(|e| ("[llm.speech]", SPEECH_TOOL_NAME, e));
+    [image, video, speech]
+        .into_iter()
+        .flatten()
+        .map(|(block, tool, e)| {
+            Finding::warning(block, format!("{tool} will not be installed: {e}"))
+        })
 }
 
 /// `[know_how] source_agent` on an agent that is not a test copy, which
