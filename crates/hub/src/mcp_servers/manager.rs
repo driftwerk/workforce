@@ -33,6 +33,7 @@ use serde_json::Value;
 use tracing::{info, warn};
 use workforce_agent::tools::registry::ToolRegistry;
 use workforce_common::cost::CostTracker;
+use workforce_common::redact::redact_url_str;
 use workforce_common::settings::{DiscoveredMetadata, McpAuthConfig, McpConfig, McpServerConfig};
 use workforce_mcp_client::{McpToolDef, ToolNameInfo, ToolNameSurvey};
 use workforce_mcp_store::{InstalledVia, McpServerRecord, McpServerStore};
@@ -428,7 +429,10 @@ impl McpServerManager {
         // servers that serve their own `.well-known`, like Metabase).
         let discovery_target = discovery_issuer.unwrap_or(&config.endpoint);
         let metadata = discover(&self.http, discovery_target).await.map_err(|e| {
-            eyre!("OAuth discovery failed for `{server_id}` at {discovery_target}: {e}")
+            eyre!(
+                "OAuth discovery failed for `{server_id}` at {}: {e}",
+                redact_url_str(discovery_target)
+            )
         })?;
 
         // Obtain an OAuth client for this server. A fresh one is needed when
@@ -460,7 +464,7 @@ impl McpServerManager {
                         Err(e) => {
                             warn!(
                                 server = %server_id,
-                                endpoint = %registration_endpoint,
+                                endpoint = %redact_url_str(registration_endpoint),
                                 error = %e,
                                 "dynamic client registration failed; falling back to an operator-registered client"
                             );

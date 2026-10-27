@@ -658,6 +658,89 @@ async fn initialize_err(endpoint: &str, http: reqwest::Client) -> McpError {
         .unwrap_err()
 }
 
+const SECRETS: [&str; 5] = ["opsuser7", "hunter2", "k-northwind42", "s3cr3t", "fr4gment"];
+
+fn secret_endpoint(addr: impl std::fmt::Display) -> String {
+    format!("http://opsuser7:hunter2@{addr}/mcp/k-northwind42?sig=s3cr3t#fr4gment")
+}
+
+fn assert_no_secrets(err: &McpError) {
+    for text in [format!("{err}"), format!("{err:?}")] {
+        for secret in SECRETS {
+            assert!(!text.contains(secret), "`{secret}` leaked: {text}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn http_status_errors_name_the_host_but_no_endpoint_secret() {
+    let cases: [(u16, fn(&McpError) -> bool); 3] = [
+        (401, |e| matches!(e, McpError::AuthExpired(_))),
+        (429, |e| matches!(e, McpError::RateLimited { .. })),
+        (500, |e| matches!(e, McpError::Transport(_))),
+    ];
+    for (status, expected) in cases {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(status).set_body_string("internal"))
+            .mount(&server)
+            .await;
+
+        let err = initialize_err(&secret_endpoint(server.address()), reqwest::Client::new()).await;
+        assert!(expected(&err), "HTTP {status} gave {err:?}");
+        assert!(
+            err.to_string().contains(&server.address().to_string()),
+            "HTTP {status} gave {err}"
+        );
+        assert_no_secrets(&err);
+    }
+}
+
+#[tokio::test]
+async fn a_refused_connection_names_the_host_but_no_endpoint_secret() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+
+    let err = initialize_err(&secret_endpoint(addr), reqwest::Client::new()).await;
+    assert!(matches!(err, McpError::Unreachable(_)), "got {err:?}");
+    assert!(err.to_string().contains(&addr.to_string()), "got {err}");
+    assert_no_secrets(&err);
+}
+
+#[tokio::test]
+async fn a_timeout_names_the_host_but_no_endpoint_secret() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(5)))
+        .mount(&server)
+        .await;
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_millis(200))
+        .build()
+        .unwrap();
+
+    let err = initialize_err(&secret_endpoint(server.address()), http).await;
+    assert!(matches!(err, McpError::Unreachable(_)), "got {err:?}");
+    assert!(
+        err.to_string().contains(&server.address().to_string()),
+        "got {err}"
+    );
+    assert_no_secrets(&err);
+}
+
+#[tokio::test]
+async fn a_rejected_scheme_names_no_endpoint_secret() {
+    let err = initialize_err(
+        "ftp://opsuser7:hunter2@127.0.0.1/mcp/k-northwind42?sig=s3cr3t#fr4gment",
+        reqwest::Client::new(),
+    )
+    .await;
+    assert!(matches!(err, McpError::Transport(_)), "got {err:?}");
+    assert!(err.to_string().contains("ftp://127.0.0.1/"), "got {err}");
+    assert_no_secrets(&err);
+}
+
 #[tokio::test]
 async fn a_refused_connection_is_unreachable() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

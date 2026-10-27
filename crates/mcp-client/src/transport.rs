@@ -20,6 +20,7 @@ use reqwest::StatusCode;
 use serde::Serialize;
 use tracing::warn;
 use url::Url;
+use workforce_common::redact::redact_url;
 
 use crate::auth::AuthProvider;
 use crate::error::McpError;
@@ -33,6 +34,7 @@ const POST: &str = "POST";
 
 pub(crate) struct Transport {
     endpoint: Url,
+    redacted_endpoint: Url,
     http: Arc<reqwest::Client>,
     auth: Arc<dyn AuthProvider>,
     max_content_bytes: usize,
@@ -46,6 +48,7 @@ impl Transport {
         max_content_bytes: usize,
     ) -> Self {
         Self {
+            redacted_endpoint: redact_url(&endpoint),
             endpoint,
             http,
             auth,
@@ -83,7 +86,7 @@ impl Transport {
             return Err(McpError::AuthExpired(format!(
                 "server returned HTTP {} on {POST} {}",
                 status.as_u16(),
-                self.endpoint
+                self.redacted_endpoint
             )));
         }
         if status == StatusCode::NOT_FOUND {
@@ -100,7 +103,7 @@ impl Transport {
                 .await
                 .unwrap_or_else(|_| "<no body>".to_string());
             return Err(McpError::RateLimited {
-                message: format!("HTTP 429 from {}: {}", self.endpoint, scrub(body)),
+                message: format!("HTTP 429 from {}: {}", self.redacted_endpoint, scrub(body)),
                 retry_after_secs,
             });
         }
@@ -112,7 +115,7 @@ impl Transport {
             return Err(McpError::Transport(format!(
                 "HTTP {} from {}: {}",
                 status.as_u16(),
-                self.endpoint,
+                self.redacted_endpoint,
                 scrub(body)
             )));
         }
@@ -210,7 +213,7 @@ impl Transport {
         let mut total = 0usize;
         let mut stream = resp.bytes_stream();
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|e| McpError::Transport(describe(&e)))?;
+            let chunk = chunk.map_err(|e| McpError::Transport(describe(e)))?;
             total = total.saturating_add(chunk.len());
             if total > self.max_content_bytes {
                 return Err(McpError::BodyTooLarge {
@@ -259,7 +262,7 @@ async fn read_capped(resp: reqwest::Response, limit: usize) -> Result<Vec<u8>, M
     let mut buf = Vec::new();
     let mut stream = resp.bytes_stream();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| McpError::Transport(describe(&e)))?;
+        let chunk = chunk.map_err(|e| McpError::Transport(describe(e)))?;
         if buf.len() + chunk.len() > limit {
             return Err(McpError::BodyTooLarge { limit });
         }
@@ -278,13 +281,17 @@ fn send_failed(e: reqwest::Error) -> McpError {
     } else {
         McpError::Transport
     };
-    error(describe(&e))
+    error(describe(e))
 }
 
 /// The scrubbed error with its whole source chain: reqwest's own text
 /// omits the cause (refused, DNS, TLS, early EOF).
-fn describe(e: &reqwest::Error) -> String {
-    let chain = std::iter::successors(Some(e as &dyn std::error::Error), |e| e.source())
+fn describe(e: reqwest::Error) -> String {
+    let e = match e.url().map(redact_url) {
+        Some(url) => e.with_url(url),
+        None => e,
+    };
+    let chain = std::iter::successors(Some(&e as &dyn std::error::Error), |e| e.source())
         .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join(": ");
@@ -392,6 +399,38 @@ mod tests {
                 assert!(message.contains("HTTP 429"), "{message}");
             }
             other => panic!("expected RateLimited, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn http_429_names_the_host_but_no_endpoint_secret() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(429).set_body_string("slow down"))
+            .mount(&server)
+            .await;
+        let addr = server.address();
+        let transport = Transport::new(
+            Url::parse(&format!(
+                "http://opsuser7:hunter2@{addr}/mcp/k-northwind42?sig=s3cr3t#fr4gment"
+            ))
+            .unwrap(),
+            Arc::new(reqwest::Client::new()),
+            Arc::new(NoAuth),
+            1024,
+        );
+        let err = transport
+            .post_request(&serde_json::json!({"jsonrpc":"2.0"}), None, None, 1)
+            .await
+            .unwrap_err();
+        let McpError::RateLimited { message, .. } = err else {
+            panic!("expected RateLimited, got {err:?}");
+        };
+        assert!(message.contains(&addr.to_string()), "{message}");
+        for secret in ["opsuser7", "hunter2", "k-northwind42", "s3cr3t", "fr4gment"] {
+            assert!(!message.contains(secret), "{message}");
         }
     }
 
