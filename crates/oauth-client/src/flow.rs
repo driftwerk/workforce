@@ -228,12 +228,9 @@ impl OAuthClient {
             .form(&grant_params)
             .send()
             .await
-            .map_err(|e| OAuthError::Transport(e.to_string()))?;
+            .map_err(OAuthError::from)?;
         let status = resp.status();
-        let body = resp
-            .text()
-            .await
-            .map_err(|e| OAuthError::Transport(e.to_string()))?;
+        let body = resp.text().await.map_err(OAuthError::from)?;
         if !status.is_success() {
             return Err(OAuthError::from_response(status.as_u16(), &body));
         }
