@@ -275,26 +275,33 @@ pub struct Verifier<'a> {
 }
 
 const VERIFIER_PROMPT: &str = "You check edits to end-user documentation against the \
-     source code they cite. You see the passage before the edit, the passage after it, and \
-     excerpts from the cited sources. List every statement the edit adds or changes that the \
-     excerpts don't support: a command, subcommand, flag, argument, key, section, default, \
-     value, name, limit or behaviour that the excerpts don't show, or show differently. Also \
-     list anything the edit removes or weakens that the excerpts show is still true (for \
-     example, dropping that an action needs an admin). Text identical in both passages is not \
-     yours to judge, and neither are wording, tone or formatting. Answer by calling `verdict` \
-     once; an empty list means the edit stands on the excerpts.";
+     source code they cite. You see the passage before the edit, the passage after it, the \
+     page section the edit sits in, and excerpts from the cited sources. List every statement \
+     the edit adds or changes that the excerpts don't support: a command, subcommand, flag, \
+     argument, key, section, default, value, name, limit or behaviour that the excerpts don't \
+     show, or show differently. Also list anything the edit removes or weakens that the \
+     excerpts show is still true (for example, dropping that an action needs an admin), and \
+     any statement elsewhere in the section that the excerpts show is wrong, which the edit \
+     should fix too. Code, data and argument definitions outrank comments: where an \
+     excerpt's comment disagrees with its code, the code is right, and a claim resting on \
+     the comment alone is unsupported. Text the edit leaves alone is not yours to judge unless \
+     the excerpts show it is wrong, and neither are wording, tone or formatting. Answer by \
+     calling `verdict` once; an empty list means the edit stands on the excerpts.";
 
 impl Verifier<'_> {
-    /// The statements in `after` that `excerpts` don't support.
+    /// The statements in `after`, or left standing in `section`, that
+    /// `excerpts` don't support.
     async fn unsupported(
         &self,
         before: &str,
         after: &str,
+        section: &str,
         excerpts: &[String],
     ) -> Result<Vec<String>> {
         let prompt = format!(
             "## Passage before the edit\n<<<\n{before}\n>>>\n\n\
              ## Passage after the edit\n<<<\n{after}\n>>>\n\n\
+             ## The page section the edit sits in, before the edit\n<<<\n{section}\n>>>\n\n\
              ## Excerpts from the cited sources\n{}",
             excerpts.join("\n")
         );
@@ -585,10 +592,12 @@ async fn edit_call(
         Ok(args) => args,
         Err(e) => return Ok(Err(e)),
     };
-    if let Err(e) = draft.locate(&args[0]) {
-        return Ok(Err(e.to_string()));
-    }
-    let cited = match vouched_for(&args[0], &args[1], input, context).await? {
+    let at = match draft.locate(&args[0]) {
+        Ok(at) => at,
+        Err(e) => return Ok(Err(e.to_string())),
+    };
+    let section = draft.section_around(at).to_string();
+    let cited = match vouched_for(&args[0], &args[1], &section, input, context).await? {
         Ok(cited) => cited,
         Err(refusal) => return Ok(Err(refusal)),
     };
@@ -608,7 +617,7 @@ async fn append_call(
         Ok(args) => args,
         Err(e) => return Ok(Err(e)),
     };
-    let cited = match vouched_for("", &args[0], input, context).await? {
+    let cited = match vouched_for("", &args[0], "", input, context).await? {
         Ok(cited) => cited,
         Err(refusal) => return Ok(Err(refusal)),
     };
@@ -635,6 +644,7 @@ fn record(context: &EditContext<'_>, cited: Vec<String>) {
 async fn vouched_for(
     before: &str,
     after: &str,
+    section: &str,
     input: &Value,
     context: &EditContext<'_>,
 ) -> Result<Result<Vec<String>, String>> {
@@ -650,7 +660,9 @@ async fn vouched_for(
     let Some(verifier) = context.verifier else {
         return Ok(Ok(ranges));
     };
-    let unsupported = verifier.unsupported(before, after, &excerpts).await?;
+    let unsupported = verifier
+        .unsupported(before, after, section, &excerpts)
+        .await?;
     if unsupported.is_empty() {
         return Ok(Ok(ranges));
     }
@@ -1187,6 +1199,14 @@ mod tests {
         // The verifier saw the change and the cited excerpt.
         let asked = serde_json::to_string(&verifier.seen.lock().unwrap()[0]).unwrap();
         assert!(asked.contains("Passage after the edit"), "{asked}");
+        assert!(
+            asked.contains("The page section the edit sits in"),
+            "{asked}"
+        );
+        assert!(
+            asked.contains("## Flags"),
+            "the section heading is shown: {asked}"
+        );
         assert!(asked.contains("documents its flags"), "{asked}");
     }
 
