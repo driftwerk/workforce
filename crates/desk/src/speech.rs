@@ -94,7 +94,7 @@ pub enum SpeakError {
     #[error("{0}")]
     Invalid(String),
     #[error(
-        "this hub has no {} key: add a {} key under Plans in Desk",
+        "this hub has no {} key: add a {} key under Voices in Desk Settings",
         .0.label(),
         .0.label()
     )]
@@ -284,7 +284,7 @@ mod tests {
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
             error(&body),
-            "this hub has no Fish Audio key: add a Fish Audio key under Plans in Desk"
+            "this hub has no Fish Audio key: add a Fish Audio key under Voices in Desk Settings"
         );
     }
 
