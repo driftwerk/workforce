@@ -20,6 +20,7 @@ use eyre::{eyre, Context, Result};
 use serde_json::{json, Value};
 use tracing::{info, warn};
 
+use workforce_agent::llm::failover::{FailoverConfig, FailoverProvider, RetryConfig};
 use workforce_agent::llm::provider::{
     create_provider_async, provider_env_key, provider_env_var_hint, with_reasoning_suppressed,
     LlmProvider, ProviderKind,
@@ -105,6 +106,11 @@ pub async fn curate_page(
     .await
 }
 
+/// The provider for a tier, behind the hub's own retry policy: transient
+/// errors are retried with backoff, and a rate limit that names when to come
+/// back (OpenRouter: "could not verify available credits in time", with
+/// `Retry-After`) is waited out on the same model. No failover chain: the
+/// curator's models are chosen, not interchangeable.
 async fn provider_for(
     tier_spec: &str,
     vault: Option<&Arc<Vault>>,
@@ -119,7 +125,20 @@ async fn provider_for(
         )
     })?;
     let provider = create_provider_async(kind, &api_key, Some(&model), None, false).await?;
-    Ok((provider, model))
+    Ok((Box::new(with_retries(Arc::from(provider))), model))
+}
+
+fn with_retries(provider: Arc<dyn LlmProvider>) -> FailoverProvider {
+    FailoverProvider::new(
+        provider,
+        FailoverConfig {
+            retry: RetryConfig {
+                retry_rate_limited: true,
+                ..RetryConfig::default()
+            },
+            ..FailoverConfig::default()
+        },
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1053,6 +1072,61 @@ mod tests {
 
     fn verdict(unsupported: &[&str]) -> LlmResponse {
         calls(&[("verdict", json!({ "unsupported": unsupported }))])
+    }
+
+    // ── Retries ────────────────────────────────────────────────────────────
+
+    /// Refuses its first call the way OpenRouter does when it can't check
+    /// credits in time, then answers.
+    struct RateLimitedOnce {
+        calls: Mutex<u32>,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for RateLimitedOnce {
+        async fn create_message(
+            &self,
+            _system_prompt: Option<&str>,
+            _messages: &[LlmMessage],
+            _tools: &[LlmToolDef],
+            _model: Option<&str>,
+            _max_tokens: Option<u32>,
+            _enable_cache: bool,
+        ) -> Result<LlmResponse> {
+            let mut calls = self.calls.lock().unwrap();
+            *calls += 1;
+            if *calls == 1 {
+                return Err(eyre!(
+                    "OpenRouter API error (429 Too Many Requests): {{\"error\":{{\"message\":\"OpenRouter could not verify available credits for this request in time. Retry shortly.\"}}}} (retry-after: 0s)"
+                ));
+            }
+            Ok(reply(
+                vec![ContentBlock::Text { text: "ok".into() }],
+                StopReason::EndTurn,
+                5,
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_rate_limited_call_is_retried_after_its_retry_after() {
+        let inner = Arc::new(RateLimitedOnce {
+            calls: Mutex::new(0),
+        });
+        let provider = with_retries(inner.clone());
+        let messages = [user_text("hi".into())];
+        let response = invoke(
+            &provider,
+            "deepseek/deepseek-v4-pro",
+            None,
+            &messages,
+            &[],
+            100,
+        )
+        .await
+        .expect("the 429 is waited out, not returned");
+        assert_eq!(response.text().as_deref(), Some("ok"));
+        assert_eq!(*inner.calls.lock().unwrap(), 2);
     }
 
     // ── Evidence and the verifier ──────────────────────────────────────────
