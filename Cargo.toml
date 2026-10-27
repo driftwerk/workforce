@@ -159,7 +159,7 @@ unicode-width = "0.2"
 blake3 = "1.6.0"
 aes-gcm = "0.10"
 argon2 = "0.5"
-rand = "0.8"
+rand = "0.10"
 
 # vellev
 vellev-client = "0.1"
