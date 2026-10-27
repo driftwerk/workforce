@@ -99,7 +99,7 @@ Output includes NATS connection status, running agents, and registered nodes.
 Show all configured agents.
 
 ```sh
-workforce agent list --config workforce.toml
+workforce agent list
 ```
 
 ### `workforce agent show`
@@ -115,7 +115,7 @@ workforce agent show default
 Add a new agent.
 
 ```sh
-workforce agent create --id reviewer --name "Code Reviewer" --role reviewer
+workforce agent create reviewer --name "Code Reviewer" --role reviewer
 ```
 
 ### `workforce agent update`
@@ -123,7 +123,7 @@ workforce agent create --id reviewer --name "Code Reviewer" --role reviewer
 Modify an existing agent.
 
 ```sh
-workforce agent update --id reviewer --name "Senior Reviewer" --model claude-3-5-sonnet-20241022
+workforce agent update reviewer --name "Senior Reviewer"
 ```
 
 ### `workforce agent delete`
@@ -131,7 +131,7 @@ workforce agent update --id reviewer --name "Senior Reviewer" --model claude-3-5
 Remove an agent.
 
 ```sh
-workforce agent delete --id reviewer --delete-workspace
+workforce agent delete reviewer --delete-workspace
 ```
 
 Use `--delete-workspace` to also delete the agent's data directory.
@@ -354,10 +354,10 @@ workforce pair devices
 
 ### `workforce pair config`
 
-View or update pairing configuration.
+Show the pairing configuration summary.
 
 ```sh
-workforce pair config --show
+workforce pair config
 ```
 
 ### `workforce pair allowlist`
@@ -373,7 +373,7 @@ workforce pair allowlist
 Manually add a sender to the channel allowlist.
 
 ```sh
-workforce pair allow user@example.com
+workforce pair allow slack U0123ABCD
 ```
 
 ### `workforce pair revoke`
@@ -381,7 +381,7 @@ workforce pair allow user@example.com
 Remove a sender from the channel allowlist.
 
 ```sh
-workforce pair revoke user@example.com
+workforce pair revoke slack U0123ABCD
 ```
 
 ### `workforce pair revoke-device`
@@ -401,7 +401,7 @@ Workflows are defined in TOML files and orchestrate multi‑step processes.
 List workflow definitions.
 
 ```sh
-workforce workflow list --workflows-dir .driftwerk/workflows
+workforce workflow --workflows-dir .driftwerk/workflows list
 ```
 
 ### `workforce workflow validate`
@@ -417,7 +417,7 @@ workforce workflow validate .driftwerk/workflows/onboarding.toml
 Generate a scaffold for a new workflow.
 
 ```sh
-workforce workflow create --id onboarding --workflows-dir .driftwerk/workflows
+workforce workflow --workflows-dir .driftwerk/workflows create onboarding
 ```
 
 ### `workforce workflow instances`
@@ -425,7 +425,7 @@ workforce workflow create --id onboarding --workflows-dir .driftwerk/workflows
 Show running workflow instances.
 
 ```sh
-workforce workflow instances --data-dir ./data
+workforce workflow --data-dir ./data instances
 ```
 
 ### `workforce workflow show`
@@ -433,7 +433,7 @@ workforce workflow instances --data-dir ./data
 Display details of a specific workflow.
 
 ```sh
-workforce workflow show onboarding --workflows-dir .driftwerk/workflows
+workforce workflow --workflows-dir .driftwerk/workflows show onboarding
 ```
 
 ## Node Commands
@@ -673,7 +673,7 @@ workforce role show <role-id>
 Create a new role template.
 
 ```sh
-workforce role create --id editor --name "Editor"
+workforce role create editor --name "Editor" --prompt "You edit documents."
 ```
 
 ### `workforce role delete`
@@ -707,7 +707,7 @@ workforce slack scaffold --name "My Workforce Bot"
 Store Slack credentials in the vault, scoped by workspace ID.
 
 ```sh
-workforce slack configure --workspace-id T123456
+workforce slack configure --workspace-id T123456 --bot-token xoxb-...
 ```
 
 ## Google Workspace Commands
@@ -725,7 +725,7 @@ workforce google login
 Remove stored tokens for a workspace.
 
 ```sh
-workforce google logout <workspace-id>
+workforce google logout --workspace default
 ```
 
 ### `workforce google list`
@@ -745,7 +745,7 @@ Manage heartbeat checks for agents.
 List all heartbeat checks for an agent.
 
 ```sh
-workforce heartbeat list --agent default
+workforce heartbeat list default
 ```
 
 ### `workforce heartbeat show`
@@ -753,7 +753,7 @@ workforce heartbeat list --agent default
 Show details of a heartbeat check.
 
 ```sh
-workforce heartbeat show <check-id>
+workforce heartbeat show default daily-check
 ```
 
 ### `workforce heartbeat create`
@@ -761,7 +761,7 @@ workforce heartbeat show <check-id>
 Create a new heartbeat check.
 
 ```sh
-workforce heartbeat create --agent default --name "Daily check"
+workforce heartbeat create default daily-check --display-name "Daily check"
 ```
 
 ### `workforce heartbeat edit`
@@ -769,7 +769,7 @@ workforce heartbeat create --agent default --name "Daily check"
 Edit a heartbeat check.
 
 ```sh
-workforce heartbeat edit <check-id> --interval 3600
+workforce heartbeat edit default daily-check --schedule "0 * * * *"
 ```
 
 ### `workforce heartbeat enable`
@@ -777,7 +777,7 @@ workforce heartbeat edit <check-id> --interval 3600
 Enable a heartbeat check.
 
 ```sh
-workforce heartbeat enable <check-id>
+workforce heartbeat enable default daily-check
 ```
 
 ### `workforce heartbeat disable`
@@ -785,7 +785,7 @@ workforce heartbeat enable <check-id>
 Disable a heartbeat check.
 
 ```sh
-workforce heartbeat disable <check-id>
+workforce heartbeat disable default daily-check
 ```
 
 ### `workforce heartbeat delete`
@@ -793,7 +793,7 @@ workforce heartbeat disable <check-id>
 Delete a heartbeat check.
 
 ```sh
-workforce heartbeat delete <check-id>
+workforce heartbeat delete default daily-check
 ```
 
 ### `workforce heartbeat init`
@@ -821,10 +821,10 @@ workforce memory doctor
 Recreate the Weaviate schema (destructive).
 
 ```sh
-workforce memory rebuild-schema --dry-run
+workforce memory rebuild-schema
 ```
 
-Use `--dry-run` to see what would change.
+Without `--yes` this is a dry run that prints the plan; add `--yes` to actually rebuild.
 
 ### `workforce memory clean`
 
@@ -836,10 +836,10 @@ workforce memory clean
 
 ### `workforce memory backfill`
 
-Ingest historical data into memory.
+Reset an agent's consolidation cursor so the next scheduled scan reprocesses sessions updated since a date.
 
 ```sh
-workforce memory backfill
+workforce memory backfill --since 2026-05-01T00:00:00Z --agent default
 ```
 
 ### `workforce memory passive-extract`
@@ -847,7 +847,7 @@ workforce memory backfill
 Run background extraction of memories from recent sessions.
 
 ```sh
-workforce memory passive-extract
+workforce memory passive-extract --since 2026-05-01T00:00:00Z
 ```
 
 ## Lessons Commands
