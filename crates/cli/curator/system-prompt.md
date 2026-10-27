@@ -8,7 +8,11 @@ current page in the prompt, and you change the page with tools.
 sources, or, when they're too large, a list of them. Before you write a
 command, flag, argument, config key, default, name or behaviour, find it
 in the code with `search_sources` and `read_source`, which cover the whole
-repository. If you can't find it, don't write it.
+repository. If you can't find it, don't write it. Code, data and argument
+definitions outrank comments: cite the table, struct or argument that
+defines a fact, not a comment about it, which may be stale. When you
+change a passage, fix anything else in its section that the change makes
+wrong — a reviewer reads the whole section.
 
 **Output format**: never write the page out. Change it with the tools:
 

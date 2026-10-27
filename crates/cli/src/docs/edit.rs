@@ -101,6 +101,13 @@ impl PageDraft {
         Ok(())
     }
 
+    /// The section of the page that the byte offset `at` falls in: from the
+    /// heading above it to the next heading, headings inside code fences
+    /// not counting.
+    pub fn section_around(&self, at: usize) -> &str {
+        section_around(&self.current, at)
+    }
+
     /// Add `text` to the end of the page, on a line of its own.
     pub fn append(&mut self, text: &str) {
         if !self.current.is_empty() && !self.current.ends_with('\n') {
@@ -111,6 +118,33 @@ impl PageDraft {
             text: text.to_string(),
         });
     }
+}
+
+/// The section of `text` that the byte offset `at` falls in: from the
+/// heading line above it (or the start) to the next heading (or the end).
+/// Lines inside ``` or ~~~ fences are never headings.
+pub fn section_around(text: &str, at: usize) -> &str {
+    let mut start = 0;
+    let mut fence: Option<char> = None;
+    let mut offset = 0;
+    for line in text.split_inclusive('\n') {
+        let trimmed = line.trim_start();
+        let marker = trimmed.chars().next().filter(|c| *c == '`' || *c == '~');
+        if let Some(c) = marker.filter(|c| trimmed.starts_with(&c.to_string().repeat(3))) {
+            fence = match fence {
+                Some(open) if open == c => None,
+                None => Some(c),
+                other => other,
+            };
+        } else if fence.is_none() && trimmed.starts_with('#') {
+            if offset > at {
+                return &text[start..offset];
+            }
+            start = offset;
+        }
+        offset += line.len();
+    }
+    &text[start..]
 }
 
 #[cfg(test)]
@@ -160,6 +194,20 @@ mod tests {
         assert!(
             !draft.is_changed(),
             "two edits that cancel leave the page as it was"
+        );
+    }
+
+    #[test]
+    fn the_section_around_an_edit_runs_heading_to_heading() {
+        let page = "# A\nintro\n## B\nbody\n```sh\n# not a heading\n```\nmore\n## C\nend\n";
+        let at = page.find("more").unwrap();
+        assert_eq!(
+            section_around(page, at),
+            "## B\nbody\n```sh\n# not a heading\n```\nmore\n"
+        );
+        assert_eq!(
+            section_around(page, page.find("end").unwrap()),
+            "## C\nend\n"
         );
     }
 
