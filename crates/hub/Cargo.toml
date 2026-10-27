@@ -24,6 +24,7 @@ workforce-lessons = { path = "../lessons" }
 workforce-skills = { path = "../skills", features = ["slack", "teams", "github", "google", "linear", "jira", "datadog", "metabase", "hubspot", "notion", "browser", "obscura", "email", "postmark", "sendgrid", "xero", "freeagent", "spotify"] }
 workforce-distributed = { path = "../distributed" }
 workforce-games = { path = "../games" }
+workforce-desk = { path = "../desk", optional = true }
 workforce-gateway-client = { path = "../gateway-client" }
 workforce-pairing = { path = "../pairing" }
 workforce-identity = { path = "../identity" }
@@ -171,6 +172,7 @@ default = []
 oidc = ["dep:openidconnect"]
 postgres = [
     "dep:tokio-postgres",
+    "dep:workforce-desk",
     "dep:deadpool-postgres",
     "dep:refinery",
     "workforce-common/postgres",
@@ -189,6 +191,7 @@ workforce-agent = { path = "../agent-runtime", features = ["s3", "test-support"]
 tempfile = "3"
 tower = "0.5"
 wiremock = "0.6"
+tokio-tungstenite = "0.28"
 serde_yaml = { workspace = true }
 rust_xlsxwriter = { workspace = true }
 workforce-postgres = { workspace = true, features = ["test-support"] }

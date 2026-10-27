@@ -54,6 +54,7 @@ workforce-gateway-client = { path = "../gateway-client" }
 workforce-identity = { path = "../identity" }
 workforce-knowledge-service = { path = "../knowledge-service" }
 workforce-lessons = { path = "../lessons" }
+workforce-mcp-client = { workspace = true }
 workforce-memory = { path = "../memory" }
 workforce-nats = { path = "../nats-bus" }
 workforce-orchestrator = { path = "../orchestrator" }

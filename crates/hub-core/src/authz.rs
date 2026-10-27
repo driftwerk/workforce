@@ -580,8 +580,10 @@ impl Capability {
             Capability::ShellExec => {
                 "Run arbitrary shell commands and build or execute code on the host — exec.run, the \
                  code.* cargo/build/test/lint/git runners, the coding.* Claude Code CLI runners, \
-                 and wasm_skill.build. The most privileged capability: a holder can read any file \
-                 the process can, including the decrypted vault key from the host environment."
+                 and wasm_skill.build — and use the tools a person's own machine offers over the \
+                 node uplink (node.*) that it does not mark read-only. The most privileged \
+                 capability: a holder can read any file the process can, including the decrypted \
+                 vault key from the host environment."
             }
             Capability::DatabaseWrite => {
                 "Run writing statements (DML/DDL) against a configured database via \
@@ -674,6 +676,13 @@ impl Capability {
                 "code.git",
                 "coding.claude",
                 "coding.session",
+                "desk.sessions",
+                "desk.start",
+                "desk.prompt",
+                "desk.read",
+                "desk.wait",
+                "desk.approve",
+                "desk.stop",
                 "wasm_skill.build",
             ],
             Capability::DatabaseWrite => &["database.execute"],
@@ -1002,8 +1011,11 @@ pub fn tool_capability(tool: &str, input: &serde_json::Value) -> Option<Capabili
         // `Bash` tool enabled — an unconfined host shell, the exact reach
         // `exec.run` has — so they belong to this class. Gating only `exec.run`
         // would leave the identical escalation one tool over.
+        // `desk.*` drives the person's own Claude Code / Codex terminals, and
+        // reads them — the same host reach.
         "exec.run" | "code.cargo" | "code.build" | "code.test" | "code.lint" | "code.git"
-        | "coding.claude" | "coding.session" => Some(Capability::ShellExec),
+        | "coding.claude" | "coding.session" | "desk.sessions" | "desk.start" | "desk.prompt"
+        | "desk.read" | "desk.wait" | "desk.approve" | "desk.stop" => Some(Capability::ShellExec),
         // A language server loads the project the way a build does (build
         // scripts, proc macros, compiler plugins), so every `code.refactor`
         // action it answers is this class too. Only `replace_definition`, a
@@ -1070,6 +1082,14 @@ pub fn tool_capability(tool: &str, input: &serde_json::Value) -> Option<Capabili
         // `is_destructive`, and nothing else would notice.
         "skill.grant" | "skill.grants" | "skill.revoke" | "skill.share" | "skill.unshare"
         | "skill.visibility" | "skill.transfer" => None,
+        // A tool a person's own machine offers over the node uplink runs
+        // there with whatever reach its server has, which the hub cannot
+        // see: the command-running class, unless its node says it only
+        // reads.
+        other if other.starts_with(crate::hub_core::local_agent_registry::NODE_TOOL_PREFIX) => {
+            (!crate::hub_core::local_agent_registry::is_read_only_tool(other))
+                .then_some(Capability::ShellExec)
+        }
         // Secure-by-default: an unregistered destructive-by-name tool confirms
         // on the caller's own data (Ask). One shared destructive definition.
         other if workforce_policy::rules::is_destructive(other) => {
@@ -1427,6 +1447,48 @@ mod tests {
         let admin = summary(IdentityRole::SystemAdmin, IdentityStatus::Active);
         assert_eq!(decision(&member, "shell_exec"), Decision::Deny);
         assert_eq!(decision(&admin, "shell_exec"), Decision::Allow);
+    }
+
+    /// A tool on a person's own machine runs commands there unless its node
+    /// says it only reads, and an unknown one is assumed to.
+    #[tokio::test]
+    async fn a_node_tool_is_command_running_unless_its_node_marks_it_read_only() {
+        use crate::hub_core::local_agent_registry::{LocalAgentRegistry, NodeHello};
+        use workforce_gateway_client::protocol::NodeToolSpec;
+        let tool = |name: &str, read_only| NodeToolSpec {
+            name: name.into(),
+            description: String::new(),
+            input_schema: serde_json::json!({"type": "object"}),
+            read_only,
+        };
+        let registry = LocalAgentRegistry::new();
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        registry
+            .register(
+                NodeHello {
+                    id: "authz-mac".into(),
+                    name: "Mac".into(),
+                    capabilities: vec![],
+                    tools: vec![tool("files_read", true), tool("desk_start", false)],
+                },
+                "alice".into(),
+                tx,
+            )
+            .await
+            .unwrap();
+        let none = serde_json::json!({});
+        assert_eq!(tool_capability("node.authz-mac.files_read", &none), None);
+        for gated in [
+            "node.authz-mac.desk_start",
+            "node.authz-mac.unknown",
+            "node.x.y",
+        ] {
+            assert_eq!(
+                tool_capability(gated, &none),
+                Some(Capability::ShellExec),
+                "{gated}"
+            );
+        }
     }
 
     #[test]

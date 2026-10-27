@@ -46,6 +46,7 @@ workforce-oauth-client = { workspace = true }
 reqwest = { workspace = true }
 workforce-skills = { path = "../skills", features = ["slack", "github", "google", "browser", "email"] }
 workforce-gateway-client = { path = "../gateway-client" }
+workforce-mcp-client = { workspace = true }
 workforce-memory = { path = "../memory" }
 workforce-training = { workspace = true, features = ["postgres"] }
 workforce-self-learning = { workspace = true, features = ["postgres"] }

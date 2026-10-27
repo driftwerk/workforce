@@ -8,6 +8,7 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use workforce_agent::attachments::{Describer, Transcriber, VisionStrategy};
 use workforce_agent::tools::loading::ToolLoading;
+use workforce_common::rich::RichFeatures;
 use workforce_common::session::{CompactionConfig, Session, SpillConfig};
 use workforce_common::settings::{
     AdvisorConfig, AgentConfig, AgentDecideFirstUse, AgentWorkspaceConfig, ApprovalsConfig,
@@ -49,6 +50,7 @@ const SECTIONS: &[(&str, Option<Section>)] = &[
     ("attachments", Some(attachments)),
     ("decision", Some(decision)),
     ("scheduler", None),
+    ("rich", None),
     ("evals", Some(evals)),
     ("budget", Some(budget)),
     ("credentials", Some(credentials)),
@@ -143,6 +145,7 @@ fn tables(service: &AgentService, resolved: &ResolvedConfig) -> Vec<Layered> {
         refactor,
         know_how,
         decision,
+        rich,
         scheduler,
         research,
         handoff,
@@ -171,6 +174,7 @@ fn tables(service: &AgentService, resolved: &ResolvedConfig) -> Vec<Layered> {
         claim_grounding: own_claim_grounding,
         code_context: own_code_context,
         session_digest: own_session_digest,
+        rich: own_rich,
         // Each read from the resolved config above.
         tools: _,
         know_how: _,
@@ -392,6 +396,14 @@ fn tables(service: &AgentService, resolved: &ResolvedConfig) -> Vec<Layered> {
         )
         .layer(Source::Agent, scheduler.as_ref())
         .effective(&service.scheduler_policy()),
+        Layered::new(
+            "rich",
+            "",
+            &RichFeatures::default(),
+            &RichFeatures::default(),
+        )
+        .layer(Source::Agent, own_rich.as_ref())
+        .effective(rich),
         Layered::new(
             "research",
             "",

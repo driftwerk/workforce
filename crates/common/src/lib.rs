@@ -41,6 +41,7 @@ pub mod persona;
 pub mod pg_text;
 pub mod quarantine;
 pub mod redact;
+pub mod rich;
 pub mod roles;
 pub mod secret;
 pub mod secret_lock;

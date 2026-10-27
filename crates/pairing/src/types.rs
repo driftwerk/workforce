@@ -114,7 +114,8 @@ pub struct DevicePairingRequest {
     /// the device is paired anonymously and can be linked later.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identity_hint: Option<String>,
-    /// Which kind of device this is, e.g. `ios_device` or `voice_device`.
+    /// Which kind of device this is, e.g. `ios_device`, `voice_device` or
+    /// `desktop_device`.
     ///
     /// Becomes the key under which the device is recorded in
     /// `Identity.linked_ids`, which is a map of *platform* to one id. Pairing
@@ -134,7 +135,7 @@ pub const DEFAULT_DEVICE_KIND: &str = "ios_device";
 /// Every `linked_ids` key a paired device may be recorded under, most common
 /// first. Lookup walks this list, so a new surface must be added here or it
 /// pairs successfully and then never resolves to its owner.
-pub const DEVICE_KINDS: &[&str] = &[DEFAULT_DEVICE_KIND, "voice_device"];
+pub const DEVICE_KINDS: &[&str] = &[DEFAULT_DEVICE_KIND, "voice_device", "desktop_device"];
 
 /// Normalise a caller-supplied device kind into something safe to use as a
 /// `linked_ids` key and a database value: lowercase, ASCII alphanumeric and

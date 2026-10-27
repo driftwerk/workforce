@@ -161,6 +161,8 @@ mod tests {
             Query(WsQuery {
                 token: None,
                 agent_id: None,
+                channel: None,
+                rich: None,
             })
         };
         let status = |r: ApiResult| r.unwrap_err().into_response().status();
@@ -233,6 +235,8 @@ mod tests {
             Query(WsQuery {
                 token: Some("gateway-token".into()),
                 agent_id: None,
+                channel: None,
+                rich: None,
             })
         };
         let status = |r: ApiResult| r.unwrap_err().into_response().status();
@@ -282,6 +286,8 @@ mod tests {
             Query(WsQuery {
                 token: Some("gateway-token".into()),
                 agent_id: None,
+                channel: None,
+                rich: None,
             })
         };
         let listed = list_entries(

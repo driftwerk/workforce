@@ -579,6 +579,20 @@ workforce local-agent connect --gateway ws://localhost:8091 --token <token>
 ```
 
 This allows the hub to delegate shell commands and file operations to your machine.
+Use a device token paired to you: the agent acts for that person only, so only your
+own conversations reach it.
+
+To also offer the tools of an MCP server on your machine, name its streamable-HTTP
+endpoint and the tools to offer. Its bearer is read from `WORKFORCE_NODE_MCP_TOKEN`
+(or `--mcp-token-file`), never the command line:
+
+```sh
+WORKFORCE_NODE_MCP_TOKEN=wfr_… workforce local-agent connect --gateway wss://hub.example.com \
+  --token <device-token> --id studio \
+  --mcp http://127.0.0.1:8091/mcp/agents/<agent> --mcp-tools 'desk_*'
+```
+
+Your conversations on the hub see them as `node.studio.<tool>`.
 
 ## Identity & Permission Commands
 

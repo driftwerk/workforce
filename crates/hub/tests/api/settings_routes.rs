@@ -168,7 +168,7 @@ async fn settings_route_narrows_to_a_section_or_a_key_and_names_what_it_cannot_f
     );
     let (status, unknown) = get("key=llm.max_round").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
-    assert_eq!(unknown["error"], "no setting \"llm.max_round\" (did you mean llm.max_rounds?): a key is a config path such as llm.vision.model, and showing a section (config, llm, memory, compaction, advisor, know_how, tools, research, handoff, code_context, claim_grounding, self_learning, session_digest, worker_read_sources, attachments, decision, scheduler, evals, budget, credentials, slack) lists its keys");
+    assert_eq!(unknown["error"], "no setting \"llm.max_round\" (did you mean llm.max_rounds?): a key is a config path such as llm.vision.model, and showing a section (config, llm, memory, compaction, advisor, know_how, tools, research, handoff, code_context, claim_grounding, self_learning, session_digest, worker_read_sources, attachments, decision, scheduler, rich, evals, budget, credentials, slack) lists its keys");
     let (status, off) = get("key=know_how.max_entries").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert!(

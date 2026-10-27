@@ -393,6 +393,8 @@ fn a_phone_is_told_the_reply_is_also_on_screen() {
 fn an_unknown_surface_is_assumed_to_have_no_screen() {
     assert_eq!(VoiceSurface::of("kitchen-satellite"), VoiceSurface::Speaker);
     assert_eq!(VoiceSurface::of("ios"), VoiceSurface::Screen);
+    assert_eq!(VoiceSurface::of("desk"), VoiceSurface::Screen);
+    assert_eq!(VoiceSurface::of("desk:release"), VoiceSurface::Screen);
 }
 
 /// Surface and TTS provider are independent: the same device can change

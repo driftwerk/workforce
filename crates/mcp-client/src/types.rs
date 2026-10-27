@@ -49,6 +49,24 @@ pub struct McpToolDef {
     pub description: String,
     #[serde(rename = "inputSchema", default = "default_schema")]
     pub input_schema: Value,
+    /// What the server says of the tool's behaviour. Hints only: a server
+    /// that marks a tool read-only is trusted no further than the server.
+    #[serde(default, skip_serializing_if = "ToolAnnotations::is_empty")]
+    pub annotations: ToolAnnotations,
+}
+
+/// The MCP tool annotations a client acts on.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub struct ToolAnnotations {
+    /// The tool does not modify its environment.
+    #[serde(rename = "readOnlyHint", default)]
+    pub read_only_hint: bool,
+}
+
+impl ToolAnnotations {
+    fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 fn default_schema() -> Value {

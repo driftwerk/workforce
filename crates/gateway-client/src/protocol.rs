@@ -585,8 +585,12 @@ pub struct AgentInfo {
     pub id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// The model the agent answers with now (its live default).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// What it runs on: `claude-code`, `chatgpt`, `anthropic`, …
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
     #[serde(default)]
     pub capabilities: Vec<String>,
     #[serde(default)]
@@ -771,6 +775,10 @@ pub struct LocalAgentHello {
     /// Filesystem paths this agent allows access to.
     #[serde(default)]
     pub allowed_paths: Vec<String>,
+    /// Tools this agent offers from an MCP server it tunnels, beside
+    /// `exec.run`. Absent from agents that only run commands.
+    #[serde(default)]
+    pub tools: Vec<NodeToolSpec>,
 }
 
 /// Gateway → Local Agent: execute a shell command on the local machine.
@@ -826,6 +834,77 @@ pub struct LocalExecResult {
     pub exit_code: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+/// One tool a local agent offers, as the MCP server it tunnels lists it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NodeToolSpec {
+    /// The tool's name on that server.
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default = "object_schema")]
+    pub input_schema: serde_json::Value,
+    /// The server says the tool only reads (MCP `readOnlyHint`). Every
+    /// other tool is gated as one that runs commands on the machine.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub read_only: bool,
+}
+
+fn object_schema() -> serde_json::Value {
+    serde_json::json!({"type": "object", "properties": {}})
+}
+
+/// Local Agent → Gateway: the tools it offers now, in place of those it
+/// offered before.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeTools {
+    #[serde(rename = "type")]
+    pub msg_type: String,
+    pub tools: Vec<NodeToolSpec>,
+}
+
+/// Gateway → Local Agent: run one of the tools it offers.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeToolCall {
+    #[serde(rename = "type")]
+    pub msg_type: String,
+    /// Unique ID correlating the call with its result.
+    pub request_id: String,
+    /// The tool's name as the agent offered it.
+    pub name: String,
+    #[serde(default)]
+    pub arguments: serde_json::Value,
+}
+
+/// Gateway → Local Agent: stop a tool call nobody waits for any more.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeToolCancel {
+    #[serde(rename = "type")]
+    pub msg_type: String,
+    pub request_id: String,
+}
+
+/// Local Agent → Gateway: a tool call's outcome — the MCP `tools/call`
+/// result (`content`, `isError`), or why there is none.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeToolResult {
+    #[serde(rename = "type")]
+    pub msg_type: String,
+    pub request_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Gateway → Local Agent: the connection is refused, and why. The gateway
+/// closes it next; connecting again the same way is refused the same way.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalAgentRefused {
+    #[serde(rename = "type")]
+    pub msg_type: String,
+    pub message: String,
 }
 
 #[cfg(test)]

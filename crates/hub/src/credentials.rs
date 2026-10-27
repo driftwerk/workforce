@@ -195,7 +195,8 @@ modalities! {
         ("fish_audio", "Fish Audio", "Fish Audio — API key"),
         ("elevenlabs", "ElevenLabs", "ElevenLabs — API key"),
         ("openai", "OpenAI", "OpenAI speech — API key"),
-        ("soniox", "Soniox", "Soniox — API key")
+        ("soniox", "Soniox", "Soniox — API key"),
+        ("gemini", "Gemini", "Gemini Live voice — API key")
     ];
 }
 

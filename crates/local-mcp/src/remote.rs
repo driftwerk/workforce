@@ -405,6 +405,7 @@ pub(crate) mod test_support {
                 "properties": { "q": { "type": "string" } },
                 "anyOf": [{ "required": ["q"] }]
             }),
+            annotations: Default::default(),
         }
     }
 }
