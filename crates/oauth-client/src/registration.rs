@@ -62,12 +62,9 @@ pub async fn register_client(
         .json(request)
         .send()
         .await
-        .map_err(|e| OAuthError::Transport(e.to_string()))?;
+        .map_err(OAuthError::from)?;
     let status = resp.status();
-    let body = resp
-        .text()
-        .await
-        .map_err(|e| OAuthError::Transport(e.to_string()))?;
+    let body = resp.text().await.map_err(OAuthError::from)?;
     if !status.is_success() {
         return Err(OAuthError::from_response(status.as_u16(), &body));
     }
@@ -159,5 +156,25 @@ mod tests {
             }
             other => panic!("expected Provider error, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn a_transport_error_names_the_host_but_not_the_query() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let err = register_client(
+            &reqwest::Client::new(),
+            &format!("http://{addr}/register?sig=s3cr3t"),
+            &req(),
+        )
+        .await
+        .unwrap_err();
+        let OAuthError::Transport(message) = err else {
+            panic!("expected Transport error, got {err:?}");
+        };
+        assert!(message.contains(&addr.to_string()), "{message}");
+        assert!(!message.contains("s3cr3t"), "{message}");
     }
 }

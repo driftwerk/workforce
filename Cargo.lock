@@ -11702,6 +11702,7 @@ dependencies = [
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
+ "url",
  "uuid",
  "workforce-build-support",
  "workforce-core",

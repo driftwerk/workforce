@@ -1,6 +1,7 @@
 use std::fmt;
 
 use serde::Deserialize;
+use workforce_common::redact::redact_url;
 
 /// OAuth-side errors. Wrapped for `eyre::Result` interop at boundaries.
 #[derive(Debug)]
@@ -52,6 +53,16 @@ impl OAuthError {
             code: parsed.error,
             description: parsed.error_description,
         }
+    }
+}
+
+impl From<reqwest::Error> for OAuthError {
+    fn from(e: reqwest::Error) -> Self {
+        let e = match e.url().map(redact_url) {
+            Some(url) => e.with_url(url),
+            None => e,
+        };
+        Self::Transport(e.to_string())
     }
 }
 

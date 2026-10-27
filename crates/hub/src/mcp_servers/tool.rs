@@ -166,7 +166,7 @@ mod tests {
     fn a_rate_limited_mcp_call_carries_the_typed_signal() {
         let result = map_call_result(
             Err(McpError::RateLimited {
-                message: "HTTP 429 from https://mcp.example/mcp: slow down".into(),
+                message: "HTTP 429 from https://mcp.example/: slow down".into(),
                 retry_after_secs: Some(30),
             }),
             5,

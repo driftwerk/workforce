@@ -24,7 +24,9 @@
 //! Errors from upstream pass through
 //! `workforce_common::redact::redact_secrets` before bubbling to
 //! callers, so a vendor that echoes the bearer token in an error
-//! body never leaks it into our logs. The agent runner's egress
+//! body never leaks it into our logs. The endpoint appears in errors
+//! only as `workforce_common::redact::redact_url` renders it (scheme,
+//! host and port); the rest is never shown. The agent runner's egress
 //! sanitiser still scrubs LLM-bound content; this is the inner
 //! belt-and-braces layer.
 
