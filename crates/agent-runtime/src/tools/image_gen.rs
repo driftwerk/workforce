@@ -31,13 +31,8 @@ use crate::runner::SessionContext;
 /// `{ "artifact_id": "art_…" }` (a prior generation or a
 /// `view_attachment`/`get_user_photo` result, read back from the store) or
 /// `{ "data_base64": "…" }` (inline). `media_type` is honoured when given, else
-/// sniffed from the bytes. `label` prefixes errors (e.g. `"images[0]"`). Shared
-/// with `generate_video`'s starting-image resolution.
-pub(crate) fn resolve_image_input(
-    entry: &Value,
-    agent_id: &str,
-    label: &str,
-) -> Result<InputImage, String> {
+/// sniffed from the bytes. `label` prefixes errors (e.g. `"images[0]"`).
+fn resolve_image_input(entry: &Value, agent_id: &str, label: &str) -> Result<InputImage, String> {
     let bytes = if let Some(id_str) = entry.get("artifact_id").and_then(Value::as_str) {
         let id = ArtifactId::parse(id_str)
             .map_err(|e| format!("{label}: invalid artifact_id '{id_str}': {e}"))?;
@@ -78,7 +73,11 @@ pub(crate) fn resolve_image_input(
 }
 
 /// Resolve the `images` input array into reference images, preserving order.
-fn resolve_reference_images(images: &Value, agent_id: &str) -> Result<Vec<InputImage>, String> {
+/// Shared with `generate_video`'s input images.
+pub(crate) fn resolve_reference_images(
+    images: &Value,
+    agent_id: &str,
+) -> Result<Vec<InputImage>, String> {
     let Some(arr) = images.as_array() else {
         return Ok(Vec::new());
     };

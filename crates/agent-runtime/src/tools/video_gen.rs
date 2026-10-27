@@ -1,17 +1,12 @@
 //! `generate_video` — text/image-to-video generation as an agent tool.
 //!
 //! Sibling to [`super::image_gen`]. Calls the configured [`VideoProvider`]
-//! (Google Veo), which submits + polls + downloads the clip (1–6 min, blocking),
+//! (Gemini Omni), which creates + polls + reads the clip (15–60s, blocking),
 //! stages the MP4 bytes in the artifact store, and returns the **same**
 //! `generated_images` marker the image path uses — so the existing image sink
 //! delivers the video to Slack (`upload_file` takes any mime) with no new
 //! delivery code. Gateway/iOS keeps it staged (image-only render path), as with
 //! other non-image attachments.
-//!
-//! NOTE on latency: this blocks the tool call for the whole round-trip. The
-//! fast Veo tier returns in ~40s; slower tiers take minutes. A future revision
-//! can run it as a background job,
-//! which is intentionally avoided here to stay off the in-flight job_runner.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -21,48 +16,50 @@ use serde_json::{json, Value};
 use workforce_common::secret::KeySlot;
 use workforce_common::settings::LlmVideoGenerationConfig;
 
-use super::image_gen::{resolve_image_input, GENERATED_IMAGES_KEY};
+use super::image_gen::{resolve_reference_images, GENERATED_IMAGES_KEY};
 use super::registry::ToolRegistry;
 use super::{Tool, ToolResult};
 use crate::artifacts::store::global_store;
 use crate::artifacts::types::{ArtifactBody, ArtifactDescriptor, ContentType};
-use crate::llm::image::InputImage;
-use crate::llm::video::{provider_from_config, VideoProvider, VideoRequest};
+use crate::llm::video::{
+    clamp_duration, provider_for, route, AspectRatio, VideoProvider, VideoRequest, DURATION_SECS,
+};
 
 /// Registry name of the video-generation tool.
 pub const VIDEO_TOOL_NAME: &str = "generate_video";
 
-/// Resolve the optional starting/subject `image`. Absent or an empty object ⇒
-/// `None` (text-to-video); otherwise the shared image-input resolver.
-fn resolve_input_image(entry: &Value, agent_id: &str) -> Result<Option<InputImage>, String> {
-    if entry.get("artifact_id").is_none() && entry.get("data_base64").is_none() {
-        return Ok(None);
+/// The call's input images as an array: `images`, or the single `image`
+/// object calls made before `images` existed still send.
+fn input_images(input: &Value) -> Result<Value, String> {
+    match (&input["images"], &input["image"]) {
+        (Value::Array(_), _) => Ok(input["images"].clone()),
+        (Value::Null, Value::Object(image)) if !image.is_empty() => Ok(json!([image])),
+        (Value::Null, _) => Ok(json!([])),
+        (other, _) => Err(format!(
+            "'images' must be an array of image objects, not {other}"
+        )),
     }
-    resolve_image_input(entry, agent_id, "image").map(Some)
 }
 
 pub struct VideoGenerationTool {
     provider: Arc<dyn VideoProvider>,
     agent_id: String,
-    aspect_ratio: String,
+    aspect_ratio: AspectRatio,
     duration_secs: Option<u32>,
-    person_generation: String,
 }
 
 impl VideoGenerationTool {
     pub fn new(
         provider: Arc<dyn VideoProvider>,
         agent_id: impl Into<String>,
-        aspect_ratio: impl Into<String>,
+        aspect_ratio: AspectRatio,
         duration_secs: Option<u32>,
-        person_generation: impl Into<String>,
     ) -> Self {
         Self {
             provider,
             agent_id: agent_id.into(),
-            aspect_ratio: aspect_ratio.into(),
+            aspect_ratio,
             duration_secs,
-            person_generation: person_generation.into(),
         }
     }
 }
@@ -74,10 +71,10 @@ impl Tool for VideoGenerationTool {
     }
 
     fn description(&self) -> &str {
-        "Generate a short video clip from a text `prompt`, optionally animating a starting `image` \
-         (image-to-video — e.g. from get_user_photo to 'make a video of Tom dancing'). For an \
-         expressive person clip prefer a fuller-body source over a tight headshot. This takes a \
-         while (~1–2 min) and BLOCKS until done, then the system delivers the clip to the user \
+        "Generate a short video clip (with sound) from a text `prompt`, optionally from `images`: \
+         one image is animated; two become the first and last frame; more are subject \
+         references, named in the prompt as <IMAGE_REF_0>, <IMAGE_REF_1>, … This takes a while \
+         (~15–60s) and BLOCKS until done, then the system delivers the clip to the user \
          automatically. IMPORTANT: you will NOT see the video and the artifact is internal — that \
          is expected, not a failure. Do not re-upload, attach, verify, or claim it failed. Briefly \
          tell the user what you made (and that it's on its way)."
@@ -89,23 +86,30 @@ impl Tool for VideoGenerationTool {
             "properties": {
                 "prompt": {
                     "type": "string",
-                    "description": "What should happen in the clip (subject + motion + setting)."
+                    "description": "What should happen in the clip (subject + motion + setting + sound)."
                 },
-                "image": {
-                    "type": "object",
-                    "description": "Optional starting/subject image to animate. { \"artifact_id\": \"art_…\", \"media_type\": \"image/png\" } from get_user_photo / view_attachment / a prior generate_image.",
-                    "properties": {
-                        "artifact_id": { "type": "string" },
-                        "media_type": { "type": "string" }
+                "images": {
+                    "type": "array",
+                    "description": "Optional input images, in order. Each { \"artifact_id\": \"art_…\", \"media_type\": \"image/png\" } from view_attachment / get_user_photo / a prior generate_image, or { \"data_base64\": \"…\" }.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "artifact_id": { "type": "string" },
+                            "data_base64": { "type": "string" },
+                            "media_type": { "type": "string" }
+                        }
                     }
                 },
                 "aspect_ratio": {
                     "type": "string",
-                    "description": "Optional, e.g. '16:9' or '9:16'. Defaults to the configured value."
+                    "enum": AspectRatio::ALL.map(AspectRatio::as_str),
+                    "description": "Optional. Defaults to the configured value."
                 },
                 "duration_secs": {
                     "type": "integer",
-                    "description": "Optional clip length in seconds (model-clamped)."
+                    "minimum": DURATION_SECS.start(),
+                    "maximum": DURATION_SECS.end(),
+                    "description": "Optional clip length in seconds, 3–10. Defaults to the configured length."
                 }
             },
             "required": ["prompt"]
@@ -123,27 +127,33 @@ impl Tool for VideoGenerationTool {
             ));
         };
 
-        let input_image = match resolve_input_image(&input["image"], &self.agent_id) {
-            Ok(img) => img,
+        let images = match input_images(&input)
+            .and_then(|images| resolve_reference_images(&images, &self.agent_id))
+        {
+            Ok(images) => images,
             Err(msg) => return Ok(ToolResult::failure(msg, elapsed(started))),
         };
 
-        let aspect_ratio = input["aspect_ratio"]
+        let aspect_ratio = match input["aspect_ratio"]
             .as_str()
             .filter(|s| !s.trim().is_empty())
-            .map(str::to_string)
-            .unwrap_or_else(|| self.aspect_ratio.clone());
+            .map(str::parse)
+            .transpose()
+        {
+            Ok(requested) => requested.unwrap_or(self.aspect_ratio),
+            Err(msg) => return Ok(ToolResult::failure(msg, elapsed(started))),
+        };
         let duration_secs = input["duration_secs"]
             .as_u64()
-            .map(|v| v as u32)
-            .or(self.duration_secs);
+            .map(|v| u32::try_from(v).unwrap_or(u32::MAX))
+            .or(self.duration_secs)
+            .map(clamp_duration);
 
         let req = VideoRequest {
             prompt: prompt.to_string(),
-            input_image,
+            images,
             aspect_ratio,
             duration_secs,
-            person_generation: self.person_generation.clone(),
         };
 
         let video = match self.provider.generate(&req).await {
@@ -192,6 +202,10 @@ impl Tool for VideoGenerationTool {
             }]),
         );
         output.insert("prompt".to_string(), json!(prompt));
+        output.insert("aspect_ratio".to_string(), json!(aspect_ratio.as_str()));
+        if let Some(secs) = duration_secs {
+            output.insert("duration_secs".to_string(), json!(secs));
+        }
         output.insert(
             "note".to_string(),
             json!("Generated. The system is delivering the video to this conversation automatically — it happens outside your context, so you will NOT see the attachment. This is expected, NOT a failure: do not re-upload, attach, verify, or claim it failed. Just briefly tell the user what you made."),
@@ -252,8 +266,8 @@ pub fn install_video_tool(
     reinstall_video_tool(tools, agent_id, next, key)
 }
 
-/// Rebuild the `generate_video` tool from `cfg` unconditionally; Veo reads its
-/// key from `key` on every generation.
+/// Rebuild the `generate_video` tool from `cfg` unconditionally; the provider
+/// reads its key from `key` on every generation.
 pub fn reinstall_video_tool(
     tools: &ToolRegistry,
     agent_id: &str,
@@ -261,14 +275,13 @@ pub fn reinstall_video_tool(
     key: KeySlot,
 ) -> VideoReload {
     match cfg.filter(|c| c.enabled) {
-        Some(cfg) => match provider_from_config(cfg, key) {
-            Ok(provider) => {
+        Some(cfg) => match route(cfg) {
+            Ok(route) => {
                 tools.register(Arc::new(VideoGenerationTool::new(
-                    Arc::from(provider),
+                    Arc::from(provider_for(&route, key)),
                     agent_id,
-                    cfg.aspect_ratio.clone(),
+                    route.aspect_ratio,
                     cfg.duration_secs,
-                    cfg.person_generation.clone(),
                 )));
                 VideoReload::Installed {
                     model: cfg.model.clone(),
@@ -304,7 +317,7 @@ mod tests {
             &tools,
             "agent",
             None,
-            Some(&video_cfg("veo:standard")),
+            Some(&video_cfg("gemini:standard")),
             KeySlot::fixed("k"),
         );
         assert!(matches!(outcome, VideoReload::Installed { .. }));
@@ -314,7 +327,7 @@ mod tests {
     #[test]
     fn install_removes_tool_when_disabled() {
         let tools = ToolRegistry::new();
-        let enabled = video_cfg("veo:standard");
+        let enabled = video_cfg("gemini:standard");
         install_video_tool(&tools, "agent", None, Some(&enabled), KeySlot::fixed("k"));
         let disabled = LlmVideoGenerationConfig {
             enabled: false,
@@ -334,12 +347,104 @@ mod tests {
     #[test]
     fn install_is_noop_when_unchanged() {
         let tools = ToolRegistry::new();
-        let cfg = video_cfg("veo:standard");
+        let cfg = video_cfg("gemini:standard");
         install_video_tool(&tools, "agent", None, Some(&cfg), KeySlot::fixed("k"));
         let outcome =
             install_video_tool(&tools, "agent", Some(&cfg), Some(&cfg), KeySlot::fixed("k"));
         assert!(matches!(outcome, VideoReload::Unchanged));
         assert!(tools.has(VIDEO_TOOL_NAME));
+    }
+
+    /// A provider that records the request it is asked for and declines it,
+    /// so a test sees what the tool sends without staging anything.
+    #[derive(Default)]
+    struct Recording(std::sync::Mutex<Option<VideoRequest>>);
+
+    #[async_trait]
+    impl VideoProvider for Recording {
+        async fn generate(
+            &self,
+            req: &VideoRequest,
+        ) -> eyre::Result<crate::llm::video::GeneratedVideo> {
+            *self.0.lock().unwrap() = Some(req.clone());
+            eyre::bail!("recorded")
+        }
+    }
+
+    fn tool(provider: Arc<Recording>) -> VideoGenerationTool {
+        VideoGenerationTool::new(provider, "agent", AspectRatio::Landscape, Some(30))
+    }
+
+    #[tokio::test]
+    async fn images_reach_the_provider_in_order_with_the_clip_bounded() {
+        use base64::Engine;
+        let b64 = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+        let provider = Arc::new(Recording::default());
+        tool(Arc::clone(&provider))
+            .execute(json!({
+                "prompt": "from dawn to dusk",
+                "images": [
+                    { "data_base64": b64(b"first"), "media_type": "image/png" },
+                    { "data_base64": b64(b"last"), "media_type": "image/jpeg" },
+                ],
+                "aspect_ratio": "9:16",
+            }))
+            .await
+            .unwrap();
+        let sent = provider
+            .0
+            .lock()
+            .unwrap()
+            .take()
+            .expect("provider was called");
+        let images: Vec<(&[u8], &str)> = sent
+            .images
+            .iter()
+            .map(|i| (i.data.as_slice(), i.media_type.as_str()))
+            .collect();
+        assert_eq!(
+            images,
+            [(&b"first"[..], "image/png"), (&b"last"[..], "image/jpeg")]
+        );
+        assert_eq!(sent.aspect_ratio, AspectRatio::Portrait);
+        assert_eq!(sent.duration_secs, Some(10));
+    }
+
+    #[tokio::test]
+    async fn a_lone_image_is_still_animated_and_a_malformed_list_refused() {
+        use base64::Engine;
+        let photo = base64::engine::general_purpose::STANDARD.encode(b"photo");
+        let provider = Arc::new(Recording::default());
+        tool(Arc::clone(&provider))
+            .execute(json!({ "prompt": "wave", "image": { "data_base64": photo } }))
+            .await
+            .unwrap();
+        let sent = provider
+            .0
+            .lock()
+            .unwrap()
+            .take()
+            .expect("provider was called");
+        assert_eq!(sent.images.len(), 1);
+        assert_eq!(sent.images[0].data, b"photo");
+
+        let result = tool(Arc::clone(&provider))
+            .execute(json!({ "prompt": "wave", "images": { "data_base64": photo } }))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(provider.0.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_shape_the_model_does_not_render_fails_before_the_provider() {
+        let provider = Arc::new(Recording::default());
+        let result = tool(Arc::clone(&provider))
+            .execute(json!({ "prompt": "a cube", "aspect_ratio": "1:1" }))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(provider.0.lock().unwrap().is_none());
     }
 
     #[test]

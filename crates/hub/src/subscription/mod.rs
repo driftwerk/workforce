@@ -644,6 +644,67 @@ mod tests {
     }
 
     #[test]
+    fn a_media_block_its_tool_cannot_be_built_from_warns_naming_the_tool() {
+        use workforce_common::settings::{
+            LlmImageGenerationConfig, LlmSpeechConfig, LlmVideoGenerationConfig,
+        };
+        let broken = LlmConfig {
+            image: Some(LlmImageGenerationConfig {
+                model: "anthropic:standard".into(),
+                ..Default::default()
+            }),
+            video: Some(LlmVideoGenerationConfig {
+                model: "veo-3.1-generate-preview".into(),
+                ..Default::default()
+            }),
+            speech: Some(LlmSpeechConfig {
+                provider: "elevenlabs".into(),
+                voice: None,
+                ..Default::default()
+            }),
+            ..LlmConfig::default()
+        };
+        let found = review_agent_llm(&broken, &resolved(), &LOCAL);
+        let named: Vec<(&str, &str)> = found
+            .iter()
+            .map(|f| (f.spec.as_str(), f.message.split(':').next().unwrap()))
+            .collect();
+        assert_eq!(
+            named,
+            [
+                ("[llm.image]", "generate_image will not be installed"),
+                ("[llm.video]", "generate_video will not be installed"),
+                ("[llm.speech]", "generate_speech will not be installed"),
+            ]
+        );
+        assert!(found.iter().all(|f| f.severity == Severity::Warning));
+        assert!(
+            found[1].message.contains("gemini:standard"),
+            "{}",
+            found[1].message
+        );
+        validate_agent_llm(&broken, &resolved(), &LOCAL)
+            .expect("a media tool that won't build never stops the agent loading");
+
+        let sound = LlmConfig {
+            video: Some(LlmVideoGenerationConfig {
+                model: "veo:standard".into(),
+                ..Default::default()
+            }),
+            ..LlmConfig::default()
+        };
+        assert!(review_agent_llm(&sound, &resolved(), &LOCAL).is_empty());
+        let switched_off = LlmConfig {
+            video: Some(LlmVideoGenerationConfig {
+                enabled: false,
+                ..Default::default()
+            }),
+            ..LlmConfig::default()
+        };
+        assert!(review_agent_llm(&switched_off, &resolved(), &LOCAL).is_empty());
+    }
+
+    #[test]
     fn validate_refuses_exactly_the_refused_findings() {
         let llm = LlmConfig {
             failover: vec![

@@ -216,7 +216,7 @@ and the agent and global vaults come from the service the work runs in.
 | `vision/<provider>/api_key` (anthropic, openrouter, gemini) | either | the `[llm.vision]` describer, per description, for the person whose turn it is |
 | `transcription/<provider>/api_key` (openai, groq, gemini, openrouter) | either | the `[llm.transcription]` transcriber, per transcription |
 | `image/<provider>/api_key` (gemini, openrouter) | either | `generate_image`, per request |
-| `video/gemini/api_key` | either | `generate_video` (Veo), once per clip |
+| `video/gemini/api_key` | either | `generate_video` (Gemini Omni), once per clip |
 | `speech/<provider>/api_key` (fish_audio, elevenlabs, openai, soniox) | either | `generate_speech`, per clip |
 | `knowledge/summariser/api_key` | shared, global vault only | the knowledge summariser, per summary |
 

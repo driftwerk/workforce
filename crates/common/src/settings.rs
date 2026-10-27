@@ -5255,31 +5255,33 @@ fn default_image_count() -> u8 {
 /// Video-generation provider configuration (`[llm.video]`), sibling to
 /// `[llm.image]`. Opt-in per install — absent block ⇒ no `generate_video` tool.
 ///
-/// Today the only backend is Google Veo via the Gemini API (`predictLongRunning`
-/// submit → poll → download), so `model` resolves against `default_video_tiers.toml`
-/// (e.g. `veo:standard`). The credential resolves like image gen
-/// (the vault's `video/gemini/api_key` for the person asking → `api_key` →
-/// `VIDEO_API_KEY` → vault account → `GEMINI_API_KEY`).
+/// The backend is Gemini Omni via the Gemini API's Interactions endpoint
+/// (background create → poll → inline bytes), so `model` resolves against
+/// `default_video_tiers.toml` (e.g. `gemini:standard`). The credential resolves
+/// like image gen (the vault's `video/gemini/api_key` for the person asking →
+/// `api_key` → `VIDEO_API_KEY` → vault account → `GEMINI_API_KEY`).
 ///
 /// ```toml
 /// [llm.video]
-/// model = "veo:cheap"           # tier shorthand → veo-3.1-lite-generate-preview
-/// person_generation = "allow_adult"   # required to animate a real person's face
+/// model = "gemini:cheap"        # tier shorthand → gemini-omni-1.1-flash
+/// resolution = "720p"
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LlmVideoGenerationConfig {
     /// Enable video generation. Default true when the block is present.
     #[serde(default = "default_video_enabled")]
     pub enabled: bool,
-    /// Provider id ("veo", or "gemini", whose API serves it): the only video
-    /// provider, so a bare `model` is Veo's without it.
+    /// Provider id ("gemini" or "google", whose API serves it; "veo" is a
+    /// legacy spelling of the same): the only video provider, so a bare
+    /// `model` is Gemini's without it.
     #[serde(default)]
     pub provider: Option<String>,
-    /// Base URL override (unused for Veo; reserved for self-hosted backends).
+    /// Base URL override (unused for Gemini; reserved for self-hosted backends).
     #[serde(default)]
     pub url: Option<String>,
-    /// Model spec. Tier shorthand (`veo:standard`, `veo:cheap`) resolved against
-    /// the video tier registry (`default_video_tiers.toml`), or a Veo model id.
+    /// Model spec. Tier shorthand (`gemini:standard`, `gemini:cheap`) resolved
+    /// against the video tier registry (`default_video_tiers.toml`), or a
+    /// Gemini video model id.
     pub model: String,
     /// Optional API key, read when no vault level holds
     /// `video/gemini/api_key` for the person a clip is for. Falls back to
@@ -5290,14 +5292,14 @@ pub struct LlmVideoGenerationConfig {
     /// Aspect ratio for generated clips, e.g. `"16:9"` or `"9:16"`.
     #[serde(default = "default_video_aspect")]
     pub aspect_ratio: String,
-    /// Requested clip duration in seconds (model-clamped).
+    /// Requested clip duration in seconds (clamped to the model's 3–10s).
     #[serde(default)]
     pub duration_secs: Option<u32>,
-    /// People-generation safety knob. `"allow_adult"` is required to animate a
-    /// real person's face on Veo image-to-video; `"dont_allow"` blocks people.
-    #[serde(default = "default_person_generation")]
-    pub person_generation: String,
-    /// Region override for region-bound providers (reserved; Veo is global).
+    /// Output resolution: `"360p"`, `"720p"`, `"1080p"` or `"4k"`. Unset ⇒ the
+    /// model's default (720p). Cost scales with it.
+    #[serde(default)]
+    pub resolution: Option<String>,
+    /// Region override for region-bound providers (reserved; Gemini is global).
     #[serde(default)]
     pub region: Option<String>,
 }
@@ -5312,7 +5314,7 @@ impl Default for LlmVideoGenerationConfig {
             api_key: None,
             aspect_ratio: default_video_aspect(),
             duration_secs: None,
-            person_generation: default_person_generation(),
+            resolution: None,
             region: None,
         }
     }
@@ -5323,9 +5325,6 @@ fn default_video_enabled() -> bool {
 }
 fn default_video_aspect() -> String {
     "16:9".to_string()
-}
-fn default_person_generation() -> String {
-    "allow_adult".to_string()
 }
 
 /// Speech-synthesis (text-to-speech) provider configuration (`[llm.speech]`),
@@ -5576,7 +5575,7 @@ pub struct LlmConfig {
     #[serde(default)]
     pub image: Option<LlmImageGenerationConfig>,
     /// Video-generation provider (`[llm.video]`). When set, the `generate_video`
-    /// tool is registered (Google Veo). Absent ⇒ no video tool (opt-in).
+    /// tool is registered (Gemini Omni). Absent ⇒ no video tool (opt-in).
     #[serde(default)]
     pub video: Option<LlmVideoGenerationConfig>,
     /// Speech-synthesis provider (`[llm.speech]`). When set, the
