@@ -561,3 +561,52 @@ async fn discovery_issuer_overrides_mcp_endpoint() {
         "discovery against an endpoint with no .well-known must fail"
     );
 }
+
+const SECRETS: [&str; 5] = ["opsuser7", "hunter2", "k-northwind42", "s3cr3t", "fr4gment"];
+
+fn secret_endpoint(addr: impl std::fmt::Display) -> String {
+    format!("http://opsuser7:hunter2@{addr}/mcp/k-northwind42?sig=s3cr3t#fr4gment")
+}
+
+#[tokio::test]
+async fn discovery_failure_names_no_endpoint_secret() {
+    let server = MockServer::start().await;
+    let f = fixture();
+
+    let err = f
+        .manager
+        .install_dynamic(
+            "acme",
+            discover_config(secret_endpoint(server.address()), "acme"),
+            None,
+            Some(PUBLIC_URL),
+            None,
+            InstalledVia::Api,
+        )
+        .await
+        .unwrap_err();
+    let text = format!("{err:#}");
+    assert!(text.contains("OAuth discovery failed"), "{text}");
+    assert!(text.contains(&server.address().to_string()), "{text}");
+    for secret in SECRETS {
+        assert!(!text.contains(secret), "`{secret}` leaked: {text}");
+    }
+
+    let err = f
+        .manager
+        .install_dynamic(
+            "acme",
+            discover_config(secret_endpoint(server.address()), "acme"),
+            None,
+            Some(PUBLIC_URL),
+            Some("https://opsuser7:hunter2@[bad"),
+            InstalledVia::Api,
+        )
+        .await
+        .unwrap_err();
+    let text = format!("{err:#}");
+    assert!(text.contains("<unparseable url>"), "{text}");
+    for secret in SECRETS {
+        assert!(!text.contains(secret), "`{secret}` leaked: {text}");
+    }
+}

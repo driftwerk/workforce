@@ -36,6 +36,7 @@ hex = "0.4"
 tempfile = "3"
 parking_lot = { workspace = true }
 rand = { workspace = true }
+url = { workspace = true }
 
 # Optional Postgres backend (Phase 0 of the multi-store migration roadmap).
 # When the `postgres` feature is enabled, individual stores can opt into a

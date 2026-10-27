@@ -24,6 +24,7 @@ use std::collections::HashMap;
 
 use once_cell::sync::Lazy;
 use regex::Regex;
+use url::Url;
 
 use crate::secret::Secret;
 #[cfg(test)]
@@ -440,9 +441,112 @@ pub fn redact_value(value: &str) -> String {
     format!("{head}…{tail}")
 }
 
+const UNPARSEABLE_URL: &str = "<unparseable url>";
+
+/// `url` reduced to scheme, host and any non-default port. Userinfo, query
+/// and fragment can hold credentials, and so can the path of a capability
+/// URL, so none of them survive.
+pub fn redact_url(url: &Url) -> Url {
+    let mut redacted = url.clone();
+    let _ = redacted.set_username("");
+    let _ = redacted.set_password(None);
+    redacted.set_path("");
+    redacted.set_query(None);
+    redacted.set_fragment(None);
+    redacted
+}
+
+/// [`redact_url`] for a URL still in text form. Input that does not parse
+/// is never echoed, since nothing in it can be told apart from a secret.
+pub fn redact_url_str(raw: &str) -> String {
+    Url::parse(raw).map_or_else(
+        |_| UNPARSEABLE_URL.to_string(),
+        |url| redact_url(&url).to_string(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const URL_SECRETS: [&str; 5] = ["opsuser7", "hunter2", "k-northwind42", "s3cr3t", "fr4gment"];
+
+    const URL_CASES: &[(&str, &str)] = &[
+        (
+            "https://opsuser7:hunter2@mcp.acme.example/mcp",
+            "https://mcp.acme.example/",
+        ),
+        (
+            "https://opsuser7@mcp.acme.example/mcp",
+            "https://mcp.acme.example/",
+        ),
+        (
+            "https://:hunter2@mcp.acme.example/",
+            "https://mcp.acme.example/",
+        ),
+        (
+            "https://opsuser7:hun%40ter2@mcp.acme.example/",
+            "https://mcp.acme.example/",
+        ),
+        (
+            "https://mcp.acme.example/mcp?sig=s3cr3t&api_key=x",
+            "https://mcp.acme.example/",
+        ),
+        (
+            "https://mcp.acme.example/mcp#fr4gment",
+            "https://mcp.acme.example/",
+        ),
+        (
+            "https://gw.northwind.example/mcp/k-northwind42/sse",
+            "https://gw.northwind.example/",
+        ),
+        (
+            "http://opsuser7:hunter2@[::1]:8443/mcp?sig=s3cr3t",
+            "http://[::1]:8443/",
+        ),
+        (
+            "https://mcp.acme.example:8443/mcp",
+            "https://mcp.acme.example:8443/",
+        ),
+        (
+            "https://mcp.acme.example:443/mcp",
+            "https://mcp.acme.example/",
+        ),
+        (
+            "custom://opsuser7:hunter2@h.example:9/x?sig=s3cr3t",
+            "custom://h.example:9",
+        ),
+        ("mailto:hunter2@acme.example", "mailto:"),
+        ("https://opsuser7:hunter2@[bad", "<unparseable url>"),
+        ("hunter2", "<unparseable url>"),
+    ];
+
+    #[test]
+    fn a_redacted_url_keeps_only_scheme_host_and_port() {
+        for (input, expected) in URL_CASES {
+            assert_eq!(redact_url_str(input), *expected, "input: {input}");
+        }
+    }
+
+    #[test]
+    fn redacting_a_url_twice_changes_nothing() {
+        for url in URL_CASES
+            .iter()
+            .filter_map(|(input, _)| Url::parse(input).ok())
+        {
+            assert_eq!(redact_url(&redact_url(&url)), redact_url(&url), "{url}");
+        }
+    }
+
+    #[test]
+    fn no_url_secret_survives_redaction() {
+        for (input, _) in URL_CASES {
+            let redacted = redact_url_str(input);
+            for secret in URL_SECRETS {
+                assert!(!redacted.contains(secret), "{input} -> {redacted}");
+            }
+        }
+    }
 
     #[test]
     fn a_credential_field_is_named_by_its_last_word_not_by_a_count_or_a_flag() {

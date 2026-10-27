@@ -54,8 +54,8 @@ async fn protected_resource_issuer(http: &reqwest::Client, origin: &str) -> Opti
 
 /// Scheme + host (+ port) of a URL, discarding path/query.
 fn origin_of(raw: &str) -> Result<String, OAuthError> {
-    let url = url::Url::parse(raw)
-        .map_err(|e| OAuthError::InvalidInput(format!("invalid url `{raw}`: {e}")))?;
+    let url =
+        url::Url::parse(raw).map_err(|e| OAuthError::InvalidInput(format!("invalid url: {e}")))?;
     Ok(url.origin().ascii_serialization())
 }
 
@@ -63,7 +63,7 @@ fn origin_of(raw: &str) -> Result<String, OAuthError> {
 /// between the issuer's host and any issuer path component.
 fn well_known(issuer: &str, name: &str) -> Result<String, OAuthError> {
     let url = url::Url::parse(issuer)
-        .map_err(|e| OAuthError::InvalidInput(format!("invalid issuer `{issuer}`: {e}")))?;
+        .map_err(|e| OAuthError::InvalidInput(format!("invalid issuer: {e}")))?;
     let origin = url.origin().ascii_serialization();
     let path = url.path().trim_end_matches('/');
     Ok(format!("{origin}/.well-known/{name}{path}"))
@@ -73,16 +73,9 @@ async fn fetch_json<T: serde::de::DeserializeOwned>(
     http: &reqwest::Client,
     url: &str,
 ) -> Result<T, OAuthError> {
-    let resp = http
-        .get(url)
-        .send()
-        .await
-        .map_err(|e| OAuthError::Transport(e.to_string()))?;
+    let resp = http.get(url).send().await.map_err(OAuthError::from)?;
     let status = resp.status();
-    let body = resp
-        .text()
-        .await
-        .map_err(|e| OAuthError::Transport(e.to_string()))?;
+    let body = resp.text().await.map_err(OAuthError::from)?;
     if !status.is_success() {
         return Err(OAuthError::from_response(status.as_u16(), &body));
     }
@@ -184,6 +177,20 @@ mod tests {
         .await
         .unwrap_err();
         assert!(matches!(err, OAuthError::Provider { status: 404, .. }));
+    }
+
+    #[tokio::test]
+    async fn an_unparseable_url_is_never_echoed() {
+        let err = discover(&reqwest::Client::new(), "https://opsuser7:hunter2@[bad")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, OAuthError::InvalidInput(_)), "{err:?}");
+        for text in [format!("{err}"), format!("{err:?}")] {
+            assert!(
+                !text.contains("opsuser7") && !text.contains("hunter2"),
+                "{text}"
+            );
+        }
     }
 
     #[test]
