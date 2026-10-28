@@ -293,8 +293,26 @@ pub fn setup_logging() -> Result<()> {
         .with(BufferLayer { buffer })
         .with(fmt_layer());
 
+    // The sentry capture layers, split the way sentry-tracing's legacy
+    // combined layer behaved: INFO+ spans become transactions (sent only if
+    // a traces sample rate is set), ERROR events become Sentry events, and
+    // WARN/INFO events become breadcrumbs on the next one.
     #[cfg(feature = "sentry")]
-    let registry = registry.with(sentry_tracing::layer());
+    let registry = {
+        use tracing_subscriber::filter::{filter_fn, LevelFilter};
+        use tracing_subscriber::Layer as _;
+        registry
+            .with(sentry_tracing::SpanLayer::new().with_filter(LevelFilter::INFO))
+            .with(
+                sentry_tracing::BreadcrumbLayer::new().with_filter(filter_fn(|metadata| {
+                    matches!(
+                        *metadata.level(),
+                        tracing::Level::WARN | tracing::Level::INFO
+                    )
+                })),
+            )
+            .with(sentry_tracing::ErrorLayer::new().with_filter(LevelFilter::ERROR))
+    };
 
     // OTLP layers are `Option<L>`: the blanket `impl Layer<S> for Option<L>`
     // no-ops when None, which keeps the registry's compile-time type stable
@@ -352,17 +370,14 @@ fn init_sentry() {
         Ok(v) if !v.is_empty() => v,
         _ => return,
     };
-    let guard = sentry::init((
-        dsn,
-        sentry::ClientOptions {
-            release: sentry::release_name!(),
-            environment: std::env::var("WORKFORCE_DEPLOYMENT_ENV")
-                .ok()
-                .filter(|v| !v.is_empty())
-                .map(Into::into),
-            ..Default::default()
-        },
-    ));
+    let mut options = sentry::ClientOptions::new().maybe_release(sentry::release_name!());
+    if let Some(env) = std::env::var("WORKFORCE_DEPLOYMENT_ENV")
+        .ok()
+        .filter(|v| !v.is_empty())
+    {
+        options = options.environment(env);
+    }
+    let guard = sentry::init((dsn, options));
     let _ = SENTRY_GUARD.set(guard);
 }
 
