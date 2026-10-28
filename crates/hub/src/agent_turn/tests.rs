@@ -1494,6 +1494,41 @@ async fn the_configured_effort_reaches_the_cli_and_a_pinned_one_beats_it() {
     );
 }
 
+/// The `reasoning.effort` of each request the ChatGPT backend received.
+async fn chatgpt_efforts(hub: &Hub) -> Vec<serde_json::Value> {
+    hub.server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.url.path() == "/responses")
+        .map(|r| {
+            serde_json::from_slice::<serde_json::Value>(&r.body).unwrap()["reasoning"]["effort"]
+                .clone()
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn the_configured_effort_reaches_the_chatgpt_request_on_every_turn_path() {
+    let hub = hub(|_| {}).await;
+    hub.chatgpt_login(ALICE).await;
+
+    set_effort(&hub, Some("high"));
+    hub.ask(ALICE, "one").await.unwrap();
+    set_effort(&hub, Some("xhigh"));
+    let (_, streamed) = hub.stream(ALICE, "two", None, None).await;
+    streamed.unwrap();
+    set_effort(&hub, None);
+    hub.ask(ALICE, "three").await.unwrap();
+
+    assert_eq!(
+        chatgpt_efforts(&hub).await,
+        [json!("high"), json!("xhigh"), serde_json::Value::Null],
+        "the live effort reaches the backend, streamed or not, and none leaves its default"
+    );
+}
+
 #[tokio::test]
 async fn advisor_model_backend_on_claude_code_primary_runs_on_the_cli() {
     let hub = hub(claude_first).await;
