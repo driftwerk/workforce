@@ -437,6 +437,9 @@ pub async fn mount(
                 Arc::new(move || crate::gateway::login_vaults(&state))
             },
         }),
+        Arc::new(crate::desk_conversations::HubConversations(Arc::clone(
+            state,
+        ))),
     )))
 }
 

@@ -6,6 +6,7 @@ mod adopt;
 pub mod api;
 mod claude;
 mod codex;
+pub mod conversations;
 pub mod local;
 pub mod model;
 pub mod providers;
@@ -21,6 +22,7 @@ mod transcript;
 mod worktree;
 
 pub use api::{router, Authorize};
+pub use conversations::{Author, ConversationError, Conversations, Page, Said};
 pub use providers::{AccountError, Accounts, Fields, Spec, Standing};
 pub use realtime::{KeySource, Provider, Realtime};
 pub use service::{Desk, DeskError, Options, RestorePolicy};

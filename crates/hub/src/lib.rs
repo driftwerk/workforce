@@ -87,6 +87,8 @@ pub use hub_core::formatting;
 pub mod freeagent_oauth_callback;
 pub use hub_core::fs_watcher;
 #[cfg(feature = "postgres")]
+pub mod desk_conversations;
+#[cfg(feature = "postgres")]
 pub mod desk_driver;
 #[cfg(feature = "postgres")]
 pub mod desk_tools;

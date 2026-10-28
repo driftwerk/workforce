@@ -16,6 +16,10 @@ mod authz_routes;
 #[path = "api/caller_identity_routes.rs"]
 mod caller_identity_routes;
 
+#[cfg(feature = "postgres")]
+#[path = "api/desk_conversation_routes.rs"]
+mod desk_conversation_routes;
+
 #[path = "api/eval_routes.rs"]
 mod eval_routes;
 
