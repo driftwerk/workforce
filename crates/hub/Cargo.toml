@@ -40,7 +40,7 @@ workforce-knowledge-service = { path = "../knowledge-service" }
 workforce-wasm-runtime = { path = "../wasm-runtime" }
 workforce-postgres = { workspace = true }
 
-async-nats = "0.38"
+async-nats = { workspace = true }
 async-trait = "0.1"
 futures = "0.3"
 axum = { version = "0.8", features = ["ws", "multipart"] }

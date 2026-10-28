@@ -12,7 +12,7 @@ path = "src/lib.rs"
 [dependencies]
 aes-gcm = { workspace = true }
 argon2 = { workspace = true }
-async-nats = "0.38"
+async-nats = { workspace = true }
 async-trait = "0.1"
 base64 = { workspace = true }
 chrono = { version = "0.4", features = ["serde"] }

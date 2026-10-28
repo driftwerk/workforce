@@ -81,7 +81,7 @@ thiserror = "2.0.11"
 config = "0.15.7"
 
 # NATS messaging
-async-nats = "0.38.0"
+async-nats = "0.51"
 bytes = "1.10.0"
 
 # Database
