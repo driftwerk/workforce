@@ -163,7 +163,7 @@ aws-sdk-cloudwatch = { version = "1", default-features = false, features = [
 
 # OIDC / SSO login (behind the `oidc` feature). Handles PKCE, JWKS,
 # id_token validation, and discovery for any compliant OpenID Connect IdP.
-openidconnect = { version = "3", optional = true }
+openidconnect = { version = "4", optional = true }
 url = { workspace = true }
 
 [features]

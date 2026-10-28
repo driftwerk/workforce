@@ -25,10 +25,10 @@ use std::time::{Duration, Instant};
 
 use eyre::{eyre, Context, Result};
 use openidconnect::core::{CoreAuthenticationFlow, CoreClient, CoreProviderMetadata};
-use openidconnect::reqwest::async_http_client;
 use openidconnect::{
-    AuthorizationCode, ClientId, ClientSecret, CsrfToken, IssuerUrl, Nonce, PkceCodeChallenge,
-    PkceCodeVerifier, RedirectUrl, Scope, TokenResponse,
+    AuthorizationCode, ClientId, ClientSecret, CsrfToken, EndpointMaybeSet, EndpointNotSet,
+    EndpointSet, IssuerUrl, Nonce, PkceCodeChallenge, PkceCodeVerifier, RedirectUrl, Scope,
+    TokenResponse,
 };
 use tokio::sync::RwLock;
 use tracing::{info, warn};
@@ -90,11 +90,34 @@ impl IdentityResolution {
     }
 }
 
+/// The client `CoreClient::from_provider_metadata` builds: the authorization
+/// endpoint is always known, the token and userinfo endpoints only when the
+/// discovery document publishes them.
+type DiscoveredClient = CoreClient<
+    EndpointSet,
+    EndpointNotSet,
+    EndpointNotSet,
+    EndpointNotSet,
+    EndpointMaybeSet,
+    EndpointMaybeSet,
+>;
+
+/// The HTTP client for discovery, JWKS and the token exchange. Redirects
+/// are not followed, so an IdP response cannot bounce a request (and the
+/// client secret or code with it) somewhere else (SSRF).
+fn idp_http_client() -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .context("building the OIDC HTTP client")
+}
+
 /// Runtime OIDC provider — constructed once at startup via `discover`
 /// and shared through `GatewayState`.
 pub struct OidcProvider {
     config: OidcConfig,
-    client: CoreClient,
+    client: DiscoveredClient,
+    http: reqwest::Client,
     /// The IdP's end_session_endpoint, if published in the discovery doc.
     /// openidconnect::core does not expose this field directly, so we
     /// fetch the discovery document ourselves alongside the main discover
@@ -111,7 +134,8 @@ impl OidcProvider {
         let issuer = IssuerUrl::new(config.issuer_url.clone())
             .with_context(|| format!("invalid OIDC issuer_url: {}", config.issuer_url))?;
 
-        let provider_metadata = CoreProviderMetadata::discover_async(issuer, async_http_client)
+        let http = idp_http_client()?;
+        let provider_metadata = CoreProviderMetadata::discover_async(issuer, &http)
             .await
             .with_context(|| format!("OIDC discovery failed for {}", config.issuer_url))?;
 
@@ -130,6 +154,7 @@ impl OidcProvider {
         let provider = Arc::new(Self {
             config,
             client,
+            http,
             end_session_endpoint,
             state_store: Arc::new(RwLock::new(HashMap::new())),
         });
@@ -233,8 +258,9 @@ impl OidcProvider {
         let token_response = self
             .client
             .exchange_code(AuthorizationCode::new(code.to_string()))
+            .context("IdP publishes no token endpoint")?
             .set_pkce_verifier(entry.pkce_verifier)
-            .request_async(async_http_client)
+            .request_async(&self.http)
             .await
             .context("OIDC token exchange failed")?;
 
