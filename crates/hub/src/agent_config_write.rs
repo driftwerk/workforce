@@ -56,7 +56,93 @@ pub struct Saved {
 /// `ref_id` (the agent's id), provided `expects` accepts the
 /// file it replaces (`None`: there is none), both before the revision is
 /// recorded and again under the lock every writer holds as it lands.
+///
+/// A body that makes the agent the crew's overseer switches the overseer
+/// before it off, in its own config.toml: one agent oversees at a time.
 pub async fn save(
+    service: &AgentService,
+    ref_id: &str,
+    store: Option<&WorkflowStore>,
+    body: &str,
+    edit: EditContext<'_>,
+    expects: impl Fn(Option<&str>) -> bool,
+) -> Result<Saved, Refused> {
+    let saved = save_one(service, ref_id, store, body, edit, expects).await?;
+    if oversees(body) {
+        one_overseer(service, store).await;
+    }
+    Ok(saved)
+}
+
+/// Whether a config.toml body makes its agent the crew's overseer.
+pub(crate) fn oversees(body: &str) -> bool {
+    workforce_common::settings::AgentWorkspaceConfig::parse(body)
+        .ok()
+        .and_then(|c| c.oversight().ok())
+        .is_some_and(|o| o.enabled)
+}
+
+/// `body` with its `[oversight]` switched off and everything else as it was,
+/// the table itself kept (an absent one reads as never set, which Desk's hub
+/// would turn back on for its own agent). `None` when it doesn't parse.
+pub(crate) fn oversight_off(body: &str) -> Option<String> {
+    let mut doc: toml_edit::DocumentMut = body.parse().ok()?;
+    match doc.get_mut("oversight")? {
+        toml_edit::Item::Table(t) => {
+            t.insert("enabled", toml_edit::value(false));
+        }
+        toml_edit::Item::Value(toml_edit::Value::InlineTable(t)) => {
+            t.insert("enabled", false.into());
+        }
+        _ => return None,
+    }
+    Some(doc.to_string())
+}
+
+/// Switches every agent but `keep` that oversees the crew off, through the
+/// same write path (history, admission, hot reload).
+pub(crate) async fn one_overseer(keep: &AgentService, store: Option<&WorkflowStore>) {
+    let Some(registry) = keep.agent_registry.get().and_then(std::sync::Weak::upgrade) else {
+        return;
+    };
+    for other in registry.all_services() {
+        if other.agent_id == keep.agent_id {
+            continue;
+        }
+        let path = other
+            .workspace
+            .join(workforce_common::config_files::WORKSPACE_CONFIG);
+        let Ok(Some(current)) = workforce_common::config_files::read(&path) else {
+            continue;
+        };
+        if !oversees(&current) {
+            continue;
+        }
+        let Some(off) = oversight_off(&current) else {
+            continue;
+        };
+        let id = other.agent_id.as_str().to_string();
+        match save_one(
+            &other,
+            &id,
+            store,
+            &off,
+            EditContext::new("oversight", None),
+            |now| now == Some(current.as_str()),
+        )
+        .await
+        {
+            Ok(_) => tracing::info!(
+                agent_id = %id,
+                overseer = %keep.agent_id,
+                "Another agent oversees the crew now; this one no longer does"
+            ),
+            Err(e) => tracing::warn!(agent_id = %id, error = %e, "Could not switch oversight off"),
+        }
+    }
+}
+
+async fn save_one(
     service: &AgentService,
     ref_id: &str,
     store: Option<&WorkflowStore>,
@@ -150,4 +236,27 @@ pub async fn record_revision(
         .await
         .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn oversight_is_switched_off_in_place_in_either_form() {
+        let tables = "# mine\n[llm]\nprovider = \"chatgpt\"\n\n[oversight]\nenabled = true\nlevel = \"act\"\n\n[oversight.wake]\nquiet_minutes = 0\n";
+        let off = oversight_off(tables).unwrap();
+        assert!(off.starts_with("# mine\n[llm]\nprovider = \"chatgpt\"\n"));
+        assert!(!oversees(&off));
+        assert!(off.contains("level = \"act\""));
+        assert!(off.contains("[oversight.wake]\nquiet_minutes = 0"));
+
+        let inline = "oversight = { enabled = true, level = \"watch\" }\n";
+        assert!(oversees(inline));
+        let off = oversight_off(inline).unwrap();
+        assert!(!oversees(&off));
+        assert!(off.contains("level = \"watch\""));
+
+        assert_eq!(oversight_off("[llm]\n"), None);
+    }
 }

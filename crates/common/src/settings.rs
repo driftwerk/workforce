@@ -7278,9 +7278,20 @@ pub struct AgentWorkspaceConfig {
     /// them; all off by default, hot-reloaded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rich: Option<crate::rich::RichFeatures>,
+    /// Per-agent `[oversight]`: whether this agent oversees the crew and
+    /// how. Kept as written and read by [`crate::oversight::Oversight`],
+    /// which says what is wrong with it in plain words.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oversight: Option<toml::Value>,
 }
 
 impl AgentWorkspaceConfig {
+    /// This agent's `[oversight]`, its defaults (off) where it has none, or
+    /// what is wrong with it.
+    pub fn oversight(&self) -> Result<crate::oversight::Oversight, String> {
+        crate::oversight::Oversight::of(self.oversight.as_ref())
+    }
+
     /// This agent's own `[tools.programs]`, if its `config.toml` has one.
     pub fn programs(&self) -> Option<&AgentProgramsConfig> {
         self.tools.as_ref()?.programs.as_ref()

@@ -187,6 +187,8 @@ fn tables(service: &AgentService, resolved: &ResolvedConfig) -> Vec<Layered> {
         // Their own sections, read from the agent's file alone.
         evals: _,
         environments: _,
+        // Read and written by Desk from the agent's own file.
+        oversight: _,
     } = workspace.clone().unwrap_or_default();
     let ToolsConfig {
         validation,

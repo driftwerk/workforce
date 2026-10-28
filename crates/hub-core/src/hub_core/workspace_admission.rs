@@ -125,6 +125,7 @@ impl WorkspaceAdmission {
 
     /// The findings on `workspace`, or why the agent would not load it.
     fn review(&self, workspace: &AgentWorkspaceConfig) -> Result<Vec<Finding>, ConfigRefusal> {
+        workspace.oversight().map_err(ConfigRefusal::Parse)?;
         let prospective = self
             .prospective(Some(workspace))
             .map_err(|e| ConfigRefusal::Parse(e.to_string()))?;
@@ -164,6 +165,30 @@ pub fn admit_workspace(service: &AgentService, body: &str) -> Result<Vec<Finding
 mod tests {
     use super::*;
     use crate::hub_core::subscriptions::Severity;
+
+    #[test]
+    fn oversight_is_admitted_in_either_form_and_refused_in_plain_words() {
+        let admission = WorkspaceAdmission::new(
+            Arc::new(WorkforceConfig::default()),
+            "desk",
+            Arc::new(parking_lot::RwLock::new("anthropic".to_string())),
+        );
+        admission
+            .review_toml(
+                "[oversight]\nenabled = true\nlevel = \"watch\"\nwake = { quiet_minutes = 0 }\n",
+            )
+            .unwrap();
+        admission
+            .review_toml("[oversight]\nenabled = true\n[oversight.wake]\nwaiting_minutes = 0\n")
+            .unwrap();
+        let refused = admission
+            .review_toml("[oversight]\nlevel = \"boss\"\n")
+            .unwrap_err();
+        assert_eq!(
+            refused.to_string(),
+            "How much the overseer does on its own must be watch, suggest or act."
+        );
+    }
 
     #[test]
     fn source_agent_on_an_agent_that_is_no_copy_is_a_warning() {
