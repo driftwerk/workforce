@@ -108,19 +108,65 @@ async fn config_put_refusing_unloadable_toml_leaves_file_and_revisions() {
 
         let (status, body) = fx.put(&[], UNLOADABLE).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-        assert!(
-            body["error"].as_str().unwrap().contains("remote worker"),
-            "{body}"
+        assert_eq!(
+            body["error"],
+            "That change couldn’t be saved: the agent can’t run with those settings.",
+            "plain words for a person; the details are in findings"
         );
         assert_eq!(body["findings"][0]["severity"], "refused");
         assert_eq!(body["findings"][0]["spec"], "codex:gpt-5.5");
+        assert!(
+            body["findings"][0]["message"]
+                .as_str()
+                .unwrap()
+                .contains("remote worker"),
+            "{body}"
+        );
         assert_eq!(fx.on_disk(), KEPT, "the file is untouched");
         assert_eq!(fx.revisions().await, revisions, "and so is its history");
 
         let (status, body) = fx.put(&[], "[llm\n").await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-        assert!(body.get("findings").is_none(), "{body}");
+        assert_eq!(
+            body["error"],
+            "That change couldn’t be saved: the agent can’t read those settings."
+        );
+        assert_eq!(body["findings"][0]["severity"], "refused");
         assert_eq!(fx.on_disk(), KEPT);
+
+        let (status, body) = fx.put(&[], "[oversight]\nlevel = \"boss\"\n").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(
+            body["error"],
+            "That change couldn’t be saved. How much the overseer does on its own must be \
+             watch, suggest or act."
+        );
+        assert_eq!(fx.on_disk(), KEPT);
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn config_put_refuses_a_stranger_and_a_missing_agent_in_plain_words() {
+    with_fixture(|fx| async move {
+        let request = Request::builder()
+            .method("PUT")
+            .uri("/api/agents/scout/config")
+            .body(Body::from(KEPT))
+            .unwrap();
+        let (status, _, text) = send(router(Arc::clone(&fx.gateway.state)), request).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{text}");
+        let body: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            body["error"],
+            "You aren’t allowed to change this agent’s settings."
+        );
+
+        let (status, _, text) = fx.call("PUT", "/api/agents/atlas/config", &[], KEPT).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{text}");
+        let body: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(body["error"], "There’s no agent called atlas.");
+        assert_eq!(fx.on_disk(), "", "nothing was written");
     })
     .await;
 }
@@ -201,6 +247,13 @@ async fn config_put_with_stale_if_match_is_409() {
         let (status, body) = fx.put(&[("if-match", &read)], KEPT).await;
         assert_eq!(status, StatusCode::CONFLICT, "{body}");
         assert!(body["current_hash"].is_string(), "{body}");
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap()
+                .starts_with("These settings were changed somewhere else"),
+            "{body}"
+        );
         assert_eq!(fx.on_disk(), WARNED, "the newer save survives");
 
         let current = body["current_hash"].as_str().unwrap().to_string();

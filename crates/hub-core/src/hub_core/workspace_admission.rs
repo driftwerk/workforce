@@ -28,6 +28,9 @@ pub struct Prospective {
 pub enum ConfigRefusal {
     /// The body does not parse, or names a provider that does not exist.
     Parse(String),
+    /// A setting holds what it can't, said in plain words for the person
+    /// who set it (`[oversight]`).
+    Said(String),
     /// The agent would not load it: every finding, the refused ones first.
     Refused(Vec<Finding>),
 }
@@ -35,7 +38,7 @@ pub enum ConfigRefusal {
 impl fmt::Display for ConfigRefusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Parse(reason) => f.write_str(reason),
+            Self::Parse(reason) | Self::Said(reason) => f.write_str(reason),
             Self::Refused(findings) => findings
                 .iter()
                 .find(|finding| finding.is_refused())
@@ -125,7 +128,7 @@ impl WorkspaceAdmission {
 
     /// The findings on `workspace`, or why the agent would not load it.
     fn review(&self, workspace: &AgentWorkspaceConfig) -> Result<Vec<Finding>, ConfigRefusal> {
-        workspace.oversight().map_err(ConfigRefusal::Parse)?;
+        workspace.oversight().map_err(ConfigRefusal::Said)?;
         let prospective = self
             .prospective(Some(workspace))
             .map_err(|e| ConfigRefusal::Parse(e.to_string()))?;
@@ -185,9 +188,15 @@ mod tests {
             .review_toml("[oversight]\nlevel = \"boss\"\n")
             .unwrap_err();
         assert_eq!(
-            refused.to_string(),
-            "How much the overseer does on its own must be watch, suggest or act."
+            refused,
+            ConfigRefusal::Said(
+                "How much the overseer does on its own must be watch, suggest or act.".into()
+            )
         );
+        assert!(matches!(
+            admission.review_toml("[oversight\n"),
+            Err(ConfigRefusal::Parse(_))
+        ));
     }
 
     #[test]

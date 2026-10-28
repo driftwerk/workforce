@@ -10436,7 +10436,12 @@ pub(crate) fn if_match_holds(headers: &axum::http::HeaderMap, current: Option<&s
     })
 }
 
-/// A config.toml write that did not land, as the response that says why.
+/// What a person reads when a settings change failed on the hub's side.
+const SAVE_FAILED: &str = "Saving the change failed; try again.";
+
+/// A config.toml write that did not land, as the response that says why: in
+/// plain words for whoever made the change (Desk shows `error` as it is),
+/// the details in the log and `findings`.
 pub(crate) fn config_write_refused(
     id: &str,
     refused: crate::agent_config_write::Refused,
@@ -10446,26 +10451,57 @@ pub(crate) fn config_write_refused(
         Refused::Stale { current_hash } => (
             StatusCode::CONFLICT,
             Json(serde_json::json!({
-                "error": "config.toml changed since it was read; reload it and reapply the edit",
+                "error": "These settings were changed somewhere else while you were editing \
+                          them. Reload them and make your change again.",
                 "current_hash": format!("\"{current_hash}\""),
             })),
         ),
-        Refused::Unloadable(refusal) => config_refused(refusal),
+        Refused::Unloadable(refusal) => config_write_unloadable(id, refusal),
         Refused::Revision(e) => {
             warn!(agent_id = %id, error = %e, "Config revision capture failed — refusing write");
             (
                 StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({"error": format!("revision capture failed: {e}")})),
+                Json(serde_json::json!({"error": SAVE_FAILED})),
             )
         }
         Refused::Io(e) => {
             warn!(agent_id = %id, error = %e, "Failed to write agent config.toml");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "failed to write config.toml"})),
+                Json(serde_json::json!({"error": SAVE_FAILED})),
             )
         }
     }
+}
+
+/// A config.toml write the agent would not load, as a 400 in plain words:
+/// a setting's own plain refusal as it is, anything else generically, with
+/// what was wrong in `findings` (a body that doesn't read as one finding).
+fn config_write_unloadable(
+    id: &str,
+    refusal: crate::workspace_admission::ConfigRefusal,
+) -> (StatusCode, Json<serde_json::Value>) {
+    use crate::workspace_admission::ConfigRefusal;
+    info!(agent_id = %id, refusal = %refusal, "Agent config.toml write refused");
+    let (error, findings) = match refusal {
+        ConfigRefusal::Said(said) => (format!("That change couldn’t be saved. {said}"), None),
+        ConfigRefusal::Refused(findings) => (
+            "That change couldn’t be saved: the agent can’t run with those settings.".to_string(),
+            Some(findings),
+        ),
+        ConfigRefusal::Parse(detail) => (
+            "That change couldn’t be saved: the agent can’t read those settings.".to_string(),
+            Some(vec![crate::subscription::Finding::refused(
+                workforce_common::config_files::WORKSPACE_CONFIG,
+                detail,
+            )]),
+        ),
+    };
+    let mut body = serde_json::json!({ "error": error });
+    if let Some(findings) = findings {
+        body["findings"] = serde_json::json!(findings);
+    }
+    (StatusCode::BAD_REQUEST, Json(body))
 }
 
 /// A config the agent would not load, as a 400.
@@ -10537,7 +10573,7 @@ async fn agent_config_check(
         Ok(findings) | Err(ConfigRefusal::Refused(findings)) => {
             Ok(Json(serde_json::json!({ "findings": findings })))
         }
-        Err(parse @ ConfigRefusal::Parse(_)) => Err(config_refused(parse)),
+        Err(other) => Err(config_refused(other)),
     }
 }
 
@@ -10554,11 +10590,18 @@ async fn agent_config_put(
     if !check_owner_auth(&state, &headers, query.token.as_deref()) {
         return Err((
             StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({"error": "unauthorized — owner token required"})),
+            Json(serde_json::json!({
+                "error": "You aren’t allowed to change this agent’s settings.",
+            })),
         ));
     }
     let caller = resolve_caller_context(&state, &headers, query.token.as_deref()).await;
-    let service = resolve_agent(&state, &id)?;
+    let service = state.registry.get(&id).ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": format!("There’s no agent called {id}.")})),
+        )
+    })?;
     let edit = workforce_orchestrator::workflow_store::EditContext::new(
         "web",
         caller.identity_id.as_deref(),
@@ -13396,6 +13439,71 @@ mod vault_admin_tests {
             caller_actor(&CallerContext::default()),
             VaultActor::RestOwner
         ));
+    }
+
+    #[test]
+    fn a_refused_config_write_is_said_in_plain_words_with_the_details_in_findings() {
+        use crate::agent_config_write::Refused;
+        use crate::workspace_admission::ConfigRefusal;
+        let said = |refused| {
+            let (status, Json(body)) = config_write_refused("scout", refused);
+            (status, body)
+        };
+        let jargon = ["config", "toml", "revision", "[", "_", "refused"];
+        let plain = |body: &serde_json::Value| {
+            let error = body["error"].as_str().unwrap().to_string();
+            assert!(
+                !jargon.iter().any(|j| error.to_lowercase().contains(j)),
+                "{error}"
+            );
+            error
+        };
+
+        let (status, body) = said(Refused::Stale {
+            current_hash: "abc".into(),
+        });
+        assert_eq!(status, StatusCode::CONFLICT);
+        plain(&body);
+        assert_eq!(body["current_hash"], "\"abc\"");
+
+        let (status, body) = said(Refused::Revision("pool timed out".into()));
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(plain(&body), "Saving the change failed; try again.");
+        let (status, body) = said(Refused::Io("disk full".into()));
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(plain(&body), "Saving the change failed; try again.");
+
+        let (status, body) = said(Refused::Unloadable(ConfigRefusal::Said(
+            "How much the overseer does on its own must be watch, suggest or act.".into(),
+        )));
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            plain(&body),
+            "That change couldn’t be saved. How much the overseer does on its own must be \
+             watch, suggest or act."
+        );
+        assert!(body.get("findings").is_none(), "{body}");
+
+        let finding = crate::subscription::Finding::refused(
+            "codex:gpt-6.1-sol",
+            "\"codex:gpt-6.1-sol\" routes to codex: set [coding_session.executor]".into(),
+        );
+        let (status, body) = said(Refused::Unloadable(ConfigRefusal::Refused(vec![
+            finding.clone()
+        ])));
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(plain(&body).starts_with("That change couldn’t be saved: "));
+        assert_eq!(body["findings"], serde_json::json!([finding]));
+
+        let (status, body) = said(Refused::Unloadable(ConfigRefusal::Parse(
+            "invalid config.toml: TOML parse error at line 1".into(),
+        )));
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(plain(&body).starts_with("That change couldn’t be saved: "));
+        assert!(body["findings"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("line 1"));
     }
 
     #[test]
