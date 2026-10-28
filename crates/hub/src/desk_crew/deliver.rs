@@ -29,7 +29,12 @@ impl CrewHub {
         listed: Option<Vec<MentionedApproval>>,
     ) -> Result<(String, String)> {
         let agent_id = service.agent_id.as_str();
-        let session = crate::gateway::anchor_session(service, DESK_CHANNEL, owner, agent_id)?;
+        // The session a DM already open is on: not rolled over here, or an
+        // open socket (which only re-points on its own messages) would miss
+        // the answer. The person's next connect rolls a stale one.
+        let session = service
+            .sessions
+            .get_or_create(DESK_CHANNEL, owner, agent_id)?;
         let sid = session.id.clone();
         if hop > 0 {
             self.hops.lock().insert(sid.clone(), hop);
@@ -77,6 +82,12 @@ impl CrewHub {
             )
             .await?;
         let session_id = progress.session_id.clone();
+        let tx = if session_id == sid {
+            tx
+        } else {
+            self.rolled(&sid, &session_id);
+            both(tx, sid.clone())
+        };
         let forward = {
             let (tx, sid) = (tx.clone(), session_id.clone());
             let mentions = crate::gateway::mentions_for(service, &sid);
@@ -100,5 +111,46 @@ impl CrewHub {
         }
         drop(live);
         Ok((session_id, answer?))
+    }
+}
+
+/// A sender that delivers each message as tagged and again tagged `old`: a
+/// DM left open on a session the turn rolled over from still hears it.
+fn both(
+    tx: tokio::sync::broadcast::Sender<BroadcastMessage>,
+    old: String,
+) -> tokio::sync::broadcast::Sender<BroadcastMessage> {
+    use tokio::sync::broadcast::error::RecvError;
+    let (relay, mut rx) = tokio::sync::broadcast::channel::<BroadcastMessage>(1024);
+    tokio::spawn(async move {
+        loop {
+            match rx.recv().await {
+                Ok(message) => {
+                    let mut copy = message.clone();
+                    copy.session_id = old.clone();
+                    let _ = tx.send(message);
+                    let _ = tx.send(copy);
+                }
+                Err(RecvError::Lagged(_)) => continue,
+                Err(RecvError::Closed) => return,
+            }
+        }
+    });
+    relay
+}
+
+impl CrewHub {
+    /// The overseer's turn in `old` runs in its successor `new`: what is
+    /// kept about the turn follows it.
+    fn rolled(&self, old: &str, new: &str) {
+        let mut turns = self.manager_turns.lock();
+        if let Some(at) = turns.get(old).copied() {
+            turns.insert(new.to_string(), at);
+        }
+        drop(turns);
+        let mut listed = self.listed.lock();
+        if let Some(l) = listed.get(old).cloned() {
+            listed.insert(new.to_string(), l);
+        }
     }
 }

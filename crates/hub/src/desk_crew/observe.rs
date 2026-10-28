@@ -47,9 +47,15 @@ impl CrewHub {
         &self,
         service: &AgentService,
         channel: &str,
+        user: &str,
         message: &str,
         session_id: Option<&str>,
     ) -> Option<Track> {
+        // Housekeeping: heartbeat checks and monitors report to their own
+        // channels; they are not the crew's work.
+        if !workforce_common::subscription::personalizes_prompt(user) {
+            return None;
+        }
         let agent_id = service.agent_id.as_str().to_string();
         let overseer = self
             .overseer_service()
@@ -295,8 +301,8 @@ impl<T: TurnHost> TurnHost for Observed<T> {
         trust_level: Option<workforce_common::trust::TrustLevel>,
         run_as: Option<&str>,
     ) -> Result<String> {
-        let track =
-            super::for_service(service).and_then(|c| c.track(service, channel, message, None));
+        let track = super::for_service(service)
+            .and_then(|c| c.track(service, channel, user, message, None));
         let result = self
             .0
             .process_message(
@@ -353,7 +359,7 @@ impl<T: TurnHost> TurnHost for Observed<T> {
         voice_channel: Option<&str>,
     ) -> Result<MessageProgress> {
         let track = super::for_service(service)
-            .and_then(|c| c.track(service, channel, message, session_id));
+            .and_then(|c| c.track(service, channel, user, message, session_id));
         let progress = self
             .0
             .process_message_with_progress(
@@ -412,8 +418,8 @@ impl<T: TurnHost> TurnHost for Observed<T> {
         run_as: Option<&str>,
         author: RunAuthor,
     ) -> Result<TurnOutcome> {
-        let track =
-            super::for_service(service).and_then(|c| c.track(service, channel, message, None));
+        let track = super::for_service(service)
+            .and_then(|c| c.track(service, channel, user, message, None));
         let result = self
             .0
             .process_turn(

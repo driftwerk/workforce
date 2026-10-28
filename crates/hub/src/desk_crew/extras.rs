@@ -70,7 +70,15 @@ impl CrewHub {
         let Some(service) = self.state.registry.get(agent_id) else {
             return;
         };
-        let message = service.sessions.get(sid).ok().flatten().and_then(|s| {
+        // A turn that rolled the DM over answered in its successor.
+        let session = service.sessions.get(sid).ok().flatten().and_then(|s| {
+            if s.is_sealed() {
+                service.sessions.find(&s.channel, &s.owner).ok().flatten()
+            } else {
+                Some(s)
+            }
+        });
+        let message = session.and_then(|s| {
             s.messages
                 .iter()
                 .rev()

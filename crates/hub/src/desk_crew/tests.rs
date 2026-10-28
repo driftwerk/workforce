@@ -797,3 +797,44 @@ async fn the_overseer_messages_the_crew_within_the_loop_guard() {
     })
     .await;
 }
+
+/// A DM left a few days is still the one an open Desk is on: the overseer's
+/// unprompted answer goes out on it rather than on a successor it can't see.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unprompted_answer_reaches_a_dm_left_open_for_days() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, crew, _d, _llm) = overseeing(
+            dir.path(),
+            pool,
+            "Morning: nothing needs you.",
+            "[oversight]\nenabled = true\n",
+            &[],
+        )
+        .await;
+        let mut dm = overseer
+            .sessions
+            .find(DESK_CHANNEL, PERSON)
+            .unwrap()
+            .unwrap();
+        dm.add_user_message("anything new?", None);
+        dm.add_assistant_message("All quiet.", 3);
+        let old = chrono::Utc::now() - chrono::Duration::days(3);
+        for m in &mut dm.messages {
+            m.timestamp = old;
+        }
+        dm.updated_at = old;
+        overseer.sessions.save(&dm).unwrap();
+        let mut frames = crew.state.broadcast_tx.subscribe();
+        super::run_summary(&overseer, false).await.unwrap();
+        let mut ended = false;
+        while let Ok(frame) = frames.try_recv() {
+            ended |= frame.session_id == dm.id && frame.msg_type == "stream_end";
+        }
+        assert!(
+            ended,
+            "the answer went out on the session the open DM is on"
+        );
+    })
+    .await;
+}
