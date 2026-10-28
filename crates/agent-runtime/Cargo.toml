@@ -101,7 +101,7 @@ csv = { workspace = true }
 # the same pipeline): docx is a zip of XML, spreadsheets and PDFs need readers.
 quick-xml = { workspace = true }
 calamine = { workspace = true }
-pdf-extract = "0.10"
+pdf-extract = "0.12"
 
 [dev-dependencies]
 tokio = { workspace = true }

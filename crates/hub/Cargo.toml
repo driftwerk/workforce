@@ -94,7 +94,7 @@ flate2 = "1"
 zip = { workspace = true }
 quick-xml = { workspace = true }
 pulldown-cmark = { workspace = true }
-pdf-extract = "0.10"
+pdf-extract = "0.12"
 parking_lot = { workspace = true }
 semver = { workspace = true }
 tempfile = "3"
