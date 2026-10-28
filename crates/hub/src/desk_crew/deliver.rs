@@ -9,17 +9,26 @@ use std::sync::Arc;
 use eyre::{bail, Result};
 use workforce_agent::tools::approval::SelfServe;
 use workforce_common::channels::DESK_CHANNEL;
+use workforce_common::session::MessageRole;
 use workforce_desk::crew::MentionedApproval;
+use workforce_desk::Speaker;
 
 use super::CrewHub;
 use crate::broadcast::BroadcastMessage;
 use crate::live_turns::Ending;
 use crate::serve::AgentService;
 
+/// The frame a message of the DM the person didn't type goes out live as:
+/// `{"type": "user_message", "content", "session_id", "id", "author"}`, its
+/// `content` and `id` as the DM's history gives them.
+pub const USER_MESSAGE: &str = "user_message";
+
 impl CrewHub {
     /// Runs `prompt` as a turn in `service`'s Desk DM with `owner`, at `hop`
-    /// hand-offs; `listed` are the requests a wake-up names. The session it
-    /// ran in and the answer.
+    /// hand-offs; `listed` are the requests a wake-up names. A prompt with
+    /// an `author` (a nudge or task sent on) is a message of the DM: kept as
+    /// theirs and sent live as a `user_message`. The session it ran in and
+    /// the answer.
     pub(crate) async fn run_dm_turn(
         &self,
         service: &Arc<AgentService>,
@@ -27,6 +36,7 @@ impl CrewHub {
         prompt: &str,
         hop: i16,
         listed: Option<Vec<MentionedApproval>>,
+        author: Option<Speaker>,
     ) -> Result<(String, String)> {
         let agent_id = service.agent_id.as_str();
         // The session a DM already open is on: not rolled over here, or an
@@ -88,6 +98,9 @@ impl CrewHub {
             self.rolled(&sid, &session_id);
             both(tx, sid.clone())
         };
+        if let Some(author) = author {
+            self.relayed(service, &session_id, author, &tx).await;
+        }
         let forward = {
             let (tx, sid) = (tx.clone(), session_id.clone());
             let mentions = crate::gateway::mentions_for(service, &sid);
@@ -140,6 +153,48 @@ fn both(
 }
 
 impl CrewHub {
+    /// The prompt just saved in `service`'s DM session `sid` is `author`'s:
+    /// kept by its message, and sent to an open DM as it reads in history.
+    async fn relayed(
+        &self,
+        service: &AgentService,
+        sid: &str,
+        author: Speaker,
+        tx: &tokio::sync::broadcast::Sender<BroadcastMessage>,
+    ) {
+        // The turn holds the session, so its newest user message is this
+        // prompt, saved before the turn began.
+        let message = service.sessions.get(sid).ok().flatten().and_then(|s| {
+            s.messages
+                .iter()
+                .rev()
+                .find(|m| m.role == MessageRole::User)
+                .map(|m| (m.id.clone(), m.content.clone()))
+        });
+        let Some((id, content)) = message else {
+            tracing::warn!(session_id = %sid, "a message to the crew was not in its DM");
+            return;
+        };
+        if let Err(e) = self
+            .desk
+            .store()
+            .put_author(&id, service.agent_id.as_str(), &author)
+            .await
+        {
+            tracing::warn!(error = %e, "keeping a message's author failed");
+        }
+        let frame = BroadcastMessage {
+            id: Some(id),
+            author: serde_json::to_value(&author).ok(),
+            ..BroadcastMessage::silent(
+                sid,
+                USER_MESSAGE,
+                crate::desk_conversations::shown(&content),
+            )
+        };
+        let _ = tx.send(frame);
+    }
+
     /// The overseer's turn in `old` runs in its successor `new`: what is
     /// kept about the turn follows it.
     fn rolled(&self, old: &str, new: &str) {

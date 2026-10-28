@@ -287,6 +287,14 @@ pub struct ServerMessage {
     /// mentions to act on in place (`{"approvals": […], "suggestions": […]}`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub desk: Option<serde_json::Value>,
+    /// On a Desk DM's `user_message`: the message's id, as the DM's history
+    /// gives it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// On a Desk DM's `user_message`: who said it,
+    /// `{"kind": "you"|"overseer"|"agent", "id", "name"}`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<serde_json::Value>,
 }
 
 fn default_speakable() -> bool {
@@ -417,6 +425,8 @@ impl ServerMessage {
             connect_prompt: None,
             route: None,
             desk: None,
+            id: None,
+            author: None,
         }
     }
 }

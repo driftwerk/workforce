@@ -528,7 +528,13 @@ async fn a_blocked_session_wakes_the_overseer_and_its_answer_offers_the_approval
                    "summary": "Run npm install @acme/ds@4.2.0?"})
         );
         // It is in the DM's history, the prompt left out, with what it offers.
-        let page = crate::desk_conversations::page(overseer.sessions.as_ref(), PERSON, None, 50).unwrap();
+        let page = crate::desk_conversations::page(
+            overseer.sessions.as_ref(),
+            &workforce_desk::Speaker::agent("desk", "desk"),
+            PERSON,
+            None,
+            50,
+        ).unwrap();
         assert_eq!(page.messages.len(), 1, "{page:?}");
         let kept = eventually("the extras to be kept", async || {
             let mut page = page.clone();
@@ -766,8 +772,22 @@ async fn the_overseer_messages_the_crew_within_the_loop_guard() {
                 json!({"agent_id": "scout", "message": "How is the staging check going?", "reason": "Quiet for 40 min."}),
             )
         };
+        let mut frames = crew.state.broadcast_tx.subscribe();
         let done = nudge().await.unwrap();
         assert_eq!(done.output["done"], "asked scout", "{done:?}");
+        // The overseer's message goes out live to Scout's open DM before the
+        // answer starts, and is the overseer's in the DM's history.
+        let (said, before) = relayed_frame(&mut frames, &dm.id).await;
+        assert!(!before.iter().any(|t| t.starts_with("stream")), "{before:?}");
+        assert_eq!(said.content, "desk asks: How is the staging check going?");
+        assert_eq!(
+            said.author,
+            Some(json!({"kind": "overseer", "id": "desk", "name": "desk"}))
+        );
+        let item = history_item(&crew, &scout, PERSON, said.id.as_deref().unwrap()).await;
+        assert_eq!(item["from"], "user");
+        assert_eq!(item["author"], said.author.clone().unwrap());
+        assert_eq!(item["text"], said.content);
         let started = eventually("Scout's turn", async || {
             let page = d.activity(Filter::All, None, 20).await.unwrap();
             page.events.into_iter().find(|e| e.kind == Kind::Started && e.actor.id == "scout")
@@ -794,6 +814,115 @@ async fn the_overseer_messages_the_crew_within_the_loop_guard() {
         assert!(format!("{:?}", held).contains("Loop guard"), "{held:?}");
         crew.person_spoke();
         assert!(nudge().await.unwrap().success, "the person spoke again");
+    })
+    .await;
+}
+
+/// The next `user_message` frame on `sid`, and the types of the frames on
+/// `sid` before it.
+async fn relayed_frame(
+    frames: &mut tokio::sync::broadcast::Receiver<crate::broadcast::BroadcastMessage>,
+    sid: &str,
+) -> (crate::broadcast::BroadcastMessage, Vec<String>) {
+    let mut before = Vec::new();
+    loop {
+        let frame = tokio::time::timeout(Duration::from_secs(20), frames.recv())
+            .await
+            .expect("a user_message frame")
+            .expect("the broadcast is open");
+        if frame.session_id != sid {
+            continue;
+        }
+        if frame.msg_type == super::deliver::USER_MESSAGE {
+            return (frame, before);
+        }
+        before.push(frame.msg_type);
+    }
+}
+
+/// The item of `owner`'s DM with `agent` that is message `id`, as
+/// `GET /api/desk/conversations/{agent}` serves it.
+async fn history_item(crew: &CrewHub, agent: &AgentService, owner: &str, id: &str) -> Value {
+    let speaker = workforce_desk::Speaker::agent(agent.agent_id.as_str(), &super::name_of(agent));
+    let mut page =
+        crate::desk_conversations::page(agent.sessions.as_ref(), &speaker, owner, None, 50)
+            .unwrap();
+    crate::desk_conversations::with_authors(&crew.desk, &mut page).await;
+    let wire = serde_json::to_value(&page).unwrap();
+    wire["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["id"] == id)
+        .cloned()
+        .unwrap_or_else(|| panic!("message {id} is in the history: {wire}"))
+}
+
+/// Saying yes to a suggestion to ask an agent something sends it as yours,
+/// worded with your name for the agent reading it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_suggestion_said_yes_to_is_yours_and_worded_with_your_name() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (scout, _s) = agent(dir.path(), "scout", "On it.").await;
+        let (_overseer, crew, _d, _llm) = overseeing(
+            dir.path(),
+            pool,
+            "ok",
+            "[oversight]\nenabled = true\nlevel = \"suggest\"\n",
+            &[Arc::clone(&scout)],
+        )
+        .await;
+        let morgan = workforce_identity::types::Identity::new(
+            "Morgan Lee",
+            workforce_identity::types::IdentityRole::Member,
+        );
+        crew.state
+            .identity_store
+            .as_ref()
+            .unwrap()
+            .create(&morgan)
+            .unwrap();
+        let owner = morgan.id.to_string();
+        let dm = scout.sessions.get_or_create(DESK_CHANNEL, &owner, "scout").unwrap();
+        scout.sessions.save(&dm).unwrap();
+        assert_eq!(crew.person_name(&owner), "Morgan Lee");
+        assert_eq!(crew.person_name(PERSON), "The person you work for");
+        assert_eq!(
+            crew.person_name(&uuid::Uuid::new_v4().to_string()),
+            "The person you work for"
+        );
+
+        let mut frames = crew.state.broadcast_tx.subscribe();
+        let suggestion = workforce_desk::crew::Suggestion {
+            id: workforce_desk::crew::new_id(),
+            at: workforce_desk::crew::now(),
+            text: "Ask scout: “Can you check staging?”".into(),
+            action: json!({"tool": "crew.nudge", "input": {"agent_id": "scout", "message": "Can you check staging?"}}),
+            state: SuggestionState::Open,
+            subject: None,
+            agent_id: "desk".into(),
+        };
+        crew.accept(&suggestion).await.unwrap();
+        let (said, _) = relayed_frame(&mut frames, &dm.id).await;
+        assert_eq!(said.content, "Morgan Lee asks: Can you check staging?");
+        assert_eq!(
+            said.author,
+            Some(json!({"kind": "you", "id": "you", "name": "You"}))
+        );
+        let item = history_item(&crew, &scout, &owner, said.id.as_deref().unwrap()).await;
+        assert_eq!(item["author"]["kind"], "you");
+        assert_eq!(item["text"], "Morgan Lee asks: Can you check staging?");
+        // Scout's answer is Scout's.
+        let answer = eventually("Scout's answer", async || {
+            let speaker = workforce_desk::Speaker::agent("scout", &super::name_of(&scout));
+            let page =
+                crate::desk_conversations::page(scout.sessions.as_ref(), &speaker, &owner, None, 50)
+                    .unwrap();
+            page.messages.into_iter().find(|m| m.text == "On it.")
+        })
+        .await;
+        assert_eq!(answer.author, workforce_desk::Speaker::agent("scout", "scout"));
     })
     .await;
 }

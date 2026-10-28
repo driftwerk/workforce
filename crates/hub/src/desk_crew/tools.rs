@@ -204,11 +204,18 @@ impl CrewTool {
                 let Some(owner) = crew.person(Some(&service)) else {
                     return Ok(json!({ "messages": [] }));
                 };
-                let page =
-                    crate::desk_conversations::page(service.sessions.as_ref(), &owner, None, limit)
-                        .map_err(|e| e.to_string())?;
+                let speaker = workforce_desk::Speaker::agent(agent, &super::name_of(&service));
+                let mut page = crate::desk_conversations::page(
+                    service.sessions.as_ref(),
+                    &speaker,
+                    &owner,
+                    None,
+                    limit,
+                )
+                .map_err(|e| e.to_string())?;
+                crate::desk_conversations::with_authors(&crew.desk, &mut page).await;
                 Ok(json!({ "messages": page.messages.iter().map(|m| json!({
-                    "from": m.from, "text": crew::clip(&m.text, 1500), "at": m.at,
+                    "from": m.from, "author": m.author, "text": crew::clip(&m.text, 1500), "at": m.at,
                 })).collect::<Vec<_>>() }))
             }
             _ => Err("not a reading tool".into()),

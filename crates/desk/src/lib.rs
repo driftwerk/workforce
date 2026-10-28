@@ -26,7 +26,9 @@ mod transcript;
 mod worktree;
 
 pub use api::{router, sessions_router, Authorize};
-pub use conversations::{Author, ConversationError, Conversations, Page, Said};
+pub use conversations::{
+    Author, ConversationError, Conversations, Page, Said, Speaker, SpeakerKind,
+};
 pub use crew_store::CheckIn;
 pub use providers::{AccountError, Accounts, Fields, Spec, Standing};
 pub use realtime::{KeySource, Provider, Realtime};

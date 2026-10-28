@@ -27,13 +27,63 @@ pub enum Author {
     Agent,
 }
 
+/// Whose a message is, as Desk shows it: the person's own (typed, or a
+/// suggestion they said yes to), the overseer's (a nudge or task it sent
+/// this agent), or the agent's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SpeakerKind {
+    You,
+    Overseer,
+    Agent,
+}
+
+/// Who said a message: `{"kind": "you"|"overseer"|"agent", "id", "name"}`.
+/// The person is always `{"kind": "you", "id": "you", "name": "You"}`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Speaker {
+    pub kind: SpeakerKind,
+    pub id: String,
+    pub name: String,
+}
+
+impl Speaker {
+    pub fn you() -> Self {
+        Self {
+            kind: SpeakerKind::You,
+            id: "you".into(),
+            name: "You".into(),
+        }
+    }
+
+    pub fn overseer(id: &str, name: &str) -> Self {
+        Self {
+            kind: SpeakerKind::Overseer,
+            id: id.into(),
+            name: name.into(),
+        }
+    }
+
+    pub fn agent(id: &str, name: &str) -> Self {
+        Self {
+            kind: SpeakerKind::Agent,
+            id: id.into(),
+            name: name.into(),
+        }
+    }
+}
+
 /// One message of the conversation. `text` is what the live `desk` channel
 /// delivers as a finished reply's `content`: its rich blocks are fenced
 /// inside it, and secrets read as they read live.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Said {
     pub id: String,
+    /// `user` or `agent`, as the transcript has it; [`Said::author`] says
+    /// who.
     pub from: Author,
+    /// Who said it: a `user` message the overseer sent on is the overseer's.
+    pub author: Speaker,
     pub text: String,
     pub at: DateTime<Utc>,
     /// What an overseer's message mentions to act on in place.
@@ -171,6 +221,7 @@ mod tests {
                 messages: vec![Said {
                     id: "m1".into(),
                     from: Author::Agent,
+                    author: Speaker::agent("scout", "Scout"),
                     text: "Hello".into(),
                     at: "2026-10-28T09:00:00Z".parse().unwrap(),
                     desk: None,
@@ -208,7 +259,9 @@ mod tests {
             body,
             json!({
                 "messages": [{
-                    "id": "m1", "from": "agent", "text": "Hello",
+                    "id": "m1", "from": "agent",
+                    "author": {"kind": "agent", "id": "scout", "name": "Scout"},
+                    "text": "Hello",
                     "at": "2026-10-28T09:00:00Z",
                 }],
                 "more": true,

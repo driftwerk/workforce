@@ -10,6 +10,7 @@ use uuid::Uuid;
 use workforce_common::oversight::{Level, Oversight};
 use workforce_desk::crew::{self, By, Kind, Party};
 use workforce_desk::model::{Engine, NewSession, PendingApproval};
+use workforce_desk::Speaker;
 
 use super::CrewHub;
 
@@ -558,18 +559,42 @@ impl CrewHub {
             format!("{verb} {name} “{}”", crew::one_line(text, 120)),
         );
         let hop = by.hop;
-        let message = format!("{} {prefix}: {text}", by.party.name);
+        // Worded for the agent reading it: the overseer by its name, the
+        // person (saying yes to a suggestion) by theirs.
+        let (author, says) = if from_overseer {
+            (
+                Speaker::overseer(&by.party.id, &by.party.name),
+                by.party.name.clone(),
+            )
+        } else {
+            (Speaker::you(), self.person_name(&owner))
+        };
+        let message = format!("{says} {prefix}: {text}");
         self.desk.note(event);
         let crew = self.me();
         tokio::spawn(async move {
             if let Err(e) = crew
-                .run_dm_turn(&service, &owner, &message, hop, None)
+                .run_dm_turn(&service, &owner, &message, hop, None, Some(author))
                 .await
             {
                 tracing::warn!(agent_id = %service.agent_id, error = %e, "a message to the crew did not run");
             }
         });
         Ok(format!("{verb} {name}"))
+    }
+
+    /// What the agents call the person `owner`: their name, when the hub
+    /// knows them by one.
+    pub(super) fn person_name(&self, owner: &str) -> String {
+        Uuid::parse_str(owner)
+            .ok()
+            .and_then(|id| {
+                let store = self.state.identity_store.as_ref()?;
+                store.get_by_id(id).ok().flatten()
+            })
+            .map(|person| person.display_name.trim().to_string())
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| "The person you work for".into())
     }
 
     /// The suggestion `action` becomes, recorded and announced.

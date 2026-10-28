@@ -1554,6 +1554,8 @@ async fn handle_ws(
         connect_prompt: None,
         route: None,
         desk: None,
+        id: None,
+        author: None,
     };
     let _ = sender
         .send(Message::Text(
@@ -1610,6 +1612,8 @@ async fn handle_ws(
                 connect_prompt: msg.connect_prompt,
                 route: msg.route,
                 desk: msg.desk,
+                id: msg.id,
+                author: msg.author,
             };
             if sender
                 .send(Message::Text(

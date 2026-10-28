@@ -366,7 +366,9 @@ impl CrewHub {
             tracing::warn!(error = %e, "recording a check-in failed");
         }
         *self.wake_hop.lock() = Some(hop);
-        let ran = self.run_dm_turn(service, owner, prompt, hop, listed).await;
+        let ran = self
+            .run_dm_turn(service, owner, prompt, hop, listed, None)
+            .await;
         *self.wake_hop.lock() = None;
         match ran {
             Ok((_, reply)) => {

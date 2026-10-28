@@ -48,6 +48,13 @@ pub struct BroadcastMessage {
     /// through to `ServerMessage.desk`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub desk: Option<serde_json::Value>,
+    /// The message a `user_message` is, by the id the DM's history gives it,
+    /// carried through to `ServerMessage.id`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// Who said a `user_message`, carried through to `ServerMessage.author`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub author: Option<serde_json::Value>,
     /// Voice-bridge channel this message is addressed to. When set, the WS
     /// forwarder delivers ONLY to connections that registered the channel via
     /// `voice_listen` (and admit `target_identity`) — never to session
@@ -84,6 +91,8 @@ impl BroadcastMessage {
             connect_prompt: None,
             route: None,
             desk: None,
+            id: None,
+            author: None,
             target_channel: None,
             target_identity: None,
         }
@@ -147,6 +156,8 @@ impl BroadcastMessage {
             connect_prompt: None,
             route: None,
             desk: None,
+            id: None,
+            author: None,
             target_channel: None,
             target_identity: None,
         }

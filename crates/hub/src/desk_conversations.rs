@@ -17,7 +17,7 @@ use workforce_common::channels::DESK_CHANNEL;
 use workforce_common::secret_marker::render_markers_as_preview;
 use workforce_common::security_scanner::{contains_credentials, redact_credentials};
 use workforce_common::session::{MessageRole, SessionStore, TranscriptEntry};
-use workforce_desk::{Author, ConversationError, Conversations, Page, Said};
+use workforce_desk::{Author, ConversationError, Conversations, Page, Said, Speaker};
 
 use crate::gateway::{resolve_caller_context, AuthFailure, GatewayState};
 
@@ -39,13 +39,14 @@ const HUB_NOTES: &[&str] = &[
 ];
 
 /// What a transcript entry shows in the conversation, if it is one of its
-/// messages: said by the person or the agent, not tool chatter, a system
+/// messages: said by the person or by `agent`, not tool chatter, a system
 /// prompt or a note the hub left for the model. The text is what the live
-/// channel sends: secret markers as previews, credentials redacted.
-fn said(entry: &TranscriptEntry) -> Option<Said> {
-    let from = match entry.role {
-        MessageRole::User => Author::User,
-        MessageRole::Assistant => Author::Agent,
+/// channel sends: secret markers as previews, credentials redacted. A
+/// person's message is theirs until [`with_authors`] says otherwise.
+fn said(entry: &TranscriptEntry, agent: &Speaker) -> Option<Said> {
+    let (from, author) = match entry.role {
+        MessageRole::User => (Author::User, Speaker::you()),
+        MessageRole::Assistant => (Author::Agent, agent.clone()),
         MessageRole::System | MessageRole::Tool => return None,
     };
     let text = entry.content.trim();
@@ -55,18 +56,25 @@ fn said(entry: &TranscriptEntry) -> Option<Said> {
     {
         return None;
     }
-    let rendered = render_markers_as_preview(&entry.content);
-    let text = match contains_credentials(&rendered) {
-        true => redact_credentials(&rendered),
-        false => rendered,
-    };
+    let text = shown(&entry.content);
     Some(Said {
         id: entry.id.clone(),
         from,
+        author,
         text,
         at: entry.timestamp,
         desk: None,
     })
+}
+
+/// A message's text as the live channel sends it: secret markers as
+/// previews, credentials redacted.
+pub(crate) fn shown(content: &str) -> String {
+    let rendered = render_markers_as_preview(content);
+    match contains_credentials(&rendered) {
+        true => redact_credentials(&rendered),
+        false => rendered,
+    }
 }
 
 /// The chain member that holds the message `id`, walking back from `head`:
@@ -89,11 +97,12 @@ fn holder(store: &dyn SessionStore, head: &str, id: &str) -> eyre::Result<Option
     Ok(None)
 }
 
-/// `owner`'s conversation on the `desk` channel in `store`: at most `limit`
-/// messages ending just before `before`, oldest first. Reads only: it never
-/// creates the session or rolls it over.
+/// `owner`'s conversation on the `desk` channel with `agent` in `store`: at
+/// most `limit` messages ending just before `before`, oldest first. Reads
+/// only: it never creates the session or rolls it over.
 pub(crate) fn page(
     store: &dyn SessionStore,
+    agent: &Speaker,
     owner: &str,
     before: Option<&str>,
     limit: usize,
@@ -125,7 +134,7 @@ pub(crate) fn page(
                 ENTRIES_PER_READ,
             )
             .map_err(internal)?;
-        gathered.extend(read.messages.iter().rev().filter_map(said));
+        gathered.extend(read.messages.iter().rev().filter_map(|e| said(e, agent)));
         let oldest = read.messages.first();
         exhausted = !read.has_more || oldest.is_none();
         if gathered.len() > limit || exhausted {
@@ -157,6 +166,26 @@ pub(crate) async fn with_extras(desk: &workforce_desk::Desk, page: &mut Page) {
             .iter_mut()
             .for_each(|m| m.desk = extras.remove(&m.id)),
         Err(e) => tracing::warn!(error = %e, "reading the extras of a DM failed"),
+    }
+}
+
+/// Who said the person's messages on `page` that they didn't type, as the
+/// desk kept it: the overseer's nudges and tasks, and suggestions said yes
+/// to.
+pub(crate) async fn with_authors(desk: &workforce_desk::Desk, page: &mut Page) {
+    let ids: Vec<String> = page
+        .messages
+        .iter()
+        .filter(|m| m.from == Author::User)
+        .map(|m| m.id.clone())
+        .collect();
+    match desk.store().authors(&ids).await {
+        Ok(mut authors) => page.messages.iter_mut().for_each(|m| {
+            if let Some(author) = authors.remove(&m.id) {
+                m.author = author;
+            }
+        }),
+        Err(e) => tracing::warn!(error = %e, "reading the authors of a DM failed"),
     }
 }
 
@@ -218,9 +247,14 @@ impl Conversations for HubConversations {
             .registry
             .get(agent)
             .ok_or_else(|| ConversationError::NotFound(format!("no agent named {agent:?}")))?;
-        let mut page = page(service.sessions.as_ref(), &owner, before, limit)?;
+        let speaker = Speaker::agent(
+            agent,
+            &service.display_name().unwrap_or_else(|| agent.to_string()),
+        );
+        let mut page = page(service.sessions.as_ref(), &speaker, &owner, before, limit)?;
         if let Some(crew) = crate::desk_crew::for_state(state) {
             with_extras(crew.desk(), &mut page).await;
+            with_authors(crew.desk(), &mut page).await;
         }
         Ok(page)
     }
@@ -232,6 +266,10 @@ mod tests {
     use workforce_common::session::{InMemorySessionStore, JsonlSessionStore, SessionMessage};
 
     const ME: &str = "identity-1";
+
+    fn scout() -> Speaker {
+        Speaker::agent("scout", "Scout")
+    }
 
     fn texts(page: &Page) -> Vec<(&str, Author)> {
         page.messages
@@ -282,7 +320,7 @@ mod tests {
             9,
         );
         store.save(&session).unwrap();
-        let page = page(&store, ME, None, 200).unwrap();
+        let page = page(&store, &scout(), ME, None, 200).unwrap();
         assert_eq!(
             texts(&page),
             [
@@ -294,6 +332,8 @@ mod tests {
             ]
         );
         assert!(!page.more);
+        assert_eq!(page.messages[0].author, Speaker::you());
+        assert_eq!(page.messages[1].author, scout());
         assert_eq!(page.messages[0].id, session.messages[1].id);
         assert_eq!(page.messages[0].at, session.messages[1].timestamp);
     }
@@ -303,14 +343,14 @@ mod tests {
         let store = InMemorySessionStore::new();
         exchange(&store, 0);
         assert_eq!(
-            page(&store, "identity-2", None, 200).unwrap(),
+            page(&store, &scout(), "identity-2", None, 200).unwrap(),
             Page::default()
         );
         assert!(store.find(DESK_CHANNEL, "identity-2").unwrap().is_none());
         let mut room = store.get_or_create("desk:release", ME, "scout").unwrap();
         room.add_user_message("in the room", None);
         store.save(&room).unwrap();
-        let mine = page(&store, ME, None, 200).unwrap();
+        let mine = page(&store, &scout(), ME, None, 200).unwrap();
         assert_eq!(mine.messages.len(), 2, "a room is not the DM");
     }
 
@@ -320,7 +360,7 @@ mod tests {
         for n in 0..5 {
             exchange(&store, n);
         }
-        let newest = page(&store, ME, None, 4).unwrap();
+        let newest = page(&store, &scout(), ME, None, 4).unwrap();
         assert_eq!(
             texts(&newest),
             [
@@ -331,17 +371,17 @@ mod tests {
             ]
         );
         assert!(newest.more);
-        let older = page(&store, ME, Some(&newest.messages[0].id), 4).unwrap();
+        let older = page(&store, &scout(), ME, Some(&newest.messages[0].id), 4).unwrap();
         assert_eq!(older.messages[0].text, "question 1");
         assert_eq!(older.messages[3].text, "answer 2");
         assert!(older.more);
-        let oldest = page(&store, ME, Some(&older.messages[0].id), 4).unwrap();
+        let oldest = page(&store, &scout(), ME, Some(&older.messages[0].id), 4).unwrap();
         assert_eq!(
             texts(&oldest),
             [("question 0", Author::User), ("answer 0", Author::Agent)]
         );
         assert!(!oldest.more);
-        let refused = page(&store, ME, Some("not-a-message"), 4).unwrap_err();
+        let refused = page(&store, &scout(), ME, Some("not-a-message"), 4).unwrap_err();
         assert!(
             matches!(refused, ConversationError::Invalid(_)),
             "{refused}"
@@ -357,7 +397,7 @@ mod tests {
             5,
         );
         store.save(&session).unwrap();
-        let text = &page(&store, ME, None, 10).unwrap().messages[0].text;
+        let text = &page(&store, &scout(), ME, None, 10).unwrap().messages[0].text;
         assert!(!text.contains("AKIAIOSFODNN7EXAMPLE"), "{text}");
     }
 
@@ -376,10 +416,11 @@ mod tests {
                     exchange(store.as_ref(), n);
                 }
                 let walk = |store: &dyn SessionStore| {
-                    let newest = page(store, ME, None, 4).unwrap();
+                    let newest = page(store, &scout(), ME, None, 4).unwrap();
                     assert_eq!(newest.messages[0].text, "question 1");
                     assert!(newest.more);
-                    let oldest = page(store, ME, Some(&newest.messages[0].id), 4).unwrap();
+                    let oldest =
+                        page(store, &scout(), ME, Some(&newest.messages[0].id), 4).unwrap();
                     assert_eq!(
                         texts(&oldest),
                         [("question 0", Author::User), ("answer 0", Author::Agent)]
@@ -414,7 +455,7 @@ mod tests {
         .unwrap();
         assert_ne!(successor.id, old.id, "the DM rolled over");
         exchange(&store, 1);
-        let page = page(&store, ME, None, 200).unwrap();
+        let page = page(&store, &scout(), ME, None, 200).unwrap();
         assert_eq!(
             texts(&page),
             [
@@ -424,7 +465,7 @@ mod tests {
                 ("answer 1", Author::Agent),
             ]
         );
-        let older = super::page(&store, ME, Some(&page.messages[2].id), 200).unwrap();
+        let older = super::page(&store, &scout(), ME, Some(&page.messages[2].id), 200).unwrap();
         assert_eq!(older.messages.len(), 2, "the cursor crosses the seam");
     }
 }

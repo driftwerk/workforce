@@ -8,6 +8,7 @@ use eyre::{Context, Result};
 use serde_json::Value;
 use tokio_postgres::Row;
 
+use crate::conversations::Speaker;
 use crate::crew::{Event, Extras, Filter, Kind, Party, Suggestion, SuggestionState};
 use crate::store::DeskStore;
 
@@ -291,6 +292,47 @@ impl DeskStore {
             .collect()
     }
 
+    /// Keeps who said the DM message `message_id`, when its role doesn't.
+    pub async fn put_author(
+        &self,
+        message_id: &str,
+        agent_id: &str,
+        author: &Speaker,
+    ) -> Result<()> {
+        let client = self.pool().get().await?;
+        client
+            .execute(
+                "INSERT INTO message_authors (message_id, agent_id, author, at) VALUES ($1,$2,$3,now()) \
+                 ON CONFLICT (message_id) DO UPDATE SET author = $3",
+                &[&message_id, &agent_id, &serde_json::to_value(author)?],
+            )
+            .await
+            .context("saving a message's author")?;
+        Ok(())
+    }
+
+    /// The authors kept for whichever of `ids` have one.
+    pub async fn authors(&self, ids: &[String]) -> Result<HashMap<String, Speaker>> {
+        if ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let client = self.pool().get().await?;
+        let rows = client
+            .query(
+                "SELECT message_id, author FROM message_authors WHERE message_id = ANY($1)",
+                &[&ids],
+            )
+            .await?;
+        rows.iter()
+            .map(|r| {
+                Ok((
+                    r.try_get("message_id")?,
+                    serde_json::from_value(r.try_get("author")?)?,
+                ))
+            })
+            .collect()
+    }
+
     pub async fn put_check_in(&self, c: &CheckIn) -> Result<()> {
         let client = self.pool().get().await?;
         client
@@ -384,7 +426,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn suggestions_extras_and_check_ins_round_trip() {
+    async fn suggestions_extras_authors_and_check_ins_round_trip() {
         with_test_pool(build_pool, |pool| async move {
             DeskStore::migrate(&pool).await.unwrap();
             let store = DeskStore::from_pool(pool);
@@ -418,6 +460,22 @@ mod tests {
                 .unwrap();
             assert_eq!(got.len(), 1);
             assert_eq!(got["m1"], extras);
+
+            store
+                .put_author("m3", "scout", &Speaker::overseer("desk", "Atlas"))
+                .await
+                .unwrap();
+            store
+                .put_author("m4", "scout", &Speaker::you())
+                .await
+                .unwrap();
+            let authors = store
+                .authors(&["m3".to_string(), "m4".to_string(), "m5".to_string()])
+                .await
+                .unwrap();
+            assert_eq!(authors.len(), 2);
+            assert_eq!(authors["m3"], Speaker::overseer("desk", "Atlas"));
+            assert_eq!(authors["m4"], Speaker::you());
 
             let mut c = CheckIn {
                 id: crate::crew::new_id(),
