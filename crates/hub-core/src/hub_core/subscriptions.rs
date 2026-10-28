@@ -500,14 +500,15 @@ pub fn review_agent_llm(
     refused.into_iter().chain(warnings).collect()
 }
 
-/// What `[llm] effort` says that the agent's provider cannot honour: a level
-/// it does not take is refused, naming the ones it does; a provider with no
-/// effort control ignores a level, which is said.
+/// What `[llm] effort` says that the agent's provider and model cannot
+/// honour: a level they do not take is refused, naming the ones they do; a
+/// provider or model with no effort control ignores a level, which is said.
 fn effort_finding(llm: &LlmConfig, resolved: &ResolvedConfig) -> Option<Finding> {
     const SPEC: &str = "[llm] effort";
     let effort = resolved.effort.as_deref()?;
     let (kind, _) = parse_provider_spec(llm.provider.trim()).ok().flatten()?;
-    let offered = kind.efforts();
+    let model = llm.default_model.trim();
+    let offered = kind.model_efforts(model);
     let name = kind.canonical_name();
     if offered
         .iter()
@@ -516,10 +517,16 @@ fn effort_finding(llm: &LlmConfig, resolved: &ResolvedConfig) -> Option<Finding>
         return None;
     }
     let list = |levels: &[&str]| levels.join(", ");
+    // Without effort control the level is ignored rather than refused, so
+    // an agent switched onto such a model still loads.
+    let uncontrolled = match kind.efforts().is_empty() {
+        true => format!("{name} has no effort control"),
+        false => format!("{model} on {name} has no effort control"),
+    };
     match (offered.is_empty(), resolved.effort_level()) {
         (true, Some(_)) => Some(Finding::warning(
             SPEC,
-            format!("{name} has no effort control, so effort = {effort:?} is ignored"),
+            format!("{uncontrolled}, so effort = {effort:?} is ignored"),
         )),
         (true, None) => Some(Finding::refused(
             SPEC,

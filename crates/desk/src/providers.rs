@@ -96,6 +96,32 @@ pub struct Model {
     /// with the model family for those the hub routes by family
     /// (`bedrock:anthropic`, `openrouter:openai`).
     pub provider: String,
+    /// The efforts this model takes, when they are not its provider's; an
+    /// empty list is no effort control.
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    pub efforts: Option<Efforts>,
+}
+
+/// Effort levels, lowest first, and the one to start at (none without any).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Efforts {
+    pub efforts: Vec<&'static str>,
+    pub default_effort: Option<&'static str>,
+}
+
+impl Efforts {
+    fn of(efforts: Vec<&'static str>) -> Self {
+        let default_effort = efforts
+            .iter()
+            .copied()
+            .find(|e| *e == DEFAULT_EFFORT)
+            .or_else(|| efforts.first().copied());
+        Self {
+            efforts,
+            default_effort,
+        }
+    }
 }
 
 /// The `[llm] provider` value that reaches `model` on the provider `id`.
@@ -155,6 +181,7 @@ impl Spec {
                 description: description.into(),
                 default,
                 provider: route(self.id, id),
+                efforts: None,
             })
             .collect()
     }
@@ -530,6 +557,11 @@ pub trait Accounts: Send + Sync {
     /// The effort levels the hub honours on `provider`, lowest first; none
     /// when it has no effort control.
     fn efforts(&self, provider: &str) -> Vec<&'static str>;
+    /// The effort levels the hub honours on `model` through `provider`:
+    /// fewer than the provider's for a model it can send no effort to.
+    fn model_efforts(&self, provider: &str, _model: &str) -> Vec<&'static str> {
+        self.efforts(provider)
+    }
     /// Stores `fields` (already checked against the provider's) where the
     /// hub reads `provider`'s credentials.
     async fn connect(&self, provider: &Spec, fields: &Fields) -> Result<(), AccountError>;
@@ -554,17 +586,21 @@ pub(crate) struct Entry {
 impl Entry {
     pub(crate) async fn of(spec: &'static Spec, accounts: &dyn Accounts) -> Self {
         let standing = accounts.standing(spec).await;
-        let models = if spec.lists_installed() {
+        let mut models = if spec.lists_installed() {
             installed(spec.id, standing.installed)
         } else {
             spec.curated()
         };
-        let efforts = accounts.efforts(spec.id);
-        let default_effort = efforts
-            .iter()
-            .copied()
-            .find(|e| *e == DEFAULT_EFFORT)
-            .or_else(|| efforts.first().copied());
+        let Efforts {
+            efforts,
+            default_effort,
+        } = Efforts::of(accounts.efforts(spec.id));
+        for model in &mut models {
+            let own = accounts.model_efforts(spec.id, &model.id);
+            if own != efforts {
+                model.efforts = Some(Efforts::of(own));
+            }
+        }
         Self {
             id: spec.id,
             name: spec.name,
@@ -589,6 +625,7 @@ fn installed(provider: &str, models: Vec<String>) -> Vec<Model> {
             description: "Installed on the server".into(),
             default: i == 0,
             provider: provider.into(),
+            efforts: None,
             id,
         })
         .collect()
@@ -687,8 +724,15 @@ mod tests {
         fn efforts(&self, provider: &str) -> Vec<&'static str> {
             match provider {
                 "claude-code" => vec!["low", "medium", "high", "max"],
-                "anthropic" => vec!["low", "medium", "high", "xhigh", "max"],
+                "anthropic" | "bedrock" => vec!["low", "medium", "high", "xhigh", "max"],
                 _ => Vec::new(),
+            }
+        }
+
+        fn model_efforts(&self, provider: &str, model: &str) -> Vec<&'static str> {
+            match model.starts_with("anthropic.") || provider != "bedrock" {
+                true => self.efforts(provider),
+                false => Vec::new(),
             }
         }
 
@@ -889,6 +933,27 @@ mod tests {
                 "required": true, "multiline": false, "placeholder": "",
             }])
         );
+        let bedrock = providers.iter().find(|p| p["id"] == "bedrock").unwrap();
+        assert_eq!(bedrock["defaultEffort"], "medium");
+        let opus = &bedrock["models"][1];
+        assert_eq!(opus["id"], "anthropic.claude-opus-5-5");
+        assert!(
+            opus.get("efforts").is_none() && opus.get("defaultEffort").is_none(),
+            "a model that takes the provider's efforts carries none of its own: {opus}"
+        );
+        let deepseek = bedrock["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["id"] == "deepseek.v3.2")
+            .unwrap();
+        assert_eq!(deepseek["efforts"], json!([]));
+        assert_eq!(
+            deepseek["defaultEffort"],
+            Value::Null,
+            "said, so the provider's is not read in its place"
+        );
+        assert!(deepseek.as_object().unwrap().contains_key("defaultEffort"));
         let ollama = providers.iter().find(|p| p["id"] == "ollama").unwrap();
         assert_eq!(ollama["group"], "local");
         assert_eq!(ollama["connect"]["kind"], "probe");

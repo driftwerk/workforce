@@ -353,6 +353,12 @@ impl Accounts for HubAccounts {
             .unwrap_or_default()
     }
 
+    fn model_efforts(&self, provider: &str, model: &str) -> Vec<&'static str> {
+        ProviderKind::parse(provider)
+            .map(|kind| kind.model_efforts(model).to_vec())
+            .unwrap_or_default()
+    }
+
     async fn connect(&self, spec: &Spec, fields: &Fields) -> Result<(), AccountError> {
         let (kind, name) = metered(spec)?;
         let record = account(kind, fields)?;
@@ -806,7 +812,7 @@ mod tests {
         }
 
         #[test]
-        fn every_model_desk_offers_loads_on_its_route_at_every_effort_its_provider_takes() {
+        fn every_model_desk_offers_loads_on_its_route_at_every_effort_it_takes() {
             let admission = admission();
             let accounts = HubAccounts {
                 vault: None,
@@ -817,8 +823,8 @@ mod tests {
                     true => vec!["llama4:8b"],
                     false => spec.model_ids().collect(),
                 };
-                let efforts = accounts.efforts(spec.id);
                 for model in models {
+                    let efforts = accounts.model_efforts(spec.id, model);
                     let provider = route(spec.id, model);
                     for effort in std::iter::once(None).chain(efforts.iter().copied().map(Some)) {
                         let findings = admission
@@ -858,6 +864,69 @@ mod tests {
                 .unwrap();
             assert_eq!(ignored.len(), 1, "{ignored:?}");
             assert!(ignored[0].message.contains("grok has no effort control"));
+        }
+
+        #[test]
+        fn bedrocks_open_models_take_no_effort_and_a_level_on_them_is_ignored_not_refused() {
+            let accounts = HubAccounts {
+                vault: None,
+                known: Arc::new(Vec::new),
+            };
+            let bedrock = spec("bedrock").unwrap();
+            let unhonoured: Vec<&str> = bedrock
+                .model_ids()
+                .filter(|m| accounts.model_efforts("bedrock", m).is_empty())
+                .collect();
+            assert_eq!(
+                unhonoured,
+                [
+                    "qwen.qwen3-coder-480b-a35b-v1:0",
+                    "deepseek.v3.2",
+                    "zai.glm-5"
+                ]
+            );
+            for other in PROVIDERS.iter().filter(|s| s.id != "bedrock") {
+                for model in other.model_ids() {
+                    assert_eq!(
+                        accounts.model_efforts(other.id, model),
+                        accounts.efforts(other.id),
+                        "{} {model}",
+                        other.id
+                    );
+                }
+            }
+            let admission = admission();
+            let ignored = admission
+                .review_toml(&agent_toml(
+                    "bedrock:deepseek",
+                    "deepseek.v3.2",
+                    Some("high"),
+                ))
+                .unwrap();
+            assert_eq!(ignored.len(), 1, "{ignored:?}");
+            assert_eq!(
+                ignored[0].message,
+                "deepseek.v3.2 on bedrock has no effort control, so effort = \"high\" is ignored"
+            );
+            let refused = admission
+                .review_toml(&agent_toml(
+                    "bedrock:deepseek",
+                    "deepseek.v3.2",
+                    Some("extreme"),
+                ))
+                .unwrap_err();
+            assert!(
+                refused.to_string().contains("is not an effort level"),
+                "{refused}"
+            );
+            assert!(admission
+                .review_toml(&agent_toml(
+                    "bedrock:anthropic",
+                    "anthropic.claude-opus-5-5",
+                    Some("max")
+                ))
+                .unwrap()
+                .is_empty());
         }
 
         #[test]

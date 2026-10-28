@@ -939,6 +939,35 @@ impl ProviderKind {
         }
     }
 
+    /// The `[llm] effort` levels this provider's calls honour on `model`:
+    /// [`Self::efforts`], less a model the request carries no effort or
+    /// thinking budget for. On Bedrock only Claude on the Invoke API with a
+    /// thinking budget takes one (the open models' bodies carry none); on
+    /// Vertex and the Anthropic API, a Claude model without thinking takes
+    /// none. A model the tables cannot place (a tier name, an id they do not
+    /// list) keeps the provider's levels.
+    pub fn model_efforts(self, model: &str) -> &'static [&'static str] {
+        use super::bedrock_capabilities::{self as bedrock, ThinkingMode, WireFormat};
+        let model = model.trim();
+        let honoured = match self {
+            Self::Bedrock if model.contains('.') => {
+                bedrock::wire_format_for(model) == WireFormat::Invoke
+                    && bedrock::thinking(model) == ThinkingMode::ToggleWithBudget
+            }
+            Self::VertexAnthropic if model.starts_with("claude-") => {
+                super::vertex_capabilities::thinking(model) == ThinkingMode::ToggleWithBudget
+            }
+            Self::Anthropic if model.starts_with("claude-") => {
+                bedrock::thinking(&format!("anthropic.{model}")) == ThinkingMode::ToggleWithBudget
+            }
+            _ => true,
+        };
+        match honoured {
+            true => self.efforts(),
+            false => &[],
+        }
+    }
+
     /// Canonical lowercase identifier, matched first by [`Self::parse`].
     /// Exhaustive on every variant by design — the compiler will fail to
     /// build when a new provider lands without picking a name. A
@@ -1449,6 +1478,40 @@ mod verify_credentials_default_tests {
 mod provider_kind_tests {
     use super::{create_provider, ProviderKind, ProviderParseError};
     use workforce_common::settings::{REMOVED_PROVIDER_ALIASES, REMOVED_PROVIDER_POINTER};
+
+    #[test]
+    fn a_model_the_request_carries_no_effort_for_takes_no_level() {
+        let all = ProviderKind::Bedrock.efforts();
+        assert!(!all.is_empty());
+        for (kind, model) in [
+            (ProviderKind::Bedrock, "anthropic.claude-opus-5-5"),
+            (ProviderKind::Bedrock, "eu.anthropic.claude-sonnet-5-5"),
+            (ProviderKind::Bedrock, "standard"),
+            (ProviderKind::VertexAnthropic, "claude-haiku-4-5@20251001"),
+            (ProviderKind::VertexAnthropic, "powerful"),
+            (ProviderKind::Anthropic, "claude-fable-5-1"),
+        ] {
+            assert_eq!(kind.model_efforts(model), all, "{model}");
+        }
+        for (kind, model) in [
+            (ProviderKind::Bedrock, "qwen.qwen3-coder-480b-a35b-v1:0"),
+            (ProviderKind::Bedrock, "deepseek.v3.2"),
+            (ProviderKind::Bedrock, "zai.glm-5"),
+            (
+                ProviderKind::Bedrock,
+                "anthropic.claude-3-haiku-20240307-v1:0",
+            ),
+            (ProviderKind::VertexAnthropic, "claude-3-5-haiku@20241022"),
+            (ProviderKind::Anthropic, "claude-3-haiku-20240307"),
+        ] {
+            assert!(kind.model_efforts(model).is_empty(), "{model}");
+        }
+        assert_eq!(
+            ProviderKind::ClaudeCode.model_efforts("haiku"),
+            ProviderKind::ClaudeCode.efforts()
+        );
+        assert!(ProviderKind::Grok.model_efforts("grok-4.7").is_empty());
+    }
 
     #[test]
     fn removed_provider_names_are_refused_with_the_pointer() {
