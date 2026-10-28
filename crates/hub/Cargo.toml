@@ -115,12 +115,11 @@ aws-config = { version = "1", default-features = false, features = [
     "rt-tokio",
     "behavior-version-latest",
     "credentials-process",
-    "client-hyper",
-    "rustls",
+    "default-https-client",
 ] }
 aws-sdk-s3 = { version = "1", default-features = false, features = [
     "rt-tokio",
-    "rustls",
+    "default-https-client",
     "behavior-version-latest",
 ] }
 # Read-only infra-diagnosis tools (aws.ecs/ecr/elbv2/rds/sts.*). Same feature
@@ -128,37 +127,37 @@ aws-sdk-s3 = { version = "1", default-features = false, features = [
 # cargo feature, matching the S3 surface.
 aws-sdk-ecs = { version = "1", default-features = false, features = [
     "rt-tokio",
-    "rustls",
+    "default-https-client",
     "behavior-version-latest",
 ] }
 aws-sdk-ecr = { version = "1", default-features = false, features = [
     "rt-tokio",
-    "rustls",
+    "default-https-client",
     "behavior-version-latest",
 ] }
 aws-sdk-elasticloadbalancingv2 = { version = "1", default-features = false, features = [
     "rt-tokio",
-    "rustls",
+    "default-https-client",
     "behavior-version-latest",
 ] }
 aws-sdk-rds = { version = "1", default-features = false, features = [
     "rt-tokio",
-    "rustls",
+    "default-https-client",
     "behavior-version-latest",
 ] }
 aws-sdk-sts = { version = "1", default-features = false, features = [
     "rt-tokio",
-    "rustls",
+    "default-https-client",
     "behavior-version-latest",
 ] }
 aws-sdk-cloudwatchlogs = { version = "1", default-features = false, features = [
     "rt-tokio",
-    "rustls",
+    "default-https-client",
     "behavior-version-latest",
 ] }
 aws-sdk-cloudwatch = { version = "1", default-features = false, features = [
     "rt-tokio",
-    "rustls",
+    "default-https-client",
     "behavior-version-latest",
 ] }
 

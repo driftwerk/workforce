@@ -57,12 +57,11 @@ aws-config = { version = "1", default-features = false, features = [
     "rt-tokio",
     "behavior-version-latest",
     "credentials-process",
-    "client-hyper",
-    "rustls",
+    "default-https-client",
 ] }
 aws-sdk-bedrock = { version = "1", default-features = false, features = [
     "rt-tokio",
-    "rustls",
+    "default-https-client",
     "behavior-version-latest",
 ] }
 # Optional S3 artifact-store backend (gated by the `s3` feature). aws-config /
@@ -70,7 +69,7 @@ aws-sdk-bedrock = { version = "1", default-features = false, features = [
 # only pulls in the S3 client; the hub builds the client and injects it.
 aws-sdk-s3 = { version = "1", default-features = false, features = [
     "rt-tokio",
-    "rustls",
+    "default-https-client",
     "behavior-version-latest",
 ], optional = true }
 gcp_auth = "0.12"
