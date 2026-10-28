@@ -240,15 +240,33 @@ impl Vault {
     /// chat-provider and image-provider resolution, so a key added via
     /// `system.add_account` is visible to both.
     pub fn find_account_api_key(&self, provider: &str) -> Option<String> {
+        self.find_account(provider)
+            .and_then(|(_, record)| record["api_key"].as_str().map(str::to_string))
+    }
+
+    /// The path and record of the first `llm/accounts/*` entry whose stored
+    /// `provider` matches `provider` and that holds an `api_key`: the one
+    /// [`Self::find_account_api_key`] reads.
+    pub fn find_account(&self, provider: &str) -> Option<(String, serde_json::Value)> {
         self.list(Some("llm/accounts/"))
             .into_iter()
             .find_map(|path| {
                 let parsed: serde_json::Value = serde_json::from_str(&self.get(&path)?).ok()?;
-                (parsed["provider"].as_str()? == provider)
-                    .then(|| parsed["api_key"].as_str())
-                    .flatten()
-                    .map(str::to_string)
+                (parsed["provider"].as_str()? == provider && parsed["api_key"].is_string())
+                    .then_some((path, parsed))
             })
+    }
+
+    /// Every `llm/accounts/*` path whose record names `provider`.
+    pub fn account_paths(&self, provider: &str) -> Vec<String> {
+        self.list(Some("llm/accounts/"))
+            .into_iter()
+            .filter(|path| {
+                self.get(path)
+                    .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+                    .is_some_and(|record| record["provider"].as_str() == Some(provider))
+            })
+            .collect()
     }
 
     /// The master key from the `WORKFORCE_VAULT_KEY` env var or an existing
@@ -588,6 +606,19 @@ pub fn find_account_api_key_layered(
     agent
         .and_then(|v| v.find_account_api_key(provider))
         .or_else(|| global.and_then(|v| v.find_account_api_key(provider)))
+}
+
+/// The `llm/accounts/*` record [`find_account_api_key_layered`] reads its key
+/// from: the agent vault's, then the global vault's.
+pub fn find_account_layered(
+    agent: Option<&Vault>,
+    global: Option<&Vault>,
+    provider: &str,
+) -> Option<serde_json::Value> {
+    agent
+        .and_then(|v| v.find_account(provider))
+        .or_else(|| global.and_then(|v| v.find_account(provider)))
+        .map(|(_, record)| record)
 }
 
 /// A speaking user's own voice for `provider`, resolved at request time for

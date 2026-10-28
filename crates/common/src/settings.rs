@@ -7075,6 +7075,24 @@ pub struct AgentLlmConfig {
     /// ```
     #[serde(default)]
     pub voice_thinking_budget_tokens: Option<u32>,
+    /// How hard the agent thinks on its turns: `"low"`, `"medium"`,
+    /// `"high"`, `"xhigh"` or `"max"`, as far as its provider takes one. The
+    /// Claude Code CLI gets it as `--effort` (low, medium, high, max), the
+    /// ChatGPT backend as `reasoning.effort` (low through xhigh), and Claude
+    /// on the Anthropic API, Bedrock and Vertex as `output_config.effort`, or
+    /// as a thinking budget on a model that takes budgets. A level the
+    /// provider does not take is refused when the config is saved; on a
+    /// provider with no effort control the setting is ignored. Read every
+    /// turn, so an edit applies on the next one; it beats
+    /// `thinking_budget_tokens`, and a voice turn's
+    /// `voice_thinking_budget_tokens` beats it.
+    ///
+    /// ```toml
+    /// [llm]
+    /// effort = "high"
+    /// ```
+    #[serde(default)]
+    pub effort: Option<String>,
     /// Model tier equivalences across providers. Maps tier names ("powerful",
     /// "standard", "cheap") to lists of equivalent models. Used by adaptive
     /// routing and failover to pick the right model when switching providers.

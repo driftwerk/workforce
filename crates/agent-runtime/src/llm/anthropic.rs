@@ -32,7 +32,8 @@ struct OutputConfig {
 }
 
 /// Adaptive-thinking effort — soft guidance on how much Claude thinks.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Ordered lowest to highest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Effort {
     Low,
     Medium,
@@ -42,6 +43,33 @@ pub enum Effort {
 }
 
 impl Effort {
+    /// Every level, lowest first.
+    pub const ALL: [Self; 5] = [Self::Low, Self::Medium, Self::High, Self::Xhigh, Self::Max];
+
+    /// [`Self::ALL`]'s names.
+    pub const NAMES: &'static [&'static str] = &["low", "medium", "high", "xhigh", "max"];
+
+    /// The level named `name`, in any case.
+    pub fn parse(name: &str) -> Option<Self> {
+        let name = name.trim();
+        Self::ALL
+            .into_iter()
+            .find(|e| e.as_str().eq_ignore_ascii_case(name))
+    }
+
+    /// The thinking budget a model that takes budgets rather than an effort
+    /// is given for the level, each above the one [`Self::from_budget`] reads
+    /// back as the level below.
+    pub const fn budget(self) -> u32 {
+        match self {
+            Self::Low => 2_000,
+            Self::Medium => 8_000,
+            Self::High => 16_000,
+            Self::Xhigh => 24_000,
+            Self::Max => 32_000,
+        }
+    }
+
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Low => "low",
@@ -78,28 +106,52 @@ impl Serialize for Effort {
 /// `max_tokens` is needed because the legacy `enabled` schema requires
 /// `max_tokens > budget_tokens`: the budget is capped to fit the caller's
 /// `max_tokens`, or thinking disabled when it cannot.
+///
+/// An `effort` (the agent's `[llm] effort`) wins over the budget: an adaptive
+/// model is sent it as is, and a model on the legacy schema the budget the
+/// level stands for ([`Effort::budget`]).
 fn thinking_config(
     model: &str,
     budget: Option<u32>,
+    effort: Option<Effort>,
     max_tokens: u32,
 ) -> (Option<ThinkingConfig>, Option<OutputConfig>) {
-    match budget {
-        Some(budget) if super::bedrock_capabilities::requires_adaptive_thinking(model) => (
+    let adaptive = super::bedrock_capabilities::requires_adaptive_thinking(model);
+    match (effort.or_else(|| budget.map(Effort::from_budget)), budget) {
+        (Some(effort), _) if adaptive => (
             Some(ThinkingConfig::Adaptive {
                 display: "summarized",
             }),
-            Some(OutputConfig {
-                effort: Effort::from_budget(budget),
-            }),
+            Some(OutputConfig { effort }),
         ),
-        Some(budget) => {
+        (Some(level), budget) => {
+            let budget = match effort {
+                Some(effort) => effort.budget(),
+                None => budget.unwrap_or(level.budget()),
+            };
             match super::bedrock_capabilities::clamp_thinking_budget(budget, max_tokens) {
                 Some(b) => (Some(ThinkingConfig::Enabled { budget_tokens: b }), None),
                 None => (None, None),
             }
         }
-        None => (None, None),
+        (None, _) => (None, None),
     }
+}
+
+/// [`thinking_config`] as the JSON `thinking` and `output_config` fields, for
+/// the hosts (Bedrock Invoke, Vertex) that build their bodies as JSON.
+pub(crate) fn thinking_fields(
+    model: &str,
+    budget: Option<u32>,
+    effort: Option<Effort>,
+    max_tokens: u32,
+) -> (Option<serde_json::Value>, Option<serde_json::Value>) {
+    let (thinking, output) = thinking_config(model, budget, effort, max_tokens);
+    let json = |v: Option<serde_json::Value>| v.filter(|v| !v.is_null());
+    (
+        json(thinking.and_then(|t| serde_json::to_value(t).ok())),
+        json(output.and_then(|o| serde_json::to_value(o).ok())),
+    )
 }
 
 /// Client for the Anthropic Claude API.
@@ -299,8 +351,12 @@ impl AnthropicClient {
             })
             .collect();
 
-        let (thinking, output_config) =
-            thinking_config(model, self.effective_thinking_budget(), max_tokens);
+        let (thinking, output_config) = thinking_config(
+            model,
+            self.effective_thinking_budget(),
+            super::provider::effective_effort(),
+            max_tokens,
+        );
 
         let request = ApiRequest {
             model: model.to_string(),
@@ -576,7 +632,7 @@ mod tests {
 
     #[test]
     fn opus_4_7_uses_adaptive_thinking_with_effort() {
-        let (thinking, output) = thinking_config("claude-opus-4-7", Some(10000), 64_000);
+        let (thinking, output) = thinking_config("claude-opus-4-7", Some(10000), None, 64_000);
         let thinking = serde_json::to_value(thinking.unwrap()).unwrap();
         assert_eq!(thinking["type"], "adaptive");
         assert_eq!(thinking["display"], "summarized");
@@ -590,7 +646,7 @@ mod tests {
 
     #[test]
     fn sonnet_5_uses_adaptive_thinking_with_effort() {
-        let (thinking, output) = thinking_config("claude-sonnet-5", Some(8000), 64_000);
+        let (thinking, output) = thinking_config("claude-sonnet-5", Some(8000), None, 64_000);
         let thinking = serde_json::to_value(thinking.unwrap()).unwrap();
         assert_eq!(thinking["type"], "adaptive");
         assert!(thinking.get("budget_tokens").is_none());
@@ -599,7 +655,7 @@ mod tests {
 
     #[test]
     fn non_adaptive_model_uses_enabled_budget() {
-        let (thinking, output) = thinking_config("claude-sonnet-4-6", Some(8000), 64_000);
+        let (thinking, output) = thinking_config("claude-sonnet-4-6", Some(8000), None, 64_000);
         let thinking = serde_json::to_value(thinking.unwrap()).unwrap();
         assert_eq!(thinking["type"], "enabled");
         assert_eq!(thinking["budget_tokens"], 8000);
@@ -609,24 +665,72 @@ mod tests {
     #[test]
     fn enabled_budget_clamped_or_disabled_by_max_tokens() {
         // max_tokens leaves room → budget capped below it (output headroom).
-        let (thinking, _) = thinking_config("claude-sonnet-4-6", Some(10000), 9000);
+        let (thinking, _) = thinking_config("claude-sonnet-4-6", Some(10000), None, 9000);
         let thinking = serde_json::to_value(thinking.unwrap()).unwrap();
         assert_eq!(thinking["budget_tokens"], 9000 - 1024);
         // max_tokens too small for a valid budget → thinking disabled, no 400.
-        let (thinking, _) = thinking_config("claude-sonnet-4-6", Some(10000), 1500);
+        let (thinking, _) = thinking_config("claude-sonnet-4-6", Some(10000), None, 1500);
         assert!(thinking.is_none());
     }
 
     #[test]
+    fn a_configured_effort_is_sent_as_is_on_adaptive_models_and_as_a_budget_on_others() {
+        for model in [
+            "claude-fable-5-1",
+            "claude-opus-5-5",
+            "claude-sonnet-5-5",
+            "claude-haiku-5-5",
+        ] {
+            for effort in Effort::ALL {
+                let (thinking, output) = thinking_config(model, None, Some(effort), 64_000);
+                assert_eq!(
+                    serde_json::to_value(thinking.unwrap()).unwrap()["type"],
+                    "adaptive"
+                );
+                assert_eq!(
+                    serde_json::to_value(output.unwrap()).unwrap()["effort"],
+                    effort.as_str(),
+                    "{model}"
+                );
+            }
+        }
+        let (thinking, output) =
+            thinking_config("claude-opus-5-5", Some(1_000), Some(Effort::Max), 64_000);
+        assert!(thinking.is_some());
+        assert_eq!(
+            serde_json::to_value(output.unwrap()).unwrap()["effort"],
+            "max",
+            "the effort beats the budget"
+        );
+        let (thinking, output) =
+            thinking_config("claude-haiku-4-5", None, Some(Effort::High), 64_000);
+        let thinking = serde_json::to_value(thinking.unwrap()).unwrap();
+        assert_eq!(thinking["type"], "enabled");
+        assert_eq!(thinking["budget_tokens"], Effort::High.budget());
+        assert!(output.is_none());
+    }
+
+    #[test]
+    fn efforts_parse_by_name_and_their_budgets_read_back_as_themselves() {
+        assert_eq!(Effort::NAMES, Effort::ALL.map(Effort::as_str));
+        assert_eq!(Effort::parse(" XHigh "), Some(Effort::Xhigh));
+        assert_eq!(Effort::parse("extreme"), None);
+        for effort in [Effort::Low, Effort::Medium, Effort::High] {
+            assert_eq!(Effort::from_budget(effort.budget()), effort);
+        }
+    }
+
+    #[test]
     fn no_budget_emits_no_thinking() {
-        let (thinking, output) = thinking_config("claude-opus-4-7", None, 64_000);
+        let (thinking, output) = thinking_config("claude-opus-4-7", None, None, 64_000);
         assert!(thinking.is_none());
         assert!(output.is_none());
     }
 
     #[test]
     fn api_request_places_effort_in_output_config_not_thinking() {
-        let (thinking, output_config) = thinking_config("claude-opus-4-7", Some(10000), 64_000);
+        let (thinking, output_config) =
+            thinking_config("claude-opus-4-7", Some(10000), None, 64_000);
         let request = ApiRequest {
             model: "claude-opus-4-7".to_string(),
             max_tokens: 16000,

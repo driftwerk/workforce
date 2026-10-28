@@ -40,6 +40,8 @@ enum ProviderInit {
     Adc,
     /// Load a service-account JSON from the given path at first use.
     ServiceAccountFile(PathBuf),
+    /// Parse a service-account key's JSON at first use.
+    ServiceAccountKey(super::vertex_credentials::ServiceAccountKey),
 }
 
 impl LazyGcpAuthTokenSource {
@@ -61,6 +63,15 @@ impl LazyGcpAuthTokenSource {
         }
     }
 
+    /// Use a service-account key's JSON, as a vault account holds it. It is
+    /// parsed on the first call to [`fetch_token`] and never written to disk.
+    pub fn from_service_account_key(key: super::vertex_credentials::ServiceAccountKey) -> Self {
+        Self {
+            init: ProviderInit::ServiceAccountKey(key),
+            provider: OnceCell::new(),
+        }
+    }
+
     async fn provider(&self) -> Result<&Arc<dyn TokenProvider>> {
         self.provider
             .get_or_try_init(|| async { build_provider(&self.init).await })
@@ -74,6 +85,11 @@ async fn build_provider(init: &ProviderInit) -> Result<Arc<dyn TokenProvider>> {
             .await
             .wrap_err("failed to discover Google Application Default Credentials"),
         ProviderInit::ServiceAccountFile(path) => load_service_account(path),
+        ProviderInit::ServiceAccountKey(key) => {
+            let sa = CustomServiceAccount::from_json(key.json())
+                .map_err(|_| eyre::eyre!("the Vertex service-account key could not be read"))?;
+            Ok(Arc::new(sa))
+        }
     }
 }
 

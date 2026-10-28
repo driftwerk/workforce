@@ -80,6 +80,14 @@ tokio::task_local! {
     /// voice actually uses.
     static THINKING_BUDGET_OVERRIDE: u32;
 
+    /// The agent's `[llm] effort` for the turn in scope. Set once per turn
+    /// from the agent's live config, so an edit takes effect on the next turn
+    /// without rebuilding a provider; read through [`effective_effort`] by
+    /// the providers that take an effort natively ([`ProviderKind::efforts`]).
+    /// Carried across the streaming spawn by hand like
+    /// [`THINKING_BUDGET_OVERRIDE`].
+    static REASONING_EFFORT: super::anthropic::Effort;
+
     /// Number of leading messages that recur byte-identically on the next
     /// turn (the replayed history). Set by the runner for round 1 of a turn
     /// with history so providers place the message breakpoint at the end of
@@ -155,6 +163,33 @@ where
     match budget {
         Some(b) => THINKING_BUDGET_OVERRIDE.scope(b, fut).await,
         None => fut.await,
+    }
+}
+
+/// The turn's configured effort in scope, if any. See [`REASONING_EFFORT`].
+pub fn effort_override() -> Option<super::anthropic::Effort> {
+    REASONING_EFFORT.try_with(|v| *v).ok()
+}
+
+/// Run `fut` with `effort` as the turn's effort. `None` is a plain
+/// passthrough.
+pub async fn with_effort_override<F>(effort: Option<super::anthropic::Effort>, fut: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    match effort {
+        Some(e) => REASONING_EFFORT.scope(e, fut).await,
+        None => fut.await,
+    }
+}
+
+/// The effort the request now being built asks for: the turn's configured
+/// effort, unless reasoning is suppressed (a background extraction) or the
+/// turn's own thinking budget (a voice turn's) replaces the agent's.
+pub fn effective_effort() -> Option<super::anthropic::Effort> {
+    match reasoning_suppressed() || thinking_budget_override().is_some() {
+        true => None,
+        false => effort_override(),
     }
 }
 
@@ -879,6 +914,31 @@ impl ProviderKind {
         Self::Codex,
     ];
 
+    /// The `[llm] effort` levels this provider's calls honour, lowest first:
+    /// the Claude Code CLI's `--effort`, the ChatGPT backend's
+    /// `reasoning.effort`, and `output_config.effort` on Claude through the
+    /// Anthropic API, Bedrock and Vertex (a model that takes thinking budgets
+    /// instead is given a budget for the level). Empty for a provider with no
+    /// effort control, which ignores the setting.
+    pub fn efforts(self) -> &'static [&'static str] {
+        use workforce_common::settings::{CLAUDE_CODE_EFFORTS, CODEX_EFFORTS};
+        match self {
+            Self::ClaudeCode => CLAUDE_CODE_EFFORTS,
+            Self::Codex => CODEX_EFFORTS,
+            Self::ChatGpt => super::responses::CHATGPT_EFFORTS,
+            Self::Anthropic | Self::Bedrock | Self::VertexAnthropic => {
+                super::anthropic::Effort::NAMES
+            }
+            Self::OpenRouter
+            | Self::Grok
+            | Self::Ollama
+            | Self::Gemini
+            | Self::Vllm
+            | Self::Cerebras
+            | Self::Zai => &[],
+        }
+    }
+
     /// Canonical lowercase identifier, matched first by [`Self::parse`].
     /// Exhaustive on every variant by design — the compiler will fail to
     /// build when a new provider lands without picking a name. A
@@ -1091,6 +1151,67 @@ pub fn create_provider(
     thinking_budget: Option<u32>,
     zai_subscription: bool,
 ) -> Result<Box<dyn LlmProvider>> {
+    create_provider_with(
+        kind,
+        api_key,
+        &AccountExtras::default(),
+        model,
+        thinking_budget,
+        zai_subscription,
+    )
+}
+
+/// What an `llm/accounts/*` record holds beside its `api_key`, for the
+/// providers a key alone does not reach: Bedrock's region, Vertex's project
+/// and location, and the bearer key of a local server whose `api_key` slot is
+/// its URL. Each unset field falls back on what [`create_provider`] reads.
+#[derive(Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AccountExtras {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub location: Option<String>,
+    /// The bearer key of an Ollama or vLLM server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+}
+
+impl std::fmt::Debug for AccountExtras {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AccountExtras")
+            .field("region", &self.region)
+            .field("project", &self.project)
+            .field("location", &self.location)
+            .field("token", &self.token.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
+impl AccountExtras {
+    fn given(value: &Option<String>) -> Option<&str> {
+        value.as_deref().map(str::trim).filter(|v| !v.is_empty())
+    }
+
+    /// The local server's bearer key: this record's, else `var`'s.
+    fn token_or_env(&self, var: &str) -> String {
+        Self::given(&self.token)
+            .map(str::to_string)
+            .or_else(|| std::env::var(var).ok())
+            .unwrap_or_default()
+    }
+}
+
+/// [`create_provider`] on an account's [`AccountExtras`] too.
+pub fn create_provider_with(
+    kind: ProviderKind,
+    api_key: &str,
+    extras: &AccountExtras,
+    model: Option<&str>,
+    thinking_budget: Option<u32>,
+    zai_subscription: bool,
+) -> Result<Box<dyn LlmProvider>> {
     Ok(match kind {
         ProviderKind::Anthropic => {
             let client = AnthropicClient::new(api_key)?;
@@ -1125,7 +1246,7 @@ pub fn create_provider(
             } else {
                 api_key.to_string()
             };
-            let ollama_api_key = std::env::var("OLLAMA_API_KEY").unwrap_or_default();
+            let ollama_api_key = extras.token_or_env("OLLAMA_API_KEY");
             let mut client = OllamaClient::new(base_url).with_api_key(ollama_api_key);
             if let Some(m) = model {
                 client = client.with_model(m);
@@ -1152,7 +1273,7 @@ pub fn create_provider(
                 api_key.to_string()
             };
             let vision_url = std::env::var("VLLM_VISION_URL").unwrap_or_default();
-            let vllm_api_key = std::env::var("VLLM_API_KEY").unwrap_or_default();
+            let vllm_api_key = extras.token_or_env("VLLM_API_KEY");
             let mut client = VllmClient::new(base_url)
                 .with_vision_url(vision_url)
                 .with_api_key(vllm_api_key);
@@ -1186,7 +1307,7 @@ pub fn create_provider(
         }
         ProviderKind::Bedrock => {
             let resolver = CredentialResolver::from_packed(api_key);
-            let region = bedrock::resolve_region(None);
+            let region = bedrock::resolve_region(AccountExtras::given(&extras.region));
             let client = BedrockClient::new(resolver, region).with_catalog(bedrock_catalog());
             let client = model.into_iter().fold(client, |c, m| c.with_model(m));
             let client = thinking_budget
@@ -1196,12 +1317,19 @@ pub fn create_provider(
         }
         ProviderKind::VertexAnthropic => {
             let source = vertex_credentials::resolve_source(api_key)?;
-            let project = vertex_credentials::resolve_project(None)?;
-            let location = vertex_credentials::resolve_location(None)?;
+            let project = AccountExtras::given(&extras.project)
+                .map(str::to_string)
+                .or_else(|| source.project_id());
+            let project = vertex_credentials::resolve_project(project.as_deref())?;
+            let location =
+                vertex_credentials::resolve_location(AccountExtras::given(&extras.location))?;
             let token_source: Arc<dyn VertexTokenSource> = match source {
                 VertexCredentialSource::Adc => Arc::new(LazyGcpAuthTokenSource::adc()),
                 VertexCredentialSource::ServiceAccountFile(p) => {
                     Arc::new(LazyGcpAuthTokenSource::from_service_account_file(p))
+                }
+                VertexCredentialSource::ServiceAccountKey(key) => {
+                    Arc::new(LazyGcpAuthTokenSource::from_service_account_key(key))
                 }
             };
             let client = VertexAnthropicClient::new(token_source, project, location);

@@ -1440,6 +1440,60 @@ async fn claude_effort_none_asks_the_least() {
     assert_eq!(medium.claude.calls()[0].flag("--effort"), Some("medium"));
 }
 
+/// `hub` with its live `[llm] effort` set to `effort`, as a config edit
+/// would leave it.
+fn set_effort(hub: &Hub, effort: Option<&str>) {
+    let mut resolved = (*hub.service.resolved.snapshot()).clone();
+    resolved.effort = effort.map(String::from);
+    hub.service.resolved.store(resolved);
+}
+
+#[tokio::test]
+async fn the_configured_effort_reaches_the_cli_and_a_pinned_one_beats_it() {
+    let hub = hub(|config| {
+        claude_first(config);
+        config.llm.thinking_budget_tokens = Some(1_000);
+    })
+    .await;
+    hub.claude_login(ALICE);
+
+    set_effort(&hub, Some("max"));
+    hub.ask(ALICE, "one").await.unwrap();
+    assert_eq!(
+        hub.claude.calls()[0].flag("--effort"),
+        Some("max"),
+        "the agent's effort beats its thinking budget"
+    );
+
+    set_effort(&hub, Some("xhigh"));
+    hub.ask(ALICE, "two").await.unwrap();
+    assert_eq!(
+        hub.claude.calls()[1].flag("--effort"),
+        Some("high"),
+        "a level the CLI lacks asks for the one below it"
+    );
+
+    let mut session = hub.session(ALICE);
+    session.set_claude_chat_choice(None, Some("low"));
+    hub.service.sessions.save(&session).unwrap();
+    hub.ask(ALICE, "three").await.unwrap();
+    assert_eq!(
+        hub.claude.calls()[2].flag("--effort"),
+        Some("low"),
+        "the session's own choice wins"
+    );
+
+    session.set_claude_chat_choice(None, None);
+    hub.service.sessions.save(&session).unwrap();
+    set_effort(&hub, None);
+    hub.ask(ALICE, "four").await.unwrap();
+    assert_eq!(
+        hub.claude.calls()[3].flag("--effort"),
+        Some("low"),
+        "with no effort the budget decides again"
+    );
+}
+
 #[tokio::test]
 async fn advisor_model_backend_on_claude_code_primary_runs_on_the_cli() {
     let hub = hub(claude_first).await;
@@ -1984,6 +2038,7 @@ async fn agent_turn_remote_placement_is_connection_bound() {
         instructions: &cli::Instructions::default(),
         tools: None,
         transcript: &transcript,
+        pinned_effort: None,
         deadline: tokio::time::Instant::now() + AGENT_TURN_TIMEOUT,
         program: None,
     };

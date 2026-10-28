@@ -69,6 +69,35 @@ impl CliKind {
         }
     }
 
+    /// The level the CLI is asked for an agent's configured `effort`: the
+    /// level itself when the CLI takes it, else the highest it takes below
+    /// it (Claude Code has no `xhigh`), else the least it takes.
+    pub fn effort_for(self, effort: workforce_agent::llm::anthropic::Effort) -> &'static str {
+        let efforts = self.efforts();
+        let rank = |name: &str| workforce_agent::llm::anthropic::Effort::parse(name);
+        efforts
+            .iter()
+            .copied()
+            .rfind(|name| rank(name).is_some_and(|level| level <= effort))
+            .or_else(|| efforts.first().copied())
+            .unwrap_or(effort.as_str())
+    }
+
+    /// Whether the CLI takes the level `name`.
+    pub fn accepts(self, name: &str) -> bool {
+        self.efforts()
+            .iter()
+            .any(|e| e.eq_ignore_ascii_case(name.trim()))
+    }
+
+    fn efforts(self) -> &'static [&'static str] {
+        match self {
+            Self::ClaudeCode => CodingEngineKind::ClaudeCode,
+            Self::Codex => CodingEngineKind::Codex,
+        }
+        .efforts()
+    }
+
     /// The effort a thinking `budget` asks of the CLI, when it takes one: a
     /// budget that turns thinking off asks for the least it takes.
     pub fn effort(self, budget: u32) -> Option<&'static str> {
@@ -460,6 +489,7 @@ pub fn review_agent_llm(
         .chain(models)
         .chain(direct_off)
         .chain(media_findings(llm))
+        .chain(effort_finding(llm, resolved))
         .chain(
             resolved
                 .workspace
@@ -468,6 +498,44 @@ pub fn review_agent_llm(
         )
         .partition(Finding::is_refused);
     refused.into_iter().chain(warnings).collect()
+}
+
+/// What `[llm] effort` says that the agent's provider cannot honour: a level
+/// it does not take is refused, naming the ones it does; a provider with no
+/// effort control ignores a level, which is said.
+fn effort_finding(llm: &LlmConfig, resolved: &ResolvedConfig) -> Option<Finding> {
+    const SPEC: &str = "[llm] effort";
+    let effort = resolved.effort.as_deref()?;
+    let (kind, _) = parse_provider_spec(llm.provider.trim()).ok().flatten()?;
+    let offered = kind.efforts();
+    let name = kind.canonical_name();
+    if offered
+        .iter()
+        .any(|e| e.eq_ignore_ascii_case(effort.trim()))
+    {
+        return None;
+    }
+    let list = |levels: &[&str]| levels.join(", ");
+    match (offered.is_empty(), resolved.effort_level()) {
+        (true, Some(_)) => Some(Finding::warning(
+            SPEC,
+            format!("{name} has no effort control, so effort = {effort:?} is ignored"),
+        )),
+        (true, None) => Some(Finding::refused(
+            SPEC,
+            format!(
+                "effort = {effort:?} is not an effort level: use one of {}",
+                list(workforce_agent::llm::anthropic::Effort::NAMES)
+            ),
+        )),
+        (false, _) => Some(Finding::refused(
+            SPEC,
+            format!(
+                "effort = {effort:?} is not a level {name} takes: use one of {}",
+                list(offered)
+            ),
+        )),
+    }
 }
 
 /// Each enabled media block its tool cannot be built from, checked with the

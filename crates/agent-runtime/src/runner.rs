@@ -6130,6 +6130,7 @@ impl AgentRunner {
         // silently miss the streaming one, which is the path voice actually
         // takes.
         let thinking_override = crate::llm::provider::thinking_budget_override();
+        let effort = crate::llm::provider::effort_override();
         let stream_handle = spawn_in_session_context(async move {
             with_cached_prefix(
                 cached_prefix,
@@ -6137,14 +6138,17 @@ impl AgentRunner {
                     deferral,
                     crate::llm::provider::with_thinking_budget_override(
                         thinking_override,
-                        llm.create_message_stream(
-                            Some(&system_prompt),
-                            &messages_owned,
-                            &tool_defs_owned,
-                            model.as_deref(),
-                            max_tokens,
-                            true,
-                            stream_tx,
+                        crate::llm::provider::with_effort_override(
+                            effort,
+                            llm.create_message_stream(
+                                Some(&system_prompt),
+                                &messages_owned,
+                                &tool_defs_owned,
+                                model.as_deref(),
+                                max_tokens,
+                                true,
+                                stream_tx,
+                            ),
                         ),
                     ),
                 ),
@@ -10645,6 +10649,7 @@ mod tests {
     /// silently evaporates on the streaming path.
     struct BudgetProbeProvider {
         seen: std::sync::Mutex<Option<Option<u32>>>,
+        effort: std::sync::Mutex<Option<crate::llm::anthropic::Effort>>,
     }
 
     #[async_trait::async_trait]
@@ -10679,6 +10684,7 @@ mod tests {
             tx: mpsc::Sender<StreamEvent>,
         ) -> Result<()> {
             *self.seen.lock().unwrap() = Some(crate::llm::provider::thinking_budget_override());
+            *self.effort.lock().unwrap() = crate::llm::provider::effort_override();
             let _ = tx.send(StreamEvent::ContentStart { index: 0 }).await;
             let _ = tx
                 .send(StreamEvent::TextDelta {
@@ -10701,6 +10707,7 @@ mod tests {
     async fn thinking_budget_override_survives_the_streaming_spawn() {
         let provider = Arc::new(BudgetProbeProvider {
             seen: std::sync::Mutex::new(None),
+            effort: std::sync::Mutex::new(None),
         });
         let runner = make_runner(provider.clone());
         let (tx, _rx) = mpsc::channel(64);
@@ -10720,9 +10727,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_turns_effort_survives_the_streaming_spawn() {
+        use crate::llm::anthropic::Effort;
+        let provider = Arc::new(BudgetProbeProvider {
+            seen: std::sync::Mutex::new(None),
+            effort: std::sync::Mutex::new(None),
+        });
+        let runner = make_runner(provider.clone());
+        let (tx, _rx) = mpsc::channel(64);
+
+        crate::llm::provider::with_effort_override(
+            Some(Effort::Xhigh),
+            runner.run_with_progress("Hi", tx),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(*provider.effort.lock().unwrap(), Some(Effort::Xhigh));
+    }
+
+    #[tokio::test]
     async fn no_thinking_budget_override_leaves_the_stream_call_untouched() {
         let provider = Arc::new(BudgetProbeProvider {
             seen: std::sync::Mutex::new(None),
+            effort: std::sync::Mutex::new(None),
         });
         let runner = make_runner(provider.clone());
         let (tx, _rx) = mpsc::channel(64);

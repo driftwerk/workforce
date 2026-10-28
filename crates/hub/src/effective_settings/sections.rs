@@ -134,6 +134,7 @@ fn tables(service: &AgentService, resolved: &ResolvedConfig) -> Vec<Layered> {
         model_preferences,
         voice_model,
         voice_thinking_budget_tokens,
+        effort,
         aws_s3,
         worker_read_sources_enabled,
         self_learning,
@@ -278,6 +279,7 @@ fn tables(service: &AgentService, resolved: &ResolvedConfig) -> Vec<Layered> {
             .effective_field("speech", &*service.speech_config.read())
             .effective_field("voice_model", voice_model)
             .effective_field("voice_thinking_budget_tokens", voice_thinking_budget_tokens)
+            .effective_field("effort", effort)
             .effective_field("model_preferences", model_preferences)
             .runtime(&json!({
                 "default_model": *service.active_model.read(),

@@ -417,11 +417,20 @@ fn request_body(call: &Call<'_>) -> Value {
     body
 }
 
+/// The `reasoning.effort` levels the models here take, lowest first.
+pub const CHATGPT_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh"];
+
 /// The models here take low…xhigh, so "don't think" (suppression, or a zero
-/// budget) is clamped to `low`. No budget leaves the model its default.
+/// budget) is clamped to `low`, and `max` to `xhigh`. The turn's configured
+/// effort beats the budget; neither leaves the model its default.
 fn reasoning(configured: Option<u32>) -> Value {
     let effort = if reasoning_suppressed() {
         Some("low")
+    } else if let Some(effort) = super::provider::effective_effort() {
+        Some(match effort {
+            super::anthropic::Effort::Max => "xhigh",
+            effort => effort.as_str(),
+        })
     } else {
         effective_thinking_budget(configured).map(|budget| match budget_to_effort(budget) {
             "none" => "low",
@@ -1227,6 +1236,50 @@ mod tests {
         assert_eq!(effort(Some(0)), "low");
         assert_eq!(effort(Some(5_000)), "medium");
         assert_eq!(reasoning(None), json!({ "summary": "auto" }));
+    }
+
+    #[tokio::test]
+    async fn the_configured_effort_is_the_reasoning_effort_unless_reasoning_is_held_back() {
+        use crate::llm::anthropic::Effort;
+        use crate::llm::provider::with_effort_override;
+        let effort = |budget: Option<u32>| reasoning(budget)["effort"].clone();
+        for (level, sent) in [
+            (Effort::Low, "low"),
+            (Effort::Medium, "medium"),
+            (Effort::High, "high"),
+            (Effort::Xhigh, "xhigh"),
+            (Effort::Max, "xhigh"),
+        ] {
+            assert_eq!(
+                with_effort_override(Some(level), async { effort(Some(1_000)) }).await,
+                sent
+            );
+            assert_eq!(
+                with_effort_override(Some(level), async { effort(None) }).await,
+                sent
+            );
+        }
+        assert_eq!(
+            with_effort_override(
+                Some(Effort::Xhigh),
+                with_reasoning_suppressed(async { effort(None) })
+            )
+            .await,
+            "low",
+            "a background extraction still thinks the least"
+        );
+        assert_eq!(
+            with_effort_override(
+                Some(Effort::Xhigh),
+                with_thinking_budget_override(Some(0), async { effort(None) })
+            )
+            .await,
+            "low",
+            "a voice turn's budget beats the agent's effort"
+        );
+        for level in CHATGPT_EFFORTS {
+            assert!(Effort::parse(level).is_some(), "{level}");
+        }
     }
 
     #[test]

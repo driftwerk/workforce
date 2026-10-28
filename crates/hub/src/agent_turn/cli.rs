@@ -577,6 +577,7 @@ impl AgentTurnRig {
                 instructions,
                 tools: tools.as_ref(),
                 transcript: &transcript,
+                pinned_effort: conversation.and_then(|c| c.session.claude_chat_effort()),
                 deadline,
                 #[cfg(test)]
                 program: self.programs.get(&turn.cli),

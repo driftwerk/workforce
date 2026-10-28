@@ -24,6 +24,45 @@ pub enum VertexCredentialSource {
     Adc,
     /// Explicit service-account JSON loaded from the given path.
     ServiceAccountFile(PathBuf),
+    /// A service-account key's JSON itself, as a vault account holds it.
+    ServiceAccountKey(ServiceAccountKey),
+}
+
+impl VertexCredentialSource {
+    /// The project a service-account key names, if it is one that does.
+    pub fn project_id(&self) -> Option<String> {
+        match self {
+            Self::ServiceAccountKey(key) => key.project_id(),
+            Self::Adc | Self::ServiceAccountFile(_) => None,
+        }
+    }
+}
+
+/// A service-account key's JSON. Its `Debug` never shows it.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ServiceAccountKey(String);
+
+impl ServiceAccountKey {
+    pub fn json(&self) -> &str {
+        &self.0
+    }
+
+    /// The `project_id` the key names.
+    pub fn project_id(&self) -> Option<String> {
+        serde_json::from_str::<serde_json::Value>(&self.0)
+            .ok()?
+            .get("project_id")?
+            .as_str()
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .map(str::to_string)
+    }
+}
+
+impl std::fmt::Debug for ServiceAccountKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ServiceAccountKey(<redacted>)")
+    }
 }
 
 /// Parse the packed `api_key` field into a credential source.
@@ -31,6 +70,7 @@ pub enum VertexCredentialSource {
 /// Accepted forms:
 /// - empty, `"adc"`, `"none"` → [`VertexCredentialSource::Adc`]
 /// - a `.json` path that exists on disk → [`VertexCredentialSource::ServiceAccountFile`]
+/// - a JSON object (a service-account key itself) → [`VertexCredentialSource::ServiceAccountKey`]
 pub fn resolve_source(api_key: &str) -> Result<VertexCredentialSource> {
     let trimmed = api_key.trim();
     if trimmed.is_empty()
@@ -38,6 +78,16 @@ pub fn resolve_source(api_key: &str) -> Result<VertexCredentialSource> {
         || trimmed.eq_ignore_ascii_case("none")
     {
         return Ok(VertexCredentialSource::Adc);
+    }
+    if trimmed.starts_with('{') {
+        return match serde_json::from_str::<serde_json::Value>(trimmed) {
+            Ok(serde_json::Value::Object(_)) => Ok(VertexCredentialSource::ServiceAccountKey(
+                ServiceAccountKey(trimmed.to_string()),
+            )),
+            _ => Err(eyre!(
+                "the Vertex service-account key is not a JSON object; paste the whole key file"
+            )),
+        };
     }
     let path = PathBuf::from(trimmed);
     let looks_like_json = path
@@ -95,6 +145,21 @@ mod tests {
     use std::sync::Mutex;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn a_pasted_key_is_a_source_that_names_its_project_and_never_shows_itself() {
+        let json =
+            r#"{"type":"service_account","project_id":"acme-ai","private_key":"-----BEGIN"}"#;
+        let source = resolve_source(&format!("  {json}\n")).unwrap();
+        assert_eq!(source.project_id().as_deref(), Some("acme-ai"));
+        let shown = format!("{source:?}");
+        assert!(
+            !shown.contains("BEGIN") && !shown.contains("acme"),
+            "{shown}"
+        );
+        let err = resolve_source("{not json").unwrap_err().to_string();
+        assert!(!err.contains("not json"), "{err}");
+    }
 
     fn with_env<F: FnOnce()>(vars: &[(&str, Option<&str>)], f: F) {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());

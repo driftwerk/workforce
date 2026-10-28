@@ -95,10 +95,15 @@ impl CliCompletion {
         }
     }
 
-    /// The effort the completion's thinking budget asks of its CLI.
+    /// The effort the completion asks of its CLI: the turn's configured
+    /// effort in scope, else what its thinking budget asks.
     fn effort(&self) -> Option<String> {
-        self.thinking_budget
-            .and_then(|budget| self.cli.effort(budget))
+        workforce_agent::llm::provider::effective_effort()
+            .map(|effort| self.cli.effort_for(effort))
+            .or_else(|| {
+                self.thinking_budget
+                    .and_then(|budget| self.cli.effort(budget))
+            })
             .map(str::to_string)
     }
 

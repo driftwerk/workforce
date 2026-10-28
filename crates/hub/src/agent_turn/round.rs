@@ -97,6 +97,9 @@ pub(crate) struct Round<'a> {
     pub(crate) instructions: &'a Instructions,
     pub(crate) tools: Option<&'a RoundTools>,
     pub(crate) transcript: &'a Transcript,
+    /// The effort the session's thread was opened at (`effort:` on a `/cc`
+    /// or `/cx` command), which beats the agent's configured one.
+    pub(crate) pinned_effort: Option<&'a str>,
     pub(crate) deadline: Instant,
     #[cfg(test)]
     pub(crate) program: Option<&'a PathBuf>,
@@ -234,13 +237,24 @@ impl Round<'_> {
         run.await
     }
 
-    /// The effort the agent's thinking budget asks of the turn's CLI, when it
-    /// takes one.
+    /// The effort the turn's CLI is asked for: the session's pinned choice
+    /// when the CLI takes it, then the agent's `[llm] effort` (unless a
+    /// voice turn's budget replaces it), then what its thinking budget asks.
     fn effort(&self) -> Option<String> {
-        thinking_budget_override()
-            .or(self.service.effective_llm.thinking_budget_tokens)
-            .and_then(|budget| self.turn.cli.effort(budget))
-            .map(str::to_string)
+        let cli = self.turn.cli;
+        self.pinned_effort
+            .filter(|pinned| cli.accepts(pinned))
+            .map(str::to_ascii_lowercase)
+            .or_else(|| {
+                workforce_agent::llm::provider::effective_effort()
+                    .map(|effort| cli.effort_for(effort).to_string())
+            })
+            .or_else(|| {
+                thinking_budget_override()
+                    .or(self.service.effective_llm.thinking_budget_tokens)
+                    .and_then(|budget| cli.effort(budget))
+                    .map(str::to_string)
+            })
     }
 
     /// The contained Claude Code invocation for one round of the turn, sent

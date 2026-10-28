@@ -8,7 +8,7 @@ use std::collections::BTreeSet;
 
 use serde_json::{json, Value};
 
-use super::anthropic::{build_system_blocks, CacheControl, Effort};
+use super::anthropic::{build_system_blocks, CacheControl};
 use super::bedrock_capabilities::{self, ThinkingMode};
 use super::provider::{tool_deferral, ToolDeferral};
 use super::types::{
@@ -56,12 +56,18 @@ pub fn build_body(
         body["tools"] = serde_json::to_value(&anthropic_tools).unwrap_or(Value::Null);
     }
 
-    if let (ThinkingMode::ToggleWithBudget, Some(budget)) = (thinking, thinking_budget) {
-        if bedrock_capabilities::requires_adaptive_thinking(model_id) {
-            body["thinking"] = json!({ "type": "adaptive", "display": "summarized" });
-            body["output_config"] = json!({ "effort": Effort::from_budget(budget).as_str() });
-        } else if let Some(b) = bedrock_capabilities::clamp_thinking_budget(budget, max_tokens) {
-            body["thinking"] = json!({ "type": "enabled", "budget_tokens": b });
+    if thinking == ThinkingMode::ToggleWithBudget {
+        let (thinking, output) = super::anthropic::thinking_fields(
+            model_id,
+            thinking_budget,
+            super::provider::effective_effort(),
+            max_tokens,
+        );
+        if let Some(thinking) = thinking {
+            body["thinking"] = thinking;
+        }
+        if let Some(output) = output {
+            body["output_config"] = output;
         }
     }
 
@@ -600,6 +606,28 @@ mod tests {
         assert!(body["thinking"].get("budget_tokens").is_none());
         assert!(body["thinking"].get("effort").is_none());
         assert_eq!(body["output_config"]["effort"].as_str(), Some("high"));
+    }
+
+    #[tokio::test]
+    async fn body_sends_the_turns_configured_effort_with_or_without_a_budget() {
+        use crate::llm::anthropic::Effort;
+        use crate::llm::provider::{with_effort_override, with_reasoning_suppressed};
+        for budget in [None, Some(1_000)] {
+            let body = with_effort_override(Some(Effort::Max), async {
+                build_body(None, &[user("hi")], &[], 16384, OPUS, false, budget)
+            })
+            .await;
+            assert_eq!(body["thinking"]["type"].as_str(), Some("adaptive"));
+            assert_eq!(body["output_config"]["effort"].as_str(), Some("max"));
+        }
+        let held_back = with_effort_override(
+            Some(Effort::Max),
+            with_reasoning_suppressed(async {
+                build_body(None, &[user("hi")], &[], 16384, OPUS, false, None)
+            }),
+        )
+        .await;
+        assert!(held_back.get("output_config").is_none());
     }
 
     #[test]

@@ -10,8 +10,8 @@ use tracing::{info, warn};
 use workforce_agent::llm::failover::FailoverProvider;
 use workforce_agent::llm::pool::PooledProvider;
 use workforce_agent::llm::provider::{
-    chain_credential_fallback, create_named_provider_async, provider_env_key,
-    provider_env_var_hint, LlmProvider, ProviderKind, ProviderParseError,
+    chain_credential_fallback, create_provider_with, provider_env_key, provider_env_var_hint,
+    AccountExtras, LlmProvider, ProviderKind, ProviderParseError,
 };
 use workforce_agent::llm::tiers::{extract_routing_provider, Provider};
 use workforce_common::settings::{is_claude_oat, oat_refusal, LlmConfig};
@@ -90,6 +90,18 @@ pub fn external_routes<'a>(
         .collect()
 }
 
+/// `kind`'s key from an environment variable someone set: for Ollama and
+/// vLLM, whose [`provider_env_key`] falls back on a built-in local URL, only
+/// a URL set in the environment, so a vault account's URL beats the default.
+fn explicit_env_key(kind: ProviderKind) -> Option<String> {
+    match kind {
+        ProviderKind::Ollama => std::env::var("OLLAMA_URL").ok(),
+        ProviderKind::Vllm => std::env::var("VLLM_URL").ok(),
+        _ => provider_env_key(kind),
+    }
+    .filter(|key| !key.trim().is_empty())
+}
+
 /// Where a metered provider's credential comes from, in the order
 /// [`AgentProviders::metered_key`] looks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -152,12 +164,14 @@ impl AgentProviders {
                 .as_deref()
                 .is_some_and(|vault| vault.find_account_api_key(name).is_some())
         };
-        if provider_env_key(kind).is_some() {
+        if explicit_env_key(kind).is_some() {
             Some(KeySource::Env)
         } else if held(&self.vault) {
             Some(KeySource::AgentVault)
         } else if held(&self.global_vault) {
             Some(KeySource::GlobalVault)
+        } else if provider_env_key(kind).is_some() {
+            Some(KeySource::Env)
         } else if chain_credential_fallback(kind).is_some() {
             Some(KeySource::ProviderChain)
         } else {
@@ -167,17 +181,28 @@ impl AgentProviders {
 
     /// The credential a metered `kind` authenticates with: its env var, then
     /// the agent vault's `llm/accounts/*`, then the global vault's, then the
-    /// provider's credential chain (Bedrock, Vertex).
+    /// built-in local URL (Ollama, vLLM) or the provider's credential chain
+    /// (Bedrock, Vertex).
     pub fn metered_key(&self, kind: ProviderKind) -> Option<String> {
-        provider_env_key(kind)
+        self.metered_account(kind).map(|(key, _)| key)
+    }
+
+    /// [`Self::metered_key`], with what the vault account holds beside it.
+    fn metered_account(&self, kind: ProviderKind) -> Option<(String, AccountExtras)> {
+        explicit_env_key(kind)
+            .map(|key| (key, AccountExtras::default()))
             .or_else(|| {
-                crate::vault::find_account_api_key_layered(
+                let record = crate::vault::find_account_layered(
                     self.vault.as_deref(),
                     self.global_vault.as_deref(),
                     vault_provider_name(kind),
-                )
+                )?;
+                let key = record["api_key"].as_str()?.to_string();
+                let extras = serde_json::from_value(record).unwrap_or_default();
+                Some((key, extras))
             })
-            .or_else(|| chain_credential_fallback(kind))
+            .or_else(|| provider_env_key(kind).map(|key| (key, AccountExtras::default())))
+            .or_else(|| chain_credential_fallback(kind).map(|key| (key, AccountExtras::default())))
     }
 
     /// The agent's provider of `kind`, serving `model` by default: a
@@ -194,22 +219,24 @@ impl AgentProviders {
         if kind.is_subscription() {
             return self.plans.provider(kind, model, thinking_budget);
         }
-        let api_key = api_key.or_else(|| self.metered_key(kind)).ok_or_else(|| {
-            eyre::eyre!(
-                "no API key for provider {}: set {} or add an account",
-                kind.canonical_name(),
-                provider_env_var_hint(kind)
-            )
-        })?;
-        create_named_provider_async(
+        let (api_key, extras) = api_key
+            .map(|key| (key, AccountExtras::default()))
+            .or_else(|| self.metered_account(kind))
+            .ok_or_else(|| {
+                eyre::eyre!(
+                    "no API key for provider {}: set {} or add an account",
+                    kind.canonical_name(),
+                    provider_env_var_hint(kind)
+                )
+            })?;
+        create_provider_with(
             kind,
-            "default",
             &api_key,
+            &extras,
             model,
             thinking_budget,
             zai_subscription,
         )
-        .await
         .map(Arc::from)
     }
 

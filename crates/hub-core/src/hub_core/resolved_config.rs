@@ -44,6 +44,10 @@ pub struct ResolvedConfig {
     /// turns. Resolved the same workspace → agent-section way as
     /// `voice_model`, and applied independently of it.
     pub voice_thinking_budget_tokens: Option<u32>,
+    /// `[llm] effort` as written, resolved workspace → agent section like
+    /// `voice_model`. Read every turn ([`Self::effort_level`]), so not
+    /// structural; admission refuses a level the provider does not take.
+    pub effort: Option<String>,
     /// `[aws_s3]` — surfaced here only so [`Self::structural_diff`] can
     /// report when an edit needs a restart. The hub doesn't read this
     /// per-turn (tools take their config at registration time); a
@@ -188,6 +192,10 @@ impl ResolvedConfig {
         let voice_thinking_budget_tokens = workspace_llm
             .and_then(|llm| llm.voice_thinking_budget_tokens)
             .or_else(|| agent_llm.and_then(|llm| llm.voice_thinking_budget_tokens));
+        let effort = workspace_llm
+            .and_then(|llm| llm.effort.clone())
+            .or_else(|| agent_llm.and_then(|llm| llm.effort.clone()))
+            .filter(|effort| !effort.trim().is_empty());
 
         // Per-agent workspace `config.toml` override → global default. (The
         // workspace file is the fs-watched, hot-reloadable per-agent config.)
@@ -234,6 +242,7 @@ impl ResolvedConfig {
             model_preferences,
             voice_model,
             voice_thinking_budget_tokens,
+            effort,
             aws_s3: global.aws_s3.clone(),
             worker_read_sources_enabled,
             self_learning,
@@ -271,6 +280,13 @@ impl ResolvedConfig {
     /// baked into a resource built at startup (the memory store connection or
     /// the consolidation background task), so a restart is required. Returned
     /// so the operator can be told which parts of their edit are deferred.
+    /// The `[llm] effort` level the agent's turns run at, when it names one.
+    pub fn effort_level(&self) -> Option<workforce_agent::llm::anthropic::Effort> {
+        self.effort
+            .as_deref()
+            .and_then(workforce_agent::llm::anthropic::Effort::parse)
+    }
+
     pub fn structural_diff(&self, next: &Self) -> Vec<&'static str> {
         let mut changed = Vec::new();
         if self.memory.backend != next.memory.backend {
@@ -360,6 +376,7 @@ mod tests {
             model_preferences: None,
             voice_model: None,
             voice_thinking_budget_tokens: None,
+            effort: None,
             aws_s3: AwsS3Config::default(),
             worker_read_sources_enabled: false,
             self_learning: workforce_common::settings::SelfLearningConfig::default(),
