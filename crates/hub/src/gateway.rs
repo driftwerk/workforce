@@ -226,9 +226,30 @@ async fn static_index() -> impl IntoResponse {
     serve_embedded("index.html")
 }
 
-/// Fallback handler for static files and SPA routing.
-async fn static_fallback(uri: axum::http::Uri) -> impl IntoResponse {
+/// Whether `path` is under the API or websocket prefixes, which a client
+/// calls rather than a browser navigates to.
+fn is_api_path(path: &str) -> bool {
+    let path = path.trim_start_matches('/');
+    ["api", "ws"]
+        .iter()
+        .any(|prefix| path == *prefix || path.starts_with(&format!("{prefix}/")))
+}
+
+/// Fallback for every path no route matches: an API or websocket path is a
+/// JSON 404 (a client must not mistake the dashboard's index.html for an
+/// answer); any other path GET serves the static files and SPA routing.
+async fn static_fallback(method: Method, uri: axum::http::Uri) -> axum::response::Response {
     let path = uri.path().trim_start_matches('/');
+    if is_api_path(path) {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "not found" })),
+        )
+            .into_response();
+    }
+    if method != Method::GET && method != Method::HEAD {
+        return StatusCode::METHOD_NOT_ALLOWED.into_response();
+    }
     serve_embedded(if path.is_empty() { "index.html" } else { path })
 }
 
@@ -1084,7 +1105,7 @@ pub fn router(state: Arc<GatewayState>) -> Router {
         .route("/api/budget/overrides", axum::routing::put(crate::api_handlers::budget::put_override))
         .route("/api/budget/overrides/clear", axum::routing::post(crate::api_handlers::budget::clear_override))
         .with_state(state)
-        .fallback(get(static_fallback))
+        .fallback(static_fallback)
         // Audit F2 (2026-05-15).
         .layer(axum::middleware::from_fn(
             crate::security::security_headers_middleware,
@@ -15366,5 +15387,79 @@ mod turn_control_tests {
             forwarders.withdraw("s1", next),
             "a stopped session's forwarder ends"
         );
+    }
+}
+
+#[cfg(test)]
+mod fallback_tests {
+    use axum::body::{to_bytes, Body};
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    use super::*;
+
+    async fn call(method: Method, path: &str) -> (StatusCode, Option<String>, Vec<u8>) {
+        let app: Router = Router::new()
+            .route("/api/known", get(|| async { "known" }))
+            .fallback(static_fallback);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let content_type = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        let body = to_bytes(response.into_body(), 1 << 22)
+            .await
+            .unwrap()
+            .to_vec();
+        (status, content_type, body)
+    }
+
+    #[tokio::test]
+    async fn an_api_or_websocket_path_no_route_matches_is_a_json_404() {
+        for (method, path) in [
+            (Method::GET, "/api/desk/providers"),
+            (Method::POST, "/api/desk/providers/anthropic/connect"),
+            (Method::DELETE, "/api/nothing/here"),
+            (Method::GET, "/api"),
+            (Method::GET, "/ws/elsewhere"),
+        ] {
+            let (status, content_type, body) = call(method.clone(), path).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{method} {path}");
+            assert_eq!(content_type.as_deref(), Some("application/json"), "{path}");
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+                serde_json::json!({ "error": "not found" })
+            );
+        }
+        let (status, _, body) = call(Method::GET, "/api/known").await;
+        assert_eq!((status, body.as_slice()), (StatusCode::OK, &b"known"[..]));
+    }
+
+    #[tokio::test]
+    async fn any_other_path_keeps_the_dashboards_spa_fallback() {
+        for path in ["/agents/allan", "/apiary", "/wsx", "/"] {
+            let (status, content_type, _) = call(Method::GET, path).await;
+            let content_type = content_type.unwrap_or_default();
+            // The UI may not be built in this checkout: either way it is
+            // the dashboard's answer, never the API's JSON 404.
+            assert!(
+                (status == StatusCode::OK && content_type.starts_with("text/html"))
+                    || (status == StatusCode::NOT_FOUND && content_type == "text/plain"),
+                "{path}: {status} {content_type}"
+            );
+        }
+        let (status, _, _) = call(Method::POST, "/agents/allan").await;
+        assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
     }
 }
