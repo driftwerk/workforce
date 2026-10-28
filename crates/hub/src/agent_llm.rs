@@ -102,6 +102,12 @@ fn explicit_env_key(kind: ProviderKind) -> Option<String> {
     .filter(|key| !key.trim().is_empty())
 }
 
+/// Whether a vault account's credential beats the environment's for `kind`:
+/// a local server's address, which Desk sets in the vault, does.
+fn vault_beats_env(kind: ProviderKind) -> bool {
+    matches!(kind, ProviderKind::Ollama | ProviderKind::Vllm)
+}
+
 /// Where a metered provider's credential comes from, in the order
 /// [`AgentProviders::metered_key`] looks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -158,51 +164,76 @@ impl AgentProviders {
     /// Where [`Self::metered_key`] finds `kind`'s credential, without the
     /// credential: the first place it looks that holds one.
     pub fn metered_key_source(&self, kind: ProviderKind) -> Option<KeySource> {
+        self.metered_key_source_with(kind, explicit_env_key(kind))
+    }
+
+    /// [`Self::metered_key_source`] with `env` as what the environment sets.
+    fn metered_key_source_with(
+        &self,
+        kind: ProviderKind,
+        env: Option<String>,
+    ) -> Option<KeySource> {
         let name = vault_provider_name(kind);
         let held = |vault: &Option<Arc<Vault>>| {
             vault
                 .as_deref()
                 .is_some_and(|vault| vault.find_account_api_key(name).is_some())
         };
-        if explicit_env_key(kind).is_some() {
-            Some(KeySource::Env)
-        } else if held(&self.vault) {
-            Some(KeySource::AgentVault)
-        } else if held(&self.global_vault) {
-            Some(KeySource::GlobalVault)
-        } else if provider_env_key(kind).is_some() {
-            Some(KeySource::Env)
-        } else if chain_credential_fallback(kind).is_some() {
-            Some(KeySource::ProviderChain)
-        } else {
-            None
+        let vault = || {
+            if held(&self.vault) {
+                Some(KeySource::AgentVault)
+            } else if held(&self.global_vault) {
+                Some(KeySource::GlobalVault)
+            } else {
+                None
+            }
+        };
+        let env = || env.as_ref().map(|_| KeySource::Env);
+        match vault_beats_env(kind) {
+            true => vault().or_else(env),
+            false => env().or_else(vault),
         }
+        .or_else(|| provider_env_key(kind).map(|_| KeySource::Env))
+        .or_else(|| chain_credential_fallback(kind).map(|_| KeySource::ProviderChain))
     }
 
     /// The credential a metered `kind` authenticates with: its env var, then
     /// the agent vault's `llm/accounts/*`, then the global vault's, then the
     /// built-in local URL (Ollama, vLLM) or the provider's credential chain
-    /// (Bedrock, Vertex).
+    /// (Bedrock, Vertex). A local server's address in a vault account beats
+    /// the environment's: it is the one Desk set.
     pub fn metered_key(&self, kind: ProviderKind) -> Option<String> {
         self.metered_account(kind).map(|(key, _)| key)
     }
 
     /// [`Self::metered_key`], with what the vault account holds beside it.
     fn metered_account(&self, kind: ProviderKind) -> Option<(String, AccountExtras)> {
-        explicit_env_key(kind)
-            .map(|key| (key, AccountExtras::default()))
-            .or_else(|| {
-                let record = crate::vault::find_account_layered(
-                    self.vault.as_deref(),
-                    self.global_vault.as_deref(),
-                    vault_provider_name(kind),
-                )?;
-                let key = record["api_key"].as_str()?.to_string();
-                let extras = serde_json::from_value(record).unwrap_or_default();
-                Some((key, extras))
-            })
-            .or_else(|| provider_env_key(kind).map(|key| (key, AccountExtras::default())))
-            .or_else(|| chain_credential_fallback(kind).map(|key| (key, AccountExtras::default())))
+        self.metered_account_with(kind, explicit_env_key(kind))
+    }
+
+    /// [`Self::metered_account`] with `env` as what the environment sets.
+    fn metered_account_with(
+        &self,
+        kind: ProviderKind,
+        env: Option<String>,
+    ) -> Option<(String, AccountExtras)> {
+        let env = || env.clone().map(|key| (key, AccountExtras::default()));
+        let vault = || {
+            let record = crate::vault::find_account_layered(
+                self.vault.as_deref(),
+                self.global_vault.as_deref(),
+                vault_provider_name(kind),
+            )?;
+            let key = record["api_key"].as_str()?.to_string();
+            let extras = serde_json::from_value(record).unwrap_or_default();
+            Some((key, extras))
+        };
+        match vault_beats_env(kind) {
+            true => vault().or_else(env),
+            false => env().or_else(vault),
+        }
+        .or_else(|| provider_env_key(kind).map(|key| (key, AccountExtras::default())))
+        .or_else(|| chain_credential_fallback(kind).map(|key| (key, AccountExtras::default())))
     }
 
     /// The agent's provider of `kind`, serving `model` by default: a
@@ -388,6 +419,60 @@ mod tests {
             Subscriptions::new(config),
             CredentialScope::system(Arc::clone(vault), &config.subscription),
         )
+    }
+
+    #[test]
+    fn a_local_servers_address_in_the_vault_beats_the_environments() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = Arc::new(Vault::open(&dir.path().join("global.enc"), "test-key").unwrap());
+        let providers = AgentProviders::new(
+            None,
+            Some(Arc::clone(&vault)),
+            system_plans(&WorkforceConfig::default(), &vault),
+        );
+        let env = || Some("http://from-env:1".to_string());
+        for kind in [ProviderKind::Ollama, ProviderKind::Vllm] {
+            let name = vault_provider_name(kind);
+            assert_eq!(
+                providers.metered_account_with(kind, env()).unwrap().0,
+                "http://from-env:1",
+                "{name}: the environment, with nothing set in the vault"
+            );
+            assert_eq!(
+                providers.metered_key_source_with(kind, env()),
+                Some(KeySource::Env)
+            );
+            vault
+                .set(
+                    &format!("llm/accounts/{name}"),
+                    &serde_json::json!({
+                        "provider": name, "api_key": "http://from-desk:2", "token": "t",
+                    })
+                    .to_string(),
+                )
+                .unwrap();
+            let (url, extras) = providers.metered_account_with(kind, env()).unwrap();
+            assert_eq!(url, "http://from-desk:2", "{name}");
+            assert_eq!(extras.token.as_deref(), Some("t"));
+            assert_eq!(
+                providers.metered_key_source_with(kind, env()),
+                Some(KeySource::GlobalVault)
+            );
+        }
+        vault
+            .set(
+                "llm/accounts/grok",
+                &serde_json::json!({ "provider": "grok", "api_key": "vault-key" }).to_string(),
+            )
+            .unwrap();
+        assert_eq!(
+            providers
+                .metered_account_with(ProviderKind::Grok, Some("env-key".into()))
+                .unwrap()
+                .0,
+            "env-key",
+            "a key provider's environment still comes first"
+        );
     }
 
     #[tokio::test]

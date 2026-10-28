@@ -286,9 +286,19 @@ impl HubAccounts {
             .ok_or_else(|| AccountError::Unavailable("the hub has no vault".into()))
     }
 
-    /// Where a local server is, and its bearer key: a URL set in the hub's
-    /// environment, else the vault account's, else Ollama's usual port.
+    /// Where a local server is, and its bearer key: the vault account's URL
+    /// (the one Desk set), else a URL set in the hub's environment, else
+    /// Ollama's usual port.
     fn endpoint(&self, kind: ProviderKind) -> Option<(String, Option<String>)> {
+        self.endpoint_with(kind, |var| std::env::var(var).ok())
+    }
+
+    /// [`Self::endpoint`] with `env` as the environment.
+    fn endpoint_with(
+        &self,
+        kind: ProviderKind,
+        env: impl Fn(&str) -> Option<String>,
+    ) -> Option<(String, Option<String>)> {
         let (url_var, key_var, default) = match kind {
             ProviderKind::Ollama => (
                 "OLLAMA_URL",
@@ -298,24 +308,23 @@ impl HubAccounts {
             ProviderKind::Vllm => ("VLLM_URL", "VLLM_API_KEY", None),
             _ => return None,
         };
-        let env_key = || std::env::var(key_var).ok();
-        if let Some(url) = std::env::var(url_var).ok().filter(|u| !u.trim().is_empty()) {
-            return Some((url, env_key()));
-        }
+        let env_key = || env(key_var);
         let record = self
             .vault
             .as_deref()
-            .and_then(|vault| vault.find_account(vault_provider_name(kind)));
-        match record {
-            Some((_, record)) => Some((
-                record["api_key"].as_str()?.to_string(),
-                record["token"]
-                    .as_str()
-                    .map(str::to_string)
-                    .or_else(env_key),
-            )),
-            None => default.map(|url| (url.to_string(), env_key())),
+            .and_then(|vault| vault.find_account(vault_provider_name(kind)))
+            .and_then(|(_, record)| {
+                let url = record["api_key"].as_str()?.trim().to_string();
+                let token = record["token"].as_str().map(str::to_string);
+                (!url.is_empty()).then_some((url, token))
+            });
+        if let Some((url, token)) = record {
+            return Some((url, token.or_else(env_key)));
         }
+        if let Some(url) = env(url_var).filter(|u| !u.trim().is_empty()) {
+            return Some((url, env_key()));
+        }
+        default.map(|url| (url.to_string(), env_key()))
     }
 
     async fn write(&self, path: &str, value: &str) -> Result<(), AccountError> {
@@ -631,8 +640,7 @@ mod tests {
         /// The variables that would put `kind`'s key ahead of the vault.
         fn env_set(kind: ProviderKind) -> bool {
             let vars: &[&str] = match kind {
-                ProviderKind::Ollama => &["OLLAMA_URL"],
-                ProviderKind::Vllm => &["VLLM_URL"],
+                ProviderKind::Ollama | ProviderKind::Vllm => &[],
                 ProviderKind::Bedrock => &["AWS_ACCESS_KEY_ID"],
                 ProviderKind::VertexAnthropic => &["GOOGLE_APPLICATION_CREDENTIALS"],
                 kind => crate::credentials::provider_env(kind),
@@ -708,18 +716,62 @@ mod tests {
                 })
             );
             assert_eq!(record("ollama")["api_key"], "http://127.0.0.1:9");
-            if std::env::var("VLLM_URL").is_err() {
-                assert!(
-                    accounts.standing(spec("vllm").unwrap()).await.connected,
-                    "an addressed vLLM is connected"
-                );
+            assert!(
+                accounts.standing(spec("vllm").unwrap()).await.connected,
+                "an addressed vLLM is connected"
+            );
+            assert!(
+                !accounts.standing(spec("ollama").unwrap()).await.connected,
+                "an Ollama that does not answer at its address is not"
+            );
+        }
+
+        #[test]
+        fn the_address_desk_set_beats_the_environments_and_the_default() {
+            let dir = tempfile::tempdir().unwrap();
+            let global = vault(dir.path());
+            let accounts = accounts(&global);
+            let env = |var: &str| match var {
+                "OLLAMA_URL" => Some("http://env-ollama:1".to_string()),
+                "VLLM_URL" => Some("http://env-vllm:1".to_string()),
+                "VLLM_API_KEY" => Some("env-token".to_string()),
+                _ => None,
+            };
+            let nothing = |_: &str| None;
+            assert_eq!(
+                accounts.endpoint_with(ProviderKind::Ollama, nothing),
+                Some(("http://localhost:11434".into(), None))
+            );
+            assert_eq!(accounts.endpoint_with(ProviderKind::Vllm, nothing), None);
+            assert_eq!(
+                accounts.endpoint_with(ProviderKind::Ollama, env),
+                Some(("http://env-ollama:1".into(), None))
+            );
+            for (id, kind) in [
+                ("ollama", ProviderKind::Ollama),
+                ("vllm", ProviderKind::Vllm),
+            ] {
+                let record = account(
+                    kind,
+                    &fields(&[("url", "http://desk-set:9/")]),
+                    &accounts.google_login,
+                )
+                .unwrap();
+                global
+                    .set(&format!("llm/accounts/{id}"), &record.to_string())
+                    .unwrap();
+                let (url, _) = accounts.endpoint_with(kind, env).unwrap();
+                assert_eq!(url, "http://desk-set:9", "{id}");
             }
-            if std::env::var("OLLAMA_URL").is_err() {
-                assert!(
-                    !accounts.standing(spec("ollama").unwrap()).await.connected,
-                    "an Ollama that does not answer is not"
-                );
-            }
+            assert_eq!(
+                accounts
+                    .endpoint_with(ProviderKind::Vllm, env)
+                    .unwrap()
+                    .1
+                    .as_deref(),
+                Some("env-token"),
+                "a key the account lacks still comes from the environment"
+            );
         }
 
         #[tokio::test]
