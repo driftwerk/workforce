@@ -1474,6 +1474,9 @@ pub struct AgentService {
     /// Runtime owner override — takes precedence over config when set.
     /// Tuple: (owner_id, owner_type).
     pub owner_override: crate::hub_core::owners::OwnerOverride,
+    /// Display name set at runtime (a rename), ahead of the config's until
+    /// the agent is next built from the config that now holds it.
+    pub name_override: parking_lot::RwLock<Option<String>>,
     /// Which subscription login pays for each of this agent's calls.
     pub logins: Arc<dyn crate::hosts::LoginHost>,
     /// Builds this agent's providers of every kind (boot, reload, switch).
@@ -1898,6 +1901,16 @@ impl AgentService {
     /// Get the effective owner (live override or config).
     pub fn effective_owner(&self) -> (Option<String>, workforce_common::settings::OwnerType) {
         self.logins.effective_owner()
+    }
+
+    /// The agent's display name: a rename made since it was built, else its
+    /// config's.
+    pub fn display_name(&self) -> Option<String> {
+        self.name_override.read().clone().or_else(|| {
+            self.config
+                .agent_by_id(self.agent_id.as_str())
+                .and_then(|a| a.name.clone())
+        })
     }
 
     /// What this hub's agents' subscription providers share.

@@ -41,6 +41,8 @@ pub struct GatewayParts {
     pub device_pairing: Option<Arc<workforce_pairing::DevicePairingService>>,
     pub monitor_engine: Option<Arc<workforce_hub::monitor::MonitorEngine>>,
     pub destructive_baseline_active: bool,
+    /// The base config file the overlay writes beside.
+    pub config_path: Option<std::path::PathBuf>,
 }
 
 impl GatewayParts {
@@ -59,6 +61,7 @@ impl GatewayParts {
             device_pairing: None,
             monitor_engine: None,
             destructive_baseline_active: false,
+            config_path: None,
         }
     }
 
@@ -91,7 +94,7 @@ impl GatewayParts {
                 .monitor_engine
                 .map(|engine| engine as Arc<dyn workforce_hub::hosts::MonitorHost>),
             engagement_overrides: Arc::new(workforce_common::engagement::EngagementOverrides::new()),
-            config_path: None,
+            config_path: self.config_path,
             identity_store: Some(self.identities),
             team_store: None,
             remote_mcp_tokens: None,

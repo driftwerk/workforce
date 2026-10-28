@@ -7,6 +7,9 @@ mod admin_tests;
 #[path = "api/admin_scope_routes.rs"]
 mod admin_scope_routes;
 
+#[path = "api/agent_rename_routes.rs"]
+mod agent_rename_routes;
+
 #[path = "api/agent_config_routes.rs"]
 mod agent_config_routes;
 

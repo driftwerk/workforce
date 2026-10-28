@@ -401,7 +401,10 @@ pub fn router(state: Arc<GatewayState>) -> Router {
         .route("/api/agents", get(list_agents))
         // Agent CRUD & detail endpoints (DW-421)
         .route("/api/agents", post(create_agent))
-        .route("/api/agents/{id}", get(get_agent).put(update_agent).delete(delete_agent))
+        .route(
+            "/api/agents/{id}",
+            get(get_agent).put(update_agent).patch(patch_agent).delete(delete_agent),
+        )
         .route("/api/agents/{id}/tools", get(get_agent_tools))
         .route("/api/agents/{id}/identity/{filename}", get(get_agent_identity).put(put_agent_identity))
         .route(
@@ -3657,7 +3660,7 @@ async fn list_agents(
             let provider = svc.provider_kind.read().canonical_name().to_string();
             Some(workforce_gateway_client::AgentInfo {
                 id: id_str.clone(),
-                name: agent_config.and_then(|a| a.name.clone()),
+                name: svc.display_name(),
                 model: Some(model).filter(|m| !m.is_empty()),
                 provider: Some(provider),
                 capabilities: agent_config
@@ -4625,7 +4628,7 @@ async fn get_agent(
 
     let response = workforce_gateway_client::AgentDetailResponse {
         id: id.clone(),
-        name: agent_config.and_then(|a| a.name.clone()),
+        name: service.display_name(),
         model: agent_config.and_then(|a| a.model.clone()),
         capabilities: agent_config
             .map(|a| a.capabilities.clone())
@@ -5208,6 +5211,78 @@ async fn wait_until(timeout: std::time::Duration, mut cond: impl FnMut() -> bool
     }
 }
 
+/// The longest display name an agent may be given.
+const AGENT_NAME_MAX_CHARS: usize = 100;
+
+/// A rename's name, trimmed: 1–100 characters.
+fn agent_name(name: &str) -> Result<String, (StatusCode, Json<serde_json::Value>)> {
+    let name = name.trim();
+    match name.chars().count() {
+        1..=AGENT_NAME_MAX_CHARS => Ok(name.to_string()),
+        _ => Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!("an agent's name is 1 to {AGENT_NAME_MAX_CHARS} characters")
+            })),
+        )),
+    }
+}
+
+/// Writes a new display name and instructions to the agent's config overlay
+/// entry, where every later build of it reads them (a restart included), and
+/// shows the name at once. An empty `system_prompt` removes the instructions.
+async fn persist_name_and_prompt(
+    state: &GatewayState,
+    caller: &CallerContext,
+    id: &str,
+    name: Option<String>,
+    system_prompt: Option<String>,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    if name.is_none() && system_prompt.is_none() {
+        return Ok(());
+    }
+    let (config_path, data_dir, lock_manager) = resolve_overlay_ctx(state)?;
+    let written = name.clone();
+    crate::config_writer::overlay_update_agent_fields(
+        &config_path,
+        &data_dir,
+        id,
+        move |entry| {
+            if let Some(name) = written {
+                entry.insert("name".to_string(), toml::Value::String(name));
+            }
+            match system_prompt {
+                Some(prompt) if prompt.trim().is_empty() => {
+                    entry.remove("system_prompt");
+                }
+                Some(prompt) => {
+                    entry.insert("system_prompt".to_string(), toml::Value::String(prompt));
+                }
+                None => {}
+            }
+        },
+        caller.identity_id.as_deref(),
+        "web",
+        state.def_store.as_deref(),
+        &lock_manager,
+    )
+    .await
+    .map_err(|e| {
+        warn!(agent_id = %id, error = %e, "Failed to save an agent's name to the config overlay");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "saving the agent failed"})),
+        )
+    })?;
+    if let (Some(name), Some(service)) = (name, state.registry.get(id)) {
+        *service.name_override.write() = Some(name);
+    }
+    if let Some(kick) = &state.overlay_kick {
+        kick.notify_one();
+    }
+    Ok(())
+}
+
 /// `PUT /api/agents/{id}` — Update an existing agent.
 async fn update_agent(
     Path(id): Path<String>,
@@ -5217,9 +5292,69 @@ async fn update_agent(
     Json(body): Json<workforce_gateway_client::UpdateAgentRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     let caller = require_admin_action(&state, &headers, query.token.as_deref()).await?;
+    apply_agent_update(&state, &caller, &id, &body).await?;
+    Ok(Json(serde_json::json!({
+        "updated": id,
+        "applied": {
+            "model": body.model,
+            "name": body.name,
+            "system_prompt": body.system_prompt.as_ref().map(|_| "(set)"),
+            "capabilities": body.capabilities,
+            "default": body.default,
+            "owner_id": body.owner_id,
+            "owner_type": body.owner_type,
+        },
+        "note": "Name, owner and model changes are applied live. Other changes require restart.",
+    })))
+}
+
+/// `PATCH /api/agents/{id}` — the update `PUT` makes (a rename, with the
+/// instructions that name the agent), answered with the agent as
+/// `GET /api/agents` lists it.
+async fn patch_agent(
+    Path(id): Path<String>,
+    Query(query): Query<WsQuery>,
+    headers: axum::http::HeaderMap,
+    State(state): State<Arc<GatewayState>>,
+    Json(body): Json<workforce_gateway_client::UpdateAgentRequest>,
+) -> Result<Json<workforce_gateway_client::AgentInfo>, (StatusCode, Json<serde_json::Value>)> {
+    let caller = require_admin_action(&state, &headers, query.token.as_deref()).await?;
+    apply_agent_update(&state, &caller, &id, &body).await?;
+    let service = resolve_agent(&state, &id)?;
+    let (owner_id, owner_type) = service.effective_owner();
+    let model = service.current_default_model.read().clone();
+    let provider = service.provider_kind.read().canonical_name().to_string();
+    Ok(Json(workforce_gateway_client::AgentInfo {
+        id: id.clone(),
+        name: service.display_name(),
+        model: Some(model).filter(|m| !m.is_empty()),
+        provider: Some(provider),
+        capabilities: service
+            .config
+            .agent_by_id(&id)
+            .map(|a| a.capabilities.clone())
+            .unwrap_or_default(),
+        default: id == state.registry.default_id(),
+        owner_id,
+        owner_type: Some(format!("{owner_type:?}").to_lowercase()),
+    }))
+}
+
+async fn apply_agent_update(
+    state: &Arc<GatewayState>,
+    caller: &CallerContext,
+    id: &str,
+    body: &workforce_gateway_client::UpdateAgentRequest,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    let id = id.to_string();
+    let state = Arc::clone(state);
+    let caller = caller.clone();
 
     // Verify agent exists
     let _service = resolve_agent(&state, &id)?;
+
+    let name = body.name.as_deref().map(agent_name).transpose()?;
+    persist_name_and_prompt(&state, &caller, &id, name, body.system_prompt.clone()).await?;
 
     // Live model override (no restart required)
     if let Some(ref model) = body.model {
@@ -5324,20 +5459,7 @@ async fn update_agent(
     }
 
     info!(agent_id = %id, "Agent updated via API");
-
-    Ok(Json(serde_json::json!({
-        "updated": id,
-        "applied": {
-            "model": body.model,
-            "name": body.name,
-            "system_prompt": body.system_prompt.as_ref().map(|_| "(set)"),
-            "capabilities": body.capabilities,
-            "default": body.default,
-            "owner_id": body.owner_id,
-            "owner_type": body.owner_type,
-        },
-        "note": "Owner and model changes are applied live. Other changes require restart.",
-    })))
+    Ok(())
 }
 
 /// `DELETE /api/agents/{id}` — Delete an agent.

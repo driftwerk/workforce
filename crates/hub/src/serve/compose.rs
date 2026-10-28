@@ -938,6 +938,7 @@ pub(super) async fn build_inner(
         agent_registry,
         trace_writer,
         owner_override,
+        name_override: parking_lot::RwLock::new(None),
         logins,
         providers: Arc::clone(&providers) as Arc<dyn crate::hosts::ProviderHost>,
         subscriptions,
