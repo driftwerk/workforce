@@ -52,6 +52,10 @@ impl CrewHub {
         if let Some(listed) = listed {
             self.listed.lock().insert(sid.clone(), listed);
         }
+        // A message of the DM is found again by a mark of its own.
+        let relay = author
+            .is_some()
+            .then(|| format!("desk-relay:{}", workforce_desk::crew::new_id()));
         let tx = self.state.broadcast_tx.clone();
         let (mut live, inbox) = match service
             .begin_live_turn(&sid, SelfServe::answerable_if(false))
@@ -70,7 +74,7 @@ impl CrewHub {
                 owner,
                 None,
                 prompt,
-                None,
+                relay.as_deref(),
                 Some(&sid),
                 None,
                 None,
@@ -98,8 +102,8 @@ impl CrewHub {
             self.rolled(&sid, &session_id);
             both(tx, sid.clone())
         };
-        if let Some(author) = author {
-            self.relayed(service, &session_id, author, &tx).await;
+        if let (Some(author), Some(relay)) = (author, relay.as_deref()) {
+            self.relayed(service, &session_id, relay, author, &tx).await;
         }
         let forward = {
             let (tx, sid) = (tx.clone(), session_id.clone());
@@ -153,22 +157,23 @@ fn both(
 }
 
 impl CrewHub {
-    /// The prompt just saved in `service`'s DM session `sid` is `author`'s:
-    /// kept by its message, and sent to an open DM as it reads in history.
+    /// The prompt just saved in `service`'s DM session `sid`, marked `relay`,
+    /// is `author`'s: kept by its message, and sent to an open DM as it
+    /// reads in history.
     async fn relayed(
         &self,
         service: &AgentService,
         sid: &str,
+        relay: &str,
         author: Speaker,
         tx: &tokio::sync::broadcast::Sender<BroadcastMessage>,
     ) {
-        // The turn holds the session, so its newest user message is this
-        // prompt, saved before the turn began.
+        // Saved, marked `relay`, before the turn began.
         let message = service.sessions.get(sid).ok().flatten().and_then(|s| {
             s.messages
                 .iter()
                 .rev()
-                .find(|m| m.role == MessageRole::User)
+                .find(|m| m.role == MessageRole::User && m.external_id.as_deref() == Some(relay))
                 .map(|m| (m.id.clone(), m.content.clone()))
         });
         let Some((id, content)) = message else {
