@@ -334,14 +334,19 @@ pub const PROVIDERS: &[Spec] = &[
             fields: &[
                 Field {
                     multiline: true,
-                    placeholder: "{ \"type\": \"service_account\", … }",
+                    required: false,
+                    placeholder:
+                        "Empty to use your Google login, or { \"type\": \"service_account\", … }",
                     ..Field::secret("service_account_json", "Service account key (JSON)")
                 },
                 Field::plain("location", "Location", "global").optional("global"),
-                Field::plain("project", "Project ID", "").optional("From the key"),
+                Field::plain("project", "Project ID", "")
+                    .optional("Needed with your Google login; a key names its own"),
             ],
-            hint: "A service account key with the Vertex AI User role, from IAM in the \
-                   Google Cloud console",
+            hint: "Leave the key empty to use your Google login on this Mac and give your \
+                   Project ID; you may need to run gcloud auth application-default login \
+                   first. Or paste a service account key with the Vertex AI User role, from \
+                   IAM in the Google Cloud console.",
         },
         models: &[
             (("claude-opus-5-5", "Claude Opus 5.5", OPUS), false),
@@ -654,7 +659,7 @@ pub(crate) struct ConnectBody {
 
 /// `fields` trimmed and held to `spec`'s: every required one given, none it
 /// does not take, blanks dropped.
-pub(crate) fn checked(spec: &Spec, fields: Fields) -> Result<Fields, AccountError> {
+pub fn checked(spec: &Spec, fields: Fields) -> Result<Fields, AccountError> {
     if spec.connect.kind == ConnectKind::Login {
         return Err(AccountError::Invalid(format!(
             "{} connects by signing in from Desk, not with fields",
@@ -1030,6 +1035,29 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(held.0.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn vertex_takes_a_key_or_the_persons_google_login() {
+        let vertex = spec("vertex-anthropic").unwrap();
+        let key = vertex.connect.fields[0];
+        assert_eq!(key.name, "service_account_json");
+        assert!(!key.required && key.secret && key.multiline);
+        assert!(vertex.connect.fields.iter().all(|f| !f.required));
+        assert!(vertex
+            .connect
+            .hint
+            .contains("empty to use your Google login"));
+        assert!(vertex
+            .connect
+            .hint
+            .contains("gcloud auth application-default login"));
+        let given = checked(
+            vertex,
+            [("project".to_string(), "acme-ai".to_string())].into(),
+        )
+        .unwrap();
+        assert_eq!(given["project"], "acme-ai");
     }
 
     #[tokio::test]

@@ -4,7 +4,7 @@
 //! credentials of the providers a Desk agent thinks with, and the `/api/desk`
 //! routes on the gateway.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -15,7 +15,9 @@ use eyre::{Context, Result};
 use tokio_util::sync::CancellationToken;
 use workforce_agent::llm::provider::{AccountExtras, ProviderKind};
 use workforce_agent::llm::speech::{provider_from_config, SpeechRequest};
-use workforce_agent::llm::vertex_credentials::{resolve_source, VertexCredentialSource};
+use workforce_agent::llm::vertex_credentials::{
+    adc_file, resolve_source, VertexCredentialSource, CHAIN_SENTINEL,
+};
 use workforce_common::secret::KeySlot;
 use workforce_common::settings::{
     is_claude_oat, DeskRestore, LlmSpeechConfig, VaultActor, WorkforceConfig,
@@ -149,7 +151,12 @@ struct HubAccounts {
     vault: Option<Arc<Vault>>,
     /// The vaults a login is checked against for duplicates.
     known: Arc<dyn Fn() -> Vec<Arc<Vault>> + Send + Sync>,
+    /// Where the person's Google login (Application Default Credentials) is
+    /// on this machine, if they have one.
+    google_login: GoogleLogin,
 }
+
+type GoogleLogin = Arc<dyn Fn() -> Option<PathBuf> + Send + Sync>;
 
 /// The subscription a plan provider signs in to.
 fn plan(spec: &Spec) -> Option<SubscriptionKind> {
@@ -189,7 +196,11 @@ fn server_url(fields: &Fields) -> Result<String, AccountError> {
 /// The `llm/accounts/*` record `fields` make for `kind`: its `api_key` slot
 /// as [`workforce_agent::llm::provider::create_provider_with`] reads it, and
 /// the [`AccountExtras`] beside it.
-fn account(kind: ProviderKind, fields: &Fields) -> Result<serde_json::Value, AccountError> {
+fn account(
+    kind: ProviderKind,
+    fields: &Fields,
+    google_login: &GoogleLogin,
+) -> Result<serde_json::Value, AccountError> {
     let required = |name: &str| {
         field(fields, name)
             .map(str::to_string)
@@ -204,6 +215,25 @@ fn account(kind: ProviderKind, fields: &Fields) -> Result<serde_json::Value, Acc
                 required("access_key_id")?,
                 required("secret_access_key")?
             )
+        }
+        ProviderKind::VertexAnthropic if field(fields, "service_account_json").is_none() => {
+            extras.project = Some(field(fields, "project").map(str::to_string).ok_or_else(
+                || {
+                    AccountError::Invalid(
+                        "using your Google login needs the Project ID: a login names no project"
+                            .into(),
+                    )
+                },
+            )?);
+            if google_login().is_none() {
+                return Err(AccountError::Invalid(
+                    "no Google login was found on this Mac: run gcloud auth \
+                     application-default login, or paste a service account key"
+                        .into(),
+                ));
+            }
+            extras.location = Some(field(fields, "location").unwrap_or("global").to_string());
+            CHAIN_SENTINEL.to_string()
         }
         ProviderKind::VertexAnthropic => {
             let key = required("service_account_json")?;
@@ -327,6 +357,13 @@ impl Accounts for HubAccounts {
         let Ok((kind, name)) = metered(spec) else {
             return Standing::default();
         };
+        if kind == ProviderKind::VertexAnthropic {
+            // A key's account, or one on the person's Google login.
+            return Standing {
+                connected: vault.find_account(name).is_some(),
+                installed: Vec::new(),
+            };
+        }
         if spec.group != Group::Local {
             return Standing {
                 connected: vault
@@ -361,7 +398,7 @@ impl Accounts for HubAccounts {
 
     async fn connect(&self, spec: &Spec, fields: &Fields) -> Result<(), AccountError> {
         let (kind, name) = metered(spec)?;
-        let record = account(kind, fields)?;
+        let record = account(kind, fields, &self.google_login)?;
         let path = self
             .vault()?
             .find_account(name)
@@ -442,6 +479,7 @@ pub async fn mount(
                 let state = Arc::clone(state);
                 Arc::new(move || crate::gateway::login_vaults(&state))
             },
+            google_login: Arc::new(adc_file),
         }),
         Arc::new(crate::desk_conversations::HubConversations(Arc::clone(
             state,
@@ -545,6 +583,7 @@ mod tests {
             HubAccounts {
                 vault: Some(Arc::clone(vault)),
                 known: Arc::new(Vec::new),
+                google_login: Arc::new(|| None),
             }
         }
 
@@ -734,6 +773,82 @@ mod tests {
             assert!(!accounts.standing(claude).await.connected);
         }
 
+        /// What `gcloud auth application-default login` writes, as a test
+        /// stands it in.
+        const GOOGLE_LOGIN: &str = r#"{"type":"authorized_user","client_id":"desk-test.apps.googleusercontent.com","client_secret":"desk-test-client-secret","refresh_token":"desk-test-refresh-token"}"#;
+
+        #[tokio::test]
+        async fn vertex_connects_on_the_persons_google_login_without_copying_it() {
+            let dir = tempfile::tempdir().unwrap();
+            let global = vault(dir.path());
+            let login = dir.path().join("application_default_credentials.json");
+            std::fs::write(&login, GOOGLE_LOGIN).unwrap();
+            let accounts = HubAccounts {
+                google_login: Arc::new(move || Some(login.clone())),
+                ..accounts(&global)
+            };
+            let vertex = spec("vertex-anthropic").unwrap();
+            let checked = workforce_desk::providers::checked(
+                vertex,
+                fields(&[("service_account_json", "  "), ("project", "acme-ai")]),
+            )
+            .expect("no key is needed");
+            accounts.connect(vertex, &checked).await.unwrap();
+            let stored = global.get("llm/accounts/vertex-anthropic").unwrap();
+            assert!(!stored.contains("refresh"), "{stored}");
+            assert!(!stored.contains("client_secret"), "{stored}");
+            let record: serde_json::Value = serde_json::from_str(&stored).unwrap();
+            assert_eq!(
+                record,
+                serde_json::json!({
+                    "provider": "vertex-anthropic",
+                    "api_key": CHAIN_SENTINEL,
+                    "project": "acme-ai",
+                    "location": "global",
+                })
+            );
+            assert!(accounts.standing(vertex).await.connected);
+            agent_providers(&global)
+                .provider(
+                    kind("vertex-anthropic"),
+                    Some("claude-sonnet-5-5"),
+                    None,
+                    false,
+                    None,
+                )
+                .await
+                .expect("an agent builds on the login");
+            accounts.disconnect(vertex).await.unwrap();
+            assert!(!accounts.standing(vertex).await.connected);
+        }
+
+        #[tokio::test]
+        async fn a_google_login_needs_a_project_and_a_login() {
+            let dir = tempfile::tempdir().unwrap();
+            let global = vault(dir.path());
+            let vertex = spec("vertex-anthropic").unwrap();
+            let login = dir.path().join("application_default_credentials.json");
+            std::fs::write(&login, GOOGLE_LOGIN).unwrap();
+            let signed_in = HubAccounts {
+                google_login: Arc::new(move || Some(login.clone())),
+                ..accounts(&global)
+            };
+            let e = signed_in.connect(vertex, &Fields::new()).await.unwrap_err();
+            assert!(
+                matches!(&e, AccountError::Invalid(m) if m.contains("Project ID")),
+                "{e}"
+            );
+            let e = accounts(&global)
+                .connect(vertex, &fields(&[("project", "acme-ai")]))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&e, AccountError::Invalid(m) if m.contains("gcloud auth application-default login")),
+                "{e}"
+            );
+            assert!(global.list(None).is_empty());
+        }
+
         #[tokio::test]
         async fn a_wrong_credential_is_refused_without_repeating_it() {
             let dir = tempfile::tempdir().unwrap();
@@ -787,6 +902,7 @@ mod tests {
             let unavailable = HubAccounts {
                 vault: None,
                 known: Arc::new(Vec::new),
+                google_login: Arc::new(|| None),
             }
             .connect(spec("grok").unwrap(), &fields(&[("api_key", "k")]))
             .await
@@ -817,6 +933,7 @@ mod tests {
             let accounts = HubAccounts {
                 vault: None,
                 known: Arc::new(Vec::new),
+                google_login: Arc::new(|| None),
             };
             for spec in PROVIDERS {
                 let models: Vec<&str> = match spec.lists_installed() {
@@ -871,6 +988,7 @@ mod tests {
             let accounts = HubAccounts {
                 vault: None,
                 known: Arc::new(Vec::new),
+                google_login: Arc::new(|| None),
             };
             let bedrock = spec("bedrock").unwrap();
             let unhonoured: Vec<&str> = bedrock

@@ -104,6 +104,27 @@ pub fn resolve_source(api_key: &str) -> Result<VertexCredentialSource> {
     ))
 }
 
+/// The Application Default Credentials file a Google login leaves, when there
+/// is one: `GOOGLE_APPLICATION_CREDENTIALS`, else the file
+/// `gcloud auth application-default login` writes. Only where it is; what it
+/// holds is read by `gcp_auth` at request time, never here.
+pub fn adc_file() -> Option<PathBuf> {
+    let named = std::env::var_os("GOOGLE_APPLICATION_CREDENTIALS")
+        .filter(|p| !p.is_empty())
+        .map(PathBuf::from);
+    let gcloud = || {
+        let config = match std::env::var_os("CLOUDSDK_CONFIG").filter(|p| !p.is_empty()) {
+            Some(dir) => PathBuf::from(dir),
+            None if cfg!(windows) => PathBuf::from(std::env::var_os("APPDATA")?).join("gcloud"),
+            None => PathBuf::from(std::env::var_os("HOME")?)
+                .join(".config")
+                .join("gcloud"),
+        };
+        Some(config.join("application_default_credentials.json"))
+    };
+    named.or_else(gcloud).filter(|path| path.is_file())
+}
+
 /// Resolve the target GCP project. Precedence: explicit → `GOOGLE_CLOUD_PROJECT`
 /// → `GCP_PROJECT`. Errors with a setup hint when nothing is set.
 pub fn resolve_project(explicit: Option<&str>) -> Result<String> {
@@ -180,6 +201,42 @@ mod tests {
                 None => std::env::remove_var(&k),
             }
         }
+    }
+
+    #[test]
+    fn the_google_login_is_found_where_gcloud_or_the_variable_puts_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let gcloud = dir.path().join("gcloud");
+        std::fs::create_dir_all(&gcloud).unwrap();
+        let written = gcloud.join("application_default_credentials.json");
+        let named = dir.path().join("named.json");
+        let config = gcloud.to_str().unwrap();
+        with_env(
+            &[
+                ("GOOGLE_APPLICATION_CREDENTIALS", None),
+                ("CLOUDSDK_CONFIG", Some(config)),
+            ],
+            || assert_eq!(adc_file(), None, "no login yet"),
+        );
+        std::fs::write(&written, "{}").unwrap();
+        with_env(
+            &[
+                ("GOOGLE_APPLICATION_CREDENTIALS", None),
+                ("CLOUDSDK_CONFIG", Some(config)),
+            ],
+            || assert_eq!(adc_file(), Some(written.clone())),
+        );
+        std::fs::write(&named, "{}").unwrap();
+        with_env(
+            &[
+                (
+                    "GOOGLE_APPLICATION_CREDENTIALS",
+                    Some(named.to_str().unwrap()),
+                ),
+                ("CLOUDSDK_CONFIG", Some(config)),
+            ],
+            || assert_eq!(adc_file(), Some(named.clone()), "the variable wins"),
+        );
     }
 
     #[test]
