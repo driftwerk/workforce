@@ -13,6 +13,7 @@ use chrono::Utc;
 use tokio::sync::broadcast::error::RecvError;
 use tokio_util::sync::CancellationToken;
 use workforce_common::oversight::{Level, Oversight};
+use workforce_desk::crew::Crew as _;
 use workforce_desk::crew::{
     self, Event, ItemKind, ItemState, Kind, MentionedApproval, Party, PartyKind,
 };
@@ -123,47 +124,57 @@ impl CrewHub {
     }
 
     async fn sync_summaries(&self, service: &AgentService, o: Option<&Oversight>) {
-        let Some(scheduler) = service.scheduler.as_ref() else {
-            return;
-        };
-        let wanted = [
-            (MORNING_JOB, o.and_then(|o| o.summaries.morning), false),
-            (EVENING_JOB, o.and_then(|o| o.summaries.evening), true),
-        ];
-        let jobs = scheduler.list_jobs().await;
-        for (name, at, evening) in wanted {
-            match at {
-                Some((h, m)) => {
-                    let schedule = Schedule::Cron {
-                        expr: format!("{m} {h} * * *"),
-                        tz: None,
-                    };
-                    let same = jobs
-                        .iter()
-                        .any(|j| j.name == name && j.schedule == schedule && j.enabled);
-                    if !same {
-                        if let Err(e) = scheduler
-                            .upsert_job(
-                                name,
-                                Some("The overseer's summary of the crew, in its Desk DM"),
-                                schedule,
-                                JobPayload::CrewSummary { evening },
-                            )
-                            .await
-                        {
-                            tracing::warn!(error = %e, "registering a crew summary failed");
-                        }
+        if let Some(scheduler) = service.scheduler.as_ref() {
+            sync_summaries(scheduler.as_ref(), o).await;
+        }
+    }
+}
+
+/// Registers the summary jobs `o` asks for on `scheduler`, and removes the
+/// ones it doesn't (all of them when the agent doesn't oversee).
+pub(super) async fn sync_summaries(
+    scheduler: &dyn crate::hosts::SchedulerHost,
+    o: Option<&Oversight>,
+) {
+    let wanted = [
+        (MORNING_JOB, o.and_then(|o| o.summaries.morning), false),
+        (EVENING_JOB, o.and_then(|o| o.summaries.evening), true),
+    ];
+    let jobs = scheduler.list_jobs().await;
+    for (name, at, evening) in wanted {
+        match at {
+            Some((h, m)) => {
+                let schedule = Schedule::Cron {
+                    expr: format!("{m} {h} * * *"),
+                    tz: None,
+                };
+                let same = jobs
+                    .iter()
+                    .any(|j| j.name == name && j.schedule == schedule && j.enabled);
+                if !same {
+                    if let Err(e) = scheduler
+                        .upsert_job(
+                            name,
+                            Some("The overseer's summary of the crew, in its Desk DM"),
+                            schedule,
+                            JobPayload::CrewSummary { evening },
+                        )
+                        .await
+                    {
+                        tracing::warn!(error = %e, "registering a crew summary failed");
                     }
                 }
-                None => {
-                    for job in jobs.iter().filter(|j| j.name == name) {
-                        scheduler.remove_job(&job.id).await;
-                    }
+            }
+            None => {
+                for job in jobs.iter().filter(|j| j.name == name) {
+                    scheduler.remove_job(&job.id).await;
                 }
             }
         }
     }
+}
 
+impl CrewHub {
     /// What `event` wakes the overseer for, if anything.
     pub(super) fn trigger_for(
         &self,
@@ -436,8 +447,6 @@ impl CrewHub {
         }
     }
 }
-
-use workforce_desk::crew::Crew as _;
 
 /// Runs [`CrewHub::sync`] every tick, and at once when a config is saved.
 pub(super) async fn sync_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {

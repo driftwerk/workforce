@@ -21,8 +21,8 @@ use workforce_postgres::test_support::with_test_pool;
 use super::{CrewHub, Timing};
 use crate::agent_registry::AgentRegistry;
 use crate::gateway::GatewayState;
-use crate::serve::Compose as _;
 use crate::serve::AgentService;
+use crate::serve::Compose as _;
 
 const FAST: Timing = Timing {
     tick: Duration::from_millis(50),
@@ -530,12 +530,20 @@ async fn a_blocked_session_wakes_the_overseer_and_its_answer_offers_the_approval
         // It is in the DM's history, the prompt left out, with what it offers.
         let page = crate::desk_conversations::page(overseer.sessions.as_ref(), PERSON, None, 50).unwrap();
         assert_eq!(page.messages.len(), 1, "{page:?}");
-        let said = &page.messages[0];
         let kept = eventually("the extras to be kept", async || {
-            d.store().extras(std::slice::from_ref(&said.id)).await.unwrap().remove(&said.id)
+            let mut page = page.clone();
+            crate::desk_conversations::with_extras(&d, &mut page).await;
+            page.messages[0].desk.clone()
         })
         .await;
         assert_eq!(kept.approvals[0].approval_id, pending.id.to_string());
+        let mut read = page.clone();
+        crate::desk_conversations::with_extras(&d, &mut read).await;
+        let wire = serde_json::to_value(&read).unwrap();
+        assert_eq!(
+            wire["messages"][0]["desk"]["approvals"][0]["sessionId"],
+            s.id.to_string()
+        );
         // Its first paragraph is the brief.
         let brief = d.overview(crew.as_ref()).await.unwrap().brief.unwrap();
         assert_eq!(
@@ -577,6 +585,215 @@ async fn a_blocked_session_wakes_the_overseer_and_its_answer_offers_the_approval
             .events
             .iter()
             .all(|e| e.subject.as_ref().is_none_or(|s| s.id != "desk")));
+    })
+    .await;
+}
+
+/// An overseer with `oversight`, and a person's DM with it.
+async fn overseeing(
+    dir: &Path,
+    pool: workforce_postgres::PostgresPool,
+    reply: &str,
+    oversight: &str,
+    crew_agents: &[Arc<AgentService>],
+) -> (Arc<AgentService>, Arc<CrewHub>, Desk, wiremock::MockServer) {
+    let (overseer, llm) = agent(dir, "desk", reply).await;
+    write_config(&overseer, oversight);
+    let mut all = vec![Arc::clone(&overseer)];
+    all.extend(crew_agents.iter().cloned());
+    let state = hub(&all);
+    let d = desk(pool, dir).await;
+    let crew = CrewHub::start(state, d.clone(), FAST, CancellationToken::new());
+    let dm = overseer
+        .sessions
+        .get_or_create(DESK_CHANNEL, PERSON, "desk")
+        .unwrap();
+    overseer.sessions.save(&dm).unwrap();
+    (overseer, crew, d, llm)
+}
+
+fn session_party(name: &str) -> workforce_desk::crew::Party {
+    workforce_desk::crew::Party {
+        kind: PartyKind::Session,
+        id: uuid::Uuid::new_v4().to_string(),
+        name: name.into(),
+        engine: Some(Engine::Claude),
+        origin: Some(workforce_desk::model::Origin::Desk),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn only_what_the_settings_ask_wakes_the_overseer_and_never_its_own_doing() {
+    use workforce_desk::crew::{Event, Party};
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, crew, _, _llm) = overseeing(
+            dir.path(),
+            pool,
+            "ok",
+            "[oversight]\nenabled = true\ntrack = { crew = false }\nwake = { on_failure = false }\n",
+            &[],
+        )
+        .await;
+        let (_, o) = crew.overseer_service().unwrap();
+        let web = session_party("acme-web");
+        let own = |kind: Kind, who: &Party| Event::new(kind, who.clone(), Some(who.clone()), "finished");
+        assert!(crew.trigger_for(&own(Kind::Finished, &web), "desk", &o).is_some());
+        assert!(crew.trigger_for(&own(Kind::Question, &web), "desk", &o).is_some());
+        assert!(crew.trigger_for(&own(Kind::Failed, &web), "desk", &o).is_none(), "on_failure is off");
+        assert!(crew.trigger_for(&own(Kind::Working, &web), "desk", &o).is_none());
+        let scout = Party::agent("scout", "Scout");
+        assert!(crew.trigger_for(&own(Kind::Finished, &scout), "desk", &o).is_none(), "the crew isn't tracked");
+        let me = Party::agent("desk", "Desk");
+        assert!(crew.trigger_for(&own(Kind::Finished, &me), "desk", &o).is_none(), "its own turns");
+        let by_it = Event::new(Kind::Finished, Party::manager("desk", "Desk"), Some(web.clone()), "x");
+        assert!(crew.trigger_for(&by_it, "desk", &o).is_none(), "its own actions");
+        let by_you = Event::new(Kind::Finished, Party::you(), Some(web.clone()), "x");
+        assert!(crew.trigger_for(&by_you, "desk", &o).is_none(), "yours");
+        let handed_on = own(Kind::Finished, &web).hop(super::MAX_HOPS);
+        assert!(crew.trigger_for(&handed_on, "desk", &o).is_none(), "the loop guard");
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn what_happens_together_is_one_check_in_and_the_day_has_a_cap() {
+    use workforce_desk::crew::Event;
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, _crew, d, _llm) = overseeing(
+            dir.path(),
+            pool,
+            "Both sessions finished.",
+            "[oversight]\nenabled = true\nmax_checkins_per_day = 1\nwake = { waiting_minutes = 0, quiet_minutes = 0 }\n",
+            &[],
+        )
+        .await;
+        for name in ["acme-web", "workforce-e7"] {
+            let s = session_party(name);
+            d.note(Event::new(Kind::Finished, s.clone(), Some(s), "finished · all green"));
+        }
+        let first = eventually("a check-in", async || {
+            d.store().latest_check_in("desk").await.unwrap()
+        })
+        .await;
+        assert!(first.prompt.contains("acme-web") && first.prompt.contains("workforce-e7"), "{}", first.prompt);
+        let s = session_party("dw-676");
+        d.note(Event::new(Kind::Finished, s.clone(), Some(s), "finished · merged"));
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        assert_eq!(
+            d.store().wake_ups_since(chrono::Utc::now() - chrono::Duration::hours(1)).await.unwrap(),
+            1,
+            "a day's check-ins are capped"
+        );
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn summaries_are_scheduled_as_set_and_run_in_the_dm() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, crew, d, _llm) = overseeing(
+            dir.path(),
+            pool,
+            "Quiet night: nothing needs you.\n\nLedger finished the AWS check.",
+            "[oversight]\nenabled = true\nsummaries = { morning = \"08:30\", evening = \"\" }\n",
+            &[],
+        )
+        .await;
+        let scheduler = crate::scheduler::Scheduler::new(Arc::clone(&overseer));
+        let (_, o) = crew.overseer_service().unwrap();
+        super::watcher::sync_summaries(&scheduler, Some(&o)).await;
+        let jobs = crate::hosts::SchedulerHost::list_jobs(&scheduler).await;
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].name, "crew-summary-morning");
+        assert_eq!(
+            jobs[0].schedule,
+            crate::scheduler::Schedule::Cron {
+                expr: "30 8 * * *".into(),
+                tz: None
+            }
+        );
+        assert!(matches!(
+            jobs[0].payload,
+            crate::scheduler::JobPayload::CrewSummary { evening: false }
+        ));
+        super::watcher::sync_summaries(&scheduler, None).await;
+        assert!(crate::hosts::SchedulerHost::list_jobs(&scheduler)
+            .await
+            .is_empty());
+
+        let reply = super::run_summary(&overseer, false).await.unwrap();
+        assert!(reply.starts_with("Quiet night"));
+        let summary = eventually("the summary in Activity", async || {
+            let page = d.activity(Filter::Manager, None, 10).await.unwrap();
+            page.events.into_iter().find(|e| e.kind == Kind::Summary)
+        })
+        .await;
+        assert_eq!(summary.text, "sent your morning summary");
+        assert_eq!(summary.subject, None);
+        let brief = d.overview(crew.as_ref()).await.unwrap().brief.unwrap();
+        assert_eq!(brief.text, "Quiet night: nothing needs you.");
+        assert_eq!(
+            d.store().wake_ups_since(crew.midnight()).await.unwrap(),
+            0,
+            "a summary is no check-in"
+        );
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_overseer_messages_the_crew_within_the_loop_guard() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (scout, _s) = agent(dir.path(), "scout", "Nearly done.").await;
+        let dm = scout.sessions.get_or_create(DESK_CHANNEL, PERSON, "scout").unwrap();
+        scout.sessions.save(&dm).unwrap();
+        let (overseer, crew, d, _llm) = overseeing(
+            dir.path(),
+            pool,
+            "ok",
+            "[oversight]\nenabled = true\nlevel = \"act\"\n",
+            &[Arc::clone(&scout)],
+        )
+        .await;
+        eventually("the overseer's tools", async || overseer.tools.has("crew.nudge").then_some(())).await;
+        let tool = overseer.tools.get("crew.nudge").unwrap();
+        let nudge = || {
+            tool.execute(
+                json!({"agent_id": "scout", "message": "How is the staging check going?", "reason": "Quiet for 40 min."}),
+            )
+        };
+        let done = nudge().await.unwrap();
+        assert_eq!(done.output["done"], "asked scout", "{done:?}");
+        let started = eventually("Scout's turn", async || {
+            let page = d.activity(Filter::All, None, 20).await.unwrap();
+            page.events.into_iter().find(|e| e.kind == Kind::Started && e.actor.id == "scout")
+        })
+        .await;
+        assert_eq!(started.text, "started “desk asks: How is the staging check going?”");
+        assert_eq!(started.hop, 1, "a hand-off from the overseer");
+        let asked = d
+            .activity(Filter::Manager, None, 5)
+            .await
+            .unwrap()
+            .events
+            .into_iter()
+            .find(|e| e.kind == Kind::Nudged)
+            .unwrap();
+        assert_eq!(asked.text, "asked scout “How is the staging check going?”");
+        assert_eq!(asked.reason.as_deref(), Some("Quiet for 40 min."));
+
+        for _ in 1..super::TURN_BUDGET {
+            assert!(nudge().await.unwrap().success);
+        }
+        let held = nudge().await.unwrap();
+        assert!(!held.success);
+        assert!(format!("{:?}", held).contains("Loop guard"), "{held:?}");
+        crew.person_spoke();
+        assert!(nudge().await.unwrap().success, "the person spoke again");
     })
     .await;
 }

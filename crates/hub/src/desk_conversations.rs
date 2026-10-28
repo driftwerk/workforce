@@ -142,6 +142,24 @@ pub(crate) fn page(
     })
 }
 
+/// What the agent's messages on `page` mention to act on in place, as the
+/// desk kept it.
+pub(crate) async fn with_extras(desk: &workforce_desk::Desk, page: &mut Page) {
+    let ids: Vec<String> = page
+        .messages
+        .iter()
+        .filter(|m| m.from == Author::Agent)
+        .map(|m| m.id.clone())
+        .collect();
+    match desk.store().extras(&ids).await {
+        Ok(mut extras) => page
+            .messages
+            .iter_mut()
+            .for_each(|m| m.desk = extras.remove(&m.id)),
+        Err(e) => tracing::warn!(error = %e, "reading the extras of a DM failed"),
+    }
+}
+
 /// `GET /api/desk/conversations/{agent}` on `state`'s agents.
 pub fn router(state: Arc<GatewayState>) -> axum::Router {
     workforce_desk::conversations::router(Arc::new(HubConversations(state)))
@@ -202,19 +220,7 @@ impl Conversations for HubConversations {
             .ok_or_else(|| ConversationError::NotFound(format!("no agent named {agent:?}")))?;
         let mut page = page(service.sessions.as_ref(), &owner, before, limit)?;
         if let Some(crew) = crate::desk_crew::for_state(state) {
-            let ids: Vec<String> = page
-                .messages
-                .iter()
-                .filter(|m| m.from == Author::Agent)
-                .map(|m| m.id.clone())
-                .collect();
-            match crew.desk().store().extras(&ids).await {
-                Ok(mut extras) => page
-                    .messages
-                    .iter_mut()
-                    .for_each(|m| m.desk = extras.remove(&m.id)),
-                Err(e) => tracing::warn!(error = %e, "reading the extras of a DM failed"),
-            }
+            with_extras(crew.desk(), &mut page).await;
         }
         Ok(page)
     }
