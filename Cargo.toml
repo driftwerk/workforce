@@ -96,7 +96,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 # OS trust store for the opt-in TLS verify path (tls_verify=true).
 rustls-native-certs = "0.7"
 # MySQL / MariaDB driver for the direct database-access tools (rustls TLS).
-mysql_async = { version = "0.34", default-features = false, features = ["default-rustls"] }
+mysql_async = { version = "0.37", default-features = false, features = ["default-rustls-ring"] }
 
 # Logging & tracing
 tracing = "0.1.41"
