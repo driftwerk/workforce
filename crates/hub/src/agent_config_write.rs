@@ -71,6 +71,8 @@ pub async fn save(
     if oversees(body) {
         one_overseer(service, store).await;
     }
+    #[cfg(feature = "postgres")]
+    crate::desk_crew::config_saved(service);
     Ok(saved)
 }
 

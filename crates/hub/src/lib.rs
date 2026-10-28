@@ -89,6 +89,8 @@ pub use hub_core::fs_watcher;
 #[cfg(feature = "postgres")]
 pub mod desk_conversations;
 #[cfg(feature = "postgres")]
+pub mod desk_crew;
+#[cfg(feature = "postgres")]
 pub mod desk_driver;
 #[cfg(feature = "postgres")]
 pub mod desk_tools;

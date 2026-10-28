@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use eyre::Result;
 use parking_lot::Mutex;
 use serde_json::Value;
@@ -17,6 +17,7 @@ use uuid::Uuid;
 use crate::adopt::{self, External};
 use crate::claude::{self, Hook};
 use crate::codex::{self, AppServer, CodexEvent, Seen};
+use crate::crew::{self, By, Event, Kind, Party};
 use crate::model::{
     Approvals, Decision, DeskEvent, Engine, NewSession, Origin, PendingApproval, SessionPatch,
     SessionRecord, SessionState, SessionView,
@@ -99,11 +100,21 @@ struct State {
     live: HashMap<Uuid, Live>,
     /// Transcript mtimes already read for adopted sessions.
     seen_transcripts: HashMap<Uuid, SystemTime>,
+    /// When each session came into the state it is in.
+    state_since: HashMap<Uuid, DateTime<Utc>>,
+    /// When each session's last `working` event was recorded.
+    working_noted: HashMap<Uuid, std::time::Instant>,
+    /// Sessions whose next stop or resume someone's action already recorded.
+    acted: HashSet<Uuid>,
 }
+
+/// How often a busy session's tool is recorded as `working`.
+const WORKING_EVERY: Duration = Duration::from_secs(60);
 
 enum Persist {
     Put(Box<SessionRecord>),
     Delete(Uuid),
+    Event(Box<Event>),
 }
 
 struct Inner {
@@ -227,15 +238,169 @@ impl Desk {
     }
 
     fn save(&self, r: SessionRecord) {
-        let view = {
+        let before = {
+            let st = self.0.state.lock();
+            st.records.get(&r.id).map(|old| Self::view_of(&st, old))
+        };
+        self.save_after(before, r);
+    }
+
+    /// Saves `r`, recording what changed since `before` as activity.
+    fn save_after(&self, before: Option<SessionView>, r: SessionRecord) {
+        let (view, events) = {
             let mut st = self.0.state.lock();
             st.records.insert(r.id, r.clone());
-            Self::view_of(&st, &r)
+            let view = Self::view_of(&st, &r);
+            if before.as_ref().is_none_or(|b| b.state != view.state) {
+                st.state_since.insert(r.id, view.updated_at);
+            }
+            let events = Self::session_events(&mut st, before.as_ref(), &view);
+            (view, events)
         };
         let _ = self.0.persist.send(Persist::Put(Box::new(r)));
         let _ = self.0.events.send(DeskEvent::Session {
             session: Box::new(view),
         });
+        events.into_iter().for_each(|e| self.note(e));
+    }
+
+    /// Records `event` in Activity and tells every Desk watching.
+    pub fn note(&self, event: Event) {
+        let _ = self.0.persist.send(Persist::Event(Box::new(event.clone())));
+        let _ = self.0.events.send(DeskEvent::Activity {
+            event: Box::new(event),
+        });
+    }
+
+    /// The events a session's own change makes: what it started, needs,
+    /// finished, asked or hit.
+    fn session_events(
+        st: &mut State,
+        before: Option<&SessionView>,
+        now: &SessionView,
+    ) -> Vec<Event> {
+        let me = Party::session(now);
+        let own = |kind: Kind, text: String| Event::new(kind, me.clone(), Some(me.clone()), text);
+        let mut out = Vec::new();
+        let Some(before) = before else {
+            out.push(own(
+                Kind::Started,
+                match now.origin {
+                    Origin::External => "started in another terminal".into(),
+                    Origin::Desk => "started".into(),
+                },
+            ));
+            return out;
+        };
+        use SessionState as S;
+        let pending_changed =
+            now.pending.as_ref().map(|p| p.id) != before.pending.as_ref().map(|p| p.id);
+        match now.state {
+            S::Blocked if before.state != S::Blocked || pending_changed => {
+                if let Some(p) = &now.pending {
+                    let name = p.tool.split('(').next().unwrap_or(&p.tool);
+                    let detail = if p.detail.trim().is_empty() {
+                        p.tool.clone()
+                    } else {
+                        p.detail.clone()
+                    };
+                    let text = match name {
+                        "Input" => format!("is asking: {}", crew::clip(&p.detail, 160)),
+                        "Bash" => format!("wants to run {}", crew::clip(&detail, 160)),
+                        "Edit" | "Write" | "MultiEdit" => {
+                            format!("wants to edit {}", crew::clip(&detail, 160))
+                        }
+                        _ if !p.answerable && p.detail == "Answer in the terminal" => {
+                            "is waiting for an answer in its terminal".into()
+                        }
+                        _ => format!("wants to use {}", crew::clip(&p.tool, 160)),
+                    };
+                    out.push(own(Kind::NeedsYou, text).approval(p.id));
+                }
+            }
+            S::Working
+                if matches!(before.state, S::Done | S::Idle | S::Starting)
+                    && now.last_prompt.is_some()
+                    && now.last_prompt != before.last_prompt =>
+            {
+                let prompt = now.last_prompt.as_deref().unwrap_or_default();
+                out.push(own(
+                    Kind::Started,
+                    format!("started “{}”", crew::one_line(prompt, 100)),
+                ));
+            }
+            S::Done if before.state != S::Done => {
+                let reply = now.last_reply.as_deref().unwrap_or_default();
+                if crew::hit_limit(reply) {
+                    out.push(own(Kind::Limit, "hit its usage limit".into()));
+                } else if let Some(q) = crew::question_in(reply) {
+                    let options = crew::options_in(reply, &q);
+                    out.push(own(Kind::Question, format!("asked “{q}”")).detail(
+                        serde_json::json!({ "question": { "text": q, "options": options } }),
+                    ));
+                } else if reply.trim().is_empty() {
+                    out.push(own(Kind::Finished, "finished".into()));
+                } else {
+                    out.push(own(
+                        Kind::Finished,
+                        format!("finished · {}", crew::one_line(reply, 120)),
+                    ));
+                }
+            }
+            S::Stopped | S::Closed if before.state.is_running() => {
+                if !st.acted.remove(&now.id) {
+                    let text = if now.state == S::Closed {
+                        "closed in its terminal"
+                    } else {
+                        "stopped"
+                    };
+                    out.push(own(Kind::Stopped, text.into()));
+                }
+            }
+            S::Interrupted if before.state != S::Interrupted => {
+                st.acted.remove(&now.id);
+                out.push(own(Kind::Failed, "stopped unexpectedly".into()));
+            }
+            S::Starting
+                if matches!(
+                    before.state,
+                    S::Stopped | S::Interrupted | S::Closed | S::Done | S::Idle
+                ) =>
+            {
+                if !st.acted.remove(&now.id) {
+                    out.push(own(Kind::Resumed, "resumed".into()));
+                }
+            }
+            _ => {}
+        }
+        if now.state == S::Working
+            && now.current_tool.is_some()
+            && now.current_tool != before.current_tool
+        {
+            let due = st
+                .working_noted
+                .get(&now.id)
+                .is_none_or(|at| at.elapsed() >= WORKING_EVERY);
+            if due {
+                st.working_noted.insert(now.id, std::time::Instant::now());
+                let tool = now.current_tool.as_deref().unwrap_or_default();
+                out.push(own(
+                    Kind::Working,
+                    format!("is running {}", crew::clip(tool, 120)),
+                ));
+            }
+        }
+        out
+    }
+
+    /// The registry and the crew's tables.
+    pub fn store(&self) -> &DeskStore {
+        &self.0.store
+    }
+
+    /// When the session came into the state it is in.
+    pub fn state_since(&self, id: Uuid) -> Option<DateTime<Utc>> {
+        self.0.state.lock().state_since.get(&id).copied()
     }
 
     fn publish(&self, id: Uuid) {
@@ -253,17 +418,19 @@ impl Desk {
     /// Applies `f` to a session's record (and its live part, if running),
     /// then persists and announces the result.
     fn change(&self, id: Uuid, f: impl FnOnce(&mut SessionRecord, Option<&mut Live>)) {
-        let r = {
+        let (before, r) = {
             let mut guard = self.0.state.lock();
             let st = &mut *guard;
-            let Some(r) = st.records.get_mut(&id) else {
+            let Some(old) = st.records.get(&id) else {
                 return;
             };
+            let before = Self::view_of(st, old);
+            let r = st.records.get_mut(&id).expect("just read");
             f(r, st.live.get_mut(&id));
             r.updated_at = Utc::now();
-            r.clone()
+            (before, r.clone())
         };
-        self.save(r);
+        self.save_after(Some(before), r);
     }
 
     fn record(&self, id: Uuid) -> Result<SessionRecord, DeskError> {
@@ -328,7 +495,9 @@ impl Desk {
             .ok_or_else(|| DeskError::Conflict("session is not running".into()))
     }
 
-    pub async fn create(&self, new: NewSession) -> Result<SessionView, DeskError> {
+    /// Starts a session; `by` is who asked (none: the session's own
+    /// `started` is recorded).
+    pub async fn create(&self, new: NewSession, by: Option<By>) -> Result<SessionView, DeskError> {
         let name = new.name.trim();
         if name.is_empty() {
             return Err(DeskError::Invalid("a session needs a name".into()));
@@ -382,7 +551,13 @@ impl Desk {
         }
         // Persist what hooks may already have changed since launch.
         self.change(id, |_, _| {});
-        self.view(id)
+        let view = self.view(id)?;
+        let me = Party::session(&view);
+        self.note(match by {
+            Some(by) => by.event(Kind::Started, Some(me), format!("started {}", view.name)),
+            None => Event::new(Kind::Started, me.clone(), Some(me), "started"),
+        });
+        Ok(view)
     }
 
     pub fn update(&self, id: Uuid, patch: SessionPatch) -> Result<SessionView, DeskError> {
@@ -404,7 +579,7 @@ impl Desk {
         self.view(id)
     }
 
-    pub fn stop(&self, id: Uuid) -> Result<SessionView, DeskError> {
+    pub fn stop(&self, id: Uuid, by: Option<By>) -> Result<SessionView, DeskError> {
         let pty = {
             let mut st = self.0.state.lock();
             let live = st
@@ -412,13 +587,30 @@ impl Desk {
                 .get_mut(&id)
                 .ok_or_else(|| DeskError::Conflict("session is not running".into()))?;
             live.stopping = true;
-            Arc::clone(&live.pty)
+            let pty = Arc::clone(&live.pty);
+            if by.is_some() {
+                st.acted.insert(id);
+            }
+            pty
         };
         pty.kill();
-        self.view(id)
+        let view = self.view(id)?;
+        if let Some(by) = by {
+            self.note(by.event(
+                Kind::Stopped,
+                Some(Party::session(&view)),
+                format!("stopped {}", view.name),
+            ));
+        }
+        Ok(view)
     }
 
-    pub async fn resume(&self, id: Uuid, prompt: Option<String>) -> Result<SessionView, DeskError> {
+    pub async fn resume(
+        &self,
+        id: Uuid,
+        prompt: Option<String>,
+        by: Option<By>,
+    ) -> Result<SessionView, DeskError> {
         let r = self.record(id)?;
         if self.0.state.lock().live.contains_key(&id) {
             return Err(DeskError::Conflict("session is already running".into()));
@@ -433,6 +625,9 @@ impl Desk {
                 "this session never started a conversation, so there is nothing to resume".into(),
             ));
         }
+        if by.is_some() {
+            self.0.state.lock().acted.insert(id);
+        }
         self.change(id, |r, _| {
             r.origin = Origin::Desk;
             r.external_pid = None;
@@ -443,13 +638,52 @@ impl Desk {
             }
         });
         if let Err(e) = self.launch(&r, true, prompt.as_deref()).await {
+            self.0.state.lock().acted.remove(&id);
             self.save(SessionRecord {
                 updated_at: Utc::now(),
                 ..r
             });
             return Err(e);
         }
-        self.view(id)
+        let view = self.view(id)?;
+        if let Some(by) = by {
+            let text = match &prompt {
+                Some(p) => format!("resumed {} with “{}”", view.name, crew::one_line(p, 100)),
+                None => format!("resumed {}", view.name),
+            };
+            self.note(by.event(Kind::Resumed, Some(Party::session(&view)), text));
+        }
+        Ok(view)
+    }
+
+    /// Stops a running session (if it runs) and resumes its conversation,
+    /// with `prompt` if given: one `restarted` event by `by`.
+    pub async fn restart(
+        &self,
+        id: Uuid,
+        prompt: Option<String>,
+        by: By,
+    ) -> Result<SessionView, DeskError> {
+        self.record(id)?;
+        let running = self.0.state.lock().live.contains_key(&id);
+        if running {
+            self.0.state.lock().acted.insert(id);
+            self.stop(id, None)?;
+            for _ in 0..250 {
+                if !self.0.state.lock().live.contains_key(&id) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(40)).await;
+            }
+        }
+        self.0.state.lock().acted.insert(id);
+        let view = self.resume(id, prompt.clone(), None).await?;
+        let text = match &prompt {
+            Some(p) => format!("restarted {} with “{}”", view.name, crew::one_line(p, 100)),
+            None => format!("restarted {}", view.name),
+        };
+        self.note(by.event(Kind::Restarted, Some(Party::session(&view)), text));
+        Ok(view)
     }
 
     /// Resumes each id, returning those that came back; failures are logged
@@ -457,7 +691,7 @@ impl Desk {
     pub async fn restore(&self, ids: &[Uuid]) -> Vec<SessionView> {
         let mut back = Vec::new();
         for &id in ids {
-            match self.resume(id, None).await {
+            match self.resume(id, None, None).await {
                 Ok(v) => back.push(v),
                 Err(e) => tracing::warn!(%id, error = %e, "desk session could not be restored"),
             }
@@ -498,7 +732,15 @@ impl Desk {
         id: Uuid,
         approval: Uuid,
         decision: Decision,
+        by: Option<By>,
     ) -> Result<SessionView, DeskError> {
+        let asked = self
+            .0
+            .state
+            .lock()
+            .live
+            .get(&id)
+            .and_then(|l| l.pending.clone());
         let answer = {
             let mut st = self.0.state.lock();
             let live = st
@@ -534,13 +776,38 @@ impl Desk {
                 r.state = SessionState::Working;
             }
         });
-        self.view(id)
+        let view = self.view(id)?;
+        if let (Some(by), Some(p)) = (by, asked) {
+            let what = match p.tool.split('(').next().unwrap_or(&p.tool) {
+                "Bash" if !p.detail.is_empty() => format!("run {}", crew::clip(&p.detail, 120)),
+                "Edit" | "Write" | "MultiEdit" if !p.detail.is_empty() => {
+                    format!("edit {}", crew::clip(&p.detail, 120))
+                }
+                _ => format!("use {}", crew::clip(&p.tool, 120)),
+            };
+            let me = Some(Party::session(&view));
+            let event = match decision {
+                Decision::Allow => Some(by.event(
+                    Kind::Approved,
+                    me,
+                    format!("allowed {} to {what}", view.name),
+                )),
+                Decision::Deny => {
+                    Some(by.event(Kind::Denied, me, format!("denied {} to {what}", view.name)))
+                }
+                Decision::Terminal => None,
+            };
+            if let Some(e) = event {
+                self.note(e.approval(p.id));
+            }
+        }
+        Ok(view)
     }
 
     /// Types a prompt into a running session's terminal and submits it, as a
     /// person at the keyboard would (bracketed paste, so newlines stay in
     /// the prompt).
-    pub fn prompt(&self, id: Uuid, text: &str) -> Result<SessionView, DeskError> {
+    pub fn prompt(&self, id: Uuid, text: &str, by: Option<By>) -> Result<SessionView, DeskError> {
         if text.trim().is_empty() {
             return Err(DeskError::Invalid("the prompt is empty".into()));
         }
@@ -549,7 +816,15 @@ impl Desk {
         input.extend_from_slice(text.as_bytes());
         input.extend_from_slice(b"\x1b[201~\r");
         pty.write(&input)?;
-        self.view(id)
+        let view = self.view(id)?;
+        if let Some(by) = by {
+            self.note(by.event(
+                Kind::Nudged,
+                Some(Party::session(&view)),
+                format!("asked {} “{}”", view.name, crew::one_line(text, 120)),
+            ));
+        }
+        Ok(view)
     }
 
     /// Waits until the session reaches one of `states` (or stops running),
@@ -1263,6 +1538,7 @@ async fn persist_loop(store: Arc<DeskStore>, mut rx: mpsc::UnboundedReceiver<Per
         let result = match &op {
             Persist::Put(r) => store.put(r).await,
             Persist::Delete(id) => store.delete(*id).await,
+            Persist::Event(e) => store.add_event(e).await,
         };
         if let Err(e) = result {
             tracing::error!(error = %e, "desk registry write failed");
@@ -1318,15 +1594,18 @@ mod tests {
     }
 
     async fn new_session(d: &Desk, dir: &Path) -> SessionView {
-        d.create(NewSession {
-            engine: Engine::Claude,
-            name: "auth-fix".into(),
-            cwd: dir.to_string_lossy().into_owned(),
-            goal: "fix the race".into(),
-            worktree: None,
-            prompt: None,
-            approvals: None,
-        })
+        d.create(
+            NewSession {
+                engine: Engine::Claude,
+                name: "auth-fix".into(),
+                cwd: dir.to_string_lossy().into_owned(),
+                goal: "fix the race".into(),
+                worktree: None,
+                prompt: None,
+                approvals: None,
+            },
+            None,
+        )
         .await
         .unwrap()
     }
@@ -1448,12 +1727,109 @@ mod tests {
             };
             assert!(pending.answerable);
             assert_eq!(d.view(s.id).unwrap().state, SessionState::Blocked);
-            assert!(d.decide(s.id, Uuid::new_v4(), Decision::Allow).is_err());
+            assert!(d.decide(s.id, Uuid::new_v4(), Decision::Allow, None).is_err());
 
-            d.decide(s.id, pending.id, Decision::Allow).unwrap();
+            d.decide(s.id, pending.id, Decision::Allow, None).unwrap();
             assert_eq!(waiting.await.unwrap(), claude::allow());
             let v = d.view(s.id).unwrap();
             assert_eq!((v.state, v.pending), (SessionState::Working, None));
+        })
+        .await;
+    }
+
+    /// The kinds and texts of everything recorded, oldest first, once
+    /// `n` events are in.
+    async fn recorded(d: &Desk, n: usize) -> Vec<(crew::Kind, String, crew::PartyKind)> {
+        for _ in 0..200 {
+            let page = d.activity(crew::Filter::All, None, 100).await.unwrap();
+            if page.events.len() >= n {
+                return page
+                    .events
+                    .into_iter()
+                    .rev()
+                    .map(|e| (e.kind, e.text, e.actor.kind))
+                    .collect();
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("fewer than {n} events were recorded");
+    }
+
+    #[tokio::test]
+    async fn a_sessions_life_is_recorded_as_activity() {
+        use crew::{Kind as K, PartyKind as P};
+        with_test_pool(build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let d = desk(pool, dir.path()).await;
+            let (_, mut live) = d.subscribe();
+            let s = d
+                .create(
+                    NewSession {
+                        engine: Engine::Claude,
+                        name: "acme-web".into(),
+                        cwd: dir.path().to_string_lossy().into_owned(),
+                        goal: "upgrade the date picker".into(),
+                        worktree: None,
+                        prompt: None,
+                        approvals: None,
+                    },
+                    Some(By::you()),
+                )
+                .await
+                .unwrap();
+            post(&d, s.id, json!({"hook_event_name": "UserPromptSubmit", "prompt": "Upgrade the picker. Then test."})).await;
+            post(&d, s.id, json!({"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {"command": "ls"}})).await;
+            post(&d, s.id, json!({"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {"command": "pwd"}})).await;
+            let waiting = tokio::spawn({
+                let d = d.clone();
+                let id = s.id;
+                async move {
+                    post(&d, id, json!({"hook_event_name": "PermissionRequest", "tool_name": "Bash", "tool_input": {"command": "npm install @acme/ds@4.2.0"}})).await
+                }
+            });
+            let pending = loop {
+                if let Some(p) = d.view(s.id).unwrap().pending {
+                    break p;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            };
+            d.decide(s.id, pending.id, Decision::Allow, Some(By::you())).unwrap();
+            waiting.await.unwrap();
+            post(&d, s.id, json!({"hook_event_name": "Stop", "last_assistant_message": "Upgraded. Should I deploy main or release/4.2?"})).await;
+            d.stop(s.id, Some(By::manager("desk", "Desk", "It is done."))).unwrap();
+            let events = recorded(&d, 7).await;
+            assert_eq!(
+                events,
+                vec![
+                    (K::Started, "started acme-web".into(), P::You),
+                    (K::Started, "started “Upgrade the picker.”".into(), P::Session),
+                    (K::Working, "is running Bash(ls)".into(), P::Session),
+                    (K::NeedsYou, "wants to run npm install @acme/ds@4.2.0".into(), P::Session),
+                    (K::Approved, "allowed acme-web to run npm install @acme/ds@4.2.0".into(), P::You),
+                    (K::Question, "asked “Should I deploy main or release/4.2?”".into(), P::Session),
+                    (K::Stopped, "stopped acme-web".into(), P::Manager),
+                ]
+            );
+            let page = d.activity(crew::Filter::All, None, 100).await.unwrap();
+            let needs = page.events.iter().find(|e| e.kind == K::NeedsYou).unwrap();
+            assert_eq!(needs.approval_id.as_deref(), Some(pending.id.to_string().as_str()));
+            assert_eq!(needs.subject.as_ref().unwrap().id, s.id.to_string());
+            let stopped = &page.events[0];
+            assert_eq!(stopped.reason.as_deref(), Some("It is done."));
+            // The stop the overseer asked for is not recorded twice.
+            for _ in 0..100 {
+                if !d.view(s.id).unwrap().live {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert_eq!(d.activity(crew::Filter::All, None, 100).await.unwrap().events.len(), 7);
+            let mut seen = false;
+            while let Ok(e) = live.try_recv() {
+                seen |= matches!(e, DeskEvent::Activity { .. });
+            }
+            assert!(seen, "activity goes out live");
         })
         .await;
     }
@@ -1469,7 +1845,7 @@ mod tests {
             assert_eq!(answer, claude::ask_in_terminal());
             let p = d.view(s.id).unwrap().pending.unwrap();
             assert!(!p.answerable);
-            assert!(d.decide(s.id, p.id, Decision::Allow).is_err());
+            assert!(d.decide(s.id, p.id, Decision::Allow, None).is_err());
         })
         .await;
     }
@@ -1480,7 +1856,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let d = desk(pool, dir.path()).await;
             let s = new_session(&d, dir.path()).await;
-            d.stop(s.id).unwrap();
+            d.stop(s.id, None).unwrap();
             for _ in 0..100 {
                 if !d.view(s.id).unwrap().live {
                     break;
@@ -1488,10 +1864,10 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
             assert_eq!(d.view(s.id).unwrap().state, SessionState::Stopped);
-            let back = d.resume(s.id, Some("continue".into())).await.unwrap();
+            let back = d.resume(s.id, Some("continue".into()), None).await.unwrap();
             assert!(back.live);
             assert_eq!(back.last_prompt.as_deref(), Some("continue"));
-            assert!(d.resume(s.id, None).await.is_err());
+            assert!(d.resume(s.id, None, None).await.is_err());
         })
         .await;
     }
@@ -1502,8 +1878,8 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let d = desk(pool, dir.path()).await;
             let s = new_session(&d, dir.path()).await;
-            assert!(d.prompt(s.id, "  ").is_err());
-            d.prompt(s.id, "run the tests\nthen push").unwrap();
+            assert!(d.prompt(s.id, "  ", None).is_err());
+            d.prompt(s.id, "run the tests\nthen push", None).unwrap();
 
             let quick = d
                 .wait_for(s.id, &[SessionState::Done], Duration::from_millis(50))
@@ -1633,7 +2009,7 @@ mod tests {
             d.reconcile_external(ext(true)).await;
             let s = d.list().into_iter().find(|s| s.name == "vellev-36").unwrap();
             assert_eq!((s.origin, s.state, s.live), (Origin::External, SessionState::Working, false));
-            assert!(d.resume(s.id, None).await.is_err(), "still running elsewhere");
+            assert!(d.resume(s.id, None, None).await.is_err(), "still running elsewhere");
 
             d.reconcile_external(ext(false)).await;
             assert_eq!(d.view(s.id).unwrap().state, SessionState::Idle);

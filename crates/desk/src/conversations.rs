@@ -36,6 +36,9 @@ pub struct Said {
     pub from: Author,
     pub text: String,
     pub at: DateTime<Utc>,
+    /// What an overseer's message mentions to act on in place.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desk: Option<crate::crew::Extras>,
 }
 
 /// A page of the conversation, oldest first; `more` when older messages
@@ -170,6 +173,7 @@ mod tests {
                     from: Author::Agent,
                     text: "Hello".into(),
                     at: "2026-10-28T09:00:00Z".parse().unwrap(),
+                    desk: None,
                 }],
                 more: true,
             })

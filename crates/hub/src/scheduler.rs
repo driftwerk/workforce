@@ -2195,6 +2195,20 @@ impl Scheduler {
                     (true, "monitor sweep complete".to_string(), false)
                 }
             },
+            JobPayload::CrewSummary { evening } => {
+                #[cfg(feature = "postgres")]
+                {
+                    match crate::desk_crew::run_summary(&service, *evening).await {
+                        Ok(reply) => (true, reply, true),
+                        Err(e) => (false, e, false),
+                    }
+                }
+                #[cfg(not(feature = "postgres"))]
+                {
+                    let _ = evening;
+                    (false, "Desk is not on in this hub".to_string(), false)
+                }
+            }
             JobPayload::Consolidation { identity_id } => {
                 match crate::memory_consolidation::execute(
                     &service,

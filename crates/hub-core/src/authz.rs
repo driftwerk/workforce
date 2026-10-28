@@ -683,6 +683,17 @@ impl Capability {
                 "desk.wait",
                 "desk.approve",
                 "desk.stop",
+                "crew.overview",
+                "crew.activity",
+                "crew.history",
+                "crew.nudge",
+                "crew.approve",
+                "crew.deny",
+                "crew.stop",
+                "crew.resume",
+                "crew.restart",
+                "crew.start_session",
+                "crew.assign",
                 "wasm_skill.build",
             ],
             Capability::DatabaseWrite => &["database.execute"],
@@ -1015,7 +1026,11 @@ pub fn tool_capability(tool: &str, input: &serde_json::Value) -> Option<Capabili
         // reads them — the same host reach.
         "exec.run" | "code.cargo" | "code.build" | "code.test" | "code.lint" | "code.git"
         | "coding.claude" | "coding.session" | "desk.sessions" | "desk.start" | "desk.prompt"
-        | "desk.read" | "desk.wait" | "desk.approve" | "desk.stop" => Some(Capability::ShellExec),
+        | "desk.read" | "desk.wait" | "desk.approve" | "desk.stop"
+        // The crew overseer reads and drives the same terminals.
+        | "crew.overview" | "crew.activity" | "crew.history" | "crew.nudge" | "crew.approve"
+        | "crew.deny" | "crew.stop" | "crew.resume" | "crew.restart" | "crew.start_session"
+        | "crew.assign" => Some(Capability::ShellExec),
         // A language server loads the project the way a build does (build
         // scripts, proc macros, compiler plugins), so every `code.refactor`
         // action it answers is this class too. Only `replace_definition`, a

@@ -42,6 +42,12 @@ impl DeskStore {
             .context("running desk migrations")
     }
 
+    /// A store on `pool`, its migrations applied.
+    pub async fn with_pool(pool: PostgresPool) -> Result<Self> {
+        Self::migrate(&pool).await?;
+        Ok(Self { pool })
+    }
+
     pub(crate) fn pool(&self) -> &PostgresPool {
         &self.pool
     }

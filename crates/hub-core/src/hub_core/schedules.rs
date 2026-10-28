@@ -188,7 +188,8 @@ impl ScheduledJob {
         match &self.payload {
             JobPayload::WorkflowStart { .. }
             | JobPayload::MonitorSweep
-            | JobPayload::Consolidation { .. } => None,
+            | JobPayload::Consolidation { .. }
+            | JobPayload::CrewSummary { .. } => None,
             JobPayload::Reminder { .. } => {
                 self.effective_run_as_identity().or_else(|| self.owner())
             }
@@ -564,6 +565,14 @@ pub enum JobPayload {
         #[serde(default)]
         identity_id: Option<String>,
     },
+    /// The crew overseer's morning (or evening) summary, run as a turn in
+    /// its Desk DM. Registered and removed by the hub as the overseer's
+    /// `[oversight.summaries]` say.
+    #[serde(rename = "crew_summary")]
+    CrewSummary {
+        #[serde(default)]
+        evening: bool,
+    },
 }
 
 /// A record of a single job run.
@@ -576,7 +585,7 @@ impl JobPayload {
             }
             Self::Reminder { user_id, .. } => Some(user_id),
             Self::Consolidation { identity_id } => identity_id.as_deref(),
-            Self::WorkflowStart { .. } | Self::MonitorSweep => None,
+            Self::WorkflowStart { .. } | Self::MonitorSweep | Self::CrewSummary { .. } => None,
         }
     }
 
@@ -590,7 +599,7 @@ impl JobPayload {
                 identity_id: user_id,
             } => user_id.as_mut(),
             Self::Reminder { user_id, .. } => Some(user_id),
-            Self::WorkflowStart { .. } | Self::MonitorSweep => None,
+            Self::WorkflowStart { .. } | Self::MonitorSweep | Self::CrewSummary { .. } => None,
         };
         match slot {
             Some(id) if names.contains(id) => {

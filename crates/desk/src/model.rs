@@ -174,6 +174,10 @@ pub enum DeskEvent {
     RoomMessage {
         message: Box<crate::rooms::RoomMessage>,
     },
+    /// Something that happened on the crew, as Activity records it.
+    Activity {
+        event: Box<crate::crew::Event>,
+    },
 }
 
 #[derive(Debug, Clone, Deserialize)]

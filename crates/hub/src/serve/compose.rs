@@ -898,7 +898,7 @@ pub(super) async fn build_inner(
         tool_usage_refresh: std::sync::OnceLock::new(),
         turn_rig: crate::hub_core::slot::Slot::new(),
         hosts: crate::serve::ServiceHosts::new(
-            Arc::new(crate::turn_loop::TurnLoop),
+            turn_host(),
             Arc::new(crate::reconfigure::Reconfigurer),
         ),
         known_vaults,
@@ -5392,4 +5392,17 @@ pub(crate) fn routes_subscription(
             crate::subscription::routed_subscriptions(&prospective.effective, &prospective.next)
                 .contains(&kind)
         })
+}
+
+/// The hub's turn loop; with the desk compiled in, its turns are recorded
+/// for the crew (a pass-through where the desk is off).
+fn turn_host() -> Arc<dyn crate::hosts::TurnHost> {
+    #[cfg(feature = "postgres")]
+    {
+        Arc::new(crate::desk_crew::Observed(crate::turn_loop::TurnLoop))
+    }
+    #[cfg(not(feature = "postgres"))]
+    {
+        Arc::new(crate::turn_loop::TurnLoop)
+    }
 }

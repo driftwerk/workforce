@@ -44,6 +44,10 @@ pub struct BroadcastMessage {
     /// What ran the answer, set on `route` broadcasts with empty `content`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub route: Option<String>,
+    /// What a Desk overseer's answer mentions to act on in place, carried
+    /// through to `ServerMessage.desk`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub desk: Option<serde_json::Value>,
     /// Voice-bridge channel this message is addressed to. When set, the WS
     /// forwarder delivers ONLY to connections that registered the channel via
     /// `voice_listen` (and admit `target_identity`) — never to session
@@ -79,6 +83,7 @@ impl BroadcastMessage {
             code_citations: None,
             connect_prompt: None,
             route: None,
+            desk: None,
             target_channel: None,
             target_identity: None,
         }
@@ -141,6 +146,7 @@ impl BroadcastMessage {
             code_citations: None,
             connect_prompt: None,
             route: None,
+            desk: None,
             target_channel: None,
             target_identity: None,
         }

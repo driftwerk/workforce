@@ -107,7 +107,7 @@ fn flatten_clip(text: &str, max: usize) -> String {
 
 /// First sentence of `text` (falling back to its first non-empty line),
 /// flattened and clipped.
-fn first_sentence(text: &str) -> Option<String> {
+pub(crate) fn first_sentence(text: &str) -> Option<String> {
     let line = text.lines().map(str::trim).find(|l| !l.is_empty())?;
     let sentence = line
         .char_indices()

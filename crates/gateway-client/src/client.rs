@@ -1147,6 +1147,7 @@ mod tests {
             code_citations: None,
             connect_prompt: None,
             route: None,
+            desk: None,
         };
         assert_eq!(msg.kind(), ServerMessageKind::StreamDelta);
         assert!(msg.is_stream_delta());
@@ -1175,6 +1176,7 @@ mod tests {
             code_citations: None,
             connect_prompt: None,
             route: None,
+            desk: None,
         };
         let json = serde_json::to_string(&msg).unwrap();
         let parsed: ServerMessage = serde_json::from_str(&json).unwrap();
@@ -1205,6 +1207,7 @@ mod tests {
             code_citations: None,
             connect_prompt: None,
             route: None,
+            desk: None,
         };
         assert_eq!(start.kind(), ServerMessageKind::ToolStart);
         assert_eq!(start.text(), Some("filesystem.read"));
@@ -1229,6 +1232,7 @@ mod tests {
             code_citations: None,
             connect_prompt: None,
             route: None,
+            desk: None,
         };
         assert_eq!(end.kind(), ServerMessageKind::ToolEnd);
     }
@@ -1255,6 +1259,7 @@ mod tests {
             code_citations: None,
             connect_prompt: None,
             route: None,
+            desk: None,
         };
         assert!(msg.is_error());
         assert_eq!(msg.error.as_deref(), Some("Rate limit exceeded"));
@@ -1282,6 +1287,7 @@ mod tests {
             code_citations: None,
             connect_prompt: None,
             route: None,
+            desk: None,
         };
         assert_eq!(msg.kind(), ServerMessageKind::Reminder);
     }
@@ -1379,6 +1385,7 @@ mod tests {
             code_citations: None,
             connect_prompt: None,
             route: None,
+            desk: None,
         };
         assert!(msg.is_stream_start());
         assert_eq!(msg.kind(), ServerMessageKind::StreamStart);
@@ -1408,6 +1415,7 @@ mod tests {
             code_citations: None,
             connect_prompt: None,
             route: None,
+            desk: None,
         };
         assert!(msg.is_stream_end());
         assert_eq!(msg.kind(), ServerMessageKind::StreamEnd);
@@ -1452,6 +1460,7 @@ mod tests {
                 code_citations: None,
                 connect_prompt: None,
                 route: None,
+                desk: None,
             };
             assert_eq!(
                 msg.kind(),
@@ -1484,6 +1493,7 @@ mod tests {
             code_citations: None,
             connect_prompt: None,
             route: None,
+            desk: None,
         };
         let json = serde_json::to_string(&msg).unwrap();
         let parsed: ServerMessage = serde_json::from_str(&json).unwrap();

@@ -1465,7 +1465,7 @@ fn invalid_ws_channel(channel: &str) -> axum::response::Response {
 /// `agent_id`. A dormant conversation rolls over at resume, so the client is
 /// handed a fresh session instead of one whose history would replay
 /// weeks-old exchanges.
-fn anchor_session(
+pub(crate) fn anchor_session(
     service: &AgentService,
     channel: &str,
     owner: &str,
@@ -1553,6 +1553,7 @@ async fn handle_ws(
         code_citations: None,
         connect_prompt: None,
         route: None,
+        desk: None,
     };
     let _ = sender
         .send(Message::Text(
@@ -1608,6 +1609,7 @@ async fn handle_ws(
                 code_citations: msg.code_citations,
                 connect_prompt: msg.connect_prompt,
                 route: msg.route,
+                desk: msg.desk,
             };
             if sender
                 .send(Message::Text(
@@ -2183,12 +2185,14 @@ async fn handle_ws(
                                         tokio::spawn(async move {
                                             let forward = {
                                                 let (tx, sid) = (tx.clone(), sid.clone());
+                                                let mentions = mentions_for(&service, &sid);
                                                 move |rx| {
                                                     forward_local_progress(
                                                         rx,
                                                         tx,
                                                         sid,
                                                         tts_normalize,
+                                                        mentions,
                                                     )
                                                 }
                                             };
@@ -2360,16 +2364,39 @@ async fn handle_ws(
     info!("WebSocket client disconnected");
 }
 
+/// What a Desk overseer's answer mentions to act on in place, worked out
+/// from its text when its `stream_end` / `message` goes out.
+pub type Mentions = Arc<
+    dyn Fn(String) -> futures::future::BoxFuture<'static, Option<serde_json::Value>> + Send + Sync,
+>;
+
+/// The mentions of a turn in `sid` of `service`'s, when it is the Desk
+/// overseer answering in its DM.
+pub(crate) fn mentions_for(service: &AgentService, sid: &str) -> Option<Mentions> {
+    #[cfg(feature = "postgres")]
+    {
+        crate::desk_crew::mentions_for(service, sid)
+    }
+    #[cfg(not(feature = "postgres"))]
+    {
+        let _ = (service, sid);
+        None
+    }
+}
+
 /// Forward NATS [`ChatProgress`] events to the broadcast channel until `Done`.
 /// Broadcast a standalone turn's progress to this instance's WebSocket
 /// clients, ticking the in-flight tool line while a quiet tool runs.
-async fn forward_local_progress(
+pub(crate) async fn forward_local_progress(
     mut progress_rx: tokio::sync::mpsc::Receiver<ProgressEvent>,
     tx: broadcast::Sender<BroadcastMessage>,
     sid: String,
     tts_normalize: bool,
+    mentions: Option<Mentions>,
 ) {
     let mut delivery = crate::chat_worker::AnswerDelivery::default();
+    // What has streamed of the answer, for what it mentions.
+    let mut said = String::new();
     // The in-flight `tool_start` line the
     // heartbeat ticks while a black-box tool
     // (knowledge.ask) or quiet advisor round
@@ -2437,6 +2464,9 @@ async fn forward_local_progress(
                 String::new(),
             )),
             ProgressEvent::StreamDelta { text } => {
+                if mentions.is_some() {
+                    said.push_str(&text);
+                }
                 let content = if tts_normalize {
                     crate::formatting::normalize_delta_for_tts(&text)
                 } else {
@@ -2444,11 +2474,13 @@ async fn forward_local_progress(
                 };
                 Some(BroadcastMessage::new(sid.clone(), "stream_delta", content))
             }
-            ProgressEvent::StreamEnd => Some(BroadcastMessage::silent(
-                sid.clone(),
-                "stream_end",
-                String::new(),
-            )),
+            ProgressEvent::StreamEnd => {
+                let mut end = BroadcastMessage::silent(sid.clone(), "stream_end", String::new());
+                if let Some(mentions) = &mentions {
+                    end.desk = mentions(said.clone()).await;
+                }
+                Some(end)
+            }
             // Answer complete; the
             // annotations after it stream
             // as ordinary text and this
@@ -2456,9 +2488,12 @@ async fn forward_local_progress(
             // against a final answer, so
             // there is nothing to settle.
             ProgressEvent::AnswerSettled => None,
-            ProgressEvent::StreamDiscard { reason } => reason
-                .retracts()
-                .then(|| BroadcastMessage::silent(sid.clone(), "stream_discard", reason.as_str())),
+            ProgressEvent::StreamDiscard { reason } => {
+                said.clear();
+                reason.retracts().then(|| {
+                    BroadcastMessage::silent(sid.clone(), "stream_discard", reason.as_str())
+                })
+            }
             ProgressEvent::Response { ref text } => {
                 if !delivery.delivers_response() {
                     // Response was already delivered via
@@ -2482,7 +2517,11 @@ async fn forward_local_progress(
                     };
                     // Non-streamed response (e.g. slash
                     // commands) — send as a regular message.
-                    Some(BroadcastMessage::new(sid.clone(), "message", content))
+                    let mut message = BroadcastMessage::new(sid.clone(), "message", content);
+                    if let Some(mentions) = &mentions {
+                        message.desk = mentions(message.content.clone()).await;
+                    }
+                    Some(message)
                 }
             }
             ProgressEvent::CompactStart => Some(BroadcastMessage::new(
@@ -2823,7 +2862,7 @@ async fn forward_nats_progress(
 }
 
 /// Convert a [`ChatProgress`] event into a [`BroadcastMessage`] for WebSocket delivery.
-fn chat_progress_to_broadcast(
+pub(crate) fn chat_progress_to_broadcast(
     progress: ChatProgress,
     session_id: &str,
     tts_normalize: bool,
@@ -13251,7 +13290,7 @@ mod chat_progress_tests {
             .await
             .unwrap();
         drop(progress_tx);
-        forward_local_progress(progress_rx, tx, "s-1".into(), false).await;
+        forward_local_progress(progress_rx, tx, "s-1".into(), false, None).await;
         std::iter::from_fn(|| rx.try_recv().ok())
             .filter(|message| message.msg_type == "stream_discard")
             .collect()

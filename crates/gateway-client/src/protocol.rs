@@ -283,6 +283,10 @@ pub struct ServerMessage {
     /// stays empty, so a client that does not know the type shows nothing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub route: Option<String>,
+    /// On a Desk overseer's `message` / `stream_end`: what the answer
+    /// mentions to act on in place (`{"approvals": […], "suggestions": […]}`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desk: Option<serde_json::Value>,
 }
 
 fn default_speakable() -> bool {
@@ -412,6 +416,7 @@ impl ServerMessage {
             code_citations: None,
             connect_prompt: None,
             route: None,
+            desk: None,
         }
     }
 }

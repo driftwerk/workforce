@@ -1371,6 +1371,11 @@ pub(crate) fn serialize_job(j: &crate::hub_core::schedules::ScheduledJob) -> ser
         JobPayload::Reminder { text, .. } => Some(text.clone()),
         JobPayload::WorkflowStart { workflow_id, .. } => Some(format!("workflow: {workflow_id}")),
         JobPayload::MonitorSweep => Some("monitor sweep".to_string()),
+        JobPayload::CrewSummary { evening } => Some(if *evening {
+            "the overseer's evening summary".to_string()
+        } else {
+            "the overseer's morning summary".to_string()
+        }),
         JobPayload::Consolidation { identity_id } => Some(match identity_id {
             Some(id) => format!("memory consolidation for {id}"),
             None => "memory consolidation".to_string(),

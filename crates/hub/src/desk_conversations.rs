@@ -31,7 +31,12 @@ const MAX_READS: usize = 25;
 /// User-role rows the hub writes for the model, never typed by anyone: a
 /// rolled-over thread's carry-over, compaction's orientation note, and the
 /// overflow notes the runner leaves when it drops context.
-const HUB_NOTES: &[&str] = &[CARRYOVER_PREFIX, "[System note:", "[SYSTEM]"];
+const HUB_NOTES: &[&str] = &[
+    CARRYOVER_PREFIX,
+    "[System note:",
+    "[SYSTEM]",
+    crate::desk_crew::CHECK_IN,
+];
 
 /// What a transcript entry shows in the conversation, if it is one of its
 /// messages: said by the person or the agent, not tool chatter, a system
@@ -60,6 +65,7 @@ fn said(entry: &TranscriptEntry) -> Option<Said> {
         from,
         text,
         at: entry.timestamp,
+        desk: None,
     })
 }
 
@@ -194,7 +200,23 @@ impl Conversations for HubConversations {
             .registry
             .get(agent)
             .ok_or_else(|| ConversationError::NotFound(format!("no agent named {agent:?}")))?;
-        page(service.sessions.as_ref(), &owner, before, limit)
+        let mut page = page(service.sessions.as_ref(), &owner, before, limit)?;
+        if let Some(crew) = crate::desk_crew::for_state(state) {
+            let ids: Vec<String> = page
+                .messages
+                .iter()
+                .filter(|m| m.from == Author::Agent)
+                .map(|m| m.id.clone())
+                .collect();
+            match crew.desk().store().extras(&ids).await {
+                Ok(mut extras) => page
+                    .messages
+                    .iter_mut()
+                    .for_each(|m| m.desk = extras.remove(&m.id)),
+                Err(e) => tracing::warn!(error = %e, "reading the extras of a DM failed"),
+            }
+        }
+        Ok(page)
     }
 }
 

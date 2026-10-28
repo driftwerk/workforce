@@ -19,6 +19,7 @@ use tokio::sync::broadcast::error::RecvError;
 use uuid::Uuid;
 
 use crate::conversations::{self, Conversations};
+use crate::crew::By;
 use crate::model::{Decision, NewSession, SessionPatch};
 use crate::providers::{self, AccountError, Accounts, Catalog, ConnectBody, Entry};
 use crate::realtime::{Engine, Realtime, RealtimeError};
@@ -85,7 +86,11 @@ async fn list(State(s): S, h: HeaderMap, Query(q): Q) -> Response {
 
 async fn create(State(s): S, h: HeaderMap, Query(q): Q, Json(new): Json<NewSession>) -> Response {
     guarded!(s, h, q);
-    s.desk.create(new).await.map(Json).into_response()
+    s.desk
+        .create(new, Some(By::you()))
+        .await
+        .map(Json)
+        .into_response()
 }
 
 async fn update(
@@ -109,7 +114,7 @@ async fn forget(State(s): S, h: HeaderMap, Query(q): Q, Path(id): Path<Uuid>) ->
 
 async fn stop(State(s): S, h: HeaderMap, Query(q): Q, Path(id): Path<Uuid>) -> Response {
     guarded!(s, h, q);
-    s.desk.stop(id).map(Json).into_response()
+    s.desk.stop(id, Some(By::you())).map(Json).into_response()
 }
 
 #[derive(Deserialize, Default)]
@@ -128,7 +133,11 @@ async fn resume(
     let prompt = body
         .and_then(|Json(b)| b.prompt)
         .filter(|p| !p.trim().is_empty());
-    s.desk.resume(id, prompt).await.map(Json).into_response()
+    s.desk
+        .resume(id, prompt, Some(By::you()))
+        .await
+        .map(Json)
+        .into_response()
 }
 
 #[derive(Deserialize)]
@@ -145,7 +154,7 @@ async fn decide(
 ) -> Response {
     guarded!(s, h, q);
     s.desk
-        .decide(id, approval, b.decision)
+        .decide(id, approval, b.decision, Some(By::you()))
         .map(Json)
         .into_response()
 }
@@ -338,14 +347,8 @@ async fn search(State(s): S, h: HeaderMap, Query(sq): Query<SearchQuery>) -> Res
     s.desk.search(&sq.q).await.map(Json).into_response()
 }
 
-pub fn router(
-    desk: Desk,
-    auth: Arc<dyn Authorize>,
-    realtime: Arc<Realtime>,
-    speech: Arc<dyn Speech>,
-    accounts: Arc<dyn Accounts>,
-    conversations: Arc<dyn Conversations>,
-) -> Router {
+/// The sessions' and rooms' routes and the events socket alone.
+pub fn sessions_router(desk: Desk, auth: Arc<dyn Authorize>) -> Router {
     Router::new()
         .route("/api/desk/sessions", get(list).post(create))
         .route("/api/desk/sessions/{id}", patch(update).delete(forget))
@@ -366,10 +369,20 @@ pub fn router(
             "/api/desk/rooms/{id}/messages",
             get(room_messages).post(post_message),
         )
-        .with_state(Arc::new(ApiState {
-            desk,
-            auth: Arc::clone(&auth),
-        }))
+        .with_state(Arc::new(ApiState { desk, auth }))
+}
+
+pub fn router(
+    desk: Desk,
+    auth: Arc<dyn Authorize>,
+    realtime: Arc<Realtime>,
+    speech: Arc<dyn Speech>,
+    accounts: Arc<dyn Accounts>,
+    conversations: Arc<dyn Conversations>,
+    crew: Arc<dyn crate::crew::Crew>,
+) -> Router {
+    sessions_router(desk.clone(), Arc::clone(&auth))
+        .merge(crate::crew_api::crew_router(desk, Arc::clone(&auth), crew))
         .merge(voice_router(Arc::clone(&auth), realtime, speech))
         .merge(providers_router(auth, accounts))
         .merge(conversations::router(conversations))

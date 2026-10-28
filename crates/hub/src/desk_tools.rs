@@ -10,6 +10,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
 use workforce_agent::tools::{Tool, ToolResult};
+use workforce_desk::crew::{By, Party};
 use workforce_desk::model::{Decision, Engine, NewSession, SessionState};
 use workforce_desk::{Desk, DeskError};
 
@@ -109,6 +110,20 @@ struct ApproveInput {
     allow: bool,
 }
 
+/// The agent calling the tool, as the actor of what it does.
+fn caller() -> Option<By> {
+    let id = workforce_agent::runner::CURRENT_AGENT_ID
+        .try_with(|a| a.clone())
+        .ok()
+        .filter(|a| !a.is_empty())?;
+    Some(By {
+        party: Party::agent(&id, &id),
+        reason: None,
+        suggestion_id: None,
+        hop: 0,
+    })
+}
+
 fn out<T: serde::Serialize>(v: T) -> Result<Value, DeskError> {
     serde_json::to_value(v).map_err(|e| DeskError::Internal(e.into()))
 }
@@ -125,20 +140,23 @@ impl DeskTool {
             Verb::Start => {
                 let i: StartInput = parse(input)?;
                 out(d
-                    .create(NewSession {
-                        engine: i.engine.unwrap_or(Engine::Claude),
-                        name: i.name,
-                        cwd: i.cwd,
-                        goal: i.goal.unwrap_or_default(),
-                        worktree: i.worktree,
-                        prompt: i.prompt,
-                        approvals: None,
-                    })
+                    .create(
+                        NewSession {
+                            engine: i.engine.unwrap_or(Engine::Claude),
+                            name: i.name,
+                            cwd: i.cwd,
+                            goal: i.goal.unwrap_or_default(),
+                            worktree: i.worktree,
+                            prompt: i.prompt,
+                            approvals: None,
+                        },
+                        caller(),
+                    )
                     .await?)
             }
             Verb::Prompt => {
                 let i: PromptInput = parse(input)?;
-                out(d.prompt(i.session_id, &i.prompt)?)
+                out(d.prompt(i.session_id, &i.prompt, caller())?)
             }
             Verb::Read => {
                 let i: ReadInput = parse(input)?;
@@ -170,11 +188,11 @@ impl DeskTool {
                 } else {
                     Decision::Deny
                 };
-                out(d.decide(i.session_id, i.approval_id, decision)?)
+                out(d.decide(i.session_id, i.approval_id, decision, caller())?)
             }
             Verb::Stop => {
                 let i: IdInput = parse(input)?;
-                out(d.stop(i.session_id)?)
+                out(d.stop(i.session_id, caller())?)
             }
         }
     }

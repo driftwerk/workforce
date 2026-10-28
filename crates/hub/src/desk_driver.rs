@@ -466,6 +466,7 @@ pub async fn mount(
     let store = DeskStore::connect(pg)
         .await
         .context("opening the desk registry")?;
+    let cancel_crew = cancel.clone();
     let desk = Desk::start(store, options(config), cancel)
         .await
         .context("starting desk sessions")?;
@@ -476,6 +477,12 @@ pub async fn mount(
         register_tools(&service);
     }
     tracing::info!("desk sessions enabled");
+    let crew = crate::desk_crew::CrewHub::start(
+        Arc::clone(state),
+        desk.clone(),
+        crate::desk_crew::Timing::default(),
+        cancel_crew,
+    );
     let voice = Realtime::new(Arc::new(VaultKeys(state.vault.clone())));
     Ok(app.merge(workforce_desk::router(
         desk,
@@ -493,6 +500,7 @@ pub async fn mount(
         Arc::new(crate::desk_conversations::HubConversations(Arc::clone(
             state,
         ))),
+        crew,
     )))
 }
 
