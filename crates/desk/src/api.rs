@@ -18,8 +18,8 @@ use serde_json::json;
 use tokio::sync::broadcast::error::RecvError;
 use uuid::Uuid;
 
-use crate::catalog::{Catalog, Models};
 use crate::model::{Decision, NewSession, SessionPatch};
+use crate::providers::{self, AccountError, Accounts, Catalog, ConnectBody, Entry};
 use crate::realtime::{Engine, Realtime, RealtimeError};
 use crate::rooms::{NewMessage, NewRoom, RoomPatch};
 use crate::service::{Desk, DeskError};
@@ -342,7 +342,7 @@ pub fn router(
     auth: Arc<dyn Authorize>,
     realtime: Arc<Realtime>,
     speech: Arc<dyn Speech>,
-    models: Arc<dyn Models>,
+    accounts: Arc<dyn Accounts>,
 ) -> Router {
     Router::new()
         .route("/api/desk/sessions", get(list).post(create))
@@ -369,23 +369,98 @@ pub fn router(
             auth: Arc::clone(&auth),
         }))
         .merge(voice_router(Arc::clone(&auth), realtime, speech))
-        .merge(models_router(auth, models))
+        .merge(providers_router(auth, accounts))
 }
 
-struct ModelsApi {
+struct ProvidersApi {
     auth: Arc<dyn Authorize>,
-    models: Arc<dyn Models>,
+    accounts: Arc<dyn Accounts>,
 }
 
-async fn models(State(s): State<Arc<ModelsApi>>, h: HeaderMap, Query(q): Q) -> Response {
+type P = State<Arc<ProvidersApi>>;
+
+impl IntoResponse for AccountError {
+    fn into_response(self) -> Response {
+        let status = match &self {
+            AccountError::Invalid(_) => StatusCode::BAD_REQUEST,
+            AccountError::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
+            AccountError::Internal(e) => {
+                tracing::error!(error = %e, "desk provider credentials failed");
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
+        };
+        (status, Json(json!({ "error": self.to_string() }))).into_response()
+    }
+}
+
+fn unknown_provider(id: &str) -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(json!({ "error": format!("no provider named {id:?}") })),
+    )
+        .into_response()
+}
+
+async fn list_providers(State(s): P, h: HeaderMap, Query(q): Q) -> Response {
     guarded!(s, h, q);
-    Json(Catalog::of(&*s.models)).into_response()
+    Json(Catalog::of(&*s.accounts).await).into_response()
 }
 
-pub(crate) fn models_router(auth: Arc<dyn Authorize>, models: Arc<dyn Models>) -> Router {
+/// Saves the credentials a provider's fields hold where the hub reads them,
+/// and answers the provider as it now stands. What was typed is never logged
+/// or echoed.
+async fn connect_provider(
+    State(s): P,
+    h: HeaderMap,
+    Query(q): Q,
+    Path(id): Path<String>,
+    body: Result<Json<ConnectBody>, JsonRejection>,
+) -> Response {
+    guarded!(s, h, q);
+    let Some(spec) = providers::spec(&id) else {
+        return unknown_provider(&id);
+    };
+    let fields = body
+        .map_err(|_| AccountError::Invalid("the body is {\"fields\": {name: value}}".into()))
+        .and_then(|Json(b)| providers::checked(spec, b.fields));
+    let fields = match fields {
+        Ok(fields) => fields,
+        Err(e) => return e.into_response(),
+    };
+    if let Err(e) = s.accounts.connect(spec, &fields).await {
+        return e.into_response();
+    }
+    tracing::info!(provider = spec.id, "desk provider connected");
+    Json(Entry::of(spec, &*s.accounts).await).into_response()
+}
+
+/// Removes a provider's credentials (a plan's login included).
+async fn disconnect_provider(
+    State(s): P,
+    h: HeaderMap,
+    Query(q): Q,
+    Path(id): Path<String>,
+) -> Response {
+    guarded!(s, h, q);
+    let Some(spec) = providers::spec(&id) else {
+        return unknown_provider(&id);
+    };
+    if let Err(e) = s.accounts.disconnect(spec).await {
+        return e.into_response();
+    }
+    tracing::info!(provider = spec.id, "desk provider disconnected");
+    Json(Entry::of(spec, &*s.accounts).await).into_response()
+}
+
+pub(crate) fn providers_router(auth: Arc<dyn Authorize>, accounts: Arc<dyn Accounts>) -> Router {
     Router::new()
-        .route("/api/desk/models", get(self::models))
-        .with_state(Arc::new(ModelsApi { auth, models }))
+        .route("/api/desk/providers", get(list_providers))
+        .route(
+            "/api/desk/providers/{id}",
+            axum::routing::delete(disconnect_provider),
+        )
+        .route("/api/desk/providers/{id}/connect", post(connect_provider))
+        .with_state(Arc::new(ProvidersApi { auth, accounts }))
 }
 
 struct VoiceApi {

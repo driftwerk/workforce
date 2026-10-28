@@ -4,10 +4,11 @@
 
 mod adopt;
 pub mod api;
-pub mod catalog;
 mod claude;
 mod codex;
+pub mod local;
 pub mod model;
+pub mod providers;
 mod pty;
 pub mod realtime;
 pub mod rooms;
@@ -20,7 +21,7 @@ mod transcript;
 mod worktree;
 
 pub use api::{router, Authorize};
-pub use catalog::{Models, TierModel};
+pub use providers::{AccountError, Accounts, Fields, Spec, Standing};
 pub use realtime::{KeySource, Provider, Realtime};
 pub use service::{Desk, DeskError, Options, RestorePolicy};
 pub use speech::{Audio, Speak, SpeakError, Speech, SpeechProvider};

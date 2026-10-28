@@ -1,8 +1,8 @@
 //! Hub adapter for `workforce-desk`: the session registry in Postgres,
 //! system-admin-only access (a desk session runs commands as the hub's
 //! user), the vault keys behind cloud voice sessions and spoken replies, the
-//! tier models the agent picker offers, and the `/api/desk` routes on the
-//! gateway.
+//! credentials of the providers a Desk agent thinks with, and the `/api/desk`
+//! routes on the gateway.
 
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
@@ -13,21 +13,27 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::Router;
 use eyre::{Context, Result};
 use tokio_util::sync::CancellationToken;
-use workforce_agent::llm::provider::ProviderKind;
+use workforce_agent::llm::provider::{AccountExtras, ProviderKind};
 use workforce_agent::llm::speech::{provider_from_config, SpeechRequest};
-use workforce_agent::llm::tiers::TierRegistry;
+use workforce_agent::llm::vertex_credentials::{resolve_source, VertexCredentialSource};
 use workforce_common::secret::KeySlot;
-use workforce_common::settings::{DeskRestore, LlmSpeechConfig, WorkforceConfig};
+use workforce_common::settings::{
+    is_claude_oat, DeskRestore, LlmSpeechConfig, VaultActor, WorkforceConfig,
+};
+use workforce_common::subscription::SubscriptionKind;
+use workforce_desk::local::{self, Server};
+use workforce_desk::providers::Group;
 use workforce_desk::{
-    Audio, Authorize, Desk, DeskStore, KeySource, Models, Options, Provider, Realtime,
-    RestorePolicy, Speak, SpeakError, Speech, TierModel,
+    AccountError, Accounts, Audio, Authorize, Desk, DeskStore, Fields, KeySource, Options,
+    Provider, Realtime, RestorePolicy, Speak, SpeakError, Spec, Speech, Standing,
 };
 
+use crate::agent_llm::vault_provider_name;
 use crate::credentials::{how_to_add, Caller, Legacy};
 use crate::desk_tools::DeskTool;
 use crate::gateway::{resolve_caller_context, GatewayState};
 use crate::hub_core::formatting::normalize_for_tts;
-use crate::hub_core::subscriptions::tiered_models;
+use crate::hub_core::logins::store as login_store;
 use crate::serve::AgentService;
 use crate::skill_loader::CredScope;
 use crate::vault::Vault;
@@ -135,23 +141,238 @@ impl Speech for VaultKeys {
     }
 }
 
-/// The hub's own tiers: `[llm.equivalences]` belongs to an agent's config,
-/// and a desk session is not a hub agent.
-struct Tiers(TierRegistry);
+/// The credentials of the providers a Desk agent thinks with, in the global
+/// vault where every agent reads them: a plan's login at its
+/// [`SubscriptionKind::vault_key`] (where Desk's sign-ins write it), a key
+/// provider's `llm/accounts/*` record, a local server's address in one too.
+struct HubAccounts {
+    vault: Option<Arc<Vault>>,
+    /// The vaults a login is checked against for duplicates.
+    known: Arc<dyn Fn() -> Vec<Arc<Vault>> + Send + Sync>,
+}
 
-impl Models for Tiers {
-    fn tiers(&self, provider: &str) -> Vec<TierModel> {
-        ProviderKind::parse(provider)
-            .map(|kind| {
-                tiered_models(kind, &self.0)
-                    .into_iter()
-                    .map(|(tier, model)| TierModel {
-                        tier: tier.as_str(),
-                        model,
-                    })
-                    .collect()
+/// The subscription a plan provider signs in to.
+fn plan(spec: &Spec) -> Option<SubscriptionKind> {
+    match ProviderKind::parse(spec.id).ok()? {
+        ProviderKind::ClaudeCode => Some(SubscriptionKind::Claude),
+        ProviderKind::ChatGpt => Some(SubscriptionKind::ChatGpt),
+        _ => None,
+    }
+}
+
+/// The provider kind of a key or local provider, and its account name.
+fn metered(spec: &Spec) -> Result<(ProviderKind, &'static str), AccountError> {
+    ProviderKind::parse(spec.id)
+        .ok()
+        .filter(|kind| !kind.is_subscription())
+        .map(|kind| (kind, vault_provider_name(kind)))
+        .ok_or_else(|| AccountError::Invalid(format!("{} takes no key", spec.name)))
+}
+
+fn field<'a>(fields: &'a Fields, name: &str) -> Option<&'a str> {
+    fields.get(name).map(String::as_str)
+}
+
+/// A server address as the client is handed it.
+fn server_url(fields: &Fields) -> Result<String, AccountError> {
+    let url = field(fields, "url").unwrap_or_default();
+    match url::Url::parse(url) {
+        Ok(parsed) if matches!(parsed.scheme(), "http" | "https") => {
+            Ok(url.trim_end_matches('/').to_string())
+        }
+        _ => Err(AccountError::Invalid(
+            "the server URL is an http:// or https:// address".into(),
+        )),
+    }
+}
+
+/// The `llm/accounts/*` record `fields` make for `kind`: its `api_key` slot
+/// as [`workforce_agent::llm::provider::create_provider_with`] reads it, and
+/// the [`AccountExtras`] beside it.
+fn account(kind: ProviderKind, fields: &Fields) -> Result<serde_json::Value, AccountError> {
+    let required = |name: &str| {
+        field(fields, name)
+            .map(str::to_string)
+            .ok_or_else(|| AccountError::Invalid(format!("{name} is missing")))
+    };
+    let mut extras = AccountExtras::default();
+    let api_key = match kind {
+        ProviderKind::Bedrock => {
+            extras.region = field(fields, "region").map(str::to_string);
+            format!(
+                "{}:{}",
+                required("access_key_id")?,
+                required("secret_access_key")?
+            )
+        }
+        ProviderKind::VertexAnthropic => {
+            let key = required("service_account_json")?;
+            let Ok(source @ VertexCredentialSource::ServiceAccountKey(_)) = resolve_source(&key)
+            else {
+                return Err(AccountError::Invalid(
+                    "the service account key is the whole JSON key file, starting with {".into(),
+                ));
+            };
+            extras.project = field(fields, "project")
+                .map(str::to_string)
+                .or_else(|| source.project_id());
+            if extras.project.is_none() {
+                return Err(AccountError::Invalid(
+                    "the key names no project: give the Project ID".into(),
+                ));
+            }
+            extras.location = Some(field(fields, "location").unwrap_or("global").to_string());
+            key
+        }
+        ProviderKind::Ollama => server_url(fields)?,
+        ProviderKind::Vllm => {
+            extras.token = field(fields, "api_key").map(str::to_string);
+            server_url(fields)?
+        }
+        ProviderKind::Anthropic => {
+            let key = required("api_key")?;
+            if is_claude_oat(&key) {
+                return Err(AccountError::Invalid(
+                    "that is a Claude subscription token, not an API key: connect the Claude \
+                     plan instead"
+                        .into(),
+                ));
+            }
+            key
+        }
+        _ => required("api_key")?,
+    };
+    let mut record = serde_json::to_value(extras)
+        .map_err(|e| AccountError::Internal(format!("building the account: {e}")))?;
+    record["provider"] = vault_provider_name(kind).into();
+    record["api_key"] = api_key.into();
+    Ok(record)
+}
+
+impl HubAccounts {
+    fn vault(&self) -> Result<&Arc<Vault>, AccountError> {
+        self.vault
+            .as_ref()
+            .ok_or_else(|| AccountError::Unavailable("the hub has no vault".into()))
+    }
+
+    /// Where a local server is, and its bearer key: a URL set in the hub's
+    /// environment, else the vault account's, else Ollama's usual port.
+    fn endpoint(&self, kind: ProviderKind) -> Option<(String, Option<String>)> {
+        let (url_var, key_var, default) = match kind {
+            ProviderKind::Ollama => (
+                "OLLAMA_URL",
+                "OLLAMA_API_KEY",
+                Some("http://localhost:11434"),
+            ),
+            ProviderKind::Vllm => ("VLLM_URL", "VLLM_API_KEY", None),
+            _ => return None,
+        };
+        let env_key = || std::env::var(key_var).ok();
+        if let Some(url) = std::env::var(url_var).ok().filter(|u| !u.trim().is_empty()) {
+            return Some((url, env_key()));
+        }
+        let record = self
+            .vault
+            .as_deref()
+            .and_then(|vault| vault.find_account(vault_provider_name(kind)));
+        match record {
+            Some((_, record)) => Some((
+                record["api_key"].as_str()?.to_string(),
+                record["token"]
+                    .as_str()
+                    .map(str::to_string)
+                    .or_else(env_key),
+            )),
+            None => default.map(|url| (url.to_string(), env_key())),
+        }
+    }
+
+    async fn write(&self, path: &str, value: &str) -> Result<(), AccountError> {
+        let vault = self.vault()?;
+        let known = Arc::clone(&self.known);
+        login_store::set(vault, path, value, move || known(), VaultActor::RestOwner)
+            .await
+            .map_err(|e| {
+                tracing::warn!(path, error = %e, "desk provider credential not stored");
+                AccountError::Internal(format!("saving {path} failed"))
             })
+    }
+
+    async fn delete(&self, path: &str) -> Result<(), AccountError> {
+        login_store::delete(self.vault()?, path, VaultActor::RestOwner)
+            .await
+            .map(drop)
+            .map_err(|e| {
+                tracing::warn!(path, error = %e, "desk provider credential not removed");
+                AccountError::Internal(format!("removing {path} failed"))
+            })
+    }
+}
+
+#[async_trait]
+impl Accounts for HubAccounts {
+    async fn standing(&self, spec: &Spec) -> Standing {
+        let Some(vault) = self.vault.as_deref() else {
+            return Standing::default();
+        };
+        if let Some(kind) = plan(spec) {
+            return Standing {
+                connected: vault
+                    .get(kind.vault_key())
+                    .is_some_and(|v| !v.trim().is_empty()),
+                installed: Vec::new(),
+            };
+        }
+        let Ok((kind, name)) = metered(spec) else {
+            return Standing::default();
+        };
+        if spec.group != Group::Local {
+            return Standing {
+                connected: vault
+                    .find_account_api_key(name)
+                    .is_some_and(|key| !key.trim().is_empty()),
+                installed: Vec::new(),
+            };
+        }
+        let (Some(server), Some((url, token))) = (Server::of(spec.id), self.endpoint(kind)) else {
+            return Standing::default();
+        };
+        let installed =
+            local::installed(server, &url, token.as_deref(), local::PROBE_TIMEOUT).await;
+        Standing {
+            // Ollama is connected when it answers; vLLM when it has an address.
+            connected: installed.is_some() || server == Server::Vllm,
+            installed: installed.unwrap_or_default(),
+        }
+    }
+
+    fn efforts(&self, provider: &str) -> Vec<&'static str> {
+        ProviderKind::parse(provider)
+            .map(|kind| kind.efforts().to_vec())
             .unwrap_or_default()
+    }
+
+    async fn connect(&self, spec: &Spec, fields: &Fields) -> Result<(), AccountError> {
+        let (kind, name) = metered(spec)?;
+        let record = account(kind, fields)?;
+        let path = self
+            .vault()?
+            .find_account(name)
+            .map(|(path, _)| path)
+            .unwrap_or_else(|| format!("llm/accounts/{name}"));
+        self.write(&path, &record.to_string()).await
+    }
+
+    async fn disconnect(&self, spec: &Spec) -> Result<(), AccountError> {
+        if let Some(kind) = plan(spec) {
+            return self.delete(kind.vault_key()).await;
+        }
+        let (_, name) = metered(spec)?;
+        for path in self.vault()?.account_paths(name) {
+            self.delete(&path).await?;
+        }
+        Ok(())
     }
 }
 
@@ -209,7 +430,13 @@ pub async fn mount(
         Arc::new(SystemAdmins(Arc::clone(state))),
         Arc::new(voice),
         Arc::new(VaultKeys(state.vault.clone())),
-        Arc::new(Tiers(TierRegistry::new(None))),
+        Arc::new(HubAccounts {
+            vault: state.vault.clone(),
+            known: {
+                let state = Arc::clone(state);
+                Arc::new(move || crate::gateway::login_vaults(&state))
+            },
+        }),
     )))
 }
 
@@ -298,32 +525,361 @@ mod tests {
         }
     }
 
-    #[test]
-    fn the_picker_offers_each_local_providers_tiers() {
-        let tiers = Tiers(TierRegistry::new(None));
-        let named = |provider| {
-            tiers
-                .tiers(provider)
-                .into_iter()
-                .map(|m| (m.tier, m.model))
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(
-            named("claude-code"),
-            [
-                ("powerful", "opus".to_string()),
-                ("standard", "sonnet".to_string()),
-                ("cheap", "haiku".to_string()),
-            ]
-        );
-        assert_eq!(
-            named("chatgpt"),
-            [
-                ("powerful", "gpt-6.1-sol".to_string()),
-                ("standard", "gpt-6-sol".to_string()),
-                ("cheap", "gpt-6-luna".to_string()),
-            ]
-        );
-        assert!(named("not-a-provider").is_empty());
+    mod providers {
+        use super::*;
+        use crate::agent_llm::{AgentProviders, KeySource};
+        use crate::subscription::{CredentialScope, PlanLogins, Subscriptions};
+        use crate::workspace_admission::WorkspaceAdmission;
+        use workforce_desk::providers::{route, spec, PROVIDERS};
+
+        fn accounts(vault: &Arc<Vault>) -> HubAccounts {
+            HubAccounts {
+                vault: Some(Arc::clone(vault)),
+                known: Arc::new(Vec::new),
+            }
+        }
+
+        fn fields(pairs: &[(&str, &str)]) -> Fields {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        }
+
+        const SERVICE_ACCOUNT: &str = r#"{"type":"service_account","project_id":"acme-ai","private_key_id":"k1","private_key":"-----BEGIN PRIVATE KEY-----\nMII\n-----END PRIVATE KEY-----\n","client_email":"desk@acme-ai.iam.gserviceaccount.com","token_uri":"https://oauth2.googleapis.com/token"}"#;
+
+        /// What Desk sends to connect each key and local provider.
+        fn connect_fields(id: &str) -> Fields {
+            match id {
+                "anthropic" => fields(&[("api_key", "sk-ant-api03-desk")]),
+                "bedrock" => fields(&[
+                    ("access_key_id", "AKIADESK"),
+                    ("secret_access_key", "desk/secret+key"),
+                    ("region", "eu-west-2"),
+                ]),
+                "vertex-anthropic" => fields(&[("service_account_json", SERVICE_ACCOUNT)]),
+                "ollama" => fields(&[("url", "http://127.0.0.1:9/")]),
+                "vllm" => fields(&[("url", "http://127.0.0.1:9"), ("api_key", "vk-desk")]),
+                id => fields(&[("api_key", &format!("{id}-desk-key"))]),
+            }
+        }
+
+        fn kind(id: &str) -> ProviderKind {
+            ProviderKind::parse(id).unwrap()
+        }
+
+        fn agent_providers(vault: &Arc<Vault>) -> AgentProviders {
+            let config = WorkforceConfig::default();
+            AgentProviders::new(
+                None,
+                Some(Arc::clone(vault)),
+                PlanLogins::new(
+                    Subscriptions::new(&config),
+                    CredentialScope::system(Arc::clone(vault), &config.subscription),
+                ),
+            )
+        }
+
+        /// The variables that would put `kind`'s key ahead of the vault.
+        fn env_set(kind: ProviderKind) -> bool {
+            let vars: &[&str] = match kind {
+                ProviderKind::Ollama => &["OLLAMA_URL"],
+                ProviderKind::Vllm => &["VLLM_URL"],
+                ProviderKind::Bedrock => &["AWS_ACCESS_KEY_ID"],
+                ProviderKind::VertexAnthropic => &["GOOGLE_APPLICATION_CREDENTIALS"],
+                kind => crate::credentials::provider_env(kind),
+            };
+            vars.iter().any(|var| std::env::var(var).is_ok())
+        }
+
+        #[tokio::test]
+        async fn every_connected_key_or_local_provider_is_read_and_built_by_its_agents() {
+            for spec in PROVIDERS.iter().filter(|s| s.group != Group::Plan) {
+                let dir = tempfile::tempdir().unwrap();
+                let global = vault(dir.path());
+                let accounts = accounts(&global);
+                accounts
+                    .connect(spec, &connect_fields(spec.id))
+                    .await
+                    .unwrap_or_else(|e| panic!("{}: {e}", spec.id));
+                let kind = kind(spec.id);
+                let providers = agent_providers(&global);
+                if !env_set(kind) {
+                    assert_eq!(
+                        providers.metered_key_source(kind),
+                        Some(KeySource::GlobalVault),
+                        "{}",
+                        spec.id
+                    );
+                }
+                let model = spec.model_ids().next().unwrap_or("llama4:8b");
+                providers
+                    .provider(kind, Some(model), None, false, None)
+                    .await
+                    .unwrap_or_else(|e| panic!("{} does not build: {e}", spec.id));
+                if spec.group == Group::Key {
+                    assert!(accounts.standing(spec).await.connected, "{}", spec.id);
+                }
+                accounts.disconnect(spec).await.unwrap();
+                assert!(global.list(Some("llm/accounts/")).is_empty(), "{}", spec.id);
+            }
+        }
+
+        #[tokio::test]
+        async fn accounts_hold_what_each_client_reads_beside_its_key() {
+            let dir = tempfile::tempdir().unwrap();
+            let global = vault(dir.path());
+            let accounts = accounts(&global);
+            let record = |name: &str| -> serde_json::Value {
+                serde_json::from_str(&global.get(&format!("llm/accounts/{name}")).unwrap()).unwrap()
+            };
+            for id in ["bedrock", "vertex-anthropic", "vllm", "ollama"] {
+                accounts
+                    .connect(spec(id).unwrap(), &connect_fields(id))
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(
+                record("bedrock"),
+                serde_json::json!({
+                    "provider": "bedrock",
+                    "api_key": "AKIADESK:desk/secret+key",
+                    "region": "eu-west-2",
+                })
+            );
+            let vertex = record("vertex-anthropic");
+            assert_eq!(vertex["project"], "acme-ai", "named by the key");
+            assert_eq!(vertex["location"], "global");
+            assert_eq!(vertex["api_key"], SERVICE_ACCOUNT);
+            assert_eq!(
+                record("vllm"),
+                serde_json::json!({
+                    "provider": "vllm",
+                    "api_key": "http://127.0.0.1:9",
+                    "token": "vk-desk",
+                })
+            );
+            assert_eq!(record("ollama")["api_key"], "http://127.0.0.1:9");
+            if std::env::var("VLLM_URL").is_err() {
+                assert!(
+                    accounts.standing(spec("vllm").unwrap()).await.connected,
+                    "an addressed vLLM is connected"
+                );
+            }
+            if std::env::var("OLLAMA_URL").is_err() {
+                assert!(
+                    !accounts.standing(spec("ollama").unwrap()).await.connected,
+                    "an Ollama that does not answer is not"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn connecting_replaces_the_record_agents_read_and_disconnecting_clears_every_one() {
+            let dir = tempfile::tempdir().unwrap();
+            let global = vault(dir.path());
+            let old = serde_json::json!({ "provider": "zai", "api_key": "old-key" }).to_string();
+            global.set("llm/accounts/main", &old).unwrap();
+            global
+                .set(
+                    "llm/accounts/spare",
+                    &serde_json::json!({ "provider": "zai", "api_key": "spare" }).to_string(),
+                )
+                .unwrap();
+            let accounts = accounts(&global);
+            let zai = spec("zai").unwrap();
+            accounts
+                .connect(zai, &fields(&[("api_key", "new-key")]))
+                .await
+                .unwrap();
+            assert_eq!(
+                global.find_account_api_key("zai").as_deref(),
+                Some("new-key")
+            );
+            assert!(
+                global.get("llm/accounts/zai").is_none(),
+                "the read record is rewritten"
+            );
+            accounts.disconnect(zai).await.unwrap();
+            assert!(global.find_account_api_key("zai").is_none());
+            assert!(!accounts.standing(zai).await.connected);
+        }
+
+        #[tokio::test]
+        async fn a_plan_is_connected_by_its_login_and_disconnecting_signs_it_out() {
+            let dir = tempfile::tempdir().unwrap();
+            let global = vault(dir.path());
+            let accounts = accounts(&global);
+            let claude = spec("claude-code").unwrap();
+            assert!(!accounts.standing(claude).await.connected);
+            global
+                .set(
+                    SubscriptionKind::Claude.vault_key(),
+                    "sk-ant-oat01-desk-login",
+                )
+                .unwrap();
+            assert!(accounts.standing(claude).await.connected);
+            assert!(!accounts.standing(spec("chatgpt").unwrap()).await.connected);
+            accounts.disconnect(claude).await.unwrap();
+            assert!(global.get(SubscriptionKind::Claude.vault_key()).is_none());
+            assert!(!accounts.standing(claude).await.connected);
+        }
+
+        #[tokio::test]
+        async fn a_wrong_credential_is_refused_without_repeating_it() {
+            let dir = tempfile::tempdir().unwrap();
+            let global = vault(dir.path());
+            let accounts = accounts(&global);
+            let refused = |e: AccountError, secret: &str| {
+                assert!(matches!(e, AccountError::Invalid(_)), "{e:?}");
+                assert!(!e.to_string().contains(secret), "{e}");
+            };
+            let oat = "sk-ant-oat01-pasted-plan-token";
+            refused(
+                accounts
+                    .connect(spec("anthropic").unwrap(), &fields(&[("api_key", oat)]))
+                    .await
+                    .unwrap_err(),
+                oat,
+            );
+            let half = "{\"private_key\": \"-----BEGIN";
+            refused(
+                accounts
+                    .connect(
+                        spec("vertex-anthropic").unwrap(),
+                        &fields(&[("service_account_json", half)]),
+                    )
+                    .await
+                    .unwrap_err(),
+                "BEGIN",
+            );
+            let no_project = r#"{"type":"service_account","private_key":"-----BEGIN"}"#;
+            refused(
+                accounts
+                    .connect(
+                        spec("vertex-anthropic").unwrap(),
+                        &fields(&[("service_account_json", no_project)]),
+                    )
+                    .await
+                    .unwrap_err(),
+                "BEGIN",
+            );
+            refused(
+                accounts
+                    .connect(
+                        spec("ollama").unwrap(),
+                        &fields(&[("url", "localhost:11434")]),
+                    )
+                    .await
+                    .unwrap_err(),
+                "\u{0}",
+            );
+            assert!(global.list(None).is_empty());
+            let unavailable = HubAccounts {
+                vault: None,
+                known: Arc::new(Vec::new),
+            }
+            .connect(spec("grok").unwrap(), &fields(&[("api_key", "k")]))
+            .await
+            .unwrap_err();
+            assert!(matches!(unavailable, AccountError::Unavailable(_)));
+        }
+
+        fn admission() -> WorkspaceAdmission {
+            let mut config = WorkforceConfig::default();
+            config.subscription.chatgpt_direct = true;
+            WorkspaceAdmission::new(
+                Arc::new(config),
+                "desk-agent",
+                Arc::new(parking_lot::RwLock::new("anthropic".to_string())),
+            )
+        }
+
+        fn agent_toml(provider: &str, model: &str, effort: Option<&str>) -> String {
+            let effort = effort
+                .map(|e| format!("effort = {e:?}\n"))
+                .unwrap_or_default();
+            format!("[llm]\nprovider = {provider:?}\ndefault_model = {model:?}\n{effort}")
+        }
+
+        #[test]
+        fn every_model_desk_offers_loads_on_its_route_at_every_effort_its_provider_takes() {
+            let admission = admission();
+            let accounts = HubAccounts {
+                vault: None,
+                known: Arc::new(Vec::new),
+            };
+            for spec in PROVIDERS {
+                let models: Vec<&str> = match spec.lists_installed() {
+                    true => vec!["llama4:8b"],
+                    false => spec.model_ids().collect(),
+                };
+                let efforts = accounts.efforts(spec.id);
+                for model in models {
+                    let provider = route(spec.id, model);
+                    for effort in std::iter::once(None).chain(efforts.iter().copied().map(Some)) {
+                        let findings = admission
+                            .review_toml(&agent_toml(&provider, model, effort))
+                            .unwrap_or_else(|e| panic!("{provider} {model} {effort:?}: {e}"));
+                        assert!(
+                            findings.is_empty(),
+                            "{provider} {model} {effort:?}: {findings:?}"
+                        );
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn a_level_the_provider_does_not_take_is_refused_naming_the_ones_it_does() {
+            let admission = admission();
+            let refusal = |provider: &str, effort: &str| {
+                admission
+                    .review_toml(&agent_toml(provider, "m", Some(effort)))
+                    .unwrap_err()
+                    .to_string()
+            };
+            assert_eq!(
+                refusal("claude-code", "xhigh"),
+                "effort = \"xhigh\" is not a level claude-code takes: use one of low, medium, high, max"
+            );
+            assert_eq!(
+                refusal("chatgpt", "max"),
+                "effort = \"max\" is not a level chatgpt takes: use one of low, medium, high, xhigh"
+            );
+            assert!(refusal("anthropic", "extreme")
+                .contains("use one of low, medium, high, xhigh, max"));
+            assert!(refusal("grok", "extreme").contains("is not an effort level"));
+            let ignored = admission
+                .review_toml(&agent_toml("grok", "grok-4.7", Some("high")))
+                .unwrap();
+            assert_eq!(ignored.len(), 1, "{ignored:?}");
+            assert!(ignored[0].message.contains("grok has no effort control"));
+        }
+
+        #[test]
+        fn the_hub_knows_every_model_desk_offers() {
+            let pricing = workforce_agent::llm::DEFAULT_PRICING_TOML;
+            let tiers = workforce_agent::llm::tiers::TierRegistry::new(None);
+            for spec in PROVIDERS {
+                for model in spec.model_ids() {
+                    let priced = [format!("\"{model}\""), format!("\"{}:{model}\"", spec.id)]
+                        .iter()
+                        .any(|quoted| pricing.contains(quoted.as_str()));
+                    let tier_key = route(spec.id, model).replace(':', ".");
+                    let tiered =
+                        workforce_agent::llm::tiers::ModelTier::ALL
+                            .into_iter()
+                            .any(|tier| {
+                                tiers.resolve_for_tier(tier, &tier_key).as_deref() == Some(model)
+                            });
+                    assert!(
+                        priced || tiered,
+                        "{} {model} is not one the hub knows",
+                        spec.id
+                    );
+                }
+            }
+        }
     }
 }
