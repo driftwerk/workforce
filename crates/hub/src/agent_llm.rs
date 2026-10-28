@@ -103,9 +103,13 @@ fn explicit_env_key(kind: ProviderKind) -> Option<String> {
 }
 
 /// Whether a vault account's credential beats the environment's for `kind`:
-/// a local server's address, which Desk sets in the vault, does.
+/// what Desk sets in the vault for a local server's address, and Vertex's
+/// account (a key, or the person's Google login with its project), does.
 fn vault_beats_env(kind: ProviderKind) -> bool {
-    matches!(kind, ProviderKind::Ollama | ProviderKind::Vllm)
+    matches!(
+        kind,
+        ProviderKind::Ollama | ProviderKind::Vllm | ProviderKind::VertexAnthropic
+    )
 }
 
 /// Where a metered provider's credential comes from, in the order
@@ -422,7 +426,7 @@ mod tests {
     }
 
     #[test]
-    fn a_local_servers_address_in_the_vault_beats_the_environments() {
+    fn an_address_or_vertex_account_in_the_vault_beats_the_environments() {
         let dir = tempfile::tempdir().unwrap();
         let vault = Arc::new(Vault::open(&dir.path().join("global.enc"), "test-key").unwrap());
         let providers = AgentProviders::new(
@@ -459,6 +463,28 @@ mod tests {
                 Some(KeySource::GlobalVault)
             );
         }
+        vault
+            .set(
+                "llm/accounts/vertex-anthropic",
+                &serde_json::json!({
+                    "provider": "vertex-anthropic", "api_key": "adc",
+                    "project": "acme-ai", "location": "global",
+                })
+                .to_string(),
+            )
+            .unwrap();
+        let (key, extras) = providers
+            .metered_account_with(
+                ProviderKind::VertexAnthropic,
+                Some("/etc/gcp/other-key.json".into()),
+            )
+            .unwrap();
+        assert_eq!(
+            key, "adc",
+            "Vertex's account beats GOOGLE_APPLICATION_CREDENTIALS"
+        );
+        assert_eq!(extras.project.as_deref(), Some("acme-ai"));
+        assert_eq!(extras.location.as_deref(), Some("global"));
         vault
             .set(
                 "llm/accounts/grok",

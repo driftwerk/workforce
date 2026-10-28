@@ -63,17 +63,22 @@ fn said(entry: &TranscriptEntry) -> Option<Said> {
     })
 }
 
-/// The chain member that holds the message `id`, walking back from `head`.
+/// The chain member that holds the message `id`, walking back from `head`:
+/// in its archive, or in its live messages for a session the archive does
+/// not hold yet (whose transcript reads them instead).
 fn holder(store: &dyn SessionStore, head: &str, id: &str) -> eyre::Result<Option<String>> {
     let mut session = Some(head.to_string());
     for _ in 0..50 {
         let Some(current) = session else { break };
-        if store.read_archive_message(&current, id)?.is_some() {
+        let live = store.get(&current)?;
+        if store.read_archive_message(&current, id)?.is_some()
+            || live
+                .as_ref()
+                .is_some_and(|s| s.messages.iter().any(|m| m.id == id))
+        {
             return Ok(Some(current));
         }
-        session = store
-            .get(&current)?
-            .and_then(|s| s.prev_session_id().map(str::to_string));
+        session = live.and_then(|s| s.prev_session_id().map(str::to_string));
     }
     Ok(None)
 }
@@ -326,6 +331,42 @@ mod tests {
         store.save(&session).unwrap();
         let text = &page(&store, ME, None, 10).unwrap().messages[0].text;
         assert!(!text.contains("AKIAIOSFODNN7EXAMPLE"), "{text}");
+    }
+
+    /// The hub's own store: pages walk back the same whether the messages
+    /// are in the archive yet or only in the session.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn on_postgres_pages_walk_back_from_the_archive_or_the_live_session() {
+        use workforce_common::session_postgres::PostgresSessionStore;
+        workforce_postgres::test_support::with_test_pool(
+            PostgresSessionStore::build_pool,
+            |pool| async move {
+                let store = PostgresSessionStore::with_pool(pool, "scout")
+                    .await
+                    .expect("store");
+                for n in 0..3 {
+                    exchange(store.as_ref(), n);
+                }
+                let walk = |store: &dyn SessionStore| {
+                    let newest = page(store, ME, None, 4).unwrap();
+                    assert_eq!(newest.messages[0].text, "question 1");
+                    assert!(newest.more);
+                    let oldest = page(store, ME, Some(&newest.messages[0].id), 4).unwrap();
+                    assert_eq!(
+                        texts(&oldest),
+                        [("question 0", Author::User), ("answer 0", Author::Agent)]
+                    );
+                    assert!(!oldest.more);
+                };
+                walk(store.as_ref());
+                let session = store.find(DESK_CHANNEL, ME).unwrap().unwrap();
+                for message in &session.messages {
+                    store.append_to_archive(&session.id, message).unwrap();
+                }
+                walk(store.as_ref());
+            },
+        )
+        .await;
     }
 
     /// A dormant DM goes on in a successor; the read crosses the seam.

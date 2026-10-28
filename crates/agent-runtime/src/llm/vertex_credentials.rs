@@ -104,25 +104,33 @@ pub fn resolve_source(api_key: &str) -> Result<VertexCredentialSource> {
     ))
 }
 
-/// The Application Default Credentials file a Google login leaves, when there
-/// is one: `GOOGLE_APPLICATION_CREDENTIALS`, else the file
-/// `gcloud auth application-default login` writes. Only where it is; what it
-/// holds is read by `gcp_auth` at request time, never here.
+/// The Application Default Credentials file `gcp_auth` will fetch tokens
+/// with, when there is one it can use: `GOOGLE_APPLICATION_CREDENTIALS` when
+/// set (which `gcp_auth` reads as a service-account key, and nothing else),
+/// else the file `gcloud auth application-default login` writes in the home
+/// directory. Only the file's `type` is looked at; what it holds is read by
+/// `gcp_auth` at request time, never kept here.
 pub fn adc_file() -> Option<PathBuf> {
-    let named = std::env::var_os("GOOGLE_APPLICATION_CREDENTIALS")
-        .filter(|p| !p.is_empty())
-        .map(PathBuf::from);
-    let gcloud = || {
-        let config = match std::env::var_os("CLOUDSDK_CONFIG").filter(|p| !p.is_empty()) {
-            Some(dir) => PathBuf::from(dir),
-            None if cfg!(windows) => PathBuf::from(std::env::var_os("APPDATA")?).join("gcloud"),
-            None => PathBuf::from(std::env::var_os("HOME")?)
-                .join(".config")
-                .join("gcloud"),
-        };
-        Some(config.join("application_default_credentials.json"))
+    if let Some(named) =
+        std::env::var_os("GOOGLE_APPLICATION_CREDENTIALS").filter(|p| !p.is_empty())
+    {
+        let path = PathBuf::from(named);
+        let kind = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+            .and_then(|json| json.get("type")?.as_str().map(str::to_string));
+        return (kind.as_deref() == Some("service_account")).then_some(path);
+    }
+    let config = match cfg!(windows) {
+        true => PathBuf::from(std::env::var_os("APPDATA")?),
+        false => PathBuf::from(std::env::var_os("HOME")?).join(".config"),
     };
-    named.or_else(gcloud).filter(|path| path.is_file())
+    Some(
+        config
+            .join("gcloud")
+            .join("application_default_credentials.json"),
+    )
+    .filter(|p| p.is_file())
 }
 
 /// Resolve the target GCP project. Precedence: explicit → `GOOGLE_CLOUD_PROJECT`
@@ -204,39 +212,37 @@ mod tests {
     }
 
     #[test]
-    fn the_google_login_is_found_where_gcloud_or_the_variable_puts_it() {
-        let dir = tempfile::tempdir().unwrap();
-        let gcloud = dir.path().join("gcloud");
+    fn the_google_login_is_found_where_gcp_auth_reads_it() {
+        let home = tempfile::tempdir().unwrap();
+        let gcloud = home.path().join(".config").join("gcloud");
         std::fs::create_dir_all(&gcloud).unwrap();
         let written = gcloud.join("application_default_credentials.json");
-        let named = dir.path().join("named.json");
-        let config = gcloud.to_str().unwrap();
-        with_env(
-            &[
-                ("GOOGLE_APPLICATION_CREDENTIALS", None),
-                ("CLOUDSDK_CONFIG", Some(config)),
-            ],
-            || assert_eq!(adc_file(), None, "no login yet"),
-        );
-        std::fs::write(&written, "{}").unwrap();
-        with_env(
-            &[
-                ("GOOGLE_APPLICATION_CREDENTIALS", None),
-                ("CLOUDSDK_CONFIG", Some(config)),
-            ],
-            || assert_eq!(adc_file(), Some(written.clone())),
-        );
-        std::fs::write(&named, "{}").unwrap();
-        with_env(
-            &[
-                (
-                    "GOOGLE_APPLICATION_CREDENTIALS",
-                    Some(named.to_str().unwrap()),
-                ),
-                ("CLOUDSDK_CONFIG", Some(config)),
-            ],
-            || assert_eq!(adc_file(), Some(named.clone()), "the variable wins"),
-        );
+        let named = home.path().join("named.json");
+        let home_dir = home.path().to_str().unwrap();
+        let unset = [
+            ("GOOGLE_APPLICATION_CREDENTIALS", None),
+            ("HOME", Some(home_dir)),
+        ];
+        with_env(&unset, || assert_eq!(adc_file(), None, "no login yet"));
+        std::fs::write(&written, r#"{"type":"authorized_user"}"#).unwrap();
+        with_env(&unset, || assert_eq!(adc_file(), Some(written.clone())));
+        let set = [
+            (
+                "GOOGLE_APPLICATION_CREDENTIALS",
+                Some(named.to_str().unwrap()),
+            ),
+            ("HOME", Some(home_dir)),
+        ];
+        std::fs::write(&named, r#"{"type":"authorized_user"}"#).unwrap();
+        with_env(&set, || {
+            assert_eq!(
+                adc_file(),
+                None,
+                "gcp_auth reads the variable as a service-account key and fails on a login"
+            )
+        });
+        std::fs::write(&named, r#"{"type":"service_account"}"#).unwrap();
+        with_env(&set, || assert_eq!(adc_file(), Some(named.clone())));
     }
 
     #[test]

@@ -944,8 +944,9 @@ impl ProviderKind {
     /// thinking budget for. On Bedrock only Claude on the Invoke API with a
     /// thinking budget takes one (the open models' bodies carry none); on
     /// Vertex and the Anthropic API, a Claude model without thinking takes
-    /// none. A model the tables cannot place (a tier name, an id they do not
-    /// list) keeps the provider's levels.
+    /// none. A name that is no model id (a tier name such as `standard`)
+    /// keeps the provider's levels; a Bedrock id the table does not list is
+    /// sent no effort, so it takes none.
     pub fn model_efforts(self, model: &str) -> &'static [&'static str] {
         use super::bedrock_capabilities::{self as bedrock, ThinkingMode, WireFormat};
         let model = model.trim();

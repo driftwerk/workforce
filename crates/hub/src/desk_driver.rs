@@ -642,7 +642,7 @@ mod tests {
             let vars: &[&str] = match kind {
                 ProviderKind::Ollama | ProviderKind::Vllm => &[],
                 ProviderKind::Bedrock => &["AWS_ACCESS_KEY_ID"],
-                ProviderKind::VertexAnthropic => &["GOOGLE_APPLICATION_CREDENTIALS"],
+                ProviderKind::VertexAnthropic => &[],
                 kind => crate::credentials::provider_env(kind),
             };
             vars.iter().any(|var| std::env::var(var).is_ok())
