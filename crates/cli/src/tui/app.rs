@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use chrono::Utc;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use ratatui::text::Text;
-use tui_textarea::{CursorMove, TextArea};
+use ratatui_textarea::{CursorMove, TextArea};
 
 use workforce_gateway_client::protocol::{ServerMessageKind, TranscriptEntryDto};
 use workforce_gateway_client::GatewayEvent;

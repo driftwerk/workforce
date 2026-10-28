@@ -62,7 +62,7 @@ uuid = { workspace = true }
 chrono = { workspace = true }
 ratatui = { workspace = true }
 crossterm = { workspace = true }
-tui-textarea = { workspace = true }
+ratatui-textarea = { workspace = true }
 futures = { workspace = true }
 tokio-tungstenite = { version = "0.28", features = ["native-tls"] }
 pulldown-cmark = { workspace = true }

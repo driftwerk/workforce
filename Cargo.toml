@@ -150,9 +150,9 @@ indicatif = "0.17.9"
 console = "0.15.10"
 
 # TUI
-ratatui = "0.29"
-crossterm = { version = "0.28", features = ["event-stream"] }
-tui-textarea = "0.7"
+ratatui = "0.30"
+crossterm = { version = "0.29", features = ["event-stream"] }
+ratatui-textarea = "0.9"
 pulldown-cmark = "0.12"
 unicode-width = "0.2"
 
