@@ -166,7 +166,7 @@ struct RestoreBody {
 
 async fn restore(State(s): S, h: HeaderMap, Query(q): Q, Json(b): Json<RestoreBody>) -> Response {
     guarded!(s, h, q);
-    Json(s.desk.restore(&b.ids).await).into_response()
+    Json(s.desk.restore(&b.ids, Some(By::you())).await).into_response()
 }
 
 async fn dismiss_restore(State(s): S, h: HeaderMap, Query(q): Q) -> Response {

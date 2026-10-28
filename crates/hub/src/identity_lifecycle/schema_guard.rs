@@ -161,6 +161,24 @@ const CLAIMS: &[(&str, &str, &str, Claim)] = &[
         NotPersonal("the room's agents, as hub/agent keys"),
     ),
     (
+        "desk",
+        "activity",
+        "actor",
+        NotPersonal("an agent, a session, the overseer, or \"you\" — never a person's id"),
+    ),
+    (
+        "desk",
+        "activity",
+        "subject",
+        NotPersonal("the agent or session an event is about"),
+    ),
+    (
+        "desk",
+        "suggestions",
+        "subject",
+        NotPersonal("the agent or session a suggestion is about"),
+    ),
+    (
         "hub-core",
         "budget_overrides",
         "scope",

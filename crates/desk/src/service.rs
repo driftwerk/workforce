@@ -210,7 +210,7 @@ impl Desk {
                 .into_iter()
                 .map(|s| s.id)
                 .collect::<Vec<_>>();
-            desk.restore(&ids).await;
+            desk.restore(&ids, None).await;
         }
         tokio::spawn({
             let desk = desk.clone();
@@ -688,10 +688,10 @@ impl Desk {
 
     /// Resumes each id, returning those that came back; failures are logged
     /// and leave the session on offer.
-    pub async fn restore(&self, ids: &[Uuid]) -> Vec<SessionView> {
+    pub async fn restore(&self, ids: &[Uuid], by: Option<By>) -> Vec<SessionView> {
         let mut back = Vec::new();
         for &id in ids {
-            match self.resume(id, None, None).await {
+            match self.resume(id, None, by.clone()).await {
                 Ok(v) => back.push(v),
                 Err(e) => tracing::warn!(%id, error = %e, "desk session could not be restored"),
             }
