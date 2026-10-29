@@ -32,6 +32,9 @@ mod login_store_routes;
 #[path = "api/monitor_routes.rs"]
 mod monitor_routes;
 
+#[path = "api/pair_routes.rs"]
+mod pair_routes;
+
 #[path = "api/schedule_routes.rs"]
 mod schedule_routes;
 
