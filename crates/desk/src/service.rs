@@ -18,6 +18,7 @@ use crate::adopt::{self, External};
 use crate::claude::{self, Hook};
 use crate::codex::{self, AppServer, CodexEvent, Seen};
 use crate::crew::{self, By, Event, Kind, Party};
+use crate::floor::Outcome;
 use crate::holder::{Held, Holder};
 use crate::model::{
     Approvals, Decision, DeskEvent, Engine, NewSession, Origin, PendingApproval, SessionPatch,
@@ -34,6 +35,9 @@ use crate::worktree;
 
 mod groups;
 mod terminals;
+mod transition;
+
+use transition::Transition;
 
 pub use groups::{
     local_agent_item, session_item, Group, Import, Imported, Layout, Ungrouped, UNGROUPED,
@@ -157,6 +161,8 @@ struct State {
     working_noted: HashMap<Uuid, std::time::Instant>,
     /// Sessions whose next stop or resume someone's action already recorded.
     acted: HashSet<Uuid>,
+    /// Requests Desk answered, until the change that clears them is seen.
+    decided: HashSet<Uuid>,
     terminals: HashMap<Uuid, TerminalRecord>,
     terminal_ptys: HashMap<Uuid, Arc<Pty>>,
     /// The sidebar's groups.
@@ -203,6 +209,25 @@ fn hub_secret(name: &str) -> bool {
         && name
             .split('_')
             .any(|part| SECRET.iter().any(|s| part.starts_with(s)))
+}
+
+/// How a session's pending request reads in Activity.
+fn asking(p: &PendingApproval) -> String {
+    let name = p.tool.split('(').next().unwrap_or(&p.tool);
+    let detail = if p.detail.trim().is_empty() {
+        p.tool.clone()
+    } else {
+        p.detail.clone()
+    };
+    match name {
+        "Input" => format!("is asking: {}", crew::clip(&p.detail, 160)),
+        "Bash" => format!("wants to run {}", crew::clip(&detail, 160)),
+        "Edit" | "Write" | "MultiEdit" => format!("wants to edit {}", crew::clip(&detail, 160)),
+        _ if !p.answerable && p.detail == "Answer in the terminal" => {
+            "is waiting for an answer in its terminal".into()
+        }
+        _ => format!("wants to use {}", crew::clip(&p.tool, 160)),
+    }
 }
 
 /// The environment sessions, terminals and the CLIs Desk runs start from:
@@ -486,7 +511,13 @@ impl Desk {
             if before.as_ref().is_none_or(|b| b.state != view.state) {
                 st.state_since.insert(r.id, view.updated_at);
             }
-            let events = Self::session_events(&mut st, before.as_ref(), &view);
+            let transitions = Transition::of(before.as_ref(), &view, &st.decided);
+            transitions.iter().for_each(|t| {
+                if let Transition::Unblocked { pending, .. } = t {
+                    st.decided.remove(&pending.id);
+                }
+            });
+            let events = Self::session_events(&mut st, &transitions, &view);
             (view, events)
         };
         let _ = self.0.persist.send(Persist::Put(Box::new(r)));
@@ -513,121 +544,77 @@ impl Desk {
     /// finished, asked or hit.
     fn session_events(
         st: &mut State,
-        before: Option<&SessionView>,
+        transitions: &[Transition<'_>],
         now: &SessionView,
     ) -> Vec<Event> {
         let me = Party::session(now);
         let own = |kind: Kind, text: String| Event::new(kind, me.clone(), Some(me.clone()), text);
-        let mut out = Vec::new();
-        let Some(before) = before else {
-            out.push(own(
-                Kind::Started,
-                match now.origin {
-                    Origin::External => "started in another terminal".into(),
-                    Origin::Desk => "started".into(),
-                },
-            ));
-            return out;
-        };
-        use SessionState as S;
-        let pending_changed =
-            now.pending.as_ref().map(|p| p.id) != before.pending.as_ref().map(|p| p.id);
-        match now.state {
-            S::Blocked if before.state != S::Blocked || pending_changed => {
-                if let Some(p) = &now.pending {
-                    let name = p.tool.split('(').next().unwrap_or(&p.tool);
-                    let detail = if p.detail.trim().is_empty() {
-                        p.tool.clone()
-                    } else {
-                        p.detail.clone()
-                    };
-                    let text = match name {
-                        "Input" => format!("is asking: {}", crew::clip(&p.detail, 160)),
-                        "Bash" => format!("wants to run {}", crew::clip(&detail, 160)),
-                        "Edit" | "Write" | "MultiEdit" => {
-                            format!("wants to edit {}", crew::clip(&detail, 160))
-                        }
-                        _ if !p.answerable && p.detail == "Answer in the terminal" => {
-                            "is waiting for an answer in its terminal".into()
-                        }
-                        _ => format!("wants to use {}", crew::clip(&p.tool, 160)),
-                    };
-                    out.push(own(Kind::NeedsYou, text).approval(p.id));
-                }
-            }
-            S::Working
-                if matches!(before.state, S::Done | S::Idle | S::Starting)
-                    && now.last_prompt.is_some()
-                    && now.last_prompt != before.last_prompt =>
-            {
-                let prompt = now.last_prompt.as_deref().unwrap_or_default();
-                out.push(own(
+        transitions
+            .iter()
+            .filter_map(|t| match *t {
+                Transition::Started => Some(own(
+                    Kind::Started,
+                    match now.origin {
+                        Origin::External => "started in another terminal".into(),
+                        Origin::Desk => "started".into(),
+                    },
+                )),
+                Transition::Prompted { prompt } => Some(own(
                     Kind::Started,
                     format!("started “{}”", crew::one_line(prompt, 100)),
-                ));
-            }
-            S::Done if before.state != S::Done => {
-                let reply = now.last_reply.as_deref().unwrap_or_default();
-                if crew::hit_limit(reply) {
-                    out.push(own(Kind::Limit, "hit its usage limit".into()));
-                } else if let Some(q) = crew::question_in(reply) {
-                    let options = crew::options_in(reply, &q);
-                    out.push(own(Kind::Question, format!("asked “{q}”")).detail(
-                        serde_json::json!({ "question": { "text": q, "options": options } }),
-                    ));
-                } else if reply.trim().is_empty() {
-                    out.push(own(Kind::Finished, "finished".into()));
-                } else {
-                    out.push(own(
-                        Kind::Finished,
-                        format!("finished · {}", crew::one_line(reply, 120)),
-                    ));
+                )),
+                Transition::Blocked { pending } => {
+                    Some(own(Kind::NeedsYou, asking(pending)).approval(pending.id))
                 }
-            }
-            S::Stopped | S::Closed if before.state.is_running() => {
-                if !st.acted.remove(&now.id) {
-                    let text = if now.state == S::Closed {
-                        "closed in its terminal"
-                    } else {
-                        "stopped"
-                    };
-                    out.push(own(Kind::Stopped, text.into()));
+                Transition::Unblocked {
+                    pending,
+                    by_desk: false,
+                } => Some(
+                    own(Kind::Answered, "was answered in its terminal".into()).approval(pending.id),
+                ),
+                Transition::Unblocked { by_desk: true, .. } => None,
+                Transition::Finished { reply } => Some(match crew::outcome_of(Ok(reply)) {
+                    (Outcome::Limit, _, _) => own(Kind::Limit, "hit its usage limit".into()),
+                    (Outcome::Asked, _, Some(q)) => {
+                        own(Kind::Question, format!("asked “{}”", q.text))
+                            .detail(serde_json::json!({ "question": q }))
+                    }
+                    (_, Some(answer), _) => own(Kind::Finished, format!("finished · {answer}")),
+                    _ => own(Kind::Finished, "finished".into()),
+                }),
+                Transition::Stopped { closed } => (!st.acted.remove(&now.id)).then(|| {
+                    own(
+                        Kind::Stopped,
+                        if closed {
+                            "closed in its terminal"
+                        } else {
+                            "stopped"
+                        }
+                        .into(),
+                    )
+                }),
+                Transition::Interrupted => {
+                    st.acted.remove(&now.id);
+                    Some(own(Kind::Failed, "stopped unexpectedly".into()))
                 }
-            }
-            S::Interrupted if before.state != S::Interrupted => {
-                st.acted.remove(&now.id);
-                out.push(own(Kind::Failed, "stopped unexpectedly".into()));
-            }
-            S::Starting
-                if matches!(
-                    before.state,
-                    S::Stopped | S::Interrupted | S::Closed | S::Done | S::Idle
-                ) =>
-            {
-                if !st.acted.remove(&now.id) {
-                    out.push(own(Kind::Resumed, "resumed".into()));
+                Transition::Resumed => {
+                    (!st.acted.remove(&now.id)).then(|| own(Kind::Resumed, "resumed".into()))
                 }
-            }
-            _ => {}
-        }
-        if now.state == S::Working
-            && now.current_tool.is_some()
-            && now.current_tool != before.current_tool
-        {
-            let due = st
-                .working_noted
-                .get(&now.id)
-                .is_none_or(|at| at.elapsed() >= WORKING_EVERY);
-            if due {
-                st.working_noted.insert(now.id, std::time::Instant::now());
-                let tool = now.current_tool.as_deref().unwrap_or_default();
-                out.push(own(
-                    Kind::Working,
-                    format!("is running {}", crew::clip(tool, 120)),
-                ));
-            }
-        }
-        out
+                Transition::Tool { tool } => {
+                    let due = st
+                        .working_noted
+                        .get(&now.id)
+                        .is_none_or(|at| at.elapsed() >= WORKING_EVERY);
+                    due.then(|| {
+                        st.working_noted.insert(now.id, std::time::Instant::now());
+                        own(
+                            Kind::Working,
+                            format!("is running {}", crew::clip(tool, 120)),
+                        )
+                    })
+                }
+            })
+            .collect()
     }
 
     /// The registry and the crew's tables.
@@ -1014,7 +1001,8 @@ impl Desk {
             .get(&id)
             .and_then(|l| l.pending.clone());
         let answer = {
-            let mut st = self.0.state.lock();
+            let mut guard = self.0.state.lock();
+            let st = &mut *guard;
             let live = st
                 .live
                 .get_mut(&id)
@@ -1034,7 +1022,10 @@ impl Desk {
                         p.answerable = false;
                     }
                 }
-                Decision::Allow | Decision::Deny => live.pending = None,
+                Decision::Allow | Decision::Deny => {
+                    live.pending = None;
+                    st.decided.insert(approval);
+                }
             }
             answer
         };

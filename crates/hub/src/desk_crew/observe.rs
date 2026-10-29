@@ -15,6 +15,7 @@ use workforce_agent::runner::ProgressEvent;
 use workforce_common::channels::DESK_CHANNEL;
 use workforce_common::session::SessionAttachment;
 use workforce_desk::crew::{self, Event, Kind, Party};
+use workforce_desk::floor::Outcome;
 
 use super::{CrewHub, Running, CHECK_IN};
 use crate::hosts::TurnHost;
@@ -141,48 +142,22 @@ impl Track {
             return;
         }
         crew.running.lock().remove(&self.key);
-        let me = || Some(self.party.clone());
-        let event = match outcome {
-            Ok(answer) => {
-                let answer_line = line(answer);
-                let detail = |question: Option<serde_json::Value>| json!({ "task": self.task, "answer": answer_line, "question": question });
-                if crew::hit_limit(answer) {
-                    Event::new(Kind::Limit, self.party.clone(), me(), "hit a usage limit")
-                        .detail(detail(None))
-                } else if let Some(q) = crew::question_in(answer) {
-                    let options = crew::options_in(answer, &q);
-                    Event::new(
-                        Kind::Question,
-                        self.party.clone(),
-                        me(),
-                        format!("asked “{q}”"),
-                    )
-                    .detail(detail(Some(json!({ "text": q, "options": options }))))
-                } else {
-                    Event::new(
-                        Kind::Finished,
-                        self.party.clone(),
-                        me(),
-                        match &answer_line {
-                            Some(a) => format!("finished · {a}"),
-                            None => "finished".into(),
-                        },
-                    )
-                    .detail(detail(None))
-                }
-            }
-            Err(e) if crew::hit_limit(&e) => {
-                Event::new(Kind::Limit, self.party.clone(), me(), "hit a usage limit")
-                    .detail(json!({ "task": self.task }))
-            }
-            Err(e) => Event::new(
-                Kind::Failed,
-                self.party.clone(),
-                me(),
-                format!("failed: {}", crew::one_line(&e, 120)),
-            )
-            .detail(json!({ "task": self.task })),
+        let (ended, answer, question) =
+            crew::outcome_of(outcome.as_deref().map_err(String::as_str));
+        let text = match (ended, &answer, &question) {
+            (Outcome::Limit, _, _) => "hit a usage limit".to_string(),
+            (Outcome::Asked, _, Some(q)) => format!("asked “{}”", q.text),
+            (Outcome::Failed, Some(a), _) => format!("failed: {a}"),
+            (Outcome::Finished, Some(a), _) => format!("finished · {a}"),
+            (outcome, _, _) => outcome.as_str().to_string(),
         };
+        let event = Event::new(
+            crew::ended_kind(ended),
+            self.party.clone(),
+            Some(self.party.clone()),
+            text,
+        )
+        .detail(json!({ "task": self.task, "answer": answer, "question": question }));
         crew.desk.note(event.hop(self.hop));
     }
 }

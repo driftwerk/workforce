@@ -27,6 +27,8 @@ macro_rules! text_enum {
     };
 }
 
+pub(crate) use text_enum;
+
 text_enum!(Engine { Claude => "claude", Codex => "codex" });
 
 text_enum!(Origin { Desk => "desk", External => "external" });
