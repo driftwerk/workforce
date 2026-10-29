@@ -1,21 +1,16 @@
-// A message's markdown with its wf-* fences rendered as rich blocks. Agent
-// output is untrusted, so the markdown is sanitized; wide tables are wrapped to
-// scroll instead of overflowing, and links open through the host when it can,
-// otherwise in a new tab.
+// A message's markdown with its wf-* fences rendered as rich blocks and its
+// other fenced code highlighted. Agent output is untrusted, so the markdown is
+// sanitized, and code is highlighted only after that, from the sanitized text,
+// into React text; wide tables are wrapped to scroll instead of overflowing,
+// and links open through the host when it can, otherwise in a new tab.
 
 import { useMemo, useRef, type ComponentProps } from "react";
 import Markdown, { type Components, type ExtraProps } from "react-markdown";
 import rehypeSanitize from "rehype-sanitize";
 import remarkGfm from "remark-gfm";
 
-import {
-  ALL_RICH_FEATURES,
-  anyRichKind,
-  balanceFences,
-  fenceInfo,
-  richKind,
-  type RichFeatures,
-} from "./fence";
+import { CodeBlock } from "./CodeBlock";
+import { ALL_RICH_FEATURES, balanceFences, codeBlockInfo, richKind, type RichFeatures } from "./fence";
 import { useHost } from "./host";
 import { RichBlock } from "./RichBlock";
 
@@ -71,26 +66,28 @@ export function RichMarkdown({
   // from skeleton to its code-block fallback.
   const streamingRef = useRef(streaming);
   streamingRef.current = streaming;
-  const components = useMemo<Components>(() => {
-    if (!anyRichKind(features)) return MD_COMPONENTS;
-    return {
+  const components = useMemo<Components>(
+    () => ({
       ...MD_COMPONENTS,
       pre: ({ node, ...props }) => {
-        const fence = fenceInfo(node);
-        const kind = fence && richKind(fence.lang, features);
-        if (!kind) return <pre {...props} />;
+        const block = codeBlockInfo(node);
+        if (!block) return <pre {...props} />;
+        const code = <CodeBlock lang={block.lang} text={block.text} />;
+        const kind = block.lang && richKind(block.lang, features);
+        if (!kind) return code;
         return (
           <RichBlock
             kind={kind}
-            payload={fence.text}
+            payload={block.text}
             streaming={streamingRef.current}
-            fallback={<pre {...props} />}
+            fallback={code}
             excalidraw={features.excalidraw}
           />
         );
       },
-    };
-  }, [features]);
+    }),
+    [features],
+  );
   return (
     <div className="wf-md">
       <Markdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeSanitize]} components={components}>
