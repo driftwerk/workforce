@@ -703,6 +703,11 @@ impl ResolutionPath {
 pub struct SurfaceRegistry {
     surfaces: HashMap<SurfaceKey, Arc<dyn ChannelSurface>>,
     primaries: HashMap<SurfaceKey, Arc<dyn ChannelSurface>>,
+    /// Surfaces that post into the hub's own sessions (Desk), by platform.
+    /// They resolve by platform like any other, but are kept out of
+    /// [`Self::all`] and [`Self::all_for`]: those are the lists callers loop
+    /// over with a platform's own channel ids.
+    session_surfaces: HashMap<String, Arc<dyn ChannelSurface>>,
     routes: ChannelRouteCache,
 }
 
@@ -720,6 +725,16 @@ impl SurfaceRegistry {
         self.surfaces.insert(key, surface);
     }
 
+    /// Register the surface that posts into the hub's own sessions for
+    /// `platform`.
+    pub fn register_session_surface(
+        &mut self,
+        platform: impl Into<String>,
+        surface: Arc<dyn ChannelSurface>,
+    ) {
+        self.session_surfaces.insert(platform.into(), surface);
+    }
+
     pub fn deregister(&mut self, key: &SurfaceKey) {
         self.surfaces.remove(key);
         self.primaries.remove(key);
@@ -730,7 +745,13 @@ impl SurfaceRegistry {
     }
 
     pub fn get(&self, key: &SurfaceKey) -> Option<&Arc<dyn ChannelSurface>> {
-        self.primaries.get(key).or_else(|| self.surfaces.get(key))
+        self.primaries
+            .get(key)
+            .or_else(|| self.surfaces.get(key))
+            .or_else(|| match key.workspace_id {
+                None => self.session_surfaces.get(&key.platform),
+                Some(_) => None,
+            })
     }
 
     /// Surfaces matching `platform`. Includes primaries for that platform
@@ -812,6 +833,9 @@ impl SurfaceRegistry {
         channel: &str,
         hint: ChannelHint,
     ) -> Result<(Arc<dyn ChannelSurface>, ResolutionPath)> {
+        if let Some(surface) = self.session_surfaces.get(platform) {
+            return Ok((Arc::clone(surface), ResolutionPath::Single));
+        }
         if let Some(ws) = hint.explicit_workspace.as_deref() {
             let key = SurfaceKey::workspace(platform, ws);
             return self
@@ -1393,6 +1417,24 @@ mod tests {
             .to_string();
         assert!(err.contains("ghost"));
         assert!(err.contains('a'));
+    }
+
+    #[tokio::test]
+    async fn a_session_surface_resolves_by_platform_but_is_never_broadcast_to() {
+        let (slack, _) = MockSurface::arc("slack", "a", &[], &[]);
+        let (desk, _) = MockSurface::arc("desk", "-", &[], &[]);
+        let mut reg = SurfaceRegistry::new();
+        reg.register(slack_key("a"), slack);
+        reg.register_session_surface("desk", Arc::clone(&desk) as Arc<dyn ChannelSurface>);
+        let resolved = reg
+            .resolve("desk", "desk:room", ChannelHint::default())
+            .await
+            .unwrap();
+        assert_eq!(resolved.platform(), "desk");
+        assert!(reg.get(&SurfaceKey::platform("desk")).is_some());
+        assert!(reg.all().iter().all(|s| s.platform() == "slack"));
+        assert!(reg.all_for("desk").is_empty());
+        assert_eq!(reg.platforms(), vec!["slack".to_string()]);
     }
 
     #[tokio::test]

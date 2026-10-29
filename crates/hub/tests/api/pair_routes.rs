@@ -391,3 +391,56 @@ async fn the_admin_route_still_links_by_hint() {
     assert!(approved.get("linked_identity_id").is_none(), "{approved}");
     assert!(approved["token"].as_str().is_some());
 }
+
+/// Desk's "Disconnect": a device unpairs itself, and only itself.
+#[tokio::test]
+async fn a_device_revokes_itself_and_nothing_else() {
+    let hub = hub().await;
+    let (person, person_token) = hub.person("person@example.com", IdentityRole::Member);
+    let mut tokens = Vec::new();
+    for _ in 0..2 {
+        let code = hub.request_code(None).await["code"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let (status, _) = hub.approve_self(&person_token, &code).await;
+        assert_eq!(status, StatusCode::OK);
+        let (_, polled) = hub.status(&code).await;
+        tokens.push(polled["token"].as_str().unwrap().to_string());
+    }
+
+    let (status, revoked) = hub
+        .call(
+            Some(&tokens[0]),
+            Method::POST,
+            "/api/pair/device/revoke-self",
+            None,
+        )
+        .await;
+    assert_eq!(
+        (status, revoked),
+        (StatusCode::OK, json!({ "revoked": true }))
+    );
+    let (gone, _) = hub
+        .call(Some(&tokens[0]), Method::GET, "/api/me", None)
+        .await;
+    assert_eq!(gone, StatusCode::UNAUTHORIZED);
+    let (kept, me) = hub
+        .call(Some(&tokens[1]), Method::GET, "/api/me", None)
+        .await;
+    assert_eq!(kept, StatusCode::OK);
+    assert_eq!(me["id"], person.id.to_string());
+    let (refused, _) = hub
+        .call(
+            Some(&person_token),
+            Method::POST,
+            "/api/pair/device/revoke-self",
+            None,
+        )
+        .await;
+    assert_eq!(
+        refused,
+        StatusCode::UNAUTHORIZED,
+        "only a device token unpairs a device"
+    );
+}

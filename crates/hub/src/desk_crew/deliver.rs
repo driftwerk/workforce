@@ -189,11 +189,7 @@ impl CrewHub {
         let frame = BroadcastMessage {
             id: Some(id),
             author: serde_json::to_value(&author).ok(),
-            ..BroadcastMessage::silent(
-                sid,
-                USER_MESSAGE,
-                crate::desk_conversations::shown(&content),
-            )
+            ..BroadcastMessage::silent(sid, USER_MESSAGE, crate::desk_surface::shown(&content))
         };
         let _ = tx.send(frame);
     }

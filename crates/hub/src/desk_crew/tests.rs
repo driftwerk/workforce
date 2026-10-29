@@ -533,7 +533,8 @@ async fn a_blocked_session_wakes_the_overseer_and_its_answer_offers_the_approval
             overseer.sessions.as_ref(),
             &workforce_desk::Speaker::agent("desk", "desk"),
             PERSON,
-            None,
+            workforce_common::channels::DESK_CHANNEL,
+            workforce_desk::Cursor::Newest,
             50,
         ).unwrap();
         assert_eq!(page.messages.len(), 1, "{page:?}");
@@ -845,9 +846,15 @@ async fn relayed_frame(
 /// `GET /api/desk/conversations/{agent}` serves it.
 async fn history_item(crew: &CrewHub, agent: &AgentService, owner: &str, id: &str) -> Value {
     let speaker = workforce_desk::Speaker::agent(agent.agent_id.as_str(), &super::name_of(agent));
-    let mut page =
-        crate::desk_conversations::page(agent.sessions.as_ref(), &speaker, owner, None, 50)
-            .unwrap();
+    let mut page = crate::desk_conversations::page(
+        agent.sessions.as_ref(),
+        &speaker,
+        owner,
+        workforce_common::channels::DESK_CHANNEL,
+        workforce_desk::Cursor::Newest,
+        50,
+    )
+    .unwrap();
     crate::desk_conversations::with_authors(&crew.desk, &mut page).await;
     let wire = serde_json::to_value(&page).unwrap();
     wire["messages"]
@@ -918,7 +925,7 @@ async fn a_suggestion_said_yes_to_is_yours_and_worded_with_your_name() {
         let answer = eventually("Scout's answer", async || {
             let speaker = workforce_desk::Speaker::agent("scout", &super::name_of(&scout));
             let page =
-                crate::desk_conversations::page(scout.sessions.as_ref(), &speaker, &owner, None, 50)
+                crate::desk_conversations::page(scout.sessions.as_ref(), &speaker, &owner, workforce_common::channels::DESK_CHANNEL, workforce_desk::Cursor::Newest, 50)
                     .unwrap();
             page.messages.into_iter().find(|m| m.text == "On it.")
         })

@@ -3967,6 +3967,7 @@ rules:
                 nats_for_gateway.clone(),
                 broadcast_tx.clone(),
             );
+            workforce_hub::session_push::install(session_push.clone());
             let _session_push_relay = nats_for_gateway
                 .clone()
                 .map(|nats| workforce_hub::session_push::spawn_relay(nats, broadcast_tx.clone()));

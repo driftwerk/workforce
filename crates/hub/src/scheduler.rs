@@ -937,6 +937,37 @@ impl Scheduler {
         changed.into_iter().map(|(job, _)| job.id).collect()
     }
 
+    /// Point the Desk delivery of every job `owner` owns that `retarget`
+    /// moves somewhere else. Reloads from the shared store and writes
+    /// `deliver_to` alone, which no peer's bookkeeping refresh touches.
+    /// Returns the ids changed.
+    pub async fn retarget_desk(
+        &self,
+        owner: &str,
+        retarget: &(dyn Fn(&DeliveryTarget) -> Option<DeliveryTarget> + Send + Sync),
+    ) -> Vec<String> {
+        let mut jobs = self.jobs.write().await;
+        self.reload_from_shared_store(&mut jobs).await;
+        let changed: Vec<ScheduledJob> = jobs
+            .iter_mut()
+            .filter(|job| job.owner() == Some(owner))
+            .filter_map(|job| {
+                let moved = job.deliver_to.as_ref().and_then(retarget)?;
+                job.deliver_to = Some(moved);
+                Some(job.clone())
+            })
+            .collect();
+        for job in &changed {
+            self.persist_change(
+                &jobs,
+                crate::scheduler_store::JobChange::Fields(job, &["deliver_to"]),
+            )
+            .await;
+        }
+        drop(jobs);
+        changed.into_iter().map(|job| job.id).collect()
+    }
+
     /// Stop every job someone else owns from running as or billing anyone in
     /// `names` (who are being deleted): such a job runs as and bills its
     /// owner again. Who last edited it stays, as a record. Returns the ids
@@ -2514,6 +2545,14 @@ impl crate::hosts::SchedulerHost for Scheduler {
 
     async fn hold_for_suspension(&self, names: &[String], apply: bool) -> Vec<ScheduledJob> {
         Scheduler::hold_for_suspension(self, names, apply).await
+    }
+
+    async fn retarget_desk(
+        &self,
+        owner: &str,
+        retarget: &(dyn for<'t> Fn(&'t DeliveryTarget) -> Option<DeliveryTarget> + Send + Sync),
+    ) -> Vec<String> {
+        Scheduler::retarget_desk(self, owner, retarget).await
     }
 
     async fn reassign_jobs(
@@ -4270,6 +4309,76 @@ mod tests {
         let names = vec!["u".to_string()];
         assert_eq!(sched.hold_for_suspension(&names, true).await.len(), 1);
         (sched, store, id, names)
+    }
+
+    /// A room that is gone points its owner's jobs at their DM, writing
+    /// `deliver_to` alone, so a peer's bookkeeping save made from its older
+    /// copy does not put the room back; another person's job is untouched.
+    #[tokio::test]
+    async fn retargeting_moves_only_the_owners_desk_deliveries_and_survives_a_peer_refresh() {
+        use workforce_common::channels::desk::{DeskPlace, DeskTarget};
+        let (sched, store) = follower().await;
+        let room = DeskTarget {
+            place: DeskPlace::Room {
+                room: uuid::Uuid::from_u128(1),
+                name: "Planning".into(),
+                thread: None,
+            },
+            channel: "desk:planning".into(),
+            device: Some("device-1".into()),
+            spoken: false,
+        };
+        let mut jobs = Vec::new();
+        for owner in ["u", "v"] {
+            let id = sched
+                .add_job_owned(
+                    "t",
+                    None,
+                    hourly(),
+                    reminder_payload(),
+                    Some(owner.into()),
+                    None,
+                )
+                .await
+                .unwrap();
+            let mut job = sched.get_job(&id).await.unwrap();
+            job.deliver_to = Some(DeliveryTarget::desk(room.clone()));
+            store.peer_writes(&job);
+            jobs.push(job);
+        }
+        let moved = sched
+            .retarget_desk("u", &|target| {
+                target
+                    .desk_target()
+                    .filter(|desk| desk.channel == "desk:planning")
+                    .map(|desk| DeliveryTarget::desk(desk.dm()))
+            })
+            .await;
+        assert_eq!(moved, vec![jobs[0].id.clone()]);
+
+        let mut peer = jobs[0].clone();
+        peer.run_count = 7;
+        store.merge(
+            &peer,
+            &[
+                "next_run",
+                "last_run",
+                "run_count",
+                "delivery_failures",
+                "enabled",
+            ],
+        );
+        let stored = store.load_all().await.unwrap();
+        let of = |id: &str| stored.iter().find(|job| job.id == id).unwrap().clone();
+        assert_eq!(
+            of(&jobs[0].id).deliver_to,
+            Some(DeliveryTarget::desk(room.dm()))
+        );
+        assert_eq!(of(&jobs[0].id).run_count, 7);
+        assert_eq!(
+            of(&jobs[1].id).deliver_to,
+            Some(DeliveryTarget::desk(room.clone()))
+        );
     }
 
     #[tokio::test]

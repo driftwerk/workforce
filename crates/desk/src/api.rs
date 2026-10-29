@@ -18,7 +18,6 @@ use serde_json::json;
 use tokio::sync::broadcast::error::RecvError;
 use uuid::Uuid;
 
-use crate::conversations::{self, Conversations};
 use crate::crew::By;
 use crate::model::{Decision, NewSession, SessionPatch};
 use crate::providers::{self, AccountError, Accounts, Catalog, ConnectBody, Entry};
@@ -655,7 +654,6 @@ pub fn router(
     realtime: Arc<Realtime>,
     speech: Arc<dyn Speech>,
     accounts: Arc<dyn Accounts>,
-    conversations: Arc<dyn Conversations>,
     crew: Arc<dyn crate::crew::Crew>,
 ) -> Router {
     sessions_router(desk.clone(), Arc::clone(&auth))
@@ -663,7 +661,6 @@ pub fn router(
         .merge(crate::crew_api::crew_router(desk, Arc::clone(&auth), crew))
         .merge(voice_router(Arc::clone(&auth), realtime, speech))
         .merge(providers_router(auth, accounts))
-        .merge(conversations::router(conversations))
 }
 
 struct ProvidersApi {

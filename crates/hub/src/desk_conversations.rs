@@ -1,24 +1,26 @@
-//! A Desk DM read back: the conversation one person keeps with one agent on
-//! the `desk` channel, from the session store the agent itself reads.
+//! A Desk conversation read back: the DM or a room's conversation one person
+//! keeps with one agent, from the session store the agent itself reads.
 //!
-//! The conversation is the session a `/ws` connection on `desk` anchors on
-//! for its person (`identity_id`, else the paired device) and agent: one
-//! active session per person and agent, in the agent's own store, so a
-//! reconnect, a Desk restart or a hub restart lands on the same one. A
-//! conversation left a day goes on in a successor holding a carry-over;
-//! the read walks the whole chain, so it reads as one.
+//! The conversation is the session a `/ws` connection on its Desk channel
+//! anchors on for its person (`identity_id`, else the paired device) and
+//! agent: one active session per person, channel and agent, in the agent's
+//! own store, so a reconnect, a Desk restart or a hub restart lands on the
+//! same one. A conversation left a day goes on in a successor holding a
+//! carry-over; the read walks the whole chain, so it reads as one.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use axum::http::HeaderMap;
+use chrono::{DateTime, Utc};
 use workforce_agent::rollover::CARRYOVER_PREFIX;
-use workforce_common::channels::DESK_CHANNEL;
-use workforce_common::secret_marker::render_markers_as_preview;
-use workforce_common::security_scanner::{contains_credentials, redact_credentials};
+use workforce_common::channels::is_desk_conversation;
 use workforce_common::session::{MessageRole, SessionStore, TranscriptEntry};
-use workforce_desk::{Author, ConversationError, Conversations, Page, Said, Speaker};
+use workforce_desk::{
+    Active, Author, Close, Closed, ConversationError, Conversations, Cursor, Page, Said, Speaker,
+};
 
+use crate::desk_surface::shown;
 use crate::gateway::{resolve_caller_context, AuthFailure, GatewayState};
 
 /// How many transcript entries one read of the store asks for: dialogue is
@@ -64,91 +66,85 @@ fn said(entry: &TranscriptEntry, agent: &Speaker) -> Option<Said> {
         text,
         at: entry.timestamp,
         desk: None,
+        mark: entry.desk.clone(),
     })
 }
 
-/// A message's text as the live channel sends it: secret markers as
-/// previews, credentials redacted.
-pub(crate) fn shown(content: &str) -> String {
-    let rendered = render_markers_as_preview(content);
-    match contains_credentials(&rendered) {
-        true => redact_credentials(&rendered),
-        false => rendered,
-    }
-}
-
-/// The chain member that holds the message `id`, walking back from `head`:
-/// in its archive, or in its live messages for a session the archive does
-/// not hold yet (whose transcript reads them instead).
-fn holder(store: &dyn SessionStore, head: &str, id: &str) -> eyre::Result<Option<String>> {
-    let mut session = Some(head.to_string());
-    for _ in 0..50 {
-        let Some(current) = session else { break };
-        let live = store.get(&current)?;
-        if store.read_archive_message(&current, id)?.is_some()
-            || live
-                .as_ref()
-                .is_some_and(|s| s.messages.iter().any(|m| m.id == id))
-        {
-            return Ok(Some(current));
-        }
-        session = live.and_then(|s| s.prev_session_id().map(str::to_string));
-    }
-    Ok(None)
-}
-
-/// `owner`'s conversation on the `desk` channel with `agent` in `store`: at
-/// most `limit` messages ending just before `before`, oldest first. Reads
-/// only: it never creates the session or rolls it over.
+/// `owner`'s conversation on the Desk `channel` with `agent` in `store`: at
+/// most `limit` messages at `cursor`, oldest first. Reads only: it never
+/// creates the session or rolls it over.
 pub(crate) fn page(
     store: &dyn SessionStore,
     agent: &Speaker,
     owner: &str,
-    before: Option<&str>,
+    channel: &str,
+    cursor: Cursor<'_>,
     limit: usize,
 ) -> Result<Page, ConversationError> {
     let internal = |e: eyre::Report| ConversationError::Internal(format!("{e:#}"));
-    let Some(head) = store.find(DESK_CHANNEL, owner).map_err(internal)? else {
+    if !is_desk_conversation(channel) {
+        return Err(ConversationError::Invalid(format!(
+            "{channel:?} is not a Desk conversation"
+        )));
+    }
+    let Some(head) = store.find(channel, owner).map_err(internal)? else {
         return Ok(Page::default());
     };
-    let mut cursor = match before {
-        None => None,
-        Some(id) => match holder(store, &head.id, id).map_err(internal)? {
-            Some(session) => Some((session, id.to_string())),
-            None => {
-                return Err(ConversationError::Invalid(
-                    "before names no message of this conversation".into(),
-                ))
-            }
-        },
+    let unknown = |side: &str| {
+        ConversationError::Invalid(format!("{side} names no message of this conversation"))
     };
-    // Newest first while gathering; one past the limit says more remain.
+    let (mut read_from, after) = match cursor {
+        Cursor::Newest => (None, None),
+        Cursor::Before(id) => {
+            match crate::desk_surface::message_in_chain(store, &head.id, id).map_err(internal)? {
+                Some((session, _)) => (Some((session, id.to_string())), None),
+                None => return Err(unknown("before")),
+            }
+        }
+        Cursor::After(id) => (None, Some(id)),
+    };
+    // Newest first while gathering: past the limit, or reaching the message
+    // a forward page starts after, ends it.
     let mut gathered: Vec<Said> = Vec::new();
     let mut exhausted = false;
+    let mut reached = false;
     for _ in 0..MAX_READS {
         let read = store
             .read_thread_page(
                 &head.id,
-                cursor.as_ref().map(|(s, _)| s.as_str()),
-                cursor.as_ref().map(|(_, id)| id.as_str()),
+                read_from.as_ref().map(|(s, _)| s.as_str()),
+                read_from.as_ref().map(|(_, id)| id.as_str()),
                 ENTRIES_PER_READ,
             )
             .map_err(internal)?;
-        gathered.extend(read.messages.iter().rev().filter_map(|e| said(e, agent)));
+        let newer: Vec<&TranscriptEntry> = read
+            .messages
+            .iter()
+            .rev()
+            .take_while(|e| Some(e.id.as_str()) != after)
+            .collect();
+        reached = after.is_some() && newer.len() < read.messages.len();
+        gathered.extend(newer.into_iter().filter_map(|e| said(e, agent)));
         let oldest = read.messages.first();
         exhausted = !read.has_more || oldest.is_none();
-        if gathered.len() > limit || exhausted {
+        if reached || exhausted || (after.is_none() && gathered.len() > limit) {
             break;
         }
-        cursor = oldest.map(|e| (e.session_id.clone(), e.id.clone()));
+        read_from = oldest.map(|e| (e.session_id.clone(), e.id.clone()));
     }
-    let more = gathered.len() > limit || !exhausted;
-    gathered.truncate(limit);
+    if after.is_some() && !reached {
+        return Err(unknown("after"));
+    }
     gathered.reverse();
-    Ok(Page {
-        messages: gathered,
-        more,
-    })
+    let more = match after {
+        Some(_) => gathered.len() > limit,
+        None => gathered.len() > limit || !exhausted,
+    };
+    let messages = match after {
+        Some(_) => gathered.into_iter().take(limit).collect(),
+        None => gathered.split_off(gathered.len().saturating_sub(limit)),
+    };
+    Ok(Page { messages, more })
 }
 
 /// What the agent's messages on `page` mention to act on in place, as the
@@ -189,26 +185,28 @@ pub(crate) async fn with_authors(desk: &workforce_desk::Desk, page: &mut Page) {
     }
 }
 
-/// `GET /api/desk/conversations/{agent}` on `state`'s agents.
+/// The Desk conversation routes on `state`'s agents.
 pub fn router(state: Arc<GatewayState>) -> axum::Router {
     workforce_desk::conversations::router(Arc::new(HubConversations(state)))
 }
 
-/// Reads a Desk DM for the person a request carries: a paired device (or a
-/// signed-in person) reads their own. The gateway's admin token names no
-/// person, so it reads none.
+/// How many of a person's sessions with one agent are looked through for
+/// the Desk conversations that changed.
+const ACTIVE_SEARCHED: usize = 1_000;
+
+/// Reads a person's Desk conversations for the person a request carries: a
+/// paired device (or a signed-in person) reads their own. The gateway's
+/// admin token names no person, so it reads none.
 pub(crate) struct HubConversations(pub(crate) Arc<GatewayState>);
 
-#[async_trait]
-impl Conversations for HubConversations {
-    async fn page(
+impl HubConversations {
+    /// The person a request is from, when they may read their
+    /// conversations.
+    async fn person(
         &self,
         headers: &HeaderMap,
         token: Option<&str>,
-        agent: &str,
-        before: Option<&str>,
-        limit: usize,
-    ) -> Result<Page, ConversationError> {
+    ) -> Result<String, ConversationError> {
         let state = &self.0;
         let caller = resolve_caller_context(state, headers, token).await;
         match caller.auth_failure {
@@ -243,26 +241,118 @@ impl Conversations for HubConversations {
                 ));
             }
         }
-        let service = state
+        Ok(owner)
+    }
+
+    fn agent(&self, agent: &str) -> Result<Arc<crate::serve::AgentService>, ConversationError> {
+        self.0
             .registry
             .get(agent)
-            .ok_or_else(|| ConversationError::NotFound(format!("no agent named {agent:?}")))?;
+            .ok_or_else(|| ConversationError::NotFound(format!("no agent named {agent:?}")))
+    }
+}
+
+#[async_trait]
+impl Conversations for HubConversations {
+    async fn page(
+        &self,
+        headers: &HeaderMap,
+        token: Option<&str>,
+        agent: &str,
+        channel: &str,
+        cursor: Cursor<'_>,
+        limit: usize,
+    ) -> Result<Page, ConversationError> {
+        let owner = self.person(headers, token).await?;
+        let service = self.agent(agent)?;
         let speaker = Speaker::agent(
             agent,
             &service.display_name().unwrap_or_else(|| agent.to_string()),
         );
-        let mut page = page(service.sessions.as_ref(), &speaker, &owner, before, limit)?;
-        if let Some(crew) = crate::desk_crew::for_state(state) {
+        let mut page = page(
+            service.sessions.as_ref(),
+            &speaker,
+            &owner,
+            channel,
+            cursor,
+            limit,
+        )?;
+        if let Some(crew) = crate::desk_crew::for_state(&self.0) {
             with_extras(crew.desk(), &mut page).await;
             with_authors(crew.desk(), &mut page).await;
         }
         Ok(page)
     }
+
+    async fn active(
+        &self,
+        headers: &HeaderMap,
+        token: Option<&str>,
+        since: Option<DateTime<Utc>>,
+    ) -> Result<Vec<Active>, ConversationError> {
+        let owner = self.person(headers, token).await?;
+        let registry = &self.0.registry;
+        let mut active = registry
+            .agent_ids()
+            .iter()
+            .filter_map(|id| registry.get(id.as_str()).map(|service| (id, service)))
+            .map(|(id, service)| active_of(service.sessions.as_ref(), id.as_str(), &owner, since))
+            .collect::<eyre::Result<Vec<_>>>()
+            .map_err(|e| ConversationError::Internal(format!("{e:#}")))?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        active.sort_by_key(|a| a.updated_at);
+        Ok(active)
+    }
+
+    async fn close(
+        &self,
+        headers: &HeaderMap,
+        token: Option<&str>,
+        agent: &str,
+        close: Close,
+    ) -> Result<Closed, ConversationError> {
+        let owner = self.person(headers, token).await?;
+        let service = self.agent(agent)?;
+        if !crate::desk_surface::is_room(&close.channel) {
+            return Err(ConversationError::Invalid(format!(
+                "{:?} is not a Desk room's conversation",
+                close.channel
+            )));
+        }
+        crate::desk_surface::close(&service, &owner, &close.channel, &close.undelivered)
+            .await
+            .map(|copied| Closed { copied })
+            .map_err(|e| ConversationError::Internal(format!("{e:#}")))
+    }
+}
+
+/// The Desk conversations `owner` holds with `agent` in `store` whose head
+/// changed after `since`.
+fn active_of(
+    store: &dyn SessionStore,
+    agent: &str,
+    owner: &str,
+    since: Option<DateTime<Utc>>,
+) -> eyre::Result<Vec<Active>> {
+    Ok(store
+        .list_for_owner(owner, ACTIVE_SEARCHED)?
+        .into_iter()
+        .take_while(|s| since.is_none_or(|since| s.updated_at > since))
+        .filter(|s| is_desk_conversation(&s.channel) && !s.is_sealed())
+        .map(|s| Active {
+            agent_id: agent.to_string(),
+            channel: s.channel,
+            updated_at: s.updated_at,
+        })
+        .collect())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use workforce_common::channels::DESK_CHANNEL;
     use workforce_common::session::{InMemorySessionStore, JsonlSessionStore, SessionMessage};
 
     const ME: &str = "identity-1";
@@ -320,7 +410,7 @@ mod tests {
             9,
         );
         store.save(&session).unwrap();
-        let page = page(&store, &scout(), ME, None, 200).unwrap();
+        let page = page(&store, &scout(), ME, DESK_CHANNEL, Cursor::Newest, 200).unwrap();
         assert_eq!(
             texts(&page),
             [
@@ -343,14 +433,22 @@ mod tests {
         let store = InMemorySessionStore::new();
         exchange(&store, 0);
         assert_eq!(
-            page(&store, &scout(), "identity-2", None, 200).unwrap(),
+            page(
+                &store,
+                &scout(),
+                "identity-2",
+                DESK_CHANNEL,
+                Cursor::Newest,
+                200
+            )
+            .unwrap(),
             Page::default()
         );
         assert!(store.find(DESK_CHANNEL, "identity-2").unwrap().is_none());
         let mut room = store.get_or_create("desk:release", ME, "scout").unwrap();
         room.add_user_message("in the room", None);
         store.save(&room).unwrap();
-        let mine = page(&store, &scout(), ME, None, 200).unwrap();
+        let mine = page(&store, &scout(), ME, DESK_CHANNEL, Cursor::Newest, 200).unwrap();
         assert_eq!(mine.messages.len(), 2, "a room is not the DM");
     }
 
@@ -360,7 +458,7 @@ mod tests {
         for n in 0..5 {
             exchange(&store, n);
         }
-        let newest = page(&store, &scout(), ME, None, 4).unwrap();
+        let newest = page(&store, &scout(), ME, DESK_CHANNEL, Cursor::Newest, 4).unwrap();
         assert_eq!(
             texts(&newest),
             [
@@ -371,17 +469,41 @@ mod tests {
             ]
         );
         assert!(newest.more);
-        let older = page(&store, &scout(), ME, Some(&newest.messages[0].id), 4).unwrap();
+        let older = page(
+            &store,
+            &scout(),
+            ME,
+            DESK_CHANNEL,
+            Cursor::Before(&newest.messages[0].id),
+            4,
+        )
+        .unwrap();
         assert_eq!(older.messages[0].text, "question 1");
         assert_eq!(older.messages[3].text, "answer 2");
         assert!(older.more);
-        let oldest = page(&store, &scout(), ME, Some(&older.messages[0].id), 4).unwrap();
+        let oldest = page(
+            &store,
+            &scout(),
+            ME,
+            DESK_CHANNEL,
+            Cursor::Before(&older.messages[0].id),
+            4,
+        )
+        .unwrap();
         assert_eq!(
             texts(&oldest),
             [("question 0", Author::User), ("answer 0", Author::Agent)]
         );
         assert!(!oldest.more);
-        let refused = page(&store, &scout(), ME, Some("not-a-message"), 4).unwrap_err();
+        let refused = page(
+            &store,
+            &scout(),
+            ME,
+            DESK_CHANNEL,
+            Cursor::Before("not-a-message"),
+            4,
+        )
+        .unwrap_err();
         assert!(
             matches!(refused, ConversationError::Invalid(_)),
             "{refused}"
@@ -397,7 +519,10 @@ mod tests {
             5,
         );
         store.save(&session).unwrap();
-        let text = &page(&store, &scout(), ME, None, 10).unwrap().messages[0].text;
+        let text = &page(&store, &scout(), ME, DESK_CHANNEL, Cursor::Newest, 10)
+            .unwrap()
+            .messages[0]
+            .text;
         assert!(!text.contains("AKIAIOSFODNN7EXAMPLE"), "{text}");
     }
 
@@ -416,11 +541,19 @@ mod tests {
                     exchange(store.as_ref(), n);
                 }
                 let walk = |store: &dyn SessionStore| {
-                    let newest = page(store, &scout(), ME, None, 4).unwrap();
+                    let newest =
+                        page(store, &scout(), ME, DESK_CHANNEL, Cursor::Newest, 4).unwrap();
                     assert_eq!(newest.messages[0].text, "question 1");
                     assert!(newest.more);
-                    let oldest =
-                        page(store, &scout(), ME, Some(&newest.messages[0].id), 4).unwrap();
+                    let oldest = page(
+                        store,
+                        &scout(),
+                        ME,
+                        DESK_CHANNEL,
+                        Cursor::Before(&newest.messages[0].id),
+                        4,
+                    )
+                    .unwrap();
                     assert_eq!(
                         texts(&oldest),
                         [("question 0", Author::User), ("answer 0", Author::Agent)]
@@ -436,6 +569,73 @@ mod tests {
             },
         )
         .await;
+    }
+
+    /// A room's conversation pages forward after a message Desk already
+    /// placed, across a rollover, and each message carries its place.
+    #[test]
+    fn a_room_reads_forward_after_a_message_across_the_seam() {
+        use workforce_common::channels::desk::{DeliveryKind, DeskMark};
+        let room = "desk:planning";
+        let dir = tempfile::tempdir().unwrap();
+        let store = JsonlSessionStore::new(dir.path()).unwrap();
+        let said_in_room = |store: &JsonlSessionStore, text: &str, mark: Option<DeskMark>| {
+            let mut session = store.get_or_create(room, ME, "scout").unwrap();
+            session.add_assistant_message(text, 1);
+            session.messages.last_mut().unwrap().desk = mark;
+            store.save(&session).unwrap();
+        };
+        said_in_room(&store, "first", None);
+        let old = store.find(room, ME).unwrap().unwrap();
+        let successor = workforce_agent::rollover::roll_if_stale(
+            &store,
+            old.clone(),
+            &workforce_common::session::CompactionConfig::default(),
+            chrono::Utc::now() + chrono::Duration::days(3),
+        )
+        .unwrap();
+        assert_ne!(successor.id, old.id, "the room's conversation rolled over");
+        let reminder = DeskMark {
+            delivery: Some(DeliveryKind::Reminder),
+            ..DeskMark::default()
+        };
+        said_in_room(&store, "second", Some(reminder.clone()));
+        said_in_room(&store, "third", None);
+
+        let all = page(&store, &scout(), ME, room, Cursor::Newest, 200).unwrap();
+        let texts: Vec<&str> = all.messages.iter().map(|m| m.text.as_str()).collect();
+        assert_eq!(texts, ["first", "second", "third"]);
+        assert_eq!(all.messages[1].mark, Some(reminder));
+
+        let after_first = page(
+            &store,
+            &scout(),
+            ME,
+            room,
+            Cursor::After(&all.messages[0].id),
+            1,
+        )
+        .unwrap();
+        assert_eq!(after_first.messages[0].text, "second");
+        assert!(after_first.more, "the third is newer still");
+        let caught_up = page(
+            &store,
+            &scout(),
+            ME,
+            room,
+            Cursor::After(&all.messages[2].id),
+            10,
+        )
+        .unwrap();
+        assert_eq!(caught_up, Page::default());
+        assert!(matches!(
+            page(&store, &scout(), ME, room, Cursor::After("nope"), 10),
+            Err(ConversationError::Invalid(_))
+        ));
+        assert!(matches!(
+            page(&store, &scout(), ME, "ios", Cursor::Newest, 10),
+            Err(ConversationError::Invalid(_))
+        ));
     }
 
     /// A dormant DM goes on in a successor; the read crosses the seam.
@@ -455,7 +655,7 @@ mod tests {
         .unwrap();
         assert_ne!(successor.id, old.id, "the DM rolled over");
         exchange(&store, 1);
-        let page = page(&store, &scout(), ME, None, 200).unwrap();
+        let page = page(&store, &scout(), ME, DESK_CHANNEL, Cursor::Newest, 200).unwrap();
         assert_eq!(
             texts(&page),
             [
@@ -465,7 +665,15 @@ mod tests {
                 ("answer 1", Author::Agent),
             ]
         );
-        let older = super::page(&store, &scout(), ME, Some(&page.messages[2].id), 200).unwrap();
+        let older = super::page(
+            &store,
+            &scout(),
+            ME,
+            DESK_CHANNEL,
+            Cursor::Before(&page.messages[2].id),
+            200,
+        )
+        .unwrap();
         assert_eq!(older.messages.len(), 2, "the cursor crosses the seam");
     }
 }

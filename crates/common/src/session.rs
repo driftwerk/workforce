@@ -4834,10 +4834,7 @@ impl JsonlSessionStore {
 }
 
 /// Convert a `SessionMessage` into a `TranscriptEntry`.
-pub(crate) fn message_to_transcript_entry(
-    session_id: &str,
-    msg: &SessionMessage,
-) -> TranscriptEntry {
+pub fn message_to_transcript_entry(session_id: &str, msg: &SessionMessage) -> TranscriptEntry {
     let tool_metadata = msg.tool_data.as_ref().and_then(|td| {
         Some(ToolMetadata {
             name: td.get("name")?.as_str()?.to_string(),

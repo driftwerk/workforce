@@ -447,6 +447,17 @@ pub trait SchedulerHost: Send + Sync {
         to: &str,
         editor: Option<&str>,
     ) -> Vec<String>;
+    /// Point the Desk delivery of each job `owner` owns that `retarget`
+    /// moves elsewhere; the ids changed.
+    async fn retarget_desk(
+        &self,
+        owner: &str,
+        retarget: &(dyn for<'t> Fn(
+            &'t workforce_common::delivery::DeliveryTarget,
+        ) -> Option<workforce_common::delivery::DeliveryTarget>
+              + Send
+              + Sync),
+    ) -> Vec<String>;
     /// Release the jobs held for people `suspended` no longer says are.
     async fn release_suspension_holds(
         &self,

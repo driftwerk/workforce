@@ -38,12 +38,11 @@ fn hub(
     .state()
 }
 
-/// The gateway with the conversation route Desk mounts beside it.
+/// The gateway, which serves Desk's conversation routes itself.
 async fn serve(state: Arc<GatewayState>) -> SocketAddr {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let app = workforce_hub::gateway::router(Arc::clone(&state))
-        .merge(workforce_hub::desk_conversations::router(state));
+    let app = workforce_hub::gateway::router(state);
     tokio::spawn(async move {
         axum::serve(
             listener,
@@ -221,4 +220,126 @@ async fn a_dm_is_one_conversation_across_reconnects_and_restarts_and_reads_back(
     )
     .await;
     assert_eq!(status, 401);
+}
+
+/// Desk asks what changed, pages a room forward from what it last placed,
+/// and closes a room it deleted: what the room never showed goes to the DM,
+/// once.
+#[tokio::test]
+async fn desk_drains_its_conversations_and_closes_a_room_it_deleted() {
+    use workforce_common::channels::desk::{DeskPlace, DeskTarget};
+    let data = tempfile::tempdir().unwrap();
+    let identities: Arc<dyn IdentityStore> = Arc::new(SqliteIdentityStore::in_memory().unwrap());
+    let pairing = Arc::new(DevicePairingService::new(
+        Arc::new(SqlitePairingStore::in_memory().unwrap()),
+        PairingConfig {
+            device_pairing_enabled: true,
+            ..Default::default()
+        },
+    ));
+    let service = agent_service(data.path()).await;
+    let addr = serve(hub(&service, &identities, &pairing)).await;
+    let (person, token) = paired_desk(addr).await;
+    let started = chrono::Utc::now();
+
+    let room_id = uuid::Uuid::new_v4();
+    let room = format!("desk:{room_id}");
+    let mut session = service
+        .sessions
+        .get_or_create(&room, &person, "scout")
+        .unwrap();
+    session.set_desk_origin(&DeskTarget {
+        place: DeskPlace::Room {
+            room: room_id,
+            name: "Planning".into(),
+            thread: None,
+        },
+        channel: room.clone(),
+        device: None,
+        spoken: false,
+    });
+    session.add_assistant_message("placed already", 1);
+    session.add_assistant_message("never shown", 1);
+    service.sessions.save(&session).unwrap();
+    let mut someone_elses = service
+        .sessions
+        .get_or_create("desk", "someone-else", "scout")
+        .unwrap();
+    someone_elses.add_assistant_message("not yours", 1);
+    service.sessions.save(&someone_elses).unwrap();
+
+    let (status, changed) = call(
+        addr,
+        &token,
+        reqwest::Method::GET,
+        &format!(
+            "/api/desk/conversations?since={}",
+            (started - chrono::Duration::seconds(1))
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+        ),
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "{changed}");
+    assert_eq!(
+        changed["conversations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| (c["agent_id"].clone(), c["channel"].clone()))
+            .collect::<Vec<_>>(),
+        vec![(json!("scout"), json!(room))],
+        "only the caller's Desk conversations: {changed}"
+    );
+
+    let placed = &session.messages[0].id;
+    let (status, page) = call(
+        addr,
+        &token,
+        reqwest::Method::GET,
+        &format!("/api/desk/conversations/scout?channel={room}&after={placed}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "{page}");
+    let messages = page["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0]["text"], "never shown");
+    let unplaced = messages[0]["id"].as_str().unwrap().to_string();
+
+    for copied in [1, 0] {
+        let (status, closed) = call(
+            addr,
+            &token,
+            reqwest::Method::POST,
+            "/api/desk/conversations/scout/close",
+            Some(json!({"channel": room, "undelivered": [unplaced]})),
+        )
+        .await;
+        assert_eq!((status, closed), (200, json!({ "copied": copied })));
+    }
+    let (_, dm) = call(
+        addr,
+        &token,
+        reqwest::Method::GET,
+        "/api/desk/conversations/scout",
+        None,
+    )
+    .await;
+    let dm = dm["messages"].as_array().unwrap();
+    assert_eq!(dm.len(), 1, "{dm:?}");
+    assert_eq!(
+        dm[0]["text"],
+        "(for #Planning, which was deleted) never shown"
+    );
+    assert_eq!(dm[0]["mark"], json!({"delivery": "resumed"}));
+    let (status, _) = call(
+        addr,
+        &token,
+        reqwest::Method::POST,
+        "/api/desk/conversations/scout/close",
+        Some(json!({"channel": "desk"})),
+    )
+    .await;
+    assert_eq!(status, 400, "the DM is not a room");
 }

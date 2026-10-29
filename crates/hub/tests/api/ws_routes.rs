@@ -330,7 +330,11 @@ async fn a_desk_connection_sends_turns_the_agent_reads_in_their_place() {
     );
     let (mut desk, connected) =
         connect(addr, &format!("token={token}&channel={channel}&desk=1")).await;
-    assert_eq!(connected["features"], json!(["desk.place"]));
+    assert_eq!(
+        connected["features"],
+        json!(["desk.place", "desk.deliveries"]),
+        "a person's Desk is offered the hub link too"
+    );
 
     let thread = uuid::Uuid::new_v4();
     let turn = |room| {

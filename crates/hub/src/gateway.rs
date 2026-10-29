@@ -566,6 +566,10 @@ pub fn router(state: Arc<GatewayState>) -> Router {
             "/api/pair/device/rotate",
             post(pair_device_rotate_self),
         )
+        .route(
+            "/api/pair/device/revoke-self",
+            post(pair_device_revoke_self),
+        )
         // Pairing endpoints
         .route("/api/pair/pending", get(pair_list_pending))
         .route("/api/pair/approve/{code}", post(pair_approve))
@@ -1132,7 +1136,8 @@ pub fn router(state: Arc<GatewayState>) -> Router {
         .route("/api/budget/status", get(crate::api_handlers::budget::get_status))
         .route("/api/budget/overrides", axum::routing::put(crate::api_handlers::budget::put_override))
         .route("/api/budget/overrides/clear", axum::routing::post(crate::api_handlers::budget::clear_override))
-        .with_state(state)
+        .with_state(Arc::clone(&state))
+        .merge(desk_routes(state))
         .fallback(static_fallback)
         // Audit F2 (2026-05-15).
         .layer(axum::middleware::from_fn(
@@ -1140,6 +1145,25 @@ pub fn router(state: Arc<GatewayState>) -> Router {
         ))
         // Audit F3 (2026-05-15); per-route override on /api/sessions/{id}/upload.
         .layer(axum::extract::DefaultBodyLimit::max(1024 * 1024))
+}
+
+/// Desk's routes beside the gateway's: its hub link and its conversations.
+/// They read conversations from the Postgres-backed hub, so a hub without
+/// it serves neither.
+fn desk_routes(state: Arc<GatewayState>) -> Router {
+    #[cfg(feature = "postgres")]
+    {
+        crate::desk_conversations::router(Arc::clone(&state)).merge(
+            Router::new()
+                .route("/ws/desk", get(crate::desk_surface::link::handler))
+                .with_state(state),
+        )
+    }
+    #[cfg(not(feature = "postgres"))]
+    {
+        let _ = state;
+        Router::new()
+    }
 }
 
 /// A 403 for a connection whose person is suspended. Not a 401: the
@@ -1162,6 +1186,121 @@ fn suspended_refusal(
     )
 }
 
+/// Who a WebSocket handshake's token says is connecting: a paired device
+/// (and the person it is linked to), or a signed-in person.
+#[derive(Debug, Clone)]
+pub(crate) struct WsCaller {
+    pub(crate) device_id: Option<String>,
+    pub(crate) scopes: Option<Vec<String>>,
+    pub(crate) identity_id: Option<String>,
+    /// Which slot of a device's token chain matched, for `connected`.
+    pub(crate) token_match: Option<String>,
+    pub(crate) identity_role: String,
+}
+
+/// Authenticate a WebSocket handshake's `token`: a device pairing token, then
+/// a JWT. The refusal is the response the upgrade is answered with: 403 for a
+/// suspended person, 503 when the pairing store could not be read, else 401.
+pub(crate) async fn authenticate_ws(
+    state: &GatewayState,
+    token: &str,
+) -> Result<WsCaller, axum::response::Response> {
+    // The admin token names nobody, so it never opens a WebSocket; it stays
+    // valid for REST APIs, MCP and admin endpoints.
+    let mut pairing_store_error = false;
+
+    if let Some(ref pairing) = state.device_pairing {
+        match pairing
+            .validate_token_with_match_async(token.to_string())
+            .await
+        {
+            Ok(Some((device, kind))) => {
+                let identity_id = state
+                    .identity_store
+                    .as_ref()
+                    .and_then(|store| identity_for_device(store.as_ref(), &device.id));
+                if let Some(refused) = suspended_refusal(state, identity_id.as_deref()) {
+                    return Err(refused);
+                }
+                return Ok(WsCaller {
+                    device_id: Some(device.id),
+                    scopes: Some(device.scopes),
+                    identity_id,
+                    token_match: Some(
+                        match kind {
+                            workforce_pairing::TokenMatch::Current => "current",
+                            workforce_pairing::TokenMatch::Previous => "previous",
+                        }
+                        .to_string(),
+                    ),
+                    // Paired devices are the primary user → Owner trust, no wrap.
+                    identity_role: "manager".to_string(),
+                });
+            }
+            Ok(None) => {}
+            Err(e) => {
+                // Store failure ≠ bad token, and the JWT strategy below has
+                // no dependency on the pairing store — a valid JWT must still
+                // connect. Record the failure and only surface it after JWT
+                // has had its chance.
+                warn!(
+                    token_prefix = %token_prefix_hint(token),
+                    error = %e,
+                    "Pairing store error during WebSocket auth — failing closed"
+                );
+                pairing_store_error = true;
+            }
+        }
+    }
+
+    if let Some(ref jwt_config) = state.jwt_config {
+        if let Ok(claims) = crate::jwt::validate_token(jwt_config, token) {
+            if let Some(refused) = suspended_refusal(state, claims.identity_id.as_deref()) {
+                return Err(refused);
+            }
+            let identity_id = claims.identity_id.clone();
+            let legacy_unscoped = claims.scopes.is_empty();
+            let claims = crate::jwt::current_claims(state.identity_store.as_ref(), claims);
+            return Ok(WsCaller {
+                device_id: claims.device_id,
+                scopes: (!legacy_unscoped).then_some(claims.scopes),
+                identity_id,
+                token_match: None,
+                identity_role: claims.role.as_str().to_string(),
+            });
+        }
+    }
+
+    if pairing_store_error {
+        // The token wasn't a valid JWT and the pairing store couldn't be
+        // consulted, so its validity is unknown. A 401 here would make the
+        // iOS client count an auth strike (three disable reconnection);
+        // 503 keeps it on the plain retry-with-backoff path.
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({
+                "error": "service_unavailable",
+                "message": "Authentication backend unavailable — retry shortly."
+            })),
+        )
+            .into_response());
+    }
+
+    warn!(
+        token_prefix = %token_prefix_hint(token),
+        "WebSocket auth failed — invalid or expired token"
+    );
+
+    Err((
+        StatusCode::UNAUTHORIZED,
+        axum::Json(serde_json::json!({
+            "error": "unauthorized",
+            "message": "Authentication required. Provide a valid gateway token (?token=...) or pair your device via /api/pair/device/request."
+        })),
+    )
+        .into_response())
+}
+
 /// WebSocket upgrade handler.
 async fn ws_handler(
     ws: WebSocketUpgrade,
@@ -1180,131 +1319,23 @@ async fn ws_handler(
     let rich = workforce_common::rich::RichFeatures::from_names(query.rich.as_deref());
     let declared =
         query.desk == Some(1) && workforce_common::channels::is_desk_conversation(&anchor_channel);
-    let token = query.token.unwrap_or_default();
-
-    // Strategy 1 (admin token) removed — no identity context for per-user scoping.
-    // Admin token remains valid for REST APIs, MCP, and admin endpoints.
-
-    let mut pairing_store_error = false;
-
-    // Strategy 2: validate device pairing token (wfp_*)
-    if let Some(ref pairing) = state.device_pairing {
-        match pairing
-            .validate_token_with_match_async(token.to_string())
-            .await
-        {
-            Ok(Some((device, kind))) => {
-                let device_scopes = Some(device.scopes);
-                let device_id_str = device.id;
-                let identity_id = state
-                    .identity_store
-                    .as_ref()
-                    .and_then(|store| identity_for_device(store.as_ref(), &device_id_str));
-                if let Some(refused) = suspended_refusal(&state, identity_id.as_deref()) {
-                    return refused;
-                }
-                let device_id = Some(device_id_str);
-                let agent_id = query.agent_id;
-                let token_match = Some(match kind {
-                    workforce_pairing::TokenMatch::Current => "current".to_string(),
-                    workforce_pairing::TokenMatch::Previous => "previous".to_string(),
-                });
-                // Paired devices are the primary user → Owner trust, no wrap.
-                let identity_role = "manager".to_string();
-                return ws
-                    .on_upgrade(move |socket| {
-                        handle_ws(
-                            socket,
-                            state,
-                            anchor_channel,
-                            rich,
-                            declared,
-                            agent_id,
-                            device_id,
-                            device_scopes,
-                            identity_id,
-                            token_match,
-                            identity_role,
-                        )
-                    })
-                    .into_response();
-            }
-            Ok(None) => {}
-            Err(e) => {
-                // Store failure ≠ bad token, and the JWT strategy below has
-                // no dependency on the pairing store — a valid JWT must still
-                // connect. Record the failure and only surface it after JWT
-                // has had its chance.
-                warn!(
-                    token_prefix = %token_prefix_hint(&token),
-                    error = %e,
-                    "Pairing store error during WebSocket auth — failing closed"
-                );
-                pairing_store_error = true;
-            }
-        }
-    }
-
-    // Strategy 3: validate JWT token
-    if let Some(ref jwt_config) = state.jwt_config {
-        if let Ok(claims) = crate::jwt::validate_token(jwt_config, &token) {
-            if let Some(refused) = suspended_refusal(&state, claims.identity_id.as_deref()) {
-                return refused;
-            }
-            let agent_id = query.agent_id;
-            let identity_id = claims.identity_id.clone();
-            let legacy_unscoped = claims.scopes.is_empty();
-            let claims = crate::jwt::current_claims(state.identity_store.as_ref(), claims);
-            let scopes = (!legacy_unscoped).then_some(claims.scopes);
-            let identity_role = claims.role.as_str().to_string();
-            return ws
-                .on_upgrade(move |socket| {
-                    handle_ws(
-                        socket,
-                        state,
-                        anchor_channel,
-                        rich,
-                        declared,
-                        agent_id,
-                        claims.device_id,
-                        scopes,
-                        identity_id,
-                        None,
-                        identity_role,
-                    )
-                })
-                .into_response();
-        }
-    }
-
-    if pairing_store_error {
-        // The token wasn't a valid JWT and the pairing store couldn't be
-        // consulted, so its validity is unknown. A 401 here would make the
-        // iOS client count an auth strike (three disable reconnection);
-        // 503 keeps it on the plain retry-with-backoff path.
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            axum::Json(serde_json::json!({
-                "error": "service_unavailable",
-                "message": "Authentication backend unavailable — retry shortly."
-            })),
+    let caller = match authenticate_ws(&state, query.token.as_deref().unwrap_or_default()).await {
+        Ok(caller) => caller,
+        Err(refused) => return refused,
+    };
+    let agent_id = query.agent_id;
+    ws.on_upgrade(move |socket| {
+        handle_ws(
+            socket,
+            state,
+            anchor_channel,
+            rich,
+            declared,
+            agent_id,
+            caller,
         )
-            .into_response();
-    }
-
-    warn!(
-        token_prefix = %token_prefix_hint(&token),
-        "WebSocket auth failed — invalid or expired token"
-    );
-
-    (
-        StatusCode::UNAUTHORIZED,
-        axum::Json(serde_json::json!({
-            "error": "unauthorized",
-            "message": "Authentication required. Provide a valid gateway token (?token=...) or pair your device via /api/pair/device/request."
-        })),
-    )
-        .into_response()
+    })
+    .into_response()
 }
 
 /// Whether the broadcast forwarder should deliver `msg` on a connection.
@@ -1317,7 +1348,8 @@ async fn ws_handler(
 ///
 /// A message addressed to a person alone (a device request) reaches every
 /// connection of that person — `conn_owner`, the identity or else the device
-/// its sessions are owned by — and no other.
+/// its sessions are owned by — and no other. A Desk delivery signal is for
+/// the person's hub links (`/ws/desk`) and never reaches a chat connection.
 fn forward_admits(
     msg: &BroadcastMessage,
     conn_session: Option<&str>,
@@ -1325,6 +1357,9 @@ fn forward_admits(
     conn_identity: Option<&str>,
     conn_owner: Option<&str>,
 ) -> bool {
+    if msg.msg_type == crate::broadcast::DESK_DELIVERED {
+        return false;
+    }
     match (
         msg.target_channel.as_deref(),
         msg.target_identity.as_deref(),
@@ -1342,16 +1377,25 @@ fn forward_admits(
     }
 }
 
-/// The feature a Desk connection is told it may use: structured turns.
+/// What a Desk connection is told it may use: structured turns, and the
+/// hub link with its conversation drain.
 const DESK_PLACE: &str = "desk.place";
+const DESK_DELIVERIES: &str = "desk.deliveries";
 
 /// Frames only a Desk connection is sent; any other connection is sent the
 /// frames it always was.
 const DESK_ONLY_FRAMES: &[&str] = &["turn_end", "turn_snapshot", "desk_delivered"];
 
-/// What a declared Desk connection is offered, on its `connected`.
-fn desk_features() -> Vec<String> {
-    vec![DESK_PLACE.to_string()]
+/// What a declared Desk connection is offered, on its `connected`. The hub
+/// link and the drain are for a person's conversations and need the
+/// conversation routes, so only a connection that is a person's, on a hub
+/// that serves them, is offered deliveries.
+pub(crate) fn desk_features(of_a_person: bool) -> Vec<String> {
+    let deliveries = cfg!(feature = "postgres") && of_a_person;
+    std::iter::once(DESK_PLACE)
+        .chain(deliveries.then_some(DESK_DELIVERIES))
+        .map(str::to_string)
+        .collect()
 }
 
 /// The Desk turn a chat frame is: the one a declared Desk connection sent,
@@ -1685,6 +1729,23 @@ mod voice_forward_tests {
         ));
         assert!(!forward_admits(&msg, None, None, None, None));
 
+        let signal = BroadcastMessage::desk_delivered(
+            "uid-1",
+            workforce_common::channels::desk::DeskDelivered {
+                agent_id: "scout".into(),
+                channel: "desk".into(),
+                session_id: "sess-1".into(),
+                message_id: "m1".into(),
+                kind: workforce_common::channels::desk::DeliveryKind::Job,
+                place: workforce_common::channels::desk::DeskPlace::Dm,
+                spoken: false,
+            },
+        );
+        assert!(
+            !forward_admits(&signal, Some("sess-1"), None, Some("uid-1"), Some("uid-1")),
+            "a Desk delivery signal is for the hub link, never a chat connection"
+        );
+
         let unlinked = BroadcastMessage::node_invoke("device-1", "{}");
         assert!(forward_admits(
             &unlinked,
@@ -1729,7 +1790,6 @@ pub(crate) fn anchor_session(
 }
 
 /// Handle an authenticated WebSocket connection.
-#[allow(clippy::too_many_arguments)]
 async fn handle_ws(
     socket: WebSocket,
     state: Arc<GatewayState>,
@@ -1737,12 +1797,15 @@ async fn handle_ws(
     rich: workforce_common::rich::RichFeatures,
     declared: bool,
     agent_id: Option<String>,
-    device_id: Option<String>,
-    device_scopes: Option<Vec<String>>,
-    identity_id: Option<String>,
-    token_match: Option<String>,
-    identity_role: String,
+    caller: WsCaller,
 ) {
+    let WsCaller {
+        device_id,
+        scopes: device_scopes,
+        identity_id,
+        token_match,
+        identity_role,
+    } = caller;
     let (mut sender, mut receiver) = socket.split();
     let mut broadcast_rx = state.broadcast_tx.subscribe();
 
@@ -1807,7 +1870,7 @@ async fn handle_ws(
         desk: None,
         id: None,
         author: None,
-        features: declared.then(desk_features),
+        features: declared.then(|| desk_features(identity_id.is_some())),
         turn_ref: None,
     };
     let _ = sender
@@ -7718,12 +7781,63 @@ async fn pair_revoke_device(
     )
     .await?;
     let pairing = state.device_pairing.as_ref().ok_or(StatusCode::NOT_FOUND)?;
-    match pairing.revoke_async(device_id).await {
-        Ok(()) => Ok(Json(serde_json::json!({ "revoked": true }))),
+    let owner = state
+        .identity_store
+        .as_ref()
+        .and_then(|store| identity_for_device(store.as_ref(), &device_id))
+        .unwrap_or_else(|| device_id.clone());
+    match pairing.revoke_async(device_id.clone()).await {
+        Ok(()) => {
+            retarget_device(&state, &owner, &device_id).await;
+            Ok(Json(serde_json::json!({ "revoked": true })))
+        }
         Err(e) => {
             warn!("Device revocation failed: {e}");
             Err(StatusCode::NOT_FOUND)
         }
+    }
+}
+
+/// A device unpaired itself (Desk's "Disconnect"): only the device whose
+/// token the request carries.
+async fn pair_device_revoke_self(
+    headers: axum::http::HeaderMap,
+    State(state): State<Arc<GatewayState>>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let pairing = state.device_pairing.as_ref().ok_or(StatusCode::NOT_FOUND)?;
+    let token = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .ok_or(StatusCode::UNAUTHORIZED)?;
+    let (device, _) = pairing
+        .validate_token_with_match_async(token.to_string())
+        .await
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
+        .ok_or(StatusCode::UNAUTHORIZED)?;
+    let owner = state
+        .identity_store
+        .as_ref()
+        .and_then(|store| identity_for_device(store.as_ref(), &device.id))
+        .unwrap_or_else(|| device.id.clone());
+    pairing.revoke_async(device.id.clone()).await.map_err(|e| {
+        warn!("Device self-revocation failed: {e}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    retarget_device(&state, &owner, &device.id).await;
+    Ok(Json(serde_json::json!({ "revoked": true })))
+}
+
+/// What `owner` had delivered to Desk rooms on the unpaired `device` goes to
+/// their DM instead, with every agent.
+async fn retarget_device(state: &GatewayState, owner: &str, device: &str) {
+    for service in state.registry.all_services() {
+        crate::desk_surface::retarget(
+            &service,
+            owner,
+            crate::desk_surface::Matches::Device(device),
+        )
+        .await;
     }
 }
 

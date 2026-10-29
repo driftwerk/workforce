@@ -75,7 +75,15 @@ pub struct BroadcastMessage {
     /// never serialized.
     #[serde(skip_serializing)]
     pub target_identity: Option<String>,
+    /// On a `desk_delivered` signal, the delivery a person's Desk hub links
+    /// are told of; routing metadata like the target fields.
+    #[serde(skip_serializing)]
+    pub delivered: Option<workforce_core::desk::DeskDelivered>,
 }
+
+/// The frame telling a person's Desk that a conversation of theirs gained a
+/// message outside a live turn.
+pub const DESK_DELIVERED: &str = "desk_delivered";
 
 impl BroadcastMessage {
     /// Create a broadcast message that should be spoken in audio mode.
@@ -105,6 +113,7 @@ impl BroadcastMessage {
             turn_ref: None,
             target_channel: None,
             target_identity: None,
+            delivered: None,
         }
     }
 
@@ -171,6 +180,7 @@ impl BroadcastMessage {
             turn_ref: None,
             target_channel: None,
             target_identity: None,
+            delivered: None,
         }
     }
 
@@ -181,6 +191,16 @@ impl BroadcastMessage {
         Self {
             target_identity: Some(owner.to_string()),
             ..Self::silent("", "node_invoke", request)
+        }
+    }
+
+    /// Build the signal that `delivered` landed in a conversation of
+    /// `owner`'s, for their Desk hub links alone.
+    pub fn desk_delivered(owner: &str, delivered: workforce_core::desk::DeskDelivered) -> Self {
+        Self {
+            target_identity: Some(owner.to_string()),
+            delivered: Some(delivered),
+            ..Self::silent("", DESK_DELIVERED, String::new())
         }
     }
 

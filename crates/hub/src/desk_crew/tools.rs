@@ -257,7 +257,8 @@ impl CrewTool {
                     service.sessions.as_ref(),
                     &speaker,
                     &owner,
-                    None,
+                    workforce_common::channels::DESK_CHANNEL,
+                    workforce_desk::Cursor::Newest,
                     limit,
                 )
                 .map_err(|e| e.to_string())?;

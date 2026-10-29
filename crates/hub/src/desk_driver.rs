@@ -516,9 +516,6 @@ pub async fn mount(
             },
             google_login: Arc::new(adc_file),
         }),
-        Arc::new(crate::desk_conversations::HubConversations(Arc::clone(
-            state,
-        ))),
         crew,
     )))
 }

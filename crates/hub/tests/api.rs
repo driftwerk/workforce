@@ -23,6 +23,10 @@ mod caller_identity_routes;
 #[path = "api/desk_conversation_routes.rs"]
 mod desk_conversation_routes;
 
+#[cfg(feature = "postgres")]
+#[path = "api/desk_link_routes.rs"]
+mod desk_link_routes;
+
 #[path = "api/eval_routes.rs"]
 mod eval_routes;
 

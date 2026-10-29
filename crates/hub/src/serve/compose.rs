@@ -1003,6 +1003,15 @@ pub(super) async fn build_inner(
 
     memory_metrics.spawn();
 
+    service_arc
+        .surface_registry
+        .write()
+        .await
+        .register_session_surface(
+            workforce_common::channels::desk::DESK_PLATFORM,
+            Arc::new(crate::desk_surface::DeskSurface::new(&service_arc)),
+        );
+
     Ok(service_arc)
 }
 
