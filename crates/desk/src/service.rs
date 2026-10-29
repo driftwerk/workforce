@@ -870,8 +870,7 @@ impl Desk {
 
     /// The end of what the terminal shows, as plain text.
     pub fn terminal_text(&self, id: Uuid, max_chars: usize) -> Result<String, DeskError> {
-        let (bytes, _) = self.attach(id)?.attach();
-        let text = crate::pty::plain_text(&bytes);
+        let text = crate::pty::plain_text(self.attach(id)?.text().as_bytes());
         let skip = text.chars().count().saturating_sub(max_chars);
         Ok(text.chars().skip(skip).collect())
     }
@@ -1105,7 +1104,12 @@ impl Desk {
                 )
             }
         };
-        let (pty, exit) = Pty::spawn(&spec, self.0.opts.scrollback_bytes)?;
+        let (pty, exit) = Pty::spawn(
+            &spec,
+            crate::pty::DEFAULT_COLS,
+            crate::pty::DEFAULT_ROWS,
+            crate::pty::history_rows(self.0.opts.scrollback_bytes),
+        )?;
         self.0.state.lock().live.insert(
             r.id,
             Live {

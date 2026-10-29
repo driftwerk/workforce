@@ -11879,6 +11879,7 @@ dependencies = [
  "deadpool-postgres",
  "eyre",
  "futures",
+ "libc",
  "parking_lot",
  "portable-pty",
  "refinery",

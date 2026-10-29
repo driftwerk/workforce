@@ -10,6 +10,7 @@ pub mod conversations;
 pub mod crew;
 mod crew_api;
 mod crew_store;
+mod cwd;
 pub mod local;
 pub mod model;
 pub mod overview;
@@ -24,6 +25,7 @@ pub mod store;
 #[cfg(test)]
 mod testing;
 mod transcript;
+mod vt;
 mod worktree;
 
 pub use api::{router, sessions_router, Authorize};

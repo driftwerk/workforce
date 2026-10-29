@@ -22,6 +22,7 @@ use crate::conversations::{self, Conversations};
 use crate::crew::By;
 use crate::model::{Decision, NewSession, SessionPatch};
 use crate::providers::{self, AccountError, Accounts, Catalog, ConnectBody, Entry};
+use crate::pty::Frame;
 use crate::realtime::{Engine, Realtime, RealtimeError};
 use crate::rooms::{NewMessage, NewRoom, RoomPatch};
 use crate::service::{Desk, DeskError};
@@ -228,39 +229,76 @@ async fn pty(
 #[serde(tag = "type", rename_all = "lowercase")]
 enum Control {
     Resize { cols: u16, rows: u16 },
+    Claim,
+}
+
+/// A frame as the viewer `me` is sent it: output and snapshots as binary,
+/// the terminal's size and this viewer's role as text.
+fn pty_message(me: u64, frame: Frame) -> Option<Message> {
+    match frame {
+        Frame::Bytes(bytes) => Some(Message::Binary(bytes)),
+        Frame::Size { cols, rows } => Some(Message::text(
+            json!({ "type": "size", "cols": cols, "rows": rows }).to_string(),
+        )),
+        Frame::Active(active) => Some(Message::text(
+            json!({ "type": "role", "active": active == Some(me), "free": active.is_none() })
+                .to_string(),
+        )),
+        Frame::Exit => None,
+    }
 }
 
 /// Binary frames carry terminal bytes both ways; text frames carry control
-/// messages (resize).
+/// messages: `resize` and `claim` from the viewer, `size` and `role` to it.
+/// Only the active viewer's keys and size reach the terminal; a viewer that
+/// falls behind is sent the screen again rather than losing bytes.
 async fn stream_pty(socket: WebSocket, pty: Arc<crate::pty::Pty>) {
     let (mut tx, mut rx) = socket.split();
-    let (scrollback, mut output) = pty.attach();
-    if !scrollback.is_empty() && tx.send(Message::Binary(scrollback)).await.is_err() {
-        return;
+    let (viewer, frames, mut output) = pty.attach();
+    let me = viewer.id();
+    for frame in frames {
+        if let Some(m) = pty_message(me, frame) {
+            if tx.send(m).await.is_err() {
+                return;
+            }
+        }
     }
     loop {
         tokio::select! {
             out = output.recv() => match out {
-                Ok(bytes) => if tx.send(Message::Binary(bytes)).await.is_err() { return },
-                Err(RecvError::Lagged(_)) => continue,
-                Err(RecvError::Closed) => {
+                Ok(Frame::Exit) | Err(RecvError::Closed) => {
                     let _ = tx.send(Message::Close(None)).await;
                     return;
+                }
+                Ok(frame) => {
+                    if let Some(m) = pty_message(me, frame) {
+                        if tx.send(m).await.is_err() { return }
+                    }
+                }
+                Err(RecvError::Lagged(_)) => {
+                    let (frames, fresh) = viewer.resync();
+                    output = fresh;
+                    for frame in frames {
+                        if let Some(m) = pty_message(me, frame) {
+                            if tx.send(m).await.is_err() { return }
+                        }
+                    }
                 }
             },
             incoming = rx.next() => match incoming {
                 Some(Ok(Message::Binary(bytes))) => {
-                    if let Err(e) = pty.write(&bytes) {
+                    if let Err(e) = viewer.input(&bytes) {
                         tracing::debug!(error = %e, "terminal input dropped");
                         return;
                     }
                 }
                 Some(Ok(Message::Text(text))) => match serde_json::from_str::<Control>(&text) {
                     Ok(Control::Resize { cols, rows }) => {
-                        if let Err(e) = pty.resize(cols, rows) {
+                        if let Err(e) = viewer.resize(cols, rows) {
                             tracing::debug!(error = %e, "terminal resize failed");
                         }
                     }
+                    Ok(Control::Claim) => viewer.claim(),
                     Err(e) => tracing::debug!(error = %e, "unknown terminal control message"),
                 },
                 Some(Ok(Message::Close(_))) | None | Some(Err(_)) => return,
