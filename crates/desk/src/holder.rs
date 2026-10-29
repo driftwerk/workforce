@@ -236,6 +236,10 @@ pub async fn serve(socket: &Path, token: &str, cancel: CancellationToken) -> Res
     let listener =
         UnixListener::bind(socket).with_context(|| format!("listening on {}", socket.display()))?;
     std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600))?;
+    // Beside the socket, for whoever must replace this holder (a new
+    // protocol version) to find it.
+    let pid_file = pid_file(socket);
+    std::fs::write(&pid_file, format!("{}\n", std::process::id()))?;
     tracing::info!(socket = %socket.display(), "PTY holder listening");
     let state = Arc::new(HolderState {
         token: token.to_string(),
@@ -263,7 +267,13 @@ pub async fn serve(socket: &Path, token: &str, cancel: CancellationToken) -> Res
     );
     ptys.iter().for_each(|p| p.kill());
     let _ = std::fs::remove_file(socket);
+    let _ = std::fs::remove_file(pid_file);
     Ok(())
+}
+
+/// Where a holder serving `socket` writes its process id.
+pub fn pid_file(socket: &Path) -> PathBuf {
+    socket.with_extension("pid")
 }
 
 /// `workforce pty-holder`: detaches from whoever started it (its own
@@ -888,6 +898,8 @@ pub(crate) mod tests {
             .err()
             .unwrap();
         assert!(err.to_string().contains("wrong token"), "{err}");
+        let pid = std::fs::read_to_string(pid_file(&socket)).unwrap();
+        assert_eq!(pid.trim(), std::process::id().to_string());
         let mode = std::fs::metadata(&socket).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
         let dir_mode = std::fs::metadata(socket.parent().unwrap())
