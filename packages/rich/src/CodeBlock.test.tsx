@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 
 import { RichMarkdown } from "./RichMarkdown";
 
@@ -143,14 +143,18 @@ describe("CodeBlock", () => {
       expect(last.querySelector(".wf-tok-keyword")?.textContent).toBe("let");
     });
 
-    // The closing fence ends the stream; the block is whole and coloured.
-    await act(async () => {
-      rerender(<RichMarkdown text={head + "const c = 3;\nlet d = 4;\n```\n"} />);
-    });
+    // The line ends; while the fence is still open the block has a blank last
+    // line, which the closing fence then drops. That shrink must not send the
+    // block back to plain, not even for a frame.
+    rerender(<RichMarkdown text={head + "const c = 3;\nlet d = 4;\n"} streaming />);
     await waitFor(() =>
       expect(container.querySelectorAll(".wf-code-line")[3]!.querySelector(".wf-tok-keyword")).not.toBeNull(),
     );
+    rerender(<RichMarkdown text={head + "const c = 3;\nlet d = 4;\n```\n"} />);
     expect(lineTexts(container)).toEqual(["const a = 1;", "const b = 2;", "const c = 3;", "let d = 4;"]);
+    for (const line of container.querySelectorAll(".wf-code-line")) {
+      expect(line.querySelector(".wf-tok-keyword")).not.toBeNull();
+    }
   });
 
   it("leaves inline code alone", () => {

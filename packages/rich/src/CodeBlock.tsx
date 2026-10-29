@@ -54,12 +54,14 @@ function useTokenizer(grammar: string | null): Tokenize | null {
 interface Highlighted {
   grammar: string;
   code: string;
+  /** The text of each line the tokens were made from. */
+  texts: string[];
   lines: CodeToken[][];
 }
 
-function tokenizeSafely(tokenize: Tokenize, code: string): CodeToken[][] | null {
+function highlight(tokenize: Tokenize, grammar: string, code: string): Highlighted | null {
   try {
-    return tokenize(code);
+    return { grammar, code, texts: code.split("\n"), lines: tokenize(code) };
   } catch {
     return null;
   }
@@ -88,8 +90,7 @@ function useHighlighted(grammar: string | null, code: string): Highlighted | nul
   const tokenize = useTokenizer(grammar);
   const [highlighted, setHighlighted] = useState<Highlighted | null>(() => {
     if (!grammar || !tokenize || code.length > FIRST_RENDER_MAX) return null;
-    const lines = tokenizeSafely(tokenize, code);
-    return lines && { grammar, code, lines };
+    return highlight(tokenize, grammar, code);
   });
 
   const latest = useRef({ grammar, code, tokenize });
@@ -115,9 +116,9 @@ function useHighlighted(grammar: string | null, code: string): Highlighted | nul
       const now = latest.current;
       if (!now.grammar || !now.tokenize || now.code.length > HIGHLIGHT_MAX) return;
       const start = performance.now();
-      const lines = tokenizeSafely(now.tokenize, now.code);
+      const next = highlight(now.tokenize, now.grammar, now.code);
       cost.current = performance.now() - start;
-      if (lines) setHighlighted({ grammar: now.grammar, code: now.code, lines });
+      if (next) setHighlighted(next);
     }, delay);
   });
 
@@ -191,11 +192,13 @@ export function CodeBlock({ lang, text }: { lang: string | null; text: string })
   const highlighted = useHighlighted(resolved.grammar, code);
   const lines = code.split("\n");
 
-  // Tokens still apply to the text they were made from; while the block grows,
-  // that is every line but the last one they saw, which may since have grown.
+  // A line's tokens depend only on it and the lines above it, so they still
+  // apply up to the first line that differs from the text they were made from:
+  // a line still growing, or the blank line a streaming fence drops on closing.
   let covered = 0;
-  if (highlighted && highlighted.grammar === resolved.grammar && code.startsWith(highlighted.code)) {
-    covered = highlighted.code === code ? highlighted.lines.length : highlighted.lines.length - 1;
+  if (highlighted && highlighted.grammar === resolved.grammar) {
+    const n = Math.min(lines.length, highlighted.texts.length, highlighted.lines.length);
+    while (covered < n && highlighted.texts[covered] === lines[covered]) covered++;
   }
 
   return (
