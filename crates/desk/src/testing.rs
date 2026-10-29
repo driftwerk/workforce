@@ -72,6 +72,7 @@ pub(crate) fn options(dir: &std::path::Path) -> crate::service::Options {
         approval_timeout: std::time::Duration::from_secs(30),
         restore: crate::service::RestorePolicy::Ask,
         adopt_every: None,
+        holder: None,
     }
 }
 

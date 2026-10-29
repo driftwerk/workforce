@@ -26,8 +26,8 @@ use workforce_common::subscription::SubscriptionKind;
 use workforce_desk::local::{self, Server};
 use workforce_desk::providers::Group;
 use workforce_desk::{
-    AccountError, Accounts, Audio, Authorize, Desk, DeskStore, Fields, KeySource, Options,
-    Provider, Realtime, RestorePolicy, Speak, SpeakError, Spec, Speech, Standing,
+    AccountError, Accounts, Audio, Authorize, Desk, DeskStore, Fields, HolderOptions, KeySource,
+    Options, Provider, Realtime, RestorePolicy, Speak, SpeakError, Spec, Speech, Standing,
 };
 
 use crate::agent_llm::vault_provider_name;
@@ -444,7 +444,26 @@ fn options(config: &WorkforceConfig) -> Options {
         },
         adopt_every: (desk.adopt_interval_secs > 0)
             .then(|| Duration::from_secs(desk.adopt_interval_secs)),
+        holder: holder_options(desk),
     }
+}
+
+/// The PTY holder, when `[desk]` names its socket and a token.
+fn holder_options(desk: &workforce_common::settings::DeskConfig) -> Option<HolderOptions> {
+    let socket = desk.pty_holder_socket.as_deref().map(str::trim)?;
+    let token = desk.pty_holder_token.as_deref().map(str::trim)?;
+    if socket.is_empty() || token.is_empty() || token.starts_with("${") {
+        if !socket.is_empty() {
+            tracing::warn!(
+                "[desk] pty_holder_socket is set without a token; terminals run in the hub"
+            );
+        }
+        return None;
+    }
+    Some(HolderOptions {
+        socket: socket.into(),
+        token: token.into(),
+    })
 }
 
 /// Merges the desk routes into `app` when `[desk]` is enabled. Fails closed
@@ -514,6 +533,25 @@ mod tests {
 
     fn vault(dir: &std::path::Path) -> Arc<Vault> {
         Arc::new(Vault::open(&dir.join("global"), "test-key").unwrap())
+    }
+
+    #[test]
+    fn the_pty_holder_is_used_only_with_a_socket_and_a_token() {
+        use workforce_common::settings::DeskConfig;
+        let with = |socket: Option<&str>, token: Option<&str>| {
+            holder_options(&DeskConfig {
+                pty_holder_socket: socket.map(Into::into),
+                pty_holder_token: token.map(Into::into),
+                ..DeskConfig::default()
+            })
+        };
+        assert!(with(None, None).is_none());
+        assert!(with(Some("/run/desk/pty.sock"), None).is_none());
+        // `${WORKFORCE_PTY_HOLDER_TOKEN}` unset expands to nothing.
+        assert!(with(Some("/run/desk/pty.sock"), Some("")).is_none());
+        let h = with(Some("/run/desk/pty.sock"), Some("s3cret-token-value")).unwrap();
+        assert_eq!(h.socket, std::path::PathBuf::from("/run/desk/pty.sock"));
+        assert!(options(&WorkforceConfig::default()).holder.is_none());
     }
 
     #[test]

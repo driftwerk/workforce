@@ -11,6 +11,7 @@ pub mod crew;
 mod crew_api;
 mod crew_store;
 mod cwd;
+pub mod holder;
 pub mod local;
 pub mod model;
 pub mod overview;
@@ -35,6 +36,9 @@ pub use conversations::{
 pub use crew_store::CheckIn;
 pub use providers::{AccountError, Accounts, Fields, Spec, Standing};
 pub use realtime::{KeySource, Provider, Realtime};
-pub use service::{Desk, DeskError, Options, RestorePolicy};
+pub use service::{
+    Desk, DeskError, HolderOptions, NewTerminal, Options, RestorePolicy, TerminalPatch,
+    TerminalState, TerminalView,
+};
 pub use speech::{Audio, Speak, SpeakError, Speech, SpeechProvider};
 pub use store::DeskStore;

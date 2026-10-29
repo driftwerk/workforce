@@ -25,7 +25,7 @@ use crate::providers::{self, AccountError, Accounts, Catalog, ConnectBody, Entry
 use crate::pty::Frame;
 use crate::realtime::{Engine, Realtime, RealtimeError};
 use crate::rooms::{NewMessage, NewRoom, RoomPatch};
-use crate::service::{Desk, DeskError};
+use crate::service::{Desk, DeskError, NewTerminal, TerminalPatch};
 use crate::speech::{Speak, SpeakError, Speech};
 
 /// Decides whether a request may use the desk. Implemented by the hub.
@@ -308,6 +308,59 @@ async fn stream_pty(socket: WebSocket, pty: Arc<crate::pty::Pty>) {
     }
 }
 
+async fn terminals(State(s): S, h: HeaderMap, Query(q): Q) -> Response {
+    guarded!(s, h, q);
+    Json(s.desk.terminals()).into_response()
+}
+
+async fn create_terminal(
+    State(s): S,
+    h: HeaderMap,
+    Query(q): Q,
+    Json(new): Json<NewTerminal>,
+) -> Response {
+    guarded!(s, h, q);
+    s.desk.create_terminal(new).await.map(Json).into_response()
+}
+
+async fn update_terminal(
+    State(s): S,
+    h: HeaderMap,
+    Query(q): Q,
+    Path(id): Path<Uuid>,
+    Json(p): Json<TerminalPatch>,
+) -> Response {
+    guarded!(s, h, q);
+    s.desk.update_terminal(id, p).map(Json).into_response()
+}
+
+async fn close_terminal(State(s): S, h: HeaderMap, Query(q): Q, Path(id): Path<Uuid>) -> Response {
+    guarded!(s, h, q);
+    s.desk
+        .close_terminal(id)
+        .map(|()| StatusCode::NO_CONTENT)
+        .into_response()
+}
+
+async fn reopen_terminal(State(s): S, h: HeaderMap, Query(q): Q, Path(id): Path<Uuid>) -> Response {
+    guarded!(s, h, q);
+    s.desk.reopen_terminal(id).await.map(Json).into_response()
+}
+
+async fn terminal_pty(
+    State(s): S,
+    h: HeaderMap,
+    Query(q): Q,
+    Path(id): Path<Uuid>,
+    ws: WebSocketUpgrade,
+) -> Response {
+    guarded!(s, h, q);
+    match s.desk.attach_terminal(id) {
+        Ok(pty) => ws.on_upgrade(move |socket| stream_pty(socket, pty)),
+        Err(e) => e.into_response(),
+    }
+}
+
 async fn rooms(State(s): S, h: HeaderMap, Query(q): Q) -> Response {
     guarded!(s, h, q);
     Json(s.desk.rooms()).into_response()
@@ -394,6 +447,13 @@ pub fn sessions_router(desk: Desk, auth: Arc<dyn Authorize>) -> Router {
         .route("/api/desk/sessions/{id}/resume", post(resume))
         .route("/api/desk/sessions/{id}/approvals/{approval}", post(decide))
         .route("/api/desk/sessions/{id}/pty", get(pty))
+        .route("/api/desk/terminals", get(terminals).post(create_terminal))
+        .route(
+            "/api/desk/terminals/{id}",
+            patch(update_terminal).delete(close_terminal),
+        )
+        .route("/api/desk/terminals/{id}/reopen", post(reopen_terminal))
+        .route("/api/desk/terminals/{id}/pty", get(terminal_pty))
         .route("/api/desk/restore", post(restore))
         .route("/api/desk/restore/dismiss", post(dismiss_restore))
         .route("/api/desk/events", get(events))

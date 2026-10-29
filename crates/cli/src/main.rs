@@ -169,6 +169,19 @@ enum Commands {
         #[arg(long)]
         accept_uid: u32,
     },
+    /// Keep Desk's terminals across hub restarts: a small long-lived process
+    /// that owns their PTYs and serves them to the hub over a unix socket.
+    ///
+    /// Started by Desk's helper before the hub and left running when the hub
+    /// restarts. Reads its token from `WORKFORCE_PTY_HOLDER_TOKEN` (never an
+    /// argument, so it stays out of `ps`). Exits at once if a holder already
+    /// serves the socket; SIGTERM ends it and its terminals.
+    #[command(name = "pty-holder")]
+    PtyHolder {
+        /// Unix socket path (its folder is made owner-only).
+        #[arg(long)]
+        socket: PathBuf,
+    },
     /// Run a task using a team from the config.
     Team {
         /// The task description.
@@ -6220,6 +6233,16 @@ rules:
             serve(listener, Arc::new(LocalJobHandler))
                 .await
                 .map_err(|e| eyre::eyre!("exec runner error: {e}"))?;
+        }
+        Commands::PtyHolder { socket } => {
+            let _ = tracing_subscriber::fmt()
+                .with_writer(std::io::stderr)
+                .with_env_filter(
+                    tracing_subscriber::EnvFilter::try_from_default_env()
+                        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+                )
+                .try_init();
+            workforce_desk::holder::run(&socket).await?;
         }
         Commands::McpServe {
             agent_id,

@@ -240,6 +240,7 @@ mod tests {
                 approval_timeout: std::time::Duration::from_secs(30),
                 restore: crate::service::RestorePolicy::Off,
                 adopt_every: None,
+                holder: None,
             },
             CancellationToken::new(),
         )

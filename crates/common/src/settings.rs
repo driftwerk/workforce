@@ -679,6 +679,14 @@ pub struct DeskConfig {
     /// 0 turns that off.
     #[serde(default = "default_desk_adopt_interval_secs")]
     pub adopt_interval_secs: u64,
+    /// The PTY holder's socket (`workforce pty-holder --socket`), which keeps
+    /// terminals running across hub restarts. Unset: terminals are the hub's
+    /// own and end with it.
+    #[serde(default)]
+    pub pty_holder_socket: Option<String>,
+    /// The holder's token, usually `${WORKFORCE_PTY_HOLDER_TOKEN}`.
+    #[serde(default)]
+    pub pty_holder_token: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -700,6 +708,8 @@ impl Default for DeskConfig {
             approval_timeout_secs: default_desk_approval_timeout_secs(),
             scrollback_kb: default_desk_scrollback_kb(),
             adopt_interval_secs: default_desk_adopt_interval_secs(),
+            pty_holder_socket: None,
+            pty_holder_token: None,
         }
     }
 }

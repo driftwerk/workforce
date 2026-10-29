@@ -158,6 +158,13 @@ pub enum DeskEvent {
         sessions: Vec<SessionView>,
         restore: Vec<SessionView>,
         rooms: Vec<crate::rooms::Room>,
+        terminals: Vec<crate::service::TerminalView>,
+    },
+    Terminal {
+        terminal: Box<crate::service::TerminalView>,
+    },
+    TerminalRemoved {
+        id: Uuid,
     },
     Session {
         session: Box<SessionView>,

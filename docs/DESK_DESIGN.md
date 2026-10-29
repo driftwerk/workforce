@@ -404,6 +404,22 @@ Repo: new `driftwerk/workforce-desk`, depending on workforce-public via pinned g
   spans calls (no triggers needed). Requests = the principal's speech starting with a roster
   name, or their `agent_prompt`; others' speech is context only. Replies via
   `tuple notifications send`. There is no `message_user` any more.
+- **Terminal screens**: each PTY's output is parsed into a `vt100` model (plus the modes it
+  leaves out: `?1004`, `?2031`, kitty keyboard flags, modifyOtherKeys, the title). Attaching
+  sends the screen with its history and modes; a viewer that falls behind gets the screen again
+  (prefixed with CAN). One viewer is *active* (`{type:"claim"}`; the first to attach while none
+  is); only its keys and size count, others mirror it via `{type:"size"}` / `{type:"role"}`.
+  With no active viewer the hub answers DA1/DA2/DSR/DECRQM as xterm.js 6 would, and leaves
+  XTVERSION, `CSI ? u` and OSC 7501 unanswered as xterm.js does.
+- **PTY holder**: `workforce pty-holder --socket <path>` (token in `WORKFORCE_PTY_HOLDER_TOKEN`)
+  owns the PTYs when `[desk] pty_holder_socket`/`pty_holder_token` are set; a restarted hub takes
+  back the running sessions (same processes, hook port and tokens kept in the holder's per-PTY
+  meta), Codex app-servers and terminals. Without it terminals are the hub's own, as before.
+- **Terminals** (`/api/desk/terminals`): plain login shells with extra env from Desk; cwd
+  followed (`proc_pidinfo`, OSC 7) and kept with the env in `desk.terminals`; reopened there
+  after a reboot unless restore is `off`.
+- **Desk state** (`/api/desk/state/{key}`): a JSON value per key in `desk.state`, committed
+  before the answer, announced as `{type:"state"}` (re-read on any `snapshot`).
 - **Security fix found on the way**: `/ws/agent` accepted any token when device pairing was
   configured (`validate_token_async(..).is_ok()` on an `Ok(None)`); fixed with tests on
   `fix/ws-agent-token-auth`, not pushed.

@@ -101,6 +101,29 @@ impl Screen {
         (core.active.is_none() && !replies.is_empty()).then_some(replies)
     }
 
+    /// Starts over from a snapshot of the screen (a holder's, after the
+    /// hub reconnected or fell behind it); viewers are resynced.
+    pub(crate) fn reset(&self, cols: u16, rows: u16, history: usize, snapshot: &[u8]) {
+        let mut core = self.core.lock();
+        let mut term = Term::new(cols, rows, history);
+        term.feed(snapshot);
+        core.term = term;
+        let _ = self.tx.send(Frame::Size { cols, rows });
+        let _ = self
+            .tx
+            .send(Frame::Bytes(Bytes::from(core.term.snapshot(false))));
+    }
+
+    /// A snapshot and every frame after it, taken together.
+    pub(crate) fn snapshot_and_subscribe(
+        &self,
+        history: bool,
+    ) -> (u16, u16, Vec<u8>, broadcast::Receiver<Frame>) {
+        let core = self.core.lock();
+        let (cols, rows) = core.term.size();
+        (cols, rows, core.term.snapshot(history), self.tx.subscribe())
+    }
+
     fn resized(&self, cols: u16, rows: u16) {
         let mut core = self.core.lock();
         core.term.resize(cols, rows);
@@ -113,7 +136,6 @@ impl Screen {
         let _ = self.tx.send(Frame::Exit);
     }
 
-    #[cfg(test)]
     pub(crate) fn snapshot(&self, history: bool) -> (u16, u16, Vec<u8>) {
         let core = self.core.lock();
         let (cols, rows) = core.term.size();
@@ -164,7 +186,6 @@ impl Pty {
         self.pid
     }
 
-    #[cfg(test)]
     pub(crate) fn screen(&self) -> &Arc<Screen> {
         &self.screen
     }

@@ -11699,6 +11699,7 @@ dependencies = [
  "workforce-common",
  "workforce-core",
  "workforce-decide",
+ "workforce-desk",
  "workforce-distributed",
  "workforce-gateway-client",
  "workforce-hub",
