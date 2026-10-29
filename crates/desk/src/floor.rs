@@ -165,6 +165,8 @@ pub struct Turn {
     pub waits: Vec<Wait>,
     /// The session's turn token (agents), for liveness.
     pub token: Option<String>,
+    /// The hub instance running it (agents), for liveness.
+    pub instance: Option<String>,
 }
 
 impl Turn {
@@ -747,6 +749,7 @@ mod tests {
             settled_at: None,
             waits: vec![],
             token: None,
+            instance: None,
         }
     }
 

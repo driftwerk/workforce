@@ -2758,6 +2758,11 @@ pub trait SessionStore: Send + Sync {
     /// `claim_id`.
     fn end_turn(&self, session_id: &str, token: &str) -> eyre::Result<bool>;
 
+    /// The token of the turn each of `session_ids` is running, for those
+    /// running one on an instance that is still alive: a crashed instance's
+    /// turn is not live even before its record is recovered.
+    fn live_turns(&self, session_ids: &[String]) -> eyre::Result<HashMap<String, String>>;
+
     /// Append `entry` to the session's turn journal; an entry already there is
     /// left as it is. Like the turn record, the journal lives outside the
     /// session value, so appending never touches the transcript or its
@@ -3175,6 +3180,17 @@ impl SessionStore for InMemorySessionStore {
             turns.remove(session_id);
         }
         Ok(ours)
+    }
+
+    fn live_turns(&self, session_ids: &[String]) -> eyre::Result<HashMap<String, String>> {
+        let turns = self
+            .turns
+            .lock()
+            .map_err(|e| eyre::eyre!("Lock poisoned: {}", e))?;
+        Ok(session_ids
+            .iter()
+            .filter_map(|id| Some((id.clone(), turns.get(id)?.token.clone())))
+            .collect())
     }
 
     fn journal_append(&self, session_id: &str, entry: &JournalEntry) -> eyre::Result<()> {
@@ -4186,6 +4202,19 @@ impl SessionStore for JsonlSessionStore {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
             Err(e) => Err(eyre::eyre!("Failed to remove turn record: {e}")),
         }
+    }
+
+    /// A record another process left is not live: this store is one
+    /// process's own.
+    fn live_turns(&self, session_ids: &[String]) -> eyre::Result<HashMap<String, String>> {
+        Ok(session_ids
+            .iter()
+            .filter_map(|id| {
+                let bytes = std::fs::read(self.turn_path(id)).ok()?;
+                let turn = serde_json::from_slice::<ActiveTurn>(&bytes).ok()?;
+                (turn.instance == self.instance_id).then(|| (id.clone(), turn.token))
+            })
+            .collect())
     }
 
     /// One JSON line per entry, flushed to disk before returning. A line cut
@@ -5421,6 +5450,42 @@ mod tests {
             "sealing keeps the predecessor's transcript"
         );
         assert!(store.get(&second.id).unwrap().unwrap().is_sealed());
+    }
+
+    fn assert_live_turns_are_this_processs(mine: &dyn SessionStore, other: &dyn SessionStore) {
+        let s = mine.get_or_create("ws:desk", "u", "agent-a").unwrap();
+        let ids = [s.id.clone(), "gone".to_string()];
+        assert!(mine.live_turns(&ids).unwrap().is_empty());
+        let token = mine
+            .begin_turn(&s.id, None, &TurnPrincipal::default())
+            .unwrap();
+        assert_eq!(
+            mine.live_turns(&ids).unwrap(),
+            HashMap::from([(s.id.clone(), token.clone())])
+        );
+        assert!(
+            other.live_turns(&ids).unwrap().is_empty(),
+            "another process's turn is not this store's to vouch for"
+        );
+        mine.end_turn(&s.id, &token).unwrap();
+        assert!(mine.live_turns(&ids).unwrap().is_empty());
+    }
+
+    #[test]
+    fn in_memory_live_turns_are_the_ones_it_runs() {
+        assert_live_turns_are_this_processs(
+            &InMemorySessionStore::new(),
+            &InMemorySessionStore::new_as("hub-2"),
+        );
+    }
+
+    #[test]
+    fn jsonl_live_turns_are_this_processs_records() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        assert_live_turns_are_this_processs(
+            &JsonlSessionStore::new(dir.path()).expect("store"),
+            &JsonlSessionStore::new_as(dir.path(), "hub-2").expect("store"),
+        );
     }
 
     #[test]

@@ -813,6 +813,47 @@ impl SessionStore for PostgresSessionStore {
         })
     }
 
+    fn live_turns(
+        &self,
+        session_ids: &[String],
+    ) -> Result<std::collections::HashMap<String, String>> {
+        let ids: Vec<Uuid> = session_ids
+            .iter()
+            .filter_map(|id| Uuid::parse_str(id).ok())
+            .collect();
+        if ids.is_empty() {
+            return Ok(Default::default());
+        }
+        self.block_on(async move {
+            let mut conn = self.pool.get().await?;
+            let scoped = self.scope(&mut conn).await?;
+            // Live by the rule a turn claim is stolen by: a stale heartbeat is
+            // a crashed holder, a missing one is not.
+            let rows = scoped
+                .query(
+                    "SELECT s.id, s.turn_token FROM sessions s
+                       LEFT JOIN instance_heartbeats h ON h.instance_id = s.turn_instance
+                      WHERE s.agent_id = $1 AND s.tenant_id = $2 AND s.id = ANY($3)
+                        AND s.turn_token IS NOT NULL
+                        AND (s.turn_instance = $4 OR h.instance_id IS NULL
+                             OR h.last_seen >= now() - make_interval(secs => $5::double precision))",
+                    &[
+                        &self.agent_id,
+                        &self.tenant_id(),
+                        &ids,
+                        &self.instance_id,
+                        &(HEARTBEAT_STALE_SECS as f64),
+                    ],
+                )
+                .await?;
+            scoped.finish().await?;
+            Ok(rows
+                .iter()
+                .map(|r| (r.get::<_, Uuid>(0).to_string(), r.get::<_, String>(1)))
+                .collect())
+        })
+    }
+
     fn interrupted_turns(&self) -> Result<Vec<InterruptedTurn>> {
         self.block_on(async move {
             let mut conn = self.pool.get().await?;
@@ -3621,6 +3662,66 @@ pub(crate) mod tests {
                 TurnPrincipal::default(),
                 "the old replica's turn resumes as the owner, never as alice"
             );
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_turn_is_live_until_its_instance_goes_stale_or_it_ends() {
+        with_embedded_pg_pool(|pool| async move {
+            let mine = PostgresSessionStore::with_pool(pool.clone(), "agent-a")
+                .await
+                .expect("run migrations");
+            let other = PostgresSessionStore::with_shared_pool_as(pool.clone(), "agent-a", "hub-2");
+            let sess = mine.get_or_create("slack:t:c:1", "u", "agent-a").unwrap();
+            let ids = [
+                sess.id.clone(),
+                Uuid::new_v4().to_string(),
+                "not-a-uuid".into(),
+            ];
+            assert!(other.live_turns(&ids).unwrap().is_empty());
+            let token = mine
+                .begin_turn(&sess.id, Some("msg-a"), &TurnPrincipal::default())
+                .unwrap();
+            let live = |store: &PostgresSessionStore| store.live_turns(&ids).unwrap();
+            assert_eq!(live(&mine).get(&sess.id), Some(&token));
+            assert_eq!(
+                live(&other).get(&sess.id),
+                Some(&token),
+                "no heartbeat is not a crash"
+            );
+
+            let conn = pool.get().await.unwrap();
+            let instance = mine.instance_id.clone();
+            let beat = |ago: &'static str| {
+                let (conn, instance) = (&conn, &instance);
+                async move {
+                    conn.execute(
+                        &format!(
+                            "INSERT INTO instance_heartbeats (instance_id, last_seen) \
+                             VALUES ($1, now() - interval '{ago}') \
+                             ON CONFLICT (instance_id) DO UPDATE SET last_seen = EXCLUDED.last_seen"
+                        ),
+                        &[instance],
+                    )
+                    .await
+                    .unwrap();
+                }
+            };
+            beat("1 hour").await;
+            assert!(
+                live(&other).is_empty(),
+                "a crashed instance's turn is not live"
+            );
+            assert_eq!(
+                live(&mine).get(&sess.id),
+                Some(&token),
+                "its own turn always is"
+            );
+            beat("1 second").await;
+            assert_eq!(live(&other).get(&sess.id), Some(&token));
+            mine.end_turn(&sess.id, &token).unwrap();
+            assert!(live(&other).is_empty());
         })
         .await;
     }

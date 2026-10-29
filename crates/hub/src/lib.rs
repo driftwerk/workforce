@@ -83,6 +83,7 @@ pub mod external_skill_publish;
 pub mod external_skills;
 pub mod failed_tools;
 pub mod findings;
+pub mod floor;
 pub use hub_core::formatting;
 pub mod freeagent_oauth_callback;
 pub use hub_core::fs_watcher;
