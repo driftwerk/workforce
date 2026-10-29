@@ -173,6 +173,7 @@ impl ServerHandler for LocalMcpServer {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    workforce_common::tls::install_default_crypto_provider();
     if cli::Cli::parse().dispatch()? {
         return Ok(());
     }

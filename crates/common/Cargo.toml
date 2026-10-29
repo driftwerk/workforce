@@ -24,6 +24,8 @@ chrono = { workspace = true }
 chrono-tz = "0.10"
 uuid = { workspace = true }
 tokio = { workspace = true }
+# The process-wide TLS crypto provider every binary installs (see `tls`).
+rustls = { workspace = true }
 rusqlite = { workspace = true }
 libc = "0.2"
 regex = { workspace = true }

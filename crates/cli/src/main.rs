@@ -3472,6 +3472,9 @@ fn build_oauth_state_store(
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Before any TLS client exists, including the telemetry exporters
+    // `setup_logging` builds.
+    workforce_common::tls::install_default_crypto_provider();
     workforce_common::errors::setup_error_handling()?;
     // `mcp-serve` speaks JSON-RPC on stdout; the global subscriber writes
     // logs to stdout (DD JSON formatter) and pollutes the protocol stream —

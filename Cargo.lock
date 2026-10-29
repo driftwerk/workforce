@@ -11774,6 +11774,7 @@ dependencies = [
  "refinery",
  "regex",
  "rusqlite",
+ "rustls",
  "sentry",
  "sentry-tracing",
  "serde",

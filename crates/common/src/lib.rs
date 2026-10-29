@@ -74,6 +74,7 @@ pub mod temporal;
 pub mod tenancy;
 pub mod text;
 pub mod timezone;
+pub mod tls;
 pub mod tool_input;
 pub mod trust;
 pub mod vault_scope;
