@@ -92,7 +92,10 @@ struct RetryState {
 
 /// The heartbeat runner -- manages periodic agent check-ins with external delivery.
 pub struct HeartbeatRunner {
+    /// What the agent runs with now: the install's `base`, its own
+    /// `[heartbeat]` over it, re-read each minute.
     config: HeartbeatSettings,
+    base: HeartbeatSettings,
     service: Arc<AgentService>,
     workspace: std::path::PathBuf,
     user_tz: Tz,
@@ -127,6 +130,7 @@ impl HeartbeatRunner {
         };
 
         let runner = Self {
+            base: config.clone(),
             config,
             service,
             workspace: workspace.to_path_buf(),
@@ -245,6 +249,10 @@ impl HeartbeatRunner {
         loop {
             tokio::select! {
                 _ = tokio::time::sleep(tokio::time::Duration::from_secs(60)) => {
+                    self.refresh();
+                    if !self.config.enabled {
+                        continue;
+                    }
                     if !self.is_active_hours() {
                         debug!("Skipping heartbeat outside active hours");
                         continue;
@@ -283,6 +291,37 @@ impl HeartbeatRunner {
         }
     }
 
+    /// The install's heartbeat with the agent's own `[heartbeat]` over it,
+    /// as its `config.toml` says now. An unreadable file keeps what was.
+    fn refresh(&mut self) {
+        match workforce_common::settings::AgentWorkspaceConfig::load_with_text(&self.workspace) {
+            Ok(own) => {
+                let own = own.and_then(|(config, _)| config.heartbeat);
+                self.config = self.base.for_agent(own.as_ref());
+            }
+            Err(e) => {
+                debug!(error = %e, "Heartbeat: the agent's config could not be read; keeping the last")
+            }
+        }
+    }
+
+    /// Delivers what a check-in found: into the agent's Desk DM with its
+    /// person where Desk is on (as a check-in of the agent's own), else to
+    /// the install's heartbeat channels. Whether it went anywhere.
+    async fn deliver(&self, message: String) -> bool {
+        #[cfg(feature = "postgres")]
+        if crate::desk_crew::heartbeat_found(&self.service, &message).await {
+            return true;
+        }
+        match self.delivery {
+            Some(ref delivery) => {
+                delivery("heartbeat".to_string(), message).await;
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Run one tick of the heartbeat system.
     ///
     /// If `only_check_id` is set, only that specific check is executed.
@@ -305,11 +344,19 @@ impl HeartbeatRunner {
                 .map(|mut d| d.next().is_some())
                 .unwrap_or(false);
 
-        if has_checks_dir {
+        let ran = if has_checks_dir {
             self.tick_multi_check(now, only_check_id).await;
+            true
         } else {
             // Legacy fallback: use HEARTBEAT.md
-            self.beat_legacy().await;
+            self.beat_legacy().await
+        };
+        // Only a beat that ran counts as the last: legacy mode waits out
+        // `interval_secs` from it, so a tick that found nothing due must not
+        // put it off again (it did, every minute, and the list never ran
+        // a second time).
+        if !ran {
+            return;
         }
 
         // Update persistent state
@@ -516,7 +563,7 @@ impl HeartbeatRunner {
             };
 
             if should_deliver {
-                if let Some(ref delivery) = self.delivery {
+                {
                     let count = actionable_results.len();
                     let body: String = actionable_results
                         .iter()
@@ -533,7 +580,7 @@ impl HeartbeatRunner {
                         "\u{1FAC0} Heartbeat Report ({} check(s))\n\n{}",
                         count, body
                     );
-                    delivery("heartbeat".to_string(), message).await;
+                    self.deliver(message).await;
                 }
             }
         }
@@ -667,7 +714,9 @@ impl HeartbeatRunner {
     }
 
     /// Execute the legacy single-file heartbeat (HEARTBEAT.md).
-    async fn beat_legacy(&mut self) {
+    /// Whether it ran: not when HEARTBEAT.md has nothing in it or is not
+    /// yet due.
+    async fn beat_legacy(&mut self) -> bool {
         // Load HEARTBEAT.md for the prompt
         let heartbeat_md =
             workforce_common::config_files::read(&self.workspace.join("HEARTBEAT.md"))
@@ -681,7 +730,7 @@ impl HeartbeatRunner {
                 .all(|l| l.starts_with('#') || l.trim().is_empty())
         {
             debug!("HEARTBEAT.md empty or comments only, skipping");
-            return;
+            return false;
         }
 
         // Respect interval_secs for legacy mode
@@ -693,7 +742,7 @@ impl HeartbeatRunner {
                     "Legacy heartbeat: not yet due ({}s < {}s)",
                     elapsed, self.config.interval_secs
                 );
-                return;
+                return false;
             }
         }
 
@@ -738,12 +787,7 @@ impl HeartbeatRunner {
                 };
 
                 let delivered = if should_deliver {
-                    if let Some(ref delivery) = self.delivery {
-                        delivery("heartbeat".to_string(), response.clone()).await;
-                        true
-                    } else {
-                        false
-                    }
+                    self.deliver(response.clone()).await
                 } else {
                     debug!("Heartbeat: suppressed (HEARTBEAT_OK, actionable_only mode, or quiet hours)");
                     false
@@ -776,6 +820,7 @@ impl HeartbeatRunner {
                 tracing::error!("Heartbeat error: {}", e);
             }
         }
+        true
     }
 
     /// Push a record into the history ring buffer.
@@ -1137,6 +1182,7 @@ mod tests {
         // ManuallyDrop prevents the null Arc from being dropped.
         std::mem::ManuallyDrop::new(HeartbeatRunner {
             config: HeartbeatSettings::default(),
+            base: HeartbeatSettings::default(),
             service: unsafe { Arc::from_raw(std::ptr::null::<AgentService>()) },
             workspace: std::path::PathBuf::from("/tmp/test"),
             user_tz: chrono_tz::UTC,

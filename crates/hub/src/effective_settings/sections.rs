@@ -189,6 +189,8 @@ fn tables(service: &AgentService, resolved: &ResolvedConfig) -> Vec<Layered> {
         environments: _,
         // Read and written by Desk from the agent's own file.
         oversight: _,
+        // Read by the agent's heartbeat runner from its own file.
+        heartbeat: _,
     } = workspace.clone().unwrap_or_default();
     let ToolsConfig {
         validation,

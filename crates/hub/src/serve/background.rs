@@ -35,28 +35,29 @@ pub(super) fn start_sweeps(service: &Arc<AgentService>) {
             ));
     }
 
-    // Background session scanning for memory consolidation
-    if service.effective_memory().consolidation {
+    // Background session scanning for memory consolidation. Always running,
+    // and reading the agent's `[memory]` on every pass, so that turning
+    // consolidation on or off, or changing how often, in the agent's own
+    // config takes effect without a restart.
+    {
         let scan_service = Arc::clone(service);
-        let scan_interval = service.effective_memory().consolidation_interval_secs;
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(scan_interval));
-            interval.tick().await; // skip immediate first tick
             loop {
-                interval.tick().await;
+                let every = scan_service.effective_memory().consolidation_interval_secs;
+                tokio::time::sleep(std::time::Duration::from_secs(every.max(60))).await;
+                let memory = scan_service.effective_memory();
+                if !memory.consolidation {
+                    continue;
+                }
                 if !scan_service.leader_gate.is_leader() {
                     continue; // shared stores — one consolidator per fleet
                 }
-                let model = scan_service
-                    .effective_memory()
-                    .passive_model
-                    .clone()
-                    .or_else(|| {
-                        scan_service
-                            .current_compaction_config()
-                            .compaction_model
-                            .clone()
-                    });
+                let model = memory.passive_model.clone().or_else(|| {
+                    scan_service
+                        .current_compaction_config()
+                        .compaction_model
+                        .clone()
+                });
                 let Some(ref store) = scan_service.memory_store else {
                     tracing::debug!(
                         "Session scan skipped — no memory store configured for this agent"

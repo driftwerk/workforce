@@ -1190,18 +1190,19 @@ async fn build_workflow_runtime(
 /// path has cross-agent lookup. The tool is interactive-only by
 /// construction: it reads `CURRENT_SESSION_ID` / falls back to the
 /// most recent session, neither of which is set in workflow steps.
+///
+/// Registered while the agent's own config or the install's turns the
+/// advisor on, so that an agent turned off and on again in its own config
+/// finds it there; the tool refuses while the agent's is off.
 pub fn register_advisor_tool(service: &Arc<AgentService>) {
-    if !service.effective_advisor().enabled {
+    if !service.effective_advisor().enabled && !service.config.advisor.enabled {
         return;
     }
     if service.tools.has(crate::advisor::AdvisorTool::NAME) {
         return;
     }
-    let tool = crate::advisor::AdvisorTool::new(
-        Arc::clone(service),
-        service.effective_advisor().clone(),
-        Arc::clone(&service.agent_registry),
-    );
+    let tool =
+        crate::advisor::AdvisorTool::new(Arc::clone(service), Arc::clone(&service.agent_registry));
     service.tools.register(Arc::new(tool));
     info!(
         target: "advisor",

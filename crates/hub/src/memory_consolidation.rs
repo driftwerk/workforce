@@ -103,6 +103,41 @@ const CURSOR_FILENAME: &str = "consolidation-cursor";
 /// failure mode is closed.
 pub const CONSOLIDATION_SYSTEM_IDENTITY: &str = "system:consolidation";
 
+/// Arms the agent's consolidation job as its `[memory]` now says: at its
+/// interval while consolidation is on, removed while it is off. Run when the
+/// agent's config changes either.
+pub async fn rearm(service: &crate::serve::AgentService) {
+    let Some(scheduler) = service.scheduler.as_ref() else {
+        return;
+    };
+    let memory = service.effective_memory();
+    if memory.consolidation {
+        match register_consolidation_job(
+            scheduler.as_ref(),
+            Some(memory.consolidation_interval_secs),
+        )
+        .await
+        {
+            Ok(job_id) => info!(
+                agent = %service.agent_id,
+                job_id = %job_id,
+                every_secs = memory.consolidation_interval_secs,
+                "Memory consolidation job re-armed"
+            ),
+            Err(e) => {
+                warn!(agent = %service.agent_id, error = %e, "Failed to re-arm memory consolidation")
+            }
+        }
+        return;
+    }
+    let jobs = scheduler.list_jobs().await;
+    for job in jobs.iter().filter(|j| j.name == "memory-consolidation") {
+        if scheduler.remove_job(&job.id).await {
+            info!(agent = %service.agent_id, job_id = %job.id, "Memory consolidation job removed: turned off");
+        }
+    }
+}
+
 /// Register the memory consolidation job with the scheduler.
 ///
 /// One job per agent: each run consolidates people's memories, each as that
@@ -237,6 +272,17 @@ struct UnitCursor {
     attempted: DateTime<Utc>,
 }
 
+/// When `identity`'s memories on the agent whose workspace this is were
+/// last consolidated: the end of its last successful run's scope.
+/// `None` for `identity`: anyone's, the latest.
+pub fn last_consolidated(workspace: &Path, identity: Option<&str>) -> Option<DateTime<Utc>> {
+    let cursors = UnitCursors::load(workspace);
+    match identity {
+        Some(identity) => cursors.get(Unit::of(identity)).and_then(|c| c.consolidated),
+        None => cursors.0.values().filter_map(|c| c.consolidated).max(),
+    }
+}
+
 impl UnitCursors {
     fn path(workspace: &Path) -> std::path::PathBuf {
         workspace.join("memory").join(UNIT_CURSORS_FILENAME)
@@ -305,6 +351,12 @@ pub async fn execute(
     cancel: Option<&tokio_util::sync::CancellationToken>,
 ) -> Result<String> {
     let mem = service.effective_memory();
+    // The agent's own config may have turned consolidation off since the
+    // job was armed (it is re-read on every change): a pass then does
+    // nothing until it is turned on again.
+    if !mem.consolidation {
+        return Ok("consolidation is off for this agent".to_string());
+    }
     let mut cursors = UnitCursors::load(&service.workspace);
     let units = match identity {
         Some(identity) => vec![Unit::of(identity)],

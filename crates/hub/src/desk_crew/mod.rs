@@ -115,6 +115,15 @@ pub(crate) fn for_service(service: &AgentService) -> Option<Arc<CrewHub>> {
     })
 }
 
+/// Puts what `service`'s own check-in found into its Desk DM, when Desk
+/// is on for its hub. Whether it was delivered.
+pub(crate) async fn heartbeat_found(service: &Arc<AgentService>, found: &str) -> bool {
+    match for_service(service) {
+        Some(crew) => crew.heartbeat_found(service, found).await,
+        None => false,
+    }
+}
+
 /// The crew of the hub `state` serves.
 pub(crate) fn for_state(state: &Arc<GatewayState>) -> Option<Arc<CrewHub>> {
     CREWS

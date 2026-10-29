@@ -247,6 +247,7 @@ pub(crate) mod slack_held;
 pub mod slack_manager;
 pub mod slack_onboarding;
 pub mod slack_tool;
+pub mod sqlite_memory_move;
 pub(crate) use hub_core::standing;
 pub mod state;
 pub use hub_core::stop_registry;

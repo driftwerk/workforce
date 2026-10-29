@@ -261,6 +261,40 @@ impl SqliteMemoryStore {
         })
     }
 
+    /// Every memory this store holds, forgotten ones too, as the raw
+    /// objects the other stores hold (`id` and `properties`, no vector), in
+    /// order of id: for moving them into another store, which embeds them.
+    /// A memory whose content cannot be embedded (empty) is left out and
+    /// counted in [`SqliteExport::unmovable`]. An object's id is its memory
+    /// id where that is a UUID, else one derived from it; every lookup goes
+    /// by `memoryId`, which is kept as it is.
+    pub fn export_objects(&self) -> Result<SqliteExport> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| eyre::eyre!("Failed to lock database: {}", e))?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, content, layer, owner, visibility, importance, tags,
+                        created_at, last_accessed, access_count, deleted,
+                        source, identity_id, source_session_id, source_message_ids,
+                        recurrence_count, last_recurrence_at, event_time
+                 FROM memories ORDER BY id",
+            )
+            .wrap_err("Failed to read memories")?;
+        let memories = stmt
+            .query_map([], Self::parse_row)?
+            .collect::<rusqlite::Result<Vec<Memory>>>()
+            .wrap_err("Failed to read memories")?;
+        let total = memories.len();
+        let objects: Vec<serde_json::Value> = memories.iter().filter_map(exported).collect();
+        Ok(SqliteExport {
+            total,
+            unmovable: total - objects.len(),
+            objects,
+        })
+    }
+
     /// Initialize the database schema (memories table + FTS5 index).
     fn init_schema(conn: &Connection) -> Result<()> {
         conn.execute_batch(
@@ -1129,6 +1163,38 @@ fn clone_sql_param(p: &dyn rusqlite::types::ToSql) -> Box<dyn rusqlite::types::T
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
+
+/// What [`SqliteMemoryStore::export_objects`] gives.
+#[derive(Debug, Clone)]
+pub struct SqliteExport {
+    /// Memories in the file, forgotten ones included.
+    pub total: usize,
+    /// Those left out: nothing in them can be embedded.
+    pub unmovable: usize,
+    pub objects: Vec<serde_json::Value>,
+}
+
+/// The object id `memory` is kept under elsewhere: its own id if a UUID.
+pub fn object_id_of(memory_id: &str) -> String {
+    match uuid::Uuid::parse_str(memory_id) {
+        Ok(id) => id.to_string(),
+        Err(_) => uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, memory_id.as_bytes()).to_string(),
+    }
+}
+
+/// `memory` as a raw object, with what it has become since it was made
+/// (forgotten, recalled), or `None` when its content cannot be embedded.
+fn exported(memory: &Memory) -> Option<serde_json::Value> {
+    let content =
+        workforce_common::vectorizable::VectorizableText::try_new(&memory.content).ok()?;
+    let mut properties = crate::shape::properties(memory, &content);
+    properties["deleted"] = serde_json::Value::Bool(memory.deleted);
+    properties["accessCount"] = serde_json::json!(memory.access_count);
+    Some(serde_json::json!({
+        "id": object_id_of(&memory.id.0),
+        "properties": properties,
+    }))
+}
 
 #[cfg(test)]
 mod tests {
