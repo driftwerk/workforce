@@ -411,24 +411,35 @@ impl WorkflowNotifySink {
         }
     }
 
-    async fn send(&self, surface: &str, target: &str, text: String, what: &str) -> ActionOutcome {
+    async fn send(
+        &self,
+        surface: &str,
+        target: &str,
+        thread: Option<&str>,
+        text: String,
+        what: &str,
+    ) -> ActionOutcome {
         let (surface, channel) = match self.resolve_target(surface, target).await {
             Ok(pair) => pair,
             Err(e) => return ActionOutcome::Transient(format!("{what} resolve: {e}")),
         };
-        match surface
-            .send_message(&OutboundMessage::text(channel, text))
-            .await
-        {
+        let message = OutboundMessage {
+            thread_id: thread.map(str::to_string),
+            ..OutboundMessage::text(channel, text)
+        };
+        match surface.send_message(&message).await {
             Ok(_) => ActionOutcome::Done(None),
             Err(e) => ActionOutcome::Transient(format!("{what} send: {e}")),
         }
     }
 
+    /// Post the rendered template to `target`, or — with no target — as a
+    /// reply in the matched message's thread (a top-level message's reply
+    /// opens its thread).
     async fn notify(
         &self,
         ev: &MonitorEvent,
-        target: &str,
+        target: Option<&str>,
         template: &str,
         named_surface: Option<&str>,
     ) -> ActionOutcome {
@@ -436,7 +447,12 @@ impl WorkflowNotifySink {
             Ok(surface) => surface,
             Err(e) => return ActionOutcome::Terminal(format!("notify: {e}")),
         };
-        self.send(&surface, target, ev.render(template), "notify")
+        let Some((target, thread)) = notify_destination(target, ev) else {
+            return ActionOutcome::Terminal(
+                "notify: in_thread needs a channel message to reply to".to_string(),
+            );
+        };
+        self.send(&surface, target, thread, ev.render(template), "notify")
             .await
     }
 }
@@ -461,7 +477,11 @@ impl ActionSink for WorkflowNotifySink {
                 target,
                 template,
                 surface,
-            } => self.notify(ev, target, template, surface.as_deref()).await,
+                ..
+            } => {
+                self.notify(ev, target.as_deref(), template, surface.as_deref())
+                    .await
+            }
             Action::AgentTask {
                 agent,
                 prompt,
@@ -498,13 +518,34 @@ impl ActionSink for WorkflowNotifySink {
             ActionOutcome::Terminal(format!("{reason}: no messaging surface reaches {owner}"));
         for surface in candidates {
             outcome = self
-                .send(&surface, &format!("@{owner}"), notice.to_string(), reason)
+                .send(
+                    &surface,
+                    &format!("@{owner}"),
+                    None,
+                    notice.to_string(),
+                    reason,
+                )
                 .await;
             if matches!(outcome, ActionOutcome::Done(_)) {
                 break;
             }
         }
         outcome
+    }
+}
+
+/// Where a notify posts: its target at the top level, or — with none — the
+/// matched message's channel, in the message's thread (a top-level message's
+/// own ts opens one). `None` for an in-thread reply to an observation.
+fn notify_destination<'a>(
+    target: Option<&'a str>,
+    ev: &'a MonitorEvent,
+) -> Option<(&'a str, Option<&'a str>)> {
+    match target {
+        Some(target) => Some((target, None)),
+        None => ev
+            .channel()
+            .map(|channel| (channel, Some(ev.thread().unwrap_or(ev.id())))),
     }
 }
 
@@ -859,6 +900,8 @@ impl MonitorEngine {
                 agent: agent.clone(),
                 monitor_id: mon.def.monitor.id.clone(),
                 exclude_thread_replies: binding.exclude_thread_replies,
+                exclude_users: binding.exclude_users.clone(),
+                active_hours: mon.def.monitor.active_hours.clone(),
             };
             match map.get(&channel) {
                 Some(existing) if existing.monitor_id <= persona.monitor_id => {}
@@ -1012,21 +1055,18 @@ impl MonitorEngine {
         if self.is_self(ev).await {
             return;
         }
+        let sent = ev.sent_at();
         for mon in mons {
-            // A binding that excludes thread replies fires only on top-level
-            // channel messages (the thread root still counts). Persona is a
+            // The binding's own rules (thread replies, excluded users) and the
+            // active hours, judged by when the message was sent so a sweep's
+            // catch-up decides as the live tap would have. Persona is a
             // standing binding (applied via the override layer on reload), not a
             // per-message dispatch.
-            let excludes_replies = mon
-                .def
-                .monitor
-                .binding()
-                .is_some_and(|b| b.exclude_thread_replies);
-            if excludes_replies && ev.is_thread_reply() {
+            let m = &mon.def.monitor;
+            if m.binding().is_some_and(|b| b.excludes(ev)) || !m.active_at(sent) {
                 continue;
             }
-            if !mon.def.monitor.action.is_per_message()
-                || !mon.filter().is_some_and(|filter| filter.matches(ev))
+            if !m.action.is_per_message() || !mon.filter().is_some_and(|filter| filter.matches(ev))
             {
                 continue;
             }
@@ -1361,12 +1401,16 @@ impl MonitorEngine {
 
     /// Poll `mon` only after taking its slot, so two engines — the leader's
     /// tick and a replica answering a save — never read one source at once.
-    /// `None` when the slot was not ours.
+    /// `None` when the slot was not ours, or the monitor is outside its active
+    /// hours (its state is untouched, so it polls once the window opens).
     pub async fn poll_when_due(
         &self,
         mon: &OwnedMonitor,
         state: Option<&SourceState>,
     ) -> Option<PollReport> {
+        if !mon.def.monitor.active_at(Utc::now()) {
+            return None;
+        }
         let key = mon.monitor_key();
         match self
             .store
@@ -2512,6 +2556,79 @@ template = "x"
     }
 
     #[test]
+    fn notify_replies_in_the_messages_thread_or_posts_to_its_target() {
+        let top = MonitorEvent::Message(inbound("top", "U1", "1.0"));
+        let mut reply = inbound("reply", "U1", "2.0");
+        reply.thread_ts = Some("1.0".into());
+        let reply = MonitorEvent::Message(reply);
+        assert_eq!(notify_destination(Some("C2"), &top), Some(("C2", None)));
+        assert_eq!(notify_destination(None, &top), Some(("C1", Some("1.0"))));
+        assert_eq!(notify_destination(None, &reply), Some(("C1", Some("1.0"))));
+        let observed = MonitorEvent::Observed(Observation {
+            source: "jira.search".into(),
+            key: "k".into(),
+            observed_at: Utc::now(),
+            text: String::new(),
+            value: serde_json::Value::Null,
+            previous: None,
+            item: serde_json::Value::Null,
+        });
+        assert_eq!(notify_destination(None, &observed), None);
+    }
+
+    const REPLY_TOML: &str = r#"
+[monitor]
+id = "m3"
+name = "M3"
+[monitor.active_hours]
+days = ["thu"]
+start = "10:00"
+end = "16:00"
+tz = "UTC"
+[monitor.binding]
+surface = "slack"
+channel = "C1"
+exclude_users = ["U9"]
+[monitor.action]
+type = "notify"
+in_thread = true
+template = "x"
+"#;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn excluded_users_and_messages_sent_out_of_hours_do_not_fire() {
+        let dir = temp_dir("monhours");
+        std::fs::write(dir.join("m3.toml"), REPLY_TOML).unwrap();
+        let sink = Arc::new(FakeSink::default());
+
+        workforce_postgres::test_support::with_test_pool(MonitorStore::build_pool, {
+            let dir = dir.clone();
+            let sink = Arc::clone(&sink);
+            |pool| async move {
+                let store = Arc::new(MonitorStore::new(pool).await.unwrap());
+                let engine = engine_with_monitors(&dir, store, Arc::clone(&sink), 30).await;
+                // Thursday 29 Oct 2026: 12:00, 12:01 and 09:00 UTC; Friday 12:00.
+                let (noon, later, early, friday) = (
+                    "1793275200.000100",
+                    "1793275260.000100",
+                    "1793264400.000100",
+                    "1793361600.000100",
+                );
+                engine.handle_inbound(inbound("in", "U1", noon)).await;
+                engine
+                    .handle_inbound(inbound("excluded", "U9", later))
+                    .await;
+                engine.handle_inbound(inbound("early", "U1", early)).await;
+                engine.handle_inbound(inbound("friday", "U1", friday)).await;
+
+                assert_eq!(fired_by(&sink, "m3"), [noon]);
+            }
+        })
+        .await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn notices_name_the_monitor_what_failed_and_the_reenable_command() {
         let def = MonitorDefinition::from_toml(MONITOR_TOML).unwrap();
         let notice = auto_disable_notice(
@@ -2668,9 +2785,14 @@ template = "x"
 [monitor]
 id = "p1"
 name = "P1"
+[monitor.active_hours]
+start = "10:00"
+end = "16:00"
+tz = "UTC"
 [monitor.binding]
 surface = "slack"
 channel = "C9"
+exclude_users = ["U9"]
 [monitor.filter]
 type = "all"
 [monitor.action]
@@ -2701,6 +2823,14 @@ prompt = "be helpful"
                 assert_eq!(p.agent, "lynx");
                 assert_eq!(p.system_prompt, "be helpful");
                 assert!(matches!(p.mode, ResponseMode::All));
+                assert_eq!(p.exclude_users, ["U9"]);
+                assert_eq!(
+                    p.active_hours,
+                    MonitorDefinition::from_toml(PERSONA_TOML)
+                        .unwrap()
+                        .monitor
+                        .active_hours
+                );
 
                 let mut on_c9 = inbound("hi", "U1", "5.0");
                 on_c9.channel = "C9".into();
@@ -3409,6 +3539,54 @@ template = "x"
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn a_source_is_not_polled_outside_its_active_hours() {
+        let dir = temp_dir("monsrchours");
+        // A window that closed an hour ago and opens again in two.
+        let now = Utc::now();
+        let hhmm = |offset: i64| {
+            (now + chrono::Duration::hours(offset))
+                .format("%H:%M")
+                .to_string()
+        };
+        let closed = SOURCE_TOML.replace(
+            "[monitor.source]",
+            &format!(
+                "[monitor.active_hours]\nstart = \"{}\"\nend = \"{}\"\ntz = \"UTC\"\n[monitor.source]",
+                hhmm(2),
+                hhmm(-1)
+            ),
+        );
+        std::fs::write(dir.join("src.toml"), closed).unwrap();
+        let sink = Arc::new(FakeSink::default());
+        let invoker = FakeInvoker::knowing(&["jira.search", "books.file"]);
+
+        workforce_postgres::test_support::with_test_pool(MonitorStore::build_pool, {
+            let dir = dir.clone();
+            let sink = Arc::clone(&sink);
+            let invoker = Arc::clone(&invoker);
+            |pool| async move {
+                let store = Arc::new(MonitorStore::new(pool).await.unwrap());
+                let engine = source_engine(
+                    &dir,
+                    Arc::clone(&store),
+                    Arc::clone(&sink),
+                    Arc::clone(&invoker),
+                    None,
+                    30,
+                );
+                invoker.answer(Ok(issues(&[("A-1", "open")])));
+                engine.poll_due().await;
+                let mon = engine.runtime.get("src", None).await.unwrap();
+                assert!(engine.poll_when_due(&mon, None).await.is_none());
+                assert!(invoker.calls().is_empty(), "nothing was read");
+                assert!(source_state(&store, "src").await.is_none(), "no slot taken");
+            }
+        })
+        .await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn a_source_baselines_then_fires_each_change_once_through_the_owner_s_tools() {
         let dir = temp_dir("monsrc");
         std::fs::write(dir.join("src.toml"), SOURCE_TOML).unwrap();
@@ -3798,9 +3976,10 @@ template = "x"
                 );
                 let mut edited = def.clone();
                 edited.monitor.action = Action::Notify {
-                    target: "C2".into(),
+                    target: Some("C2".into()),
                     template: "changed".into(),
                     surface: Some("slack".into()),
+                    in_thread: false,
                 };
                 engine
                     .apply_catch_up_policy(&key, &edited, Some(&def))

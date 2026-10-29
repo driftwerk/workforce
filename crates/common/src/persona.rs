@@ -5,18 +5,23 @@
 //! engine rebuilds it on every reload via [`PersonaOverrides::replace_all`]. It is
 //! deliberately NOT vault-persisted (the monitor defs are the source of truth) and
 //! is consulted by the channel adapter at message time, so changes take effect
-//! without a restart. Precedence at the adapter: a user's runtime `set_mode`
-//! (vault-persisted [`crate::engagement::EngagementOverrides`]) wins over a
-//! persona, which wins over the static channel config, which wins over the default.
+//! without a restart. The map is hub-wide, keyed by channel; an adapter applies
+//! an entry only when the agent it serves is the persona's `agent`, so every
+//! other bot in the channel keeps its own behaviour. Precedence at the adapter:
+//! a user's runtime `set_mode` (vault-persisted
+//! [`crate::engagement::EngagementOverrides`]) wins over a persona, which wins
+//! over the static channel config, which wins over the default.
 
 use std::collections::HashMap;
 
+use chrono::{DateTime, Utc};
 use tokio::sync::RwLock;
 
 use crate::settings::ResponseMode;
+use crate::timezone::ActiveHours;
 
 /// One channel's persona: the system prompt the bound agent should use, the
-/// response mode, and which agent the monitor named (for diagnostics).
+/// response mode, the agent the monitor named, and the binding's rules.
 #[derive(Debug, Clone)]
 pub struct ChannelPersona {
     pub system_prompt: String,
@@ -27,6 +32,26 @@ pub struct ChannelPersona {
     /// bound agent does not respond to messages posted as thread replies in this
     /// channel (it still engages with top-level messages and thread roots).
     pub exclude_thread_replies: bool,
+    /// Mirrors the binding's `exclude_users`: platform user ids the bound agent
+    /// does not respond to in this channel.
+    pub exclude_users: Vec<String>,
+    /// Mirrors the monitor's `active_hours`: outside it the bound agent does
+    /// not respond in this channel.
+    pub active_hours: Option<ActiveHours>,
+}
+
+impl ChannelPersona {
+    /// Whether the persona keeps its agent from answering a message: a thread
+    /// reply when replies are excluded, an excluded author, or one sent
+    /// outside the active hours.
+    pub fn ignores(&self, is_thread_reply: bool, user: Option<&str>, sent: DateTime<Utc>) -> bool {
+        (self.exclude_thread_replies && is_thread_reply)
+            || user.is_some_and(|user| self.exclude_users.iter().any(|u| u == user))
+            || self
+                .active_hours
+                .as_ref()
+                .is_some_and(|hours| !hours.contains(sent))
+    }
 }
 
 /// The live channel→persona map, rebuilt from monitor defs on reload.

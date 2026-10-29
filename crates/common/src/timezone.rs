@@ -1,5 +1,6 @@
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Datelike, NaiveTime, Utc, Weekday};
 use chrono_tz::Tz;
+use serde::{Deserialize, Serialize};
 
 /// Return the current time in the given user timezone.
 pub fn now_in_user_tz(tz: Tz) -> DateTime<Tz> {
@@ -58,6 +59,110 @@ pub fn system_prompt_section(tz: Tz) -> String {
     section
 }
 
+/// Parse an `HH:MM` wall-clock time ("08:00", "23:30").
+pub fn parse_hhmm(s: &str) -> Option<NaiveTime> {
+    let (hour, minute) = s.split_once(':')?;
+    NaiveTime::from_hms_opt(hour.parse().ok()?, minute.parse().ok()?, 0)
+}
+
+/// Whether `t` falls in `[start, end)`; an `end` before `start` wraps midnight.
+pub fn time_in_window(t: NaiveTime, start: NaiveTime, end: NaiveTime) -> bool {
+    if start <= end {
+        start <= t && t < end
+    } else {
+        t >= start || t < end
+    }
+}
+
+/// A recurring wall-clock window in a named timezone: `start` to `end` on each
+/// of `days` (every day when empty). A window whose `end` is before its
+/// `start` wraps midnight and belongs to the day it opens on; one whose `end`
+/// equals its `start` is the whole day.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "ActiveHoursSpec", into = "ActiveHoursSpec")]
+pub struct ActiveHours {
+    pub days: Vec<Weekday>,
+    pub start: NaiveTime,
+    pub end: NaiveTime,
+    pub tz: Tz,
+}
+
+/// [`ActiveHours`] as written: `days = ["mon", …]`, `start`/`end` as `HH:MM`,
+/// `tz` an IANA name.
+#[derive(Serialize, Deserialize)]
+struct ActiveHoursSpec {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    days: Vec<String>,
+    start: String,
+    end: String,
+    tz: String,
+}
+
+impl TryFrom<ActiveHoursSpec> for ActiveHours {
+    type Error = String;
+
+    fn try_from(spec: ActiveHoursSpec) -> Result<Self, Self::Error> {
+        let time = |field: &str, value: &str| {
+            parse_hhmm(value).ok_or_else(|| format!("active_hours {field} '{value}' is not HH:MM"))
+        };
+        let start = time("start", &spec.start)?;
+        let end = time("end", &spec.end)?;
+        let days = spec
+            .days
+            .iter()
+            .map(|day| {
+                day.parse::<Weekday>().map_err(|_| {
+                    format!("active_hours day '{day}' is not a weekday (mon, tue, … sun)")
+                })
+            })
+            .collect::<Result<_, _>>()?;
+        let tz = spec.tz.parse::<Tz>().map_err(|_| {
+            format!(
+                "active_hours tz '{}' is not an IANA timezone (e.g. Europe/London)",
+                spec.tz
+            )
+        })?;
+        Ok(Self {
+            days,
+            start,
+            end,
+            tz,
+        })
+    }
+}
+
+impl From<ActiveHours> for ActiveHoursSpec {
+    fn from(hours: ActiveHours) -> Self {
+        Self {
+            days: hours
+                .days
+                .iter()
+                .map(|day| day.to_string().to_lowercase())
+                .collect(),
+            start: hours.start.format("%H:%M").to_string(),
+            end: hours.end.format("%H:%M").to_string(),
+            tz: hours.tz.name().to_string(),
+        }
+    }
+}
+
+impl ActiveHours {
+    /// Whether `at` falls inside the window.
+    pub fn contains(&self, at: DateTime<Utc>) -> bool {
+        let local = at.with_timezone(&self.tz);
+        let t = local.time();
+        if self.start != self.end && !time_in_window(t, self.start, self.end) {
+            return false;
+        }
+        let opened_on = if self.start > self.end && t < self.end {
+            local.weekday().pred()
+        } else {
+            local.weekday()
+        };
+        self.days.is_empty() || self.days.contains(&opened_on)
+    }
+}
+
 /// Return the English ordinal suffix for a numeric day string ("1" → "st", "2" → "nd", etc.).
 fn ordinal_suffix(day: &str) -> &'static str {
     let n: u32 = day.parse().unwrap_or(0);
@@ -109,6 +214,102 @@ mod tests {
 
     use super::*;
     use chrono::TimeZone;
+
+    fn hours(toml: &str) -> Result<ActiveHours, String> {
+        toml::from_str::<ActiveHours>(toml).map_err(|e| e.to_string())
+    }
+
+    fn london(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> DateTime<Utc> {
+        chrono_tz::Europe::London
+            .with_ymd_and_hms(y, mo, d, h, mi, 0)
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    #[test]
+    fn parse_hhmm_reads_wall_clock_times() {
+        assert_eq!(parse_hhmm("08:00"), NaiveTime::from_hms_opt(8, 0, 0));
+        assert_eq!(parse_hhmm("23:59"), NaiveTime::from_hms_opt(23, 59, 0));
+        for bad in ["25:00", "12:60", "abc", "", "12", "1:2:3"] {
+            assert_eq!(parse_hhmm(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn active_hours_weekdays_in_local_time() {
+        let h = hours(
+            "days = [\"mon\", \"Tue\", \"wednesday\", \"thu\", \"fri\"]\n\
+             start = \"10:00\"\nend = \"16:00\"\ntz = \"Europe/London\"",
+        )
+        .unwrap();
+        // Thursday 29 Oct 2026, GMT.
+        assert!(h.contains(london(2026, 10, 29, 10, 0)));
+        assert!(h.contains(london(2026, 10, 29, 15, 59)));
+        assert!(!h.contains(london(2026, 10, 29, 16, 0)));
+        assert!(!h.contains(london(2026, 10, 29, 9, 59)));
+        // Saturday.
+        assert!(!h.contains(london(2026, 10, 31, 12, 0)));
+        // BST: 10:30 local is 09:30 UTC.
+        assert!(h.contains(london(2026, 7, 15, 10, 30)));
+        assert!(!h.contains(london(2026, 7, 15, 9, 30)));
+    }
+
+    #[test]
+    fn active_hours_wrapping_belongs_to_the_day_it_opens() {
+        let h =
+            hours("days = [\"fri\"]\nstart = \"22:00\"\nend = \"06:00\"\ntz = \"UTC\"").unwrap();
+        let at = |d, hh| Utc.with_ymd_and_hms(2026, 10, d, hh, 0, 0).unwrap();
+        assert!(h.contains(at(30, 23)), "Friday night");
+        assert!(h.contains(at(31, 2)), "early Saturday, opened Friday");
+        assert!(!h.contains(at(31, 23)), "Saturday night");
+        assert!(!h.contains(at(30, 2)), "early Friday, opened Thursday");
+    }
+
+    #[test]
+    fn active_hours_ending_where_they_start_are_the_whole_day() {
+        let h =
+            hours("days = [\"sat\"]\nstart = \"00:00\"\nend = \"00:00\"\ntz = \"UTC\"").unwrap();
+        let at = |d, hh, mm| Utc.with_ymd_and_hms(2026, 10, d, hh, mm, 0).unwrap();
+        assert!(h.contains(at(31, 0, 0)));
+        assert!(h.contains(at(31, 23, 59)));
+        assert!(!h.contains(at(30, 23, 59)), "Friday");
+        assert!(
+            !h.contains(Utc.with_ymd_and_hms(2026, 11, 1, 0, 0, 0).unwrap()),
+            "Sunday"
+        );
+    }
+
+    #[test]
+    fn active_hours_without_days_is_every_day() {
+        let h = hours("start = \"10:00\"\nend = \"16:00\"\ntz = \"UTC\"").unwrap();
+        assert!(h.days.is_empty());
+        assert!(h.contains(Utc.with_ymd_and_hms(2026, 11, 1, 12, 0, 0).unwrap()));
+    }
+
+    #[test]
+    fn active_hours_refuses_what_it_cannot_read() {
+        let err = |toml: &str| hours(toml).unwrap_err();
+        assert!(err("start = \"9\"\nend = \"16:00\"\ntz = \"UTC\"").contains("start '9'"));
+        assert!(
+            err("days = [\"funday\"]\nstart = \"10:00\"\nend = \"16:00\"\ntz = \"UTC\"")
+                .contains("'funday'")
+        );
+        assert!(err("start = \"10:00\"\nend = \"16:00\"\ntz = \"London\"").contains("IANA"));
+        assert!(err("start = \"10:00\"\nend = \"16:00\"").contains("tz"));
+    }
+
+    #[test]
+    fn active_hours_round_trips_in_its_written_form() {
+        let h = hours(
+            "days = [\"Monday\", \"fri\"]\nstart = \"07:05\"\nend = \"16:00\"\ntz = \"Europe/London\"",
+        )
+        .unwrap();
+        let written = toml::to_string(&h).unwrap();
+        assert!(written.contains("days = [\"mon\", \"fri\"]"), "{written}");
+        assert!(written.contains("start = \"07:05\""), "{written}");
+        assert!(written.contains("tz = \"Europe/London\""), "{written}");
+        assert_eq!(hours(&written).unwrap(), h);
+    }
 
     #[test]
     fn ordinal_suffixes() {

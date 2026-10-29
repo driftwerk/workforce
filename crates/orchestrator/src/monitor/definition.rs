@@ -15,6 +15,7 @@ use regex::Regex;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use workforce_common::channels::InboundEvent;
+use workforce_common::timezone::ActiveHours;
 
 use super::condition::{as_number, CompiledCondition};
 
@@ -57,6 +58,10 @@ pub struct MonitorMeta {
         deserialize_with = "deserialize_instant"
     )]
     pub expires_at: Option<DateTime<Utc>>,
+    /// Act only inside this window: a channel monitor on messages sent in it,
+    /// a source monitor by polling only in it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_hours: Option<ActiveHours>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub binding: Option<Binding>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -111,6 +116,14 @@ impl MonitorMeta {
                 .clone()
                 .unwrap_or_else(|| source.default_condition())
         })
+    }
+
+    /// Whether `at` is inside this monitor's active hours (always, when it
+    /// names none).
+    pub fn active_at(&self, at: DateTime<Utc>) -> bool {
+        self.active_hours
+            .as_ref()
+            .is_none_or(|hours| hours.contains(at))
     }
 
     /// Whether `now` is past this monitor's expiry.
@@ -170,6 +183,21 @@ pub struct Binding {
     /// injects it into a config that didn't set it.
     #[serde(default, skip_serializing_if = "is_false")]
     pub exclude_thread_replies: bool,
+    /// Platform user ids whose messages the monitor ignores.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exclude_users: Vec<String>,
+}
+
+impl Binding {
+    /// Whether the binding's own rules keep `ev` from the monitor: a thread
+    /// reply when replies are excluded, or a message from an excluded user.
+    pub fn excludes(&self, ev: &InboundEvent) -> bool {
+        (self.exclude_thread_replies && ev.is_thread_reply())
+            || ev
+                .user
+                .as_deref()
+                .is_some_and(|user| self.exclude_users.iter().any(|u| u == user))
+    }
 }
 
 /// What a source monitor reads, how often, and which part of the reading it
@@ -409,12 +437,17 @@ pub enum Action {
         #[serde(default = "empty_object", skip_serializing_if = "is_empty_object")]
         input: Value,
     },
+    /// Post `template`, rendered, to `target` — or, with `in_thread`, as a
+    /// reply in the thread of the message that matched.
     Notify {
-        target: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<String>,
         template: String,
         /// The surface to deliver on; a channel monitor's own when absent.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         surface: Option<String>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        in_thread: bool,
     },
     /// Run a one-shot agent turn for the matching message and deliver its reply
     /// to `deliver_to` (a `#channel` id or `@user` DM).
@@ -444,12 +477,13 @@ impl Action {
     }
 
     /// Where a `notify` or `agent_task` delivers: the target and the surface
-    /// it names for it, if any.
+    /// it names for it, if any. A reply in the matched message's thread
+    /// delivers nowhere of its own: it posts in the watched channel.
     pub fn delivery(&self) -> Option<(&str, Option<&str>)> {
         match self {
             Action::Notify {
                 target, surface, ..
-            } => Some((target, surface.as_deref())),
+            } => target.as_deref().map(|target| (target, surface.as_deref())),
             Action::AgentTask {
                 deliver_to,
                 surface,
@@ -674,6 +708,11 @@ impl MonitorDefinition {
             }
             _ => {}
         }
+        if binding.exclude_users.iter().any(|u| u.trim().is_empty()) {
+            return Err(eyre::eyre!(
+                "Monitor '{id}' binding.exclude_users cannot hold an empty user id"
+            ));
+        }
         CompiledFilter::compile(m.filter()).map_err(|e| eyre::eyre!("Monitor '{id}': {e}"))?;
         Ok(())
     }
@@ -707,10 +746,20 @@ impl MonitorDefinition {
             CompiledCondition::compile(condition)
                 .map_err(|e| eyre::eyre!("Monitor '{id}': {e}"))?;
         }
-        if matches!(m.action, Action::Persona { .. }) {
-            return Err(eyre::eyre!(
-                "Monitor '{id}' watches a source, which a persona cannot converse in"
-            ));
+        match m.action {
+            Action::Persona { .. } => {
+                return Err(eyre::eyre!(
+                    "Monitor '{id}' watches a source, which a persona cannot converse in"
+                ))
+            }
+            Action::Notify {
+                in_thread: true, ..
+            } => {
+                return Err(eyre::eyre!(
+                "Monitor '{id}' watches a source, so its notify has no message thread to reply in"
+            ))
+            }
+            _ => {}
         }
         Ok(())
     }
@@ -732,14 +781,22 @@ impl MonitorDefinition {
                 target,
                 template,
                 surface,
+                in_thread,
             } => {
-                if target.trim().is_empty() {
-                    return Err(needs("a target"));
-                }
                 if template.trim().is_empty() {
                     return Err(needs("a template"));
                 }
-                Self::validate_surface(id, surface.as_deref())
+                match (target.as_deref(), in_thread) {
+                    (Some(_), true) => Err(eyre::eyre!(
+                        "Monitor '{id}' notify takes a target or in_thread, not both"
+                    )),
+                    (None, false) => Err(needs("a target, or in_thread = true")),
+                    (Some(target), false) if target.trim().is_empty() => Err(needs("a target")),
+                    (None, true) if surface.is_some() => Err(eyre::eyre!(
+                        "Monitor '{id}' notify in_thread replies on the message's own surface; drop surface"
+                    )),
+                    _ => Self::validate_surface(id, surface.as_deref()),
+                }
             }
             Action::AgentTask {
                 prompt,
@@ -801,6 +858,7 @@ impl MonitorDefinition {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
 
     fn ev(text: &str, user: Option<&str>, bot_id: Option<&str>, has_files: bool) -> InboundEvent {
         InboundEvent {
@@ -1155,6 +1213,120 @@ input = { id = "{{id}}" }
         assert!(toml::to_string(&def)
             .unwrap()
             .contains("exclude_thread_replies = true"));
+    }
+
+    #[test]
+    fn exclude_users_skips_their_messages_and_is_left_out_when_empty() {
+        let def = MonitorDefinition::from_toml(VALID).unwrap();
+        assert!(!toml::to_string(&def).unwrap().contains("exclude_users"));
+        let with = VALID.replace(
+            "channel = \"C0RELEASES\"",
+            "channel = \"C0RELEASES\"\nexclude_users = [\"U1\", \"U2\"]",
+        );
+        let def = MonitorDefinition::from_toml(&with).unwrap();
+        let binding = def.monitor.binding().unwrap();
+        assert!(binding.excludes(&ev("x", Some("U2"), None, false)));
+        assert!(!binding.excludes(&ev("x", Some("U3"), None, false)));
+        assert!(!binding.excludes(&ev("x", None, Some("B1"), false)));
+        assert!(toml::to_string(&def)
+            .unwrap()
+            .contains("exclude_users = [\"U1\", \"U2\"]"));
+        let blank = VALID.replace(
+            "channel = \"C0RELEASES\"",
+            "channel = \"C0RELEASES\"\nexclude_users = [\" \"]",
+        );
+        assert!(MonitorDefinition::from_toml(&blank)
+            .unwrap_err()
+            .to_string()
+            .contains("empty user id"));
+    }
+
+    #[test]
+    fn binding_excludes_thread_replies_only_when_asked() {
+        let def = MonitorDefinition::from_toml(VALID).unwrap();
+        let reply = InboundEvent {
+            ts: "2.0".into(),
+            thread_ts: Some("1.0".into()),
+            ..ev("x", Some("U1"), None, false)
+        };
+        assert!(!def.monitor.binding().unwrap().excludes(&reply));
+        let with = VALID.replace(
+            "channel = \"C0RELEASES\"",
+            "channel = \"C0RELEASES\"\nexclude_thread_replies = true",
+        );
+        let def = MonitorDefinition::from_toml(&with).unwrap();
+        assert!(def.monitor.binding().unwrap().excludes(&reply));
+    }
+
+    #[test]
+    fn active_hours_gate_both_kinds_and_round_trip() {
+        let hours = "[monitor.active_hours]\ndays = [\"mon\", \"fri\"]\nstart = \"10:00\"\nend = \"16:00\"\ntz = \"Europe/London\"\n\n";
+        let at = |d, h| Utc.with_ymd_and_hms(2026, 10, d, h, 0, 0).unwrap();
+        for toml in [VALID, SOURCE] {
+            let def = MonitorDefinition::from_toml(toml).unwrap();
+            assert!(
+                def.monitor.active_at(at(31, 3)),
+                "no window is always active"
+            );
+            let with = toml.replacen("\n[monitor.", &format!("\n{hours}[monitor."), 1);
+            let def = MonitorDefinition::from_toml(&with).unwrap();
+            // Friday 30 Oct 2026, GMT.
+            assert!(def.monitor.active_at(at(30, 12)));
+            assert!(!def.monitor.active_at(at(30, 17)));
+            assert!(!def.monitor.active_at(at(29, 12)), "Thursday");
+            let written = toml::to_string(&def).unwrap();
+            let again = MonitorDefinition::from_toml(&written).unwrap();
+            assert_eq!(again.monitor.active_hours, def.monitor.active_hours);
+        }
+        let bad = VALID.replacen(
+            "\n[monitor.",
+            "\n[monitor.active_hours]\nstart = \"10:00\"\nend = \"16:00\"\ntz = \"Mars/Base\"\n\n[monitor.",
+            1,
+        );
+        assert!(
+            format!("{:?}", MonitorDefinition::from_toml(&bad).unwrap_err()).contains("Mars/Base")
+        );
+    }
+
+    #[test]
+    fn notify_replies_in_the_thread_or_names_a_target() {
+        let in_thread = with_action(
+            "[monitor.action]\ntype = \"notify\"\nin_thread = true\ntemplate = \"Thanks — logged.\"\n",
+        );
+        let def = MonitorDefinition::from_toml(&in_thread).unwrap();
+        assert_eq!(
+            def.monitor.action.delivery(),
+            None,
+            "it posts where the message is"
+        );
+        let written = toml::to_string(&def).unwrap();
+        assert!(
+            written.contains("in_thread = true") && !written.contains("target"),
+            "{written}"
+        );
+
+        let targeted = with_action(
+            "[monitor.action]\ntype = \"notify\"\ntarget = \"C0OUT\"\ntemplate = \"x\"\n",
+        );
+        let def = MonitorDefinition::from_toml(&targeted).unwrap();
+        assert_eq!(def.monitor.action.delivery(), Some(("C0OUT", None)));
+        assert!(!toml::to_string(&def).unwrap().contains("in_thread"));
+
+        let refusal = |toml: &str| MonitorDefinition::from_toml(toml).unwrap_err().to_string();
+        assert!(refusal(
+            &in_thread.replace("in_thread = true", "in_thread = true\ntarget = \"C0OUT\"")
+        )
+        .contains("not both"));
+        assert!(refusal(&with_action(
+            "[monitor.action]\ntype = \"notify\"\ntemplate = \"x\"\n"
+        ))
+        .contains("in_thread"));
+        assert!(refusal(&format!("{in_thread}surface = \"slack\"\n")).contains("drop surface"));
+        let source = SOURCE.replace(
+            "type = \"run_skill\"\ntool = \"books.file_invoice\"\ninput = { id = \"{{id}}\" }",
+            "type = \"notify\"\nin_thread = true\ntemplate = \"x\"",
+        );
+        assert!(refusal(&source).contains("no message thread"));
     }
 
     #[test]

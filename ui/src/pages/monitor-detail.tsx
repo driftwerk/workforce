@@ -37,11 +37,18 @@ enabled = true
 # once = true            # optional: stop after the first successful fire
 # expires_at = "2026-12-31T00:00:00Z"   # optional: stop then, telling the owner
 
+# [monitor.active_hours] # optional: act only on messages sent inside this window
+# days = ["mon", "tue", "wed", "thu", "fri"]   # default every day
+# start = "10:00"
+# end = "16:00"          # exclusive; an end before start runs past midnight
+# tz = "Europe/London"   # required: an IANA timezone
+
 [monitor.binding]
 surface = "slack"        # "slack" | "teams" | "any"
 channel = "C0XXXXXXX"    # the channel id to watch
 # exclude_thread_replies = true   # optional (default false): only top-level
                                   # channel messages, never thread replies
+# exclude_users = ["U0XXXXXXX"]   # optional: ignore these users' messages
 
 [monitor.filter]
 type = "contains_any"    # all | contains_any | regex | from_user | from_bot | from_human | has_file
@@ -66,6 +73,10 @@ workflow = "my-workflow"
 # type = "notify"
 # target = "C0OUTPUT"            # channel id, or "@U0XXXXXXX" to DM a user
 # template = "New release: {{text}}"   # {{text}} {{user}} {{channel}} {{ts}} {{json:/a/b}}
+# --- or reply in the thread of the matching message (no target) ---
+# type = "notify"
+# in_thread = true               # pair with exclude_thread_replies = true and type = "from_human"
+# template = "Thanks — logged."  # or every reply in that thread is answered again
 # --- or run a one-shot agent turn and deliver its reply ---
 # type = "agent_task"
 # agent = "lynx"                 # optional; defaults to the default agent
@@ -87,6 +98,12 @@ enabled = true
                          # else the hub's default agent)
 # once = true            # optional: stop after the first successful fire
 # expires_at = "2026-12-31T00:00:00Z"   # optional: stop then, telling the owner
+
+# [monitor.active_hours] # optional: poll only inside this window
+# days = ["mon", "tue", "wed", "thu", "fri"]   # default every day
+# start = "09:00"
+# end = "18:00"          # exclusive; an end before start runs past midnight
+# tz = "Europe/London"   # required: an IANA timezone
 
 [monitor.source]
 tool = "google.gmail.search"      # any tool you may call: an adapter, http.request, a WASM skill
