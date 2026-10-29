@@ -350,9 +350,12 @@ pub async fn memory_summary(
             Json(serde_json::json!({"error": "the memory store did not answer"})),
         ))
     };
+    // A count of no one's is of everyone's: lessons are the agent's own,
+    // and the install's token sees all.
     let count = |identity: Option<String>, source: Option<MemorySource>| {
         store.count(MemoryFilter {
             owner: Some(service.agent_id.clone()),
+            system_unscoped: identity.is_none(),
             identity_id: identity,
             source,
             ..Default::default()
