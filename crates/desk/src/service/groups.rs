@@ -787,6 +787,7 @@ mod tests {
         let desk = Desk::start(
             store,
             crate::testing::options(dir),
+            Default::default(),
             tokio_util::sync::CancellationToken::new(),
         )
         .await
@@ -893,6 +894,7 @@ mod tests {
                 let again = Desk::start(
                     DeskStore::from_pool(pool),
                     crate::testing::options(dir.path()),
+                    Default::default(),
                     tokio_util::sync::CancellationToken::new(),
                 )
                 .await
@@ -941,6 +943,7 @@ mod tests {
                 let again = Desk::start(
                     DeskStore::from_pool(pool.clone()),
                     crate::testing::options(dir.path()),
+                    Default::default(),
                     tokio_util::sync::CancellationToken::new(),
                 )
                 .await

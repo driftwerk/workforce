@@ -142,7 +142,7 @@ pub(crate) fn config_saved(service: &AgentService) {
     }
 }
 
-fn name_of(service: &AgentService) -> String {
+pub(crate) fn name_of(service: &AgentService) -> String {
     service
         .display_name()
         .unwrap_or_else(|| service.agent_id.as_str().to_string())

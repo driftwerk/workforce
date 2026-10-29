@@ -486,7 +486,7 @@ pub async fn mount(
         .await
         .context("opening the desk registry")?;
     let cancel_crew = cancel.clone();
-    let desk = Desk::start(store, options(config), cancel)
+    let desk = Desk::start(store, options(config), crate::floor::desk_floor(), cancel)
         .await
         .context("starting desk sessions")?;
     if DESK.set(desk.clone()).is_err() {

@@ -85,6 +85,7 @@ pub(crate) async fn desk_on(
     crate::service::Desk::start(
         crate::store::DeskStore::from_pool(pool),
         options(dir),
+        Default::default(),
         tokio_util::sync::CancellationToken::new(),
     )
     .await

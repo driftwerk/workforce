@@ -895,6 +895,7 @@ mod tests {
             let d = Desk::start(
                 crate::store::DeskStore::from_pool(pool.clone()),
                 opts.clone(),
+                Default::default(),
                 cancel.clone(),
             )
             .await
@@ -946,7 +947,7 @@ mod tests {
             );
             assert_eq!(saved[0].env["DESK_HOOK_TOKEN"], "tok");
 
-            let d = Desk::start(store, opts, CancellationToken::new())
+            let d = Desk::start(store, opts, Default::default(), CancellationToken::new())
                 .await
                 .unwrap();
             let back = d.terminal(id).unwrap();
@@ -1014,6 +1015,7 @@ mod tests {
         Desk::start(
             crate::store::DeskStore::from_pool(pool),
             opts,
+            Default::default(),
             CancellationToken::new(),
         )
         .await
@@ -1211,6 +1213,7 @@ mod tests {
             let d = Desk::start(
                 crate::store::DeskStore::from_pool(pool.clone()),
                 opts.clone(),
+                Default::default(),
                 cancel.clone(),
             )
             .await
@@ -1248,6 +1251,7 @@ mod tests {
             let d = Desk::start(
                 crate::store::DeskStore::from_pool(pool),
                 opts,
+                Default::default(),
                 CancellationToken::new(),
             )
             .await

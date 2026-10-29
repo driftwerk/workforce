@@ -242,6 +242,7 @@ mod tests {
                 adopt_every: None,
                 holder: None,
             },
+            Default::default(),
             CancellationToken::new(),
         )
         .await

@@ -3,8 +3,11 @@
 
 use std::collections::HashSet;
 
+use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
+use crate::crew;
+use crate::floor::{Answer, DecideRef, Outcome, Place, Subject, Turn, TurnOp, Wait};
 use crate::model::{PendingApproval, SessionState, SessionView};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -15,7 +18,16 @@ pub(super) enum Transition<'a> {
     Prompted {
         prompt: &'a str,
     },
+    /// The person's prompt reached it otherwise: its first, given at start,
+    /// or one typed while it was busy.
+    Spoke {
+        prompt: &'a str,
+    },
     Blocked {
+        pending: &'a PendingApproval,
+    },
+    /// A request Desk could answer passed to the terminal.
+    ToTerminal {
         pending: &'a PendingApproval,
     },
     /// A request it was waiting on was answered: through Desk, or in its
@@ -89,12 +101,196 @@ impl<'a> Transition<'a> {
             }
             _ => None,
         };
+        let spoke = now
+            .last_prompt
+            .as_deref()
+            .filter(|_| !matches!(state, Some(Self::Prompted { .. })))
+            .filter(|_| {
+                now.last_prompt != before.last_prompt
+                    || (now.state == S::Working && matches!(before.state, S::Starting | S::Idle))
+            })
+            .map(|prompt| Self::Spoke { prompt });
+        let to_terminal = now
+            .pending
+            .as_ref()
+            .filter(|p| {
+                !p.answerable
+                    && before
+                        .pending
+                        .as_ref()
+                        .is_some_and(|b| b.id == p.id && b.answerable)
+            })
+            .map(|pending| Self::ToTerminal { pending });
         let tool = now
             .current_tool
             .as_deref()
             .filter(|_| now.state == S::Working && now.current_tool != before.current_tool)
             .map(|tool| Self::Tool { tool });
-        unblocked.into_iter().chain(state).chain(tool).collect()
+        unblocked
+            .into_iter()
+            .chain(state)
+            .chain(spoke)
+            .chain(to_terminal)
+            .chain(tool)
+            .collect()
+    }
+}
+
+/// The turn log's writes for `transitions` of `now`, at `at`, given the turn
+/// it has open; and the turn open after them. A turn begins on the person's
+/// prompt, or (not theirs to settle anything) when work is seen without one.
+pub(super) fn turn_ops(
+    transitions: &[Transition<'_>],
+    now: &SessionView,
+    open: Option<Uuid>,
+    at: DateTime<Utc>,
+    mut fresh: impl FnMut() -> Uuid,
+) -> (Vec<TurnOp>, Option<Uuid>) {
+    let subject = Subject::Session {
+        id: now.id,
+        engine: now.engine,
+    };
+    let mut begin = |by_person: bool, task: Option<&str>| {
+        let id = fresh();
+        let turn = Turn {
+            id,
+            owner: None,
+            subject: subject.clone(),
+            name: now.label().to_string(),
+            place: Place::Session,
+            task: task
+                .map(|t| crew::one_line(t, TASK_CHARS))
+                .filter(|t| !t.is_empty()),
+            doing: None,
+            started_at: at,
+            heard_at: at,
+            ended_at: None,
+            outcome: None,
+            answer: None,
+            question: None,
+            settled_at: None,
+            waits: vec![],
+            token: None,
+            instance: None,
+        };
+        (
+            TurnOp::Begin {
+                turn: Box::new(turn),
+                by_person,
+            },
+            id,
+        )
+    };
+    let task = now
+        .last_prompt
+        .as_deref()
+        .or(Some(now.goal.as_str()).filter(|g| !g.trim().is_empty()));
+    let end = |turn: Uuid, (outcome, answer, question)| TurnOp::End {
+        turn,
+        at,
+        outcome,
+        answer,
+        question,
+    };
+    let settle = || TurnOp::Settle {
+        subject: subject.key(),
+        owner: None,
+        at,
+    };
+    let mut ops = Vec::new();
+    let mut open = open;
+    for t in transitions {
+        let mut working = |ops: &mut Vec<TurnOp>, open: &mut Option<Uuid>| match *open {
+            Some(id) => id,
+            None => {
+                let (op, id) = begin(false, task);
+                ops.push(op);
+                *open = Some(id);
+                id
+            }
+        };
+        match *t {
+            Transition::Started | Transition::Resumed => {}
+            Transition::Prompted { prompt } => {
+                if let Some(id) = open.take() {
+                    ops.push(end(id, (Outcome::Interrupted, None, None)));
+                }
+                let (op, id) = begin(true, Some(prompt));
+                ops.push(op);
+                open = Some(id);
+            }
+            Transition::Spoke { prompt } => match open {
+                Some(_) => ops.push(settle()),
+                None => {
+                    let (op, id) = begin(true, Some(prompt));
+                    ops.push(op);
+                    open = Some(id);
+                }
+            },
+            Transition::Blocked { pending } | Transition::ToTerminal { pending } => {
+                let turn = working(&mut ops, &mut open);
+                ops.push(TurnOp::Wait {
+                    turn,
+                    wait: wait_of(now.id, pending),
+                });
+            }
+            Transition::Unblocked { pending, .. } => {
+                if let Some(turn) = open {
+                    ops.push(TurnOp::Unwait {
+                        turn,
+                        key: pending.id.to_string(),
+                        at,
+                    });
+                }
+            }
+            Transition::Finished { reply } => {
+                let turn = working(&mut ops, &mut open);
+                ops.push(end(turn, crew::outcome_of(Ok(reply))));
+                open = None;
+            }
+            Transition::Stopped { .. } | Transition::Interrupted => {
+                let outcome = match t {
+                    Transition::Interrupted => Outcome::Interrupted,
+                    _ => Outcome::Stopped,
+                };
+                if let Some(id) = open.take() {
+                    ops.push(end(id, (outcome, None, None)));
+                }
+                ops.push(settle());
+            }
+            Transition::Tool { tool } => {
+                let turn = working(&mut ops, &mut open);
+                ops.push(TurnOp::Progress {
+                    turn,
+                    doing: Some(format!("● {tool}")),
+                    at,
+                });
+            }
+        }
+    }
+    (ops, open)
+}
+
+/// How long a turn's task line is kept.
+const TASK_CHARS: usize = 120;
+
+/// A pending request as the wait it makes.
+fn wait_of(session: Uuid, p: &PendingApproval) -> Wait {
+    Wait {
+        key: p.id.to_string(),
+        from: p.since,
+        to: None,
+        ask: crew::approval_summary(&p.tool, &p.detail),
+        answer: match (p.tool.as_str(), p.answerable) {
+            ("Input", _) => Answer::Reply,
+            (_, true) => Answer::Decide {
+                at: DecideRef::Session {
+                    session_id: session,
+                    approval_id: p.id,
+                },
+            },
+            (_, false) => Answer::Terminal,
+        },
     }
 }
 
@@ -359,6 +555,192 @@ mod tests {
             Desk::session_events(&mut st, &[Transition::Stopped { closed: false }], &now)
                 .is_empty(),
             "a stop someone's action recorded is not recorded again"
+        );
+    }
+
+    fn ops(
+        transitions: &[Transition<'_>],
+        now: &SessionView,
+        open: Option<Uuid>,
+    ) -> (Vec<TurnOp>, Option<Uuid>) {
+        let mut n = 0u128;
+        turn_ops(transitions, now, open, now.updated_at, || {
+            n += 1;
+            Uuid::from_u128(n)
+        })
+    }
+
+    fn kinds(ops: &[TurnOp]) -> Vec<&'static str> {
+        ops.iter()
+            .map(|op| match op {
+                TurnOp::Begin {
+                    by_person: true, ..
+                } => "begin by person",
+                TurnOp::Begin { .. } => "begin",
+                TurnOp::Progress { .. } => "progress",
+                TurnOp::Wait { .. } => "wait",
+                TurnOp::Unwait { .. } => "unwait",
+                TurnOp::End { .. } => "end",
+                TurnOp::Settle { .. } => "settle",
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_sessions_changes_write_its_turns() {
+        use SessionState as S;
+        let working = view(S::Working);
+        let open = Some(Uuid::from_u128(99));
+        let (o, after) = ops(&[Transition::Prompted { prompt: "fix it" }], &working, None);
+        assert_eq!(
+            (kinds(&o), after),
+            (vec!["begin by person"], Some(Uuid::from_u128(1)))
+        );
+        let TurnOp::Begin { turn, .. } = &o[0] else {
+            unreachable!()
+        };
+        assert_eq!(
+            (turn.task.as_deref(), turn.owner.as_deref(), &turn.place),
+            (Some("fix it"), None, &Place::Session)
+        );
+
+        let (o, after) = ops(&[Transition::Prompted { prompt: "again" }], &working, open);
+        assert_eq!(
+            kinds(&o),
+            ["end", "begin by person"],
+            "a turn left open ends"
+        );
+        assert_eq!(after, Some(Uuid::from_u128(1)));
+
+        let (o, after) = ops(&[Transition::Spoke { prompt: "and docs" }], &working, open);
+        assert_eq!(
+            (kinds(&o), after),
+            (vec!["settle"], open),
+            "spoken to while busy"
+        );
+        let (o, _) = ops(&[Transition::Spoke { prompt: "first" }], &working, None);
+        assert_eq!(kinds(&o), ["begin by person"]);
+
+        let p = pending("Bash(cargo test)");
+        let (o, after) = ops(&[Transition::Blocked { pending: &p }], &working, None);
+        assert_eq!(kinds(&o), ["begin", "wait"], "work seen without a prompt");
+        assert_eq!(after, Some(Uuid::from_u128(1)));
+        let TurnOp::Wait { wait, .. } = &o[1] else {
+            unreachable!()
+        };
+        assert_eq!(
+            (wait.key.clone(), wait.ask.as_str(), &wait.answer),
+            (
+                p.id.to_string(),
+                "Run cargo test?",
+                &Answer::Decide {
+                    at: DecideRef::Session {
+                        session_id: working.id,
+                        approval_id: p.id
+                    }
+                }
+            )
+        );
+        let terminal = PendingApproval {
+            answerable: false,
+            ..p.clone()
+        };
+        let (o, _) = ops(
+            &[Transition::ToTerminal { pending: &terminal }],
+            &working,
+            open,
+        );
+        let TurnOp::Wait { wait, .. } = &o[0] else {
+            unreachable!()
+        };
+        assert_eq!(wait.answer, Answer::Terminal);
+        let input = PendingApproval {
+            tool: "Input".into(),
+            ..terminal
+        };
+        let (o, _) = ops(&[Transition::Blocked { pending: &input }], &working, open);
+        let TurnOp::Wait { wait, .. } = &o[0] else {
+            unreachable!()
+        };
+        assert_eq!(
+            wait.answer,
+            Answer::Reply,
+            "asking in its terminal is a question"
+        );
+
+        let (o, after) = ops(
+            &[Transition::Unblocked {
+                pending: &p,
+                by_desk: false,
+            }],
+            &working,
+            open,
+        );
+        assert_eq!((kinds(&o), after), (vec!["unwait"], open));
+
+        let (o, after) = ops(&[Transition::Tool { tool: "Bash(ls)" }], &working, open);
+        assert_eq!((kinds(&o), after), (vec!["progress"], open));
+
+        let (o, after) = ops(
+            &[Transition::Finished {
+                reply: "Done. Ship it?",
+            }],
+            &working,
+            open,
+        );
+        assert_eq!((kinds(&o), after), (vec!["end"], None));
+        let TurnOp::End {
+            outcome, question, ..
+        } = &o[0]
+        else {
+            unreachable!()
+        };
+        assert_eq!(*outcome, Outcome::Asked);
+        assert_eq!(question.as_ref().unwrap().text, "Ship it?");
+
+        let (o, after) = ops(&[Transition::Stopped { closed: false }], &working, open);
+        assert_eq!((kinds(&o), after), (vec!["end", "settle"], None));
+        let (o, _) = ops(&[Transition::Interrupted], &working, None);
+        assert_eq!(kinds(&o), ["settle"]);
+        let (o, after) = ops(&[Transition::Started, Transition::Resumed], &working, open);
+        assert_eq!((kinds(&o), after), (vec![], open));
+    }
+
+    #[test]
+    fn the_persons_prompt_reaching_it_otherwise_is_spoken() {
+        use SessionState as S;
+        let none = HashSet::new();
+        let idle = view(S::Idle);
+        let first = view(S::Working);
+        assert_eq!(
+            Transition::of(Some(&idle), &first, &none),
+            [Transition::Spoke {
+                prompt: "fix the login"
+            }],
+            "the prompt it was started with"
+        );
+        let typed = SessionView {
+            last_prompt: Some("and the docs".into()),
+            ..first.clone()
+        };
+        assert_eq!(
+            Transition::of(Some(&first), &typed, &none),
+            [Transition::Spoke {
+                prompt: "and the docs"
+            }],
+            "typed while it worked"
+        );
+        let p = pending("Bash(cargo test)");
+        let asks = blocked(&p);
+        let handed = blocked(&PendingApproval {
+            answerable: false,
+            ..p.clone()
+        });
+        assert_eq!(
+            Transition::of(Some(&asks), &handed, &none),
+            [Transition::ToTerminal {
+                pending: handed.pending.as_ref().unwrap()
+            }]
         );
     }
 }

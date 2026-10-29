@@ -138,6 +138,7 @@ async fn desk(pool: workforce_postgres::PostgresPool, dir: &Path) -> Desk {
             adopt_every: None,
             holder: None,
         },
+        Default::default(),
         CancellationToken::new(),
     )
     .await

@@ -5,12 +5,22 @@
 use workforce_common::settings::WorkforceConfig;
 
 #[cfg(feature = "postgres")]
+pub(crate) mod agents;
+#[cfg(feature = "postgres")]
 mod log;
 #[cfg(feature = "postgres")]
 pub mod postgres;
 
 #[cfg(feature = "postgres")]
 pub use log::turns;
+
+/// What the desk reports to: the installed log.
+#[cfg(feature = "postgres")]
+pub fn desk_floor() -> workforce_desk::Floor {
+    workforce_desk::Floor {
+        turns: turns().cloned(),
+    }
+}
 
 /// Opens the log once and keeps it pruned; nothing without Postgres.
 pub async fn install(config: &WorkforceConfig) {

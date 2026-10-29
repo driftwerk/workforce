@@ -18,7 +18,7 @@ use crate::adopt::{self, External};
 use crate::claude::{self, Hook};
 use crate::codex::{self, AppServer, CodexEvent, Seen};
 use crate::crew::{self, By, Event, Kind, Party};
-use crate::floor::Outcome;
+use crate::floor::{Outcome, TurnLog, TurnOp};
 use crate::holder::{Held, Holder};
 use crate::model::{
     Approvals, Decision, DeskEvent, Engine, NewSession, Origin, PendingApproval, SessionPatch,
@@ -163,6 +163,8 @@ struct State {
     acted: HashSet<Uuid>,
     /// Requests Desk answered, until the change that clears them is seen.
     decided: HashSet<Uuid>,
+    /// The turn each session has open in the floor's log.
+    turns: HashMap<Uuid, OpenTurn>,
     terminals: HashMap<Uuid, TerminalRecord>,
     terminal_ptys: HashMap<Uuid, Arc<Pty>>,
     /// The sidebar's groups.
@@ -172,12 +174,29 @@ struct State {
 /// How often a busy session's tool is recorded as `working`.
 const WORKING_EVERY: Duration = Duration::from_secs(60);
 
+/// How often a busy session's progress is written to the floor's log.
+const PROGRESS_EVERY: Duration = Duration::from_secs(15);
+
+#[derive(Debug, Clone, Copy)]
+struct OpenTurn {
+    id: Uuid,
+    progressed: Option<std::time::Instant>,
+}
+
+/// Where the desk reports what it sees beyond its own registry: the floor's
+/// turn log.
+#[derive(Clone, Default)]
+pub struct Floor {
+    pub turns: Option<Arc<dyn TurnLog>>,
+}
+
 enum Persist {
     Terminal(Box<TerminalRecord>),
     DeleteTerminal(Uuid),
     Put(Box<SessionRecord>),
     Delete(Uuid),
     Event(Box<Event>),
+    Turn(Box<TurnOp>),
 }
 
 struct Inner {
@@ -269,7 +288,12 @@ impl Desk {
     /// Loads the registry, marks what was running as interrupted or stopped
     /// (its processes did not survive the hub), and starts the hook endpoint
     /// and the adoption poller. `cancel` stops all of it and every session.
-    pub async fn start(store: DeskStore, opts: Options, cancel: CancellationToken) -> Result<Self> {
+    pub async fn start(
+        store: DeskStore,
+        opts: Options,
+        floor: Floor,
+        cancel: CancellationToken,
+    ) -> Result<Self> {
         let store = Arc::new(store);
         let layout = store.layout().await?;
         let (holder, held) = connect_holder(opts.holder.as_ref()).await;
@@ -324,7 +348,7 @@ impl Desk {
             holder: Mutex::new(holder),
             layout_write: tokio::sync::Mutex::new(()),
         }));
-        tokio::spawn(persist_loop(store, persist_rx));
+        tokio::spawn(persist_loop(store, floor.turns, persist_rx));
         recovered.into_iter().for_each(|r| desk.save(r));
         desk.adopt_held(held).await;
 
@@ -504,7 +528,7 @@ impl Desk {
 
     /// Saves `r`, recording what changed since `before` as activity.
     fn save_after(&self, before: Option<SessionView>, r: SessionRecord) {
-        let (view, events) = {
+        let (view, events, ops) = {
             let mut st = self.0.state.lock();
             st.records.insert(r.id, r.clone());
             let view = Self::view_of(&st, &r);
@@ -518,13 +542,63 @@ impl Desk {
                 }
             });
             let events = Self::session_events(&mut st, &transitions, &view);
-            (view, events)
+            let ops = Self::turn_ops(&mut st, &transitions, &view);
+            (view, events, ops)
         };
         let _ = self.0.persist.send(Persist::Put(Box::new(r)));
         let _ = self.0.events.send(DeskEvent::Session {
             session: Box::new(view),
         });
         events.into_iter().for_each(|e| self.note(e));
+        ops.into_iter().for_each(|op| {
+            let _ = self.0.persist.send(Persist::Turn(Box::new(op)));
+        });
+    }
+
+    /// The floor's writes for a session's change, keeping its open turn and
+    /// writing its progress no more often than [`PROGRESS_EVERY`].
+    fn turn_ops(st: &mut State, transitions: &[Transition<'_>], now: &SessionView) -> Vec<TurnOp> {
+        let open = st.turns.get(&now.id).copied();
+        let (ops, after) = transition::turn_ops(
+            transitions,
+            now,
+            open.map(|o| o.id),
+            now.updated_at,
+            Uuid::new_v4,
+        );
+        let progressed = open
+            .filter(|o| Some(o.id) == after)
+            .and_then(|o| o.progressed);
+        let due = progressed.is_none_or(|at| at.elapsed() >= PROGRESS_EVERY);
+        let ops: Vec<TurnOp> = ops
+            .into_iter()
+            .filter(|op| due || !matches!(op, TurnOp::Progress { .. }))
+            .collect();
+        let wrote_progress = ops.iter().any(|op| matches!(op, TurnOp::Progress { .. }));
+        match after {
+            Some(id) => {
+                st.turns.insert(
+                    now.id,
+                    OpenTurn {
+                        id,
+                        progressed: if wrote_progress {
+                            Some(std::time::Instant::now())
+                        } else {
+                            progressed
+                        },
+                    },
+                );
+            }
+            None => {
+                st.turns.remove(&now.id);
+            }
+        }
+        ops
+    }
+
+    /// The turns the floor's log has open for sessions running now.
+    pub fn open_turns(&self) -> HashSet<Uuid> {
+        self.0.state.lock().turns.values().map(|t| t.id).collect()
     }
 
     /// Tells every Desk watching.
@@ -572,7 +646,9 @@ impl Desk {
                 } => Some(
                     own(Kind::Answered, "was answered in its terminal".into()).approval(pending.id),
                 ),
-                Transition::Unblocked { by_desk: true, .. } => None,
+                Transition::Unblocked { by_desk: true, .. }
+                | Transition::Spoke { .. }
+                | Transition::ToTerminal { .. } => None,
                 Transition::Finished { reply } => Some(match crew::outcome_of(Ok(reply)) {
                     (Outcome::Limit, _, _) => own(Kind::Limit, "hit its usage limit".into()),
                     (Outcome::Asked, _, Some(q)) => {
@@ -1598,13 +1674,14 @@ impl Desk {
         match tokio::time::timeout(wait, rx).await {
             Ok(Ok(answer)) => answer,
             _ => {
-                if let Some(l) = self.0.state.lock().live.get_mut(&id) {
-                    if let Some(p) = l.pending.as_mut().filter(|p| p.id == pending.id) {
-                        p.answerable = false;
+                self.change(id, |_, l| {
+                    if let Some(l) = l {
+                        if let Some(p) = l.pending.as_mut().filter(|p| p.id == pending.id) {
+                            p.answerable = false;
+                        }
+                        l.answer = None;
                     }
-                    l.answer = None;
-                }
-                self.publish(id);
+                });
                 claude::ask_in_terminal()
             }
         }
@@ -1657,12 +1734,16 @@ impl Desk {
                         };
                         r.restore_offer = false;
                         if let Some(l) = l {
-                            l.pending = waiting.then(|| PendingApproval {
-                                id: Uuid::new_v4(),
-                                tool: l.current_tool.clone().unwrap_or_else(|| "Codex".into()),
-                                detail: "Answer in the terminal".into(),
-                                since: Utc::now(),
-                                answerable: false,
+                            // A repeated notice is the same request, still asked.
+                            let asked = l.pending.take();
+                            l.pending = waiting.then(|| {
+                                asked.unwrap_or_else(|| PendingApproval {
+                                    id: Uuid::new_v4(),
+                                    tool: l.current_tool.clone().unwrap_or_else(|| "Codex".into()),
+                                    detail: "Answer in the terminal".into(),
+                                    since: Utc::now(),
+                                    answerable: false,
+                                })
                             });
                         }
                     }
@@ -1941,14 +2022,24 @@ fn find_transcript(home: &Path, session_id: &str) -> Option<String> {
         .map(|p| p.to_string_lossy().into_owned())
 }
 
-async fn persist_loop(store: Arc<DeskStore>, mut rx: mpsc::UnboundedReceiver<Persist>) {
+async fn persist_loop(
+    store: Arc<DeskStore>,
+    turns: Option<Arc<dyn TurnLog>>,
+    mut rx: mpsc::UnboundedReceiver<Persist>,
+) {
     while let Some(op) = rx.recv().await {
-        let result = match &op {
-            Persist::Put(r) => store.put(r).await,
-            Persist::Delete(id) => store.delete(*id).await,
-            Persist::Event(e) => store.add_event(e).await,
-            Persist::Terminal(t) => store.put_terminal(t).await,
-            Persist::DeleteTerminal(id) => store.delete_terminal(*id).await,
+        let result = match op {
+            Persist::Put(r) => store.put(&r).await,
+            Persist::Delete(id) => store.delete(id).await,
+            Persist::Event(e) => store.add_event(&e).await,
+            Persist::Terminal(t) => store.put_terminal(&t).await,
+            Persist::DeleteTerminal(id) => store.delete_terminal(id).await,
+            Persist::Turn(op) => {
+                if let Some(turns) = &turns {
+                    turns.send(*op);
+                }
+                Ok(())
+            }
         };
         if let Err(e) = result {
             tracing::error!(error = %e, "desk registry write failed");
@@ -1994,6 +2085,7 @@ mod tests {
         Desk::start(
             DeskStore::from_pool(pool),
             options(dir),
+            Default::default(),
             CancellationToken::new(),
         )
         .await
@@ -2133,6 +2225,7 @@ mod tests {
             let first = Desk::start(
                 DeskStore::from_pool(pool.clone()),
                 opts.clone(),
+                Default::default(),
                 first_cancel.clone(),
             )
             .await
@@ -2154,6 +2247,7 @@ mod tests {
             let second = Desk::start(
                 DeskStore::from_pool(pool.clone()),
                 opts.clone(),
+                Default::default(),
                 CancellationToken::new(),
             )
             .await
@@ -2212,9 +2306,14 @@ mod tests {
                 token: "irrelevant-token-123".into(),
             });
             DeskStore::migrate(&pool).await.unwrap();
-            let d = Desk::start(DeskStore::from_pool(pool), opts, CancellationToken::new())
-                .await
-                .unwrap();
+            let d = Desk::start(
+                DeskStore::from_pool(pool),
+                opts,
+                Default::default(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
             let s = new_session(&d, dir.path()).await;
             assert!(s.live);
         })

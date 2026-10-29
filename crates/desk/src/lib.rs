@@ -38,7 +38,7 @@ pub use crew_store::CheckIn;
 pub use providers::{AccountError, Accounts, Fields, Spec, Standing};
 pub use realtime::{KeySource, Provider, Realtime};
 pub use service::{
-    local_agent_item, session_item, Desk, DeskError, Group, HolderOptions, Import, Imported,
+    local_agent_item, session_item, Desk, DeskError, Floor, Group, HolderOptions, Import, Imported,
     Layout, NewTerminal, Options, RestorePolicy, TerminalPatch, TerminalState, TerminalView,
     Ungrouped, UNGROUPED,
 };
