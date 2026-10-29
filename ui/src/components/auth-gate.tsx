@@ -2,6 +2,8 @@ import { useEffect, type ReactNode } from "react";
 import { useAuthStore, TOKEN_KEY, IDENTITY_KEY, OIDC_ID_TOKEN_KEY } from "@/stores/auth-store";
 import { LoginPage } from "@/pages/login";
 import { PageSkeleton } from "@/components/loading-skeleton";
+import { takeReturnTo } from "@/lib/return-to";
+import { router } from "@/router";
 
 /**
  * Parse the URL hash for OIDC callback outcomes before the auth store
@@ -15,10 +17,13 @@ import { PageSkeleton } from "@/components/loading-skeleton";
  *   #logged_out=1
  *     → the IdP has completed RP-initiated logout and bounced back; clear
  *       any residual auth state and surface a "signed out" toast.
+ *
+ * Returns the page parked before an SSO sign-in (see `saveReturnTo`) when
+ * a login just completed, so the caller can route back to it.
  */
-function consumeOidcHash(): void {
+function consumeOidcHash(): string | null {
   const hash = window.location.hash;
-  if (!hash || hash.length < 2) return;
+  if (!hash || hash.length < 2) return null;
   const params = new URLSearchParams(hash.slice(1));
 
   const token = params.get("token");
@@ -38,7 +43,7 @@ function consumeOidcHash(): void {
       sessionStorage.setItem(OIDC_ID_TOKEN_KEY, idToken);
     }
     history.replaceState(null, "", window.location.pathname);
-    return;
+    return takeReturnTo();
   }
 
   const err = params.get("error");
@@ -49,7 +54,7 @@ function consumeOidcHash(): void {
       detail ? `${err}: ${detail}` : err,
     );
     history.replaceState(null, "", window.location.pathname);
-    return;
+    return null;
   }
 
   if (params.get("logged_out") === "1") {
@@ -59,14 +64,17 @@ function consumeOidcHash(): void {
     sessionStorage.setItem("workforce-oidc-logged-out", "1");
     history.replaceState(null, "", window.location.pathname);
   }
+  return null;
 }
 
 export function AuthGate({ children }: { children: ReactNode }) {
   const { isAuthenticated, isLoading, initialize } = useAuthStore();
 
   useEffect(() => {
-    consumeOidcHash();
+    const returnTo = consumeOidcHash();
     initialize();
+    // The router read its location before the hash was consumed; move it.
+    if (returnTo) void router.navigate(returnTo, { replace: true });
   }, [initialize]);
 
   if (isLoading) return <PageSkeleton />;

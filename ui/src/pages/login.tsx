@@ -13,6 +13,7 @@ import {
 import { Lock, Loader2, Key, LogIn } from "lucide-react";
 import { gateway } from "@/lib/api-client";
 import { authConfigApi, cacheAuthConfig } from "@/lib/api/auth-config";
+import { saveReturnTo } from "@/lib/return-to";
 
 export function LoginPage() {
   const [email, setEmail] = useState("");
@@ -54,6 +55,8 @@ export function LoginPage() {
   const handleOidcLogin = async () => {
     setOidcLoading(true);
     setError("");
+    // SSO comes back to `/`; park this page (e.g. `/pair?code=…`) to return to.
+    saveReturnTo(window.location.pathname + window.location.search);
     try {
       const resp = await gateway.get<{ authorization_url: string }>(
         "/api/auth/oidc/login",
