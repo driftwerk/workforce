@@ -295,8 +295,8 @@ mod kept {
     use workforce_desk::{Desk, Page, Said, Speaker};
 
     /// A file delivered to or uploaded into `session`, a Desk DM or room
-    /// session of `agent`'s: kept by artifact, kept in the store for the
-    /// retention, and its length and thumbnail worked out after.
+    /// session of `agent`'s: kept by artifact, and its length and thumbnail
+    /// worked out after.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn keep(
         desk: &Desk,
@@ -330,19 +330,6 @@ mod kept {
         if let Err(e) = desk.store().put_attachment(&kept).await {
             warn!(error = %e, artifact_id = artifact_id.as_str(), "keeping a conversation's file failed");
             return;
-        }
-        if let Some(store) = global_store() {
-            let retention = limits().retention;
-            match store.retain(agent, artifact_id, retention) {
-                Ok(true) => {}
-                Ok(false) => debug!(
-                    artifact_id = artifact_id.as_str(),
-                    "the store keeps this file no longer than it was staged for"
-                ),
-                Err(e) => {
-                    warn!(error = %e, artifact_id = artifact_id.as_str(), "keeping a conversation's file longer failed")
-                }
-            }
         }
         if media_type.starts_with("video/")
             || media_type.starts_with("audio/")
@@ -576,8 +563,10 @@ pub struct StagedFile {
 /// **The seam** between a turn's staged files and Desk: `files` go into the
 /// conversation `to`. They are kept for its history (on the turn's answer
 /// once the turn ends, see [`bind_turn`], or as messages of their own) and
-/// kept in the store for the retention. Whether `to` is a Desk conversation
-/// on a hub with the desk on; anything else is left alone. The live frames
+/// kept in the store for the retention (filed under the conversation if
+/// they name no session, so its reader may download them). History needs
+/// the desk on this hub; retention does not. Whether `to` is a Desk
+/// conversation; anything else is left alone. The live frames
 /// are the caller's: today the gateway sink broadcasts each file to the
 /// session's clients, filtered by what each declared it shows.
 pub(crate) async fn into_desk_conversation(
@@ -585,17 +574,39 @@ pub(crate) async fn into_desk_conversation(
     to: &DeskConversation,
     files: &[StagedFile],
 ) -> bool {
-    #[cfg(feature = "postgres")]
-    {
-        let Some(desk) = crate::desk_driver::desk() else {
-            return false;
-        };
-        let Ok(Some(session)) = sessions.get(&to.session_id) else {
-            return false;
-        };
-        if !is_desk_conversation(&session.channel) {
-            return false;
+    let Ok(Some(session)) = sessions.get(&to.session_id) else {
+        return false;
+    };
+    if !is_desk_conversation(&session.channel) {
+        return false;
+    }
+    // Kept for as long as the conversation shows it, and filed under it so
+    // its reader may download it, whether or not this hub keeps Desk's
+    // history: a room on another hub may point at it.
+    if let Some(store) = global_store() {
+        let retention = limits().retention;
+        for file in files {
+            match store.retain(
+                &to.agent_id,
+                &file.artifact_id,
+                retention,
+                Some(&session.id),
+            ) {
+                Ok(true) => {}
+                Ok(false) => debug!(
+                    artifact_id = file.artifact_id.as_str(),
+                    "the store keeps this file no longer than it was staged for"
+                ),
+                Err(e) => warn!(
+                    error = %e,
+                    artifact_id = file.artifact_id.as_str(),
+                    "keeping a conversation's file longer failed"
+                ),
+            }
         }
+    }
+    #[cfg(feature = "postgres")]
+    if let Some(desk) = crate::desk_driver::desk() {
         for file in files {
             keep(
                 desk,
@@ -610,13 +621,8 @@ pub(crate) async fn into_desk_conversation(
             )
             .await;
         }
-        true
     }
-    #[cfg(not(feature = "postgres"))]
-    {
-        let _ = (sessions, to, files);
-        false
-    }
+    true
 }
 
 // ── Routes ───────────────────────────────────────────────────────────────

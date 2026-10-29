@@ -116,9 +116,15 @@ fn store() -> Arc<dyn ArtifactStore> {
 
 /// `bytes` staged in `session` of `agent`'s as a delivering tool stages
 /// them.
-fn staged(agent: &str, session: &str, bytes: &[u8], media_type: &str, name: &str) -> ArtifactId {
+fn staged(
+    agent: &str,
+    session: Option<&str>,
+    bytes: &[u8],
+    media_type: &str,
+    name: &str,
+) -> ArtifactId {
     let descriptor = ArtifactDescriptor {
-        session_id: Some(session.to_string()),
+        session_id: session.map(str::to_string),
         ..ArtifactDescriptor::from_context("browser.pdf", ContentType::OctetStream, agent)
             .with_file_meta(name, media_type)
     };
@@ -232,6 +238,61 @@ fn gateway(
     (state, people)
 }
 
+/// The next text frame on `socket`.
+async fn frame(
+    socket: &mut (impl futures::Stream<
+        Item = Result<
+            tokio_tungstenite::tungstenite::Message,
+            tokio_tungstenite::tungstenite::Error,
+        >,
+    > + Unpin),
+) -> serde_json::Value {
+    use futures::StreamExt;
+    loop {
+        let next = tokio::time::timeout(Duration::from_secs(30), socket.next())
+            .await
+            .expect("a frame")
+            .unwrap()
+            .unwrap();
+        if let Ok(text) = next.to_text() {
+            return serde_json::from_str(text).unwrap();
+        }
+    }
+}
+
+/// Frames on `socket` until one of type `kind`, which it answers with.
+async fn until(
+    socket: &mut (impl futures::Stream<
+        Item = Result<
+            tokio_tungstenite::tungstenite::Message,
+            tokio_tungstenite::tungstenite::Error,
+        >,
+    > + Unpin),
+    kind: &str,
+) -> serde_json::Value {
+    loop {
+        let next = frame(socket).await;
+        if next["type"] == kind {
+            return next;
+        }
+    }
+}
+
+/// `state`'s gateway on a port of its own: where it listens.
+async fn serve_on_a_port(state: &Arc<GatewayState>) -> std::net::SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = crate::gateway::router(Arc::clone(state));
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+    });
+    addr
+}
+
 fn context(session: &str, agent: &str) -> workforce_agent::runner::SessionContext {
     workforce_agent::runner::SessionContext {
         id: Some(session.to_string()),
@@ -278,45 +339,16 @@ fn get(
 /// each with its reference and size.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_client_that_declared_nothing_is_never_sent_a_pdf() {
-    use futures::StreamExt;
     let dir = tempfile::tempdir().unwrap();
     let (scout, _llm) = agent(dir.path(), "scout", "ok", Duration::ZERO).await;
     let (state, [(_, alice), _]) = gateway(&scout);
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let app = crate::gateway::router(Arc::clone(&state));
-    tokio::spawn(async move {
-        axum::serve(
-            listener,
-            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-        )
-        .await
-    });
+    let addr = serve_on_a_port(&state).await;
     let connect = |accept: &str| {
         let url = format!("ws://{addr}/ws?token={alice}&channel=desk{accept}");
         async move { tokio_tungstenite::connect_async(url).await.unwrap().0 }
     };
     let mut ios = connect("").await;
     let mut desk = connect("&accept=*/*").await;
-    async fn frame(
-        socket: &mut (impl futures::Stream<
-            Item = Result<
-                tokio_tungstenite::tungstenite::Message,
-                tokio_tungstenite::tungstenite::Error,
-            >,
-        > + Unpin),
-    ) -> serde_json::Value {
-        loop {
-            let next = tokio::time::timeout(Duration::from_secs(10), socket.next())
-                .await
-                .expect("a frame")
-                .unwrap()
-                .unwrap();
-            if let Ok(text) = next.to_text() {
-                return serde_json::from_str(text).unwrap();
-            }
-        }
-    }
     let session = frame(&mut ios).await["session_id"]
         .as_str()
         .unwrap()
@@ -326,12 +358,18 @@ async fn a_client_that_declared_nothing_is_never_sent_a_pdf() {
     let sink = crate::mcp_gate::media_sinks(&scout).deliver;
     let pdf = staged(
         "scout",
-        &session,
+        Some(&session),
         b"%PDF-1.7 report",
         "application/pdf",
         "report.pdf",
     );
-    let chart = staged("scout", &session, &png(4, 3), "image/png", "chart.png");
+    let chart = staged(
+        "scout",
+        Some(&session),
+        &png(4, 3),
+        "image/png",
+        "chart.png",
+    );
     let ctx = context(&session, "scout");
     sink.deliver(&ctx, &pdf, "application/pdf", Some("report.pdf"), None)
         .await
@@ -380,13 +418,12 @@ fn base64_of(bytes: &[u8]) -> String {
 #[cfg(feature = "postgres")]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_desk_dms_files_ride_on_its_messages_and_are_served_to_their_reader_alone() {
-    use workforce_common::session::SessionAttachment;
     use workforce_desk::Conversations as _;
     use workforce_postgres::test_support::with_test_pool;
     use workforce_skills::adapters::image_view::ConversationFiles as _;
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
-        let (scout, llm) = agent(
+        let (scout, _llm) = agent(
             dir.path(),
             "scout",
             "Here is the report.",
@@ -407,40 +444,44 @@ async fn a_desk_dms_files_ride_on_its_messages_and_are_served_to_their_reader_al
         );
         store();
 
-        // The person's DM, as their app opens it.
-        let session = crate::gateway::anchor_session(&scout, DESK_CHANNEL, &alice_id, "scout")
+        // Alice's Desk opens her DM, showing every file.
+        use futures::SinkExt;
+        let addr = serve_on_a_port(&state).await;
+        let (mut socket, _) = tokio_tungstenite::connect_async(format!(
+            "ws://{addr}/ws?token={alice}&agent_id=scout&channel=desk&accept=*/*"
+        ))
+        .await
+        .unwrap();
+        let session = frame(&mut socket).await["session_id"]
+            .as_str()
             .unwrap()
-            .id;
-        // The person asks; while the turn runs, a tool delivers a PDF.
-        let turn = {
-            let (scout, alice_id) = (Arc::clone(&scout), alice_id.clone());
-            tokio::spawn(async move {
-                scout
-                    .process_message(
-                        DESK_CHANNEL,
-                        &alice_id,
-                        "Make me the Q3 report.",
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                    )
-                    .await
-            })
+            .to_string();
+        let say = |content: &str, attachments: serde_json::Value| {
+            tokio_tungstenite::tungstenite::Message::Text(
+                json!({"type": "chat", "content": content, "attachments": attachments})
+                    .to_string()
+                    .into(),
+            )
         };
-        crate::desk_crew::tests::eventually("the model is asked", async || {
-            (!llm.received_requests().await?.is_empty()).then_some(())
+        // She asks; while the turn runs, a tool delivers a PDF that names
+        // no session of its own.
+        socket
+            .send(say("Make me the Q3 report.", json!([])))
+            .await
+            .unwrap();
+        // The turn has begun once her question is in the session (the
+        // model takes a while to answer).
+        crate::desk_crew::tests::eventually("the question is kept", async || {
+            let kept = scout.sessions.get(&session).ok()??;
+            kept.messages
+                .iter()
+                .any(|m| m.role == MessageRole::User)
+                .then_some(())
         })
         .await;
         let sink = crate::mcp_gate::media_sinks(&scout).deliver;
         let pdf_bytes = b"%PDF-1.7\n1 0 obj\n<<>>\nendobj\n";
-        let pdf = staged("scout", &session, pdf_bytes, "application/pdf", "q3.pdf");
+        let pdf = staged("scout", None, pdf_bytes, "application/pdf", "q3.pdf");
         sink.deliver(
             &context(&session, "scout"),
             &pdf,
@@ -450,10 +491,25 @@ async fn a_desk_dms_files_ride_on_its_messages_and_are_served_to_their_reader_al
         )
         .await
         .unwrap();
-        assert!(turn.await.unwrap().unwrap().contains("report"));
+        let live = until(&mut socket, "image").await;
+        assert_eq!(live["attachments"][0]["artifact_id"], pdf.as_str());
+        assert_eq!(live["attachments"][0]["size"], pdf_bytes.len());
+        until(&mut socket, "stream_end").await;
+        let conversations = crate::desk_conversations::HubConversations(Arc::clone(&state));
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", format!("Bearer {alice}").parse().unwrap());
+        let read = || conversations.page(&headers, None, "scout", None, 50);
+        crate::desk_crew::tests::eventually("the PDF is on the answer", async || {
+            let page = read().await.ok()?;
+            page.messages
+                .iter()
+                .any(|m| m.text == "Here is the report." && !m.attachments.is_empty())
+                .then_some(())
+        })
+        .await;
 
         // After the answer: a file of its own.
-        let late = staged("scout", &session, &png(2, 2), "image/png", "late.png");
+        let late = staged("scout", Some(&session), &png(2, 2), "image/png", "late.png");
         sink.deliver(
             &context(&session, "scout"),
             &late,
@@ -464,10 +520,6 @@ async fn a_desk_dms_files_ride_on_its_messages_and_are_served_to_their_reader_al
         .await
         .unwrap();
 
-        let conversations = crate::desk_conversations::HubConversations(Arc::clone(&state));
-        let mut headers = HeaderMap::new();
-        headers.insert("authorization", format!("Bearer {alice}").parse().unwrap());
-        let read = || conversations.page(&headers, None, "scout", None, 50);
         let page = read().await.unwrap();
         let texts: Vec<(&str, usize)> = page
             .messages
@@ -532,7 +584,7 @@ async fn a_desk_dms_files_ride_on_its_messages_and_are_served_to_their_reader_al
         assert_eq!(status, StatusCode::NOT_FOUND, "not Bob's conversation");
         let (status, ..) = call(&state, get(&uri, None, None)).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
-        let bystander = staged("scout", "", b"%PDF-1.7", "application/pdf", "x.pdf");
+        let bystander = staged("scout", None, b"%PDF-1.7", "application/pdf", "x.pdf");
         let (status, ..) = call(
             &state,
             get(
@@ -546,7 +598,7 @@ async fn a_desk_dms_files_ride_on_its_messages_and_are_served_to_their_reader_al
 
         // An upload: its type from its bytes, its size capped.
         configure(&workforce_common::settings::DeskConfig {
-            attachment_max_mb: 1,
+            attachment_max_mb: 3,
             ..Default::default()
         });
         let upload = |name: &str, bytes: Vec<u8>, token: &str| {
@@ -574,33 +626,77 @@ async fn a_desk_dms_files_ride_on_its_messages_and_are_served_to_their_reader_al
         );
         assert_eq!(uploaded["session_id"], session.as_str());
         let photo = uploaded["artifact_id"].as_str().unwrap().to_string();
-        let (status, ..) = call(&state, upload("big.bin", vec![7; 1024 * 1024 + 1], &alice)).await;
+        // Past the gateway's 1 MB body limit, up to the cap, raw or as a form.
+        let two_mb = [b"%PDF-1.7\n".as_slice(), &vec![b'x'; 2 * 1024 * 1024]].concat();
+        let (status, _, body) = call(&state, upload("big.pdf", two_mb.clone(), &alice)).await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        let boundary = "desk-boundary";
+        let form = [
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; \
+                 filename=\"form.pdf\"\r\nContent-Type: image/png\r\n\r\n"
+            )
+            .into_bytes(),
+            two_mb,
+            format!("\r\n--{boundary}--\r\n").into_bytes(),
+        ]
+        .concat();
+        let (status, _, body) = call(
+            &state,
+            axum::http::Request::post("/api/agents/scout/attachments?channel=desk")
+                .header("authorization", format!("Bearer {alice}"))
+                .header(
+                    "content-type",
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .body(axum::body::Body::from(form))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        let formed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            (formed["filename"].clone(), formed["media_type"].clone()),
+            (json!("form.pdf"), json!("application/pdf")),
+            "what the form said it was is not asked"
+        );
+        let (status, ..) = call(
+            &state,
+            upload("big.bin", vec![7; 3 * 1024 * 1024 + 1], &alice),
+        )
+        .await;
         assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        let (status, ..) = call(&state, upload("photo.png", png(1, 1), &bob)).await;
+        assert_eq!(status, StatusCode::CREATED, "Bob may upload to his own DM");
         configure(&workforce_common::settings::DeskConfig::default());
 
-        // It goes on the person's next message, and the agent can look at it.
-        scout
-            .process_message(
-                DESK_CHANNEL,
-                &alice_id,
+        // It goes on her next message, and the agent can look at it.
+        socket
+            .send(say(
                 "And this photo?",
-                None,
-                None,
-                None,
-                None,
-                Some(vec![SessionAttachment::from_artifact(
-                    "photo.txt",
-                    "image/png",
-                    photo.clone(),
-                )]),
-                None,
-                None,
-                None,
-                None,
-                None,
-            )
+                json!([{"filename": "photo.txt", "mime_type": "image/png", "artifact_id": photo}]),
+            ))
             .await
             .unwrap();
+        until(&mut socket, "stream_end").await;
+        crate::desk_crew::tests::eventually("the photo is on her message", async || {
+            let page = read().await.ok()?;
+            page.messages
+                .iter()
+                .any(|m| m.text == "And this photo?" && !m.attachments.is_empty())
+                .then_some(())
+        })
+        .await;
         let page = read().await.unwrap();
         let asked = page
             .messages

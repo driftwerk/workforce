@@ -417,7 +417,13 @@ impl super::store::ArtifactStore for S3ArtifactStore {
 
     /// Rewrites the sidecar with the longer life. A bucket lifecycle rule
     /// still deletes objects on its own schedule, whatever the sidecar says.
-    fn retain(&self, agent_id: &str, id: &ArtifactId, ttl: Duration) -> Result<bool> {
+    fn retain(
+        &self,
+        agent_id: &str,
+        id: &ArtifactId,
+        ttl: Duration,
+        session: Option<&str>,
+    ) -> Result<bool> {
         Self::now_block_on(async {
             let now = SystemTime::now();
             let Some(sidecar) = self
@@ -427,7 +433,7 @@ impl super::store::ArtifactStore for S3ArtifactStore {
             else {
                 return Ok(false);
             };
-            if let Some(kept) = sidecar.retained(now, ttl) {
+            if let Some(kept) = sidecar.retained(now, ttl, session) {
                 let meta_key = sidecar_key(&object_key(&self.prefix, agent_id, id)?);
                 self.client
                     .put_object()

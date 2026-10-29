@@ -95,9 +95,17 @@ pub trait ArtifactStore: Send + Sync {
 
     /// Keeps a live artifact until at least `ttl` from now — a file that
     /// became part of a conversation's history outlives the turn that staged
-    /// it. Never shortens a longer life. Whether the artifact was there to
-    /// keep; the default store can't, and keeps nothing longer.
-    fn retain(&self, _agent_id: &str, _id: &ArtifactId, _ttl: Duration) -> Result<bool> {
+    /// it — and files one that names no session under `session`, the
+    /// conversation it was delivered into. Never shortens a longer life nor
+    /// moves a filed artifact. Whether the artifact was there to keep; the
+    /// default store can't, and keeps nothing longer.
+    fn retain(
+        &self,
+        _agent_id: &str,
+        _id: &ArtifactId,
+        _ttl: Duration,
+        _session: Option<&str>,
+    ) -> Result<bool> {
         Ok(false)
     }
 
@@ -124,9 +132,14 @@ pub(crate) struct Sidecar {
 }
 
 impl Sidecar {
-    /// This sidecar kept until at least `ttl` after `now`, or `None` when it
-    /// already lives that long.
-    pub(crate) fn retained(&self, now: SystemTime, ttl: Duration) -> Option<Sidecar> {
+    /// This sidecar kept until at least `ttl` after `now` and, when it names
+    /// no session, filed under `session`; `None` when nothing changes.
+    pub(crate) fn retained(
+        &self,
+        now: SystemTime,
+        ttl: Duration,
+        session: Option<&str>,
+    ) -> Option<Sidecar> {
         let now_secs = now
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -134,9 +147,15 @@ impl Sidecar {
         let wanted = now_secs
             .saturating_sub(self.created_at_secs)
             .saturating_add(ttl.as_secs());
-        (wanted > self.descriptor.ttl_seconds).then(|| Sidecar {
+        let longer = wanted > self.descriptor.ttl_seconds;
+        let filed = self.descriptor.session_id.is_none() && session.is_some_and(|s| !s.is_empty());
+        (longer || filed).then(|| Sidecar {
             descriptor: ArtifactDescriptor {
-                ttl_seconds: wanted,
+                ttl_seconds: wanted.max(self.descriptor.ttl_seconds),
+                session_id: match filed {
+                    true => session.map(str::to_string),
+                    false => self.descriptor.session_id.clone(),
+                },
                 ..self.descriptor.clone()
             },
             created_at_secs: self.created_at_secs,
@@ -458,12 +477,18 @@ impl ArtifactStore for FsArtifactStore {
         Some(dir)
     }
 
-    fn retain(&self, agent_id: &str, id: &ArtifactId, ttl: Duration) -> Result<bool> {
+    fn retain(
+        &self,
+        agent_id: &str,
+        id: &ArtifactId,
+        ttl: Duration,
+        session: Option<&str>,
+    ) -> Result<bool> {
         let now = SystemTime::now();
         let Some(sidecar) = self.load_sidecar(agent_id, id)?.filter(|s| !s.expired(now)) else {
             return Ok(false);
         };
-        if let Some(kept) = sidecar.retained(now, ttl) {
+        if let Some(kept) = sidecar.retained(now, ttl, session) {
             write_atomic(
                 &self.agent_dir(agent_id)?,
                 &self.meta_path(agent_id, id)?,
@@ -823,34 +848,40 @@ mod tests {
             )
             .unwrap();
         let month = Duration::from_secs(30 * 24 * 3600);
-        assert!(store.retain("agent-a", &handle.id, month).unwrap());
+        assert!(store
+            .retain("agent-a", &handle.id, month, Some("session-1"))
+            .unwrap());
         let kept = store.metadata("agent-a", &handle.id).unwrap().unwrap();
         assert!(kept.ttl_seconds >= month.as_secs());
+        assert_eq!(kept.session_id.as_deref(), Some("session-1"), "filed");
         // A shorter retention keeps the longer life.
-        assert!(store.retain("agent-a", &handle.id, DEFAULT_TTL).unwrap());
+        assert!(store
+            .retain("agent-a", &handle.id, DEFAULT_TTL, Some("session-2"))
+            .unwrap());
+        let again = store.metadata("agent-a", &handle.id).unwrap().unwrap();
+        assert_eq!(again.ttl_seconds, kept.ttl_seconds);
         assert_eq!(
-            store
-                .metadata("agent-a", &handle.id)
-                .unwrap()
-                .unwrap()
-                .ttl_seconds,
-            kept.ttl_seconds
+            again.session_id.as_deref(),
+            Some("session-1"),
+            "never moved"
         );
         let unknown = ArtifactId::fresh();
-        assert!(!store.retain("agent-a", &unknown, month).unwrap());
+        assert!(!store.retain("agent-a", &unknown, month, None).unwrap());
         // An old artifact is kept `ttl` from now, not from its making.
         let sidecar = Sidecar {
             descriptor: json_descriptor("agent-a", DEFAULT_TTL),
             created_at_secs: now_secs() - 7200,
         };
-        let later = sidecar.retained(SystemTime::now(), DEFAULT_TTL).unwrap();
+        let later = sidecar
+            .retained(SystemTime::now(), DEFAULT_TTL, None)
+            .unwrap();
         assert!(!later.expired(SystemTime::now() + Duration::from_secs(3000)));
         let fresh = Sidecar {
             descriptor: json_descriptor("agent-a", DEFAULT_TTL),
             created_at_secs: now_secs(),
         };
         assert!(fresh
-            .retained(SystemTime::now(), Duration::from_secs(60))
+            .retained(SystemTime::now(), Duration::from_secs(60), None)
             .is_none());
     }
 
