@@ -343,6 +343,24 @@ impl CrewHub {
             .await;
     }
 
+    /// Puts what `service`'s own scheduled check-in (its heartbeat) found
+    /// into its Desk DM with the person, as a check-in of its own: the
+    /// agent tells them in its words. Whether it was delivered.
+    pub(crate) async fn heartbeat_found(&self, service: &Arc<AgentService>, found: &str) -> bool {
+        let Some(owner) = self.person(Some(service)) else {
+            tracing::info!(agent = %service.agent_id, "a check-in found something, but there is no Desk conversation to put it in yet");
+            return false;
+        };
+        let prompt = format!(
+            "{CHECK_IN} Your own scheduled check-in, going through your check-in list (HEARTBEAT.md), found \
+             something that needs the person:\n\n{found}\n\nTell them briefly, in plain words, what needs them \
+             and what you suggest."
+        );
+        self.check_in(service, &owner, "heartbeat", &prompt, 0, None)
+            .await
+            .is_some()
+    }
+
     /// Runs one unprompted turn of the overseer's and keeps it as a
     /// check-in. Its answer, if it gave one.
     async fn check_in(

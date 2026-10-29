@@ -319,6 +319,73 @@ pub async fn memory_stats(
     })))
 }
 
+/// `GET /api/agents/{id}/memory/summary`: how much the agent remembers of
+/// the caller, how many lessons it has learned, and when the caller's
+/// memories were last tidied (consolidated). For Desk's Settings tab; the
+/// memories themselves are reached through the agent.
+pub async fn memory_summary(
+    Path(id): Path<String>,
+    Query(query): Query<crate::gateway::WsQuery>,
+    headers: axum::http::HeaderMap,
+    State(state): State<Arc<GatewayState>>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    use workforce_memory::types::{MemoryFilter, MemorySource};
+    let (service, caller) =
+        crate::gateway::authorise_agent_reader(&state, &headers, query.token.as_deref(), &id)
+            .await?;
+    let Some(identity) = caller.identity_id.clone() else {
+        return Err(ApiError::from((
+            axum::http::StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": "a memory summary is a person's own"})),
+        )));
+    };
+    let Some(store) = service.memory_store.as_ref() else {
+        return Ok(Json(serde_json::json!({
+            "agent_id": id, "memories": 0, "lessons": 0, "tidied_at": null,
+        })));
+    };
+    let owner = Some(service.agent_id.clone());
+    let unavailable = |e: eyre::Report| {
+        tracing::warn!(agent = %id, error = %e, "memory summary: the memory store did not answer");
+        ApiError::from((
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "the memory store did not answer"})),
+        ))
+    };
+    let all = store
+        .count(MemoryFilter {
+            owner: owner.clone(),
+            identity_id: Some(identity.clone()),
+            ..Default::default()
+        })
+        .await
+        .map_err(unavailable)?;
+    let lessons = store
+        .count(MemoryFilter {
+            owner,
+            source: Some(MemorySource::Lesson),
+            ..Default::default()
+        })
+        .await
+        .map_err(unavailable)?;
+    let mine_lessons = store
+        .count(MemoryFilter {
+            owner: Some(service.agent_id.clone()),
+            identity_id: Some(identity.clone()),
+            source: Some(MemorySource::Lesson),
+            ..Default::default()
+        })
+        .await
+        .map_err(unavailable)?;
+    let tidied = crate::memory_consolidation::last_consolidated(&service.workspace, &identity);
+    Ok(Json(serde_json::json!({
+        "agent_id": id,
+        "memories": all.saturating_sub(mine_lessons),
+        "lessons": lessons,
+        "tidied_at": tidied.map(|t| t.to_rfc3339()),
+    })))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

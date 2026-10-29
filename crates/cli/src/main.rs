@@ -4130,20 +4130,24 @@ rules:
             // heartbeat are per-agent: a supervisor runs one runner per agent
             // scoped to that agent's own workspace, rather than one runner bound
             // to the default agent and a hardcoded `{data_dir}/workspace`.
-            let heartbeat_delivery: Option<workforce_hub::heartbeat::HeartbeatDeliveryCallback> =
+            // Heartbeat runners run for every agent, whether or not the
+            // install turns heartbeats on: an agent's own `[heartbeat]` may
+            // turn them on (or off) for it, and each runner reads it as it
+            // goes. One that is off only re-reads its config each minute.
+            let heartbeat_delivery: Option<workforce_hub::heartbeat::HeartbeatDeliveryCallback> = {
+                let broadcast_tx_for_heartbeat = broadcast_tx.clone();
+                let cb: workforce_hub::heartbeat::HeartbeatDeliveryCallback =
+                    Arc::new(move |_name: String, response: String| {
+                        let tx = broadcast_tx_for_heartbeat.clone();
+                        Box::pin(async move {
+                            let _ = tx.send(workforce_hub::gateway::BroadcastMessage::new(
+                                "heartbeat",
+                                "message",
+                                response,
+                            ));
+                        })
+                    });
                 if wf_config.heartbeat.enabled {
-                    let broadcast_tx_for_heartbeat = broadcast_tx.clone();
-                    let cb: workforce_hub::heartbeat::HeartbeatDeliveryCallback =
-                        Arc::new(move |_name: String, response: String| {
-                            let tx = broadcast_tx_for_heartbeat.clone();
-                            Box::pin(async move {
-                                let _ = tx.send(workforce_hub::gateway::BroadcastMessage::new(
-                                    "heartbeat",
-                                    "message",
-                                    response,
-                                ));
-                            })
-                        });
                     eprintln!(
                         "  Heartbeat: {} (every {}m, active {}-{})",
                         style("enabled").cyan(),
@@ -4151,11 +4155,14 @@ rules:
                         wf_config.heartbeat.active_start,
                         wf_config.heartbeat.active_end,
                     );
-                    Some(cb)
                 } else {
-                    eprintln!("  Heartbeat: {}", style("not configured").dim());
-                    None
-                };
+                    eprintln!(
+                        "  Heartbeat: {}",
+                        style("only where an agent turns it on").dim()
+                    );
+                }
+                Some(cb)
+            };
 
             // Register daily briefing job if enabled (DW-168)
             if wf_config.briefing.enabled {

@@ -532,6 +532,7 @@ pub fn router(state: Arc<GatewayState>) -> Router {
         )
         .route("/api/heartbeat/checks/{id}/trigger", post(trigger_heartbeat_check))
         .route("/api/heartbeat/history", get(get_heartbeat_history))
+        .route("/api/agents/{id}/heartbeat", get(agent_heartbeat_status))
         // Unauthenticated device pairing endpoints (self-service flow)
         .route(
             "/api/pair/device/request",
@@ -885,6 +886,7 @@ pub fn router(state: Arc<GatewayState>) -> Router {
         )
         .route("/api/agents/{id}/memory/tasks", get(crate::api_handlers::memory::memory_list_tasks))
         .route("/api/agents/{id}/memory/stats", get(crate::api_handlers::memory::memory_stats))
+        .route("/api/agents/{id}/memory/summary", get(crate::api_handlers::memory::memory_summary))
         // Auth endpoints (DW-466)
         .route("/api/auth/login", post(auth_login))
         .route("/api/auth/refresh", post(auth_refresh))
@@ -4415,13 +4417,15 @@ fn is_conversational_channel(channel: &str) -> bool {
 
 // ── Agent CRUD & Detail Endpoints (DW-421) ────────────────────────────────
 
-/// Identity files that can be read/written via the API.
+/// Identity files that can be read/written via the API. HEARTBEAT.md is the
+/// agent's check-in list, which Desk edits beside the others.
 const ALLOWED_IDENTITY_FILES: &[&str] = &[
     "SOUL.md",
     "AGENTS.md",
     "TOOLS.md",
     "IDENTITY.md",
     "WELCOME.md",
+    "HEARTBEAT.md",
 ];
 
 /// Helper: resolve an agent service by ID, returning an appropriate error.
@@ -6087,6 +6091,69 @@ async fn admin_reset_model(
 /// the response text of recent runs — gated on `SCOPE_HEARTBEAT` so it
 /// can't be used as a free-attendance oracle. For pure liveness probes
 /// (load balancers etc.) see [`livez`].
+/// The items of a check-in list: its Markdown list items.
+fn checklist_items(list: &str) -> usize {
+    list.lines()
+        .map(str::trim_start)
+        .filter(|l| {
+            l.starts_with("- ")
+                || l.starts_with("* ")
+                || l.split_once(". ")
+                    .is_some_and(|(n, _)| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
+        })
+        .count()
+}
+
+#[cfg(test)]
+mod checklist_tests {
+    #[test]
+    fn a_check_in_list_counts_its_list_items_only() {
+        let list = "# Check-in list\n\nLook over:\n- the build\n  * nested ones count too\n1. Acme's inbox\n12. the calendar\nnot an item\n2025. was a year\n";
+        assert_eq!(super::checklist_items(list), 5);
+        assert_eq!(super::checklist_items(""), 0);
+    }
+}
+
+/// `GET /api/agents/{id}/heartbeat`: one agent's own check-ins, as its own
+/// `[heartbeat]` over the install's says: on or off, how often, its quiet
+/// hours, how many things are on its check-in list (HEARTBEAT.md), when it
+/// last went through it, and whether that needed the person.
+async fn agent_heartbeat_status(
+    Path(id): Path<String>,
+    Query(query): Query<WsQuery>,
+    headers: axum::http::HeaderMap,
+    State(state): State<Arc<GatewayState>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let (service, _caller) =
+        authorise_agent_reader(&state, &headers, query.token.as_deref(), &id).await?;
+    let own = workforce_common::settings::AgentWorkspaceConfig::load_with_text(&service.workspace)
+        .ok()
+        .flatten()
+        .and_then(|(config, _)| config.heartbeat);
+    let effective = service.config.heartbeat.for_agent(own.as_ref());
+    let list = workforce_common::config_files::read(&service.workspace.join("HEARTBEAT.md"))
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    let last_checked = crate::heartbeat::HeartbeatState::load(&service.workspace).last_heartbeat;
+    let handle = service.heartbeat_handle.read().clone();
+    let last = match handle {
+        Some(handle) => handle.last().await,
+        None => None,
+    };
+    Ok(Json(serde_json::json!({
+        "agent_id": id,
+        "enabled": effective.enabled,
+        "interval_secs": effective.interval_secs,
+        "quiet_start": effective.quiet_start,
+        "quiet_end": effective.quiet_end,
+        "items": checklist_items(&list),
+        "last_checked": last_checked.map(|t| t.to_rfc3339()),
+        "needed_you": last.as_ref().map(|r| r.actionable),
+        "last_error": last.and_then(|r| r.error),
+    })))
+}
+
 async fn heartbeat_status(
     Query(query): Query<WsQuery>,
     headers: axum::http::HeaderMap,

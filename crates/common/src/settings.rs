@@ -6218,6 +6218,47 @@ impl Default for HeartbeatSettings {
     }
 }
 
+/// `[heartbeat]` in an agent's own `config.toml`: whether this agent checks
+/// in on its own, how often, and its quiet hours, each over the install's
+/// `[heartbeat]`. Read by the agent's heartbeat runner as it goes, so a
+/// change takes effect within a minute, without a restart.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentHeartbeatConfig {
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub interval_secs: Option<u64>,
+    #[serde(default)]
+    pub quiet_start: Option<String>,
+    #[serde(default)]
+    pub quiet_end: Option<String>,
+}
+
+impl HeartbeatSettings {
+    /// The heartbeat `own` (an agent's `[heartbeat]`) runs with: the
+    /// install's, each field it sets over it. An empty quiet hour clears the
+    /// install's.
+    pub fn for_agent(&self, own: Option<&AgentHeartbeatConfig>) -> Self {
+        let mut out = self.clone();
+        let Some(own) = own else {
+            return out;
+        };
+        if let Some(enabled) = own.enabled {
+            out.enabled = enabled;
+        }
+        if let Some(every) = own.interval_secs.filter(|s| *s >= 60) {
+            out.interval_secs = every;
+        }
+        if let Some(start) = &own.quiet_start {
+            out.quiet_start = (!start.is_empty()).then(|| start.clone());
+        }
+        if let Some(end) = &own.quiet_end {
+            out.quiet_end = (!end.is_empty()).then(|| end.clone());
+        }
+        out
+    }
+}
+
 fn default_heartbeat_interval() -> u64 {
     1800 // 30 minutes
 }
@@ -7246,6 +7287,10 @@ pub struct AgentWorkspaceConfig {
     /// Per-agent `[know_how]`, field by field over the install's; hot-reloaded.
     #[serde(default)]
     pub know_how: Option<AgentKnowHowConfig>,
+    /// Per-agent `[heartbeat]`, field by field over the install's; read by
+    /// the agent's heartbeat runner each minute.
+    #[serde(default)]
+    pub heartbeat: Option<AgentHeartbeatConfig>,
     /// Per-agent `[decision]`: whether this agent's decisions are recorded;
     /// hot-reloaded.
     #[serde(default)]
@@ -13577,6 +13622,39 @@ cc_max_turns = 12
             advisor.max_rounds, 12,
             "legacy cc_max_turns key must alias onto max_rounds"
         );
+    }
+
+    #[test]
+    fn an_agents_heartbeat_is_the_installs_with_its_own_choices_over_it() {
+        let install = HeartbeatSettings {
+            quiet_start: Some("22:00".into()),
+            quiet_end: Some("07:00".into()),
+            ..HeartbeatSettings::default()
+        };
+        assert!(!install.for_agent(None).enabled);
+        let own = AgentHeartbeatConfig {
+            enabled: Some(true),
+            interval_secs: Some(900),
+            quiet_start: Some(String::new()),
+            quiet_end: None,
+        };
+        let mine = install.for_agent(Some(&own));
+        assert!(mine.enabled);
+        assert_eq!(mine.interval_secs, 900);
+        assert_eq!(mine.quiet_start, None);
+        assert_eq!(mine.quiet_end.as_deref(), Some("07:00"));
+        // Less than a minute is not taken.
+        let fast = AgentHeartbeatConfig {
+            interval_secs: Some(5),
+            ..AgentHeartbeatConfig::default()
+        };
+        assert_eq!(
+            install.for_agent(Some(&fast)).interval_secs,
+            install.interval_secs
+        );
+        let parsed: AgentWorkspaceConfig =
+            toml::from_str("[heartbeat]\nenabled = true\ninterval_secs = 3600\n").unwrap();
+        assert_eq!(parsed.heartbeat.unwrap().interval_secs, Some(3600));
     }
 
     #[test]
