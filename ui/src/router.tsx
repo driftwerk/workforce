@@ -57,5 +57,7 @@ export const router = createBrowserRouter([
       { path: ":roomId", lazy: () => import("@/pages/games/room").then((m) => ({ Component: m.default })) },
     ],
   },
+  // Standalone: a person confirming a device they hold, outside the dashboard chrome.
+  { path: "pair", lazy: () => import("@/pages/pair").then((m) => ({ Component: m.default })) },
   { path: "docs/*", lazy: () => import("@/pages/docs").then((m) => ({ Component: m.default })) },
 ]);

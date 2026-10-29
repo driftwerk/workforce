@@ -20,7 +20,7 @@ serde_json = "1"
 thiserror = { workspace = true }
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
-uuid = { version = "1", features = ["v4", "serde"] }
+uuid = { version = "1", features = ["v4", "v5", "serde"] }
 vellev-client = { workspace = true }
 vellev-core = { workspace = true }
 vellev-index = { workspace = true }

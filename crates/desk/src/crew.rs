@@ -62,7 +62,7 @@ impl Party {
         Self {
             kind: PartyKind::Session,
             id: v.id.to_string(),
-            name: v.name.clone(),
+            name: v.label().to_string(),
             engine: Some(v.engine),
             origin: Some(v.origin),
         }
@@ -301,7 +301,18 @@ pub struct ItemQuestion {
 pub struct Item {
     pub kind: ItemKind,
     pub id: String,
+    /// What the person calls it: a session's own name when they gave it
+    /// one, else the hub's.
     pub name: String,
+    /// The hub's name for a session the person renamed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hub_name: Option<String>,
+    /// A session's folder.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    /// The sidebar group it is in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
     pub engine: Option<Engine>,
     pub origin: Option<Origin>,
     pub state: ItemState,
@@ -339,6 +350,9 @@ pub struct Overview {
     pub brief: Option<Brief>,
     pub counts: Counts,
     pub items: Vec<Item>,
+    /// The sidebar's group names, in order.
+    #[serde(default)]
+    pub groups: Vec<String>,
 }
 
 /// The overseer, as `GET /api/desk/manager` says.

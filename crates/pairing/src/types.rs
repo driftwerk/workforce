@@ -137,6 +137,12 @@ pub const DEFAULT_DEVICE_KIND: &str = "ios_device";
 /// pairs successfully and then never resolves to its owner.
 pub const DEVICE_KINDS: &[&str] = &[DEFAULT_DEVICE_KIND, "voice_device", "desktop_device"];
 
+/// Names a client has sent for a kind in [`DEVICE_KINDS`]. Desk first paired
+/// as `desk`, which nothing looked up, so its devices never resolved to their
+/// person; a request naming an alias is recorded under the real kind, and
+/// lookup still reads links already saved under the alias.
+pub const DEVICE_KIND_ALIASES: &[(&str, &str)] = &[("desk", "desktop_device")];
+
 /// Normalise a caller-supplied device kind into something safe to use as a
 /// `linked_ids` key and a database value: lowercase, ASCII alphanumeric and
 /// underscores only, length-bounded. Anything else is rejected rather than
@@ -144,6 +150,9 @@ pub const DEVICE_KINDS: &[&str] = &[DEFAULT_DEVICE_KIND, "voice_device", "deskto
 /// second namespace that never matches on lookup.
 pub fn normalise_device_kind(raw: &str) -> Option<String> {
     let kind = raw.trim().to_ascii_lowercase().replace(['-', ' '], "_");
+    if let Some((_, canonical)) = DEVICE_KIND_ALIASES.iter().find(|(alias, _)| *alias == kind) {
+        return Some((*canonical).to_string());
+    }
     let valid = !kind.is_empty()
         && kind.len() <= 32
         && kind.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
@@ -226,6 +235,22 @@ pub struct PairingConfig {
     /// Device token TTL in seconds (default: 30 days). 0 = never expires.
     #[serde(default = "default_device_token_ttl")]
     pub device_token_ttl_secs: u64,
+    /// Who may connect a device to an account: every member, each into their
+    /// own account (the default), or only admins.
+    #[serde(default)]
+    pub who_can_connect: WhoCanConnect,
+}
+
+/// `[pairing] who_can_connect` — who may approve a device pairing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WhoCanConnect {
+    /// Any signed-in person may connect a device to their own account; only
+    /// admins may connect one to someone else's.
+    #[default]
+    Members,
+    /// Only admins may approve a device pairing.
+    Admins,
 }
 
 impl Default for PairingConfig {
@@ -238,6 +263,7 @@ impl Default for PairingConfig {
             device_pairing_enabled: false,
             node_pairing_enabled: false,
             device_token_ttl_secs: default_device_token_ttl(),
+            who_can_connect: WhoCanConnect::default(),
         }
     }
 }

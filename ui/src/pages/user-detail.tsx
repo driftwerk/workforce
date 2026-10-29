@@ -401,8 +401,9 @@ export default function UserDetailPage() {
           ))}
           <DeviceLinkSelector
             existingIds={linkedEntries.map(([, id]) => id)}
-            onLink={(deviceId) => {
-              const updated = { ...user.linked_ids, ios_device: deviceId };
+            onLink={(deviceId, _name, kind) => {
+              // One key per device, so a person keeps every device they own.
+              const updated = { ...user.linked_ids, [`${kind}:${deviceId}`]: deviceId };
               update.mutate({ id: user.id, linked_ids: updated });
             }}
             disabled={update.isPending}
@@ -632,18 +633,30 @@ function DeviceLinkSelector({
   disabled,
 }: {
   existingIds: string[];
-  onLink: (deviceId: string, deviceName: string) => void;
+  onLink: (deviceId: string, deviceName: string, kind: string) => void;
   disabled: boolean;
 }) {
   const { data } = usePairedDevices();
+  const [kind, setKind] = useState("ios_device");
+  // Devices nobody owns yet; one that belongs to someone is moved, not linked.
   const devices = ((data?.devices ?? []) as PairedDevice[]).filter(
-    (d) => !d.revoked && !existingIds.includes(d.id),
+    (d) => !d.revoked && !d.owner && !existingIds.includes(d.id),
   );
 
   if (devices.length === 0) return null;
 
   return (
-    <div className="flex flex-wrap gap-2">
+    <div className="flex flex-wrap items-center gap-2">
+      <select
+        className="h-8 rounded-md border bg-background px-2 text-xs"
+        value={kind}
+        onChange={(e) => setKind(e.target.value)}
+        aria-label="Device kind"
+      >
+        <option value="ios_device">iPhone or iPad</option>
+        <option value="desktop_device">Desk</option>
+        <option value="voice_device">Voice device</option>
+      </select>
       {devices.map((device) => (
         <Button
           key={device.id}
@@ -651,7 +664,7 @@ function DeviceLinkSelector({
           size="sm"
           className="h-8 text-xs"
           disabled={disabled}
-          onClick={() => onLink(device.id, device.device_name)}
+          onClick={() => onLink(device.id, device.device_name, kind)}
         >
           <Smartphone className="mr-1.5 h-3.5 w-3.5" />
           {device.device_name || device.id.slice(0, 8)}

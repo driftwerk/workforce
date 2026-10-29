@@ -2589,6 +2589,8 @@ async fn owned_chatgpt_service(
 ) -> Arc<AgentService> {
     chatgpt_service(data_dir, server, |config| {
         config.memory.db_path = data_dir.join("memory.db").to_string_lossy().into_owned();
+        // A pass does nothing for an agent with consolidation off.
+        config.memory.consolidation = true;
         config.subscription.operator = operator.map(|o| uuid::Uuid::parse_str(o).unwrap());
         config.agents.push(workforce_common::settings::AgentConfig {
             id: "allan".into(),
@@ -4410,6 +4412,7 @@ async fn claude_code_consolidation(
 ) -> (Arc<AgentService>, String) {
     let service = chatgpt_service(dir, server, |config| {
         config.memory.db_path = dir.join("memory.db").to_string_lossy().into_owned();
+        config.memory.consolidation = true;
         config.memory.consolidation_source = workforce_common::settings::CurationSource::ClaudeCode;
         config.memory.consolidation_cc_failover = failover;
         config.agents.push(workforce_common::settings::AgentConfig {
@@ -4772,6 +4775,8 @@ async fn a_consolidation_unit_the_budget_refuses_is_skipped() {
     let server = wiremock::MockServer::start().await;
     let service = chatgpt_service(tmp.path(), &server, |config| {
         config.memory.db_path = tmp.path().join("memory.db").to_string_lossy().into_owned();
+        // A pass does nothing for an agent with consolidation off.
+        config.memory.consolidation = true;
         config.budget.enabled = true;
         config.budget.identity_daily_usd = 1.0;
     })

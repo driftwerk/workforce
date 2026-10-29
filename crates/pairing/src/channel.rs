@@ -427,6 +427,7 @@ mod tests {
             device_pairing_enabled: false,
             node_pairing_enabled: false,
             device_token_ttl_secs: 2_592_000,
+            who_can_connect: WhoCanConnect::default(),
         }
     }
 

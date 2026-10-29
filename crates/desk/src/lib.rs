@@ -10,6 +10,8 @@ pub mod conversations;
 pub mod crew;
 mod crew_api;
 mod crew_store;
+mod cwd;
+pub mod holder;
 pub mod local;
 pub mod model;
 pub mod overview;
@@ -19,10 +21,12 @@ pub mod realtime;
 pub mod rooms;
 mod service;
 pub mod speech;
+pub mod state;
 pub mod store;
 #[cfg(test)]
 mod testing;
 mod transcript;
+mod vt;
 mod worktree;
 
 pub use api::{router, sessions_router, Authorize};
@@ -32,6 +36,10 @@ pub use conversations::{
 pub use crew_store::CheckIn;
 pub use providers::{AccountError, Accounts, Fields, Spec, Standing};
 pub use realtime::{KeySource, Provider, Realtime};
-pub use service::{Desk, DeskError, Options, RestorePolicy};
+pub use service::{
+    local_agent_item, session_item, Desk, DeskError, Group, HolderOptions, Import, Imported,
+    Layout, NewTerminal, Options, RestorePolicy, TerminalPatch, TerminalState, TerminalView,
+    Ungrouped, UNGROUPED,
+};
 pub use speech::{Audio, Speak, SpeakError, Speech, SpeechProvider};
 pub use store::DeskStore;

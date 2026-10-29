@@ -169,6 +169,19 @@ enum Commands {
         #[arg(long)]
         accept_uid: u32,
     },
+    /// Keep Desk's terminals across hub restarts: a small long-lived process
+    /// that owns their PTYs and serves them to the hub over a unix socket.
+    ///
+    /// Started by Desk's helper before the hub and left running when the hub
+    /// restarts. Reads its token from `WORKFORCE_PTY_HOLDER_TOKEN` (never an
+    /// argument, so it stays out of `ps`). Exits at once if a holder already
+    /// serves the socket; SIGTERM ends it and its terminals.
+    #[command(name = "pty-holder")]
+    PtyHolder {
+        /// Unix socket path (its folder is made owner-only).
+        #[arg(long)]
+        socket: PathBuf,
+    },
     /// Run a task using a team from the config.
     Team {
         /// The task description.
@@ -2024,6 +2037,26 @@ enum MemoryCommand {
         /// memory of anyone else is taken as erased: purged, never copied.
         #[arg(long)]
         known_customers: Option<PathBuf>,
+        /// Workforce config file.
+        #[arg(short, long, default_value = "workforce.toml")]
+        config: PathBuf,
+    },
+    /// Move the memories a hub kept in its SQLite file into vellev, the
+    /// store `[memory] backend = "vellev"` serves them from, keeping their
+    /// ids; then read every one back. Run it with the hub stopped and its
+    /// config already set to vellev. A dry run without `--apply`, and safe
+    /// to run again. Exits non-zero unless every memory with something in
+    /// it was moved and read back as it was. The SQLite file is only read.
+    MoveSqlite {
+        /// The SQLite memory file (`[memory] db_path` before the move).
+        #[arg(long)]
+        from: PathBuf,
+        /// Write; without it nothing is changed and counts are printed.
+        #[arg(long)]
+        apply: bool,
+        /// Print the counts as one line of JSON.
+        #[arg(long)]
+        json: bool,
         /// Workforce config file.
         #[arg(short, long, default_value = "workforce.toml")]
         config: PathBuf,
@@ -4110,20 +4143,24 @@ rules:
             // heartbeat are per-agent: a supervisor runs one runner per agent
             // scoped to that agent's own workspace, rather than one runner bound
             // to the default agent and a hardcoded `{data_dir}/workspace`.
-            let heartbeat_delivery: Option<workforce_hub::heartbeat::HeartbeatDeliveryCallback> =
+            // Heartbeat runners run for every agent, whether or not the
+            // install turns heartbeats on: an agent's own `[heartbeat]` may
+            // turn them on (or off) for it, and each runner reads it as it
+            // goes. One that is off only re-reads its config each minute.
+            let heartbeat_delivery: Option<workforce_hub::heartbeat::HeartbeatDeliveryCallback> = {
+                let broadcast_tx_for_heartbeat = broadcast_tx.clone();
+                let cb: workforce_hub::heartbeat::HeartbeatDeliveryCallback =
+                    Arc::new(move |_name: String, response: String| {
+                        let tx = broadcast_tx_for_heartbeat.clone();
+                        Box::pin(async move {
+                            let _ = tx.send(workforce_hub::gateway::BroadcastMessage::new(
+                                "heartbeat",
+                                "message",
+                                response,
+                            ));
+                        })
+                    });
                 if wf_config.heartbeat.enabled {
-                    let broadcast_tx_for_heartbeat = broadcast_tx.clone();
-                    let cb: workforce_hub::heartbeat::HeartbeatDeliveryCallback =
-                        Arc::new(move |_name: String, response: String| {
-                            let tx = broadcast_tx_for_heartbeat.clone();
-                            Box::pin(async move {
-                                let _ = tx.send(workforce_hub::gateway::BroadcastMessage::new(
-                                    "heartbeat",
-                                    "message",
-                                    response,
-                                ));
-                            })
-                        });
                     eprintln!(
                         "  Heartbeat: {} (every {}m, active {}-{})",
                         style("enabled").cyan(),
@@ -4131,11 +4168,14 @@ rules:
                         wf_config.heartbeat.active_start,
                         wf_config.heartbeat.active_end,
                     );
-                    Some(cb)
                 } else {
-                    eprintln!("  Heartbeat: {}", style("not configured").dim());
-                    None
-                };
+                    eprintln!(
+                        "  Heartbeat: {}",
+                        style("only where an agent turns it on").dim()
+                    );
+                }
+                Some(cb)
+            };
 
             // Register daily briefing job if enabled (DW-168)
             if wf_config.briefing.enabled {
@@ -4584,11 +4624,18 @@ rules:
 
             // Register device pairing management tools on all agents
             if let Some(ref dp) = device_pairing {
-                let pairing_ctx = workforce_hub::pairing_tool::PairingToolContext {
-                    device_pairing: Arc::clone(dp),
-                };
                 for service in registry.all_services() {
-                    for tool in workforce_hub::pairing_tool::pairing_tools(pairing_ctx.clone()) {
+                    // The identity store is filled into each service's
+                    // late-bound handle once it is built, below; the tools
+                    // read it when they run.
+                    let pairing_ctx = workforce_hub::pairing_tool::PairingToolContext {
+                        device_pairing: Arc::clone(dp),
+                        identity_store: Arc::clone(&service.identity_store),
+                        is_admin: workforce_hub::authz::make_admin_policy(Arc::clone(
+                            &service.identity_store,
+                        )),
+                    };
+                    for tool in workforce_hub::pairing_tool::pairing_tools(pairing_ctx) {
                         service.tools.register(tool);
                     }
                 }
@@ -6220,6 +6267,16 @@ rules:
             serve(listener, Arc::new(LocalJobHandler))
                 .await
                 .map_err(|e| eyre::eyre!("exec runner error: {e}"))?;
+        }
+        Commands::PtyHolder { socket } => {
+            let _ = tracing_subscriber::fmt()
+                .with_writer(std::io::stderr)
+                .with_env_filter(
+                    tracing_subscriber::EnvFilter::try_from_default_env()
+                        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+                )
+                .try_init();
+            workforce_desk::holder::run(&socket).await?;
         }
         Commands::McpServe {
             agent_id,
@@ -12486,6 +12543,33 @@ async fn handle_memory_command(command: MemoryCommand) -> Result<()> {
             );
             if !apply {
                 println!("dry run: nothing was changed; add --apply");
+            }
+            Ok(())
+        }
+        MemoryCommand::MoveSqlite {
+            from,
+            apply,
+            json,
+            config,
+        } => {
+            let wf_config = WorkforceConfig::load(&config)?;
+            let counts = workforce_hub::sqlite_memory_move::run(&wf_config, &from, apply).await?;
+            if json {
+                println!("{}", serde_json::to_string(&counts)?);
+            } else {
+                println!(
+                    "move-sqlite: {} memories in SQLite, {} with nothing to move, {} moved, {} read back as they were",
+                    counts.in_sqlite, counts.unmovable, counts.moved, counts.verified
+                );
+            }
+            if !apply {
+                if !json {
+                    println!("dry run: nothing was changed; add --apply");
+                }
+                return Ok(());
+            }
+            if !counts.complete() {
+                eyre::bail!("the move is not complete: {counts:?}");
             }
             Ok(())
         }

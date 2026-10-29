@@ -94,6 +94,7 @@ pub mod desk_crew;
 pub mod desk_driver;
 #[cfg(feature = "postgres")]
 pub mod desk_tools;
+pub(crate) mod device_link;
 pub mod games_driver;
 pub mod gateway;
 pub mod git_hardening;
@@ -247,6 +248,7 @@ pub(crate) mod slack_held;
 pub mod slack_manager;
 pub mod slack_onboarding;
 pub mod slack_tool;
+pub mod sqlite_memory_move;
 pub(crate) use hub_core::standing;
 pub mod state;
 pub use hub_core::stop_registry;

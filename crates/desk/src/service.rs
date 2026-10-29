@@ -18,6 +18,7 @@ use crate::adopt::{self, External};
 use crate::claude::{self, Hook};
 use crate::codex::{self, AppServer, CodexEvent, Seen};
 use crate::crew::{self, By, Event, Kind, Party};
+use crate::holder::{Held, Holder};
 use crate::model::{
     Approvals, Decision, DeskEvent, Engine, NewSession, Origin, PendingApproval, SessionPatch,
     SessionRecord, SessionState, SessionView,
@@ -30,6 +31,15 @@ use crate::rooms::{
 use crate::store::DeskStore;
 use crate::transcript;
 use crate::worktree;
+
+mod groups;
+mod terminals;
+
+pub use groups::{
+    local_agent_item, session_item, Group, Import, Imported, Layout, Ungrouped, UNGROUPED,
+};
+
+pub use terminals::{NewTerminal, TerminalPatch, TerminalRecord, TerminalState, TerminalView};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RestorePolicy {
@@ -54,6 +64,15 @@ pub struct Options {
     /// How often other terminals' Claude Code sessions are looked for;
     /// `None` turns adoption off.
     pub adopt_every: Option<Duration>,
+    /// The PTY holder that keeps terminals across hub restarts; without
+    /// one (or while it can't be reached) they are the hub's own children.
+    pub holder: Option<HolderOptions>,
+}
+
+#[derive(Debug, Clone)]
+pub struct HolderOptions {
+    pub socket: PathBuf,
+    pub token: String,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -70,8 +89,8 @@ pub enum DeskError {
 
 type Answer = oneshot::Sender<Value>;
 
-struct Live {
-    pty: Arc<Pty>,
+pub(crate) struct Live {
+    pub(crate) pty: Arc<Pty>,
     token: String,
     current_tool: Option<String>,
     pending: Option<PendingApproval>,
@@ -79,11 +98,43 @@ struct Live {
     ended: bool,
     stopping: bool,
     _codex: Option<CodexLink>,
+    /// The Desk terminal it runs in: its PTY is the terminal's, which
+    /// outlives it.
+    terminal: Option<Uuid>,
 }
 
-/// A Codex session's app-server and observer; dropping it stops both.
+impl Live {
+    /// Ends the session's processes, wherever they run (a terminal's shell
+    /// is the terminal's to end).
+    fn end(&self) {
+        if self.terminal.is_none() {
+            self.pty.kill();
+        }
+        if let Some(Server::Held(server)) = self._codex.as_ref().map(|c| &c.server) {
+            server.kill();
+        }
+    }
+}
+
+/// A Codex session's app-server: the hub's child, or the holder's.
+enum Server {
+    Local(AppServer),
+    Held(Arc<Pty>),
+}
+
+impl Server {
+    fn socket(&self, fallback: &Path) -> PathBuf {
+        match self {
+            Self::Local(s) => s.socket.clone(),
+            Self::Held(_) => fallback.to_path_buf(),
+        }
+    }
+}
+
+/// A Codex session's app-server and observer; dropping it stops the
+/// observer, and the app-server when it is the hub's own.
 struct CodexLink {
-    _server: AppServer,
+    server: Server,
     watch: CancellationToken,
 }
 
@@ -106,12 +157,18 @@ struct State {
     working_noted: HashMap<Uuid, std::time::Instant>,
     /// Sessions whose next stop or resume someone's action already recorded.
     acted: HashSet<Uuid>,
+    terminals: HashMap<Uuid, TerminalRecord>,
+    terminal_ptys: HashMap<Uuid, Arc<Pty>>,
+    /// The sidebar's groups.
+    layout: Layout,
 }
 
 /// How often a busy session's tool is recorded as `working`.
 const WORKING_EVERY: Duration = Duration::from_secs(60);
 
 enum Persist {
+    Terminal(Box<TerminalRecord>),
+    DeleteTerminal(Uuid),
     Put(Box<SessionRecord>),
     Delete(Uuid),
     Event(Box<Event>),
@@ -125,21 +182,62 @@ struct Inner {
     events: broadcast::Sender<DeskEvent>,
     persist: mpsc::UnboundedSender<Persist>,
     hook_base: String,
+    hook_port: u16,
     cancel: CancellationToken,
+    holder: Mutex<Option<Holder>>,
+    layout_write: tokio::sync::Mutex<()>,
 }
 
 #[derive(Clone)]
 pub struct Desk(Arc<Inner>);
 
+/// One of the hub's own secrets, which Desk Helper or the person's setup
+/// hands the hub (its admin token, JWT secret, vault key, the PTY holder's
+/// token, its Postgres password): a `WORKFORCE_`/`DESK_` name that says
+/// it is a token, secret, key or password. The person's own keys (say
+/// `ANTHROPIC_API_KEY`) are theirs and carry on; a terminal's
+/// `DESK_HOOK_TOKEN` is added after this, per terminal.
+fn hub_secret(name: &str) -> bool {
+    const SECRET: [&str; 5] = ["TOKEN", "SECRET", "KEY", "PASSWORD", "CREDENTIAL"];
+    (name.starts_with("WORKFORCE_") || name.starts_with("DESK_"))
+        && name
+            .split('_')
+            .any(|part| SECRET.iter().any(|s| part.starts_with(s)))
+}
+
+/// The environment sessions, terminals and the CLIs Desk runs start from:
+/// the hub's, without what a parent Claude Code left in it (`CLAUDE*`) and
+/// without the hub's own secrets.
 fn cli_env(base: &BTreeMap<String, String>) -> BTreeMap<String, String> {
     let mut env: BTreeMap<String, String> = base
         .iter()
-        .filter(|(k, _)| !k.starts_with("CLAUDE"))
+        .filter(|(k, _)| !k.starts_with("CLAUDE") && !hub_secret(k))
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
     env.insert("TERM".into(), "xterm-256color".into());
     env.insert("COLORTERM".into(), "truecolor".into());
     env
+}
+
+/// The layout without sessions the registry no longer has (forgotten
+/// before the hub took them out of it, or by an older hub). A failure to
+/// save it is only logged: the next start tries again.
+async fn prune_layout(
+    store: &DeskStore,
+    layout: Layout,
+    records: &HashMap<Uuid, SessionRecord>,
+) -> Layout {
+    let pruned = layout.without_sessions(|id| !records.contains_key(&id));
+    if pruned == layout {
+        return layout;
+    }
+    match store.put_layout(&pruned).await {
+        Ok(()) => pruned,
+        Err(e) => {
+            tracing::warn!(error = %e, "couldn't take forgotten sessions out of the sidebar's layout");
+            layout
+        }
+    }
 }
 
 impl Desk {
@@ -148,6 +246,8 @@ impl Desk {
     /// and the adoption poller. `cancel` stops all of it and every session.
     pub async fn start(store: DeskStore, opts: Options, cancel: CancellationToken) -> Result<Self> {
         let store = Arc::new(store);
+        let layout = store.layout().await?;
+        let (holder, held) = connect_holder(opts.holder.as_ref()).await;
         let rooms = store
             .rooms()
             .await?
@@ -159,20 +259,27 @@ impl Desk {
         for mut r in store.all().await? {
             let lost = r.state.is_running()
                 && match r.origin {
-                    Origin::Desk => true,
+                    Origin::Desk => match r.terminal_id {
+                        // Runs in a terminal: lost with it.
+                        Some(t) => !held.terminals.contains_key(&t),
+                        None => !held.sessions.contains_key(&r.id),
+                    },
                     Origin::External => !r.external_pid.is_some_and(adopt::alive),
                 };
             if lost {
                 r.state = r.state.after_loss();
-                r.restore_offer = opts.restore != RestorePolicy::Off;
+                // One started in a terminal is started there again, not by Desk.
+                r.restore_offer = opts.restore != RestorePolicy::Off && r.terminal_id.is_none();
                 r.updated_at = Utc::now();
                 recovered.push(r.clone());
             }
             records.insert(r.id, r);
         }
+        let layout = prune_layout(&store, layout, &records).await;
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-        let hook_base = format!("http://{}", listener.local_addr()?);
+        let listener = hook_listener(held.hook_port).await?;
+        let hook_port = listener.local_addr()?.port();
+        let hook_base = format!("http://127.0.0.1:{hook_port}");
         let (persist, persist_rx) = mpsc::unbounded_channel();
         let desk = Self(Arc::new(Inner {
             env: cli_env(&opts.env),
@@ -181,15 +288,20 @@ impl Desk {
             state: Mutex::new(State {
                 records,
                 rooms,
+                layout,
                 ..State::default()
             }),
             events: broadcast::channel(256).0,
             persist,
             hook_base,
+            hook_port,
             cancel: cancel.clone(),
+            holder: Mutex::new(holder),
+            layout_write: tokio::sync::Mutex::new(()),
         }));
         tokio::spawn(persist_loop(store, persist_rx));
         recovered.into_iter().for_each(|r| desk.save(r));
+        desk.adopt_held(held).await;
 
         let hooks = crate::api::hook_router(desk.clone());
         let shutdown = cancel.clone();
@@ -222,19 +334,139 @@ impl Desk {
         Ok(desk)
     }
 
+    /// Lets go of every session: the hub's own processes end with it, the
+    /// holder's carry on for the next hub to take back.
     fn shutdown(&self) {
-        let live: Vec<_> = self.0.state.lock().live.drain().collect();
+        let (live, terminals): (Vec<_>, Vec<_>) = {
+            let mut st = self.0.state.lock();
+            (
+                st.live.drain().collect(),
+                st.terminal_ptys.drain().collect(),
+            )
+        };
         drop(live);
+        drop(terminals);
+        if let Some(holder) = self.0.holder.lock().take() {
+            holder.close();
+        }
+    }
+
+    /// The holder, reconnecting if it went away; `None` without one.
+    pub(crate) async fn holder(&self) -> Option<Holder> {
+        let current = self.0.holder.lock().clone();
+        if let Some(h) = current.filter(Holder::is_connected) {
+            return Some(h);
+        }
+        let opts = self.0.opts.holder.as_ref()?;
+        match Holder::connect(&opts.socket, &opts.token).await {
+            Ok(h) => {
+                tracing::info!("reconnected to the PTY holder");
+                *self.0.holder.lock() = Some(h.clone());
+                Some(h)
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "PTY holder unavailable; this terminal runs in the hub");
+                None
+            }
+        }
+    }
+
+    /// Starts `spec` in the holder when there is one, else as the hub's
+    /// own child.
+    pub(crate) async fn start_pty(
+        &self,
+        spec: &crate::pty::Spawn,
+        meta: Value,
+    ) -> Result<(Pty, oneshot::Receiver<Exit>), DeskError> {
+        let history = crate::pty::history_rows(self.0.opts.scrollback_bytes);
+        let (cols, rows) = (crate::pty::DEFAULT_COLS, crate::pty::DEFAULT_ROWS);
+        if let Some(holder) = self.holder().await {
+            return Ok(holder.spawn(spec, cols, rows, history, meta).await?);
+        }
+        Ok(Pty::spawn(spec, cols, rows, history)?)
+    }
+
+    /// Takes back the sessions whose processes the holder kept while the
+    /// hub was away, as they were: same processes, same hook tokens.
+    async fn adopt_held(&self, mut held: HeldSet) {
+        let holder = self.0.holder.lock().clone();
+        let terminals = std::mem::take(&mut held.terminals).into_iter().collect();
+        self.adopt_terminals(holder.as_ref(), terminals).await;
+        tokio::spawn(self.clone().follow_cwds());
+        let Some(holder) = holder else {
+            return;
+        };
+        let history = crate::pty::history_rows(self.0.opts.scrollback_bytes);
+        for (id, h) in std::mem::take(&mut held.sessions) {
+            let known = self.0.state.lock().records.get(&id).cloned();
+            let Some(record) = known else {
+                held.strays.push(h);
+                continue;
+            };
+            let (pty, exit) = holder.adopt(&h, history);
+            let codex = match held.servers.remove(&id) {
+                Some(server) if record.engine == Engine::Codex => {
+                    let socket = server.meta["socket"].as_str().map(PathBuf::from);
+                    let (server_pty, _) = holder.adopt(&server, history);
+                    let server = Server::Held(Arc::new(server_pty));
+                    socket.map(|socket| self.observe_codex(id, server, socket))
+                }
+                other => {
+                    held.strays.extend(other);
+                    None
+                }
+            };
+            self.0.state.lock().live.insert(
+                id,
+                Live {
+                    pty: Arc::new(pty),
+                    token: h.meta["token"].as_str().unwrap_or_default().to_string(),
+                    current_tool: None,
+                    // An approval the old hub held died with it: the
+                    // terminal asks now.
+                    pending: (record.state == SessionState::Blocked).then(|| PendingApproval {
+                        id: Uuid::new_v4(),
+                        tool: "Input".into(),
+                        detail: "Answer in the terminal".into(),
+                        since: Utc::now(),
+                        answerable: false,
+                    }),
+                    answer: None,
+                    ended: false,
+                    stopping: false,
+                    _codex: codex,
+                    terminal: None,
+                },
+            );
+            tokio::spawn(self.clone().on_exit(id, exit));
+            if !record.state.is_running() {
+                self.change(id, |r, _| r.state = SessionState::Idle);
+            } else {
+                self.publish(id);
+            }
+            tracing::info!(%id, "desk session taken back from the PTY holder");
+        }
+        held.strays.extend(held.servers.into_values());
+        for stray in held.strays {
+            if stray.exited {
+                holder.reap(stray.id);
+            } else {
+                tracing::info!(id = %stray.id, "ending a held terminal no session owns");
+                holder.adopt(&stray, 0).0.kill();
+            }
+        }
     }
 
     fn view_of(state: &State, r: &SessionRecord) -> SessionView {
         let live = state.live.get(&r.id);
-        SessionView::new(
+        let mut view = SessionView::new(
             r,
             live.is_some(),
             live.and_then(|l| l.current_tool.clone()),
             live.and_then(|l| l.pending.clone()),
-        )
+        );
+        view.group = Self::group_ref(&state.layout, &groups::session_item(r.id));
+        view
     }
 
     fn save(&self, r: SessionRecord) {
@@ -262,6 +494,11 @@ impl Desk {
             session: Box::new(view),
         });
         events.into_iter().for_each(|e| self.note(e));
+    }
+
+    /// Tells every Desk watching.
+    pub(crate) fn announce(&self, event: DeskEvent) {
+        let _ = self.0.events.send(event);
     }
 
     /// Records `event` in Activity and tells every Desk watching.
@@ -480,6 +717,8 @@ impl Desk {
                 sessions: self.list(),
                 restore: self.restore_offer(),
                 rooms: self.rooms(),
+                terminals: self.terminals(),
+                layout: self.layout(),
             },
             rx,
         )
@@ -541,6 +780,8 @@ impl Desk {
             last_reply: None,
             external_pid: None,
             restore_offer: false,
+            terminal_id: None,
+            display_name: None,
             created_at: now,
             updated_at: now,
         };
@@ -554,7 +795,7 @@ impl Desk {
         let view = self.view(id)?;
         let me = Party::session(&view);
         self.note(match by {
-            Some(by) => by.event(Kind::Started, Some(me), format!("started {}", view.name)),
+            Some(by) => by.event(Kind::Started, Some(me), format!("started {}", view.label())),
             None => Event::new(Kind::Started, me.clone(), Some(me), "started"),
         });
         Ok(view)
@@ -565,6 +806,17 @@ impl Desk {
         if patch.name.as_deref().is_some_and(|n| n.trim().is_empty()) {
             return Err(DeskError::Invalid("a session needs a name".into()));
         }
+        let display_name = patch
+            .display_name
+            .map(|n| n.map(|n| n.trim().to_string()).filter(|n| !n.is_empty()));
+        if display_name
+            .as_ref()
+            .is_some_and(|n| n.as_ref().is_some_and(|n| n.chars().count() > 200))
+        {
+            return Err(DeskError::Invalid(
+                "a name is at most 200 characters".into(),
+            ));
+        }
         self.change(id, |r, _| {
             if let Some(n) = patch.name {
                 r.name = n.trim().to_string();
@@ -574,6 +826,9 @@ impl Desk {
             }
             if let Some(a) = patch.approvals.filter(|_| r.engine == Engine::Claude) {
                 r.approvals = a;
+            }
+            if let Some(n) = display_name {
+                r.display_name = n;
             }
         });
         self.view(id)
@@ -586,6 +841,11 @@ impl Desk {
                 .live
                 .get_mut(&id)
                 .ok_or_else(|| DeskError::Conflict("session is not running".into()))?;
+            if live.terminal.is_some() {
+                return Err(DeskError::Conflict(
+                    "this session runs in a terminal; end it there".into(),
+                ));
+            }
             live.stopping = true;
             let pty = Arc::clone(&live.pty);
             if by.is_some() {
@@ -599,7 +859,7 @@ impl Desk {
             self.note(by.event(
                 Kind::Stopped,
                 Some(Party::session(&view)),
-                format!("stopped {}", view.name),
+                format!("stopped {}", view.label()),
             ));
         }
         Ok(view)
@@ -631,6 +891,8 @@ impl Desk {
         self.change(id, |r, _| {
             r.origin = Origin::Desk;
             r.external_pid = None;
+            // Desk runs it now, not the terminal it started in.
+            r.terminal_id = None;
             r.state = SessionState::Starting;
             r.restore_offer = false;
             if let Some(p) = prompt.clone() {
@@ -648,8 +910,8 @@ impl Desk {
         let view = self.view(id)?;
         if let Some(by) = by {
             let text = match &prompt {
-                Some(p) => format!("resumed {} with “{}”", view.name, crew::one_line(p, 100)),
-                None => format!("resumed {}", view.name),
+                Some(p) => format!("resumed {} with “{}”", view.label(), crew::one_line(p, 100)),
+                None => format!("resumed {}", view.label()),
             };
             self.note(by.event(Kind::Resumed, Some(Party::session(&view)), text));
         }
@@ -679,8 +941,12 @@ impl Desk {
         self.0.state.lock().acted.insert(id);
         let view = self.resume(id, prompt.clone(), None).await?;
         let text = match &prompt {
-            Some(p) => format!("restarted {} with “{}”", view.name, crew::one_line(p, 100)),
-            None => format!("restarted {}", view.name),
+            Some(p) => format!(
+                "restarted {} with “{}”",
+                view.label(),
+                crew::one_line(p, 100)
+            ),
+            None => format!("restarted {}", view.label()),
         };
         self.note(by.event(Kind::Restarted, Some(Party::session(&view)), text));
         Ok(view)
@@ -714,16 +980,22 @@ impl Desk {
         }
     }
 
-    pub fn forget(&self, id: Uuid) -> Result<(), DeskError> {
+    /// Forgets a session: ends it, deletes its record and takes it out of
+    /// the sidebar's layout.
+    pub async fn forget(&self, id: Uuid) -> Result<(), DeskError> {
         let live = {
             let mut st = self.0.state.lock();
             st.records.remove(&id).ok_or(DeskError::NotFound)?;
             st.seen_transcripts.remove(&id);
             st.live.remove(&id)
         };
+        if let Some(live) = &live {
+            live.end();
+        }
         drop(live);
         let _ = self.0.persist.send(Persist::Delete(id));
         let _ = self.0.events.send(DeskEvent::Removed { id });
+        self.drop_from_layout(id).await;
         Ok(())
     }
 
@@ -790,11 +1062,13 @@ impl Desk {
                 Decision::Allow => Some(by.event(
                     Kind::Approved,
                     me,
-                    format!("allowed {} to {what}", view.name),
+                    format!("allowed {} to {what}", view.label()),
                 )),
-                Decision::Deny => {
-                    Some(by.event(Kind::Denied, me, format!("denied {} to {what}", view.name)))
-                }
+                Decision::Deny => Some(by.event(
+                    Kind::Denied,
+                    me,
+                    format!("denied {} to {what}", view.label()),
+                )),
                 Decision::Terminal => None,
             };
             if let Some(e) = event {
@@ -821,7 +1095,7 @@ impl Desk {
             self.note(by.event(
                 Kind::Nudged,
                 Some(Party::session(&view)),
-                format!("asked {} “{}”", view.name, crew::one_line(text, 120)),
+                format!("asked {} “{}”", view.label(), crew::one_line(text, 120)),
             ));
         }
         Ok(view)
@@ -865,8 +1139,7 @@ impl Desk {
 
     /// The end of what the terminal shows, as plain text.
     pub fn terminal_text(&self, id: Uuid, max_chars: usize) -> Result<String, DeskError> {
-        let (bytes, _) = self.attach(id)?.attach();
-        let text = crate::pty::plain_text(&bytes);
+        let text = crate::pty::plain_text(self.attach(id)?.text().as_bytes());
         let skip = text.chars().count().saturating_sub(max_chars);
         Ok(text.chars().skip(skip).collect())
     }
@@ -1067,11 +1340,11 @@ impl Desk {
             }
             Engine::Codex => {
                 let socket = self.0.opts.run_dir.join(format!("{}.sock", r.id.simple()));
-                let server = AppServer::start(&self.0.opts.codex, socket, &self.0.env).await?;
+                let server = self.start_app_server(r.id, &socket).await?;
                 let spec = codex::spawn(&codex::CodexSpawn {
                     program: &self.0.opts.codex,
                     cwd,
-                    socket: &server.socket,
+                    socket: &socket,
                     launch: match (resume, r.cli_session_id.as_deref()) {
                         (true, Some(thread_id)) => codex::Launch::Resume { thread_id },
                         _ => codex::Launch::New,
@@ -1079,28 +1352,26 @@ impl Desk {
                     prompt,
                     env: &self.0.env,
                 });
-                let watch = self.0.cancel.child_token();
-                let (tx, rx) = mpsc::channel(64);
-                tokio::spawn({
-                    let socket = server.socket.clone();
-                    let watch = watch.clone();
-                    async move {
-                        if let Err(e) = codex::observe(socket, tx, watch).await {
-                            tracing::warn!(error = %e, "codex observer stopped");
-                        }
-                    }
-                });
-                tokio::spawn(self.clone().codex_loop(r.id, rx));
-                (
-                    spec,
-                    Some(CodexLink {
-                        _server: server,
-                        watch,
-                    }),
-                )
+                let link = self.observe_codex(r.id, server, socket);
+                (spec, Some(link))
             }
         };
-        let (pty, exit) = Pty::spawn(&spec, self.0.opts.scrollback_bytes)?;
+        let meta = serde_json::json!({
+            "kind": "session",
+            "session": r.id,
+            "token": token,
+            "hookPort": self.0.hook_port,
+        });
+        let started = self.start_pty(&spec, meta).await;
+        let (pty, exit) = match started {
+            Ok(started) => started,
+            Err(e) => {
+                if let Some(Server::Held(server)) = codex.as_ref().map(|c| &c.server) {
+                    server.kill();
+                }
+                return Err(e);
+            }
+        };
         self.0.state.lock().live.insert(
             r.id,
             Live {
@@ -1112,18 +1383,65 @@ impl Desk {
                 ended: false,
                 stopping: false,
                 _codex: codex,
+                terminal: None,
             },
         );
         tokio::spawn(self.clone().on_exit(r.id, exit));
         Ok(())
     }
 
+    /// Starts a Codex session's app-server on `socket`: in the holder when
+    /// there is one, so it outlives the hub with the TUI attached to it.
+    async fn start_app_server(&self, id: Uuid, socket: &Path) -> Result<Server, DeskError> {
+        let Some(holder) = self.holder().await else {
+            let server =
+                AppServer::start(&self.0.opts.codex, socket.to_path_buf(), &self.0.env).await?;
+            return Ok(Server::Local(server));
+        };
+        codex::prepare_socket(socket).await?;
+        let spec = codex::app_server(&self.0.opts.codex, socket, &self.0.env);
+        let meta = serde_json::json!({
+            "kind": "codex-app-server",
+            "session": id,
+            "socket": socket,
+        });
+        let (pty, _) = holder.spawn(&spec, 80, 24, 0, meta).await?;
+        let pty = Arc::new(pty);
+        if let Err(e) = codex::wait_for_socket(socket).await {
+            pty.kill();
+            return Err(e.into());
+        }
+        Ok(Server::Held(pty))
+    }
+
+    /// Joins a Codex session's app-server as a second client to follow it.
+    fn observe_codex(&self, id: Uuid, server: Server, socket: PathBuf) -> CodexLink {
+        let watch = self.0.cancel.child_token();
+        let (tx, rx) = mpsc::channel(64);
+        tokio::spawn({
+            let socket = server.socket(&socket);
+            let watch = watch.clone();
+            async move {
+                if let Err(e) = codex::observe(socket, tx, watch).await {
+                    tracing::warn!(error = %e, "codex observer stopped");
+                }
+            }
+        });
+        tokio::spawn(self.clone().codex_loop(id, rx));
+        CodexLink { server, watch }
+    }
+
     async fn on_exit(self, id: Uuid, exit: oneshot::Receiver<Exit>) {
         let code = exit.await.ok().flatten();
+        if self.0.cancel.is_cancelled() {
+            // The hub is stopping: whatever ends now is not the session's doing.
+            return;
+        }
         let live = self.0.state.lock().live.remove(&id);
         let Some(live) = live else { return };
         tracing::info!(%id, ?code, "desk session exited");
         let clean = live.ended || live.stopping;
+        live.end();
         drop(live);
         self.change(id, |r, _| {
             r.state = if clean {
@@ -1273,11 +1591,19 @@ impl Desk {
         }
         // Answer a little before Claude Code's own hook timeout, so a slow
         // human falls back to the terminal dialog rather than an error.
-        let wait = self
+        let in_terminal = self
             .0
-            .opts
-            .approval_timeout
-            .saturating_sub(Duration::from_secs(5));
+            .state
+            .lock()
+            .live
+            .get(&id)
+            .is_some_and(|l| l.terminal.is_some());
+        let wait = if in_terminal {
+            terminals::TERMINAL_APPROVAL_WAIT
+        } else {
+            self.0.opts.approval_timeout
+        }
+        .saturating_sub(Duration::from_secs(5));
         match tokio::time::timeout(wait, rx).await {
             Ok(Ok(answer)) => answer,
             _ => {
@@ -1396,9 +1722,12 @@ impl Desk {
         let (ours, by_cli): (HashSet<String>, HashMap<String, Uuid>) = {
             let st = self.0.state.lock();
             (
-                st.live
-                    .keys()
-                    .filter_map(|id| st.records.get(id)?.cli_session_id.clone())
+                // Running here, or started in one of Desk's terminals (whose
+                // hooks report it): never another terminal's.
+                st.records
+                    .values()
+                    .filter(|r| st.live.contains_key(&r.id) || r.terminal_id.is_some())
+                    .filter_map(|r| r.cli_session_id.clone())
                     .collect(),
                 st.records
                     .values()
@@ -1471,6 +1800,8 @@ impl Desk {
                         last_reply: tail.last_reply,
                         external_pid: ext.pid,
                         restore_offer: false,
+                        terminal_id: None,
+                        display_name: None,
                         created_at: now,
                         updated_at: now,
                     };
@@ -1508,6 +1839,92 @@ impl Desk {
     }
 }
 
+/// What the holder still had when the hub started, by owner.
+#[derive(Default)]
+pub(crate) struct HeldSet {
+    sessions: HashMap<Uuid, Held>,
+    servers: HashMap<Uuid, Held>,
+    pub(crate) terminals: HashMap<Uuid, Held>,
+    /// Ended, or owned by nothing the hub knows.
+    pub(crate) strays: Vec<Held>,
+    /// The port the held sessions' hooks post to.
+    hook_port: Option<u16>,
+}
+
+impl HeldSet {
+    fn sort(all: Vec<Held>) -> Self {
+        let mut set = Self::default();
+        for h in all {
+            let owner = |key: &str| h.meta[key].as_str().and_then(|s| Uuid::parse_str(s).ok());
+            if h.exited {
+                set.strays.push(h);
+                continue;
+            }
+            match (h.meta["kind"].as_str(), owner("session"), owner("terminal")) {
+                (Some("session"), Some(id), _) => {
+                    set.hook_port = set.hook_port.or_else(|| {
+                        h.meta["hookPort"]
+                            .as_u64()
+                            .and_then(|p| u16::try_from(p).ok())
+                    });
+                    set.sessions.insert(id, h);
+                }
+                (Some("codex-app-server"), Some(id), _) => {
+                    set.servers.insert(id, h);
+                }
+                (Some("terminal"), _, Some(id)) => {
+                    set.hook_port = set.hook_port.or_else(|| {
+                        h.meta["hookPort"]
+                            .as_u64()
+                            .and_then(|p| u16::try_from(p).ok())
+                    });
+                    set.terminals.insert(id, h);
+                }
+                _ => set.strays.push(h),
+            }
+        }
+        set
+    }
+}
+
+/// Connects to the holder, when there is one, and lists what it kept.
+async fn connect_holder(opts: Option<&HolderOptions>) -> (Option<Holder>, HeldSet) {
+    let Some(opts) = opts else {
+        return (None, HeldSet::default());
+    };
+    let holder = match Holder::connect(&opts.socket, &opts.token).await {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::warn!(error = %e, socket = %opts.socket.display(),
+                "PTY holder unavailable; terminals run in the hub and end with it");
+            return (None, HeldSet::default());
+        }
+    };
+    match holder.list().await {
+        Ok(all) => {
+            tracing::info!(held = all.len(), "connected to the PTY holder");
+            (Some(holder), HeldSet::sort(all))
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "PTY holder did not list its terminals");
+            (Some(holder), HeldSet::default())
+        }
+    }
+}
+
+/// The hooks' listener, on the port held sessions already post to when
+/// there are any (so they keep reporting), else on any free port.
+async fn hook_listener(port: Option<u16>) -> Result<tokio::net::TcpListener> {
+    if let Some(port) = port {
+        match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
+            Ok(l) => return Ok(l),
+            Err(e) => tracing::error!(port, error = %e,
+                "the held sessions' hook port is taken; their hooks go unheard until they are restarted"),
+        }
+    }
+    Ok(tokio::net::TcpListener::bind("127.0.0.1:0").await?)
+}
+
 fn dedup(members: Vec<Member>) -> Vec<Member> {
     let mut seen = HashSet::new();
     members
@@ -1539,6 +1956,8 @@ async fn persist_loop(store: Arc<DeskStore>, mut rx: mpsc::UnboundedReceiver<Per
             Persist::Put(r) => store.put(r).await,
             Persist::Delete(id) => store.delete(*id).await,
             Persist::Event(e) => store.add_event(e).await,
+            Persist::Terminal(t) => store.put_terminal(t).await,
+            Persist::DeleteTerminal(id) => store.delete_terminal(*id).await,
         };
         if let Err(e) = result {
             tracing::error!(error = %e, "desk registry write failed");
@@ -1575,6 +1994,7 @@ mod tests {
             approval_timeout: Duration::from_secs(30),
             restore: RestorePolicy::Ask,
             adopt_every: None,
+            holder: None,
         }
     }
 
@@ -1621,10 +2041,45 @@ mod tests {
             ("CLAUDE_CODE_CHILD_SESSION".into(), "1".into()),
             ("CLAUDECODE".into(), "1".into()),
             ("HOME".into(), "/Users/k".into()),
+            ("ANTHROPIC_API_KEY".into(), "theirs".into()),
+            ("WORKFORCE_GATEWAY_URL".into(), "http://127.0.0.1:1".into()),
+            ("DESK_HOME".into(), "/tmp/desk".into()),
+            ("KEYBOARD_LAYOUT".into(), "uk".into()),
         ]));
         assert!(!env.keys().any(|k| k.starts_with("CLAUDE")));
         assert_eq!(env["HOME"], "/Users/k");
+        assert_eq!(env["ANTHROPIC_API_KEY"], "theirs", "the person's own");
+        assert_eq!(env["WORKFORCE_GATEWAY_URL"], "http://127.0.0.1:1");
+        assert_eq!(env["DESK_HOME"], "/tmp/desk");
+        assert_eq!(env["KEYBOARD_LAYOUT"], "uk");
         assert_eq!(env["TERM"], "xterm-256color");
+    }
+
+    /// What Desk Helper hands the hub, and the PTY holder's token, never
+    /// reach a session, a terminal or a CLI the hub runs.
+    #[test]
+    fn cli_env_drops_the_hubs_secrets() {
+        let secrets = [
+            crate::holder::TOKEN_ENV,
+            "WORKFORCE_GATEWAY_TOKEN",
+            "WORKFORCE_JWT_SECRET",
+            "WORKFORCE_VAULT_KEY",
+            "WORKFORCE_VAULT_NEW_KEY",
+            "WORKFORCE_PAIRING_TOKEN",
+            "WORKFORCE_GOOGLE_CLIENT_SECRET",
+            "WORKFORCE_VELLEV_API_KEY",
+            "DESK_POSTGRES_PASSWORD",
+        ];
+        let env = cli_env(
+            &secrets
+                .iter()
+                .map(|k| (k.to_string(), "s3cret".to_string()))
+                .collect(),
+        );
+        for k in secrets {
+            assert!(!env.contains_key(k), "{k}");
+        }
+        assert!(!env.values().any(|v| v == "s3cret"));
     }
 
     #[tokio::test]
@@ -1667,6 +2122,110 @@ mod tests {
                 .unwrap();
             assert_eq!(saved.state, SessionState::Interrupted);
             assert!(!saved.restore_offer);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn sessions_the_holder_kept_are_taken_back_as_they_were_after_a_hub_restart() {
+        with_test_pool(build_pool, |pool| async move {
+            let (_hdir, socket, holder_cancel) = crate::holder::tests::holder().await;
+            let dir = tempfile::tempdir().unwrap();
+            let mut opts = options(dir.path());
+            opts.restore = RestorePolicy::Auto;
+            opts.holder = Some(HolderOptions {
+                socket: socket.clone(),
+                token: crate::holder::tests::TOKEN.into(),
+            });
+            DeskStore::migrate(&pool).await.unwrap();
+            let first_cancel = CancellationToken::new();
+            let first = Desk::start(
+                DeskStore::from_pool(pool.clone()),
+                opts.clone(),
+                first_cancel.clone(),
+            )
+            .await
+            .unwrap();
+            let s = new_session(&first, dir.path()).await;
+            let token = token(&first, s.id);
+            let pid = first.attach(s.id).unwrap().pid();
+            post(
+                &first,
+                s.id,
+                json!({"hook_event_name": "UserPromptSubmit", "prompt": "run the tests"}),
+            )
+            .await;
+            let port = first.0.hook_port;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            first_cancel.cancel();
+            tokio::time::sleep(Duration::from_millis(300)).await;
+
+            let second = Desk::start(
+                DeskStore::from_pool(pool.clone()),
+                opts.clone(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            let v = second.view(s.id).unwrap();
+            assert!(v.live, "taken back");
+            assert_eq!(v.state, SessionState::Working, "not interrupted");
+            assert!(second.restore_offer().is_empty(), "nothing to restore");
+            assert_eq!(
+                second.attach(s.id).unwrap().pid(),
+                pid,
+                "the same process, not relaunched"
+            );
+            assert_eq!(second.0.hook_port, port, "hooks post where they did");
+            // The hook URL the running CLI was given still works.
+            let url = format!("http://127.0.0.1:{port}/hook/{}/{token}", s.id);
+            let answer = reqwest::Client::new()
+                .post(url)
+                .json(&json!({"hook_event_name": "Stop", "last_assistant_message": "All green."}))
+                .send()
+                .await
+                .unwrap();
+            assert!(answer.status().is_success());
+            let v = second.view(s.id).unwrap();
+            assert_eq!(
+                (v.state, v.last_reply.as_deref()),
+                (SessionState::Done, Some("All green."))
+            );
+
+            // Stopping it ends the held process for good.
+            second.stop(s.id, None).unwrap();
+            for _ in 0..100 {
+                if !second.view(s.id).unwrap().live {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert_eq!(second.view(s.id).unwrap().state, SessionState::Stopped);
+            let h = crate::holder::Holder::connect(&socket, crate::holder::tests::TOKEN)
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert!(h.list().await.unwrap().is_empty());
+            holder_cancel.cancel();
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn without_its_holder_the_hub_runs_terminals_itself() {
+        with_test_pool(build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let mut opts = options(dir.path());
+            opts.holder = Some(HolderOptions {
+                socket: dir.path().join("nobody.sock"),
+                token: "irrelevant-token-123".into(),
+            });
+            DeskStore::migrate(&pool).await.unwrap();
+            let d = Desk::start(DeskStore::from_pool(pool), opts, CancellationToken::new())
+                .await
+                .unwrap();
+            let s = new_session(&d, dir.path()).await;
+            assert!(s.live);
         })
         .await;
     }

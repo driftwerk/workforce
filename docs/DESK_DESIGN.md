@@ -404,6 +404,44 @@ Repo: new `driftwerk/workforce-desk`, depending on workforce-public via pinned g
   spans calls (no triggers needed). Requests = the principal's speech starting with a roster
   name, or their `agent_prompt`; others' speech is context only. Replies via
   `tuple notifications send`. There is no `message_user` any more.
+- **Terminal screens**: each PTY's output is parsed into a `vt100` model (plus the modes it
+  leaves out: `?1004`, `?2031`, kitty keyboard flags, modifyOtherKeys, the title). Attaching
+  sends the screen with its history and modes; a viewer that falls behind gets the screen again
+  (prefixed with CAN). One viewer is *active* (`{type:"claim"}`; the first to attach while none
+  is); only its keys and size count, others mirror it via `{type:"size"}` / `{type:"role"}`.
+  With no active viewer the hub answers DA1/DA2/DSR/DECRQM as xterm.js 6 would, and leaves
+  XTVERSION, `CSI ? u` and OSC 7501 unanswered as xterm.js does.
+- **PTY holder**: `workforce pty-holder --socket <path>` (token in `WORKFORCE_PTY_HOLDER_TOKEN`)
+  owns the PTYs when `[desk] pty_holder_socket`/`pty_holder_token` are set; a restarted hub takes
+  back the running sessions (same processes, hook port and tokens kept in the holder's per-PTY
+  meta), Codex app-servers and terminals. Without it terminals are the hub's own, as before.
+- **Terminals** (`/api/desk/terminals`): plain login shells with extra env from Desk; cwd
+  followed (`proc_pidinfo`, OSC 7) and kept with the env in `desk.terminals`; reopened there
+  after a reboot unless restore is `off`.
+  Each shell gets `DESK_TERMINAL_ID`, `DESK_HOOK_TOKEN`, `DESK_HOOK_BASE` and `DESK_HOOK_URL`
+  (`<hook base>/hook/terminal/<id>/<token>`); the person's `CLAUDE_CODE_PLUGIN_DIRS` always
+  carries through, with Desk's plugin dir appended when Desk sends one. Sessions, terminals and
+  the CLIs the hub runs start from the hub's environment without `CLAUDE*` and without the
+  hub's own secrets (`WORKFORCE_*`/`DESK_*` names saying TOKEN, SECRET, KEY, PASSWORD or
+  CREDENTIAL: the gateway token, JWT secret, vault key, holder token, Postgres password); the
+  holder passes on only what the hub asks for, never its own environment. A `claude` started there posts its hooks to that URL: SessionStart
+  registers a Desk-origin session with `terminalId` (or takes back the one with that
+  `session_id`), later hooks drive it like a Desk-launched session (approvals held up to a day),
+  SessionEnd or the shell ending stops it, and the `claude agents` adopter leaves it alone.
+- **Names and groups**: a session's person-given name (`displayName`, `PUT
+  /api/desk/sessions/{id}/name`) and the sidebar's groups (`/api/desk/groups`, `/api/desk/layout`,
+  Desk's `Layout` shape; members `session:<id>` / `agent:<hub>/<agent>`) live in Postgres and go
+  out as `{type:"layout"}`. Ungrouped's order is Desk's to settle (it lists what shows there
+  unplaced: every hub's agents, in Desk's order), so putting an item in Ungrouped or taking it
+  out of a group is `PUT /api/desk/groups/ungrouped/order {items}` with Ungrouped's order as
+  Desk shows it: each item comes out of its group, what Ungrouped listed and `items` leaves out
+  follows, and something coming out of a group opens Ungrouped. Deleting a group is `DELETE`,
+  then that order. A forgotten session leaves every group and Ungrouped at once, and the
+  hub drops any it no longer has on start and from Desk's first push. Agents see them: sessions carry `displayName` and `group`, the
+  overview names each by the person's name first and lists it under its group, and
+  `desk.sessions {query}` finds sessions by either name, folder or group.
+- **Desk state** (`/api/desk/state/{key}`): a JSON value per key in `desk.state`, committed
+  before the answer, announced as `{type:"state"}` (re-read on any `snapshot`).
 - **Security fix found on the way**: `/ws/agent` accepted any token when device pairing was
   configured (`validate_token_async(..).is_ok()` on an `Ok(None)`); fixed with tests on
   `fix/ws-agent-token-auth`, not pushed.

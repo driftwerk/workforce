@@ -277,8 +277,9 @@ impl ResolvedConfig {
     }
 
     /// Names of fields whose change cannot be hot-applied because they are
-    /// baked into a resource built at startup (the memory store connection or
-    /// the consolidation background task), so a restart is required. Returned
+    /// baked into a resource built at startup (the memory store connection),
+    /// so a restart is required. Consolidation is not among them: its job is
+    /// re-armed and its scan reads the live config. Returned
     /// so the operator can be told which parts of their edit are deferred.
     /// The `[llm] effort` level the agent's turns run at, when it names one.
     pub fn effort_level(&self) -> Option<workforce_agent::llm::anthropic::Effort> {
@@ -298,13 +299,6 @@ impl ResolvedConfig {
         // Applied to the store at construction (`with_min_certainty`).
         if self.memory.recall_min_certainty != next.memory.recall_min_certainty {
             changed.push("memory.recall_min_certainty");
-        }
-        // Decided once when the consolidation scanner is (or isn't) spawned.
-        if self.memory.consolidation != next.memory.consolidation {
-            changed.push("memory.consolidation");
-        }
-        if self.memory.consolidation_interval_secs != next.memory.consolidation_interval_secs {
-            changed.push("memory.consolidation_interval_secs");
         }
         if self.aws_s3.enabled != next.aws_s3.enabled {
             changed.push("aws_s3.enabled");

@@ -18,6 +18,7 @@ workforce-nats = { workspace = true }
 workforce-policy = { workspace = true }
 workforce-agent = { workspace = true }
 workforce-decide = { path = "../decide" }
+workforce-desk = { path = "../desk" }
 workforce-distributed = { path = "../distributed" }
 workforce-identity = { path = "../identity", features = ["postgres"] }
 toml = { workspace = true }

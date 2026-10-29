@@ -7,6 +7,7 @@
 pub mod budget;
 pub mod channel_display;
 pub mod config;
+pub mod device_pairing;
 pub mod engagement;
 pub mod environments;
 pub mod errors;

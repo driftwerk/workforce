@@ -40,23 +40,37 @@ export interface FenceInfo {
   text: string;
 }
 
-/** The fence language + raw payload of a `<pre>` whose sole child is a
- *  `<code class="language-…">`, or `null` for anything else. */
-export function fenceInfo(node: unknown): FenceInfo | null {
+export interface CodeBlockInfo {
+  /** The fence word, or `null` for a bare fence or an indented block. */
+  lang: string | null;
+  text: string;
+}
+
+/** The language (if any) + raw text of a `<pre>` whose sole child is a
+ *  `<code>`, or `null` for anything else. */
+export function codeBlockInfo(node: unknown): CodeBlockInfo | null {
   const pre = node as HastNode | undefined;
   const code = pre?.children?.length === 1 ? pre.children[0] : undefined;
   if (!code || code.tagName !== "code") return null;
   const classes = code.properties?.className;
-  if (!Array.isArray(classes)) return null;
-  const lang = classes
-    .find((c): c is string => typeof c === "string" && c.startsWith("language-"))
-    ?.slice("language-".length);
-  if (!lang) return null;
+  const lang =
+    (Array.isArray(classes)
+      ? classes
+          .find((c): c is string => typeof c === "string" && c.startsWith("language-"))
+          ?.slice("language-".length)
+      : undefined) || null;
   const text = (code.children ?? [])
     .filter((c) => c.type === "text" && typeof c.value === "string")
     .map((c) => c.value)
     .join("");
   return { lang, text };
+}
+
+/** The fence language + raw payload of a `<pre>` whose sole child is a
+ *  `<code class="language-…">`, or `null` for anything else. */
+export function fenceInfo(node: unknown): FenceInfo | null {
+  const block = codeBlockInfo(node);
+  return block?.lang ? { lang: block.lang, text: block.text } : null;
 }
 
 /** Which rich renderer (if any) handles this fence, given the agent's flags. */

@@ -313,7 +313,7 @@ impl CrewHub {
     fn session_name(&self, id: Uuid) -> String {
         self.desk
             .view(id)
-            .map(|v| v.name)
+            .map(|v| v.label().to_string())
             .unwrap_or_else(|_| "that session".into())
     }
 
@@ -434,7 +434,7 @@ impl CrewHub {
                 message,
             } => {
                 let v = d.prompt(*s, message, Some(by)).map_err(plain)?;
-                Ok(format!("asked {}", v.name))
+                Ok(format!("asked {}", v.label()))
             }
             Action::Nudge {
                 to: Target::Agent(a),
@@ -452,7 +452,7 @@ impl CrewHub {
                         Some(by),
                     )
                     .map_err(plain)?;
-                Ok(format!("allowed {}", v.name))
+                Ok(format!("allowed {}", v.label()))
             }
             Action::Deny { session, approval } => {
                 let v = d
@@ -463,25 +463,25 @@ impl CrewHub {
                         Some(by),
                     )
                     .map_err(plain)?;
-                Ok(format!("denied {}", v.name))
+                Ok(format!("denied {}", v.label()))
             }
             Action::Stop { session } => {
                 let v = d.stop(*session, Some(by)).map_err(plain)?;
-                Ok(format!("stopped {}", v.name))
+                Ok(format!("stopped {}", v.label()))
             }
             Action::Resume { session, prompt } => {
                 let v = d
                     .resume(*session, prompt.clone(), Some(by))
                     .await
                     .map_err(plain)?;
-                Ok(format!("resumed {}", v.name))
+                Ok(format!("resumed {}", v.label()))
             }
             Action::Restart { session, prompt } => {
                 let v = d
                     .restart(*session, prompt.clone(), by)
                     .await
                     .map_err(plain)?;
-                Ok(format!("restarted {}", v.name))
+                Ok(format!("restarted {}", v.label()))
             }
             Action::StartSession {
                 path,
@@ -508,7 +508,7 @@ impl CrewHub {
                     )
                     .await
                     .map_err(plain)?;
-                Ok(format!("started {} ({})", v.name, v.id))
+                Ok(format!("started {} ({})", v.label(), v.id))
             }
         }
     }

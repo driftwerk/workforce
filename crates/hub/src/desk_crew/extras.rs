@@ -44,7 +44,9 @@ impl CrewHub {
                 continue;
             };
             let id = p.id.to_string();
-            let named = text.contains(&v.name) || text.contains(&v.id.to_string());
+            let named = text.contains(&v.name)
+                || v.display_name.as_deref().is_some_and(|n| text.contains(n))
+                || text.contains(&v.id.to_string());
             if named || listed.iter().any(|l| l.approval_id == id) {
                 approvals.push(MentionedApproval {
                     session_id: v.id.to_string(),

@@ -136,6 +136,7 @@ async fn desk(pool: workforce_postgres::PostgresPool, dir: &Path) -> Desk {
             approval_timeout: Duration::from_secs(60),
             restore: RestorePolicy::Off,
             adopt_every: None,
+            holder: None,
         },
         CancellationToken::new(),
     )

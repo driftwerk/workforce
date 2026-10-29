@@ -22,9 +22,10 @@ use crate::conversations::{self, Conversations};
 use crate::crew::By;
 use crate::model::{Decision, NewSession, SessionPatch};
 use crate::providers::{self, AccountError, Accounts, Catalog, ConnectBody, Entry};
+use crate::pty::Frame;
 use crate::realtime::{Engine, Realtime, RealtimeError};
 use crate::rooms::{NewMessage, NewRoom, RoomPatch};
-use crate::service::{Desk, DeskError};
+use crate::service::{Desk, DeskError, Import, Layout, NewTerminal, TerminalPatch};
 use crate::speech::{Speak, SpeakError, Speech};
 
 /// Decides whether a request may use the desk. Implemented by the hub.
@@ -108,6 +109,7 @@ async fn forget(State(s): S, h: HeaderMap, Query(q): Q, Path(id): Path<Uuid>) ->
     guarded!(s, h, q);
     s.desk
         .forget(id)
+        .await
         .map(|()| StatusCode::NO_CONTENT)
         .into_response()
 }
@@ -228,39 +230,76 @@ async fn pty(
 #[serde(tag = "type", rename_all = "lowercase")]
 enum Control {
     Resize { cols: u16, rows: u16 },
+    Claim,
+}
+
+/// A frame as the viewer `me` is sent it: output and snapshots as binary,
+/// the terminal's size and this viewer's role as text.
+fn pty_message(me: u64, frame: Frame) -> Option<Message> {
+    match frame {
+        Frame::Bytes(bytes) => Some(Message::Binary(bytes)),
+        Frame::Size { cols, rows } => Some(Message::text(
+            json!({ "type": "size", "cols": cols, "rows": rows }).to_string(),
+        )),
+        Frame::Active(active) => Some(Message::text(
+            json!({ "type": "role", "active": active == Some(me), "free": active.is_none() })
+                .to_string(),
+        )),
+        Frame::Exit => None,
+    }
 }
 
 /// Binary frames carry terminal bytes both ways; text frames carry control
-/// messages (resize).
+/// messages: `resize` and `claim` from the viewer, `size` and `role` to it.
+/// Only the active viewer's keys and size reach the terminal; a viewer that
+/// falls behind is sent the screen again rather than losing bytes.
 async fn stream_pty(socket: WebSocket, pty: Arc<crate::pty::Pty>) {
     let (mut tx, mut rx) = socket.split();
-    let (scrollback, mut output) = pty.attach();
-    if !scrollback.is_empty() && tx.send(Message::Binary(scrollback)).await.is_err() {
-        return;
+    let (viewer, frames, mut output) = pty.attach();
+    let me = viewer.id();
+    for frame in frames {
+        if let Some(m) = pty_message(me, frame) {
+            if tx.send(m).await.is_err() {
+                return;
+            }
+        }
     }
     loop {
         tokio::select! {
             out = output.recv() => match out {
-                Ok(bytes) => if tx.send(Message::Binary(bytes)).await.is_err() { return },
-                Err(RecvError::Lagged(_)) => continue,
-                Err(RecvError::Closed) => {
+                Ok(Frame::Exit) | Err(RecvError::Closed) => {
                     let _ = tx.send(Message::Close(None)).await;
                     return;
+                }
+                Ok(frame) => {
+                    if let Some(m) = pty_message(me, frame) {
+                        if tx.send(m).await.is_err() { return }
+                    }
+                }
+                Err(RecvError::Lagged(_)) => {
+                    let (frames, fresh) = viewer.resync();
+                    output = fresh;
+                    for frame in frames {
+                        if let Some(m) = pty_message(me, frame) {
+                            if tx.send(m).await.is_err() { return }
+                        }
+                    }
                 }
             },
             incoming = rx.next() => match incoming {
                 Some(Ok(Message::Binary(bytes))) => {
-                    if let Err(e) = pty.write(&bytes) {
+                    if let Err(e) = viewer.input(&bytes) {
                         tracing::debug!(error = %e, "terminal input dropped");
                         return;
                     }
                 }
                 Some(Ok(Message::Text(text))) => match serde_json::from_str::<Control>(&text) {
                     Ok(Control::Resize { cols, rows }) => {
-                        if let Err(e) = pty.resize(cols, rows) {
+                        if let Err(e) = viewer.resize(cols, rows) {
                             tracing::debug!(error = %e, "terminal resize failed");
                         }
                     }
+                    Ok(Control::Claim) => viewer.claim(),
                     Err(e) => tracing::debug!(error = %e, "unknown terminal control message"),
                 },
                 Some(Ok(Message::Close(_))) | None | Some(Err(_)) => return,
@@ -268,6 +307,217 @@ async fn stream_pty(socket: WebSocket, pty: Arc<crate::pty::Pty>) {
             },
         }
     }
+}
+
+async fn terminals(State(s): S, h: HeaderMap, Query(q): Q) -> Response {
+    guarded!(s, h, q);
+    Json(s.desk.terminals()).into_response()
+}
+
+async fn create_terminal(
+    State(s): S,
+    h: HeaderMap,
+    Query(q): Q,
+    Json(new): Json<NewTerminal>,
+) -> Response {
+    guarded!(s, h, q);
+    s.desk.create_terminal(new).await.map(Json).into_response()
+}
+
+async fn update_terminal(
+    State(s): S,
+    h: HeaderMap,
+    Query(q): Q,
+    Path(id): Path<Uuid>,
+    Json(p): Json<TerminalPatch>,
+) -> Response {
+    guarded!(s, h, q);
+    s.desk.update_terminal(id, p).map(Json).into_response()
+}
+
+async fn close_terminal(State(s): S, h: HeaderMap, Query(q): Q, Path(id): Path<Uuid>) -> Response {
+    guarded!(s, h, q);
+    s.desk
+        .close_terminal(id)
+        .map(|()| StatusCode::NO_CONTENT)
+        .into_response()
+}
+
+async fn reopen_terminal(State(s): S, h: HeaderMap, Query(q): Q, Path(id): Path<Uuid>) -> Response {
+    guarded!(s, h, q);
+    s.desk.reopen_terminal(id).await.map(Json).into_response()
+}
+
+async fn terminal_pty(
+    State(s): S,
+    h: HeaderMap,
+    Query(q): Q,
+    Path(id): Path<Uuid>,
+    ws: WebSocketUpgrade,
+) -> Response {
+    guarded!(s, h, q);
+    match s.desk.attach_terminal(id) {
+        Ok(pty) => ws.on_upgrade(move |socket| stream_pty(socket, pty)),
+        Err(e) => e.into_response(),
+    }
+}
+
+async fn layout(State(s): S, h: HeaderMap, Query(q): Q) -> Response {
+    guarded!(s, h, q);
+    Json(s.desk.layout()).into_response()
+}
+
+async fn replace_layout(State(s): S, h: HeaderMap, Query(q): Q, Json(l): Json<Layout>) -> Response {
+    guarded!(s, h, q);
+    s.desk
+        .change_layout(|_| Ok(l))
+        .await
+        .map(Json)
+        .into_response()
+}
+
+async fn import_layout(State(s): S, h: HeaderMap, Query(q): Q, Json(i): Json<Import>) -> Response {
+    guarded!(s, h, q);
+    s.desk.import_layout(i).await.map(Json).into_response()
+}
+
+#[derive(Deserialize)]
+struct NewGroup {
+    #[serde(default)]
+    id: Option<String>,
+    name: String,
+    #[serde(default)]
+    items: Vec<String>,
+    #[serde(default)]
+    before: Option<String>,
+}
+
+async fn create_group(State(s): S, h: HeaderMap, Query(q): Q, Json(g): Json<NewGroup>) -> Response {
+    guarded!(s, h, q);
+    let id = g.id.unwrap_or_else(|| Uuid::new_v4().to_string());
+    s.desk
+        .change_layout(|l| l.create(&id, &g.name, &g.items, g.before.as_deref()))
+        .await
+        .map(Json)
+        .into_response()
+}
+
+#[derive(Deserialize)]
+struct GroupPatch {
+    name: Option<String>,
+    collapsed: Option<bool>,
+}
+
+async fn update_group(
+    State(s): S,
+    h: HeaderMap,
+    Query(q): Q,
+    Path(id): Path<String>,
+    Json(p): Json<GroupPatch>,
+) -> Response {
+    guarded!(s, h, q);
+    s.desk
+        .change_layout(|l| l.edit(&id, p.name.as_deref(), p.collapsed))
+        .await
+        .map(Json)
+        .into_response()
+}
+
+async fn delete_group(State(s): S, h: HeaderMap, Query(q): Q, Path(id): Path<String>) -> Response {
+    guarded!(s, h, q);
+    s.desk
+        .change_layout(|l| l.delete(&id))
+        .await
+        .map(Json)
+        .into_response()
+}
+
+#[derive(Deserialize, Default)]
+struct Before {
+    #[serde(default)]
+    before: Option<String>,
+}
+
+async fn move_group(
+    State(s): S,
+    h: HeaderMap,
+    Query(q): Q,
+    Path(id): Path<String>,
+    body: Option<Json<Before>>,
+) -> Response {
+    guarded!(s, h, q);
+    let before = body.map(|Json(b)| b.before).unwrap_or_default();
+    s.desk
+        .change_layout(|l| l.move_group(&id, before.as_deref()))
+        .await
+        .map(Json)
+        .into_response()
+}
+
+async fn put_member(
+    State(s): S,
+    h: HeaderMap,
+    Query(q): Q,
+    Path((id, item)): Path<(String, String)>,
+    body: Option<Json<Before>>,
+) -> Response {
+    guarded!(s, h, q);
+    let before = body.map(|Json(b)| b.before).unwrap_or_default();
+    s.desk
+        .change_layout(|l| l.put(&item, &id, before.as_deref()))
+        .await
+        .map(Json)
+        .into_response()
+}
+
+async fn remove_member(
+    State(s): S,
+    h: HeaderMap,
+    Query(q): Q,
+    Path((id, item)): Path<(String, String)>,
+) -> Response {
+    guarded!(s, h, q);
+    s.desk
+        .change_layout(|l| match l.group_of(&item) {
+            Some(g) if g.id == id => l.remove(&item),
+            _ => Err(DeskError::NotFound),
+        })
+        .await
+        .map(Json)
+        .into_response()
+}
+
+#[derive(Deserialize)]
+struct Order {
+    items: Vec<String>,
+}
+
+/// Ungrouped's order as Desk shows it (`Layout::order_ungrouped`): the
+/// route for putting an item in Ungrouped or taking it out of a group,
+/// since only Desk knows what shows there unlisted.
+async fn order_ungrouped(State(s): S, h: HeaderMap, Query(q): Q, Json(o): Json<Order>) -> Response {
+    guarded!(s, h, q);
+    s.desk
+        .change_layout(|l| l.order_ungrouped(&o.items))
+        .await
+        .map(Json)
+        .into_response()
+}
+
+#[derive(Deserialize)]
+struct NameBody {
+    name: Option<String>,
+}
+
+async fn name_session(
+    State(s): S,
+    h: HeaderMap,
+    Query(q): Q,
+    Path(id): Path<Uuid>,
+    Json(b): Json<NameBody>,
+) -> Response {
+    guarded!(s, h, q);
+    s.desk.name_session(id, b.name).map(Json).into_response()
 }
 
 async fn rooms(State(s): S, h: HeaderMap, Query(q): Q) -> Response {
@@ -356,6 +606,33 @@ pub fn sessions_router(desk: Desk, auth: Arc<dyn Authorize>) -> Router {
         .route("/api/desk/sessions/{id}/resume", post(resume))
         .route("/api/desk/sessions/{id}/approvals/{approval}", post(decide))
         .route("/api/desk/sessions/{id}/pty", get(pty))
+        .route(
+            "/api/desk/sessions/{id}/name",
+            axum::routing::put(name_session),
+        )
+        .route("/api/desk/layout", get(layout).put(replace_layout))
+        .route("/api/desk/layout/import", post(import_layout))
+        .route("/api/desk/groups", get(layout).post(create_group))
+        .route(
+            "/api/desk/groups/{id}",
+            patch(update_group).delete(delete_group),
+        )
+        .route("/api/desk/groups/{id}/move", post(move_group))
+        .route(
+            "/api/desk/groups/ungrouped/order",
+            axum::routing::put(order_ungrouped),
+        )
+        .route(
+            "/api/desk/groups/{id}/items/{*item}",
+            axum::routing::put(put_member).delete(remove_member),
+        )
+        .route("/api/desk/terminals", get(terminals).post(create_terminal))
+        .route(
+            "/api/desk/terminals/{id}",
+            patch(update_terminal).delete(close_terminal),
+        )
+        .route("/api/desk/terminals/{id}/reopen", post(reopen_terminal))
+        .route("/api/desk/terminals/{id}/pty", get(terminal_pty))
         .route("/api/desk/restore", post(restore))
         .route("/api/desk/restore/dismiss", post(dismiss_restore))
         .route("/api/desk/events", get(events))
@@ -382,6 +659,7 @@ pub fn router(
     crew: Arc<dyn crate::crew::Crew>,
 ) -> Router {
     sessions_router(desk.clone(), Arc::clone(&auth))
+        .merge(crate::state::router(desk.clone(), Arc::clone(&auth)))
         .merge(crate::crew_api::crew_router(desk, Arc::clone(&auth), crew))
         .merge(voice_router(Arc::clone(&auth), realtime, speech))
         .merge(providers_router(auth, accounts))
@@ -596,10 +874,268 @@ async fn hook(
     }
 }
 
+async fn terminal_hook(
+    State(desk): State<Desk>,
+    Path((terminal, token)): Path<(Uuid, String)>,
+    body: Bytes,
+) -> Response {
+    match desk.terminal_hook(terminal, &token, &body).await {
+        Some(answer) => Json(answer).into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
 /// Served on its own loopback listener; the per-session token in the URL is
 /// the credential.
 pub(crate) fn hook_router(desk: Desk) -> Router {
     Router::new()
         .route("/hook/{id}/{token}", post(hook))
+        .route("/hook/terminal/{terminal}/{token}", post(terminal_hook))
         .with_state(desk)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::time::Duration;
+
+    use futures::{SinkExt, StreamExt};
+    use serde_json::{json, Value};
+    use tokio_tungstenite::tungstenite::Message as Ws;
+    use workforce_postgres::test_support::with_test_pool;
+
+    use crate::service::NewTerminal;
+    use crate::store::{build_pool, DeskStore};
+    use crate::testing::{allow_all, options};
+
+    type Client = tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >;
+
+    /// The next text frame of `kind`, skipping output.
+    async fn next_text(ws: &mut Client, kind: &str) -> Value {
+        loop {
+            let m = tokio::time::timeout(Duration::from_secs(5), ws.next())
+                .await
+                .expect("a frame in time")
+                .unwrap()
+                .unwrap();
+            if let Ws::Text(t) = m {
+                let v: Value = serde_json::from_str(&t).unwrap();
+                if v["type"] == kind {
+                    return v;
+                }
+            }
+        }
+    }
+
+    /// Output until `needle` shows up.
+    async fn output_until(ws: &mut Client, needle: &str) -> String {
+        let mut seen = String::new();
+        while !seen.contains(needle) {
+            let m = tokio::time::timeout(Duration::from_secs(5), ws.next())
+                .await
+                .expect("output in time")
+                .unwrap()
+                .unwrap();
+            if let Ws::Binary(b) = m {
+                seen.push_str(&String::from_utf8_lossy(&b));
+            }
+        }
+        seen
+    }
+
+    #[tokio::test]
+    async fn two_viewers_one_types_the_other_mirrors_until_it_claims() {
+        with_test_pool(build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let mut opts = options(dir.path());
+            opts.env = BTreeMap::from([
+                ("PATH".into(), "/usr/bin:/bin".into()),
+                ("SHELL".into(), "/bin/sh".into()),
+            ]);
+            DeskStore::migrate(&pool).await.unwrap();
+            let desk = crate::Desk::start(
+                DeskStore::from_pool(pool),
+                opts,
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            let t = desk
+                .create_terminal(NewTerminal {
+                    id: None,
+                    name: None,
+                    cwd: dir.path().to_string_lossy().into_owned(),
+                    env: BTreeMap::new(),
+                })
+                .await
+                .unwrap();
+            let app = super::sessions_router(desk.clone(), allow_all());
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let url = format!("ws://{addr}/api/desk/terminals/{}/pty", t.id);
+
+            let (mut first, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+            let size = next_text(&mut first, "size").await;
+            assert_eq!(
+                (size["cols"].as_u64(), size["rows"].as_u64()),
+                (Some(120), Some(40))
+            );
+            assert_eq!(next_text(&mut first, "role").await["active"], true);
+            let (mut second, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+            let role = next_text(&mut second, "role").await;
+            assert_eq!(
+                (role["active"].as_bool(), role["free"].as_bool()),
+                (Some(false), Some(false))
+            );
+
+            // The mirror's keys and size go nowhere.
+            second
+                .send(Ws::Binary("echo from-mirror\n".into()))
+                .await
+                .unwrap();
+            second
+                .send(Ws::text(
+                    json!({ "type": "resize", "cols": 50, "rows": 10 }).to_string(),
+                ))
+                .await
+                .unwrap();
+            first
+                .send(Ws::text(
+                    json!({ "type": "resize", "cols": 100, "rows": 30 }).to_string(),
+                ))
+                .await
+                .unwrap();
+            let size = next_text(&mut second, "size").await;
+            assert_eq!(
+                (size["cols"].as_u64(), size["rows"].as_u64()),
+                (Some(100), Some(30))
+            );
+            first
+                .send(Ws::Binary("echo from-first\n".into()))
+                .await
+                .unwrap();
+            let seen = output_until(&mut second, "from-first\r\n").await;
+            assert!(!seen.contains("from-mirror"));
+
+            // Claiming makes it the one that types, at the size it asked for.
+            second.send(Ws::text(r#"{"type":"claim"}"#)).await.unwrap();
+            assert_eq!(next_text(&mut second, "role").await["active"], true);
+            assert_eq!(next_text(&mut first, "role").await["active"], false);
+            let size = next_text(&mut first, "size").await;
+            assert_eq!(
+                (size["cols"].as_u64(), size["rows"].as_u64()),
+                (Some(50), Some(10))
+            );
+            second
+                .send(Ws::Binary("echo now-second\n".into()))
+                .await
+                .unwrap();
+            output_until(&mut first, "now-second\r\n").await;
+            desk.close_terminal(t.id).unwrap();
+        })
+        .await;
+    }
+
+    async fn call(
+        app: &axum::Router,
+        method: &str,
+        uri: &str,
+        body: Option<Value>,
+    ) -> (u16, Value) {
+        use tower::ServiceExt;
+        let req = axum::http::Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(body.map_or_else(axum::body::Body::empty, |b| {
+                axum::body::Body::from(b.to_string())
+            }))
+            .unwrap();
+        let res = app.clone().oneshot(req).await.unwrap();
+        let status = res.status().as_u16();
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        )
+    }
+
+    #[tokio::test]
+    async fn names_and_groups_through_the_routes() {
+        with_test_pool(build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            DeskStore::migrate(&pool).await.unwrap();
+            let store = DeskStore::from_pool(pool);
+            let r = crate::store::tests::record_fixture("monorepo-fd");
+            store.put(&r).await.unwrap();
+            let desk = crate::Desk::start(store, options(dir.path()), tokio_util::sync::CancellationToken::new())
+                .await
+                .unwrap();
+            let app = super::sessions_router(desk, allow_all());
+            let s = format!("session:{}", r.id);
+
+            let (status, v) = call(&app, "PUT", &format!("/api/desk/sessions/{}/name", r.id), Some(json!({ "name": "Ledger migration" }))).await;
+            assert_eq!((status, &v["displayName"]), (200, &json!("Ledger migration")));
+            let (_, v) = call(&app, "PATCH", &format!("/api/desk/sessions/{}", r.id), Some(json!({ "displayName": null }))).await;
+            assert_eq!(v["displayName"], Value::Null);
+            assert_eq!(v["name"], "monorepo-fd");
+
+            let (status, l) = call(&app, "POST", "/api/desk/groups", Some(json!({ "id": "g1", "name": "Atlas" }))).await;
+            assert_eq!((status, &l["groups"][0]["name"]), (200, &json!("Atlas")));
+            call(&app, "POST", "/api/desk/groups", Some(json!({ "id": "g2", "name": "Infra", "items": ["agent:dw/allan"] }))).await;
+            let (status, l) = call(&app, "PUT", &format!("/api/desk/groups/g1/items/{s}"), Some(json!({ "before": null }))).await;
+            assert_eq!((status, &l["groups"][0]["items"]), (200, &json!([s])));
+            let (_, v) = call(&app, "GET", "/api/desk/sessions", None).await;
+            assert_eq!(v[0]["group"], json!({ "id": "g1", "name": "Atlas" }));
+            let (_, l) = call(&app, "POST", "/api/desk/groups/g2/move", Some(json!({ "before": "g1" }))).await;
+            assert_eq!(l["groups"][0]["id"], "g2");
+            let (_, l) = call(&app, "PATCH", "/api/desk/groups/g1", Some(json!({ "name": "Atlas work", "collapsed": true }))).await;
+            assert_eq!((&l["groups"][1]["name"], &l["groups"][1]["collapsed"]), (&json!("Atlas work"), &json!(true)));
+            let (_, l) = call(&app, "PATCH", "/api/desk/groups/ungrouped", Some(json!({ "collapsed": true }))).await;
+            assert_eq!(l["ungrouped"]["collapsed"], true);
+            let (status, _) = call(&app, "PATCH", "/api/desk/groups/ungrouped", Some(json!({ "name": "x" }))).await;
+            assert_eq!(status, 400);
+            let (status, l) = call(&app, "DELETE", &format!("/api/desk/groups/g1/items/{s}"), None).await;
+            assert_eq!((status, &l["ungrouped"]["items"]), (200, &json!([s])));
+            let (status, _) = call(&app, "DELETE", "/api/desk/groups/g1/items/agent:dw/allan", None).await;
+            assert_eq!(status, 404, "not in that group");
+            let (status, l) = call(&app, "DELETE", "/api/desk/groups/g2", None).await;
+            assert_eq!(status, 200);
+            assert_eq!(l["ungrouped"]["items"], json!([s, "agent:dw/allan"]));
+            let (status, _) = call(&app, "POST", "/api/desk/groups", Some(json!({ "name": "  " }))).await;
+            assert_eq!(status, 400);
+            let (_, got) = call(&app, "GET", "/api/desk/layout", None).await;
+            assert_eq!(got["groups"].as_array().unwrap().len(), 1);
+            let (status, l) = call(&app, "PUT", "/api/desk/layout", Some(json!({ "groups": [], "ungrouped": { "collapsed": false, "items": [] } }))).await;
+            assert_eq!((status, l["groups"].as_array().unwrap().len()), (200, 0));
+            let (status, i) = call(&app, "POST", "/api/desk/layout/import", Some(json!({
+                "layout": { "groups": [{ "id": "m", "name": "Atlas", "collapsed": false, "items": [s] }], "ungrouped": { "collapsed": false, "items": [] } },
+                "sessionNames": { r.id.to_string(): "Ledger migration" }
+            }))).await;
+            assert_eq!((status, &i["imported"]), (200, &json!(true)));
+            assert_eq!(i["sessionNames"][r.id.to_string()], "Ledger migration");
+
+            // Ungrouped's order as Desk settled it: taken out of its group.
+            let (status, l) = call(&app, "PUT", "/api/desk/groups/ungrouped/order", Some(json!({ "items": ["agent:dw/allan", s, "agent:local/scout"] }))).await;
+            assert_eq!((status, &l["ungrouped"]["items"]), (200, &json!(["agent:dw/allan", s, "agent:local/scout"])));
+            assert_eq!(l["groups"][0]["items"], json!([]));
+            let (status, _) = call(&app, "PUT", "/api/desk/groups/ungrouped/order", Some(json!({ "items": ["nonsense"] }))).await;
+            assert_eq!(status, 400);
+            // Still a group's own route: a group may not be called "ungrouped".
+            let (status, l) = call(&app, "PUT", &format!("/api/desk/groups/m/items/{s}"), Some(json!({}))).await;
+            assert_eq!((status, &l["groups"][0]["items"]), (200, &json!([s])));
+
+            // Forgotten, the session leaves the layout.
+            let (status, _) = call(&app, "DELETE", &format!("/api/desk/sessions/{}", r.id), None).await;
+            assert_eq!(status, 204);
+            let (_, l) = call(&app, "GET", "/api/desk/layout", None).await;
+            assert_eq!((&l["groups"][0]["items"], &l["ungrouped"]["items"]), (&json!([]), &json!(["agent:dw/allan", "agent:local/scout"])));
+        })
+        .await;
+    }
 }

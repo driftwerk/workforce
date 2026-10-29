@@ -956,6 +956,7 @@ impl workforce_pairing::PairingStore for FailingPairingStore {
         fn get_device_request_by_code(&self, code: &str) -> eyre::Result<Option<workforce_pairing::DevicePairingRequest>>;
         fn list_pending_device_requests(&self) -> eyre::Result<Vec<workforce_pairing::DevicePairingRequest>>;
         fn update_device_request_status(&self, id: &str, status: workforce_pairing::PairingStatus, approved_by: Option<&str>) -> eyre::Result<()>;
+        fn claim_device_request(&self, id: &str, approved_by: &str) -> eyre::Result<bool>;
         fn register_device(&self, device: &workforce_pairing::ApprovedDevice) -> eyre::Result<()>;
         fn get_device_by_id(&self, id: &str) -> eyre::Result<Option<workforce_pairing::ApprovedDevice>>;
         fn validate_device_token_hash(&self, token_hash: &str) -> eyre::Result<Option<(workforce_pairing::ApprovedDevice, workforce_pairing::TokenMatch)>>;

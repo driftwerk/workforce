@@ -54,7 +54,43 @@ pub fn spawn(s: &CodexSpawn<'_>) -> Spawn {
     }
 }
 
-/// The per-session app-server. Killed when dropped.
+/// How to run a session's app-server, listening on `socket`.
+pub fn app_server(program: &Path, socket: &Path, env: &BTreeMap<String, String>) -> Spawn {
+    Spawn {
+        program: program.to_path_buf(),
+        args: vec![
+            "app-server".into(),
+            "--listen".into(),
+            format!("unix://{}", socket.display()),
+        ],
+        cwd: socket
+            .parent()
+            .map_or_else(|| PathBuf::from("/"), Path::to_path_buf),
+        env: env.clone(),
+    }
+}
+
+/// Makes `socket`'s folder and clears a stale socket, before a server starts.
+pub async fn prepare_socket(socket: &Path) -> Result<()> {
+    if let Some(dir) = socket.parent() {
+        tokio::fs::create_dir_all(dir).await?;
+    }
+    let _ = tokio::fs::remove_file(socket).await;
+    Ok(())
+}
+
+/// Waits up to ten seconds for a server to open `socket`.
+pub async fn wait_for_socket(socket: &Path) -> Result<()> {
+    for _ in 0..100 {
+        if tokio::fs::try_exists(socket).await.unwrap_or(false) {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    eyre::bail!("codex app-server did not open {}", socket.display())
+}
+
+/// The per-session app-server as the hub's own child. Killed when dropped.
 pub struct AppServer {
     _child: Child,
     pub socket: PathBuf,
@@ -66,13 +102,10 @@ impl AppServer {
         socket: PathBuf,
         env: &BTreeMap<String, String>,
     ) -> Result<Self> {
-        if let Some(dir) = socket.parent() {
-            tokio::fs::create_dir_all(dir).await?;
-        }
-        let _ = tokio::fs::remove_file(&socket).await;
-        let child = Command::new(program)
-            .args(["app-server", "--listen"])
-            .arg(format!("unix://{}", socket.display()))
+        prepare_socket(&socket).await?;
+        let spec = app_server(program, &socket, env);
+        let child = Command::new(&spec.program)
+            .args(&spec.args)
             .env_clear()
             .envs(env)
             .stdin(std::process::Stdio::null())
@@ -81,16 +114,11 @@ impl AppServer {
             .kill_on_drop(true)
             .spawn()
             .context("starting codex app-server")?;
-        for _ in 0..100 {
-            if tokio::fs::try_exists(&socket).await.unwrap_or(false) {
-                return Ok(Self {
-                    _child: child,
-                    socket,
-                });
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-        eyre::bail!("codex app-server did not open {}", socket.display())
+        wait_for_socket(&socket).await?;
+        Ok(Self {
+            _child: child,
+            socket,
+        })
     }
 }
 

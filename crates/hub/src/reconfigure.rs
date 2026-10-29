@@ -52,7 +52,14 @@ pub(crate) async fn apply_config(service: &AgentService) -> eyre::Result<Vec<Str
         .map(str::to_string)
         .collect();
 
+    let consolidation = |m: &workforce_common::settings::MemoryConfig| {
+        (m.consolidation, m.consolidation_interval_secs)
+    };
+    let rearm = consolidation(&service.resolved.snapshot().memory) != consolidation(&next.memory);
     service.resolved.store(next);
+    if rearm {
+        crate::memory_consolidation::rearm(service).await;
+    }
     // Self-learning is hot-reloadable (excluded from `structural_diff`): if
     // it just flipped on and no store is open, open it now so curation can
     // start without a restart. The runner already no-ops while disabled.

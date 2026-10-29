@@ -205,11 +205,13 @@ async fn the_admin_token_pairs_a_desktop_device_that_chats_as_its_person() {
         .get_by_id(uuid::Uuid::parse_str(&person_id).unwrap())
         .unwrap()
         .unwrap();
-    assert!(
-        person.linked_ids.contains_key("ios_device"),
-        "the phone stays linked"
-    );
-    assert!(person.linked_ids.contains_key("desktop_device"));
+    let kinds: Vec<&str> = person
+        .linked_ids
+        .keys()
+        .filter_map(|key| key.split_once(':').map(|(kind, _)| kind))
+        .collect();
+    assert!(kinds.contains(&"ios_device"), "the phone stays linked");
+    assert!(kinds.contains(&"desktop_device"));
 
     let desk = anchored_session(addr, &format!("token={}&channel=desk", tokens[1])).await;
     let session = service

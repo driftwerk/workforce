@@ -38,6 +38,11 @@ pub trait PairingStore: Send + Sync {
         status: PairingStatus,
         approved_by: Option<&str>,
     ) -> Result<()>;
+    /// Move a still-pending device request to approved, in one conditional
+    /// write. `Ok(false)` means it was no longer pending — another approval or
+    /// a rejection got there first — so a code is approved at most once even
+    /// when two approvers race.
+    fn claim_device_request(&self, id: &str, approved_by: &str) -> Result<bool>;
     fn register_device(&self, device: &ApprovedDevice) -> Result<()>;
     fn get_device_by_id(&self, id: &str) -> Result<Option<ApprovedDevice>>;
     /// Look up a device by hashed bearer token. Returns the device plus
@@ -153,6 +158,21 @@ pub(crate) fn device_request_contract(store: &dyn PairingStore) {
         .unwrap();
     assert_eq!(approved.status, PairingStatus::Approved);
     assert_eq!(kept(&approved), expected);
+
+    assert!(
+        store.claim_device_request(&legacy.id, "first").unwrap(),
+        "a pending request is claimed"
+    );
+    assert!(
+        !store.claim_device_request(&legacy.id, "second").unwrap(),
+        "a request is claimed once"
+    );
+    let claimed = store
+        .get_device_request_by_code("LEGACY01")
+        .unwrap()
+        .unwrap();
+    assert_eq!(claimed.status, PairingStatus::Approved);
+    assert_eq!(claimed.approved_by.as_deref(), Some("first"));
 }
 
 /// SQLite-backed pairing store.
@@ -636,6 +656,17 @@ impl PairingStore for SqlitePairingStore {
             params![status.as_str(), approved_by, approved_at, id],
         )?;
         Ok(())
+    }
+
+    fn claim_device_request(&self, id: &str, approved_by: &str) -> Result<bool> {
+        let conn = self.lock()?;
+        let changed = conn.execute(
+            "UPDATE device_pairing_requests
+             SET status = 'approved', approved_by = ?1, approved_at = ?2
+             WHERE id = ?3 AND status = 'pending'",
+            params![approved_by, Utc::now().to_rfc3339(), id],
+        )?;
+        Ok(changed == 1)
     }
 
     fn register_device(&self, device: &ApprovedDevice) -> Result<()> {

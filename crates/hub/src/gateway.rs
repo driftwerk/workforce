@@ -532,12 +532,31 @@ pub fn router(state: Arc<GatewayState>) -> Router {
         )
         .route("/api/heartbeat/checks/{id}/trigger", post(trigger_heartbeat_check))
         .route("/api/heartbeat/history", get(get_heartbeat_history))
+        .route("/api/agents/{id}/heartbeat", get(agent_heartbeat_status))
         // Unauthenticated device pairing endpoints (self-service flow)
         .route(
             "/api/pair/device/request",
             post(pair_device_request_unauthenticated),
         )
         .route("/api/pair/device/status/{code}", get(pair_device_status))
+        // Connecting a device from the browser: the signed-in person approves
+        // it into their own account, or an admin assigns it to someone.
+        .route(
+            "/api/pair/device/pending/{code}",
+            get(crate::api_handlers::device_pairing::pending),
+        )
+        .route(
+            "/api/pair/device/approve-self",
+            post(crate::api_handlers::device_pairing::approve_self),
+        )
+        .route(
+            "/api/pair/device/reject-self",
+            post(crate::api_handlers::device_pairing::reject_self),
+        )
+        .route(
+            "/api/pair/device/approve",
+            post(crate::api_handlers::device_pairing::assign),
+        )
         .route(
             "/api/pair/device/rotate",
             post(pair_device_rotate_self),
@@ -885,6 +904,7 @@ pub fn router(state: Arc<GatewayState>) -> Router {
         )
         .route("/api/agents/{id}/memory/tasks", get(crate::api_handlers::memory::memory_list_tasks))
         .route("/api/agents/{id}/memory/stats", get(crate::api_handlers::memory::memory_stats))
+        .route("/api/agents/{id}/memory/summary", get(crate::api_handlers::memory::memory_summary))
         // Auth endpoints (DW-466)
         .route("/api/auth/login", post(auth_login))
         .route("/api/auth/refresh", post(auth_refresh))
@@ -4364,8 +4384,34 @@ async fn get_me(
         "role": identity.role.as_str(),
         "status": identity.status.as_str(),
         "device_id": caller.device_id,
-        "linked_ios_device": identity.linked_ids.get("ios_device"),
+        "linked_ios_device": linked_ios_device(&identity, caller.device_id.as_deref()),
     })))
+}
+
+/// The iPhone `/api/me` reports as this person's: the calling device when it
+/// is one of theirs, else their first. A person may hold several, each under
+/// its own `ios_device:{id}` key, or one under the bare key pairing used to
+/// write.
+fn linked_ios_device<'a>(
+    identity: &'a workforce_identity::types::Identity,
+    calling_device: Option<&str>,
+) -> Option<&'a str> {
+    let kind = workforce_pairing::types::DEFAULT_DEVICE_KIND;
+    let mut theirs = identity
+        .linked_ids
+        .iter()
+        .filter(|(key, _)| {
+            key.as_str() == kind
+                || key
+                    .strip_prefix(kind)
+                    .is_some_and(|rest| rest.starts_with(':'))
+        })
+        .map(|(_, id)| id.as_str())
+        .collect::<Vec<_>>();
+    theirs.sort_unstable();
+    calling_device
+        .and_then(|d| theirs.iter().copied().find(|id| *id == d))
+        .or_else(|| theirs.first().copied())
 }
 
 /// `GET /api/me/capabilities` — the authenticated caller's role and the
@@ -4415,13 +4461,15 @@ fn is_conversational_channel(channel: &str) -> bool {
 
 // ── Agent CRUD & Detail Endpoints (DW-421) ────────────────────────────────
 
-/// Identity files that can be read/written via the API.
+/// Identity files that can be read/written via the API. HEARTBEAT.md is the
+/// agent's check-in list, which Desk edits beside the others.
 const ALLOWED_IDENTITY_FILES: &[&str] = &[
     "SOUL.md",
     "AGENTS.md",
     "TOOLS.md",
     "IDENTITY.md",
     "WELCOME.md",
+    "HEARTBEAT.md",
 ];
 
 /// Helper: resolve an agent service by ID, returning an appropriate error.
@@ -6087,6 +6135,69 @@ async fn admin_reset_model(
 /// the response text of recent runs — gated on `SCOPE_HEARTBEAT` so it
 /// can't be used as a free-attendance oracle. For pure liveness probes
 /// (load balancers etc.) see [`livez`].
+/// The items of a check-in list: its Markdown list items.
+fn checklist_items(list: &str) -> usize {
+    list.lines()
+        .map(str::trim_start)
+        .filter(|l| {
+            l.starts_with("- ")
+                || l.starts_with("* ")
+                || l.split_once(". ")
+                    .is_some_and(|(n, _)| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
+        })
+        .count()
+}
+
+#[cfg(test)]
+mod checklist_tests {
+    #[test]
+    fn a_check_in_list_counts_its_list_items_only() {
+        let list = "# Check-in list\n\nLook over:\n- the build\n  * nested ones count too\n1. Acme's inbox\n12. the calendar\nnot an item\n2025. was a year\n";
+        assert_eq!(super::checklist_items(list), 5);
+        assert_eq!(super::checklist_items(""), 0);
+    }
+}
+
+/// `GET /api/agents/{id}/heartbeat`: one agent's own check-ins, as its own
+/// `[heartbeat]` over the install's says: on or off, how often, its quiet
+/// hours, how many things are on its check-in list (HEARTBEAT.md), when it
+/// last went through it, and whether that needed the person.
+async fn agent_heartbeat_status(
+    Path(id): Path<String>,
+    Query(query): Query<WsQuery>,
+    headers: axum::http::HeaderMap,
+    State(state): State<Arc<GatewayState>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let (service, _caller) =
+        authorise_agent_reader(&state, &headers, query.token.as_deref(), &id).await?;
+    let own = workforce_common::settings::AgentWorkspaceConfig::load_with_text(&service.workspace)
+        .ok()
+        .flatten()
+        .and_then(|(config, _)| config.heartbeat);
+    let effective = service.config.heartbeat.for_agent(own.as_ref());
+    let list = workforce_common::config_files::read(&service.workspace.join("HEARTBEAT.md"))
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    let last_checked = crate::heartbeat::HeartbeatState::load(&service.workspace).last_heartbeat;
+    let handle = service.heartbeat_handle.read().clone();
+    let last = match handle {
+        Some(handle) => handle.last().await,
+        None => None,
+    };
+    Ok(Json(serde_json::json!({
+        "agent_id": id,
+        "enabled": effective.enabled,
+        "interval_secs": effective.interval_secs,
+        "quiet_start": effective.quiet_start,
+        "quiet_end": effective.quiet_end,
+        "items": checklist_items(&list),
+        "last_checked": last_checked.map(|t| t.to_rfc3339()),
+        "needed_you": last.as_ref().map(|r| r.actionable),
+        "last_error": last.and_then(|r| r.error),
+    })))
+}
+
 async fn heartbeat_status(
     Query(query): Query<WsQuery>,
     headers: axum::http::HeaderMap,
@@ -6937,142 +7048,42 @@ async fn pair_approve(
         }
     }
 
-    // Try device pairing
+    // Try device pairing. This older route links by the device's own
+    // `identity_hint`; the person-confirmed paths are approve-self and the
+    // admin assign below.
     if let Some(ref pairing) = state.device_pairing {
-        // Read the request before approval so the identity_hint captured at
-        // initiation is available regardless of approve internals.
-        let pending = pairing
-            .check_status_async(code.clone())
-            .await
-            .ok()
-            .flatten();
-        let identity_hint = pending.as_ref().and_then(|req| req.identity_hint.clone());
-        let device_kind = pending
-            .as_ref()
-            .and_then(|req| req.device_kind.clone())
-            .unwrap_or_else(|| workforce_pairing::types::DEFAULT_DEVICE_KIND.to_string());
-
-        if let Ok((device, token)) = pairing
-            .approve_async(code.clone(), "admin".to_string())
-            .await
+        if let Ok(approval) = crate::device_link::approve_and_link(
+            pairing,
+            state.identity_store.as_deref(),
+            &code,
+            "admin",
+            crate::device_link::LinkChoice::FromHint,
+        )
+        .await
         {
-            // Auto-link device → identity. Failures are non-fatal: the
-            // device is still paired; an admin can link manually via
-            // `/api/me/link-device` or the management UI.
-            let link_result = identity_hint.as_deref().and_then(|hint| {
-                let store = state.identity_store.as_ref()?;
-                match auto_link_device_to_identity(store.as_ref(), hint, &device.id, &device_kind) {
-                    Ok(linked) => linked,
-                    Err(e) => {
-                        warn!(
-                            device_id = %device.id,
-                            hint = %hint,
-                            error = %e,
-                            "Auto-link failed during device pairing approval"
-                        );
-                        None
-                    }
-                }
-            });
-
+            crate::device_link::audit_device_pair(
+                "admin_hint",
+                _caller.identity_id.as_deref(),
+                &approval,
+            );
+            let device = &approval.device;
             let mut response = serde_json::json!({
                 "type": "device",
                 "approved": true,
                 "device_name": device.device_name,
                 "device_id": device.id,
-                "token": token,
+                "token": approval.token,
                 "scopes": device.scopes,
             });
-            if let Some((identity_id, kind)) = link_result {
+            if let Some((identity_id, kind)) = approval.link {
                 response["linked_identity_id"] = serde_json::json!(identity_id);
                 response["linked_via"] = serde_json::json!(kind);
-            } else if let Some(hint) = identity_hint {
-                warn!(
-                    device_id = %device.id,
-                    hint = %hint,
-                    "Pairing approved but identity hint did not match any identity — device is unlinked"
-                );
             }
             return Ok(Json(response));
         }
     }
 
     Err(StatusCode::NOT_FOUND)
-}
-
-/// Resolve `hint` to an identity and link `device_id` to it as an
-/// `ios_device` linked-id. Mirrors the auto-match flow already used by
-/// Slack ([`crate::slack_manager::resolve_slack_identity`]) and Keycloak
-/// ([`crate::oidc`]).
-///
-/// Resolution order:
-///  1. `hint` parses as a UUID → look up by `Identity.id`.
-///  2. `hint` looks like an email → look up by email; if missing,
-///     auto-provision a new identity (status=AutoProvisioned) under the
-///     provisioning source `IosAuto`. This matches Slack's behaviour:
-///     trust the email at the auth boundary, create the row.
-///
-/// Returns `Ok(Some((identity_id, kind)))` on success where `kind` is
-/// `"id"` / `"email"` / `"auto_provisioned"`. `Ok(None)` means the hint
-/// did not resolve and no identity was created (e.g. a malformed hint).
-fn auto_link_device_to_identity(
-    store: &dyn workforce_identity::store::IdentityStore,
-    hint: &str,
-    device_id: &str,
-    device_kind: &str,
-) -> eyre::Result<Option<(String, &'static str)>> {
-    use workforce_identity::types::*;
-
-    if let Ok(uuid) = uuid::Uuid::parse_str(hint) {
-        let Some(mut identity) = store.get_by_id(uuid)? else {
-            return Ok(None);
-        };
-        if identity.status == IdentityStatus::Suspended {
-            return Ok(None);
-        }
-        identity.link_id(device_kind, device_id);
-        store.update(&identity)?;
-        info!(
-            identity_id = %identity.id,
-            device_id = device_id,
-            "Linked device to identity by UUID"
-        );
-        return Ok(Some((identity.id.to_string(), "id")));
-    }
-
-    if !hint.contains('@') {
-        return Ok(None);
-    }
-
-    if let Some(mut existing) = store.get_by_email(hint)? {
-        if existing.status == IdentityStatus::Suspended {
-            return Ok(None);
-        }
-        existing.link_id(device_kind, device_id);
-        store.update(&existing)?;
-        info!(
-            identity_id = %existing.id,
-            email = hint,
-            device_id = device_id,
-            "Linked device to existing identity by email"
-        );
-        return Ok(Some((existing.id.to_string(), "email")));
-    }
-
-    let identity = Identity::new(hint, IdentityRole::Member)
-        .with_email(hint)
-        .with_status(IdentityStatus::AutoProvisioned)
-        .with_provisioning_source(ProvisioningSource::IosAuto)
-        .with_linked_id(device_kind, device_id);
-    let id_str = identity.id.to_string();
-    store.create(&identity)?;
-    info!(
-        identity_id = %id_str,
-        email = hint,
-        device_id = device_id,
-        "Auto-provisioned identity for device pairing by email"
-    );
-    Ok(Some((id_str, "auto_provisioned")))
 }
 
 /// Reject a pairing code.
@@ -7141,26 +7152,7 @@ struct InitiateDeviceRequest {
     device_kind: Option<String>,
 }
 
-/// Resolve the identity that owns `device_id`, whatever kind it paired as.
-///
-/// A device is recorded under its own `linked_ids` key (`ios_device`,
-/// `voice_device`, …), so a lookup fixed to `ios_device` would authenticate
-/// iPhones and leave every other surface anonymous. Tries the known kinds in
-/// turn; the iOS key stays first because it is by far the common case.
-pub(crate) fn identity_for_device(
-    store: &dyn workforce_identity::store::IdentityStore,
-    device_id: &str,
-) -> Option<String> {
-    workforce_pairing::types::DEVICE_KINDS
-        .iter()
-        .find_map(|kind| {
-            store
-                .get_by_linked_id(kind, device_id)
-                .ok()
-                .flatten()
-                .map(|identity| identity.id.to_string())
-        })
-}
+pub(crate) use crate::device_link::identity_for_device;
 
 /// Validate a caller-supplied device kind. `None` stays `None` (meaning
 /// `ios_device`); a malformed kind is a 400 rather than a silent default,
@@ -7227,6 +7219,7 @@ async fn pair_device_request_unauthenticated(
         Ok(pairing_req) => Ok(Json(serde_json::json!({
             "code": pairing_req.code,
             "device_name": pairing_req.device_name,
+            "approve_url": pair_approve_url(&state, &headers, &pairing_req.code),
             "expires_at": pairing_req.expires_at.to_rfc3339(),
         }))),
         Err(e) => {
@@ -7234,6 +7227,62 @@ async fn pair_device_request_unauthenticated(
             Err(StatusCode::BAD_REQUEST)
         }
     }
+}
+
+/// Where the device's person approves `code`: the hub's `/pair` page.
+///
+/// The base is `[hub].public_url`; failing that, the origin SSO redirects back
+/// to; failing that, the host the device reached the hub at.
+fn pair_approve_url(state: &GatewayState, headers: &axum::http::HeaderMap, code: &str) -> String {
+    let configured = state
+        .default_service()
+        .and_then(|service| service.config.hub.public_url.clone())
+        .filter(|url| !url.trim().is_empty());
+    #[cfg(feature = "oidc")]
+    let configured = configured.or_else(|| {
+        state
+            .oidc_provider
+            .as_ref()
+            .map(|oidc| oidc.post_logout_redirect_uri())
+    });
+    let base = configured.unwrap_or_else(|| {
+        let host = headers
+            .get(axum::http::header::HOST)
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or("localhost");
+        let scheme = headers
+            .get("x-forwarded-proto")
+            .and_then(|h| h.to_str().ok())
+            .filter(|p| *p == "https" || *p == "http")
+            .unwrap_or("http");
+        format!("{scheme}://{host}")
+    });
+    format!("{}/pair?code={code}", base.trim_end_matches('/'))
+}
+
+/// The account an approved request's device was connected to, as the device
+/// shows it ("connected as …"): its name and email, or `null` when the device
+/// is anonymous.
+async fn approved_identity(
+    state: &GatewayState,
+    pairing: &DevicePairingService,
+    req: &workforce_pairing::types::DevicePairingRequest,
+) -> serde_json::Value {
+    let Some(store) = state.identity_store.as_ref() else {
+        return serde_json::Value::Null;
+    };
+    let Ok(Some(device)) = pairing.device_for_request_async(req).await else {
+        return serde_json::Value::Null;
+    };
+    identity_for_device(store.as_ref(), &device.id)
+        .and_then(|id| uuid::Uuid::parse_str(&id).ok())
+        .and_then(|id| store.get_by_id(id).ok().flatten())
+        .map_or(serde_json::Value::Null, |identity| {
+            serde_json::json!({
+                "display_name": identity.display_name,
+                "email": identity.email,
+            })
+        })
 }
 
 /// Poll device pairing status by code (unauthenticated).
@@ -7277,17 +7326,21 @@ async fn pair_device_status(
             Ok(Json(serde_json::json!({ "status": "pending" })))
         }
         workforce_pairing::types::PairingStatus::Approved => {
-            if let Some(token) = req.pending_token {
+            if let Some(token) = req.pending_token.clone() {
                 // One-time token retrieval — clear it after returning
-                let _ = pairing.clear_pending_token_async(req.id).await;
+                let _ = pairing.clear_pending_token_async(req.id.clone()).await;
                 Ok(Json(serde_json::json!({
                     "status": "approved",
                     "token": token,
                     "scopes": req.scopes,
+                    "identity": approved_identity(&state, pairing, &req).await,
                 })))
             } else {
                 // Token already retrieved
-                Ok(Json(serde_json::json!({ "status": "approved" })))
+                Ok(Json(serde_json::json!({
+                    "status": "approved",
+                    "identity": approved_identity(&state, pairing, &req).await,
+                })))
             }
         }
         workforce_pairing::types::PairingStatus::Rejected => {
@@ -7356,6 +7409,22 @@ async fn pair_list_devices(
     .await?;
     if let Some(ref pairing) = state.device_pairing {
         if let Ok(devices) = pairing.list_devices_async().await {
+            // Each device with the person it belongs to, so a person's devices
+            // can be found and revoked.
+            let devices: Vec<serde_json::Value> = devices
+                .into_iter()
+                .map(|device| {
+                    let owner = state.identity_store.as_ref().and_then(|store| {
+                        crate::device_link::device_owner(store.as_ref(), &device.id)
+                    });
+                    let mut entry = serde_json::to_value(&device).unwrap_or_default();
+                    entry["owner"] = owner.as_ref().map_or(
+                        serde_json::Value::Null,
+                        crate::device_link::identity_summary,
+                    );
+                    entry
+                })
+                .collect();
             return Ok(Json(serde_json::json!({ "devices": devices })));
         }
     }
@@ -14812,6 +14881,7 @@ mod pairing_auto_link_tests {
     //! paths in [`auto_link_device_to_identity`] and the input-normalisation
     //! rules.
     use super::*;
+    use crate::device_link::{auto_link_device_to_identity, device_link_key};
     use workforce_identity::sqlite::SqliteIdentityStore;
     use workforce_identity::store::IdentityStore;
     use workforce_identity::types::*;
@@ -14862,7 +14932,10 @@ mod pairing_auto_link_tests {
 
         let after = store.get_by_id(identity.id).unwrap().unwrap();
         assert_eq!(
-            after.linked_ids.get("ios_device").map(String::as_str),
+            after
+                .linked_ids
+                .get(&device_link_key("ios_device", "device-1"))
+                .map(String::as_str),
             Some("device-1")
         );
     }
@@ -14897,7 +14970,10 @@ mod pairing_auto_link_tests {
         assert_eq!(created.status, IdentityStatus::AutoProvisioned);
         assert_eq!(created.provisioning_source, ProvisioningSource::IosAuto);
         assert_eq!(
-            created.linked_ids.get("ios_device").map(String::as_str),
+            created
+                .linked_ids
+                .get(&device_link_key("ios_device", "device-3"))
+                .map(String::as_str),
             Some("device-3")
         );
     }
@@ -14918,11 +14994,17 @@ mod pairing_auto_link_tests {
             .unwrap()
             .expect("identity created");
         assert_eq!(
-            created.linked_ids.get("desktop_device").map(String::as_str),
+            created
+                .linked_ids
+                .get(&device_link_key("desktop_device", "desk-1"))
+                .map(String::as_str),
             Some("desk-1")
         );
         assert_eq!(
-            created.linked_ids.get("ios_device").map(String::as_str),
+            created
+                .linked_ids
+                .get(&device_link_key("ios_device", "phone-1"))
+                .map(String::as_str),
             Some("phone-1")
         );
         assert_eq!(
@@ -14978,12 +15060,18 @@ mod pairing_auto_link_tests {
 
         let after = store.get_by_id(id_uuid).unwrap().unwrap();
         assert_eq!(
-            after.linked_ids.get("ios_device").map(String::as_str),
+            after
+                .linked_ids
+                .get(&device_link_key("ios_device", "phone-1"))
+                .map(String::as_str),
             Some("phone-1"),
             "pairing a voice device must not unlink the phone"
         );
         assert_eq!(
-            after.linked_ids.get("voice_device").map(String::as_str),
+            after
+                .linked_ids
+                .get(&device_link_key("voice_device", "bridge-1"))
+                .map(String::as_str),
             Some("bridge-1")
         );
     }
@@ -15008,26 +15096,54 @@ mod pairing_auto_link_tests {
         assert!(identity_for_device(&store, "never-paired").is_none());
     }
 
+    /// A person's second iPhone (or iPad) joins the first instead of
+    /// replacing it: each device is linked under its own key, so the first
+    /// one's token never goes on working anonymously.
     #[test]
-    fn auto_link_replaces_existing_device_link_of_the_same_kind() {
-        // Two devices of the SAME kind still share one slot: `linked_ids` maps
-        // a platform to one id, so a second iPhone replaces the first. That is
-        // unchanged — see the sibling test for devices of different kinds.
+    fn devices_of_the_same_kind_coexist_on_one_identity() {
         let store = store();
         let identity = Identity::new("Kings", IdentityRole::Member).with_email("kings@example.com");
-        let id_uuid = identity.id;
+        let id_str = identity.id.to_string();
         store.create(&identity).unwrap();
 
-        let _ = auto_link_device_to_identity(&store, "kings@example.com", "phone-1", "ios_device")
-            .unwrap();
-        let _ = auto_link_device_to_identity(&store, "kings@example.com", "phone-2", "ios_device")
-            .unwrap();
+        for phone in ["phone-1", "phone-2"] {
+            auto_link_device_to_identity(&store, "kings@example.com", phone, "ios_device").unwrap();
+        }
+
+        for phone in ["phone-1", "phone-2"] {
+            assert_eq!(
+                identity_for_device(&store, phone).as_deref(),
+                Some(id_str.as_str()),
+                "{phone} stays linked"
+            );
+        }
+    }
+
+    /// Devices linked before per-device keys, under one kind's single slot,
+    /// still resolve, and a re-link moves them to their own key.
+    #[test]
+    fn a_device_linked_the_old_way_still_resolves_and_moves_to_its_own_key() {
+        let store = store();
+        let identity = Identity::new("Kings", IdentityRole::Member)
+            .with_email("kings@example.com")
+            .with_linked_id("ios_device", "phone-1");
+        let id_uuid = identity.id;
+        store.create(&identity).unwrap();
+        assert_eq!(
+            identity_for_device(&store, "phone-1"),
+            Some(id_uuid.to_string())
+        );
+
+        auto_link_device_to_identity(&store, "kings@example.com", "phone-1", "ios_device").unwrap();
 
         let after = store.get_by_id(id_uuid).unwrap().unwrap();
+        assert!(!after.linked_ids.contains_key("ios_device"));
         assert_eq!(
-            after.linked_ids.get("ios_device").map(String::as_str),
-            Some("phone-2"),
-            "second pairing should replace the first device link"
+            after
+                .linked_ids
+                .get(&device_link_key("ios_device", "phone-1"))
+                .map(String::as_str),
+            Some("phone-1")
         );
     }
 }
