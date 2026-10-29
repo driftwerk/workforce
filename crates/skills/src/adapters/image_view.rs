@@ -22,7 +22,7 @@ use tokio::sync::RwLock;
 use tracing::info;
 
 use workforce_agent::attachments::FrameSelection;
-use workforce_agent::runner::{CURRENT_CHANNEL_ID, CURRENT_THREAD_ID};
+use workforce_agent::runner::{CURRENT_CHANNEL_ID, CURRENT_SESSION_ID, CURRENT_THREAD_ID};
 use workforce_agent::tools::image_view::{stage_for_view, view_pending_note, VIEWED_IMAGES_KEY};
 use workforce_agent::tools::{Tool, ToolResult};
 use workforce_common::channels::{ChannelFile, ChannelMessage, SurfaceRegistry};
@@ -98,14 +98,126 @@ fn select<'a>(files: &'a [Candidate], reference: Option<&str>) -> Result<&'a Cha
         .ok_or_else(|| format!("no file matching '{reference}' — available: {}", names()))
 }
 
+/// A file of a conversation that has no channel surface to read it from:
+/// the gateway's apps (Desk, the web UI, iOS), whose files the hub keeps.
+#[derive(Debug, Clone)]
+pub struct ConversationFile {
+    /// Where the hub can find it again (an artifact id).
+    pub id: String,
+    pub name: String,
+    pub mime_type: String,
+    /// When it was posted.
+    pub at: chrono::DateTime<chrono::Utc>,
+    pub size: Option<u64>,
+}
+
+/// The files of the conversation a turn runs in, when it runs on no channel
+/// surface. Implemented by the hub over the agent's own sessions and store.
+#[async_trait]
+pub trait ConversationFiles: Send + Sync {
+    /// The files of the conversation the session `session_id` is part of.
+    async fn files(&self, session_id: &str) -> Result<Vec<ConversationFile>>;
+    /// The bytes of one of them.
+    async fn read(&self, session_id: &str, file: &ConversationFile) -> Result<Vec<u8>>;
+}
+
 /// Loads a file from the current conversation into the agent's view.
 pub struct ViewAttachmentTool {
     surfaces: Arc<RwLock<SurfaceRegistry>>,
+    conversation: Option<Arc<dyn ConversationFiles>>,
 }
 
 impl ViewAttachmentTool {
     pub fn new(surfaces: Arc<RwLock<SurfaceRegistry>>) -> Self {
-        Self { surfaces }
+        Self {
+            surfaces,
+            conversation: None,
+        }
+    }
+
+    /// Reads the files of a conversation on no channel surface from
+    /// `files`.
+    pub fn with_conversation_files(mut self, files: Arc<dyn ConversationFiles>) -> Self {
+        self.conversation = Some(files);
+        self
+    }
+
+    /// Views a file of the session `session_id`'s conversation, which runs
+    /// on no channel surface.
+    async fn view_from_session(
+        &self,
+        files: &dyn ConversationFiles,
+        session_id: &str,
+        input: &serde_json::Value,
+        selection: Option<FrameSelection>,
+        elapsed: impl Fn() -> u64,
+    ) -> Result<ToolResult> {
+        let listed = match files.files(session_id).await {
+            Ok(listed) => listed,
+            Err(e) => {
+                return Ok(ToolResult::failure(
+                    format!("failed to read conversation: {e}"),
+                    elapsed(),
+                ))
+            }
+        };
+        let candidates: Vec<Candidate> = listed
+            .iter()
+            .map(|f| Candidate {
+                ts: f.at.timestamp_millis() as f64 / 1000.0,
+                file: ChannelFile {
+                    id: f.id.clone(),
+                    name: f.name.clone(),
+                    mime_type: f.mime_type.clone(),
+                    url: None,
+                    size: f.size,
+                },
+            })
+            .collect();
+        let mut candidates = candidates;
+        candidates.sort_by(|a, b| b.ts.total_cmp(&a.ts));
+        if candidates.is_empty() {
+            return Ok(ToolResult::empty(
+                "no files found in this conversation",
+                elapsed(),
+            ));
+        }
+        let chosen = match select(&candidates, input["reference"].as_str()) {
+            Ok(f) => f,
+            Err(msg) => return Ok(ToolResult::failure(msg, elapsed())),
+        };
+        let Some(file) = listed.iter().find(|f| f.id == chosen.id) else {
+            return Ok(ToolResult::failure("that file is gone", elapsed()));
+        };
+        let bytes = match files.read(session_id, file).await {
+            Ok(b) => b,
+            Err(e) => {
+                return Ok(ToolResult::failure(
+                    format!("failed to read file: {e}"),
+                    elapsed(),
+                ))
+            }
+        };
+        let staged = match stage_for_view(
+            VIEW_ATTACHMENT_TOOL_NAME,
+            bytes,
+            &file.mime_type,
+            &file.name,
+        ) {
+            Ok(staged) => match &selection {
+                Some(selection) => staged.selecting(selection),
+                None => staged,
+            },
+            Err(msg) => return Ok(ToolResult::failure(msg, elapsed())),
+        };
+        info!(file = %file.name, session = %session_id, "Staged conversation file for viewing");
+        Ok(ToolResult::success(
+            serde_json::json!({
+                VIEWED_IMAGES_KEY: staged.marker,
+                "note": view_pending_note(&file.name),
+            }),
+            elapsed(),
+        ))
     }
 }
 
@@ -198,6 +310,17 @@ impl Tool for ViewAttachmentTool {
         // An explicit `channel` reads from another conversation (the bot must
         // be a member); otherwise fall back to the current channel/thread.
         let explicit_channel = input["channel"].as_str().filter(|s| !s.trim().is_empty());
+        // A conversation on no channel surface (the gateway's apps) is read
+        // from the files the hub keeps for its session.
+        if explicit_channel.is_none() && task_local(&CURRENT_CHANNEL_ID).is_none() {
+            if let (Some(files), Some(session)) =
+                (self.conversation.as_ref(), task_local(&CURRENT_SESSION_ID))
+            {
+                return self
+                    .view_from_session(files.as_ref(), &session, &input, selection, elapsed)
+                    .await;
+            }
+        }
         let Some(channel) = explicit_channel
             .map(str::to_string)
             .or_else(|| task_local(&CURRENT_CHANNEL_ID))
@@ -442,5 +565,85 @@ mod tests {
     #[test]
     fn select_errors_when_no_files() {
         assert!(select(&[], None).is_err());
+    }
+
+    /// A conversation's files as the hub would list them, and which were
+    /// read.
+    struct Kept {
+        files: Vec<ConversationFile>,
+        read: std::sync::Mutex<Vec<(String, String)>>,
+    }
+
+    #[async_trait]
+    impl ConversationFiles for Kept {
+        async fn files(&self, _session_id: &str) -> Result<Vec<ConversationFile>> {
+            Ok(self.files.clone())
+        }
+        async fn read(&self, session_id: &str, file: &ConversationFile) -> Result<Vec<u8>> {
+            self.read
+                .lock()
+                .unwrap()
+                .push((session_id.to_string(), file.id.clone()));
+            Ok(b"%PDF-1.7".to_vec())
+        }
+    }
+
+    fn kept(id: &str, name: &str, minutes_ago: i64) -> ConversationFile {
+        ConversationFile {
+            id: id.into(),
+            name: name.into(),
+            mime_type: "application/pdf".into(),
+            at: chrono::Utc::now() - chrono::Duration::minutes(minutes_ago),
+            size: Some(8),
+        }
+    }
+
+    /// On no channel surface (a Desk DM), the tool reads the session's
+    /// files from the hub instead of failing for want of a channel.
+    #[tokio::test]
+    async fn a_conversation_on_no_channel_reads_its_files_from_the_hub() {
+        let files = Arc::new(Kept {
+            files: vec![kept("art_old", "q2.pdf", 30), kept("art_new", "q3.pdf", 1)],
+            read: Default::default(),
+        });
+        let tool = ViewAttachmentTool::new(Arc::new(RwLock::new(SurfaceRegistry::new())))
+            .with_conversation_files(files.clone());
+        let result = CURRENT_SESSION_ID
+            .scope("session-1".to_string(), async {
+                tool.execute(serde_json::json!({ "reference": "q2" })).await
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            files.read.lock().unwrap().as_slice(),
+            [("session-1".to_string(), "art_old".to_string())]
+        );
+        // Staging needs the hub's store and an agent, which this test has
+        // neither of.
+        assert!(!result.success, "{result:?}");
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("stage"),
+            "{result:?}"
+        );
+
+        let empty = ViewAttachmentTool::new(Arc::new(RwLock::new(SurfaceRegistry::new())))
+            .with_conversation_files(Arc::new(Kept {
+                files: Vec::new(),
+                read: Default::default(),
+            }));
+        let result = CURRENT_SESSION_ID
+            .scope("session-1".to_string(), async {
+                empty.execute(serde_json::json!({})).await
+            })
+            .await
+            .unwrap();
+        assert!(
+            format!("{result:?}").contains("no files found"),
+            "{result:?}"
+        );
     }
 }

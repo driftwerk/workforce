@@ -123,7 +123,7 @@ fn fake_cli(dir: &Path) -> PathBuf {
     path
 }
 
-async fn desk(pool: workforce_postgres::PostgresPool, dir: &Path) -> Desk {
+pub(crate) async fn desk(pool: workforce_postgres::PostgresPool, dir: &Path) -> Desk {
     let cli = fake_cli(dir);
     Desk::start(
         DeskStore::with_pool(pool).await.unwrap(),
@@ -181,7 +181,7 @@ async fn hook(url: &str, body: Value) -> Value {
     serde_json::from_str(&text).unwrap_or_else(|_| panic!("{url} answered {status}: {text:?}"))
 }
 
-async fn eventually<T>(what: &str, mut check: impl AsyncFnMut() -> Option<T>) -> T {
+pub(crate) async fn eventually<T>(what: &str, mut check: impl AsyncFnMut() -> Option<T>) -> T {
     for _ in 0..400 {
         if let Some(found) = check().await {
             return found;

@@ -220,9 +220,49 @@ impl Drop for AbortOnDrop {
     }
 }
 
+/// A turn in a conversation the desk keeps files for, which, once ended,
+/// puts the files it delivered on its answer (see
+/// [`crate::desk_attachments::bind_turn`]).
+pub(super) struct Bind {
+    service: Arc<AgentService>,
+    since: chrono::DateTime<Utc>,
+}
+
+impl Bind {
+    /// A turn of `service`'s starting now on `channel`, when the desk is on
+    /// and `channel` is one of its conversations.
+    fn starting(service: &Arc<AgentService>, channel: &str) -> Option<Self> {
+        crate::desk_driver::desk()?;
+        crate::desk_attachments::is_desk_conversation(channel).then(|| Self {
+            service: Arc::clone(service),
+            since: Utc::now(),
+        })
+    }
+
+    /// The turn ended in `session_id`.
+    async fn ended(self, session_id: &str) {
+        if let Some(desk) = crate::desk_driver::desk() {
+            crate::desk_attachments::bind_turn(desk, &self.service, session_id, self.since).await;
+        }
+    }
+
+    /// The turn on `channel` for `user` ended, in their conversation's
+    /// current session.
+    async fn ended_for(self, channel: &str, user: &str) {
+        if let Ok(Some(session)) = self.service.sessions.find(channel, user) {
+            self.ended(&session.id).await;
+        }
+    }
+}
+
 /// `progress` with its turn recorded: its tools mark the agent busy, and
-/// its end is recorded once the turn's own task ends.
-fn observed(progress: MessageProgress, track: Track) -> MessageProgress {
+/// its end is recorded once the turn's own task ends; the files it
+/// delivered are put on its answer.
+fn observed(
+    progress: MessageProgress,
+    track: Option<Track>,
+    bind: Option<Bind>,
+) -> MessageProgress {
     let MessageProgress {
         progress_rx: mut inner_rx,
         handle: inner,
@@ -234,13 +274,13 @@ fn observed(progress: MessageProgress, track: Track) -> MessageProgress {
         served,
     } = progress;
     let (tx, progress_rx) = mpsc::channel(64);
-    let crew = Arc::clone(&track.crew);
-    let key = track.key.clone();
+    let busy = track.as_ref().map(|t| (Arc::clone(&t.crew), t.key.clone()));
+    let ran_in = session_id.clone();
     tokio::spawn(async move {
         let mut reading = true;
         while let Some(event) = inner_rx.recv().await {
-            if let ProgressEvent::ToolStart { name, .. } = &event {
-                crew.tool_started(&key, name);
+            if let (ProgressEvent::ToolStart { name, .. }, Some((crew, key))) = (&event, &busy) {
+                crew.tool_started(key, name);
             }
             // Once nobody reads the progress, keep draining it so the turn
             // never blocks on it.
@@ -259,12 +299,20 @@ fn observed(progress: MessageProgress, track: Track) -> MessageProgress {
                     Ok(r) => Ok(r.response.as_str()),
                     Err(e) => Err(format!("{e:#}")),
                 };
-                track.finish(outcome).await;
+                if let Some(track) = track {
+                    track.finish(outcome).await;
+                }
+                if let Some(bind) = bind {
+                    bind.ended(&ran_in).await;
+                }
                 result
             }
             Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
             Err(_) => {
                 drop(track);
+                if let Some(bind) = bind {
+                    bind.ended(&ran_in).await;
+                }
                 Err(eyre::eyre!("the turn was cancelled"))
             }
         }
@@ -303,6 +351,7 @@ impl<T: TurnHost> TurnHost for Observed<T> {
     ) -> Result<String> {
         let track = super::for_service(service)
             .and_then(|c| c.track(service, channel, user, message, None));
+        let bind = Bind::starting(service, channel);
         let result = self
             .0
             .process_message(
@@ -326,6 +375,9 @@ impl<T: TurnHost> TurnHost for Observed<T> {
             track
                 .finish(result.as_deref().map_err(|e| format!("{e:#}")))
                 .await;
+        }
+        if let Some(bind) = bind {
+            bind.ended_for(channel, user).await;
         }
         result
     }
@@ -360,6 +412,7 @@ impl<T: TurnHost> TurnHost for Observed<T> {
     ) -> Result<MessageProgress> {
         let track = super::for_service(service)
             .and_then(|c| c.track(service, channel, user, message, session_id));
+        let bind = Bind::starting(service, channel);
         let progress = self
             .0
             .process_message_with_progress(
@@ -389,13 +442,15 @@ impl<T: TurnHost> TurnHost for Observed<T> {
                 voice_channel,
             )
             .await;
-        match (progress, track) {
-            (Ok(progress), Some(track)) => Ok(observed(progress, track)),
-            (Err(e), Some(track)) => {
-                track.finish(Err(format!("{e:#}"))).await;
+        match (progress, track, bind) {
+            (Ok(progress), None, None) => Ok(progress),
+            (Ok(progress), track, bind) => Ok(observed(progress, track, bind)),
+            (Err(e), track, _) => {
+                if let Some(track) = track {
+                    track.finish(Err(format!("{e:#}"))).await;
+                }
                 Err(e)
             }
-            (progress, None) => progress,
         }
     }
 
@@ -420,6 +475,7 @@ impl<T: TurnHost> TurnHost for Observed<T> {
     ) -> Result<TurnOutcome> {
         let track = super::for_service(service)
             .and_then(|c| c.track(service, channel, user, message, None));
+        let bind = Bind::starting(service, channel);
         let result = self
             .0
             .process_turn(
@@ -450,6 +506,9 @@ impl<T: TurnHost> TurnHost for Observed<T> {
                 }
                 Err(e) => track.finish(Err(format!("{e:#}"))).await,
             }
+        }
+        if let Some(bind) = bind {
+            bind.ended_for(channel, user).await;
         }
         result
     }

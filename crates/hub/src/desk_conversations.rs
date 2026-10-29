@@ -64,6 +64,7 @@ fn said(entry: &TranscriptEntry, agent: &Speaker) -> Option<Said> {
         text,
         at: entry.timestamp,
         desk: None,
+        attachments: Vec::new(),
     })
 }
 
@@ -95,6 +96,26 @@ fn holder(store: &dyn SessionStore, head: &str, id: &str) -> eyre::Result<Option
         session = live.and_then(|s| s.prev_session_id().map(str::to_string));
     }
     Ok(None)
+}
+
+/// When the message `id` of `owner`'s DM in `store` was said.
+pub(crate) fn said_at(
+    store: &dyn SessionStore,
+    owner: &str,
+    id: &str,
+) -> eyre::Result<Option<chrono::DateTime<chrono::Utc>>> {
+    let Some(head) = store.find(DESK_CHANNEL, owner)? else {
+        return Ok(None);
+    };
+    let Some(session) = holder(store, &head.id, id)? else {
+        return Ok(None);
+    };
+    if let Some(entry) = store.read_archive_message(&session, id)? {
+        return Ok(Some(entry.timestamp));
+    }
+    Ok(store
+        .get(&session)?
+        .and_then(|s| s.messages.iter().find(|m| m.id == id).map(|m| m.timestamp)))
 }
 
 /// `owner`'s conversation on the `desk` channel with `agent` in `store`: at
@@ -255,6 +276,20 @@ impl Conversations for HubConversations {
         if let Some(crew) = crate::desk_crew::for_state(state) {
             with_extras(crew.desk(), &mut page).await;
             with_authors(crew.desk(), &mut page).await;
+            let before_at = match before {
+                Some(id) => said_at(service.sessions.as_ref(), &owner, id)
+                    .map_err(|e| ConversationError::Internal(format!("{e:#}")))?,
+                None => None,
+            };
+            crate::desk_attachments::with_attachments(
+                crew.desk(),
+                &speaker,
+                DESK_CHANNEL,
+                &owner,
+                &mut page,
+                before_at,
+            )
+            .await;
         }
         Ok(page)
     }

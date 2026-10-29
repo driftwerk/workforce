@@ -687,6 +687,13 @@ pub struct DeskConfig {
     /// The holder's token, usually `${WORKFORCE_PTY_HOLDER_TOKEN}`.
     #[serde(default)]
     pub pty_holder_token: Option<String>,
+    /// The largest file one upload to a conversation may be, in MB.
+    #[serde(default = "default_desk_attachment_max_mb")]
+    pub attachment_max_mb: u64,
+    /// How long a file in a Desk conversation is kept after it is posted,
+    /// in days, so its history can still open it.
+    #[serde(default = "default_desk_attachment_retention_days")]
+    pub attachment_retention_days: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -710,8 +717,18 @@ impl Default for DeskConfig {
             adopt_interval_secs: default_desk_adopt_interval_secs(),
             pty_holder_socket: None,
             pty_holder_token: None,
+            attachment_max_mb: default_desk_attachment_max_mb(),
+            attachment_retention_days: default_desk_attachment_retention_days(),
         }
     }
+}
+
+fn default_desk_attachment_max_mb() -> u64 {
+    100
+}
+
+fn default_desk_attachment_retention_days() -> u64 {
+    30
 }
 
 fn default_desk_claude() -> String {

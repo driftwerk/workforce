@@ -200,6 +200,11 @@ pub struct WsQuery {
     /// are taught the ones its agent also has on; a name this hub does not
     /// know is ignored.
     pub rich: Option<String>,
+    /// The media types a `/ws` client shows, comma-separated
+    /// (`image/*,application/pdf,video/*`, or `*/*`): the files agents
+    /// deliver that it is sent. Images alone, inline, when omitted. See
+    /// [`workforce_gateway_client::protocol::MediaAccept`].
+    pub accept: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -394,6 +399,16 @@ pub fn router(state: Arc<GatewayState>) -> Router {
         .route(
             "/api/sessions/{id}/files/{name}",
             get(crate::session_handlers::session_file_get),
+        )
+        .route(
+            "/api/agents/{id}/attachments",
+            post(crate::desk_attachments::upload)
+                // The handler caps the file as it streams it to disk.
+                .layer(axum::extract::DefaultBodyLimit::disable()),
+        )
+        .route(
+            "/api/agents/{id}/attachments/{artifact}",
+            get(crate::desk_attachments::download),
         )
         .route("/api/models/health", get(model_health))
         .route("/api/models/aliases", get(model_aliases))
@@ -1173,6 +1188,8 @@ async fn ws_handler(
         Some(channel) => return invalid_ws_channel(channel),
     };
     let rich = workforce_common::rich::RichFeatures::from_names(query.rich.as_deref());
+    let accept =
+        workforce_gateway_client::protocol::MediaAccept::from_names(query.accept.as_deref());
     let token = query.token.unwrap_or_default();
 
     // Strategy 1 (admin token) removed — no identity context for per-user scoping.
@@ -1211,6 +1228,7 @@ async fn ws_handler(
                             state,
                             anchor_channel,
                             rich,
+                            accept,
                             agent_id,
                             device_id,
                             device_scopes,
@@ -1256,6 +1274,7 @@ async fn ws_handler(
                         state,
                         anchor_channel,
                         rich,
+                        accept,
                         agent_id,
                         claims.device_id,
                         scopes,
@@ -1502,6 +1521,7 @@ async fn handle_ws(
     state: Arc<GatewayState>,
     anchor_channel: String,
     rich: workforce_common::rich::RichFeatures,
+    accept: workforce_gateway_client::protocol::MediaAccept,
     agent_id: Option<String>,
     device_id: Option<String>,
     device_scopes: Option<Vec<String>>,
@@ -1606,6 +1626,16 @@ async fn handle_ws(
             ) {
                 continue;
             }
+            // Only the files this client shows, shaped as it expects them;
+            // a frame that only carried files it doesn't is not sent.
+            let attachments = match msg.attachments {
+                Some(files) => match accept.shape(files) {
+                    Some(shown) => Some(shown),
+                    None if msg.msg_type == "image" => continue,
+                    None => None,
+                },
+                None => None,
+            };
 
             let server_msg = ServerMessage {
                 msg_type: msg.msg_type,
@@ -1627,7 +1657,7 @@ async fn handle_ws(
                 request_id: msg.request_id,
                 tool_name: msg.tool_name,
                 prompt_options: msg.prompt_options,
-                attachments: msg.attachments,
+                attachments,
                 code_citations: msg.code_citations,
                 connect_prompt: msg.connect_prompt,
                 route: msg.route,
@@ -2777,7 +2807,7 @@ pub(crate) async fn steer(
 /// acts in it (a new turn, a stop, an approval answer) only when its sender
 /// is the person that session's turns run as; an unknown or unreadable
 /// session is nobody's.
-fn owns_session(
+pub(crate) fn owns_session(
     sessions: &dyn workforce_common::session::SessionStore,
     session_id: &str,
     owner: &str,
@@ -14066,6 +14096,7 @@ mod session_visibility_tests {
             agent_id: None,
             channel: None,
             rich: None,
+            accept: None,
         });
         chat_handler(
             headers.clone(),

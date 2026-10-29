@@ -8,9 +8,11 @@
 //!     surface and perform a native `files.upload` to the channel/thread.
 //!   - **Gateway / iOS** (no Slack channel): emit a `ServerMessage::image`
 //!     over the in-process broadcast, filtered to the session by the WS
-//!     forwarder. An image rides inline as base64, which both the web UI and
-//!     iOS render; any other file rides by `artifact_id`, which the web UI
-//!     offers as a download through the session file route and iOS ignores.
+//!     forwarder. Every file carries its `artifact_id` and size, and an image
+//!     rides inline as base64 too. Each connection is sent the files of the
+//!     types it declared at connect (`accept`); one that declared none (iOS)
+//!     is sent images alone, inline, as before. In a Desk DM or room the
+//!     file is also kept for the conversation's history.
 //!     NATS-only (distributed) deployments have no in-process broadcast
 //!     wired, so there the bytes stay staged as an artifact.
 
@@ -28,6 +30,7 @@ use workforce_agent::artifacts::types::{ArtifactBody, ArtifactId};
 use workforce_agent::runner::SessionContext;
 use workforce_agent::tools::image_gen::ImageSink;
 use workforce_common::channels::{ChannelHint, SurfaceRegistry};
+use workforce_common::session::SessionStore;
 
 use crate::broadcast::BroadcastMessage;
 use workforce_gateway_client::protocol::Attachment;
@@ -40,6 +43,9 @@ pub struct HubImageSink {
     /// In-process broadcast sender for gateway/iOS delivery. `None` when the
     /// gateway channel isn't wired (e.g. NATS-only deployments).
     broadcast: Option<broadcast::Sender<BroadcastMessage>>,
+    /// The agent's sessions, to tell a Desk conversation's files (kept for
+    /// its history) from any other app's.
+    sessions: Option<Arc<dyn SessionStore>>,
 }
 
 impl HubImageSink {
@@ -52,7 +58,15 @@ impl HubImageSink {
             surface_registry,
             agent_id: agent_id.into(),
             broadcast,
+            sessions: None,
         }
+    }
+
+    /// Keeps the files delivered into a Desk conversation of `sessions`'
+    /// for its history.
+    pub fn with_sessions(mut self, sessions: Arc<dyn SessionStore>) -> Self {
+        self.sessions = Some(sessions);
+        self
     }
 
     /// Read the staged attachment bytes from the artifact store.
@@ -141,6 +155,40 @@ impl ImageSink for HubImageSink {
                 "no session id in context; cannot route generated image to a gateway client"
             ));
         };
+        let inline = media_type.starts_with("image/");
+        let bytes = match inline {
+            true => Some(self.read_bytes(artifact_id)?),
+            false => None,
+        };
+        let described = global_store()
+            .map(|store| {
+                crate::desk_attachments::describe(
+                    store.as_ref(),
+                    &self.agent_id,
+                    artifact_id,
+                    media_type,
+                    bytes.as_deref(),
+                )
+            })
+            .unwrap_or_default();
+        if let Some(sessions) = &self.sessions {
+            use crate::desk_attachments::{into_desk_conversation, DeskConversation, StagedFile};
+            into_desk_conversation(
+                sessions.as_ref(),
+                &DeskConversation {
+                    agent_id: self.agent_id.clone(),
+                    session_id: session_id.to_string(),
+                },
+                &[StagedFile {
+                    artifact_id: artifact_id.clone(),
+                    media_type: media_type.to_string(),
+                    filename: filename.clone(),
+                    caption: caption.map(str::to_string),
+                    described,
+                }],
+            )
+            .await;
+        }
         let Some(tx) = self.broadcast.as_ref() else {
             // NATS-only / unwired deployment: bytes remain staged as an artifact.
             debug!(
@@ -151,16 +199,18 @@ impl ImageSink for HubImageSink {
             return Ok(());
         };
 
-        let inline = media_type.starts_with("image/");
+        // Every file carries its reference and size; a client that declared
+        // no `accept` is sent images alone, as it always was (see
+        // `MediaAccept::shape`).
         let attachment = Attachment {
             filename,
             mime_type: media_type.to_string(),
-            data: if inline {
-                BASE64.encode(self.read_bytes(artifact_id)?)
-            } else {
-                String::new()
-            },
-            artifact_id: (!inline).then(|| artifact_id.as_str().to_string()),
+            data: bytes.map(|b| BASE64.encode(b)).unwrap_or_default(),
+            artifact_id: Some(artifact_id.as_str().to_string()),
+            size: Some(described.size),
+            width: described.width,
+            height: described.height,
+            duration: None,
         };
         let msg = BroadcastMessage::image(
             session_id,

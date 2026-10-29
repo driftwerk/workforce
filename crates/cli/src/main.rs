@@ -5251,6 +5251,7 @@ rules:
                 workforce_hub::remote_mcp::server::RemoteMcpState::new(Arc::clone(&gateway_state)),
             );
 
+            workforce_hub::desk_attachments::configure(&wf_config.desk);
             let gateway_app = workforce_hub::gateway::router(gateway_state.clone())
                 .merge(webhook_router)
                 .merge(trigger_router)

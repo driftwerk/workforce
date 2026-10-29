@@ -141,7 +141,9 @@ function wsUrl(agentId: string): string {
   const token = useAuthStore.getState().token ?? "";
   const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
   const host = window.location.host;
-  return `${proto}//${host}/ws?token=${encodeURIComponent(token)}&agent_id=${encodeURIComponent(agentId)}`;
+  // `accept`: every file an agent delivers is shown (images inline, the
+  // rest as download chips); without it the hub sends images alone.
+  return `${proto}//${host}/ws?token=${encodeURIComponent(token)}&agent_id=${encodeURIComponent(agentId)}&accept=${encodeURIComponent("*/*")}`;
 }
 
 function cleanupConnection() {

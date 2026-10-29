@@ -32,7 +32,7 @@ mod tools;
 mod watcher;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 pub(crate) use extras::mentions_for;
 pub use observe::Observed;
