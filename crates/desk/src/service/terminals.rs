@@ -373,15 +373,26 @@ impl Desk {
         self.open_terminal(r).await
     }
 
-    /// Ends a terminal's shell and forgets it.
+    /// Ends a terminal's shell and forgets it. What ran in it is stopped
+    /// here: with the terminal gone from `terminal_ptys`, its exit watcher
+    /// no longer finds it to end them.
     pub fn close_terminal(&self, id: Uuid) -> Result<(), DeskError> {
-        let pty = {
+        let (pty, hosted) = {
             let mut st = self.0.state.lock();
             st.terminals.remove(&id).ok_or(DeskError::NotFound)?;
-            st.terminal_ptys.remove(&id)
+            let hosted: Vec<Uuid> = st
+                .live
+                .iter()
+                .filter(|(_, l)| l.terminal == Some(id))
+                .map(|(s, _)| *s)
+                .collect();
+            (st.terminal_ptys.remove(&id), hosted)
         };
         if let Some(pty) = pty {
             pty.kill();
+        }
+        for session in hosted {
+            self.end_terminal_session(session, true);
         }
         let _ = self.0.persist.send(Persist::DeleteTerminal(id));
         self.announce(DeskEvent::TerminalRemoved { id });
@@ -1122,6 +1133,38 @@ mod tests {
             // The terminal going ends what ran in it.
             pty.kill();
             wait_until(|| d.list().iter().all(|v| !v.live)).await;
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn closing_a_terminal_stops_the_claude_in_it() {
+        with_test_pool(build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let d = shell_desk(pool, dir.path()).await;
+            let (tid, token) = open(&d, dir.path()).await;
+            d.terminal_hook(
+                tid,
+                &token,
+                &hook("SessionStart", "cc-close", serde_json::json!({})),
+            )
+            .await
+            .unwrap();
+            let s = d
+                .list()
+                .into_iter()
+                .find(|s| s.terminal_id == Some(tid))
+                .unwrap();
+            assert!(s.live);
+
+            d.close_terminal(tid).unwrap();
+
+            // Not left running in a terminal that's gone: stopped, so Desk offers Resume.
+            let v = d.view(s.id).unwrap();
+            assert_eq!((v.live, v.state), (false, SessionState::Stopped));
+            let resumed = d.resume(s.id, None, None).await.unwrap();
+            assert_eq!((resumed.live, resumed.terminal_id), (true, None));
+            d.forget(s.id).await.unwrap();
         })
         .await;
     }
