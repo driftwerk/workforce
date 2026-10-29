@@ -486,6 +486,23 @@ impl PairingStore for PostgresPairingStore {
         })
     }
 
+    fn claim_device_request(&self, id: &str, approved_by: &str) -> Result<bool> {
+        let id = id.to_string();
+        let approved_by = approved_by.to_string();
+        self.block_on(async move {
+            let conn = self.pool.get().await?;
+            let changed = conn
+                .execute(
+                    "UPDATE device_pairing_requests
+                     SET status = 'approved', approved_by = $1, approved_at = $2
+                     WHERE id = $3 AND status = 'pending'",
+                    &[&approved_by, &Utc::now(), &id],
+                )
+                .await?;
+            Ok(changed == 1)
+        })
+    }
+
     fn register_device(&self, device: &ApprovedDevice) -> Result<()> {
         let device = device.clone();
         self.block_on(async move {

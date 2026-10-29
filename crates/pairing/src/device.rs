@@ -70,75 +70,12 @@ impl DevicePairingService {
 
     /// Approve a device pairing request. Returns the approved device and a bearer token.
     pub fn approve(&self, code: &str, approved_by: &str) -> Result<(ApprovedDevice, String)> {
-        let req = self
-            .store
-            .get_device_request_by_code(code)?
-            .ok_or_else(|| eyre::eyre!("Unknown pairing code: {code}"))?;
+        approve_in(self.store.as_ref(), &self.config, code, approved_by)
+    }
 
-        if req.status != PairingStatus::Pending {
-            return Err(eyre::eyre!(
-                "Device pairing request is already {}",
-                req.status.as_str()
-            ));
-        }
-
-        if req.expires_at < Utc::now() {
-            self.store
-                .update_device_request_status(&req.id, PairingStatus::Expired, None)?;
-            return Err(eyre::eyre!("Pairing code has expired"));
-        }
-
-        // Mark as approved
-        self.store.update_device_request_status(
-            &req.id,
-            PairingStatus::Approved,
-            Some(approved_by),
-        )?;
-
-        // Generate a bearer token for the device
-        let token = format!("wfp_{}", Uuid::new_v4().as_simple());
-        let token_hash = blake3::hash(token.as_bytes()).to_hex().to_string();
-
-        let now = Utc::now();
-        let expires_at = if self.config.device_token_ttl_secs == 0 {
-            None
-        } else {
-            Some(now + Duration::seconds(self.config.device_token_ttl_secs as i64))
-        };
-
-        // If client_id matches an existing device, reuse its id for stable identity
-        let device_id = if let Some(ref cid) = req.client_id {
-            if let Ok(Some(existing)) = self.store.find_device_by_client_id(cid) {
-                // Remove the old device record so we can re-register with the same id
-                self.store.revoke_device(&existing.id)?;
-                existing.id
-            } else {
-                req.id.clone()
-            }
-        } else {
-            req.id.clone()
-        };
-
-        let device = ApprovedDevice {
-            id: device_id.clone(),
-            device_name: req.device_name.clone(),
-            client_id: req.client_id.clone(),
-            scopes: req.scopes.clone(),
-            token_hash,
-            created_at: now,
-            last_used: None,
-            revoked: false,
-            expires_at,
-        };
-        self.store.register_device(&device)?;
-        self.store.set_device_pending_token(&req.id, &token)?;
-
-        info!(
-            device_name = req.device_name,
-            device_id = device_id,
-            "Approved device pairing"
-        );
-        Ok((device, token))
+    /// This workspace's pairing settings.
+    pub fn config(&self) -> &PairingConfig {
+        &self.config
     }
 
     /// Reject a device pairing request.
@@ -304,65 +241,28 @@ impl DevicePairingService {
         let store = Arc::clone(&self.store);
         let config = self.config.clone();
         tokio::task::spawn_blocking(move || {
-            let req = store
-                .get_device_request_by_code(&code)?
-                .ok_or_else(|| eyre::eyre!("Unknown pairing code: {code}"))?;
-            if req.status != PairingStatus::Pending {
-                return Err(eyre::eyre!(
-                    "Device pairing request is already {}",
-                    req.status.as_str()
-                ));
-            }
-            if req.expires_at < Utc::now() {
-                store.update_device_request_status(&req.id, PairingStatus::Expired, None)?;
-                return Err(eyre::eyre!("Pairing code has expired"));
-            }
-            store.update_device_request_status(
-                &req.id,
-                PairingStatus::Approved,
-                Some(&approved_by),
-            )?;
-            let token = format!("wfp_{}", Uuid::new_v4().as_simple());
-            let token_hash = blake3::hash(token.as_bytes()).to_hex().to_string();
-            let now = Utc::now();
-            let expires_at = if config.device_token_ttl_secs == 0 {
-                None
-            } else {
-                Some(now + Duration::seconds(config.device_token_ttl_secs as i64))
-            };
+            approve_in(store.as_ref(), &config, &code, &approved_by)
+        })
+        .await
+        .map_err(|e| eyre::eyre!("spawn_blocking join error: {e}"))?
+    }
 
-            // If client_id matches an existing device, reuse its id for stable identity
-            let device_id = if let Some(ref cid) = req.client_id {
-                if let Ok(Some(existing)) = store.find_device_by_client_id(cid) {
-                    // Remove the old device record so we can re-register with the same id
-                    store.revoke_device(&existing.id)?;
-                    existing.id
-                } else {
-                    req.id.clone()
-                }
-            } else {
-                req.id.clone()
-            };
-
-            let device = ApprovedDevice {
-                id: device_id.clone(),
-                device_name: req.device_name.clone(),
-                client_id: req.client_id.clone(),
-                scopes: req.scopes.clone(),
-                token_hash,
-                created_at: now,
-                last_used: None,
-                revoked: false,
-                expires_at,
-            };
-            store.register_device(&device)?;
-            store.set_device_pending_token(&req.id, &token)?;
-            info!(
-                device_name = req.device_name,
-                device_id = device_id,
-                "Approved device pairing"
-            );
-            Ok((device, token))
+    /// The device an approved request registered: the request's own id, or
+    /// the earlier device it re-paired when it carried a known `client_id`.
+    pub async fn device_for_request_async(
+        &self,
+        req: &DevicePairingRequest,
+    ) -> Result<Option<ApprovedDevice>> {
+        let store = Arc::clone(&self.store);
+        let (id, client_id) = (req.id.clone(), req.client_id.clone());
+        tokio::task::spawn_blocking(move || {
+            if let Some(device) = store.get_device_by_id(&id)? {
+                return Ok(Some(device));
+            }
+            match client_id {
+                Some(cid) => store.find_device_by_client_id(&cid),
+                None => Ok(None),
+            }
         })
         .await
         .map_err(|e| eyre::eyre!("spawn_blocking join error: {e}"))?
@@ -497,6 +397,81 @@ impl DevicePairingService {
     }
 }
 
+/// Approve the pending request `code`: claim it (once, however many approvers
+/// race), then register the device and park its one-time token for the
+/// device to collect.
+fn approve_in(
+    store: &dyn PairingStore,
+    config: &PairingConfig,
+    code: &str,
+    approved_by: &str,
+) -> Result<(ApprovedDevice, String)> {
+    let req = store
+        .get_device_request_by_code(code)?
+        .ok_or_else(|| eyre::eyre!("Unknown pairing code: {code}"))?;
+
+    if req.status != PairingStatus::Pending {
+        return Err(eyre::eyre!(
+            "Device pairing request is already {}",
+            req.status.as_str()
+        ));
+    }
+
+    if req.expires_at < Utc::now() {
+        store.update_device_request_status(&req.id, PairingStatus::Expired, None)?;
+        return Err(eyre::eyre!("Pairing code has expired"));
+    }
+
+    if !store.claim_device_request(&req.id, approved_by)? {
+        return Err(eyre::eyre!("Device pairing request is no longer pending"));
+    }
+
+    // Generate a bearer token for the device
+    let token = format!("wfp_{}", Uuid::new_v4().as_simple());
+    let token_hash = blake3::hash(token.as_bytes()).to_hex().to_string();
+
+    let now = Utc::now();
+    let expires_at = if config.device_token_ttl_secs == 0 {
+        None
+    } else {
+        Some(now + Duration::seconds(config.device_token_ttl_secs as i64))
+    };
+
+    // If client_id matches an existing device, reuse its id for stable identity
+    let device_id = if let Some(ref cid) = req.client_id {
+        if let Ok(Some(existing)) = store.find_device_by_client_id(cid) {
+            // Remove the old device record so we can re-register with the same id
+            store.revoke_device(&existing.id)?;
+            existing.id
+        } else {
+            req.id.clone()
+        }
+    } else {
+        req.id.clone()
+    };
+
+    let device = ApprovedDevice {
+        id: device_id.clone(),
+        device_name: req.device_name.clone(),
+        client_id: req.client_id.clone(),
+        scopes: req.scopes.clone(),
+        token_hash,
+        created_at: now,
+        last_used: None,
+        revoked: false,
+        expires_at,
+    };
+    store.register_device(&device)?;
+    store.set_device_pending_token(&req.id, &token)?;
+
+    info!(
+        device_name = req.device_name,
+        device_id = device_id,
+        "Approved device pairing"
+    );
+    Ok((device, token))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -512,6 +487,7 @@ mod tests {
             device_pairing_enabled: true,
             node_pairing_enabled: false,
             device_token_ttl_secs: 2_592_000,
+            who_can_connect: WhoCanConnect::default(),
         }
     }
 
