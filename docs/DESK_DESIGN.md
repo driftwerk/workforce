@@ -419,8 +419,12 @@ Repo: new `driftwerk/workforce-desk`, depending on workforce-public via pinned g
   followed (`proc_pidinfo`, OSC 7) and kept with the env in `desk.terminals`; reopened there
   after a reboot unless restore is `off`.
   Each shell gets `DESK_TERMINAL_ID`, `DESK_HOOK_TOKEN`, `DESK_HOOK_BASE` and `DESK_HOOK_URL`
-  (`<hook base>/hook/terminal/<id>/<token>`); Desk's plugin dir is appended to the person's
-  `CLAUDE_CODE_PLUGIN_DIRS`. A `claude` started there posts its hooks to that URL: SessionStart
+  (`<hook base>/hook/terminal/<id>/<token>`); the person's `CLAUDE_CODE_PLUGIN_DIRS` always
+  carries through, with Desk's plugin dir appended when Desk sends one. Sessions, terminals and
+  the CLIs the hub runs start from the hub's environment without `CLAUDE*` and without the
+  hub's own secrets (`WORKFORCE_*`/`DESK_*` names saying TOKEN, SECRET, KEY, PASSWORD or
+  CREDENTIAL: the gateway token, JWT secret, vault key, holder token, Postgres password); the
+  holder passes on only what the hub asks for, never its own environment. A `claude` started there posts its hooks to that URL: SessionStart
   registers a Desk-origin session with `terminalId` (or takes back the one with that
   `session_id`), later hooks drive it like a Desk-launched session (approvals held up to a day),
   SessionEnd or the shell ending stops it, and the `claude agents` adopter leaves it alone.

@@ -170,6 +170,23 @@ fn check_env(env: &BTreeMap<String, String>) -> Result<(), DeskError> {
     Ok(())
 }
 
+/// The person's plugin folders, then Desk's, each once; `None` for none.
+fn plugin_dirs(theirs: Option<&String>, ours: Option<&String>) -> Option<String> {
+    let mut dirs: Vec<&str> = Vec::new();
+    for dir in [theirs, ours]
+        .into_iter()
+        .flatten()
+        .flat_map(|v| v.split(':'))
+        .map(str::trim)
+        .filter(|d| !d.is_empty())
+    {
+        if !dirs.contains(&dir) {
+            dirs.push(dir);
+        }
+    }
+    (!dirs.is_empty()).then(|| dirs.join(":"))
+}
+
 fn folder_name(cwd: &str) -> String {
     Path::new(cwd)
         .file_name()
@@ -384,23 +401,14 @@ impl Desk {
     fn terminal_spawn(&self, r: &TerminalRecord) -> Spawn {
         let mut env = self.0.env.clone();
         env.extend(r.env.clone());
-        // Desk's plugin folder joins any the person already loads.
-        if let (Some(ours), Some(theirs)) = (
-            r.env.get(PLUGIN_DIRS),
-            self.0
-                .opts
-                .env
-                .get(PLUGIN_DIRS)
-                .filter(|v| !v.trim().is_empty()),
-        ) {
-            let mut dirs: Vec<&str> = theirs.split(':').filter(|d| !d.is_empty()).collect();
-            for dir in ours.split(':').filter(|d| !d.is_empty()) {
-                if !dirs.contains(&dir) {
-                    dirs.push(dir);
-                }
-            }
-            env.insert(PLUGIN_DIRS.into(), dirs.join(":"));
-        }
+        // The person's own plugin folders always carry through (the base
+        // environment drops every CLAUDE* marker), with Desk's after them
+        // when it sends one.
+        let dirs = plugin_dirs(self.0.opts.env.get(PLUGIN_DIRS), r.env.get(PLUGIN_DIRS));
+        match dirs {
+            Some(dirs) => env.insert(PLUGIN_DIRS.into(), dirs),
+            None => env.remove(PLUGIN_DIRS),
+        };
         env.insert("DESK_TERMINAL_ID".into(), r.id.to_string());
         let token = r.env.get(HOOK_TOKEN).cloned().unwrap_or_default();
         env.insert("DESK_HOOK_BASE".into(), self.0.hook_base.clone());
@@ -807,6 +815,56 @@ mod tests {
         for bad in ["", "1X", "A-B", "A B"] {
             assert!(check_env(&env(bad)).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn plugin_dirs_are_the_persons_then_desks_each_once() {
+        let v = |s: &str| Some(s.to_string());
+        let dirs = |a: Option<String>, b: Option<String>| plugin_dirs(a.as_ref(), b.as_ref());
+        assert_eq!(dirs(v("/mine:/also"), None), v("/mine:/also"));
+        assert_eq!(dirs(None, v("/plugins/desk")), v("/plugins/desk"));
+        assert_eq!(
+            dirs(v("/mine"), v("/plugins/desk")),
+            v("/mine:/plugins/desk")
+        );
+        assert_eq!(
+            dirs(v("/mine:/plugins/desk"), v("/plugins/desk:/mine")),
+            v("/mine:/plugins/desk")
+        );
+        assert_eq!(dirs(v(" : "), v("")), None);
+    }
+
+    /// A terminal Desk opens without its plugin folder still loads the
+    /// person's own.
+    #[tokio::test]
+    async fn a_terminal_without_desks_plugins_keeps_the_persons() {
+        with_test_pool(build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let d = shell_desk(pool, dir.path()).await;
+            let t = d
+                .create_terminal(NewTerminal {
+                    id: None,
+                    name: None,
+                    cwd: dir.path().to_string_lossy().into_owned(),
+                    env: BTreeMap::new(),
+                })
+                .await
+                .unwrap();
+            let r = d.0.state.lock().terminals[&t.id].clone();
+            assert_eq!(
+                d.terminal_spawn(&r)
+                    .env
+                    .get(PLUGIN_DIRS)
+                    .map(String::as_str),
+                Some("/mine")
+            );
+            let pty = d.attach_terminal(t.id).unwrap();
+            pty.write(b"echo \"plugins=$CLAUDE_CODE_PLUGIN_DIRS.\"\n")
+                .unwrap();
+            crate::pty::tests::wait_for(&pty, "plugins=/mine.").await;
+            d.close_terminal(t.id).unwrap();
+        })
+        .await;
     }
 
     #[tokio::test]
