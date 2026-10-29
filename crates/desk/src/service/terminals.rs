@@ -929,7 +929,12 @@ mod tests {
     /// A desk whose terminals run `/bin/sh`, with a plugin folder of the
     /// person's own in its login environment.
     async fn shell_desk(pool: workforce_postgres::PostgresPool, dir: &Path) -> Desk {
+        use std::os::unix::fs::PermissionsExt;
         let mut opts = options(dir);
+        let cli = dir.join("fake-claude");
+        std::fs::write(&cli, "#!/bin/sh\nexec sleep 60\n").unwrap();
+        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+        opts.claude = cli;
         opts.env = BTreeMap::from([
             ("PATH".into(), "/usr/bin:/bin".into()),
             ("SHELL".into(), "/bin/sh".into()),
@@ -984,10 +989,11 @@ mod tests {
             crate::pty::tests::wait_for(&pty, &want).await;
 
             // SessionStart, posted where the shell was told to.
+            let repo = dir.path().to_string_lossy().into_owned();
             let url = format!("{}/hook/terminal/{tid}/{token}", d.0.hook_base);
             let started = reqwest::Client::new()
                 .post(&url)
-                .body(hook("SessionStart", "cc-1", serde_json::json!({ "cwd": "/repo" })))
+                .body(hook("SessionStart", "cc-1", serde_json::json!({ "cwd": repo })))
                 .send()
                 .await
                 .unwrap();
@@ -995,7 +1001,7 @@ mod tests {
             let s = d.list().into_iter().find(|s| s.terminal_id == Some(tid)).unwrap();
             assert_eq!(
                 (s.origin, s.state, s.live, s.cli_session_id.as_deref(), s.cwd.as_str(), s.name.as_str()),
-                (Origin::Desk, SessionState::Idle, true, Some("cc-1"), "/repo", "api")
+                (Origin::Desk, SessionState::Idle, true, Some("cc-1"), repo.as_str(), "api")
             );
             assert!(d.stop(s.id, None).is_err(), "ended in its terminal, not by Desk");
 
@@ -1041,6 +1047,11 @@ mod tests {
             d.terminal_hook(tid, &token, &hook("SessionStart", "cc-2", serde_json::json!({}))).await.unwrap();
             assert!(!d.view(s.id).unwrap().live);
             assert_eq!(d.list().iter().filter(|v| v.terminal_id == Some(tid) && v.live).count(), 1);
+
+            // Resumed from Desk, the old one runs as Desk's own, out of the terminal.
+            let resumed = d.resume(s.id, None, None).await.unwrap();
+            assert_eq!((resumed.live, resumed.terminal_id), (true, None));
+            d.forget(s.id).unwrap();
 
             // Wrong token, unknown terminal: refused.
             assert!(d.terminal_hook(tid, "nope", &hook("SessionStart", "x", serde_json::json!({}))).await.is_none());

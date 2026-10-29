@@ -823,6 +823,8 @@ impl Desk {
         self.change(id, |r, _| {
             r.origin = Origin::Desk;
             r.external_pid = None;
+            // Desk runs it now, not the terminal it started in.
+            r.terminal_id = None;
             r.state = SessionState::Starting;
             r.restore_offer = false;
             if let Some(p) = prompt.clone() {

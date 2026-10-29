@@ -233,6 +233,12 @@ pub async fn serve(socket: &Path, token: &str, cancel: CancellationToken) -> Res
         tracing::info!(socket = %socket.display(), "a PTY holder is already running");
         return Ok(());
     }
+    // Two holders starting at once: only the one holding the lock serves,
+    // so neither unlinks the other's socket. Held until this returns.
+    let Some(_lock) = lock_beside(socket)? else {
+        tracing::info!(socket = %socket.display(), "another PTY holder is starting");
+        return Ok(());
+    };
     let listener =
         UnixListener::bind(socket).with_context(|| format!("listening on {}", socket.display()))?;
     std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600))?;
@@ -269,6 +275,19 @@ pub async fn serve(socket: &Path, token: &str, cancel: CancellationToken) -> Res
     let _ = std::fs::remove_file(socket);
     let _ = std::fs::remove_file(pid_file);
     Ok(())
+}
+
+/// An exclusive lock on `<socket>.lock`; `None` when another process has it.
+fn lock_beside(socket: &Path) -> Result<Option<std::fs::File>> {
+    use std::os::fd::AsRawFd;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(socket.with_extension("lock"))?;
+    // SAFETY: flock on a descriptor this function owns.
+    let locked = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
+    Ok(locked.then_some(file))
 }
 
 /// Where a holder serving `socket` writes its process id.
