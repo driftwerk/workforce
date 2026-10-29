@@ -25,7 +25,8 @@ use crate::tools::arguments::{
     check_arguments, render_argument_problems, summarise_argument_problems, ArgumentValidation,
 };
 use crate::tools::registry::ToolRegistry;
-use crate::tools::RateLimit;
+use crate::tools::{RateLimit, SurfaceEffect};
+use workforce_common::channels::CHAT_SURFACE_PLATFORMS;
 
 /// The authorisation inputs a tool call is gated with, detached from the
 /// rest of [`RunnerConfig`] so callers without a runner can gate too.
@@ -98,6 +99,12 @@ pub fn gate_tool_call(
     let response = apply_capability_gate(gates, response, tool_name, input);
     let response = apply_cascade_gate(gates, response, tool_name);
     let response = apply_tool_requirement(tools, response, tool_name);
+    let response = apply_surface_gate(
+        response,
+        surface_effect_of(tools, tool_name, input).as_ref(),
+        crate::runner::current_desk().as_ref(),
+        input,
+    );
     if let PolicyDecision::Deny { reason } = response.decision {
         return GateOutcome::Blocked {
             message: format!("Policy denied: {reason}"),
@@ -398,6 +405,75 @@ pub fn apply_tool_requirement(
         );
     }
     combined
+}
+
+/// What a call does to a messaging surface. A tool's own declaration
+/// wins; without one, any tool in the namespace of a chat platform
+/// ([`CHAT_SURFACE_PLATFORMS`]) writes to it, so a Slack tool added later is
+/// held at the gate until it says it only reads. Anything else touches no
+/// surface.
+pub fn surface_effect_of(
+    tools: &ToolRegistry,
+    tool_name: &str,
+    input: &Value,
+) -> Option<SurfaceEffect> {
+    tools
+        .get(tool_name)
+        .and_then(|tool| tool.surface_effect(input))
+        .or_else(|| {
+            let namespace = tool_name.split('.').next()?;
+            CHAT_SURFACE_PLATFORMS
+                .contains(&namespace)
+                .then(|| SurfaceEffect::Writes {
+                    platform: namespace.to_string(),
+                    destination: input["channel"].as_str().unwrap_or_default().to_string(),
+                })
+        })
+}
+
+/// The longest stretch of what a held write would say that its prompt shows.
+const PREVIEW_CHARS: usize = 200;
+
+/// Hold a write to any surface but Desk, made during a Desk turn a person
+/// is attending, for that person's say: an agent asked in Desk posts on
+/// Slack or sends an email only when they want it to. "Always allow" stays
+/// open, so a destination they post to often costs one click once. Only
+/// ever escalates an `Allow`; a run nobody attends, and any turn not from
+/// Desk, is untouched.
+pub fn apply_surface_gate(
+    response: PolicyResponse,
+    effect: Option<&SurfaceEffect>,
+    desk: Option<&workforce_common::channels::desk::DeskScope>,
+    input: &Value,
+) -> PolicyResponse {
+    match (&response.decision, effect, desk) {
+        (
+            PolicyDecision::Allow,
+            Some(SurfaceEffect::Writes {
+                platform,
+                destination,
+            }),
+            Some(scope),
+        ) if scope.attended && platform != workforce_common::channels::desk::DESK_PLATFORM => {
+            let preview: String = ["text", "message", "body", "subject", "content"]
+                .iter()
+                .find_map(|field| input[*field].as_str())
+                .unwrap_or_default()
+                .chars()
+                .take(PREVIEW_CHARS)
+                .collect();
+            PolicyResponse {
+                decision: PolicyDecision::RequireApproval {
+                    reason: format!(
+                        "Posts outside Desk, to {platform} {destination}: \"{preview}\""
+                    ),
+                    allow_save_allow: true,
+                },
+                ..response
+            }
+        }
+        _ => response,
+    }
 }
 
 /// The refusal a tool that requires human approval gets on a path with no
@@ -1423,5 +1499,177 @@ mod tests {
         .await;
         assert!(out.is_error);
         assert_eq!(out.output_text, tool_not_found_message("nope", &registry()));
+    }
+
+    /// A tool that says what it does to its surface, or says nothing.
+    struct Surfaced {
+        name: &'static str,
+        effect: Option<SurfaceEffect>,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for Surfaced {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn description(&self) -> &str {
+            "surfaced"
+        }
+        fn input_schema(&self) -> Value {
+            serde_json::json!({"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]})
+        }
+        fn surface_effect(&self, _input: &Value) -> Option<SurfaceEffect> {
+            self.effect.clone()
+        }
+        async fn execute(&self, input: Value) -> eyre::Result<ToolResult> {
+            Ok(ToolResult::success(input, 1))
+        }
+    }
+
+    fn surfaced_tools() -> ToolRegistry {
+        let tools = ToolRegistry::new();
+        let writes = |platform: &str| {
+            Some(SurfaceEffect::Writes {
+                platform: platform.into(),
+                destination: "C1".into(),
+            })
+        };
+        for (name, effect) in [
+            ("messaging.send", writes("slack")),
+            ("messaging.read", Some(SurfaceEffect::Reads)),
+            ("slack.list_channels", Some(SurfaceEffect::Reads)),
+            ("slack.update_message", None),
+            ("slack.send", None),
+            ("email.send", writes("email")),
+            ("notes.write", None),
+        ] {
+            tools.register(Arc::new(Surfaced { name, effect }));
+        }
+        tools
+    }
+
+    fn desk(attended: bool) -> workforce_common::channels::desk::DeskScope {
+        use workforce_common::channels::desk::{DeskPlace, DeskTarget};
+        workforce_common::channels::desk::DeskScope {
+            target: DeskTarget::of_turn(&DeskPlace::Dm, "desk", None, false),
+            attended,
+        }
+    }
+
+    fn allowed() -> PolicyResponse {
+        PolicyResponse {
+            decision: PolicyDecision::Allow,
+            matched_rule: None,
+            evaluation_time_us: 0,
+        }
+    }
+
+    #[test]
+    fn a_chat_platform_s_tool_writes_unless_it_says_it_reads() {
+        let tools = surfaced_tools();
+        let input = serde_json::json!({"channel": "C9", "text": "hi"});
+        let effect = |name| surface_effect_of(&tools, name, &input);
+        assert_eq!(
+            effect("slack.send"),
+            Some(SurfaceEffect::Writes {
+                platform: "slack".into(),
+                destination: "C9".into()
+            })
+        );
+        assert!(matches!(
+            effect("slack.update_message"),
+            Some(SurfaceEffect::Writes { .. })
+        ));
+        assert_eq!(effect("slack.list_channels"), Some(SurfaceEffect::Reads));
+        assert_eq!(effect("messaging.read"), Some(SurfaceEffect::Reads));
+        assert_eq!(effect("notes.write"), None);
+        assert!(matches!(
+            effect("slack.anything_added_later"),
+            Some(SurfaceEffect::Writes { .. })
+        ));
+    }
+
+    #[test]
+    fn a_write_off_desk_in_an_attended_desk_turn_needs_the_person_s_say() {
+        let input = serde_json::json!({"channel": "C1", "text": "the release is out"});
+        let to = |platform: &str| SurfaceEffect::Writes {
+            platform: platform.into(),
+            destination: "C1".into(),
+        };
+        let gated = apply_surface_gate(allowed(), Some(&to("slack")), Some(&desk(true)), &input);
+        match gated.decision {
+            PolicyDecision::RequireApproval {
+                reason,
+                allow_save_allow,
+            } => {
+                assert_eq!(
+                    reason,
+                    "Posts outside Desk, to slack C1: \"the release is out\""
+                );
+                assert!(allow_save_allow);
+            }
+            other => panic!("expected an approval, got {other:?}"),
+        }
+        let email = apply_surface_gate(allowed(), Some(&to("email")), Some(&desk(true)), &input);
+        assert!(matches!(
+            email.decision,
+            PolicyDecision::RequireApproval { .. }
+        ));
+        for (effect, scope) in [
+            (Some(to("desk")), Some(desk(true))),
+            (Some(to("slack")), Some(desk(false))),
+            (Some(to("slack")), None),
+            (Some(SurfaceEffect::Reads), Some(desk(true))),
+            (None, Some(desk(true))),
+        ] {
+            let decision =
+                apply_surface_gate(allowed(), effect.as_ref(), scope.as_ref(), &input).decision;
+            assert_eq!(decision, PolicyDecision::Allow, "{effect:?} {scope:?}");
+        }
+        let denied = PolicyResponse {
+            decision: PolicyDecision::Deny {
+                reason: "no".into(),
+            },
+            ..allowed()
+        };
+        assert!(matches!(
+            apply_surface_gate(denied, Some(&to("slack")), Some(&desk(true)), &input).decision,
+            PolicyDecision::Deny { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn the_gate_holds_a_slack_post_from_a_desk_turn_and_nothing_else() {
+        let tools = surfaced_tools();
+        let calls = Arc::new(Calls::default());
+        let g = gates(&calls, None, CascadeState::Allow);
+        let post = serde_json::json!({"channel": "C1", "text": "hi"});
+        let in_desk = crate::runner::with_desk(Some(desk(true)), async {
+            as_user(|| gate_tool_call(&g, &permissive_policy(), &tools, "slack.send", &post))
+        })
+        .await;
+        assert!(
+            matches!(in_desk, GateOutcome::RequireApproval { .. }),
+            "{in_desk:?}"
+        );
+        let read = crate::runner::with_desk(Some(desk(true)), async {
+            as_user(|| {
+                gate_tool_call(
+                    &g,
+                    &permissive_policy(),
+                    &tools,
+                    "slack.list_channels",
+                    &post,
+                )
+            })
+        })
+        .await;
+        assert!(matches!(read, GateOutcome::Execute { .. }), "{read:?}");
+        let from_slack =
+            as_user(|| gate_tool_call(&g, &permissive_policy(), &tools, "slack.send", &post));
+        assert!(
+            matches!(from_slack, GateOutcome::Execute { .. }),
+            "{from_slack:?}"
+        );
     }
 }

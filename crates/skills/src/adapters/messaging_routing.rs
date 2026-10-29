@@ -24,8 +24,30 @@ pub fn channel_hint_from_input(input: &serde_json::Value) -> ChannelHint {
     )
 }
 
+/// The platform a messaging call names, else the one the run is on: the
+/// Desk conversation a Desk run answers to, otherwise Slack.
 pub fn platform_arg(input: &serde_json::Value) -> &str {
-    input["platform"].as_str().unwrap_or(DEFAULT_PLATFORM)
+    input["platform"].as_str().unwrap_or(default_platform())
+}
+
+fn default_platform() -> &'static str {
+    match workforce_agent::runner::current_desk() {
+        Some(_) => workforce_common::channels::desk::DESK_PLATFORM,
+        None => DEFAULT_PLATFORM,
+    }
+}
+
+/// What a messaging call that posts does to its surface: writes to the
+/// channel it names on the platform it resolves to.
+pub fn writes(input: &serde_json::Value) -> workforce_agent::tools::SurfaceEffect {
+    workforce_agent::tools::SurfaceEffect::Writes {
+        platform: platform_arg(input).to_string(),
+        destination: input["channel"]
+            .as_str()
+            .or(input["user"].as_str())
+            .unwrap_or_default()
+            .to_string(),
+    }
 }
 
 /// Cross-channel read guard for `messaging.read` / `view_attachment`. A tool may
@@ -106,13 +128,35 @@ pub fn schema_workspace_property() -> serde_json::Value {
 pub fn schema_platform_property() -> serde_json::Value {
     serde_json::json!({
         "type": "string",
-        "description": "Platform (slack, discord, etc.). Defaults to slack."
+        "description": "Platform (slack, desk, etc.). Defaults to the Desk conversation in a \
+                        Desk conversation, else slack."
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn the_platform_defaults_to_desk_in_a_desk_conversation_and_slack_elsewhere() {
+        use workforce_common::channels::desk::{DeskPlace, DeskScope, DeskTarget};
+        let input = serde_json::json!({"text": "hi"});
+        assert_eq!(platform_arg(&input), "slack");
+        let scope = DeskScope {
+            target: DeskTarget::of_turn(&DeskPlace::Dm, "desk", None, false),
+            attended: true,
+        };
+        let on_desk = workforce_agent::runner::with_desk(Some(scope.clone()), async {
+            platform_arg(&input).to_string()
+        })
+        .await;
+        assert_eq!(on_desk, "desk");
+        let named = workforce_agent::runner::with_desk(Some(scope), async {
+            platform_arg(&serde_json::json!({"platform": "slack"})).to_string()
+        })
+        .await;
+        assert_eq!(named, "slack");
+    }
 
     #[test]
     fn channel_not_found_variants_all_match() {

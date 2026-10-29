@@ -102,6 +102,35 @@ pub struct ToolDefinition {
     pub input_schema: serde_json::Value,
 }
 
+/// What a tool call does to a messaging surface.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SurfaceEffect {
+    Reads,
+    Writes {
+        platform: String,
+        destination: String,
+    },
+}
+
+impl SurfaceEffect {
+    /// A write of an email to whom `input` addresses it.
+    pub fn email(input: &serde_json::Value) -> Self {
+        let to = match &input["to"] {
+            serde_json::Value::String(to) => to.clone(),
+            serde_json::Value::Array(to) => to
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .collect::<Vec<_>>()
+                .join(", "),
+            _ => String::new(),
+        };
+        Self::Writes {
+            platform: "email".to_string(),
+            destination: to,
+        }
+    }
+}
+
 /// Trait that all tools must implement.
 #[async_trait]
 pub trait Tool: Send + Sync {
@@ -153,6 +182,14 @@ pub trait Tool: Send + Sync {
     /// dispatch, so it must be a cheap read of already-loaded state.
     /// Defaults to `None`: policy alone decides.
     fn approval_requirement(&self) -> Option<String> {
+        None
+    }
+
+    /// What THIS call does to a messaging surface: reads it, or writes to a
+    /// destination on a platform. The cross-surface gate reads it to hold a
+    /// write outside the Desk conversation a person is in for their say.
+    /// `None`, the default, leaves the gate to the tool's namespace.
+    fn surface_effect(&self, _input: &serde_json::Value) -> Option<SurfaceEffect> {
         None
     }
 

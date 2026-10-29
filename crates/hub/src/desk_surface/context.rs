@@ -38,6 +38,7 @@ pub(crate) fn desk_context(
     let turn = &desk.turn;
     let named = person.unwrap_or("the person you work for");
     let owner = person.map_or_else(|| "your person's".to_string(), |p| format!("{p}'s"));
+    let asks = person.unwrap_or("them");
     let conversation = match &turn.place {
         DeskPlace::Dm => format!("a direct message with {named}"),
         DeskPlace::Room {
@@ -77,7 +78,9 @@ pub(crate) fn desk_context(
          speaking: {speaking}\n\
          session_channel: {session_channel}\n\
          session_id: {session_id}\n\
-         Your reply is posted into this {posted}."
+         Your reply is posted into this {posted}. messaging.send with no platform posts to this \
+         Desk conversation. Posting to Slack or any other surface asks {asks} first, so only do \
+         it when they ask you to."
     );
     match thread_lines(desk, session_channel) {
         Some(seed) => format!("{block}\n\n{seed}"),
@@ -178,7 +181,9 @@ mod tests {
              speaking: Sam (the person you work for)\n\
              session_channel: desk:room-1\n\
              session_id: s1\n\
-             Your reply is posted into this thread.\n\n\
+             Your reply is posted into this thread. messaging.send with no platform posts to \
+             this Desk conversation. Posting to Slack or any other surface asks Sam first, so \
+             only do it when they ask you to.\n\n\
              ## Earlier in this thread\n\
              Sam: can you check the build?\n\
              helper (agent): on it\n\n\
@@ -196,7 +201,8 @@ mod tests {
         );
         assert!(dm.contains("surface: desk (your person's desktop app)\n"));
         assert!(dm.contains("conversation: a direct message with the person you work for\n"));
-        assert!(dm.ends_with("Your reply is posted into this conversation."));
+        assert!(dm.contains("Your reply is posted into this conversation. "));
+        assert!(dm.contains("surface asks them first"));
 
         let call = desk_context(
             &context(
@@ -228,7 +234,7 @@ mod tests {
         assert!(hand_off.contains(
             "speaking: helper, another agent in this room, handing off to you (hand-off 2 of 3)\n"
         ));
-        assert!(hand_off.ends_with("Your reply is posted into this room."));
+        assert!(hand_off.contains("Your reply is posted into this room. "));
     }
 
     #[test]

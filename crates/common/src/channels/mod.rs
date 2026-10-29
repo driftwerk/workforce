@@ -43,6 +43,10 @@ pub fn channel_id(channel: &str) -> &str {
 pub use workforce_core::desk;
 pub use workforce_core::desk::{is_desk_conversation, is_desk_room, DESK_CHANNEL};
 
+/// The chat platforms whose tools post where people read: a tool in one of
+/// their namespaces is taken to write there unless it says it only reads.
+pub const CHAT_SURFACE_PLATFORMS: &[&str] = &["slack", "teams", "discord", "telegram", "whatsapp"];
+
 /// The gateway's persistent one-chat-per-user channels: the iOS app, the web
 /// UI, the terminal and the desktop app, each a screen the reply is read on.
 pub const CONVERSATIONAL_CHANNELS: &[&str] = &["ios", "web", "terminal", DESK_CHANNEL];

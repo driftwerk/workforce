@@ -135,6 +135,17 @@ impl ChannelSurface for DeskSurface {
         Err(eyre!("Desk has no reactions"))
     }
 
+    async fn read_messages(
+        &self,
+        _channel: &str,
+        _limit: usize,
+        _oldest: Option<&str>,
+    ) -> Result<Vec<workforce_common::channels::ChannelMessage>> {
+        Err(eyre!(
+            "not supported: the conversation's recent messages are in your context"
+        ))
+    }
+
     async fn send_message(&self, message: &OutboundMessage) -> Result<SentMessage> {
         let service = self
             .service

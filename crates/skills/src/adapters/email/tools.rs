@@ -1978,6 +1978,13 @@ impl Tool for EmailSendTool {
         "email.send"
     }
 
+    fn surface_effect(
+        &self,
+        input: &serde_json::Value,
+    ) -> Option<workforce_agent::tools::SurfaceEffect> {
+        Some(workforce_agent::tools::SurfaceEffect::email(input))
+    }
+
     fn description(&self) -> &str {
         "Send email with text/HTML, CC/BCC, reply threading"
     }
@@ -3428,6 +3435,13 @@ impl EmailForwardTool {
 impl Tool for EmailForwardTool {
     fn name(&self) -> &str {
         "email.forward"
+    }
+
+    fn surface_effect(
+        &self,
+        input: &serde_json::Value,
+    ) -> Option<workforce_agent::tools::SurfaceEffect> {
+        Some(workforce_agent::tools::SurfaceEffect::email(input))
     }
 
     fn description(&self) -> &str {
