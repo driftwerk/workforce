@@ -219,6 +219,27 @@ fn cli_env(base: &BTreeMap<String, String>) -> BTreeMap<String, String> {
     env
 }
 
+/// The layout without sessions the registry no longer has (forgotten
+/// before the hub took them out of it, or by an older hub). A failure to
+/// save it is only logged: the next start tries again.
+async fn prune_layout(
+    store: &DeskStore,
+    layout: Layout,
+    records: &HashMap<Uuid, SessionRecord>,
+) -> Layout {
+    let pruned = layout.without_sessions(|id| !records.contains_key(&id));
+    if pruned == layout {
+        return layout;
+    }
+    match store.put_layout(&pruned).await {
+        Ok(()) => pruned,
+        Err(e) => {
+            tracing::warn!(error = %e, "couldn't take forgotten sessions out of the sidebar's layout");
+            layout
+        }
+    }
+}
+
 impl Desk {
     /// Loads the registry, marks what was running as interrupted or stopped
     /// (its processes did not survive the hub), and starts the hook endpoint
@@ -254,6 +275,7 @@ impl Desk {
             }
             records.insert(r.id, r);
         }
+        let layout = prune_layout(&store, layout, &records).await;
 
         let listener = hook_listener(held.hook_port).await?;
         let hook_port = listener.local_addr()?.port();
@@ -958,7 +980,9 @@ impl Desk {
         }
     }
 
-    pub fn forget(&self, id: Uuid) -> Result<(), DeskError> {
+    /// Forgets a session: ends it, deletes its record and takes it out of
+    /// the sidebar's layout.
+    pub async fn forget(&self, id: Uuid) -> Result<(), DeskError> {
         let live = {
             let mut st = self.0.state.lock();
             st.records.remove(&id).ok_or(DeskError::NotFound)?;
@@ -971,6 +995,7 @@ impl Desk {
         drop(live);
         let _ = self.0.persist.send(Persist::Delete(id));
         let _ = self.0.events.send(DeskEvent::Removed { id });
+        self.drop_from_layout(id).await;
         Ok(())
     }
 

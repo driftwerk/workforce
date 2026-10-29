@@ -109,6 +109,7 @@ async fn forget(State(s): S, h: HeaderMap, Query(q): Q, Path(id): Path<Uuid>) ->
     guarded!(s, h, q);
     s.desk
         .forget(id)
+        .await
         .map(|()| StatusCode::NO_CONTENT)
         .into_response()
 }
@@ -487,6 +488,23 @@ async fn remove_member(
 }
 
 #[derive(Deserialize)]
+struct Order {
+    items: Vec<String>,
+}
+
+/// Ungrouped's order as Desk shows it (`Layout::order_ungrouped`): the
+/// route for putting an item in Ungrouped or taking it out of a group,
+/// since only Desk knows what shows there unlisted.
+async fn order_ungrouped(State(s): S, h: HeaderMap, Query(q): Q, Json(o): Json<Order>) -> Response {
+    guarded!(s, h, q);
+    s.desk
+        .change_layout(|l| l.order_ungrouped(&o.items))
+        .await
+        .map(Json)
+        .into_response()
+}
+
+#[derive(Deserialize)]
 struct NameBody {
     name: Option<String>,
 }
@@ -600,6 +618,10 @@ pub fn sessions_router(desk: Desk, auth: Arc<dyn Authorize>) -> Router {
             patch(update_group).delete(delete_group),
         )
         .route("/api/desk/groups/{id}/move", post(move_group))
+        .route(
+            "/api/desk/groups/ungrouped/order",
+            axum::routing::put(order_ungrouped),
+        )
         .route(
             "/api/desk/groups/{id}/items/{*item}",
             axum::routing::put(put_member).delete(remove_member),
@@ -1097,6 +1119,22 @@ mod tests {
             }))).await;
             assert_eq!((status, &i["imported"]), (200, &json!(true)));
             assert_eq!(i["sessionNames"][r.id.to_string()], "Ledger migration");
+
+            // Ungrouped's order as Desk settled it: taken out of its group.
+            let (status, l) = call(&app, "PUT", "/api/desk/groups/ungrouped/order", Some(json!({ "items": ["agent:dw/allan", s, "agent:local/scout"] }))).await;
+            assert_eq!((status, &l["ungrouped"]["items"]), (200, &json!(["agent:dw/allan", s, "agent:local/scout"])));
+            assert_eq!(l["groups"][0]["items"], json!([]));
+            let (status, _) = call(&app, "PUT", "/api/desk/groups/ungrouped/order", Some(json!({ "items": ["nonsense"] }))).await;
+            assert_eq!(status, 400);
+            // Still a group's own route: a group may not be called "ungrouped".
+            let (status, l) = call(&app, "PUT", &format!("/api/desk/groups/m/items/{s}"), Some(json!({}))).await;
+            assert_eq!((status, &l["groups"][0]["items"]), (200, &json!([s])));
+
+            // Forgotten, the session leaves the layout.
+            let (status, _) = call(&app, "DELETE", &format!("/api/desk/sessions/{}", r.id), None).await;
+            assert_eq!(status, 204);
+            let (_, l) = call(&app, "GET", "/api/desk/layout", None).await;
+            assert_eq!((&l["groups"][0]["items"], &l["ungrouped"]["items"]), (&json!([]), &json!(["agent:dw/allan", "agent:local/scout"])));
         })
         .await;
     }

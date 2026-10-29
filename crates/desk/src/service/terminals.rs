@@ -1110,7 +1110,7 @@ mod tests {
             // Resumed from Desk, the old one runs as Desk's own, out of the terminal.
             let resumed = d.resume(s.id, None, None).await.unwrap();
             assert_eq!((resumed.live, resumed.terminal_id), (true, None));
-            d.forget(s.id).unwrap();
+            d.forget(s.id).await.unwrap();
 
             // Wrong token, unknown terminal: refused.
             assert!(d.terminal_hook(tid, "nope", &hook("SessionStart", "x", serde_json::json!({}))).await.is_none());

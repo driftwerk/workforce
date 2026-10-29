@@ -284,6 +284,58 @@ impl Layout {
             None => Ok(self.clone()),
         }
     }
+
+    /// Ungrouped's order as Desk shows it: `items` first, in that order,
+    /// each taken out of whichever group held it, then whatever Ungrouped
+    /// listed before and `items` leaves out, as it was. Only Desk knows what
+    /// shows there without being listed (every hub's agents, in its order),
+    /// so it settles the order and the hub keeps it. Taking something out of
+    /// a group opens Ungrouped, as moving into a group opens that one.
+    pub fn order_ungrouped(&self, items: &[String]) -> Result<Self, DeskError> {
+        items.iter().try_for_each(|k| check_item(k))?;
+        let mut listed = Vec::with_capacity(items.len());
+        let mut seen = HashSet::new();
+        for k in items {
+            if seen.insert(k.as_str()) {
+                listed.push(k.clone());
+            }
+        }
+        let mut out = self.clone();
+        let mut moved_in = false;
+        for g in &mut out.groups {
+            let before = g.items.len();
+            g.items.retain(|k| !seen.contains(k.as_str()));
+            moved_in |= g.items.len() != before;
+        }
+        listed.extend(
+            self.ungrouped
+                .items
+                .iter()
+                .filter(|k| !seen.contains(k.as_str()))
+                .cloned(),
+        );
+        out.ungrouped.items = listed;
+        if moved_in {
+            out.ungrouped.collapsed = false;
+        }
+        Ok(out)
+    }
+
+    /// Without the sessions `gone` picks out, from every group and from
+    /// Ungrouped.
+    pub fn without_sessions(&self, gone: impl Fn(Uuid) -> bool) -> Self {
+        let drop = |k: &String| {
+            k.strip_prefix("session:")
+                .and_then(|id| Uuid::parse_str(id).ok())
+                .is_some_and(&gone)
+        };
+        let mut out = self.clone();
+        for g in &mut out.groups {
+            g.items.retain(|k| !drop(k));
+        }
+        out.ungrouped.items.retain(|k| !drop(k));
+        out
+    }
 }
 
 impl DeskStore {
@@ -443,6 +495,17 @@ impl Desk {
         Ok(after)
     }
 
+    /// Takes a forgotten session out of the layout. Its record is already
+    /// gone, so a failure here is only logged: the next start tidies it.
+    pub(super) async fn drop_from_layout(&self, id: Uuid) {
+        if let Err(e) = self
+            .change_layout(|l| Ok(l.without_sessions(|s| s == id)))
+            .await
+        {
+            tracing::warn!(%id, error = %e, "a forgotten session stays in the sidebar's layout until the hub restarts");
+        }
+    }
+
     /// Sets (or, with `None` or a blank name, clears) the person's name for
     /// a session.
     pub fn name_session(&self, id: Uuid, name: Option<String>) -> Result<SessionView, DeskError> {
@@ -460,7 +523,12 @@ impl Desk {
     /// nothing.
     pub async fn import_layout(&self, import: Import) -> Result<Imported, DeskError> {
         let fresh = self.0.store.layout_is_empty().await?;
-        let layout = import.layout.checked()?;
+        // Desk's own copy can still name sessions the hub has forgotten.
+        let known: HashSet<Uuid> = self.0.state.lock().records.keys().copied().collect();
+        let layout = import
+            .layout
+            .checked()?
+            .without_sessions(|id| !known.contains(&id));
         let imported = fresh || import.force;
         if imported {
             self.change_layout(|_| Ok(layout)).await?;
@@ -565,6 +633,97 @@ mod tests {
         assert!(l.edit(UNGROUPED, Some("x"), None).is_err());
         assert!(l.put("nonsense", "g2", None).is_err());
         assert!(l.put(&s(9), "nowhere", None).is_err());
+    }
+
+    /// Desk's `model.test.ts` fixture `two`: what shows in Ungrouped
+    /// unlisted (ada, s3) only Desk knows, so it sends the order it
+    /// settled and the hub keeps exactly that.
+    #[test]
+    fn ungrouped_keeps_the_order_desk_settled() {
+        let (scout, ada, zed) = ("agent:local/scout", "agent:remote/ada", "agent:offline/zed");
+        let two = Layout {
+            groups: vec![
+                Group {
+                    id: "acme".into(),
+                    name: "Acme".into(),
+                    collapsed: false,
+                    items: vec![scout.into(), s(1)],
+                },
+                Group {
+                    id: "beta".into(),
+                    name: "Beta".into(),
+                    collapsed: false,
+                    items: vec![s(2), zed.into()],
+                },
+            ],
+            ungrouped: Ungrouped {
+                collapsed: true,
+                items: vec![],
+            },
+        };
+        // What placing by `before` alone did: s3 isn't listed, so s1 went
+        // to the end of the listed ones, which show first.
+        assert_eq!(
+            two.put(&s(1), UNGROUPED, Some(&s(3)))
+                .unwrap()
+                .ungrouped
+                .items,
+            [s(1)]
+        );
+
+        // moveItem(two, present, s1, UNGROUPED, s3): ada, s1, s3.
+        let l = two
+            .order_ungrouped(&[ada.into(), s(1), s(3)])
+            .unwrap()
+            .checked()
+            .unwrap();
+        assert_eq!(l.ungrouped.items, [ada.to_string(), s(1), s(3)]);
+        assert_eq!(l.groups[0].items, [scout]);
+        assert!(!l.ungrouped.collapsed, "moving in opens it");
+
+        // removeFromGroup(two, present, scout): ada, s3, scout.
+        let l = two
+            .order_ungrouped(&[ada.into(), s(3), scout.into()])
+            .unwrap();
+        assert_eq!(l.ungrouped.items, [ada.to_string(), s(3), scout.into()]);
+        assert_eq!(l.groups[0].items, [s(1)]);
+
+        // deleteGroup(two, present, acme): DELETE, then the order.
+        let settled = [ada.to_string(), s(3), scout.into(), s(1)];
+        let l = two
+            .delete("acme")
+            .unwrap()
+            .order_ungrouped(&settled)
+            .unwrap();
+        assert_eq!(l.ungrouped.items, settled);
+        assert!(l.ungrouped.collapsed, "nothing came out of a group");
+
+        // What Ungrouped listed and the order leaves out follows; a
+        // repeated item counts once; nonsense is refused.
+        let l = Layout {
+            ungrouped: Ungrouped {
+                collapsed: false,
+                items: vec![s(7), s(8)],
+            },
+            ..Layout::default()
+        };
+        let l = l.order_ungrouped(&[s(8), s(9), s(9)]).unwrap();
+        assert_eq!(l.ungrouped.items, [s(8), s(9), s(7)]);
+        assert!(l.order_ungrouped(&["nonsense".into()]).is_err());
+    }
+
+    #[test]
+    fn forgotten_sessions_leave_every_group_and_ungrouped() {
+        let l = Layout::default()
+            .create("g", "G", &[s(1), s(2), "agent:local/scout".into()], None)
+            .unwrap()
+            .put(&s(3), UNGROUPED, None)
+            .unwrap()
+            .put(&s(4), UNGROUPED, None)
+            .unwrap();
+        let l = l.without_sessions(|id| id == Uuid::from_u128(2) || id == Uuid::from_u128(3));
+        assert_eq!(l.groups[0].items, [s(1), "agent:local/scout".into()]);
+        assert_eq!(l.ungrouped.items, [s(4)]);
     }
 
     #[test]
@@ -746,6 +905,53 @@ mod tests {
                 // Cleared, the hub's name is what it is called.
                 d.name_session(id, None).unwrap();
                 assert_eq!(d.view(id).unwrap().label(), "monorepo-fd");
+            },
+        )
+        .await;
+    }
+
+    /// Forgetting a session takes it out of the layout at once, with the
+    /// layout announced; one an older hub left behind goes on the next start.
+    #[tokio::test]
+    async fn forgotten_sessions_leave_the_layout() {
+        workforce_postgres::test_support::with_test_pool(
+            crate::store::build_pool,
+            |pool| async move {
+                let dir = tempfile::tempdir().unwrap();
+                let (d, id) = desk_with(pool.clone(), dir.path()).await;
+                let ghost = Uuid::new_v4();
+                d.change_layout(|l| {
+                    l.create("g", "Atlas", &[session_item(id), session_item(ghost)], None)?
+                        .put(&local_agent_item("scout"), UNGROUPED, None)
+                })
+                .await
+                .unwrap();
+                let (_, mut events) = d.subscribe();
+
+                d.forget(id).await.unwrap();
+                assert_eq!(d.layout().groups[0].items, [session_item(ghost)]);
+                let mut heard = None;
+                while let Ok(e) = events.try_recv() {
+                    if let DeskEvent::Layout { layout } = e {
+                        heard = Some(layout);
+                    }
+                }
+                assert_eq!(heard.as_ref(), Some(&d.layout()), "announced");
+
+                let again = Desk::start(
+                    DeskStore::from_pool(pool.clone()),
+                    crate::testing::options(dir.path()),
+                    tokio_util::sync::CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+                assert!(again.layout().groups[0].items.is_empty());
+                assert_eq!(again.layout().ungrouped.items, [local_agent_item("scout")]);
+                assert_eq!(
+                    DeskStore::from_pool(pool).layout().await.unwrap(),
+                    again.layout(),
+                    "saved"
+                );
             },
         )
         .await;

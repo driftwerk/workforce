@@ -431,7 +431,13 @@ Repo: new `driftwerk/workforce-desk`, depending on workforce-public via pinned g
 - **Names and groups**: a session's person-given name (`displayName`, `PUT
   /api/desk/sessions/{id}/name`) and the sidebar's groups (`/api/desk/groups`, `/api/desk/layout`,
   Desk's `Layout` shape; members `session:<id>` / `agent:<hub>/<agent>`) live in Postgres and go
-  out as `{type:"layout"}`. Agents see them: sessions carry `displayName` and `group`, the
+  out as `{type:"layout"}`. Ungrouped's order is Desk's to settle (it lists what shows there
+  unplaced: every hub's agents, in Desk's order), so putting an item in Ungrouped or taking it
+  out of a group is `PUT /api/desk/groups/ungrouped/order {items}` with Ungrouped's order as
+  Desk shows it: each item comes out of its group, what Ungrouped listed and `items` leaves out
+  follows, and something coming out of a group opens Ungrouped. Deleting a group is `DELETE`,
+  then that order. A forgotten session leaves every group and Ungrouped at once, and the
+  hub drops any it no longer has on start and from Desk's first push. Agents see them: sessions carry `displayName` and `group`, the
   overview names each by the person's name first and lists it under its group, and
   `desk.sessions {query}` finds sessions by either name, folder or group.
 - **Desk state** (`/api/desk/state/{key}`): a JSON value per key in `desk.state`, committed
