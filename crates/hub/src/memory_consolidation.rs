@@ -274,10 +274,13 @@ struct UnitCursor {
 
 /// When `identity`'s memories on the agent whose workspace this is were
 /// last consolidated: the end of its last successful run's scope.
-pub fn last_consolidated(workspace: &Path, identity: &str) -> Option<DateTime<Utc>> {
-    UnitCursors::load(workspace)
-        .get(Unit::of(identity))
-        .and_then(|cursor| cursor.consolidated)
+/// `None` for `identity`: anyone's, the latest.
+pub fn last_consolidated(workspace: &Path, identity: Option<&str>) -> Option<DateTime<Utc>> {
+    let cursors = UnitCursors::load(workspace);
+    match identity {
+        Some(identity) => cursors.get(Unit::of(identity)).and_then(|c| c.consolidated),
+        None => cursors.0.values().filter_map(|c| c.consolidated).max(),
+    }
 }
 
 impl UnitCursors {
