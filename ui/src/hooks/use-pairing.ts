@@ -23,3 +23,16 @@ export function useRevokeDevice() {
   const qc = useQueryClient();
   return useMutation({ mutationFn: pairingApi.revokeDevice, onSuccess: () => { qc.invalidateQueries({ queryKey: ["pairing-devices"] }); } });
 }
+
+/** Admin: approve a waiting device straight into a chosen person's account. */
+export function useApproveInto() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ code, identityId }: { code: string; identityId: string }) =>
+      pairingApi.approveInto(code, identityId),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["pairing-pending"] });
+      qc.invalidateQueries({ queryKey: ["pairing-devices"] });
+    },
+  });
+}

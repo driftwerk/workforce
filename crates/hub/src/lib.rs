@@ -94,6 +94,7 @@ pub mod desk_crew;
 pub mod desk_driver;
 #[cfg(feature = "postgres")]
 pub mod desk_tools;
+pub(crate) mod device_link;
 pub mod games_driver;
 pub mod gateway;
 pub mod git_hardening;

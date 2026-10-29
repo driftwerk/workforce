@@ -95,6 +95,10 @@ pub enum AuditOperation {
     /// or was refused. Resource = `"workflow_run:{instance_id}"`, owner = the
     /// identity the run acts as.
     WorkflowRunSteer,
+    /// A device pairing was approved into an account — by its person signing
+    /// in, by an admin assigning it, or by an agent for the person who asked.
+    /// Resource = `"device:{id}"`, owner = the identity it was connected to.
+    DevicePair,
 }
 
 impl AuditOperation {
@@ -114,6 +118,7 @@ impl AuditOperation {
             Self::ResourceAccessOverride => "resource_access_override",
             Self::ResourceOwnerChange => "resource_owner_change",
             Self::WorkflowRunSteer => "workflow_run_steer",
+            Self::DevicePair => "device_pair",
         }
     }
 }
@@ -461,6 +466,7 @@ mod tests {
             AuditOperation::ResourceAccessOverride,
             AuditOperation::ResourceOwnerChange,
             AuditOperation::WorkflowRunSteer,
+            AuditOperation::DevicePair,
         ];
         for op in ops {
             let json = serde_json::to_value(op).unwrap();

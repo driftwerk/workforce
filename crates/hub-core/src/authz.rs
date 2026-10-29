@@ -379,10 +379,11 @@ pub enum Capability {
     /// grants no reach on the host, so an admin can hand a role the ability to
     /// drive external APIs without handing over the shell.
     NetworkWrite,
-    /// Administer the device fleet — approve/reject/revoke device pairings (which
-    /// mint bearer tokens + scopes) and invoke device capabilities. Admin-only:
-    /// pairing requests and approved devices carry no verified owner, so this
-    /// cannot be owner-scoped.
+    /// Administer the device fleet — connect a device to someone else's account,
+    /// reject/revoke device pairings (which mint bearer tokens + scopes), link an
+    /// existing device, and invoke device capabilities. Admin-only: a pending
+    /// request carries no verified owner, so this cannot be owner-scoped.
+    /// Approving a code into one's own account is not this capability.
     DevicesManage,
     /// Mutate the shared, org-wide knowledge base (drop/prune a repo's graph +
     /// vector index). Admin-only: the index is a single shared resource with no
@@ -597,8 +598,10 @@ impl Capability {
                  chooses."
             }
             Capability::DevicesManage => {
-                "Administer the device fleet — approve, reject, or revoke device pairings (which \
-                 mint bearer tokens) and invoke device capabilities."
+                "Administer the device fleet — connect a device to someone else's account, reject \
+                 or revoke device pairings (which mint bearer tokens), link existing devices, and \
+                 invoke device capabilities. Connecting a device to one's own account needs no \
+                 capability."
             }
             Capability::KnowledgeManage => {
                 "Delete or prune the shared, org-wide knowledge base index for a repository."
@@ -699,9 +702,9 @@ impl Capability {
             Capability::DatabaseWrite => &["database.execute"],
             Capability::NetworkWrite => &["http.request"],
             Capability::DevicesManage => &[
-                "pairing.approve",
                 "pairing.revoke",
                 "pairing.devices",
+                "pairing.link",
                 "node_invoke",
             ],
             Capability::KnowledgeManage => &["knowledge.delete"],
@@ -957,8 +960,17 @@ pub fn tool_capability(tool: &str, input: &serde_json::Value) -> Option<Capabili
         // owner (pending requests have only an unverified `identity_hint`,
         // approved devices have no owner field, the invoke is an untargeted
         // broadcast), so owner-scoping is not expressible — they are admin-only.
-        "pairing.approve" | "pairing.reject" | "pairing.revoke" | "pairing.devices"
-        | "pairing.pending" | "node_invoke" => Some(Capability::DevicesManage),
+        "pairing.reject" | "pairing.revoke" | "pairing.devices" | "pairing.pending"
+        | "pairing.link" | "node_invoke" => Some(Capability::DevicesManage),
+        // Approving a code connects the device to the account of the person
+        // asking — their own, which any member may do (the tool refuses a turn
+        // with no person, and `[pairing] who_can_connect = "admins"` refuses
+        // members). Connecting it to someone else (`for`) is fleet admin.
+        "pairing.approve" => input
+            .get("for")
+            .and_then(|v| v.as_str())
+            .is_some_and(|v| !v.trim().is_empty())
+            .then_some(Capability::DevicesManage),
         // `knowledge.delete` drops/prunes the **shared, org-wide** knowledge index
         // (graph + vector store) for a repo — a single resource with no per-user
         // owner, so the default `is_destructive` → `OwnDataDestructive` (Ask) is
@@ -1721,8 +1733,8 @@ mod tests {
             ("heartbeat.delete", Capability::HeartbeatManage),
             ("heartbeat.trigger", Capability::HeartbeatManage),
             // Device fleet (no verified owner → admin-only).
-            ("pairing.approve", Capability::DevicesManage),
             ("pairing.reject", Capability::DevicesManage),
+            ("pairing.link", Capability::DevicesManage),
             ("pairing.revoke", Capability::DevicesManage),
             ("pairing.devices", Capability::DevicesManage),
             ("pairing.pending", Capability::DevicesManage),
@@ -2425,6 +2437,26 @@ mod tests {
             assert_eq!(Capability::from_key(cap.key()), Some(cap));
         }
         assert_eq!(Capability::from_key("nope"), None);
+    }
+
+    #[test]
+    fn approving_a_device_for_oneself_is_open_and_for_someone_else_is_fleet_admin() {
+        assert_eq!(
+            tool_capability("pairing.approve", &serde_json::json!({ "code": "ABC" })),
+            None
+        );
+        assert_eq!(
+            tool_capability(
+                "pairing.approve",
+                &serde_json::json!({ "code": "ABC", "for": "a@example.com" })
+            ),
+            Some(Capability::DevicesManage)
+        );
+        assert_eq!(
+            tool_capability("pairing.approve", &serde_json::json!({ "for": " " })),
+            None,
+            "a blank `for` approves for the caller, as the tool does"
+        );
     }
 
     #[test]

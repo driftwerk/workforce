@@ -22,6 +22,8 @@ export interface PairedDevice {
   created_at: string;
   last_used?: string;
   revoked: boolean;
+  /** The person the device belongs to; null when it acts anonymously. */
+  owner?: { id: string; display_name: string; email?: string | null } | null;
 }
 
 function formatTs(ts?: string): string {
@@ -85,6 +87,11 @@ export function DeviceList() {
               {device.device_name || "Unnamed device"}
             </span>
           </div>
+          <span className="block pl-4 text-xs text-muted-foreground">
+            {device.owner
+              ? device.owner.email ?? device.owner.display_name
+              : "Not connected to an account"}
+          </span>
         </td>
         <td className="px-4 py-3">
           <span className="text-xs font-mono text-muted-foreground truncate max-w-[140px] block">
