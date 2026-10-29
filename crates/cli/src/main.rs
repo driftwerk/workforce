@@ -4584,11 +4584,18 @@ rules:
 
             // Register device pairing management tools on all agents
             if let Some(ref dp) = device_pairing {
-                let pairing_ctx = workforce_hub::pairing_tool::PairingToolContext {
-                    device_pairing: Arc::clone(dp),
-                };
                 for service in registry.all_services() {
-                    for tool in workforce_hub::pairing_tool::pairing_tools(pairing_ctx.clone()) {
+                    // The identity store is filled into each service's
+                    // late-bound handle once it is built, below; the tools
+                    // read it when they run.
+                    let pairing_ctx = workforce_hub::pairing_tool::PairingToolContext {
+                        device_pairing: Arc::clone(dp),
+                        identity_store: Arc::clone(&service.identity_store),
+                        is_admin: workforce_hub::authz::make_admin_policy(Arc::clone(
+                            &service.identity_store,
+                        )),
+                    };
+                    for tool in workforce_hub::pairing_tool::pairing_tools(pairing_ctx) {
                         service.tools.register(tool);
                     }
                 }

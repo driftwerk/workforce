@@ -753,8 +753,8 @@ mod tests {
     #[test]
     fn device_knowledge_ops_tools_denied_for_member_allowed_for_admin() {
         let tools = [
-            "pairing.approve",
             "pairing.reject",
+            "pairing.link",
             "pairing.revoke",
             "pairing.devices",
             "pairing.pending",
