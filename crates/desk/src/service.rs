@@ -93,12 +93,18 @@ pub(crate) struct Live {
     ended: bool,
     stopping: bool,
     _codex: Option<CodexLink>,
+    /// The Desk terminal it runs in: its PTY is the terminal's, which
+    /// outlives it.
+    terminal: Option<Uuid>,
 }
 
 impl Live {
-    /// Ends the session's processes, wherever they run.
+    /// Ends the session's processes, wherever they run (a terminal's shell
+    /// is the terminal's to end).
     fn end(&self) {
-        self.pty.kill();
+        if self.terminal.is_none() {
+            self.pty.kill();
+        }
         if let Some(Server::Held(server)) = self._codex.as_ref().map(|c| &c.server) {
             server.kill();
         }
@@ -180,7 +186,7 @@ pub struct Desk(Arc<Inner>);
 fn cli_env(base: &BTreeMap<String, String>) -> BTreeMap<String, String> {
     let mut env: BTreeMap<String, String> = base
         .iter()
-        .filter(|(k, _)| !k.starts_with("CLAUDE"))
+        .filter(|(k, _)| !k.starts_with("CLAUDE") && k.as_str() != crate::holder::TOKEN_ENV)
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
     env.insert("TERM".into(), "xterm-256color".into());
@@ -206,12 +212,17 @@ impl Desk {
         for mut r in store.all().await? {
             let lost = r.state.is_running()
                 && match r.origin {
-                    Origin::Desk => !held.sessions.contains_key(&r.id),
+                    Origin::Desk => match r.terminal_id {
+                        // Runs in a terminal: lost with it.
+                        Some(t) => !held.terminals.contains_key(&t),
+                        None => !held.sessions.contains_key(&r.id),
+                    },
                     Origin::External => !r.external_pid.is_some_and(adopt::alive),
                 };
             if lost {
                 r.state = r.state.after_loss();
-                r.restore_offer = opts.restore != RestorePolicy::Off;
+                // One started in a terminal is started there again, not by Desk.
+                r.restore_offer = opts.restore != RestorePolicy::Off && r.terminal_id.is_none();
                 r.updated_at = Utc::now();
                 recovered.push(r.clone());
             }
@@ -361,11 +372,20 @@ impl Desk {
                     pty: Arc::new(pty),
                     token: h.meta["token"].as_str().unwrap_or_default().to_string(),
                     current_tool: None,
-                    pending: None,
+                    // An approval the old hub held died with it: the
+                    // terminal asks now.
+                    pending: (record.state == SessionState::Blocked).then(|| PendingApproval {
+                        id: Uuid::new_v4(),
+                        tool: "Input".into(),
+                        detail: "Answer in the terminal".into(),
+                        since: Utc::now(),
+                        answerable: false,
+                    }),
                     answer: None,
                     ended: false,
                     stopping: false,
                     _codex: codex,
+                    terminal: None,
                 },
             );
             tokio::spawn(self.clone().on_exit(id, exit));
@@ -707,6 +727,7 @@ impl Desk {
             last_reply: None,
             external_pid: None,
             restore_offer: false,
+            terminal_id: None,
             created_at: now,
             updated_at: now,
         };
@@ -752,6 +773,11 @@ impl Desk {
                 .live
                 .get_mut(&id)
                 .ok_or_else(|| DeskError::Conflict("session is not running".into()))?;
+            if live.terminal.is_some() {
+                return Err(DeskError::Conflict(
+                    "this session runs in a terminal; end it there".into(),
+                ));
+            }
             live.stopping = true;
             let pty = Arc::clone(&live.pty);
             if by.is_some() {
@@ -1278,6 +1304,7 @@ impl Desk {
                 ended: false,
                 stopping: false,
                 _codex: codex,
+                terminal: None,
             },
         );
         tokio::spawn(self.clone().on_exit(r.id, exit));
@@ -1485,11 +1512,19 @@ impl Desk {
         }
         // Answer a little before Claude Code's own hook timeout, so a slow
         // human falls back to the terminal dialog rather than an error.
-        let wait = self
+        let in_terminal = self
             .0
-            .opts
-            .approval_timeout
-            .saturating_sub(Duration::from_secs(5));
+            .state
+            .lock()
+            .live
+            .get(&id)
+            .is_some_and(|l| l.terminal.is_some());
+        let wait = if in_terminal {
+            terminals::TERMINAL_APPROVAL_WAIT
+        } else {
+            self.0.opts.approval_timeout
+        }
+        .saturating_sub(Duration::from_secs(5));
         match tokio::time::timeout(wait, rx).await {
             Ok(Ok(answer)) => answer,
             _ => {
@@ -1608,9 +1643,12 @@ impl Desk {
         let (ours, by_cli): (HashSet<String>, HashMap<String, Uuid>) = {
             let st = self.0.state.lock();
             (
-                st.live
-                    .keys()
-                    .filter_map(|id| st.records.get(id)?.cli_session_id.clone())
+                // Running here, or started in one of Desk's terminals (whose
+                // hooks report it): never another terminal's.
+                st.records
+                    .values()
+                    .filter(|r| st.live.contains_key(&r.id) || r.terminal_id.is_some())
+                    .filter_map(|r| r.cli_session_id.clone())
                     .collect(),
                 st.records
                     .values()
@@ -1683,6 +1721,7 @@ impl Desk {
                         last_reply: tail.last_reply,
                         external_pid: ext.pid,
                         restore_offer: false,
+                        terminal_id: None,
                         created_at: now,
                         updated_at: now,
                     };
@@ -1754,6 +1793,11 @@ impl HeldSet {
                     set.servers.insert(id, h);
                 }
                 (Some("terminal"), _, Some(id)) => {
+                    set.hook_port = set.hook_port.or_else(|| {
+                        h.meta["hookPort"]
+                            .as_u64()
+                            .and_then(|p| u16::try_from(p).ok())
+                    });
                     set.terminals.insert(id, h);
                 }
                 _ => set.strays.push(h),
@@ -1916,9 +1960,11 @@ mod tests {
         let env = cli_env(&BTreeMap::from([
             ("CLAUDE_CODE_CHILD_SESSION".into(), "1".into()),
             ("CLAUDECODE".into(), "1".into()),
+            ("WORKFORCE_PTY_HOLDER_TOKEN".into(), "t".into()),
             ("HOME".into(), "/Users/k".into()),
         ]));
         assert!(!env.keys().any(|k| k.starts_with("CLAUDE")));
+        assert!(!env.contains_key("WORKFORCE_PTY_HOLDER_TOKEN"));
         assert_eq!(env["HOME"], "/Users/k");
         assert_eq!(env["TERM"], "xterm-256color");
     }

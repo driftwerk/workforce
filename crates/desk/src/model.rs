@@ -82,6 +82,8 @@ pub struct SessionRecord {
     pub last_reply: Option<String>,
     pub external_pid: Option<i32>,
     pub restore_offer: bool,
+    /// The Desk terminal it runs in, when it was started in one.
+    pub terminal_id: Option<Uuid>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -118,6 +120,8 @@ pub struct SessionView {
     pub current_tool: Option<String>,
     pub pending: Option<PendingApproval>,
     pub approvals: Approvals,
+    /// The Desk terminal it runs in, when it was started in one.
+    pub terminal_id: Option<Uuid>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -145,6 +149,7 @@ impl SessionView {
             current_tool,
             pending,
             approvals: r.approvals,
+            terminal_id: r.terminal_id,
             created_at: r.created_at,
             updated_at: r.updated_at,
         }

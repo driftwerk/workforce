@@ -169,16 +169,17 @@ pub(crate) async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> Result<Option
 
 /// Whether the two tokens are equal, in time that doesn't depend on where
 /// they differ.
-fn same_token(a: &str, b: &str) -> bool {
+pub(crate) fn same_token(a: &str, b: &str) -> bool {
     let (a, b) = (a.as_bytes(), b.as_bytes());
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
-/// Whether the peer runs as this process's user.
-fn same_user(stream: &UnixStream) -> bool {
+/// Whether the peer runs as this process's user; `None` when it hung up
+/// before it could be asked (another holder checking the socket is in use).
+fn same_user(stream: &UnixStream) -> Option<bool> {
     // SAFETY: geteuid has no preconditions.
     let me = unsafe { libc::geteuid() };
-    stream.peer_cred().is_ok_and(|c| c.uid() == me)
+    stream.peer_cred().ok().map(|c| c.uid() == me)
 }
 
 // ---------------------------------------------------------------- holder
@@ -220,6 +221,14 @@ pub async fn serve(socket: &Path, token: &str, cancel: CancellationToken) -> Res
     if token.len() < 16 {
         eyre::bail!("the holder's token must be at least 16 characters");
     }
+    // macOS keeps a socket's path in 104 bytes, its NUL included.
+    if socket.as_os_str().len() > 103 {
+        eyre::bail!(
+            "{} is too long for a unix socket ({} bytes; at most 103)",
+            socket.display(),
+            socket.as_os_str().len()
+        );
+    }
     if !claim_socket(socket).await? {
         tracing::info!(socket = %socket.display(), "a PTY holder is already running");
         return Ok(());
@@ -236,13 +245,13 @@ pub async fn serve(socket: &Path, token: &str, cancel: CancellationToken) -> Res
         tokio::select! {
             _ = cancel.cancelled() => break,
             accepted = listener.accept() => match accepted {
-                Ok((stream, _)) => {
-                    if same_user(&stream) {
+                Ok((stream, _)) => match same_user(&stream) {
+                    Some(true) => {
                         tokio::spawn(connection(Arc::clone(&state), stream, cancel.clone()));
-                    } else {
-                        tracing::warn!("PTY holder refused a connection from another user");
                     }
-                }
+                    Some(false) => tracing::warn!("PTY holder refused a connection from another user"),
+                    None => tracing::debug!("a connection closed before it was checked"),
+                },
                 Err(e) => tracing::warn!(error = %e, "PTY holder accept failed"),
             },
         }
@@ -266,8 +275,11 @@ pub async fn run(socket: &Path) -> Result<()> {
     let token = std::env::var(TOKEN_ENV).map_err(|_| eyre::eyre!("{TOKEN_ENV} is not set"))?;
     // SAFETY: setsid has no preconditions; it fails harmlessly when this
     // process already leads a group.
-    unsafe {
-        libc::setsid();
+    if unsafe { libc::setsid() } == -1 {
+        tracing::warn!(
+            error = %std::io::Error::last_os_error(),
+            "PTY holder could not start its own session; it ends with its starter's process group"
+        );
     }
     let mut hup = signal(SignalKind::hangup())?;
     let mut term = signal(SignalKind::terminate())?;
@@ -375,9 +387,17 @@ async fn connection(state: Arc<HolderState>, stream: UnixStream, cancel: Cancell
                         if let Some((_, old)) = attached.remove(&id) {
                             old.abort();
                         }
-                        let (viewer, _, _) = pty.attach();
-                        let task =
-                            tokio::spawn(forward(Arc::clone(&state), id, pty, exit, out.clone()));
+                        // Claimed, snapshotted and subscribed at once: output
+                        // (a program's queries) can't fall between them.
+                        let (viewer, first, rx) = pty.attach();
+                        let task = tokio::spawn(forward(
+                            Arc::clone(&state),
+                            id,
+                            pty,
+                            exit,
+                            out.clone(),
+                            (first, rx),
+                        ));
                         attached.insert(id, (viewer, task));
                         None
                     }
@@ -496,13 +516,22 @@ async fn forward(
     pty: Arc<Pty>,
     mut exit: watch::Receiver<Option<Exit>>,
     out: mpsc::Sender<Vec<u8>>,
+    (first, mut rx): (Vec<Frame>, broadcast::Receiver<Frame>),
 ) {
     let snapshot = |pty: &Pty| {
         let (cols, rows, bytes, rx) = pty.screen().snapshot_and_subscribe(true);
         (encode(&Msg::Snapshot { id, cols, rows }, &bytes), rx)
     };
-    let (first, mut rx) = snapshot(&pty);
-    if out.send(first).await.is_err() {
+    let (mut cols, mut rows, mut bytes) = (0, 0, Vec::new());
+    for frame in first {
+        match frame {
+            Frame::Size { cols: c, rows: r } => (cols, rows) = (c, r),
+            Frame::Bytes(b) => bytes = b.to_vec(),
+            _ => {}
+        }
+    }
+    let snap = encode(&Msg::Snapshot { id, cols, rows }, &bytes);
+    if out.send(snap).await.is_err() {
         return;
     }
     let output = |bytes: &[u8]| encode(&Msg::Output { id }, bytes);

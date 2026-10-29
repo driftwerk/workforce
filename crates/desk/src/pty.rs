@@ -68,8 +68,25 @@ pub(crate) trait Io: Send + Sync {
 struct Core {
     term: Term,
     active: Option<u64>,
+    /// Attached viewers, oldest first, with the size each last asked for.
+    viewers: Vec<(u64, Option<(u16, u16)>)>,
     next_viewer: u64,
     exited: bool,
+}
+
+impl Core {
+    /// Makes `id` the active viewer; the size it asked for, to apply.
+    fn activate(&mut self, id: u64, tx: &broadcast::Sender<Frame>) -> Option<(u16, u16)> {
+        if self.active != Some(id) {
+            self.active = Some(id);
+            let _ = tx.send(Frame::Active(Some(id)));
+        }
+        self.viewers
+            .iter()
+            .find(|(v, _)| *v == id)
+            .and_then(|(_, size)| *size)
+            .filter(|&size| size != self.term.size())
+    }
 }
 
 /// The screen model and the viewers' channel, shared with whatever reads
@@ -85,6 +102,7 @@ impl Screen {
             core: Mutex::new(Core {
                 term: Term::new(cols, rows, history),
                 active: None,
+                viewers: Vec::new(),
                 next_viewer: 1,
                 exited: false,
             }),
@@ -197,6 +215,7 @@ impl Pty {
         let mut core = self.screen.core.lock();
         let id = core.next_viewer;
         core.next_viewer += 1;
+        core.viewers.push((id, None));
         if core.active.is_none() && !core.exited {
             core.active = Some(id);
             let _ = self.screen.tx.send(Frame::Active(Some(id)));
@@ -243,12 +262,13 @@ impl Pty {
         self.screen.text()
     }
 
-    /// The working directory the shell last reported (OSC 7), else the
-    /// process's own as the system knows it.
+    /// The process's working directory as the system knows it, else the
+    /// one the shell last reported (OSC 7, which an `ssh` session would set
+    /// to a remote path, so it comes second).
     pub fn cwd(&self) -> Option<String> {
-        self.screen
-            .cwd()
-            .or_else(|| self.pid.and_then(crate::cwd::of_pid))
+        self.pid
+            .and_then(crate::cwd::of_pid)
+            .or_else(|| self.screen.cwd())
     }
 }
 
@@ -261,12 +281,16 @@ impl Viewer {
         self.pty.screen.core.lock().active == Some(self.id)
     }
 
-    /// Makes this viewer the active one.
+    /// Makes this viewer the active one, at the size it last asked for.
     pub fn claim(&self) {
-        let mut core = self.pty.screen.core.lock();
-        if core.active != Some(self.id) {
-            core.active = Some(self.id);
-            let _ = self.pty.screen.tx.send(Frame::Active(Some(self.id)));
+        let size = self
+            .pty
+            .screen
+            .core
+            .lock()
+            .activate(self.id, &self.pty.screen.tx);
+        if let Some((cols, rows)) = size {
+            let _ = self.pty.resize(cols, rows);
         }
     }
 
@@ -279,9 +303,17 @@ impl Viewer {
         self.pty.write(bytes).map(|()| true)
     }
 
-    /// The viewer's size; applies only when it is active.
+    /// The viewer's size: applied when it is active, remembered for when
+    /// it becomes so.
     pub fn resize(&self, cols: u16, rows: u16) -> Result<bool> {
-        if !self.is_active() {
+        let active = {
+            let mut core = self.pty.screen.core.lock();
+            if let Some(v) = core.viewers.iter_mut().find(|(v, _)| *v == self.id) {
+                v.1 = Some((cols.max(2), rows.max(2)));
+            }
+            core.active == Some(self.id)
+        };
+        if !active {
             return Ok(false);
         }
         self.pty.resize(cols, rows).map(|()| true)
@@ -302,12 +334,28 @@ impl Viewer {
     }
 }
 
+/// When the active viewer goes, the most recently attached one left takes
+/// over (a window's terminal reattaching before its old socket closed must
+/// not end up unable to type), at its size; with none left, no one is.
 impl Drop for Viewer {
     fn drop(&mut self) {
-        let mut core = self.pty.screen.core.lock();
-        if core.active == Some(self.id) {
-            core.active = None;
-            let _ = self.pty.screen.tx.send(Frame::Active(None));
+        let size = {
+            let mut core = self.pty.screen.core.lock();
+            core.viewers.retain(|(v, _)| *v != self.id);
+            if core.active != Some(self.id) {
+                return;
+            }
+            match core.viewers.last().map(|(v, _)| *v) {
+                Some(next) => core.activate(next, &self.pty.screen.tx),
+                None => {
+                    core.active = None;
+                    let _ = self.pty.screen.tx.send(Frame::Active(None));
+                    None
+                }
+            }
+        };
+        if let Some((cols, rows)) = size {
+            let _ = self.pty.resize(cols, rows);
         }
     }
 }
@@ -315,7 +363,9 @@ impl Drop for Viewer {
 /// The hub's own child in a PTY; killed when dropped.
 pub(crate) struct Local {
     master: Mutex<Box<dyn MasterPty + Send>>,
-    writer: Arc<Mutex<Box<dyn Write + Send>>>,
+    /// To the thread that writes to the terminal, so a terminal that isn't
+    /// reading never blocks whoever types into it.
+    input: std::sync::mpsc::Sender<Vec<u8>>,
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
     pub(crate) pid: Option<u32>,
 }
@@ -349,14 +399,28 @@ impl Local {
             .master
             .try_clone_reader()
             .map_err(failed("reading the terminal"))?;
-        let writer = Arc::new(Mutex::new(
-            pair.master
-                .take_writer()
-                .map_err(failed("writing the terminal"))?,
-        ));
+        let mut writer = pair
+            .master
+            .take_writer()
+            .map_err(failed("writing the terminal"))?;
+        let (input, queue) = std::sync::mpsc::channel::<Vec<u8>>();
+        std::thread::Builder::new()
+            .name("desk-pty-write".into())
+            .spawn(move || {
+                while let Ok(bytes) = queue.recv() {
+                    if writer
+                        .write_all(&bytes)
+                        .and_then(|()| writer.flush())
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            })
+            .context("starting the terminal writer")?;
         let screen = Screen::new(cols, rows, history);
 
-        let (sink, answer) = (Arc::clone(&screen), Arc::clone(&writer));
+        let (sink, answer) = (Arc::clone(&screen), input.clone());
         std::thread::Builder::new()
             .name("desk-pty-read".into())
             .spawn(move || {
@@ -366,8 +430,7 @@ impl Local {
                         break;
                     }
                     if let Some(replies) = sink.push(&buf[..n]) {
-                        let mut w = answer.lock();
-                        let _ = w.write_all(&replies).and_then(|()| w.flush());
+                        let _ = answer.send(replies);
                     }
                 }
             })
@@ -390,7 +453,7 @@ impl Local {
         Ok((
             Self {
                 master: Mutex::new(pair.master),
-                writer,
+                input,
                 killer: Mutex::new(killer),
                 pid,
             },
@@ -402,10 +465,9 @@ impl Local {
 
 impl Io for Local {
     fn write(&self, input: &[u8]) -> Result<()> {
-        let mut w = self.writer.lock();
-        w.write_all(input)?;
-        w.flush()?;
-        Ok(())
+        self.input
+            .send(input.to_vec())
+            .map_err(|_| eyre::eyre!("the terminal is closed"))
     }
 
     fn resize(&self, cols: u16, rows: u16) -> Result<()> {
@@ -602,9 +664,17 @@ pub(crate) mod tests {
             }
         };
         assert_eq!(size, (90, 20));
+        // The first asked for 70x15 while mirroring; it gets that when the
+        // active one goes and it takes over.
+        assert!(!first.resize(70, 15).unwrap());
         drop(mirror);
-        assert!(!first.is_active());
-        assert!(!first.input(b"nobody\r").unwrap());
+        assert!(first.is_active());
+        assert_eq!(pty.screen().snapshot(false).0, 70);
+        assert!(first.input(b"first-again\r").unwrap());
+        read_until(&mut rx, "got:first-again").await;
+        drop(first);
+        let (late, frames, _) = pty.attach();
+        assert!(matches!(frames[1], Frame::Active(Some(id)) if id == late.id()));
         pty.kill();
     }
 
@@ -690,5 +760,39 @@ pub(crate) mod tests {
                 break;
             }
         }
+    }
+
+    /// Real Claude Code with no viewer attached: the hub's answers get it
+    /// past its terminal probes. Run with DESK_REAL_CLAUDE=<path to claude>.
+    #[tokio::test]
+    #[ignore = "needs a real Claude Code: DESK_REAL_CLAUDE=<path>"]
+    async fn real_claude_code_starts_with_no_viewer_attached() {
+        let Ok(claude) = std::env::var("DESK_REAL_CLAUDE") else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let env: BTreeMap<String, String> = std::env::vars()
+            .filter(|(k, _)| !k.starts_with("CLAUDE"))
+            .chain([("TERM".to_string(), "xterm-256color".to_string())])
+            .collect();
+        let spec = Spawn {
+            program: claude.into(),
+            args: vec![],
+            cwd: dir.path().into(),
+            env,
+        };
+        let started = std::time::Instant::now();
+        let (pty, _exit) = Pty::spawn(&spec, 120, 40, 100).unwrap();
+        let mut shown = String::new();
+        for _ in 0..300 {
+            shown = pty.text();
+            if shown.to_lowercase().contains("trust") || shown.contains('>') {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        eprintln!("first screen after {:?}:\n{shown}", started.elapsed());
+        pty.kill();
+        assert!(!shown.trim().is_empty(), "Claude Code drew nothing");
     }
 }

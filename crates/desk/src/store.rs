@@ -101,12 +101,12 @@ impl DeskStore {
             .execute(
                 "INSERT INTO sessions (id, engine, name, goal, cwd, branch, origin, state, \
                  approvals, cli_session_id, transcript, last_prompt, last_reply, external_pid, \
-                 restore_offer, created_at, updated_at) \
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17) \
+                 restore_offer, created_at, updated_at, terminal_id) \
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18) \
                  ON CONFLICT (id) DO UPDATE SET engine = $2, name = $3, goal = $4, cwd = $5, \
                  branch = $6, origin = $7, state = $8, approvals = $9, cli_session_id = $10, \
                  transcript = $11, last_prompt = $12, last_reply = $13, external_pid = $14, \
-                 restore_offer = $15, updated_at = $17",
+                 restore_offer = $15, updated_at = $17, terminal_id = $18",
                 &[
                     &r.id,
                     &r.engine.as_str(),
@@ -125,6 +125,7 @@ impl DeskStore {
                     &r.restore_offer,
                     &r.created_at,
                     &r.updated_at,
+                    &r.terminal_id,
                 ],
             )
             .await
@@ -158,6 +159,7 @@ fn record(row: &Row) -> Result<SessionRecord> {
         last_reply: row.try_get("last_reply")?,
         external_pid: row.try_get("external_pid")?,
         restore_offer: row.try_get("restore_offer")?,
+        terminal_id: row.try_get("terminal_id")?,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
     })
@@ -200,6 +202,7 @@ pub(crate) mod tests {
             last_reply: None,
             external_pid: None,
             restore_offer: false,
+            terminal_id: None,
             created_at: now,
             updated_at: now,
         }

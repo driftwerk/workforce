@@ -418,6 +418,12 @@ Repo: new `driftwerk/workforce-desk`, depending on workforce-public via pinned g
 - **Terminals** (`/api/desk/terminals`): plain login shells with extra env from Desk; cwd
   followed (`proc_pidinfo`, OSC 7) and kept with the env in `desk.terminals`; reopened there
   after a reboot unless restore is `off`.
+  Each shell gets `DESK_TERMINAL_ID`, `DESK_HOOK_TOKEN`, `DESK_HOOK_BASE` and `DESK_HOOK_URL`
+  (`<hook base>/hook/terminal/<id>/<token>`); Desk's plugin dir is appended to the person's
+  `CLAUDE_CODE_PLUGIN_DIRS`. A `claude` started there posts its hooks to that URL: SessionStart
+  registers a Desk-origin session with `terminalId` (or takes back the one with that
+  `session_id`), later hooks drive it like a Desk-launched session (approvals held up to a day),
+  SessionEnd or the shell ending stops it, and the `claude agents` adopter leaves it alone.
 - **Desk state** (`/api/desk/state/{key}`): a JSON value per key in `desk.state`, committed
   before the answer, announced as `{type:"state"}` (re-read on any `snapshot`).
 - **Security fix found on the way**: `/ws/agent` accepted any token when device pairing was

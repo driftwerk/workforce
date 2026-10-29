@@ -695,10 +695,168 @@ async fn hook(
     }
 }
 
+async fn terminal_hook(
+    State(desk): State<Desk>,
+    Path((terminal, token)): Path<(Uuid, String)>,
+    body: Bytes,
+) -> Response {
+    match desk.terminal_hook(terminal, &token, &body).await {
+        Some(answer) => Json(answer).into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
 /// Served on its own loopback listener; the per-session token in the URL is
 /// the credential.
 pub(crate) fn hook_router(desk: Desk) -> Router {
     Router::new()
         .route("/hook/{id}/{token}", post(hook))
+        .route("/hook/terminal/{terminal}/{token}", post(terminal_hook))
         .with_state(desk)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::time::Duration;
+
+    use futures::{SinkExt, StreamExt};
+    use serde_json::{json, Value};
+    use tokio_tungstenite::tungstenite::Message as Ws;
+    use workforce_postgres::test_support::with_test_pool;
+
+    use crate::service::NewTerminal;
+    use crate::store::{build_pool, DeskStore};
+    use crate::testing::{allow_all, options};
+
+    type Client = tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >;
+
+    /// The next text frame of `kind`, skipping output.
+    async fn next_text(ws: &mut Client, kind: &str) -> Value {
+        loop {
+            let m = tokio::time::timeout(Duration::from_secs(5), ws.next())
+                .await
+                .expect("a frame in time")
+                .unwrap()
+                .unwrap();
+            if let Ws::Text(t) = m {
+                let v: Value = serde_json::from_str(&t).unwrap();
+                if v["type"] == kind {
+                    return v;
+                }
+            }
+        }
+    }
+
+    /// Output until `needle` shows up.
+    async fn output_until(ws: &mut Client, needle: &str) -> String {
+        let mut seen = String::new();
+        while !seen.contains(needle) {
+            let m = tokio::time::timeout(Duration::from_secs(5), ws.next())
+                .await
+                .expect("output in time")
+                .unwrap()
+                .unwrap();
+            if let Ws::Binary(b) = m {
+                seen.push_str(&String::from_utf8_lossy(&b));
+            }
+        }
+        seen
+    }
+
+    #[tokio::test]
+    async fn two_viewers_one_types_the_other_mirrors_until_it_claims() {
+        with_test_pool(build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let mut opts = options(dir.path());
+            opts.env = BTreeMap::from([
+                ("PATH".into(), "/usr/bin:/bin".into()),
+                ("SHELL".into(), "/bin/sh".into()),
+            ]);
+            DeskStore::migrate(&pool).await.unwrap();
+            let desk = crate::Desk::start(
+                DeskStore::from_pool(pool),
+                opts,
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            let t = desk
+                .create_terminal(NewTerminal {
+                    id: None,
+                    name: None,
+                    cwd: dir.path().to_string_lossy().into_owned(),
+                    env: BTreeMap::new(),
+                })
+                .await
+                .unwrap();
+            let app = super::sessions_router(desk.clone(), allow_all());
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let url = format!("ws://{addr}/api/desk/terminals/{}/pty", t.id);
+
+            let (mut first, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+            let size = next_text(&mut first, "size").await;
+            assert_eq!(
+                (size["cols"].as_u64(), size["rows"].as_u64()),
+                (Some(120), Some(40))
+            );
+            assert_eq!(next_text(&mut first, "role").await["active"], true);
+            let (mut second, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+            let role = next_text(&mut second, "role").await;
+            assert_eq!(
+                (role["active"].as_bool(), role["free"].as_bool()),
+                (Some(false), Some(false))
+            );
+
+            // The mirror's keys and size go nowhere.
+            second
+                .send(Ws::Binary("echo from-mirror\n".into()))
+                .await
+                .unwrap();
+            second
+                .send(Ws::text(
+                    json!({ "type": "resize", "cols": 50, "rows": 10 }).to_string(),
+                ))
+                .await
+                .unwrap();
+            first
+                .send(Ws::text(
+                    json!({ "type": "resize", "cols": 100, "rows": 30 }).to_string(),
+                ))
+                .await
+                .unwrap();
+            let size = next_text(&mut second, "size").await;
+            assert_eq!(
+                (size["cols"].as_u64(), size["rows"].as_u64()),
+                (Some(100), Some(30))
+            );
+            first
+                .send(Ws::Binary("echo from-first\n".into()))
+                .await
+                .unwrap();
+            let seen = output_until(&mut second, "from-first\r\n").await;
+            assert!(!seen.contains("from-mirror"));
+
+            // Claiming makes it the one that types, at the size it asked for.
+            second.send(Ws::text(r#"{"type":"claim"}"#)).await.unwrap();
+            assert_eq!(next_text(&mut second, "role").await["active"], true);
+            assert_eq!(next_text(&mut first, "role").await["active"], false);
+            let size = next_text(&mut first, "size").await;
+            assert_eq!(
+                (size["cols"].as_u64(), size["rows"].as_u64()),
+                (Some(50), Some(10))
+            );
+            second
+                .send(Ws::Binary("echo now-second\n".into()))
+                .await
+                .unwrap();
+            output_until(&mut first, "now-second\r\n").await;
+            desk.close_terminal(t.id).unwrap();
+        })
+        .await;
+    }
 }
