@@ -20,8 +20,17 @@
      --rich-border        borders, grid lines, the map's no-data fill
      --rich-accent        links, focus, primary actions, accent-toned nodes
      --rich-accent-text   text on --rich-accent
-     --rich-code-bg       fenced code background (RichMarkdown)
-     --rich-code-text     fenced code text (RichMarkdown)
+   Code (fenced blocks in RichMarkdown)
+     --rich-code-bg       fenced code background
+     --rich-code-text     fenced code text, and any token without a colour below
+     --rich-code-comment  --rich-code-keyword  --rich-code-string
+     --rich-code-string-expression   quoted strings, templates, regexps, tags
+     --rich-code-constant            numbers, literals, properties, built-ins
+     --rich-code-function            functions, types, attributes
+     --rich-code-parameter  --rich-code-punctuation  --rich-code-link
+     --rich-code-inserted  --rich-code-deleted  --rich-code-changed
+                          diff lines; added and removed lines are also tinted
+                          with their colour
    Status (diagram node tones; --rich-bad also marks form errors)
      --rich-good  --rich-warn  --rich-bad
    Data
@@ -44,8 +53,20 @@
   --rich-border: #e6eaf0;
   --rich-accent: #05405c;
   --rich-accent-text: #ffffff;
-  --rich-code-bg: #0f172a;
-  --rich-code-text: #e2e8f0;
+  --rich-code-bg: #f6f8fa;
+  --rich-code-text: #1f2328;
+  --rich-code-comment: #59636e;
+  --rich-code-keyword: #cf222e;
+  --rich-code-string: #0a3069;
+  --rich-code-string-expression: #0a3069;
+  --rich-code-constant: #0550ae;
+  --rich-code-function: #8250df;
+  --rich-code-parameter: #953800;
+  --rich-code-punctuation: #1f2328;
+  --rich-code-link: #0a3069;
+  --rich-code-inserted: #116329;
+  --rich-code-deleted: #82071e;
+  --rich-code-changed: #953800;
   --rich-good: #1baf7a;
   --rich-warn: #eda100;
   --rich-bad: #e34948;
@@ -85,7 +106,19 @@
   --rich-accent: #6aa7ff;
   --rich-accent-text: #0b1220;
   --rich-code-bg: #0b0d10;
-  --rich-code-text: #e2e8f0;
+  --rich-code-text: #e6edf3;
+  --rich-code-comment: #8b949e;
+  --rich-code-keyword: #ff7b72;
+  --rich-code-string: #a5d6ff;
+  --rich-code-string-expression: #a5d6ff;
+  --rich-code-constant: #79c0ff;
+  --rich-code-function: #d2a8ff;
+  --rich-code-parameter: #ffa657;
+  --rich-code-punctuation: #c9d1d9;
+  --rich-code-link: #a5d6ff;
+  --rich-code-inserted: #7ee787;
+  --rich-code-deleted: #ffa198;
+  --rich-code-changed: #ffa657;
   --rich-lane-1: #3d86e0;
   --rich-lane-2: #1baf7a;
   --rich-lane-3: #b87a00;
@@ -119,6 +152,53 @@
   font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
   font-size: 12px; line-height: 1.5; white-space: pre; background: none; color: inherit; padding: 0;
 }
+
+/* Fenced code (CodeBlock): a header outside the scroller, then the code, which
+   scrolls sideways inside the block. The code is as wide as its longest line
+   (and at least the block), so a diff line's tint runs the full width. */
+.wf-code {
+  margin: 8px 0; min-width: 0; max-width: 100%; overflow: hidden; border-radius: 10px;
+  background: var(--rich-code-bg); color: var(--rich-code-text);
+  border: 1px solid color-mix(in srgb, var(--rich-code-text) 10%, var(--rich-code-bg));
+}
+.wf-code-head {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  padding: 3px 4px 3px 12px; font: 11.5px var(--rich-font);
+  color: color-mix(in srgb, var(--rich-code-text) 65%, var(--rich-code-bg));
+  border-bottom: 1px solid color-mix(in srgb, var(--rich-code-text) 10%, var(--rich-code-bg));
+}
+.wf-code-lang { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.wf-code-copy {
+  flex-shrink: 0; border: 0; background: none; color: inherit; cursor: pointer;
+  border-radius: 6px; padding: 3px 8px; font: inherit; transition: background 0.12s, color 0.12s;
+}
+.wf-code-copy:hover { background: color-mix(in srgb, var(--rich-code-text) 10%, transparent); color: var(--rich-code-text); }
+.wf-code-copy:focus-visible { outline: 2px solid var(--rich-accent); outline-offset: -2px; }
+.wf-code .wf-code-pre { margin: 0; padding: 10px 0; border-radius: 0; background: none; overflow-x: auto; }
+.wf-code .wf-code-pre code { display: block; width: max-content; min-width: 100%; }
+.wf-code-line { display: block; padding: 0 14px; }
+/* An empty line still takes a line's height. */
+.wf-code-line:empty::before { content: " "; }
+
+.wf-tok-comment { color: var(--rich-code-comment); }
+.wf-tok-keyword { color: var(--rich-code-keyword); }
+.wf-tok-string { color: var(--rich-code-string); }
+.wf-tok-string-expression { color: var(--rich-code-string-expression); }
+.wf-tok-constant { color: var(--rich-code-constant); }
+.wf-tok-function { color: var(--rich-code-function); }
+.wf-tok-parameter { color: var(--rich-code-parameter); }
+.wf-tok-punctuation { color: var(--rich-code-punctuation); }
+.wf-tok-link { color: var(--rich-code-link); }
+.wf-tok-inserted { color: var(--rich-code-inserted); }
+.wf-tok-deleted { color: var(--rich-code-deleted); }
+.wf-tok-changed { color: var(--rich-code-changed); }
+.wf-tok-i { font-style: italic; }
+.wf-tok-u { text-decoration: underline; }
+
+.wf-code-add { color: var(--rich-code-inserted); background: color-mix(in srgb, var(--rich-code-inserted) 14%, transparent); }
+.wf-code-del { color: var(--rich-code-deleted); background: color-mix(in srgb, var(--rich-code-deleted) 14%, transparent); }
+.wf-code-hunk { color: var(--rich-code-changed); }
+.wf-code-meta { color: var(--rich-code-comment); }
 
 /* tables — markdown and wf-table alike: wrapped so wide ones scroll, with
    header + zebra */
