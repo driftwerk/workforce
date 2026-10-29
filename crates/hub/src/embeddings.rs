@@ -216,13 +216,29 @@ pub fn base_store(config: &WorkforceConfig) -> Result<Arc<dyn Switchable>> {
     // cannot use here, not when its config was read (DW-676).
     config.check_memory_backend()?;
     Ok(if config.memory.is_vellev() {
-        Arc::new(vellev_store(config, vellev::DEFAULT_COLLECTION)?)
+        let store = vellev_store(config, vellev::DEFAULT_COLLECTION)?;
+        // With no embedder of the hub's, this is the store memories are
+        // served from, embedded by the node's own bge: `[embeddings]
+        // score_map` then puts its certainty on the scale the recall floors
+        // were tuned on, as it does for the hub's bge. With an embedder, the
+        // map is for the hub's model and this store is only the previous one.
+        let store = if config.embeddings.enabled() {
+            store
+        } else {
+            store.with_score_map(e_score_map(&config.embeddings))
+        };
+        Arc::new(store)
     } else {
         Arc::new(WeaviateStore::new(
             &config.weaviate.url,
             config.weaviate.api_key.as_deref(),
         ))
     })
+}
+
+/// `[embeddings] score_map` as a store takes it.
+fn e_score_map(e: &EmbeddingsConfig) -> Vec<(f32, f32)> {
+    e.score_map.iter().map(|[a, b]| (*a, *b)).collect()
 }
 
 fn vellev_store(config: &WorkforceConfig, collection: &str) -> Result<VellevStore> {
@@ -310,7 +326,7 @@ fn embedded_store(
     reranker: Option<Arc<dyn Reranker>>,
 ) -> Result<Arc<dyn Switchable>> {
     let e = &config.embeddings;
-    let score_map = e.score_map.iter().map(|[a, b]| (*a, *b)).collect();
+    let score_map = e_score_map(e);
     Ok(if backend == Backend::Vellev {
         Arc::new(
             vellev_store(config, &e.collection_name())?
