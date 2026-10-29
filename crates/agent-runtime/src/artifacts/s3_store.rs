@@ -415,6 +415,34 @@ impl super::store::ArtifactStore for S3ArtifactStore {
         None
     }
 
+    /// Rewrites the sidecar with the longer life. A bucket lifecycle rule
+    /// still deletes objects on its own schedule, whatever the sidecar says.
+    fn retain(&self, agent_id: &str, id: &ArtifactId, ttl: Duration) -> Result<bool> {
+        Self::now_block_on(async {
+            let now = SystemTime::now();
+            let Some(sidecar) = self
+                .load_sidecar(agent_id, id)
+                .await?
+                .filter(|s| !s.expired(now))
+            else {
+                return Ok(false);
+            };
+            if let Some(kept) = sidecar.retained(now, ttl) {
+                let meta_key = sidecar_key(&object_key(&self.prefix, agent_id, id)?);
+                self.client
+                    .put_object()
+                    .bucket(&self.bucket)
+                    .key(&meta_key)
+                    .content_type("application/json")
+                    .body(ByteStream::from(sidecar_bytes(&kept)?))
+                    .send()
+                    .await
+                    .map_err(|e| eyre!("put_object {meta_key} failed: {e}"))?;
+            }
+            Ok(true)
+        })
+    }
+
     /// S3 lifecycle rules own GC; TTL is enforced at read via `Sidecar::expired`.
     fn purge_expired(&self) -> Result<usize> {
         Ok(0)

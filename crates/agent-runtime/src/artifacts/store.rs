@@ -93,6 +93,14 @@ pub trait ArtifactStore: Send + Sync {
         Ok(())
     }
 
+    /// Keeps a live artifact until at least `ttl` from now — a file that
+    /// became part of a conversation's history outlives the turn that staged
+    /// it. Never shortens a longer life. Whether the artifact was there to
+    /// keep; the default store can't, and keeps nothing longer.
+    fn retain(&self, _agent_id: &str, _id: &ArtifactId, _ttl: Duration) -> Result<bool> {
+        Ok(false)
+    }
+
     /// Walk every agent directory, delete expired body+meta pairs, and
     /// return the count purged. Idempotent; safe to run on a timer.
     fn purge_expired(&self) -> Result<usize>;
@@ -116,6 +124,25 @@ pub(crate) struct Sidecar {
 }
 
 impl Sidecar {
+    /// This sidecar kept until at least `ttl` after `now`, or `None` when it
+    /// already lives that long.
+    pub(crate) fn retained(&self, now: SystemTime, ttl: Duration) -> Option<Sidecar> {
+        let now_secs = now
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let wanted = now_secs
+            .saturating_sub(self.created_at_secs)
+            .saturating_add(ttl.as_secs());
+        (wanted > self.descriptor.ttl_seconds).then(|| Sidecar {
+            descriptor: ArtifactDescriptor {
+                ttl_seconds: wanted,
+                ..self.descriptor.clone()
+            },
+            created_at_secs: self.created_at_secs,
+        })
+    }
+
     pub(crate) fn expired(&self, now: SystemTime) -> bool {
         let created = UNIX_EPOCH + Duration::from_secs(self.created_at_secs);
         match now.duration_since(created) {
@@ -429,6 +456,21 @@ impl ArtifactStore for FsArtifactStore {
         let dir = self.agent_dir(agent_id).ok()?;
         fs::create_dir_all(&dir).ok()?;
         Some(dir)
+    }
+
+    fn retain(&self, agent_id: &str, id: &ArtifactId, ttl: Duration) -> Result<bool> {
+        let now = SystemTime::now();
+        let Some(sidecar) = self.load_sidecar(agent_id, id)?.filter(|s| !s.expired(now)) else {
+            return Ok(false);
+        };
+        if let Some(kept) = sidecar.retained(now, ttl) {
+            write_atomic(
+                &self.agent_dir(agent_id)?,
+                &self.meta_path(agent_id, id)?,
+                &serde_json::to_vec(&kept)?,
+            )?;
+        }
+        Ok(true)
     }
 
     fn delete(&self, agent_id: &str, id: &ArtifactId) -> Result<()> {
@@ -767,6 +809,49 @@ mod tests {
         let fresh = ArtifactId::fresh();
         let err = store.read("agent-a", &fresh).unwrap_err().to_string();
         assert!(err.contains("not found"));
+    }
+
+    #[test]
+    fn a_retained_artifact_outlives_its_ttl_and_is_never_shortened() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = FsArtifactStore::new(tmp.path().to_path_buf()).unwrap();
+        let handle = store
+            .write(
+                "agent-a",
+                json_descriptor("agent-a", DEFAULT_TTL),
+                ArtifactBody::Json(serde_json::json!({"a": 1})),
+            )
+            .unwrap();
+        let month = Duration::from_secs(30 * 24 * 3600);
+        assert!(store.retain("agent-a", &handle.id, month).unwrap());
+        let kept = store.metadata("agent-a", &handle.id).unwrap().unwrap();
+        assert!(kept.ttl_seconds >= month.as_secs());
+        // A shorter retention keeps the longer life.
+        assert!(store.retain("agent-a", &handle.id, DEFAULT_TTL).unwrap());
+        assert_eq!(
+            store
+                .metadata("agent-a", &handle.id)
+                .unwrap()
+                .unwrap()
+                .ttl_seconds,
+            kept.ttl_seconds
+        );
+        let unknown = ArtifactId::fresh();
+        assert!(!store.retain("agent-a", &unknown, month).unwrap());
+        // An old artifact is kept `ttl` from now, not from its making.
+        let sidecar = Sidecar {
+            descriptor: json_descriptor("agent-a", DEFAULT_TTL),
+            created_at_secs: now_secs() - 7200,
+        };
+        let later = sidecar.retained(SystemTime::now(), DEFAULT_TTL).unwrap();
+        assert!(!later.expired(SystemTime::now() + Duration::from_secs(3000)));
+        let fresh = Sidecar {
+            descriptor: json_descriptor("agent-a", DEFAULT_TTL),
+            created_at_secs: now_secs(),
+        };
+        assert!(fresh
+            .retained(SystemTime::now(), Duration::from_secs(60))
+            .is_none());
     }
 
     #[test]
