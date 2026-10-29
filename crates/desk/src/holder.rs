@@ -935,6 +935,37 @@ pub(crate) mod tests {
         cancel.cancel();
     }
 
+    /// A held terminal has only the environment the hub asked for: none of
+    /// the holder's own (its token among it), which here is this test's.
+    #[tokio::test]
+    async fn a_held_terminal_has_none_of_the_holders_environment() {
+        let (_dir, socket, cancel) = holder().await;
+        let client = Holder::connect(&socket, TOKEN).await.unwrap();
+        let mut spec = sh("env; echo env-done");
+        spec.env.insert("ASKED_FOR".into(), "yes".into());
+        let (pty, _exit) = client
+            .spawn(&spec, 200, 50, 100, json!({ "kind": "terminal" }))
+            .await
+            .unwrap();
+        let text = wait_for(&pty, "env-done").await;
+        assert!(text.contains("ASKED_FOR=yes"), "{text}");
+        assert!(text.contains("PATH=/usr/bin:/bin"), "{text}");
+        // sh sets PWD, SHLVL and _; portable-pty always sets SHELL, from
+        // the password database when the spec has none.
+        for (k, _) in std::env::vars() {
+            if spec.env.contains_key(&k) || ["PWD", "SHLVL", "_", "SHELL"].contains(&k.as_str()) {
+                continue;
+            }
+            let set = format!("{k}=");
+            assert!(
+                !text.lines().any(|l| l.trim_start().starts_with(&set)),
+                "{k} leaked into a held terminal"
+            );
+        }
+        assert!(!text.contains(TOKEN_ENV));
+        cancel.cancel();
+    }
+
     #[tokio::test]
     async fn a_terminal_outlives_its_client_and_comes_back_with_its_screen() {
         let (_dir, socket, cancel) = holder().await;

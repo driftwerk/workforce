@@ -191,10 +191,27 @@ struct Inner {
 #[derive(Clone)]
 pub struct Desk(Arc<Inner>);
 
+/// One of the hub's own secrets, which Desk Helper or the person's setup
+/// hands the hub (its admin token, JWT secret, vault key, the PTY holder's
+/// token, its Postgres password): a `WORKFORCE_`/`DESK_` name that says
+/// it is a token, secret, key or password. The person's own keys (say
+/// `ANTHROPIC_API_KEY`) are theirs and carry on; a terminal's
+/// `DESK_HOOK_TOKEN` is added after this, per terminal.
+fn hub_secret(name: &str) -> bool {
+    const SECRET: [&str; 5] = ["TOKEN", "SECRET", "KEY", "PASSWORD", "CREDENTIAL"];
+    (name.starts_with("WORKFORCE_") || name.starts_with("DESK_"))
+        && name
+            .split('_')
+            .any(|part| SECRET.iter().any(|s| part.starts_with(s)))
+}
+
+/// The environment sessions, terminals and the CLIs Desk runs start from:
+/// the hub's, without what a parent Claude Code left in it (`CLAUDE*`) and
+/// without the hub's own secrets.
 fn cli_env(base: &BTreeMap<String, String>) -> BTreeMap<String, String> {
     let mut env: BTreeMap<String, String> = base
         .iter()
-        .filter(|(k, _)| !k.starts_with("CLAUDE") && k.as_str() != crate::holder::TOKEN_ENV)
+        .filter(|(k, _)| !k.starts_with("CLAUDE") && !hub_secret(k))
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
     env.insert("TERM".into(), "xterm-256color".into());
@@ -1998,13 +2015,46 @@ mod tests {
         let env = cli_env(&BTreeMap::from([
             ("CLAUDE_CODE_CHILD_SESSION".into(), "1".into()),
             ("CLAUDECODE".into(), "1".into()),
-            ("WORKFORCE_PTY_HOLDER_TOKEN".into(), "t".into()),
             ("HOME".into(), "/Users/k".into()),
+            ("ANTHROPIC_API_KEY".into(), "theirs".into()),
+            ("WORKFORCE_GATEWAY_URL".into(), "http://127.0.0.1:1".into()),
+            ("DESK_HOME".into(), "/tmp/desk".into()),
+            ("KEYBOARD_LAYOUT".into(), "uk".into()),
         ]));
         assert!(!env.keys().any(|k| k.starts_with("CLAUDE")));
-        assert!(!env.contains_key("WORKFORCE_PTY_HOLDER_TOKEN"));
         assert_eq!(env["HOME"], "/Users/k");
+        assert_eq!(env["ANTHROPIC_API_KEY"], "theirs", "the person's own");
+        assert_eq!(env["WORKFORCE_GATEWAY_URL"], "http://127.0.0.1:1");
+        assert_eq!(env["DESK_HOME"], "/tmp/desk");
+        assert_eq!(env["KEYBOARD_LAYOUT"], "uk");
         assert_eq!(env["TERM"], "xterm-256color");
+    }
+
+    /// What Desk Helper hands the hub, and the PTY holder's token, never
+    /// reach a session, a terminal or a CLI the hub runs.
+    #[test]
+    fn cli_env_drops_the_hubs_secrets() {
+        let secrets = [
+            crate::holder::TOKEN_ENV,
+            "WORKFORCE_GATEWAY_TOKEN",
+            "WORKFORCE_JWT_SECRET",
+            "WORKFORCE_VAULT_KEY",
+            "WORKFORCE_VAULT_NEW_KEY",
+            "WORKFORCE_PAIRING_TOKEN",
+            "WORKFORCE_GOOGLE_CLIENT_SECRET",
+            "WORKFORCE_VELLEV_API_KEY",
+            "DESK_POSTGRES_PASSWORD",
+        ];
+        let env = cli_env(
+            &secrets
+                .iter()
+                .map(|k| (k.to_string(), "s3cret".to_string()))
+                .collect(),
+        );
+        for k in secrets {
+            assert!(!env.contains_key(k), "{k}");
+        }
+        assert!(!env.values().any(|v| v == "s3cret"));
     }
 
     #[tokio::test]
