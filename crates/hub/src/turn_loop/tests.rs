@@ -690,6 +690,7 @@ fn fake_session_message(
         attachments: None,
         trust_level: None,
         actor: None,
+        desk: None,
     }
 }
 

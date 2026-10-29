@@ -12,7 +12,7 @@ use uuid::Uuid;
 use crate::store::DeskStore;
 
 /// Agent-to-agent hand-offs allowed from one message of yours.
-pub const MAX_HOPS: i16 = 3;
+pub const MAX_HOPS: i16 = workforce_core::desk::MAX_HOPS as i16;
 /// Agent messages allowed in a room (or thread) before you speak again.
 pub const TURN_BUDGET: i64 = 12;
 

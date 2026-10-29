@@ -40,29 +40,12 @@ pub fn channel_id(channel: &str) -> &str {
     parse_channel(channel).1
 }
 
-/// The desktop app's channel. Each of its rooms is a conversation of its own,
-/// on `desk:<slug>` (see [`is_desk_room`]).
-pub const DESK_CHANNEL: &str = "desk";
+pub use workforce_core::desk;
+pub use workforce_core::desk::{is_desk_conversation, is_desk_room, DESK_CHANNEL};
 
 /// The gateway's persistent one-chat-per-user channels: the iOS app, the web
 /// UI, the terminal and the desktop app, each a screen the reply is read on.
 pub const CONVERSATIONAL_CHANNELS: &[&str] = &["ios", "web", "terminal", DESK_CHANNEL];
-
-const DESK_ROOM_SLUG_MAX: usize = 64;
-
-/// True for a desktop app room's channel: `desk:<slug>`, the slug 1–64 of
-/// `[a-z0-9-]`.
-pub fn is_desk_room(channel: &str) -> bool {
-    channel
-        .strip_prefix(DESK_CHANNEL)
-        .and_then(|rest| rest.strip_prefix(':'))
-        .is_some_and(|slug| {
-            (1..=DESK_ROOM_SLUG_MAX).contains(&slug.len())
-                && slug
-                    .bytes()
-                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-        })
-}
 
 /// True for channels representing a direct human-driven conversation — one of
 /// [`CONVERSATIONAL_CHANNELS`] or a desktop app room, as opposed to

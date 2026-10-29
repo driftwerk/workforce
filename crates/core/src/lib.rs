@@ -1,5 +1,6 @@
 pub mod access;
 pub mod code_citation;
+pub mod desk;
 pub mod message;
 pub mod participant;
 pub mod policy;

@@ -1467,6 +1467,7 @@ mod tests {
                 content: format!("msg {i}"),
                 tool_metadata: None,
                 token_usage: None,
+                desk: None,
             })
             .collect();
 
@@ -1492,6 +1493,7 @@ mod tests {
             content: "hi".into(),
             tool_metadata: None,
             token_usage: None,
+            desk: None,
         }];
 
         assert_eq!(

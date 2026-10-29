@@ -354,6 +354,7 @@ fn roll_onto_carryover(
         attachments: None,
         trust_level: None,
         actor: None,
+        desk: None,
     });
     next.total_tokens = next.estimated_total_tokens() as u64;
 
@@ -471,6 +472,7 @@ pub async fn seed_summary(
         attachments: None,
         trust_level: None,
         actor: None,
+        desk: None,
     };
     next.messages.insert(0, carryover);
     next.cached_message_count = None;

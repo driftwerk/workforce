@@ -17,8 +17,8 @@ pub(crate) use crate::hub_core::schedules::continues_conversation;
 pub(crate) use crate::hub_core::schedules::{cron_next_run, next_run_time};
 pub use crate::hub_core::schedules::{
     runs_per_day, DeliveryTarget, EditRefused, JobEdit, JobPayload, JobRunRecord, Outcomes,
-    RecurringCost, Schedule, ScheduledJob, SessionMode, DELIVERY_SURFACE_VOICE, OWNER_TOKEN_EDITOR,
-    VISIBILITY_GLOBAL, VISIBILITY_PRIVATE,
+    RecurringCost, Schedule, ScheduledJob, SessionMode, OWNER_TOKEN_EDITOR, VISIBILITY_GLOBAL,
+    VISIBILITY_PRIVATE,
 };
 use crate::serve::AgentService;
 
@@ -513,10 +513,7 @@ impl Scheduler {
             .try_with(|c| c.clone())
             .ok()
             .filter(|c| !c.is_empty())
-            .map(|channel| DeliveryTarget {
-                surface: DELIVERY_SURFACE_VOICE.to_string(),
-                channel,
-            })
+            .map(DeliveryTarget::voice)
     }
 
     /// Default run/spend/expiry caps for a new job. Only owned recurring
@@ -5825,10 +5822,7 @@ mod tests {
         let job = sched.get_job(&id).await.unwrap();
         assert_eq!(
             job.deliver_to,
-            Some(DeliveryTarget {
-                surface: DELIVERY_SURFACE_VOICE.to_string(),
-                channel: "voice-pe".to_string(),
-            })
+            Some(DeliveryTarget::voice("voice-pe".to_string()))
         );
     }
 
@@ -5960,10 +5954,7 @@ mod tests {
         assert!(job.deliver_to.is_none());
 
         let mut job = job;
-        job.deliver_to = Some(DeliveryTarget {
-            surface: DELIVERY_SURFACE_VOICE.to_string(),
-            channel: "voice-pe".to_string(),
-        });
+        job.deliver_to = Some(DeliveryTarget::voice("voice-pe".to_string()));
         let back: ScheduledJob =
             serde_json::from_value(serde_json::to_value(&job).unwrap()).unwrap();
         assert_eq!(back.deliver_to, job.deliver_to);

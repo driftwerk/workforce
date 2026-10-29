@@ -1291,6 +1291,7 @@ pub(super) mod tests {
             attachments: None,
             trust_level: None,
             actor: None,
+            desk: None,
         };
         let messages = [
             msg(MessageRole::System, "prompt"),

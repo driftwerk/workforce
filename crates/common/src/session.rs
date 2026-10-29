@@ -414,6 +414,10 @@ pub struct TranscriptEntry {
     /// Token usage for this turn (present for LLM responses).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_usage: Option<TurnTokenUsage>,
+    /// The message's place in a Desk conversation, as
+    /// [`SessionMessage::desk`] has it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desk: Option<crate::channels::desk::DeskMark>,
 }
 
 /// Metadata about a tool invocation.
@@ -734,6 +738,10 @@ pub struct SessionMessage {
     /// filter when a shared session replays to a different speaker.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub actor: Option<String>,
+    /// What the message is in a Desk conversation: the room and thread it
+    /// belongs to, who said it, and why it was delivered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desk: Option<crate::channels::desk::DeskMark>,
 }
 
 const COMPACTION_SUMMARY_PREFIX: &str = "[Compaction Summary";
@@ -797,6 +805,7 @@ impl SessionMessage {
             attachments: None,
             trust_level: None,
             actor: None,
+            desk: None,
         }
     }
 
@@ -1481,6 +1490,7 @@ impl Session {
             attachments,
             trust_level,
             actor: None,
+            desk: None,
         };
         let id = msg.id.clone();
         self.total_tokens += msg.tokens as u64;
@@ -1502,6 +1512,7 @@ impl Session {
             attachments: None,
             trust_level: None,
             actor: None,
+            desk: None,
         };
         let id = msg.id.clone();
         self.total_tokens += tokens as u64;
@@ -1523,6 +1534,7 @@ impl Session {
             attachments: None,
             trust_level: None,
             actor: None,
+            desk: None,
         };
         self.total_tokens += msg.tokens as u64;
         self.messages.push(msg);
@@ -1559,6 +1571,7 @@ impl Session {
                 attachments: None,
                 trust_level: None,
                 actor: None,
+                desk: None,
             };
             self.total_tokens += new_tokens as u64;
             self.messages.insert(0, msg);
@@ -2273,6 +2286,7 @@ impl Session {
             attachments: None,
             trust_level: None,
             actor: None,
+            desk: None,
         };
         new_messages.push(summary_msg);
 
@@ -4823,6 +4837,7 @@ pub(crate) fn message_to_transcript_entry(
         content: msg.content.clone(),
         tool_metadata,
         token_usage,
+        desk: msg.desk.clone(),
     }
 }
 
@@ -6603,6 +6618,46 @@ mod tests {
     }
 
     #[test]
+    fn a_message_saved_before_desk_marks_reads_unchanged() {
+        let stored = serde_json::json!({
+            "id": "m1",
+            "role": "assistant",
+            "content": "hello",
+            "timestamp": "2026-10-01T09:00:00Z",
+            "tokens": 3,
+        });
+        let message: SessionMessage = serde_json::from_value(stored.clone()).unwrap();
+        assert_eq!(message.desk, None);
+        assert_eq!(serde_json::to_value(&message).unwrap(), stored);
+    }
+
+    #[test]
+    fn a_desk_mark_round_trips_through_the_live_session_and_the_archive() {
+        use crate::channels::desk::{DeliveryKind, DeskMark};
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = JsonlSessionStore::new(dir.path()).expect("store");
+        let mut s = store.get_or_create("desk", "u", "agent").expect("create");
+        let mark = DeskMark {
+            room: Some(Uuid::new_v4()),
+            thread: Some(Uuid::new_v4()),
+            delivery: Some(DeliveryKind::Reminder),
+            request_id: Some("r1".into()),
+            ..DeskMark::default()
+        };
+        s.add_assistant_message("a reminder", 2);
+        let message = s.messages.last_mut().unwrap();
+        message.desk = Some(mark.clone());
+        let message = message.clone();
+        store.save(&s).expect("save");
+        store.append_to_archive(&s.id, &message).expect("archive");
+
+        let live = store.get(&s.id).unwrap().unwrap();
+        assert_eq!(live.messages.last().unwrap().desk.as_ref(), Some(&mark));
+        let page = store.read_archive_page(&s.id, None, 10).unwrap();
+        assert_eq!(page.messages.last().unwrap().desk.as_ref(), Some(&mark));
+    }
+
+    #[test]
     fn search_sessions_finds_archived_detail_compacted_out_of_live() {
         let dir = tempfile::tempdir().expect("temp dir");
         let store = JsonlSessionStore::new(dir.path()).expect("store");
@@ -6646,6 +6701,7 @@ mod tests {
             attachments: None,
             trust_level: None,
             actor: None,
+            desk: None,
         }
     }
 
@@ -6778,6 +6834,7 @@ mod tests {
                 attachments: None,
                 trust_level: None,
                 actor: None,
+                desk: None,
             };
             store.append_to_archive(sid, &m).expect("archive");
         }
@@ -6869,6 +6926,7 @@ mod tests {
             attachments: None,
             trust_level: None,
             actor: None,
+            desk: None,
         };
         session.messages.push(msg);
         store.save(&session).expect("save failed");
@@ -8074,6 +8132,7 @@ mod tests {
                 content: format!("message {i}"),
                 tool_metadata: None,
                 token_usage: None,
+                desk: None,
             })
             .collect();
 
@@ -8095,6 +8154,7 @@ mod tests {
                 content: format!("message {i}"),
                 tool_metadata: None,
                 token_usage: None,
+                desk: None,
             })
             .collect();
 
@@ -8116,6 +8176,7 @@ mod tests {
                 content: format!("message {i}"),
                 tool_metadata: None,
                 token_usage: None,
+                desk: None,
             })
             .collect();
 
@@ -8137,6 +8198,7 @@ mod tests {
                 content: format!("message {i}"),
                 tool_metadata: None,
                 token_usage: None,
+                desk: None,
             })
             .collect();
 
@@ -8168,6 +8230,7 @@ mod tests {
             attachments: None,
             trust_level: Some(TrustLevel::Paired),
             actor: None,
+            desk: None,
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains(r#""trust_level":"paired""#));

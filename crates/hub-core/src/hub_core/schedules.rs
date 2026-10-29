@@ -65,8 +65,8 @@ pub struct ScheduledJob {
     #[serde(default)]
     pub expires_at: Option<DateTime<Utc>>,
     /// Where the result should be delivered instead of the default Slack DM.
-    /// Stamped at creation from the originating turn (currently only voice
-    /// bridges); delivery falls back to Slack when the target is unreachable.
+    /// Stamped at creation from the originating turn: a voice bridge or a
+    /// Desk conversation. Voice falls back to Slack when no bridge listens.
     #[serde(default)]
     pub deliver_to: Option<DeliveryTarget>,
     /// Who last changed when the job runs or who may read it, when that was
@@ -85,24 +85,9 @@ pub struct ScheduledJob {
     pub paused_by_suspension: bool,
 }
 
-/// A non-Slack delivery destination remembered on a job.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DeliveryTarget {
-    /// Which kind of surface — only [`DELIVERY_SURFACE_VOICE`] is honoured.
-    pub surface: String,
-    /// Surface-specific channel: for voice, the bridge's gateway channel
-    /// name (e.g. `voice-pe`).
-    pub channel: String,
-}
-
-/// `DeliveryTarget::surface` for voice-bridge announcement delivery.
-pub const DELIVERY_SURFACE_VOICE: &str = "voice";
-
-impl DeliveryTarget {
-    pub fn is_voice(&self) -> bool {
-        self.surface == DELIVERY_SURFACE_VOICE
-    }
-}
+pub use workforce_common::delivery::{
+    DeliveryTarget, DELIVERY_SURFACE_DESK, DELIVERY_SURFACE_VOICE,
+};
 
 /// Visibility: only the owner (and admins) may see, run, or edit the job.
 pub const VISIBILITY_PRIVATE: &str = "private";

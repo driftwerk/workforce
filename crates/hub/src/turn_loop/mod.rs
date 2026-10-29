@@ -3417,6 +3417,7 @@ pub(crate) async fn process_admitted(
                         attachments: None,
                         trust_level: None,
                         actor: None,
+                        desk: None,
                     });
                 session.total_tokens = session.estimated_total_tokens() as u64;
 

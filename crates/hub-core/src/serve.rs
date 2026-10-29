@@ -4190,6 +4190,7 @@ pub mod tests {
             trust_level: None,
             actor: None,
             external_id: None,
+            desk: None,
         }
     }
 
@@ -4596,6 +4597,7 @@ pub mod tests {
             attachments: None,
             trust_level: trust,
             actor: None,
+            desk: None,
         }
     }
 
@@ -4672,6 +4674,7 @@ pub mod tests {
             attachments: None,
             trust_level: None,
             actor: actor.map(String::from),
+            desk: None,
         }
     }
 

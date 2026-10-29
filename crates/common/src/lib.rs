@@ -13,6 +13,7 @@ pub mod config_overlay;
 pub mod cost;
 pub mod cost_analytics;
 pub mod delivered_text;
+pub mod delivery;
 pub mod emoji;
 pub mod engagement;
 pub mod errors;

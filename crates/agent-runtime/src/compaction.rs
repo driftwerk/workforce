@@ -1312,6 +1312,7 @@ mod tests {
             attachments: None,
             trust_level: None,
             actor: None,
+            desk: None,
         }
     }
 

@@ -56,6 +56,7 @@ pub mod config_writer;
 pub mod consolidation_runtime;
 pub mod context_fuse_tool;
 pub mod context_tool;
+pub(crate) mod conversation_seed;
 pub mod cost_analytics_tools;
 pub use hub_core::cost_forecast;
 pub use hub_core::cost_governor;

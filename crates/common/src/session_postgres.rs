@@ -1457,6 +1457,7 @@ impl SessionStore for PostgresSessionStore {
                     attachments: None,
                     trust_level: None,
                     actor: None,
+                    desk: None,
                 };
                 if redact_message_secrets(&mut msg) {
                     redacted += 1;
@@ -1645,6 +1646,11 @@ impl SessionStore for PostgresSessionStore {
                 crate::pg_text::strip_nuls_json(&mut v);
                 v
             });
+            let desk = message
+                .desk
+                .as_ref()
+                .map(serde_json::to_value)
+                .transpose()?;
             // DO NOTHING: a CAS-losing post-turn save can replay an archive
             // append for a message another writer already archived. No
             // target, for the same reason as `get_or_create`: a hub keeps
@@ -1653,8 +1659,8 @@ impl SessionStore for PostgresSessionStore {
             scoped
                 .execute(
                     "INSERT INTO session_archive
-                     (tenant_id, session_id, message_id, role, content, tool_data, ts, tokens)
-                     VALUES ($8, $1, $2, $3, $4, $5, $6, $7)
+                     (tenant_id, session_id, message_id, role, content, tool_data, ts, tokens, desk)
+                     VALUES ($8, $1, $2, $3, $4, $5, $6, $7, $9)
                      ON CONFLICT DO NOTHING",
                     &[
                         &id,
@@ -1665,6 +1671,7 @@ impl SessionStore for PostgresSessionStore {
                         &message.timestamp,
                         &(message.tokens as i32),
                         &self.tenant_id(),
+                        &desk,
                     ],
                 )
                 .await?;
@@ -1739,7 +1746,7 @@ impl SessionStore for PostgresSessionStore {
                 Some(seq) => {
                     scoped
                         .query(
-                            "SELECT seq, message_id, role, content, tool_data, ts, tokens
+                            "SELECT seq, message_id, role, content, tool_data, ts, tokens, desk
                              FROM session_archive
                              WHERE session_id = $1 AND seq < $2 AND tenant_id = $4
                              ORDER BY seq DESC LIMIT $3",
@@ -1750,7 +1757,7 @@ impl SessionStore for PostgresSessionStore {
                 None => {
                     scoped
                         .query(
-                            "SELECT seq, message_id, role, content, tool_data, ts, tokens
+                            "SELECT seq, message_id, role, content, tool_data, ts, tokens, desk
                              FROM session_archive
                              WHERE session_id = $1 AND tenant_id = $3
                              ORDER BY seq DESC LIMIT $2",
@@ -1789,7 +1796,7 @@ impl SessionStore for PostgresSessionStore {
             let scoped = self.scope(&mut conn).await?;
             let row = scoped
                 .query_opt(
-                    "SELECT a.seq, a.message_id, a.role, a.content, a.tool_data, a.ts, a.tokens
+                    "SELECT a.seq, a.message_id, a.role, a.content, a.tool_data, a.ts, a.tokens, a.desk
                      FROM session_archive a
                      JOIN sessions s ON s.id = a.session_id AND s.tenant_id = a.tenant_id
                      WHERE a.session_id = $1 AND a.message_id = $2
@@ -1997,6 +2004,7 @@ impl PostgresSessionStore {
                 attachments: None,
                 trust_level: None,
                 actor: None,
+                desk: None,
             };
             if redact_message_secrets(&mut msg) {
                 redacted += 1;
@@ -2074,6 +2082,9 @@ fn archive_row_to_entry(session_id: &str, r: &tokio_postgres::Row) -> Transcript
         attachments: None,
         trust_level: None,
         actor: None,
+        desk: r
+            .get::<_, Option<serde_json::Value>>(7)
+            .and_then(|mark| serde_json::from_value(mark).ok()),
     };
     message_to_transcript_entry(session_id, &msg)
 }
@@ -2133,6 +2144,7 @@ pub(crate) mod tests {
             attachments: None,
             trust_level: None,
             actor: None,
+            desk: None,
         }
     }
 
@@ -2318,6 +2330,39 @@ pub(crate) mod tests {
             assert_eq!(older.messages.len(), 2);
             assert_eq!(older.messages[0].content, "turn 1");
             assert_eq!(older.messages[1].content, "turn 2");
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_desk_mark_round_trips_through_the_archive() {
+        use crate::channels::desk::{DeliveryKind, DeskMark, DeskSpeaker};
+        with_store(|store| async move {
+            let s: Arc<dyn SessionStore> = store;
+            let sess = s.get_or_create("desk", "u", "agent-a").unwrap();
+            let mark = DeskMark {
+                room: Some(Uuid::new_v4()),
+                speaker: Some(DeskSpeaker::Agent {
+                    name: "helper".into(),
+                }),
+                delivery: Some(DeliveryKind::Job),
+                ..DeskMark::default()
+            };
+            let marked = SessionMessage {
+                desk: Some(mark.clone()),
+                ..user_msg("marked")
+            };
+            s.append_to_archive(&sess.id, &user_msg("plain")).unwrap();
+            s.append_to_archive(&sess.id, &marked).unwrap();
+
+            let page = s.read_archive_page(&sess.id, None, 10).unwrap();
+            let marks: Vec<_> = page.messages.iter().map(|m| m.desk.clone()).collect();
+            assert_eq!(marks, vec![None, Some(mark.clone())]);
+            let one = s
+                .read_archive_message(&sess.id, &marked.id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(one.desk, Some(mark));
         })
         .await;
     }
