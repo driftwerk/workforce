@@ -93,7 +93,6 @@ interface ChatState {
   // Messages
   messages: ChatMessage[];
   sessionId: string | null;
-  welcomeText: string | null;
 
   // Streaming state
   isStreaming: boolean;
@@ -171,7 +170,6 @@ export const useChatStore = create<ChatState>((set, get) => ({
   agentId: null,
   messages: [],
   sessionId: null,
-  welcomeText: null,
   isStreaming: false,
   isTyping: false,
   isCompacting: false,
@@ -383,9 +381,6 @@ function handleServerMessage(msg: ServerMessage) {
     case "connected":
       if (msg.session_id) {
         store.setState({ sessionId: msg.session_id });
-      }
-      if (msg.content) {
-        store.setState({ welcomeText: msg.content });
       }
       if (pending) void collect(pending);
       break;

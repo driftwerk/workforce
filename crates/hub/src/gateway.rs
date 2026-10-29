@@ -1762,12 +1762,7 @@ async fn handle_ws(
     let conn_identity_send = identity_id.clone();
     let conn_owner_send = identity_id.clone().or_else(|| device_id.clone());
 
-    // Resolve welcome directive from the agent's WELCOME.md (if configured)
     let resolved_id = agent_id.as_deref().unwrap_or(state.registry.default_id());
-    let welcome_text = match state.registry.get(resolved_id) {
-        Some(service) => service.welcome().await,
-        None => None,
-    };
 
     // Eagerly resolve the connection's anchor session so the client receives
     // a session_id on connect, and so per-message dispatch has a stable
@@ -1787,9 +1782,11 @@ async fn handle_ws(
     let anchored_session_id = initial_session_id.clone();
 
     let conn_agent = agent_id.clone();
+    // WELCOME.md is the agent's own directive for greeting a new session,
+    // read by the turn loop; it is never client copy.
     let connected_msg = ServerMessage {
         msg_type: "connected".to_string(),
-        content: welcome_text,
+        content: Some(String::new()),
         session_id: initial_session_id,
         error: None,
         agent_id,

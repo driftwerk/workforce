@@ -102,3 +102,13 @@ describe("stream_discard", () => {
     expect(answers()).toEqual(["Kept where it stopped"]);
   });
 });
+
+describe("connected", () => {
+  it("adopts its session and shows none of its content", () => {
+    server({ type: "connected", session_id: "s2", content: "Greet the person warmly." });
+    const state = useChatStore.getState();
+    expect(state.sessionId).toBe("s2");
+    expect(state.messages).toEqual([]);
+    expect(JSON.stringify(state)).not.toContain("Greet the person warmly.");
+  });
+});

@@ -410,3 +410,27 @@ async fn a_spoken_desk_message_is_a_voice_turn_without_latching_voice_mode() {
     assert!(!session.is_voice());
     assert!(session.metadata.get("voice_mode").is_none());
 }
+
+/// WELCOME.md is the agent's own directive for greeting a new conversation,
+/// read by its turns; no client is ever sent it.
+#[tokio::test]
+async fn welcome_md_is_never_sent_to_a_client() {
+    const WELCOME: &str = "Open by asking which project they want to pick up.";
+    let data = tempfile::tempdir().unwrap();
+    let service = agent_service(data.path()).await;
+    service.identity.write().await.welcome = Some(WELCOME.to_string());
+    let gateway = Gateway::new(vec![("default", service)], None);
+    let token = gateway.admin_token();
+    let addr = serve(gateway.state.clone()).await;
+
+    for query in [
+        format!("token={token}"),
+        format!("token={token}&channel=web"),
+        format!("token={token}&channel=terminal"),
+        format!("token={token}&channel=desk&desk=1"),
+    ] {
+        let (_socket, connected) = connect(addr, &query).await;
+        assert_eq!(connected["content"], "", "{query}: {connected}");
+        assert!(!connected.to_string().contains(WELCOME));
+    }
+}

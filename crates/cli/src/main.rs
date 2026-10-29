@@ -2504,7 +2504,7 @@ async fn run_gateway_chat(gateway_url: &str, token: &str) -> Result<()> {
 
     // Wait for the connected event
     match tokio::time::timeout(std::time::Duration::from_secs(5), events.recv()).await {
-        Ok(Some(GatewayEvent::Connected { .. })) => {
+        Ok(Some(GatewayEvent::Connected)) => {
             eprintln!("  {} Connected to gateway", style("✓").green().bold(),);
         }
         Ok(Some(GatewayEvent::Message(msg))) if msg.is_connected() => {
@@ -2748,7 +2748,7 @@ async fn run_gateway_chat(gateway_url: &str, token: &str) -> Result<()> {
                         eprintln!("{} Failed to reconnect to gateway", style("✗").red().bold());
                         break;
                     }
-                    GatewayEvent::Connected { .. } => {
+                    GatewayEvent::Connected => {
                         eprintln!("{} Reconnected", style("✓").green().bold());
                     }
                 }
