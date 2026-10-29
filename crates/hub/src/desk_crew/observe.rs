@@ -357,6 +357,7 @@ impl<T: TurnHost> TurnHost for Observed<T> {
         trust_level: Option<workforce_common::trust::TrustLevel>,
         cancel_token: Option<tokio_util::sync::CancellationToken>,
         voice_channel: Option<&str>,
+        desk: Option<&workforce_common::channels::desk::DeskTurnContext>,
     ) -> Result<MessageProgress> {
         let track = super::for_service(service)
             .and_then(|c| c.track(service, channel, user, message, session_id));
@@ -387,6 +388,7 @@ impl<T: TurnHost> TurnHost for Observed<T> {
                 trust_level,
                 cancel_token,
                 voice_channel,
+                desk,
             )
             .await;
         match (progress, track) {

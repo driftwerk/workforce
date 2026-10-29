@@ -746,6 +746,9 @@ pub struct SessionMessage {
 
 const COMPACTION_SUMMARY_PREFIX: &str = "[Compaction Summary";
 
+/// Session metadata key holding [`Session::desk_origin`].
+const DESK_ORIGIN_KEY: &str = "desk_origin";
+
 /// Sentinel prefix for the `owner` of a shared (multi-human) conversation. A
 /// shared session is keyed by thread rather than by a single user, so its
 /// `owner` is `shared:{thread_root}` — a value no real identity or device id
@@ -1139,6 +1142,23 @@ impl Session {
         true
     }
 
+    /// Where the latest Desk turn on this session was asked, so an answer
+    /// made after the turn (a resumed approval, a recovered turn) reaches
+    /// the same place.
+    pub fn desk_origin(&self) -> Option<crate::channels::desk::DeskTarget> {
+        self.metadata
+            .get(DESK_ORIGIN_KEY)
+            .and_then(|origin| serde_json::from_value(origin.clone()).ok())
+    }
+
+    /// Record `target` as where the latest Desk turn was asked.
+    pub fn set_desk_origin(&mut self, target: &crate::channels::desk::DeskTarget) {
+        if let Ok(origin) = serde_json::to_value(target) {
+            self.metadata_object_mut()
+                .insert(DESK_ORIGIN_KEY.to_string(), origin);
+        }
+    }
+
     /// Copy the client-facing conversation-mode keys (voice mode, TTS
     /// provider, the rich blocks rendered) from `from` — a rollover
     /// successor must keep speaking the way its predecessor did. Selective
@@ -1147,6 +1167,7 @@ impl Session {
     /// doesn't strand that turn's mode.
     pub fn adopt_conversation_mode(&mut self, from: &Session) {
         for key in [
+            DESK_ORIGIN_KEY,
             "voice_mode",
             "voice_turn",
             "tts_provider",
@@ -1501,8 +1522,19 @@ impl Session {
 
     /// Add an assistant message.
     pub fn add_assistant_message(&mut self, content: &str, tokens: u32) -> String {
+        self.add_assistant_message_with_id(Uuid::new_v4().to_string(), content, tokens)
+    }
+
+    /// Add an assistant message under `id`, which a client was told the
+    /// answer would be saved under.
+    pub fn add_assistant_message_with_id(
+        &mut self,
+        id: String,
+        content: &str,
+        tokens: u32,
+    ) -> String {
         let msg = SessionMessage {
-            id: Uuid::new_v4().to_string(),
+            id,
             role: MessageRole::Assistant,
             content: content.to_string(),
             tool_data: None,

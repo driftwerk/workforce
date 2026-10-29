@@ -330,7 +330,8 @@ pub async fn stop_session_turn(
         &session_id,
         workforce_nats::chat::TurnControl::Cancel,
     )
-    .await;
+    .await
+    .applied();
     info!(session_id = %session_id, stopped, "Turn stop requested via API");
     Json(serde_json::json!({
         "session_id": session_id,
@@ -1266,6 +1267,7 @@ mod tests {
             .begin(
                 &session.id,
                 workforce_agent::tools::approval::SelfServe::Unanswerable,
+                None,
                 None,
             )
             .await

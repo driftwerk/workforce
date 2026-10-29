@@ -558,6 +558,7 @@ mod tests {
             artifact_scope: None,
             secret_policy: None,
             served: None,
+            desk: None,
         }
     }
 

@@ -660,6 +660,7 @@ async fn stream_path_applies_game_sandbox() {
                     None,
                     None,
                     None,
+                    None,
                 )
                 .await
                 .unwrap();
@@ -1268,7 +1269,7 @@ async fn dm_turn(service: &Arc<AgentService>, channel: &str, user: &str, message
     } = service
         .process_message_with_progress(
             channel, user, None, message, None, None, None, None, None, None, None, None, None,
-            None, None, None, None, None, None, None, None, None, None,
+            None, None, None, None, None, None, None, None, None, None, None,
         )
         .await
         .unwrap();
@@ -1771,6 +1772,7 @@ async fn whitelisted_workflow_step_is_offered_its_tools_in_full() {
             None,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -2065,6 +2067,7 @@ async fn progress_turn_scopes_billing_identity() {
                     None,
                     None,
                     Some("ticket-7"),
+                    None,
                     None,
                     None,
                     None,
@@ -4190,6 +4193,7 @@ async fn a_workflow_step_run_as_a_person_reads_as_the_engine() {
                 None,
                 None,
                 None,
+                None,
             ),
         )
         .await
@@ -4872,6 +4876,7 @@ async fn stream_turn(service: &Arc<AgentService>, message: &str, ticket: &str) -
             None,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -5522,4 +5527,106 @@ fn load_policy_registers_builtin_rules_in_default_config() {
             "expected allow for {tool}"
         );
     }
+}
+
+/// A Desk room turn: the agent is told the room, the thread and the lines
+/// before the ask, while the transcript keeps the person's words, marked with
+/// their place, and the answer under the id the client was promised.
+#[tokio::test]
+async fn a_desk_room_turn_is_told_where_it_is_and_keeps_its_place() {
+    use workforce_common::channels::desk::{
+        DeskLine, DeskPlace, DeskSpeaker, DeskTurn, DeskTurnContext,
+    };
+    use workforce_common::session::SessionContextType;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (service, server) = service_on_mock_llm(tmp.path()).await;
+    let room = uuid::Uuid::from_u128(11);
+    let channel = format!("desk:{room}");
+    let asked = uuid::Uuid::from_u128(12);
+    let turn = DeskTurn {
+        place: DeskPlace::Room {
+            room,
+            name: "Planning".into(),
+            thread: Some(uuid::Uuid::from_u128(13)),
+        },
+        speaker: DeskSpeaker::Person,
+        hop: 0,
+        context: vec![DeskLine {
+            from: "helper (agent)".into(),
+            text: "the build is green".into(),
+        }],
+        message: Some(asked),
+        spoken: false,
+    };
+    let desk = DeskTurnContext::new(
+        turn.clone().validated(&channel).unwrap(),
+        &channel,
+        Some("device-1"),
+        false,
+        Some("ref-1".into()),
+        "reply-1".into(),
+    );
+    let MessageProgress {
+        mut progress_rx,
+        handle,
+        ..
+    } = service
+        .process_message_with_progress(
+            &channel,
+            "owner-1",
+            None,
+            "and the release?",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&desk),
+        )
+        .await
+        .unwrap();
+    while progress_rx.recv().await.is_some() {}
+    handle.await.unwrap().unwrap();
+
+    let requests = server.received_requests().await.unwrap();
+    let body = String::from_utf8_lossy(&requests.last().unwrap().body).into_owned();
+    assert!(
+        body.contains("conversation: room \\\"Planning\\\", in a thread"),
+        "{body}"
+    );
+    assert!(body.contains("## Earlier in this thread\\nhelper (agent): the build is green"));
+
+    let session = service.sessions.find(&channel, "owner-1").unwrap().unwrap();
+    let asked_message = session
+        .messages
+        .iter()
+        .find(|m| m.role == MessageRole::User)
+        .unwrap();
+    assert_eq!(asked_message.content, "and the release?");
+    assert_eq!(asked_message.desk, Some(turn.mark()));
+    assert_eq!(asked_message.external_id, Some(asked.to_string()));
+    let reply = session.messages.last().unwrap();
+    assert_eq!(
+        (reply.role.clone(), reply.id.as_str()),
+        (MessageRole::Assistant, "reply-1")
+    );
+    assert_eq!(reply.desk, Some(turn.place.mark()));
+    assert_eq!(session.desk_origin(), Some(desk.target.clone()));
+    assert_eq!(session.context_type, Some(SessionContextType::Dm));
+    assert!(!session.is_shared_conversation());
 }

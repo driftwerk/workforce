@@ -65,7 +65,19 @@ pub struct ClientMessage {
     /// self-serve approvals. Absent means such calls are refused at once.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub answers_approvals: Option<bool>,
+    /// On a Desk connection (`/ws?…&desk=1`): where in Desk this message was
+    /// asked, who asked, and the thread lines around it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desk: Option<workforce_core::desk::DeskTurn>,
+    /// The client's own id for the turn this message starts, at most
+    /// [`TURN_REF_MAX`] characters, echoed on every frame of the turn on a
+    /// Desk connection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_ref: Option<String>,
 }
+
+/// The longest `turn_ref` a client may send.
+pub const TURN_REF_MAX: usize = 64;
 
 impl ClientMessage {
     /// Create a chat message.
@@ -83,6 +95,8 @@ impl ClientMessage {
             request_id: None,
             choice: None,
             answers_approvals: None,
+            desk: None,
+            turn_ref: None,
         }
     }
 
@@ -106,6 +120,8 @@ impl ClientMessage {
             request_id: Some(request_id.to_string()),
             choice: Some(choice),
             answers_approvals: None,
+            desk: None,
+            turn_ref: None,
         }
     }
 
@@ -124,6 +140,8 @@ impl ClientMessage {
             request_id: None,
             choice: None,
             answers_approvals: None,
+            desk: None,
+            turn_ref: None,
         }
     }
 
@@ -150,6 +168,8 @@ impl ClientMessage {
             request_id: None,
             choice: None,
             answers_approvals: None,
+            desk: None,
+            turn_ref: None,
         }
     }
 
@@ -168,6 +188,8 @@ impl ClientMessage {
             request_id: None,
             choice: None,
             answers_approvals: None,
+            desk: None,
+            turn_ref: None,
         }
     }
 
@@ -186,6 +208,8 @@ impl ClientMessage {
             request_id: None,
             choice: None,
             answers_approvals: None,
+            desk: None,
+            turn_ref: None,
         }
     }
 
@@ -295,6 +319,14 @@ pub struct ServerMessage {
     /// `{"kind": "you"|"overseer"|"agent", "id", "name"}`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub author: Option<serde_json::Value>,
+    /// On a Desk connection's `connected`: what the hub offers it
+    /// (`desk.place`, …).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub features: Option<Vec<String>>,
+    /// On a Desk connection: the client's id for the turn a frame belongs
+    /// to, as it sent it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_ref: Option<String>,
 }
 
 fn default_speakable() -> bool {
@@ -427,6 +459,8 @@ impl ServerMessage {
             desk: None,
             id: None,
             author: None,
+            features: None,
+            turn_ref: None,
         }
     }
 }

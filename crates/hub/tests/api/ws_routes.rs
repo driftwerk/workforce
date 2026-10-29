@@ -264,3 +264,149 @@ async fn the_admin_token_pairs_a_desktop_device_that_chats_as_its_person() {
     .await;
     assert_eq!(resumed, desk, "a lost token is replaced without re-pairing");
 }
+
+type Socket =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// A connection on `query` and its `connected` frame.
+async fn connect(addr: SocketAddr, query: &str) -> (Socket, Value) {
+    let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws?{query}"))
+        .await
+        .expect("websocket connects");
+    let connected = next_frame(&mut socket).await;
+    assert_eq!(connected["type"], "connected", "{connected}");
+    (socket, connected)
+}
+
+async fn next_frame(socket: &mut Socket) -> Value {
+    let frame = tokio::time::timeout(std::time::Duration::from_secs(20), socket.next())
+        .await
+        .expect("a frame in time")
+        .expect("a frame")
+        .expect("a readable frame");
+    serde_json::from_str(frame.to_text().unwrap()).unwrap()
+}
+
+/// Frames until one of type `kind`, which is returned with those before it.
+async fn frames_until(socket: &mut Socket, kind: &str) -> Vec<Value> {
+    let mut frames = Vec::new();
+    loop {
+        let frame = next_frame(socket).await;
+        let done = frame["type"] == kind;
+        frames.push(frame);
+        if done {
+            return frames;
+        }
+    }
+}
+
+async fn send(socket: &mut Socket, frame: Value) {
+    use futures::SinkExt;
+    socket
+        .send(tungstenite::Message::Text(frame.to_string().into()))
+        .await
+        .unwrap();
+}
+
+/// Desk declares itself and is offered structured turns; its room turn
+/// reaches the model told the room, the thread and the lines before it,
+/// while a connection that declares nothing sees no change.
+#[tokio::test]
+async fn a_desk_connection_sends_turns_the_agent_reads_in_their_place() {
+    let data = tempfile::tempdir().unwrap();
+    let (service, llm) = crate::support::agent_on_mock_llm(data.path()).await;
+    let gateway = Gateway::new(vec![("default", service.clone())], None);
+    let token = gateway.admin_token();
+    let addr = serve(gateway.state.clone()).await;
+    let room = uuid::Uuid::new_v4();
+    let channel = format!("desk:{room}");
+
+    let (_old, connected) = connect(addr, &format!("token={token}&channel={channel}")).await;
+    assert!(connected.get("features").is_none(), "{connected}");
+    let (_phone, connected) = connect(addr, &format!("token={token}&desk=1")).await;
+    assert!(
+        connected.get("features").is_none(),
+        "only a Desk channel can declare Desk: {connected}"
+    );
+    let (mut desk, connected) =
+        connect(addr, &format!("token={token}&channel={channel}&desk=1")).await;
+    assert_eq!(connected["features"], json!(["desk.place"]));
+
+    let thread = uuid::Uuid::new_v4();
+    let turn = |room| {
+        json!({
+            "place": {"kind": "room", "room": room, "name": "Planning", "thread": thread},
+            "speaker": {"kind": "person"},
+            "context": [{"from": "helper (agent)", "text": "the build is green"}],
+        })
+    };
+    send(
+        &mut desk,
+        json!({"type": "chat", "content": "and the release?", "turn_ref": "ref-wrong",
+               "desk": turn(uuid::Uuid::new_v4())}),
+    )
+    .await;
+    let refused = next_frame(&mut desk).await;
+    assert_eq!(
+        (&refused["type"], &refused["turn_ref"]),
+        (&json!("error"), &json!("ref-wrong"))
+    );
+
+    send(
+        &mut desk,
+        json!({"type": "chat", "content": "and the release?", "turn_ref": "ref-1", "desk": turn(room)}),
+    )
+    .await;
+    let frames = frames_until(&mut desk, "stream_end").await;
+    assert!(frames.iter().any(|f| f["content"] == "done"), "{frames:?}");
+
+    let asked = llm.received_requests().await.unwrap();
+    let body = String::from_utf8_lossy(&asked.last().unwrap().body).into_owned();
+    assert!(
+        body.contains("conversation: room \\\"Planning\\\", in a thread"),
+        "{body}"
+    );
+    assert!(body.contains("## Earlier in this thread\\nhelper (agent): the build is green"));
+    let session = service
+        .sessions
+        .find(&channel, &gateway.admin.id.to_string())
+        .unwrap()
+        .expect("the room's conversation");
+    let user = session
+        .messages
+        .iter()
+        .find(|m| m.role == workforce_common::session::MessageRole::User)
+        .unwrap();
+    assert_eq!(user.content, "and the release?");
+    assert_eq!(
+        user.desk.as_ref().and_then(|mark| mark.thread),
+        Some(thread)
+    );
+}
+
+/// A spoken Desk message gets the agent's voice settings for that message
+/// alone: the conversation does not become a voice conversation.
+#[tokio::test]
+async fn a_spoken_desk_message_is_a_voice_turn_without_latching_voice_mode() {
+    let data = tempfile::tempdir().unwrap();
+    let (service, _llm) = crate::support::agent_on_mock_llm(data.path()).await;
+    let gateway = Gateway::new(vec![("default", service.clone())], None);
+    let token = gateway.admin_token();
+    let addr = serve(gateway.state.clone()).await;
+    let (mut desk, connected) = connect(addr, &format!("token={token}&channel=desk&desk=1")).await;
+    send(
+        &mut desk,
+        json!({"type": "chat", "content": "what's next?", "turn_ref": "ref-1",
+               "desk": {"place": {"kind": "dm"}, "speaker": {"kind": "person"}, "spoken": true}}),
+    )
+    .await;
+    frames_until(&mut desk, "stream_end").await;
+    let session = service
+        .sessions
+        .get(connected["session_id"].as_str().unwrap())
+        .unwrap()
+        .unwrap();
+    assert!(session.is_voice_turn());
+    assert!(!session.is_voice());
+    assert!(session.metadata.get("voice_mode").is_none());
+}

@@ -192,6 +192,7 @@ async fn run_chat_turn(
         .begin_live_turn(
             &requested,
             SelfServe::answerable_if(request.answers_approvals),
+            request.desk.as_ref().map(|desk| desk.turn.place.clone()),
         )
         .await
     {
@@ -239,9 +240,12 @@ async fn run_chat_turn(
             None, // no tool_whitelist
             None, // no persona override
             None, // no workspace_id — chat workers operate outside Slack context
-            None, // no trust classification — chat workers run system-initiated work
+            // No trust classification — chat workers run system-initiated
+            // work — save that another agent's hand-off is never the person's.
+            crate::desk_surface::hand_off_trust(request.desk.as_ref().map(|desk| &desk.turn), None),
             Some(live.cancel_token()),
             request.voice_channel.as_deref(),
+            request.desk.as_ref(),
         )
         .await;
     let progress = match started {
@@ -683,6 +687,7 @@ mod live_control_tests {
             attachments: Vec::new(),
             voice_channel: None,
             answers_approvals: false,
+            desk: None,
         }
     }
 

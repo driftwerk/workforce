@@ -37,6 +37,10 @@ pub struct NatsChatRequest {
     /// that cannot gets such calls refused at once rather than left waiting.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub answers_approvals: bool,
+    /// The Desk turn this is, when it came from Desk: an instance that
+    /// predates it runs the turn as before, without its context.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desk: Option<workforce_core::desk::DeskTurnContext>,
 }
 
 /// A control message for a live turn, sent as a request on
@@ -47,8 +51,15 @@ pub enum TurnControl {
     /// Stop the turn. Acknowledged once the turn has settled and its claim is
     /// released.
     Cancel,
-    /// A follow-up message to absorb into the running turn.
-    FollowUp { text: String, user: String },
+    /// A follow-up message to absorb into the running turn. A follow-up
+    /// from Desk names its place, and is refused as busy by a turn asked in
+    /// another one.
+    FollowUp {
+        text: String,
+        user: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        place: Option<workforce_core::desk::DeskPlace>,
+    },
     /// An answer to one of the turn's approval prompts.
     Approval {
         request_id: String,
@@ -60,10 +71,17 @@ pub enum TurnControl {
 }
 
 /// The owning instance's answer to a [`TurnControl`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TurnControlReply {
     pub applied: bool,
+    /// Why a control the turn is live for was not applied: `busy` for a
+    /// follow-up from another place than the turn's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refused: Option<String>,
 }
+
+/// [`TurnControlReply::refused`] for a follow-up the live turn will not take.
+pub const REFUSED_BUSY: &str = "busy";
 
 /// An attachment within a chat request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -171,6 +189,12 @@ mod tests {
             TurnControl::FollowUp {
                 text: "also check main".into(),
                 user: "u1".into(),
+                place: None,
+            },
+            TurnControl::FollowUp {
+                text: "and the thread".into(),
+                user: "u1".into(),
+                place: Some(workforce_core::desk::DeskPlace::Dm),
             },
             TurnControl::Approval {
                 request_id: "r1".into(),
@@ -218,5 +242,35 @@ mod tests {
         }))
         .unwrap();
         assert!(!request.answers_approvals);
+        assert!(request.desk.is_none());
+    }
+
+    #[test]
+    fn an_old_instance_s_follow_up_and_reply_still_read() {
+        let follow_up: TurnControl = serde_json::from_value(serde_json::json!({
+            "kind": "follow_up", "text": "hi", "user": "u1"
+        }))
+        .unwrap();
+        assert_eq!(
+            follow_up,
+            TurnControl::FollowUp {
+                text: "hi".into(),
+                user: "u1".into(),
+                place: None
+            }
+        );
+        let reply: TurnControlReply =
+            serde_json::from_value(serde_json::json!({"applied": true})).unwrap();
+        assert_eq!(
+            reply,
+            TurnControlReply {
+                applied: true,
+                refused: None
+            }
+        );
+        assert_eq!(
+            serde_json::to_value(&reply).unwrap(),
+            serde_json::json!({"applied": true})
+        );
     }
 }

@@ -250,6 +250,15 @@ impl DeskTurn {
         })
     }
 
+    /// What the message this turn carries is in its conversation: its room
+    /// and thread, and who said it.
+    pub fn mark(&self) -> DeskMark {
+        DeskMark {
+            speaker: Some(self.speaker.clone()),
+            ..self.place.mark()
+        }
+    }
+
     /// Whether another agent, not the person, said this.
     pub fn is_hand_off(&self) -> bool {
         matches!(self.speaker, DeskSpeaker::Agent { .. })
@@ -359,11 +368,12 @@ pub struct DeskMark {
 
 /// A Desk turn as the turn loop runs it: what Desk sent, where its later
 /// output goes, the client's id for the turn, and the id its answer is saved
-/// under.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// under. It rides the NATS chat request to whichever instance runs the turn.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeskTurnContext {
     pub turn: DeskTurn,
     pub target: DeskTarget,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_ref: Option<String>,
     pub reply_id: String,
 }
@@ -581,6 +591,14 @@ mod tests {
             }
         );
         assert_eq!(DeskPlace::Dm.mark(), DeskMark::default());
+        assert_eq!(
+            turn(in_room(None)).mark(),
+            DeskMark {
+                room: Some(room_id()),
+                speaker: Some(DeskSpeaker::Person),
+                ..DeskMark::default()
+            }
+        );
         assert_eq!(DeskPlace::Call.mark(), DeskMark::default());
     }
 

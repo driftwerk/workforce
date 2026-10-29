@@ -5214,7 +5214,8 @@ impl WorkflowRuntime {
                                 None,
                                 None,
                                 None,
-                                None, // workflow steps are never spoken
+                                None, // workflow steps are never spoken,
+                                None,
                             ),
                         )
                         .await

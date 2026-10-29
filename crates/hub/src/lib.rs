@@ -93,6 +93,7 @@ pub mod desk_conversations;
 pub mod desk_crew;
 #[cfg(feature = "postgres")]
 pub mod desk_driver;
+pub(crate) mod desk_surface;
 #[cfg(feature = "postgres")]
 pub mod desk_tools;
 pub(crate) mod device_link;

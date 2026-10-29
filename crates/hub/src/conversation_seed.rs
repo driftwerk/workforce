@@ -15,6 +15,9 @@ pub(crate) struct SeedLine<'a> {
 pub(crate) enum SeedScope {
     Thread,
     Channel,
+    Room,
+    Call,
+    Conversation,
 }
 
 impl SeedScope {
@@ -22,6 +25,9 @@ impl SeedScope {
         match self {
             Self::Thread => "## Earlier in this thread",
             Self::Channel => "## Recent messages in this channel",
+            Self::Room => "## Recent messages in this room",
+            Self::Call => "## Earlier in this call",
+            Self::Conversation => "## Earlier in this conversation",
         }
     }
 }

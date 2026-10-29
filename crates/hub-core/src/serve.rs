@@ -2393,12 +2393,13 @@ impl AgentService {
         &self,
         session_id: &str,
         self_serve: workforce_agent::tools::approval::SelfServe,
+        place: Option<workforce_common::channels::desk::DeskPlace>,
     ) -> Result<
         (crate::hub_core::live_turns::LiveTurn, TurnInbox),
         crate::hub_core::live_turns::TurnBusy,
     > {
         self.live_turns
-            .begin(session_id, self_serve, self.nats())
+            .begin(session_id, self_serve, place, self.nats())
             .await
     }
 
@@ -3246,6 +3247,7 @@ impl AgentService {
         trust_level: Option<workforce_common::trust::TrustLevel>,
         cancel_token: Option<tokio_util::sync::CancellationToken>,
         voice_channel: Option<&str>,
+        desk: Option<&workforce_common::channels::desk::DeskTurnContext>,
     ) -> Result<MessageProgress> {
         self.hosts
             .turn
@@ -3274,6 +3276,7 @@ impl AgentService {
                 trust_level,
                 cancel_token,
                 voice_channel,
+                desk,
             )
             .await
     }

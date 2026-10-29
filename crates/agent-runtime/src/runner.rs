@@ -122,6 +122,10 @@ tokio::task_local! {
     /// Current Slack thread timestamp (e.g. "1234567890.123456") — set during
     /// agent runs so tools can resolve thread context without needing a scheduler.
     pub static CURRENT_THREAD_ID: String;
+    /// The Desk conversation the current run answers to: a live Desk turn's,
+    /// attended, or the one a job, workflow or heartbeat check made from Desk
+    /// was stamped with, unattended. Unset everywhere else, Slack included.
+    pub static CURRENT_DESK: workforce_common::channels::desk::DeskScope;
     /// Current agent ID — set during agent runs so tools (e.g., WASM skill
     /// tools) can identify which agent invoked them.
     pub static CURRENT_AGENT_ID: String;
@@ -464,6 +468,22 @@ pub fn current_progress_tx() -> Option<tokio::sync::mpsc::Sender<ProgressEvent>>
     CURRENT_PROGRESS_TX.try_with(|t| t.clone()).ok()
 }
 
+/// The Desk conversation the current run answers to, if it answers to one.
+pub fn current_desk() -> Option<workforce_common::channels::desk::DeskScope> {
+    CURRENT_DESK.try_with(Clone::clone).ok()
+}
+
+/// Run `fut` answering to `desk`, or as it is when there is none.
+pub async fn with_desk<F: std::future::Future>(
+    desk: Option<workforce_common::channels::desk::DeskScope>,
+    fut: F,
+) -> F::Output {
+    match desk {
+        Some(desk) => CURRENT_DESK.scope(desk, fut).await,
+        None => fut.await,
+    }
+}
+
 /// The approval ledger of the turn a tool runs in; `None` where nobody can
 /// answer a prompt.
 pub fn current_turn_approvals() -> Option<Arc<TurnApprovals>> {
@@ -755,6 +775,9 @@ pub struct SessionContext {
     /// The enclosing scope's [`ServedLog`], so a call made in the spawned
     /// task is billed on the record that scope writes.
     pub served: Option<ServedLog>,
+    /// [`CURRENT_DESK`], carried so a tool in the spawned task delivers to,
+    /// and is gated by, the Desk conversation the run answers to.
+    pub desk: Option<workforce_common::channels::desk::DeskScope>,
 }
 
 fn task_local_value(
@@ -803,6 +826,7 @@ impl SessionContext {
             last_user_comm: LAST_USER_COMM.try_with(Arc::clone).ok(),
             secret_policy: workforce_common::secret_policy::capture(),
             served: CURRENT_SERVED.try_with(ServedLog::clone).ok(),
+            desk: current_desk(),
         }
     }
 
@@ -828,6 +852,7 @@ impl SessionContext {
         let last_user_comm = self.last_user_comm;
         let secret_policy = self.secret_policy;
         let served = self.served;
+        let desk = self.desk;
         let layers: [(&'static tokio::task::LocalKey<String>, Option<String>, bool); 13] = [
             (&CURRENT_ARTIFACT_SCOPE, self.artifact_scope, false),
             (&CURRENT_AGENT_ID, self.agent_id, true),
@@ -887,6 +912,7 @@ impl SessionContext {
                 None => inner.await,
             }
         };
+        let inner = with_desk(desk, inner);
         match last_user_comm {
             Some(clock) => LAST_USER_COMM.scope(clock, inner).await,
             None => inner.await,
@@ -922,6 +948,7 @@ impl SessionContext {
         let artifact_store = self.artifact_store;
         let secret_policy = self.secret_policy;
         let served = self.served;
+        let desk = self.desk;
         let layers: [(&'static tokio::task::LocalKey<String>, Option<String>); 10] = [
             (&CURRENT_AGENT_ID, self.agent_id),
             (&CURRENT_CHANNEL_ID, self.channel_id),
@@ -952,6 +979,10 @@ impl SessionContext {
             move || workforce_common::secret_policy::sync_scope_if_present(secret_policy, outer);
         let outer = move || match served {
             Some(log) => CURRENT_SERVED.sync_scope(log, outer),
+            None => outer(),
+        };
+        let outer = move || match desk {
+            Some(desk) => CURRENT_DESK.sync_scope(desk, outer),
             None => outer(),
         };
         let outer = move || match artifact_store {
@@ -8105,6 +8136,17 @@ mod tests {
                 .into(),
             }),
             served: Some(ServedLog::default()),
+            // A reminder or a file made in the spawned tool task goes to the
+            // Desk conversation the turn answers to.
+            desk: Some(workforce_common::channels::desk::DeskScope {
+                target: workforce_common::channels::desk::DeskTarget {
+                    place: workforce_common::channels::desk::DeskPlace::Dm,
+                    channel: "desk".into(),
+                    device: None,
+                    spoken: false,
+                },
+                attended: true,
+            }),
         };
         let captured = Arc::new(std::sync::Mutex::new(SessionContext::default()));
         let c = Arc::clone(&captured);
@@ -8133,6 +8175,7 @@ mod tests {
         assert_eq!(after.voice_channel, original.voice_channel);
         assert_eq!(after.automated_origin, original.automated_origin);
         assert_eq!(after.billing_identity, original.billing_identity);
+        assert_eq!(after.desk, original.desk);
         after
             .served
             .expect("served log survives the spawn")

@@ -21,7 +21,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::warn;
 use workforce_agent::runner::{InjectedMessage, ProgressEvent, RunResult};
 use workforce_agent::tools::approval::SelfServe;
-use workforce_nats::chat::{TurnControl, TurnControlReply};
+use workforce_core::desk::DeskPlace;
+use workforce_nats::chat::{TurnControl, TurnControlReply, REFUSED_BUSY};
 
 use crate::serve::TurnInbox;
 
@@ -75,17 +76,25 @@ impl std::error::Error for TurnStopped {}
 pub enum Control {
     Cancel,
     Inject(InjectedMessage),
+    /// A person's follow-up, from the Desk place it names, if any.
+    FollowUp {
+        message: InjectedMessage,
+        place: Option<DeskPlace>,
+    },
 }
 
 impl From<TurnControl> for Control {
     fn from(control: TurnControl) -> Self {
         match control {
             TurnControl::Cancel => Self::Cancel,
-            TurnControl::FollowUp { text, user } => Self::Inject(InjectedMessage::UserMessage {
-                text,
-                user,
-                external_id: None,
-            }),
+            TurnControl::FollowUp { text, user, place } => Self::FollowUp {
+                message: InjectedMessage::UserMessage {
+                    text,
+                    user,
+                    external_id: None,
+                },
+                place,
+            },
             TurnControl::Approval {
                 request_id,
                 approved,
@@ -109,6 +118,9 @@ pub enum Applied {
     /// The stop was delivered but the turn had not settled within
     /// [`SETTLE_WAIT`].
     Unsettled,
+    /// A follow-up from another Desk place than the live turn's: it waits
+    /// for the turn to end rather than steering it.
+    Busy,
 }
 
 impl Applied {
@@ -134,6 +146,7 @@ struct Entry {
     settled: CancellationToken,
     answered: Arc<AtomicBool>,
     inject: mpsc::Sender<InjectedMessage>,
+    place: Option<DeskPlace>,
 }
 
 impl Entry {
@@ -142,6 +155,23 @@ impl Entry {
         match tokio::time::timeout(SETTLE_WAIT, self.settled.cancelled()).await {
             Ok(()) => Applied::Settled,
             Err(_) => Applied::Unsettled,
+        }
+    }
+
+    /// Hand `message` to the turn. A turn whose answer is already out is
+    /// wound up instead, so the message starts the next turn once this one
+    /// has saved.
+    async fn inject(&self, message: InjectedMessage) -> Applied {
+        if self.cancel.is_cancelled() {
+            return Applied::NotLive;
+        }
+        if self.answered.load(Ordering::Acquire) {
+            self.stop().await;
+            return Applied::NotLive;
+        }
+        match self.inject.try_send(message) {
+            Ok(()) => Applied::Injected,
+            Err(_) => Applied::NotLive,
         }
     }
 }
@@ -159,13 +189,15 @@ impl LiveTurns {
         })
     }
 
-    /// Register a turn for `session_id`, or refuse while one is live, with the
-    /// inbox the turn must run on. With `nats`, the turn also answers control
-    /// requests from other instances.
+    /// Register a turn for `session_id`, asked at the Desk `place` if it came
+    /// from Desk, or refuse while one is live, with the inbox the turn must
+    /// run on. With `nats`, the turn also answers control requests from other
+    /// instances.
     pub async fn begin(
         self: &Arc<Self>,
         session_id: &str,
         self_serve: SelfServe,
+        place: Option<DeskPlace>,
         nats: Option<async_nats::Client>,
     ) -> Result<(LiveTurn, TurnInbox), TurnBusy> {
         let (inject, rx) = mpsc::channel(INBOX_BUFFER);
@@ -175,6 +207,7 @@ impl LiveTurns {
             settled: CancellationToken::new(),
             answered: Arc::new(AtomicBool::new(false)),
             inject,
+            place,
         };
         {
             let mut turns = self.turns.lock();
@@ -195,24 +228,21 @@ impl LiveTurns {
     }
 
     /// Steer the live turn for `session_id`. A stop resolves once the turn has
-    /// settled. A message for a turn whose answer is already out is not
-    /// absorbed: the turn is wound up instead, so the message starts the next
-    /// turn once this one has saved.
+    /// settled. A follow-up from another Desk place than the turn's is
+    /// refused as [`Applied::Busy`], so two threads' asks never merge into
+    /// one turn.
     pub async fn apply(&self, session_id: &str, control: Control) -> Applied {
         let Some(entry) = self.turns.lock().get(session_id).cloned() else {
             return Applied::NotLive;
         };
         match control {
             Control::Cancel => entry.stop().await,
-            Control::Inject(_) if entry.cancel.is_cancelled() => Applied::NotLive,
-            Control::Inject(_) if entry.answered.load(Ordering::Acquire) => {
-                entry.stop().await;
-                Applied::NotLive
+            Control::FollowUp {
+                place: Some(place), ..
+            } if entry.place.as_ref().is_some_and(|live| live != &place) => Applied::Busy,
+            Control::FollowUp { message, .. } | Control::Inject(message) => {
+                entry.inject(message).await
             }
-            Control::Inject(message) => match entry.inject.try_send(message) {
-                Ok(()) => Applied::Injected,
-                Err(_) => Applied::NotLive,
-            },
         }
     }
 
@@ -405,8 +435,12 @@ async fn pump(
         };
         let (turns, nats, session_id) = (Arc::clone(&turns), nats.clone(), session_id.clone());
         tokio::spawn(async move {
-            let applied = turns.apply(&session_id, control.into()).await.applied();
-            match serde_json::to_vec(&TurnControlReply { applied }) {
+            let applied = turns.apply(&session_id, control.into()).await;
+            let reply = TurnControlReply {
+                applied: applied.applied(),
+                refused: (applied == Applied::Busy).then(|| REFUSED_BUSY.to_string()),
+            };
+            match serde_json::to_vec(&reply) {
                 Ok(payload) => {
                     if let Err(e) = nats.publish(reply_to, payload.into()).await {
                         warn!(session_id = %session_id, error = %e, "Replying to turn control failed");
@@ -436,7 +470,7 @@ mod tests {
 
     async fn begin(turns: &Arc<LiveTurns>, session_id: &str) -> (LiveTurn, TurnInbox) {
         turns
-            .begin(session_id, SelfServe::Unanswerable, None)
+            .begin(session_id, SelfServe::Unanswerable, None, None)
             .await
             .expect("no live turn yet")
     }
@@ -446,19 +480,22 @@ mod tests {
         let turns = LiveTurns::new("allan");
         let (mut first, _inbox) = begin(&turns, "s1").await;
         assert!(turns
-            .begin("s1", SelfServe::Answerable, None)
+            .begin("s1", SelfServe::Answerable, None, None)
             .await
             .is_err());
         first.alias("s2").await;
         assert!(
             turns
-                .begin("s2", SelfServe::Answerable, None)
+                .begin("s2", SelfServe::Answerable, None, None)
                 .await
                 .is_err(),
             "the rollover alias is live too"
         );
         drop(first);
-        assert!(turns.begin("s1", SelfServe::Answerable, None).await.is_ok());
+        assert!(turns
+            .begin("s1", SelfServe::Answerable, None, None)
+            .await
+            .is_ok());
     }
 
     #[tokio::test]
@@ -639,13 +676,75 @@ mod tests {
         assert!(matches!(
             Control::from(TurnControl::FollowUp {
                 text: "hi".into(),
-                user: "u1".into()
+                user: "u1".into(),
+                place: Some(DeskPlace::Dm),
             }),
-            Control::Inject(InjectedMessage::UserMessage {
-                external_id: None,
-                ..
-            })
+            Control::FollowUp {
+                message: InjectedMessage::UserMessage {
+                    external_id: None,
+                    ..
+                },
+                place: Some(DeskPlace::Dm),
+            }
         ));
+    }
+
+    fn follow_up_from(place: Option<DeskPlace>) -> Control {
+        Control::FollowUp {
+            message: InjectedMessage::UserMessage {
+                text: "and this".into(),
+                user: "u1".into(),
+                external_id: None,
+            },
+            place,
+        }
+    }
+
+    fn room_thread(thread: u128) -> DeskPlace {
+        DeskPlace::Room {
+            room: uuid::Uuid::from_u128(1),
+            name: "Planning".into(),
+            thread: Some(uuid::Uuid::from_u128(thread)),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_follow_up_from_another_place_is_refused_as_busy() {
+        let turns = LiveTurns::new("allan");
+        let (_turn, mut inbox) = turns
+            .begin("s1", SelfServe::Answerable, Some(room_thread(2)), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            turns
+                .apply("s1", follow_up_from(Some(room_thread(3))))
+                .await,
+            Applied::Busy
+        );
+        assert!(!Applied::Busy.applied());
+        assert!(inbox.rx.try_recv().is_err(), "nothing reached the turn");
+        assert_eq!(
+            turns
+                .apply("s1", follow_up_from(Some(room_thread(2))))
+                .await,
+            Applied::Injected
+        );
+        assert_eq!(
+            turns.apply("s1", follow_up_from(None)).await,
+            Applied::Injected,
+            "a surface that names no place steers as before"
+        );
+        assert!(inbox.rx.try_recv().is_ok() && inbox.rx.try_recv().is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_turn_from_no_place_takes_any_follow_up() {
+        let turns = LiveTurns::new("allan");
+        let (_turn, _inbox) = begin(&turns, "s1").await;
+        assert_eq!(
+            turns.apply("s1", follow_up_from(Some(DeskPlace::Dm))).await,
+            Applied::Injected
+        );
     }
 
     /// Against a real NATS server with the hub's streams in place:
@@ -675,7 +774,7 @@ mod tests {
         );
 
         let (turn, _inbox) = turns
-            .begin("s1", SelfServe::Unanswerable, Some(nats.clone()))
+            .begin("s1", SelfServe::Unanswerable, None, Some(nats.clone()))
             .await
             .unwrap();
         let stopping = tokio::spawn(request(&TurnControl::Cancel));
@@ -685,5 +784,29 @@ mod tests {
         let reply = stopping.await.unwrap().expect("the owner replies");
         let reply: TurnControlReply = serde_json::from_slice(&reply.payload).unwrap();
         assert!(reply.applied);
+
+        let (_turn, _inbox) = turns
+            .begin(
+                "s1",
+                SelfServe::Answerable,
+                Some(room_thread(2)),
+                Some(nats.clone()),
+            )
+            .await
+            .unwrap();
+        let elsewhere = TurnControl::FollowUp {
+            text: "and this".into(),
+            user: "u1".into(),
+            place: Some(room_thread(3)),
+        };
+        let reply = request(&elsewhere).await.expect("the owner replies");
+        let reply: TurnControlReply = serde_json::from_slice(&reply.payload).unwrap();
+        assert_eq!(
+            reply,
+            TurnControlReply {
+                applied: false,
+                refused: Some(REFUSED_BUSY.into())
+            }
+        );
     }
 }

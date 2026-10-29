@@ -528,6 +528,7 @@ pub trait TurnHost: Send + Sync {
         trust_level: Option<workforce_common::trust::TrustLevel>,
         cancel_token: Option<tokio_util::sync::CancellationToken>,
         voice_channel: Option<&str>,
+        desk: Option<&workforce_common::channels::desk::DeskTurnContext>,
     ) -> Result<MessageProgress>;
     #[allow(clippy::too_many_arguments)]
     async fn process_turn(

@@ -3,6 +3,11 @@
 use serde::Serialize;
 use workforce_gateway_client::protocol::Attachment;
 
+/// The frame a message of the DM the person didn't type goes out live as:
+/// `{"type": "user_message", "content", "session_id", "id", "author"}`, its
+/// `content` and `id` as the DM's history gives them.
+pub const USER_MESSAGE: &str = "user_message";
+
 /// A message broadcast to connected clients.
 #[derive(Debug, Clone, Serialize)]
 pub struct BroadcastMessage {
@@ -55,6 +60,10 @@ pub struct BroadcastMessage {
     /// Who said a `user_message`, carried through to `ServerMessage.author`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub author: Option<serde_json::Value>,
+    /// The Desk client's id for the turn this frame belongs to, carried
+    /// through to `ServerMessage.turn_ref` on Desk connections only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub turn_ref: Option<String>,
     /// Voice-bridge channel this message is addressed to. When set, the WS
     /// forwarder delivers ONLY to connections that registered the channel via
     /// `voice_listen` (and admit `target_identity`) — never to session
@@ -93,6 +102,7 @@ impl BroadcastMessage {
             desk: None,
             id: None,
             author: None,
+            turn_ref: None,
             target_channel: None,
             target_identity: None,
         }
@@ -158,6 +168,7 @@ impl BroadcastMessage {
             desk: None,
             id: None,
             author: None,
+            turn_ref: None,
             target_channel: None,
             target_identity: None,
         }

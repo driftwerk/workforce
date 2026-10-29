@@ -3680,7 +3680,8 @@ pub fn spawn_slack_dispatch_loop(
                                 Some(&workspace_id),
                                 session_trust_level,
                                 Some(cancel_token.clone()),
-                                None, // Slack turns are typed, never spoken
+                                None, // Slack turns are typed, never spoken,
+                                None,
                             )
                             .await;
 
@@ -11397,6 +11398,7 @@ async fn resume_in_session(
         .begin_live_turn(
             &session.id,
             workforce_agent::tools::approval::SelfServe::Unanswerable,
+            None,
         )
         .await?;
     let started = svc
@@ -11423,6 +11425,7 @@ async fn resume_in_session(
             None,
             None,
             Some(live.cancel_token()),
+            None,
             None,
         )
         .await;

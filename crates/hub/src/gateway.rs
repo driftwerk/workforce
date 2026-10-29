@@ -18,8 +18,9 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 use tracing::{info, warn};
 use workforce_agent::runner::ProgressEvent;
 use workforce_agent::tools::approval::SelfServe;
+use workforce_common::channels::desk::{DeskPlace, DeskTurn};
 use workforce_nats::chat::{
-    ChatProgress, NatsChatAttachment, NatsChatRequest, TurnControl, TurnControlReply,
+    ChatProgress, NatsChatAttachment, NatsChatRequest, TurnControl, TurnControlReply, REFUSED_BUSY,
 };
 use workforce_nats::envelope::Envelope;
 
@@ -35,6 +36,7 @@ use crate::def_write_auth::{
     authorize_def_write, may_read_def, resolve_visibility, run_as_write, write_visibility,
     DefWriteGrant, DefWriter, StoredShares,
 };
+use crate::hub_core::live_turns::Applied;
 use crate::hub_core::schedules::{
     JobPayload, Schedule, ScheduledJob, VISIBILITY_GLOBAL, VISIBILITY_PRIVATE,
 };
@@ -200,6 +202,9 @@ pub struct WsQuery {
     /// are taught the ones its agent also has on; a name this hub does not
     /// know is ignored.
     pub rich: Option<String>,
+    /// `1` declares a Desk client on a Desk channel: it sends structured
+    /// turns and reads the frames only Desk is sent. Ignored elsewhere.
+    pub desk: Option<u8>,
 }
 
 #[derive(serde::Deserialize)]
@@ -1173,6 +1178,8 @@ async fn ws_handler(
         Some(channel) => return invalid_ws_channel(channel),
     };
     let rich = workforce_common::rich::RichFeatures::from_names(query.rich.as_deref());
+    let declared =
+        query.desk == Some(1) && workforce_common::channels::is_desk_conversation(&anchor_channel);
     let token = query.token.unwrap_or_default();
 
     // Strategy 1 (admin token) removed — no identity context for per-user scoping.
@@ -1211,6 +1218,7 @@ async fn ws_handler(
                             state,
                             anchor_channel,
                             rich,
+                            declared,
                             agent_id,
                             device_id,
                             device_scopes,
@@ -1256,6 +1264,7 @@ async fn ws_handler(
                         state,
                         anchor_channel,
                         rich,
+                        declared,
                         agent_id,
                         claims.device_id,
                         scopes,
@@ -1330,6 +1339,230 @@ fn forward_admits(
         (Some(_), None) => false,
         (None, Some(owner)) => conn_owner == Some(owner),
         (None, None) => msg.session_id.is_empty() || conn_session == Some(msg.session_id.as_str()),
+    }
+}
+
+/// The feature a Desk connection is told it may use: structured turns.
+const DESK_PLACE: &str = "desk.place";
+
+/// Frames only a Desk connection is sent; any other connection is sent the
+/// frames it always was.
+const DESK_ONLY_FRAMES: &[&str] = &["turn_end", "turn_snapshot", "desk_delivered"];
+
+/// What a declared Desk connection is offered, on its `connected`.
+fn desk_features() -> Vec<String> {
+    vec![DESK_PLACE.to_string()]
+}
+
+/// The Desk turn a chat frame is: the one a declared Desk connection sent,
+/// checked against the channel it is anchored on, else the one an older
+/// Desk's message on a Desk channel implies. `None` off Desk. The refusal is
+/// what the client is told.
+fn desk_turn_of(
+    declared: bool,
+    sent: Option<DeskTurn>,
+    anchor_channel: &str,
+    turn_ref: Option<&str>,
+) -> Result<Option<DeskTurn>, String> {
+    if turn_ref
+        .is_some_and(|r| r.chars().count() > workforce_gateway_client::protocol::TURN_REF_MAX)
+    {
+        return Err(format!(
+            "turn_ref is longer than {} characters",
+            workforce_gateway_client::protocol::TURN_REF_MAX
+        ));
+    }
+    match sent.filter(|_| declared) {
+        Some(turn) => turn
+            .validated(anchor_channel)
+            .map(Some)
+            .map_err(|e| e.to_string()),
+        None => Ok(DeskTurn::legacy(anchor_channel)),
+    }
+}
+
+/// The frame a connection is sent for `msg`. A connection that did not
+/// declare itself Desk's (iOS, the web UI, an old Desk) gets exactly the
+/// frame it always did: no turn ref, no reply id, and none of Desk's own
+/// frames.
+fn server_frame(msg: BroadcastMessage, declared: bool) -> Option<ServerMessage> {
+    if !declared && DESK_ONLY_FRAMES.contains(&msg.msg_type.as_str()) {
+        return None;
+    }
+    let id = msg
+        .id
+        .filter(|_| declared || msg.msg_type == crate::broadcast::USER_MESSAGE);
+    Some(ServerMessage {
+        content: Some(msg.content),
+        session_id: (!msg.session_id.is_empty()).then_some(msg.session_id),
+        error: None,
+        agent_id: msg.agent_id,
+        context_tokens: msg.context_tokens,
+        context_max: msg.context_max,
+        team_id: None,
+        sender_role: None,
+        next_speaker: None,
+        speakable: msg.speakable,
+        token_match: None,
+        request_id: msg.request_id,
+        tool_name: msg.tool_name,
+        prompt_options: msg.prompt_options,
+        attachments: msg.attachments,
+        code_citations: msg.code_citations,
+        connect_prompt: msg.connect_prompt,
+        route: msg.route,
+        desk: msg.desk,
+        id,
+        author: msg.author,
+        features: None,
+        turn_ref: msg.turn_ref.filter(|_| declared),
+        msg_type: msg.msg_type,
+    })
+}
+
+#[cfg(test)]
+mod desk_frame_tests {
+    use super::*;
+
+    fn stamped(msg: BroadcastMessage) -> BroadcastMessage {
+        BroadcastMessage {
+            turn_ref: Some("ref-1".into()),
+            id: Some("reply-1".into()),
+            ..msg
+        }
+    }
+
+    fn sent(msg: BroadcastMessage, declared: bool) -> Option<String> {
+        server_frame(msg, declared).map(|frame| serde_json::to_string(&frame).unwrap())
+    }
+
+    /// What iOS, the web UI and an old Desk were sent before Desk had frames
+    /// of its own, byte for byte, whatever a turn now carries for Desk.
+    #[test]
+    fn an_undeclared_connection_is_sent_exactly_what_it_always_was() {
+        let prompt = BroadcastMessage::permission_prompt(
+            "s1",
+            "scout",
+            "r1",
+            "slack.send",
+            "Post to a channel",
+            workforce_core::policy::PermissionPromptOptions::ask(true),
+        );
+        let image = BroadcastMessage::image(
+            "s1",
+            Some("scout".into()),
+            Some("a chart".into()),
+            vec![Attachment {
+                filename: "c.png".into(),
+                mime_type: "image/png".into(),
+                data: "iVBO".into(),
+                artifact_id: None,
+            }],
+        );
+        let user_message = BroadcastMessage {
+            id: Some("m1".into()),
+            author: Some(serde_json::json!({"kind": "you", "id": "you", "name": "You"})),
+            ..BroadcastMessage::new("s1", crate::broadcast::USER_MESSAGE, "hi")
+        };
+        let golden = [
+            (
+                BroadcastMessage::silent("s1", "stream_start", ""),
+                r#"{"type":"stream_start","content":"","session_id":"s1","speakable":false}"#,
+            ),
+            (
+                BroadcastMessage::new("s1", "stream_delta", "Hel"),
+                r#"{"type":"stream_delta","content":"Hel","session_id":"s1"}"#,
+            ),
+            (
+                BroadcastMessage::silent("s1", "stream_end", ""),
+                r#"{"type":"stream_end","content":"","session_id":"s1","speakable":false}"#,
+            ),
+            (
+                BroadcastMessage::new("s1", "message", "Done."),
+                r#"{"type":"message","content":"Done.","session_id":"s1"}"#,
+            ),
+            (
+                BroadcastMessage::silent("s1", "typing", ""),
+                r#"{"type":"typing","content":"","session_id":"s1","speakable":false}"#,
+            ),
+            (
+                prompt,
+                r#"{"type":"permission_prompt","content":"Post to a channel","session_id":"s1","agent_id":"scout","speakable":false,"request_id":"r1","tool_name":"slack.send","prompt_options":{"allow_once":true,"deny_once":true,"allow_always":true,"deny_always":true}}"#,
+            ),
+            (
+                image,
+                r#"{"type":"image","content":"a chart","session_id":"s1","agent_id":"scout","speakable":false,"attachments":[{"filename":"c.png","mime_type":"image/png","data":"iVBO"}]}"#,
+            ),
+            (
+                BroadcastMessage::new("", "pong", ""),
+                r#"{"type":"pong","content":"","session_id":null}"#,
+            ),
+        ];
+        for (msg, expected) in golden {
+            assert_eq!(sent(stamped(msg), false).as_deref(), Some(expected));
+        }
+        assert_eq!(
+            sent(user_message, false).as_deref(),
+            Some(
+                r#"{"type":"user_message","content":"hi","session_id":"s1","id":"m1","author":{"id":"you","kind":"you","name":"You"}}"#
+            ),
+            "a DM's user_message keeps its id"
+        );
+        for desk_only in DESK_ONLY_FRAMES {
+            assert_eq!(
+                sent(BroadcastMessage::new("s1", *desk_only, ""), false),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn a_desk_connection_is_sent_the_turn_ref_and_reply_id() {
+        let frame = server_frame(
+            stamped(BroadcastMessage::new("s1", "stream_delta", "Hel")),
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            (frame.turn_ref.as_deref(), frame.id.as_deref()),
+            (Some("ref-1"), Some("reply-1"))
+        );
+        assert!(server_frame(BroadcastMessage::new("s1", "turn_end", ""), true).is_some());
+    }
+
+    #[test]
+    fn a_desk_connection_s_turn_is_checked_or_inferred() {
+        let room = format!("desk:{}", uuid::Uuid::from_u128(5));
+        let sent = DeskTurn {
+            place: DeskPlace::Dm,
+            ..DeskTurn::legacy("desk").unwrap()
+        };
+        assert_eq!(
+            desk_turn_of(true, Some(sent.clone()), "desk", Some("ref-1")),
+            Ok(Some(sent.clone()))
+        );
+        assert_eq!(
+            desk_turn_of(true, Some(sent.clone()), &room, None),
+            Err("the turn's place is not this conversation's".into())
+        );
+        assert_eq!(
+            desk_turn_of(false, Some(sent), &room, None),
+            Ok(DeskTurn::legacy(&room)),
+            "an undeclared connection's turn is inferred from its channel"
+        );
+        assert_eq!(desk_turn_of(false, None, "ios", None), Ok(None));
+        assert!(desk_turn_of(true, None, "desk", Some(&"r".repeat(65))).is_err());
+    }
+
+    #[test]
+    fn a_busy_reply_from_the_owning_instance_reads_as_busy() {
+        let reply = |applied, refused: Option<&str>| TurnControlReply {
+            applied,
+            refused: refused.map(str::to_string),
+        };
+        assert_eq!(applied_by(&reply(true, None)), Applied::Injected);
+        assert_eq!(applied_by(&reply(false, Some(REFUSED_BUSY))), Applied::Busy);
+        assert_eq!(applied_by(&reply(false, None)), Applied::NotLive);
     }
 }
 
@@ -1502,6 +1735,7 @@ async fn handle_ws(
     state: Arc<GatewayState>,
     anchor_channel: String,
     rich: workforce_common::rich::RichFeatures,
+    declared: bool,
     agent_id: Option<String>,
     device_id: Option<String>,
     device_scopes: Option<Vec<String>>,
@@ -1576,6 +1810,8 @@ async fn handle_ws(
         desk: None,
         id: None,
         author: None,
+        features: declared.then(desk_features),
+        turn_ref: None,
     };
     let _ = sender
         .send(Message::Text(
@@ -1607,33 +1843,8 @@ async fn handle_ws(
                 continue;
             }
 
-            let server_msg = ServerMessage {
-                msg_type: msg.msg_type,
-                content: Some(msg.content),
-                session_id: if msg.session_id.is_empty() {
-                    None
-                } else {
-                    Some(msg.session_id)
-                },
-                error: None,
-                agent_id: msg.agent_id,
-                context_tokens: msg.context_tokens,
-                context_max: msg.context_max,
-                team_id: None,
-                sender_role: None,
-                next_speaker: None,
-                speakable: msg.speakable,
-                token_match: None,
-                request_id: msg.request_id,
-                tool_name: msg.tool_name,
-                prompt_options: msg.prompt_options,
-                attachments: msg.attachments,
-                code_citations: msg.code_citations,
-                connect_prompt: msg.connect_prompt,
-                route: msg.route,
-                desk: msg.desk,
-                id: msg.id,
-                author: msg.author,
+            let Some(server_msg) = server_frame(msg, declared) else {
+                continue;
             };
             if sender
                 .send(Message::Text(
@@ -1697,6 +1908,24 @@ async fn handle_ws(
                                     continue;
                                 }
                             }
+                            let turn_ref = client_msg.turn_ref.clone();
+                            let desk_turn = match desk_turn_of(
+                                declared,
+                                client_msg.desk,
+                                &anchor_channel,
+                                turn_ref.as_deref(),
+                            ) {
+                                Ok(turn) => turn,
+                                Err(refusal) => {
+                                    let session =
+                                        conn_session_recv.lock().await.clone().unwrap_or_default();
+                                    let _ = broadcast_tx.send(BroadcastMessage {
+                                        turn_ref,
+                                        ..BroadcastMessage::new(session, "error", refusal)
+                                    });
+                                    continue;
+                                }
+                            };
                             let raw_content = client_msg.content.unwrap_or_default();
                             // Channel is metadata for downstream tooling only —
                             // session lookup uses session_id, not channel.
@@ -1726,20 +1955,27 @@ async fn handle_ws(
                                     ws_role,
                                 );
                                 tracing::info!(target: "sentinel", trust = %trust, source = "gateway", "Trust classified");
-                                if trust < TrustLevel::Owner {
-                                    let scan = workforce_agent::security::external_content::scan_for_injection(&raw_content);
-                                    if scan.suspicious {
-                                        tracing::warn!(
-                                            channel = %channel,
-                                            score = scan.score,
-                                            hostile = scan.hostile,
-                                            "Suspicious patterns in gateway message"
-                                        );
-                                    }
-                                }
                                 gateway_trust = Some(trust);
                                 raw_content.clone()
                             };
+                            let gateway_trust = crate::desk_surface::hand_off_trust(
+                                desk_turn.as_ref(),
+                                gateway_trust,
+                            );
+                            if gateway_trust.is_some_and(|trust| trust < TrustLevel::Owner) {
+                                let scan =
+                                    workforce_agent::security::external_content::scan_for_injection(
+                                        &raw_content,
+                                    );
+                                if scan.suspicious {
+                                    tracing::warn!(
+                                        channel = %channel,
+                                        score = scan.score,
+                                        hostile = scan.hostile,
+                                        "Suspicious patterns in gateway message"
+                                    );
+                                }
+                            }
 
                             let (content, _captured_gateway_secrets) =
                                 workforce_common::redact::tokenize_secrets(
@@ -1923,7 +2159,18 @@ async fn handle_ws(
                             // "this message was spoken". Model selection keys on
                             // that one, so typing after speaking drops back off
                             // `[llm] voice_model`.
-                            let voice_turn = client_msg.voice_mode.unwrap_or(false);
+                            let voice_turn = client_msg.voice_mode.unwrap_or(false)
+                                || desk_turn.as_ref().is_some_and(|turn| turn.spoken);
+                            let desk = desk_turn.map(|turn| {
+                                workforce_common::channels::desk::DeskTurnContext::new(
+                                    turn,
+                                    &anchor_channel,
+                                    ws_device_id.as_deref(),
+                                    voice_turn,
+                                    turn_ref.clone(),
+                                    uuid::Uuid::new_v4().to_string(),
+                                )
+                            });
                             // Which voice BRIDGE (if any) this turn was spoken
                             // on, decided here and carried with the turn. The
                             // session cannot answer it: one WebSocket anchor
@@ -1983,21 +2230,39 @@ async fn handle_ws(
                             // A follow-up joins the live turn, wherever it runs.
                             // Attachments never do: an injected message is
                             // text-only, so absorbing one would drop its files.
-                            if !has_attachments
-                                && steer(
+                            // One from another Desk place waits for the live
+                            // turn instead, and the client queues it.
+                            if !has_attachments {
+                                let steered = steer(
                                     nats.as_ref(),
                                     &service,
                                     &effective_session_id,
-                                    followup_injection(&content, session_owner),
+                                    followup_injection(
+                                        &content,
+                                        session_owner,
+                                        desk.as_ref().map(|d| d.turn.place.clone()),
+                                    ),
                                 )
-                                .await
-                            {
-                                let _ = broadcast_tx.send(BroadcastMessage::new(
-                                    effective_session_id.clone(),
-                                    "injected",
-                                    "Follow-up absorbed into active run".to_string(),
-                                ));
-                                continue;
+                                .await;
+                                if steered == Applied::Busy {
+                                    let _ = broadcast_tx.send(BroadcastMessage {
+                                        turn_ref: turn_ref.clone(),
+                                        ..BroadcastMessage::new(
+                                            effective_session_id.clone(),
+                                            "error",
+                                            REFUSED_BUSY,
+                                        )
+                                    });
+                                    continue;
+                                }
+                                if steered.applied() {
+                                    let _ = broadcast_tx.send(BroadcastMessage::new(
+                                        effective_session_id.clone(),
+                                        "injected",
+                                        "Follow-up absorbed into active run".to_string(),
+                                    ));
+                                    continue;
+                                }
                             }
 
                             // A `typing` opens a model call on clients, so a
@@ -2053,6 +2318,7 @@ async fn handle_ws(
                                     attachments: nats_attachments,
                                     voice_channel: voice_channel.clone(),
                                     answers_approvals,
+                                    desk: desk.clone(),
                                 };
                                 let envelope = Envelope::new(&chat_subject, "gateway", request);
 
@@ -2130,6 +2396,7 @@ async fn handle_ws(
                                     .begin_live_turn(
                                         &effective_session_id,
                                         SelfServe::answerable_if(answers_approvals),
+                                        desk.as_ref().map(|d| d.turn.place.clone()),
                                     )
                                     .await
                                 {
@@ -2176,6 +2443,7 @@ async fn handle_ws(
                                         gateway_trust,
                                         Some(live.cancel_token()),
                                         voice_channel.as_deref(),
+                                        desk.as_ref(),
                                     )
                                     .await
                                 {
@@ -2297,8 +2565,9 @@ async fn handle_ws(
                             // inline, so that message is read only once the
                             // turn has settled.
                             state.progress_forwarders.stop(sid);
-                            let settled =
-                                steer(nats.as_ref(), &service, sid, TurnControl::Cancel).await;
+                            let settled = steer(nats.as_ref(), &service, sid, TurnControl::Cancel)
+                                .await
+                                .applied();
                             info!(session_id = %sid, settled, "Cancelling active turn");
                         }
                         "node_invoke_result" => {
@@ -2358,7 +2627,7 @@ async fn handle_ws(
                                 user: owner,
                                 choice: Some(choice),
                             };
-                            if !steer(nats.as_ref(), &service, &sid, answer).await {
+                            if !steer(nats.as_ref(), &service, &sid, answer).await.applied() {
                                 warn!(
                                     session_id = %sid,
                                     request_id = %request_id,
@@ -2762,14 +3031,10 @@ pub(crate) async fn steer(
     service: &AgentService,
     session_id: &str,
     control: TurnControl,
-) -> bool {
+) -> Applied {
     match nats {
         Some(nats) => control_turn(nats, service.agent_id.as_str(), session_id, &control).await,
-        None => service
-            .live_turns
-            .apply(session_id, control.into())
-            .await
-            .applied(),
+        None => service.live_turns.apply(session_id, control.into()).await,
     }
 }
 
@@ -2798,13 +3063,13 @@ async fn control_turn(
     agent_id: &str,
     session_id: &str,
     control: &TurnControl,
-) -> bool {
+) -> Applied {
     let subject = workforce_nats::subjects::turn_control(agent_id, session_id);
     let payload = match serde_json::to_vec(control) {
         Ok(payload) => payload,
         Err(e) => {
             warn!(error = %e, "Encoding turn control failed");
-            return false;
+            return Applied::NotLive;
         }
     };
     let request = async_nats::Request::new()
@@ -2812,18 +3077,27 @@ async fn control_turn(
         .timeout(Some(CONTROL_WAIT));
     match nats.send_request(subject, request).await {
         Ok(reply) => serde_json::from_slice::<TurnControlReply>(&reply.payload)
-            .is_ok_and(|reply| reply.applied),
-        Err(e) if e.kind() == async_nats::RequestErrorKind::NoResponders => false,
+            .map_or(Applied::NotLive, |reply| applied_by(&reply)),
+        Err(e) if e.kind() == async_nats::RequestErrorKind::NoResponders => Applied::NotLive,
         Err(e) => {
             warn!(session_id, error = %e, "Turn control request failed");
-            false
+            Applied::NotLive
         }
     }
 }
 
+/// What the owning instance's reply says became of a control.
+fn applied_by(reply: &TurnControlReply) -> Applied {
+    match (reply.applied, reply.refused.as_deref()) {
+        (true, _) => Applied::Injected,
+        (false, Some(REFUSED_BUSY)) => Applied::Busy,
+        (false, _) => Applied::NotLive,
+    }
+}
+
 /// A chat message offered to a live turn: an `approve <id>` / `reject <id>`
-/// answers one of its prompts, anything else is a follow-up.
-fn followup_injection(content: &str, user: &str) -> TurnControl {
+/// answers one of its prompts, anything else is a follow-up from `place`.
+fn followup_injection(content: &str, user: &str, place: Option<DeskPlace>) -> TurnControl {
     let trimmed = content.trim();
     let lowered = trimmed.to_lowercase();
     let verdict = [("approve ", true), ("reject ", false)]
@@ -2843,6 +3117,7 @@ fn followup_injection(content: &str, user: &str) -> TurnControl {
         None => TurnControl::FollowUp {
             text: content.to_string(),
             user: user.to_string(),
+            place,
         },
     }
 }
@@ -14066,6 +14341,7 @@ mod session_visibility_tests {
             agent_id: None,
             channel: None,
             rich: None,
+            desk: None,
         });
         chat_handler(
             headers.clone(),
@@ -15718,7 +15994,7 @@ mod turn_control_tests {
     #[test]
     fn followup_injection_answers_prompts_and_forwards_everything_else() {
         assert_eq!(
-            followup_injection("  Approve req-1 ", "u1"),
+            followup_injection("  Approve req-1 ", "u1", None),
             TurnControl::Approval {
                 request_id: "req-1".into(),
                 approved: true,
@@ -15727,22 +16003,24 @@ mod turn_control_tests {
             }
         );
         assert!(matches!(
-            followup_injection("reject req-2", "u1"),
+            followup_injection("reject req-2", "u1", None),
             TurnControl::Approval { approved: false, request_id, .. } if request_id == "req-2"
         ));
         assert_eq!(
-            followup_injection("approve ", "u1"),
+            followup_injection("approve ", "u1", None),
             TurnControl::FollowUp {
                 text: "approve ".into(),
                 user: "u1".into(),
+                place: None,
             },
             "no request id is a plain follow-up"
         );
         assert_eq!(
-            followup_injection("approved, ship it", "u1"),
+            followup_injection("approved, ship it", "u1", Some(DeskPlace::Dm)),
             TurnControl::FollowUp {
                 text: "approved, ship it".into(),
                 user: "u1".into(),
+                place: Some(DeskPlace::Dm),
             }
         );
     }

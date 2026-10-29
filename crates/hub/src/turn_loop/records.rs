@@ -219,10 +219,24 @@ pub(crate) fn observe_system_prefix(session: &mut Session, stable: &str) -> bool
 /// ingress (which tokenizes), assistant output is masked — a model echo
 /// of a credential must not become a cache-backed marker the agent could
 /// later resolve back to cleartext at a sink.
-pub(crate) fn add_redacted_assistant_message(session: &mut Session, response: &str) {
+pub(crate) fn add_redacted_assistant_message(
+    session: &mut Session,
+    response: &str,
+    desk: Option<&workforce_common::channels::desk::DeskTurnContext>,
+) {
     let masked = workforce_common::redact::redact_secrets(response);
     let tokens = estimate_tokens(&masked);
-    session.add_assistant_message(&masked, tokens);
+    match desk {
+        Some(desk) => {
+            session.add_assistant_message_with_id(desk.reply_id.clone(), &masked, tokens);
+            if let Some(reply) = session.messages.last_mut() {
+                reply.desk = Some(desk.turn.place.mark());
+            }
+        }
+        None => {
+            session.add_assistant_message(&masked, tokens);
+        }
+    }
 }
 
 /// Save a served turn's answer in `session` and keep what its route leaves
@@ -235,8 +249,9 @@ pub(crate) fn settle_served(
     result: &RunResult,
     route: crate::agent_turn::RouteTag,
     reserved: workforce_common::session::ReservedContext,
+    desk: Option<&workforce_common::channels::desk::DeskTurnContext>,
 ) -> Option<&'static str> {
-    add_redacted_assistant_message(session, &result.response);
+    add_redacted_assistant_message(session, &result.response, desk);
     if !route.is_cli() {
         record_observed_usage(session, result, reserved);
     }

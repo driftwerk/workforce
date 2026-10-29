@@ -576,6 +576,7 @@ fn assistant_message_is_masked_at_rest() {
             "your key is ghp_AB",
             "CDEFGHIJKLMNOPQRSTUVWXYZabcdefghij1234 — keep it safe"
         ),
+        None,
     );
     let stored = &session.messages.last().expect("message stored").content;
     assert!(!stored.contains("ABCDEFGHIJKLMNOPQRSTUVWXYZ"));
@@ -1041,4 +1042,25 @@ fn inject_intro_skipped_when_channel_id_missing() {
         None,
         Some("1234.5678"),
     ));
+}
+
+/// Slack's block, byte for byte as the turn loop wrote it before Desk had
+/// one of its own.
+#[test]
+fn the_slack_messaging_context_is_unchanged() {
+    use super::surface::{surface_context, TurnSurface};
+    let in_thread = TurnSurface::of(Some("C123"), Some("1700.1"), None);
+    assert_eq!(
+        format!(
+            "{}\n\nwhat is up?",
+            surface_context(&in_thread, "slack:W1:C123:1700.1", "sess-1", "U42", None).unwrap()
+        ),
+        "[MESSAGING CONTEXT — use these values when calling messaging tools]\nchannel: C123\nsession_channel: slack:W1:C123:1700.1\nthread_id: 1700.1\nsession_id: sess-1\nuser: U42\n\nwhat is up?"
+    );
+    let top_level = TurnSurface::of(Some("C123"), None, None);
+    assert_eq!(
+        surface_context(&top_level, "slack:W1:C123:1700.1", "sess-1", "U42", None).unwrap(),
+        "[MESSAGING CONTEXT — use these values when calling messaging tools]\nchannel: C123\nsession_channel: slack:W1:C123:1700.1\nsession_id: sess-1\nuser: U42"
+    );
+    assert!(surface_context(&TurnSurface::of(None, None, None), "ios", "s", "u", None).is_none());
 }

@@ -239,6 +239,46 @@ pub async fn agent_service(data_dir: &std::path::Path) -> Arc<AgentService> {
         .expect("test service")
 }
 
+/// An agent service on a fresh data directory whose model is the returned
+/// mock: it streams `done` to every turn and records what it was asked.
+pub async fn agent_on_mock_llm(
+    data_dir: &std::path::Path,
+) -> (Arc<AgentService>, wiremock::MockServer) {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let chunk = |body: serde_json::Value| format!("data: {body}\n\n");
+    let sse = [
+        chunk(serde_json::json!({"id": "c1", "object": "chat.completion.chunk", "model": "mock",
+            "choices": [{"index": 0, "delta": {"role": "assistant", "content": "done"}, "finish_reason": null}]})),
+        chunk(serde_json::json!({"id": "c1", "object": "chat.completion.chunk", "model": "mock",
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}})),
+        "data: [DONE]\n\n".to_string(),
+    ]
+    .concat();
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(sse),
+        )
+        .mount(&server)
+        .await;
+    let mut config = workforce_common::settings::WorkforceConfig::default();
+    config.hub.data_dir = data_dir.to_string_lossy().to_string();
+    config.memory.db_path = data_dir.join("memory.db").to_string_lossy().into_owned();
+    config.llm.provider = "ollama".into();
+    config.llm.api_key = Some(server.uri());
+    config.llm.default_model = "mock".into();
+    let service = AgentService::from_config(config, None)
+        .await
+        .expect("test service");
+    (service, server)
+}
+
 /// Send `request` to `app`; the status, headers and body as text.
 pub async fn send(
     app: axum::Router,

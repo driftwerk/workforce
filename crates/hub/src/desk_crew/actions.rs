@@ -586,14 +586,7 @@ impl CrewHub {
     /// What the agents call the person `owner`: their name, when the hub
     /// knows them by one.
     pub(super) fn person_name(&self, owner: &str) -> String {
-        Uuid::parse_str(owner)
-            .ok()
-            .and_then(|id| {
-                let store = self.state.identity_store.as_ref()?;
-                store.get_by_id(id).ok().flatten()
-            })
-            .map(|person| person.display_name.trim().to_string())
-            .filter(|name| !name.is_empty())
+        crate::desk_surface::person_name(self.state.identity_store.as_ref(), owner)
             .unwrap_or_else(|| "The person you work for".into())
     }
 
