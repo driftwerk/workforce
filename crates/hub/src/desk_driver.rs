@@ -43,6 +43,11 @@ use crate::vault::Vault;
 /// The hub's one desk, once `[desk]` has started it.
 static DESK: OnceLock<Desk> = OnceLock::new();
 
+/// The hub's desk, once `[desk]` has started it.
+pub fn desk() -> Option<&'static Desk> {
+    DESK.get()
+}
+
 /// Gives `service` the `desk.*` tools when desk sessions are on. Called for
 /// every agent at boot and for agents spawned later.
 pub fn register_tools(service: &AgentService) {
@@ -474,6 +479,10 @@ pub async fn mount(
     config: &WorkforceConfig,
     cancel: CancellationToken,
 ) -> Result<Router> {
+    let app = app.merge(crate::desk_floor::router(
+        Arc::clone(state),
+        crate::desk_floor::Sources::installed(),
+    ));
     if !config.desk.enabled {
         return Ok(app);
     }

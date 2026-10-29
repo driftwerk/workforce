@@ -20,11 +20,35 @@ const BACKLOG: usize = 1024;
 /// How often a full backlog is reported.
 const DROP_WARN_EVERY: Duration = Duration::from_secs(60);
 
-static TURNS: OnceLock<Arc<dyn TurnLog>> = OnceLock::new();
+static INSTALLED: OnceLock<Installed> = OnceLock::new();
 
-/// The installed log, once [`install`] opened it.
+/// The floor's store as the hub runs it: the log written through its one
+/// writer, and the store it reads from.
+#[derive(Clone)]
+pub struct Installed {
+    pub log: Arc<dyn TurnLog>,
+    pub store: Arc<PgFloorStore>,
+}
+
+impl Installed {
+    /// Starts the writer over `store`.
+    pub fn open(store: PgFloorStore) -> Self {
+        let store = Arc::new(store);
+        Self {
+            log: Arc::new(Logged::start(Arc::clone(&store))),
+            store,
+        }
+    }
+}
+
+/// The installed store, once [`install`] opened it.
+pub fn installed() -> Option<&'static Installed> {
+    INSTALLED.get()
+}
+
+/// The installed log.
 pub fn turns() -> Option<&'static Arc<dyn TurnLog>> {
-    TURNS.get()
+    installed().map(|i| &i.log)
 }
 
 pub(super) async fn install(config: &WorkforceConfig) {
@@ -36,9 +60,9 @@ pub(super) async fn install(config: &WorkforceConfig) {
             };
             match PgFloorStore::new(pg).await {
                 Ok(store) => {
-                    let store = Arc::new(store);
-                    let _ = TURNS.set(Arc::new(Logged::start(Arc::clone(&store))));
-                    tokio::spawn(prune_forever(store));
+                    let installed = Installed::open(store);
+                    tokio::spawn(prune_forever(Arc::clone(&installed.store)));
+                    let _ = INSTALLED.set(installed);
                 }
                 Err(e) => warn!(
                     target: "floor",
@@ -52,14 +76,14 @@ pub(super) async fn install(config: &WorkforceConfig) {
 
 /// The log as the hub writes it: every op through one writer, in order.
 /// A turn's correctness never waits on it; a full backlog drops the op.
-pub(crate) struct Logged {
+struct Logged {
     tx: mpsc::Sender<TurnOp>,
     store: Arc<PgFloorStore>,
     warned: Mutex<Option<Instant>>,
 }
 
 impl Logged {
-    pub(crate) fn start(store: Arc<PgFloorStore>) -> Self {
+    fn start(store: Arc<PgFloorStore>) -> Self {
         let (tx, mut rx) = mpsc::channel::<TurnOp>(BACKLOG);
         let writer = Arc::clone(&store);
         tokio::spawn(async move {

@@ -58,7 +58,11 @@ async fn activity(State(s): S, h: HeaderMap, Query(q): Query<ActivityQuery>) -> 
     }
     let limit = q.limit.unwrap_or(100).clamp(1, 500);
     let before = q.before.as_deref().filter(|b| !b.trim().is_empty());
-    match s.desk.activity(q.filter, before, limit).await {
+    let page = match q.filter {
+        Filter::NeedsYou => s.desk.needs_you(&*s.crew, before, limit).await,
+        filter => s.desk.activity(filter, before, limit).await,
+    };
+    match page {
         Ok(page) => Json(page).into_response(),
         Err(e) => failed(e),
     }

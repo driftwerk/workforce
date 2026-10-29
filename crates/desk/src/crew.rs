@@ -7,11 +7,11 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::floor::Outcome;
+use crate::floor::{Need, Outcome};
 use crate::model::{Engine, Origin, SessionState, SessionView};
 
 /// Who or what an event is by or about.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PartyKind {
     Agent,
@@ -477,6 +477,11 @@ pub trait Crew: Send + Sync {
     /// Does what `suggestion` proposed, as you; what went wrong in plain
     /// words.
     async fn accept(&self, suggestion: &Suggestion) -> Result<(), String>;
+    /// What still needs the person, from the floor; `None` where the hub
+    /// keeps none.
+    async fn open_needs(&self) -> Option<Vec<Need>> {
+        None
+    }
 }
 
 // ── Words ────────────────────────────────────────────────────────────────

@@ -64,3 +64,7 @@ mod ws_routes;
 
 #[path = "api/node_routes.rs"]
 mod node_routes;
+
+#[cfg(feature = "postgres")]
+#[path = "api/desk_floor_routes.rs"]
+mod desk_floor_routes;

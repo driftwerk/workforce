@@ -718,13 +718,24 @@ impl Desk {
     /// Applies `f` to a session's record (and its live part, if running),
     /// then persists and announces the result.
     fn change(&self, id: Uuid, f: impl FnOnce(&mut SessionRecord, Option<&mut Live>)) {
+        self.change_since(None, id, f);
+    }
+
+    /// [`Self::change`], reading the change from `seen` when the session's
+    /// live part already moved on from it.
+    fn change_since(
+        &self,
+        seen: Option<SessionView>,
+        id: Uuid,
+        f: impl FnOnce(&mut SessionRecord, Option<&mut Live>),
+    ) {
         let (before, r) = {
             let mut guard = self.0.state.lock();
             let st = &mut *guard;
             let Some(old) = st.records.get(&id) else {
                 return;
             };
-            let before = Self::view_of(st, old);
+            let before = seen.unwrap_or_else(|| Self::view_of(st, old));
             let r = st.records.get_mut(&id).expect("just read");
             f(r, st.live.get_mut(&id));
             r.updated_at = Utc::now();
@@ -1076,9 +1087,10 @@ impl Desk {
             .live
             .get(&id)
             .and_then(|l| l.pending.clone());
-        let answer = {
+        let (answer, seen) = {
             let mut guard = self.0.state.lock();
             let st = &mut *guard;
+            let seen = st.records.get(&id).map(|r| Self::view_of(st, r));
             let live = st
                 .live
                 .get_mut(&id)
@@ -1103,14 +1115,14 @@ impl Desk {
                     st.decided.insert(approval);
                 }
             }
-            answer
+            (answer, seen)
         };
         let _ = answer.send(match decision {
             Decision::Allow => claude::allow(),
             Decision::Deny => claude::deny(),
             Decision::Terminal => claude::ask_in_terminal(),
         });
-        self.change(id, |r, l| {
+        self.change_since(seen, id, |r, l| {
             if l.is_some_and(|l| l.pending.is_none()) {
                 r.state = SessionState::Working;
             }

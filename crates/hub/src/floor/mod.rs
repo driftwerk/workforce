@@ -12,7 +12,7 @@ mod log;
 pub mod postgres;
 
 #[cfg(feature = "postgres")]
-pub use log::turns;
+pub use log::{installed, turns, Installed};
 
 /// What the desk reports to: the installed log.
 #[cfg(feature = "postgres")]
