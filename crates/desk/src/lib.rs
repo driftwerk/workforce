@@ -4,6 +4,7 @@
 
 mod adopt;
 pub mod api;
+pub mod attachments;
 mod claude;
 mod codex;
 pub mod conversations;
