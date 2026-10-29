@@ -1573,26 +1573,19 @@ pub async fn dispatch(
 
 // ─── Tool ──────────────────────────────────────────────────────────────────
 
-/// The `advisor` tool exposed to the calling agent.
+/// The `advisor` tool exposed to the calling agent. Each call runs as the
+/// agent's `[advisor]` says at that moment, so a change to its own config
+/// (on or off, effort, how many lenses) takes effect without a restart.
 pub struct AdvisorTool {
     service: Arc<AgentService>,
-    config: AdvisorConfig,
     registry: crate::hosts::RegistryCell,
 }
 
 impl AdvisorTool {
     pub const NAME: &'static str = "advisor";
 
-    pub fn new(
-        service: Arc<AgentService>,
-        config: AdvisorConfig,
-        registry: crate::hosts::RegistryCell,
-    ) -> Self {
-        Self {
-            service,
-            config,
-            registry,
-        }
+    pub fn new(service: Arc<AgentService>, registry: crate::hosts::RegistryCell) -> Self {
+        Self { service, registry }
     }
 }
 
@@ -1691,6 +1684,15 @@ impl Tool for AdvisorTool {
 
     async fn execute(&self, input: serde_json::Value) -> Result<ToolResult> {
         let start = Instant::now();
+        let config = self.service.effective_advisor();
+        if !config.enabled {
+            return Ok(ToolResult::success(
+                serde_json::json!({
+                    "advisor_unavailable": "The advisor is turned off for this agent; answer without it.",
+                }),
+                start.elapsed().as_millis() as u64,
+            ));
+        }
         let parsed: AdvisorInput = serde_json::from_value(input).unwrap_or_default();
 
         let Some(session) = resolve_session(&self.service, parsed.session_id.as_deref())? else {
@@ -1714,14 +1716,14 @@ impl Tool for AdvisorTool {
         }
 
         let calls_so_far = advisor_invocations_this_turn(&session, Self::NAME);
-        if calls_so_far >= self.config.per_turn_invocation_limit {
+        if calls_so_far >= config.per_turn_invocation_limit {
             let failure = AdvisorFailure::TurnLimitExceeded {
-                limit: self.config.per_turn_invocation_limit,
+                limit: config.per_turn_invocation_limit,
             };
             info!(
                 target: "advisor",
                 calls_so_far,
-                limit = self.config.per_turn_invocation_limit,
+                limit = config.per_turn_invocation_limit,
                 "advisor turn-limit reached"
             );
             return Ok(ToolResult::success(
@@ -1733,23 +1735,20 @@ impl Tool for AdvisorTool {
             ));
         }
 
-        let (payload_text, truncated) = build_payload(
-            &session,
-            self.config.payload,
-            self.config.payload_max_tokens,
-        );
-        let (lenses, dropped) = sanitise_lenses(parsed.lenses, self.config.fanout.max_lenses);
+        let (payload_text, truncated) =
+            build_payload(&session, config.payload, config.payload_max_tokens);
+        let (lenses, dropped) = sanitise_lenses(parsed.lenses, config.fanout.max_lenses);
         if dropped > 0 {
             info!(
                 target: "advisor",
                 kept = lenses.len(),
                 dropped,
-                max = self.config.fanout.max_lenses,
+                max = config.fanout.max_lenses,
                 "advisor fan-out lenses capped"
             );
         }
         let request = AdvisorRequest {
-            payload: self.config.payload,
+            payload: config.payload,
             payload_text,
             payload_truncated: truncated,
             question: parsed.question,
@@ -1762,7 +1761,7 @@ impl Tool for AdvisorTool {
 
         let outcome = dispatch(
             &self.service,
-            &self.config,
+            &config,
             &request,
             identity_id.as_deref(),
             &self.registry,
