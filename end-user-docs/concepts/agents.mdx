@@ -66,9 +66,18 @@ Driftwerk uses three capability tiers for easier configuration:
 
 You can specify tiers directly in configuration:
 ```toml
-model = "anthropic:powerful"  # Resolves to Claude Opus
-model = "openrouter:deepseek:standard"  # Routes through OpenRouter
-model = "gemini:cheap"  # Resolves to Gemini Flash
+[llm]
+default_model = "anthropic:powerful"  # Resolves to Claude Opus
+```
+
+```toml
+[llm]
+default_model = "openrouter:deepseek:standard"  # Routes through OpenRouter
+```
+
+```toml
+[llm]
+default_model = "gemini:cheap"  # Cheapest Gemini tier
 ```
 
 Tier mappings are defined in `default_tiers.toml` but can be overridden in your workspace root.
