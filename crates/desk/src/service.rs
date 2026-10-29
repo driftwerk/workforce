@@ -264,6 +264,11 @@ impl Desk {
         events.into_iter().for_each(|e| self.note(e));
     }
 
+    /// Tells every Desk watching.
+    pub(crate) fn announce(&self, event: DeskEvent) {
+        let _ = self.0.events.send(event);
+    }
+
     /// Records `event` in Activity and tells every Desk watching.
     pub fn note(&self, event: Event) {
         let _ = self.0.persist.send(Persist::Event(Box::new(event.clone())));

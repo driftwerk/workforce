@@ -41,3 +41,51 @@ impl Speech for Mute {
         Err(SpeakError::NoKey(request.provider))
     }
 }
+
+struct Fixed(Result<(), StatusCode>);
+
+#[async_trait]
+impl Authorize for Fixed {
+    async fn authorize(&self, _: &HeaderMap, _: Option<&str>) -> Result<(), StatusCode> {
+        self.0
+    }
+}
+
+/// Lets everyone in.
+pub(crate) fn allow_all() -> std::sync::Arc<dyn Authorize> {
+    std::sync::Arc::new(Fixed(Ok(())))
+}
+
+/// Lets no one in.
+pub(crate) fn deny_all() -> std::sync::Arc<dyn Authorize> {
+    std::sync::Arc::new(Fixed(Err(StatusCode::UNAUTHORIZED)))
+}
+
+/// Options for a desk whose CLIs never run.
+pub(crate) fn options(dir: &std::path::Path) -> crate::service::Options {
+    crate::service::Options {
+        claude: "/bin/false".into(),
+        codex: "/bin/false".into(),
+        env: Default::default(),
+        run_dir: dir.join("run"),
+        scrollback_bytes: 1024,
+        approval_timeout: std::time::Duration::from_secs(30),
+        restore: crate::service::RestorePolicy::Ask,
+        adopt_every: None,
+    }
+}
+
+/// A desk on `pool`, its migrations applied.
+pub(crate) async fn desk_on(
+    pool: workforce_postgres::PostgresPool,
+    dir: &std::path::Path,
+) -> crate::service::Desk {
+    crate::store::DeskStore::migrate(&pool).await.unwrap();
+    crate::service::Desk::start(
+        crate::store::DeskStore::from_pool(pool),
+        options(dir),
+        tokio_util::sync::CancellationToken::new(),
+    )
+    .await
+    .unwrap()
+}

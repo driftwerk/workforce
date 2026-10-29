@@ -28,6 +28,7 @@ tokio-tungstenite = { version = "0.28", features = ["native-tls"] }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
+vt100 = "0.18.1"
 workforce-postgres = { path = "../postgres", features = ["postgres"] }
 
 [build-dependencies]

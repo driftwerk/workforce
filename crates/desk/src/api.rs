@@ -382,6 +382,7 @@ pub fn router(
     crew: Arc<dyn crate::crew::Crew>,
 ) -> Router {
     sessions_router(desk.clone(), Arc::clone(&auth))
+        .merge(crate::state::router(desk.clone(), Arc::clone(&auth)))
         .merge(crate::crew_api::crew_router(desk, Arc::clone(&auth), crew))
         .merge(voice_router(Arc::clone(&auth), realtime, speech))
         .merge(providers_router(auth, accounts))

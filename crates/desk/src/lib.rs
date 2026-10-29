@@ -19,6 +19,7 @@ pub mod realtime;
 pub mod rooms;
 mod service;
 pub mod speech;
+pub mod state;
 pub mod store;
 #[cfg(test)]
 mod testing;

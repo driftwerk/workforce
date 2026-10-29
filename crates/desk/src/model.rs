@@ -178,6 +178,11 @@ pub enum DeskEvent {
     Activity {
         event: Box<crate::crew::Event>,
     },
+    /// A key of Desk's own state changed; `value` is `null` once removed.
+    State {
+        key: String,
+        value: serde_json::Value,
+    },
 }
 
 #[derive(Debug, Clone, Deserialize)]
