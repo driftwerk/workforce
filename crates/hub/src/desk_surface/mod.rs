@@ -17,6 +17,7 @@ use workforce_common::trust::TrustLevel;
 #[cfg(feature = "postgres")]
 pub(crate) use close::{close, is_room, message_in_chain};
 pub(crate) use context::{desk_context, person_name};
+pub(crate) use deliver::{deliver, resumed, Delivery};
 pub(crate) use retarget::{retarget, Matches};
 pub(crate) use surface::DeskSurface;
 
@@ -28,6 +29,28 @@ pub(crate) fn shown(content: &str) -> String {
         true => workforce_common::security_scanner::redact_credentials(&rendered),
         false => rendered,
     }
+}
+
+/// Where output a run sets up to come later goes, stamped when the job,
+/// heartbeat check or workflow run is made: the voice bridge a spoken turn
+/// came from, else the Desk conversation the run answers to. `None` leaves
+/// it to Slack, as before either existed.
+///
+/// Reads the per-turn task-locals, never the session: one session is shared
+/// by every surface a person uses with an agent, so its flags say what one
+/// of the person's turns was, not what this one is. The stamp is permanent
+/// and invisible, so it has to be right; whether the surface is reachable
+/// is decided when the output is delivered.
+pub(crate) fn origin() -> Option<workforce_common::delivery::DeliveryTarget> {
+    workforce_agent::runner::CURRENT_VOICE_CHANNEL
+        .try_with(Clone::clone)
+        .ok()
+        .filter(|channel| !channel.is_empty())
+        .map(workforce_common::delivery::DeliveryTarget::voice)
+        .or_else(|| {
+            workforce_agent::runner::current_desk()
+                .map(|scope| workforce_common::delivery::DeliveryTarget::desk(scope.target))
+        })
 }
 
 /// The trust a turn runs at: another agent's hand-off is that agent's
@@ -59,6 +82,33 @@ mod tests {
             message: None,
             spoken: false,
         }
+    }
+
+    #[tokio::test]
+    async fn what_a_run_sets_up_goes_to_the_voice_bridge_then_desk_then_slack() {
+        use workforce_agent::runner::{with_desk, CURRENT_VOICE_CHANNEL};
+        use workforce_common::channels::desk::{DeskScope, DeskTarget};
+        use workforce_common::delivery::DeliveryTarget;
+        let desk = || {
+            Some(DeskScope {
+                target: DeskTarget::of_turn(&DeskPlace::Dm, "desk", None, false),
+                attended: true,
+            })
+        };
+        assert_eq!(origin(), None);
+        assert_eq!(
+            with_desk(desk(), async { origin() }).await,
+            Some(DeliveryTarget::desk(DeskTarget::of_turn(
+                &DeskPlace::Dm,
+                "desk",
+                None,
+                false
+            )))
+        );
+        let spoken = CURRENT_VOICE_CHANNEL
+            .scope("voice-pe".into(), with_desk(desk(), async { origin() }))
+            .await;
+        assert_eq!(spoken, Some(DeliveryTarget::voice("voice-pe".into())));
     }
 
     #[test]

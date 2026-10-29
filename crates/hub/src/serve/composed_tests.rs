@@ -2663,7 +2663,6 @@ async fn fire_heartbeat(
         Arc::clone(service),
         &service.workspace,
         chrono_tz::UTC,
-        None,
     );
     let cancel = tokio_util::sync::CancellationToken::new();
     let running = tokio::spawn(runner.run(cancel.clone()));
@@ -3377,7 +3376,8 @@ async fn call_tool_once(server: &wiremock::MockServer, marker: &str, tool: &str)
 
 /// A scheduler over an agent on a mock model whose gate reads `ada`'s
 /// recorded roles, and a daily job of hers whose turn calls
-/// `agent.create`, which only an administrator may.
+/// `agent.create`, which only an administrator may, delivering to a Slack
+/// channel the returned surface records.
 async fn admin_tool_job(
     dir: &std::path::Path,
     ada: &Identity,
@@ -3385,7 +3385,7 @@ async fn admin_tool_job(
     Scheduler,
     Arc<workforce_identity::sqlite::SqliteIdentityStore>,
     String,
-    Arc<std::sync::Mutex<Vec<String>>>,
+    Arc<SentToSlack>,
 ) {
     use workforce_identity::store::IdentityStore;
     let (service, server) = service_on_mock_llm(dir).await;
@@ -3402,16 +3402,8 @@ async fn admin_tool_job(
         .with_role_history(store.clone()),
     ));
     call_tool_once(&server, "MAKE-AGENT", "agent.create").await;
-    let delivered = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let log = Arc::clone(&delivered);
-    let scheduler = Scheduler::with_delivery_and_timezone(
-        Arc::clone(&service),
-        Arc::new(move |_, text| {
-            log.lock().unwrap().push(text);
-            Box::pin(async {}) as _
-        }),
-        chrono_tz::UTC,
-    );
+    let delivered = SentToSlack::on(&service).await;
+    let scheduler = Scheduler::new(Arc::clone(&service));
     let id = scheduler
         .add_job_owned(
             "make",
@@ -3420,7 +3412,7 @@ async fn admin_tool_job(
             crate::scheduler::JobPayload::AgentTurn {
                 message: "MAKE-AGENT".into(),
                 channel: None,
-                channel_id: None,
+                channel_id: Some("C-reports".into()),
                 thread_id: None,
                 model: None,
                 user_id: None,
@@ -3461,7 +3453,12 @@ async fn a_job_run_after_its_person_was_demoted_stops_with_one_sentence() {
     let sentence = "This run stopped: the person it runs as no longer has permission to manage agents (agent.create).";
     assert!(!run.success, "{run:?}");
     assert_eq!(run.output, sentence);
-    assert_eq!(*delivered.lock().unwrap(), [sentence]);
+    let texts: Vec<String> = delivered
+        .sent()
+        .into_iter()
+        .map(|(_, _, text)| text)
+        .collect();
+    assert_eq!(texts, [sentence]);
 }
 
 /// A member's job whose agent tries a tool they never could runs as it
@@ -3474,10 +3471,10 @@ async fn a_job_refused_a_capability_its_person_never_held_answers_as_before() {
 
     let run = Box::pin(scheduler.run_job_now(&id)).await.unwrap();
     assert!(run.success, "{run:?}");
-    let delivered = delivered.lock().unwrap();
+    let delivered = delivered.sent();
     assert_eq!(delivered.len(), 1);
     assert!(
-        !delivered[0].contains("no longer has permission"),
+        !delivered[0].2.contains("no longer has permission"),
         "{delivered:?}"
     );
 }
@@ -5629,4 +5626,163 @@ async fn a_desk_room_turn_is_told_where_it_is_and_keeps_its_place() {
     assert_eq!(session.desk_origin(), Some(desk.target.clone()));
     assert_eq!(session.context_type, Some(SessionContextType::Dm));
     assert!(!session.is_shared_conversation());
+}
+
+/// A check made in a Desk thread tells its creator what it found there, as
+/// a check-in; once its room is gone it reports to their DM and still runs
+/// as them; a hand edit of where it reports stops it running as anyone.
+#[tokio::test]
+async fn a_check_made_in_desk_checks_in_there_and_stays_its_creators_when_moved() {
+    use crate::desk_surface::Matches;
+    use workforce_common::channels::desk::{DeliveryKind, DeskPlace, DeskScope, DeskTarget};
+    use workforce_common::heartbeat_check::{load_heartbeat_check, save_heartbeat_check};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let key = tmp.path().join("vault-key.txt");
+    std::fs::write(&key, "a test vault key").unwrap();
+    let (service, _server) = service_on_mock_llm_with(tmp.path(), |config| {
+        config.vault.key_file = Some(key.to_string_lossy().into_owned());
+    })
+    .await;
+    let room = uuid::Uuid::from_u128(31);
+    let target = DeskTarget::of_turn(
+        &DeskPlace::Room {
+            room,
+            name: "Planning".into(),
+            thread: Some(uuid::Uuid::from_u128(32)),
+        },
+        &format!("desk:{room}"),
+        Some("device-1"),
+        false,
+    );
+    workforce_agent::runner::with_desk(
+        Some(DeskScope {
+            target: target.clone(),
+            attended: true,
+        }),
+        heartbeat_check(&service, "inbox", Some(BOB)),
+    )
+    .await;
+    let signer = service.check_signer.as_deref().expect("a signing key");
+    let check = load_heartbeat_check(&service.workspace, "inbox").unwrap();
+    assert_eq!(
+        check.meta.deliver_to,
+        Some(workforce_common::delivery::DeliveryTarget::desk(
+            target.clone()
+        ))
+    );
+    assert_eq!(
+        signer.creator(&check).map(|c| c.to_string()).as_deref(),
+        Some(BOB)
+    );
+
+    let history = fire_heartbeat(&service, "inbox").await;
+    assert!(history.iter().all(|r| r.delivered), "{history:?}");
+    let said = service
+        .sessions
+        .find(&target.channel, BOB)
+        .unwrap()
+        .expect("the room's conversation")
+        .messages
+        .pop()
+        .unwrap();
+    assert_eq!(said.content, "**inbox**: done");
+    assert_eq!(
+        said.desk.as_ref().and_then(|mark| mark.delivery),
+        Some(DeliveryKind::CheckIn)
+    );
+
+    let moved =
+        crate::desk_surface::retarget(&service, BOB, Matches::Channel(&target.channel)).await;
+    assert!(moved.contains(&"inbox".to_string()), "{moved:?}");
+    let check = load_heartbeat_check(&service.workspace, "inbox").unwrap();
+    assert_eq!(
+        check.meta.deliver_to,
+        Some(workforce_common::delivery::DeliveryTarget::desk(
+            target.dm()
+        ))
+    );
+    assert_eq!(
+        signer.creator(&check).map(|c| c.to_string()).as_deref(),
+        Some(BOB),
+        "still its creator's"
+    );
+
+    let mut tampered = check;
+    tampered.meta.deliver_to = Some(workforce_common::delivery::DeliveryTarget::desk(target));
+    save_heartbeat_check(&service.workspace, &tampered).unwrap();
+    let reread = load_heartbeat_check(&service.workspace, "inbox").unwrap();
+    assert_eq!(
+        signer.creator(&reread),
+        None,
+        "the signature covers where it reports"
+    );
+}
+
+/// An approval decided after its turn ended resumes answering to the Desk
+/// conversation it was asked in: the answer is saved there as resumed, and
+/// the person's Desk is told of it.
+#[tokio::test]
+async fn an_approval_decided_later_resumes_in_its_desk_conversation() {
+    use workforce_common::channels::desk::{DeliveryKind, DeskPlace, DeskTarget};
+    let tmp = tempfile::tempdir().unwrap();
+    let (service, _server) = service_on_mock_llm(tmp.path()).await;
+    let agent = service.agent_id.to_string();
+    let mut dm = service.sessions.get_or_create("desk", BOB, &agent).unwrap();
+    dm.set_desk_origin(&DeskTarget::of_turn(&DeskPlace::Dm, "desk", None, false));
+    service.sessions.save(&dm).unwrap();
+    let row = crate::approvals::PendingApproval {
+        request_id: "r-desk".into(),
+        agent_id: agent.clone(),
+        session_key: "desk".into(),
+        workspace_id: None,
+        channel_id: None,
+        thread_ts: None,
+        requester_id: BOB.into(),
+        tool_name: "slack.send".into(),
+        tool_input: serde_json::json!({"channel": "C1", "text": "hi"}),
+        reason: "Posts outside Desk".into(),
+        allow_self_approval: true,
+        status: "denied".into(),
+        resolved_by: Some(BOB.into()),
+        channel_notice: None,
+        channel_notice_ts: None,
+        created_at: Utc::now(),
+        expires_at: Utc::now(),
+    };
+    let registry = Arc::new(crate::agent_registry::AgentRegistry::from_parts(
+        [(agent.clone(), Arc::clone(&service))]
+            .into_iter()
+            .collect(),
+        agent,
+    ));
+    let mut heard = crate::session_push::subscribe_for_tests();
+
+    crate::approvals::resume::launch_resume(
+        &registry,
+        &row,
+        crate::approvals::ApprovalOutcome::Denied,
+        "you",
+    )
+    .await;
+
+    let dm = service.sessions.get(&dm.id).unwrap().unwrap();
+    let answer = dm
+        .messages
+        .iter()
+        .rev()
+        .find(|m| m.role == MessageRole::Assistant)
+        .unwrap();
+    assert_eq!(answer.content, "done");
+    assert_eq!(
+        answer.desk.as_ref().and_then(|mark| mark.delivery),
+        Some(DeliveryKind::Resumed)
+    );
+    let signal = std::iter::from_fn(|| heard.try_recv().ok())
+        .find_map(|frame| frame.delivered.filter(|d| d.session_id == dm.id))
+        .expect("the person's Desk is told");
+    assert_eq!(
+        (signal.message_id.as_str(), signal.kind),
+        (answer.id.as_str(), DeliveryKind::Resumed)
+    );
 }

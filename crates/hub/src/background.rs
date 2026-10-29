@@ -24,7 +24,7 @@ use tracing::info;
 use workforce_common::settings::HeartbeatSettings;
 
 use crate::agent_registry::AgentRegistry;
-use crate::heartbeat::{HeartbeatDeliveryCallback, HeartbeatRunner};
+use crate::heartbeat::HeartbeatRunner;
 use crate::self_learning::SelfLearningRunner;
 use crate::serve::AgentService;
 
@@ -142,7 +142,6 @@ pub async fn supervise_heartbeat(
     registry: Weak<AgentRegistry>,
     leader_flag: Option<Arc<AtomicBool>>,
     user_tz: Tz,
-    delivery: Option<HeartbeatDeliveryCallback>,
     cancel: CancellationToken,
 ) {
     supervise(registry, cancel, "Heartbeat", |service, child| {
@@ -151,7 +150,6 @@ pub async fn supervise_heartbeat(
             Arc::clone(service),
             &service.workspace,
             user_tz,
-            delivery.clone(),
         );
         if let Some(flag) = &leader_flag {
             runner.set_leader_flag(Arc::clone(flag));

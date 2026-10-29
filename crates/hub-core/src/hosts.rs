@@ -638,6 +638,17 @@ pub trait WorkflowHost: DefinitionSurface + HubReads {
         workspace_surfaces: &HashMap<String, Arc<dyn ChannelSurface>>,
     );
     fn set_shutdown_token(&self, token: CancellationToken);
+    /// Point the Desk conversation of every live run `owner` started that
+    /// `retarget` moves elsewhere; the runs changed.
+    fn retarget_desk(
+        &self,
+        owner: &str,
+        retarget: &(dyn for<'t> Fn(
+            &'t workforce_common::channels::desk::DeskTarget,
+        ) -> Option<workforce_common::channels::desk::DeskTarget>
+              + Send
+              + Sync),
+    ) -> Vec<String>;
     async fn reload_definitions(&self) -> eyre::Result<usize>;
     async fn sync_schedule_triggers(&self) -> eyre::Result<usize>;
     fn can_schedule(&self) -> bool;

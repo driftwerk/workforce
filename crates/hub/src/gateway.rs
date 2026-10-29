@@ -570,6 +570,10 @@ pub fn router(state: Arc<GatewayState>) -> Router {
             "/api/pair/device/revoke-self",
             post(pair_device_revoke_self),
         )
+        .route(
+            "/api/approvals/{request_id}/decision",
+            post(crate::approvals::decide::decision),
+        )
         // Pairing endpoints
         .route("/api/pair/pending", get(pair_list_pending))
         .route("/api/pair/approve/{code}", post(pair_approve))
@@ -6775,6 +6779,7 @@ async fn create_heartbeat_check(
             tools: None,
             creator: None,
             creator_sig: None,
+            deliver_to: None,
         },
         body: body.body,
     };

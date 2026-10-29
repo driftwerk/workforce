@@ -9,7 +9,9 @@ use uuid::Uuid;
 use workforce_common::channels::desk::{
     DeliveryKind, DeskDelivered, DeskMark, DeskPlace, DeskTarget, DESK_CHANNEL,
 };
-use workforce_common::session::{estimate_tokens, SessionAttachment, SessionStore};
+use workforce_common::session::{
+    estimate_tokens, MessageRole, Session, SessionAttachment, SessionStore,
+};
 
 use crate::serve::AgentService;
 
@@ -110,27 +112,96 @@ pub(crate) async fn deliver(
     if let Err(e) = sessions.append_to_archive(&session.id, &message) {
         tracing::warn!(session_id = %session.id, error = %e, "archiving a Desk delivery");
     }
-    if let Some(push) = crate::session_push::installed() {
-        push.message(&session.id, &super::shown(&text), Some(&message_id))
-            .await;
-        push.delivered(
+    let delivered = Delivered {
+        session_id: session.id,
+        message_id,
+    };
+    announce(service, owner, &target, &delivered, &text, delivery.kind).await;
+    Ok(delivered)
+}
+
+/// Tell whoever watches the conversation that `delivered` landed in it, and
+/// the person's Desk hub links on every replica. Best effort: the message
+/// is saved already, and a Desk drains it whenever it connects.
+pub(crate) async fn announce(
+    service: &AgentService,
+    owner: &str,
+    target: &DeskTarget,
+    delivered: &Delivered,
+    text: &str,
+    kind: DeliveryKind,
+) {
+    let Some(push) = crate::session_push::installed() else {
+        return;
+    };
+    push.message(
+        &delivered.session_id,
+        &super::shown(text),
+        Some(&delivered.message_id),
+    )
+    .await;
+    push.delivered(
+        owner,
+        DeskDelivered {
+            agent_id: service.agent_id.to_string(),
+            channel: target.channel.clone(),
+            session_id: delivered.session_id.clone(),
+            message_id: delivered.message_id.clone(),
+            kind,
+            place: target.place.clone(),
+            spoken: target.spoken,
+        },
+    )
+    .await;
+}
+
+/// Hand `answer`, what a turn re-run after the fact in `session` said (an
+/// approval's resume, a recovered turn), to the Desk conversation the
+/// session answers to. A Desk conversation's own session holds the answer
+/// already, so it is announced; any other (a job's run) delivers it there.
+/// `false` when the session answers to no Desk conversation.
+pub(crate) async fn resumed(
+    service: &AgentService,
+    session: &Session,
+    owner: &str,
+    answer: &str,
+) -> eyre::Result<bool> {
+    let Some(target) = session.desk_origin() else {
+        return Ok(false);
+    };
+    if session.channel != target.channel {
+        deliver(
+            service,
             owner,
-            DeskDelivered {
-                agent_id: service.agent_id.to_string(),
-                channel: target.channel.clone(),
-                session_id: session.id.clone(),
-                message_id: message_id.clone(),
-                kind: delivery.kind,
-                place: target.place.clone(),
-                spoken: target.spoken,
-            },
+            &target,
+            Delivery::text(DeliveryKind::Resumed, answer),
+        )
+        .await?;
+        return Ok(true);
+    }
+    let saved = service.sessions.get(&session.id)?.and_then(|now| {
+        now.messages
+            .iter()
+            .rev()
+            .find(|m| m.role == MessageRole::Assistant)
+            .map(|m| (m.id.clone(), m.content.clone()))
+    });
+    if let Some((message_id, text)) = saved {
+        let delivered = Delivered {
+            session_id: session.id.clone(),
+            message_id,
+        };
+        announce(
+            service,
+            owner,
+            &target,
+            &delivered,
+            &text,
+            DeliveryKind::Resumed,
         )
         .await;
     }
-    Ok(Delivered {
-        session_id: session.id,
-        message_id,
-    })
+    Ok(true)
 }
 
 #[cfg(test)]

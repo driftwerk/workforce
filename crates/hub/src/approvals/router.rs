@@ -157,8 +157,47 @@ impl HubApprovalRouter {
     }
 }
 
+/// A run nobody attends that was made in a Desk conversation, a job or a
+/// workflow, has no one to answer a self-serve prompt: its own person is
+/// asked there instead, as a routed approval only they need give. Every
+/// other decision stands.
+fn for_unattended_desk(
+    decision: ApprovalDecision,
+    requester: &str,
+    desk: Option<&workforce_common::channels::desk::DeskScope>,
+    ttl: Duration,
+) -> ApprovalDecision {
+    match (decision, desk) {
+        (ApprovalDecision::SelfServe, Some(scope)) if !scope.attended && !requester.is_empty() => {
+            ApprovalDecision::Routed(ApprovalRoute {
+                approver_user_ids: vec![requester.to_string()],
+                allow_self_approval: true,
+                ttl,
+            })
+        }
+        (decision, _) => decision,
+    }
+}
+
 impl ApprovalRouter for HubApprovalRouter {
     fn route(&self, ctx: &ApprovalRouteCtx<'_>) -> ApprovalDecision {
+        for_unattended_desk(
+            self.route_by_rules(ctx),
+            ctx.user_id,
+            workforce_agent::runner::current_desk().as_ref(),
+            self.default_ttl,
+        )
+    }
+
+    fn defer(&self, record: &PendingApprovalCore) -> eyre::Result<()> {
+        self.defer_core(record)
+    }
+}
+
+impl HubApprovalRouter {
+    /// Who the permission rules say approves the call, after the
+    /// four-eyes and Slack-reachability filters.
+    fn route_by_rules(&self, ctx: &ApprovalRouteCtx<'_>) -> ApprovalDecision {
         let team_ids = self.team_ids_for(ctx.user_id);
         let mut scopes: Vec<(PermissionScope, &str)> = vec![
             (PermissionScope::Agent, ctx.agent_id),
@@ -194,7 +233,7 @@ impl ApprovalRouter for HubApprovalRouter {
         }
     }
 
-    fn defer(&self, record: &PendingApprovalCore) -> eyre::Result<()> {
+    fn defer_core(&self, record: &PendingApprovalCore) -> eyre::Result<()> {
         let (workspace_id, thread_ts) = parse_session_key(&record.session_key);
         let expires_at = chrono::Utc::now()
             + chrono::Duration::from_std(record.ttl)
@@ -238,6 +277,40 @@ mod tests {
             ident.linked_ids.insert("slack".to_string(), s.to_string());
         }
         ident
+    }
+
+    #[test]
+    fn an_unattended_desk_run_asks_its_own_person_and_nothing_else_changes() {
+        use workforce_common::channels::desk::{DeskPlace, DeskScope, DeskTarget};
+        let scope = |attended| DeskScope {
+            target: DeskTarget::of_turn(&DeskPlace::Dm, "desk", None, false),
+            attended,
+        };
+        let ttl = Duration::from_secs(60);
+        match for_unattended_desk(ApprovalDecision::SelfServe, "p1", Some(&scope(false)), ttl) {
+            ApprovalDecision::Routed(route) => {
+                assert_eq!(route.approver_user_ids, vec!["p1".to_string()]);
+                assert!(route.allow_self_approval);
+            }
+            _ => panic!("expected the person to be asked"),
+        }
+        assert!(matches!(
+            for_unattended_desk(ApprovalDecision::SelfServe, "p1", Some(&scope(true)), ttl),
+            ApprovalDecision::SelfServe
+        ));
+        assert!(matches!(
+            for_unattended_desk(ApprovalDecision::SelfServe, "p1", None, ttl),
+            ApprovalDecision::SelfServe
+        ));
+        assert!(matches!(
+            for_unattended_desk(
+                ApprovalDecision::DenyUnreachable,
+                "p1",
+                Some(&scope(false)),
+                ttl
+            ),
+            ApprovalDecision::DenyUnreachable
+        ));
     }
 
     struct Fixture {

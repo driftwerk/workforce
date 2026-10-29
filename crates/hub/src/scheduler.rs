@@ -21,13 +21,15 @@ pub use crate::hub_core::schedules::{
     VISIBILITY_PRIVATE,
 };
 use crate::serve::AgentService;
+use workforce_common::channels::desk::DeliveryKind;
 
-/// Callback for delivering job results (e.g., to WebSocket clients, Slack, etc.).
-pub type DeliveryCallback = Arc<
-    dyn Fn(String, String) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
-        + Send
-        + Sync,
->;
+/// Whether `job` was made in a Desk conversation, which its output goes to.
+fn desk_targeted(job: &ScheduledJob) -> bool {
+    job.deliver_to
+        .as_ref()
+        .and_then(DeliveryTarget::desk_target)
+        .is_some()
+}
 
 /// [`ScheduledJob::edited_by`] for a save through the scheduler tool in a
 /// turn that names nobody.
@@ -208,8 +210,6 @@ pub struct Scheduler {
     /// against [`Self::service`], which prefers the owner once adopted.
     seed: Arc<AgentService>,
     owner: OnceLock<Weak<AgentService>>,
-    /// Optional callback to deliver job results to connected clients.
-    delivery: Option<DeliveryCallback>,
     /// Default timezone for cron evaluation when a job doesn't specify one.
     default_tz: Tz,
     /// Directory for persisting jobs and run history.
@@ -251,24 +251,11 @@ pub struct Scheduler {
 
 impl Scheduler {
     pub fn new(service: Arc<AgentService>) -> Self {
-        Self::build(service, None, chrono_tz::UTC)
+        Self::new_with_timezone(service, chrono_tz::UTC)
     }
 
     /// Create a scheduler with a specific default timezone.
-    pub fn new_with_timezone(service: Arc<AgentService>, default_tz: Tz) -> Self {
-        Self::build(service, None, default_tz)
-    }
-
-    /// Create a scheduler with a delivery callback and a specific default timezone.
-    pub fn with_delivery_and_timezone(
-        service: Arc<AgentService>,
-        delivery: DeliveryCallback,
-        default_tz: Tz,
-    ) -> Self {
-        Self::build(service, Some(delivery), default_tz)
-    }
-
-    fn build(seed: Arc<AgentService>, delivery: Option<DeliveryCallback>, default_tz: Tz) -> Self {
+    pub fn new_with_timezone(seed: Arc<AgentService>, default_tz: Tz) -> Self {
         // Per-agent job store under the agent's workspace, so each agent's
         // scheduler owns its own `jobs.json` and they never collide on names.
         let data_dir = seed.workspace.clone();
@@ -276,7 +263,6 @@ impl Scheduler {
             jobs: Arc::new(RwLock::new(Vec::new())),
             seed,
             owner: OnceLock::new(),
-            delivery,
             default_tz,
             data_dir,
             run_history: Arc::new(RwLock::new(Vec::new())),
@@ -459,7 +445,7 @@ impl Scheduler {
         let next = next_run_time(&schedule, &now, self.default_tz);
         let is_reminder = matches!(payload, JobPayload::Reminder { .. });
         let caps = self.creation_caps(&schedule, &payload, creator_identity_id.as_deref(), now);
-        let deliver_to = self.capture_voice_origin();
+        let deliver_to = crate::desk_surface::origin();
         let job = ScheduledJob {
             id: Uuid::new_v4().to_string(),
             name: name.to_string(),
@@ -492,28 +478,6 @@ impl Scheduler {
         self.persist_change(&jobs, crate::scheduler_store::JobChange::Upserted(&job))
             .await;
         Ok(id)
-    }
-
-    /// A schedule created during a spoken turn on a voice-bridge channel
-    /// remembers that surface, so its result is spoken by the device the user
-    /// asked from instead of defaulting to Slack.
-    ///
-    /// Reads the per-turn channel the gateway decided at dispatch — NOT the
-    /// session's voice flag. One WebSocket anchor session is shared by every
-    /// surface the same person uses with the same agent, so that flag answers
-    /// "was one of my turns spoken", and a web turn racing a spoken one would
-    /// be stamped for a device it never came from. The stamp is permanent and
-    /// invisible, so it has to be right.
-    ///
-    /// Deliberately independent of whether a bridge is connected right now:
-    /// the target is a standing fact about the job, and fire-time delivery
-    /// handles absence by falling back to Slack.
-    fn capture_voice_origin(&self) -> Option<DeliveryTarget> {
-        workforce_agent::runner::CURRENT_VOICE_CHANNEL
-            .try_with(|c| c.clone())
-            .ok()
-            .filter(|c| !c.is_empty())
-            .map(DeliveryTarget::voice)
     }
 
     /// Default run/spend/expiry caps for a new job. Only owned recurring
@@ -1609,6 +1573,210 @@ impl Scheduler {
         }
     }
 
+    /// Deliver `text` to the Desk conversation the job was made in, as its
+    /// owner's. `true` once it is saved there: Desk drains it whenever it
+    /// connects, so Desk being closed is no failure. `false` for a job made
+    /// elsewhere, or when the conversation could not be written.
+    async fn deliver_via_desk(&self, job: &ScheduledJob, kind: DeliveryKind, text: &str) -> bool {
+        let (Some(target), Some(owner)) = (
+            job.deliver_to
+                .as_ref()
+                .and_then(DeliveryTarget::desk_target),
+            job.owner(),
+        ) else {
+            return false;
+        };
+        match crate::desk_surface::deliver(
+            &self.service(),
+            owner,
+            target,
+            crate::desk_surface::Delivery::text(kind, text),
+        )
+        .await
+        {
+            Ok(delivered) => {
+                info!(
+                    job_id = %job.id,
+                    session_id = %delivered.session_id,
+                    "Delivered to Desk"
+                );
+                true
+            }
+            Err(e) => {
+                error!(job_id = %job.id, error = %e, "Failed to deliver to Desk");
+                false
+            }
+        }
+    }
+
+    /// Send a system event's `text` to its owner's Slack DM, else to the
+    /// channel it names. Whether it went, or had nowhere to go.
+    async fn deliver_system_event_to_slack(
+        &self,
+        job: &ScheduledJob,
+        text: &str,
+        channel_id: Option<&str>,
+        user_id: Option<&str>,
+    ) -> bool {
+        // Always deliver to DM via open_conversation for reliability.
+        // Stored channel_id/thread_id can become stale after token
+        // rotation or thread deletion.
+        let service = self.service();
+        let registry = service.surface_registry.read().await;
+        let mut delivered = false;
+
+        let slack_uid = user_id.and_then(|uid| {
+            let mapped = self.slack_user_for_dm(uid);
+            if mapped.is_none() {
+                warn!(
+                    job_id = %job.id,
+                    user_id = %uid,
+                    "System-event owner has no linked Slack id — using stored channel"
+                );
+            }
+            mapped
+        });
+        if let Some(uid) = slack_uid {
+            match registry
+                .resolve_user_dm(
+                    "slack",
+                    &uid,
+                    workforce_common::channels::ChannelHint::default(),
+                )
+                .await
+            {
+                Ok((surface, dm_channel)) => {
+                    info!(
+                        job_id = %job.id,
+                        dm_channel = %dm_channel,
+                        "Delivering system event to DM"
+                    );
+                    match surface
+                        .send_message(&OutboundMessage {
+                            channel: dm_channel,
+                            text: text.to_string(),
+                            thread_id: None,
+                            username: None,
+                            icon_url: None,
+                            blocks: None,
+                        })
+                        .await
+                    {
+                        Ok(_) => delivered = true,
+                        Err(e) => {
+                            error!(
+                                job_id = %job.id,
+                                error = %e,
+                                "Failed to deliver system event"
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!(
+                        job_id = %job.id,
+                        user_id = %uid,
+                        error = %e,
+                        "Failed to open DM for system event"
+                    );
+                }
+            }
+        } else if let Some(cid) = channel_id {
+            // Fallback: no user_id or no linked Slack id — stored channel
+            for surface in registry.all() {
+                match surface
+                    .send_message(&OutboundMessage {
+                        channel: cid.to_string(),
+                        text: text.to_string(),
+                        thread_id: None,
+                        username: None,
+                        icon_url: None,
+
+                        blocks: None,
+                    })
+                    .await
+                {
+                    Ok(_) => delivered = true,
+                    Err(e) => {
+                        error!(
+                            job_id = %job.id,
+                            error = %e,
+                            "Failed to deliver system event to channel"
+                        );
+                    }
+                }
+            }
+        } else {
+            // Nowhere to deliver is not a failed delivery: retrying
+            // would only find nowhere again.
+            warn!(job_id = %job.id, name = %job.name, "No user_id or channel_id — skipping surface delivery");
+            delivered = true;
+        }
+        delivered
+    }
+
+    /// Send a reminder's `text` to `user_id`'s Slack DM. Whether it went.
+    async fn deliver_via_slack_dm(&self, job: &ScheduledJob, user_id: &str, text: &str) -> bool {
+        let service = self.service();
+        let registry = service.surface_registry.read().await;
+        let dm_result = match self.slack_user_for_dm(user_id) {
+            Some(slack_uid) => {
+                registry
+                    .resolve_user_dm(
+                        "slack",
+                        &slack_uid,
+                        workforce_common::channels::ChannelHint::default(),
+                    )
+                    .await
+            }
+            None => Err(eyre::eyre!(
+                "reminder owner '{user_id}' has no linked Slack id"
+            )),
+        };
+        match dm_result {
+            Ok((surface, dm_channel)) => {
+                let reminder_text = format!("\u{1f514} *Reminder:* {}", text);
+                match surface
+                    .send_message(&OutboundMessage {
+                        channel: dm_channel,
+                        text: reminder_text,
+                        thread_id: None,
+                        username: None,
+                        icon_url: None,
+                        blocks: None,
+                    })
+                    .await
+                {
+                    Ok(_) => {
+                        info!(
+                            job_id = %job.id,
+                            user_id = %user_id,
+                            "Reminder delivered via DM"
+                        );
+                        true
+                    }
+                    Err(e) => {
+                        error!(
+                            job_id = %job.id,
+                            error = %e,
+                            "Failed to deliver reminder"
+                        );
+                        false
+                    }
+                }
+            }
+            Err(e) => {
+                error!(
+                    job_id = %job.id,
+                    user_id = %user_id,
+                    error = %e,
+                    "Failed to open DM for reminder"
+                );
+                false
+            }
+        }
+    }
+
     /// Whom a job's spend is billed to: its explicit bill-to, else, when no
     /// person runs it, the person its background work falls to.
     fn billing_of(&self, job: &ScheduledJob) -> Option<String> {
@@ -1622,14 +1790,26 @@ impl Scheduler {
             })
     }
 
-    /// Execute a job and return a run record.
-    ///
-    /// If the job has a `run_as_identity_id` or `creator_identity_id`, scopes
-    /// `CURRENT_USER_ID` for the duration so credential resolution and memory
-    /// scoping use the correct identity. Jobs without an identity (legacy or
-    /// system-created) run without user context. The job is billed as
-    /// [`Self::billing_of`] says.
+    /// Execute a job and return a run record, answering to the Desk
+    /// conversation it was made in, unattended, when it was made in one.
     async fn execute_job(&self, job: &ScheduledJob) -> JobRunRecord {
+        let desk = job
+            .deliver_to
+            .as_ref()
+            .and_then(DeliveryTarget::desk_target)
+            .map(|target| workforce_common::channels::desk::DeskScope {
+                target: target.clone(),
+                attended: false,
+            });
+        workforce_agent::runner::with_desk(desk, self.execute_job_as(job)).await
+    }
+
+    /// [`Self::execute_job`] as the job's `run_as_identity_id` or
+    /// `creator_identity_id`, scoped as `CURRENT_USER_ID` for the duration so
+    /// credential resolution and memory scoping use the correct identity.
+    /// Jobs without an identity (legacy or system-created) run without user
+    /// context. The job is billed as [`Self::billing_of`] says.
+    async fn execute_job_as(&self, job: &ScheduledJob) -> JobRunRecord {
         let billing = self.billing_of(job).unwrap_or_default();
         // Billing scoped even when empty: an empty value is treated as unset
         // by `current_billing_identity_id`, so nesting stays uniform.
@@ -1668,103 +1848,21 @@ impl Scheduler {
                 user_id,
             } => {
                 info!(job_id = %job.id, name = %job.name, "Delivering system event");
-                let mut delivered = false;
-
-                // Always deliver to DM via open_conversation for reliability.
-                // Stored channel_id/thread_id can become stale after token
-                // rotation or thread deletion.
-                let registry = service.surface_registry.read().await;
-
-                let slack_uid = user_id.as_ref().and_then(|uid| {
-                    let mapped = self.slack_user_for_dm(uid);
-                    if mapped.is_none() {
-                        warn!(
-                            job_id = %job.id,
-                            user_id = %uid,
-                            "System-event owner has no linked Slack id — using stored channel"
-                        );
-                    }
-                    mapped
-                });
-                if let Some(uid) = slack_uid {
-                    match registry
-                        .resolve_user_dm(
-                            "slack",
-                            &uid,
-                            workforce_common::channels::ChannelHint::default(),
+                // One made in Desk is delivered there, or retried: never to
+                // a Slack DM it was not asked from.
+                let delivered = match desk_targeted(job) {
+                    true => self.deliver_via_desk(job, DeliveryKind::Job, text).await,
+                    false => {
+                        self.deliver_system_event_to_slack(
+                            job,
+                            text,
+                            channel_id.as_deref(),
+                            user_id.as_deref(),
                         )
                         .await
-                    {
-                        Ok((surface, dm_channel)) => {
-                            info!(
-                                job_id = %job.id,
-                                dm_channel = %dm_channel,
-                                "Delivering system event to DM"
-                            );
-                            match surface
-                                .send_message(&OutboundMessage {
-                                    channel: dm_channel,
-                                    text: text.clone(),
-                                    thread_id: None,
-                                    username: None,
-                                    icon_url: None,
-                                    blocks: None,
-                                })
-                                .await
-                            {
-                                Ok(_) => delivered = true,
-                                Err(e) => {
-                                    error!(
-                                        job_id = %job.id,
-                                        error = %e,
-                                        "Failed to deliver system event"
-                                    );
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            error!(
-                                job_id = %job.id,
-                                user_id = %uid,
-                                error = %e,
-                                "Failed to open DM for system event"
-                            );
-                        }
                     }
-                } else if let Some(cid) = channel_id {
-                    // Fallback: no user_id or no linked Slack id — stored channel
-                    for surface in registry.all() {
-                        match surface
-                            .send_message(&OutboundMessage {
-                                channel: cid.clone(),
-                                text: text.clone(),
-                                thread_id: None,
-                                username: None,
-                                icon_url: None,
+                };
 
-                                blocks: None,
-                            })
-                            .await
-                        {
-                            Ok(_) => delivered = true,
-                            Err(e) => {
-                                error!(
-                                    job_id = %job.id,
-                                    error = %e,
-                                    "Failed to deliver system event to channel"
-                                );
-                            }
-                        }
-                    }
-                } else {
-                    warn!(job_id = %job.id, name = %job.name, "No user_id or channel_id — skipping surface delivery");
-                }
-
-                // Also broadcast via WebSocket callback
-                if let Some(ref delivery) = self.delivery {
-                    delivery(job.name.clone(), text.clone()).await;
-                    delivered = true;
-                }
                 (true, text.clone(), delivered)
             }
             JobPayload::AgentTurn {
@@ -1792,8 +1890,10 @@ impl Scheduler {
 
                 // Always deliver to DM via open_conversation for reliability.
                 // Resolve DM channel up front so we can pass it to process_message.
+                // A job made in Desk answers there: its run has no Slack DM.
                 let effective_cid = match user_id
                     .as_ref()
+                    .filter(|_| !desk_targeted(job))
                     .map(|uid| (uid, self.slack_user_for_dm(uid)))
                 {
                     Some((_, Some(slack_uid))) => {
@@ -1826,7 +1926,7 @@ impl Scheduler {
                         );
                         channel_id.clone()
                     }
-                    None => channel_id.clone(),
+                    None => channel_id.clone().filter(|_| !desk_targeted(job)),
                 };
                 let author = run_author(job, &self.jobs.read().await);
 
@@ -1968,23 +2068,27 @@ impl Scheduler {
                         // A stopped run's reason is the scheduler's to deliver
                         // whoever owns delivery: the agent posted no result.
                         let agent_owns_delivery = *agent_owns_delivery && answered;
-                        // A job asked from a voice bridge answers on it; the
-                        // Slack DM below stays the fallback. Self-delivering
-                        // jobs already posted during the turn, so an
-                        // announcement would double-deliver.
-                        let mut delivered = if agent_owns_delivery {
-                            false
-                        } else {
-                            self.deliver_via_voice(job, &response).await
-                        };
+                        // A job asked from a voice bridge answers on it, and one
+                        // made in Desk in its conversation; the Slack DM below
+                        // stays the voice fallback. Self-delivering jobs already
+                        // posted during the turn, so delivering again would
+                        // double-deliver.
+                        let mut delivered = !agent_owns_delivery
+                            && (self.deliver_via_voice(job, &response).await
+                                || self
+                                    .deliver_via_desk(job, DeliveryKind::Job, &response)
+                                    .await);
 
                         // Send the agent's final text to the job's destination —
                         // UNLESS the job owns its own delivery (it self-posts the
                         // result during the turn), in which case the scheduler
                         // staying silent is what prevents the duplicate
-                        // "report + chatty `Done`" double-post.
+                        // "report + chatty `Done`" double-post. A Desk job whose
+                        // delivery failed is retried, never counted delivered.
                         if !delivered {
-                            if agent_owns_delivery || effective_cid.is_none() {
+                            if agent_owns_delivery
+                                || (effective_cid.is_none() && !desk_targeted(job))
+                            {
                                 // Self-posting jobs and jobs with no destination
                                 // have nothing for the scheduler to deliver; an
                                 // undelivered run must mean a real send failure so
@@ -2019,11 +2123,6 @@ impl Scheduler {
                             }
                         }
 
-                        // Also broadcast via WebSocket callback
-                        if let Some(ref delivery) = self.delivery {
-                            delivery(job.name.clone(), response.clone()).await;
-                            delivered = true;
-                        }
                         (answered, response, delivered)
                     }
                     Err(e) => {
@@ -2034,70 +2133,19 @@ impl Scheduler {
             }
             JobPayload::Reminder { text, user_id } => {
                 info!(job_id = %job.id, name = %job.name, user_id = %user_id, "Delivering reminder");
-                // The device the reminder was asked from comes first; a voice
-                // failure (bridge offline) falls back to the Slack DM, and a
-                // failure of both rides the existing retry-with-backoff, so
-                // the reminder is announced when the bridge returns.
-                let mut delivered = self.deliver_via_voice(job, text).await;
-
-                if !delivered {
-                    let registry = service.surface_registry.read().await;
-
-                    let dm_result = match self.slack_user_for_dm(user_id) {
-                        Some(slack_uid) => {
-                            registry
-                                .resolve_user_dm(
-                                    "slack",
-                                    &slack_uid,
-                                    workforce_common::channels::ChannelHint::default(),
-                                )
-                                .await
-                        }
-                        None => Err(eyre::eyre!(
-                            "reminder owner '{user_id}' has no linked Slack id"
-                        )),
-                    };
-                    match dm_result {
-                        Ok((surface, dm_channel)) => {
-                            let reminder_text = format!("\u{1f514} *Reminder:* {}", text);
-                            match surface
-                                .send_message(&OutboundMessage {
-                                    channel: dm_channel,
-                                    text: reminder_text,
-                                    thread_id: None,
-                                    username: None,
-                                    icon_url: None,
-                                    blocks: None,
-                                })
-                                .await
-                            {
-                                Ok(_) => {
-                                    delivered = true;
-                                    info!(
-                                        job_id = %job.id,
-                                        user_id = %user_id,
-                                        "Reminder delivered via DM"
-                                    );
-                                }
-                                Err(e) => {
-                                    error!(
-                                        job_id = %job.id,
-                                        error = %e,
-                                        "Failed to deliver reminder"
-                                    );
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            error!(
-                                job_id = %job.id,
-                                user_id = %user_id,
-                                error = %e,
-                                "Failed to open DM for reminder"
-                            );
-                        }
-                    }
-                }
+                // The device or Desk conversation the reminder was asked from
+                // comes first; a voice failure (bridge offline) falls back to
+                // the Slack DM, and a failure of every one rides the existing
+                // retry-with-backoff, so the reminder still arrives.
+                let delivered = self.deliver_via_voice(job, text).await
+                    || self
+                        .deliver_via_desk(
+                            job,
+                            DeliveryKind::Reminder,
+                            &format!("\u{1f514} Reminder: {text}"),
+                        )
+                        .await
+                    || self.deliver_via_slack_dm(job, user_id, text).await;
 
                 (true, text.clone(), delivered)
             }
@@ -2796,10 +2844,6 @@ mod tests {
         Arc::new(Scheduler::new(test_service().await))
     }
 
-    fn noop_delivery() -> DeliveryCallback {
-        Arc::new(|_: String, _: String| Box::pin(async {}) as _)
-    }
-
     /// The creator a reminder added inside a turn run as `principal`, and
     /// billed to `billed`, records.
     async fn creator_in_turn(sched: &Scheduler, principal: &str, billed: &str) -> Option<String> {
@@ -2949,17 +2993,15 @@ mod tests {
     async fn the_default_scheduler_runs_jobs_against_the_service_that_owns_it() {
         let config = test_config();
         let subscriptions = crate::subscription::Subscriptions::boot(&config, None);
-        let (service, scheduler) =
-            crate::serve::AgentService::from_config_with_scheduler_delivery_and_reactions(
-                config,
-                None,
-                noop_delivery(),
-                None,
-                false,
-                subscriptions.clone(),
-            )
-            .await
-            .expect("test service");
+        let (service, scheduler) = crate::serve::AgentService::from_config_for_hub(
+            config,
+            None,
+            None,
+            false,
+            subscriptions.clone(),
+        )
+        .await
+        .expect("test service");
         assert!(service
             .scheduler
             .as_ref()
@@ -2990,7 +3032,6 @@ mod tests {
             config,
             None,
             &agent,
-            noop_delivery(),
             Arc::new(workforce_common::locking::LockManager::new()),
             None,
             None,
@@ -3281,17 +3322,15 @@ mod tests {
     async fn removing_an_agent_from_the_registry_retires_its_scheduler() {
         let config = test_config();
         let subscriptions = crate::subscription::Subscriptions::boot(&config, None);
-        let (default_service, _) =
-            crate::serve::AgentService::from_config_with_scheduler_delivery_and_reactions(
-                config,
-                None,
-                noop_delivery(),
-                None,
-                false,
-                subscriptions.clone(),
-            )
-            .await
-            .expect("default service");
+        let (default_service, _) = crate::serve::AgentService::from_config_for_hub(
+            config,
+            None,
+            None,
+            false,
+            subscriptions.clone(),
+        )
+        .await
+        .expect("default service");
         let agent = workforce_common::settings::AgentConfig {
             id: "second".into(),
             ..Default::default()
@@ -3300,7 +3339,6 @@ mod tests {
             test_config(),
             None,
             &agent,
-            noop_delivery(),
             Arc::new(workforce_common::locking::LockManager::new()),
             None,
             None,
@@ -3476,6 +3514,21 @@ mod tests {
         }
     }
 
+    /// [`turn_payload`] delivering to the Slack channel `channel`.
+    fn turn_payload_to(channel: &str) -> JobPayload {
+        JobPayload::AgentTurn {
+            message: "go".into(),
+            channel: None,
+            channel_id: Some(channel.into()),
+            thread_id: None,
+            model: None,
+            user_id: None,
+            max_rounds: None,
+            agent_owns_delivery: false,
+            tools: None,
+        }
+    }
+
     fn hourly() -> Schedule {
         Schedule::Every {
             every_secs: 3600,
@@ -3523,25 +3576,21 @@ mod tests {
         }
     }
 
-    /// A scheduler on a mock model whose deliveries land in the returned log.
+    /// A scheduler on a mock model whose deliveries land on the returned
+    /// Slack surface.
     async fn delivering_scheduler(
         data_dir: &std::path::Path,
         configure: impl FnOnce(&mut workforce_common::settings::WorkforceConfig),
     ) -> (
         Arc<Scheduler>,
-        Arc<std::sync::Mutex<Vec<String>>>,
+        Arc<crate::serve::testing::SentToSlack>,
         wiremock::MockServer,
     ) {
         let (service, server) =
             crate::serve::testing::service_on_mock_llm_with(data_dir, configure).await;
-        let delivered = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let log = Arc::clone(&delivered);
-        let delivery: DeliveryCallback = Arc::new(move |_, text| {
-            log.lock().unwrap().push(text);
-            Box::pin(async {}) as _
-        });
-        let sched = Scheduler::with_delivery_and_timezone(service, delivery, chrono_tz::UTC);
-        (Arc::new(sched), delivered, server)
+        let slack = crate::serve::testing::SentToSlack::on(&service).await;
+        let sched = Scheduler::new(service);
+        (Arc::new(sched), slack, server)
     }
 
     /// The scheduler sessions holding at least one run, as (channel, messages).
@@ -3637,7 +3686,7 @@ mod tests {
         assert!(records
             .iter()
             .all(|r| r.success && r.delivered && r.note.is_none()));
-        assert_eq!(delivered.lock().unwrap().len(), 4, "every run delivered");
+        assert_eq!(delivered.sent().len(), 4, "every run delivered");
         let fresh: Vec<(String, usize)> = run_sessions(&sched)
             .into_iter()
             .filter(|(channel, _)| *channel != pin)
@@ -3809,7 +3858,7 @@ mod tests {
                 "queue",
                 None,
                 hourly(),
-                turn_payload(),
+                turn_payload_to("C-queue"),
                 Some("owner".into()),
                 None,
             )
@@ -3824,7 +3873,7 @@ mod tests {
         assert!(records
             .iter()
             .all(|r| r.success && r.delivered && r.note.is_none()));
-        assert_eq!(delivered.lock().unwrap().len(), 4, "every run delivered");
+        assert_eq!(delivered.sent().len(), 4, "every run delivered");
         let sessions = &sched.service().sessions;
         let thread: Vec<_> = sessions
             .list_for_owner("scheduler", 100)
@@ -4144,7 +4193,7 @@ mod tests {
                 "queue",
                 None,
                 hourly(),
-                turn_payload(),
+                turn_payload_to("C-queue"),
                 Some("owner".into()),
                 None,
             )
@@ -4157,7 +4206,7 @@ mod tests {
         assert!(records
             .iter()
             .all(|r| r.success && r.note.as_deref() == Some(RAN_FRESH_BY_POLICY)));
-        assert_eq!(delivered.lock().unwrap().len(), 2);
+        assert_eq!(delivered.sent().len(), 2);
         let sessions = run_sessions(&sched);
         assert_eq!(sessions.len(), 2, "{sessions:?}");
         assert!(sessions.iter().all(|(channel, _)| *channel != pin));
@@ -6042,6 +6091,115 @@ mod tests {
 
         assert!(!record.delivered, "nothing was listening anywhere");
         assert!(rx.try_recv().is_err(), "no announcement should be queued");
+    }
+
+    /// A Desk room thread, as a turn there answers to it.
+    fn desk_thread() -> workforce_common::channels::desk::DeskScope {
+        use workforce_common::channels::desk::{DeskPlace, DeskTarget};
+        let room = uuid::Uuid::from_u128(21);
+        workforce_common::channels::desk::DeskScope {
+            target: DeskTarget::of_turn(
+                &DeskPlace::Room {
+                    room,
+                    name: "Planning".into(),
+                    thread: Some(uuid::Uuid::from_u128(22)),
+                },
+                &format!("desk:{room}"),
+                Some("device-1"),
+                false,
+            ),
+            attended: true,
+        }
+    }
+
+    /// Make a job in a turn of `person`'s answering to `scope`.
+    async fn add_job_on_desk(
+        sched: &Arc<Scheduler>,
+        person: Option<&str>,
+        scope: workforce_common::channels::desk::DeskScope,
+        payload: JobPayload,
+    ) -> String {
+        workforce_agent::runner::with_desk(
+            Some(scope),
+            sched.add_job_owned(
+                "from desk",
+                None,
+                Schedule::At {
+                    at: Utc::now() + chrono::Duration::seconds(30),
+                },
+                payload,
+                person.map(str::to_string),
+                None,
+            ),
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_reminder_made_in_a_desk_thread_lands_there_with_desk_closed_and_no_slack() {
+        let sched = test_scheduler().await;
+        let slack = crate::serve::testing::SentToSlack::on(&sched.service()).await;
+        let scope = desk_thread();
+        let id = add_job_on_desk(&sched, Some("user-A"), scope.clone(), reminder_payload()).await;
+        assert_eq!(
+            sched.get_job(&id).await.unwrap().deliver_to,
+            Some(DeliveryTarget::desk(scope.target.clone()))
+        );
+
+        let record = sched.run_job_now(&id).await.unwrap();
+
+        assert!(record.delivered);
+        let room = sched
+            .service()
+            .sessions
+            .find(&scope.target.channel, "user-A")
+            .unwrap()
+            .expect("the room's conversation");
+        let said = room.messages.last().unwrap();
+        assert_eq!(said.content, "\u{1f514} Reminder: stretch");
+        let mark = said.desk.clone().unwrap();
+        assert_eq!(
+            (mark.delivery, mark.thread),
+            (
+                Some(DeliveryKind::Reminder),
+                Some(uuid::Uuid::from_u128(22))
+            )
+        );
+        assert!(slack.sent().is_empty(), "nothing went to Slack");
+    }
+
+    #[tokio::test]
+    async fn a_desk_job_answers_in_its_conversation_and_one_with_nowhere_to_go_is_not_delivered() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (sched, slack, _server) = delivering_scheduler(tmp.path(), |_| {}).await;
+        let dm = || workforce_common::channels::desk::DeskScope {
+            target: desk_thread().target.dm(),
+            attended: true,
+        };
+        let owned = add_job_on_desk(&sched, Some("owner"), dm(), turn_payload()).await;
+        let record = sched.run_job_now(&owned).await.unwrap();
+        assert!(record.success && record.delivered, "{record:?}");
+        let conversation = sched
+            .service()
+            .sessions
+            .find("desk", "owner")
+            .unwrap()
+            .expect("the DM");
+        let said = conversation.messages.last().unwrap();
+        assert_eq!(said.content, "done");
+        assert_eq!(
+            said.desk.as_ref().and_then(|mark| mark.delivery),
+            Some(DeliveryKind::Job)
+        );
+
+        let ownerless = add_job_on_desk(&sched, None, dm(), turn_payload()).await;
+        let record = sched.run_job_now(&ownerless).await.unwrap();
+        assert!(
+            !record.delivered,
+            "a Desk job that could not be delivered is retried, not counted delivered"
+        );
+        assert!(slack.sent().is_empty());
     }
 
     /// The new field must not break pre-upgrade rows — `load_jobs` drops the

@@ -226,16 +226,39 @@ pub(crate) fn add_redacted_assistant_message(
 ) {
     let masked = workforce_common::redact::redact_secrets(response);
     let tokens = estimate_tokens(&masked);
+    let (id, mark) = reply_slot(desk, &session.channel);
+    session.add_assistant_message_with_id(
+        id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+        &masked,
+        tokens,
+    );
+    if let Some(reply) = session.messages.last_mut() {
+        reply.desk = mark;
+    }
+}
+
+/// The id and Desk mark a turn's answer in a session on `channel` is saved
+/// with: for a live Desk turn, the id its client was promised and its
+/// place; for a turn re-run in a Desk conversation nobody is attending (an
+/// approval's resume, a recovered turn), its place, as resumed.
+pub(crate) fn reply_slot(
+    desk: Option<&workforce_common::channels::desk::DeskTurnContext>,
+    channel: &str,
+) -> (
+    Option<String>,
+    Option<workforce_common::channels::desk::DeskMark>,
+) {
     match desk {
-        Some(desk) => {
-            session.add_assistant_message_with_id(desk.reply_id.clone(), &masked, tokens);
-            if let Some(reply) = session.messages.last_mut() {
-                reply.desk = Some(desk.turn.place.mark());
-            }
-        }
-        None => {
-            session.add_assistant_message(&masked, tokens);
-        }
+        Some(desk) => (Some(desk.reply_id.clone()), Some(desk.turn.place.mark())),
+        None => (
+            None,
+            workforce_agent::runner::current_desk()
+                .filter(|scope| !scope.attended && scope.target.channel == channel)
+                .map(|scope| workforce_common::channels::desk::DeskMark {
+                    delivery: Some(workforce_common::channels::desk::DeliveryKind::Resumed),
+                    ..scope.target.place.mark()
+                }),
+        ),
     }
 }
 

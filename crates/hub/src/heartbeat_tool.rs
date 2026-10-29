@@ -37,6 +37,12 @@ pub struct HeartbeatToolContext {
     pub min_cooldown_secs: u64,
 }
 
+/// The Desk conversation a check made or edited now reports to: the one the
+/// turn answers to, if any. A check reports nowhere else of its own.
+fn desk_origin() -> Option<workforce_common::delivery::DeliveryTarget> {
+    crate::desk_surface::origin().filter(|target| target.desk_target().is_some())
+}
+
 /// A check's effective cooldown: defaulted to the floor and never below it.
 /// A floor of 0 preserves the caller's value untouched.
 fn floored_cooldown(requested: Option<u64>, floor: u64) -> Option<u64> {
@@ -304,6 +310,7 @@ impl Tool for HeartbeatCreateTool {
                 tools: None,
                 creator: None,
                 creator_sig: None,
+                deliver_to: desk_origin(),
             },
             body: params.body,
         };
@@ -449,6 +456,7 @@ impl Tool for HeartbeatUpdateTool {
         if let Some(tags) = params.tags {
             check.meta.tags = tags;
         }
+        check.meta.deliver_to = desk_origin().or(check.meta.deliver_to.take());
         stamp_creator(
             self.ctx.signer.as_deref(),
             &mut check,

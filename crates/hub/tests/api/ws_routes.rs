@@ -438,3 +438,26 @@ async fn welcome_md_is_never_sent_to_a_client() {
         assert!(!connected.to_string().contains(WELCOME));
     }
 }
+
+/// Desk answers a routed approval by REST: only a person may, and only for
+/// a request that exists.
+#[tokio::test]
+async fn an_approval_decision_is_a_persons_for_a_request_that_exists() {
+    let data = tempfile::tempdir().unwrap();
+    let gateway = Gateway::new(vec![("default", agent_service(data.path()).await)], None);
+    let addr = serve(gateway.state.clone()).await;
+    let decide = |bearer: String| async move {
+        reqwest::Client::new()
+            .post(format!("http://{addr}/api/approvals/r-unknown/decision"))
+            .bearer_auth(bearer)
+            .json(&json!({"choice": "allow_once"}))
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16()
+    };
+    assert_eq!(decide(gateway.admin_token()).await, 404);
+    assert_eq!(decide(crate::support::GATEWAY_TOKEN.to_string()).await, 403);
+    assert_eq!(decide("not-a-token".to_string()).await, 401);
+}

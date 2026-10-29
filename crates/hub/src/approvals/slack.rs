@@ -325,6 +325,9 @@ pub async fn deliver_routed_for_invocations(
         tracing::warn!("routed approvals raised but no pending-approval store is configured");
         return;
     };
+    // The person a run made in Desk acts for is asked there; designated
+    // approvers in Slack, as ever.
+    let desk = workforce_agent::runner::current_desk().filter(|scope| !scope.attended);
     for req in routed {
         let row = match store.get(&req.request_id) {
             Ok(Some(row)) if row.is_pending() => row,
@@ -337,6 +340,18 @@ pub async fn deliver_routed_for_invocations(
                 continue;
             }
         };
+        let (on_desk, in_slack): (Vec<String>, Vec<String>) = req
+            .approver_user_ids
+            .iter()
+            .cloned()
+            .partition(|approver| desk.is_some() && *approver == row.requester_id);
+        if let (Some(scope), false) = (&desk, on_desk.is_empty()) {
+            super::desk::deliver_routed_approval(svc, &store, &row, &req.detail, &scope.target)
+                .await;
+        }
+        if in_slack.is_empty() {
+            continue;
+        }
         let Some(surface) = resolution_surface(svc, &row).await else {
             tracing::warn!(request = %req.request_id, "no Slack surface to deliver routed approval; row stays pending for the sweeper");
             continue;
@@ -351,7 +366,7 @@ pub async fn deliver_routed_for_invocations(
             &req.detail,
             &row.reason,
             &PermissionPromptOptions::ask(false),
-            &req.approver_user_ids,
+            &in_slack,
             &row.requester_id,
             row.channel_id.as_deref().unwrap_or_default(),
             row.thread_ts.as_deref(),

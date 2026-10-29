@@ -34,20 +34,30 @@ impl Matches<'_> {
 }
 
 /// Point every delivery `owner` set up with `service`'s agent that `matches`
-/// names at their DM. Returns the jobs moved.
+/// names at their DM: their jobs, their heartbeat checks (signed again as
+/// theirs) and their live workflow runs. Returns what moved, by id.
 pub(crate) async fn retarget(
     service: &AgentService,
     owner: &str,
     matches: Matches<'_>,
 ) -> Vec<String> {
-    match &service.scheduler {
+    let jobs = match &service.scheduler {
         Some(scheduler) => {
             scheduler
                 .retarget_desk(owner, &|target| matches.retargeted(target))
                 .await
         }
         None => Vec::new(),
-    }
+    };
+    let checks =
+        crate::heartbeat::retarget_checks(service, owner, &|target| matches.retargeted(target));
+    let runs = service
+        .workflow_runtime()
+        .map(|runtime| {
+            runtime.retarget_desk(owner, &|target| matches.names(target).then(|| target.dm()))
+        })
+        .unwrap_or_default();
+    jobs.into_iter().chain(checks).chain(runs).collect()
 }
 
 #[cfg(test)]

@@ -3133,6 +3133,11 @@ pub(crate) async fn process_admitted(
     if session.context_type.is_none() {
         session.context_type = Some(classify_context_type(channel_id, thread_id));
     }
+    // A run made in a Desk conversation remembers it on the session it runs
+    // in, so its approvals' resumes answer there.
+    if let Some(scope) = workforce_agent::runner::current_desk() {
+        session.set_desk_origin(&scope.target);
+    }
 
     // Build augmented message with channel context and welcome directive.
     // The original message is stored in the session; augmentation only affects the LLM.
@@ -4554,8 +4559,11 @@ pub(crate) async fn stream_admitted(
     ) {
         effective_message = format!("{block}\n\n{effective_message}");
     }
-    if let Some(desk) = desk {
-        session.set_desk_origin(&desk.target);
+    if let Some(target) = desk
+        .map(|desk| desk.target.clone())
+        .or_else(|| workforce_agent::runner::current_desk().map(|scope| scope.target))
+    {
+        session.set_desk_origin(&target);
     }
 
     // Prepend channel-specific system prompt if configured

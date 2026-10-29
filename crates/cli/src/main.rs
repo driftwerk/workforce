@@ -3121,10 +3121,9 @@ struct OverlayWatcherCtx {
     mcp_http: Arc<reqwest::Client>,
     mcp_managers: Arc<McpManagerMap>,
     broadcast_tx: tokio::sync::broadcast::Sender<workforce_hub::gateway::BroadcastMessage>,
-    /// Shared reminder-delivery callback and leader flag, so a live-spawned
-    /// agent gets its own scheduler (and reminder/scheduler tools) exactly like
-    /// a startup agent, rather than `scheduler = None` until the next restart.
-    scheduler_delivery: workforce_hub::scheduler::DeliveryCallback,
+    /// Shared leader flag, so a live-spawned agent gets its own scheduler (and
+    /// reminder/scheduler tools) exactly like a startup agent, rather than
+    /// `scheduler = None` until the next restart.
     voice_announcer: Arc<workforce_hub::voice_announce::VoiceAnnouncer>,
     leader_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
     nats: Option<async_nats::Client>,
@@ -3285,7 +3284,6 @@ async fn spawn_and_wire_agent(
             config.clone(),
             None, // config_path not available in hub server mode (matches startup)
             agent_config,
-            Arc::clone(&ctx.scheduler_delivery),
             Arc::clone(&ctx.lock_manager),
             ctx.shared_knowledge.clone(),
             ctx.shared_local_agents.clone(),
@@ -3822,34 +3820,9 @@ rules:
                 }
             }
 
-            // Create broadcast channel first (needed by scheduler delivery and reactions)
+            // Create the broadcast channel first: reactions and the gateway take it.
             let (broadcast_tx, _) =
                 broadcast::channel::<workforce_hub::gateway::BroadcastMessage>(256);
-            let broadcast_tx_for_scheduler = broadcast_tx.clone();
-            // One delivery callback shared by every agent's scheduler — it just
-            // broadcasts a reminder to connected WebSocket clients.
-            let scheduler_delivery: workforce_hub::scheduler::DeliveryCallback = Arc::new(
-                move |job_name: String, response: String| {
-                    let tx = broadcast_tx_for_scheduler.clone();
-                    Box::pin(async move {
-                        tracing::info!(
-                            job = %job_name,
-                            receivers = tx.receiver_count(),
-                            "Delivering reminder via broadcast"
-                        );
-                        match tx.send(workforce_hub::gateway::BroadcastMessage::new(
-                            "scheduler",
-                            "reminder",
-                            format!("⏰ **{}**: {}", job_name, response),
-                        )) {
-                            Ok(n) => tracing::info!(receivers = n, "Reminder broadcast sent"),
-                            Err(e) => {
-                                tracing::debug!(error = %e, "Reminder broadcast skipped (no WebSocket receivers)")
-                            }
-                        }
-                    })
-                },
-            );
 
             // Open the hub-level global vault BEFORE agents are built, so
             // per-user credential overlays (written to the global vault via
@@ -3927,10 +3900,9 @@ rules:
 
             // Build the default agent service with scheduler and reactions
             let (default_service, scheduler) =
-                workforce_hub::serve::AgentService::from_config_with_scheduler_delivery_and_reactions(
+                workforce_hub::serve::AgentService::from_config_for_hub(
                     wf_config.clone(),
                     Some(config_path.clone()),
-                    Arc::clone(&scheduler_delivery),
                     global_vault.clone(),
                     // Hub canonical model: the MaintenanceRunner is the sole
                     // indexer, so the default service must not also index its
@@ -4137,46 +4109,28 @@ rules:
                     token
                 });
 
-            // Heartbeat delivery routes a check's output to the broadcast
-            // channel. Build it here — cloning `broadcast_tx` before the gateway
-            // takes it — and hand it to the per-agent heartbeat supervisor that's
-            // spawned once the agent registry exists (below). Self-learning and
-            // heartbeat are per-agent: a supervisor runs one runner per agent
-            // scoped to that agent's own workspace, rather than one runner bound
-            // to the default agent and a hardcoded `{data_dir}/workspace`.
-            // Heartbeat runners run for every agent, whether or not the
-            // install turns heartbeats on: an agent's own `[heartbeat]` may
-            // turn them on (or off) for it, and each runner reads it as it
-            // goes. One that is off only re-reads its config each minute.
-            let heartbeat_delivery: Option<workforce_hub::heartbeat::HeartbeatDeliveryCallback> = {
-                let broadcast_tx_for_heartbeat = broadcast_tx.clone();
-                let cb: workforce_hub::heartbeat::HeartbeatDeliveryCallback =
-                    Arc::new(move |_name: String, response: String| {
-                        let tx = broadcast_tx_for_heartbeat.clone();
-                        Box::pin(async move {
-                            let _ = tx.send(workforce_hub::gateway::BroadcastMessage::new(
-                                "heartbeat",
-                                "message",
-                                response,
-                            ));
-                        })
-                    });
-                if wf_config.heartbeat.enabled {
-                    eprintln!(
-                        "  Heartbeat: {} (every {}m, active {}-{})",
-                        style("enabled").cyan(),
-                        wf_config.heartbeat.interval_secs / 60,
-                        wf_config.heartbeat.active_start,
-                        wf_config.heartbeat.active_end,
-                    );
-                } else {
-                    eprintln!(
-                        "  Heartbeat: {}",
-                        style("only where an agent turns it on").dim()
-                    );
-                }
-                Some(cb)
-            };
+            // Self-learning and heartbeat are per-agent: a supervisor runs one
+            // runner per agent scoped to that agent's own workspace, rather
+            // than one runner bound to the default agent and a hardcoded
+            // `{data_dir}/workspace`. Heartbeat runners run for every agent,
+            // whether or not the install turns heartbeats on: an agent's own
+            // `[heartbeat]` may turn them on (or off) for it, and each runner
+            // reads it as it goes. One that is off only re-reads its config
+            // each minute.
+            if wf_config.heartbeat.enabled {
+                eprintln!(
+                    "  Heartbeat: {} (every {}m, active {}-{})",
+                    style("enabled").cyan(),
+                    wf_config.heartbeat.interval_secs / 60,
+                    wf_config.heartbeat.active_start,
+                    wf_config.heartbeat.active_end,
+                );
+            } else {
+                eprintln!(
+                    "  Heartbeat: {}",
+                    style("only where an agent turns it on").dim()
+                );
+            }
 
             // Register daily briefing job if enabled (DW-168)
             if wf_config.briefing.enabled {
@@ -4246,7 +4200,6 @@ rules:
                         wf_config.clone(),
                         None, // config_path not available in hub server mode
                         agent_config,
-                        Arc::clone(&scheduler_delivery),
                         Arc::clone(&lock_manager_for_agents),
                         shared_knowledge.clone(),
                         shared_local_agents.clone(),
@@ -4310,7 +4263,7 @@ rules:
                     .await;
                 });
             }
-            if let Some(delivery) = heartbeat_delivery {
+            {
                 let registry = Arc::downgrade(&registry);
                 let leader_flag = leader_flag.clone();
                 let user_tz = wf_config.user_timezone();
@@ -4322,7 +4275,6 @@ rules:
                         registry,
                         leader_flag,
                         user_tz,
-                        Some(delivery),
                         cancel,
                     )
                     .await;
@@ -4566,7 +4518,6 @@ rules:
                 mcp_http: Arc::clone(&mcp_http),
                 mcp_managers: Arc::clone(&mcp_managers),
                 broadcast_tx: broadcast_tx.clone(),
-                scheduler_delivery: Arc::clone(&scheduler_delivery),
                 voice_announcer: Arc::clone(&voice_announcer),
                 leader_flag: leader_flag.clone(),
                 nats: nats_for_gateway.clone(),
@@ -9635,6 +9586,7 @@ rules:
                             tools: None,
                             creator: None,
                             creator_sig: None,
+                            deliver_to: None,
                         },
                         body: body.unwrap_or_else(|| {
                             format!(

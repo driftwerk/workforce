@@ -5519,60 +5519,41 @@ async fn handle_routed_permission_button(
     choice: workforce_core::policy::PermissionChoice,
     response_url: &str,
 ) -> bool {
-    let Some(svc) = registry.resolve(None) else {
-        return false;
-    };
-    let Some(store) = svc.pending_approval_store.read().clone() else {
-        return false;
-    };
-    let Some(row) = store.get(request_id).ok().flatten() else {
-        return false;
-    };
-    let targets = store.targets(request_id).unwrap_or_default();
-
-    // Authorise: only a designated approver may action this request.
-    if !crate::approvals::slack::clicker_is_eligible(&targets, clicker_slack_id) {
-        post_ephemeral(
-            response_url,
-            "Only the designated approvers can action this request.",
-        )
-        .await;
-        return true;
-    }
-
-    let outcome = if choice.is_allow() {
-        crate::hub_core::approvals::ApprovalOutcome::Approved
-    } else {
-        crate::hub_core::approvals::ApprovalOutcome::Denied
-    };
-    let resolver_id = svc
-        .identity_store
-        .read()
-        .clone()
-        .and_then(|s| s.get_by_linked_id("slack", clicker_slack_id).ok().flatten())
-        .map(|i| i.id.to_string())
-        .unwrap_or_else(|| clicker_slack_id.to_string());
-
-    match store.claim(request_id, outcome, &resolver_id) {
-        Ok(true) => {
-            // First-wins: launch the resume turn (on the *requesting* agent's
-            // service), then rewrite every DM + the origin-channel notice.
-            let row = store.get(request_id).ok().flatten().unwrap_or(row);
-            let resolver_display = format!("<@{clicker_slack_id}>");
-            crate::approvals::slack::rewrite_all_targets(&svc, &store, &row, outcome, &resolver_id)
-                .await;
-            crate::approvals::resume::launch_resume(registry, &row, outcome, &resolver_display)
-                .await;
+    use crate::approvals::decide::{decide, DecideError, Decided, Decider};
+    match decide(
+        registry,
+        request_id,
+        Decider::Slack(clicker_slack_id),
+        choice,
+    )
+    .await
+    {
+        Err(DecideError::Unknown) => return false,
+        Err(DecideError::NotAnApprover) => {
+            post_ephemeral(
+                response_url,
+                "Only the designated approvers can action this request.",
+            )
+            .await;
         }
-        Ok(false) => {
+        Ok(Decided::Resolved(_)) => {}
+        Ok(Decided::AlreadyResolved(row)) => {
             // Lost the race (already resolved/expired): rewrite just this
             // clicker's DM and tell them privately who decided.
-            let row = store.get(request_id).ok().flatten().unwrap_or(row);
-            if let (Some(surface), Some(target)) = (
-                surface,
-                targets.iter().find(|t| t.slack_user_id == clicker_slack_id),
-            ) {
-                crate::approvals::slack::rewrite_single_target(&svc, surface, target, &row).await;
+            if let Some(svc) = registry.resolve(None) {
+                let targets = svc
+                    .pending_approval_store
+                    .read()
+                    .clone()
+                    .and_then(|store| store.targets(request_id).ok())
+                    .unwrap_or_default();
+                if let (Some(surface), Some(target)) = (
+                    surface,
+                    targets.iter().find(|t| t.slack_user_id == clicker_slack_id),
+                ) {
+                    crate::approvals::slack::rewrite_single_target(&svc, surface, target, &row)
+                        .await;
+                }
             }
             let who = row
                 .resolved_by
@@ -5582,7 +5563,7 @@ async fn handle_routed_permission_button(
                 .unwrap_or_else(|| "the system".to_string());
             post_ephemeral(response_url, &format!("Already resolved by {who}.")).await;
         }
-        Err(e) => {
+        Err(DecideError::Failed(e)) => {
             warn!(error = %e, request = %request_id, "routed approval claim failed");
             post_ephemeral(
                 response_url,
@@ -11288,7 +11269,19 @@ pub async fn resume_turn(
                 )
                 .await
             }
-            ResumeDelivery::Session => resume_in_session(svc, session, run_as, prompt).await,
+            ResumeDelivery::Session => {
+                let desk = session.desk_origin().map(|target| {
+                    workforce_common::channels::desk::DeskScope {
+                        target,
+                        attended: false,
+                    }
+                });
+                workforce_agent::runner::with_desk(
+                    desk,
+                    resume_in_session(svc, session, run_as, prompt),
+                )
+                .await
+            }
         }
     })
     .await
@@ -11373,7 +11366,7 @@ pub async fn rerun_unanswered(
         };
         match resume_turn(svc, &session, &waiter.principal, &delivery, prompt).await {
             Ok(answer) => {
-                deliver_resumed(&delivery, surfaces, push, session_id, answer).await;
+                deliver_resumed(svc, &delivery, surfaces, push, session_id, answer).await;
                 Attempt::Done(Ok(()))
             }
             Err(e) if held_elsewhere(&e) => Attempt::Held,
@@ -11475,6 +11468,7 @@ fn save_answer(
 
 /// Hand a resumed turn's answer, or its apology, to where it goes.
 async fn deliver_resumed(
+    svc: &crate::serve::AgentService,
     delivery: &ResumeDelivery,
     surfaces: &[Arc<dyn ChannelSurface>],
     push: &crate::session_push::SessionPush,
@@ -11483,7 +11477,24 @@ async fn deliver_resumed(
 ) {
     match delivery {
         ResumeDelivery::Thread(target) => send_to_thread(surfaces, target, text).await,
-        ResumeDelivery::Session => push.deliver(session_id, &text).await,
+        ResumeDelivery::Session => {
+            // A Desk conversation's person also hears of it on their hub
+            // links, so a Desk that is closed or elsewhere drains it.
+            let on_desk = match svc.sessions.get(session_id) {
+                Ok(Some(session)) => {
+                    crate::desk_surface::resumed(svc, &session, &session.owner, &text)
+                        .await
+                        .unwrap_or_else(|e| {
+                            warn!(session_id, error = %e, "announcing a resumed answer on Desk");
+                            false
+                        })
+                }
+                _ => false,
+            };
+            if !on_desk {
+                push.deliver(session_id, &text).await;
+            }
+        }
     }
 }
 
@@ -11631,7 +11642,7 @@ pub async fn resume_interrupted_tasks(
                             // the transcript, so dying here leaves a record the
                             // next sweep sees as answered and clears — whereas
                             // clearing first would drop the delivery for good.
-                            deliver_resumed(&delivery, surfaces, push, session_id, response).await;
+                            deliver_resumed(svc, &delivery, surfaces, push, session_id, response).await;
                             crate::serve::end_turn_record(&svc.sessions, session_id, &turn.token);
                             info!(session_id = %session_id, "Resumed interrupted turn");
                             Attempt::Done(())
@@ -11658,6 +11669,7 @@ pub async fn resume_interrupted_tasks(
                                 save_answer(&svc.sessions, session_id, RESUME_APOLOGY);
                             }
                             deliver_resumed(
+                                svc,
                                 &delivery,
                                 surfaces,
                                 push,

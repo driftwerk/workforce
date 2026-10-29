@@ -3,11 +3,14 @@
 //! Once the policy + cascade layers settle a tool call on
 //! `RequireApproval`, [`router::HubApprovalRouter`] decides *who* is
 //! asked and *how*. Routed approvals are persisted in
-//! [`store::PendingApprovalStore`], delivered as Slack DMs
-//! ([`slack`]), resolved first-wins, and the approved action is
-//! re-executed deterministically by a fresh turn ([`resume`]). A
-//! background [`sweeper`] expires lapsed requests.
+//! [`store::PendingApprovalStore`], delivered as Slack DMs ([`slack`]) or
+//! in the Desk conversation a run was made in ([`desk`]), resolved
+//! first-wins ([`decide`]), and the approved action is re-executed
+//! deterministically by a fresh turn ([`resume`]). A background
+//! [`sweeper`] expires lapsed requests.
 
+pub mod decide;
+pub(crate) mod desk;
 pub mod resume;
 pub mod router;
 pub mod slack;
