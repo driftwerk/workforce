@@ -1355,7 +1355,7 @@ async fn a_member_is_not_shown_where_the_install_runs_or_which_other_agents_it_s
 }
 
 #[tokio::test]
-async fn a_memory_edit_the_running_store_cannot_take_waits_for_a_restart() {
+async fn a_consolidation_edit_takes_effect_without_a_restart() {
     let hub = hub(|_| {}).await;
     let started = row(&all(&hub, &member(ALICE)).await, "memory.consolidation").clone();
     assert_eq!(
@@ -1363,6 +1363,8 @@ async fn a_memory_edit_the_running_store_cannot_take_waits_for_a_restart() {
         (Some(Source::Default), None)
     );
 
+    // Consolidation re-arms its job when the config changes, so the edit
+    // shows as live at once rather than waiting for a restart.
     configured(
         &hub,
         &format!(
@@ -1374,11 +1376,8 @@ async fn a_memory_edit_the_running_store_cannot_take_waits_for_a_restart() {
     .await;
     let rows = all(&hub, &member(ALICE)).await;
     let held = row(&rows, "memory.consolidation");
-    assert_eq!(
-        (held.source, held.status, &held.value),
-        (Some(Source::Default), Some(Status::Inert), &started.value)
-    );
-    assert!(reason(&rows, "memory.consolidation").contains("until it restarts"));
+    assert_eq!(held.status, None, "{held:?}");
+    assert_eq!(held.value, json!(started.value == json!(false)));
     assert_eq!(row(&rows, "memory.passive").status, None);
 }
 

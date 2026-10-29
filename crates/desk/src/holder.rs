@@ -756,6 +756,13 @@ impl Holder {
                     }
                 }
             }
+            // This hub hung up (it is stopping): the holder keeps the
+            // terminals for the next hub, so nothing is lost or ended here.
+            if reader.closed.is_cancelled() {
+                tracing::debug!("hung up on the PTY holder; it keeps the terminals");
+                reader.pending.lock().clear();
+                return;
+            }
             tracing::warn!("lost the PTY holder; its terminals are gone to this hub");
             reader.lost();
         });
