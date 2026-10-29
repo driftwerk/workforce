@@ -72,42 +72,89 @@ fn cell(s: &str) -> String {
     s.replace('|', "/").replace('\n', " ")
 }
 
-/// The overview as a table the overseer reads and can act from.
-fn table(items: &[Item]) -> String {
-    let mut out = String::from(
-        "| Who | Kind | Id | State | Doing | Detail | Since |\n|---|---|---|---|---|---|---|\n",
+/// One row of the overview's table.
+fn row(i: &Item) -> String {
+    let kind = match (i.kind, i.engine, i.origin) {
+        (crew::ItemKind::Agent, ..) => "agent".to_string(),
+        (_, Some(engine), Some(origin)) => format!(
+            "{} session{}",
+            engine.as_str(),
+            if origin == workforce_desk::model::Origin::External {
+                " (other terminal)"
+            } else {
+                ""
+            }
+        ),
+        _ => "session".to_string(),
+    };
+    let mut detail = i.detail.clone().unwrap_or_default();
+    if let Some(a) = &i.approval {
+        detail = format!("asks: {} (approval {})", a.summary, a.id);
+    }
+    if let Some(q) = &i.question {
+        detail = format!("asks you: {}", q.text);
+    }
+    // The person's name for it first; the hub's and its folder after.
+    let also: Vec<String> = i
+        .hub_name
+        .iter()
+        .cloned()
+        .chain(i.cwd.as_deref().map(|c| format!("in {c}")))
+        .collect();
+    let who = if also.is_empty() {
+        i.name.clone()
+    } else {
+        format!("{} ({})", i.name, also.join(", "))
+    };
+    format!(
+        "| {} | {} | {} | {} | {} | {} | {} |\n",
+        cell(&who),
+        kind,
+        i.id,
+        state_word(i.state),
+        cell(i.task.as_deref().unwrap_or("")),
+        cell(&detail),
+        i.since.map(|t| t.to_rfc3339()).unwrap_or_default(),
+    )
+}
+
+/// The overview as tables the overseer reads and can act from: one per
+/// sidebar group, in the person's order, then whatever is in none.
+fn table(items: &[Item], groups: &[String]) -> String {
+    const HEAD: &str =
+        "| Who | Kind | Id | State | Doing | Detail | Since |\n|---|---|---|---|---|---|---|\n";
+    let mut out = String::new();
+    let mut section = |title: Option<&str>, rows: Vec<&Item>| {
+        if rows.is_empty() {
+            return;
+        }
+        match title {
+            Some(t) => out.push_str(&format!("Group “{}”:\n", cell(t))),
+            None if !out.is_empty() => out.push_str("In no group:\n"),
+            None => {}
+        }
+        out.push_str(HEAD);
+        rows.into_iter().for_each(|i| out.push_str(&row(i)));
+        out.push('\n');
+    };
+    for g in groups {
+        section(
+            Some(g),
+            items
+                .iter()
+                .filter(|i| i.group.as_deref() == Some(g.as_str()))
+                .collect(),
+        );
+    }
+    section(
+        None,
+        items
+            .iter()
+            .filter(|i| i.group.as_ref().is_none_or(|g| !groups.contains(g)))
+            .collect(),
     );
-    for i in items {
-        let kind = match (i.kind, i.engine, i.origin) {
-            (crew::ItemKind::Agent, ..) => "agent".to_string(),
-            (_, Some(engine), Some(origin)) => format!(
-                "{} session{}",
-                engine.as_str(),
-                if origin == workforce_desk::model::Origin::External {
-                    " (other terminal)"
-                } else {
-                    ""
-                }
-            ),
-            _ => "session".to_string(),
-        };
-        let mut detail = i.detail.clone().unwrap_or_default();
-        if let Some(a) = &i.approval {
-            detail = format!("asks: {} (approval {})", a.summary, a.id);
-        }
-        if let Some(q) = &i.question {
-            detail = format!("asks you: {}", q.text);
-        }
-        out.push_str(&format!(
-            "| {} | {} | {} | {} | {} | {} | {} |\n",
-            cell(&i.name),
-            kind,
-            i.id,
-            state_word(i.state),
-            cell(i.task.as_deref().unwrap_or("")),
-            cell(&detail),
-            i.since.map(|t| t.to_rfc3339()).unwrap_or_default(),
-        ));
+    if out.is_empty() {
+        out.push_str(HEAD);
     }
     out
 }
@@ -123,7 +170,7 @@ impl CrewTool {
                 let o = crew.desk.overview(crew.as_ref()).await.map_err(internal)?;
                 Ok(json!({
                     "counts": o.counts,
-                    "table": table(&o.items),
+                    "table": table(&o.items, &o.groups),
                 }))
             }
             "crew.activity" => {
@@ -188,7 +235,8 @@ impl CrewTool {
                         .map_err(|_| "That session isn’t there any more.".to_string())?;
                     let terminal = crew.desk.terminal_text(id, 3000).ok();
                     return Ok(json!({
-                        "name": v.name, "goal": v.goal, "state": v.state, "cwd": v.cwd,
+                        "name": v.label(), "hub_name": v.name, "group": v.group.map(|g| g.name),
+                        "goal": v.goal, "state": v.state, "cwd": v.cwd,
                         "last_prompt": v.last_prompt, "last_reply": v.last_reply,
                         "pending": v.pending, "terminal": terminal,
                     }));
@@ -361,5 +409,51 @@ impl Tool for CrewTool {
             Ok(v) => ToolResult::success(v, ms()),
             Err(e) => ToolResult::failure(e, ms()),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use workforce_desk::model::{Engine, Origin};
+
+    fn item(name: &str, hub_name: Option<&str>, group: Option<&str>) -> Item {
+        Item {
+            kind: crew::ItemKind::Session,
+            id: format!("id-{name}"),
+            name: name.into(),
+            hub_name: hub_name.map(Into::into),
+            cwd: Some("/Users/k/dev/monorepo".into()),
+            group: group.map(Into::into),
+            engine: Some(Engine::Claude),
+            origin: Some(Origin::Desk),
+            state: ItemState::Working,
+            task: None,
+            detail: None,
+            since: None,
+            last_activity: None,
+            approval: None,
+            question: None,
+        }
+    }
+
+    #[test]
+    fn the_overseer_reads_sessions_under_their_groups_by_both_names() {
+        let items = [
+            item("auth-fix", None, None),
+            item("Ledger migration", Some("monorepo-fd"), Some("Atlas")),
+        ];
+        let t = table(&items, &["Atlas".to_string(), "Empty".to_string()]);
+        let atlas = t.find("Group “Atlas”:").expect("a Atlas section");
+        let row = t
+            .find("| Ledger migration (monorepo-fd, in /Users/k/dev/monorepo) |")
+            .expect("both names");
+        let rest = t.find("In no group:").expect("the rest after");
+        assert!(atlas < row && row < rest, "{t}");
+        assert!(
+            !t.contains("Empty"),
+            "a group with nothing in it is left out"
+        );
+        assert!(t[rest..].contains("| auth-fix (in /Users/k/dev/monorepo) |"));
     }
 }

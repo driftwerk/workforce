@@ -32,7 +32,12 @@ use crate::store::DeskStore;
 use crate::transcript;
 use crate::worktree;
 
+mod groups;
 mod terminals;
+
+pub use groups::{
+    local_agent_item, session_item, Group, Import, Imported, Layout, Ungrouped, UNGROUPED,
+};
 
 pub use terminals::{NewTerminal, TerminalPatch, TerminalRecord, TerminalState, TerminalView};
 
@@ -154,6 +159,8 @@ struct State {
     acted: HashSet<Uuid>,
     terminals: HashMap<Uuid, TerminalRecord>,
     terminal_ptys: HashMap<Uuid, Arc<Pty>>,
+    /// The sidebar's groups.
+    layout: Layout,
 }
 
 /// How often a busy session's tool is recorded as `working`.
@@ -178,6 +185,7 @@ struct Inner {
     hook_port: u16,
     cancel: CancellationToken,
     holder: Mutex<Option<Holder>>,
+    layout_write: tokio::sync::Mutex<()>,
 }
 
 #[derive(Clone)]
@@ -200,6 +208,7 @@ impl Desk {
     /// and the adoption poller. `cancel` stops all of it and every session.
     pub async fn start(store: DeskStore, opts: Options, cancel: CancellationToken) -> Result<Self> {
         let store = Arc::new(store);
+        let layout = store.layout().await?;
         let (holder, held) = connect_holder(opts.holder.as_ref()).await;
         let rooms = store
             .rooms()
@@ -240,6 +249,7 @@ impl Desk {
             state: Mutex::new(State {
                 records,
                 rooms,
+                layout,
                 ..State::default()
             }),
             events: broadcast::channel(256).0,
@@ -248,6 +258,7 @@ impl Desk {
             hook_port,
             cancel: cancel.clone(),
             holder: Mutex::new(holder),
+            layout_write: tokio::sync::Mutex::new(()),
         }));
         tokio::spawn(persist_loop(store, persist_rx));
         recovered.into_iter().for_each(|r| desk.save(r));
@@ -409,12 +420,14 @@ impl Desk {
 
     fn view_of(state: &State, r: &SessionRecord) -> SessionView {
         let live = state.live.get(&r.id);
-        SessionView::new(
+        let mut view = SessionView::new(
             r,
             live.is_some(),
             live.and_then(|l| l.current_tool.clone()),
             live.and_then(|l| l.pending.clone()),
-        )
+        );
+        view.group = Self::group_ref(&state.layout, &groups::session_item(r.id));
+        view
     }
 
     fn save(&self, r: SessionRecord) {
@@ -666,6 +679,7 @@ impl Desk {
                 restore: self.restore_offer(),
                 rooms: self.rooms(),
                 terminals: self.terminals(),
+                layout: self.layout(),
             },
             rx,
         )
@@ -728,6 +742,7 @@ impl Desk {
             external_pid: None,
             restore_offer: false,
             terminal_id: None,
+            display_name: None,
             created_at: now,
             updated_at: now,
         };
@@ -741,7 +756,7 @@ impl Desk {
         let view = self.view(id)?;
         let me = Party::session(&view);
         self.note(match by {
-            Some(by) => by.event(Kind::Started, Some(me), format!("started {}", view.name)),
+            Some(by) => by.event(Kind::Started, Some(me), format!("started {}", view.label())),
             None => Event::new(Kind::Started, me.clone(), Some(me), "started"),
         });
         Ok(view)
@@ -752,6 +767,17 @@ impl Desk {
         if patch.name.as_deref().is_some_and(|n| n.trim().is_empty()) {
             return Err(DeskError::Invalid("a session needs a name".into()));
         }
+        let display_name = patch
+            .display_name
+            .map(|n| n.map(|n| n.trim().to_string()).filter(|n| !n.is_empty()));
+        if display_name
+            .as_ref()
+            .is_some_and(|n| n.as_ref().is_some_and(|n| n.chars().count() > 200))
+        {
+            return Err(DeskError::Invalid(
+                "a name is at most 200 characters".into(),
+            ));
+        }
         self.change(id, |r, _| {
             if let Some(n) = patch.name {
                 r.name = n.trim().to_string();
@@ -761,6 +787,9 @@ impl Desk {
             }
             if let Some(a) = patch.approvals.filter(|_| r.engine == Engine::Claude) {
                 r.approvals = a;
+            }
+            if let Some(n) = display_name {
+                r.display_name = n;
             }
         });
         self.view(id)
@@ -791,7 +820,7 @@ impl Desk {
             self.note(by.event(
                 Kind::Stopped,
                 Some(Party::session(&view)),
-                format!("stopped {}", view.name),
+                format!("stopped {}", view.label()),
             ));
         }
         Ok(view)
@@ -842,8 +871,8 @@ impl Desk {
         let view = self.view(id)?;
         if let Some(by) = by {
             let text = match &prompt {
-                Some(p) => format!("resumed {} with “{}”", view.name, crew::one_line(p, 100)),
-                None => format!("resumed {}", view.name),
+                Some(p) => format!("resumed {} with “{}”", view.label(), crew::one_line(p, 100)),
+                None => format!("resumed {}", view.label()),
             };
             self.note(by.event(Kind::Resumed, Some(Party::session(&view)), text));
         }
@@ -873,8 +902,12 @@ impl Desk {
         self.0.state.lock().acted.insert(id);
         let view = self.resume(id, prompt.clone(), None).await?;
         let text = match &prompt {
-            Some(p) => format!("restarted {} with “{}”", view.name, crew::one_line(p, 100)),
-            None => format!("restarted {}", view.name),
+            Some(p) => format!(
+                "restarted {} with “{}”",
+                view.label(),
+                crew::one_line(p, 100)
+            ),
+            None => format!("restarted {}", view.label()),
         };
         self.note(by.event(Kind::Restarted, Some(Party::session(&view)), text));
         Ok(view)
@@ -987,11 +1020,13 @@ impl Desk {
                 Decision::Allow => Some(by.event(
                     Kind::Approved,
                     me,
-                    format!("allowed {} to {what}", view.name),
+                    format!("allowed {} to {what}", view.label()),
                 )),
-                Decision::Deny => {
-                    Some(by.event(Kind::Denied, me, format!("denied {} to {what}", view.name)))
-                }
+                Decision::Deny => Some(by.event(
+                    Kind::Denied,
+                    me,
+                    format!("denied {} to {what}", view.label()),
+                )),
                 Decision::Terminal => None,
             };
             if let Some(e) = event {
@@ -1018,7 +1053,7 @@ impl Desk {
             self.note(by.event(
                 Kind::Nudged,
                 Some(Party::session(&view)),
-                format!("asked {} “{}”", view.name, crew::one_line(text, 120)),
+                format!("asked {} “{}”", view.label(), crew::one_line(text, 120)),
             ));
         }
         Ok(view)
@@ -1724,6 +1759,7 @@ impl Desk {
                         external_pid: ext.pid,
                         restore_offer: false,
                         terminal_id: None,
+                        display_name: None,
                         created_at: now,
                         updated_at: now,
                     };

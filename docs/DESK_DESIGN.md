@@ -424,6 +424,12 @@ Repo: new `driftwerk/workforce-desk`, depending on workforce-public via pinned g
   registers a Desk-origin session with `terminalId` (or takes back the one with that
   `session_id`), later hooks drive it like a Desk-launched session (approvals held up to a day),
   SessionEnd or the shell ending stops it, and the `claude agents` adopter leaves it alone.
+- **Names and groups**: a session's person-given name (`displayName`, `PUT
+  /api/desk/sessions/{id}/name`) and the sidebar's groups (`/api/desk/groups`, `/api/desk/layout`,
+  Desk's `Layout` shape; members `session:<id>` / `agent:<hub>/<agent>`) live in Postgres and go
+  out as `{type:"layout"}`. Agents see them: sessions carry `displayName` and `group`, the
+  overview names each by the person's name first and lists it under its group, and
+  `desk.sessions {query}` finds sessions by either name, folder or group.
 - **Desk state** (`/api/desk/state/{key}`): a JSON value per key in `desk.state`, committed
   before the answer, announced as `{type:"state"}` (re-read on any `snapshot`).
 - **Security fix found on the way**: `/ws/agent` accepted any token when device pairing was

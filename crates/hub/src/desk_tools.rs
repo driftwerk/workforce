@@ -136,7 +136,10 @@ impl DeskTool {
     async fn run(&self, input: Value) -> Result<Value, DeskError> {
         let d = &self.desk;
         match self.verb {
-            Verb::List => out(d.list()),
+            Verb::List => {
+                let query = input["query"].as_str().unwrap_or_default();
+                out(d.find_sessions(query))
+            }
             Verb::Start => {
                 let i: StartInput = parse(input)?;
                 out(d
@@ -206,7 +209,7 @@ impl Tool for DeskTool {
 
     fn description(&self) -> &str {
         match self.verb {
-            Verb::List => "List the person's Claude Code and Codex sessions on this machine: name, goal, state (working, blocked = needs an answer, done, idle, interrupted, stopped), last prompt and reply.",
+            Verb::List => "List the person's Claude Code and Codex sessions on this machine: displayName (what the person calls it — use it first), name (the hub's), cwd, group (the sidebar group it is in), goal, state (working, blocked = needs an answer, done, idle, interrupted, stopped), last prompt and reply. With query, only the sessions it names: matched on the person's names, the hub's, the folder and the group, ignoring case and on parts of words (\"ledger\", \"the Atlas sessions\").",
             Verb::Start => "Start a Claude Code (default) or Codex session in a folder on this machine, optionally on a new git worktree branch and with a first prompt. It runs in a real terminal the person can watch in Desk.",
             Verb::Prompt => "Type a prompt into a running session and submit it, as the person would.",
             Verb::Read => "Read one session's state, last prompt and last reply; with terminal=true also the end of its terminal as plain text.",
@@ -218,7 +221,12 @@ impl Tool for DeskTool {
 
     fn input_schema(&self) -> Value {
         match self.verb {
-            Verb::List => json!({ "type": "object", "properties": {} }),
+            Verb::List => json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "Words that name the sessions: a name the person gave, the hub's name, the folder, or the group" }
+                }
+            }),
             Verb::Start => json!({
                 "type": "object",
                 "properties": {

@@ -672,6 +672,7 @@ impl Desk {
                     external_pid: None,
                     restore_offer: false,
                     terminal_id: Some(terminal),
+                    display_name: None,
                     created_at: now,
                     updated_at: now,
                 });

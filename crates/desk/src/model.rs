@@ -84,6 +84,8 @@ pub struct SessionRecord {
     pub restore_offer: bool,
     /// The Desk terminal it runs in, when it was started in one.
     pub terminal_id: Option<Uuid>,
+    /// What the person calls it in Desk, when they renamed it.
+    pub display_name: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -122,11 +124,45 @@ pub struct SessionView {
     pub approvals: Approvals,
     /// The Desk terminal it runs in, when it was started in one.
     pub terminal_id: Option<Uuid>,
+    /// What the person calls it in Desk (`name` is the hub's own).
+    pub display_name: Option<String>,
+    /// The sidebar group it is in, if any.
+    pub group: Option<GroupRef>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
 
+/// A sidebar group, as a session or agent in it names it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupRef {
+    pub id: String,
+    pub name: String,
+}
+
 impl SessionView {
+    /// What to call it: the person's name for it, else the hub's.
+    pub fn label(&self) -> &str {
+        self.display_name.as_deref().unwrap_or(&self.name)
+    }
+
+    /// The words the person may find it by: both names, its folder, its
+    /// group, its goal.
+    pub fn search_text(&self) -> String {
+        let folder = std::path::Path::new(&self.cwd)
+            .file_name()
+            .map(|f| f.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        [
+            self.display_name.as_deref().unwrap_or_default(),
+            &self.name,
+            &folder,
+            self.group.as_ref().map_or("", |g| g.name.as_str()),
+            &self.goal,
+        ]
+        .join(" ")
+        .to_lowercase()
+    }
+
     pub fn new(
         r: &SessionRecord,
         live: bool,
@@ -150,6 +186,8 @@ impl SessionView {
             pending,
             approvals: r.approvals,
             terminal_id: r.terminal_id,
+            display_name: r.display_name.clone(),
+            group: None,
             created_at: r.created_at,
             updated_at: r.updated_at,
         }
@@ -164,6 +202,11 @@ pub enum DeskEvent {
         restore: Vec<SessionView>,
         rooms: Vec<crate::rooms::Room>,
         terminals: Vec<crate::service::TerminalView>,
+        layout: crate::service::Layout,
+    },
+    /// The sidebar's groups changed; the whole layout as it now is.
+    Layout {
+        layout: crate::service::Layout,
     },
     Terminal {
         terminal: Box<crate::service::TerminalView>,
@@ -219,6 +262,18 @@ pub struct SessionPatch {
     pub name: Option<String>,
     pub goal: Option<String>,
     pub approvals: Option<Approvals>,
+    /// The person's name for it; `null` (or blank) clears it.
+    #[serde(default, deserialize_with = "present")]
+    pub display_name: Option<Option<String>>,
+}
+
+/// A field that may be absent (`None`), `null` (`Some(None)`) or a value.
+fn present<'de, D, T>(d: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(d).map(Some)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]

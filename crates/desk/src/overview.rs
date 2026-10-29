@@ -66,7 +66,10 @@ fn session_item(
     Item {
         kind: ItemKind::Session,
         id: v.id.to_string(),
-        name: v.name.clone(),
+        name: v.label().to_string(),
+        hub_name: v.display_name.as_ref().map(|_| v.name.clone()),
+        cwd: Some(v.cwd.clone()),
+        group: v.group.as_ref().map(|g| g.name.clone()),
         engine: Some(v.engine),
         origin: Some(v.origin),
         state,
@@ -106,6 +109,9 @@ fn agent_item(
         kind: ItemKind::Agent,
         id: a.id.clone(),
         name: a.name.clone(),
+        hub_name: None,
+        cwd: None,
+        group: None,
         engine: None,
         origin: None,
         state: ItemState::Idle,
@@ -192,11 +198,14 @@ impl Desk {
             .map(|v| session_item(v, self.state_since(v.id), now, midnight, quiet))
             .collect();
         let latest = self.store().latest_turn_events().await?;
-        items.extend(
-            crew.agents()
-                .iter()
-                .map(|a| agent_item(a, latest.get(&a.id), now, midnight, quiet)),
-        );
+        let layout = self.layout();
+        items.extend(crew.agents().iter().map(|a| {
+            let mut item = agent_item(a, latest.get(&a.id), now, midnight, quiet);
+            item.group = layout
+                .group_of(&crate::service::local_agent_item(&a.id))
+                .map(|g| g.name.clone());
+            item
+        }));
         items.sort_by(|a, b| {
             rank(a.state)
                 .cmp(&rank(b.state))
@@ -231,6 +240,7 @@ impl Desk {
             brief,
             counts,
             items,
+            groups: layout.groups.iter().map(|g| g.name.clone()).collect(),
         })
     }
 }

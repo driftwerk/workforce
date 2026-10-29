@@ -25,7 +25,7 @@ use crate::providers::{self, AccountError, Accounts, Catalog, ConnectBody, Entry
 use crate::pty::Frame;
 use crate::realtime::{Engine, Realtime, RealtimeError};
 use crate::rooms::{NewMessage, NewRoom, RoomPatch};
-use crate::service::{Desk, DeskError, NewTerminal, TerminalPatch};
+use crate::service::{Desk, DeskError, Import, Layout, NewTerminal, TerminalPatch};
 use crate::speech::{Speak, SpeakError, Speech};
 
 /// Decides whether a request may use the desk. Implemented by the hub.
@@ -361,6 +361,147 @@ async fn terminal_pty(
     }
 }
 
+async fn layout(State(s): S, h: HeaderMap, Query(q): Q) -> Response {
+    guarded!(s, h, q);
+    Json(s.desk.layout()).into_response()
+}
+
+async fn replace_layout(State(s): S, h: HeaderMap, Query(q): Q, Json(l): Json<Layout>) -> Response {
+    guarded!(s, h, q);
+    s.desk
+        .change_layout(|_| Ok(l))
+        .await
+        .map(Json)
+        .into_response()
+}
+
+async fn import_layout(State(s): S, h: HeaderMap, Query(q): Q, Json(i): Json<Import>) -> Response {
+    guarded!(s, h, q);
+    s.desk.import_layout(i).await.map(Json).into_response()
+}
+
+#[derive(Deserialize)]
+struct NewGroup {
+    #[serde(default)]
+    id: Option<String>,
+    name: String,
+    #[serde(default)]
+    items: Vec<String>,
+    #[serde(default)]
+    before: Option<String>,
+}
+
+async fn create_group(State(s): S, h: HeaderMap, Query(q): Q, Json(g): Json<NewGroup>) -> Response {
+    guarded!(s, h, q);
+    let id = g.id.unwrap_or_else(|| Uuid::new_v4().to_string());
+    s.desk
+        .change_layout(|l| l.create(&id, &g.name, &g.items, g.before.as_deref()))
+        .await
+        .map(Json)
+        .into_response()
+}
+
+#[derive(Deserialize)]
+struct GroupPatch {
+    name: Option<String>,
+    collapsed: Option<bool>,
+}
+
+async fn update_group(
+    State(s): S,
+    h: HeaderMap,
+    Query(q): Q,
+    Path(id): Path<String>,
+    Json(p): Json<GroupPatch>,
+) -> Response {
+    guarded!(s, h, q);
+    s.desk
+        .change_layout(|l| l.edit(&id, p.name.as_deref(), p.collapsed))
+        .await
+        .map(Json)
+        .into_response()
+}
+
+async fn delete_group(State(s): S, h: HeaderMap, Query(q): Q, Path(id): Path<String>) -> Response {
+    guarded!(s, h, q);
+    s.desk
+        .change_layout(|l| l.delete(&id))
+        .await
+        .map(Json)
+        .into_response()
+}
+
+#[derive(Deserialize, Default)]
+struct Before {
+    #[serde(default)]
+    before: Option<String>,
+}
+
+async fn move_group(
+    State(s): S,
+    h: HeaderMap,
+    Query(q): Q,
+    Path(id): Path<String>,
+    body: Option<Json<Before>>,
+) -> Response {
+    guarded!(s, h, q);
+    let before = body.map(|Json(b)| b.before).unwrap_or_default();
+    s.desk
+        .change_layout(|l| l.move_group(&id, before.as_deref()))
+        .await
+        .map(Json)
+        .into_response()
+}
+
+async fn put_member(
+    State(s): S,
+    h: HeaderMap,
+    Query(q): Q,
+    Path((id, item)): Path<(String, String)>,
+    body: Option<Json<Before>>,
+) -> Response {
+    guarded!(s, h, q);
+    let before = body.map(|Json(b)| b.before).unwrap_or_default();
+    s.desk
+        .change_layout(|l| l.put(&item, &id, before.as_deref()))
+        .await
+        .map(Json)
+        .into_response()
+}
+
+async fn remove_member(
+    State(s): S,
+    h: HeaderMap,
+    Query(q): Q,
+    Path((id, item)): Path<(String, String)>,
+) -> Response {
+    guarded!(s, h, q);
+    s.desk
+        .change_layout(|l| match l.group_of(&item) {
+            Some(g) if g.id == id => l.remove(&item),
+            _ => Err(DeskError::NotFound),
+        })
+        .await
+        .map(Json)
+        .into_response()
+}
+
+#[derive(Deserialize)]
+struct NameBody {
+    name: Option<String>,
+}
+
+async fn name_session(
+    State(s): S,
+    h: HeaderMap,
+    Query(q): Q,
+    Path(id): Path<Uuid>,
+    Json(b): Json<NameBody>,
+) -> Response {
+    guarded!(s, h, q);
+    s.desk.name_session(id, b.name).map(Json).into_response()
+}
+
 async fn rooms(State(s): S, h: HeaderMap, Query(q): Q) -> Response {
     guarded!(s, h, q);
     Json(s.desk.rooms()).into_response()
@@ -447,6 +588,22 @@ pub fn sessions_router(desk: Desk, auth: Arc<dyn Authorize>) -> Router {
         .route("/api/desk/sessions/{id}/resume", post(resume))
         .route("/api/desk/sessions/{id}/approvals/{approval}", post(decide))
         .route("/api/desk/sessions/{id}/pty", get(pty))
+        .route(
+            "/api/desk/sessions/{id}/name",
+            axum::routing::put(name_session),
+        )
+        .route("/api/desk/layout", get(layout).put(replace_layout))
+        .route("/api/desk/layout/import", post(import_layout))
+        .route("/api/desk/groups", get(layout).post(create_group))
+        .route(
+            "/api/desk/groups/{id}",
+            patch(update_group).delete(delete_group),
+        )
+        .route("/api/desk/groups/{id}/move", post(move_group))
+        .route(
+            "/api/desk/groups/{id}/items/{*item}",
+            axum::routing::put(put_member).delete(remove_member),
+        )
         .route("/api/desk/terminals", get(terminals).post(create_terminal))
         .route(
             "/api/desk/terminals/{id}",
@@ -856,6 +1013,90 @@ mod tests {
                 .unwrap();
             output_until(&mut first, "now-second\r\n").await;
             desk.close_terminal(t.id).unwrap();
+        })
+        .await;
+    }
+
+    async fn call(
+        app: &axum::Router,
+        method: &str,
+        uri: &str,
+        body: Option<Value>,
+    ) -> (u16, Value) {
+        use tower::ServiceExt;
+        let req = axum::http::Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(body.map_or_else(axum::body::Body::empty, |b| {
+                axum::body::Body::from(b.to_string())
+            }))
+            .unwrap();
+        let res = app.clone().oneshot(req).await.unwrap();
+        let status = res.status().as_u16();
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        )
+    }
+
+    #[tokio::test]
+    async fn names_and_groups_through_the_routes() {
+        with_test_pool(build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            DeskStore::migrate(&pool).await.unwrap();
+            let store = DeskStore::from_pool(pool);
+            let r = crate::store::tests::record_fixture("monorepo-fd");
+            store.put(&r).await.unwrap();
+            let desk = crate::Desk::start(store, options(dir.path()), tokio_util::sync::CancellationToken::new())
+                .await
+                .unwrap();
+            let app = super::sessions_router(desk, allow_all());
+            let s = format!("session:{}", r.id);
+
+            let (status, v) = call(&app, "PUT", &format!("/api/desk/sessions/{}/name", r.id), Some(json!({ "name": "Ledger migration" }))).await;
+            assert_eq!((status, &v["displayName"]), (200, &json!("Ledger migration")));
+            let (_, v) = call(&app, "PATCH", &format!("/api/desk/sessions/{}", r.id), Some(json!({ "displayName": null }))).await;
+            assert_eq!(v["displayName"], Value::Null);
+            assert_eq!(v["name"], "monorepo-fd");
+
+            let (status, l) = call(&app, "POST", "/api/desk/groups", Some(json!({ "id": "g1", "name": "Atlas" }))).await;
+            assert_eq!((status, &l["groups"][0]["name"]), (200, &json!("Atlas")));
+            call(&app, "POST", "/api/desk/groups", Some(json!({ "id": "g2", "name": "Infra", "items": ["agent:dw/allan"] }))).await;
+            let (status, l) = call(&app, "PUT", &format!("/api/desk/groups/g1/items/{s}"), Some(json!({ "before": null }))).await;
+            assert_eq!((status, &l["groups"][0]["items"]), (200, &json!([s])));
+            let (_, v) = call(&app, "GET", "/api/desk/sessions", None).await;
+            assert_eq!(v[0]["group"], json!({ "id": "g1", "name": "Atlas" }));
+            let (_, l) = call(&app, "POST", "/api/desk/groups/g2/move", Some(json!({ "before": "g1" }))).await;
+            assert_eq!(l["groups"][0]["id"], "g2");
+            let (_, l) = call(&app, "PATCH", "/api/desk/groups/g1", Some(json!({ "name": "Atlas work", "collapsed": true }))).await;
+            assert_eq!((&l["groups"][1]["name"], &l["groups"][1]["collapsed"]), (&json!("Atlas work"), &json!(true)));
+            let (_, l) = call(&app, "PATCH", "/api/desk/groups/ungrouped", Some(json!({ "collapsed": true }))).await;
+            assert_eq!(l["ungrouped"]["collapsed"], true);
+            let (status, _) = call(&app, "PATCH", "/api/desk/groups/ungrouped", Some(json!({ "name": "x" }))).await;
+            assert_eq!(status, 400);
+            let (status, l) = call(&app, "DELETE", &format!("/api/desk/groups/g1/items/{s}"), None).await;
+            assert_eq!((status, &l["ungrouped"]["items"]), (200, &json!([s])));
+            let (status, _) = call(&app, "DELETE", "/api/desk/groups/g1/items/agent:dw/allan", None).await;
+            assert_eq!(status, 404, "not in that group");
+            let (status, l) = call(&app, "DELETE", "/api/desk/groups/g2", None).await;
+            assert_eq!(status, 200);
+            assert_eq!(l["ungrouped"]["items"], json!([s, "agent:dw/allan"]));
+            let (status, _) = call(&app, "POST", "/api/desk/groups", Some(json!({ "name": "  " }))).await;
+            assert_eq!(status, 400);
+            let (_, got) = call(&app, "GET", "/api/desk/layout", None).await;
+            assert_eq!(got["groups"].as_array().unwrap().len(), 1);
+            let (status, l) = call(&app, "PUT", "/api/desk/layout", Some(json!({ "groups": [], "ungrouped": { "collapsed": false, "items": [] } }))).await;
+            assert_eq!((status, l["groups"].as_array().unwrap().len()), (200, 0));
+            let (status, i) = call(&app, "POST", "/api/desk/layout/import", Some(json!({
+                "layout": { "groups": [{ "id": "m", "name": "Atlas", "collapsed": false, "items": [s] }], "ungrouped": { "collapsed": false, "items": [] } },
+                "sessionNames": { r.id.to_string(): "Ledger migration" }
+            }))).await;
+            assert_eq!((status, &i["imported"]), (200, &json!(true)));
+            assert_eq!(i["sessionNames"][r.id.to_string()], "Ledger migration");
         })
         .await;
     }
