@@ -25,8 +25,8 @@ use crate::model::{
 };
 use crate::pty::{Exit, Pty};
 use crate::rooms::{
-    slug_for, Member, NewMessage, NewRoom, Room, RoomMessage, RoomPatch, SearchHit, DESK, MAX_HOPS,
-    TURN_BUDGET, YOU,
+    channel_for, place_in_timeline, slug_for, Member, NewMessage, NewRoom, Posted, Room,
+    RoomMessage, RoomPatch, SearchHit, DESK, MAX_HOPS, THREAD_GONE, TURN_BUDGET, YOU,
 };
 use crate::store::DeskStore;
 use crate::transcript;
@@ -1150,6 +1150,11 @@ impl Desk {
         rooms
     }
 
+    /// The room `id`, while this desk has it.
+    pub fn room(&self, id: Uuid) -> Option<Room> {
+        self.0.state.lock().rooms.get(&id).cloned()
+    }
+
     fn room_of(&self, id: Uuid) -> Result<Room, DeskError> {
         self.0
             .state
@@ -1188,8 +1193,10 @@ impl Desk {
     pub async fn create_room(&self, new: NewRoom) -> Result<Room, DeskError> {
         let now = Utc::now();
         let members = dedup(new.members);
+        let id = Uuid::new_v4();
         self.save_room(Room {
-            id: Uuid::new_v4(),
+            id,
+            channel: channel_for(id),
             slug: slug_for(&new.name),
             name: new.name.trim().to_string(),
             default_member: new
@@ -1251,9 +1258,22 @@ impl Desk {
 
     /// Adds a message to a room. Agent messages are held to the loop guard:
     /// at most [`MAX_HOPS`] hand-offs and [`TURN_BUDGET`] agent messages
-    /// before you speak again.
-    pub async fn post(&self, id: Uuid, new: NewMessage) -> Result<RoomMessage, DeskError> {
+    /// before you speak again. A delivery (a reminder, a job's answer) is
+    /// no hand-off and starts none, so it is held to neither, and may come
+    /// from an agent that has left the room since it was set up. A message
+    /// with a source is kept once: posting it again answers with the one
+    /// kept, and a thread it names that has gone takes it to the timeline.
+    pub async fn post(&self, id: Uuid, new: NewMessage) -> Result<Posted, DeskError> {
         let room = self.room_of(id)?;
+        if let Some(kept) = match new.source.as_deref() {
+            Some(source) => self.0.store.by_source(source).await?,
+            None => None,
+        } {
+            return Ok(Posted {
+                message: kept,
+                created: false,
+            });
+        }
         if new.content.trim().is_empty() && new.attachments.is_empty() {
             return Err(DeskError::Invalid("the message is empty".into()));
         }
@@ -1267,47 +1287,74 @@ impl Desk {
             return Err(DeskError::Invalid(why));
         }
         let is_agent = new.author != YOU && new.author != DESK;
-        if is_agent && !room.members.iter().any(|m| m.key() == new.author) {
+        let delivered = new.delivery.is_some();
+        if delivered && (!is_agent || Member::parse(&new.author).is_none()) {
+            return Err(DeskError::Invalid(format!(
+                "a delivery comes from an agent, as hub/agent, not {}",
+                new.author
+            )));
+        }
+        if is_agent && !delivered && !room.members.iter().any(|m| m.key() == new.author) {
             return Err(DeskError::Invalid(format!(
                 "{} is not a member of the room",
                 new.author
             )));
         }
-        if let Some(t) = new.thread_id {
-            let parent = self.0.store.message(t).await?;
-            if parent.is_none_or(|p| p.room_id != id || p.thread_id.is_some()) {
-                return Err(DeskError::Invalid(
-                    "threads hang off a message in this room's timeline".into(),
-                ));
-            }
+        let parent = match new.thread_id {
+            Some(t) => self.0.store.message(t).await?,
+            None => None,
+        };
+        let thread_id = place_in_timeline(id, new.thread_id, parent.as_ref());
+        let thread_gone = new.thread_id.is_some() && thread_id.is_none();
+        if thread_gone && new.source.is_none() {
+            return Err(DeskError::Invalid(
+                "threads hang off a message in this room's timeline".into(),
+            ));
         }
-        if is_agent {
+        if is_agent && !delivered {
             if new.hop > MAX_HOPS {
                 return Err(DeskError::Conflict(format!(
                     "loop guard: agents have handed this on {MAX_HOPS} times already"
                 )));
             }
-            if self.0.store.agent_run(id, new.thread_id).await? >= TURN_BUDGET {
+            if self.0.store.agent_run(id, thread_id).await? >= TURN_BUDGET {
                 return Err(DeskError::Conflict(format!(
                     "loop guard: {TURN_BUDGET} agent messages since you last spoke"
                 )));
             }
         }
-        let message = RoomMessage {
-            id: Uuid::new_v4(),
-            room_id: id,
-            thread_id: new.thread_id,
-            author: new.author,
-            content: new.content,
-            hop: if is_agent { new.hop.max(0) } else { 0 },
-            created_at: Utc::now(),
-            attachments: new.attachments,
-        };
-        self.0.store.add_message(&message).await?;
-        let _ = self.0.events.send(DeskEvent::RoomMessage {
-            message: Box::new(message.clone()),
-        });
-        Ok(message)
+        let posted = self
+            .0
+            .store
+            .add_message(&RoomMessage {
+                id: Uuid::new_v4(),
+                room_id: id,
+                thread_id,
+                author: new.author,
+                content: match thread_gone {
+                    true => format!("{THREAD_GONE} {}", new.content)
+                        .trim_end()
+                        .to_string(),
+                    false => new.content,
+                },
+                hop: if is_agent && !delivered {
+                    new.hop.max(0)
+                } else {
+                    0
+                },
+                created_at: Utc::now(),
+                attachments: new.attachments,
+                source: new.source,
+                request_id: new.request_id.filter(|_| new.delivery.is_some()),
+                delivery: new.delivery,
+            })
+            .await?;
+        if posted.created {
+            let _ = self.0.events.send(DeskEvent::RoomMessage {
+                message: Box::new(posted.message.clone()),
+            });
+        }
+        Ok(posted)
     }
 
     pub async fn search(&self, query: &str) -> Result<Vec<SearchHit>, DeskError> {
@@ -2520,6 +2567,9 @@ mod tests {
                 thread_id: None,
                 hop,
                 attachments: Vec::new(),
+                source: None,
+                delivery: None,
+                request_id: None,
             };
             d.post(room.id, post(YOU, 0)).await.unwrap();
             // Files may stand in for text, and come back with the message.
@@ -2549,7 +2599,7 @@ mod tests {
                     .attachments,
                 vec![report.clone()]
             );
-            assert_eq!(filed.attachments, vec![report.clone()]);
+            assert_eq!(filed.message.attachments, vec![report.clone()]);
             assert!(matches!(
                 d.post(
                     room.id,
@@ -2612,6 +2662,152 @@ mod tests {
             assert_eq!(removed.default_member, None);
             d.delete_room(room.id).await.unwrap();
             assert!(d.rooms().is_empty());
+        })
+        .await;
+    }
+
+    /// A room's channel outlives its name; a sourced message is kept once,
+    /// announced once, and placed in the timeline when its thread is gone;
+    /// a delivery skips the loop guard and may be from a former member.
+    #[tokio::test]
+    async fn rooms_keep_their_channel_and_take_sourced_deliveries_once() {
+        with_test_pool(build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let d = desk(pool, dir.path()).await;
+            let scout = Member {
+                hub: crate::rooms::LOCAL_HUB.into(),
+                agent: "scout".into(),
+            };
+            let room = d
+                .create_room(NewRoom {
+                    name: "Release".into(),
+                    members: vec![scout.clone()],
+                    default_member: None,
+                })
+                .await
+                .unwrap();
+            assert_eq!(room.channel, channel_for(room.id));
+            let renamed = d
+                .update_room(
+                    room.id,
+                    RoomPatch {
+                        name: Some("Launch".into()),
+                        members: Some(vec![]),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                (renamed.slug.as_str(), renamed.channel.as_str()),
+                ("launch", room.channel.as_str())
+            );
+            assert_eq!(d.room(room.id), Some(renamed));
+
+            let (_, mut events) = d.subscribe();
+            let ask = d
+                .post(
+                    room.id,
+                    NewMessage {
+                        author: YOU.into(),
+                        content: "remind me at five".into(),
+                        thread_id: None,
+                        hop: 0,
+                        attachments: Vec::new(),
+                        source: None,
+                        delivery: None,
+                        request_id: None,
+                    },
+                )
+                .await
+                .unwrap()
+                .message;
+            for _ in 0..TURN_BUDGET {
+                d.post(
+                    room.id,
+                    NewMessage {
+                        author: "dw/allan".into(),
+                        content: "noted".into(),
+                        thread_id: Some(ask.id),
+                        hop: 0,
+                        attachments: Vec::new(),
+                        source: None,
+                        delivery: Some(workforce_core::desk::DeliveryKind::Notice),
+                        request_id: None,
+                    },
+                )
+                .await
+                .unwrap();
+            }
+            let reminder = NewMessage {
+                author: "local/scout".into(),
+                content: "🔔 Reminder: five o'clock".into(),
+                thread_id: Some(ask.id),
+                hop: 2,
+                attachments: Vec::new(),
+                source: Some(crate::rooms::source_key("local", "scout", "m-1")),
+                delivery: Some(workforce_core::desk::DeliveryKind::Reminder),
+                request_id: None,
+            };
+            let first = d.post(room.id, reminder.clone()).await.unwrap();
+            assert!(first.created, "past the loop guard, from a former member");
+            assert_eq!(
+                (first.message.thread_id, first.message.hop),
+                (Some(ask.id), 0)
+            );
+            let again = d.post(room.id, reminder.clone()).await.unwrap();
+            assert_eq!(
+                (again.created, again.message),
+                (false, first.message.clone())
+            );
+            let announced: Vec<_> = std::iter::from_fn(|| events.try_recv().ok())
+                .filter(
+                    |e| matches!(e, DeskEvent::RoomMessage { message } if message.source.is_some()),
+                )
+                .collect();
+            assert_eq!(announced.len(), 1, "a repeat is not announced again");
+
+            let lost = d
+                .post(
+                    room.id,
+                    NewMessage {
+                        thread_id: Some(Uuid::new_v4()),
+                        source: Some(crate::rooms::source_key("local", "scout", "m-2")),
+                        content: "job done".into(),
+                        ..reminder.clone()
+                    },
+                )
+                .await
+                .unwrap()
+                .message;
+            assert_eq!(lost.thread_id, None);
+            assert_eq!(lost.content, format!("{THREAD_GONE} job done"));
+            assert!(matches!(
+                d.post(
+                    room.id,
+                    NewMessage {
+                        thread_id: Some(Uuid::new_v4()),
+                        source: None,
+                        ..reminder.clone()
+                    }
+                )
+                .await,
+                Err(DeskError::Invalid(_))
+            ));
+            for author in [YOU, "scout"] {
+                assert!(matches!(
+                    d.post(
+                        room.id,
+                        NewMessage {
+                            author: author.into(),
+                            source: None,
+                            ..reminder.clone()
+                        }
+                    )
+                    .await,
+                    Err(DeskError::Invalid(_))
+                ));
+            }
         })
         .await;
     }

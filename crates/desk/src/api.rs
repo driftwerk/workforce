@@ -581,7 +581,17 @@ async fn post_message(
     Json(m): Json<NewMessage>,
 ) -> Response {
     guarded!(s, h, q);
-    s.desk.post(id, m).await.map(Json).into_response()
+    s.desk
+        .post(id, m)
+        .await
+        .map(|posted| {
+            let status = match posted.created {
+                true => StatusCode::CREATED,
+                false => StatusCode::OK,
+            };
+            (status, Json(posted.message))
+        })
+        .into_response()
 }
 
 #[derive(Deserialize)]
@@ -1132,6 +1142,34 @@ mod tests {
             assert_eq!(status, 204);
             let (_, l) = call(&app, "GET", "/api/desk/layout", None).await;
             assert_eq!((&l["groups"][0]["items"], &l["ungrouped"]["items"]), (&json!([]), &json!(["agent:dw/allan", "agent:local/scout"])));
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_sourced_room_post_is_created_once_and_repeats_answer_with_it() {
+        with_test_pool(build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let store = DeskStore::with_pool(pool).await.unwrap();
+            let desk = crate::Desk::start(store, options(dir.path()), tokio_util::sync::CancellationToken::new())
+                .await
+                .unwrap();
+            let app = super::sessions_router(desk, allow_all());
+            let (status, room) = call(&app, "POST", "/api/desk/rooms", Some(json!({ "name": "Release", "members": [{ "hub": "local", "agent": "scout" }] }))).await;
+            assert_eq!(status, 200);
+            let channel = format!("desk:{}", room["id"].as_str().unwrap());
+            assert_eq!(room["channel"], json!(channel));
+            let uri = format!("/api/desk/rooms/{}/messages", room["id"].as_str().unwrap());
+            let reply = json!({ "author": "local/scout", "content": "may I?", "source": "local/scout/m-1", "delivery": "approval", "requestId": "req-1" });
+            let (status, first) = call(&app, "POST", &uri, Some(reply.clone())).await;
+            assert_eq!(
+                (status, &first["source"], &first["delivery"], &first["requestId"]),
+                (201, &json!("local/scout/m-1"), &json!("approval"), &json!("req-1"))
+            );
+            let (status, again) = call(&app, "POST", &uri, Some(reply)).await;
+            assert_eq!((status, &again["id"]), (200, &first["id"]));
+            let (status, said) = call(&app, "POST", &uri, Some(json!({ "author": "you", "content": "thanks" }))).await;
+            assert_eq!((status, said.get("source"), said.get("delivery")), (201, None, None));
         })
         .await;
     }
