@@ -468,8 +468,8 @@ impl Scope {
 #[async_trait]
 pub trait TurnLog: Send + Sync {
     fn send(&self, op: TurnOp);
-    /// Turns of `scope` started since `since`, every open one, and every
-    /// question still unanswered, however old.
+    /// Turns of `scope` started or ended since `since`, every open one, and
+    /// every question still unanswered, however old.
     async fn relevant(&self, scope: &Scope, since: DateTime<Utc>) -> eyre::Result<Vec<Turn>>;
 }
 

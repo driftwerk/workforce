@@ -111,8 +111,8 @@ impl PgFloorStore {
         Ok(whose)
     }
 
-    /// Turns of `scope` started since `since`, every open one, and every
-    /// question still unanswered, however old.
+    /// Turns of `scope` started or ended since `since`, every open one, and
+    /// every question still unanswered, however old.
     pub async fn relevant(&self, scope: &Scope, since: DateTime<Utc>) -> Result<Vec<Turn>> {
         let conn = self.pool.get().await?;
         let rows = conn
@@ -120,7 +120,7 @@ impl PgFloorStore {
                 &format!(
                     "SELECT {COLUMNS} FROM turns \
                      WHERE (owner = $1 OR ($2 AND owner IS NULL)) \
-                       AND (started_at >= $3 OR ended_at IS NULL \
+                       AND (started_at >= $3 OR ended_at IS NULL OR ended_at >= $3 \
                             OR (outcome = 'asked' AND settled_at IS NULL)) \
                      ORDER BY started_at"
                 ),
@@ -639,6 +639,24 @@ mod tests {
             assert_eq!(mine[1].idle[0].to, Some(at("2026-10-29T09:10:00Z")));
             let theirs_now = store.relevant(&scope("u2"), since).await.unwrap();
             assert!(theirs_now[0].asking(), "only u1's questions settled");
+
+            let long = turn("scout", Some("u3"), "2026-10-28T20:00:00Z");
+            store.apply(&begin(&long, false)).await.unwrap();
+            store
+                .apply(&TurnOp::End {
+                    turn: long.id,
+                    at: at("2026-10-29T01:00:00Z"),
+                    outcome: Outcome::Finished,
+                    answer: Some("Done.".into()),
+                    question: None,
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                store.relevant(&scope("u3"), since).await.unwrap()[0].id,
+                long.id,
+                "a turn begun before and ended within the window is read"
+            );
         })
         .await;
     }
