@@ -2928,14 +2928,14 @@ mod tests {
     }
 
     /// A stand-in for Claude Code that leaves one of its Bash tool shells
-    /// running, its pid where the test reads it.
+    /// running, its pid where the test reads it once it runs as that shell.
     fn shell_cli(dir: &Path) -> PathBuf {
         let path = dir.join("shell-cli");
         std::fs::write(
             &path,
             format!(
-                "#!/bin/sh\n/bin/sh -c 'sleep 60; true' {dir}/shell-snapshots/snapshot-zsh-1.sh &\n\
-                 echo $! > \"{dir}/shell-$$\"\nexec sleep 60\n",
+                "#!/bin/sh\n/bin/sh -c 'echo $$ > \"$1\"; sleep 60; true' \
+                 {dir}/shell-snapshots/snapshot-zsh-1.sh \"{dir}/shell-$$\" &\nexec sleep 60\n",
                 dir = dir.display()
             ),
         )
