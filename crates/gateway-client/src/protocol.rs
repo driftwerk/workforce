@@ -614,6 +614,25 @@ pub struct AgentInfo {
     pub owner_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_type: Option<String>,
+    /// The picture shown for the agent, when it has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub picture: Option<PictureInfo>,
+}
+
+/// The picture an agent or a person is shown with: one chosen for them,
+/// else their Slack picture. Its image is served at the owner's
+/// `…/picture` route; `version` changes whenever the image does.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PictureInfo {
+    pub version: String,
+    /// `chosen` or `slack`.
+    pub source: String,
+    /// When it was chosen, or fetched from Slack.
+    pub at: String,
+    /// The Slack workspace a Slack picture is held from, also while a
+    /// chosen one overrides it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slack: Option<String>,
 }
 
 /// Agents list response.

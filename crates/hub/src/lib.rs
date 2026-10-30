@@ -163,6 +163,7 @@ pub mod passive_memory;
 pub mod passive_memory_backfill;
 pub use hub_core::permissions_audit;
 pub mod permissions_writer;
+pub mod pictures;
 pub mod pipeline;
 pub mod pipeline_api;
 pub mod pipeline_tool;

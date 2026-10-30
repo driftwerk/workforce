@@ -5083,6 +5083,20 @@ rules:
                 .resolved_skills_dir(&wf_config.hub.data_dir);
             let external_skills =
                 workforce_hub::external_skills::ExternalSkills::shared(&skills_dir);
+            let pictures = workforce_hub::pictures::open(&wf_config).await;
+            if let Some(store) = pictures.clone() {
+                let agents = Arc::clone(&registry);
+                workforce_hub::pictures::refresh::Refresher::new(
+                    store,
+                    Arc::new(workforce_hub::pictures::refresh::HubSlack::new(
+                        Arc::clone(&slack_slot),
+                        Arc::clone(&registry),
+                    )),
+                    Arc::new(move || agents.agent_ids().iter().map(|id| id.to_string()).collect()),
+                    identity_store.clone().map(|s| s.as_identity_store()),
+                )
+                .spawn(leader_flag.clone(), background_cancel.clone());
+            }
             let gateway_state = Arc::new(workforce_hub::gateway::GatewayState {
                 registry: Arc::clone(&registry),
                 nats: nats_for_gateway.clone(),
@@ -5149,6 +5163,7 @@ rules:
                 )),
                 external_skills,
                 oidc_provider,
+                pictures: pictures.clone(),
             });
             if let Some(store) = identity_store.clone() {
                 workforce_hub::identity_lifecycle::install(
@@ -5160,6 +5175,7 @@ rules:
                         channels: gateway_state.channel_pairing.clone(),
                         defs: gateway_state.def_store.clone(),
                         artifacts: gateway_state.artifact_store.clone(),
+                        pictures,
                         external_skills: Arc::clone(&gateway_state.external_skills),
                         data_dir: std::path::PathBuf::from(&wf_config.hub.data_dir),
                         runs: workforce_hub::identity_lifecycle::Runs::until(

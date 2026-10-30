@@ -35,6 +35,12 @@ fn task_local(key: &'static tokio::task::LocalKey<String>) -> Option<String> {
     key.try_with(|v| v.clone()).ok().filter(|s| !s.is_empty())
 }
 
+/// A higher-resolution variant of an avatar address, where the CDN's
+/// address carries its size (Slack: `…_192.png`); others as they are.
+pub fn larger_avatar(url: &str) -> String {
+    url.replace("_192.", "_512.")
+}
+
 /// Fetches a user's profile photo into the agent's view, for use as a reference
 /// image in `generate_image` edits.
 pub struct GetUserPhotoTool {
@@ -133,9 +139,7 @@ impl Tool for GetUserPhotoTool {
                 elapsed(),
             ));
         };
-        // Prefer a higher-res variant where the CDN URL exposes the size suffix
-        // (Slack: `..._192.png`); harmless string op that no-ops otherwise.
-        let url = avatar_url.replace("_192.", "_512.");
+        let url = larger_avatar(&avatar_url);
 
         let resp = match self.http.get(&url).send().await {
             Ok(r) if r.status().is_success() => r,

@@ -176,6 +176,8 @@ pub struct GatewayState {
     /// Optional OIDC/OAuth2 provider for SSO login (Keycloak etc.).
     #[cfg(feature = "oidc")]
     pub oidc_provider: Option<Arc<crate::oidc::OidcProvider>>,
+    /// Agents' and people's pictures. `None` without Postgres.
+    pub pictures: Option<Arc<dyn crate::pictures::PictureStore>>,
 }
 
 impl GatewayState {}
@@ -347,6 +349,9 @@ pub fn build_cors_layer(enabled: bool, allowed_origins: &[String]) -> CorsLayer 
         .allow_credentials(true)
 }
 
+/// A picture upload's body: the largest picture, and room for framing.
+const PICTURE_BODY_LIMIT: usize = crate::pictures::MAX_BYTES + 64 * 1024;
+
 /// Build the gateway router.
 pub fn router(state: Arc<GatewayState>) -> Router {
     Router::new()
@@ -464,6 +469,13 @@ pub fn router(state: Arc<GatewayState>) -> Router {
         .route(
             "/api/agents/{id}/slack",
             get(agent_slack_status).put(agent_slack_connect).delete(agent_slack_disconnect),
+        )
+        .route(
+            "/api/agents/{id}/picture",
+            get(crate::api_handlers::pictures::agent_picture_get)
+                .put(crate::api_handlers::pictures::agent_picture_put)
+                .delete(crate::api_handlers::pictures::agent_picture_delete)
+                .layer(axum::extract::DefaultBodyLimit::max(PICTURE_BODY_LIMIT)),
         )
         // Global (non-agent-scoped) skill endpoints
         .route("/api/skills", get(global_skills_list))
@@ -992,6 +1004,13 @@ pub fn router(state: Arc<GatewayState>) -> Router {
         .route("/api/schedules/{id}/history", get(schedule_history))
         // Per-user settings (DW-505)
         .route("/api/me", get(get_me))
+        .route(
+            "/api/me/picture",
+            get(crate::api_handlers::pictures::my_picture_get)
+                .put(crate::api_handlers::pictures::my_picture_put)
+                .delete(crate::api_handlers::pictures::my_picture_delete)
+                .layer(axum::extract::DefaultBodyLimit::max(PICTURE_BODY_LIMIT)),
+        )
         .route("/api/me/capabilities", get(get_my_capabilities))
         .route(
             "/api/me/relationship",
@@ -3690,6 +3709,7 @@ async fn list_agents(
     }
 
     let viewer = AgentViewer::new(&state, caller);
+    let faces = picture_faces(&state).await;
 
     let agents = state
         .registry
@@ -3732,10 +3752,41 @@ async fn list_agents(
                 default: id_str == state.registry.default_id(),
                 owner_id,
                 owner_type,
+                picture: faces.get(&id_str).map(crate::pictures::Face::info),
             })
         })
         .collect();
     Ok(Json(workforce_gateway_client::AgentsResponse { agents }))
+}
+
+/// Every agent's picture, by agent id; none, said in the log, when the
+/// store can't be read (the roster still answers).
+async fn picture_faces(state: &GatewayState) -> HashMap<String, crate::pictures::Face> {
+    let Some(store) = state.pictures.as_ref() else {
+        return HashMap::new();
+    };
+    crate::pictures::faces(store.as_ref(), crate::pictures::Kind::Agent)
+        .await
+        .unwrap_or_else(|e| {
+            warn!(target: "pictures", error = %format!("{e:#}"), "couldn't read agents' pictures");
+            HashMap::new()
+        })
+}
+
+/// The picture `owner` is shown with; none, said in the log, when the
+/// store can't be read.
+async fn picture_info(
+    state: &GatewayState,
+    owner: &crate::pictures::Owner,
+) -> Option<workforce_gateway_client::PictureInfo> {
+    let store = state.pictures.as_ref()?;
+    match crate::pictures::face(store.as_ref(), owner).await {
+        Ok(face) => face.map(|f| f.info()),
+        Err(e) => {
+            warn!(target: "pictures", %owner, error = %format!("{e:#}"), "couldn't read a picture");
+            None
+        }
+    }
 }
 
 /// Authenticated caller's identity for ownership-aware filtering and session
@@ -4385,6 +4436,7 @@ async fn get_me(
         "status": identity.status.as_str(),
         "device_id": caller.device_id,
         "linked_ios_device": linked_ios_device(&identity, caller.device_id.as_deref()),
+        "picture": picture_info(&state, &crate::pictures::Owner::identity(identity.id.to_string())).await,
     })))
 }
 
@@ -5428,6 +5480,7 @@ async fn patch_agent(
         default: id == state.registry.default_id(),
         owner_id,
         owner_type: Some(format!("{owner_type:?}").to_lowercase()),
+        picture: picture_info(&state, &crate::pictures::Owner::agent(&id)).await,
     }))
 }
 
@@ -5616,6 +5669,13 @@ async fn delete_agent(
         }
         None => false,
     };
+
+    // A new agent given this id later starts with no picture.
+    if let Some(store) = state.pictures.as_ref() {
+        if let Err(e) = store.forget(&crate::pictures::Owner::agent(&id)).await {
+            warn!(agent_id = %id, error = %format!("{e:#}"), "Failed to remove the agent's pictures");
+        }
+    }
 
     info!(agent_id = %id, gone, "Agent removed via API (overlay)");
 

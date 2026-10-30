@@ -93,6 +93,7 @@ pub enum Category {
     Artifacts,
     Skills,
     GameTallies,
+    Pictures,
     Signals,
     CostLedger,
     ConfigReferences,
@@ -101,7 +102,7 @@ pub enum Category {
 }
 
 impl Category {
-    pub const ALL: [Category; 32] = [
+    pub const ALL: [Category; 33] = [
         Self::IdentityRecord,
         Self::RemoteMcpTokens,
         Self::Devices,
@@ -129,6 +130,7 @@ impl Category {
         Self::Artifacts,
         Self::Skills,
         Self::GameTallies,
+        Self::Pictures,
         Self::Signals,
         Self::CostLedger,
         Self::ConfigReferences,
@@ -172,6 +174,7 @@ impl Category {
             ),
             Self::Skills => (M::Move, D::Transfer),
             Self::Signals => (M::Move, D::Erase),
+            Self::Pictures => (M::Move, D::Erase),
             Self::CostLedger => (M::Move, D::Keep),
             Self::AuditRecords => (M::Keep, D::Keep),
             Self::ConfigReferences => (M::Report, D::Report),
@@ -186,6 +189,7 @@ impl Category {
             | Self::Documents
             | Self::TrainingCorpora
             | Self::GameTallies
+            | Self::Pictures
             | Self::Signals
             | Self::CostLedger => OrphanRule::Personal,
             Self::IdentityRecord
@@ -236,6 +240,7 @@ impl Category {
             | Self::Artifacts
             | Self::Skills
             | Self::GameTallies
+            | Self::Pictures
             | Self::Signals
             | Self::CostLedger
             | Self::ConfigReferences
@@ -279,6 +284,7 @@ impl Category {
             Self::Artifacts => "artifacts",
             Self::Skills => "skills",
             Self::GameTallies => "game_tallies",
+            Self::Pictures => "pictures",
             Self::Signals => "signals",
             Self::CostLedger => "cost_ledger",
             Self::ConfigReferences => "config_references",
@@ -634,6 +640,8 @@ pub struct Lifecycle {
     pub channels: Option<Arc<workforce_pairing::ChannelPairingService>>,
     pub defs: Option<Arc<workforce_orchestrator::workflow_store::WorkflowStore>>,
     pub artifacts: Option<Arc<workforce_orchestrator::artifact_store::KnowledgeStore>>,
+    /// People's pictures.
+    pub pictures: Option<Arc<dyn crate::pictures::PictureStore>>,
     pub external_skills: Arc<crate::external_skills::ExternalSkills>,
     pub data_dir: PathBuf,
     pub runs: Runs,
@@ -837,6 +845,7 @@ pub fn pausable(category: Category) -> Option<&'static dyn Pausable> {
         | Category::Artifacts
         | Category::Skills
         | Category::GameTallies
+        | Category::Pictures
         | Category::Signals
         | Category::CostLedger
         | Category::ConfigReferences
@@ -869,6 +878,7 @@ pub fn holding(category: Category) -> &'static dyn Holding {
         Category::Memories => &conversations::Memories,
         Category::PersonalFiles => &conversations::PersonalFiles,
         Category::GameTallies => &conversations::GameTallies,
+        Category::Pictures => &records::Pictures,
         Category::Signals => &conversations::Signals,
         Category::CostLedger => &conversations::CostLedger,
         Category::Vault => &records::Vault,
