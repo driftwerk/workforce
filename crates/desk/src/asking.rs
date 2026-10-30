@@ -470,14 +470,15 @@ pub fn read(reply: &str) -> Reading {
     }
     if let Some(q) = crew::question_in(reply) {
         let lower = q.to_lowercase();
-        if q.split_whitespace().count() < 3 || RHETORICAL.iter().any(|r| lower.ends_with(r)) {
+        if RHETORICAL.iter().any(|r| lower.ends_with(r)) {
             return Reading::Done;
         }
         if let Some(options) = crew::options_in(reply, &q) {
             let why = format!("asked you to choose between {} options", options.len());
             return Reading::Asks(Asked::asks(&q, why, Some(options)));
         }
-        if TO_YOU.iter().any(|w| says(&q, w)) {
+        // "Ship it?", "Proceed?": short, and only ever put to the person.
+        if q.split_whitespace().count() <= 3 || TO_YOU.iter().any(|w| says(&q, w)) {
             return Reading::Asks(Asked::asks(&q, "asked you a question", None));
         }
         return Reading::Unsure;
@@ -687,6 +688,10 @@ mod tests {
             Reading::Done
         );
         assert_eq!(read("It was the clock all along. Who knew?"), Reading::Done);
+        let Reading::Asks(asked) = read("The release is built. Ship it?") else {
+            panic!()
+        };
+        assert_eq!(asked.ask, "Ship it?");
     }
 
     #[test]
