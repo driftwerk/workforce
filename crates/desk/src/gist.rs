@@ -440,7 +440,7 @@ fn word_of(token: &str) -> Word<'_> {
         lead: &token[..start],
         core,
         trail: &rest[core.len()..],
-        dropped: false,
+        dropped: !core.is_empty() && identifier(core),
     }
 }
 
@@ -454,9 +454,6 @@ fn lower_in(word: &str, list: &[&str]) -> bool {
 pub fn plain(text: &str) -> String {
     let text = text.replace(['`', '*'], "");
     let mut words: Vec<Word<'_>> = text.split_whitespace().map(word_of).collect();
-    for i in 0..words.len() {
-        words[i].dropped = !words[i].core.is_empty() && identifier(words[i].core);
-    }
     for i in 1..words.len() {
         if words[i].dropped && words[i - 1].trail.is_empty() && lower_in(words[i - 1].core, NAMING)
         {
