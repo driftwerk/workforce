@@ -156,6 +156,11 @@ pub fn token_for(identity: &Identity) -> String {
 /// A JWT holding every scope, `admin` included, for `identity`, as the
 /// legacy-wildcard rollback mints one for any role.
 pub fn wildcard_token_for(identity: &Identity) -> String {
+    scoped_token_for(identity, &["*"])
+}
+
+/// A JWT for `identity` holding `scopes` alone.
+pub fn scoped_token_for(identity: &Identity, scopes: &[&str]) -> String {
     refresh_token(
         &jwt(),
         &Claims {
@@ -164,7 +169,7 @@ pub fn wildcard_token_for(identity: &Identity) -> String {
             identity_id: Some(identity.id.to_string()),
             iat: 0,
             exp: 0,
-            scopes: vec!["*".to_string()],
+            scopes: scopes.iter().map(|scope| scope.to_string()).collect(),
             device_id: None,
         },
     )

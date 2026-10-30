@@ -14,7 +14,9 @@ use workforce_identity::store::IdentityStore;
 use workforce_identity::types::{Identity, IdentityRole};
 use workforce_pairing::{DevicePairingService, PairingConfig, SqlitePairingStore};
 
-use crate::support::{agent_service, serve, token_for, GatewayParts, GATEWAY_TOKEN};
+use crate::support::{
+    agent_service, scoped_token_for, serve, token_for, GatewayParts, GATEWAY_TOKEN,
+};
 
 type Socket =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
@@ -164,6 +166,17 @@ async fn a_link_hears_its_persons_deliveries_and_no_one_elses() {
     assert_eq!(response.status(), 403);
     let body = String::from_utf8(response.body().clone().unwrap_or_default()).unwrap();
     assert!(body.contains("link_requires_identity"), "{body}");
+
+    let refused = tokio_tungstenite::connect_async(format!(
+        "ws://{addr}/ws/desk?token={}",
+        scoped_token_for(&other, &["chat"])
+    ))
+    .await
+    .expect_err("a token that may not read conversations hears none of them");
+    let tungstenite::Error::Http(response) = refused else {
+        panic!("expected an HTTP refusal, got {refused:?}");
+    };
+    assert_eq!(response.status(), 403);
 }
 
 async fn reqwest_json(

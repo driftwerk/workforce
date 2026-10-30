@@ -96,6 +96,17 @@ pub(crate) async fn handler(
         )
             .into_response();
     };
+    if caller
+        .scopes
+        .as_ref()
+        .is_some_and(|scopes| !crate::jwt::has_scope(scopes, crate::jwt::SCOPE_SESSIONS))
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            axum::Json(serde_json::json!({ "error": "link_requires_sessions" })),
+        )
+            .into_response();
+    }
     let listener = Listener {
         holds: holds(&state, &identity),
         identity,
