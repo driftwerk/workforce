@@ -1681,6 +1681,7 @@ impl Desk {
                 source: new.source,
                 request_id: new.request_id.filter(|_| new.delivery.is_some()),
                 delivery: new.delivery,
+                replies: None,
             })
             .await?;
         if posted.created {

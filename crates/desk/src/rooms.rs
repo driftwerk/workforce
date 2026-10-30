@@ -111,6 +111,17 @@ pub struct RoomMessage {
     /// hub of its agent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
+    /// On a main-timeline message as read back, its thread's replies.
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    pub replies: Option<Replies>,
+}
+
+/// How many replies a message's thread has, and when the last came.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Replies {
+    pub reply_count: i64,
+    pub last_reply_at: Option<DateTime<Utc>>,
 }
 
 /// A message as posting left it: kept now, or kept before under the same
@@ -229,6 +240,13 @@ fn message(row: &Row) -> Result<RoomMessage> {
             .map(|kind| serde_json::from_value(serde_json::Value::String(kind)))
             .transpose()?,
         request_id: row.try_get("request_id")?,
+        replies: match row.try_get::<_, Option<Uuid>>("thread_id")? {
+            Some(_) => None,
+            None => Some(Replies {
+                reply_count: row.try_get("reply_count")?,
+                last_reply_at: row.try_get("last_reply_at")?,
+            }),
+        },
     })
 }
 
@@ -240,9 +258,14 @@ fn delivery_name(kind: Option<DeliveryKind>) -> Result<Option<String>> {
     .transpose()
 }
 
+/// A message's columns, with its thread's replies counted: read from
+/// `room_messages` unaliased (a `RETURNING` included).
 const MESSAGE_COLUMNS: &str =
     "id, room_id, thread_id, author, content, hop, created_at, attachments, source, delivery, \
-     request_id";
+     request_id, \
+     (SELECT count(*) FROM room_messages r WHERE r.thread_id = room_messages.id) AS reply_count, \
+     (SELECT max(r.created_at) FROM room_messages r WHERE r.thread_id = room_messages.id) \
+       AS last_reply_at";
 
 impl DeskStore {
     pub async fn rooms(&self) -> Result<Vec<Room>> {
@@ -489,6 +512,7 @@ mod tests {
             source: None,
             delivery: None,
             request_id: None,
+            replies: None,
         }
     }
 
@@ -596,6 +620,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_main_message_says_how_many_replies_its_thread_has_and_when_the_last_came() {
+        with_test_pool(build_pool, |pool| async move {
+            DeskStore::migrate(&pool).await.unwrap();
+            let store = DeskStore::from_pool(pool);
+            let r = room_fixture("release");
+            store.put_room(&r).await.unwrap();
+            let t0 = chrono::DateTime::parse_from_rfc3339("2026-10-30T10:00:00Z")
+                .unwrap()
+                .to_utc();
+            let at = |s: i64| t0 + chrono::Duration::seconds(s);
+            let [busy, quiet, untouched] = [1, 2, 3].map(|i| msg(&r, YOU, "a question", at(i)));
+            for m in [&busy, &quiet, &untouched] {
+                store.add_message(m).await.unwrap();
+            }
+            for (parent, s) in [(&busy, 10), (&busy, 20), (&quiet, 15), (&busy, 30)] {
+                let mut reply = msg(&r, "dw/allan", "a reply", at(s));
+                reply.thread_id = Some(parent.id);
+                store.add_message(&reply).await.unwrap();
+            }
+            let main = store.messages(r.id, None, None, 50).await.unwrap();
+            let replies: Vec<_> = main.iter().map(|m| m.replies).collect();
+            assert_eq!(
+                replies,
+                [
+                    Some(Replies {
+                        reply_count: 3,
+                        last_reply_at: Some(at(30))
+                    }),
+                    Some(Replies {
+                        reply_count: 1,
+                        last_reply_at: Some(at(15))
+                    }),
+                    Some(Replies {
+                        reply_count: 0,
+                        last_reply_at: None
+                    }),
+                ]
+            );
+            assert_eq!(
+                store.message(busy.id).await.unwrap().unwrap().replies,
+                replies[0]
+            );
+            let thread = store.messages(r.id, Some(busy.id), None, 50).await.unwrap();
+            assert!(
+                thread.iter().all(|m| m.replies.is_none()),
+                "a reply has no thread of its own"
+            );
+            assert_eq!(
+                serde_json::to_value(&main[0]).unwrap()["replyCount"],
+                serde_json::json!(3)
+            );
+            assert_eq!(
+                serde_json::to_value(&main[0]).unwrap()["lastReplyAt"],
+                serde_json::json!("2026-10-30T10:00:30Z")
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
     async fn timelines_threads_budget_and_search() {
         with_test_pool(build_pool, |pool| async move {
             DeskStore::migrate(&pool).await.unwrap();
@@ -632,6 +716,7 @@ mod tests {
             let main = store.messages(r.id, None, None, 50).await.unwrap();
             assert_eq!(main.len(), 3);
             assert_eq!(main[0].id, ask.id);
+            assert_eq!(main[0].replies.map(|r| r.reply_count), Some(1));
             assert_eq!(
                 store.messages(r.id, Some(ask.id), None, 50).await.unwrap(),
                 vec![reply]
@@ -651,6 +736,13 @@ mod tests {
             sourced.request_id = Some("req-1".into());
             let first = store.add_message(&sourced).await.unwrap();
             assert!(first.created);
+            let sourced = RoomMessage {
+                replies: Some(Replies {
+                    reply_count: 0,
+                    last_reply_at: None,
+                }),
+                ..sourced
+            };
             assert_eq!(first.message, sourced);
             let again = store
                 .add_message(&RoomMessage {
