@@ -40,6 +40,7 @@ use base64::Engine as _;
 use workforce_agent::artifacts::{
     global_store, ArtifactDescriptor, ArtifactId, ArtifactStore, ContentType, ATTACHMENT_TTL,
 };
+use workforce_agent::attachments::SESSION_UPLOAD_PRODUCER;
 use workforce_common::channels::desk::DeskFile;
 use workforce_common::channels::{is_conversational, is_desk_conversation, DESK_CHANNEL};
 use workforce_common::session::{MessageRole, Session, SessionStore};
@@ -47,10 +48,6 @@ use workforce_gateway_client::protocol::Attachment;
 
 use crate::gateway::{resolve_caller_context, GatewayState};
 use crate::session_handlers::{lookup_owned_session, spool_to_disk, SessionAccess, SpoolError};
-
-/// The producer an upload is staged as: the one a chat message's
-/// by-reference attachment is accepted from.
-const UPLOAD_PRODUCER: &str = "session.upload";
 
 /// The producer a file an agent sends into a Desk conversation is staged as.
 const DELIVERY_PRODUCER: &str = "desk.delivery";
@@ -1166,9 +1163,12 @@ pub async fn upload(
     let head = read_head(&spooled.path, IMAGE_HEAD).unwrap_or_default();
     let media_type = sniff_upload(&head, &filename);
     let desk_conversation = is_desk_conversation(&channel);
-    let mut descriptor =
-        ArtifactDescriptor::from_context(UPLOAD_PRODUCER, ContentType::OctetStream, &agent_id)
-            .with_file_meta(filename.clone(), media_type.clone());
+    let mut descriptor = ArtifactDescriptor::from_context(
+        SESSION_UPLOAD_PRODUCER,
+        ContentType::OctetStream,
+        &agent_id,
+    )
+    .with_file_meta(filename.clone(), media_type.clone());
     descriptor.session_id = Some(session.id.clone());
     descriptor.user_id = caller.identity_id.clone();
     descriptor.ttl_seconds = if desk_conversation {
