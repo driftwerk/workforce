@@ -610,32 +610,28 @@ impl Desk {
     }
 
     fn save(&self, r: SessionRecord) {
-        let before = {
-            let st = self.0.state.lock();
-            st.records.get(&r.id).map(|old| Self::view_of(&st, old))
-        };
-        self.save_after(before, r);
+        let mut st = self.0.state.lock();
+        let before = st.records.get(&r.id).map(|old| Self::view_of(&st, old));
+        self.saved(&mut st, before, r);
     }
 
-    /// Saves `r`, recording what changed since `before` as activity.
-    fn save_after(&self, before: Option<SessionView>, r: SessionRecord) {
-        let (view, events, ops) = {
-            let mut st = self.0.state.lock();
-            st.records.insert(r.id, r.clone());
-            let view = Self::view_of(&st, &r);
-            if before.as_ref().is_none_or(|b| b.state != view.state) {
-                st.state_since.insert(r.id, view.updated_at);
+    /// Saves `r`, recording what changed since `before` as activity, under
+    /// the lock it was changed under: what it writes leaves in the order the
+    /// session changed.
+    fn saved(&self, st: &mut State, before: Option<SessionView>, r: SessionRecord) {
+        st.records.insert(r.id, r.clone());
+        let view = Self::view_of(st, &r);
+        if before.as_ref().is_none_or(|b| b.state != view.state) {
+            st.state_since.insert(r.id, view.updated_at);
+        }
+        let transitions = Transition::of(before.as_ref(), &view, &st.decided);
+        transitions.iter().for_each(|t| {
+            if let Transition::Unblocked { pending, .. } = t {
+                st.decided.remove(&pending.id);
             }
-            let transitions = Transition::of(before.as_ref(), &view, &st.decided);
-            transitions.iter().for_each(|t| {
-                if let Transition::Unblocked { pending, .. } = t {
-                    st.decided.remove(&pending.id);
-                }
-            });
-            let events = Self::session_events(&mut st, &transitions, &view);
-            let ops = Self::turn_ops(&mut st, &transitions, &view);
-            (view, events, ops)
-        };
+        });
+        let events = Self::session_events(st, &transitions, &view);
+        let ops = Self::turn_ops(st, &transitions, &view);
         let _ = self.0.persist.send(Persist::Put(Box::new(r)));
         let _ = self.0.events.send(DeskEvent::Session {
             session: Box::new(view),
@@ -980,19 +976,17 @@ impl Desk {
         id: Uuid,
         f: impl FnOnce(&mut SessionRecord, Option<&mut Live>),
     ) {
-        let (before, r) = {
-            let mut guard = self.0.state.lock();
-            let st = &mut *guard;
-            let Some(old) = st.records.get(&id) else {
-                return;
-            };
-            let before = seen.unwrap_or_else(|| Self::view_of(st, old));
-            let r = st.records.get_mut(&id).expect("just read");
-            f(r, st.live.get_mut(&id));
-            r.updated_at = Utc::now();
-            (before, r.clone())
+        let mut guard = self.0.state.lock();
+        let st = &mut *guard;
+        let Some(old) = st.records.get(&id) else {
+            return;
         };
-        self.save_after(Some(before), r);
+        let before = seen.unwrap_or_else(|| Self::view_of(st, old));
+        let r = st.records.get_mut(&id).expect("just read");
+        f(r, st.live.get_mut(&id));
+        r.updated_at = Utc::now();
+        let r = r.clone();
+        self.saved(st, Some(before), r);
     }
 
     fn record(&self, id: Uuid) -> Result<SessionRecord, DeskError> {
