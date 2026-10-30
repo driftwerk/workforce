@@ -45,6 +45,11 @@ pub fn under(all: &[Proc], root: u32) -> Vec<&Proc> {
     found
 }
 
+/// The processes `parent` started itself.
+pub fn children(all: &[Proc], parent: u32) -> impl Iterator<Item = &Proc> {
+    all.iter().filter(move |p| p.ppid == parent && p.pid != parent)
+}
+
 /// Whether a process is one of Claude Code's Bash tool shells, which source
 /// its shell snapshot.
 pub fn is_tool_shell(p: &Proc) -> bool {
@@ -82,6 +87,11 @@ mod tests {
         assert_eq!(pids(100).len(), 2);
         assert!(pids(100).contains(&102));
         assert!(pids(200).is_empty());
+        assert_eq!(
+            children(&all, 100).map(|p| p.pid).collect::<Vec<_>>(),
+            [101],
+            "a shell's own children are not more of its work"
+        );
         assert_eq!(
             under(&all, 100)
                 .into_iter()

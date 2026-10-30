@@ -790,17 +790,19 @@ impl Desk {
     }
 
     /// How many of a session's background processes `table` lists running:
-    /// Claude Code's tool shells; for Codex, what its turn started and left
-    /// running.
+    /// Claude Code's tool shells; for Codex, what its app-server started in
+    /// the turn and left running, each once whatever it runs under it.
     fn running(table: &[procs::Proc], look: &Look) -> usize {
-        procs::under(table, look.root)
-            .into_iter()
-            .filter(|p| match (look.engine, &look.baseline) {
-                (Engine::Claude, _) => procs::is_tool_shell(p),
-                (Engine::Codex, Some(before)) => !before.contains(&p.pid),
-                (Engine::Codex, None) => false,
-            })
-            .count()
+        match (look.engine, &look.baseline) {
+            (Engine::Claude, _) => procs::under(table, look.root)
+                .into_iter()
+                .filter(|p| procs::is_tool_shell(p))
+                .count(),
+            (Engine::Codex, Some(before)) => procs::children(table, look.root)
+                .filter(|p| !before.contains(&p.pid))
+                .count(),
+            (Engine::Codex, None) => 0,
+        }
     }
 
     /// What of a session's background work runs now, read as its turn
@@ -2582,6 +2584,34 @@ mod tests {
     async fn post(d: &Desk, id: Uuid, body: Value) -> Value {
         let t = token(d, id);
         d.hook(id, &t, body.to_string().as_bytes()).await.unwrap()
+    }
+
+    #[test]
+    fn a_codex_turns_background_is_what_its_app_server_started_in_it() {
+        let table = procs::parse(
+            "10 1 codex app-server\n\
+             11 10 node mcp-server.js\n\
+             12 10 /bin/zsh -c npm run dev\n\
+             13 12 node vite\n\
+             14 13 esbuild --service\n",
+        );
+        let look = Look {
+            root: 10,
+            engine: Engine::Codex,
+            baseline: Some(HashSet::from([11])),
+        };
+        assert_eq!(Desk::running(&table, &look), 1, "one terminal, however deep");
+        assert_eq!(
+            Desk::running(
+                &table,
+                &Look {
+                    baseline: None,
+                    ..look
+                }
+            ),
+            0,
+            "nothing is known to be the turn's"
+        );
     }
 
     #[test]
