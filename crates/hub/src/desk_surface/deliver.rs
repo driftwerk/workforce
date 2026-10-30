@@ -246,11 +246,11 @@ pub(crate) async fn into_own_room(
             author: author.key(),
             content: super::shown(text),
             thread_id: *thread,
-            hop: 0,
             attachments,
             source: Some(source_key(LOCAL_HUB, agent_id, &delivered.message_id)),
             delivery: mark.delivery,
             request_id: mark.request_id.clone(),
+            ..NewMessage::default()
         },
     )
     .await?;
@@ -580,12 +580,7 @@ mod tests {
                     NewMessage {
                         author: "you".into(),
                         content: "remind me".into(),
-                        thread_id: None,
-                        hop: 0,
-                        attachments: Vec::new(),
-                        source: None,
-                        delivery: None,
-                        request_id: None,
+                        ..NewMessage::default()
                     },
                 )
                 .await
@@ -634,7 +629,10 @@ mod tests {
                 assert!(posted);
             }
             let thread = desk
-                .room_messages(room.id, Some(ask.id), None, 50)
+                .room_messages(
+                    room.id,
+                    workforce_desk::rooms::Page::newest(Some(ask.id), 50),
+                )
                 .await
                 .unwrap();
             assert_eq!(thread.len(), 1, "posted once");
@@ -682,7 +680,10 @@ mod tests {
                     .unwrap()
             );
             let thread = desk
-                .room_messages(room.id, Some(ask.id), None, 50)
+                .room_messages(
+                    room.id,
+                    workforce_desk::rooms::Page::newest(Some(ask.id), 50),
+                )
                 .await
                 .unwrap();
             assert_eq!(thread[1].request_id.as_deref(), Some("req-1"));

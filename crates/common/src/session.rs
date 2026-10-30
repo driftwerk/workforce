@@ -2628,7 +2628,7 @@ pub enum JournalStep {
     /// collecting resumes from the latest mark rather than deciding again.
     Checkpoint { mark: String },
     /// The call returned; `message` is its row as the session holds it.
-    Finished { message: SessionMessage },
+    Finished { message: Box<SessionMessage> },
 }
 
 impl JournalEntry {
@@ -5232,7 +5232,7 @@ pub(crate) fn assert_turn_journal_contract(store: &dyn SessionStore, session_id:
         call: call.into(),
         at: Utc::now(),
         step: JournalStep::Finished {
-            message: SessionMessage {
+            message: Box::new(SessionMessage {
                 id: call.into(),
                 ..SessionMessage::tool(
                     "shell",
@@ -5242,7 +5242,7 @@ pub(crate) fn assert_turn_journal_contract(store: &dyn SessionStore, session_id:
                     5,
                     None,
                 )
-            },
+            }),
         },
     };
     let pending = JournalEntry {

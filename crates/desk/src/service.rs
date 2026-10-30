@@ -29,8 +29,9 @@ use crate::model::{
 use crate::procs;
 use crate::pty::{Exit, Pty};
 use crate::rooms::{
-    channel_for, place_in_timeline, slug_for, Member, NewMessage, NewRoom, Posted, Room,
-    RoomMessage, RoomPatch, SearchHit, DESK, MAX_HOPS, THREAD_GONE, TURN_BUDGET, YOU,
+    channel_for, place_in_timeline, slug_for, steps_refused, Member, NewMessage, NewRoom, Page,
+    Posted, Room, RoomMessage, RoomPatch, SearchHit, Span, DESK, MAX_HOPS, THREAD_GONE,
+    TURN_BUDGET, YOU,
 };
 use crate::store::DeskStore;
 use crate::transcript;
@@ -38,6 +39,8 @@ use crate::usage::{self, MacPlan, MacSignIns, PlanSink};
 use crate::worktree;
 
 mod groups;
+#[cfg(test)]
+mod rooms_tests;
 mod terminals;
 mod transition;
 
@@ -1881,19 +1884,41 @@ impl Desk {
         Ok(())
     }
 
-    pub async fn room_messages(
-        &self,
-        id: Uuid,
-        thread_id: Option<Uuid>,
-        before: Option<chrono::DateTime<Utc>>,
-        limit: i64,
-    ) -> Result<Vec<RoomMessage>, DeskError> {
+    /// A page of a room's main timeline or of one of its threads. A bound
+    /// that isn't a message of the room is not found; a message to page
+    /// around that is in another place is refused, so Desk asks there.
+    pub async fn room_messages(&self, id: Uuid, page: Page) -> Result<Vec<RoomMessage>, DeskError> {
         self.room_of(id)?;
-        Ok(self
-            .0
+        if let Span::Around(target) = page.span {
+            let (_, _, thread) = self
+                .0
+                .store
+                .cursor(id, target)
+                .await?
+                .ok_or(DeskError::NotFound)?;
+            if thread != page.thread {
+                return Err(DeskError::Invalid(match thread {
+                    Some(_) => "that message is in a thread".into(),
+                    None => "that message is in the room's timeline".into(),
+                }));
+            }
+        }
+        self.0
             .store
-            .messages(id, thread_id, before, limit.clamp(1, 200))
-            .await?)
+            .messages(id, &page)
+            .await?
+            .ok_or(DeskError::NotFound)
+    }
+
+    /// One message of a room.
+    pub async fn room_message(&self, room: Uuid, id: Uuid) -> Result<RoomMessage, DeskError> {
+        self.room_of(room)?;
+        self.0
+            .store
+            .message(id)
+            .await?
+            .filter(|m| m.room_id == room)
+            .ok_or(DeskError::NotFound)
     }
 
     /// Adds a message to a room. Agent messages are held to the loop guard:
@@ -1928,6 +1953,24 @@ impl Desk {
         }
         let is_agent = new.author != YOU && new.author != DESK;
         let delivered = new.delivery.is_some();
+        if let Some(why) = steps_refused(&new.steps, is_agent && !delivered) {
+            return Err(DeskError::Invalid(why));
+        }
+        if let Some(answered) = new.in_reply_to {
+            match self.0.store.message(answered).await? {
+                Some(m) if m.room_id == id => {}
+                Some(_) => {
+                    return Err(DeskError::Invalid(
+                        "it answers a message in another room".into(),
+                    ))
+                }
+                None => {
+                    return Err(DeskError::Invalid(
+                        "it answers a message that isn't there".into(),
+                    ))
+                }
+            }
+        }
         if delivered && (!is_agent || Member::parse(&new.author).is_none()) {
             return Err(DeskError::Invalid(format!(
                 "a delivery comes from an agent, as hub/agent, not {}",
@@ -1987,7 +2030,10 @@ impl Desk {
                 source: new.source,
                 request_id: new.request_id.filter(|_| new.delivery.is_some()),
                 delivery: new.delivery,
+                in_reply_to: new.in_reply_to,
+                steps: new.steps,
                 replies: None,
+                reading: None,
             })
             .await?;
         if posted.created {
@@ -2962,7 +3008,7 @@ mod tests {
         path
     }
 
-    fn options(dir: &Path) -> Options {
+    pub(super) fn options(dir: &Path) -> Options {
         Options {
             claude: fake_cli(dir),
             codex: fake_cli(dir),
@@ -2980,7 +3026,7 @@ mod tests {
         }
     }
 
-    async fn desk(pool: workforce_postgres::PostgresPool, dir: &Path) -> Desk {
+    pub(super) async fn desk(pool: workforce_postgres::PostgresPool, dir: &Path) -> Desk {
         DeskStore::migrate(&pool).await.unwrap();
         Desk::start(
             DeskStore::from_pool(pool),
@@ -3968,12 +4014,8 @@ mod tests {
             let post = |author: &str, hop: i16| NewMessage {
                 author: author.into(),
                 content: "on it".into(),
-                thread_id: None,
                 hop,
-                attachments: Vec::new(),
-                source: None,
-                delivery: None,
-                request_id: None,
+                ..NewMessage::default()
             };
             d.post(room.id, post(YOU, 0)).await.unwrap();
             // Files may stand in for text, and come back with the message.
@@ -3995,7 +4037,7 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(
-                d.room_messages(room.id, None, None, 50)
+                d.room_messages(room.id, crate::rooms::Page::newest(None, 50))
                     .await
                     .unwrap()
                     .last()
@@ -4115,12 +4157,7 @@ mod tests {
                     NewMessage {
                         author: YOU.into(),
                         content: "remind me at five".into(),
-                        thread_id: None,
-                        hop: 0,
-                        attachments: Vec::new(),
-                        source: None,
-                        delivery: None,
-                        request_id: None,
+                        ..NewMessage::default()
                     },
                 )
                 .await
@@ -4133,11 +4170,8 @@ mod tests {
                         author: "dw/allan".into(),
                         content: "noted".into(),
                         thread_id: Some(ask.id),
-                        hop: 0,
-                        attachments: Vec::new(),
-                        source: None,
                         delivery: Some(workforce_core::desk::DeliveryKind::Notice),
-                        request_id: None,
+                        ..NewMessage::default()
                     },
                 )
                 .await
@@ -4148,10 +4182,9 @@ mod tests {
                 content: "🔔 Reminder: five o'clock".into(),
                 thread_id: Some(ask.id),
                 hop: 2,
-                attachments: Vec::new(),
                 source: Some(crate::rooms::source_key("local", "scout", "m-1")),
                 delivery: Some(workforce_core::desk::DeliveryKind::Reminder),
-                request_id: None,
+                ..NewMessage::default()
             };
             let first = d.post(room.id, reminder.clone()).await.unwrap();
             assert!(first.created, "past the loop guard, from a former member");

@@ -23,7 +23,7 @@ use crate::model::{Decision, NewSession, SessionPatch};
 use crate::providers::{self, AccountError, Accounts, Catalog, ConnectBody, Entry};
 use crate::pty::Frame;
 use crate::realtime::{Engine, Realtime, RealtimeError};
-use crate::rooms::{NewMessage, NewRoom, RoomPatch};
+use crate::rooms::{Bound, NewMessage, NewRoom, Page, RoomPatch};
 use crate::service::{Desk, DeskError, Import, Layout, NewTerminal, TerminalPatch};
 use crate::speech::{Speak, SpeakError, Speech};
 
@@ -591,7 +591,9 @@ async fn delete_room(State(s): S, h: HeaderMap, Query(q): Q, Path(id): Path<Uuid
 struct TimelineQuery {
     token: Option<String>,
     thread: Option<Uuid>,
-    before: Option<chrono::DateTime<chrono::Utc>>,
+    before: Option<Bound>,
+    after: Option<Bound>,
+    around: Option<Uuid>,
     limit: Option<i64>,
 }
 
@@ -603,8 +605,26 @@ async fn room_messages(
 ) -> Response {
     let q = TokenQuery { token: t.token };
     guarded!(s, h, q);
+    let page = match Page::of(t.thread, t.before, t.after, t.around, t.limit) {
+        Ok(page) => page,
+        Err(why) => return DeskError::Invalid(why).into_response(),
+    };
     s.desk
-        .room_messages(id, t.thread, t.before, t.limit.unwrap_or(100))
+        .room_messages(id, page)
+        .await
+        .map(Json)
+        .into_response()
+}
+
+async fn room_message(
+    State(s): S,
+    h: HeaderMap,
+    Query(q): Q,
+    Path((id, message)): Path<(Uuid, Uuid)>,
+) -> Response {
+    guarded!(s, h, q);
+    s.desk
+        .room_message(id, message)
         .await
         .map(Json)
         .into_response()
@@ -696,6 +716,7 @@ pub fn sessions_router(desk: Desk, auth: Arc<dyn Authorize>) -> Router {
             "/api/desk/rooms/{id}/messages",
             get(room_messages).post(post_message),
         )
+        .route("/api/desk/rooms/{id}/messages/{message}", get(room_message))
         .with_state(Arc::new(ApiState { desk, auth }))
 }
 
@@ -1213,6 +1234,142 @@ mod tests {
             assert_eq!((status, &again["id"]), (200, &first["id"]));
             let (status, said) = call(&app, "POST", &uri, Some(json!({ "author": "you", "content": "thanks" }))).await;
             assert_eq!((status, said.get("source"), said.get("delivery")), (201, None, None));
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn room_pages_by_before_after_and_around_and_one_message_reads_alone() {
+        with_test_pool(build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let store = DeskStore::with_pool(pool).await.unwrap();
+            let desk = crate::Desk::start(
+                store,
+                options(dir.path()),
+                Default::default(),
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            let app = super::sessions_router(desk, allow_all());
+            let (_, room) = call(
+                &app,
+                "POST",
+                "/api/desk/rooms",
+                Some(json!({ "name": "Atlas launch" })),
+            )
+            .await;
+            let uri = format!("/api/desk/rooms/{}/messages", room["id"].as_str().unwrap());
+            let mut ids = Vec::new();
+            for i in 0..5 {
+                let (_, m) = call(
+                    &app,
+                    "POST",
+                    &uri,
+                    Some(json!({ "author": "you", "content": format!("line {i}") })),
+                )
+                .await;
+                ids.push(m["id"].as_str().unwrap().to_string());
+            }
+            let ids_of = |v: &Value| {
+                v.as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|m| m["id"].as_str().unwrap().to_string())
+                    .collect::<Vec<_>>()
+            };
+            let (status, v) = call(
+                &app,
+                "GET",
+                &format!("{uri}?before={}&limit=2", ids[3]),
+                None,
+            )
+            .await;
+            assert_eq!((status, ids_of(&v)), (200, ids[1..3].to_vec()));
+            let (_, v) = call(&app, "GET", &format!("{uri}?after={}", ids[3]), None).await;
+            assert_eq!(ids_of(&v), ids[4..].to_vec());
+            let (_, v) = call(
+                &app,
+                "GET",
+                &format!("{uri}?around={}&limit=3", ids[2]),
+                None,
+            )
+            .await;
+            assert_eq!(ids_of(&v), ids[1..4].to_vec());
+            let (_, v) = call(
+                &app,
+                "GET",
+                &format!("{uri}?before=2000-01-01T00:00:00Z"),
+                None,
+            )
+            .await;
+            assert_eq!(
+                ids_of(&v),
+                Vec::<String>::new(),
+                "a plain time still reads as one"
+            );
+            let (status, _) = call(
+                &app,
+                "GET",
+                &format!("{uri}?before={}", uuid::Uuid::new_v4()),
+                None,
+            )
+            .await;
+            assert_eq!(status, 404, "a message that isn't the room's");
+
+            let (status, one) = call(&app, "GET", &format!("{uri}/{}", ids[2]), None).await;
+            assert_eq!(
+                (status, &one["content"], &one["forYou"]),
+                (200, &json!("line 2"), &json!(false))
+            );
+            let (status, _) = call(
+                &app,
+                "GET",
+                &format!("{uri}/{}", uuid::Uuid::new_v4()),
+                None,
+            )
+            .await;
+            assert_eq!(status, 404);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn two_spans_at_once_are_refused() {
+        with_test_pool(build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let store = DeskStore::with_pool(pool).await.unwrap();
+            let desk = crate::Desk::start(
+                store,
+                options(dir.path()),
+                Default::default(),
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            let app = super::sessions_router(desk, allow_all());
+            let (_, room) = call(
+                &app,
+                "POST",
+                "/api/desk/rooms",
+                Some(json!({ "name": "Atlas launch" })),
+            )
+            .await;
+            let uri = format!("/api/desk/rooms/{}/messages", room["id"].as_str().unwrap());
+            let (_, m) = call(
+                &app,
+                "POST",
+                &uri,
+                Some(json!({ "author": "you", "content": "hi" })),
+            )
+            .await;
+            let id = m["id"].as_str().unwrap();
+            let (status, v) =
+                call(&app, "GET", &format!("{uri}?before={id}&around={id}"), None).await;
+            assert_eq!(
+                (status, &v["error"]),
+                (400, &json!("ask for one of before, after or around"))
+            );
         })
         .await;
     }

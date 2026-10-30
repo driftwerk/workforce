@@ -150,7 +150,12 @@ impl TurnJournal for SessionJournal {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push(row.clone());
-        if let Err(e) = self.append(call, JournalStep::Finished { message: row }) {
+        if let Err(e) = self.append(
+            call,
+            JournalStep::Finished {
+                message: Box::new(row),
+            },
+        ) {
             warn!(session = %self.session_id, call, error = %e, "journalling a finished call");
         }
     }
@@ -252,7 +257,7 @@ fn absorb(
     let mut absorbed: Vec<SessionMessage> = entries
         .iter()
         .filter_map(|entry| match &entry.step {
-            JournalStep::Finished { message } => Some(message.clone()),
+            JournalStep::Finished { message } => Some((**message).clone()),
             _ => None,
         })
         .collect();
@@ -291,7 +296,7 @@ pub fn left_in(entries: &[JournalEntry]) -> Left {
         returned: entries
             .iter()
             .filter_map(|entry| match &entry.step {
-                JournalStep::Finished { message } => Some(message.clone()),
+                JournalStep::Finished { message } => Some((**message).clone()),
                 _ => None,
             })
             .collect(),
@@ -326,7 +331,7 @@ pub fn settle_ended(sessions: &dyn SessionStore, session_id: &str) {
             call: call.call.to_string(),
             at: Utc::now(),
             step: JournalStep::Finished {
-                message: call.row(ENDED_UNFINISHED),
+                message: Box::new(call.row(ENDED_UNFINISHED)),
             },
         };
         if let Err(e) = sessions.journal_append(session_id, &entry) {
