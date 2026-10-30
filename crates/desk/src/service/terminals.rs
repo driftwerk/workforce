@@ -18,7 +18,7 @@ use uuid::Uuid;
 
 use serde_json::Value;
 
-use super::{Desk, DeskError, Live, Persist, RestorePolicy};
+use super::{check_env, Desk, DeskError, Live, Persist, RestorePolicy};
 use crate::claude::{self, Hook};
 use crate::holder::{Held, Holder};
 use crate::model::DeskEvent;
@@ -29,19 +29,11 @@ use crate::store::DeskStore;
 /// How long a terminal's session may hold an approval open: Desk's hook
 /// plugin gives its PermissionRequest hook a day.
 pub(super) const TERMINAL_APPROVAL_WAIT: Duration = Duration::from_secs(86_400);
-/// The variable Desk puts its hook plugin's folder in; ours is added to
-/// any the login environment already has (`:`-separated, as Claude Code
-/// splits it).
-const PLUGIN_DIRS: &str = "CLAUDE_CODE_PLUGIN_DIRS";
 /// The token a terminal's hooks present.
 const HOOK_TOKEN: &str = "DESK_HOOK_TOKEN";
 
 /// How often a running shell's working directory is looked at.
 pub(super) const CWD_EVERY: Duration = Duration::from_secs(3);
-/// Most variables a terminal's environment may add.
-const MAX_ENV: usize = 64;
-const MAX_ENV_VALUE: usize = 32 * 1024;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TerminalState {
@@ -144,47 +136,6 @@ pub struct NewTerminal {
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct TerminalPatch {
     pub name: Option<String>,
-}
-
-fn check_env(env: &BTreeMap<String, String>) -> Result<(), DeskError> {
-    if env.len() > MAX_ENV {
-        return Err(DeskError::Invalid(format!(
-            "a terminal's environment adds at most {MAX_ENV} variables"
-        )));
-    }
-    for (k, v) in env {
-        let name_ok = k
-            .chars()
-            .next()
-            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-            && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
-        if !name_ok {
-            return Err(DeskError::Invalid(format!(
-                "{k:?} is not an environment variable name"
-            )));
-        }
-        if v.len() > MAX_ENV_VALUE || v.contains('\0') {
-            return Err(DeskError::Invalid(format!("{k}'s value is not usable")));
-        }
-    }
-    Ok(())
-}
-
-/// The person's plugin folders, then Desk's, each once; `None` for none.
-fn plugin_dirs(theirs: Option<&String>, ours: Option<&String>) -> Option<String> {
-    let mut dirs: Vec<&str> = Vec::new();
-    for dir in [theirs, ours]
-        .into_iter()
-        .flatten()
-        .flat_map(|v| v.split(':'))
-        .map(str::trim)
-        .filter(|d| !d.is_empty())
-    {
-        if !dirs.contains(&dir) {
-            dirs.push(dir);
-        }
-    }
-    (!dirs.is_empty()).then(|| dirs.join(":"))
 }
 
 fn folder_name(cwd: &str) -> String {
@@ -410,23 +361,13 @@ impl Desk {
     }
 
     fn terminal_spawn(&self, r: &TerminalRecord) -> Spawn {
-        let mut env = self.0.env.clone();
-        env.extend(r.env.clone());
-        // The person's own plugin folders always carry through (the base
-        // environment drops every CLAUDE* marker), with Desk's after them
-        // when it sends one.
-        let dirs = plugin_dirs(self.0.opts.env.get(PLUGIN_DIRS), r.env.get(PLUGIN_DIRS));
-        match dirs {
-            Some(dirs) => env.insert(PLUGIN_DIRS.into(), dirs),
-            None => env.remove(PLUGIN_DIRS),
-        };
+        let mut env = self.with_added(&r.env);
         env.insert("DESK_TERMINAL_ID".into(), r.id.to_string());
         let token = r.env.get(HOOK_TOKEN).cloned().unwrap_or_default();
+        let hook_url = format!("{}/hook/terminal/{}/{token}", self.0.hook_base, r.id);
         env.insert("DESK_HOOK_BASE".into(), self.0.hook_base.clone());
-        env.insert(
-            "DESK_HOOK_URL".into(),
-            format!("{}/hook/terminal/{}/{token}", self.0.hook_base, r.id),
-        );
+        env.insert(claude::USAGE_URL.into(), hook_url.clone());
+        env.insert("DESK_HOOK_URL".into(), hook_url);
         Spawn {
             program: PathBuf::from(&r.shell),
             args: vec!["-l".into()],
@@ -567,6 +508,10 @@ impl Desk {
                 return Some(Value::Object(Default::default()));
             }
         };
+        if let Hook::Usage(limits) = hook {
+            self.report_usage(limits);
+            return Some(Value::Object(Default::default()));
+        }
         let cli = fields["session_id"].as_str().map(str::to_string);
         let cwd = fields["cwd"].as_str().map(str::to_string);
         let found = self.terminal_session(terminal, cli.as_deref());
@@ -580,7 +525,7 @@ impl Desk {
             (_, Some(id)) => id,
         };
         let ending = matches!(hook, Hook::SessionEnd);
-        let answer = self.apply_hook(id, hook).await;
+        let answer = self.apply_hook(id, hook, claude::agent_of(body)).await;
         if ending {
             self.end_terminal_session(id, true);
         }
@@ -652,6 +597,8 @@ impl Desk {
             stopping: false,
             _codex: None,
             terminal: Some(terminal),
+            background: Default::default(),
+            baseline: Default::default(),
         };
         if existing.is_some_and(|id| self.0.state.lock().live.contains_key(&id)) {
             // Already running here: nothing to take back.
@@ -756,6 +703,8 @@ impl Desk {
                             stopping: false,
                             _codex: None,
                             terminal: Some(terminal),
+                            background: Default::default(),
+                            baseline: Default::default(),
                         },
                     );
                     self.publish(id);
@@ -818,33 +767,6 @@ mod tests {
         panic!("never happened");
     }
 
-    #[test]
-    fn environment_names_are_checked() {
-        let env = |k: &str| BTreeMap::from([(k.to_string(), "v".to_string())]);
-        assert!(check_env(&env("CLAUDE_CODE_PLUGIN_DIRS")).is_ok());
-        assert!(check_env(&env("_X1")).is_ok());
-        for bad in ["", "1X", "A-B", "A B"] {
-            assert!(check_env(&env(bad)).is_err(), "{bad:?}");
-        }
-    }
-
-    #[test]
-    fn plugin_dirs_are_the_persons_then_desks_each_once() {
-        let v = |s: &str| Some(s.to_string());
-        let dirs = |a: Option<String>, b: Option<String>| plugin_dirs(a.as_ref(), b.as_ref());
-        assert_eq!(dirs(v("/mine:/also"), None), v("/mine:/also"));
-        assert_eq!(dirs(None, v("/plugins/desk")), v("/plugins/desk"));
-        assert_eq!(
-            dirs(v("/mine"), v("/plugins/desk")),
-            v("/mine:/plugins/desk")
-        );
-        assert_eq!(
-            dirs(v("/mine:/plugins/desk"), v("/plugins/desk:/mine")),
-            v("/mine:/plugins/desk")
-        );
-        assert_eq!(dirs(v(" : "), v("")), None);
-    }
-
     /// A terminal Desk opens without its plugin folder still loads the
     /// person's own.
     #[tokio::test]
@@ -865,7 +787,7 @@ mod tests {
             assert_eq!(
                 d.terminal_spawn(&r)
                     .env
-                    .get(PLUGIN_DIRS)
+                    .get(super::super::PLUGIN_DIRS)
                     .map(String::as_str),
                 Some("/mine")
             );
@@ -895,6 +817,7 @@ mod tests {
             let d = Desk::start(
                 crate::store::DeskStore::from_pool(pool.clone()),
                 opts.clone(),
+                Default::default(),
                 cancel.clone(),
             )
             .await
@@ -946,7 +869,7 @@ mod tests {
             );
             assert_eq!(saved[0].env["DESK_HOOK_TOKEN"], "tok");
 
-            let d = Desk::start(store, opts, CancellationToken::new())
+            let d = Desk::start(store, opts, Default::default(), CancellationToken::new())
                 .await
                 .unwrap();
             let back = d.terminal(id).unwrap();
@@ -1014,6 +937,7 @@ mod tests {
         Desk::start(
             crate::store::DeskStore::from_pool(pool),
             opts,
+            Default::default(),
             CancellationToken::new(),
         )
         .await
@@ -1061,6 +985,12 @@ mod tests {
             // SessionStart, posted where the shell was told to.
             let repo = dir.path().to_string_lossy().into_owned();
             let url = format!("{}/hook/terminal/{tid}/{token}", d.0.hook_base);
+            let usage = br#"{"hook_event_name":"DeskUsage","rate_limits":[]}"#;
+            assert_eq!(d.terminal_hook(tid, &token, usage).await, Some(serde_json::json!({})));
+            assert!(
+                d.list().iter().all(|s| s.terminal_id != Some(tid)),
+                "a plan's reading starts no session"
+            );
             let started = reqwest::Client::new()
                 .post(&url)
                 .body(hook("SessionStart", "cc-1", serde_json::json!({ "cwd": repo })))
@@ -1211,6 +1141,7 @@ mod tests {
             let d = Desk::start(
                 crate::store::DeskStore::from_pool(pool.clone()),
                 opts.clone(),
+                Default::default(),
                 cancel.clone(),
             )
             .await
@@ -1248,6 +1179,7 @@ mod tests {
             let d = Desk::start(
                 crate::store::DeskStore::from_pool(pool),
                 opts,
+                Default::default(),
                 CancellationToken::new(),
             )
             .await

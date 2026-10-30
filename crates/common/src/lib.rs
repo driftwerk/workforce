@@ -78,5 +78,6 @@ pub mod timezone;
 pub mod tls;
 pub mod tool_input;
 pub mod trust;
+pub mod usage;
 pub mod vault_scope;
 pub mod vectorizable;

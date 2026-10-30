@@ -965,6 +965,7 @@ mod tests {
             let desk = crate::Desk::start(
                 DeskStore::from_pool(pool),
                 opts,
+                Default::default(),
                 tokio_util::sync::CancellationToken::new(),
             )
             .await
@@ -1080,7 +1081,7 @@ mod tests {
             let store = DeskStore::from_pool(pool);
             let r = crate::store::tests::record_fixture("monorepo-fd");
             store.put(&r).await.unwrap();
-            let desk = crate::Desk::start(store, options(dir.path()), tokio_util::sync::CancellationToken::new())
+            let desk = crate::Desk::start(store, options(dir.path()), Default::default(), tokio_util::sync::CancellationToken::new())
                 .await
                 .unwrap();
             let app = super::sessions_router(desk, allow_all());
@@ -1151,7 +1152,7 @@ mod tests {
         with_test_pool(build_pool, |pool| async move {
             let dir = tempfile::tempdir().unwrap();
             let store = DeskStore::with_pool(pool).await.unwrap();
-            let desk = crate::Desk::start(store, options(dir.path()), tokio_util::sync::CancellationToken::new())
+            let desk = crate::Desk::start(store, options(dir.path()), Default::default(), tokio_util::sync::CancellationToken::new())
                 .await
                 .unwrap();
             let app = super::sessions_router(desk, allow_all());

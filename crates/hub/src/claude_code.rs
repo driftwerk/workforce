@@ -488,6 +488,8 @@ pub struct ClaudeCodeResult {
     pub handed_over: Vec<workforce_orchestrator::workflow::instance::EngineAttempt>,
     /// What the round reported about its login's usage limit.
     pub limit: Option<crate::subscription::LimitSignal>,
+    /// How full its login's plan windows were, as the round reported them.
+    pub plan_usage: Vec<workforce_common::usage::Window>,
     /// The durable job the round ran as; `None` for a round nothing will
     /// collect after a restart. Keys its cost row, so a job collected again
     /// is recorded once.
@@ -522,6 +524,7 @@ impl ClaudeCodeResult {
     pub fn round_end(&self) -> crate::hub_core::logins::resolve::RoundEnd<'_> {
         crate::hub_core::logins::resolve::RoundEnd {
             limit: self.limit.clone(),
+            usage: self.plan_usage.clone(),
             failed: self.completion == Completion::Failed,
             notice: &self.notice,
             stderr_tail: &self.stderr_tail,
@@ -744,6 +747,9 @@ struct StreamCapture {
     progress_round: u32,
     /// The last `rate_limit_event`'s report, if it reported a limit.
     limit: Option<crate::subscription::LimitSignal>,
+    /// How full the plan's windows were, as the last `rate_limit_event`
+    /// that said so reported them.
+    plan_usage: Vec<workforce_common::usage::Window>,
     /// Each model call's usage as its assistant events reported it, in
     /// order: the CLI repeats one call's usage on each of its content blocks.
     calls: Vec<(Option<String>, TokenUsage)>,
@@ -821,6 +827,10 @@ impl StreamCapture {
             }
             Some("rate_limit_event") => {
                 self.limit = crate::subscription::limits::claude_rate_limit_event(event);
+                let windows = crate::subscription::limits::claude_usage(event);
+                if !windows.is_empty() {
+                    self.plan_usage = windows;
+                }
             }
             _ => {}
         }
@@ -1745,6 +1755,7 @@ fn assemble_result(
         notice,
         handed_over: Vec::new(),
         limit,
+        plan_usage: run.capture.plan_usage.clone(),
         job: config.jobs.as_ref().map(RoundJobs::job),
     }
 }
@@ -4274,6 +4285,23 @@ pub(crate) mod tests {
         let limit = r.limit.expect("the stream's refusal");
         assert_eq!(limit.status, crate::subscription::LimitStatus::Rejected);
         assert_eq!(limit.window.as_deref(), Some("seven_day"));
+
+        let allowed = serde_json::json!({
+            "type": "rate_limit_event",
+            "rate_limit_info": {"status": "allowed", "unifiedWindows": {
+                "five_hour": {"utilization": 0.06, "resetsAt": 1_790_676_600},
+                "seven_day": {"utilization": 0.69, "resetsAt": 1_790_956_800}}},
+        });
+        let used = limited(&[allowed, rejected.clone(), result_event("success", 1)], 0);
+        assert_eq!(
+            used.round_end()
+                .usage
+                .iter()
+                .map(|w| (w.minutes, w.used_percent))
+                .collect::<Vec<_>>(),
+            [(300, 6.0), (10_080, 69.0)],
+            "an event without windows keeps the last that had them"
+        );
 
         let noticed = limited(
             &[serde_json::json!({

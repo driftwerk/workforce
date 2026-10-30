@@ -7,10 +7,11 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::floor::{Need, Outcome};
 use crate::model::{Engine, Origin, SessionState, SessionView};
 
 /// Who or what an event is by or about.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PartyKind {
     Agent,
@@ -322,6 +323,9 @@ pub struct Item {
     pub last_activity: Option<DateTime<Utc>>,
     pub approval: Option<ItemApproval>,
     pub question: Option<ItemQuestion>,
+    /// Work it started that still runs after its turn: it is working.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background: Option<crate::floor::Background>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -476,6 +480,11 @@ pub trait Crew: Send + Sync {
     /// Does what `suggestion` proposed, as you; what went wrong in plain
     /// words.
     async fn accept(&self, suggestion: &Suggestion) -> Result<(), String>;
+    /// What still needs the person, from the floor; `None` where the hub
+    /// keeps none.
+    async fn open_needs(&self) -> Option<Vec<Need>> {
+        None
+    }
 }
 
 // ── Words ────────────────────────────────────────────────────────────────
@@ -673,6 +682,42 @@ pub fn hit_limit(reply: &str) -> bool {
     .any(|p| r.contains(p))
 }
 
+/// How long an answer's line is kept.
+const ANSWER_CHARS: usize = 120;
+
+/// What a turn's answer (or, as `Err`, its failure) means: how it ended,
+/// its first line, and the question it leaves the person.
+pub fn outcome_of(answer: Result<&str, &str>) -> (Outcome, Option<String>, Option<ItemQuestion>) {
+    let (Ok(text) | Err(text)) = answer;
+    let line = Some(one_line(text, ANSWER_CHARS)).filter(|l| !l.is_empty());
+    match answer {
+        _ if hit_limit(text) => (Outcome::Limit, line, None),
+        Ok(reply) => match question_in(reply) {
+            Some(q) => {
+                let options = options_in(reply, &q);
+                (
+                    Outcome::Asked,
+                    line,
+                    Some(ItemQuestion { text: q, options }),
+                )
+            }
+            None => (Outcome::Finished, line, None),
+        },
+        Err(_) => (Outcome::Failed, line, None),
+    }
+}
+
+/// The activity a turn's end is recorded as.
+pub fn ended_kind(outcome: Outcome) -> Kind {
+    match outcome {
+        Outcome::Finished => Kind::Finished,
+        Outcome::Asked => Kind::Question,
+        Outcome::Limit => Kind::Limit,
+        Outcome::Stopped => Kind::Stopped,
+        Outcome::Failed | Outcome::Interrupted => Kind::Failed,
+    }
+}
+
 /// What a session's pending request asks, as a question: "Run npm install …?"
 pub fn approval_summary(tool: &str, detail: &str) -> String {
     let name = tool.split('(').next().unwrap_or(tool).trim();
@@ -763,6 +808,39 @@ mod tests {
             "Compare spend."
         );
         assert_eq!(one_line("abcdefghij", 5), "abcd…");
+    }
+
+    #[test]
+    fn an_answer_means_finished_asked_limited_or_failed() {
+        assert_eq!(
+            outcome_of(Ok("Fixed it. 214 tests pass.")),
+            (Outcome::Finished, Some("Fixed it.".into()), None)
+        );
+        let reply = "I can:\n- Roll back\n- Patch forward\n\nWhich would you like?";
+        assert_eq!(
+            outcome_of(Ok(reply)),
+            (
+                Outcome::Asked,
+                Some("I can:".into()),
+                Some(ItemQuestion {
+                    text: "Which would you like?".into(),
+                    options: Some(vec!["Roll back".into(), "Patch forward".into()])
+                })
+            )
+        );
+        assert_eq!(
+            outcome_of(Ok("You've hit your usage limit.")).0,
+            Outcome::Limit
+        );
+        assert_eq!(
+            outcome_of(Err("rate limit reached, try later")).0,
+            Outcome::Limit
+        );
+        assert_eq!(
+            outcome_of(Err("connection refused")),
+            (Outcome::Failed, Some("connection refused".into()), None)
+        );
+        assert_eq!(outcome_of(Ok("  ")), (Outcome::Finished, None, None));
     }
 
     #[test]

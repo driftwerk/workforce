@@ -152,6 +152,7 @@ impl DeskTool {
                             worktree: i.worktree,
                             prompt: i.prompt,
                             approvals: None,
+                            env: Default::default(),
                         },
                         caller(),
                     )

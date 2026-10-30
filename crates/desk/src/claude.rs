@@ -10,6 +10,7 @@ use std::path::Path;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use crate::background::TaskKind;
 use crate::pty::Spawn;
 
 /// What to run: a new conversation with an id Desk chose, or one to resume.
@@ -30,7 +31,14 @@ pub struct ClaudeSpawn<'a> {
 }
 
 const TOOL_EVENTS: [&str; 3] = ["PreToolUse", "PermissionRequest", "PostToolUse"];
-const PLAIN_EVENTS: [&str; 4] = ["UserPromptSubmit", "Notification", "Stop", "SessionEnd"];
+const PLAIN_EVENTS: [&str; 6] = [
+    "UserPromptSubmit",
+    "Notification",
+    "Stop",
+    "SubagentStart",
+    "SubagentStop",
+    "SessionEnd",
+];
 
 fn http_hook(url: &str, timeout_secs: u64) -> Value {
     json!({ "type": "http", "url": url, "timeout": timeout_secs })
@@ -77,13 +85,18 @@ pub fn spawn(s: &ClaudeSpawn<'_>) -> Spawn {
         hook_settings(s.hook_url, s.approval_timeout_secs).to_string(),
     ]);
     args.extend(s.prompt.map(str::to_string));
+    let mut env = s.env.clone();
+    env.insert(USAGE_URL.into(), s.hook_url.to_string());
     Spawn {
         program: s.program.to_path_buf(),
         args,
         cwd: s.cwd.to_path_buf(),
-        env: s.env.clone(),
+        env,
     }
 }
+
+/// Where Desk's plugin posts the plan's rate limits from.
+pub const USAGE_URL: &str = "DESK_USAGE_URL";
 
 #[derive(Debug, Deserialize)]
 struct Payload {
@@ -97,7 +110,23 @@ struct Payload {
     notification_type: Option<String>,
     message: Option<String>,
     last_assistant_message: Option<String>,
+    rate_limits: Option<Value>,
+    agent_id: Option<String>,
+    background_tasks: Option<Vec<BackgroundTask>>,
 }
+
+/// One entry of a `Stop`'s `background_tasks`.
+#[derive(Debug, Deserialize)]
+struct BackgroundTask {
+    id: String,
+    #[serde(rename = "type")]
+    kind: String,
+    status: String,
+}
+
+/// The prompts Claude Code submits itself when background work it started
+/// ends: not the person's words.
+const ENGINE_PROMPTS: [&str; 2] = ["<task-notification>", "<agent-message from="];
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Hook {
@@ -117,8 +146,16 @@ pub enum Hook {
     Stop {
         transcript: Option<String>,
         reply: Option<String>,
+        /// What it left running, when the CLI says.
+        background: Option<Vec<(String, TaskKind)>>,
     },
+    /// Claude Code went on by itself: background work it started ended.
+    Woken,
+    SubagentStart(String),
+    SubagentStop(String),
     SessionEnd,
+    /// Desk's plugin reporting the plan's rate limits (`DeskUsage`).
+    Usage(Value),
     Other,
 }
 
@@ -136,7 +173,16 @@ pub fn parse_hook(body: &[u8]) -> eyre::Result<Hook> {
             transcript: p.transcript_path,
             resumed: p.source.as_deref() == Some("resume"),
         },
-        "UserPromptSubmit" => Hook::Prompt(p.prompt.unwrap_or_default()),
+        "UserPromptSubmit" => match p.prompt.unwrap_or_default() {
+            prompt
+                if ENGINE_PROMPTS
+                    .iter()
+                    .any(|e| prompt.trim_start().starts_with(e)) =>
+            {
+                Hook::Woken
+            }
+            prompt => Hook::Prompt(prompt),
+        },
         "PreToolUse" => Hook::ToolStart(tool().0),
         "PermissionRequest" => {
             let (tool, detail) = tool();
@@ -149,10 +195,31 @@ pub fn parse_hook(body: &[u8]) -> eyre::Result<Hook> {
         "Stop" => Hook::Stop {
             transcript: p.transcript_path,
             reply: p.last_assistant_message.filter(|m| !m.trim().is_empty()),
+            background: p.background_tasks.map(|tasks| {
+                tasks
+                    .into_iter()
+                    .filter(|t| t.status == "running")
+                    .map(|t| {
+                        let kind = match t.kind.as_str() {
+                            "shell" => TaskKind::Shell,
+                            _ => TaskKind::Agent,
+                        };
+                        (t.id, kind)
+                    })
+                    .collect()
+            }),
         },
+        "SubagentStart" => p.agent_id.map_or(Hook::Other, Hook::SubagentStart),
+        "SubagentStop" => p.agent_id.map_or(Hook::Other, Hook::SubagentStop),
         "SessionEnd" => Hook::SessionEnd,
+        "DeskUsage" => Hook::Usage(p.rate_limits.unwrap_or(Value::Null)),
         _ => Hook::Other,
     })
+}
+
+/// The sub-agent a hook fired inside, if it fired inside one.
+pub fn agent_of(body: &[u8]) -> Option<String> {
+    serde_json::from_slice::<Payload>(body).ok()?.agent_id
 }
 
 const DETAIL_MAX: usize = 160;
@@ -241,6 +308,11 @@ mod tests {
         };
         let new = spawn(&base(Launch::New { session_id: "abc" }));
         assert_eq!(&new.args[..4], ["--session-id", "abc", "-n", "auth-fix"]);
+        assert_eq!(
+            new.env.get(USAGE_URL).map(String::as_str),
+            Some("http://h"),
+            "Desk's plugin posts the plan's usage to the session's hooks"
+        );
         assert_eq!(new.args.last().unwrap(), "continue");
         let resumed = spawn(&base(Launch::Resume { session_id: "abc" }));
         assert_eq!(&resumed.args[..2], ["--resume", "abc"]);
@@ -270,8 +342,42 @@ mod tests {
             parse_hook(stop).unwrap(),
             Hook::Stop {
                 transcript: Some("/t.jsonl".into()),
-                reply: Some("desk-e2e-dir".into())
+                reply: Some("desk-e2e-dir".into()),
+                background: None
             }
+        );
+        let waiting =
+            br#"{"hook_event_name":"Stop","last_assistant_message":"launched","background_tasks":[
+            {"id":"a471","type":"subagent","status":"running","description":"Run sleep"},
+            {"id":"baoj","type":"shell","status":"running","command":"sleep 30"},
+            {"id":"done1","type":"shell","status":"completed"}],"session_crons":[]}"#;
+        assert_eq!(
+            parse_hook(waiting).unwrap(),
+            Hook::Stop {
+                transcript: None,
+                reply: Some("launched".into()),
+                background: Some(vec![
+                    ("a471".into(), TaskKind::Agent),
+                    ("baoj".into(), TaskKind::Shell)
+                ])
+            }
+        );
+        let woken = br#"{"hook_event_name":"UserPromptSubmit","prompt":"<task-notification>\n<task-id>baoj</task-id>\n<status>completed</status>\n</task-notification>"}"#;
+        assert_eq!(
+            parse_hook(woken).unwrap(),
+            Hook::Woken,
+            "not the person's prompt"
+        );
+        let inside = br#"{"hook_event_name":"PreToolUse","agent_id":"a471","agent_type":"general-purpose","tool_name":"Bash","tool_input":{"command":"sleep 20"}}"#;
+        assert_eq!(agent_of(inside).as_deref(), Some("a471"));
+        assert_eq!(
+            parse_hook(br#"{"hook_event_name":"SubagentStop","agent_id":"a471"}"#).unwrap(),
+            Hook::SubagentStop("a471".into())
+        );
+        let usage = br#"{"hook_event_name":"DeskUsage","rate_limits":[{"kind":"five_hour","percentUsed":62}]}"#;
+        assert_eq!(
+            parse_hook(usage).unwrap(),
+            Hook::Usage(json!([{"kind": "five_hour", "percentUsed": 62}]))
         );
         let idle = br#"{"hook_event_name":"Notification","notification_type":"idle_prompt","message":"waiting"}"#;
         assert_eq!(parse_hook(idle).unwrap(), Hook::Other);

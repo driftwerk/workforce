@@ -5,6 +5,7 @@
 mod adopt;
 pub mod api;
 pub mod attachments;
+mod background;
 mod claude;
 mod codex;
 pub mod conversations;
@@ -12,10 +13,12 @@ pub mod crew;
 mod crew_api;
 mod crew_store;
 mod cwd;
+pub mod floor;
 pub mod holder;
 pub mod local;
 pub mod model;
 pub mod overview;
+mod procs;
 pub mod providers;
 mod pty;
 pub mod realtime;
@@ -27,6 +30,7 @@ pub mod store;
 #[cfg(test)]
 mod testing;
 mod transcript;
+pub mod usage;
 mod vt;
 mod worktree;
 
@@ -39,7 +43,7 @@ pub use crew_store::CheckIn;
 pub use providers::{AccountError, Accounts, Fields, Spec, Standing};
 pub use realtime::{KeySource, Provider, Realtime};
 pub use service::{
-    local_agent_item, session_item, Desk, DeskError, Group, HolderOptions, Import, Imported,
+    local_agent_item, session_item, Desk, DeskError, Floor, Group, HolderOptions, Import, Imported,
     Layout, NewTerminal, Options, RestorePolicy, TerminalPatch, TerminalState, TerminalView,
     Ungrouped, UNGROUPED,
 };

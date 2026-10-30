@@ -7,6 +7,7 @@ pub mod cooldown;
 pub mod device_login;
 pub mod errors;
 pub mod limits;
+pub mod plan_usage;
 pub mod resolve;
 pub mod store;
 #[cfg(any(test, feature = "test-support"))]

@@ -286,9 +286,13 @@ impl SubscriptionProvider {
         login.cool(signal, self.plans.scope.caller())
     }
 
-    /// Keep the plan state a response reports: a window at its limit cools
-    /// the login, one close to it is logged.
+    /// Keep the plan state a response reports: how full its windows are, a
+    /// window at its limit cools the login, one close to it is logged.
     fn observe(&self, login: &Login, snapshot: &LimitSnapshot) {
+        login.observe_usage(
+            snapshot.plan.as_deref(),
+            crate::subscription::limits::chatgpt_usage(snapshot),
+        );
         let Some(signal) = chatgpt_limit(snapshot) else {
             return;
         };

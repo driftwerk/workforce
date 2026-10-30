@@ -2,14 +2,17 @@
 //! in the overview's words, the counts Floor heads its groups with, and the
 //! overseer's latest brief.
 
+use std::collections::{HashMap, HashSet};
+
 use chrono::{DateTime, Duration, Utc};
 use eyre::Result;
 use serde_json::Value;
 
 use crate::crew::{
     self, Brief, Counts, Crew, CrewAgent, Event, Item, ItemApproval, ItemKind, ItemQuestion,
-    ItemState, Kind, Overview, Who,
+    ItemState, Kind, Overview, PartyKind, Who,
 };
+use crate::floor::Need;
 use crate::model::{SessionState, SessionView};
 use crate::service::Desk;
 
@@ -38,8 +41,12 @@ fn session_item(
     midnight: DateTime<Utc>,
     quiet_minutes: u32,
 ) -> Item {
-    let mut state = crew::session_state(v.state);
-    if state == ItemState::Working && is_quiet(v.updated_at, now, quiet_minutes) {
+    let waiting = v.waiting_on() > 0;
+    let mut state = match waiting {
+        true => ItemState::Working,
+        false => crew::session_state(v.state),
+    };
+    if state == ItemState::Working && !waiting && is_quiet(v.updated_at, now, quiet_minutes) {
         state = ItemState::Quiet;
     }
     if state == ItemState::Done && v.updated_at < midnight {
@@ -49,8 +56,12 @@ fn session_item(
         .filter(|g| !g.is_empty())
         .map(str::to_string)
         .or_else(|| v.last_prompt.as_deref().map(|p| crew::one_line(p, 120)));
-    let detail = match v.state {
-        SessionState::Done | SessionState::Idle => {
+    let detail = match (v.state, v.background) {
+        (SessionState::Done, Some(b)) if waiting => Some(match b.count {
+            1 => "Waiting on 1 background task".to_string(),
+            n => format!("Waiting on {n} background tasks"),
+        }),
+        (SessionState::Done | SessionState::Idle, _) => {
             v.last_reply.as_deref().map(|r| crew::one_line(r, 140))
         }
         _ => v.current_tool.as_ref().map(|t| format!("● {t}")),
@@ -86,7 +97,8 @@ fn session_item(
             id: p.id.to_string(),
             summary: crew::approval_summary(&p.tool, &p.detail),
         }),
-        question,
+        question: question.filter(|_| !waiting),
+        background: v.background.filter(|_| waiting),
     }
 }
 
@@ -121,6 +133,7 @@ fn agent_item(
         last_activity: None,
         approval: None,
         question: None,
+        background: None,
     };
     if let Some(live) = &a.live {
         item.state = if is_quiet(live.last_activity, now, quiet_minutes) {
@@ -171,6 +184,81 @@ fn rank(state: ItemState) -> u8 {
     }
 }
 
+/// The overview's party kind for an item.
+fn party_of(kind: ItemKind) -> PartyKind {
+    match kind {
+        ItemKind::Session => PartyKind::Session,
+        ItemKind::Agent => PartyKind::Agent,
+    }
+}
+
+/// `item` as the floor's needs say: it needs you iff one of them is its;
+/// one its own record alone said needed you is working (a session) or done
+/// with its turn (an agent).
+fn as_needed(mut item: Item, needs: &[Need], midnight: DateTime<Utc>) -> Item {
+    let needed = needs
+        .iter()
+        .any(|n| n.who.kind == party_of(item.kind) && n.who.id == item.id);
+    item.state = match (needed, item.state, item.kind) {
+        (true, _, _) => ItemState::NeedsYou,
+        (false, ItemState::NeedsYou, ItemKind::Session) => ItemState::Working,
+        (false, ItemState::NeedsYou, ItemKind::Agent) => match item.since {
+            Some(at) if at >= midnight => ItemState::Done,
+            _ => ItemState::Idle,
+        },
+        (false, state, _) => state,
+    };
+    item
+}
+
+/// The "Needs you" events that are open needs, newest first: each request
+/// still waiting, and the latest question of each subject that still asks.
+/// `events` are oldest first.
+fn open_events(events: Vec<Event>, needs: &[Need]) -> Vec<Event> {
+    let waiting: HashSet<&str> = needs
+        .iter()
+        .filter_map(|n| {
+            n.id.strip_prefix("wait:")?
+                .split_once(':')
+                .map(|(_, key)| key)
+        })
+        .collect();
+    let asking: HashSet<(PartyKind, &str)> = needs
+        .iter()
+        .filter(|n| n.id.starts_with("question:"))
+        .map(|n| (n.who.kind, n.who.id.as_str()))
+        .collect();
+    let latest_questions: HashMap<(PartyKind, String), String> = events
+        .iter()
+        .filter(|e| e.kind == Kind::Question)
+        .filter_map(|e| {
+            let s = e.subject.as_ref()?;
+            asking
+                .contains(&(s.kind, s.id.as_str()))
+                .then(|| ((s.kind, s.id.clone()), e.id.clone()))
+        })
+        .collect();
+    let mut open: Vec<Event> = events
+        .into_iter()
+        .filter(|e| match e.kind {
+            Kind::NeedsYou => e
+                .approval_id
+                .as_deref()
+                .is_some_and(|id| waiting.contains(id)),
+            Kind::Question => latest_questions.values().any(|id| *id == e.id),
+            _ => false,
+        })
+        .collect();
+    open.reverse();
+    open
+}
+
+/// How far back the events of the oldest need are looked for.
+const NEED_SLACK: Duration = Duration::minutes(1);
+
+/// The most events an open needs page reads.
+const NEED_EVENTS: i64 = 2_000;
+
 impl Desk {
     /// A page of Activity: up to `limit` events of `filter`, newest first,
     /// from before the event `before`.
@@ -182,6 +270,49 @@ impl Desk {
     ) -> Result<crew::ActivityPage> {
         let (events, more) = self.store().events(filter, before, limit).await?;
         Ok(crew::ActivityPage { events, more })
+    }
+
+    /// A page of "Needs you": only what the crew's floor says is still open,
+    /// where it keeps one; else the log's own.
+    pub async fn needs_you(
+        &self,
+        crew: &dyn Crew,
+        before: Option<&str>,
+        limit: i64,
+    ) -> Result<crew::ActivityPage> {
+        let Some(needs) = crew.open_needs().await else {
+            return self.activity(crew::Filter::NeedsYou, before, limit).await;
+        };
+        let Some(since) = needs.iter().map(|n| n.since).min() else {
+            return Ok(crew::ActivityPage {
+                events: vec![],
+                more: false,
+            });
+        };
+        let ids: Vec<String> = needs.iter().map(|n| n.who.id.clone()).collect();
+        let events = self
+            .store()
+            .events_since(since - NEED_SLACK, &ids, NEED_EVENTS)
+            .await?;
+        let cursor = before.map(|b| {
+            events
+                .iter()
+                .find(|e| e.id == b)
+                .map(|e| (e.at, e.id.clone()))
+        });
+        let rest: Vec<Event> = open_events(events, &needs)
+            .into_iter()
+            .filter(|e| match &cursor {
+                None => true,
+                Some(None) => false,
+                Some(Some(c)) => (e.at, e.id.clone()) < *c,
+            })
+            .collect();
+        let more = rest.len() as i64 > limit;
+        Ok(crew::ActivityPage {
+            events: rest.into_iter().take(limit as usize).collect(),
+            more,
+        })
     }
 
     /// The overview as of now.
@@ -206,6 +337,13 @@ impl Desk {
                 .map(|g| g.name.clone());
             item
         }));
+        let needs = crew.open_needs().await;
+        if let Some(needs) = &needs {
+            items = items
+                .into_iter()
+                .map(|i| as_needed(i, needs, midnight))
+                .collect();
+        }
         items.sort_by(|a, b| {
             rank(a.state)
                 .cmp(&rank(b.state))
@@ -216,10 +354,15 @@ impl Desk {
                 .iter()
                 .filter(|i| matches!(i.state, ItemState::Working | ItemState::Quiet))
                 .count(),
-            needs_you: items
-                .iter()
-                .filter(|i| i.state == ItemState::NeedsYou)
-                .count(),
+            needs_you: needs.as_ref().map_or_else(
+                || {
+                    items
+                        .iter()
+                        .filter(|i| i.state == ItemState::NeedsYou)
+                        .count()
+                },
+                Vec::len,
+            ),
             done_today: items.iter().filter(|i| i.state == ItemState::Done).count(),
         };
         let brief = match &overseer {
@@ -314,6 +457,121 @@ mod tests {
         assert_eq!(
             agent_item(&busy, None, now, midnight, 60).state,
             ItemState::Working
+        );
+    }
+
+    fn need(id: &str, kind: crate::floor::NeedKind, who: PartyKind, of: &str) -> Need {
+        use crate::floor::{Answer, Place, Who};
+        Need {
+            id: id.into(),
+            kind,
+            who: Who {
+                kind: who,
+                id: of.into(),
+                name: of.into(),
+                engine: None,
+            },
+            ask: "Ship it?".into(),
+            options: None,
+            since: Utc::now() - Duration::minutes(5),
+            place: Place::Dm,
+            answer: Answer::Reply,
+        }
+    }
+
+    fn item(kind: ItemKind, id: &str, state: ItemState, since: DateTime<Utc>) -> Item {
+        Item {
+            kind,
+            id: id.into(),
+            name: id.into(),
+            hub_name: None,
+            cwd: None,
+            group: None,
+            engine: None,
+            origin: None,
+            state,
+            task: None,
+            detail: None,
+            since: Some(since),
+            last_activity: Some(since),
+            approval: None,
+            question: None,
+            background: None,
+        }
+    }
+
+    #[test]
+    fn an_item_needs_you_exactly_when_the_floor_says_so() {
+        use crate::floor::NeedKind;
+        let now = Utc::now();
+        let midnight = now - Duration::hours(3);
+        let needs = [
+            need("question:t1", NeedKind::Question, PartyKind::Session, "s1"),
+            need("question:t2", NeedKind::Question, PartyKind::Agent, "scout"),
+        ];
+        let asked = item(ItemKind::Session, "s1", ItemState::Done, now);
+        assert_eq!(
+            as_needed(asked, &needs, midnight).state,
+            ItemState::NeedsYou,
+            "a done session that asked"
+        );
+        let settled = item(ItemKind::Agent, "lens", ItemState::NeedsYou, now);
+        assert_eq!(
+            as_needed(settled, &needs, midnight).state,
+            ItemState::Done,
+            "a question the log settled is done with today"
+        );
+        let old = item(
+            ItemKind::Agent,
+            "lens",
+            ItemState::NeedsYou,
+            midnight - Duration::hours(1),
+        );
+        assert_eq!(as_needed(old, &needs, midnight).state, ItemState::Idle);
+        let answered = item(ItemKind::Session, "s2", ItemState::NeedsYou, now);
+        assert_eq!(
+            as_needed(answered, &needs, midnight).state,
+            ItemState::Working
+        );
+        let busy = item(ItemKind::Agent, "s1", ItemState::Working, now);
+        assert_eq!(
+            as_needed(busy, &needs, midnight).state,
+            ItemState::Working,
+            "another kind's need is not its"
+        );
+    }
+
+    #[test]
+    fn needs_you_lists_only_the_events_still_open() {
+        use crate::floor::NeedKind;
+        let session = Party {
+            kind: PartyKind::Session,
+            id: "s1".into(),
+            name: "auth-fix".into(),
+            engine: None,
+            origin: None,
+        };
+        let scout = Party::agent("scout", "Scout");
+        let own = |p: &Party, kind, text: &str| Event::new(kind, p.clone(), Some(p.clone()), text);
+        let open_ask = own(&session, Kind::NeedsYou, "wants to run ls").approval("a2");
+        let events = vec![
+            own(&session, Kind::NeedsYou, "wants to run rm").approval("a1"),
+            own(&scout, Kind::Question, "asked “A?”"),
+            open_ask.clone(),
+            own(&scout, Kind::Question, "asked “B?”"),
+            own(&scout, Kind::Finished, "finished"),
+        ];
+        let latest = events[3].clone();
+        let needs = [
+            need("wait:t1:a2", NeedKind::Approval, PartyKind::Session, "s1"),
+            need("question:t2", NeedKind::Question, PartyKind::Agent, "scout"),
+        ];
+        assert_eq!(
+            open_events(events, &needs)
+                .iter()
+                .map(|e| e.id.clone())
+                .collect::<Vec<_>>(),
+            [latest.id, open_ask.id]
         );
     }
 

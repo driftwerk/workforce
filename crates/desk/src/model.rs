@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -26,6 +28,8 @@ macro_rules! text_enum {
         }
     };
 }
+
+pub(crate) use text_enum;
 
 text_enum!(Engine { Claude => "claude", Codex => "codex" });
 
@@ -128,8 +132,21 @@ pub struct SessionView {
     pub display_name: Option<String>,
     /// The sidebar group it is in, if any.
     pub group: Option<GroupRef>,
+    /// Work it started that still runs: while it is done, it waits on it.
+    pub background: Option<crate::floor::Background>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+impl SessionView {
+    /// What it waits on of its own work while its turn is done; none while
+    /// it works.
+    pub fn waiting_on(&self) -> u32 {
+        match (self.state, self.background) {
+            (SessionState::Done, Some(b)) => b.count,
+            _ => 0,
+        }
+    }
 }
 
 /// A sidebar group, as a session or agent in it names it.
@@ -188,6 +205,7 @@ impl SessionView {
             terminal_id: r.terminal_id,
             display_name: r.display_name.clone(),
             group: None,
+            background: None,
             created_at: r.created_at,
             updated_at: r.updated_at,
         }
@@ -254,6 +272,10 @@ pub struct NewSession {
     pub prompt: Option<String>,
     #[serde(default)]
     pub approvals: Option<Approvals>,
+    /// Added to the CLI's environment, as a terminal's is: Desk's plugin
+    /// folder in `CLAUDE_CODE_PLUGIN_DIRS`.
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

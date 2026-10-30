@@ -19,6 +19,7 @@ use workforce_common::channels::DESK_CHANNEL;
 use workforce_common::oversight::Oversight;
 use workforce_common::settings::AgentWorkspaceConfig;
 use workforce_desk::crew::{By, Crew, CrewAgent, LiveTurn, Overseer, Party, Suggestion};
+use workforce_desk::floor::Need;
 use workforce_desk::Desk;
 
 use crate::gateway::GatewayState;
@@ -142,7 +143,7 @@ pub(crate) fn config_saved(service: &AgentService) {
     }
 }
 
-fn name_of(service: &AgentService) -> String {
+pub(crate) fn name_of(service: &AgentService) -> String {
     service
         .display_name()
         .unwrap_or_else(|| service.agent_id.as_str().to_string())
@@ -329,6 +330,23 @@ impl Crew for CrewHub {
         let mut by = By::you();
         by.suggestion_id = Some(suggestion.id.clone());
         self.me().perform(&action, by).await.map(drop)
+    }
+
+    /// The needs of the person whose Desk this is, as the floor counts them.
+    async fn open_needs(&self) -> Option<Vec<Need>> {
+        let floor = crate::floor::installed()?.clone();
+        let desk = self.desk.clone();
+        let sources = crate::desk_floor::Sources::new(floor, Arc::new(move || Some(desk.clone())));
+        let caller = crate::desk_floor::FloorCaller {
+            id: self.person(None).unwrap_or_default(),
+            personal: true,
+        };
+        crate::desk_floor::open_needs(&self.state, &sources, &caller)
+            .await
+            .inspect_err(|e| {
+                tracing::warn!(target: "floor", error = %format!("{e:#}"), "the floor's needs are unavailable")
+            })
+            .ok()
     }
 }
 
