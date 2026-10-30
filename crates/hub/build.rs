@@ -19,6 +19,7 @@ fn main() {
     workforce_build_support::track_dir("migrations_know_how");
     workforce_build_support::track_dir("migrations_decision");
     workforce_build_support::track_dir("migrations_floor");
+    workforce_build_support::track_dir("migrations_pictures");
     workforce_build_support::track_dir("migrations_surface");
     let dist = Path::new("../../ui/dist");
     if !dist.exists() {

@@ -58,6 +58,7 @@ fn replica(hub: &Hub, runs: Runs) -> Arc<Lifecycle> {
         channels: None,
         defs: None,
         artifacts: None,
+        pictures: None,
         external_skills: Arc::clone(&lifecycle.external_skills),
         data_dir: lifecycle.data_dir.clone(),
         runs,

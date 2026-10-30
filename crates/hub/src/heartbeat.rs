@@ -5,7 +5,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use chrono::{DateTime, NaiveTime, Utc};
+use chrono::{DateTime, Utc};
 use chrono_tz::Tz;
 use eyre::Result;
 use serde::{Deserialize, Serialize};
@@ -17,6 +17,7 @@ use workforce_common::heartbeat_check::{self, HeartbeatCheck};
 use workforce_common::session::TurnPrincipal;
 use workforce_common::settings::{HeartbeatDeliverMode, HeartbeatSettings};
 use workforce_common::subscription::HEARTBEAT;
+use workforce_common::timezone::{parse_hhmm, time_in_window};
 
 pub use crate::hub_core::heartbeats::{HeartbeatRecord, HeartbeatWakeHandle, WakeCommand};
 use crate::memory::MemoryManager;
@@ -965,60 +966,27 @@ fn cron_next_run(
         .map(|next_local| next_local.with_timezone(&Utc))
 }
 
-/// Parse a time string like "08:00" or "23:30" into hour and minute.
-fn parse_hhmm(s: &str) -> Option<(u32, u32)> {
-    let parts: Vec<&str> = s.split(':').collect();
-    if parts.len() != 2 {
-        return None;
-    }
-    let hour: u32 = parts[0].parse().ok()?;
-    let minute: u32 = parts[1].parse().ok()?;
-    if hour > 23 || minute > 59 {
-        return None;
-    }
-    Some((hour, minute))
-}
-
 /// Pure function: check whether a given UTC instant falls inside active hours
 /// when evaluated in the supplied timezone.
 ///
 /// Active hours are specified as "HH:MM" strings (e.g. "08:00" to "23:00").
 /// Supports wrap-around midnight (e.g. "22:00" to "06:00").
 fn is_active_hours_at(now_utc: DateTime<Utc>, tz: Tz, start: &str, end: &str) -> bool {
-    let (start_h, start_m) = match parse_hhmm(start) {
-        Some(v) => v,
-        None => {
-            warn!(
-                start = start,
-                "Invalid active_start time format, defaulting to active"
-            );
-            return true;
-        }
+    let Some(start_time) = parse_hhmm(start) else {
+        warn!(
+            start = start,
+            "Invalid active_start time format, defaulting to active"
+        );
+        return true;
     };
-    let (end_h, end_m) = match parse_hhmm(end) {
-        Some(v) => v,
-        None => {
-            warn!(
-                end = end,
-                "Invalid active_end time format, defaulting to active"
-            );
-            return true;
-        }
+    let Some(end_time) = parse_hhmm(end) else {
+        warn!(
+            end = end,
+            "Invalid active_end time format, defaulting to active"
+        );
+        return true;
     };
-
-    let local = now_utc.with_timezone(&tz);
-    let local_time = local.time();
-
-    let start_time = NaiveTime::from_hms_opt(start_h, start_m, 0).unwrap();
-    let end_time = NaiveTime::from_hms_opt(end_h, end_m, 0).unwrap();
-
-    if start_time <= end_time {
-        // Normal range: e.g. 08:00 to 23:00
-        local_time >= start_time && local_time < end_time
-    } else {
-        // Wraps midnight: e.g. 22:00 to 06:00
-        local_time >= start_time || local_time < end_time
-    }
+    time_in_window(now_utc.with_timezone(&tz).time(), start_time, end_time)
 }
 
 #[cfg(test)]
@@ -1038,23 +1006,6 @@ mod tests {
         let loaded = HeartbeatState::load(dir.path());
         assert!(loaded.last_checks.contains_key("email"));
         assert!(loaded.time_since_check("email").unwrap() < 2);
-    }
-
-    #[test]
-    fn parse_hhmm_valid() {
-        assert_eq!(parse_hhmm("08:00"), Some((8, 0)));
-        assert_eq!(parse_hhmm("23:59"), Some((23, 59)));
-        assert_eq!(parse_hhmm("00:00"), Some((0, 0)));
-        assert_eq!(parse_hhmm("12:30"), Some((12, 30)));
-    }
-
-    #[test]
-    fn parse_hhmm_invalid() {
-        assert_eq!(parse_hhmm("25:00"), None);
-        assert_eq!(parse_hhmm("12:60"), None);
-        assert_eq!(parse_hhmm("abc"), None);
-        assert_eq!(parse_hhmm(""), None);
-        assert_eq!(parse_hhmm("12"), None);
     }
 
     #[test]

@@ -22,6 +22,7 @@ pub mod memory;
 pub mod my_settings;
 pub mod owned_skills;
 pub mod permissions;
+pub mod pictures;
 pub mod policy;
 pub mod relationship;
 pub mod remote_mcp_tokens;

@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use async_trait::async_trait;
+use chrono::Utc;
 use eyre::Result;
 use serde::Deserialize;
 
@@ -329,6 +330,12 @@ fn watch_note(
             "Reading channel {channel} failed ({error}); the sweep retries every two minutes."
         ),
         _ if !def.monitor.enabled => "Paused — resume it with set_enabled.".to_string(),
+        (_, _, None) if !def.monitor.active_at(Utc::now()) => format!(
+            "Outside its active hours, so not polled yet; agent '{}' polls it every {}s as the \
+             monitor's owner once the window opens.",
+            summary.agent.as_deref().unwrap_or("default"),
+            def.monitor.source().map_or(0, |s| s.every_secs())
+        ),
         (_, _, None) => format!(
             "Polled by agent '{}' every {}s as the monitor's owner, with their credentials.",
             summary.agent.as_deref().unwrap_or("default"),
@@ -694,11 +701,18 @@ enabled = true
 # once = true                      # optional: stop after the first successful fire
 # expires_at = "2026-10-20T09:00:00Z"   # optional: stop then, telling the owner
 
+# [monitor.active_hours]           # optional: act only inside this window — a channel on messages
+# days = ["mon", "tue", "wed", "thu", "fri"]   # sent in it, a source by polling only in it
+# start = "10:00"                  # days: default every day; end is exclusive; an end before
+# end = "16:00"                    # start runs past midnight
+# tz = "Europe/London"             # required: an IANA timezone
+
 # ── EITHER a channel ───────────────────────────────────────────────────────
 [monitor.binding]
 surface = "slack"                  # "slack" | "teams" | "any"
 channel = "C0RELEASES"             # channel id
 # exclude_thread_replies = true    # optional: top-level messages only (persona: no thread replies)
+# exclude_users = ["U123", "U456"] # optional: ignore these users' messages
 
 [monitor.filter]                   # channel only; default: every message
 type = "contains_any"              # all | contains_any | regex | from_user | from_bot | from_human | has_file
@@ -747,6 +761,10 @@ input = { gmail_id = "{{id}}", subject = "{{json:/snippet}}" }
 # target = "C0OUT"                 # channel id, or "@U123" to DM a user
 # template = "{{id}} is now {{value}} (was {{previous}})"
 # surface = "slack"                # source monitors: where to deliver (optional when the hub has one surface)
+# --- or reply in the thread of the matching message (channel monitors; no target, no model) ---
+# type = "notify"
+# in_thread = true                 # pair with exclude_thread_replies = true and a from_human filter,
+# template = "Thanks {{user}} — logged."  # or every reply in that thread is answered again
 # --- run a one-shot agent turn and deliver its reply ---
 # type = "agent_task"
 # agent = "lynx"                   # optional
@@ -765,6 +783,11 @@ Placeholders in templates, prompts and run_skill inputs: {{text}} {{id}} {{chann
 or the whole item; a pointer cannot contain `}`). For an observation, {{id}} is the
 item id ("value" in value mode), {{channel}} the tool, {{value}} the watched part,
 {{previous}} the previous one. Dates in `input` must be quoted strings.
+
+The same fixed reply to each message is a `notify` with `in_thread = true`, not a
+persona: a persona is a conversation and costs a model turn per message it answers.
+Keep it to working hours with [monitor.active_hours] and away from people with
+exclude_users, rather than switching the monitor on and off on a schedule.
 
 ## Authoring procedure
 1. Call action 'schema' (this) for the format.

@@ -14,7 +14,7 @@ use serde_json::Value;
 use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, warn};
 
-use workforce_common::channels::{ConversationVisibility, InboundEvent};
+use workforce_common::channels::{ts_instant, ConversationVisibility, InboundEvent};
 use workforce_common::engagement::EngagementOverrides;
 use workforce_common::persona::PersonaOverrides;
 use workforce_common::settings::{ResponseMode, SlackChannelOverride};
@@ -514,43 +514,57 @@ impl SlackEventHandler {
         // Resolve per-channel overrides
         let channel_override = self.channel_overrides.get(&channel);
 
-        // A `persona` monitor's derived, hot prompt + mode for this channel.
-        let persona = match self.persona_overrides {
-            Some(ref po) => po.resolve(&channel).await,
-            None => None,
+        // The agent this bot serves the channel as: the persona and the runtime
+        // mode are both scoped to it, so neither leaks to another bot sharing
+        // the channel.
+        let serving = serving_agent(
+            &self.agent_bindings,
+            &channel,
+            &self.workspace_id,
+            self.default_agent_id.as_deref(),
+        );
+
+        // A `persona` monitor's derived, hot prompt + mode for this channel,
+        // when it names the agent this bot serves.
+        let persona = match (self.persona_overrides.as_ref(), serving.as_deref()) {
+            (Some(po), Some(agent_id)) => po.resolve(&channel).await.filter(|persona| {
+                let ours = persona.agent == agent_id;
+                if !ours {
+                    debug!(channel = %channel, persona = %persona.agent, serving = %agent_id, "Persona names another agent; not applied");
+                }
+                ours
+            }),
+            _ => None,
         };
 
-        // A persona binding with `exclude_thread_replies` keeps the bound agent
-        // out of threads: it converses on top-level channel messages only, so a
-        // reply inside a thread is ignored — even a direct @mention there.
-        // Mirrors `InboundEvent::is_thread_reply` (thread_ts present and ≠ ts);
-        // the `zip` makes a ts-less event fall through to "not a reply" so the
+        // The persona's binding rules keep the bound agent quiet on a thread
+        // reply (when excluded) — even a direct @mention there — an excluded
+        // author, or a message outside its active hours. A thread reply mirrors
+        // `InboundEvent::is_thread_reply` (thread_ts present and ≠ ts); the
+        // `zip` makes a ts-less event fall through to "not a reply" so the
         // fail-safe direction is to respond, never to go silently quiet.
-        if persona.as_ref().is_some_and(|p| p.exclude_thread_replies)
-            && event
-                .thread_ts
-                .as_deref()
-                .zip(event.ts.as_deref())
-                .is_some_and(|(thread, ts)| thread != ts)
+        let is_thread_reply = event
+            .thread_ts
+            .as_deref()
+            .zip(event.ts.as_deref())
+            .is_some_and(|(thread, ts)| thread != ts);
+        let sent = event
+            .ts
+            .as_deref()
+            .and_then(ts_instant)
+            .unwrap_or_else(chrono::Utc::now);
+        if persona
+            .as_ref()
+            .is_some_and(|p| p.ignores(is_thread_reply, event.user.as_deref(), sent))
         {
-            debug!(channel = %channel, "Skipping thread reply (persona exclude_thread_replies)");
+            debug!(channel = %channel, "Skipping message (persona binding rules)");
             return SlackAction::Ignore;
         }
 
         // Precedence: a user's runtime set_mode > a persona > static config > default.
-        // The override is scoped to the agent that serves this channel, so one
-        // bot's mode never leaks to another sharing the channel.
-        let runtime_mode = match (
-            self.engagement_overrides.as_ref(),
-            serving_agent(
-                &self.agent_bindings,
-                &channel,
-                &self.workspace_id,
-                self.default_agent_id.as_deref(),
-            ),
-        ) {
+        let runtime_mode = match (self.engagement_overrides.as_ref(), serving.as_deref()) {
             (Some(eo), Some(agent_id)) => {
-                eo.resolve(&agent_id, &channel, event.thread_ts.as_deref())
+                eo.resolve(agent_id, &channel, event.thread_ts.as_deref())
                     .await
             }
             _ => None,
@@ -1134,26 +1148,145 @@ mod tests {
         }
     }
 
+    /// A handler serving `agent` with a persona in C123 for `persona_agent`.
+    /// `All` mode would answer everything, so a message it ignores proves the
+    /// persona's gate ran before mode evaluation.
+    async fn persona_handler(
+        agent: &str,
+        persona_agent: &str,
+        shape: impl FnOnce(&mut workforce_common::persona::ChannelPersona),
+    ) -> SlackEventHandler {
+        let mut persona = workforce_common::persona::ChannelPersona {
+            system_prompt: "be helpful".to_string(),
+            mode: ResponseMode::All,
+            agent: persona_agent.to_string(),
+            monitor_id: "m".to_string(),
+            exclude_thread_replies: false,
+            exclude_users: vec![],
+            active_hours: None,
+        };
+        shape(&mut persona);
+        let personas = Arc::new(PersonaOverrides::new());
+        personas
+            .replace_all(HashMap::from([("C123".to_string(), persona)]))
+            .await;
+        make_handler()
+            .with_agent_scope(HashMap::new(), Some(agent.to_string()))
+            .with_persona_overrides(personas)
+    }
+
+    fn channel_message(user: &str, ts: &str) -> Value {
+        serde_json::json!({
+            "event": {
+                "type": "message",
+                "user": user,
+                "text": "a channel message",
+                "channel": "C123",
+                "ts": ts
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn persona_applies_only_to_the_agent_it_names() {
+        let lynx = persona_handler("lynx", "lynx", |_| {}).await;
+        match lynx.handle(channel_message("U_USER", "100.001")).await {
+            SlackAction::ProcessMessage { system_prompt, .. } => {
+                assert_eq!(system_prompt.as_deref(), Some("be helpful"))
+            }
+            other => panic!("Expected ProcessMessage, got {other:?}"),
+        }
+
+        // Another bot in the channel keeps its own mention-only config and
+        // never takes the persona's prompt.
+        let other = persona_handler("bernard", "lynx", |_| {}).await;
+        assert!(matches!(
+            other.handle(channel_message("U_USER", "100.002")).await,
+            SlackAction::Ignore
+        ));
+        let mention = serde_json::json!({
+            "event": {
+                "type": "app_mention",
+                "user": "U_USER",
+                "text": "<@UBOT> hello",
+                "channel": "C123",
+                "ts": "100.003"
+            }
+        });
+        match other.handle(mention).await {
+            SlackAction::ProcessMessage { system_prompt, .. } => assert_eq!(system_prompt, None),
+            other => panic!("Expected ProcessMessage, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn persona_follows_a_channel_binding_over_the_bots_own_agent() {
+        // The channel is routed to lynx, so this bot serves it as lynx even
+        // though its workspace's own agent is bernard.
+        let personas = Arc::new(PersonaOverrides::new());
+        personas
+            .replace_all(HashMap::from([(
+                "C123".to_string(),
+                workforce_common::persona::ChannelPersona {
+                    system_prompt: "be helpful".to_string(),
+                    mode: ResponseMode::All,
+                    agent: "lynx".to_string(),
+                    monitor_id: "m".to_string(),
+                    exclude_thread_replies: false,
+                    exclude_users: vec![],
+                    active_hours: None,
+                },
+            )]))
+            .await;
+        let bindings = HashMap::from([
+            ("C123".to_string(), "lynx".to_string()),
+            ("test".to_string(), "bernard".to_string()),
+        ]);
+        let handler = make_handler()
+            .with_agent_scope(bindings, Some("bernard".to_string()))
+            .with_persona_overrides(personas);
+        assert!(matches!(
+            handler.handle(channel_message("U_USER", "100.001")).await,
+            SlackAction::ProcessMessage { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn persona_ignores_excluded_users_and_messages_outside_its_hours() {
+        let handler = persona_handler("lynx", "lynx", |p| {
+            p.exclude_users = vec!["U_SKIP".to_string()];
+        })
+        .await;
+        assert!(matches!(
+            handler.handle(channel_message("U_SKIP", "100.001")).await,
+            SlackAction::Ignore
+        ));
+        assert!(matches!(
+            handler.handle(channel_message("U_USER", "100.002")).await,
+            SlackAction::ProcessMessage { .. }
+        ));
+
+        let hours: workforce_common::timezone::ActiveHours =
+            toml::from_str("start = \"10:00\"\nend = \"16:00\"\ntz = \"UTC\"").unwrap();
+        let handler = persona_handler("lynx", "lynx", |p| p.active_hours = Some(hours)).await;
+        // 2026-10-29 09:00 and 12:00 UTC.
+        assert!(matches!(
+            handler
+                .handle(channel_message("U_USER", "1793264400.000100"))
+                .await,
+            SlackAction::Ignore
+        ));
+        assert!(matches!(
+            handler
+                .handle(channel_message("U_USER", "1793275200.000100"))
+                .await,
+            SlackAction::ProcessMessage { .. }
+        ));
+    }
+
     #[tokio::test]
     async fn persona_exclude_thread_replies_ignores_in_thread_keeps_top_level_and_root() {
-        use workforce_common::persona::ChannelPersona;
-
-        let personas = Arc::new(PersonaOverrides::new());
-        let mut map = std::collections::HashMap::new();
-        map.insert(
-            "C123".to_string(),
-            ChannelPersona {
-                system_prompt: "be helpful".to_string(),
-                // `All` would otherwise answer everything — proves the gate runs
-                // before mode evaluation.
-                mode: ResponseMode::All,
-                agent: "lynx".to_string(),
-                monitor_id: "m".to_string(),
-                exclude_thread_replies: true,
-            },
-        );
-        personas.replace_all(map).await;
-        let handler = make_handler().with_persona_overrides(personas);
+        let handler = persona_handler("lynx", "lynx", |p| p.exclude_thread_replies = true).await;
 
         // A reply inside a thread (thread_ts present, ≠ ts) → ignored.
         let reply = serde_json::json!({

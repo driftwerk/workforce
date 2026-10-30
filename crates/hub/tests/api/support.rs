@@ -43,6 +43,7 @@ pub struct GatewayParts {
     pub destructive_baseline_active: bool,
     /// The base config file the overlay writes beside.
     pub config_path: Option<std::path::PathBuf>,
+    pub pictures: Option<Arc<dyn workforce_hub::pictures::PictureStore>>,
 }
 
 impl GatewayParts {
@@ -62,6 +63,7 @@ impl GatewayParts {
             monitor_engine: None,
             destructive_baseline_active: false,
             config_path: None,
+            pictures: None,
         }
     }
 
@@ -119,6 +121,7 @@ impl GatewayParts {
             external_skills,
             #[cfg(feature = "oidc")]
             oidc_provider: None,
+            pictures: self.pictures,
         })
     }
 }

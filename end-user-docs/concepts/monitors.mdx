@@ -47,6 +47,7 @@ enabled = true
 surface = "slack"              # "slack" | "teams" | "any"
 channel = "C0OPS"              # the channel id to watch
 # exclude_thread_replies = true  # optional (default false): top-level messages only
+# exclude_users = ["U0LEAD"]     # optional: ignore these users' messages
 
 [monitor.filter]
 type = "contains_any"          # all | contains_any | regex | from_user | from_bot | from_human | has_file
@@ -66,11 +67,20 @@ workflow = "release-note"
   "tell me when the build goes green" with a monitor that cleans itself up. A save is
   refused if the TOML's `id` is not the id you are saving it under, or if `agent` names
   an agent this hub does not run.
+- `[monitor.active_hours]` is optional and keeps a monitor to a window: `start` and
+  `end` as `HH:MM` (the end is exclusive, and an end before the start runs past
+  midnight), `tz` as an IANA timezone such as `Europe/London`, and `days` as a list
+  such as `["mon", "tue", "wed", "thu", "fri"]`, every day when left out; a `start`
+  equal to the `end` is the whole of each day. A channel
+  monitor acts only on messages sent inside the window, judged by when each was sent;
+  a source monitor is polled only inside it, so a change made overnight is seen at the
+  first poll after the window opens.
 - `[monitor.binding]` needs a `surface` (`slack`, `teams`, or `any` for every
   connected surface) and a non-empty `channel`, which is the platform's channel id
   rather than its display name. Set `exclude_thread_replies = true` to act only on
   top-level channel messages and never on replies inside a thread; the thread's first
-  message still counts. A Teams channel cannot be watched yet: the Teams surface can
+  message still counts. `exclude_users` lists user ids whose messages the monitor
+  ignores. A Teams channel cannot be watched yet: the Teams surface can
   post but not read, so a `teams` binding never fires. A monitor has either a binding
   or a [source](#watching-a-source), never both.
 - `[monitor.filter]` picks the messages to act on, and may be left out to take every
@@ -98,7 +108,11 @@ workflow = "release-note"
 - **`notify`** posts a fixed message. `target` is a channel id, or `@` and a user to
   send a direct message, and `template` is rendered with the placeholders. On a source
   monitor, `surface` says which messaging surface to post on; it may be left out when
-  the hub has exactly one.
+  the hub has exactly one. On a channel monitor, `in_thread = true` in place of a
+  `target` replies in the thread of the message that matched, opening one under a
+  top-level message. Pair it with `exclude_thread_replies = true` and a `from_human`
+  filter, or every later reply in that thread is answered again. Nothing in a
+  `notify` calls a model.
 - **`agent_task`** runs a one-shot agent turn per matching message or observation and
   has the agent post its own result to `deliver_to` (a channel id or an `@user` DM).
   `prompt` is your instruction, with the placeholders filled in it, and `agent` and
@@ -109,9 +123,14 @@ workflow = "release-note"
 - **`persona`** is not a per-message action at all: it binds `agent` to converse in
   the watched channel with `prompt` as a channel-scoped system prompt, for as long as
   the monitor is enabled. `mode` is `all` (the default), `mention_only` or `quiet`. A
-  channel can carry only one persona, and with `exclude_thread_replies = true` the
-  persona also stops answering inside threads — including a direct mention there. A
-  source monitor cannot carry a persona.
+  channel can carry only one persona, and only the named agent takes it on: other bots
+  in the channel keep their own behaviour. With `exclude_thread_replies = true` the
+  persona also stops answering inside threads — including a direct mention there — and
+  it ignores messages from `exclude_users` and those sent outside `active_hours` the
+  same way. A
+  source monitor cannot carry a persona. To post the same reply to each message, use
+  `notify` with `in_thread` rather than a persona: a persona is a conversation, and
+  costs a model turn per message it answers.
 
 ### Placeholders
 

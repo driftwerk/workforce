@@ -13,6 +13,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use eyre::{eyre, Result};
 use futures::future::join_all;
 use serde::{Deserialize, Serialize};
@@ -217,6 +218,24 @@ impl InboundEvent {
     pub fn is_thread_reply(&self) -> bool {
         self.thread_ts.as_deref().is_some_and(|t| t != self.ts)
     }
+
+    /// When the message was sent; now when its ts says nothing.
+    pub fn sent_at(&self) -> DateTime<Utc> {
+        ts_instant(&self.ts).unwrap_or_else(Utc::now)
+    }
+}
+
+/// Latest epoch-seconds value read as a Slack ts (year 5138): an id in
+/// milliseconds or any other count reads as no instant rather than a wrong one.
+const MAX_TS_SECS: f64 = 1e11;
+
+/// The instant a Slack-style message ts (epoch seconds, `1718000000.000200`)
+/// names; `None` for a ts that is not one.
+pub fn ts_instant(ts: &str) -> Option<DateTime<Utc>> {
+    ts.parse::<f64>()
+        .ok()
+        .filter(|secs| *secs > 0.0 && *secs < MAX_TS_SECS)
+        .and_then(|secs| DateTime::from_timestamp_micros((secs * 1e6).round() as i64))
 }
 
 /// Marker a surface attaches to a read error when its bot is not a member of
@@ -1065,6 +1084,17 @@ pub mod indicator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_ts_names_its_instant_only_when_it_is_epoch_seconds() {
+        assert_eq!(
+            ts_instant("1793275200.000100").map(|at| at.timestamp_micros()),
+            Some(1_793_275_200_000_100)
+        );
+        for not_a_ts in ["", "abc", "0", "-5.0", "1793275200000"] {
+            assert_eq!(ts_instant(not_a_ts), None, "{not_a_ts}");
+        }
+    }
 
     #[test]
     fn parse_slack_channel() {

@@ -546,6 +546,20 @@ impl SlackManager {
             .unwrap_or_default()
     }
 
+    /// The icon an agent's Slack identity names in the team channels it
+    /// answers in (the first channel's, by id), if any names one.
+    pub fn agent_icon_url(&self, agent_id: &str) -> Option<String> {
+        let pending = self.pending.as_ref()?;
+        let mut channels: Vec<_> = pending.team_bindings.iter().collect();
+        channels.sort_by(|a, b| a.0.cmp(b.0));
+        channels.into_iter().find_map(|(_, team)| {
+            team.agent_identities
+                .get(agent_id)
+                .and_then(|identity| identity.icon_url.clone())
+                .filter(|url| !url.trim().is_empty())
+        })
+    }
+
     /// Workspaces left unconnected by the last registration, with why.
     pub fn skipped(&self) -> &BTreeMap<String, Unconnected> {
         &self.skipped

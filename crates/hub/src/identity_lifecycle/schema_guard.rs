@@ -229,6 +229,7 @@ const CLAIMS: &[(&str, &str, &str, Claim)] = &[
         NotPersonal("the run or replica holding a claim"),
     ),
     ("hub", "column_people", "person", By(C::KnowHow)),
+    ("hub", "identity_pictures", "identity_id", By(C::Pictures)),
     ("hub", "intents", "person", By(C::KnowHow)),
     ("hub", "provenance", "person", By(C::KnowHow)),
     ("hub", "records", "person", By(C::DecisionRecords)),

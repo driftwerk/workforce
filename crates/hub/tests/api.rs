@@ -39,6 +39,10 @@ mod monitor_routes;
 #[path = "api/pair_routes.rs"]
 mod pair_routes;
 
+#[cfg(feature = "postgres")]
+#[path = "api/picture_routes.rs"]
+mod picture_routes;
+
 #[path = "api/schedule_routes.rs"]
 mod schedule_routes;
 
