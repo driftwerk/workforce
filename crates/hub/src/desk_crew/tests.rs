@@ -123,7 +123,15 @@ fn fake_cli(dir: &Path) -> PathBuf {
     path
 }
 
-async fn desk(pool: workforce_postgres::PostgresPool, dir: &Path) -> Desk {
+pub(crate) async fn desk(pool: workforce_postgres::PostgresPool, dir: &Path) -> Desk {
+    desk_with(pool, dir, Default::default()).await
+}
+
+async fn desk_with(
+    pool: workforce_postgres::PostgresPool,
+    dir: &Path,
+    floor: workforce_desk::Floor,
+) -> Desk {
     let cli = fake_cli(dir);
     Desk::start(
         DeskStore::with_pool(pool).await.unwrap(),
@@ -138,6 +146,7 @@ async fn desk(pool: workforce_postgres::PostgresPool, dir: &Path) -> Desk {
             adopt_every: None,
             holder: None,
         },
+        floor,
         CancellationToken::new(),
     )
     .await
@@ -181,7 +190,7 @@ async fn hook(url: &str, body: Value) -> Value {
     serde_json::from_str(&text).unwrap_or_else(|_| panic!("{url} answered {status}: {text:?}"))
 }
 
-async fn eventually<T>(what: &str, mut check: impl AsyncFnMut() -> Option<T>) -> T {
+pub(crate) async fn eventually<T>(what: &str, mut check: impl AsyncFnMut() -> Option<T>) -> T {
     for _ in 0..400 {
         if let Some(found) = check().await {
             return found;
@@ -195,8 +204,12 @@ struct Anyone;
 
 #[async_trait::async_trait]
 impl Authorize for Anyone {
-    async fn authorize(&self, _: &HeaderMap, _: Option<&str>) -> Result<(), StatusCode> {
-        Ok(())
+    async fn authorize(
+        &self,
+        _: &HeaderMap,
+        _: Option<&str>,
+    ) -> Result<Option<String>, StatusCode> {
+        Ok(None)
     }
 }
 
@@ -210,6 +223,7 @@ async fn new_session(d: &Desk, dir: &Path, name: &str) -> workforce_desk::model:
             worktree: None,
             prompt: None,
             approvals: None,
+            env: Default::default(),
         },
         Some(By::you()),
     )
@@ -266,7 +280,7 @@ async fn an_agents_turns_are_activity_and_its_question_needs_you() {
             )
         );
         assert_eq!(events[0].actor.kind, PartyKind::Agent);
-        let overview = d.overview(crew.as_ref()).await.unwrap();
+        let overview = d.overview(crew.as_ref(), None).await.unwrap();
         let item = overview.items.iter().find(|i| i.id == "scout").unwrap();
         assert_eq!(item.state, ItemState::NeedsYou);
         assert_eq!(item.task.as_deref(), Some("Prepare the staging deploy."));
@@ -501,7 +515,7 @@ async fn a_blocked_session_wakes_the_overseer_and_its_answer_offers_the_approval
         .await;
         assert_eq!(needs.text, "wants to run npm install @acme/ds@4.2.0");
         assert_eq!(needs.approval_id, Some(pending.id.to_string()));
-        let overview = d.overview(crew.as_ref()).await.unwrap();
+        let overview = d.overview(crew.as_ref(), None).await.unwrap();
         let item = overview.items.iter().find(|i| i.id == s.id.to_string()).unwrap();
         assert_eq!(item.state, ItemState::NeedsYou);
         assert_eq!(
@@ -533,7 +547,8 @@ async fn a_blocked_session_wakes_the_overseer_and_its_answer_offers_the_approval
             overseer.sessions.as_ref(),
             &workforce_desk::Speaker::agent("desk", "desk"),
             PERSON,
-            None,
+            workforce_common::channels::DESK_CHANNEL,
+            workforce_desk::Cursor::Newest,
             50,
         ).unwrap();
         assert_eq!(page.messages.len(), 1, "{page:?}");
@@ -552,7 +567,7 @@ async fn a_blocked_session_wakes_the_overseer_and_its_answer_offers_the_approval
             s.id.to_string()
         );
         // Its first paragraph is the brief.
-        let brief = d.overview(crew.as_ref()).await.unwrap().brief.unwrap();
+        let brief = d.overview(crew.as_ref(), None).await.unwrap().brief.unwrap();
         assert_eq!(
             brief.text,
             "acme-web is waiting on you to run npm install. It is upgrading the date picker, so it looks expected."
@@ -740,7 +755,12 @@ async fn summaries_are_scheduled_as_set_and_run_in_the_dm() {
         .await;
         assert_eq!(summary.text, "sent your morning summary");
         assert_eq!(summary.subject, None);
-        let brief = d.overview(crew.as_ref()).await.unwrap().brief.unwrap();
+        let brief = d
+            .overview(crew.as_ref(), None)
+            .await
+            .unwrap()
+            .brief
+            .unwrap();
         assert_eq!(brief.text, "Quiet night: nothing needs you.");
         assert_eq!(
             d.store().wake_ups_since(crew.midnight()).await.unwrap(),
@@ -845,9 +865,15 @@ async fn relayed_frame(
 /// `GET /api/desk/conversations/{agent}` serves it.
 async fn history_item(crew: &CrewHub, agent: &AgentService, owner: &str, id: &str) -> Value {
     let speaker = workforce_desk::Speaker::agent(agent.agent_id.as_str(), &super::name_of(agent));
-    let mut page =
-        crate::desk_conversations::page(agent.sessions.as_ref(), &speaker, owner, None, 50)
-            .unwrap();
+    let mut page = crate::desk_conversations::page(
+        agent.sessions.as_ref(),
+        &speaker,
+        owner,
+        workforce_common::channels::DESK_CHANNEL,
+        workforce_desk::Cursor::Newest,
+        50,
+    )
+    .unwrap();
     crate::desk_conversations::with_authors(&crew.desk, &mut page).await;
     let wire = serde_json::to_value(&page).unwrap();
     wire["messages"]
@@ -918,7 +944,7 @@ async fn a_suggestion_said_yes_to_is_yours_and_worded_with_your_name() {
         let answer = eventually("Scout's answer", async || {
             let speaker = workforce_desk::Speaker::agent("scout", &super::name_of(&scout));
             let page =
-                crate::desk_conversations::page(scout.sessions.as_ref(), &speaker, &owner, None, 50)
+                crate::desk_conversations::page(scout.sessions.as_ref(), &speaker, &owner, workforce_common::channels::DESK_CHANNEL, workforce_desk::Cursor::Newest, 50)
                     .unwrap();
             page.messages.into_iter().find(|m| m.text == "On it.")
         })
@@ -967,4 +993,273 @@ async fn an_unprompted_answer_reaches_a_dm_left_open_for_days() {
         );
     })
     .await;
+}
+
+/// The floor over this hub: what needs the person, from the turns its
+/// agents and Desk sessions log, and answering it in place.
+mod floor {
+    use workforce_common::settings::WorkforceConfig;
+    use workforce_desk::floor::{Answer, NeedKind, Place, Scope, TurnLog};
+
+    use super::*;
+    use crate::desk_floor::{answer, open_needs, Choice, FloorCaller, Sources, Unanswered};
+    use crate::floor::postgres::PgFloorStore;
+    use crate::floor::Installed;
+
+    fn me(personal: bool) -> FloorCaller {
+        FloorCaller {
+            id: PERSON.into(),
+            personal,
+        }
+    }
+
+    fn behaviour(answered: &Value) -> &str {
+        answered["hookSpecificOutput"]["decision"]["behavior"]
+            .as_str()
+            .unwrap_or("terminal")
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_desk_sessions_needs_are_open_until_answered_anywhere() {
+        with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+            with_test_pool(PgFloorStore::build_pool, |floor_pool| async move {
+                let dir = tempfile::tempdir().unwrap();
+                let (scout, _llm) = agent(dir.path(), "scout", "Done.").await;
+                let state = hub(std::slice::from_ref(&scout));
+                let installed = Installed::open(PgFloorStore::with_pool(floor_pool).await.unwrap());
+                let d = desk_with(
+                    pool,
+                    dir.path(),
+                    workforce_desk::Floor {
+                        turns: Some(Arc::clone(&installed.log)),
+                        plans: None,
+                    },
+                )
+                .await;
+                let sources = Sources::new(installed, {
+                    let d = d.clone();
+                    Arc::new(move || Some(d.clone()))
+                });
+                let person = me(true);
+                let needs = || open_needs(&state, &sources, &person);
+
+                let s = new_session(&d, dir.path(), "acme-web").await;
+                let url = hook_url(dir.path(), s.id).await;
+                let ask = |command: &'static str| {
+                    let url = url.clone();
+                    tokio::spawn(async move {
+                        hook(&url, json!({"hook_event_name": "PermissionRequest", "tool_name": "Bash", "tool_input": {"command": command}})).await
+                    })
+                };
+                let asked = ask("npm install @acme/ds@4.2.0");
+                let need = eventually("the request to need you", async || {
+                    needs().await.unwrap().into_iter().next()
+                })
+                .await;
+                assert_eq!(need.kind, NeedKind::Approval);
+                assert_eq!(need.who.id, s.id.to_string());
+                assert_eq!(need.who.name, "acme-web");
+                assert_eq!(need.ask, "Run npm install @acme/ds@4.2.0?");
+                assert_eq!(need.place, Place::Session);
+                let Answer::Decide { at } = need.answer else {
+                    panic!("Desk answers it: {:?}", need.answer)
+                };
+                assert!(
+                    open_needs(&state, &sources, &me(false))
+                        .await
+                        .unwrap()
+                        .is_empty(),
+                    "another hub's caller never sees this hub's sessions"
+                );
+                assert_eq!(
+                    answer(&state, &sources, &me(false), &at, Choice::Allow).await.unwrap(),
+                    Err(Unanswered::NotYours)
+                );
+                assert_eq!(answer(&state, &sources, &me(true), &at, Choice::Allow).await.unwrap(), Ok(()));
+                assert_eq!(behaviour(&asked.await.unwrap()), "allow");
+                assert_eq!(
+                    answer(&state, &sources, &me(true), &at, Choice::Allow).await.unwrap(),
+                    Err(Unanswered::AlreadyAnswered)
+                );
+                eventually("the answered need to go", async || {
+                    needs().await.unwrap().is_empty().then_some(())
+                })
+                .await;
+
+                let asked = ask("git push");
+                let need = eventually("the next request", async || {
+                    needs().await.unwrap().into_iter().next()
+                })
+                .await;
+                hook(&url, json!({"hook_event_name": "PostToolUse", "tool_name": "Bash"})).await;
+                asked.await.unwrap();
+                eventually("a request answered in the terminal to go", async || {
+                    needs().await.unwrap().is_empty().then_some(())
+                })
+                .await;
+                let answered = eventually("the terminal's answer in Activity", async || {
+                    let page = d.activity(Filter::All, None, 50).await.unwrap();
+                    page.events.into_iter().find(|e| e.kind == Kind::Answered)
+                })
+                .await;
+                assert_eq!(answered.text, "was answered in its terminal");
+                assert!(
+                    need.id.ends_with(&format!(":{}", answered.approval_id.unwrap())),
+                    "the answer names the request that needed you"
+                );
+
+                hook(&url, json!({"hook_event_name": "Stop", "last_assistant_message": "Upgraded it. Ship it?"})).await;
+                let question = eventually("the question to need you", async || {
+                    needs().await.unwrap().into_iter().next()
+                })
+                .await;
+                assert_eq!(
+                    (question.kind, question.ask.as_str(), &question.answer),
+                    (NeedKind::Question, "Ship it?", &Answer::Reply)
+                );
+                hook(&url, json!({"hook_event_name": "UserPromptSubmit", "prompt": "Yes, ship it."})).await;
+                eventually("the next prompt to answer it", async || {
+                    needs().await.unwrap().is_empty().then_some(())
+                })
+                .await;
+            })
+            .await;
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_agents_question_needs_you_until_you_speak_to_it_anywhere_and_every_count_agrees() {
+        let config = std::sync::Mutex::new(None);
+        with_test_pool(
+            |pg| {
+                *config.lock().unwrap() = Some(pg.clone());
+                PgFloorStore::build_pool(pg)
+            },
+            |_floor_pool| async {
+                let pg = config.lock().unwrap().take().unwrap();
+                let mut config = WorkforceConfig::default();
+                config.postgres = Some(pg);
+                crate::floor::install(&config).await;
+                with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+                    let dir = tempfile::tempdir().unwrap();
+                    let (scout, _llm) = agent(
+                        dir.path(),
+                        "scout",
+                        "I've built release/4.2.\n\nDeploy it to staging?",
+                    )
+                    .await;
+                    let state = hub(std::slice::from_ref(&scout));
+                    let d = desk_with(pool, dir.path(), crate::floor::desk_floor()).await;
+                    let crew = CrewHub::start(
+                        Arc::clone(&state),
+                        d.clone(),
+                        FAST,
+                        CancellationToken::new(),
+                    );
+                    let sources = Sources::installed().expect("the floor is installed");
+                    let ask = |channel: &'static str, message: &'static str| {
+                        let scout = Arc::clone(&scout);
+                        async move {
+                            scout
+                                .process_message(
+                                    channel, PERSON, message, None, None, None, None, None, None,
+                                    None, None, None, None,
+                                )
+                                .await
+                                .unwrap()
+                        }
+                    };
+                    ask(DESK_CHANNEL, "Prepare the staging deploy.").await;
+                    let first = eventually("the question to need you", async || {
+                        open_needs(&state, &sources, &me(false))
+                            .await
+                            .unwrap()
+                            .into_iter()
+                            .next()
+                    })
+                    .await;
+                    assert_eq!(
+                        (
+                            first.kind,
+                            first.ask.as_str(),
+                            &first.place,
+                            first.who.id.as_str()
+                        ),
+                        (
+                            NeedKind::Question,
+                            "Deploy it to staging?",
+                            &Place::Dm,
+                            "scout"
+                        )
+                    );
+
+                    ask("web", "Go ahead.").await;
+                    let second = eventually("the newer question alone", async || {
+                        let needs = open_needs(&state, &sources, &me(false)).await.unwrap();
+                        (needs.len() == 1 && needs[0].id != first.id).then(|| needs[0].clone())
+                    })
+                    .await;
+                    let logged = logged_turns().await;
+                    let [earlier, later] = logged.as_slice() else {
+                        panic!("two turns: {logged:?}")
+                    };
+                    assert_eq!(
+                        earlier.settled_at,
+                        Some(later.started_at),
+                        "speaking to it elsewhere answered it, before it asked again"
+                    );
+                    assert_eq!(second.id, format!("question:{}", later.id));
+
+                    let overview = d.overview(crew.as_ref(), None).await.unwrap();
+                    assert_eq!(overview.counts.needs_you, 1);
+                    let item = overview.items.iter().find(|i| i.id == "scout").unwrap();
+                    assert_eq!(item.state, ItemState::NeedsYou);
+                    let page = d.needs_you(crew.as_ref(), None, None, 10).await.unwrap();
+                    assert_eq!(
+                        page.events
+                            .iter()
+                            .map(|e| (e.kind, e.subject.as_ref().map(|s| (s.kind, s.id.clone()))))
+                            .collect::<Vec<_>>(),
+                        [(
+                            Kind::Question,
+                            Some((PartyKind::Agent, "scout".to_string()))
+                        )],
+                        "an old Desk's “Needs you” is the one open question"
+                    );
+                    let another = uuid::Uuid::new_v4().to_string();
+                    assert_eq!(
+                        d.overview(crew.as_ref(), Some(&another))
+                            .await
+                            .unwrap()
+                            .counts
+                            .needs_you,
+                        0,
+                        "another administrator's needs are theirs, not this person's"
+                    );
+                    assert!(d
+                        .needs_you(crew.as_ref(), Some(&another), None, 10)
+                        .await
+                        .unwrap()
+                        .events
+                        .is_empty());
+                })
+                .await;
+            },
+        )
+        .await;
+    }
+
+    async fn logged_turns() -> Vec<workforce_desk::floor::Turn> {
+        let log: &dyn TurnLog = crate::floor::turns().unwrap().as_ref();
+        log.relevant(
+            &Scope {
+                owner: PERSON.into(),
+                personal: false,
+            },
+            chrono::Utc::now() - chrono::Duration::hours(1),
+        )
+        .await
+        .unwrap()
+    }
 }

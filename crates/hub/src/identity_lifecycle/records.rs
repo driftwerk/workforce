@@ -960,3 +960,89 @@ impl Holding for RetentionBound {
         Ok(Tally::default())
     }
 }
+
+/// The person's pictures: the one they chose and their Slack picture. A
+/// merge keeps the target's chosen picture when both chose one; the Slack
+/// picture is fetched again for whoever is linked to Slack.
+pub struct Pictures;
+
+impl Pictures {
+    fn owner(who: &Person) -> crate::pictures::Owner {
+        crate::pictures::Owner::identity(who.key())
+    }
+
+    async fn chose(store: &dyn crate::pictures::PictureStore, who: &Person) -> Result<bool> {
+        Ok(store
+            .kept_for(&Self::owner(who))
+            .await?
+            .iter()
+            .any(|k| k.source == crate::pictures::Source::Chosen))
+    }
+}
+
+#[async_trait]
+impl Holding for Pictures {
+    async fn owners(&self, cx: &Context<'_>) -> Result<Owners> {
+        let Some(store) = cx.pictures.as_ref() else {
+            return Ok(Owners::default());
+        };
+        Ok(Owners::counted(
+            store
+                .kept(crate::pictures::Kind::Identity)
+                .await?
+                .into_iter()
+                .map(|(id, kept)| (id, kept.len())),
+        ))
+    }
+
+    async fn held(&self, cx: &Context<'_>, who: &Person) -> Result<Tally> {
+        let Some(store) = cx.pictures.as_ref() else {
+            return Ok(Tally::default());
+        };
+        Ok(Tally::of(
+            store
+                .kept_for(&Self::owner(who))
+                .await?
+                .into_iter()
+                .map(|k| format!("{} picture", k.source.as_str())),
+        ))
+    }
+
+    async fn merge(
+        &self,
+        cx: &Context<'_>,
+        from: &Person,
+        into: &Person,
+        apply: bool,
+    ) -> Result<Tally> {
+        let mut tally = self.held(cx, from).await?;
+        let Some(store) = cx.pictures.as_ref() else {
+            return Ok(tally);
+        };
+        if Self::chose(store.as_ref(), from).await? && Self::chose(store.as_ref(), into).await? {
+            tally
+                .conflicts
+                .push(format!("kept the picture {} chose", into.display));
+        }
+        if apply {
+            store
+                .hand_over(&Self::owner(from), &Self::owner(into))
+                .await?;
+        }
+        Ok(tally)
+    }
+
+    async fn delete(
+        &self,
+        cx: &Context<'_>,
+        who: &Person,
+        _: Option<&Person>,
+        apply: bool,
+    ) -> Result<Tally> {
+        let tally = self.held(cx, who).await?;
+        if let Some(store) = cx.pictures.as_ref().filter(|_| apply) {
+            store.forget(&Self::owner(who)).await?;
+        }
+        Ok(tally)
+    }
+}

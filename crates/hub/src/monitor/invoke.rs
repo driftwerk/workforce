@@ -116,7 +116,7 @@ impl GovernedInvoker {
         Self::new(
             Arc::clone(&service.tools),
             Arc::clone(&service.policy),
-            Arc::new(move || gates.tool_gates()),
+            Arc::new(move || gates.tool_gates(crate::desk_surface::allows())),
             Arc::new(move || service.tool_access_snapshot()),
             adapters,
         )
@@ -278,6 +278,7 @@ mod tests {
                 role: None,
                 capability_gate: None,
                 permission_gate: None,
+                surface_allows: None,
                 arguments: ArgumentValidation::Off,
             }),
             Arc::new(ToolAccessSnapshot::default),
@@ -315,6 +316,7 @@ mod tests {
                 role: None,
                 capability_gate: Some(Arc::new(OnlyFor("alice"))),
                 permission_gate: None,
+                surface_allows: None,
                 arguments: ArgumentValidation::Off,
             }),
             Arc::new(move || ToolAccessSnapshot::new(blocked.clone())),

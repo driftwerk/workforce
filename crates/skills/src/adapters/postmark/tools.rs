@@ -883,6 +883,13 @@ impl Tool for PostmarkEmailSendTool {
     fn name(&self) -> &str {
         "postmark.email_send"
     }
+
+    fn surface_effect(
+        &self,
+        input: &serde_json::Value,
+    ) -> Option<workforce_agent::tools::SurfaceEffect> {
+        Some(workforce_agent::tools::SurfaceEffect::email(input))
+    }
     fn description(&self) -> &str {
         "Send a single transactional email via Postmark. Requires at least one of HtmlBody or TextBody."
     }
@@ -948,6 +955,13 @@ pm_tool_struct!(PostmarkEmailSendBatchTool);
 impl Tool for PostmarkEmailSendBatchTool {
     fn name(&self) -> &str {
         "postmark.email_send_batch"
+    }
+
+    fn surface_effect(
+        &self,
+        input: &serde_json::Value,
+    ) -> Option<workforce_agent::tools::SurfaceEffect> {
+        Some(workforce_agent::tools::SurfaceEffect::email(input))
     }
     fn description(&self) -> &str {
         "Send up to 500 transactional emails in a single batch via Postmark. Each item follows the email_send schema."
@@ -1016,6 +1030,13 @@ pm_tool_struct!(PostmarkEmailSendTemplateTool);
 impl Tool for PostmarkEmailSendTemplateTool {
     fn name(&self) -> &str {
         "postmark.email_send_template"
+    }
+
+    fn surface_effect(
+        &self,
+        input: &serde_json::Value,
+    ) -> Option<workforce_agent::tools::SurfaceEffect> {
+        Some(workforce_agent::tools::SurfaceEffect::email(input))
     }
     fn description(&self) -> &str {
         "Send a transactional email rendered from a Postmark template. Requires one of TemplateId or TemplateAlias plus a TemplateModel object."
@@ -1931,6 +1952,13 @@ pm_tool_struct!(PostmarkApiTool);
 impl Tool for PostmarkApiTool {
     fn name(&self) -> &str {
         "postmark.api"
+    }
+
+    fn surface_effect(
+        &self,
+        input: &serde_json::Value,
+    ) -> Option<workforce_agent::tools::SurfaceEffect> {
+        workforce_agent::tools::SurfaceEffect::email_api(input)
     }
     fn description(&self) -> &str {
         "Make an arbitrary Postmark REST API request. Use for endpoints not covered by the typed tools. `token_type` selects server or account token (default: server)."

@@ -22,7 +22,7 @@ use uuid::Uuid;
 
 use workforce_agent::llm::types::ContentBlock;
 use workforce_agent::runner::{
-    approval_detail, approval_route, await_approval, deliver_generated, loaded_result,
+    approval_detail, approval_route, await_approval, deliver_generated, held_prompt, loaded_result,
     render_viewed, route_approval, scope_turn, ApprovalAsk, ApprovalDecision, ApprovalRouter,
     PermissionWriter, ProgressEvent, RouteResolution, SessionContext, ToolInvocation,
     UNREACHABLE_APPROVER,
@@ -38,6 +38,7 @@ use workforce_agent::tools::dispatch::{
 use workforce_agent::tools::image_gen::ImageSink;
 use workforce_agent::tools::image_view::ImageViewSink;
 use workforce_agent::tools::registry::ToolRegistry;
+use workforce_agent::tools::Destination;
 use workforce_agent::tools::{Tool, ToolResult};
 use workforce_agent::turn_journal::{ToolCall, TurnJournal};
 use workforce_common::session::SpillConfig;
@@ -453,10 +454,15 @@ enum Gated {
         approval: RoutedApproval,
         ttl: Duration,
     },
-    Ask {
-        reason: String,
-        options: PermissionPromptOptions,
-    },
+    Ask(Asked),
+}
+
+/// A call the gates hold for a person's say: why, whether an "Always"
+/// answer may be kept, and the destination of a write the surface gate holds.
+struct Asked {
+    reason: String,
+    allow_save_allow: bool,
+    holds: Option<Destination>,
 }
 
 impl GatedExecutor {
@@ -502,12 +508,16 @@ impl GatedExecutor {
             GateOutcome::RequireApproval {
                 reason,
                 allow_save_allow,
+                holds,
             } => self.route(
                 tools,
                 name,
                 input,
-                reason,
-                PermissionPromptOptions::ask(allow_save_allow),
+                Asked {
+                    reason,
+                    allow_save_allow,
+                    holds,
+                },
             ),
         }
     }
@@ -519,8 +529,7 @@ impl GatedExecutor {
         tools: &ToolRegistry,
         name: &str,
         input: &serde_json::Value,
-        reason: String,
-        options: PermissionPromptOptions,
+        asked: Asked,
     ) -> Gated {
         let router = self.router.as_deref();
         let agent_id = &self.site.audit.agent_id;
@@ -540,10 +549,10 @@ impl GatedExecutor {
                     Gated::Settled(Held::refused(refusal.clone(), refusal))
                 }
                 ApprovalDecision::DenyUnreachable => unreachable(),
-                ApprovalDecision::SelfServe => Gated::Ask { reason, options },
+                ApprovalDecision::SelfServe => Gated::Ask(asked),
             },
             RouteResume::InSession => {
-                match route_approval(router, agent_id, name, &reason, input) {
+                match route_approval(router, agent_id, name, &asked.reason, input) {
                     RouteResolution::Routed {
                         request_id,
                         approver_user_ids,
@@ -554,8 +563,15 @@ impl GatedExecutor {
                             request_id,
                             tool_name: name.to_string(),
                             detail: approval_detail(tools, name, input),
-                            reason,
-                            options,
+                            options: held_prompt(
+                                asked.allow_save_allow,
+                                asked.holds,
+                                agent_id,
+                                self.site.gates.surface_allows.clone(),
+                                None,
+                            )
+                            .0,
+                            reason: asked.reason,
                             approver_user_ids,
                             requester_user_id: self.site.audit.identity_id.clone(),
                             channel: self.ctx.channel_id.clone(),
@@ -564,7 +580,7 @@ impl GatedExecutor {
                         ttl,
                     },
                     RouteResolution::DenyUnreachable => unreachable(),
-                    RouteResolution::SelfServe => Gated::Ask { reason, options },
+                    RouteResolution::SelfServe => Gated::Ask(asked),
                 }
             }
         }
@@ -603,14 +619,15 @@ impl GatedExecutor {
                 hand_off(routed, approval);
                 ToolResult::success(payload, 0)
             }
-            Gated::Ask { reason, options } => {
-                site.audit.record(name, "require_approval", Some(&reason));
+            Gated::Ask(asked) => {
+                site.audit
+                    .record(name, "require_approval", Some(&asked.reason));
                 let call = PendingCall::new(
                     &tools,
                     name.to_string(),
                     input,
-                    reason,
-                    options,
+                    asked.reason,
+                    PermissionPromptOptions::ask(asked.allow_save_allow),
                     site.clone(),
                 );
                 let request_id = Uuid::new_v4().to_string();
@@ -737,9 +754,7 @@ impl GatedExecutor {
                     decision: "require_approval",
                 }
             }
-            Gated::Ask { reason, options } => {
-                self.ask(turn, tools, name, input, reason, options).await
-            }
+            Gated::Ask(asked) => self.ask(turn, tools, name, input, asked).await,
         }
     }
 
@@ -751,10 +766,17 @@ impl GatedExecutor {
         tools: &ToolRegistry,
         name: &str,
         input: &serde_json::Value,
-        reason: String,
-        options: PermissionPromptOptions,
+        asked: Asked,
     ) -> Held {
         let site = &self.site;
+        let (options, keeper) = held_prompt(
+            asked.allow_save_allow,
+            asked.holds,
+            &site.audit.agent_id,
+            site.gates.surface_allows.clone(),
+            turn.writer.clone(),
+        );
+        let reason = asked.reason;
         let refused =
             |refusal: Refusal, reason| Held::refused(refusal.tool_result().into(), reason);
         let Some(ledger) = &turn.approvals else {
@@ -778,7 +800,7 @@ impl GatedExecutor {
                 reason: &reason,
                 round: 0,
                 options,
-                writer: turn.writer.as_deref(),
+                writer: keeper.as_deref(),
                 requester: Some(&site.audit.identity_id),
             },
             ledger,
@@ -861,11 +883,14 @@ pub(crate) fn media_sinks(service: &AgentService) -> crate::mcp_gate::MediaSinks
             service.video_frames(),
             service.workspace.clone(),
         ));
-    let deliver = Arc::new(crate::image_sink::HubImageSink::new(
-        Arc::clone(&service.surface_registry),
-        service.agent_id.as_str(),
-        service.image_broadcast.read().clone(),
-    ));
+    let deliver = Arc::new(
+        crate::image_sink::HubImageSink::new(
+            Arc::clone(&service.surface_registry),
+            service.agent_id.as_str(),
+            service.image_broadcast.read().clone(),
+        )
+        .with_sessions(Arc::clone(&service.sessions)),
+    );
     crate::mcp_gate::MediaSinks { view, deliver }
 }
 

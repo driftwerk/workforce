@@ -3,6 +3,11 @@
 use serde::Serialize;
 use workforce_gateway_client::protocol::Attachment;
 
+/// The frame a message of the DM the person didn't type goes out live as:
+/// `{"type": "user_message", "content", "session_id", "id", "author"}`, its
+/// `content` and `id` as the DM's history gives them.
+pub const USER_MESSAGE: &str = "user_message";
+
 /// A message broadcast to connected clients.
 #[derive(Debug, Clone, Serialize)]
 pub struct BroadcastMessage {
@@ -55,6 +60,10 @@ pub struct BroadcastMessage {
     /// Who said a `user_message`, carried through to `ServerMessage.author`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub author: Option<serde_json::Value>,
+    /// The Desk client's id for the turn this frame belongs to, carried
+    /// through to `ServerMessage.turn_ref` on Desk connections only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub turn_ref: Option<String>,
     /// Voice-bridge channel this message is addressed to. When set, the WS
     /// forwarder delivers ONLY to connections that registered the channel via
     /// `voice_listen` (and admit `target_identity`) — never to session
@@ -66,7 +75,24 @@ pub struct BroadcastMessage {
     /// never serialized.
     #[serde(skip_serializing)]
     pub target_identity: Option<String>,
+    /// On a `desk_delivered` signal, the delivery a person's Desk hub links
+    /// are told of; routing metadata like the target fields.
+    #[serde(skip_serializing)]
+    pub delivered: Option<workforce_core::desk::DeskDelivered>,
+    /// On a `turn_snapshot`, the live Desk turn as it stands.
+    #[serde(skip_serializing)]
+    pub snapshot: Option<workforce_core::desk::TurnSnapshot>,
 }
+
+/// The frame that closes a Desk turn's frames.
+pub const TURN_END: &str = "turn_end";
+
+/// The frame a Desk that connects mid-turn is sent the turn's state in.
+pub const TURN_SNAPSHOT: &str = "turn_snapshot";
+
+/// The frame telling a person's Desk that a conversation of theirs gained a
+/// message outside a live turn.
+pub const DESK_DELIVERED: &str = "desk_delivered";
 
 impl BroadcastMessage {
     /// Create a broadcast message that should be spoken in audio mode.
@@ -93,8 +119,11 @@ impl BroadcastMessage {
             desk: None,
             id: None,
             author: None,
+            turn_ref: None,
             target_channel: None,
             target_identity: None,
+            delivered: None,
+            snapshot: None,
         }
     }
 
@@ -158,8 +187,11 @@ impl BroadcastMessage {
             desk: None,
             id: None,
             author: None,
+            turn_ref: None,
             target_channel: None,
             target_identity: None,
+            delivered: None,
+            snapshot: None,
         }
     }
 
@@ -171,6 +203,68 @@ impl BroadcastMessage {
             target_identity: Some(owner.to_string()),
             ..Self::silent("", "node_invoke", request)
         }
+    }
+
+    /// This frame as one of the Desk turn `stamp` names: its client's turn
+    /// id and the id its answer is saved under. Unchanged without one.
+    pub fn stamped(self, stamp: Option<&workforce_core::desk::TurnStamp>) -> Self {
+        match stamp {
+            Some(stamp) => Self {
+                turn_ref: stamp.turn_ref.clone(),
+                id: Some(stamp.reply_id.clone()),
+                ..self
+            },
+            None => self,
+        }
+    }
+
+    /// Build the snapshot of a live Desk turn for `session_id`'s watchers.
+    pub fn turn_snapshot(
+        session_id: impl Into<String>,
+        snapshot: workforce_core::desk::TurnSnapshot,
+    ) -> Self {
+        let stamp = snapshot.stamp.clone();
+        Self {
+            snapshot: Some(snapshot),
+            ..Self::silent(session_id, TURN_SNAPSHOT, String::new())
+        }
+        .stamped(Some(&stamp))
+    }
+
+    /// Build the frame closing a Desk turn in `session_id`; its `id` is the
+    /// saved answer's, when one was saved.
+    pub fn turn_end(session_id: impl Into<String>, end: workforce_core::desk::TurnEnd) -> Self {
+        Self {
+            turn_ref: end.turn_ref,
+            id: end.reply_id,
+            ..Self::silent(session_id, TURN_END, String::new())
+        }
+    }
+
+    /// Build the signal that `delivered` landed in a conversation of
+    /// `owner`'s, for their Desk hub links alone.
+    pub fn desk_delivered(owner: &str, delivered: workforce_core::desk::DeskDelivered) -> Self {
+        Self {
+            target_identity: Some(owner.to_string()),
+            delivered: Some(delivered),
+            ..Self::silent("", DESK_DELIVERED, String::new())
+        }
+    }
+
+    /// Build the signal that `signal` changed for `owner`, for their Desk
+    /// hub links alone; with no owner, for the links of whoever holds this
+    /// hub (its Desk sessions, its shared logins).
+    pub fn desk_signal(signal: workforce_core::desk::DeskSignal, owner: Option<&str>) -> Self {
+        Self {
+            target_identity: owner.map(str::to_string),
+            ..Self::silent("", signal.frame(), String::new())
+        }
+    }
+
+    /// Whether only a Desk hub link may hear it, never a chat connection.
+    pub fn for_links_only(&self) -> bool {
+        self.msg_type == DESK_DELIVERED
+            || workforce_core::desk::DeskSignal::of_frame(&self.msg_type).is_some()
     }
 
     /// Build a spoken announcement targeted at the voice-bridge connection(s)

@@ -5,6 +5,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use eyre::{Context, Result};
@@ -18,6 +19,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::claude::tool_summary;
 use crate::pty::Spawn;
+use crate::usage::{MacAccount, MacPlan, PlanSink};
 
 pub enum Launch<'a> {
     New,
@@ -97,6 +99,10 @@ pub struct AppServer {
 }
 
 impl AppServer {
+    pub fn pid(&self) -> Option<u32> {
+        self._child.id()
+    }
+
     pub async fn start(
         program: &Path,
         socket: PathBuf,
@@ -136,6 +142,8 @@ pub enum CodexEvent {
     Prompt(String),
     Tool(String),
     Reply(String),
+    /// A sub-agent thread it started.
+    Child(String),
 }
 
 /// What happened, and on which thread.
@@ -157,6 +165,16 @@ pub fn interpret(method: &str, params: &Value) -> Option<Seen> {
     };
     let seen = |thread: Option<String>, event| thread.map(|thread| Seen { thread, event });
     match method {
+        "thread/started"
+            if params
+                .pointer("/thread/parentThreadId")
+                .is_some_and(|p| !p.is_null()) =>
+        {
+            seen(
+                s("/thread/parentThreadId"),
+                CodexEvent::Child(s("/thread/id")?),
+            )
+        }
         "thread/started" => {
             let ephemeral =
                 params.pointer("/thread/ephemeral").and_then(Value::as_bool) == Some(true);
@@ -220,11 +238,60 @@ pub fn interpret(method: &str, params: &Value) -> Option<Seen> {
     }
 }
 
+/// The id the observer reads the account's rate limits under.
+const LIMITS_READ: i64 = 2;
+
+/// Folds `from` into `into`: what it holds replaces what was known, and a
+/// value it leaves out or sends as null keeps it.
+fn fold(into: &mut Value, from: &Value) {
+    match (into.as_object_mut(), from.as_object()) {
+        (Some(into), Some(from)) => from
+            .iter()
+            .filter(|(_, v)| !v.is_null())
+            .for_each(|(k, v)| match into.get_mut(k) {
+                Some(known) if known.is_object() && v.is_object() => fold(known, v),
+                _ => {
+                    into.insert(k.clone(), v.clone());
+                }
+            }),
+        _ => *into = from.clone(),
+    }
+}
+
+/// The account's rate-limit snapshot with `msg` folded into `prev`: the
+/// answer to `account/rateLimits/read`, or an `account/rateLimits/updated`
+/// notice, which is sparse. `None` when `msg` holds no limits.
+pub fn merge_limits(prev: Option<&Value>, msg: &Value) -> Option<Value> {
+    let limits = msg.get("rateLimits").filter(|l| l.is_object())?;
+    let mut merged = prev.cloned().unwrap_or_else(|| json!({}));
+    fold(
+        &mut merged,
+        &json!({ "rateLimits": limits, "accountId": msg.get("accountId") }),
+    );
+    Some(merged)
+}
+
+/// Who a snapshot's account is, and its plan.
+fn account_of(snapshot: &Value) -> MacAccount {
+    let text = |p: &str| {
+        snapshot
+            .pointer(p)
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    };
+    MacAccount {
+        ids: text("/accountId").into_iter().collect(),
+        plan: text("/rateLimits/planType").filter(|p| p != "unknown"),
+    }
+}
+
 /// Joins the app-server as a second client until `cancel` fires or the
-/// server goes away, forwarding what it sees.
+/// server goes away, forwarding what it sees, and the account's rate
+/// limits to `plans`.
 pub async fn observe(
     socket: PathBuf,
     events: mpsc::Sender<Seen>,
+    plans: Option<Arc<dyn PlanSink>>,
     cancel: CancellationToken,
 ) -> Result<()> {
     let stream = UnixStream::connect(&socket)
@@ -241,6 +308,12 @@ pub async fn observe(
         json!({ "method": "initialized" }).to_string(),
     ))
     .await?;
+    if plans.is_some() {
+        let read = json!({ "id": LIMITS_READ, "method": "account/rateLimits/read",
+            "params": { "excludeResetCreditDetails": true } });
+        tx.send(Message::text(read.to_string())).await?;
+    }
+    let mut limits: Option<Value> = None;
     loop {
         tokio::select! {
             _ = cancel.cancelled() => return Ok(()),
@@ -248,6 +321,18 @@ pub async fn observe(
                 let Some(msg) = msg else { return Ok(()) };
                 let Message::Text(text) = msg? else { continue };
                 let Ok(v) = serde_json::from_str::<Value>(&text) else { continue };
+                let reported = match (v.get("id"), v.get("method").and_then(Value::as_str)) {
+                    (Some(id), None) if id.as_i64() == Some(LIMITS_READ) => v.get("result"),
+                    (None, Some("account/rateLimits/updated")) => v.get("params"),
+                    _ => None,
+                };
+                if let (Some(plans), Some(merged)) = (
+                    &plans,
+                    reported.and_then(|r| merge_limits(limits.as_ref(), r)),
+                ) {
+                    plans.mac(MacPlan::Codex, merged.clone(), account_of(&merged));
+                    limits = Some(merged);
+                }
                 // Server requests (approvals) belong to the TUI; never answered here.
                 if v.get("id").is_some() {
                     continue;
@@ -351,6 +436,17 @@ mod tests {
             Some(CodexEvent::Tool("Bash(cargo test)".into()))
         );
         assert_eq!(interpret("item/agentMessage/delta", &json!({})), None);
+        assert_eq!(
+            interpret(
+                "thread/started",
+                &json!({"thread": {"id": "t2", "parentThreadId": "t1", "environments": [{"cwd": "/repo"}]}})
+            ),
+            Some(Seen {
+                thread: "t1".into(),
+                event: CodexEvent::Child("t2".into())
+            }),
+            "a sub-agent's thread is its parent's"
+        );
     }
 
     #[test]
@@ -361,5 +457,35 @@ mod tests {
         std::fs::write(day.join("rollout-2026-10-27T17-06-33-t1.jsonl"), "").unwrap();
         assert!(find_rollout(home.path(), "t1").is_some());
         assert!(find_rollout(home.path(), "t2").is_none());
+    }
+
+    #[test]
+    fn a_sparse_update_folds_into_the_last_read() {
+        let read = json!({"accountId": "acct-1", "rateLimits": {"planType": "pro",
+            "primary": {"usedPercent": 12, "windowDurationMins": 300, "resetsAt": 1793300000},
+            "secondary": {"usedPercent": 40, "windowDurationMins": 10080, "resetsAt": 1793800000}}});
+        let first = merge_limits(None, &read).unwrap();
+        assert_eq!(
+            account_of(&first),
+            MacAccount {
+                ids: vec!["acct-1".into()],
+                plan: Some("pro".into())
+            }
+        );
+        let update = json!({"rateLimits": {"planType": null,
+            "primary": {"usedPercent": 15, "windowDurationMins": null, "resetsAt": 1793300000}}});
+        let merged = merge_limits(Some(&first), &update).unwrap();
+        assert_eq!(merged["rateLimits"]["primary"]["usedPercent"], 15);
+        assert_eq!(
+            merged["rateLimits"]["primary"]["windowDurationMins"], 300,
+            "null keeps it"
+        );
+        assert_eq!(
+            merged["rateLimits"]["secondary"]["usedPercent"], 40,
+            "absent keeps it"
+        );
+        assert_eq!(merged["rateLimits"]["planType"], "pro");
+        assert_eq!(merged["accountId"], "acct-1");
+        assert_eq!(merge_limits(Some(&first), &json!({"other": 1})), None);
     }
 }

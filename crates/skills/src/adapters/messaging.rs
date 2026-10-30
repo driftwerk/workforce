@@ -10,14 +10,14 @@ use eyre::Result;
 use tokio::sync::{Mutex, RwLock};
 use tracing::{info, warn};
 
-use workforce_agent::tools::{Tool, ToolResult};
+use workforce_agent::tools::{SurfaceEffect, Tool, ToolResult};
 use workforce_common::channels::{
     ChannelMessage, ChannelSurface, OutboundMessage, SurfaceRegistry,
 };
 
 use crate::adapters::messaging_routing::{
-    channel_hint_from_input, invalidate_if_channel_not_found, platform_arg,
-    schema_platform_property, schema_workspace_property,
+    channel_arg, channel_hint_from_input, invalidate_if_channel_not_found, platform_arg,
+    schema_platform_property, schema_workspace_property, writes,
 };
 use crate::adapters::utils::{coerce_to_u64, decode_upload_content};
 
@@ -152,13 +152,20 @@ impl Tool for MessagingSendTool {
         "messaging.send"
     }
 
+    fn surface_effect(&self, input: &serde_json::Value) -> Option<SurfaceEffect> {
+        Some(writes(input))
+    }
+
     fn description(&self) -> &str {
-        "Send a message to a Slack/iOS channel. Your direct text reply already posts to the \
-         channel that invoked you — use this tool ONLY when you need to message a DIFFERENT \
-         channel or thread, or when the user explicitly asks you to post a follow-up message. \
-         Do NOT call this to narrate progress in the current conversation; that's what your \
-         streaming response is for. Identical (channel, thread, text) calls within a short \
-         window are deduplicated and silently capped, so retrying the same message has no effect."
+        "Send a message on Slack, Teams or Desk. Your direct text reply already posts to the \
+         conversation that invoked you — use this tool ONLY when you need to message a \
+         DIFFERENT channel, thread or Desk conversation, or when the user explicitly asks you to \
+         post a follow-up message. In a Desk conversation, with no platform it posts to Desk: \
+         no channel is this conversation, \"dm\" the person's DM, \"#<room name>\" one of \
+         their rooms. Do NOT call this to narrate progress in the current conversation; that's \
+         what your streaming response is for. Identical (channel, thread, text) calls within a \
+         short window are deduplicated and silently capped, so retrying the same message has no \
+         effect."
     }
 
     fn input_schema(&self) -> serde_json::Value {
@@ -167,7 +174,8 @@ impl Tool for MessagingSendTool {
             "properties": {
                 "channel": {
                     "type": "string",
-                    "description": "Channel ID to send to"
+                    "description": "Channel ID to send to. Required outside a Desk \
+                                    conversation; in one it defaults to that conversation."
                 },
                 "text": {
                     "type": "string",
@@ -180,16 +188,15 @@ impl Tool for MessagingSendTool {
                 "platform": schema_platform_property(),
                 "workspace_id": schema_workspace_property()
             },
-            "required": ["channel", "text"]
+            "required": ["text"]
         })
     }
 
     async fn execute(&self, input: serde_json::Value) -> Result<ToolResult> {
         let start = std::time::Instant::now();
 
-        let channel = input["channel"]
-            .as_str()
-            .ok_or_else(|| eyre::eyre!("Missing 'channel' parameter"))?;
+        let channel =
+            channel_arg(&input).ok_or_else(|| eyre::eyre!("Missing 'channel' parameter"))?;
         let text = input["text"]
             .as_str()
             .ok_or_else(|| eyre::eyre!("Missing 'text' parameter"))?;
@@ -286,6 +293,10 @@ impl MessagingReadTool {
 impl Tool for MessagingReadTool {
     fn name(&self) -> &str {
         "messaging.read"
+    }
+
+    fn surface_effect(&self, _input: &serde_json::Value) -> Option<SurfaceEffect> {
+        Some(SurfaceEffect::Reads)
     }
 
     fn description(&self) -> &str {
@@ -450,6 +461,10 @@ impl Tool for MessagingEditTool {
         "messaging.edit"
     }
 
+    fn surface_effect(&self, input: &serde_json::Value) -> Option<SurfaceEffect> {
+        Some(writes(input))
+    }
+
     fn description(&self) -> &str {
         "Edit a message that was previously sent by the bot"
     }
@@ -555,6 +570,10 @@ impl Tool for MessagingDeleteTool {
         "messaging.delete"
     }
 
+    fn surface_effect(&self, input: &serde_json::Value) -> Option<SurfaceEffect> {
+        Some(writes(input))
+    }
+
     fn description(&self) -> &str {
         "Delete a message that was previously sent by the bot"
     }
@@ -641,6 +660,10 @@ impl MessagingReadThreadTool {
 impl Tool for MessagingReadThreadTool {
     fn name(&self) -> &str {
         "messaging.read_thread"
+    }
+
+    fn surface_effect(&self, _input: &serde_json::Value) -> Option<SurfaceEffect> {
+        Some(SurfaceEffect::Reads)
     }
 
     fn description(&self) -> &str {
@@ -743,6 +766,10 @@ impl Tool for MessagingPinTool {
         "messaging.pin"
     }
 
+    fn surface_effect(&self, input: &serde_json::Value) -> Option<SurfaceEffect> {
+        Some(writes(input))
+    }
+
     fn description(&self) -> &str {
         "Pin a message in a channel so it stays easily accessible."
     }
@@ -830,6 +857,10 @@ impl Tool for MessagingUnpinTool {
         "messaging.unpin"
     }
 
+    fn surface_effect(&self, input: &serde_json::Value) -> Option<SurfaceEffect> {
+        Some(writes(input))
+    }
+
     fn description(&self) -> &str {
         "Unpin a previously pinned message from a channel."
     }
@@ -915,6 +946,10 @@ impl MessagingListPinsTool {
 impl Tool for MessagingListPinsTool {
     fn name(&self) -> &str {
         "messaging.list_pins"
+    }
+
+    fn surface_effect(&self, _input: &serde_json::Value) -> Option<SurfaceEffect> {
+        Some(SurfaceEffect::Reads)
     }
 
     fn description(&self) -> &str {
@@ -1009,6 +1044,10 @@ impl Tool for MessagingMemberInfoTool {
         "messaging.member_info"
     }
 
+    fn surface_effect(&self, _input: &serde_json::Value) -> Option<SurfaceEffect> {
+        Some(SurfaceEffect::Reads)
+    }
+
     fn description(&self) -> &str {
         "Look up information about a user/member by their ID"
     }
@@ -1087,6 +1126,10 @@ impl MessagingEmojiListTool {
 impl Tool for MessagingEmojiListTool {
     fn name(&self) -> &str {
         "messaging.emoji_list"
+    }
+
+    fn surface_effect(&self, _input: &serde_json::Value) -> Option<SurfaceEffect> {
+        Some(SurfaceEffect::Reads)
     }
 
     fn description(&self) -> &str {
@@ -1202,8 +1245,14 @@ impl Tool for MessagingUploadFileTool {
         "messaging.upload_file"
     }
 
+    fn surface_effect(&self, input: &serde_json::Value) -> Option<SurfaceEffect> {
+        Some(writes(input))
+    }
+
     fn description(&self) -> &str {
-        "Upload a file to a channel"
+        "Upload a file to a Slack or Teams channel, or a Desk conversation. In a Desk \
+         conversation, with no platform it posts to Desk: no channel is this conversation, \
+         \"dm\" the person's DM, \"#<room name>\" one of their rooms."
     }
 
     fn input_schema(&self) -> serde_json::Value {
@@ -1212,7 +1261,8 @@ impl Tool for MessagingUploadFileTool {
             "properties": {
                 "channel": {
                     "type": "string",
-                    "description": "Channel ID to upload to"
+                    "description": "Channel ID to upload to. Required outside a Desk \
+                                    conversation; in one it defaults to that conversation."
                 },
                 "filename": {
                     "type": "string",
@@ -1237,16 +1287,15 @@ impl Tool for MessagingUploadFileTool {
                 "platform": schema_platform_property(),
                 "workspace_id": schema_workspace_property()
             },
-            "required": ["channel", "filename"]
+            "required": ["filename"]
         })
     }
 
     async fn execute(&self, input: serde_json::Value) -> Result<ToolResult> {
         let start = std::time::Instant::now();
 
-        let channel = input["channel"]
-            .as_str()
-            .ok_or_else(|| eyre::eyre!("Missing 'channel' parameter"))?;
+        let channel =
+            channel_arg(&input).ok_or_else(|| eyre::eyre!("Missing 'channel' parameter"))?;
         let filename = input["filename"]
             .as_str()
             .ok_or_else(|| eyre::eyre!("Missing 'filename' parameter"))?;
@@ -1340,12 +1389,19 @@ impl Tool for MessagingSendFileTool {
         "messaging.send_file"
     }
 
+    fn surface_effect(&self, input: &serde_json::Value) -> Option<SurfaceEffect> {
+        Some(writes(input))
+    }
+
     fn description(&self) -> &str {
         "Send a file that is already staged as an artifact — e.g. the artifact_id from a \
-         generate_image, view_attachment, or export_xlsx result — to a Slack channel or a user's \
-         DM. Use this to DM a generated image to someone, or post a file in another channel. \
-         Provide exactly one of `channel` (a channel id) or `user` (a Slack user id or an email \
-         to DM). Sending a file outside the current conversation asks the user for approval first."
+         generate_image, view_attachment, or export_xlsx result — to a Slack channel, a user's \
+         DM, or a Desk conversation. Use this to DM a generated image to someone, or post a file \
+         in another channel. Provide exactly one of `channel` (a channel id) or `user` (a Slack \
+         user id or an email to DM); in a Desk conversation, with no platform it posts to Desk: \
+         no destination is this conversation, \"dm\" the person's DM, \"#<room name>\" one of \
+         their rooms. Sending a file outside the current conversation asks the user for approval \
+         first."
     }
 
     fn input_schema(&self) -> serde_json::Value {
@@ -1359,7 +1415,8 @@ impl Tool for MessagingSendFileTool {
                 },
                 "channel": {
                     "type": "string",
-                    "description": "Destination channel id. Mutually exclusive with `user`."
+                    "description": "Destination channel id. Mutually exclusive with `user`. In \
+                                    a Desk conversation it defaults to that conversation."
                 },
                 "user": {
                     "type": "string",
@@ -1400,14 +1457,15 @@ impl Tool for MessagingSendFileTool {
                 ms(),
             ));
         };
-        let channel_in = input["channel"]
-            .as_str()
-            .map(str::trim)
-            .filter(|s| !s.is_empty());
         let user_in = input["user"]
             .as_str()
             .map(str::trim)
             .filter(|s| !s.is_empty());
+        let channel_in = input["channel"]
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .or_else(|| user_in.is_none().then(|| channel_arg(&input)).flatten());
         if channel_in.is_some() == user_in.is_some() {
             return Ok(ToolResult::failure(
                 "send_file needs exactly one destination: 'channel' or 'user'",
@@ -1543,6 +1601,10 @@ impl MessagingChannelInfoTool {
 impl Tool for MessagingChannelInfoTool {
     fn name(&self) -> &str {
         "messaging.channel_info"
+    }
+
+    fn surface_effect(&self, _input: &serde_json::Value) -> Option<SurfaceEffect> {
+        Some(SurfaceEffect::Reads)
     }
 
     fn description(&self) -> &str {
@@ -1807,7 +1869,7 @@ mod tests {
         let tool = MessagingSendTool::new(registry);
         assert_eq!(tool.name(), "messaging.send");
         let schema = tool.input_schema();
-        assert_eq!(schema["required"], serde_json::json!(["channel", "text"]));
+        assert_eq!(schema["required"], serde_json::json!(["text"]));
     }
 
     #[tokio::test]
@@ -2477,10 +2539,7 @@ mod tests {
         let tool = MessagingUploadFileTool::new(registry);
         assert_eq!(tool.name(), "messaging.upload_file");
         let schema = tool.input_schema();
-        assert_eq!(
-            schema["required"],
-            serde_json::json!(["channel", "filename"])
-        );
+        assert_eq!(schema["required"], serde_json::json!(["filename"]));
     }
 
     #[tokio::test]
@@ -2687,5 +2746,73 @@ mod tests {
             )
             .await
             .is_err());
+    }
+
+    /// In a Desk conversation messaging.send needs no channel and posts to
+    /// Desk; anywhere else a channel is still required.
+    #[tokio::test]
+    async fn a_send_with_no_channel_goes_to_the_desk_conversation_and_fails_elsewhere() {
+        use workforce_common::channels::desk::{DeskPlace, DeskScope, DeskTarget};
+        let mut registry = SurfaceRegistry::new();
+        registry.register(SurfaceKey::platform("slack"), MockSurface::new("slack"));
+        registry.register_session_surface("desk", MockSurface::new("desk"));
+        let tool = MessagingSendTool::new(Arc::new(RwLock::new(registry)));
+        assert_eq!(tool.input_schema()["required"], serde_json::json!(["text"]));
+
+        let outside = tool
+            .execute(serde_json::json!({"text": "hello there"}))
+            .await
+            .unwrap_err();
+        assert!(outside.to_string().contains("Missing 'channel' parameter"));
+
+        let scope = DeskScope {
+            target: DeskTarget::of_turn(&DeskPlace::Dm, "desk", None, false),
+            attended: true,
+            owner: "person-1".into(),
+        };
+        let on_desk = workforce_agent::runner::with_desk(
+            Some(scope),
+            tool.execute(serde_json::json!({"text": "hello again"})),
+        )
+        .await
+        .unwrap();
+        assert!(on_desk.success, "{on_desk:?}");
+        assert_eq!(on_desk.output["platform"], "desk");
+        assert_eq!(
+            tool.surface_effect(&serde_json::json!({"channel": "C1", "platform": "slack"})),
+            Some(SurfaceEffect::Writes {
+                platform: "slack".into(),
+                destination: "C1".into()
+            })
+        );
+    }
+
+    /// A file uploaded with no channel goes to the Desk conversation the
+    /// run answers to; anywhere else a channel is still required.
+    #[tokio::test]
+    async fn an_upload_with_no_channel_goes_to_the_desk_conversation_and_fails_elsewhere() {
+        use workforce_common::channels::desk::{DeskPlace, DeskScope, DeskTarget};
+        let mut registry = SurfaceRegistry::new();
+        registry.register(SurfaceKey::platform("slack"), MockSurface::new("slack"));
+        registry.register_session_surface("desk", MockSurface::new("desk"));
+        let tool = MessagingUploadFileTool::new(Arc::new(RwLock::new(registry)));
+        let upload = || serde_json::json!({"filename": "notes.txt", "content_text": "hello"});
+
+        let outside = tool.execute(upload()).await.unwrap_err();
+        assert!(outside.to_string().contains("Missing 'channel' parameter"));
+
+        let scope = DeskScope {
+            target: DeskTarget::of_turn(&DeskPlace::Dm, "desk", None, false),
+            attended: true,
+            owner: "person-1".into(),
+        };
+        let on_desk = workforce_agent::runner::with_desk(Some(scope), tool.execute(upload()))
+            .await
+            .unwrap();
+        assert!(on_desk.success, "{on_desk:?}");
+        assert_eq!(
+            (&on_desk.output["platform"], &on_desk.output["channel"]),
+            (&serde_json::json!("desk"), &serde_json::json!(""))
+        );
     }
 }

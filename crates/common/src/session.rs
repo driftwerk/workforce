@@ -58,6 +58,14 @@ pub struct SpillConfig {
     pub skip_tools: Vec<String>,
 }
 
+/// Whether a session on `session_channel` is on `channel` or a channel under
+/// it (`<channel>:…`).
+fn is_on(session_channel: &str, channel: &str) -> bool {
+    session_channel
+        .strip_prefix(channel)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with(':'))
+}
+
 fn default_spill_enabled() -> bool {
     true
 }
@@ -414,6 +422,10 @@ pub struct TranscriptEntry {
     /// Token usage for this turn (present for LLM responses).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_usage: Option<TurnTokenUsage>,
+    /// The message's place in a Desk conversation, as
+    /// [`SessionMessage::desk`] has it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desk: Option<crate::channels::desk::DeskMark>,
 }
 
 /// Metadata about a tool invocation.
@@ -654,6 +666,13 @@ pub struct SessionAttachment {
     pub artifact_id: Option<String>,
 }
 
+/// A file delivered into a Desk conversation, by reference.
+impl From<&crate::channels::desk::DeskFile> for SessionAttachment {
+    fn from(file: &crate::channels::desk::DeskFile) -> Self {
+        Self::from_artifact(&file.filename, &file.media_type, &file.artifact_id)
+    }
+}
+
 impl SessionAttachment {
     /// Build a by-reference attachment: the payload was already written to
     /// the artifact store and consumers resolve it from there.
@@ -734,9 +753,20 @@ pub struct SessionMessage {
     /// filter when a shared session replays to a different speaker.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub actor: Option<String>,
+    /// What the message is in a Desk conversation: the room and thread it
+    /// belongs to, who said it, and why it was delivered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desk: Option<crate::channels::desk::DeskMark>,
 }
 
 const COMPACTION_SUMMARY_PREFIX: &str = "[Compaction Summary";
+
+/// Session metadata key holding [`Session::desk_origin`].
+const DESK_ORIGIN_KEY: &str = "desk_origin";
+
+/// Session metadata a Desk room's conversation is stamped with once the room
+/// is gone: `{"at", "name", "copied": [message ids]}`.
+pub const DESK_CLOSED_KEY: &str = "desk_closed";
 
 /// Sentinel prefix for the `owner` of a shared (multi-human) conversation. A
 /// shared session is keyed by thread rather than by a single user, so its
@@ -797,6 +827,7 @@ impl SessionMessage {
             attachments: None,
             trust_level: None,
             actor: None,
+            desk: None,
         }
     }
 
@@ -1130,6 +1161,23 @@ impl Session {
         true
     }
 
+    /// Where the latest Desk turn on this session was asked, so an answer
+    /// made after the turn (a resumed approval, a recovered turn) reaches
+    /// the same place.
+    pub fn desk_origin(&self) -> Option<crate::channels::desk::DeskTarget> {
+        self.metadata
+            .get(DESK_ORIGIN_KEY)
+            .and_then(|origin| serde_json::from_value(origin.clone()).ok())
+    }
+
+    /// Record `target` as where the latest Desk turn was asked.
+    pub fn set_desk_origin(&mut self, target: &crate::channels::desk::DeskTarget) {
+        if let Ok(origin) = serde_json::to_value(target) {
+            self.metadata_object_mut()
+                .insert(DESK_ORIGIN_KEY.to_string(), origin);
+        }
+    }
+
     /// Copy the client-facing conversation-mode keys (voice mode, TTS
     /// provider, the rich blocks rendered) from `from` — a rollover
     /// successor must keep speaking the way its predecessor did. Selective
@@ -1138,6 +1186,8 @@ impl Session {
     /// doesn't strand that turn's mode.
     pub fn adopt_conversation_mode(&mut self, from: &Session) {
         for key in [
+            DESK_ORIGIN_KEY,
+            DESK_CLOSED_KEY,
             "voice_mode",
             "voice_turn",
             "tts_provider",
@@ -1481,6 +1531,7 @@ impl Session {
             attachments,
             trust_level,
             actor: None,
+            desk: None,
         };
         let id = msg.id.clone();
         self.total_tokens += msg.tokens as u64;
@@ -1491,8 +1542,19 @@ impl Session {
 
     /// Add an assistant message.
     pub fn add_assistant_message(&mut self, content: &str, tokens: u32) -> String {
+        self.add_assistant_message_with_id(Uuid::new_v4().to_string(), content, tokens)
+    }
+
+    /// Add an assistant message under `id`, which a client was told the
+    /// answer would be saved under.
+    pub fn add_assistant_message_with_id(
+        &mut self,
+        id: String,
+        content: &str,
+        tokens: u32,
+    ) -> String {
         let msg = SessionMessage {
-            id: Uuid::new_v4().to_string(),
+            id,
             role: MessageRole::Assistant,
             content: content.to_string(),
             tool_data: None,
@@ -1502,6 +1564,7 @@ impl Session {
             attachments: None,
             trust_level: None,
             actor: None,
+            desk: None,
         };
         let id = msg.id.clone();
         self.total_tokens += tokens as u64;
@@ -1523,6 +1586,7 @@ impl Session {
             attachments: None,
             trust_level: None,
             actor: None,
+            desk: None,
         };
         self.total_tokens += msg.tokens as u64;
         self.messages.push(msg);
@@ -1559,6 +1623,7 @@ impl Session {
                 attachments: None,
                 trust_level: None,
                 actor: None,
+                desk: None,
             };
             self.total_tokens += new_tokens as u64;
             self.messages.insert(0, msg);
@@ -2273,6 +2338,7 @@ impl Session {
             attachments: None,
             trust_level: None,
             actor: None,
+            desk: None,
         };
         new_messages.push(summary_msg);
 
@@ -2758,6 +2824,11 @@ pub trait SessionStore: Send + Sync {
     /// `claim_id`.
     fn end_turn(&self, session_id: &str, token: &str) -> eyre::Result<bool>;
 
+    /// The token of the turn each of `session_ids` is running, for those
+    /// running one on an instance that is still alive: a crashed instance's
+    /// turn is not live even before its record is recovered.
+    fn live_turns(&self, session_ids: &[String]) -> eyre::Result<HashMap<String, String>>;
+
     /// Append `entry` to the session's turn journal; an entry already there is
     /// left as it is. Like the turn record, the journal lives outside the
     /// session value, so appending never touches the transcript or its
@@ -2846,6 +2917,23 @@ pub trait SessionStore: Send + Sync {
         sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
         sessions.truncate(limit);
         Ok(sessions)
+    }
+
+    /// [`SessionStore::list_for_owner`], of the sessions on `channel` or on a
+    /// channel under it (`<channel>:…`) alone, so another surface's sessions
+    /// never crowd them out of `limit`.
+    fn list_for_owner_on(
+        &self,
+        owner: &str,
+        channel: &str,
+        limit: usize,
+    ) -> eyre::Result<Vec<Session>> {
+        Ok(self
+            .list_for_owner(owner, 10_000)?
+            .into_iter()
+            .filter(|s| is_on(&s.channel, channel))
+            .take(limit)
+            .collect())
     }
 
     /// How many sessions each owner holds, sealed ones included: what an
@@ -3175,6 +3263,17 @@ impl SessionStore for InMemorySessionStore {
             turns.remove(session_id);
         }
         Ok(ours)
+    }
+
+    fn live_turns(&self, session_ids: &[String]) -> eyre::Result<HashMap<String, String>> {
+        let turns = self
+            .turns
+            .lock()
+            .map_err(|e| eyre::eyre!("Lock poisoned: {}", e))?;
+        Ok(session_ids
+            .iter()
+            .filter_map(|id| Some((id.clone(), turns.get(id)?.token.clone())))
+            .collect())
     }
 
     fn journal_append(&self, session_id: &str, entry: &JournalEntry) -> eyre::Result<()> {
@@ -4188,6 +4287,19 @@ impl SessionStore for JsonlSessionStore {
         }
     }
 
+    /// A record another process left is not live: this store is one
+    /// process's own.
+    fn live_turns(&self, session_ids: &[String]) -> eyre::Result<HashMap<String, String>> {
+        Ok(session_ids
+            .iter()
+            .filter_map(|id| {
+                let bytes = std::fs::read(self.turn_path(id)).ok()?;
+                let turn = serde_json::from_slice::<ActiveTurn>(&bytes).ok()?;
+                (turn.instance == self.instance_id).then(|| (id.clone(), turn.token))
+            })
+            .collect())
+    }
+
     /// One JSON line per entry, flushed to disk before returning. A line cut
     /// short by a crash is closed off before the next entry, so it costs only
     /// itself and is skipped when read; a repeated entry is dropped then, so
@@ -4788,10 +4900,7 @@ impl JsonlSessionStore {
 }
 
 /// Convert a `SessionMessage` into a `TranscriptEntry`.
-pub(crate) fn message_to_transcript_entry(
-    session_id: &str,
-    msg: &SessionMessage,
-) -> TranscriptEntry {
+pub fn message_to_transcript_entry(session_id: &str, msg: &SessionMessage) -> TranscriptEntry {
     let tool_metadata = msg.tool_data.as_ref().and_then(|td| {
         Some(ToolMetadata {
             name: td.get("name")?.as_str()?.to_string(),
@@ -4823,6 +4932,7 @@ pub(crate) fn message_to_transcript_entry(
         content: msg.content.clone(),
         tool_metadata,
         token_usage,
+        desk: msg.desk.clone(),
     }
 }
 
@@ -5421,6 +5531,42 @@ mod tests {
             "sealing keeps the predecessor's transcript"
         );
         assert!(store.get(&second.id).unwrap().unwrap().is_sealed());
+    }
+
+    fn assert_live_turns_are_this_processs(mine: &dyn SessionStore, other: &dyn SessionStore) {
+        let s = mine.get_or_create("ws:desk", "u", "agent-a").unwrap();
+        let ids = [s.id.clone(), "gone".to_string()];
+        assert!(mine.live_turns(&ids).unwrap().is_empty());
+        let token = mine
+            .begin_turn(&s.id, None, &TurnPrincipal::default())
+            .unwrap();
+        assert_eq!(
+            mine.live_turns(&ids).unwrap(),
+            HashMap::from([(s.id.clone(), token.clone())])
+        );
+        assert!(
+            other.live_turns(&ids).unwrap().is_empty(),
+            "another process's turn is not this store's to vouch for"
+        );
+        mine.end_turn(&s.id, &token).unwrap();
+        assert!(mine.live_turns(&ids).unwrap().is_empty());
+    }
+
+    #[test]
+    fn in_memory_live_turns_are_the_ones_it_runs() {
+        assert_live_turns_are_this_processs(
+            &InMemorySessionStore::new(),
+            &InMemorySessionStore::new_as("hub-2"),
+        );
+    }
+
+    #[test]
+    fn jsonl_live_turns_are_this_processs_records() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        assert_live_turns_are_this_processs(
+            &JsonlSessionStore::new(dir.path()).expect("store"),
+            &JsonlSessionStore::new_as(dir.path(), "hub-2").expect("store"),
+        );
     }
 
     #[test]
@@ -6590,6 +6736,15 @@ mod tests {
         });
         let mut successor = Session::new("ios", "u", "agent");
         successor.adopt_conversation_mode(&from);
+        let mut room = Session::new("desk:planning", "u", "agent");
+        room.metadata = serde_json::json!({ DESK_CLOSED_KEY: {"name": "Planning"} });
+        let mut room_successor = Session::new("desk:planning", "u", "agent");
+        room_successor.adopt_conversation_mode(&room);
+        assert_eq!(
+            room_successor.metadata.get(DESK_CLOSED_KEY),
+            room.metadata.get(DESK_CLOSED_KEY),
+            "a room deleted stays closed in what follows on"
+        );
 
         assert!(successor.is_voice());
         assert!(successor.is_voice_turn());
@@ -6600,6 +6755,46 @@ mod tests {
                 .and_then(|v| v.as_str()),
             Some("fishaudio")
         );
+    }
+
+    #[test]
+    fn a_message_saved_before_desk_marks_reads_unchanged() {
+        let stored = serde_json::json!({
+            "id": "m1",
+            "role": "assistant",
+            "content": "hello",
+            "timestamp": "2026-10-01T09:00:00Z",
+            "tokens": 3,
+        });
+        let message: SessionMessage = serde_json::from_value(stored.clone()).unwrap();
+        assert_eq!(message.desk, None);
+        assert_eq!(serde_json::to_value(&message).unwrap(), stored);
+    }
+
+    #[test]
+    fn a_desk_mark_round_trips_through_the_live_session_and_the_archive() {
+        use crate::channels::desk::{DeliveryKind, DeskMark};
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = JsonlSessionStore::new(dir.path()).expect("store");
+        let mut s = store.get_or_create("desk", "u", "agent").expect("create");
+        let mark = DeskMark {
+            room: Some(Uuid::new_v4()),
+            thread: Some(Uuid::new_v4()),
+            delivery: Some(DeliveryKind::Reminder),
+            request_id: Some("r1".into()),
+            ..DeskMark::default()
+        };
+        s.add_assistant_message("a reminder", 2);
+        let message = s.messages.last_mut().unwrap();
+        message.desk = Some(mark.clone());
+        let message = message.clone();
+        store.save(&s).expect("save");
+        store.append_to_archive(&s.id, &message).expect("archive");
+
+        let live = store.get(&s.id).unwrap().unwrap();
+        assert_eq!(live.messages.last().unwrap().desk.as_ref(), Some(&mark));
+        let page = store.read_archive_page(&s.id, None, 10).unwrap();
+        assert_eq!(page.messages.last().unwrap().desk.as_ref(), Some(&mark));
     }
 
     #[test]
@@ -6646,6 +6841,7 @@ mod tests {
             attachments: None,
             trust_level: None,
             actor: None,
+            desk: None,
         }
     }
 
@@ -6778,6 +6974,7 @@ mod tests {
                 attachments: None,
                 trust_level: None,
                 actor: None,
+                desk: None,
             };
             store.append_to_archive(sid, &m).expect("archive");
         }
@@ -6869,6 +7066,7 @@ mod tests {
             attachments: None,
             trust_level: None,
             actor: None,
+            desk: None,
         };
         session.messages.push(msg);
         store.save(&session).expect("save failed");
@@ -8074,6 +8272,7 @@ mod tests {
                 content: format!("message {i}"),
                 tool_metadata: None,
                 token_usage: None,
+                desk: None,
             })
             .collect();
 
@@ -8095,6 +8294,7 @@ mod tests {
                 content: format!("message {i}"),
                 tool_metadata: None,
                 token_usage: None,
+                desk: None,
             })
             .collect();
 
@@ -8116,6 +8316,7 @@ mod tests {
                 content: format!("message {i}"),
                 tool_metadata: None,
                 token_usage: None,
+                desk: None,
             })
             .collect();
 
@@ -8137,6 +8338,7 @@ mod tests {
                 content: format!("message {i}"),
                 tool_metadata: None,
                 token_usage: None,
+                desk: None,
             })
             .collect();
 
@@ -8168,6 +8370,7 @@ mod tests {
             attachments: None,
             trust_level: Some(TrustLevel::Paired),
             actor: None,
+            desk: None,
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains(r#""trust_level":"paired""#));

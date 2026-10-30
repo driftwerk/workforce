@@ -9,6 +9,7 @@ use regex::Regex;
 use serde_json::Value;
 use workforce_agent::llm::responses::{LimitSnapshot, LimitWindow};
 use workforce_common::subscription::SubscriptionKind;
+use workforce_common::usage::{self, Window};
 
 use super::cooldown::{LimitSignal, LimitStatus};
 
@@ -98,6 +99,48 @@ pub fn claude_rate_limit_event(event: &Value) -> Option<LimitSignal> {
             .and_then(|at| DateTime::from_timestamp(at, 0)),
         window,
     })
+}
+
+/// How full the plan's windows were, as a Claude Code `rate_limit_event`
+/// reports them (every one, `allowed` too): `unifiedWindows` by name, each
+/// `{utilization, resetsAt}`, the utilisation a fraction, the reset epoch
+/// seconds.
+pub fn claude_usage(event: &Value) -> Vec<Window> {
+    if event.get("type").and_then(Value::as_str) != Some("rate_limit_event") {
+        return Vec::new();
+    }
+    let windows = event
+        .pointer("/rate_limit_info/unifiedWindows")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flatten()
+        .filter_map(|(name, w)| {
+            Some(Window {
+                used_percent: usage::percent(w.get("utilization")?.as_f64()? * 100.0),
+                resets_at: w
+                    .get("resetsAt")
+                    .and_then(Value::as_i64)
+                    .and_then(|at| DateTime::from_timestamp(at, 0)),
+                minutes: usage::claude_window(name)?,
+            })
+        })
+        .collect();
+    usage::ordered(windows)
+}
+
+/// How full the plan's windows were, as a ChatGPT response's headers or
+/// events report them. A window without a length is left out.
+pub fn chatgpt_usage(snapshot: &LimitSnapshot) -> Vec<Window> {
+    let windows = codex_windows(snapshot)
+        .filter_map(|(_, w)| {
+            Some(Window {
+                used_percent: usage::percent(w.used_percent),
+                resets_at: w.resets_at,
+                minutes: u32::try_from(w.window_minutes?).ok()?,
+            })
+        })
+        .collect();
+    usage::ordered(windows)
 }
 
 /// Where Claude Code's limit notice names its reset: `resets 7pm
@@ -451,6 +494,45 @@ mod tests {
 
     fn at(rfc3339: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(rfc3339).unwrap().to_utc()
+    }
+
+    #[test]
+    fn a_rate_limit_event_reports_how_full_each_window_is() {
+        let captured: Value = serde_json::from_str(CAPTURED_ALLOWED).unwrap();
+        assert_eq!(
+            claude_usage(&captured),
+            [
+                Window {
+                    used_percent: 6.0,
+                    resets_at: epoch(1_790_676_600),
+                    minutes: usage::FIVE_HOUR
+                },
+                Window {
+                    used_percent: 69.0,
+                    resets_at: epoch(1_790_956_800),
+                    minutes: usage::SEVEN_DAY
+                },
+            ]
+        );
+        assert!(claude_usage(&serde_json::json!({"type": "result"})).is_empty());
+    }
+
+    #[test]
+    fn chatgpt_headers_report_each_window_with_its_length() {
+        let snap = snapshot(&[
+            ("x-codex-primary-used-percent", "42.5"),
+            ("x-codex-primary-window-minutes", "300"),
+            ("x-codex-primary-reset-at", "1791000000"),
+            ("x-codex-secondary-used-percent", "12"),
+        ]);
+        assert_eq!(
+            chatgpt_usage(&snap),
+            [Window {
+                used_percent: 42.5,
+                resets_at: epoch(1_791_000_000),
+                minutes: 300
+            }]
+        );
     }
 
     #[test]

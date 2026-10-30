@@ -167,7 +167,11 @@ impl CrewTool {
         };
         match self.name {
             "crew.overview" => {
-                let o = crew.desk.overview(crew.as_ref()).await.map_err(internal)?;
+                let o = crew
+                    .desk
+                    .overview(crew.as_ref(), None)
+                    .await
+                    .map_err(internal)?;
                 Ok(json!({
                     "counts": o.counts,
                     "table": table(&o.items, &o.groups),
@@ -257,7 +261,8 @@ impl CrewTool {
                     service.sessions.as_ref(),
                     &speaker,
                     &owner,
-                    None,
+                    workforce_common::channels::DESK_CHANNEL,
+                    workforce_desk::Cursor::Newest,
                     limit,
                 )
                 .map_err(|e| e.to_string())?;
@@ -434,6 +439,7 @@ mod tests {
             last_activity: None,
             approval: None,
             question: None,
+            background: None,
         }
     }
 

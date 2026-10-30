@@ -464,6 +464,7 @@ fn read_archive_messages(
             attachments: None,
             trust_level: None,
             actor: None,
+            desk: None,
         })
         .collect())
 }
@@ -704,6 +705,7 @@ mod tests {
                     attachments: None,
                     trust_level: None,
                     actor: None,
+                    desk: None,
                 };
                 if i == 1 {
                     m.content = "x".repeat(ARCHIVE_BATCH_BYTES + 1);

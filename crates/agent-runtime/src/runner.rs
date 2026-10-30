@@ -122,6 +122,11 @@ tokio::task_local! {
     /// Current Slack thread timestamp (e.g. "1234567890.123456") — set during
     /// agent runs so tools can resolve thread context without needing a scheduler.
     pub static CURRENT_THREAD_ID: String;
+    /// The Desk conversation the current run answers to: a live Desk turn's,
+    /// attended, or the one a job, workflow or heartbeat check made from Desk
+    /// was stamped with, unattended. `None` or unset everywhere else, Slack
+    /// included.
+    pub static CURRENT_DESK: Option<workforce_common::channels::desk::DeskScope>;
     /// Current agent ID — set during agent runs so tools (e.g., WASM skill
     /// tools) can identify which agent invoked them.
     pub static CURRENT_AGENT_ID: String;
@@ -464,6 +469,20 @@ pub fn current_progress_tx() -> Option<tokio::sync::mpsc::Sender<ProgressEvent>>
     CURRENT_PROGRESS_TX.try_with(|t| t.clone()).ok()
 }
 
+/// The Desk conversation the current run answers to, if it answers to one.
+pub fn current_desk() -> Option<workforce_common::channels::desk::DeskScope> {
+    CURRENT_DESK.try_with(Clone::clone).ok().flatten()
+}
+
+/// Run `fut` answering to `desk`, or to no Desk conversation when there is
+/// none, whatever its caller answers to.
+pub async fn with_desk<F: std::future::Future>(
+    desk: Option<workforce_common::channels::desk::DeskScope>,
+    fut: F,
+) -> F::Output {
+    CURRENT_DESK.scope(desk, fut).await
+}
+
 /// The approval ledger of the turn a tool runs in; `None` where nobody can
 /// answer a prompt.
 pub fn current_turn_approvals() -> Option<Arc<TurnApprovals>> {
@@ -755,6 +774,9 @@ pub struct SessionContext {
     /// The enclosing scope's [`ServedLog`], so a call made in the spawned
     /// task is billed on the record that scope writes.
     pub served: Option<ServedLog>,
+    /// [`CURRENT_DESK`], carried so a tool in the spawned task delivers to,
+    /// and is gated by, the Desk conversation the run answers to.
+    pub desk: Option<workforce_common::channels::desk::DeskScope>,
 }
 
 fn task_local_value(
@@ -803,6 +825,7 @@ impl SessionContext {
             last_user_comm: LAST_USER_COMM.try_with(Arc::clone).ok(),
             secret_policy: workforce_common::secret_policy::capture(),
             served: CURRENT_SERVED.try_with(ServedLog::clone).ok(),
+            desk: current_desk(),
         }
     }
 
@@ -828,6 +851,7 @@ impl SessionContext {
         let last_user_comm = self.last_user_comm;
         let secret_policy = self.secret_policy;
         let served = self.served;
+        let desk = self.desk;
         let layers: [(&'static tokio::task::LocalKey<String>, Option<String>, bool); 13] = [
             (&CURRENT_ARTIFACT_SCOPE, self.artifact_scope, false),
             (&CURRENT_AGENT_ID, self.agent_id, true),
@@ -887,6 +911,7 @@ impl SessionContext {
                 None => inner.await,
             }
         };
+        let inner = with_desk(desk, inner);
         match last_user_comm {
             Some(clock) => LAST_USER_COMM.scope(clock, inner).await,
             None => inner.await,
@@ -922,6 +947,7 @@ impl SessionContext {
         let artifact_store = self.artifact_store;
         let secret_policy = self.secret_policy;
         let served = self.served;
+        let desk = self.desk;
         let layers: [(&'static tokio::task::LocalKey<String>, Option<String>); 10] = [
             (&CURRENT_AGENT_ID, self.agent_id),
             (&CURRENT_CHANNEL_ID, self.channel_id),
@@ -954,6 +980,7 @@ impl SessionContext {
             Some(log) => CURRENT_SERVED.sync_scope(log, outer),
             None => outer(),
         };
+        let outer = move || CURRENT_DESK.sync_scope(desk, outer);
         let outer = move || match artifact_store {
             Some(store) => CURRENT_ARTIFACT_STORE.sync_scope(store, outer),
             None => outer(),
@@ -1077,6 +1104,10 @@ pub struct RunnerConfig {
     /// the runner still honours the choice for the in-flight call but
     /// never saves it (legacy behaviour).
     pub permission_writer: Option<Arc<dyn PermissionWriter>>,
+    /// The surface gate's allow list: what each person always allows an
+    /// agent to write to from their Desk turns. `None` keeps no such
+    /// choice, and "Always allow" is not offered for those writes.
+    pub surface_allows: Option<Arc<dyn crate::tools::dispatch::SurfaceAllows>>,
     /// Cascade gate consulted *after* the PolicyEngine. Can only further
     /// restrict the PolicyEngine decision — never relax it. When `None`
     /// (the `[permissions] enabled = false` case) the cascade arm is a
@@ -1155,6 +1186,7 @@ impl Default for RunnerConfig {
             trace_writer: None,
             trace_tags: Default::default(),
             permission_writer: None,
+            surface_allows: None,
             permission_gate: None,
             arguments: crate::tools::arguments::ArgumentValidation::default(),
             tool_loading: crate::tools::loading::ToolLoading::default(),
@@ -1406,6 +1438,13 @@ pub enum ProgressEvent {
     ConnectRequired {
         prompt: workforce_common::subscription::ConnectPrompt,
     },
+    /// A live Desk turn as it stands, emitted by the turn's own relay between
+    /// two of its events, so every consumer carries it in order with the
+    /// deltas around it.
+    Snapshot(workforce_common::channels::desk::TurnSnapshot),
+    /// A file a tool delivered into the live Desk turn, which the turn's
+    /// surface shows in it.
+    File(workforce_common::channels::desk::DeskFile),
 }
 
 /// A follow-up user message absorbed into a run, reported on [`RunResult`]
@@ -1944,6 +1983,17 @@ impl Drop for Withdraws<'_> {
     }
 }
 
+/// The files `invocations` staged for delivery: what the image sink was
+/// handed for the turn's surface.
+pub fn generated_files(
+    invocations: &[ToolInvocation],
+) -> impl Iterator<Item = crate::tools::image_gen::GeneratedImageRef> + '_ {
+    invocations
+        .iter()
+        .filter(|inv| inv.success)
+        .flat_map(|inv| crate::tools::image_gen::parse_generated_images(&inv.output))
+}
+
 /// Deliver the media `invocations` generated to the surface `ctx` names. A
 /// failed delivery is logged, never fatal to the turn.
 pub async fn deliver_generated(
@@ -1951,11 +2001,7 @@ pub async fn deliver_generated(
     ctx: &SessionContext,
     invocations: &[ToolInvocation],
 ) {
-    for img in invocations
-        .iter()
-        .filter(|inv| inv.success)
-        .flat_map(|inv| crate::tools::image_gen::parse_generated_images(&inv.output))
-    {
+    for img in generated_files(invocations) {
         if let Err(e) = sink
             .deliver(
                 ctx,
@@ -2015,6 +2061,63 @@ pub async fn render_viewed(
         }
     }
     blocks
+}
+
+/// What a person is asked of a call the gates hold, and where an "Always"
+/// answer is kept. A write the surface gate holds offers no Always deny, and
+/// its Always allow is kept on the allow list for its tool, its destination
+/// and this agent; any other call's choice is the permission system's.
+pub fn held_prompt(
+    allow_save_allow: bool,
+    holds: Option<crate::tools::Destination>,
+    agent: &str,
+    allows: Option<Arc<dyn crate::tools::dispatch::SurfaceAllows>>,
+    writer: Option<Arc<dyn PermissionWriter>>,
+) -> (
+    workforce_core::policy::PermissionPromptOptions,
+    Option<Arc<dyn PermissionWriter>>,
+) {
+    let options = workforce_core::policy::PermissionPromptOptions::ask(allow_save_allow);
+    match (holds, allows) {
+        (Some(to), Some(allows)) => (
+            workforce_core::policy::PermissionPromptOptions {
+                deny_always: false,
+                ..options
+            },
+            Some(Arc::new(KeepAllowed {
+                allows,
+                agent: agent.to_string(),
+                to,
+            })),
+        ),
+        _ => (options, writer),
+    }
+}
+
+/// Where "Always allow" on a write the surface gate held is kept: on the
+/// person's allow list, for the write's tool and destination and this agent
+/// alone. No other choice is kept for it.
+struct KeepAllowed {
+    allows: Arc<dyn crate::tools::dispatch::SurfaceAllows>,
+    agent: String,
+    to: crate::tools::Destination,
+}
+
+#[async_trait::async_trait]
+impl PermissionWriter for KeepAllowed {
+    async fn persist_user_choice(
+        &self,
+        user_id: &str,
+        tool_name: &str,
+        choice: workforce_core::policy::PermissionChoice,
+    ) -> eyre::Result<()> {
+        match choice {
+            workforce_core::policy::PermissionChoice::AllowAlways => {
+                self.allows.allow(user_id, &self.agent, tool_name, &self.to)
+            }
+            _ => Ok(()),
+        }
+    }
 }
 
 /// Persist an Always-* choice as the requester's own rule before the call it
@@ -5692,9 +5795,15 @@ impl AgentRunner {
                     GateOutcome::RequireApproval {
                         reason,
                         allow_save_allow,
+                        holds,
                     } => {
-                        let prompt_options =
-                            workforce_core::policy::PermissionPromptOptions::ask(allow_save_allow);
+                        let (prompt_options, keeper) = held_prompt(
+                            allow_save_allow,
+                            holds,
+                            self.config.agent_id.as_str(),
+                            self.config.surface_allows.clone(),
+                            self.config.permission_writer.clone(),
+                        );
                         let agent_id_str = self.config.agent_id.to_string();
                         let acting_user_id = CURRENT_USER_ID
                             .try_with(|u| u.clone())
@@ -5796,8 +5905,6 @@ impl AgentRunner {
                                             .with_user_comm(&last_user_comm);
                                         let call =
                                             self.call_for(&mut round_calls, &tool_use_id, &input);
-                                        let permission_writer =
-                                            self.config.permission_writer.clone();
                                         let policy = Arc::clone(&self.policy);
                                         let access = Arc::clone(&access_snapshot);
                                         join_set.spawn(async move {
@@ -5810,7 +5917,7 @@ impl AgentRunner {
                                                     reason: &reason,
                                                     round: rounds,
                                                     options: prompt_options,
-                                                    writer: permission_writer.as_deref(),
+                                                    writer: keeper.as_deref(),
                                                     requester: acting_user_id.as_deref(),
                                                 },
                                                 &ledger,
@@ -5938,9 +6045,15 @@ impl AgentRunner {
             // What this round's programs called, recorded like direct calls.
             tool_invocations.extend(std::mem::take(&mut *round_nested.lock()));
 
-            // Deliver any images this round's tools staged (streaming path).
-            self.deliver_round_images(&tool_invocations[round_first..])
-                .await;
+            // Deliver any images this round's tools staged (streaming path),
+            // the turn's progress in scope so a surface that shows them in the
+            // turn's own stream can.
+            scope_turn(
+                Some(progress_tx.clone()),
+                None,
+                self.deliver_round_images(&tool_invocations[round_first..]),
+            )
+            .await;
 
             // ── Trace capture: write round with tool results (streaming path) ──
             if let Some(ref tw) = self.config.trace_writer {
@@ -7404,6 +7517,78 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn a_run_scoped_to_no_desk_conversation_answers_to_none_its_caller_does() {
+        use workforce_common::channels::desk::{DeskPlace, DeskScope, DeskTarget};
+        let scope = DeskScope {
+            target: DeskTarget::of_turn(&DeskPlace::Dm, "desk", None, false),
+            owner: "person-1".into(),
+            attended: true,
+        };
+        let (outer, inner) = with_desk(Some(scope.clone()), async {
+            (
+                current_desk(),
+                with_desk(None, async { current_desk() }).await,
+            )
+        })
+        .await;
+        assert_eq!(outer, Some(scope));
+        assert_eq!(inner, None);
+        assert_eq!(current_desk(), None);
+    }
+
+    #[tokio::test]
+    async fn always_allowing_a_held_write_keeps_its_tool_and_destination_and_nothing_else() {
+        type Allowed = (String, String, String, crate::tools::Destination);
+        #[derive(Default)]
+        struct Kept(parking_lot::Mutex<Vec<Allowed>>);
+        impl crate::tools::dispatch::SurfaceAllows for Kept {
+            fn allows(&self, _: &str, _: &str, _: &str, _: &crate::tools::Destination) -> bool {
+                false
+            }
+            fn allow(
+                &self,
+                person: &str,
+                agent: &str,
+                tool: &str,
+                to: &crate::tools::Destination,
+            ) -> eyre::Result<()> {
+                self.0
+                    .lock()
+                    .push((person.into(), agent.into(), tool.into(), to.clone()));
+                Ok(())
+            }
+        }
+        use workforce_core::policy::PermissionChoice as C;
+        let kept = Arc::new(Kept::default());
+        let to = crate::tools::Destination::of("slack", "#ops").unwrap();
+        let keeper = KeepAllowed {
+            allows: kept.clone(),
+            agent: "scout".into(),
+            to: to.clone(),
+        };
+        for choice in [C::AllowOnce, C::DenyOnce, C::DenyAlways] {
+            persist_choice(Some(&keeper), Some("alice"), "messaging.send", Some(choice)).await;
+        }
+        assert!(kept.0.lock().is_empty(), "only Always allow is kept");
+        persist_choice(
+            Some(&keeper),
+            Some("alice"),
+            "messaging.send",
+            Some(C::AllowAlways),
+        )
+        .await;
+        assert_eq!(
+            *kept.0.lock(),
+            vec![(
+                "alice".to_string(),
+                "scout".to_string(),
+                "messaging.send".to_string(),
+                to
+            )]
+        );
+    }
+
     /// Tools run in a spawned task, and task-locals do not cross a spawn —
     /// they survive only because [`SessionContext`] carries them by hand. A
     /// local missing from that list is silently empty inside every tool, which
@@ -8105,6 +8290,18 @@ mod tests {
                 .into(),
             }),
             served: Some(ServedLog::default()),
+            // A reminder or a file made in the spawned tool task goes to the
+            // Desk conversation the turn answers to.
+            desk: Some(workforce_common::channels::desk::DeskScope {
+                target: workforce_common::channels::desk::DeskTarget {
+                    place: workforce_common::channels::desk::DeskPlace::Dm,
+                    channel: "desk".into(),
+                    device: None,
+                    spoken: false,
+                },
+                attended: true,
+                owner: "person-1".into(),
+            }),
         };
         let captured = Arc::new(std::sync::Mutex::new(SessionContext::default()));
         let c = Arc::clone(&captured);
@@ -8133,6 +8330,7 @@ mod tests {
         assert_eq!(after.voice_channel, original.voice_channel);
         assert_eq!(after.automated_origin, original.automated_origin);
         assert_eq!(after.billing_identity, original.billing_identity);
+        assert_eq!(after.desk, original.desk);
         after
             .served
             .expect("served log survives the spawn")
@@ -8457,6 +8655,7 @@ mod tests {
             trace_writer: None,
             trace_tags: Default::default(),
             permission_writer: None,
+            surface_allows: None,
             permission_gate: None,
             arguments: crate::tools::arguments::ArgumentValidation::default(),
             tool_loading: crate::tools::loading::ToolLoading::default(),
@@ -8504,6 +8703,7 @@ mod tests {
             trace_writer: None,
             trace_tags: Default::default(),
             permission_writer: None,
+            surface_allows: None,
             permission_gate: None,
             arguments: crate::tools::arguments::ArgumentValidation::default(),
             tool_loading: crate::tools::loading::ToolLoading::default(),
@@ -10246,6 +10446,8 @@ mod tests {
                 ProgressEvent::SubActivity { .. } => "sub_activity",
                 ProgressEvent::CheckIn { .. } => "check_in",
                 ProgressEvent::ConnectRequired { .. } => "connect_required",
+                ProgressEvent::Snapshot(_) => "snapshot",
+                ProgressEvent::File(_) => "file",
             })
             .collect();
 
@@ -14528,6 +14730,7 @@ issue?"#;
             trace_writer: None,
             trace_tags: Default::default(),
             permission_writer: None,
+            surface_allows: None,
             permission_gate: None,
             arguments: crate::tools::arguments::ArgumentValidation::default(),
             tool_loading: crate::tools::loading::ToolLoading::default(),

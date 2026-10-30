@@ -23,6 +23,10 @@ mod caller_identity_routes;
 #[path = "api/desk_conversation_routes.rs"]
 mod desk_conversation_routes;
 
+#[cfg(feature = "postgres")]
+#[path = "api/desk_link_routes.rs"]
+mod desk_link_routes;
+
 #[path = "api/eval_routes.rs"]
 mod eval_routes;
 
@@ -34,6 +38,10 @@ mod monitor_routes;
 
 #[path = "api/pair_routes.rs"]
 mod pair_routes;
+
+#[cfg(feature = "postgres")]
+#[path = "api/picture_routes.rs"]
+mod picture_routes;
 
 #[path = "api/schedule_routes.rs"]
 mod schedule_routes;
@@ -64,3 +72,7 @@ mod ws_routes;
 
 #[path = "api/node_routes.rs"]
 mod node_routes;
+
+#[cfg(feature = "postgres")]
+#[path = "api/desk_floor_routes.rs"]
+mod desk_floor_routes;

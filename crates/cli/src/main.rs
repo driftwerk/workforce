@@ -2504,7 +2504,7 @@ async fn run_gateway_chat(gateway_url: &str, token: &str) -> Result<()> {
 
     // Wait for the connected event
     match tokio::time::timeout(std::time::Duration::from_secs(5), events.recv()).await {
-        Ok(Some(GatewayEvent::Connected { .. })) => {
+        Ok(Some(GatewayEvent::Connected)) => {
             eprintln!("  {} Connected to gateway", style("✓").green().bold(),);
         }
         Ok(Some(GatewayEvent::Message(msg))) if msg.is_connected() => {
@@ -2748,7 +2748,7 @@ async fn run_gateway_chat(gateway_url: &str, token: &str) -> Result<()> {
                         eprintln!("{} Failed to reconnect to gateway", style("✗").red().bold());
                         break;
                     }
-                    GatewayEvent::Connected { .. } => {
+                    GatewayEvent::Connected => {
                         eprintln!("{} Reconnected", style("✓").green().bold());
                     }
                 }
@@ -3121,10 +3121,9 @@ struct OverlayWatcherCtx {
     mcp_http: Arc<reqwest::Client>,
     mcp_managers: Arc<McpManagerMap>,
     broadcast_tx: tokio::sync::broadcast::Sender<workforce_hub::gateway::BroadcastMessage>,
-    /// Shared reminder-delivery callback and leader flag, so a live-spawned
-    /// agent gets its own scheduler (and reminder/scheduler tools) exactly like
-    /// a startup agent, rather than `scheduler = None` until the next restart.
-    scheduler_delivery: workforce_hub::scheduler::DeliveryCallback,
+    /// Shared leader flag, so a live-spawned agent gets its own scheduler (and
+    /// reminder/scheduler tools) exactly like a startup agent, rather than
+    /// `scheduler = None` until the next restart.
     voice_announcer: Arc<workforce_hub::voice_announce::VoiceAnnouncer>,
     leader_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
     nats: Option<async_nats::Client>,
@@ -3285,7 +3284,6 @@ async fn spawn_and_wire_agent(
             config.clone(),
             None, // config_path not available in hub server mode (matches startup)
             agent_config,
-            Arc::clone(&ctx.scheduler_delivery),
             Arc::clone(&ctx.lock_manager),
             ctx.shared_knowledge.clone(),
             ctx.shared_local_agents.clone(),
@@ -3666,6 +3664,7 @@ rules:
                 trace_writer: None,
                 trace_tags: Default::default(),
                 permission_writer: None,
+                surface_allows: None,
                 permission_gate: None,
                 arguments: workforce_agent::tools::arguments::ArgumentValidation::default(),
                 tool_loading: workforce_agent::tools::loading::ToolLoading::default(),
@@ -3822,34 +3821,9 @@ rules:
                 }
             }
 
-            // Create broadcast channel first (needed by scheduler delivery and reactions)
+            // Create the broadcast channel first: reactions and the gateway take it.
             let (broadcast_tx, _) =
                 broadcast::channel::<workforce_hub::gateway::BroadcastMessage>(256);
-            let broadcast_tx_for_scheduler = broadcast_tx.clone();
-            // One delivery callback shared by every agent's scheduler — it just
-            // broadcasts a reminder to connected WebSocket clients.
-            let scheduler_delivery: workforce_hub::scheduler::DeliveryCallback = Arc::new(
-                move |job_name: String, response: String| {
-                    let tx = broadcast_tx_for_scheduler.clone();
-                    Box::pin(async move {
-                        tracing::info!(
-                            job = %job_name,
-                            receivers = tx.receiver_count(),
-                            "Delivering reminder via broadcast"
-                        );
-                        match tx.send(workforce_hub::gateway::BroadcastMessage::new(
-                            "scheduler",
-                            "reminder",
-                            format!("⏰ **{}**: {}", job_name, response),
-                        )) {
-                            Ok(n) => tracing::info!(receivers = n, "Reminder broadcast sent"),
-                            Err(e) => {
-                                tracing::debug!(error = %e, "Reminder broadcast skipped (no WebSocket receivers)")
-                            }
-                        }
-                    })
-                },
-            );
 
             // Open the hub-level global vault BEFORE agents are built, so
             // per-user credential overlays (written to the global vault via
@@ -3927,10 +3901,9 @@ rules:
 
             // Build the default agent service with scheduler and reactions
             let (default_service, scheduler) =
-                workforce_hub::serve::AgentService::from_config_with_scheduler_delivery_and_reactions(
+                workforce_hub::serve::AgentService::from_config_for_hub(
                     wf_config.clone(),
                     Some(config_path.clone()),
-                    Arc::clone(&scheduler_delivery),
                     global_vault.clone(),
                     // Hub canonical model: the MaintenanceRunner is the sole
                     // indexer, so the default service must not also index its
@@ -3967,6 +3940,7 @@ rules:
                 nats_for_gateway.clone(),
                 broadcast_tx.clone(),
             );
+            workforce_hub::session_push::install(session_push.clone());
             let _session_push_relay = nats_for_gateway
                 .clone()
                 .map(|nats| workforce_hub::session_push::spawn_relay(nats, broadcast_tx.clone()));
@@ -4136,46 +4110,28 @@ rules:
                     token
                 });
 
-            // Heartbeat delivery routes a check's output to the broadcast
-            // channel. Build it here — cloning `broadcast_tx` before the gateway
-            // takes it — and hand it to the per-agent heartbeat supervisor that's
-            // spawned once the agent registry exists (below). Self-learning and
-            // heartbeat are per-agent: a supervisor runs one runner per agent
-            // scoped to that agent's own workspace, rather than one runner bound
-            // to the default agent and a hardcoded `{data_dir}/workspace`.
-            // Heartbeat runners run for every agent, whether or not the
-            // install turns heartbeats on: an agent's own `[heartbeat]` may
-            // turn them on (or off) for it, and each runner reads it as it
-            // goes. One that is off only re-reads its config each minute.
-            let heartbeat_delivery: Option<workforce_hub::heartbeat::HeartbeatDeliveryCallback> = {
-                let broadcast_tx_for_heartbeat = broadcast_tx.clone();
-                let cb: workforce_hub::heartbeat::HeartbeatDeliveryCallback =
-                    Arc::new(move |_name: String, response: String| {
-                        let tx = broadcast_tx_for_heartbeat.clone();
-                        Box::pin(async move {
-                            let _ = tx.send(workforce_hub::gateway::BroadcastMessage::new(
-                                "heartbeat",
-                                "message",
-                                response,
-                            ));
-                        })
-                    });
-                if wf_config.heartbeat.enabled {
-                    eprintln!(
-                        "  Heartbeat: {} (every {}m, active {}-{})",
-                        style("enabled").cyan(),
-                        wf_config.heartbeat.interval_secs / 60,
-                        wf_config.heartbeat.active_start,
-                        wf_config.heartbeat.active_end,
-                    );
-                } else {
-                    eprintln!(
-                        "  Heartbeat: {}",
-                        style("only where an agent turns it on").dim()
-                    );
-                }
-                Some(cb)
-            };
+            // Self-learning and heartbeat are per-agent: a supervisor runs one
+            // runner per agent scoped to that agent's own workspace, rather
+            // than one runner bound to the default agent and a hardcoded
+            // `{data_dir}/workspace`. Heartbeat runners run for every agent,
+            // whether or not the install turns heartbeats on: an agent's own
+            // `[heartbeat]` may turn them on (or off) for it, and each runner
+            // reads it as it goes. One that is off only re-reads its config
+            // each minute.
+            if wf_config.heartbeat.enabled {
+                eprintln!(
+                    "  Heartbeat: {} (every {}m, active {}-{})",
+                    style("enabled").cyan(),
+                    wf_config.heartbeat.interval_secs / 60,
+                    wf_config.heartbeat.active_start,
+                    wf_config.heartbeat.active_end,
+                );
+            } else {
+                eprintln!(
+                    "  Heartbeat: {}",
+                    style("only where an agent turns it on").dim()
+                );
+            }
 
             // Register daily briefing job if enabled (DW-168)
             if wf_config.briefing.enabled {
@@ -4245,7 +4201,6 @@ rules:
                         wf_config.clone(),
                         None, // config_path not available in hub server mode
                         agent_config,
-                        Arc::clone(&scheduler_delivery),
                         Arc::clone(&lock_manager_for_agents),
                         shared_knowledge.clone(),
                         shared_local_agents.clone(),
@@ -4309,7 +4264,7 @@ rules:
                     .await;
                 });
             }
-            if let Some(delivery) = heartbeat_delivery {
+            {
                 let registry = Arc::downgrade(&registry);
                 let leader_flag = leader_flag.clone();
                 let user_tz = wf_config.user_timezone();
@@ -4321,7 +4276,6 @@ rules:
                         registry,
                         leader_flag,
                         user_tz,
-                        Some(delivery),
                         cancel,
                     )
                     .await;
@@ -4565,7 +4519,6 @@ rules:
                 mcp_http: Arc::clone(&mcp_http),
                 mcp_managers: Arc::clone(&mcp_managers),
                 broadcast_tx: broadcast_tx.clone(),
-                scheduler_delivery: Arc::clone(&scheduler_delivery),
                 voice_announcer: Arc::clone(&voice_announcer),
                 leader_flag: leader_flag.clone(),
                 nats: nats_for_gateway.clone(),
@@ -4801,21 +4754,23 @@ rules:
                 *watcher_identity_store.write() = Some(Arc::clone(store));
             }
 
-            // Approval routing (designated approvers) — gated by
-            // `[approvals] enabled`. Needs the permission store (for the
-            // routing rules) and the identity store (to expand roles +
-            // resolve Slack ids), so it only wires when both the cascade
-            // and the identity store are present. The same pending store
-            // backs the router's `defer`, the Slack button handler, and
-            // the expiry sweeper.
+            // Approval routing — gated by `[approvals] enabled`. Needs the
+            // identity store (to expand roles and resolve Slack ids); the
+            // permission store supplies designated-approver rules when the
+            // cascade is on, and without it only a person's own unattended
+            // Desk runs are routed, to them. The same pending store backs
+            // the router's `defer`, the Slack button handler, and the
+            // expiry sweeper.
             let pending_store = build_pending_approval_store(&wf_config).await?;
             if let Some(pending_store) = pending_store.clone() {
-                match (permission_evaluator.as_ref(), identity_store.as_ref()) {
-                    (Some(evaluator), Some(id_store)) => {
+                match identity_store.as_ref() {
+                    Some(id_store) => {
                         let default_ttl =
                             std::time::Duration::from_secs(wf_config.approvals.default_ttl_secs);
                         let mut router = workforce_hub::approvals::HubApprovalRouter::new(
-                            Arc::clone(evaluator.store()),
+                            permission_evaluator
+                                .as_ref()
+                                .map(|evaluator| Arc::clone(evaluator.store())),
                             id_store.clone().as_identity_store(),
                             Arc::clone(&pending_store),
                             default_ttl,
@@ -4839,9 +4794,9 @@ rules:
                         );
                         tracing::info!("Approval routing enabled");
                     }
-                    _ => tracing::warn!(
-                        "[approvals] enabled but permission store or identity store is \
-                             unavailable; routed approvals are inactive"
+                    None => tracing::warn!(
+                        "[approvals] enabled but the identity store is unavailable; routed \
+                         approvals are inactive"
                     ),
                 }
             }
@@ -5083,6 +5038,20 @@ rules:
                 .resolved_skills_dir(&wf_config.hub.data_dir);
             let external_skills =
                 workforce_hub::external_skills::ExternalSkills::shared(&skills_dir);
+            let pictures = workforce_hub::pictures::open(&wf_config).await;
+            if let Some(store) = pictures.clone() {
+                let agents = Arc::clone(&registry);
+                workforce_hub::pictures::refresh::Refresher::new(
+                    store,
+                    Arc::new(workforce_hub::pictures::refresh::HubSlack::new(
+                        Arc::clone(&slack_slot),
+                        Arc::clone(&registry),
+                    )),
+                    Arc::new(move || agents.agent_ids().iter().map(|id| id.to_string()).collect()),
+                    identity_store.clone().map(|s| s.as_identity_store()),
+                )
+                .spawn(leader_flag.clone(), background_cancel.clone());
+            }
             let gateway_state = Arc::new(workforce_hub::gateway::GatewayState {
                 registry: Arc::clone(&registry),
                 nats: nats_for_gateway.clone(),
@@ -5149,6 +5118,7 @@ rules:
                 )),
                 external_skills,
                 oidc_provider,
+                pictures: pictures.clone(),
             });
             if let Some(store) = identity_store.clone() {
                 workforce_hub::identity_lifecycle::install(
@@ -5160,6 +5130,7 @@ rules:
                         channels: gateway_state.channel_pairing.clone(),
                         defs: gateway_state.def_store.clone(),
                         artifacts: gateway_state.artifact_store.clone(),
+                        pictures,
                         external_skills: Arc::clone(&gateway_state.external_skills),
                         data_dir: std::path::PathBuf::from(&wf_config.hub.data_dir),
                         runs: workforce_hub::identity_lifecycle::Runs::until(
@@ -5251,6 +5222,7 @@ rules:
                 workforce_hub::remote_mcp::server::RemoteMcpState::new(Arc::clone(&gateway_state)),
             );
 
+            workforce_hub::desk_attachments::configure(&wf_config.desk);
             let gateway_app = workforce_hub::gateway::router(gateway_state.clone())
                 .merge(webhook_router)
                 .merge(trigger_router)
@@ -9634,6 +9606,7 @@ rules:
                             tools: None,
                             creator: None,
                             creator_sig: None,
+                            deliver_to: None,
                         },
                         body: body.unwrap_or_else(|| {
                             format!(

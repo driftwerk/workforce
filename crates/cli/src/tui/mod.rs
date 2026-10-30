@@ -89,29 +89,6 @@ pub async fn run(
 
         let action = app.handle_event(event);
 
-        // Auto-send welcome directive if the agent has one and we just connected
-        if let Some(directive) = app.pending_welcome.take() {
-            let c = client.lock().await;
-            if let Err(e) = c
-                .send_chat(&format!(
-                    "[WELCOME DIRECTIVE — system instruction, not a user message]\n{}",
-                    directive
-                ))
-                .await
-            {
-                app.push_message(
-                    app::MessageRole::System,
-                    format!("Failed to send welcome: {}", e),
-                );
-            } else {
-                app.waiting_for_response = true;
-            }
-            // Update session ID
-            if let Some(sid) = c.session_id().await {
-                app.session_id = Some(sid);
-            }
-        }
-
         match action {
             Action::Render => {
                 term.draw(|frame| ui::draw(frame, &mut app))?;
@@ -585,7 +562,7 @@ fn read_pending_attachments(app: &mut App) -> (Vec<Attachment>, Vec<String>) {
                 filename: att.filename.clone(),
                 mime_type: "text/plain".to_string(),
                 data: content,
-                artifact_id: None,
+                ..Attachment::default()
             }),
             AttachmentKind::Image | AttachmentKind::Binary => {
                 use base64::Engine;
@@ -595,7 +572,7 @@ fn read_pending_attachments(app: &mut App) -> (Vec<Attachment>, Vec<String>) {
                         filename: att.filename.clone(),
                         mime_type: mime.to_string(),
                         data: base64::engine::general_purpose::STANDARD.encode(&bytes),
-                        artifact_id: None,
+                        ..Attachment::default()
                     }
                 })
             }

@@ -166,16 +166,25 @@ async fn process_chat_request(
     request: NatsChatRequest,
 ) {
     let progress_subject = workforce_nats::subjects::agent_progress(agent_id, &request.session_id);
+    let desk = request.desk.clone();
     let (session_id, tail, live) = run_chat_turn(&nats, &progress_subject, &service, request).await;
-    for progress in closing(tail, session_id) {
+    let end = desk.as_ref().map(|desk| {
+        ChatProgress::TurnEnd(crate::desk_surface::turn_end(&service, &session_id, desk))
+    });
+    for progress in closing(tail, end, session_id) {
         publish_progress(&nats, &progress_subject, progress).await;
     }
     drop(live);
 }
 
-/// A turn's closing events, always ending with `Done`.
-fn closing(tail: Vec<ChatProgress>, session_id: String) -> impl Iterator<Item = ChatProgress> {
+/// A turn's closing events: its tail, a Desk turn's end, and always `Done`.
+fn closing(
+    tail: Vec<ChatProgress>,
+    end: Option<ChatProgress>,
+    session_id: String,
+) -> impl Iterator<Item = ChatProgress> {
     tail.into_iter()
+        .chain(end)
         .chain(std::iter::once(ChatProgress::Done { session_id }))
 }
 
@@ -192,6 +201,7 @@ async fn run_chat_turn(
         .begin_live_turn(
             &requested,
             SelfServe::answerable_if(request.answers_approvals),
+            request.desk.as_ref(),
         )
         .await
     {
@@ -239,9 +249,12 @@ async fn run_chat_turn(
             None, // no tool_whitelist
             None, // no persona override
             None, // no workspace_id — chat workers operate outside Slack context
-            None, // no trust classification — chat workers run system-initiated work
+            // No trust classification — chat workers run system-initiated
+            // work — save that another agent's hand-off is never the person's.
+            crate::desk_surface::hand_off_trust(request.desk.as_ref().map(|desk| &desk.turn), None),
             Some(live.cancel_token()),
             request.voice_channel.as_deref(),
+            request.desk.as_ref(),
         )
         .await;
     let progress = match started {
@@ -255,24 +268,28 @@ async fn run_chat_turn(
         }
     };
     let (nats, subject) = (nats.clone(), progress_subject.to_string());
+    let desk = request.desk.is_some();
     let conducted = crate::live_turns::conduct(&mut live, service, progress, move |rx| {
-        forward_progress(rx, nats, subject)
+        forward_progress(rx, nats, subject, desk)
     })
     .await;
     let session_id = conducted.session_id.clone();
     (session_id, conducted.closing(service), Some(live))
 }
 
+/// Publish a turn's progress; a Desk turn's (`desk`) also carries what only
+/// a Desk gateway knows how to show, so an older gateway never meets it.
 async fn forward_progress(
     mut progress_rx: tokio::sync::mpsc::Receiver<ProgressEvent>,
     nats: async_nats::Client,
     subject: String,
+    desk: bool,
 ) {
     let mut delivery = AnswerDelivery::default();
     let mut delta_tail = String::new();
     while let Some(event) = progress_rx.recv().await {
         delivery.note(&event);
-        if let Some(progress) = chat_progress(event, &delivery, &mut delta_tail) {
+        if let Some(progress) = chat_progress(event, &delivery, &mut delta_tail, desk) {
             publish_progress(&nats, &subject, progress).await;
         }
     }
@@ -282,6 +299,7 @@ fn chat_progress(
     event: ProgressEvent,
     delivery: &AnswerDelivery,
     delta_tail: &mut String,
+    desk: bool,
 ) -> Option<ChatProgress> {
     match event {
         ProgressEvent::ToolStart { name, detail, .. } => Some(ChatProgress::ToolStart {
@@ -359,8 +377,18 @@ fn chat_progress(
         }
         ProgressEvent::Done { .. } => None,
         ProgressEvent::InjectedMessage { .. } => None,
-        ProgressEvent::RateLimited { .. } => None,
-        ProgressEvent::SlowModelFailover { .. } => None,
+        ProgressEvent::RateLimited { wait_secs, attempt } => {
+            desk.then_some(ChatProgress::RateLimited { wait_secs, attempt })
+        }
+        ProgressEvent::SlowModelFailover {
+            model,
+            elapsed_secs,
+        } => desk.then_some(ChatProgress::SlowModelFailover {
+            model,
+            elapsed_secs,
+        }),
+        ProgressEvent::Snapshot(snapshot) => desk.then_some(ChatProgress::Snapshot(snapshot)),
+        ProgressEvent::File(file) => desk.then_some(ChatProgress::File(file)),
         ProgressEvent::SecretConsumed { .. } => None,
         ProgressEvent::ApprovalResolved { .. } => None,
         ProgressEvent::ConnectRequired { prompt } => Some(ChatProgress::ConnectPrompt { prompt }),
@@ -536,6 +564,7 @@ mod stream_discard_tests {
             },
             &delivery,
             &mut tail,
+            false,
         );
         assert!(matches!(
             progress,
@@ -556,6 +585,7 @@ mod stream_discard_tests {
             },
             &delivery,
             &mut tail,
+            false,
         );
         assert!(progress.is_none());
         assert_eq!(tail, "kept");
@@ -604,8 +634,64 @@ mod after_answer_tests {
         let refused = vec![ChatProgress::Error {
             message: crate::hub_core::live_turns::TURN_STILL_RUNNING.into(),
         }];
-        assert_eq!(kinds(closing(refused, "s-1".into())), ["error", "done"]);
-        assert_eq!(kinds(closing(Vec::new(), "s-1".into())), ["done"]);
+        assert_eq!(
+            kinds(closing(refused, None, "s-1".into())),
+            ["error", "done"]
+        );
+        assert_eq!(kinds(closing(Vec::new(), None, "s-1".into())), ["done"]);
+        let end = ChatProgress::TurnEnd(workforce_common::channels::desk::TurnEnd {
+            turn_ref: Some("ref-1".into()),
+            reply_id: None,
+        });
+        assert_eq!(
+            kinds(closing(Vec::new(), Some(end), "s-1".into())),
+            ["turn_end", "done"],
+            "a Desk turn ends before its request does"
+        );
+    }
+
+    /// What only a Desk gateway shows goes to Desk turns alone, so a gateway
+    /// on the previous build never meets a variant it cannot read.
+    #[test]
+    fn waits_and_snapshots_are_published_for_desk_turns_only() {
+        let delivery = AnswerDelivery::default();
+        let waiting = || ProgressEvent::RateLimited {
+            wait_secs: 3,
+            attempt: 1,
+        };
+        let switching = || ProgressEvent::SlowModelFailover {
+            model: "fast".into(),
+            elapsed_secs: 30,
+        };
+        let snapshot = || {
+            ProgressEvent::Snapshot(workforce_common::channels::desk::TurnSnapshot {
+                stamp: workforce_common::channels::desk::TurnStamp {
+                    turn_ref: None,
+                    reply_id: "r".into(),
+                },
+                since: chrono::Utc::now(),
+                status: workforce_common::channels::desk::TurnPhase::Thinking,
+                text: String::new(),
+            })
+        };
+        for event in [waiting(), switching(), snapshot()] {
+            assert!(chat_progress(event, &delivery, &mut String::new(), false).is_none());
+        }
+        assert!(matches!(
+            chat_progress(waiting(), &delivery, &mut String::new(), true),
+            Some(ChatProgress::RateLimited {
+                wait_secs: 3,
+                attempt: 1
+            })
+        ));
+        assert!(matches!(
+            chat_progress(switching(), &delivery, &mut String::new(), true),
+            Some(ChatProgress::SlowModelFailover { .. })
+        ));
+        assert!(matches!(
+            chat_progress(snapshot(), &delivery, &mut String::new(), true),
+            Some(ChatProgress::Snapshot(_))
+        ));
     }
 }
 
@@ -683,6 +769,7 @@ mod live_control_tests {
             attachments: Vec::new(),
             voice_channel: None,
             answers_approvals: false,
+            desk: None,
         }
     }
 

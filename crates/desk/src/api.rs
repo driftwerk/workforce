@@ -18,7 +18,6 @@ use serde_json::json;
 use tokio::sync::broadcast::error::RecvError;
 use uuid::Uuid;
 
-use crate::conversations::{self, Conversations};
 use crate::crew::By;
 use crate::model::{Decision, NewSession, SessionPatch};
 use crate::providers::{self, AccountError, Accounts, Catalog, ConnectBody, Entry};
@@ -28,14 +27,16 @@ use crate::rooms::{NewMessage, NewRoom, RoomPatch};
 use crate::service::{Desk, DeskError, Import, Layout, NewTerminal, TerminalPatch};
 use crate::speech::{Speak, SpeakError, Speech};
 
-/// Decides whether a request may use the desk. Implemented by the hub.
+/// Decides whether a request may use the desk, and says who it is from: the
+/// person its token names, none for one that names no one. Implemented by
+/// the hub.
 #[async_trait]
 pub trait Authorize: Send + Sync {
     async fn authorize(
         &self,
         headers: &HeaderMap,
         query_token: Option<&str>,
-    ) -> Result<(), StatusCode>;
+    ) -> Result<Option<String>, StatusCode>;
 }
 
 struct ApiState {
@@ -66,6 +67,7 @@ impl IntoResponse for DeskError {
 async fn guard(auth: &dyn Authorize, headers: &HeaderMap, q: &TokenQuery) -> Result<(), Response> {
     auth.authorize(headers, q.token.as_deref())
         .await
+        .map(drop)
         .map_err(|status| (status, Json(json!({ "error": "not allowed" }))).into_response())
 }
 
@@ -582,7 +584,17 @@ async fn post_message(
     Json(m): Json<NewMessage>,
 ) -> Response {
     guarded!(s, h, q);
-    s.desk.post(id, m).await.map(Json).into_response()
+    s.desk
+        .post(id, m)
+        .await
+        .map(|posted| {
+            let status = match posted.created {
+                true => StatusCode::CREATED,
+                false => StatusCode::OK,
+            };
+            (status, Json(posted.message))
+        })
+        .into_response()
 }
 
 #[derive(Deserialize)]
@@ -655,7 +667,6 @@ pub fn router(
     realtime: Arc<Realtime>,
     speech: Arc<dyn Speech>,
     accounts: Arc<dyn Accounts>,
-    conversations: Arc<dyn Conversations>,
     crew: Arc<dyn crate::crew::Crew>,
 ) -> Router {
     sessions_router(desk.clone(), Arc::clone(&auth))
@@ -663,7 +674,6 @@ pub fn router(
         .merge(crate::crew_api::crew_router(desk, Arc::clone(&auth), crew))
         .merge(voice_router(Arc::clone(&auth), realtime, speech))
         .merge(providers_router(auth, accounts))
-        .merge(conversations::router(conversations))
 }
 
 struct ProvidersApi {
@@ -958,6 +968,7 @@ mod tests {
             let desk = crate::Desk::start(
                 DeskStore::from_pool(pool),
                 opts,
+                Default::default(),
                 tokio_util::sync::CancellationToken::new(),
             )
             .await
@@ -1073,7 +1084,7 @@ mod tests {
             let store = DeskStore::from_pool(pool);
             let r = crate::store::tests::record_fixture("monorepo-fd");
             store.put(&r).await.unwrap();
-            let desk = crate::Desk::start(store, options(dir.path()), tokio_util::sync::CancellationToken::new())
+            let desk = crate::Desk::start(store, options(dir.path()), Default::default(), tokio_util::sync::CancellationToken::new())
                 .await
                 .unwrap();
             let app = super::sessions_router(desk, allow_all());
@@ -1135,6 +1146,34 @@ mod tests {
             assert_eq!(status, 204);
             let (_, l) = call(&app, "GET", "/api/desk/layout", None).await;
             assert_eq!((&l["groups"][0]["items"], &l["ungrouped"]["items"]), (&json!([]), &json!(["agent:dw/allan", "agent:local/scout"])));
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_sourced_room_post_is_created_once_and_repeats_answer_with_it() {
+        with_test_pool(build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let store = DeskStore::with_pool(pool).await.unwrap();
+            let desk = crate::Desk::start(store, options(dir.path()), Default::default(), tokio_util::sync::CancellationToken::new())
+                .await
+                .unwrap();
+            let app = super::sessions_router(desk, allow_all());
+            let (status, room) = call(&app, "POST", "/api/desk/rooms", Some(json!({ "name": "Release", "members": [{ "hub": "local", "agent": "scout" }] }))).await;
+            assert_eq!(status, 200);
+            let channel = format!("desk:{}", room["id"].as_str().unwrap());
+            assert_eq!(room["channel"], json!(channel));
+            let uri = format!("/api/desk/rooms/{}/messages", room["id"].as_str().unwrap());
+            let reply = json!({ "author": "local/scout", "content": "may I?", "source": "local/scout/m-1", "delivery": "approval", "requestId": "req-1" });
+            let (status, first) = call(&app, "POST", &uri, Some(reply.clone())).await;
+            assert_eq!(
+                (status, &first["source"], &first["delivery"], &first["requestId"]),
+                (201, &json!("local/scout/m-1"), &json!("approval"), &json!("req-1"))
+            );
+            let (status, again) = call(&app, "POST", &uri, Some(reply)).await;
+            assert_eq!((status, &again["id"]), (200, &first["id"]));
+            let (status, said) = call(&app, "POST", &uri, Some(json!({ "author": "you", "content": "thanks" }))).await;
+            assert_eq!((status, said.get("source"), said.get("delivery")), (201, None, None));
         })
         .await;
     }

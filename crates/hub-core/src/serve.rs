@@ -2393,12 +2393,13 @@ impl AgentService {
         &self,
         session_id: &str,
         self_serve: workforce_agent::tools::approval::SelfServe,
+        desk: Option<&workforce_common::channels::desk::DeskTurnContext>,
     ) -> Result<
         (crate::hub_core::live_turns::LiveTurn, TurnInbox),
         crate::hub_core::live_turns::TurnBusy,
     > {
         self.live_turns
-            .begin(session_id, self_serve, self.nats())
+            .begin(session_id, self_serve, desk, self.nats())
             .await
     }
 
@@ -2671,14 +2672,19 @@ impl AgentService {
     }
 
     /// The authorisation inputs a tool call is gated with, for callers that
-    /// dispatch a tool outside a runner turn (the remote MCP server).
-    pub fn tool_gates(&self) -> workforce_agent::tools::dispatch::ToolGates {
+    /// dispatch a tool outside a runner turn (a CLI engine's round, the
+    /// remote MCP server, a monitor), with the hub's surface allow list.
+    pub fn tool_gates(
+        &self,
+        surface_allows: Option<Arc<dyn workforce_agent::tools::dispatch::SurfaceAllows>>,
+    ) -> workforce_agent::tools::dispatch::ToolGates {
         workforce_agent::tools::dispatch::ToolGates {
             agent_id: self.agent_id.clone(),
             team_id: None,
             role: None,
             capability_gate: self.capability_gate.read().clone(),
             permission_gate: self.permission_gate.read().clone(),
+            surface_allows,
             arguments: self.config.tools.validation.mode,
         }
     }
@@ -3246,6 +3252,7 @@ impl AgentService {
         trust_level: Option<workforce_common::trust::TrustLevel>,
         cancel_token: Option<tokio_util::sync::CancellationToken>,
         voice_channel: Option<&str>,
+        desk: Option<&workforce_common::channels::desk::DeskTurnContext>,
     ) -> Result<MessageProgress> {
         self.hosts
             .turn
@@ -3274,6 +3281,7 @@ impl AgentService {
                 trust_level,
                 cancel_token,
                 voice_channel,
+                desk,
             )
             .await
     }
@@ -4190,6 +4198,7 @@ pub mod tests {
             trust_level: None,
             actor: None,
             external_id: None,
+            desk: None,
         }
     }
 
@@ -4596,6 +4605,7 @@ pub mod tests {
             attachments: None,
             trust_level: trust,
             actor: None,
+            desk: None,
         }
     }
 
@@ -4672,6 +4682,7 @@ pub mod tests {
             attachments: None,
             trust_level: None,
             actor: actor.map(String::from),
+            desk: None,
         }
     }
 

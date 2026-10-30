@@ -317,6 +317,7 @@ mod tests {
             attachments: None,
             trust_level: None,
             actor: None,
+            desk: None,
         };
         s.messages.push(msg);
         let id = s.id.clone();

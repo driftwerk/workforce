@@ -787,6 +787,7 @@ mod tests {
         let desk = Desk::start(
             store,
             crate::testing::options(dir),
+            Default::default(),
             tokio_util::sync::CancellationToken::new(),
         )
         .await
@@ -862,7 +863,7 @@ mod tests {
                 }
                 assert!(d.find_sessions("payments").is_empty());
 
-                let o = d.overview(&NoCrew).await.unwrap();
+                let o = d.overview(&NoCrew, None).await.unwrap();
                 assert_eq!(o.groups, vec!["Atlas".to_string()]);
                 let item = o.items.iter().find(|i| i.id == id.to_string()).unwrap();
                 assert_eq!(
@@ -893,6 +894,7 @@ mod tests {
                 let again = Desk::start(
                     DeskStore::from_pool(pool),
                     crate::testing::options(dir.path()),
+                    Default::default(),
                     tokio_util::sync::CancellationToken::new(),
                 )
                 .await
@@ -941,6 +943,7 @@ mod tests {
                 let again = Desk::start(
                     DeskStore::from_pool(pool.clone()),
                     crate::testing::options(dir.path()),
+                    Default::default(),
                     tokio_util::sync::CancellationToken::new(),
                 )
                 .await

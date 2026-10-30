@@ -813,6 +813,47 @@ impl SessionStore for PostgresSessionStore {
         })
     }
 
+    fn live_turns(
+        &self,
+        session_ids: &[String],
+    ) -> Result<std::collections::HashMap<String, String>> {
+        let ids: Vec<Uuid> = session_ids
+            .iter()
+            .filter_map(|id| Uuid::parse_str(id).ok())
+            .collect();
+        if ids.is_empty() {
+            return Ok(Default::default());
+        }
+        self.block_on(async move {
+            let mut conn = self.pool.get().await?;
+            let scoped = self.scope(&mut conn).await?;
+            // Live by the rule a turn claim is stolen by: a stale heartbeat is
+            // a crashed holder, a missing one is not.
+            let rows = scoped
+                .query(
+                    "SELECT s.id, s.turn_token FROM sessions s
+                       LEFT JOIN instance_heartbeats h ON h.instance_id = s.turn_instance
+                      WHERE s.agent_id = $1 AND s.tenant_id = $2 AND s.id = ANY($3)
+                        AND s.turn_token IS NOT NULL
+                        AND (s.turn_instance = $4 OR h.instance_id IS NULL
+                             OR h.last_seen >= now() - make_interval(secs => $5::double precision))",
+                    &[
+                        &self.agent_id,
+                        &self.tenant_id(),
+                        &ids,
+                        &self.instance_id,
+                        &(HEARTBEAT_STALE_SECS as f64),
+                    ],
+                )
+                .await?;
+            scoped.finish().await?;
+            Ok(rows
+                .iter()
+                .map(|r| (r.get::<_, Uuid>(0).to_string(), r.get::<_, String>(1)))
+                .collect())
+        })
+    }
+
     fn interrupted_turns(&self) -> Result<Vec<InterruptedTurn>> {
         self.block_on(async move {
             let mut conn = self.pool.get().await?;
@@ -1112,24 +1153,11 @@ impl SessionStore for PostgresSessionStore {
     }
 
     fn list_for_owner(&self, owner: &str, limit: usize) -> Result<Vec<Session>> {
-        let owner = owner.to_string();
-        let limit = limit as i64;
-        self.block_on(async move {
-            let mut conn = self.pool.get().await?;
-            let scoped = self.scope(&mut conn).await?;
-            let rows = scoped
-                .query(
-                    &format!(
-                        "SELECT {SHELL_COLUMNS} FROM sessions
-                         WHERE agent_id = $1 AND owner = $2 AND tenant_id = $4
-                         ORDER BY updated_at DESC LIMIT $3"
-                    ),
-                    &[&self.agent_id, &owner, &limit, &self.tenant_id()],
-                )
-                .await?;
-            scoped.finish().await?;
-            rows.iter().map(row_to_shell).collect()
-        })
+        self.owned(owner, None, limit)
+    }
+
+    fn list_for_owner_on(&self, owner: &str, channel: &str, limit: usize) -> Result<Vec<Session>> {
+        self.owned(owner, Some(channel), limit)
     }
 
     fn owners(&self) -> Result<std::collections::BTreeMap<String, usize>> {
@@ -1457,6 +1485,7 @@ impl SessionStore for PostgresSessionStore {
                     attachments: None,
                     trust_level: None,
                     actor: None,
+                    desk: None,
                 };
                 if redact_message_secrets(&mut msg) {
                     redacted += 1;
@@ -1645,6 +1674,11 @@ impl SessionStore for PostgresSessionStore {
                 crate::pg_text::strip_nuls_json(&mut v);
                 v
             });
+            let desk = message
+                .desk
+                .as_ref()
+                .map(serde_json::to_value)
+                .transpose()?;
             // DO NOTHING: a CAS-losing post-turn save can replay an archive
             // append for a message another writer already archived. No
             // target, for the same reason as `get_or_create`: a hub keeps
@@ -1653,8 +1687,8 @@ impl SessionStore for PostgresSessionStore {
             scoped
                 .execute(
                     "INSERT INTO session_archive
-                     (tenant_id, session_id, message_id, role, content, tool_data, ts, tokens)
-                     VALUES ($8, $1, $2, $3, $4, $5, $6, $7)
+                     (tenant_id, session_id, message_id, role, content, tool_data, ts, tokens, desk)
+                     VALUES ($8, $1, $2, $3, $4, $5, $6, $7, $9)
                      ON CONFLICT DO NOTHING",
                     &[
                         &id,
@@ -1665,6 +1699,7 @@ impl SessionStore for PostgresSessionStore {
                         &message.timestamp,
                         &(message.tokens as i32),
                         &self.tenant_id(),
+                        &desk,
                     ],
                 )
                 .await?;
@@ -1739,7 +1774,7 @@ impl SessionStore for PostgresSessionStore {
                 Some(seq) => {
                     scoped
                         .query(
-                            "SELECT seq, message_id, role, content, tool_data, ts, tokens
+                            "SELECT seq, message_id, role, content, tool_data, ts, tokens, desk
                              FROM session_archive
                              WHERE session_id = $1 AND seq < $2 AND tenant_id = $4
                              ORDER BY seq DESC LIMIT $3",
@@ -1750,7 +1785,7 @@ impl SessionStore for PostgresSessionStore {
                 None => {
                     scoped
                         .query(
-                            "SELECT seq, message_id, role, content, tool_data, ts, tokens
+                            "SELECT seq, message_id, role, content, tool_data, ts, tokens, desk
                              FROM session_archive
                              WHERE session_id = $1 AND tenant_id = $3
                              ORDER BY seq DESC LIMIT $2",
@@ -1789,7 +1824,7 @@ impl SessionStore for PostgresSessionStore {
             let scoped = self.scope(&mut conn).await?;
             let row = scoped
                 .query_opt(
-                    "SELECT a.seq, a.message_id, a.role, a.content, a.tool_data, a.ts, a.tokens
+                    "SELECT a.seq, a.message_id, a.role, a.content, a.tool_data, a.ts, a.tokens, a.desk
                      FROM session_archive a
                      JOIN sessions s ON s.id = a.session_id AND s.tenant_id = a.tenant_id
                      WHERE a.session_id = $1 AND a.message_id = $2
@@ -1804,6 +1839,32 @@ impl SessionStore for PostgresSessionStore {
 }
 
 impl PostgresSessionStore {
+    /// `owner`'s sessions, newest-updated first, at most `limit`: those on
+    /// `channel` or a channel under it alone, when it is named.
+    fn owned(&self, owner: &str, channel: Option<&str>, limit: usize) -> Result<Vec<Session>> {
+        let owner = owner.to_string();
+        let channel = channel.map(str::to_string);
+        let limit = limit as i64;
+        self.block_on(async move {
+            let mut conn = self.pool.get().await?;
+            let scoped = self.scope(&mut conn).await?;
+            let rows = scoped
+                .query(
+                    &format!(
+                        "SELECT {SHELL_COLUMNS} FROM sessions
+                         WHERE agent_id = $1 AND owner = $2 AND tenant_id = $4
+                           AND ($5::text IS NULL OR channel = $5
+                                OR starts_with(channel, $5 || ':'))
+                         ORDER BY updated_at DESC LIMIT $3"
+                    ),
+                    &[&self.agent_id, &owner, &limit, &self.tenant_id(), &channel],
+                )
+                .await?;
+            scoped.finish().await?;
+            rows.iter().map(row_to_shell).collect()
+        })
+    }
+
     /// The shared body of `save`/`save_refreshing`: persist the session and
     /// return the row's post-write revision so callers can refresh their CAS
     /// baseline without a follow-up read.
@@ -1997,6 +2058,7 @@ impl PostgresSessionStore {
                 attachments: None,
                 trust_level: None,
                 actor: None,
+                desk: None,
             };
             if redact_message_secrets(&mut msg) {
                 redacted += 1;
@@ -2074,6 +2136,9 @@ fn archive_row_to_entry(session_id: &str, r: &tokio_postgres::Row) -> Transcript
         attachments: None,
         trust_level: None,
         actor: None,
+        desk: r
+            .get::<_, Option<serde_json::Value>>(7)
+            .and_then(|mark| serde_json::from_value(mark).ok()),
     };
     message_to_transcript_entry(session_id, &msg)
 }
@@ -2133,6 +2198,7 @@ pub(crate) mod tests {
             attachments: None,
             trust_level: None,
             actor: None,
+            desk: None,
         }
     }
 
@@ -2318,6 +2384,39 @@ pub(crate) mod tests {
             assert_eq!(older.messages.len(), 2);
             assert_eq!(older.messages[0].content, "turn 1");
             assert_eq!(older.messages[1].content, "turn 2");
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_desk_mark_round_trips_through_the_archive() {
+        use crate::channels::desk::{DeliveryKind, DeskMark, DeskSpeaker};
+        with_store(|store| async move {
+            let s: Arc<dyn SessionStore> = store;
+            let sess = s.get_or_create("desk", "u", "agent-a").unwrap();
+            let mark = DeskMark {
+                room: Some(Uuid::new_v4()),
+                speaker: Some(DeskSpeaker::Agent {
+                    name: "helper".into(),
+                }),
+                delivery: Some(DeliveryKind::Job),
+                ..DeskMark::default()
+            };
+            let marked = SessionMessage {
+                desk: Some(mark.clone()),
+                ..user_msg("marked")
+            };
+            s.append_to_archive(&sess.id, &user_msg("plain")).unwrap();
+            s.append_to_archive(&sess.id, &marked).unwrap();
+
+            let page = s.read_archive_page(&sess.id, None, 10).unwrap();
+            let marks: Vec<_> = page.messages.iter().map(|m| m.desk.clone()).collect();
+            assert_eq!(marks, vec![None, Some(mark.clone())]);
+            let one = s
+                .read_archive_message(&sess.id, &marked.id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(one.desk, Some(mark));
         })
         .await;
     }
@@ -2852,6 +2951,37 @@ pub(crate) mod tests {
                 "another instance's claim survives the bulk release"
             );
             assert_eq!(mine.release_owned_turn_claims().unwrap(), 0, "idempotent");
+        })
+        .await;
+    }
+
+    /// An owner's sessions on one surface are listed by its channel, however
+    /// many of theirs on others are newer.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_owners_sessions_on_a_channel_are_listed_past_newer_ones_elsewhere() {
+        with_store(|store| async move {
+            let s: Arc<dyn SessionStore> = store;
+            for channel in [
+                "desk",
+                "desk:planning",
+                "deskmate",
+                "slack:T1:C1",
+                "slack:T1:C2",
+            ] {
+                let mut session = s.get_or_create(channel, "u", "agent-a").unwrap();
+                session.messages.push(user_msg(channel));
+                s.save(&session).unwrap();
+            }
+            let mut on: Vec<String> = s
+                .list_for_owner_on("u", "desk", 10)
+                .unwrap()
+                .into_iter()
+                .map(|session| session.channel)
+                .collect();
+            on.sort();
+            assert_eq!(on, ["desk", "desk:planning"]);
+            assert_eq!(s.list_for_owner_on("u", "desk", 1).unwrap().len(), 1);
+            assert_eq!(s.list_for_owner("u", 10).unwrap().len(), 5);
         })
         .await;
     }
@@ -3621,6 +3751,66 @@ pub(crate) mod tests {
                 TurnPrincipal::default(),
                 "the old replica's turn resumes as the owner, never as alice"
             );
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_turn_is_live_until_its_instance_goes_stale_or_it_ends() {
+        with_embedded_pg_pool(|pool| async move {
+            let mine = PostgresSessionStore::with_pool(pool.clone(), "agent-a")
+                .await
+                .expect("run migrations");
+            let other = PostgresSessionStore::with_shared_pool_as(pool.clone(), "agent-a", "hub-2");
+            let sess = mine.get_or_create("slack:t:c:1", "u", "agent-a").unwrap();
+            let ids = [
+                sess.id.clone(),
+                Uuid::new_v4().to_string(),
+                "not-a-uuid".into(),
+            ];
+            assert!(other.live_turns(&ids).unwrap().is_empty());
+            let token = mine
+                .begin_turn(&sess.id, Some("msg-a"), &TurnPrincipal::default())
+                .unwrap();
+            let live = |store: &PostgresSessionStore| store.live_turns(&ids).unwrap();
+            assert_eq!(live(&mine).get(&sess.id), Some(&token));
+            assert_eq!(
+                live(&other).get(&sess.id),
+                Some(&token),
+                "no heartbeat is not a crash"
+            );
+
+            let conn = pool.get().await.unwrap();
+            let instance = mine.instance_id.clone();
+            let beat = |ago: &'static str| {
+                let (conn, instance) = (&conn, &instance);
+                async move {
+                    conn.execute(
+                        &format!(
+                            "INSERT INTO instance_heartbeats (instance_id, last_seen) \
+                             VALUES ($1, now() - interval '{ago}') \
+                             ON CONFLICT (instance_id) DO UPDATE SET last_seen = EXCLUDED.last_seen"
+                        ),
+                        &[instance],
+                    )
+                    .await
+                    .unwrap();
+                }
+            };
+            beat("1 hour").await;
+            assert!(
+                live(&other).is_empty(),
+                "a crashed instance's turn is not live"
+            );
+            assert_eq!(
+                live(&mine).get(&sess.id),
+                Some(&token),
+                "its own turn always is"
+            );
+            beat("1 second").await;
+            assert_eq!(live(&other).get(&sess.id), Some(&token));
+            mine.end_turn(&sess.id, &token).unwrap();
+            assert!(live(&other).is_empty());
         })
         .await;
     }

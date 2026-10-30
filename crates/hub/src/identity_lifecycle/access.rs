@@ -475,9 +475,10 @@ impl Holding for RoleGrants {
 pub struct PermissionRules;
 
 impl PermissionRules {
-    fn remove(cx: &Context<'_>, who: &Person, apply: bool) -> Result<Tally> {
+    async fn remove(cx: &Context<'_>, who: &Person, apply: bool) -> Result<Tally> {
+        let mut tally = Self::surface_allows(who, apply).await?;
         let Some(store) = permission_store(cx)? else {
-            return Ok(Tally::default());
+            return Ok(tally);
         };
         let rules = store.list_rules(&PermissionFilter {
             scope: Some(PermissionScope::User),
@@ -489,29 +490,60 @@ impl PermissionRules {
                 store.delete_rule(rule.id)?;
             }
         }
-        Ok(Tally::of(rules.into_iter().map(|r| r.tool_pattern)))
+        tally.absorb(Tally::of(rules.into_iter().map(|r| r.tool_pattern)));
+        Ok(tally)
+    }
+
+    /// The destinations the person always lets an agent write to from their
+    /// Desk turns: rules of their own, by every name they go by.
+    async fn surface_allows(who: &Person, apply: bool) -> Result<Tally> {
+        #[cfg(feature = "postgres")]
+        if let Some(store) = crate::surface_allows::store() {
+            let mut tally = Tally::default();
+            for name in &who.names {
+                tally.absorb(Tally::of(store.of(name).await?.into_iter().map(|allow| {
+                    format!(
+                        "always allow {} to {} {}",
+                        allow.agent_id, allow.platform, allow.destination
+                    )
+                })));
+                if apply {
+                    store.forget(name).await?;
+                }
+            }
+            return Ok(tally);
+        }
+        let _ = (who, apply);
+        Ok(Tally::default())
     }
 }
 
 #[async_trait]
 impl Holding for PermissionRules {
     async fn owners(&self, cx: &Context<'_>) -> Result<Owners> {
-        let Some(store) = permission_store(cx)? else {
-            return Ok(Owners::default());
+        #[cfg(feature = "postgres")]
+        let mut owners = match crate::surface_allows::store() {
+            Some(store) => Owners::counted(store.holders().await?),
+            None => Owners::default(),
         };
-        Ok(Owners::of(
-            store
-                .list_rules(&PermissionFilter {
-                    scope: Some(PermissionScope::User),
-                    ..PermissionFilter::default()
-                })?
-                .into_iter()
-                .map(|rule| rule.scope_id),
-        ))
+        #[cfg(not(feature = "postgres"))]
+        let mut owners = Owners::default();
+        if let Some(store) = permission_store(cx)? {
+            owners.absorb(Owners::of(
+                store
+                    .list_rules(&PermissionFilter {
+                        scope: Some(PermissionScope::User),
+                        ..PermissionFilter::default()
+                    })?
+                    .into_iter()
+                    .map(|rule| rule.scope_id),
+            ));
+        }
+        Ok(owners)
     }
 
     async fn held(&self, cx: &Context<'_>, who: &Person) -> Result<Tally> {
-        Self::remove(cx, who, false)
+        Self::remove(cx, who, false).await
     }
 
     async fn merge(
@@ -521,7 +553,7 @@ impl Holding for PermissionRules {
         _: &Person,
         apply: bool,
     ) -> Result<Tally> {
-        Self::remove(cx, from, apply)
+        Self::remove(cx, from, apply).await
     }
 
     async fn delete(
@@ -531,7 +563,7 @@ impl Holding for PermissionRules {
         _: Option<&Person>,
         apply: bool,
     ) -> Result<Tally> {
-        Self::remove(cx, who, apply)
+        Self::remove(cx, who, apply).await
     }
 }
 

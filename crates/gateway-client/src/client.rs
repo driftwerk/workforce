@@ -56,8 +56,8 @@ impl Default for GatewayClientConfig {
 /// Events emitted by the gateway client.
 #[derive(Debug, Clone)]
 pub enum GatewayEvent {
-    /// Successfully connected to gateway, with optional welcome message.
-    Connected { welcome: Option<String> },
+    /// Successfully connected to gateway.
+    Connected,
     /// Received a server message. Boxed to keep the enum size from being
     /// dominated by the wide-ish `ServerMessage` variant.
     Message(Box<ServerMessage>),
@@ -292,9 +292,7 @@ impl GatewayClient {
 
                             let kind = server_msg.kind();
                             let event = if kind == ServerMessageKind::Connected {
-                                GatewayEvent::Connected {
-                                    welcome: server_msg.content.clone(),
-                                }
+                                GatewayEvent::Connected
                             } else {
                                 GatewayEvent::Message(Box::new(server_msg))
                             };
@@ -1150,6 +1148,11 @@ mod tests {
             desk: None,
             id: None,
             author: None,
+            features: None,
+            turn_ref: None,
+            status: None,
+            since: None,
+            text: None,
         };
         assert_eq!(msg.kind(), ServerMessageKind::StreamDelta);
         assert!(msg.is_stream_delta());
@@ -1181,6 +1184,11 @@ mod tests {
             desk: None,
             id: None,
             author: None,
+            features: None,
+            turn_ref: None,
+            status: None,
+            since: None,
+            text: None,
         };
         let json = serde_json::to_string(&msg).unwrap();
         let parsed: ServerMessage = serde_json::from_str(&json).unwrap();
@@ -1214,6 +1222,11 @@ mod tests {
             desk: None,
             id: None,
             author: None,
+            features: None,
+            turn_ref: None,
+            status: None,
+            since: None,
+            text: None,
         };
         assert_eq!(start.kind(), ServerMessageKind::ToolStart);
         assert_eq!(start.text(), Some("filesystem.read"));
@@ -1241,6 +1254,11 @@ mod tests {
             desk: None,
             id: None,
             author: None,
+            features: None,
+            turn_ref: None,
+            status: None,
+            since: None,
+            text: None,
         };
         assert_eq!(end.kind(), ServerMessageKind::ToolEnd);
     }
@@ -1270,6 +1288,11 @@ mod tests {
             desk: None,
             id: None,
             author: None,
+            features: None,
+            turn_ref: None,
+            status: None,
+            since: None,
+            text: None,
         };
         assert!(msg.is_error());
         assert_eq!(msg.error.as_deref(), Some("Rate limit exceeded"));
@@ -1300,6 +1323,11 @@ mod tests {
             desk: None,
             id: None,
             author: None,
+            features: None,
+            turn_ref: None,
+            status: None,
+            since: None,
+            text: None,
         };
         assert_eq!(msg.kind(), ServerMessageKind::Reminder);
     }
@@ -1400,6 +1428,11 @@ mod tests {
             desk: None,
             id: None,
             author: None,
+            features: None,
+            turn_ref: None,
+            status: None,
+            since: None,
+            text: None,
         };
         assert!(msg.is_stream_start());
         assert_eq!(msg.kind(), ServerMessageKind::StreamStart);
@@ -1432,6 +1465,11 @@ mod tests {
             desk: None,
             id: None,
             author: None,
+            features: None,
+            turn_ref: None,
+            status: None,
+            since: None,
+            text: None,
         };
         assert!(msg.is_stream_end());
         assert_eq!(msg.kind(), ServerMessageKind::StreamEnd);
@@ -1479,6 +1517,11 @@ mod tests {
                 desk: None,
                 id: None,
                 author: None,
+                features: None,
+                turn_ref: None,
+                status: None,
+                since: None,
+                text: None,
             };
             assert_eq!(
                 msg.kind(),
@@ -1514,6 +1557,11 @@ mod tests {
             desk: None,
             id: None,
             author: None,
+            features: None,
+            turn_ref: None,
+            status: None,
+            since: None,
+            text: None,
         };
         let json = serde_json::to_string(&msg).unwrap();
         let parsed: ServerMessage = serde_json::from_str(&json).unwrap();

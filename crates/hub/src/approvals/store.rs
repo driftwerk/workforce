@@ -43,10 +43,10 @@ pub(crate) fn prune_contract(store: &dyn PendingApprovalStore) {
         core.request_id
     };
     let long_ago = now - chrono::Duration::days(40);
-    let approved = request("alice", long_ago);
+    let approved = request("alice", now + chrono::Duration::hours(1));
     let expired = request("alice", long_ago);
     let lapsed_but_pending = request("alice", long_ago);
-    let recent = request("alice", now - chrono::Duration::days(1));
+    let recent = request("alice", now + chrono::Duration::days(3));
     store
         .claim(&approved, ApprovalOutcome::Approved, "dave")
         .unwrap();
@@ -55,7 +55,7 @@ pub(crate) fn prune_contract(store: &dyn PendingApprovalStore) {
         .claim(&recent, ApprovalOutcome::Denied, "dave")
         .unwrap();
 
-    let cutoff = now - chrono::Duration::days(30);
+    let cutoff = now + chrono::Duration::days(1);
     assert_eq!(
         store
             .prune_resolved(long_ago - chrono::Duration::days(1))
@@ -98,6 +98,77 @@ fn sum_holders(
 const HOLDER_ROWS: &str =
     "SELECT requester_id, COUNT(*) FROM pending_approvals GROUP BY requester_id \
      UNION ALL SELECT approver_id, COUNT(*) FROM pending_approval_targets GROUP BY approver_id";
+
+/// What every backend's listing of an approver's requests must do alike:
+/// only pending, unexpired requests naming them, each one they may decide,
+/// and one past its expiry only expired.
+#[cfg(test)]
+pub(crate) fn pending_for_contract(store: &dyn PendingApprovalStore) {
+    let core = |requester: &str| PendingApprovalCore {
+        request_id: uuid::Uuid::new_v4().to_string(),
+        agent_id: "agent".into(),
+        session_key: "scheduler:j1".into(),
+        channel_id: String::new(),
+        requester_user_id: requester.into(),
+        tool_name: "slack.send".into(),
+        tool_input: serde_json::json!({"channel": "#ops"}),
+        reason: "Posts outside Desk".into(),
+        allow_self_approval: true,
+        approver_user_ids: vec![],
+        ttl: std::time::Duration::from_secs(3600),
+    };
+    let now = Utc::now();
+    let later = now + chrono::Duration::hours(1);
+    let first = core("alice");
+    let second = core("bob");
+    let resolved = core("alice");
+    let lapsed = core("alice");
+    let theirs = core("carol");
+    for (request, expires) in [
+        (&first, later),
+        (&second, later),
+        (&resolved, later),
+        (&lapsed, now - chrono::Duration::minutes(1)),
+        (&theirs, later),
+    ] {
+        store.insert_core(request, None, None, expires).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    for request in [&first, &second, &resolved, &lapsed] {
+        store.add_target(&request.request_id, "alice", "").unwrap();
+    }
+    store.add_target(&theirs.request_id, "carol", "U3").unwrap();
+    store
+        .claim(&resolved.request_id, ApprovalOutcome::Denied, "alice")
+        .unwrap();
+
+    let waiting = store.pending_for("alice", now).unwrap();
+    assert_eq!(
+        waiting
+            .iter()
+            .map(|r| r.request_id.as_str())
+            .collect::<Vec<_>>(),
+        [first.request_id.as_str(), second.request_id.as_str()],
+        "pending and unexpired, oldest first"
+    );
+    for row in &waiting {
+        let targets = store.targets(&row.request_id).unwrap();
+        assert!(
+            crate::approvals::decide::Decider::Person("alice").eligible(&targets),
+            "every request listed is one they may decide"
+        );
+    }
+    assert!(store.pending_for("dave", now).unwrap().is_empty());
+    for decided in [ApprovalOutcome::Approved, ApprovalOutcome::Denied] {
+        assert!(
+            !store.claim(&lapsed.request_id, decided, "alice").unwrap(),
+            "a request past its expiry is not decided"
+        );
+    }
+    assert!(store
+        .claim(&lapsed.request_id, ApprovalOutcome::Expired, "system")
+        .unwrap());
+}
 
 /// What every backend's identity operations must do alike.
 #[cfg(test)]

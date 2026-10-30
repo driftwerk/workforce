@@ -127,6 +127,18 @@ mod tests {
         parse_heartbeat_check(&check.id, &serialize_heartbeat_check(check).unwrap()).unwrap()
     }
 
+    /// A check with nowhere else to report reads, and signs, exactly as one
+    /// written before checks could, so its signature stays valid.
+    #[test]
+    fn an_unset_delivery_target_leaves_a_check_as_it_was() {
+        let signer = CheckSigner::from_key(b"master", "allan");
+        let mut stamped = check("Anything new?");
+        stamp_creator(Some(&signer), &mut stamped, Some(ALICE));
+        let file = serialize_heartbeat_check(&stamped).unwrap();
+        assert!(!file.contains("deliver_to"), "{file}");
+        assert!(signer.creator(&reloaded(&stamped)).is_some());
+    }
+
     #[test]
     fn a_stamped_check_verifies_after_a_round_trip_through_its_file() {
         let signer = CheckSigner::from_key(b"master", "allan");

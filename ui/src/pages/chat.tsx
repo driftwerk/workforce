@@ -17,7 +17,6 @@ export default function ChatPage() {
     connecting,
     agentId,
     messages,
-    welcomeText,
     isStreaming,
     isTyping,
     isCompacting,
@@ -120,7 +119,7 @@ export default function ChatPage() {
               <EmptyState
                 icon={Bot}
                 title={`Chat with ${agentName}`}
-                description={welcomeText ?? (agentId ? "Send a message to begin." : "Select an agent to begin.")}
+                description={agentId ? "Send a message to begin." : "Select an agent to begin."}
               />
             </div>
           </div>

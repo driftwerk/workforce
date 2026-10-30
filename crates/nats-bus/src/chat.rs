@@ -37,6 +37,10 @@ pub struct NatsChatRequest {
     /// that cannot gets such calls refused at once rather than left waiting.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub answers_approvals: bool,
+    /// The Desk turn this is, when it came from Desk: an instance that
+    /// predates it runs the turn as before, without its context.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desk: Option<workforce_core::desk::DeskTurnContext>,
 }
 
 /// A control message for a live turn, sent as a request on
@@ -47,8 +51,15 @@ pub enum TurnControl {
     /// Stop the turn. Acknowledged once the turn has settled and its claim is
     /// released.
     Cancel,
-    /// A follow-up message to absorb into the running turn.
-    FollowUp { text: String, user: String },
+    /// A follow-up message to absorb into the running turn. A follow-up
+    /// from Desk names its place, and is refused as busy by a turn asked in
+    /// another one.
+    FollowUp {
+        text: String,
+        user: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        place: Option<workforce_core::desk::DeskPlace>,
+    },
     /// An answer to one of the turn's approval prompts.
     Approval {
         request_id: String,
@@ -57,13 +68,23 @@ pub enum TurnControl {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         choice: Option<workforce_core::policy::PermissionChoice>,
     },
+    /// Put a snapshot of the live Desk turn into its own progress stream,
+    /// for a Desk that connected mid-turn.
+    Snapshot,
 }
 
 /// The owning instance's answer to a [`TurnControl`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TurnControlReply {
     pub applied: bool,
+    /// Why a control the turn is live for was not applied: `busy` for a
+    /// follow-up from another place than the turn's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refused: Option<String>,
 }
+
+/// [`TurnControlReply::refused`] for a follow-up the live turn will not take.
+pub const REFUSED_BUSY: &str = "busy";
 
 /// An attachment within a chat request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -153,6 +174,17 @@ pub enum ChatProgress {
     },
     /// An error occurred.
     Error { message: String },
+    /// The model call was rate-limited; the turn retries after a wait. Sent
+    /// for Desk turns only, as every variant below is.
+    RateLimited { wait_secs: u64, attempt: u32 },
+    /// The model was silent too long and the turn switches to the next one.
+    SlowModelFailover { model: String, elapsed_secs: u64 },
+    /// The live Desk turn as it stands.
+    Snapshot(workforce_core::desk::TurnSnapshot),
+    /// A file a tool delivered into the live Desk turn.
+    File(workforce_core::desk::DeskFile),
+    /// The Desk turn ended; its closing events have all gone out.
+    TurnEnd(workforce_core::desk::TurnEnd),
 }
 
 fn default_prompt_options() -> workforce_core::policy::PermissionPromptOptions {
@@ -171,6 +203,12 @@ mod tests {
             TurnControl::FollowUp {
                 text: "also check main".into(),
                 user: "u1".into(),
+                place: None,
+            },
+            TurnControl::FollowUp {
+                text: "and the thread".into(),
+                user: "u1".into(),
+                place: Some(workforce_core::desk::DeskPlace::Dm),
             },
             TurnControl::Approval {
                 request_id: "r1".into(),
@@ -178,6 +216,7 @@ mod tests {
                 user: "u1".into(),
                 choice: Some(PermissionChoice::AllowAlways),
             },
+            TurnControl::Snapshot,
         ]
         .into_iter()
         .for_each(|control| {
@@ -212,11 +251,103 @@ mod tests {
     }
 
     #[test]
+    fn a_desk_turn_s_snapshot_and_end_read_flat() {
+        let stamp = workforce_core::desk::TurnStamp {
+            turn_ref: Some("ref-1".into()),
+            reply_id: "reply-1".into(),
+        };
+        let snapshot = ChatProgress::Snapshot(workforce_core::desk::TurnSnapshot {
+            stamp,
+            since: "2026-10-29T09:00:00Z".parse().unwrap(),
+            status: workforce_core::desk::TurnPhase::Writing,
+            text: "Hel".into(),
+        });
+        let wire = serde_json::to_value(&snapshot).unwrap();
+        assert_eq!(
+            wire,
+            serde_json::json!({
+                "type": "snapshot", "turn_ref": "ref-1", "reply_id": "reply-1",
+                "since": "2026-10-29T09:00:00Z", "status": "writing", "text": "Hel",
+            })
+        );
+        assert!(matches!(
+            serde_json::from_value::<ChatProgress>(wire).unwrap(),
+            ChatProgress::Snapshot(_)
+        ));
+        let end = serde_json::to_value(ChatProgress::TurnEnd(workforce_core::desk::TurnEnd {
+            turn_ref: Some("ref-1".into()),
+            reply_id: None,
+        }))
+        .unwrap();
+        assert_eq!(
+            end,
+            serde_json::json!({"type": "turn_end", "turn_ref": "ref-1"})
+        );
+    }
+
+    #[test]
+    fn a_delivered_file_reads_flat() {
+        let delivered = workforce_core::desk::DeskFile {
+            artifact_id: "art_1".into(),
+            agent_id: "scout".into(),
+            filename: "chart.png".into(),
+            media_type: "image/png".into(),
+            size: 9,
+            width: Some(4),
+            height: Some(3),
+            caption: None,
+        };
+        let wire = serde_json::to_value(ChatProgress::File(delivered.clone())).unwrap();
+        assert_eq!(
+            wire,
+            serde_json::json!({
+                "type": "file", "artifact_id": "art_1", "agent_id": "scout",
+                "filename": "chart.png", "media_type": "image/png", "size": 9,
+                "width": 4, "height": 3,
+            })
+        );
+        assert!(matches!(
+            serde_json::from_value::<ChatProgress>(wire).unwrap(),
+            ChatProgress::File(read) if read == delivered
+        ));
+    }
+
+    #[test]
     fn chat_request_without_answers_approvals_defaults_to_unanswerable() {
         let request: NatsChatRequest = serde_json::from_value(serde_json::json!({
             "session_id": "s", "channel": "ios", "user": "u", "content": "hi"
         }))
         .unwrap();
         assert!(!request.answers_approvals);
+        assert!(request.desk.is_none());
+    }
+
+    #[test]
+    fn an_old_instance_s_follow_up_and_reply_still_read() {
+        let follow_up: TurnControl = serde_json::from_value(serde_json::json!({
+            "kind": "follow_up", "text": "hi", "user": "u1"
+        }))
+        .unwrap();
+        assert_eq!(
+            follow_up,
+            TurnControl::FollowUp {
+                text: "hi".into(),
+                user: "u1".into(),
+                place: None
+            }
+        );
+        let reply: TurnControlReply =
+            serde_json::from_value(serde_json::json!({"applied": true})).unwrap();
+        assert_eq!(
+            reply,
+            TurnControlReply {
+                applied: true,
+                refused: None
+            }
+        );
+        assert_eq!(
+            serde_json::to_value(&reply).unwrap(),
+            serde_json::json!({"applied": true})
+        );
     }
 }

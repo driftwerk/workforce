@@ -37,6 +37,7 @@ pub(super) async fn hub() -> Hub {
         channels: None,
         defs: None,
         artifacts: None,
+        pictures: None,
         external_skills: crate::external_skills::ExternalSkills::shared(&dir.path().join("skills")),
         data_dir: dir.path().to_path_buf(),
         runs: Runs::default(),

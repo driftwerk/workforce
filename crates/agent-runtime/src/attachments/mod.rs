@@ -442,6 +442,28 @@ async fn process_by_ref_attachment(
     }
 }
 
+/// Whether the artifact `descriptor` describes may be read as a file
+/// `sender` attached to a message in `session`: one uploaded (or downloaded
+/// from a channel) for a person, by that sender, or, when its uploader is
+/// unknown, into that very session.
+pub fn attached_by(
+    descriptor: &crate::artifacts::ArtifactDescriptor,
+    sender: Option<&str>,
+    session: Option<&str>,
+) -> Result<()> {
+    if !BYREF_ATTACHMENT_PRODUCERS.contains(&descriptor.producer.as_str()) {
+        return Err(eyre::eyre!("artifact is not an uploaded attachment"));
+    }
+    let same_user = descriptor.user_id.is_some() && descriptor.user_id.as_deref() == sender;
+    let same_session = descriptor.user_id.is_none()
+        && descriptor.session_id.is_some()
+        && descriptor.session_id.as_deref() == session;
+    match same_user || same_session {
+        true => Ok(()),
+        false => Err(eyre::eyre!("upload belongs to a different user")),
+    }
+}
+
 async fn materialize_by_ref(
     att: &SessionAttachment,
     artifact_id: &str,
@@ -462,22 +484,11 @@ async fn materialize_by_ref(
         .metadata(&agent_id, &id)?
         .ok_or_else(|| eyre::eyre!("upload not found or expired"))?;
 
-    if !BYREF_ATTACHMENT_PRODUCERS.contains(&descriptor.producer.as_str()) {
-        return Err(eyre::eyre!("artifact is not an uploaded attachment"));
-    }
-    // The uploader must be the sender of the message consuming it. A
-    // producer that couldn't resolve an identity is only accepted inside
-    // the exact session it was uploaded to.
-    let same_user = matches!(
-        (&descriptor.user_id, &staging.user_id),
-        (Some(owner), Some(current)) if owner == current
-    );
-    let same_session_fallback = descriptor.user_id.is_none()
-        && descriptor.session_id.is_some()
-        && descriptor.session_id == staging.id;
-    if !same_user && !same_session_fallback {
-        return Err(eyre::eyre!("upload belongs to a different user"));
-    }
+    attached_by(
+        &descriptor,
+        staging.user_id.as_deref(),
+        staging.id.as_deref(),
+    )?;
 
     // Spool next to the store when it lives on disk: same filesystem, so the
     // Fs copy is cheap — and never the OS temp dir first, which is tmpfs (RAM)

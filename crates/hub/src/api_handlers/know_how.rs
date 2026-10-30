@@ -163,6 +163,8 @@ mod tests {
                 agent_id: None,
                 channel: None,
                 rich: None,
+                desk: None,
+                accept: None,
             })
         };
         let status = |r: ApiResult| r.unwrap_err().into_response().status();
@@ -237,6 +239,8 @@ mod tests {
                 agent_id: None,
                 channel: None,
                 rich: None,
+                desk: None,
+                accept: None,
             })
         };
         let status = |r: ApiResult| r.unwrap_err().into_response().status();
@@ -288,6 +292,8 @@ mod tests {
                 agent_id: None,
                 channel: None,
                 rich: None,
+                desk: None,
+                accept: None,
             })
         };
         let listed = list_entries(

@@ -43,6 +43,17 @@ use crate::vault::Vault;
 /// The hub's one desk, once `[desk]` has started it.
 static DESK: OnceLock<Desk> = OnceLock::new();
 
+/// The hub's desk, when `[desk]` started one.
+pub(crate) fn desk() -> Option<&'static Desk> {
+    DESK.get()
+}
+
+/// Makes `desk` the hub's, as `[desk]` would; whether it was the first.
+#[cfg(test)]
+pub(crate) fn install_desk_for_test(desk: Desk) -> bool {
+    DESK.set(desk).is_ok()
+}
+
 /// Gives `service` the `desk.*` tools when desk sessions are on. Called for
 /// every agent at boot and for agents spawned later.
 pub fn register_tools(service: &AgentService) {
@@ -62,10 +73,10 @@ impl Authorize for SystemAdmins {
         &self,
         headers: &HeaderMap,
         query_token: Option<&str>,
-    ) -> Result<(), StatusCode> {
+    ) -> Result<Option<String>, StatusCode> {
         let caller = resolve_caller_context(&self.0, headers, query_token).await;
         match caller {
-            c if c.is_admin => Ok(()),
+            c if c.is_admin => Ok(c.identity_id),
             c if c.identity_id.is_some() || c.device_id.is_some() => Err(StatusCode::FORBIDDEN),
             _ => Err(StatusCode::UNAUTHORIZED),
         }
@@ -474,6 +485,12 @@ pub async fn mount(
     config: &WorkforceConfig,
     cancel: CancellationToken,
 ) -> Result<Router> {
+    let app = app.merge(crate::gateway::hardened(
+        crate::surface_allows::routes(Arc::clone(state)).merge(crate::desk_floor::router(
+            Arc::clone(state),
+            crate::desk_floor::Sources::installed(),
+        )),
+    ));
     if !config.desk.enabled {
         return Ok(app);
     }
@@ -486,7 +503,7 @@ pub async fn mount(
         .await
         .context("opening the desk registry")?;
     let cancel_crew = cancel.clone();
-    let desk = Desk::start(store, options(config), cancel)
+    let desk = Desk::start(store, options(config), crate::floor::desk_floor(), cancel)
         .await
         .context("starting desk sessions")?;
     if DESK.set(desk.clone()).is_err() {
@@ -516,9 +533,6 @@ pub async fn mount(
             },
             google_login: Arc::new(adc_file),
         }),
-        Arc::new(crate::desk_conversations::HubConversations(Arc::clone(
-            state,
-        ))),
         crew,
     )))
 }

@@ -928,6 +928,7 @@ mod tests {
             content: content.into(),
             tool_metadata: None,
             token_usage: None,
+            desk: None,
         }
     }
 

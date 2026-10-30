@@ -5,7 +5,7 @@
 use serde::{Deserialize, Serialize};
 
 /// A file or image attachment sent with a chat message.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Attachment {
     /// Original filename (e.g. "screenshot.png").
     pub filename: String,
@@ -20,6 +20,97 @@ pub struct Attachment {
     /// delivered, which the web UI fetches from the session file route.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifact_id: Option<String>,
+    /// Bytes, on a file a tool delivered to a client that declared what it
+    /// accepts (see [`MediaAccept`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
+    /// Pixels, for an image.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub width: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub height: Option<u32>,
+    /// Seconds, for audio and video.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration: Option<f64>,
+}
+
+/// The media types a `/ws` client shows, as it declares them at connect
+/// with `accept` (`/ws?accept=image/*,application/pdf,video/*`, or `*/*`
+/// for everything). A client that declares nothing is shown images only,
+/// each inline as it always was; a client that declares types gets the
+/// files of those types, each with its `artifact_id` (to download from
+/// `GET /api/agents/{agent}/attachments/{artifact_id}`) and what is known
+/// of its size.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MediaAccept {
+    /// Lower-cased `type/subtype` ranges; empty when nothing was declared.
+    ranges: Vec<String>,
+}
+
+impl MediaAccept {
+    /// The ranges named in a comma-separated `accept` value. Anything that
+    /// is not a `type/subtype` range is ignored, as is a `;q=` weight.
+    pub fn from_names(names: Option<&str>) -> Self {
+        let ranges = names
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(|r| r.split(';').next())
+            .map(|r| r.trim().to_ascii_lowercase())
+            .filter(|r| {
+                r.split_once('/')
+                    .is_some_and(|(t, s)| !t.is_empty() && !s.is_empty() && !s.contains('/'))
+            })
+            .collect();
+        Self { ranges }
+    }
+
+    /// Whether the client said what it shows.
+    pub fn declared(&self) -> bool {
+        !self.ranges.is_empty()
+    }
+
+    /// Whether a file of `media_type` is shown: one of the declared ranges
+    /// covers it, or, when none were declared, it is an image.
+    pub fn admits(&self, media_type: &str) -> bool {
+        let media_type = media_type
+            .split(';')
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+        let Some((kind, _)) = media_type.split_once('/') else {
+            return false;
+        };
+        if !self.declared() {
+            return kind == "image";
+        }
+        self.ranges.iter().any(|range| match range.split_once('/') {
+            Some(("*", "*")) => true,
+            Some((t, "*")) => t == kind,
+            _ => *range == media_type,
+        })
+    }
+
+    /// `attachments` as this client is sent them: only those it shows, and
+    /// for a client that declared nothing, each exactly as such clients
+    /// have always had it (inline, no `artifact_id`, nothing more). `None`
+    /// when none are left.
+    pub fn shape(&self, attachments: Vec<Attachment>) -> Option<Vec<Attachment>> {
+        let kept: Vec<Attachment> = attachments
+            .into_iter()
+            .filter(|a| self.admits(&a.mime_type))
+            .map(|a| match self.declared() {
+                true => a,
+                false => Attachment {
+                    filename: a.filename,
+                    mime_type: a.mime_type,
+                    data: a.data,
+                    ..Attachment::default()
+                },
+            })
+            .collect();
+        (!kept.is_empty()).then_some(kept)
+    }
 }
 
 /// Client → Server message format.
@@ -65,7 +156,19 @@ pub struct ClientMessage {
     /// self-serve approvals. Absent means such calls are refused at once.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub answers_approvals: Option<bool>,
+    /// On a Desk connection (`/ws?…&desk=1`): where in Desk this message was
+    /// asked, who asked, and the thread lines around it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desk: Option<workforce_core::desk::DeskTurn>,
+    /// The client's own id for the turn this message starts, at most
+    /// [`TURN_REF_MAX`] characters, echoed on every frame of the turn on a
+    /// Desk connection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_ref: Option<String>,
 }
+
+/// The longest `turn_ref` a client may send.
+pub const TURN_REF_MAX: usize = 64;
 
 impl ClientMessage {
     /// Create a chat message.
@@ -83,6 +186,8 @@ impl ClientMessage {
             request_id: None,
             choice: None,
             answers_approvals: None,
+            desk: None,
+            turn_ref: None,
         }
     }
 
@@ -106,6 +211,8 @@ impl ClientMessage {
             request_id: Some(request_id.to_string()),
             choice: Some(choice),
             answers_approvals: None,
+            desk: None,
+            turn_ref: None,
         }
     }
 
@@ -124,6 +231,8 @@ impl ClientMessage {
             request_id: None,
             choice: None,
             answers_approvals: None,
+            desk: None,
+            turn_ref: None,
         }
     }
 
@@ -150,6 +259,8 @@ impl ClientMessage {
             request_id: None,
             choice: None,
             answers_approvals: None,
+            desk: None,
+            turn_ref: None,
         }
     }
 
@@ -168,6 +279,8 @@ impl ClientMessage {
             request_id: None,
             choice: None,
             answers_approvals: None,
+            desk: None,
+            turn_ref: None,
         }
     }
 
@@ -186,6 +299,8 @@ impl ClientMessage {
             request_id: None,
             choice: None,
             answers_approvals: None,
+            desk: None,
+            turn_ref: None,
         }
     }
 
@@ -295,6 +410,23 @@ pub struct ServerMessage {
     /// `{"kind": "you"|"overseer"|"agent", "id", "name"}`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub author: Option<serde_json::Value>,
+    /// On a Desk connection's `connected`: what the hub offers it
+    /// (`desk.place`, …).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub features: Option<Vec<String>>,
+    /// On a Desk connection: the client's id for the turn a frame belongs
+    /// to, as it sent it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_ref: Option<String>,
+    /// On a `turn_snapshot`: what the live turn is doing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<workforce_core::desk::TurnPhase>,
+    /// On a `turn_snapshot`: when the turn began, RFC 3339.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since: Option<String>,
+    /// On a `turn_snapshot`: what the turn has streamed of its answer so far.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
 }
 
 fn default_speakable() -> bool {
@@ -427,6 +559,11 @@ impl ServerMessage {
             desk: None,
             id: None,
             author: None,
+            features: None,
+            turn_ref: None,
+            status: None,
+            since: None,
+            text: None,
         }
     }
 }
@@ -614,6 +751,25 @@ pub struct AgentInfo {
     pub owner_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_type: Option<String>,
+    /// The picture shown for the agent, when it has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub picture: Option<PictureInfo>,
+}
+
+/// The picture an agent or a person is shown with: one chosen for them,
+/// else their Slack picture. Its image is served at the owner's
+/// `…/picture` route; `version` changes whenever the image does.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PictureInfo {
+    pub version: String,
+    /// `chosen` or `slack`.
+    pub source: String,
+    /// When it was chosen, or fetched from Slack.
+    pub at: String,
+    /// The Slack workspace a Slack picture is held from, also while a
+    /// chosen one overrides it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slack: Option<String>,
 }
 
 /// Agents list response.
@@ -926,6 +1082,76 @@ pub struct LocalAgentRefused {
 mod tests {
     use super::*;
     use workforce_core::policy::{PermissionChoice, PermissionPromptOptions};
+
+    fn delivered(name: &str, mime: &str) -> Attachment {
+        Attachment {
+            filename: name.into(),
+            mime_type: mime.into(),
+            data: if mime.starts_with("image/") {
+                "aW1n".into()
+            } else {
+                String::new()
+            },
+            artifact_id: Some(format!("art_{name}")),
+            size: Some(3),
+            width: mime.starts_with("image/").then_some(2),
+            height: mime.starts_with("image/").then_some(1),
+            duration: None,
+        }
+    }
+
+    #[test]
+    fn a_client_that_declares_nothing_is_shown_images_as_it_always_was() {
+        let accept = MediaAccept::from_names(None);
+        assert!(!accept.declared());
+        let shown = accept
+            .shape(vec![
+                delivered("chart.png", "image/png"),
+                delivered("report.pdf", "application/pdf"),
+                delivered("clip.mp4", "video/mp4"),
+            ])
+            .unwrap();
+        assert_eq!(shown.len(), 1);
+        assert_eq!(
+            serde_json::to_value(&shown[0]).unwrap(),
+            serde_json::json!({"filename": "chart.png", "mime_type": "image/png", "data": "aW1n"}),
+            "byte for byte what such a client was sent before"
+        );
+        assert_eq!(
+            accept.shape(vec![delivered("report.pdf", "application/pdf")]),
+            None,
+            "nothing left to send"
+        );
+        assert_eq!(
+            MediaAccept::from_names(Some(" , nonsense")),
+            MediaAccept::default()
+        );
+    }
+
+    #[test]
+    fn a_client_is_shown_what_it_declared_with_its_reference_and_size() {
+        let pdf_and_video = MediaAccept::from_names(Some("application/PDF, video/*;q=0.5"));
+        assert!(pdf_and_video.admits("application/pdf"));
+        assert!(pdf_and_video.admits("video/webm"));
+        assert!(!pdf_and_video.admits("image/png"));
+        assert!(!pdf_and_video.admits("text/csv"));
+        let shown = pdf_and_video
+            .shape(vec![
+                delivered("chart.png", "image/png"),
+                delivered("report.pdf", "application/pdf"),
+            ])
+            .unwrap();
+        assert_eq!(shown, vec![delivered("report.pdf", "application/pdf")]);
+
+        let everything = MediaAccept::from_names(Some("*/*"));
+        assert!(everything.admits("application/vnd.ms-excel"));
+        assert!(!everything.admits("not a type"));
+        let shown = everything
+            .shape(vec![delivered("chart.png", "image/png")])
+            .unwrap();
+        assert_eq!(shown[0].artifact_id.as_deref(), Some("art_chart.png"));
+        assert_eq!((shown[0].width, shown[0].size), (Some(2), Some(3)));
+    }
 
     #[test]
     fn permission_prompt_constructor_carries_typed_payload() {

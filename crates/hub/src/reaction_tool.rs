@@ -10,10 +10,10 @@ use eyre::Result;
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 
-use workforce_agent::tools::{Tool, ToolResult};
+use workforce_agent::tools::{SurfaceEffect, Tool, ToolResult};
 use workforce_common::channels::{ChannelSurface, Reaction, SurfaceRegistry};
 use workforce_skills::adapters::messaging_routing::{
-    channel_hint_from_input, invalidate_if_channel_not_found, platform_arg,
+    channel_hint_from_input, invalidate_if_channel_not_found, platform_arg, writes,
 };
 
 async fn resolve(
@@ -90,6 +90,10 @@ impl Tool for ReactionTool {
         "reactions.add"
     }
 
+    fn surface_effect(&self, input: &serde_json::Value) -> Option<SurfaceEffect> {
+        Some(writes(input))
+    }
+
     fn description(&self) -> &str {
         "Add an emoji reaction to a message"
     }
@@ -159,6 +163,10 @@ impl ReactionRemoveTool {
 impl Tool for ReactionRemoveTool {
     fn name(&self) -> &str {
         "reactions.remove"
+    }
+
+    fn surface_effect(&self, input: &serde_json::Value) -> Option<SurfaceEffect> {
+        Some(writes(input))
     }
 
     fn description(&self) -> &str {

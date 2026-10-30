@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 
-use workforce_agent::runner::{PreExecutedTool, CURRENT_CHANNEL_ID, CURRENT_PREEXECUTE};
+use workforce_agent::runner::{with_desk, PreExecutedTool, CURRENT_CHANNEL_ID, CURRENT_PREEXECUTE};
 use workforce_common::channels::OutboundMessage;
 
 use super::store::{ApprovalOutcome, PendingApproval};
@@ -47,6 +47,22 @@ pub async fn launch_resume(
     let svc = &svc;
     let directive = directive_for(row, outcome, resolver_display);
     let channel_id = row.channel_id.clone().unwrap_or_default();
+    // A request made in a Desk conversation, or by a run made in one, is
+    // resumed answering to it, unattended.
+    let desk = svc
+        .sessions
+        .find(&row.session_key, &row.requester_id)
+        .ok()
+        .flatten()
+        .and_then(|session| {
+            session
+                .desk_origin()
+                .map(|target| workforce_common::channels::desk::DeskScope {
+                    target,
+                    owner: session.owner,
+                    attended: false,
+                })
+        });
 
     // Mirror the scheduler: scope the delivery channel so the resumed
     // turn loads the right per-user visibility, then (for approve) scope
@@ -57,17 +73,21 @@ pub async fn launch_resume(
                 tool_name: row.tool_name.clone(),
                 tool_input: row.tool_input.clone(),
             };
-            CURRENT_CHANNEL_ID
-                .scope(
+            with_desk(
+                desk,
+                CURRENT_CHANNEL_ID.scope(
                     channel_id.clone(),
                     CURRENT_PREEXECUTE.scope(pre, run_turn(svc, row, &directive)),
-                )
-                .await
+                ),
+            )
+            .await
         }
         ApprovalOutcome::Denied | ApprovalOutcome::Expired => {
-            CURRENT_CHANNEL_ID
-                .scope(channel_id.clone(), run_turn(svc, row, &directive))
-                .await
+            with_desk(
+                desk,
+                CURRENT_CHANNEL_ID.scope(channel_id.clone(), run_turn(svc, row, &directive)),
+            )
+            .await
         }
     };
 
@@ -110,28 +130,44 @@ async fn run_turn(
     .await
 }
 
+/// What every turn resumed on a decided approval is told first.
+pub(crate) const APPROVAL_DIRECTIVE: &str = "[Approval] ";
+
 fn directive_for(row: &PendingApproval, outcome: ApprovalOutcome, resolver: &str) -> String {
     let tool = &row.tool_name;
     match outcome {
         ApprovalOutcome::Approved => format!(
-            "[Approval] {resolver} approved your request to run `{tool}`; the action has been \
+            "{APPROVAL_DIRECTIVE}{resolver} approved your request to run `{tool}`; the action has been \
              carried out — its result is above. Continue from that result."
         ),
         ApprovalOutcome::Denied => format!(
-            "[Approval] {resolver} denied your request to run `{tool}`; do not perform it. \
+            "{APPROVAL_DIRECTIVE}{resolver} denied your request to run `{tool}`; do not perform it. \
              Inform the user and proceed accordingly."
         ),
         ApprovalOutcome::Expired => format!(
-            "[Approval] your request to run `{tool}` expired without approval and was not \
+            "{APPROVAL_DIRECTIVE}your request to run `{tool}` expired without approval and was not \
              carried out. Inform the user and pick another path if appropriate."
         ),
     }
 }
 
-/// Deliver the resumed turn's final text to the original conversation,
-/// mirroring the scheduler's surface fan-out.
+/// Deliver the resumed turn's final text to the original conversation:
+/// its Slack thread, mirroring the scheduler's surface fan-out, else the
+/// Desk conversation it answers to.
 async fn deliver(svc: &Arc<AgentService>, row: &PendingApproval, response: &str) {
     let Some(channel) = row.channel_id.clone().filter(|c| !c.is_empty()) else {
+        let session = svc
+            .sessions
+            .find(&row.session_key, &row.requester_id)
+            .ok()
+            .flatten();
+        if let Some(session) = session {
+            if let Err(e) =
+                crate::desk_surface::resumed(svc, &session, &row.requester_id, response).await
+            {
+                tracing::warn!(error = %e, request = %row.request_id, "failed to deliver approval-resume response to Desk");
+            }
+        }
         return;
     };
     let registry = svc.surface_registry.read().await;

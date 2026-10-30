@@ -232,7 +232,22 @@ pub fn sniff_mime(bytes: &[u8]) -> Option<&'static str> {
         [b'G', b'I', b'F', b'8', ..] => Some("image/gif"),
         [b'%', b'P', b'D', b'F', ..] => Some("application/pdf"),
         [b'R', b'I', b'F', b'F', _, _, _, _, b'W', b'E', b'B', b'P', ..] => Some("image/webp"),
+        [b'R', b'I', b'F', b'F', _, _, _, _, b'W', b'A', b'V', b'E', ..] => Some("audio/wav"),
         [0x50, 0x4B, 0x03, 0x04, ..] => Some("application/zip"),
+        [_, _, _, _, b'f', b't', b'y', b'p', brand @ ..] if brand.len() >= 4 => {
+            Some(match &brand[..4] {
+                b"qt  " => "video/quicktime",
+                b"M4A " | b"M4B " => "audio/mp4",
+                b"heic" | b"heix" | b"mif1" => "image/heic",
+                b"avif" => "image/avif",
+                _ => "video/mp4",
+            })
+        }
+        [0x1A, 0x45, 0xDF, 0xA3, ..] => Some("video/webm"),
+        [b'O', b'g', b'g', b'S', ..] => Some("audio/ogg"),
+        [b'f', b'L', b'a', b'C', ..] => Some("audio/flac"),
+        [b'I', b'D', b'3', ..] => Some("audio/mpeg"),
+        [0xFF, b, ..] if b & 0xE0 == 0xE0 && b & 0x06 != 0 => Some("audio/mpeg"),
         _ => None,
     }
 }
@@ -242,14 +257,24 @@ pub fn sniff_mime(bytes: &[u8]) -> Option<&'static str> {
 pub fn extension_for_mime(mime: &str) -> &'static str {
     match mime {
         "image/png" => "png",
-        "image/jpeg" => "jpg",
+        "image/jpeg" | "image/jpg" => "jpg",
         "image/gif" => "gif",
         "image/webp" => "webp",
+        "image/heic" => "heic",
+        "image/avif" => "avif",
         "application/pdf" => "pdf",
         "application/zip" => "zip",
         "text/csv" => "csv",
         "application/json" => "json",
         "text/plain" => "txt",
+        "video/mp4" => "mp4",
+        "video/quicktime" => "mov",
+        "video/webm" => "webm",
+        "audio/mpeg" | "audio/mp3" => "mp3",
+        "audio/wav" | "audio/x-wav" => "wav",
+        "audio/mp4" => "m4a",
+        "audio/ogg" | "audio/opus" => "ogg",
+        "audio/flac" => "flac",
         _ => "bin",
     }
 }
@@ -540,6 +565,17 @@ mod tests {
         assert_eq!(sniff_mime(b"%PDF-1.7"), Some("application/pdf"));
         assert_eq!(sniff_mime(b"RIFF\0\0\0\0WEBPxx"), Some("image/webp"));
         assert_eq!(sniff_mime(b"PK\x03\x04rest"), Some("application/zip"));
+        assert_eq!(sniff_mime(b"\0\0\0\x20ftypisom\0\0"), Some("video/mp4"));
+        assert_eq!(
+            sniff_mime(b"\0\0\0\x14ftypqt  \0\0"),
+            Some("video/quicktime")
+        );
+        assert_eq!(sniff_mime(b"\0\0\0\x20ftypM4A \0\0"), Some("audio/mp4"));
+        assert_eq!(sniff_mime(b"\x1A\x45\xDF\xA3xx"), Some("video/webm"));
+        assert_eq!(sniff_mime(b"ID3\x04"), Some("audio/mpeg"));
+        assert_eq!(sniff_mime(b"\xFF\xFBxx"), Some("audio/mpeg"));
+        assert_eq!(sniff_mime(b"RIFF\0\0\0\0WAVEfmt "), Some("audio/wav"));
+        assert_eq!(sniff_mime(b"OggS\0"), Some("audio/ogg"));
         assert_eq!(sniff_mime(b"plain text"), None);
         assert_eq!(sniff_mime(b""), None);
     }
@@ -551,6 +587,8 @@ mod tests {
         assert_eq!(extension_for_mime("text/csv"), "csv");
         assert_eq!(extension_for_mime("application/octet-stream"), "bin");
         assert_eq!(extension_for_mime("who/knows"), "bin");
+        assert_eq!(extension_for_mime("video/quicktime"), "mov");
+        assert_eq!(extension_for_mime("audio/mpeg"), "mp3");
     }
 
     // ---- coerce_to_id_string ----

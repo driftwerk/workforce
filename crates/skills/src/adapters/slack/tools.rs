@@ -8,7 +8,7 @@ use eyre::Result;
 use serde::Deserialize;
 use tracing::{info, warn};
 
-use workforce_agent::tools::{Tool, ToolResult};
+use workforce_agent::tools::{SurfaceEffect, Tool, ToolResult};
 use workforce_common::channels::{ChannelSurface, OutboundMessage, Reaction};
 use workforce_common::emoji;
 
@@ -211,6 +211,10 @@ impl Tool for SlackReadTool {
         "slack.read"
     }
 
+    fn surface_effect(&self, _input: &serde_json::Value) -> Option<SurfaceEffect> {
+        Some(SurfaceEffect::Reads)
+    }
+
     fn description(&self) -> &str {
         "Read messages from a Slack channel, newest first. Without `oldest`/`latest` this returns \
          one page of recent messages (max 100). Set `oldest` (a Slack ts) to walk back through \
@@ -332,6 +336,10 @@ impl SlackChannelInfoTool {
 impl Tool for SlackChannelInfoTool {
     fn name(&self) -> &str {
         "slack.channel_info"
+    }
+
+    fn surface_effect(&self, _input: &serde_json::Value) -> Option<SurfaceEffect> {
+        Some(SurfaceEffect::Reads)
     }
 
     fn description(&self) -> &str {
@@ -530,6 +538,10 @@ impl Tool for SlackListChannelsTool {
     fn name(&self) -> &str {
         "slack.list_channels"
     }
+
+    fn surface_effect(&self, _input: &serde_json::Value) -> Option<SurfaceEffect> {
+        Some(SurfaceEffect::Reads)
+    }
     fn description(&self) -> &str {
         "List channels in the Slack workspace. Returns id, name, topic, purpose, member count, and archive/private/is_member flags. Use this to discover channel IDs before reading or sending. Optional `filter` is a case-insensitive substring matched against name/topic/purpose. `types` accepts a Slack-native CSV (default: public_channel,private_channel)."
     }
@@ -613,6 +625,10 @@ impl Tool for SlackListUsersTool {
     fn name(&self) -> &str {
         "slack.list_users"
     }
+
+    fn surface_effect(&self, _input: &serde_json::Value) -> Option<SurfaceEffect> {
+        Some(SurfaceEffect::Reads)
+    }
     fn description(&self) -> &str {
         "Find users in the Slack workspace by name or email. Returns id, name, real name, email (when the bot has users:read.email scope), bot/deleted flags. \
          When `filter` (substring match on name/real_name/display_name/email) or `email` (substring on email) is set, this walks pagination on your behalf — up to 25 pages / 50 matches — so a one-shot call is enough. \
@@ -687,6 +703,10 @@ impl Tool for SlackLookupUserByEmailTool {
     fn name(&self) -> &str {
         "slack.lookup_user_by_email"
     }
+
+    fn surface_effect(&self, _input: &serde_json::Value) -> Option<SurfaceEffect> {
+        Some(SurfaceEffect::Reads)
+    }
     fn description(&self) -> &str {
         "Look up a single Slack user by exact email address. Cheaper than draining slack.list_users when you already have the email. Requires the users:read.email scope on the bot token."
     }
@@ -735,6 +755,10 @@ impl SlackListChannelMembersTool {
 impl Tool for SlackListChannelMembersTool {
     fn name(&self) -> &str {
         "slack.list_channel_members"
+    }
+
+    fn surface_effect(&self, _input: &serde_json::Value) -> Option<SurfaceEffect> {
+        Some(SurfaceEffect::Reads)
     }
     fn description(&self) -> &str {
         "List the user IDs of all members in a Slack channel. Paginated; pass cursor for next page. Returns just IDs — call slack.user_info or slack.list_users to resolve names."
@@ -799,6 +823,10 @@ impl SlackListUserConversationsTool {
 impl Tool for SlackListUserConversationsTool {
     fn name(&self) -> &str {
         "slack.list_user_conversations"
+    }
+
+    fn surface_effect(&self, _input: &serde_json::Value) -> Option<SurfaceEffect> {
+        Some(SurfaceEffect::Reads)
     }
     fn description(&self) -> &str {
         "List channels a given user is a member of. Useful for 'what channels is X in?'. Paginated."
@@ -875,6 +903,10 @@ impl Tool for SlackSearchMessagesTool {
     fn name(&self) -> &str {
         "slack.search_messages"
     }
+
+    fn surface_effect(&self, _input: &serde_json::Value) -> Option<SurfaceEffect> {
+        Some(SurfaceEffect::Reads)
+    }
     fn description(&self) -> &str {
         "Search messages across the Slack workspace using Slack's query syntax (e.g. 'incident after:2026-05-01 in:#ops from:@allan'). Requires a per-user xoxp-… token with the search:read scope and a paid Slack plan. Each caller authenticates with their OWN Slack identity — register via slack.user_token_set workspace_id=… user_token=… before searching."
     }
@@ -936,6 +968,10 @@ impl SlackGetMessageRepliesTool {
 impl Tool for SlackGetMessageRepliesTool {
     fn name(&self) -> &str {
         "slack.get_message_replies"
+    }
+
+    fn surface_effect(&self, _input: &serde_json::Value) -> Option<SurfaceEffect> {
+        Some(SurfaceEffect::Reads)
     }
     fn description(&self) -> &str {
         "Fetch the replies in a Slack thread. `ts` is the parent message timestamp. Returns parent + replies in order; paginated for long threads."
@@ -999,6 +1035,10 @@ impl SlackUserInfoTool {
 impl Tool for SlackUserInfoTool {
     fn name(&self) -> &str {
         "slack.user_info"
+    }
+
+    fn surface_effect(&self, _input: &serde_json::Value) -> Option<SurfaceEffect> {
+        Some(SurfaceEffect::Reads)
     }
     fn description(&self) -> &str {
         "Fetch full details for a single user ID. Mirrors slack.channel_info but for users."
@@ -1694,6 +1734,10 @@ impl SlackListFilesTool {
 impl Tool for SlackListFilesTool {
     fn name(&self) -> &str {
         "slack.list_files"
+    }
+
+    fn surface_effect(&self, _input: &serde_json::Value) -> Option<SurfaceEffect> {
+        Some(SurfaceEffect::Reads)
     }
     fn description(&self) -> &str {
         "List files visible to the bot, optionally filtered by channel, user, or file type (Slack CSV like 'images,pdfs')."

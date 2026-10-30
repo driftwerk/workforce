@@ -578,6 +578,7 @@ impl ChatTool {
                 Some(self.trust_for(&uid)),
                 Some(cancel.clone()),
                 None,
+                None,
             )
             .await
             .map_err(|e| ToolResult::failure(format!("could not start the turn: {e:#}"), 0))?;
@@ -1291,6 +1292,7 @@ pub(super) mod tests {
             attachments: None,
             trust_level: None,
             actor: None,
+            desk: None,
         };
         let messages = [
             msg(MessageRole::System, "prompt"),

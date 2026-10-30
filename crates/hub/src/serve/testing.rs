@@ -205,3 +205,70 @@ pub(crate) async fn answer_bearer(server: &wiremock::MockServer, access: &str) {
         .mount(server)
         .await;
 }
+
+/// A Slack surface that records every message sent through it, as
+/// `(channel, thread, text)`.
+#[derive(Default)]
+pub(crate) struct SentToSlack(parking_lot::Mutex<Vec<(String, Option<String>, String)>>);
+
+impl SentToSlack {
+    /// What was sent, in order.
+    pub(crate) fn sent(&self) -> Vec<(String, Option<String>, String)> {
+        self.0.lock().clone()
+    }
+
+    /// Register a fresh one as `service`'s Slack surface.
+    pub(crate) async fn on(service: &AgentService) -> Arc<Self> {
+        let surface = Arc::new(Self::default());
+        service.surface_registry.write().await.register(
+            workforce_common::channels::SurfaceKey::platform("slack"),
+            Arc::clone(&surface) as Arc<dyn workforce_common::channels::ChannelSurface>,
+        );
+        surface
+    }
+}
+
+#[async_trait::async_trait]
+impl workforce_common::channels::ChannelSurface for SentToSlack {
+    fn platform(&self) -> &str {
+        "slack"
+    }
+
+    fn capabilities(&self) -> workforce_common::channels::ChannelCapabilities {
+        workforce_common::channels::ChannelCapabilities {
+            send_message: true,
+            threads: true,
+            ..Default::default()
+        }
+    }
+
+    async fn add_reaction(&self, _: &workforce_common::channels::Reaction) -> eyre::Result<()> {
+        Ok(())
+    }
+
+    async fn remove_reaction(&self, _: &workforce_common::channels::Reaction) -> eyre::Result<()> {
+        Ok(())
+    }
+
+    async fn open_conversation(&self, user_id: &str) -> eyre::Result<String> {
+        Ok(format!("D-{user_id}"))
+    }
+
+    async fn send_message(
+        &self,
+        message: &workforce_common::channels::OutboundMessage,
+    ) -> eyre::Result<workforce_common::channels::SentMessage> {
+        let mut sent = self.0.lock();
+        sent.push((
+            message.channel.clone(),
+            message.thread_id.clone(),
+            message.text.clone(),
+        ));
+        Ok(workforce_common::channels::SentMessage {
+            channel: message.channel.clone(),
+            message_id: format!("{}.{}", sent.len(), 0),
+            thread_id: message.thread_id.clone(),
+            platform: "slack".into(),
+        })
+    }
+}

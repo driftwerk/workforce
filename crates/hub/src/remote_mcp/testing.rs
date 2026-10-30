@@ -90,6 +90,7 @@ pub(crate) fn fixture_with(enabled: bool, bind_tokens: bool) -> Fixture {
         external_skills,
         #[cfg(feature = "oidc")]
         oidc_provider: None,
+        pictures: None,
     });
     Fixture {
         state,

@@ -231,12 +231,32 @@ impl HubSkillToolInvoker {
             }
         }
 
-        let policy_response = self.policy.evaluate(&PolicyRequest {
-            agent_id: AgentId::new(&ctx.agent_id),
-            tool_name: tool.to_string(),
-            parameters: args.clone(),
-            context: PolicyContext::empty(),
-        });
+        // A write a skill makes outside the Desk conversation a person is in
+        // needs their say, as the model's own call would: a destination they
+        // always allow passes, and otherwise, as a skill cannot ask, it is
+        // refused like any call that needs an approval.
+        let effect =
+            workforce_agent::tools::dispatch::surface_effect_of(&self.registry, tool, args);
+        let policy_response = workforce_agent::tools::dispatch::apply_surface_gate(
+            self.policy.evaluate(&PolicyRequest {
+                agent_id: AgentId::new(&ctx.agent_id),
+                tool_name: tool.to_string(),
+                parameters: args.clone(),
+                context: PolicyContext::empty(),
+            }),
+            effect.as_ref(),
+            workforce_agent::runner::current_desk().as_ref(),
+            args,
+            || {
+                workforce_agent::tools::dispatch::kept(
+                    crate::desk_surface::allows().as_deref(),
+                    ctx.user_id.as_deref(),
+                    &ctx.agent_id,
+                    tool,
+                    effect.as_ref().and_then(|e| e.destination()).as_ref(),
+                )
+            },
+        );
         match policy_response.decision {
             PolicyDecision::Allow => {}
             PolicyDecision::Deny { reason } => {
@@ -511,6 +531,57 @@ mod tests {
         async fn execute(&self, input: Value) -> eyre::Result<ToolResult> {
             Ok(ToolResult::success(input, 1))
         }
+    }
+
+    #[derive(Debug)]
+    struct SlackPost;
+
+    #[async_trait]
+    impl Tool for SlackPost {
+        fn name(&self) -> &str {
+            "slack.send"
+        }
+        fn description(&self) -> &str {
+            "post"
+        }
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn execute(&self, input: Value) -> eyre::Result<ToolResult> {
+            Ok(ToolResult::success(input, 1))
+        }
+    }
+
+    /// A skill posting to Slack from a Desk turn needs the person's say,
+    /// which a skill cannot ask for, so it is refused; from anywhere else it
+    /// posts as before.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_skill_s_slack_post_from_a_desk_turn_is_refused_and_elsewhere_runs() {
+        use workforce_common::channels::desk::{DeskPlace, DeskScope, DeskTarget};
+        let registry = Arc::new(ToolRegistry::new());
+        registry.register(Arc::new(SlackPost));
+        let invoker = Arc::new(invoker_with(registry));
+        let args = serde_json::json!({"channel": "C1", "text": "hi"});
+        let desk = DeskScope {
+            target: DeskTarget::of_turn(&DeskPlace::Dm, "desk", None, false),
+            attended: true,
+            owner: "person-1".into(),
+        };
+        let (on_desk, elsewhere) = {
+            let invoker = Arc::clone(&invoker);
+            tokio::task::spawn_blocking(move || {
+                let permission = permission("slack.send", &[]);
+                let on_desk = workforce_agent::runner::CURRENT_DESK
+                    .sync_scope(Some(desk), || invoker.invoke(&ctx(), &permission, &args));
+                let elsewhere = invoker.invoke(&ctx(), &permission, &args);
+                (on_desk, elsewhere)
+            })
+            .await
+            .unwrap()
+        };
+        let refused = on_desk.unwrap_err();
+        assert!(refused.contains("which a skill cannot"), "{refused}");
+        assert!(elsewhere.is_ok(), "{elsewhere:?}");
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -28,6 +28,7 @@ pub(crate) mod grounding;
 pub(crate) mod prompt;
 pub(crate) mod recall;
 pub(crate) mod records;
+pub(crate) mod surface;
 #[cfg(test)]
 mod tests;
 pub(crate) mod tools;
@@ -49,6 +50,8 @@ pub(crate) use recall::{
     apply_recall_recency_boost, dedupe_recall_keep_best, fuse_recall_query,
     recall_injection_suppressed, stash_injected_lessons,
 };
+#[cfg(test)]
+pub(crate) use records::carry_delivered_files;
 pub(crate) use records::{
     add_redacted_assistant_message, begin_turn_record, observe_replay_prefix,
     observe_system_prefix, origin_default_max_rounds, record_task_telemetry_from_result,
@@ -119,6 +122,7 @@ pub(crate) struct StreamedTurn<'a> {
     trust_level: Option<workforce_common::trust::TrustLevel>,
     cancel_token: tokio_util::sync::CancellationToken,
     voice_channel: Option<&'a str>,
+    desk: Option<&'a workforce_common::channels::desk::DeskTurnContext>,
 }
 
 /// The hub's turn loop, as [`TurnHost`].
@@ -190,6 +194,7 @@ impl TurnHost for TurnLoop {
         trust_level: Option<workforce_common::trust::TrustLevel>,
         cancel_token: Option<tokio_util::sync::CancellationToken>,
         voice_channel: Option<&str>,
+        desk: Option<&workforce_common::channels::desk::DeskTurnContext>,
     ) -> Result<MessageProgress> {
         process_message_with_progress(
             service,
@@ -216,6 +221,7 @@ impl TurnHost for TurnLoop {
             trust_level,
             cancel_token,
             voice_channel,
+            desk,
         )
         .await
     }
@@ -809,8 +815,9 @@ pub(crate) fn save_notice_turn(
     archive_base: usize,
     user: &str,
     notice: &str,
+    desk: Option<&workforce_common::channels::desk::DeskTurnContext>,
 ) -> Result<()> {
-    add_redacted_assistant_message(session, notice);
+    add_redacted_assistant_message(session, notice, desk);
     if session.is_shared_conversation() {
         session.attribute_messages_from(archive_base, user);
     }
@@ -3128,6 +3135,11 @@ pub(crate) async fn process_admitted(
     if session.context_type.is_none() {
         session.context_type = Some(classify_context_type(channel_id, thread_id));
     }
+    // A run made in a Desk conversation remembers it on the session it runs
+    // in, so its approvals' resumes answer there.
+    if let Some(scope) = workforce_agent::runner::current_desk() {
+        session.set_desk_origin(&scope.target);
+    }
 
     // Build augmented message with channel context and welcome directive.
     // The original message is stored in the session; augmentation only affects the LLM.
@@ -3136,18 +3148,14 @@ pub(crate) async fn process_admitted(
 
     // Inject messaging context so the agent knows channel and thread for tool calls
     let current_session_id = session.id.clone();
-    if let Some(cid) = channel_id {
-        let thread_info = thread_id
-            .map(|t| format!("\nthread_id: {}", t))
-            .unwrap_or_default();
-        effective_message = format!(
-            "[MESSAGING CONTEXT — use these values when calling messaging tools]\n\
-             channel: {}\n\
-             session_channel: {}{}\n\
-             session_id: {}\n\
-             user: {}\n\n{}",
-            cid, channel, thread_info, current_session_id, user, effective_message
-        );
+    if let Some(block) = surface::surface_context(
+        &surface::TurnSurface::of(channel_id, thread_id, None),
+        channel,
+        &current_session_id,
+        user,
+        None,
+    ) {
+        effective_message = format!("{block}\n\n{effective_message}");
     }
 
     // Prepend channel-specific system prompt if configured
@@ -3333,6 +3341,7 @@ pub(crate) async fn process_admitted(
         trace_writer: service.trace_writer.clone(),
         trace_tags: trace_tags(service, channel, Some(message), None),
         permission_writer: service.permission_writer.read().clone(),
+        surface_allows: crate::desk_surface::allows(),
         permission_gate: service.permission_gate.read().clone(),
         arguments: service.config.tools.validation.mode,
         tool_loading: service.tool_loading(),
@@ -3417,6 +3426,7 @@ pub(crate) async fn process_admitted(
                         attachments: None,
                         trust_level: None,
                         actor: None,
+                        desk: None,
                     });
                 session.total_tokens = session.estimated_total_tokens() as u64;
 
@@ -3552,7 +3562,7 @@ pub(crate) async fn process_admitted(
     let (mut result, route) = match outcome {
         crate::agent_turn::ChainOutcome::Served { result, route } => (*result, route),
         crate::agent_turn::ChainOutcome::Notice { text } => {
-            save_notice_turn(service, &mut session, archive_base, user, &text)?;
+            save_notice_turn(service, &mut session, archive_base, user, &text, None)?;
             turn_journal.clear();
             return Ok(TurnOutcome::Answered(text));
         }
@@ -3614,7 +3624,7 @@ pub(crate) async fn process_admitted(
         tracing::info!(target: "claim_grounding", agent = %service.agent_id, "skipped: spoken turn — review footers are never spoken");
     }
 
-    let telemetry_provider = settle_served(&mut session, &result, route, reserved);
+    let telemetry_provider = settle_served(&mut session, &result, route, reserved, None);
 
     // Record cost in the cost tracker — use the actual model from the run
     // (may differ from resolved_model if failover occurred)
@@ -3918,6 +3928,7 @@ pub(crate) async fn run_isolated(
             Some(task_label.unwrap_or("subagent")),
         ),
         permission_writer: service.permission_writer.read().clone(),
+        surface_allows: crate::desk_surface::allows(),
         permission_gate: service.permission_gate.read().clone(),
         arguments: service.config.tools.validation.mode,
         tool_loading: service.tool_loading(),
@@ -4086,7 +4097,7 @@ pub(crate) async fn run_isolated(
     }
 
     // Save response (secrets masked at rest)
-    add_redacted_assistant_message(&mut session, &result.response);
+    add_redacted_assistant_message(&mut session, &result.response, None);
     service.sessions.save(&session)?;
 
     // Record cost for sub-agent run — use actual model after failover.
@@ -4291,6 +4302,7 @@ pub(crate) async fn process_message_with_progress(
     trust_level: Option<workforce_common::trust::TrustLevel>,
     cancel_token: Option<tokio_util::sync::CancellationToken>,
     voice_channel: Option<&str>,
+    desk: Option<&workforce_common::channels::desk::DeskTurnContext>,
 ) -> Result<MessageProgress> {
     // One token per run, end-to-end: a caller that claimed the runner slot
     // before setup passes its token so stop/hard-stop reaches the runner
@@ -4434,6 +4446,7 @@ pub(crate) async fn process_message_with_progress(
             trust_level,
             cancel_token,
             voice_channel,
+            desk,
         },
     )))
     .await
@@ -4469,6 +4482,7 @@ pub(crate) async fn stream_admitted(
         trust_level,
         cancel_token,
         voice_channel,
+        desk,
     } = turn;
     let (inject_rx, self_serve) = inbox.map_or((None, Default::default()), |inbox| {
         (Some(inbox.rx), inbox.self_serve)
@@ -4535,19 +4549,25 @@ pub(crate) async fn stream_admitted(
     let is_new_session = session.messages.is_empty();
     let mut effective_message = message.to_string();
 
-    // Inject messaging context so the agent knows channel and thread for tool calls
-    if let Some(cid) = channel_id {
-        let thread_info = thread_id
-            .map(|t| format!("\nthread_id: {}", t))
-            .unwrap_or_default();
-        effective_message = format!(
-            "[MESSAGING CONTEXT — use these values when calling messaging tools]\n\
-             channel: {}\n\
-             session_channel: {}{}\n\
-             session_id: {}\n\
-             user: {}\n\n{}",
-            cid, channel, thread_info, current_session_id, user, effective_message
-        );
+    // Inject messaging context so the agent knows where it is for tool calls:
+    // the Slack channel and thread, or the Desk conversation and speaker.
+    let person = desk.and_then(|_| {
+        crate::desk_surface::person_name(service.identity_store.read().as_ref(), principal)
+    });
+    if let Some(block) = surface::surface_context(
+        &surface::TurnSurface::of(channel_id, thread_id, desk),
+        channel,
+        &current_session_id,
+        user,
+        person.as_deref(),
+    ) {
+        effective_message = format!("{block}\n\n{effective_message}");
+    }
+    if let Some(target) = desk
+        .map(|desk| desk.target.clone())
+        .or_else(|| workforce_agent::runner::current_desk().map(|scope| scope.target))
+    {
+        session.set_desk_origin(&target);
     }
 
     // Prepend channel-specific system prompt if configured
@@ -4693,12 +4713,16 @@ pub(crate) async fn stream_admitted(
     let archive_base = session.messages.len();
 
     let store_content = display_content.unwrap_or(message);
+    let room_message = desk.and_then(|d| d.turn.message).map(|id| id.to_string());
     session.add_user_message_with_trust(
         store_content,
-        external_id,
+        external_id.or(room_message.as_deref()),
         attachments.clone(),
         trust_level,
     );
+    if let (Some(desk), Some(asked)) = (desk, session.messages.last_mut()) {
+        asked.desk = Some(desk.turn.mark());
+    }
     // The message this turn answers, for the resume sweep.
     let turn_message_id = session.messages.get(archive_base).map(|m| m.id.clone());
 
@@ -4781,6 +4805,7 @@ pub(crate) async fn stream_admitted(
         trace_writer: service.trace_writer.clone(),
         trace_tags: trace_tags(service, channel, Some(message), None),
         permission_writer: service.permission_writer.read().clone(),
+        surface_allows: crate::desk_surface::allows(),
         permission_gate: service.permission_gate.read().clone(),
         arguments: service.config.tools.validation.mode,
         tool_loading: service.tool_loading(),
@@ -5039,6 +5064,14 @@ pub(crate) async fn stream_admitted(
     let active_skill_instances_for_task = env_scope_for_task.skill_instances;
     let active_mcp_envs_for_task = env_scope_for_task.mcp_envs;
     let voice_channel_for_task = voice_channel.unwrap_or("").to_string();
+    let desk_for_task = desk.cloned();
+    let desk_scope_for_task = desk
+        .map(|d| workforce_common::channels::desk::DeskScope {
+            target: d.target.clone(),
+            owner: session.owner.clone(),
+            attended: true,
+        })
+        .or_else(workforce_agent::runner::current_desk);
     let origin_for_task = Origin::of_turn(user, channel, session.is_voice_turn());
     let precurated_for_task = turn_tools.exclusive;
     let principal_for_task = principal.to_string();
@@ -5046,7 +5079,7 @@ pub(crate) async fn stream_admitted(
     let turn_served = ServedLog::default();
     let served = turn_served.clone();
     let turn_claim_id = turn_claim.claim_id().to_string();
-    let handle = tokio::spawn(CURRENT_BILLING_IDENTITY.scope(
+    let handle = tokio::spawn(workforce_agent::runner::with_desk(desk_scope_for_task, CURRENT_BILLING_IDENTITY.scope(
         billing_identity_for_task.unwrap_or_default(),
         CURRENT_VOICE_CHANNEL.scope(
         voice_channel_for_task,
@@ -5165,7 +5198,7 @@ pub(crate) async fn stream_admitted(
                 let (mut result, route) = match outcome {
                     crate::agent_turn::ChainOutcome::Served { result, route } => (*result, route),
                     crate::agent_turn::ChainOutcome::Notice { text } => {
-                        let saved = save_notice_turn(&me, &mut session, archive_base_for_task, &user_id_for_attr, &text);
+                        let saved = save_notice_turn(&me, &mut session, archive_base_for_task, &user_id_for_attr, &text, desk_for_task.as_ref());
                         turn_journal.clear();
                         end_turn_record(&sessions, &session.id, &turn_token_for_task);
                         saved?;
@@ -5284,7 +5317,7 @@ pub(crate) async fn stream_admitted(
                         trust_level,
                     );
                 }
-                let telemetry_provider = settle_served(&mut session, &result, route, reserved)
+                let telemetry_provider = settle_served(&mut session, &result, route, reserved, desk_for_task.as_ref())
                     .map_or(telemetry_provider, str::to_string);
                 // Attribute this turn's tool messages to the asker so a shared
                 // session's later replay drops them for every other speaker.
@@ -5512,7 +5545,7 @@ pub(crate) async fn stream_admitted(
     ),
     ),
     ),
-    ));
+    )));
 
     Ok(MessageProgress {
         progress_rx,

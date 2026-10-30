@@ -280,18 +280,11 @@ pub trait Compose {
         config_path: Option<PathBuf>,
     ) -> Result<(Arc<Self>, Arc<Scheduler>)>;
 
-    /// Build with scheduler AND a delivery callback for pushing results to clients.
-    async fn from_config_with_scheduler_and_delivery(
+    /// Build the hub's default agent with a scheduler, on the hub's global
+    /// vault and subscriptions.
+    async fn from_config_for_hub(
         config: WorkforceConfig,
         config_path: Option<PathBuf>,
-        delivery: crate::scheduler::DeliveryCallback,
-    ) -> Result<(Arc<Self>, Arc<Scheduler>)>;
-
-    /// Build with scheduler, delivery callback, and reaction service.
-    async fn from_config_with_scheduler_delivery_and_reactions(
-        config: WorkforceConfig,
-        config_path: Option<PathBuf>,
-        delivery: crate::scheduler::DeliveryCallback,
         global_vault: Option<Arc<Vault>>,
         start_root_indexing: bool,
         subscriptions: crate::subscription::Subscriptions,
@@ -307,7 +300,6 @@ pub trait Compose {
         config: WorkforceConfig,
         config_path: Option<PathBuf>,
         agent_config: &workforce_common::settings::AgentConfig,
-        delivery: crate::scheduler::DeliveryCallback,
         lock_manager: Arc<LockManager>,
         shared_knowledge: Option<Arc<crate::knowledge::KnowledgeService>>,
         shared_local_agents: Option<Arc<crate::hub_core::local_agent_registry::LocalAgentRegistry>>,
@@ -399,27 +391,9 @@ impl Compose for AgentService {
         Ok((service_with_tool, scheduler))
     }
 
-    async fn from_config_with_scheduler_and_delivery(
+    async fn from_config_for_hub(
         config: WorkforceConfig,
         config_path: Option<PathBuf>,
-        delivery: crate::scheduler::DeliveryCallback,
-    ) -> Result<(Arc<Self>, Arc<Scheduler>)> {
-        let subscriptions = crate::subscription::Subscriptions::boot(&config, None);
-        Self::from_config_with_scheduler_delivery_and_reactions(
-            config,
-            config_path,
-            delivery,
-            None,
-            true,
-            subscriptions,
-        )
-        .await
-    }
-
-    async fn from_config_with_scheduler_delivery_and_reactions(
-        config: WorkforceConfig,
-        config_path: Option<PathBuf>,
-        delivery: crate::scheduler::DeliveryCallback,
         global_vault: Option<Arc<Vault>>,
         start_root_indexing: bool,
         subscriptions: crate::subscription::Subscriptions,
@@ -439,12 +413,7 @@ impl Compose for AgentService {
         )
         .await?;
 
-        // Create scheduler with delivery callback and configured timezone
-        let scheduler = Arc::new(Scheduler::with_delivery_and_timezone(
-            Arc::clone(&service),
-            delivery,
-            user_tz,
-        ));
+        let scheduler = Arc::new(Scheduler::new_with_timezone(Arc::clone(&service), user_tz));
 
         // Rebuild with the scheduler tool registered, reusing the first pass's
         // knowledge service (no duplicate indexing) and surface registry (DW-479).
@@ -484,7 +453,6 @@ impl Compose for AgentService {
         config: WorkforceConfig,
         config_path: Option<PathBuf>,
         agent_config: &workforce_common::settings::AgentConfig,
-        delivery: crate::scheduler::DeliveryCallback,
         lock_manager: Arc<LockManager>,
         shared_knowledge: Option<Arc<crate::knowledge::KnowledgeService>>,
         shared_local_agents: Option<Arc<crate::hub_core::local_agent_registry::LocalAgentRegistry>>,
@@ -510,11 +478,7 @@ impl Compose for AgentService {
             true,
         )
         .await?;
-        let scheduler = Arc::new(Scheduler::with_delivery_and_timezone(
-            Arc::clone(&service),
-            delivery,
-            user_tz,
-        ));
+        let scheduler = Arc::new(Scheduler::new_with_timezone(Arc::clone(&service), user_tz));
         let shared_sr = Arc::clone(&service.surface_registry);
         let service_with_tool = build_inner(
             config,
@@ -1002,6 +966,15 @@ pub(super) async fn build_inner(
     super::background::start_sweeps(&service_arc);
 
     memory_metrics.spawn();
+
+    service_arc
+        .surface_registry
+        .write()
+        .await
+        .register_session_surface(
+            workforce_common::channels::desk::DESK_PLATFORM,
+            Arc::new(crate::desk_surface::DeskSurface::new(&service_arc)),
+        );
 
     Ok(service_arc)
 }
@@ -2020,6 +1993,9 @@ impl Setup {
         // Install-wide, set once; an inconsistent `[decision]` refuses to boot.
         crate::decide::install_from_config(&config.decision)?;
         crate::decision_store::install(config).await;
+        crate::floor::install(config).await;
+        #[cfg(feature = "postgres")]
+        crate::surface_allows::install(config).await;
         let effective_memory = resolved_at_build.memory.clone();
 
         // Capture pre-resolution spec before the block below overwrites
@@ -3335,9 +3311,11 @@ fn register_messaging_tools(
     tools.register(Arc::new(MessagingReadThreadTool::new(Arc::clone(
         surface_registry,
     ))));
-    tools.register(Arc::new(ViewAttachmentTool::new(Arc::clone(
-        surface_registry,
-    ))));
+    tools.register(Arc::new(
+        ViewAttachmentTool::new(Arc::clone(surface_registry)).with_conversation_files(Arc::new(
+            crate::desk_attachments::SessionFiles::new(agent_id.as_str(), Arc::clone(sessions)),
+        )),
+    ));
     tools.register(Arc::new(GetUserPhotoTool::new(Arc::clone(
         surface_registry,
     ))));

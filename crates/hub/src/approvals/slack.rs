@@ -19,12 +19,6 @@ use crate::hub_core::approvals::{ApprovalOutcome, PendingApproval, PendingApprov
 use crate::serve::AgentService;
 use crate::slack_manager::{permission_ack_text, resolved_permission_blocks, ResolutionOutcome};
 
-/// Whether a clicker may action a request: their Slack id must match one
-/// of the persisted targets (the ACL).
-pub fn clicker_is_eligible(targets: &[Target], clicker_slack_id: &str) -> bool {
-    targets.iter().any(|t| t.slack_user_id == clicker_slack_id)
-}
-
 /// Who clicked a self-serve approval card, with the standing they click
 /// with. The same check answers a click for a `/cc` turn and for a runner
 /// turn.
@@ -125,6 +119,7 @@ pub async fn deliver_routed_approval(
             tracing::warn!(error = %e, request = %request_id, "failed to persist approval target");
             continue;
         }
+        super::approvers_changed([approver_id.as_str()]);
         let dm_channel = match surface.open_conversation(&slack_id).await {
             Ok(c) => c,
             Err(e) => {
@@ -325,6 +320,9 @@ pub async fn deliver_routed_for_invocations(
         tracing::warn!("routed approvals raised but no pending-approval store is configured");
         return;
     };
+    // The person a run made in Desk acts for is asked there; designated
+    // approvers in Slack, as ever.
+    let desk = workforce_agent::runner::current_desk().filter(|scope| !scope.attended);
     for req in routed {
         let row = match store.get(&req.request_id) {
             Ok(Some(row)) if row.is_pending() => row,
@@ -337,6 +335,18 @@ pub async fn deliver_routed_for_invocations(
                 continue;
             }
         };
+        let (on_desk, in_slack): (Vec<String>, Vec<String>) = req
+            .approver_user_ids
+            .iter()
+            .cloned()
+            .partition(|approver| desk.is_some() && *approver == row.requester_id);
+        if let (Some(scope), false) = (&desk, on_desk.is_empty()) {
+            super::desk::deliver_routed_approval(svc, &store, &row, &req.detail, &scope.target)
+                .await;
+        }
+        if in_slack.is_empty() {
+            continue;
+        }
         let Some(surface) = resolution_surface(svc, &row).await else {
             tracing::warn!(request = %req.request_id, "no Slack surface to deliver routed approval; row stays pending for the sweeper");
             continue;
@@ -351,7 +361,7 @@ pub async fn deliver_routed_for_invocations(
             &req.detail,
             &row.reason,
             &PermissionPromptOptions::ask(false),
-            &req.approver_user_ids,
+            &in_slack,
             &row.requester_id,
             row.channel_id.as_deref().unwrap_or_default(),
             row.thread_ts.as_deref(),
@@ -538,16 +548,6 @@ async fn resolution_surface(
 mod tests {
     use super::*;
 
-    fn target(approver_id: &str, slack: &str) -> Target {
-        Target {
-            request_id: "r1".to_string(),
-            approver_id: approver_id.to_string(),
-            slack_user_id: slack.to_string(),
-            dm_channel: None,
-            message_ts: None,
-        }
-    }
-
     fn invocation(policy_decision: &str, output: serde_json::Value) -> ToolInvocation {
         ToolInvocation {
             tool_name: "vault.delete".to_string(),
@@ -711,21 +711,6 @@ mod tests {
         let row = store.get(&row.request_id).unwrap().unwrap();
         assert_eq!(row.channel_notice.as_deref(), Some("D_SCHED"));
         assert_eq!(row.channel_notice_ts.as_deref(), Some("333.444"));
-    }
-
-    #[test]
-    fn authorisation_predicate_admits_only_designated_approvers() {
-        let targets = vec![target("bob", "U_BOB"), target("carol", "U_CAROL")];
-        assert!(clicker_is_eligible(&targets, "U_BOB"));
-        assert!(clicker_is_eligible(&targets, "U_CAROL"));
-        assert!(
-            !clicker_is_eligible(&targets, "U_MALLORY"),
-            "a non-approver must be refused"
-        );
-        assert!(
-            !clicker_is_eligible(&[], "U_BOB"),
-            "no targets ⇒ nobody is eligible"
-        );
     }
 
     #[test]

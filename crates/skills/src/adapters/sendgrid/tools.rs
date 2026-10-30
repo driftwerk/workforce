@@ -177,6 +177,16 @@ impl Tool for SendGridTool {
             .summary
             .and_then(|summary| summary(&self.ctx, input))
     }
+
+    fn surface_effect(&self, input: &Value) -> Option<workforce_agent::tools::SurfaceEffect> {
+        use workforce_agent::tools::SurfaceEffect;
+        match self.spec.name {
+            "sendgrid.api" => SurfaceEffect::email_api(input),
+            name => name
+                .starts_with("sendgrid.email_send")
+                .then(|| SurfaceEffect::email(input)),
+        }
+    }
 }
 
 struct ToolSpec {

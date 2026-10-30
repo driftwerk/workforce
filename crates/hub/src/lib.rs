@@ -56,6 +56,7 @@ pub mod config_writer;
 pub mod consolidation_runtime;
 pub mod context_fuse_tool;
 pub mod context_tool;
+pub(crate) mod conversation_seed;
 pub mod cost_analytics_tools;
 pub use hub_core::cost_forecast;
 pub use hub_core::cost_governor;
@@ -69,6 +70,8 @@ pub use hub_core::decision_records;
 pub mod decision_store;
 pub mod def_cmd;
 pub use workforce_hub_core::def_write_auth;
+#[cfg(feature = "postgres")]
+pub mod desk_floor;
 pub mod edge_memory_move;
 pub mod effective_settings;
 pub mod embeddings;
@@ -83,15 +86,18 @@ pub mod external_skill_publish;
 pub mod external_skills;
 pub mod failed_tools;
 pub mod findings;
+pub mod floor;
 pub use hub_core::formatting;
 pub mod freeagent_oauth_callback;
 pub use hub_core::fs_watcher;
+pub mod desk_attachments;
 #[cfg(feature = "postgres")]
 pub mod desk_conversations;
 #[cfg(feature = "postgres")]
 pub mod desk_crew;
 #[cfg(feature = "postgres")]
 pub mod desk_driver;
+pub(crate) mod desk_surface;
 #[cfg(feature = "postgres")]
 pub mod desk_tools;
 pub(crate) mod device_link;
@@ -163,6 +169,7 @@ pub mod passive_memory;
 pub mod passive_memory_backfill;
 pub use hub_core::permissions_audit;
 pub mod permissions_writer;
+pub mod pictures;
 pub mod pipeline;
 pub mod pipeline_api;
 pub mod pipeline_tool;
@@ -207,6 +214,8 @@ pub mod store;
 pub mod store_api;
 pub mod store_bridge;
 pub mod store_tool;
+#[cfg(feature = "postgres")]
+pub mod surface_allows;
 
 /// Re-export parse_relative_time for CLI use.
 pub use scheduler_tool::parse_relative_time as scheduler_tool_parse_relative_time;
@@ -217,6 +226,7 @@ pub mod memory_erasure;
 pub mod memory_mirror;
 pub mod memory_shadow;
 pub mod promotion;
+pub(crate) mod prompt_answer;
 pub mod redacting_vault;
 pub mod retention;
 pub mod retrieve_tool;

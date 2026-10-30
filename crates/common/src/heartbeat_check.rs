@@ -70,6 +70,11 @@ pub struct HeartbeatCheckMeta {
     /// check runs as its creator only while this verifies.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub creator_sig: Option<String>,
+    /// Where what the check finds goes, when it was made from a surface
+    /// other than Slack: stamped on create and update, and covered by
+    /// `creator_sig`, so a hand edit stops it running as its creator.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deliver_to: Option<crate::delivery::DeliveryTarget>,
 }
 
 /// A parsed heartbeat check file — frontmatter (TOML) + body (markdown).
@@ -211,6 +216,7 @@ pub fn builtin_heartbeat_checks() -> Vec<HeartbeatCheck> {
                 tools: None,
                 creator: None,
                 creator_sig: None,
+                deliver_to: None,
             },
             body: "# Linear Ticket Monitoring\n\n\
                 ## What to check:\n\
@@ -237,6 +243,7 @@ pub fn builtin_heartbeat_checks() -> Vec<HeartbeatCheck> {
                 tools: None,
                 creator: None,
                 creator_sig: None,
+                deliver_to: None,
             },
             body: "# GitHub PR Monitoring\n\n\
                 ## What to check:\n\
@@ -263,6 +270,7 @@ pub fn builtin_heartbeat_checks() -> Vec<HeartbeatCheck> {
                 tools: None,
                 creator: None,
                 creator_sig: None,
+                deliver_to: None,
             },
             body: "# Slack Mention Tracking\n\n\
                 ## What to check:\n\
@@ -289,6 +297,7 @@ pub fn builtin_heartbeat_checks() -> Vec<HeartbeatCheck> {
                 tools: None,
                 creator: None,
                 creator_sig: None,
+                deliver_to: None,
             },
             body: "# Session Task Management\n\n\
                 ## What to check:\n\
@@ -315,6 +324,7 @@ pub fn builtin_heartbeat_checks() -> Vec<HeartbeatCheck> {
                 tools: None,
                 creator: None,
                 creator_sig: None,
+                deliver_to: None,
             },
             body: "# Proactive Maintenance\n\n\
                 ## What to do:\n\
@@ -452,6 +462,7 @@ mod tests {
                 tools: None,
                 creator: None,
                 creator_sig: None,
+                deliver_to: None,
             },
             body: "# Test\nDo the thing.".to_string(),
         };
@@ -484,6 +495,7 @@ mod tests {
                 tools: None,
                 creator: None,
                 creator_sig: None,
+                deliver_to: None,
             },
             body: "# Test\nCheck things.".to_string(),
         };
@@ -515,6 +527,7 @@ mod tests {
                 tools: None,
                 creator: None,
                 creator_sig: None,
+                deliver_to: None,
             },
             body: "Low priority check.".to_string(),
         };
@@ -532,6 +545,7 @@ mod tests {
                 tools: None,
                 creator: None,
                 creator_sig: None,
+                deliver_to: None,
             },
             body: "High priority check.".to_string(),
         };
@@ -562,6 +576,7 @@ mod tests {
                 tools: None,
                 creator: None,
                 creator_sig: None,
+                deliver_to: None,
             },
             body: "bye".to_string(),
         };

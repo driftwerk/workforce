@@ -77,6 +77,8 @@ impl SqlitePendingApprovalStore {
             );
             CREATE INDEX IF NOT EXISTS idx_pending_approval_targets_slack
                 ON pending_approval_targets(request_id, slack_user_id);
+            CREATE INDEX IF NOT EXISTS idx_pending_approval_targets_approver
+                ON pending_approval_targets(approver_id);
             ",
         )
         .wrap_err("Failed to initialise pending-approval schema")?;
@@ -241,7 +243,8 @@ impl PendingApprovalStore for SqlitePendingApprovalStore {
             .execute(
                 "UPDATE pending_approvals
                  SET status = ?2, resolved_by = ?3, resolved_at = ?4
-                 WHERE request_id = ?1 AND status = 'pending'",
+                 WHERE request_id = ?1 AND status = 'pending'
+                   AND (?2 = 'expired' OR expires_at > ?4)",
                 params![
                     request_id,
                     outcome.as_str(),
@@ -277,6 +280,20 @@ impl PendingApprovalStore for SqlitePendingApprovalStore {
         let rows = stmt.query_map(params![limit as i64], parse_approval)?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .wrap_err("recently_resolved failed")
+    }
+
+    fn pending_for(&self, approver: &str, now: DateTime<Utc>) -> Result<Vec<PendingApproval>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {SELECT_COLS} FROM pending_approvals
+             WHERE status = 'pending' AND expires_at > ?2
+               AND request_id IN (SELECT request_id FROM pending_approval_targets
+                                  WHERE approver_id = ?1)
+             ORDER BY created_at"
+        ))?;
+        let rows = stmt.query_map(params![approver, now.to_rfc3339()], parse_approval)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .wrap_err("pending_for failed")
     }
 
     fn requested_by(&self, requester: &str) -> Result<Vec<PendingApproval>> {
@@ -349,6 +366,13 @@ impl PendingApprovalStore for SqlitePendingApprovalStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn what_waits_on_an_approver_is_their_pending_unexpired_requests() {
+        crate::approvals::store::pending_for_contract(
+            &SqlitePendingApprovalStore::in_memory().unwrap(),
+        );
+    }
 
     #[test]
     fn resolved_requests_are_pruned_past_their_window() {
@@ -466,7 +490,7 @@ mod tests {
         resolved.request_id = "resolved".to_string();
         store.insert_core(&resolved, None, None, past).unwrap();
         store
-            .claim("resolved", ApprovalOutcome::Approved, "bob")
+            .claim("resolved", ApprovalOutcome::Expired, "system")
             .unwrap();
 
         let due = store.due_for_expiry(Utc::now()).unwrap();

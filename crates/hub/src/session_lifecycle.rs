@@ -141,6 +141,7 @@ impl SessionLifecycle {
                                 "Failed to delete session during daily reset"
                             );
                         } else {
+                            crate::desk_attachments::session_ended(&session.id).await;
                             daily_reset_count += 1;
                         }
 
@@ -173,6 +174,7 @@ impl SessionLifecycle {
                             "Failed to delete expired session"
                         );
                     } else {
+                        crate::desk_attachments::session_ended(&session.id).await;
                         idle_expired_count += 1;
                         info!(
                             session_id = %session.id,

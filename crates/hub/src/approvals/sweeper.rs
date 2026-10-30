@@ -48,7 +48,10 @@ async fn sweep_once(registry: &Arc<AgentRegistry>, store: &Arc<dyn PendingApprov
     for row in due {
         // First-wins: only the caller that flips pending→expired finalises.
         match store.claim(&row.request_id, ApprovalOutcome::Expired, "") {
-            Ok(true) => finalise_expired(registry, store, &row).await,
+            Ok(true) => {
+                super::resolved(store.as_ref(), &row.request_id);
+                finalise_expired(registry, store, &row).await
+            }
             Ok(false) => {}
             Err(e) => {
                 tracing::warn!(error = %e, request = %row.request_id, "approval sweeper: claim failed")

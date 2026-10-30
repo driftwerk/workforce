@@ -219,10 +219,65 @@ pub(crate) fn observe_system_prefix(session: &mut Session, stable: &str) -> bool
 /// ingress (which tokenizes), assistant output is masked — a model echo
 /// of a credential must not become a cache-backed marker the agent could
 /// later resolve back to cleartext at a sink.
-pub(crate) fn add_redacted_assistant_message(session: &mut Session, response: &str) {
+pub(crate) fn add_redacted_assistant_message(
+    session: &mut Session,
+    response: &str,
+    desk: Option<&workforce_common::channels::desk::DeskTurnContext>,
+) {
     let masked = workforce_common::redact::redact_secrets(response);
     let tokens = estimate_tokens(&masked);
-    session.add_assistant_message(&masked, tokens);
+    let (id, mark) = reply_slot(desk, &session.channel);
+    session.add_assistant_message_with_id(
+        id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+        &masked,
+        tokens,
+    );
+    if let Some(reply) = session.messages.last_mut() {
+        reply.desk = mark;
+    }
+}
+
+/// The files a live Desk turn's `invocations` delivered, on the answer it
+/// just saved in `session`, so a Desk that missed them live reads them with
+/// it.
+pub(crate) fn carry_delivered_files(
+    session: &mut Session,
+    invocations: &[workforce_agent::runner::ToolInvocation],
+) {
+    let files = crate::desk_attachments::delivered_in(&session.agent_id, invocations);
+    if files.is_empty() {
+        return;
+    }
+    let Some(reply) = session.messages.last_mut() else {
+        return;
+    };
+    reply.attachments = Some(files.iter().map(Into::into).collect());
+    reply.desk.get_or_insert_with(Default::default).files = files;
+}
+
+/// The id and Desk mark a turn's answer in a session on `channel` is saved
+/// with: for a live Desk turn, the id its client was promised and its
+/// place; for a turn re-run in a Desk conversation nobody is attending (an
+/// approval's resume, a recovered turn), its place, as resumed.
+pub(crate) fn reply_slot(
+    desk: Option<&workforce_common::channels::desk::DeskTurnContext>,
+    channel: &str,
+) -> (
+    Option<String>,
+    Option<workforce_common::channels::desk::DeskMark>,
+) {
+    match desk {
+        Some(desk) => (Some(desk.reply_id.clone()), Some(desk.turn.place.mark())),
+        None => (
+            None,
+            workforce_agent::runner::current_desk()
+                .filter(|scope| !scope.attended && scope.target.channel == channel)
+                .map(|scope| workforce_common::channels::desk::DeskMark {
+                    delivery: Some(workforce_common::channels::desk::DeliveryKind::Resumed),
+                    ..scope.target.place.mark()
+                }),
+        ),
+    }
 }
 
 /// Save a served turn's answer in `session` and keep what its route leaves
@@ -235,8 +290,12 @@ pub(crate) fn settle_served(
     result: &RunResult,
     route: crate::agent_turn::RouteTag,
     reserved: workforce_common::session::ReservedContext,
+    desk: Option<&workforce_common::channels::desk::DeskTurnContext>,
 ) -> Option<&'static str> {
-    add_redacted_assistant_message(session, &result.response);
+    add_redacted_assistant_message(session, &result.response, desk);
+    if desk.is_some() {
+        carry_delivered_files(session, &result.tool_invocations);
+    }
     if !route.is_cli() {
         record_observed_usage(session, result, reserved);
     }

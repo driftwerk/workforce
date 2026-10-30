@@ -195,7 +195,7 @@ async fn serve(
     let surface = remote.surface_for(&service);
     let executor = GatedExecutor {
         site: CallSite {
-            gates: service.tool_gates(),
+            gates: service.tool_gates(crate::desk_surface::allows()),
             policy: Arc::clone(&service.policy),
             surface: Surface::Fixed(Arc::clone(&surface)),
             access: service.tool_access_snapshot(),
@@ -640,6 +640,7 @@ mod tests {
                         None => Arc::new(RevocableCapability(Arc::clone(&bridge.revoked))),
                     }),
                     permission_gate: Some(Arc::new(FixedCascade(cascade))),
+                    surface_allows: None,
                     arguments: workforce_agent::tools::arguments::ArgumentValidation::default(),
                 },
                 policy: Arc::new(

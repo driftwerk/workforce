@@ -27,13 +27,6 @@ use crate::serve::{AgentService, Route, Skip, TurnOutcome};
 /// The id a legacy (HEARTBEAT.md) heartbeat runs under in place of a check's.
 const LEGACY_CHECK_ID: &str = "legacy";
 
-/// Callback for delivering heartbeat output to external channels.
-pub type HeartbeatDeliveryCallback = Arc<
-    dyn Fn(String, String) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
-        + Send
-        + Sync,
->;
-
 /// A previously reported issue, used for deduplication.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReportedIssue {
@@ -91,6 +84,45 @@ struct RetryState {
     backoff_until: Option<DateTime<Utc>>,
 }
 
+/// Point the delivery of every check of `service`'s that `owner` made and
+/// `retarget` moves elsewhere, and sign it again as theirs, so it goes on
+/// running as its creator. A check whose signature no longer verifies is
+/// left alone: it runs as nobody's already, and re-signing would adopt
+/// someone's edit. Returns the checks changed.
+pub(crate) fn retarget_checks(
+    service: &AgentService,
+    owner: &str,
+    retarget: &dyn Fn(
+        &workforce_common::delivery::DeliveryTarget,
+    ) -> Option<workforce_common::delivery::DeliveryTarget>,
+) -> Vec<String> {
+    let Some(signer) = service.check_signer.as_deref() else {
+        return Vec::new();
+    };
+    let checks = match heartbeat_check::list_heartbeat_checks(&service.workspace) {
+        Ok(checks) => checks,
+        Err(e) => {
+            warn!(error = %e, "Heartbeat: checks could not be read to point them elsewhere");
+            return Vec::new();
+        }
+    };
+    checks
+        .into_iter()
+        .filter(|check| signer.creator(check).is_some_and(|c| c.to_string() == owner))
+        .filter_map(|mut check| {
+            check.meta.deliver_to = Some(check.meta.deliver_to.as_ref().and_then(retarget)?);
+            crate::heartbeat_signature::stamp_creator(Some(signer), &mut check, Some(owner));
+            match heartbeat_check::save_heartbeat_check(&service.workspace, &check) {
+                Ok(()) => Some(check.id),
+                Err(e) => {
+                    warn!(check_id = %check.id, error = %e, "Heartbeat: a check could not be pointed elsewhere");
+                    None
+                }
+            }
+        })
+        .collect()
+}
+
 /// The heartbeat runner -- manages periodic agent check-ins with external delivery.
 pub struct HeartbeatRunner {
     /// What the agent runs with now: the install's `base`, its own
@@ -100,7 +132,6 @@ pub struct HeartbeatRunner {
     service: Arc<AgentService>,
     workspace: std::path::PathBuf,
     user_tz: Tz,
-    delivery: Option<HeartbeatDeliveryCallback>,
     /// Ring buffer of recent heartbeat results.
     history: Arc<RwLock<Vec<HeartbeatRecord>>>,
     /// Channel for triggering manual wake-ups.
@@ -120,7 +151,6 @@ impl HeartbeatRunner {
         service: Arc<AgentService>,
         workspace: &Path,
         user_tz: Tz,
-        delivery: Option<HeartbeatDeliveryCallback>,
     ) -> (Self, HeartbeatWakeHandle) {
         let (wake_tx, wake_rx) = tokio::sync::mpsc::channel(8);
         let history = Arc::new(RwLock::new(Vec::new()));
@@ -136,7 +166,6 @@ impl HeartbeatRunner {
             service,
             workspace: workspace.to_path_buf(),
             user_tz,
-            delivery,
             history,
             wake_rx,
             leader: None,
@@ -180,8 +209,18 @@ impl HeartbeatRunner {
             Ok(principal) => principal,
             Err(skip) => return Ok(TurnOutcome::Skipped(skip)),
         };
-        self.service
-            .run_background_unit(
+        let desk = check
+            .and_then(|check| self.desk_of(check))
+            .map(
+                |(owner, target)| workforce_common::channels::desk::DeskScope {
+                    target,
+                    owner,
+                    attended: false,
+                },
+            );
+        workforce_agent::runner::with_desk(
+            desk,
+            self.service.run_background_unit(
                 &principal,
                 Route::Model(None),
                 workforce_agent::runner::with_tool_whitelist(
@@ -203,8 +242,47 @@ impl HeartbeatRunner {
                         crate::serve::RunAuthor::Other,
                     )),
                 ),
-            )
-            .await
+            ),
+        )
+        .await
+    }
+
+    /// The Desk conversation `check` was made in, and the person it is
+    /// theirs to tell there: its creator, while its signature verifies.
+    fn desk_of(
+        &self,
+        check: &HeartbeatCheck,
+    ) -> Option<(String, workforce_common::channels::desk::DeskTarget)> {
+        let target = check.meta.deliver_to.as_ref()?.desk_target()?.clone();
+        let creator = self.service.check_signer.as_deref()?.creator(check)?;
+        Some((creator.to_string(), target))
+    }
+
+    /// Tell `owner` at `target` what a check found, as a check-in. Whether
+    /// it was saved there.
+    async fn check_in(
+        &self,
+        owner: &str,
+        target: &workforce_common::channels::desk::DeskTarget,
+        found: &str,
+    ) -> bool {
+        match crate::desk_surface::deliver(
+            &self.service,
+            owner,
+            target,
+            crate::desk_surface::Delivery::text(
+                workforce_common::channels::desk::DeliveryKind::CheckIn,
+                found,
+            ),
+        )
+        .await
+        {
+            Ok(_) => true,
+            Err(e) => {
+                tracing::error!(error = %e, "Heartbeat: a check-in to Desk failed");
+                false
+            }
+        }
     }
 
     /// Record that a check did not run: in the history, and in the log once
@@ -306,21 +384,17 @@ impl HeartbeatRunner {
         }
     }
 
-    /// Delivers what a check-in found: into the agent's Desk DM with its
-    /// person where Desk is on (as a check-in of the agent's own), else to
-    /// the install's heartbeat channels. Whether it went anywhere.
+    /// Delivers what checks made outside Desk found: into the agent's Desk
+    /// DM with its person where the Desk crew is on, as a check-in of the
+    /// agent's own. Whether it went anywhere.
     async fn deliver(&self, message: String) -> bool {
         #[cfg(feature = "postgres")]
         if crate::desk_crew::heartbeat_found(&self.service, &message).await {
             return true;
         }
-        match self.delivery {
-            Some(ref delivery) => {
-                delivery("heartbeat".to_string(), message).await;
-                true
-            }
-            None => false,
-        }
+        #[cfg(not(feature = "postgres"))]
+        let _ = message;
+        false
     }
 
     /// Run one tick of the heartbeat system.
@@ -416,7 +490,10 @@ impl HeartbeatRunner {
         // Determine if we're in quiet hours (delivery suppressed)
         let in_quiet_hours = self.is_quiet_hours(&now);
 
+        // What every check found, for the daily notes, and what of it goes
+        // out batched: a check made in Desk tells its own conversation.
         let mut actionable_results: Vec<(String, String)> = Vec::new();
+        let mut batched: Vec<(String, String)> = Vec::new();
 
         // 5. Execute each check sequentially
         for check in &to_run {
@@ -478,6 +555,20 @@ impl HeartbeatRunner {
                         let max_len = if check.meta.take_action { 2000 } else { 500 };
                         let truncated =
                             workforce_common::text::truncate_str(&response, max_len).to_string();
+                        let told = match self.desk_of(check) {
+                            Some((owner, target)) if should_deliver => {
+                                self.check_in(
+                                    &owner,
+                                    &target,
+                                    &format!("**{}**: {}", check.meta.name, truncated),
+                                )
+                                .await
+                            }
+                            _ => false,
+                        };
+                        if !told {
+                            batched.push((check.meta.name.clone(), truncated.clone()));
+                        }
                         actionable_results.push((check.meta.name.clone(), truncated));
                     }
 
@@ -557,16 +648,16 @@ impl HeartbeatRunner {
         }
 
         // DW-299: Notification batching -- deliver all actionable results in one message
-        if !actionable_results.is_empty() && !in_quiet_hours {
+        if !batched.is_empty() && !in_quiet_hours {
             let should_deliver = match self.config.deliver {
                 HeartbeatDeliverMode::All => true,
-                HeartbeatDeliverMode::ActionableOnly => true, // actionable_results is already filtered
+                HeartbeatDeliverMode::ActionableOnly => true, // batched is already filtered
             };
 
             if should_deliver {
                 {
-                    let count = actionable_results.len();
-                    let body: String = actionable_results
+                    let count = batched.len();
+                    let body: String = batched
                         .iter()
                         .map(|(name, resp)| {
                             format!(
@@ -1120,6 +1211,7 @@ mod tests {
                 tools: None,
                 creator: None,
                 creator_sig: None,
+                deliver_to: None,
             },
             body: format!("Check body for {}", id),
         }
@@ -1137,7 +1229,6 @@ mod tests {
             service: unsafe { Arc::from_raw(std::ptr::null::<AgentService>()) },
             workspace: std::path::PathBuf::from("/tmp/test"),
             user_tz: chrono_tz::UTC,
-            delivery: None,
             history: Arc::new(RwLock::new(Vec::new())),
             wake_rx: tokio::sync::mpsc::channel(1).1,
             leader: None,

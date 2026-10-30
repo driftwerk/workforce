@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use eyre::Result;
-use workforce_agent::tools::{Tool, ToolResult};
+use workforce_agent::tools::{SurfaceEffect, Tool, ToolResult};
 
 use super::api::{GoogleApi, GoogleApiContext};
 
@@ -19,12 +19,16 @@ pub type HandlerFn = Arc<
         + Sync,
 >;
 
+/// What a call of a tool that writes to someone does to its surface.
+pub type EffectFn = fn(&serde_json::Value) -> SurfaceEffect;
+
 pub struct GoogleTool {
     name: String,
     description: String,
     schema: serde_json::Value,
     ctx: Arc<GoogleApiContext>,
     handler: HandlerFn,
+    effect: Option<EffectFn>,
 }
 
 impl GoogleTool {
@@ -41,6 +45,7 @@ impl GoogleTool {
             schema,
             ctx,
             handler,
+            effect: None,
         }
     }
 
@@ -61,6 +66,10 @@ impl Tool for GoogleTool {
 
     fn input_schema(&self) -> serde_json::Value {
         self.schema.clone()
+    }
+
+    fn surface_effect(&self, input: &serde_json::Value) -> Option<SurfaceEffect> {
+        self.effect.map(|effect| effect(input))
     }
 
     async fn execute(&self, input: serde_json::Value) -> Result<ToolResult> {
@@ -119,6 +128,23 @@ pub fn tool(
     h: HandlerFn,
 ) -> Arc<dyn Tool> {
     GoogleTool::new(name, desc, schema, ctx.clone(), h).arc()
+}
+
+/// Shorthand for a tool that sends to someone: the cross-surface gate holds
+/// a call of it in a Desk turn for the person's say.
+pub fn sending_tool(
+    name: &str,
+    desc: &str,
+    schema: serde_json::Value,
+    ctx: &Arc<GoogleApiContext>,
+    h: HandlerFn,
+    effect: EffectFn,
+) -> Arc<dyn Tool> {
+    GoogleTool {
+        effect: Some(effect),
+        ..GoogleTool::new(name, desc, schema, ctx.clone(), h)
+    }
+    .arc()
 }
 
 // ─── Input helpers ───────────────────────────────────────────────────────────

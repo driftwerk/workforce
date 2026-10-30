@@ -18,10 +18,7 @@ use crate::broadcast::BroadcastMessage;
 use crate::live_turns::Ending;
 use crate::serve::AgentService;
 
-/// The frame a message of the DM the person didn't type goes out live as:
-/// `{"type": "user_message", "content", "session_id", "id", "author"}`, its
-/// `content` and `id` as the DM's history gives them.
-pub const USER_MESSAGE: &str = "user_message";
+pub use crate::broadcast::USER_MESSAGE;
 
 impl CrewHub {
     /// Runs `prompt` as a turn in `service`'s Desk DM with `owner`, at `hop`
@@ -58,7 +55,7 @@ impl CrewHub {
             .then(|| format!("desk-relay:{}", workforce_desk::crew::new_id()));
         let tx = self.state.broadcast_tx.clone();
         let (mut live, inbox) = match service
-            .begin_live_turn(&sid, SelfServe::answerable_if(false))
+            .begin_live_turn(&sid, SelfServe::answerable_if(false), None)
             .await
         {
             Ok(begun) => begun,
@@ -93,6 +90,7 @@ impl CrewHub {
                 None,
                 Some(live.cancel_token()),
                 None,
+                None,
             )
             .await?;
         let session_id = progress.session_id.clone();
@@ -108,7 +106,7 @@ impl CrewHub {
         let forward = {
             let (tx, sid) = (tx.clone(), session_id.clone());
             let mentions = crate::gateway::mentions_for(service, &sid);
-            move |rx| crate::gateway::forward_local_progress(rx, tx, sid, false, mentions)
+            move |rx| crate::gateway::forward_local_progress(rx, tx, sid, false, mentions, None)
         };
         let conducted = crate::live_turns::conduct(&mut live, service, progress, forward).await;
         let answer = match &conducted.ending {
@@ -191,11 +189,7 @@ impl CrewHub {
         let frame = BroadcastMessage {
             id: Some(id),
             author: serde_json::to_value(&author).ok(),
-            ..BroadcastMessage::silent(
-                sid,
-                USER_MESSAGE,
-                crate::desk_conversations::shown(&content),
-            )
+            ..BroadcastMessage::silent(sid, USER_MESSAGE, crate::desk_surface::shown(&content))
         };
         let _ = tx.send(frame);
     }

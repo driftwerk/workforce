@@ -18,6 +18,7 @@ use tracing::{debug, error, info, warn};
 
 use workforce_agent::llm::tiers::TierRegistry;
 use workforce_agent::runner::ProgressEvent;
+use workforce_common::channels::desk::{DeliveryKind, DeskScope, DeskTarget};
 use workforce_common::channels::{
     self, ChannelSurface, OutboundMessage, Reaction, SurfaceRegistry,
 };
@@ -458,10 +459,13 @@ fn launch_principal(identity: Option<String>) -> TurnPrincipal {
 /// engine is the only writer: `save_instance` derives the thread-index
 /// columns from these variables, and Slack command matching
 /// (approve/reject/stop in the run's thread) depends on them.
+/// A run started from a Desk conversation also remembers it (`_desk`), so
+/// what the run says outside any turn reaches that conversation.
 fn persist_delivery_context(
     instance: &mut WorkflowInstance,
     channel_id: Option<&str>,
     thread_id: Option<&str>,
+    desk: Option<&DeskTarget>,
 ) {
     if let Some(obj) = instance.variables.as_object_mut() {
         if let Some(ch) = channel_id {
@@ -470,6 +474,47 @@ fn persist_delivery_context(
         if let Some(th) = thread_id {
             obj.insert("_thread_id".to_string(), serde_json::json!(th));
         }
+        if let Some(desk) = desk.and_then(|desk| serde_json::to_value(desk).ok()) {
+            obj.insert(DESK_KEY.to_string(), desk);
+        }
+    }
+}
+
+/// The instance variable holding the Desk conversation a run reports to.
+const DESK_KEY: &str = "_desk";
+
+/// The Desk conversation `instance` reports to, if it was started from one.
+pub(crate) fn desk_of(instance: &WorkflowInstance) -> Option<DeskTarget> {
+    instance
+        .variables
+        .get(DESK_KEY)
+        .and_then(|desk| serde_json::from_value(desk.clone()).ok())
+}
+
+/// Where a run's messages go: the Slack channel (and thread) it was started
+/// in, else the Desk conversation it answers to, else nowhere.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Destination<'a> {
+    Slack {
+        channel: &'a str,
+        thread: Option<&'a str>,
+    },
+    Desk(DeskScope),
+    Dark,
+}
+
+pub(crate) fn destination_of<'a>(
+    channel_id: Option<&'a str>,
+    thread_id: Option<&'a str>,
+    desk: Option<DeskScope>,
+) -> Destination<'a> {
+    match (channel_id, desk) {
+        (Some(channel), _) => Destination::Slack {
+            channel,
+            thread: thread_id,
+        },
+        (None, Some(desk)) => Destination::Desk(desk),
+        (None, None) => Destination::Dark,
     }
 }
 
@@ -2020,7 +2065,14 @@ impl WorkflowRuntime {
         let instance_id = instance.id.clone();
         persist_principal(&mut instance, &principal);
         persist_steering(&mut instance, &owned);
-        persist_delivery_context(&mut instance, channel_id.as_deref(), thread_id.as_deref());
+        persist_delivery_context(
+            &mut instance,
+            channel_id.as_deref(),
+            thread_id.as_deref(),
+            workforce_agent::runner::current_desk()
+                .map(|scope| scope.target)
+                .as_ref(),
+        );
 
         self.save_instance(&instance)?;
 
@@ -2119,7 +2171,12 @@ impl WorkflowRuntime {
         let principal = launch_principal(identity);
         persist_principal(&mut instance, &principal);
         persist_steering(&mut instance, owned);
-        persist_delivery_context(&mut instance, channel_id.as_deref(), thread_id.as_deref());
+        persist_delivery_context(
+            &mut instance,
+            channel_id.as_deref(),
+            thread_id.as_deref(),
+            None,
+        );
 
         let cap = def.workflow.max_concurrent;
         let _admission = self.capacity.lock().await;
@@ -3521,7 +3578,12 @@ impl WorkflowRuntime {
             if run_decision::awaiting_follow(instance).is_some() {
                 instance.status = InstanceStatus::Running;
                 instance.updated_at = Utc::now();
-                persist_delivery_context(instance, channel_id.as_deref(), thread_id.as_deref());
+                persist_delivery_context(
+                    instance,
+                    channel_id.as_deref(),
+                    thread_id.as_deref(),
+                    None,
+                );
                 return Ok((instance.clone(), intervention));
             }
             WorkflowExecutor::resume(instance, outcome.as_deref())?;
@@ -3538,7 +3600,7 @@ impl WorkflowRuntime {
                 }
                 None => false,
             };
-            persist_delivery_context(instance, channel_id.as_deref(), thread_id.as_deref());
+            persist_delivery_context(instance, channel_id.as_deref(), thread_id.as_deref(), None);
             let intervention = Intervention {
                 applied: outcome.is_some().then_some(applied),
                 outcome: outcome.clone(),
@@ -3712,6 +3774,49 @@ impl WorkflowRuntime {
     ) -> Result<Vec<WorkflowInstanceRow>> {
         self.telemetry_store
             .list_workflow_instances(status, workflow_id)
+    }
+
+    /// Point the Desk conversation of every live run `owner` started that
+    /// `retarget` moves elsewhere: a running loop reads it again at its next
+    /// step, a paused or queued run when it goes on. Returns the runs changed.
+    pub fn retarget_desk(
+        &self,
+        owner: &str,
+        retarget: &(dyn for<'t> Fn(&'t DeskTarget) -> Option<DeskTarget> + Send + Sync),
+    ) -> Vec<String> {
+        let live = ["running", "paused", "queued"]
+            .into_iter()
+            .filter_map(|status| match self.list_instances(Some(status), None) {
+                Ok(rows) => Some(rows),
+                Err(e) => {
+                    warn!(status, error = %e, "Listing runs to point at another Desk conversation");
+                    None
+                }
+            })
+            .flatten();
+        live.filter(|row| {
+            serde_json::from_str::<serde_json::Value>(&row.variables)
+                .ok()
+                .and_then(|vars| serde_json::from_value::<DeskTarget>(vars.get(DESK_KEY)?.clone()).ok())
+                .is_some_and(|target| retarget(&target).is_some())
+        })
+        .filter_map(|row| {
+                let moved = self.update_instance(&row.id, |instance| {
+                    let ours = instance_principal(instance).run_as.as_deref() == Some(owner);
+                    let moved = desk_of(instance).filter(|_| ours).and_then(|t| retarget(&t));
+                    persist_delivery_context(instance, None, None, moved.as_ref());
+                    Ok::<_, eyre::Report>(moved.is_some())
+                });
+                match moved {
+                    Ok(true) => Some(row.id),
+                    Ok(false) => None,
+                    Err(e) => {
+                        warn!(instance_id = %row.id, error = %e, "A run could not be pointed elsewhere");
+                        None
+                    }
+                }
+            })
+            .collect()
     }
 
     /// Every instance of this workflow that is still active (running, or
@@ -4189,17 +4294,31 @@ impl WorkflowRuntime {
         // owns its artifacts and the handoff can only ever fail. The loop is
         // boxed: its future is tens of kilobytes, and unboxed it is copied
         // whole through every layer that spawns or wraps this one.
+        let desk = self
+            .load_instance(instance_id)
+            .ok()
+            .as_ref()
+            .and_then(desk_of)
+            .zip(principal.run_as.clone())
+            .map(|(target, owner)| DeskScope {
+                target,
+                owner,
+                attended: false,
+            });
         let result = self
             .run_scoped(
                 principal,
-                workforce_agent::runner::CURRENT_ARTIFACT_SCOPE.scope(
-                    artifact_scope(instance_id),
-                    Box::pin(self.execute_loop_inner(
-                        instance_id,
-                        channel_id,
-                        thread_id,
-                        originating_agent_id,
-                    )),
+                workforce_agent::runner::with_desk(
+                    desk,
+                    workforce_agent::runner::CURRENT_ARTIFACT_SCOPE.scope(
+                        artifact_scope(instance_id),
+                        Box::pin(self.execute_loop_inner(
+                            instance_id,
+                            channel_id,
+                            thread_id,
+                            originating_agent_id,
+                        )),
+                    ),
                 ),
             )
             .await;
@@ -5214,7 +5333,8 @@ impl WorkflowRuntime {
                                 None,
                                 None,
                                 None,
-                                None, // workflow steps are never spoken
+                                None, // workflow steps are never spoken,
+                                None,
                             ),
                         )
                         .await
@@ -6402,13 +6522,33 @@ impl WorkflowRuntime {
         };
         let channel_id = channel_id.or_else(|| var_str("_channel_id"));
         let thread_id = thread_id.or_else(|| var_str("_thread_id"));
-        if channel_id.is_none() {
+        let desk = instance.as_ref().and_then(desk_of);
+        if channel_id.is_none() && desk.is_none() {
             return;
         }
         let text = render_terminal_status(instance_id, instance.as_ref(), &outcome);
         let agent_id = instance.as_ref().and_then(|i| i.agent_id.as_deref());
-        self.send_status(&text, channel_id, thread_id, agent_id, agent_id)
-            .await;
+        // A run can end outside its loop (a failed start), where neither its
+        // person nor its Desk conversation is in scope: both are its own.
+        let principal = instance
+            .as_ref()
+            .map(instance_principal)
+            .unwrap_or_default();
+        let desk = desk
+            .zip(principal.run_as.clone())
+            .map(|(target, owner)| DeskScope {
+                target,
+                owner,
+                attended: false,
+            });
+        self.run_scoped(
+            principal,
+            workforce_agent::runner::with_desk(
+                desk,
+                self.send_status(&text, channel_id, thread_id, agent_id, agent_id),
+            ),
+        )
+        .await;
     }
 
     /// Stop the run: fail the instance, persist that before anything else can
@@ -6548,7 +6688,19 @@ impl WorkflowRuntime {
         agent_id: Option<&str>,
         fallback_agent_id: Option<&str>,
     ) -> Option<String> {
-        let cid = channel_id?;
+        let (cid, thread_id) = match destination_of(
+            channel_id,
+            thread_id,
+            workforce_agent::runner::current_desk(),
+        ) {
+            Destination::Slack { channel, thread } => (channel, thread),
+            Destination::Desk(scope) => {
+                self.say_on_desk(&scope, text, agent_id, fallback_agent_id)
+                    .await;
+                return None;
+            }
+            Destination::Dark => return None,
+        };
         let surface = self
             .get_surface_for_agent(agent_id, fallback_agent_id)
             .await?;
@@ -6609,6 +6761,42 @@ impl WorkflowRuntime {
             }
         }
         Some(first)
+    }
+
+    /// Say `text` in the Desk conversation the run reports to (`scope`), to
+    /// its person, in the conversation with the agent that started it.
+    /// Desk's surface is append-only: each says once what Slack would show
+    /// by editing a card.
+    async fn say_on_desk(
+        &self,
+        scope: &DeskScope,
+        text: &str,
+        agent_id: Option<&str>,
+        fallback_agent_id: Option<&str>,
+    ) {
+        let service = self
+            .agent_registry
+            .get()
+            .and_then(|registry| {
+                [fallback_agent_id, agent_id]
+                    .into_iter()
+                    .flatten()
+                    .find_map(|id| registry.get(id))
+            })
+            .unwrap_or_else(|| Arc::clone(&self.service));
+        if let Err(e) = crate::desk_surface::deliver(
+            &service,
+            &scope.owner,
+            &scope.target,
+            crate::desk_surface::Delivery::text(
+                DeliveryKind::Workflow,
+                crate::redact::redact_secrets(text),
+            ),
+        )
+        .await
+        {
+            warn!(error = %e, "Failed to deliver workflow status to Desk");
+        }
     }
 
     /// Deliver a completed step's channel-facing text per the delivery mode.
@@ -6680,7 +6868,6 @@ impl WorkflowRuntime {
         agent_id: Option<&str>,
         fallback_agent_id: Option<&str>,
     ) {
-        let Some(cid) = channel_id else { return };
         if response.trim().is_empty() {
             return;
         }
@@ -6691,6 +6878,19 @@ impl WorkflowRuntime {
         }
 
         let text = format!("**{}**\n\n{}", step_name, cleaned);
+        let cid = match destination_of(
+            channel_id,
+            thread_id,
+            workforce_agent::runner::current_desk(),
+        ) {
+            Destination::Slack { channel, .. } => channel,
+            Destination::Desk(scope) => {
+                self.say_on_desk(&scope, &text, agent_id, fallback_agent_id)
+                    .await;
+                return;
+            }
+            Destination::Dark => return,
+        };
         let redacted = crate::redact::redact_secrets(&text);
 
         if let Some(surface) = self
@@ -8226,6 +8426,14 @@ impl crate::hosts::WorkflowHost for WorkflowRuntime {
         WorkflowRuntime::set_shutdown_token(self, token)
     }
 
+    fn retarget_desk(
+        &self,
+        owner: &str,
+        retarget: &(dyn for<'t> Fn(&'t DeskTarget) -> Option<DeskTarget> + Send + Sync),
+    ) -> Vec<String> {
+        WorkflowRuntime::retarget_desk(self, owner, retarget)
+    }
+
     async fn reload_definitions(&self) -> eyre::Result<usize> {
         WorkflowRuntime::reload_definitions(self).await
     }
@@ -8756,19 +8964,15 @@ mod tests {
             .into_owned();
         cfg.llm.api_key = Some("test-key".into());
         std::mem::forget(tmp);
-        let delivery: crate::scheduler::DeliveryCallback =
-            Arc::new(|_: String, _: String| Box::pin(async {}) as _);
-        let (service, _scheduler) =
-            crate::serve::AgentService::from_config_with_scheduler_delivery_and_reactions(
-                cfg.clone(),
-                None,
-                delivery,
-                None,
-                false,
-                crate::subscription::Subscriptions::boot(&cfg, None),
-            )
-            .await
-            .expect("test service");
+        let (service, _scheduler) = crate::serve::AgentService::from_config_for_hub(
+            cfg.clone(),
+            None,
+            None,
+            false,
+            crate::subscription::Subscriptions::boot(&cfg, None),
+        )
+        .await
+        .expect("test service");
         assert!(
             service
                 .workflow_runtime()
@@ -8793,19 +8997,15 @@ mod tests {
             .to_string_lossy()
             .into_owned();
         cfg.llm.api_key = Some("test-key".into());
-        let delivery: crate::scheduler::DeliveryCallback =
-            Arc::new(|_: String, _: String| Box::pin(async {}) as _);
-        let (service, _scheduler) =
-            crate::serve::AgentService::from_config_with_scheduler_delivery_and_reactions(
-                cfg.clone(),
-                None,
-                delivery,
-                None,
-                false,
-                crate::subscription::Subscriptions::boot(&cfg, None),
-            )
-            .await
-            .expect("test service");
+        let (service, _scheduler) = crate::serve::AgentService::from_config_for_hub(
+            cfg.clone(),
+            None,
+            None,
+            false,
+            crate::subscription::Subscriptions::boot(&cfg, None),
+        )
+        .await
+        .expect("test service");
 
         let workflows_dir = tmp.path().join("wf-defs");
         std::fs::create_dir_all(&workflows_dir).unwrap();
@@ -8850,6 +9050,134 @@ mod tests {
         assert_eq!(instance.variables["_channel_id"], "C_REAL");
         assert_eq!(instance.variables["_thread_id"], "168.42");
         assert_eq!(instance.variables["request"], "r");
+    }
+
+    #[test]
+    fn a_run_reports_to_its_slack_thread_else_its_desk_conversation_else_nowhere() {
+        use workforce_common::channels::desk::DeskPlace;
+        let desk = || {
+            Some(DeskScope {
+                target: DeskTarget::of_turn(&DeskPlace::Dm, "desk", None, false),
+                attended: false,
+                owner: "person-1".into(),
+            })
+        };
+        assert_eq!(
+            destination_of(Some("C1"), Some("1.0"), desk()),
+            Destination::Slack {
+                channel: "C1",
+                thread: Some("1.0")
+            }
+        );
+        assert_eq!(
+            destination_of(None, Some("1.0"), desk()),
+            Destination::Desk(desk().unwrap())
+        );
+        assert_eq!(destination_of(None, None, None), Destination::Dark);
+    }
+
+    /// A run started from a Desk thread remembers it, and what it says when
+    /// it ends goes there, as a workflow message, with no Slack involved.
+    #[tokio::test]
+    async fn a_run_started_on_desk_reports_its_end_there() {
+        use workforce_common::channels::desk::DeskPlace;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = workforce_common::settings::WorkforceConfig::default();
+        cfg.hub.data_dir = tmp.path().to_string_lossy().to_string();
+        cfg.memory.db_path = tmp.path().join("memory.db").to_string_lossy().into_owned();
+        cfg.llm.api_key = Some("test-key".into());
+        let (service, _scheduler) = crate::serve::AgentService::from_config_for_hub(
+            cfg.clone(),
+            None,
+            None,
+            false,
+            crate::subscription::Subscriptions::boot(&cfg, None),
+        )
+        .await
+        .expect("test service");
+        let slack = crate::serve::testing::SentToSlack::on(&service).await;
+        let workflows_dir = tmp.path().join("wf-defs");
+        std::fs::create_dir_all(&workflows_dir).unwrap();
+        std::fs::write(
+            workflows_dir.join("seed.toml"),
+            "[workflow]\nid = \"wf-desk\"\nname = \"Desk run\"\n\
+             \n[[step]]\nid = \"s1\"\nname = \"s1\"\ntask = \"{}\"\n\
+             tool = \"nope.nope\"\nexit = true\n",
+        )
+        .unwrap();
+        let runtime = Arc::new(WorkflowRuntime::new(
+            Arc::clone(&service),
+            Arc::clone(&service.telemetry_store),
+            workflows_dir,
+        ));
+        runtime
+            .reload_definitions()
+            .await
+            .expect("definitions load");
+        let room = uuid::Uuid::from_u128(41);
+        let target = DeskTarget::of_turn(
+            &DeskPlace::Room {
+                room,
+                name: "Planning".into(),
+                thread: Some(uuid::Uuid::from_u128(42)),
+            },
+            &format!("desk:{room}"),
+            None,
+            false,
+        );
+        const PERSON: &str = "4f1d2c3b-5a69-4788-9a0b-1c2d3e4f5a6b";
+        let id = workforce_agent::runner::CURRENT_USER_ID
+            .scope(
+                PERSON.to_string(),
+                workforce_agent::runner::with_desk(
+                    Some(DeskScope {
+                        target: target.clone(),
+                        attended: true,
+                        owner: "person-1".into(),
+                    }),
+                    Arc::clone(&runtime).start_workflow(
+                        "wf-desk",
+                        serde_json::json!({}),
+                        None,
+                        None,
+                        Some(service.agent_id.to_string()),
+                        None,
+                    ),
+                ),
+            )
+            .await
+            .expect("start");
+        assert_eq!(
+            desk_of(&runtime.load_instance(&id).unwrap()),
+            Some(target.clone())
+        );
+
+        let said = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            loop {
+                let workflow_said = service
+                    .sessions
+                    .find(&target.channel, PERSON)
+                    .ok()
+                    .flatten()
+                    .and_then(|session| {
+                        session.messages.into_iter().find(|m| {
+                            m.desk.as_ref().and_then(|mark| mark.delivery)
+                                == Some(DeliveryKind::Workflow)
+                        })
+                    });
+                if let Some(said) = workflow_said {
+                    return said;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("the run reports to Desk");
+        assert_eq!(
+            said.desk.and_then(|mark| mark.thread),
+            Some(uuid::Uuid::from_u128(42))
+        );
+        assert!(slack.sent().is_empty(), "{:?}", slack.sent());
     }
 
     #[test]

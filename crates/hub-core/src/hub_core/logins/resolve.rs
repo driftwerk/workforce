@@ -213,6 +213,7 @@ impl Login {
     /// is cooled, refused it is marked so for good. `None` otherwise: a round
     /// that timed out or hit its turn cap says nothing of its login.
     pub fn settle(&self, round: &RoundEnd<'_>, caller: &str) -> Option<SubscriptionError> {
+        self.observe_usage(None, round.usage.clone());
         let refused = |resets_at| LimitSignal {
             status: LimitStatus::Rejected,
             resets_at,
@@ -240,6 +241,8 @@ impl Login {
 /// names, whether it failed, and what to read a failure by.
 pub struct RoundEnd<'a> {
     pub limit: Option<LimitSignal>,
+    /// How full the plan's windows were, as the round last reported them.
+    pub usage: Vec<workforce_common::usage::Window>,
     pub failed: bool,
     pub notice: &'a str,
     pub stderr_tail: &'a str,

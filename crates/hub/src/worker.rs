@@ -463,6 +463,7 @@ async fn execute_task(state: &HubState, assignment: &TaskAssignment) -> Result<T
         trace_writer: None,
         trace_tags: Default::default(),
         permission_writer: state.permission_writer().cloned(),
+        surface_allows: None,
         permission_gate: state.permission_gate().cloned(),
         arguments: state.config.tools.validation.mode,
         tool_loading: workforce_agent::tools::loading::ToolLoading::default(),

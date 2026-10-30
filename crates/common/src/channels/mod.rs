@@ -41,29 +41,16 @@ pub fn channel_id(channel: &str) -> &str {
     parse_channel(channel).1
 }
 
-/// The desktop app's channel. Each of its rooms is a conversation of its own,
-/// on `desk:<slug>` (see [`is_desk_room`]).
-pub const DESK_CHANNEL: &str = "desk";
+pub use workforce_core::desk;
+pub use workforce_core::desk::{is_desk_conversation, is_desk_room, DESK_CHANNEL};
+
+/// The chat platforms whose tools post where people read: a tool in one of
+/// their namespaces is taken to write there unless it says it only reads.
+pub const CHAT_SURFACE_PLATFORMS: &[&str] = &["slack", "teams", "discord", "telegram", "whatsapp"];
 
 /// The gateway's persistent one-chat-per-user channels: the iOS app, the web
 /// UI, the terminal and the desktop app, each a screen the reply is read on.
 pub const CONVERSATIONAL_CHANNELS: &[&str] = &["ios", "web", "terminal", DESK_CHANNEL];
-
-const DESK_ROOM_SLUG_MAX: usize = 64;
-
-/// True for a desktop app room's channel: `desk:<slug>`, the slug 1–64 of
-/// `[a-z0-9-]`.
-pub fn is_desk_room(channel: &str) -> bool {
-    channel
-        .strip_prefix(DESK_CHANNEL)
-        .and_then(|rest| rest.strip_prefix(':'))
-        .is_some_and(|slug| {
-            (1..=DESK_ROOM_SLUG_MAX).contains(&slug.len())
-                && slug
-                    .bytes()
-                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-        })
-}
 
 /// True for channels representing a direct human-driven conversation — one of
 /// [`CONVERSATIONAL_CHANNELS`] or a desktop app room, as opposed to
@@ -739,6 +726,11 @@ impl ResolutionPath {
 pub struct SurfaceRegistry {
     surfaces: HashMap<SurfaceKey, Arc<dyn ChannelSurface>>,
     primaries: HashMap<SurfaceKey, Arc<dyn ChannelSurface>>,
+    /// Surfaces that post into the hub's own sessions (Desk), by platform.
+    /// They resolve by platform like any other, but are kept out of
+    /// [`Self::all`] and [`Self::all_for`]: those are the lists callers loop
+    /// over with a platform's own channel ids.
+    session_surfaces: HashMap<String, Arc<dyn ChannelSurface>>,
     routes: ChannelRouteCache,
 }
 
@@ -756,6 +748,16 @@ impl SurfaceRegistry {
         self.surfaces.insert(key, surface);
     }
 
+    /// Register the surface that posts into the hub's own sessions for
+    /// `platform`.
+    pub fn register_session_surface(
+        &mut self,
+        platform: impl Into<String>,
+        surface: Arc<dyn ChannelSurface>,
+    ) {
+        self.session_surfaces.insert(platform.into(), surface);
+    }
+
     pub fn deregister(&mut self, key: &SurfaceKey) {
         self.surfaces.remove(key);
         self.primaries.remove(key);
@@ -766,7 +768,13 @@ impl SurfaceRegistry {
     }
 
     pub fn get(&self, key: &SurfaceKey) -> Option<&Arc<dyn ChannelSurface>> {
-        self.primaries.get(key).or_else(|| self.surfaces.get(key))
+        self.primaries
+            .get(key)
+            .or_else(|| self.surfaces.get(key))
+            .or_else(|| match key.workspace_id {
+                None => self.session_surfaces.get(&key.platform),
+                Some(_) => None,
+            })
     }
 
     /// Surfaces matching `platform`. Includes primaries for that platform
@@ -848,6 +856,9 @@ impl SurfaceRegistry {
         channel: &str,
         hint: ChannelHint,
     ) -> Result<(Arc<dyn ChannelSurface>, ResolutionPath)> {
+        if let Some(surface) = self.session_surfaces.get(platform) {
+            return Ok((Arc::clone(surface), ResolutionPath::Single));
+        }
         if let Some(ws) = hint.explicit_workspace.as_deref() {
             let key = SurfaceKey::workspace(platform, ws);
             return self
@@ -1440,6 +1451,24 @@ mod tests {
             .to_string();
         assert!(err.contains("ghost"));
         assert!(err.contains('a'));
+    }
+
+    #[tokio::test]
+    async fn a_session_surface_resolves_by_platform_but_is_never_broadcast_to() {
+        let (slack, _) = MockSurface::arc("slack", "a", &[], &[]);
+        let (desk, _) = MockSurface::arc("desk", "-", &[], &[]);
+        let mut reg = SurfaceRegistry::new();
+        reg.register(slack_key("a"), slack);
+        reg.register_session_surface("desk", Arc::clone(&desk) as Arc<dyn ChannelSurface>);
+        let resolved = reg
+            .resolve("desk", "desk:room", ChannelHint::default())
+            .await
+            .unwrap();
+        assert_eq!(resolved.platform(), "desk");
+        assert!(reg.get(&SurfaceKey::platform("desk")).is_some());
+        assert!(reg.all().iter().all(|s| s.platform() == "slack"));
+        assert!(reg.all_for("desk").is_empty());
+        assert_eq!(reg.platforms(), vec!["slack".to_string()]);
     }
 
     #[tokio::test]

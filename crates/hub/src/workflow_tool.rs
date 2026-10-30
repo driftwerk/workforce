@@ -241,6 +241,13 @@ impl Tool for WorkflowTool {
         "workflow"
     }
 
+    fn surface_effect(
+        &self,
+        input: &serde_json::Value,
+    ) -> Option<workforce_agent::tools::SurfaceEffect> {
+        crate::desk_surface::delivers_to_slack(input)
+    }
+
     fn description(&self) -> &str {
         "Manage and design workflows: list, start, status, resume, reject, abort, instances, validate, save, get, delete, schema"
     }
@@ -481,6 +488,21 @@ impl WorkflowTool {
         // `_channel_id`/`_thread_id` are engine-owned: `start_workflow` seeds
         // them into instance variables from the arguments below, and the
         // constructor strips them out of payloads.
+        let reported = match crate::workflow_runtime::destination_of(
+            channel_id.as_deref(),
+            thread_id.as_deref(),
+            workforce_agent::runner::current_desk(),
+        ) {
+            crate::workflow_runtime::Destination::Slack { .. } => {
+                "will post its own progress and results to this thread"
+            }
+            crate::workflow_runtime::Destination::Desk(_) => {
+                "will post its own progress and results to this Desk conversation"
+            }
+            crate::workflow_runtime::Destination::Dark => {
+                "posts its progress nowhere: its status tool reports on it"
+            }
+        };
 
         // Auto-detect parent instance when this tool is called from within a
         // workflow step. The session key format is "workflow:{instance_id}:{step_id}".
@@ -512,7 +534,7 @@ impl WorkflowTool {
                     "message": format!(
                         "Workflow '{workflow_id}' started as instance {instance_id}. \
                          STOP HERE. The workflow is running in a separate subprocess \
-                         and will post its own progress and results to this thread. \
+                         and {reported}. \
                          Do NOT attempt to do the ticket's work yourself — no code \
                          reads, file edits, git commands, or tool calls of any kind \
                          beyond this tool call. Your only remaining job for this \

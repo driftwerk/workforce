@@ -102,6 +102,106 @@ pub struct ToolDefinition {
     pub input_schema: serde_json::Value,
 }
 
+/// What a tool call does to a messaging surface.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SurfaceEffect {
+    Reads,
+    Writes {
+        platform: String,
+        destination: String,
+    },
+}
+
+/// Where a write lands, as an "Always allow" for it is kept: the platform
+/// and the destination, written one way however a call writes it (`#ops`,
+/// `ops` and `OPS` are one channel; `@ops` is a person, not that channel).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Destination {
+    pub platform: String,
+    pub target: String,
+}
+
+impl Destination {
+    /// `target` on `platform`; none for a write that names no destination.
+    pub fn of(platform: &str, target: &str) -> Option<Self> {
+        let target = target.trim().trim_start_matches('#').trim();
+        (!target.trim_start_matches('@').trim().is_empty()).then(|| Self {
+            platform: platform.trim().to_lowercase(),
+            target: target.to_lowercase(),
+        })
+    }
+}
+
+impl SurfaceEffect {
+    /// Where it writes, if it writes somewhere it names.
+    pub fn destination(&self) -> Option<Destination> {
+        match self {
+            Self::Reads => None,
+            Self::Writes {
+                platform,
+                destination,
+            } => Destination::of(platform, destination),
+        }
+    }
+
+    /// A write of an email to everyone `input` addresses it to: the `to`,
+    /// `cc` and `bcc` (in any case) of the call and of each message it
+    /// batches (`messages`, `personalizations`), each address once.
+    pub fn email(input: &serde_json::Value) -> Self {
+        let batched = ["messages", "personalizations"]
+            .into_iter()
+            .flat_map(|key| input[key].as_array().into_iter().flatten());
+        let recipients: std::collections::BTreeSet<String> = std::iter::once(input)
+            .chain(batched)
+            .filter_map(serde_json::Value::as_object)
+            .flat_map(|message| {
+                message
+                    .iter()
+                    .filter(|(key, _)| ["to", "cc", "bcc"].contains(&key.to_lowercase().as_str()))
+                    .flat_map(|(_, addressed)| addresses(addressed))
+            })
+            .collect();
+        Self::Writes {
+            platform: "email".to_string(),
+            destination: recipients.into_iter().collect::<Vec<_>>().join(", "),
+        }
+    }
+
+    /// A raw call to an email provider's API: any but a read may send mail,
+    /// to whom its body addresses.
+    pub fn email_api(input: &serde_json::Value) -> Option<Self> {
+        (!input["method"]
+            .as_str()
+            .is_some_and(|method| method.eq_ignore_ascii_case("GET")))
+        .then(|| Self::email(&input["body"]))
+    }
+}
+
+/// The addresses `value` names: a comma-separated string (`Name <a@b>` as
+/// `a@b`), a list, or `{email}` objects, each lowercased.
+fn addresses(value: &serde_json::Value) -> Vec<String> {
+    match value {
+        serde_json::Value::String(list) => list
+            .split(',')
+            .map(|one| {
+                let one = one.trim();
+                one.rsplit_once('<')
+                    .and_then(|(_, address)| address.split_once('>'))
+                    .map_or(one, |(address, _)| address.trim())
+                    .to_lowercase()
+            })
+            .filter(|one| !one.is_empty())
+            .collect(),
+        serde_json::Value::Array(items) => items.iter().flat_map(addresses).collect(),
+        serde_json::Value::Object(named) => named
+            .iter()
+            .filter(|(key, _)| key.eq_ignore_ascii_case("email"))
+            .flat_map(|(_, address)| addresses(address))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
 /// Trait that all tools must implement.
 #[async_trait]
 pub trait Tool: Send + Sync {
@@ -153,6 +253,14 @@ pub trait Tool: Send + Sync {
     /// dispatch, so it must be a cheap read of already-loaded state.
     /// Defaults to `None`: policy alone decides.
     fn approval_requirement(&self) -> Option<String> {
+        None
+    }
+
+    /// What THIS call does to a messaging surface: reads it, or writes to a
+    /// destination on a platform. The cross-surface gate reads it to hold a
+    /// write outside the Desk conversation a person is in for their say.
+    /// `None`, the default, leaves the gate to the tool's namespace.
+    fn surface_effect(&self, _input: &serde_json::Value) -> Option<SurfaceEffect> {
         None
     }
 

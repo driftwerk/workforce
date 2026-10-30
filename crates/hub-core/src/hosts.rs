@@ -447,6 +447,17 @@ pub trait SchedulerHost: Send + Sync {
         to: &str,
         editor: Option<&str>,
     ) -> Vec<String>;
+    /// Point the Desk delivery of each job `owner` owns that `retarget`
+    /// moves elsewhere; the ids changed.
+    async fn retarget_desk(
+        &self,
+        owner: &str,
+        retarget: &(dyn for<'t> Fn(
+            &'t workforce_common::delivery::DeliveryTarget,
+        ) -> Option<workforce_common::delivery::DeliveryTarget>
+              + Send
+              + Sync),
+    ) -> Vec<String>;
     /// Release the jobs held for people `suspended` no longer says are.
     async fn release_suspension_holds(
         &self,
@@ -528,6 +539,7 @@ pub trait TurnHost: Send + Sync {
         trust_level: Option<workforce_common::trust::TrustLevel>,
         cancel_token: Option<tokio_util::sync::CancellationToken>,
         voice_channel: Option<&str>,
+        desk: Option<&workforce_common::channels::desk::DeskTurnContext>,
     ) -> Result<MessageProgress>;
     #[allow(clippy::too_many_arguments)]
     async fn process_turn(
@@ -626,6 +638,17 @@ pub trait WorkflowHost: DefinitionSurface + HubReads {
         workspace_surfaces: &HashMap<String, Arc<dyn ChannelSurface>>,
     );
     fn set_shutdown_token(&self, token: CancellationToken);
+    /// Point the Desk conversation of every live run `owner` started that
+    /// `retarget` moves elsewhere; the runs changed.
+    fn retarget_desk(
+        &self,
+        owner: &str,
+        retarget: &(dyn for<'t> Fn(
+            &'t workforce_common::channels::desk::DeskTarget,
+        ) -> Option<workforce_common::channels::desk::DeskTarget>
+              + Send
+              + Sync),
+    ) -> Vec<String>;
     async fn reload_definitions(&self) -> eyre::Result<usize>;
     async fn sync_schedule_triggers(&self) -> eyre::Result<usize>;
     fn can_schedule(&self) -> bool;

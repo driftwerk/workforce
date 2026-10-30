@@ -11898,6 +11898,7 @@ dependencies = [
  "uuid",
  "vt100",
  "workforce-build-support",
+ "workforce-core",
  "workforce-postgres",
 ]
 

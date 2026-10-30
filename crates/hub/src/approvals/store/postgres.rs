@@ -253,7 +253,8 @@ impl PendingApprovalStore for PostgresPendingApprovalStore {
                 .execute(
                     "UPDATE pending_approvals
                      SET status = $2, resolved_by = $3, resolved_at = $4
-                     WHERE request_id = $1 AND status = 'pending'",
+                     WHERE request_id = $1 AND status = 'pending'
+                       AND ($2 = 'expired' OR expires_at > $4)",
                     &[&request_id, &status, &resolver_id, &Utc::now()],
                 )
                 .await?;
@@ -284,6 +285,22 @@ impl PendingApprovalStore for PostgresPendingApprovalStore {
                  ORDER BY resolved_at DESC LIMIT $1"
             );
             let rows = conn.query(&sql, &[&limit]).await?;
+            rows.iter().map(row_to_approval).collect()
+        })
+    }
+
+    fn pending_for(&self, approver: &str, now: DateTime<Utc>) -> Result<Vec<PendingApproval>> {
+        let approver = approver.to_string();
+        self.block_on(async move {
+            let conn = self.pool.get().await?;
+            let sql = format!(
+                "SELECT {SELECT_COLS} FROM pending_approvals
+                 WHERE status = 'pending' AND expires_at > $2
+                   AND request_id IN (SELECT request_id FROM pending_approval_targets
+                                      WHERE approver_id = $1)
+                 ORDER BY created_at"
+            );
+            let rows = conn.query(&sql, &[&approver, &now]).await?;
             rows.iter().map(row_to_approval).collect()
         })
     }
@@ -389,6 +406,18 @@ mod tests {
             |pool| async move {
                 let store = PostgresPendingApprovalStore::with_pool(pool).await.unwrap();
                 crate::approvals::store::prune_contract(store.as_ref());
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn what_waits_on_an_approver_is_their_pending_unexpired_requests() {
+        with_test_pool(
+            PostgresPendingApprovalStore::build_pool,
+            |pool| async move {
+                let store = PostgresPendingApprovalStore::with_pool(pool).await.unwrap();
+                crate::approvals::store::pending_for_contract(store.as_ref());
             },
         )
         .await;

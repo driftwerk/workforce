@@ -24,8 +24,47 @@ pub fn channel_hint_from_input(input: &serde_json::Value) -> ChannelHint {
     )
 }
 
+/// The platform a messaging call names, else the one the run is on: the
+/// Desk conversation a Desk run answers to, otherwise Slack.
 pub fn platform_arg(input: &serde_json::Value) -> &str {
-    input["platform"].as_str().unwrap_or(DEFAULT_PLATFORM)
+    input["platform"].as_str().unwrap_or(default_platform())
+}
+
+fn default_platform() -> &'static str {
+    match workforce_agent::runner::current_desk() {
+        Some(_) => workforce_common::channels::desk::DESK_PLATFORM,
+        None => DEFAULT_PLATFORM,
+    }
+}
+
+/// The channel a posting call names; with none, the current conversation
+/// when it posts to Desk (`""`), else `None`.
+pub fn channel_arg(input: &serde_json::Value) -> Option<&str> {
+    input["channel"].as_str().or_else(|| {
+        (platform_arg(input) == workforce_common::channels::desk::DESK_PLATFORM).then_some("")
+    })
+}
+
+/// What a messaging call that posts does to its surface: writes to the
+/// channel it names, or the person (`@`), on the platform it resolves to, in
+/// the workspace it names.
+pub fn writes(input: &serde_json::Value) -> workforce_agent::tools::SurfaceEffect {
+    let named = |key: &str| input[key].as_str().filter(|v| !v.trim().is_empty());
+    let to = named("channel")
+        .map(str::to_string)
+        .or_else(|| named("user").map(|user| format!("@{}", user.trim_start_matches('@'))))
+        .unwrap_or_default();
+    let to = match named("thread_id") {
+        Some(thread) => format!("{to} › thread {thread}"),
+        None => to,
+    };
+    workforce_agent::tools::SurfaceEffect::Writes {
+        platform: platform_arg(input).to_string(),
+        destination: match named("workspace_id") {
+            Some(workspace) => format!("{to} in {workspace}"),
+            None => to,
+        },
+    }
 }
 
 /// Cross-channel read guard for `messaging.read` / `view_attachment`. A tool may
@@ -106,13 +145,69 @@ pub fn schema_workspace_property() -> serde_json::Value {
 pub fn schema_platform_property() -> serde_json::Value {
     serde_json::json!({
         "type": "string",
-        "description": "Platform (slack, discord, etc.). Defaults to slack."
+        "description": "Platform (slack, desk, etc.). Defaults to the Desk conversation in a \
+                        Desk conversation, else slack."
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn the_platform_defaults_to_desk_in_a_desk_conversation_and_slack_elsewhere() {
+        use workforce_common::channels::desk::{DeskPlace, DeskScope, DeskTarget};
+        let input = serde_json::json!({"text": "hi"});
+        assert_eq!(platform_arg(&input), "slack");
+        let scope = DeskScope {
+            target: DeskTarget::of_turn(&DeskPlace::Dm, "desk", None, false),
+            attended: true,
+            owner: "person-1".into(),
+        };
+        let on_desk = workforce_agent::runner::with_desk(Some(scope.clone()), async {
+            platform_arg(&input).to_string()
+        })
+        .await;
+        assert_eq!(on_desk, "desk");
+        let named = workforce_agent::runner::with_desk(Some(scope), async {
+            platform_arg(&serde_json::json!({"platform": "slack"})).to_string()
+        })
+        .await;
+        assert_eq!(named, "slack");
+    }
+
+    #[test]
+    fn a_write_into_a_thread_is_to_that_thread_of_its_channel() {
+        let to = |input| writes(&input).destination();
+        let channel = to(serde_json::json!({"platform": "slack", "channel": "#Ops", "text": "hi"}));
+        let thread = to(serde_json::json!({
+            "platform": "slack", "channel": "#ops", "thread_id": "1700.1", "text": "hi"
+        }));
+        assert_eq!(channel.as_ref().map(|d| d.target.as_str()), Some("ops"));
+        assert_eq!(
+            thread.as_ref().map(|d| d.target.as_str()),
+            Some("ops › thread 1700.1")
+        );
+        assert_ne!(channel, thread);
+    }
+
+    #[test]
+    fn a_write_to_a_person_or_another_workspace_is_not_to_the_channel() {
+        let to = |input| writes(&input).destination();
+        let channel =
+            to(serde_json::json!({"platform": "slack", "channel": "alice", "text": "hi"}));
+        let person = to(serde_json::json!({"platform": "slack", "user": "alice", "text": "hi"}));
+        let elsewhere = to(serde_json::json!({
+            "platform": "slack", "channel": "alice", "workspace_id": "T2", "text": "hi"
+        }));
+        assert_eq!(person.as_ref().map(|d| d.target.as_str()), Some("@alice"));
+        assert_eq!(
+            elsewhere.as_ref().map(|d| d.target.as_str()),
+            Some("alice in t2")
+        );
+        assert_ne!(channel, person);
+        assert_ne!(channel, elsewhere);
+    }
 
     #[test]
     fn channel_not_found_variants_all_match() {

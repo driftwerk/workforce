@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use eyre::Result;
 use serde_json::json;
 use tokio::sync::mpsc;
@@ -15,8 +15,11 @@ use workforce_agent::runner::ProgressEvent;
 use workforce_common::channels::DESK_CHANNEL;
 use workforce_common::session::SessionAttachment;
 use workforce_desk::crew::{self, Event, Kind, Party};
+use workforce_desk::floor::Outcome;
 
 use super::{CrewHub, Running, CHECK_IN};
+use crate::desk_floor::Origin;
+use crate::floor::agents::AgentTurn;
 use crate::hosts::TurnHost;
 use crate::serve::{AgentService, IsolatedRun, MessageProgress, RunAuthor, TurnInbox, TurnOutcome};
 
@@ -141,48 +144,22 @@ impl Track {
             return;
         }
         crew.running.lock().remove(&self.key);
-        let me = || Some(self.party.clone());
-        let event = match outcome {
-            Ok(answer) => {
-                let answer_line = line(answer);
-                let detail = |question: Option<serde_json::Value>| json!({ "task": self.task, "answer": answer_line, "question": question });
-                if crew::hit_limit(answer) {
-                    Event::new(Kind::Limit, self.party.clone(), me(), "hit a usage limit")
-                        .detail(detail(None))
-                } else if let Some(q) = crew::question_in(answer) {
-                    let options = crew::options_in(answer, &q);
-                    Event::new(
-                        Kind::Question,
-                        self.party.clone(),
-                        me(),
-                        format!("asked “{q}”"),
-                    )
-                    .detail(detail(Some(json!({ "text": q, "options": options }))))
-                } else {
-                    Event::new(
-                        Kind::Finished,
-                        self.party.clone(),
-                        me(),
-                        match &answer_line {
-                            Some(a) => format!("finished · {a}"),
-                            None => "finished".into(),
-                        },
-                    )
-                    .detail(detail(None))
-                }
-            }
-            Err(e) if crew::hit_limit(&e) => {
-                Event::new(Kind::Limit, self.party.clone(), me(), "hit a usage limit")
-                    .detail(json!({ "task": self.task }))
-            }
-            Err(e) => Event::new(
-                Kind::Failed,
-                self.party.clone(),
-                me(),
-                format!("failed: {}", crew::one_line(&e, 120)),
-            )
-            .detail(json!({ "task": self.task })),
+        let (ended, answer, question) =
+            crew::outcome_of(outcome.as_deref().map_err(String::as_str));
+        let text = match (ended, &answer, &question) {
+            (Outcome::Limit, _, _) => "hit a usage limit".to_string(),
+            (Outcome::Asked, _, Some(q)) => format!("asked “{}”", q.text),
+            (Outcome::Failed, Some(a), _) => format!("failed: {a}"),
+            (Outcome::Finished, Some(a), _) => format!("finished · {a}"),
+            (outcome, _, _) => outcome.as_str().to_string(),
         };
+        let event = Event::new(
+            crew::ended_kind(ended),
+            self.party.clone(),
+            Some(self.party.clone()),
+            text,
+        )
+        .detail(json!({ "task": self.task, "answer": answer, "question": question }));
         crew.desk.note(event.hop(self.hop));
     }
 }
@@ -210,6 +187,79 @@ impl Drop for Track {
     }
 }
 
+/// What the turn host keeps of one turn: the crew's activity and the floor's
+/// log, each when it applies.
+struct Watch {
+    track: Option<Track>,
+    floor: Option<AgentTurn>,
+}
+
+impl Watch {
+    fn new(service: &AgentService, origin: &Origin<'_>, session_id: Option<&str>) -> Self {
+        Self {
+            track: super::for_service(service).and_then(|c| {
+                c.track(
+                    service,
+                    origin.channel,
+                    origin.user,
+                    origin.message,
+                    session_id,
+                )
+            }),
+            floor: None,
+        }
+    }
+
+    /// Logs the turn, begun at `started`, on the floor.
+    fn begin_floor(
+        &mut self,
+        service: &AgentService,
+        origin: &Origin<'_>,
+        session_id: Option<&str>,
+        token: Option<&str>,
+        started: DateTime<Utc>,
+    ) {
+        self.floor = crate::floor::turns().and_then(|log| {
+            AgentTurn::begin(
+                log,
+                service.agent_id.as_str(),
+                super::name_of(service),
+                origin,
+                session_id,
+                token,
+                started,
+            )
+        });
+    }
+
+    fn is_empty(&self) -> bool {
+        self.track.is_none() && self.floor.is_none()
+    }
+
+    async fn finish(self, outcome: Result<&str, String>) {
+        let Self { track, floor } = self;
+        if let Some(floor) = floor {
+            floor.end(outcome.as_deref().map_err(String::as_str));
+        }
+        if let Some(track) = track {
+            track.finish(outcome).await;
+        }
+    }
+
+    /// The turn ran to an outcome other than an answer: it was skipped, or
+    /// stopped for want of the person's standing; the floor says why.
+    fn unanswered(self, outcome: &TurnOutcome) {
+        let Self { track, floor } = self;
+        if let Some(mut track) = track {
+            track.done = true;
+            track.crew.running.lock().remove(&track.key);
+        }
+        if let Some(floor) = floor {
+            floor.end(Err(&outcome.clone().into_reply()));
+        }
+    }
+}
+
 /// Aborts the turn it guards when dropped: an aborted wrapper stops the
 /// turn inside it, as aborting the turn itself would.
 struct AbortOnDrop(tokio::task::AbortHandle);
@@ -220,9 +270,60 @@ impl Drop for AbortOnDrop {
     }
 }
 
+/// A turn in a conversation the desk keeps files for, which, once ended,
+/// puts the files it delivered on its answer (see
+/// [`crate::desk_attachments::bind_turn`]).
+pub(super) struct Bind {
+    service: Arc<AgentService>,
+    since: chrono::DateTime<Utc>,
+    /// The id its answer is saved under, when the turn was promised one.
+    reply_id: Option<String>,
+}
+
+impl Bind {
+    /// A turn of `service`'s starting now on `channel`, answering under
+    /// `reply_id` when it was given one, when the desk is on and `channel`
+    /// is one of its conversations.
+    fn starting(
+        service: &Arc<AgentService>,
+        channel: &str,
+        reply_id: Option<&str>,
+    ) -> Option<Self> {
+        crate::desk_driver::desk()?;
+        workforce_common::channels::is_desk_conversation(channel).then(|| Self {
+            service: Arc::clone(service),
+            since: Utc::now(),
+            reply_id: reply_id.map(str::to_string),
+        })
+    }
+
+    /// The turn ended in `session_id`.
+    async fn ended(self, session_id: &str) {
+        if let Some(desk) = crate::desk_driver::desk() {
+            crate::desk_attachments::bind_turn(
+                desk,
+                &self.service,
+                session_id,
+                self.since,
+                self.reply_id.as_deref(),
+            )
+            .await;
+        }
+    }
+
+    /// The turn on `channel` for `user` ended, in their conversation's
+    /// current session.
+    async fn ended_for(self, channel: &str, user: &str) {
+        if let Ok(Some(session)) = self.service.sessions.find(channel, user) {
+            self.ended(&session.id).await;
+        }
+    }
+}
+
 /// `progress` with its turn recorded: its tools mark the agent busy, and
-/// its end is recorded once the turn's own task ends.
-fn observed(progress: MessageProgress, track: Track) -> MessageProgress {
+/// its end is recorded once the turn's own task ends; the files it
+/// delivered are put on its answer.
+fn observed(progress: MessageProgress, watch: Watch, bind: Option<Bind>) -> MessageProgress {
     let MessageProgress {
         progress_rx: mut inner_rx,
         handle: inner,
@@ -234,13 +335,20 @@ fn observed(progress: MessageProgress, track: Track) -> MessageProgress {
         served,
     } = progress;
     let (tx, progress_rx) = mpsc::channel(64);
-    let crew = Arc::clone(&track.crew);
-    let key = track.key.clone();
+    let crew = watch
+        .track
+        .as_ref()
+        .map(|t| (Arc::clone(&t.crew), t.key.clone()));
+    let mut heard = watch.floor.as_ref().map(AgentTurn::heard);
+    let ran_in = session_id.clone();
     tokio::spawn(async move {
         let mut reading = true;
         while let Some(event) = inner_rx.recv().await {
-            if let ProgressEvent::ToolStart { name, .. } = &event {
-                crew.tool_started(&key, name);
+            if let (ProgressEvent::ToolStart { name, .. }, Some((crew, key))) = (&event, &crew) {
+                crew.tool_started(key, name);
+            }
+            if let Some(heard) = heard.as_mut() {
+                heard.saw(&event);
             }
             // Once nobody reads the progress, keep draining it so the turn
             // never blocks on it.
@@ -259,12 +367,18 @@ fn observed(progress: MessageProgress, track: Track) -> MessageProgress {
                     Ok(r) => Ok(r.response.as_str()),
                     Err(e) => Err(format!("{e:#}")),
                 };
-                track.finish(outcome).await;
+                watch.finish(outcome).await;
+                if let Some(bind) = bind {
+                    bind.ended(&ran_in).await;
+                }
                 result
             }
             Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
             Err(_) => {
-                drop(track);
+                drop(watch);
+                if let Some(bind) = bind {
+                    bind.ended(&ran_in).await;
+                }
                 Err(eyre::eyre!("the turn was cancelled"))
             }
         }
@@ -301,8 +415,20 @@ impl<T: TurnHost> TurnHost for Observed<T> {
         trust_level: Option<workforce_common::trust::TrustLevel>,
         run_as: Option<&str>,
     ) -> Result<String> {
-        let track = super::for_service(service)
-            .and_then(|c| c.track(service, channel, user, message, None));
+        let scope = workforce_agent::runner::current_desk();
+        let origin = Origin {
+            channel,
+            user,
+            run_as,
+            message,
+            channel_id,
+            thread_id,
+            desk: None,
+            answers_to: scope.as_ref().map(|s| &s.target.place),
+        };
+        let mut watch = Watch::new(service, &origin, None);
+        watch.begin_floor(service, &origin, None, None, crew::now());
+        let bind = Bind::starting(service, channel, None);
         let result = self
             .0
             .process_message(
@@ -322,10 +448,11 @@ impl<T: TurnHost> TurnHost for Observed<T> {
                 run_as,
             )
             .await;
-        if let Some(track) = track {
-            track
-                .finish(result.as_deref().map_err(|e| format!("{e:#}")))
-                .await;
+        watch
+            .finish(result.as_deref().map_err(|e| format!("{e:#}")))
+            .await;
+        if let Some(bind) = bind {
+            bind.ended_for(channel, user).await;
         }
         result
     }
@@ -357,9 +484,22 @@ impl<T: TurnHost> TurnHost for Observed<T> {
         trust_level: Option<workforce_common::trust::TrustLevel>,
         cancel_token: Option<tokio_util::sync::CancellationToken>,
         voice_channel: Option<&str>,
+        desk: Option<&workforce_common::channels::desk::DeskTurnContext>,
     ) -> Result<MessageProgress> {
-        let track = super::for_service(service)
-            .and_then(|c| c.track(service, channel, user, message, session_id));
+        let started = crew::now();
+        let scope = workforce_agent::runner::current_desk();
+        let origin = Origin {
+            channel,
+            user,
+            run_as,
+            message,
+            channel_id,
+            thread_id,
+            desk,
+            answers_to: scope.as_ref().map(|s| &s.target.place),
+        };
+        let mut watch = Watch::new(service, &origin, session_id);
+        let bind = Bind::starting(service, channel, desk.map(|d| d.reply_id.as_str()));
         let progress = self
             .0
             .process_message_with_progress(
@@ -387,15 +527,27 @@ impl<T: TurnHost> TurnHost for Observed<T> {
                 trust_level,
                 cancel_token,
                 voice_channel,
+                desk,
             )
             .await;
-        match (progress, track) {
-            (Ok(progress), Some(track)) => Ok(observed(progress, track)),
-            (Err(e), Some(track)) => {
-                track.finish(Err(format!("{e:#}"))).await;
+        match progress {
+            Ok(progress) => {
+                watch.begin_floor(
+                    service,
+                    &origin,
+                    Some(&progress.session_id),
+                    Some(&progress.turn_token),
+                    started,
+                );
+                Ok(match (watch.is_empty(), bind) {
+                    (true, None) => progress,
+                    (_, bind) => observed(progress, watch, bind),
+                })
+            }
+            Err(e) => {
+                watch.finish(Err(format!("{e:#}"))).await;
                 Err(e)
             }
-            (progress, None) => progress,
         }
     }
 
@@ -418,8 +570,20 @@ impl<T: TurnHost> TurnHost for Observed<T> {
         run_as: Option<&str>,
         author: RunAuthor,
     ) -> Result<TurnOutcome> {
-        let track = super::for_service(service)
-            .and_then(|c| c.track(service, channel, user, message, None));
+        let scope = workforce_agent::runner::current_desk();
+        let origin = Origin {
+            channel,
+            user,
+            run_as,
+            message,
+            channel_id,
+            thread_id,
+            desk: None,
+            answers_to: scope.as_ref().map(|s| &s.target.place),
+        };
+        let mut watch = Watch::new(service, &origin, None);
+        watch.begin_floor(service, &origin, None, None, crew::now());
+        let bind = Bind::starting(service, channel, None);
         let result = self
             .0
             .process_turn(
@@ -440,16 +604,13 @@ impl<T: TurnHost> TurnHost for Observed<T> {
                 author,
             )
             .await;
-        if let Some(track) = track {
-            match &result {
-                Ok(TurnOutcome::Answered(answer)) => track.finish(Ok(answer)).await,
-                Ok(_) => {
-                    let mut track = track;
-                    track.done = true;
-                    track.crew.running.lock().remove(&track.key);
-                }
-                Err(e) => track.finish(Err(format!("{e:#}"))).await,
-            }
+        match &result {
+            Ok(TurnOutcome::Answered(answer)) => watch.finish(Ok(answer)).await,
+            Ok(other) => watch.unanswered(other),
+            Err(e) => watch.finish(Err(format!("{e:#}"))).await,
+        }
+        if let Some(bind) = bind {
+            bind.ended_for(channel, user).await;
         }
         result
     }
@@ -497,5 +658,58 @@ impl<T: TurnHost> TurnHost for Observed<T> {
         self.0
             .admit_turn_or_deny(service, identity, channel_id)
             .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use workforce_desk::floor::{TurnLog, TurnOp};
+
+    use super::*;
+    use crate::floor::agents::tests::Recorded;
+    use crate::serve::Skip;
+
+    #[test]
+    fn a_turn_that_did_not_run_says_why_on_the_floor() {
+        let recorded = Arc::new(Recorded::default());
+        let log: Arc<dyn TurnLog> = recorded.clone();
+        let origin = Origin {
+            channel: "desk",
+            user: "u1",
+            run_as: None,
+            message: "Deploy main.",
+            channel_id: None,
+            thread_id: None,
+            desk: None,
+            answers_to: None,
+        };
+        let watch = Watch {
+            track: None,
+            floor: AgentTurn::begin(
+                &log,
+                "scout",
+                "Scout".into(),
+                &origin,
+                None,
+                None,
+                crew::now(),
+            ),
+        };
+        watch.unanswered(&TurnOutcome::Skipped(Skip::NoLogin));
+        let ended: Vec<_> = recorded
+            .0
+            .lock()
+            .iter()
+            .filter_map(|op| match op {
+                TurnOp::End {
+                    outcome, answer, ..
+                } => Some((*outcome, answer.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            ended,
+            [(Outcome::Failed, Some("no login to run on".to_string()))]
+        );
     }
 }

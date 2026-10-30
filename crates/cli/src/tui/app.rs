@@ -409,9 +409,6 @@ pub struct App {
     // Compaction
     pub compacting: bool,
 
-    // Welcome directive (auto-sent on first connect)
-    pub pending_welcome: Option<String>,
-
     // Context window usage
     pub context_tokens: u32,
     pub context_max: u32,
@@ -467,8 +464,6 @@ impl App {
             pending_attachments: Vec::new(),
 
             compacting: false,
-
-            pending_welcome: None,
 
             context_tokens: 0,
             context_max: 200_000,
@@ -822,14 +817,8 @@ impl App {
 
     fn handle_gateway_event(&mut self, event: GatewayEvent) -> Action {
         match event {
-            GatewayEvent::Connected { welcome } => {
+            GatewayEvent::Connected => {
                 self.connection_status = ConnectionStatus::Connected;
-                // Store welcome directive — the main loop will auto-send it
-                if let Some(text) = welcome {
-                    if !text.is_empty() {
-                        self.pending_welcome = Some(text);
-                    }
-                }
                 Action::None
             }
             GatewayEvent::Message(msg) => {
