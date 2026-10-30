@@ -563,7 +563,14 @@ impl GatedExecutor {
                             request_id,
                             tool_name: name.to_string(),
                             detail: approval_detail(tools, name, input),
-                            options: PermissionPromptOptions::ask(asked.allow_save_allow),
+                            options: held_prompt(
+                                asked.allow_save_allow,
+                                asked.holds,
+                                agent_id,
+                                self.site.gates.surface_allows.clone(),
+                                None,
+                            )
+                            .0,
                             reason: asked.reason,
                             approver_user_ids,
                             requester_user_id: self.site.audit.identity_id.clone(),
