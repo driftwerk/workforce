@@ -241,6 +241,13 @@ impl Tool for WorkflowTool {
         "workflow"
     }
 
+    fn surface_effect(
+        &self,
+        input: &serde_json::Value,
+    ) -> Option<workforce_agent::tools::SurfaceEffect> {
+        crate::desk_surface::delivers_to_slack(input)
+    }
+
     fn description(&self) -> &str {
         "Manage and design workflows: list, start, status, resume, reject, abort, instances, validate, save, get, delete, schema"
     }

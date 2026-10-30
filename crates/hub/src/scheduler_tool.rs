@@ -297,6 +297,13 @@ impl Tool for SchedulerTool {
         "scheduler"
     }
 
+    fn surface_effect(
+        &self,
+        input: &serde_json::Value,
+    ) -> Option<workforce_agent::tools::SurfaceEffect> {
+        crate::desk_surface::delivers_to_slack(input)
+    }
+
     fn description(&self) -> &str {
         "Manage scheduled jobs, reminders, and recurring tasks. Recurring jobs cost real money: \
          every fire is a full agent turn. Before creating one, prefer (in order) an event-driven \

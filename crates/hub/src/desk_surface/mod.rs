@@ -35,6 +35,21 @@ pub(crate) fn allows() -> Option<std::sync::Arc<dyn workforce_agent::tools::disp
     }
 }
 
+/// What a call that sets up delivery to a Slack channel it names (a job's
+/// result, a workflow's status) does to its surface: writes there, so an
+/// attended Desk turn asks before it is set up, as it asks before a post.
+pub(crate) fn delivers_to_slack(
+    input: &serde_json::Value,
+) -> Option<workforce_agent::tools::SurfaceEffect> {
+    input["channel_id"]
+        .as_str()
+        .filter(|channel| !channel.trim().is_empty())
+        .map(|channel| workforce_agent::tools::SurfaceEffect::Writes {
+            platform: "slack".to_string(),
+            destination: channel.to_string(),
+        })
+}
+
 /// A message's text as a live channel sends it: secret markers as previews,
 /// credentials redacted.
 pub(crate) fn shown(content: &str) -> String {
@@ -106,6 +121,22 @@ pub(crate) fn hand_off_trust(
 mod tests {
     use super::*;
     use workforce_common::channels::desk::{DeskPlace, DeskSpeaker};
+
+    #[test]
+    fn setting_up_delivery_to_a_named_slack_channel_writes_there() {
+        assert_eq!(
+            delivers_to_slack(&serde_json::json!({"action": "create", "channel_id": "C_OPS"}))
+                .and_then(|effect| effect.destination())
+                .map(|to| (to.platform, to.target)),
+            Some(("slack".to_string(), "c_ops".to_string()))
+        );
+        for named_none in [
+            serde_json::json!({"action": "create"}),
+            serde_json::json!({"action": "create", "channel_id": " "}),
+        ] {
+            assert_eq!(delivers_to_slack(&named_none), None);
+        }
+    }
 
     fn from(speaker: DeskSpeaker) -> DeskTurn {
         DeskTurn {
