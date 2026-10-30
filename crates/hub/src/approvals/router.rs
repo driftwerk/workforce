@@ -160,7 +160,8 @@ impl HubApprovalRouter {
 }
 
 /// A run nobody attends that was made in a Desk conversation, a job or a
-/// workflow, has no one to answer a self-serve prompt: its own person is
+/// workflow, has no one to answer a self-serve prompt: its own person, the
+/// one whose conversation it answers to and who decides as an identity, is
 /// asked there instead, as a routed approval only they need give. Every
 /// other decision stands.
 fn for_unattended_desk(
@@ -170,7 +171,9 @@ fn for_unattended_desk(
     ttl: Duration,
 ) -> ApprovalDecision {
     match (decision, desk) {
-        (ApprovalDecision::SelfServe, Some(scope)) if !scope.attended && !requester.is_empty() => {
+        (ApprovalDecision::SelfServe, Some(scope))
+            if !scope.attended && scope.owner == requester && Uuid::from_str(requester).is_ok() =>
+        {
             ApprovalDecision::Routed(ApprovalRoute {
                 approver_user_ids: vec![requester.to_string()],
                 allow_self_approval: true,
@@ -284,32 +287,47 @@ mod tests {
     #[test]
     fn an_unattended_desk_run_asks_its_own_person_and_nothing_else_changes() {
         use workforce_common::channels::desk::{DeskPlace, DeskScope, DeskTarget};
-        let scope = |attended| DeskScope {
+        let person = Uuid::new_v4().to_string();
+        let scope = |attended, owner: &str| DeskScope {
             target: DeskTarget::of_turn(&DeskPlace::Dm, "desk", None, false),
             attended,
-            owner: "person-1".into(),
+            owner: owner.into(),
         };
         let ttl = Duration::from_secs(60);
-        match for_unattended_desk(ApprovalDecision::SelfServe, "p1", Some(&scope(false)), ttl) {
+        let route = |requester: &str, desk: Option<&DeskScope>| {
+            for_unattended_desk(ApprovalDecision::SelfServe, requester, desk, ttl)
+        };
+        match route(&person, Some(&scope(false, &person))) {
             ApprovalDecision::Routed(route) => {
-                assert_eq!(route.approver_user_ids, vec!["p1".to_string()]);
+                assert_eq!(route.approver_user_ids, vec![person.clone()]);
                 assert!(route.allow_self_approval);
             }
             _ => panic!("expected the person to be asked"),
         }
         assert!(matches!(
-            for_unattended_desk(ApprovalDecision::SelfServe, "p1", Some(&scope(true)), ttl),
+            route(&person, Some(&scope(true, &person))),
             ApprovalDecision::SelfServe
         ));
-        assert!(matches!(
-            for_unattended_desk(ApprovalDecision::SelfServe, "p1", None, ttl),
-            ApprovalDecision::SelfServe
-        ));
+        assert!(matches!(route(&person, None), ApprovalDecision::SelfServe));
+        assert!(
+            matches!(
+                route(&person, Some(&scope(false, &Uuid::new_v4().to_string()))),
+                ApprovalDecision::SelfServe
+            ),
+            "a run answering to someone else's conversation does not ask them"
+        );
+        assert!(
+            matches!(
+                route("device-1", Some(&scope(false, "device-1"))),
+                ApprovalDecision::SelfServe
+            ),
+            "a device decides no routed approval"
+        );
         assert!(matches!(
             for_unattended_desk(
                 ApprovalDecision::DenyUnreachable,
-                "p1",
-                Some(&scope(false)),
+                &person,
+                Some(&scope(false, &person)),
                 ttl
             ),
             ApprovalDecision::DenyUnreachable
