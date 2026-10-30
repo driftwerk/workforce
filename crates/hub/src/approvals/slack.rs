@@ -19,12 +19,6 @@ use crate::hub_core::approvals::{ApprovalOutcome, PendingApproval, PendingApprov
 use crate::serve::AgentService;
 use crate::slack_manager::{permission_ack_text, resolved_permission_blocks, ResolutionOutcome};
 
-/// Whether a clicker may action a request: their Slack id must match one
-/// of the persisted targets (the ACL).
-pub fn clicker_is_eligible(targets: &[Target], clicker_slack_id: &str) -> bool {
-    targets.iter().any(|t| t.slack_user_id == clicker_slack_id)
-}
-
 /// Who clicked a self-serve approval card, with the standing they click
 /// with. The same check answers a click for a `/cc` turn and for a runner
 /// turn.
@@ -554,16 +548,6 @@ async fn resolution_surface(
 mod tests {
     use super::*;
 
-    fn target(approver_id: &str, slack: &str) -> Target {
-        Target {
-            request_id: "r1".to_string(),
-            approver_id: approver_id.to_string(),
-            slack_user_id: slack.to_string(),
-            dm_channel: None,
-            message_ts: None,
-        }
-    }
-
     fn invocation(policy_decision: &str, output: serde_json::Value) -> ToolInvocation {
         ToolInvocation {
             tool_name: "vault.delete".to_string(),
@@ -727,21 +711,6 @@ mod tests {
         let row = store.get(&row.request_id).unwrap().unwrap();
         assert_eq!(row.channel_notice.as_deref(), Some("D_SCHED"));
         assert_eq!(row.channel_notice_ts.as_deref(), Some("333.444"));
-    }
-
-    #[test]
-    fn authorisation_predicate_admits_only_designated_approvers() {
-        let targets = vec![target("bob", "U_BOB"), target("carol", "U_CAROL")];
-        assert!(clicker_is_eligible(&targets, "U_BOB"));
-        assert!(clicker_is_eligible(&targets, "U_CAROL"));
-        assert!(
-            !clicker_is_eligible(&targets, "U_MALLORY"),
-            "a non-approver must be refused"
-        );
-        assert!(
-            !clicker_is_eligible(&[], "U_BOB"),
-            "no targets ⇒ nobody is eligible"
-        );
     }
 
     #[test]
