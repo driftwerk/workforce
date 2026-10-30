@@ -211,18 +211,20 @@ fn as_needed(mut item: Item, needs: &[Need], midnight: DateTime<Utc>) -> Item {
     item
 }
 
+/// The requests `needs` wait on.
+fn waiting_on(needs: &[Need]) -> impl Iterator<Item = &str> {
+    needs.iter().filter_map(|n| {
+        n.id.strip_prefix("wait:")?
+            .split_once(':')
+            .map(|(_, key)| key)
+    })
+}
+
 /// The "Needs you" events that are open needs, newest first: each request
 /// still waiting, and the latest question of each subject that still asks.
 /// `events` are oldest first.
 fn open_events(events: Vec<Event>, needs: &[Need]) -> Vec<Event> {
-    let waiting: HashSet<&str> = needs
-        .iter()
-        .filter_map(|n| {
-            n.id.strip_prefix("wait:")?
-                .split_once(':')
-                .map(|(_, key)| key)
-        })
-        .collect();
+    let waiting: HashSet<&str> = waiting_on(needs).collect();
     let asking: HashSet<(PartyKind, &str)> = needs
         .iter()
         .filter(|n| n.id.starts_with("question:"))
@@ -253,12 +255,6 @@ fn open_events(events: Vec<Event>, needs: &[Need]) -> Vec<Event> {
     open
 }
 
-/// How far back the events of the oldest need are looked for.
-const NEED_SLACK: Duration = Duration::minutes(1);
-
-/// The most events an open needs page reads.
-const NEED_EVENTS: i64 = 2_000;
-
 impl Desk {
     /// A page of Activity: up to `limit` events of `filter`, newest first,
     /// from before the event `before`.
@@ -283,17 +279,15 @@ impl Desk {
         let Some(needs) = crew.open_needs().await else {
             return self.activity(crew::Filter::NeedsYou, before, limit).await;
         };
-        let Some(since) = needs.iter().map(|n| n.since).min() else {
+        if needs.is_empty() {
             return Ok(crew::ActivityPage {
                 events: vec![],
                 more: false,
             });
-        };
+        }
         let ids: Vec<String> = needs.iter().map(|n| n.who.id.clone()).collect();
-        let events = self
-            .store()
-            .events_since(since - NEED_SLACK, &ids, NEED_EVENTS)
-            .await?;
+        let approvals: Vec<String> = waiting_on(&needs).map(str::to_string).collect();
+        let events = self.store().need_events(&ids, &approvals).await?;
         let cursor = before.map(|b| {
             events
                 .iter()

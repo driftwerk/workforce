@@ -169,6 +169,27 @@ impl DeskStore {
         rows.iter().map(event).collect()
     }
 
+    /// The events of the subjects in `ids` that can be open needs, oldest
+    /// first: the "Needs you" of each request in `approvals`, and each
+    /// subject's latest question, however old.
+    pub async fn need_events(&self, ids: &[String], approvals: &[String]) -> Result<Vec<Event>> {
+        let client = self.pool().get().await?;
+        let rows = client
+            .query(
+                "SELECT * FROM ( \
+                   SELECT * FROM activity WHERE kind = 'needs_you' \
+                     AND subject ->> 'id' = ANY($1) AND approval_id = ANY($2) \
+                   UNION ALL \
+                   SELECT * FROM (SELECT DISTINCT ON (subject ->> 'kind', subject ->> 'id') * \
+                     FROM activity WHERE kind = 'question' AND subject ->> 'id' = ANY($1) \
+                     ORDER BY subject ->> 'kind', subject ->> 'id', at DESC, id DESC) latest \
+                 ) open ORDER BY at, id",
+                &[&ids, &approvals],
+            )
+            .await?;
+        rows.iter().map(event).collect()
+    }
+
     /// Each agent's latest event of its own about a turn.
     pub async fn latest_turn_events(&self) -> Result<HashMap<String, Event>> {
         let client = self.pool().get().await?;
@@ -421,6 +442,49 @@ mod tests {
             assert_eq!(by[0].kind, Kind::Nudged);
             let latest = store.latest_turn_events().await.unwrap();
             assert_eq!(latest["scout"].kind, Kind::Finished);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn what_can_need_you_is_found_however_much_came_after() {
+        with_test_pool(build_pool, |pool| async move {
+            DeskStore::migrate(&pool).await.unwrap();
+            let store = DeskStore::from_pool(pool);
+            let scout = Party::agent("scout", "Scout");
+            let other = Party::agent("other", "Other");
+            let mut at = Utc::now() - chrono::Duration::days(3);
+            let mut add = |p: &Party, kind, text: &str, approval: Option<&str>| {
+                at += chrono::Duration::seconds(1);
+                let mut e = Event::new(kind, p.clone(), Some(p.clone()), text);
+                e.at = at;
+                e.approval_id = approval.map(str::to_string);
+                e
+            };
+            let events = [
+                add(&scout, Kind::Question, "asked “A?”", None),
+                add(&scout, Kind::NeedsYou, "wants to run ls", Some("a1")),
+                add(&scout, Kind::NeedsYou, "wants to run rm", Some("a2")),
+                add(&scout, Kind::Question, "asked “B?”", None),
+                add(&other, Kind::Question, "asked “C?”", None),
+            ];
+            for e in &events {
+                store.add_event(e).await.unwrap();
+            }
+            for i in 0..50 {
+                store
+                    .add_event(&add(&scout, Kind::Working, &format!("is running {i}"), None))
+                    .await
+                    .unwrap();
+            }
+            let found = store
+                .need_events(&["scout".to_string()], &["a1".to_string()])
+                .await
+                .unwrap();
+            assert_eq!(
+                found.iter().map(|e| e.text.as_str()).collect::<Vec<_>>(),
+                ["wants to run ls", "asked “B?”"]
+            );
         })
         .await;
     }
