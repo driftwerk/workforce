@@ -103,7 +103,10 @@ async fn the_floor_is_the_callers_own_for_their_day() {
         let now = Utc::now();
         let alice_id = alice.id.to_string();
         let asked = turn(&alice_id, "scout", now - chrono::Duration::minutes(30));
-        let running = turn(&alice_id, "scout", now - chrono::Duration::minutes(5));
+        let running = Turn {
+            instance: Some(workforce_common::instance::process_instance_id().to_string()),
+            ..turn(&alice_id, "scout", now - chrono::Duration::minutes(5))
+        };
         let gone = Turn {
             token: Some("an-ended-turn".into()),
             ..turn(&alice_id, "scout", now - chrono::Duration::minutes(10))

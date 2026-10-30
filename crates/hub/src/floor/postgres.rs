@@ -8,6 +8,7 @@ use deadpool_postgres::GenericClient;
 use eyre::{Context, Result};
 use tokio_postgres::Row;
 use uuid::Uuid;
+use workforce_common::session_postgres::{PostgresSessionStore, HEARTBEAT_STALE_SECS};
 use workforce_common::usage::{LoginRef, PlanKind, Reading};
 use workforce_desk::floor::{self, Outcome, Scope, Settling, Target, Turn, TurnOp};
 use workforce_postgres::{
@@ -139,22 +140,23 @@ impl PgFloorStore {
             .collect())
     }
 
-    /// Which of `instances` have crashed: their heartbeat went stale. One
-    /// with no heartbeat is not known to have.
-    pub async fn stale(&self, instances: &[String]) -> Result<HashSet<String>> {
+    /// Which of `instances` still run: their heartbeat in the sessions'
+    /// roster is fresh. An instance's id is new on every boot, so one whose
+    /// beat went stale, was pruned, or never came has gone.
+    pub async fn alive(&self, instances: &[String]) -> Result<HashSet<String>> {
         if instances.is_empty() {
             return Ok(HashSet::new());
         }
         let conn = self.pool.get().await?;
         let asked = conn
             .query(
-                "SELECT instance_id FROM public.instance_heartbeats \
-                 WHERE instance_id = ANY($1) \
-                   AND last_seen < now() - make_interval(secs => $2::double precision)",
-                &[
-                    &instances,
-                    &(workforce_common::session_postgres::HEARTBEAT_STALE_SECS as f64),
-                ],
+                &format!(
+                    "SELECT instance_id FROM {}.instance_heartbeats \
+                     WHERE instance_id = ANY($1) \
+                       AND last_seen >= now() - make_interval(secs => $2::double precision)",
+                    PostgresSessionStore::SCHEMA
+                ),
+                &[&instances, &(HEARTBEAT_STALE_SECS as f64)],
             )
             .await;
         match asked {
@@ -766,6 +768,36 @@ mod tests {
                     .await
                     .unwrap()),
                 [unanswered.id, recent.id]
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_instance_runs_while_its_heartbeat_in_the_sessions_roster_is_fresh() {
+        with_test_pool(PgFloorStore::build_pool, |pool| async move {
+            let store = store(pool.clone()).await;
+            let instances = ["hub-1", "hub-2", "hub-3"].map(String::from);
+            assert!(
+                store.alive(&instances).await.unwrap().is_empty(),
+                "without a roster no other instance is known to run"
+            );
+            pool.get()
+                .await
+                .unwrap()
+                .batch_execute(
+                    "CREATE SCHEMA IF NOT EXISTS sessions; \
+                     CREATE TABLE sessions.instance_heartbeats \
+                         (instance_id TEXT PRIMARY KEY, last_seen TIMESTAMPTZ NOT NULL); \
+                     INSERT INTO sessions.instance_heartbeats VALUES \
+                         ('hub-1', now()), ('hub-2', now() - interval '1 hour')",
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                store.alive(&instances).await.unwrap(),
+                HashSet::from(["hub-1".to_string()]),
+                "a stale beat and none at all both mean gone"
             );
         })
         .await;

@@ -194,24 +194,24 @@ impl Sources {
 }
 
 /// What says which open turns still run: the sessions' live turn tokens,
-/// the instances known to have crashed, and the Desk turns open now.
+/// the instances still running, and the Desk turns open now.
 #[derive(Debug, Default)]
 struct Running {
     tokens: HashMap<String, String>,
-    stale: HashSet<String>,
+    alive: HashSet<String>,
     desk: HashSet<Uuid>,
 }
 
 /// Whether an open turn still runs. An agent's turn with a session record
 /// runs while that record's token is its own on a live instance; one
-/// without runs while its instance has not crashed. A Desk session's runs
-/// while the desk has it open.
+/// without runs while its instance does. A Desk session's runs while the
+/// desk has it open.
 fn runs(t: &Turn, r: &Running) -> bool {
     match &t.subject {
         Subject::Session { .. } => r.desk.contains(&t.id),
         Subject::Agent { session_id, .. } => match &t.token {
             Some(token) => r.tokens.get(session_id) == Some(token),
-            None => t.instance.as_ref().is_none_or(|i| !r.stale.contains(i)),
+            None => t.instance.as_ref().is_some_and(|i| r.alive.contains(i)),
         },
     }
 }
@@ -250,20 +250,24 @@ async fn running(state: &GatewayState, sources: &Sources, turns: &[Turn]) -> eyr
         .collect::<HashSet<_>>()
         .into_iter()
         .collect();
+    let mut alive = sources.floor.store.alive(&instances).await?;
+    alive.insert(workforce_common::instance::process_instance_id().to_string());
     Ok(Running {
         tokens,
-        stale: sources.floor.store.stale(&instances).await?,
+        alive,
         desk: (sources.desk)().map(|d| d.open_turns()).unwrap_or_default(),
     })
 }
 
-/// `turns` named as their agents and sessions are called now.
+/// `turns` named as their agents and sessions are called now. What an
+/// agent or session that is gone asked is no one's to answer, and is left
+/// out; the rest of its work keeps the name it had.
 fn named(turns: Vec<Turn>, name: impl Fn(&Subject) -> Option<String>) -> Vec<Turn> {
     turns
         .into_iter()
-        .map(|t| Turn {
-            name: name(&t.subject).unwrap_or(t.name.clone()),
-            ..t
+        .filter_map(|t| match name(&t.subject) {
+            Some(name) => Some(Turn { name, ..t }),
+            None => (!t.asking()).then_some(t),
         })
         .collect()
 }
@@ -977,7 +981,7 @@ mod tests {
         };
         let running = Running {
             tokens: HashMap::from([("s1".to_string(), "tok-2".to_string())]),
-            stale: HashSet::from(["hub-dead".to_string()]),
+            alive: HashSet::from(["hub-1".to_string()]),
             desk: HashSet::new(),
         };
         assert!(runs(
@@ -993,6 +997,10 @@ mod tests {
             !runs(&open_turn(agent(), None, Some("hub-dead")), &running),
             "its instance crashed"
         );
+        assert!(
+            !runs(&open_turn(agent(), None, None), &running),
+            "nothing runs it"
+        );
         let session = open_turn(
             Subject::Session {
                 id: Uuid::new_v4(),
@@ -1007,6 +1015,34 @@ mod tests {
             ..Running::default()
         };
         assert!(runs(&session, &desk));
+    }
+
+    #[test]
+    fn a_gone_agent_s_question_is_no_one_s_and_its_work_keeps_its_name() {
+        let agent = |id: &str| Subject::Agent {
+            agent_id: id.into(),
+            session_id: "s1".into(),
+        };
+        let asked = |subject| Turn {
+            ended_at: Some(Utc::now()),
+            outcome: Some(workforce_desk::floor::Outcome::Asked),
+            ..open_turn(subject, None, None)
+        };
+        let done = Turn {
+            ended_at: Some(Utc::now()),
+            outcome: Some(workforce_desk::floor::Outcome::Finished),
+            ..open_turn(agent("gone"), None, None)
+        };
+        let kept = named(
+            vec![asked(agent("scout")), asked(agent("gone")), done.clone()],
+            |subject| match subject {
+                Subject::Agent { agent_id, .. } if agent_id == "scout" => Some("Scout 2".into()),
+                _ => None,
+            },
+        );
+        assert_eq!(kept.len(), 2);
+        assert_eq!(kept[0].name, "Scout 2");
+        assert_eq!(kept[1], done);
     }
 
     #[test]
