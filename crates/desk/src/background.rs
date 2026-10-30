@@ -77,8 +77,10 @@ impl Background {
     }
 
     /// The tasks a turn's end reported running, or `None` from a CLI that
-    /// reports none; what was heard of each is kept.
+    /// reports none; what was heard of each is kept, and what an earlier
+    /// look saw is not.
     pub fn reported(mut self, tasks: Option<Vec<(String, TaskKind)>>, now: DateTime<Utc>) -> Self {
+        self.shells = None;
         match tasks {
             Some(tasks) => {
                 let heard = std::mem::take(&mut self.tasks);
@@ -130,6 +132,14 @@ impl Background {
                 .retain(|_, t| t.kind != TaskKind::Agent || now - t.heard < AGENT_QUIET);
         }
         self.dated(now)
+    }
+
+    /// [`Self::looked`], when there was a look.
+    pub fn looked_if(self, shells: Option<usize>, now: DateTime<Utc>) -> Self {
+        match shells {
+            Some(shells) => self.looked(shells, now),
+            None => self,
+        }
     }
 
     /// Whether a look at the processes could change it.
@@ -192,6 +202,15 @@ mod tests {
             2,
             "its shells are counted by process"
         );
+    }
+
+    #[test]
+    fn a_turns_report_is_newer_than_the_last_look() {
+        let b = Background::default()
+            .reported(tasks(&[("s1", TaskKind::Shell)]), at(0))
+            .looked(0, at(1))
+            .reported(tasks(&[("s2", TaskKind::Shell)]), at(2));
+        assert_eq!(b.count(), 1, "the next turn's shell runs until a look says not");
     }
 
     #[test]

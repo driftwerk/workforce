@@ -193,6 +193,13 @@ const WORKING_EVERY: Duration = Duration::from_secs(60);
 /// How often a busy session's progress is written to the floor's log.
 const PROGRESS_EVERY: Duration = Duration::from_secs(15);
 
+/// Where a session's background work runs.
+struct Look {
+    root: u32,
+    engine: Engine,
+    baseline: Option<HashSet<u32>>,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct OpenTurn {
     id: Uuid,
@@ -766,24 +773,50 @@ impl Desk {
         Some(procs::under(&table, root).iter().map(|p| p.pid).collect())
     }
 
+    /// Where a session's background work is looked for: its own process,
+    /// its engine, and what ran under it as its turn began.
+    fn look_of(st: &State, id: Uuid) -> Option<Look> {
+        let r = st.records.get(&id)?;
+        let l = st.live.get(&id)?;
+        Some(Look {
+            root: Self::root_of(l, r.engine)?,
+            engine: r.engine,
+            baseline: l.baseline.clone(),
+        })
+    }
+
+    /// How many of a session's background processes `table` lists running:
+    /// Claude Code's tool shells; for Codex, what its turn started and left
+    /// running.
+    fn running(table: &[procs::Proc], look: &Look) -> usize {
+        procs::under(table, look.root)
+            .into_iter()
+            .filter(|p| match (look.engine, &look.baseline) {
+                (Engine::Claude, _) => procs::is_tool_shell(p),
+                (Engine::Codex, Some(before)) => !before.contains(&p.pid),
+                (Engine::Codex, None) => false,
+            })
+            .count()
+    }
+
+    /// What of a session's background work runs now, read as its turn
+    /// ends so the end and what it left running are one change.
+    async fn running_now(&self, id: Uuid) -> Option<usize> {
+        let look = Self::look_of(&self.0.state.lock(), id)?;
+        Some(Self::running(&procs::table().await?, &look))
+    }
+
     /// Looks at what runs under each of `ids` whose turn is done and that
-    /// has background work, or may have it unreported: Claude Code's tool
-    /// shells; for Codex, what its turn started and left running.
+    /// has background work, or may have it unreported.
     async fn look_at_background(&self, ids: &[Uuid]) {
-        let due: Vec<(Uuid, u32, Option<HashSet<u32>>, Engine)> = {
+        let due: Vec<(Uuid, Look)> = {
             let st = self.0.state.lock();
             ids.iter()
-                .filter_map(|id| {
-                    let r = st.records.get(id)?;
-                    let l = st.live.get(id)?;
-                    (r.state == SessionState::Done && l.background.worth_a_look()).then_some(())?;
-                    Some((
-                        *id,
-                        Self::root_of(l, r.engine)?,
-                        l.baseline.clone(),
-                        r.engine,
-                    ))
+                .filter(|id| {
+                    st.records.get(id).map(|r| r.state) == Some(SessionState::Done)
+                        && st.live.get(id).is_some_and(|l| l.background.worth_a_look())
                 })
+                .filter_map(|id| Some((*id, Self::look_of(&st, *id)?)))
                 .collect()
         };
         if due.is_empty() {
@@ -792,15 +825,8 @@ impl Desk {
         let Some(table) = procs::table().await else {
             return;
         };
-        for (id, root, baseline, engine) in due {
-            let running = procs::under(&table, root)
-                .into_iter()
-                .filter(|p| match (engine, &baseline) {
-                    (Engine::Claude, _) => procs::is_tool_shell(p),
-                    (Engine::Codex, Some(before)) => !before.contains(&p.pid),
-                    (Engine::Codex, None) => false,
-                })
-                .count();
+        for (id, look) in due {
+            let running = Self::running(&table, &look);
             let now = Utc::now();
             let looked = {
                 let st = self.0.state.lock();
@@ -1988,6 +2014,7 @@ impl Desk {
                     .flatten(),
                     (None, None) => None,
                 };
+                let running = self.running_now(id).await;
                 self.change(id, |r, l| {
                     r.state = SessionState::Done;
                     r.transcript = path.or(r.transcript.take());
@@ -1998,11 +2025,11 @@ impl Desk {
                         l.current_tool = None;
                         l.pending = None;
                         l.answer = None;
-                        l.background =
-                            std::mem::take(&mut l.background).reported(background, Utc::now());
+                        l.background = std::mem::take(&mut l.background)
+                            .reported(background, Utc::now())
+                            .looked_if(running, Utc::now());
                     }
                 });
-                self.look_at_background(&[id]).await;
             }
             Hook::SessionEnd => {
                 if let Some(l) = self.0.state.lock().live.get_mut(&id) {
@@ -2111,6 +2138,10 @@ impl Desk {
                 true => self.already_running(id).await,
                 false => None,
             };
+            let running = match &event {
+                CodexEvent::Idle => self.running_now(id).await,
+                _ => None,
+            };
             let tail = match &event {
                 CodexEvent::Idle => {
                     let rollout = self
@@ -2179,6 +2210,8 @@ impl Desk {
                         if let Some(l) = l {
                             l.current_tool = None;
                             l.pending = None;
+                            l.background =
+                                std::mem::take(&mut l.background).looked_if(running, Utc::now());
                         }
                     }
                     CodexEvent::Prompt(p) => r.last_prompt = Some(p),

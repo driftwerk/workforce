@@ -252,8 +252,9 @@ pub(super) fn turn_ops(
                 });
             }
             Transition::Background { count, .. } => {
-                let turn = working(&mut ops, &mut open);
-                ops.push(TurnOp::Background { turn, count, at });
+                if let Some(turn) = open {
+                    ops.push(TurnOp::Background { turn, count, at });
+                }
             }
             Transition::Unblocked { pending, .. } => {
                 if let Some(turn) = open {
@@ -817,6 +818,12 @@ mod tests {
         assert_eq!(
             (kinds(&o), after),
             (vec!["background"], Some(Uuid::from_u128(99)))
+        );
+        let (o, after) = ops(&[Transition::Background { from: 0, count: 1 }], &waiting, None);
+        assert_eq!(
+            (kinds(&o), after),
+            (vec![], None),
+            "work seen after its turn ended begins none"
         );
     }
 }
