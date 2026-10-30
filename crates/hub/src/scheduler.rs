@@ -371,8 +371,9 @@ impl Scheduler {
     }
 
     /// Add a job with a description. The creator is the principal of the
-    /// turn in scope ([`creator_of`]) and the job defaults to its
-    /// owner-derived visibility.
+    /// turn in scope ([`creator_of`]), the job defaults to its owner-derived
+    /// visibility, and it reports where that turn was asked
+    /// ([`crate::desk_surface::origin`]).
     pub async fn add_job_with_desc(
         &self,
         name: &str,
@@ -380,12 +381,39 @@ impl Scheduler {
         schedule: Schedule,
         payload: JobPayload,
     ) -> Result<String, String> {
+        self.add_job_reporting(
+            name,
+            description,
+            schedule,
+            payload,
+            crate::desk_surface::origin(),
+        )
+        .await
+    }
+
+    /// [`Self::add_job_with_desc`], reporting to `deliver_to`.
+    async fn add_job_reporting(
+        &self,
+        name: &str,
+        description: Option<&str>,
+        schedule: Schedule,
+        payload: JobPayload,
+        deliver_to: Option<DeliveryTarget>,
+    ) -> Result<String, String> {
         let creator = creator_of(
             Payer::classify(crate::user_config::current_identity_id().as_deref()),
             self.service().agent_id.as_str(),
         );
-        self.insert_job(name, description, schedule, payload, creator, None)
-            .await
+        self.insert_job(
+            name,
+            description,
+            schedule,
+            payload,
+            creator,
+            None,
+            deliver_to,
+        )
+        .await
     }
 
     /// Add a job with an explicit owner and visibility, for callers (e.g. the
@@ -407,6 +435,7 @@ impl Scheduler {
             payload,
             creator_identity_id,
             visibility,
+            crate::desk_surface::origin(),
         )
         .await
     }
@@ -427,6 +456,7 @@ impl Scheduler {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn insert_job(
         &self,
         name: &str,
@@ -435,6 +465,7 @@ impl Scheduler {
         payload: JobPayload,
         creator_identity_id: Option<String>,
         visibility: Option<String>,
+        deliver_to: Option<DeliveryTarget>,
     ) -> Result<String, String> {
         let now = Utc::now();
         // Owned jobs (a human or agent principal created them) are floored;
@@ -445,7 +476,6 @@ impl Scheduler {
         let next = next_run_time(&schedule, &now, self.default_tz);
         let is_reminder = matches!(payload, JobPayload::Reminder { .. });
         let caps = self.creation_caps(&schedule, &payload, creator_identity_id.as_deref(), now);
-        let deliver_to = crate::desk_surface::origin();
         let job = ScheduledJob {
             id: Uuid::new_v4().to_string(),
             name: name.to_string(),
@@ -521,7 +551,7 @@ impl Scheduler {
             return Ok(existing.id.clone());
         }
         drop(jobs);
-        self.add_job_with_desc(name, description, schedule, payload)
+        self.add_job_reporting(name, description, schedule, payload, None)
             .await
     }
 
@@ -572,7 +602,7 @@ impl Scheduler {
             return Ok(id);
         }
         drop(jobs);
-        self.add_job_with_desc(name, description, schedule, payload)
+        self.add_job_reporting(name, description, schedule, payload, None)
             .await
     }
 
@@ -6198,6 +6228,32 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    /// A job the hub registers from code, such as a workflow's schedule
+    /// synced during someone's Desk turn, reports to no Desk conversation.
+    #[tokio::test]
+    async fn a_registered_job_reports_to_no_desk_turn_it_was_synced_in() {
+        let sched = test_scheduler().await;
+        let at = || Schedule::At {
+            at: Utc::now() + chrono::Duration::hours(1),
+        };
+        let (upserted, ensured) = workforce_agent::runner::with_desk(Some(desk_thread()), async {
+            (
+                sched
+                    .upsert_job("workflow-schedule:wf:0", None, at(), reminder_payload())
+                    .await
+                    .unwrap(),
+                sched
+                    .ensure_job("consolidation", None, at(), reminder_payload())
+                    .await
+                    .unwrap(),
+            )
+        })
+        .await;
+        for id in [upserted, ensured] {
+            assert_eq!(sched.get_job(&id).await.unwrap().deliver_to, None);
+        }
     }
 
     #[tokio::test]
