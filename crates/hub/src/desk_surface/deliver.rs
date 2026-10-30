@@ -3,7 +3,8 @@
 //! outbox: the message is appended to the conversation's head session first,
 //! then pushed to whoever watches it and signalled to the person's Desk hub
 //! links, which drain it by cursor whenever they connect. A dropped socket, a
-//! closed app or a hub restart loses nothing.
+//! closed app or a hub restart loses nothing. A room of this hub's own desk
+//! is posted to at once, so it fills while the app is closed.
 
 use uuid::Uuid;
 use workforce_common::channels::desk::{
@@ -140,7 +141,7 @@ pub(crate) async fn deliver<'a>(
         session_id: session.id,
         message_id,
     };
-    let files = message.desk.map(|mark| mark.files).unwrap_or_default();
+    let mark = message.desk.unwrap_or_default();
     announce(
         outbox,
         owner,
@@ -148,10 +149,68 @@ pub(crate) async fn deliver<'a>(
         &delivered,
         &text,
         delivery.kind,
-        &files,
+        &mark.files,
     )
     .await;
+    #[cfg(feature = "postgres")]
+    if let Some(desk) = crate::desk_driver::desk() {
+        let posted = into_own_room(desk, outbox.agent_id, &target, &delivered, &text, &mark).await;
+        if let Err(e) = posted {
+            tracing::warn!(error = %e, channel = %target.channel, "posting a delivery into its room");
+        }
+    }
     Ok(delivered)
+}
+
+/// Posts a delivery, saved with `mark`, into its room when the room is
+/// `desk`'s, as Desk's drain would: under the agent's name, from this Mac's
+/// hub, keyed by the session message so the drain's own post of it later is
+/// a no-op. `false` when the room is not `desk`'s (another Mac's, or a
+/// remote hub's agent).
+#[cfg(feature = "postgres")]
+pub(crate) async fn into_own_room(
+    desk: &workforce_desk::Desk,
+    agent_id: &str,
+    target: &DeskTarget,
+    delivered: &Delivered,
+    text: &str,
+    mark: &DeskMark,
+) -> eyre::Result<bool> {
+    use workforce_desk::rooms::{source_key, Member, NewMessage, LOCAL_HUB};
+    let DeskPlace::Room { room, thread, .. } = &target.place else {
+        return Ok(false);
+    };
+    if desk.room(*room).is_none_or(|r| r.channel != target.channel) {
+        return Ok(false);
+    }
+    let attachments = mark
+        .files
+        .iter()
+        .map(|file| workforce_desk::attachments::Attachment {
+            hub: Some(LOCAL_HUB.into()),
+            agent: Some(agent_id.into()),
+            ..file.into()
+        })
+        .collect();
+    let author = Member {
+        hub: LOCAL_HUB.into(),
+        agent: agent_id.into(),
+    };
+    desk.post(
+        *room,
+        NewMessage {
+            author: author.key(),
+            content: super::shown(text),
+            thread_id: *thread,
+            hop: 0,
+            attachments,
+            source: Some(source_key(LOCAL_HUB, agent_id, &delivered.message_id)),
+            delivery: mark.delivery,
+            request_id: mark.request_id.clone(),
+        },
+    )
+    .await?;
+    Ok(true)
 }
 
 /// Deliver `file`, staged in the store of the agent of `outbox`, into
@@ -399,5 +458,148 @@ mod tests {
             routed(&legacy, None),
             (legacy.dm(), Some("(from #planning)".to_string()))
         );
+    }
+
+    /// A delivery for a room of this hub's own desk is posted into it, in
+    /// its thread, under the agent's name, with its files and its kind; the
+    /// drain posting the same message again is a no-op on its source. A
+    /// room this desk doesn't hold is left to the drain.
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn a_delivery_for_a_room_of_this_hubs_desk_is_posted_into_its_thread() {
+        use workforce_desk::rooms::{source_key, NewMessage, NewRoom};
+        use workforce_postgres::test_support::with_test_pool;
+        with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let desk = crate::desk_crew::tests::desk(pool, dir.path()).await;
+            let room = desk
+                .create_room(NewRoom {
+                    name: "Release".into(),
+                    members: Vec::new(),
+                    default_member: None,
+                })
+                .await
+                .unwrap();
+            let ask = desk
+                .post(
+                    room.id,
+                    NewMessage {
+                        author: "you".into(),
+                        content: "remind me".into(),
+                        thread_id: None,
+                        hop: 0,
+                        attachments: Vec::new(),
+                        source: None,
+                        delivery: None,
+                        request_id: None,
+                    },
+                )
+                .await
+                .unwrap()
+                .message;
+            let target = DeskTarget {
+                place: DeskPlace::Room {
+                    room: room.id,
+                    name: room.name.clone(),
+                    thread: Some(ask.id),
+                },
+                channel: room.channel.clone(),
+                device: None,
+                spoken: false,
+            };
+            let delivered = Delivered {
+                session_id: "s1".into(),
+                message_id: "m1".into(),
+            };
+            let file = DeskFile {
+                artifact_id: "art_1".into(),
+                agent_id: "scout".into(),
+                filename: "chart.png".into(),
+                media_type: "image/png".into(),
+                size: 9,
+                width: Some(2),
+                height: Some(1),
+                caption: None,
+            };
+            let mark = DeskMark {
+                delivery: Some(DeliveryKind::Reminder),
+                files: vec![file],
+                ..target.place.mark()
+            };
+            for _ in 0..2 {
+                let posted = into_own_room(
+                    &desk,
+                    "scout",
+                    &target,
+                    &delivered,
+                    "🔔 Reminder: ship it",
+                    &mark,
+                )
+                .await
+                .unwrap();
+                assert!(posted);
+            }
+            let thread = desk
+                .room_messages(room.id, Some(ask.id), None, 50)
+                .await
+                .unwrap();
+            assert_eq!(thread.len(), 1, "posted once");
+            let reminder = &thread[0];
+            assert_eq!(
+                (
+                    reminder.author.as_str(),
+                    reminder.content.as_str(),
+                    reminder.source.as_deref(),
+                    reminder.delivery
+                ),
+                (
+                    "local/scout",
+                    "🔔 Reminder: ship it",
+                    Some(source_key("local", "scout", "m1").as_str()),
+                    Some(DeliveryKind::Reminder)
+                )
+            );
+            let shown = &reminder.attachments[0];
+            assert_eq!(
+                (
+                    shown.artifact_id.as_str(),
+                    shown.hub.as_deref(),
+                    shown.agent.as_deref()
+                ),
+                ("art_1", Some("local"), Some("scout"))
+            );
+
+            let elsewhere = DeskTarget {
+                channel: format!("desk:{}", Uuid::new_v4()),
+                ..target.clone()
+            };
+            let approval = DeskMark {
+                delivery: Some(DeliveryKind::Approval),
+                request_id: Some("req-1".into()),
+                ..target.place.mark()
+            };
+            let asked = Delivered {
+                message_id: "m2".into(),
+                ..delivered.clone()
+            };
+            assert!(
+                into_own_room(&desk, "scout", &target, &asked, "May I?", &approval)
+                    .await
+                    .unwrap()
+            );
+            let thread = desk
+                .room_messages(room.id, Some(ask.id), None, 50)
+                .await
+                .unwrap();
+            assert_eq!(thread[1].request_id.as_deref(), Some("req-1"));
+            for elsewhere in [elsewhere, target.dm()] {
+                assert!(
+                    !into_own_room(&desk, "scout", &elsewhere, &delivered, "x", &approval)
+                        .await
+                        .unwrap()
+                );
+            }
+        })
+        .await;
     }
 }
