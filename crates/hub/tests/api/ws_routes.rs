@@ -330,10 +330,19 @@ async fn a_desk_connection_sends_turns_the_agent_reads_in_their_place() {
     );
     let (mut desk, connected) =
         connect(addr, &format!("token={token}&channel={channel}&desk=1")).await;
+    // The hub link needs the conversation routes, which a hub built
+    // without Postgres doesn't serve.
+    let link: &[&str] = if cfg!(feature = "postgres") {
+        &["desk.deliveries"]
+    } else {
+        &[]
+    };
+    let mut offered = vec!["desk.place", "desk.stream"];
+    offered.extend(link);
     assert_eq!(
         connected["features"],
-        json!(["desk.place", "desk.stream", "desk.deliveries"]),
-        "a person's Desk is offered the hub link too"
+        json!(offered),
+        "a person's Desk is offered the hub link too, where the hub serves it"
     );
 
     let elsewhere = service
