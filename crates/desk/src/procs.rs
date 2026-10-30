@@ -1,7 +1,7 @@
 //! This machine's processes, as `ps` lists them: what a session's own
 //! process has running under it.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// One process.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -11,7 +11,7 @@ pub struct Proc {
     pub args: String,
 }
 
-/// Every process, from `ps -axo pid=,ppid=,args=`.
+/// Every process, from `ps -A -ww -o pid=,ppid=,args=`.
 pub fn parse(listing: &str) -> Vec<Proc> {
     listing
         .lines()
@@ -28,18 +28,21 @@ pub fn parse(listing: &str) -> Vec<Proc> {
         .collect()
 }
 
-/// The processes under `root`, however deep.
+/// The processes under `root`, however deep, each once.
 pub fn under(all: &[Proc], root: u32) -> Vec<&Proc> {
     let mut children: HashMap<u32, Vec<&Proc>> = HashMap::new();
     all.iter()
         .filter(|p| p.pid != p.ppid)
         .for_each(|p| children.entry(p.ppid).or_default().push(p));
+    let mut seen = HashSet::from([root]);
     let mut found = Vec::new();
     let mut next = vec![root];
     while let Some(pid) = next.pop() {
         for child in children.get(&pid).into_iter().flatten() {
-            found.push(*child);
-            next.push(child.pid);
+            if seen.insert(child.pid) {
+                found.push(*child);
+                next.push(child.pid);
+            }
         }
     }
     found
@@ -59,7 +62,7 @@ pub fn is_tool_shell(p: &Proc) -> bool {
 /// Reads the listing now; `None` when `ps` can't be run.
 pub async fn table() -> Option<Vec<Proc>> {
     let out = tokio::process::Command::new("ps")
-        .args(["-axo", "pid=,ppid=,args="])
+        .args(["-A", "-ww", "-o", "pid=,ppid=,args="])
         .kill_on_drop(true)
         .output()
         .await
@@ -99,5 +102,19 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn a_listing_read_mid_reuse_still_ends() {
+        let all = parse("100 1 claude\n101 100 sh\n100 101 sh\n");
+        assert_eq!(under(&all, 100).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn this_machines_listing_is_read_whole() {
+        let table = table().await.expect("ps runs");
+        let me = std::process::id();
+        let mine = table.iter().find(|p| p.pid == me).expect("this process is listed");
+        assert!(!mine.args.is_empty());
     }
 }
