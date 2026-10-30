@@ -5658,6 +5658,7 @@ async fn a_check_made_in_desk_checks_in_there_and_stays_its_creators_when_moved(
     workforce_agent::runner::with_desk(
         Some(DeskScope {
             target: target.clone(),
+            owner: BOB.into(),
             attended: true,
         }),
         heartbeat_check(&service, "inbox", Some(BOB)),

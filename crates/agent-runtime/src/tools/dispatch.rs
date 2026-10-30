@@ -1552,6 +1552,7 @@ mod tests {
         use workforce_common::channels::desk::{DeskPlace, DeskTarget};
         workforce_common::channels::desk::DeskScope {
             target: DeskTarget::of_turn(&DeskPlace::Dm, "desk", None, false),
+            owner: "person-1".into(),
             attended,
         }
     }

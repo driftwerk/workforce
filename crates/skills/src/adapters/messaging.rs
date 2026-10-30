@@ -2768,6 +2768,7 @@ mod tests {
         let scope = DeskScope {
             target: DeskTarget::of_turn(&DeskPlace::Dm, "desk", None, false),
             attended: true,
+            owner: "person-1".into(),
         };
         let on_desk = workforce_agent::runner::with_desk(
             Some(scope),
@@ -2803,6 +2804,7 @@ mod tests {
         let scope = DeskScope {
             target: DeskTarget::of_turn(&DeskPlace::Dm, "desk", None, false),
             attended: true,
+            owner: "person-1".into(),
         };
         let on_desk = workforce_agent::runner::with_desk(Some(scope), tool.execute(upload()))
             .await

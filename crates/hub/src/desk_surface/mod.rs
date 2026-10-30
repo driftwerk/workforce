@@ -113,6 +113,7 @@ mod tests {
             Some(DeskScope {
                 target: DeskTarget::of_turn(&DeskPlace::Dm, "desk", None, false),
                 attended: true,
+                owner: "person-1".into(),
             })
         };
         assert_eq!(origin(), None);

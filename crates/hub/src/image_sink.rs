@@ -33,7 +33,7 @@ use workforce_agent::artifacts::store::global_store;
 use workforce_agent::artifacts::types::{ArtifactBody, ArtifactId};
 use workforce_agent::runner::{ProgressEvent, SessionContext};
 use workforce_agent::tools::image_gen::ImageSink;
-use workforce_common::channels::desk::DeskTarget;
+use workforce_common::channels::desk::DeskScope;
 use workforce_common::channels::{ChannelHint, SurfaceRegistry};
 use workforce_common::session::SessionStore;
 
@@ -75,30 +75,18 @@ impl HubImageSink {
     }
 
     /// `file`, delivered by a run nobody is attending that answers to the
-    /// Desk conversation `target`: a message of its own there, for the
-    /// person the run is for.
-    async fn deliver_to_desk(
-        &self,
-        ctx: &SessionContext,
-        target: &DeskTarget,
-        file: StagedFile,
-    ) -> Result<()> {
+    /// Desk conversation of `scope`: a message of its own there.
+    async fn deliver_to_desk(&self, scope: &DeskScope, file: StagedFile) -> Result<()> {
         let sessions = self
             .sessions
             .as_deref()
             .ok_or_else(|| eyre!("no sessions to deliver a Desk conversation's file into"))?;
-        let owner = ctx
-            .user_id
-            .as_deref()
-            .filter(|owner| !owner.is_empty())
-            .ok_or_else(|| {
-                eyre!("a Desk conversation's file is someone's: this run is for nobody")
-            })?;
         let outbox = crate::desk_surface::Outbox {
             agent_id: &self.agent_id,
             sessions,
         };
-        let delivered = crate::desk_surface::deliver_file(outbox, owner, target, file).await?;
+        let delivered =
+            crate::desk_surface::deliver_file(outbox, &scope.owner, &scope.target, file).await?;
         info!(
             session = %delivered.session_id,
             message_id = %delivered.message_id,
@@ -191,7 +179,7 @@ impl ImageSink for HubImageSink {
 
         let file = StagedFile::of(&self.agent_id, artifact_id, media_type, &filename, caption);
         if let Some(scope) = ctx.desk.as_ref().filter(|scope| !scope.attended) {
-            return self.deliver_to_desk(ctx, &scope.target, file).await;
+            return self.deliver_to_desk(scope, file).await;
         }
         let Some(session_id) = ctx.id.as_deref().filter(|s| !s.is_empty()) else {
             return Err(eyre!(

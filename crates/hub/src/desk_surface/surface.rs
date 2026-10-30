@@ -113,8 +113,10 @@ impl DeskSurface {
         }
     }
 
-    /// The agent, the person the run is for, and the conversation of theirs
-    /// `channel` and `thread` name (see [`resolve_place`]).
+    /// The agent, whose conversations are meant, and the one of theirs
+    /// `channel` and `thread` name (see [`resolve_place`]). A run that
+    /// answers to a Desk conversation means its owner's; any other, the
+    /// person it runs for.
     fn addressed(
         &self,
         channel: &str,
@@ -124,14 +126,16 @@ impl DeskSurface {
             .service
             .upgrade()
             .ok_or_else(|| eyre!("the agent is gone"))?;
-        let owner = CURRENT_USER_ID
-            .try_with(Clone::clone)
-            .ok()
+        let scope = current_desk();
+        let owner = scope
+            .as_ref()
+            .map(|scope| scope.owner.clone())
+            .or_else(|| CURRENT_USER_ID.try_with(Clone::clone).ok())
             .filter(|owner| !owner.is_empty())
             .ok_or_else(|| eyre!("a Desk message is someone's: this run is for nobody"))?;
         let rooms = rooms_of(service.sessions.as_ref(), &owner)?;
-        let target = resolve_place(current_desk().as_ref(), channel, thread, &rooms)
-            .map_err(|e| eyre!(e))?;
+        let target =
+            resolve_place(scope.as_ref(), channel, thread, &rooms).map_err(|e| eyre!(e))?;
         Ok((service, owner, target))
     }
 }
@@ -227,6 +231,7 @@ mod tests {
         DeskScope {
             target,
             attended: true,
+            owner: "person-1".into(),
         }
     }
 

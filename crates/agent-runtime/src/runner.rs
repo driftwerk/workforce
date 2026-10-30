@@ -5983,9 +5983,15 @@ impl AgentRunner {
             // What this round's programs called, recorded like direct calls.
             tool_invocations.extend(std::mem::take(&mut *round_nested.lock()));
 
-            // Deliver any images this round's tools staged (streaming path).
-            self.deliver_round_images(&tool_invocations[round_first..])
-                .await;
+            // Deliver any images this round's tools staged (streaming path),
+            // the turn's progress in scope so a surface that shows them in the
+            // turn's own stream can.
+            scope_turn(
+                Some(progress_tx.clone()),
+                None,
+                self.deliver_round_images(&tool_invocations[round_first..]),
+            )
+            .await;
 
             // ── Trace capture: write round with tool results (streaming path) ──
             if let Some(ref tw) = self.config.trace_writer {
@@ -8160,6 +8166,7 @@ mod tests {
                     spoken: false,
                 },
                 attended: true,
+                owner: "person-1".into(),
             }),
         };
         let captured = Arc::new(std::sync::Mutex::new(SessionContext::default()));

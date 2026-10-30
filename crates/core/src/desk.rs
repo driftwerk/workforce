@@ -427,12 +427,14 @@ impl DeskTurnContext {
     }
 }
 
-/// The Desk conversation a run's output reaches, and whether a person is
-/// there to answer: a live Desk turn is attended, a job or workflow it set
-/// up is not.
+/// The Desk conversation a run's output reaches, whose it is, and whether a
+/// person is there to answer: a live Desk turn is attended, a job or
+/// workflow it set up is not.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeskScope {
     pub target: DeskTarget,
+    /// The person (or paired device) whose conversation `target` is.
+    pub owner: String,
     pub attended: bool,
 }
 

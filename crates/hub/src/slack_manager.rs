@@ -11273,6 +11273,7 @@ pub async fn resume_turn(
                 let desk = session.desk_origin().map(|target| {
                     workforce_common::channels::desk::DeskScope {
                         target,
+                        owner: session.owner.clone(),
                         attended: false,
                     }
                 });

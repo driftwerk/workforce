@@ -4299,8 +4299,10 @@ impl WorkflowRuntime {
             .ok()
             .as_ref()
             .and_then(desk_of)
-            .map(|target| DeskScope {
+            .zip(principal.run_as.clone())
+            .map(|(target, owner)| DeskScope {
                 target,
+                owner,
                 attended: false,
             });
         let result = self
@@ -6532,10 +6534,13 @@ impl WorkflowRuntime {
             .as_ref()
             .map(instance_principal)
             .unwrap_or_default();
-        let desk = desk.map(|target| DeskScope {
-            target,
-            attended: false,
-        });
+        let desk = desk
+            .zip(principal.run_as.clone())
+            .map(|(target, owner)| DeskScope {
+                target,
+                owner,
+                attended: false,
+            });
         self.run_scoped(
             principal,
             workforce_agent::runner::with_desk(
@@ -9058,6 +9063,7 @@ mod tests {
             Some(DeskScope {
                 target: DeskTarget::of_turn(&DeskPlace::Dm, "desk", None, false),
                 attended: false,
+                owner: "person-1".into(),
             })
         };
         assert_eq!(
@@ -9131,6 +9137,7 @@ mod tests {
                     Some(DeskScope {
                         target: target.clone(),
                         attended: true,
+                        owner: "person-1".into(),
                     }),
                     Arc::clone(&runtime).start_workflow(
                         "wf-desk",

@@ -1797,10 +1797,14 @@ impl Scheduler {
             .deliver_to
             .as_ref()
             .and_then(DeliveryTarget::desk_target)
-            .map(|target| workforce_common::channels::desk::DeskScope {
-                target: target.clone(),
-                attended: false,
-            });
+            .zip(job.owner())
+            .map(
+                |(target, owner)| workforce_common::channels::desk::DeskScope {
+                    target: target.clone(),
+                    owner: owner.to_string(),
+                    attended: false,
+                },
+            );
         workforce_agent::runner::with_desk(desk, self.execute_job_as(job)).await
     }
 
@@ -6108,6 +6112,7 @@ mod tests {
                 Some("device-1"),
                 false,
             ),
+            owner: "person-1".into(),
             attended: true,
         }
     }
@@ -6176,6 +6181,7 @@ mod tests {
         let dm = || workforce_common::channels::desk::DeskScope {
             target: desk_thread().target.dm(),
             attended: true,
+            owner: "person-1".into(),
         };
         let owned = add_job_on_desk(&sched, Some("owner"), dm(), turn_payload()).await;
         let record = sched.run_job_now(&owned).await.unwrap();

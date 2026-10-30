@@ -5064,6 +5064,7 @@ pub(crate) async fn stream_admitted(
     let desk_for_task = desk.cloned();
     let desk_scope_for_task = desk.map(|d| workforce_common::channels::desk::DeskScope {
         target: d.target.clone(),
+        owner: session.owner.clone(),
         attended: true,
     });
     let origin_for_task = Origin::of_turn(user, channel, session.is_voice_turn());

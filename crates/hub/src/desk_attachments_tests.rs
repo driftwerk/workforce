@@ -131,7 +131,7 @@ fn staged(
 }
 
 /// An agent `id` whose model answers everything with `reply`, after
-/// `delay`.
+/// `delay`. A test mounts what its model says first at priority 1.
 async fn agent(
     dir: &Path,
     id: &str,
@@ -167,7 +167,7 @@ async fn agent(
                 .set_body_string(sse)
                 .set_delay(delay),
         )
-        .with_priority(1)
+        .with_priority(2)
         .mount(&server)
         .await;
     Mock::given(method("POST"))
@@ -181,7 +181,7 @@ async fn agent(
                 }))
                 .set_delay(delay),
         )
-        .with_priority(2)
+        .with_priority(3)
         .mount(&server)
         .await;
     let service = crate::serve::AgentService::from_config(config, None)
@@ -398,8 +398,9 @@ async fn a_client_that_declared_nothing_is_never_sent_a_pdf() {
 
 /// In a live Desk turn a delivered file goes down the turn's own stream,
 /// described; in a run nobody attends that answers to a Desk conversation
-/// it lands there as a message of its own, kept for the conversation and
-/// pushed to whoever watches it.
+/// it lands there as a message of its own, in its owner's conversation
+/// whoever the run is as, kept for the conversation and pushed to whoever
+/// watches it.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_desk_turn_s_file_rides_its_stream_and_an_unattended_run_s_lands_in_its_conversation() {
     use workforce_agent::runner::{ProgressEvent, SessionContext};
@@ -414,10 +415,11 @@ async fn a_desk_turn_s_file_rides_its_stream_and_an_unattended_run_s_lands_in_it
         .get_or_create(DESK_CHANNEL, &person, "scout")
         .unwrap();
     let as_run = |session: &str, attended: bool| SessionContext {
-        user_id: Some(person.clone()),
+        user_id: Some("runs-as-someone-else".into()),
         desk: Some(DeskScope {
             target: dm.clone(),
             attended,
+            owner: person.clone(),
         }),
         ..context(session, "scout")
     };
@@ -493,6 +495,89 @@ async fn a_desk_turn_s_file_rides_its_stream_and_an_unattended_run_s_lands_in_it
     );
 }
 
+/// A Desk turn whose tool delivers a file is sent it in the turn's own
+/// stream, named by the turn, and its answer carries it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_file_a_desk_turn_s_tool_delivers_is_in_its_stream_and_on_its_answer() {
+    use futures::SinkExt;
+    use wiremock::matchers::{body_partial_json, method, path};
+    use wiremock::{Mock, ResponseTemplate};
+    store();
+    let dir = tempfile::tempdir().unwrap();
+    let (scout, llm) = agent(dir.path(), "scout", "Here are the rows.", Duration::ZERO).await;
+    let chunk = |body: serde_json::Value| format!("data: {body}\n\n");
+    let arguments = json!({"data": [{"region": "north", "total": 3}], "filename": "rows.csv"});
+    let call = [
+        chunk(
+            json!({"id": "c0", "object": "chat.completion.chunk", "model": "mock",
+            "choices": [{"index": 0, "delta": {"role": "assistant", "tool_calls": [{
+                "index": 0, "id": "call_1", "type": "function",
+                "function": {"name": "export_csv", "arguments": arguments.to_string()}
+            }]}, "finish_reason": null}]}),
+        ),
+        chunk(
+            json!({"id": "c0", "object": "chat.completion.chunk", "model": "mock",
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}}),
+        ),
+        "data: [DONE]\n\n".to_string(),
+    ]
+    .concat();
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_partial_json(json!({"stream": true})))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(call),
+        )
+        .with_priority(1)
+        .up_to_n_times(1)
+        .mount(&llm)
+        .await;
+    let (state, [(alice_id, alice), _]) = gateway(&scout);
+    let addr = serve_on_a_port(&state).await;
+    let (mut socket, _) = tokio_tungstenite::connect_async(format!(
+        "ws://{addr}/ws?token={alice}&agent_id=scout&channel=desk&desk=1&accept=*/*"
+    ))
+    .await
+    .unwrap();
+    until(&mut socket, "connected").await;
+    socket
+        .send(tokio_tungstenite::tungstenite::Message::Text(
+            json!({"type": "chat", "content": "Export the totals.", "turn_ref": "ref-1",
+                   "desk": {"place": {"kind": "dm"}, "speaker": {"kind": "person"}}})
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+    let image = until(&mut socket, "image").await;
+    let end = until(&mut socket, "turn_end").await;
+    assert_eq!(image["turn_ref"], "ref-1");
+    assert_eq!(image["id"], end["id"], "the file is the answer's");
+    let sent = &image["attachments"][0];
+    assert_eq!(
+        (&sent["filename"], &sent["mime_type"]),
+        (&json!("rows.csv"), &json!("text/csv"))
+    );
+    let dm = scout
+        .sessions
+        .find(DESK_CHANNEL, &alice_id)
+        .unwrap()
+        .unwrap();
+    let answer = dm
+        .messages
+        .iter()
+        .find(|m| json!(m.id) == end["id"])
+        .expect("the answer is saved under the id the turn ended with");
+    assert_eq!(answer.content, "Here are the rows.");
+    assert_eq!(
+        json!(answer.desk.as_ref().unwrap().files[0].artifact_id),
+        sent["artifact_id"]
+    );
+}
+
 /// `messaging.upload_file` on Desk stages the bytes as a file of the
 /// agent's and delivers it into the conversation it names, the current one
 /// when it names none.
@@ -507,6 +592,7 @@ async fn a_file_uploaded_to_desk_is_delivered_into_the_conversation() {
     let scope = DeskScope {
         target: DeskTarget::of_turn(&DeskPlace::Dm, DESK_CHANNEL, None, false),
         attended: true,
+        owner: person.clone(),
     };
     let surface = crate::desk_surface::DeskSurface::new(&scout);
     assert!(surface.capabilities().file_upload);

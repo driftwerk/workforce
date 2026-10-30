@@ -554,6 +554,7 @@ mod tests {
         let desk = DeskScope {
             target: DeskTarget::of_turn(&DeskPlace::Dm, "desk", None, false),
             attended: true,
+            owner: "person-1".into(),
         };
         let (on_desk, elsewhere) = {
             let invoker = Arc::clone(&invoker);

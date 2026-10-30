@@ -105,7 +105,8 @@ pub struct Said {
     pub attachments: Vec<crate::attachments::Attachment>,
 }
 
-/// Where a page of a conversation sits.
+/// Where a page of a conversation sits. A cursor names a message of the
+/// transcript: a file that is a message of its own (`file:…`) is none.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Cursor<'a> {
     /// The newest messages.

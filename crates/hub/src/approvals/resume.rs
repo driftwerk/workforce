@@ -54,10 +54,14 @@ pub async fn launch_resume(
         .find(&row.session_key, &row.requester_id)
         .ok()
         .flatten()
-        .and_then(|session| session.desk_origin())
-        .map(|target| workforce_common::channels::desk::DeskScope {
-            target,
-            attended: false,
+        .and_then(|session| {
+            session
+                .desk_origin()
+                .map(|target| workforce_common::channels::desk::DeskScope {
+                    target,
+                    owner: session.owner,
+                    attended: false,
+                })
         });
 
     // Mirror the scheduler: scope the delivery channel so the resumed

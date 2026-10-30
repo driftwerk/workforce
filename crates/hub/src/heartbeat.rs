@@ -210,10 +210,13 @@ impl HeartbeatRunner {
         };
         let desk = check
             .and_then(|check| self.desk_of(check))
-            .map(|(_, target)| workforce_common::channels::desk::DeskScope {
-                target,
-                attended: false,
-            });
+            .map(
+                |(owner, target)| workforce_common::channels::desk::DeskScope {
+                    target,
+                    owner,
+                    attended: false,
+                },
+            );
         workforce_agent::runner::with_desk(
             desk,
             self.service.run_background_unit(

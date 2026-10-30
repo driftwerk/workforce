@@ -285,6 +285,7 @@ mod tests {
         let scope = |attended| DeskScope {
             target: DeskTarget::of_turn(&DeskPlace::Dm, "desk", None, false),
             attended,
+            owner: "person-1".into(),
         };
         let ttl = Duration::from_secs(60);
         match for_unattended_desk(ApprovalDecision::SelfServe, "p1", Some(&scope(false)), ttl) {
