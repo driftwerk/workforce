@@ -33,7 +33,9 @@ use super::store::PendingApprovalStore;
 const TEAM_CACHE_TTL: Duration = Duration::from_secs(60);
 
 pub struct HubApprovalRouter {
-    permissions: Arc<dyn PermissionStore>,
+    /// Where designated-approver rules are read; none with `[permissions]`
+    /// off, when only a person's own unattended Desk runs are routed.
+    permissions: Option<Arc<dyn PermissionStore>>,
     identity: Arc<dyn IdentityStore>,
     team_store: Option<Arc<dyn TeamStore>>,
     pending: Arc<dyn PendingApprovalStore>,
@@ -44,7 +46,7 @@ pub struct HubApprovalRouter {
 
 impl HubApprovalRouter {
     pub fn new(
-        permissions: Arc<dyn PermissionStore>,
+        permissions: Option<Arc<dyn PermissionStore>>,
         identity: Arc<dyn IdentityStore>,
         pending: Arc<dyn PendingApprovalStore>,
         default_ttl: Duration,
@@ -196,8 +198,11 @@ impl ApprovalRouter for HubApprovalRouter {
 
 impl HubApprovalRouter {
     /// Who the permission rules say approves the call, after the
-    /// four-eyes and Slack-reachability filters.
+    /// four-eyes and Slack-reachability filters; self-serve with no rules.
     fn route_by_rules(&self, ctx: &ApprovalRouteCtx<'_>) -> ApprovalDecision {
+        let Some(permissions) = &self.permissions else {
+            return ApprovalDecision::SelfServe;
+        };
         let team_ids = self.team_ids_for(ctx.user_id);
         let mut scopes: Vec<(PermissionScope, &str)> = vec![
             (PermissionScope::Agent, ctx.agent_id),
@@ -205,10 +210,7 @@ impl HubApprovalRouter {
         ];
         scopes.extend(team_ids.iter().map(|t| (PermissionScope::Team, t.as_str())));
 
-        let rule = match self
-            .permissions
-            .approval_routing_for(&scopes, ctx.tool_name)
-        {
+        let rule = match permissions.approval_routing_for(&scopes, ctx.tool_name) {
             Ok(Some(rule)) => rule,
             Ok(None) => return ApprovalDecision::SelfServe,
             Err(e) => {
@@ -330,7 +332,7 @@ mod tests {
         let pending: Arc<dyn PendingApprovalStore> =
             Arc::new(SqlitePendingApprovalStore::in_memory().unwrap());
         let router = HubApprovalRouter::new(
-            Arc::clone(&permissions),
+            Some(Arc::clone(&permissions)),
             identity,
             pending,
             Duration::from_secs(3600),
@@ -362,6 +364,35 @@ mod tests {
             user_id: user,
             agent_id: agent,
             tool_name: tool,
+        }
+    }
+
+    #[tokio::test]
+    async fn without_permission_rules_only_an_unattended_desk_run_is_routed_to_its_person() {
+        use workforce_common::channels::desk::{DeskPlace, DeskScope, DeskTarget};
+        let router = HubApprovalRouter::new(
+            None,
+            Arc::new(SqliteIdentityStore::in_memory().unwrap()),
+            Arc::new(SqlitePendingApprovalStore::in_memory().unwrap()),
+            Duration::from_secs(3600),
+        );
+        let uid = Uuid::new_v4().to_string();
+        assert!(matches!(
+            router.route(&ctx(&uid, "atlas", "slack.send")),
+            ApprovalDecision::SelfServe
+        ));
+        let scope = DeskScope {
+            target: DeskTarget::of_turn(&DeskPlace::Dm, "desk", None, false),
+            attended: false,
+            owner: uid.clone(),
+        };
+        let routed = workforce_agent::runner::with_desk(Some(scope), async {
+            router.route(&ctx(&uid, "atlas", "slack.send"))
+        })
+        .await;
+        match routed {
+            ApprovalDecision::Routed(route) => assert_eq!(route.approver_user_ids, vec![uid]),
+            _ => panic!("a Desk-made job's person is asked"),
         }
     }
 

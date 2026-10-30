@@ -4754,21 +4754,23 @@ rules:
                 *watcher_identity_store.write() = Some(Arc::clone(store));
             }
 
-            // Approval routing (designated approvers) — gated by
-            // `[approvals] enabled`. Needs the permission store (for the
-            // routing rules) and the identity store (to expand roles +
-            // resolve Slack ids), so it only wires when both the cascade
-            // and the identity store are present. The same pending store
-            // backs the router's `defer`, the Slack button handler, and
-            // the expiry sweeper.
+            // Approval routing — gated by `[approvals] enabled`. Needs the
+            // identity store (to expand roles and resolve Slack ids); the
+            // permission store supplies designated-approver rules when the
+            // cascade is on, and without it only a person's own unattended
+            // Desk runs are routed, to them. The same pending store backs
+            // the router's `defer`, the Slack button handler, and the
+            // expiry sweeper.
             let pending_store = build_pending_approval_store(&wf_config).await?;
             if let Some(pending_store) = pending_store.clone() {
-                match (permission_evaluator.as_ref(), identity_store.as_ref()) {
-                    (Some(evaluator), Some(id_store)) => {
+                match identity_store.as_ref() {
+                    Some(id_store) => {
                         let default_ttl =
                             std::time::Duration::from_secs(wf_config.approvals.default_ttl_secs);
                         let mut router = workforce_hub::approvals::HubApprovalRouter::new(
-                            Arc::clone(evaluator.store()),
+                            permission_evaluator
+                                .as_ref()
+                                .map(|evaluator| Arc::clone(evaluator.store())),
                             id_store.clone().as_identity_store(),
                             Arc::clone(&pending_store),
                             default_ttl,
@@ -4792,9 +4794,9 @@ rules:
                         );
                         tracing::info!("Approval routing enabled");
                     }
-                    _ => tracing::warn!(
-                        "[approvals] enabled but permission store or identity store is \
-                             unavailable; routed approvals are inactive"
+                    None => tracing::warn!(
+                        "[approvals] enabled but the identity store is unavailable; routed \
+                         approvals are inactive"
                     ),
                 }
             }
