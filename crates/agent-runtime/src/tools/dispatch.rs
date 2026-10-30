@@ -523,13 +523,7 @@ pub fn apply_surface_gate(
     match kept() {
         Kept::Allowed => response,
         kept => {
-            let preview: String = ["text", "message", "body", "subject", "content"]
-                .iter()
-                .find_map(|field| input[*field].as_str())
-                .unwrap_or_default()
-                .chars()
-                .take(PREVIEW_CHARS)
-                .collect();
+            let preview: String = preview_of(input).chars().take(PREVIEW_CHARS).collect();
             PolicyResponse {
                 decision: PolicyDecision::RequireApproval {
                     reason: format!(
@@ -541,6 +535,22 @@ pub fn apply_surface_gate(
             }
         }
     }
+}
+
+/// What a write says, as its prompt previews it: the first of its text,
+/// message or body fields (in any case: `TextBody` is Postmark's), else its
+/// subject or content.
+fn preview_of(input: &Value) -> &str {
+    let fields = input.as_object();
+    ["text", "message", "body", "textbody", "subject", "content"]
+        .iter()
+        .find_map(|wanted| {
+            fields?
+                .iter()
+                .find(|(key, value)| key.eq_ignore_ascii_case(wanted) && value.is_string())
+                .and_then(|(_, value)| value.as_str())
+        })
+        .unwrap_or_default()
 }
 
 /// The refusal a tool that requires human approval gets on a path with no
@@ -1756,6 +1766,20 @@ mod tests {
                 .insert((person.into(), agent.into(), tool.into(), to.clone()));
             Ok(())
         }
+    }
+
+    #[test]
+    fn a_held_write_shows_what_it_says_however_its_tool_names_it() {
+        assert_eq!(
+            preview_of(&serde_json::json!({"text": "hi", "subject": "s"})),
+            "hi"
+        );
+        assert_eq!(
+            preview_of(&serde_json::json!({"Subject": "Q3", "TextBody": "numbers attached"})),
+            "numbers attached"
+        );
+        assert_eq!(preview_of(&serde_json::json!({"Subject": "Q3"})), "Q3");
+        assert_eq!(preview_of(&serde_json::json!({"text": 3})), "");
     }
 
     #[test]
