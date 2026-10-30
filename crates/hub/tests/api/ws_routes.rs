@@ -336,6 +336,11 @@ async fn a_desk_connection_sends_turns_the_agent_reads_in_their_place() {
         "a person's Desk is offered the hub link too"
     );
 
+    let elsewhere = service
+        .sessions
+        .get_or_create("ios", &gateway.admin.id.to_string(), "default")
+        .unwrap();
+    service.sessions.save(&elsewhere).unwrap();
     let thread = uuid::Uuid::new_v4();
     let turn = |room| {
         json!({
@@ -370,11 +375,22 @@ async fn a_desk_connection_sends_turns_the_agent_reads_in_their_place() {
 
     send(
         &mut desk,
-        json!({"type": "chat", "content": "and the release?", "turn_ref": "ref-1", "desk": turn(room)}),
+        json!({"type": "chat", "content": "and the release?", "turn_ref": "ref-1", "desk": turn(room),
+               "session_id": elsewhere.id}),
     )
     .await;
     let frames = frames_until(&mut desk, "turn_end").await;
     assert!(frames.iter().any(|f| f["content"] == "done"), "{frames:?}");
+    assert!(
+        service
+            .sessions
+            .get(&elsewhere.id)
+            .unwrap()
+            .unwrap()
+            .messages
+            .is_empty(),
+        "a Desk turn runs in its own conversation, not another the person owns"
+    );
 
     let asked = llm.received_requests().await.unwrap();
     let body = String::from_utf8_lossy(&asked.last().unwrap().body).into_owned();

@@ -2376,15 +2376,20 @@ async fn handle_ws(
                                 .filter(|s| !s.is_empty())
                             {
                                 None => fallback_session_id,
+                                // A Desk turn is placed in its connection's
+                                // conversation, so it runs in no other.
                                 Some(sid) => {
-                                    if owns_session(service.sessions.as_ref(), sid, session_owner) {
+                                    let honoured =
+                                        owned_session(service.sessions.as_ref(), sid, session_owner)
+                                            .is_some_and(|s| !declared || s.channel == anchor_channel);
+                                    if honoured {
                                         sid.to_string()
                                     } else {
                                         warn!(
                                             requested = sid,
                                             anchor = %fallback_session_id,
                                             owner = session_owner,
-                                            "Client requested non-owned or unknown session — using anchor"
+                                            "Client requested a session it may not use here — using anchor"
                                         );
                                         fallback_session_id
                                     }
@@ -3436,11 +3441,20 @@ pub(crate) fn owns_session(
     session_id: &str,
     owner: &str,
 ) -> bool {
+    owned_session(sessions, session_id, owner).is_some()
+}
+
+/// `session_id`, when `owner` owns it ([`owns_session`]).
+fn owned_session(
+    sessions: &dyn workforce_common::session::SessionStore,
+    session_id: &str,
+    owner: &str,
+) -> Option<workforce_common::session::Session> {
     match sessions.get(session_id) {
-        Ok(session) => session.is_some_and(|s| s.owner == owner),
+        Ok(session) => session.filter(|s| s.owner == owner),
         Err(e) => {
             warn!(session_id, error = %e, "Session lookup failed");
-            false
+            None
         }
     }
 }
