@@ -637,6 +637,10 @@ impl Desk {
             session: Box::new(view),
         });
         events.into_iter().for_each(|e| self.note(e));
+        self.log_turns(ops);
+    }
+
+    fn log_turns(&self, ops: Vec<TurnOp>) {
         ops.into_iter().for_each(|op| {
             let _ = self.0.persist.send(Persist::Turn(Box::new(op)));
         });
@@ -1303,13 +1307,20 @@ impl Desk {
         }
     }
 
-    /// Forgets a session: ends it, deletes its record and takes it out of
-    /// the sidebar's layout.
+    /// Forgets a session: ends it and its turn, deletes its record and
+    /// takes it out of the sidebar's layout.
     pub async fn forget(&self, id: Uuid) -> Result<(), DeskError> {
         let live = {
-            let mut st = self.0.state.lock();
-            st.records.remove(&id).ok_or(DeskError::NotFound)?;
+            let mut guard = self.0.state.lock();
+            let st = &mut *guard;
+            let view = Self::view_of(st, st.records.get(&id).ok_or(DeskError::NotFound)?);
+            let ops = Self::turn_ops(st, &[Transition::Stopped { closed: false }], &view);
+            self.log_turns(ops);
+            st.records.remove(&id);
             st.seen_transcripts.remove(&id);
+            st.state_since.remove(&id);
+            st.working_noted.remove(&id);
+            st.acted.remove(&id);
             st.live.remove(&id)
         };
         if let Some(live) = &live {
@@ -3057,6 +3068,43 @@ mod tests {
                 d.view(older.id).unwrap().waiting_on(),
                 1,
                 "a CLI that reports nothing: its shell is found running"
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_forgotten_session_leaves_no_turn_running() {
+        with_test_pool(build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            DeskStore::migrate(&pool).await.unwrap();
+            let logged = Arc::new(Logged::default());
+            let d = Desk::start(
+                DeskStore::from_pool(pool),
+                options(dir.path()),
+                Floor {
+                    turns: Some(logged.clone()),
+                    plans: None,
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            let s = new_session(&d, dir.path()).await;
+            post(&d, s.id, json!({"hook_event_name": "UserPromptSubmit", "prompt": "run the tests"})).await;
+            assert_eq!(d.open_turns().len(), 1);
+            d.forget(s.id).await.unwrap();
+            assert!(d.open_turns().is_empty(), "nothing runs it");
+            assert!(
+                logs(&logged, |ops| ops.iter().any(|op| matches!(
+                    op,
+                    TurnOp::End {
+                        outcome: Outcome::Stopped,
+                        ..
+                    }
+                )) && ops.iter().any(|op| matches!(op, TurnOp::Settle { .. })))
+                .await,
+                "its turn ended, and what it asked with it"
             );
         })
         .await;
