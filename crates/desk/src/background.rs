@@ -115,10 +115,11 @@ impl Background {
         self.dated(now)
     }
 
-    /// A piece the CLI's own events track started.
+    /// A piece the CLI's own events track started, or was heard working.
     pub fn started(mut self, id: &str, kind: TaskKind, now: DateTime<Utc>) -> Self {
         self.tasks
             .entry(id.to_string())
+            .and_modify(|t| t.heard = now)
             .or_insert(Task { kind, heard: now });
         self.dated(now)
     }
@@ -241,6 +242,14 @@ mod tests {
             .started("t2", TaskKind::Agent, at(0))
             .started("t2", TaskKind::Agent, at(1));
         assert_eq!(b.view().map(|v| (v.count, v.since)), Some((1, at(0))));
+        assert_eq!(
+            b.clone()
+                .started("t2", TaskKind::Agent, at(9))
+                .looked(0, at(15))
+                .count(),
+            1,
+            "heard working lately"
+        );
         assert_eq!(b.ended("t2", at(2)).view(), None);
     }
 }
