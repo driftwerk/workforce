@@ -50,7 +50,8 @@ pub fn under(all: &[Proc], root: u32) -> Vec<&Proc> {
 
 /// The processes `parent` started itself.
 pub fn children(all: &[Proc], parent: u32) -> impl Iterator<Item = &Proc> {
-    all.iter().filter(move |p| p.ppid == parent && p.pid != parent)
+    all.iter()
+        .filter(move |p| p.ppid == parent && p.pid != parent)
 }
 
 /// Whether a process is one of Claude Code's Bash tool shells, which source
@@ -114,7 +115,10 @@ mod tests {
     async fn this_machines_listing_is_read_whole() {
         let table = table().await.expect("ps runs");
         let me = std::process::id();
-        let mine = table.iter().find(|p| p.pid == me).expect("this process is listed");
+        let mine = table
+            .iter()
+            .find(|p| p.pid == me)
+            .expect("this process is listed");
         assert!(!mine.args.is_empty());
     }
 }

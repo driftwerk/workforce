@@ -685,7 +685,15 @@ mod tests {
         };
         let watch = Watch {
             track: None,
-            floor: AgentTurn::begin(&log, "scout", "Scout".into(), &origin, None, None, crew::now()),
+            floor: AgentTurn::begin(
+                &log,
+                "scout",
+                "Scout".into(),
+                &origin,
+                None,
+                None,
+                crew::now(),
+            ),
         };
         watch.unanswered(&TurnOutcome::Skipped(Skip::NoLogin));
         let ended: Vec<_> = recorded

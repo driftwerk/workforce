@@ -211,7 +211,11 @@ mod tests {
             .reported(tasks(&[("s1", TaskKind::Shell)]), at(0))
             .looked(0, at(1))
             .reported(tasks(&[("s2", TaskKind::Shell)]), at(2));
-        assert_eq!(b.count(), 1, "the next turn's shell runs until a look says not");
+        assert_eq!(
+            b.count(),
+            1,
+            "the next turn's shell runs until a look says not"
+        );
     }
 
     #[test]

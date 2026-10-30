@@ -922,7 +922,11 @@ mod tests {
             (kinds(&o), after),
             (vec!["background"], Some(Uuid::from_u128(99)))
         );
-        let (o, after) = ops(&[Transition::Background { from: 0, count: 1 }], &waiting, None);
+        let (o, after) = ops(
+            &[Transition::Background { from: 0, count: 1 }],
+            &waiting,
+            None,
+        );
         assert_eq!(
             (kinds(&o), after),
             (vec![], None),

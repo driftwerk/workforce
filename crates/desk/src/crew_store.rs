@@ -473,7 +473,12 @@ mod tests {
             }
             for i in 0..50 {
                 store
-                    .add_event(&add(&scout, Kind::Working, &format!("is running {i}"), None))
+                    .add_event(&add(
+                        &scout,
+                        Kind::Working,
+                        &format!("is running {i}"),
+                        None,
+                    ))
                     .await
                     .unwrap();
             }

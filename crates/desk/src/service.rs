@@ -2600,7 +2600,11 @@ mod tests {
             engine: Engine::Codex,
             baseline: Some(HashSet::from([11])),
         };
-        assert_eq!(Desk::running(&table, &look), 1, "one terminal, however deep");
+        assert_eq!(
+            Desk::running(&table, &look),
+            1,
+            "one terminal, however deep"
+        );
         assert_eq!(
             Desk::running(
                 &table,
@@ -3165,7 +3169,12 @@ mod tests {
             .await
             .unwrap();
             let s = new_session(&d, dir.path()).await;
-            post(&d, s.id, json!({"hook_event_name": "UserPromptSubmit", "prompt": "run the tests"})).await;
+            post(
+                &d,
+                s.id,
+                json!({"hook_event_name": "UserPromptSubmit", "prompt": "run the tests"}),
+            )
+            .await;
             assert_eq!(d.open_turns().len(), 1);
             d.forget(s.id).await.unwrap();
             assert!(d.open_turns().is_empty(), "nothing runs it");
@@ -3176,7 +3185,9 @@ mod tests {
                         outcome: Outcome::Stopped,
                         ..
                     }
-                )) && ops.iter().any(|op| matches!(op, TurnOp::Settle { .. })))
+                )) && ops
+                    .iter()
+                    .any(|op| matches!(op, TurnOp::Settle { .. })))
                 .await,
                 "its turn ended, and what it asked with it"
             );
