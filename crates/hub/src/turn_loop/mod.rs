@@ -5065,11 +5065,13 @@ pub(crate) async fn stream_admitted(
     let active_mcp_envs_for_task = env_scope_for_task.mcp_envs;
     let voice_channel_for_task = voice_channel.unwrap_or("").to_string();
     let desk_for_task = desk.cloned();
-    let desk_scope_for_task = desk.map(|d| workforce_common::channels::desk::DeskScope {
-        target: d.target.clone(),
-        owner: session.owner.clone(),
-        attended: true,
-    });
+    let desk_scope_for_task = desk
+        .map(|d| workforce_common::channels::desk::DeskScope {
+            target: d.target.clone(),
+            owner: session.owner.clone(),
+            attended: true,
+        })
+        .or_else(workforce_agent::runner::current_desk);
     let origin_for_task = Origin::of_turn(user, channel, session.is_voice_turn());
     let precurated_for_task = turn_tools.exclusive;
     let principal_for_task = principal.to_string();

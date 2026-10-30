@@ -5628,6 +5628,46 @@ async fn a_desk_room_turn_is_told_where_it_is_and_keeps_its_place() {
     assert!(!session.is_shared_conversation());
 }
 
+/// A streamed turn run inside an unattended Desk scope, as a workflow step
+/// or a recovered turn is, answers to that conversation: its reply is
+/// marked as resumed there.
+#[tokio::test]
+async fn a_streamed_turn_answers_to_the_desk_scope_it_was_started_in() {
+    use workforce_common::channels::desk::{DeliveryKind, DeskPlace, DeskScope, DeskTarget};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (service, _server) = service_on_mock_llm(tmp.path()).await;
+    let target = DeskTarget::of_turn(&DeskPlace::Dm, "desk", None, false);
+    let MessageProgress {
+        mut progress_rx,
+        handle,
+        ..
+    } = workforce_agent::runner::with_desk(
+        Some(DeskScope {
+            target: target.clone(),
+            owner: "owner-1".into(),
+            attended: false,
+        }),
+        service.process_message_with_progress(
+            "desk", "owner-1", None, "and the release?", None, None, None, None, None, None,
+            None, None, None, None, None, None, None, None, None, None, None, None, None, None,
+        ),
+    )
+    .await
+    .unwrap();
+    while progress_rx.recv().await.is_some() {}
+    handle.await.unwrap().unwrap();
+
+    let session = service.sessions.find("desk", "owner-1").unwrap().unwrap();
+    let reply = session.messages.last().unwrap();
+    assert_eq!(reply.role, MessageRole::Assistant);
+    assert_eq!(
+        reply.desk.as_ref().and_then(|mark| mark.delivery),
+        Some(DeliveryKind::Resumed)
+    );
+    assert_eq!(session.desk_origin(), Some(target));
+}
+
 /// A check made in a Desk thread tells its creator what it found there, as
 /// a check-in; once the device holding its room is unpaired it reports to
 /// their DM and still runs as them; a hand edit of where it reports stops it
