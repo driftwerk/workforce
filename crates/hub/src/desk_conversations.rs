@@ -27,7 +27,9 @@ use crate::gateway::{resolve_caller_context, AuthFailure, GatewayState};
 /// interleaved with tool rows, so a page of messages takes several.
 const ENTRIES_PER_READ: usize = 400;
 
-/// How many reads one page may take before it settles for what it has.
+/// How many reads a page back from the newest, or from a message, may take
+/// before it settles for what it has. A page forward from a message reads
+/// back until it reaches that message, however far.
 const MAX_READS: usize = 25;
 
 /// User-role rows the hub writes for the model, never typed by anyone: a
@@ -128,11 +130,16 @@ pub(crate) fn read(
         Cursor::After(id) => (None, Some(id), None),
     };
     // Newest first while gathering: past the limit, or reaching the message
-    // a forward page starts after, ends it.
+    // a forward page starts after, ends it. A forward page keeps only the
+    // oldest of what it passes on the way back, which is all it returns.
     let mut gathered: Vec<Said> = Vec::new();
     let mut exhausted = false;
     let mut reached = false;
-    for _ in 0..MAX_READS {
+    let reads = match after {
+        Some(_) => usize::MAX,
+        None => MAX_READS,
+    };
+    for _ in 0..reads {
         let read = store
             .read_thread_page(
                 &head.id,
@@ -156,6 +163,9 @@ pub(crate) fn read(
                 .map(|e| e.timestamp);
         }
         gathered.extend(newer.into_iter().filter_map(|e| said(e, agent)));
+        if after.is_some() && gathered.len() > limit + 1 {
+            gathered.drain(..gathered.len() - (limit + 1));
+        }
         let oldest = read.messages.first();
         exhausted = !read.has_more || oldest.is_none();
         if reached || exhausted || (after.is_none() && gathered.len() > limit) {
@@ -730,6 +740,35 @@ mod tests {
                 ..DeskMark::default()
             })
         );
+    }
+
+    /// A Desk closed while a conversation ran on reads forward from where it
+    /// was, however far back that is: nothing between is skipped.
+    #[test]
+    fn a_forward_page_from_far_back_starts_right_after_its_cursor() {
+        let store = InMemorySessionStore::new();
+        let exchanges = MAX_READS * ENTRIES_PER_READ / 3 + 50;
+        let mut session = store.get_or_create(DESK_CHANNEL, ME, "scout").unwrap();
+        for n in 0..exchanges {
+            session.add_user_message(&format!("question {n}"), None);
+            session.messages.push(SessionMessage::tool(
+                "notes",
+                &serde_json::json!({}),
+                &serde_json::json!("ok"),
+                true,
+                1,
+                None,
+            ));
+            session.add_assistant_message(&format!("answer {n}"), 5);
+        }
+        store.save(&session).unwrap();
+        let first = session.messages[2].id.clone();
+        let next = page(&store, &scout(), ME, DESK_CHANNEL, Cursor::After(&first), 2).unwrap();
+        assert_eq!(
+            texts(&next),
+            [("question 1", Author::User), ("answer 1", Author::Agent)]
+        );
+        assert!(next.more);
     }
 
     #[test]
