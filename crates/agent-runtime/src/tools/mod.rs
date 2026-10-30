@@ -166,6 +166,15 @@ impl SurfaceEffect {
             destination: recipients.into_iter().collect::<Vec<_>>().join(", "),
         }
     }
+
+    /// A raw call to an email provider's API: any but a read may send mail,
+    /// to whom its body addresses.
+    pub fn email_api(input: &serde_json::Value) -> Option<Self> {
+        (!input["method"]
+            .as_str()
+            .is_some_and(|method| method.eq_ignore_ascii_case("GET")))
+        .then(|| Self::email(&input["body"]))
+    }
 }
 
 /// The addresses `value` names: a comma-separated string (`Name <a@b>` as

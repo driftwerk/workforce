@@ -1816,6 +1816,19 @@ mod tests {
             Some("carol@x.com, dan@x.com".to_string())
         );
         assert_eq!(to(serde_json::json!({"subject": "nobody"})), None);
+        assert_eq!(
+            SurfaceEffect::email_api(&serde_json::json!({
+                "method": "POST", "path": "/email", "body": {"To": "bob@x.com"}
+            }))
+            .and_then(|e| e.destination())
+            .map(|d| d.target),
+            Some("bob@x.com".to_string()),
+            "a raw send names its recipients in its body"
+        );
+        assert_eq!(
+            SurfaceEffect::email_api(&serde_json::json!({"method": "get", "path": "/servers"})),
+            None
+        );
     }
 
     #[test]

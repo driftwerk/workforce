@@ -1953,6 +1953,13 @@ impl Tool for PostmarkApiTool {
     fn name(&self) -> &str {
         "postmark.api"
     }
+
+    fn surface_effect(
+        &self,
+        input: &serde_json::Value,
+    ) -> Option<workforce_agent::tools::SurfaceEffect> {
+        workforce_agent::tools::SurfaceEffect::email_api(input)
+    }
     fn description(&self) -> &str {
         "Make an arbitrary Postmark REST API request. Use for endpoints not covered by the typed tools. `token_type` selects server or account token (default: server)."
     }

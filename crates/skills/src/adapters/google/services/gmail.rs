@@ -24,7 +24,7 @@ use serde_json::{json, Map, Value};
 use workforce_agent::tools::image_view::{
     stage_for_view, view_pending_note, within_view_cap, MAX_VIEW_BYTES, VIEWED_IMAGES_KEY,
 };
-use workforce_agent::tools::Tool;
+use workforce_agent::tools::{SurfaceEffect, Tool};
 
 use crate::adapters::google::api::{GoogleApi, GoogleApiContext};
 use crate::adapters::outbound_mail::{assemble, MailPart};
@@ -33,7 +33,8 @@ use crate::adapters::utils::{
 };
 
 use crate::adapters::google::tool_helpers::{
-    handler, object_schema, optional_str, optional_u64, props, required_str, tool, urlencode,
+    handler, object_schema, optional_str, optional_u64, props, required_str, sending_tool, tool,
+    urlencode,
 };
 
 const BASE: &str = "https://gmail.googleapis.com/gmail/v1/users/me";
@@ -128,12 +129,13 @@ pub fn tools(ctx: Arc<GoogleApiContext>) -> Vec<Arc<dyn Tool>> {
         ]),
         &["to", "subject"],
     );
-    out.push(tool(
+    out.push(sending_tool(
         "google.gmail.send",
         "Send a Gmail message",
         send_schema,
         &ctx,
         handler(|i, a| Box::pin(gmail_send(i, a))),
+        SurfaceEffect::email,
     ));
 
     // ── modify (add/remove labels) ───────────────────────────────────────────
@@ -316,12 +318,16 @@ pub fn tools(ctx: Arc<GoogleApiContext>) -> Vec<Arc<dyn Tool>> {
         props(&[("draft_id", json!({"type":"string"}))]),
         &["draft_id"],
     );
-    out.push(tool(
+    out.push(sending_tool(
         "google.gmail.draft_send",
         "Send an existing draft",
         draft_send_schema,
         &ctx,
         handler(|i, a| Box::pin(gmail_draft_send(i, a))),
+        |_| SurfaceEffect::Writes {
+            platform: "email".to_string(),
+            destination: String::new(),
+        },
     ));
 
     let draft_delete_schema = object_schema(

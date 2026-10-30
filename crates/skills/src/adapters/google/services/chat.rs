@@ -6,15 +6,24 @@ use std::sync::Arc;
 
 use eyre::{Result, WrapErr};
 use serde_json::{json, Map, Value};
-use workforce_agent::tools::Tool;
+use workforce_agent::tools::{SurfaceEffect, Tool};
 
 use crate::adapters::google::api::{GoogleApi, GoogleApiContext};
 
 use crate::adapters::google::tool_helpers::{
-    handler, object_schema, optional_str, optional_u64, props, required_str, tool, urlencode,
+    handler, object_schema, optional_str, optional_u64, props, required_str, sending_tool, tool,
+    urlencode,
 };
 
 const BASE: &str = "https://chat.googleapis.com/v1";
+
+/// A write to Google Chat, at what `field` of the call names.
+fn chat_write(input: &Value, field: &str) -> SurfaceEffect {
+    SurfaceEffect::Writes {
+        platform: "google_chat".to_string(),
+        destination: input[field].as_str().unwrap_or_default().to_string(),
+    }
+}
 
 pub fn tools(ctx: Arc<GoogleApiContext>) -> Vec<Arc<dyn Tool>> {
     let mut out: Vec<Arc<dyn Tool>> = Vec::new();
@@ -98,12 +107,13 @@ pub fn tools(ctx: Arc<GoogleApiContext>) -> Vec<Arc<dyn Tool>> {
         ]),
         &["space", "text"],
     );
-    out.push(tool(
+    out.push(sending_tool(
         "google.chat.messages_send",
         "Send a message in a Chat space",
         send_schema,
         &ctx,
         handler(|i, a| Box::pin(messages_send(i, a))),
+        |input| chat_write(input, "space"),
     ));
 
     // ── dm send ──────────────────────────────────────────────────────────────
@@ -117,12 +127,16 @@ pub fn tools(ctx: Arc<GoogleApiContext>) -> Vec<Arc<dyn Tool>> {
         ]),
         &["user", "text"],
     );
-    out.push(tool(
+    out.push(sending_tool(
         "google.chat.dm_send",
         "Send a direct message to a user",
         dm_schema,
         &ctx,
         handler(|i, a| Box::pin(dm_send(i, a))),
+        |input| SurfaceEffect::Writes {
+            platform: "google_chat".to_string(),
+            destination: format!("@{}", input["user"].as_str().unwrap_or_default()),
+        },
     ));
 
     // ── reactions create ─────────────────────────────────────────────────────
@@ -139,12 +153,13 @@ pub fn tools(ctx: Arc<GoogleApiContext>) -> Vec<Arc<dyn Tool>> {
         ]),
         &["message", "emoji"],
     );
-    out.push(tool(
+    out.push(sending_tool(
         "google.chat.reactions_create",
         "Add a reaction to a message",
         react_schema,
         &ctx,
         handler(|i, a| Box::pin(reactions_create(i, a))),
+        |input| chat_write(input, "message"),
     ));
 
     // ── reactions list ───────────────────────────────────────────────────────
@@ -168,12 +183,13 @@ pub fn tools(ctx: Arc<GoogleApiContext>) -> Vec<Arc<dyn Tool>> {
         )]),
         &["reaction"],
     );
-    out.push(tool(
+    out.push(sending_tool(
         "google.chat.reactions_delete",
         "Remove a reaction",
         react_del_schema,
         &ctx,
         handler(|i, a| Box::pin(reactions_delete(i, a))),
+        |input| chat_write(input, "reaction"),
     ));
 
     // ── threads list ─────────────────────────────────────────────────────────

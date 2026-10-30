@@ -64,13 +64,7 @@ mod tests {
         }
     }
 
-    /// Regression: the `tool_names()` enumeration on the parent
-    /// `adapters::google` module must list every tool that `build_all()`
-    /// actually registers, plus `google.setup`. Drift here breaks the
-    /// `/cc` MCP allow-list: a missing name means the model can't call
-    /// the tool, an extra name is ignored.
-    #[test]
-    fn parent_tool_names_covers_build_all_plus_setup() {
+    fn context() -> Arc<GoogleApiContext> {
         let creds = OAuthClientCreds {
             client_id: "test".into(),
             client_secret: "test".into(),
@@ -78,11 +72,64 @@ mod tests {
         };
         let http = reqwest::Client::new();
         let tokens = TokenStore::new(Arc::new(NullStore), "default".into(), creds, http.clone());
-        let ctx = Arc::new(GoogleApiContext::single(Arc::new(GoogleApi::new(
+        Arc::new(GoogleApiContext::single(Arc::new(GoogleApi::new(
             http, tokens,
-        ))));
+        ))))
+    }
 
-        let mut registered: HashSet<String> = build_all(ctx)
+    #[test]
+    fn only_a_tool_that_sends_to_someone_writes_to_its_surface() {
+        use serde_json::json;
+        use workforce_agent::tools::SurfaceEffect;
+        let tools = build_all(context());
+        let effect = |name: &str, input: serde_json::Value| {
+            tools
+                .iter()
+                .find(|t| t.name() == name)
+                .and_then(|t| t.surface_effect(&input))
+        };
+        let writes = |name: &str, input| {
+            effect(name, input)
+                .and_then(|e| e.destination())
+                .map(|d| format!("{} {}", d.platform, d.target))
+        };
+        assert_eq!(
+            writes(
+                "google.gmail.send",
+                json!({"to": "a@x.com", "bcc": "b@x.com"})
+            ),
+            Some("email a@x.com, b@x.com".into())
+        );
+        assert_eq!(
+            writes(
+                "google.chat.messages_send",
+                json!({"space": "spaces/AAA", "text": "hi"})
+            ),
+            Some("google_chat spaces/aaa".into())
+        );
+        assert_eq!(
+            writes(
+                "google.chat.dm_send",
+                json!({"user": "users/1", "text": "hi"})
+            ),
+            Some("google_chat @users/1".into())
+        );
+        assert!(matches!(
+            effect("google.gmail.draft_send", json!({"draft_id": "d1"})),
+            Some(SurfaceEffect::Writes { .. })
+        ));
+        assert_eq!(effect("google.gmail.search", json!({})), None);
+        assert_eq!(effect("google.chat.messages_list", json!({})), None);
+    }
+
+    /// Regression: the `tool_names()` enumeration on the parent
+    /// `adapters::google` module must list every tool that `build_all()`
+    /// actually registers, plus `google.setup`. Drift here breaks the
+    /// `/cc` MCP allow-list: a missing name means the model can't call
+    /// the tool, an extra name is ignored.
+    #[test]
+    fn parent_tool_names_covers_build_all_plus_setup() {
+        let mut registered: HashSet<String> = build_all(context())
             .iter()
             .map(|t| t.name().to_string())
             .collect();
@@ -109,19 +156,8 @@ mod tests {
     /// `"tools: Tool names must be unique."` and breaks every provider.
     #[test]
     fn build_all_has_no_duplicate_tool_names_after_normalization() {
-        let creds = OAuthClientCreds {
-            client_id: "test".into(),
-            client_secret: "test".into(),
-            redirect_uri: None,
-        };
-        let http = reqwest::Client::new();
-        let tokens = TokenStore::new(Arc::new(NullStore), "default".into(), creds, http.clone());
-        let ctx = Arc::new(GoogleApiContext::single(Arc::new(GoogleApi::new(
-            http, tokens,
-        ))));
-
         let mut seen: HashSet<String> = HashSet::new();
-        let duplicates: Vec<String> = build_all(ctx)
+        let duplicates: Vec<String> = build_all(context())
             .iter()
             .map(|t| t.name().replace('.', "_"))
             .filter(|n| !seen.insert(n.clone()))

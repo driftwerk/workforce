@@ -179,10 +179,13 @@ impl Tool for SendGridTool {
     }
 
     fn surface_effect(&self, input: &Value) -> Option<workforce_agent::tools::SurfaceEffect> {
-        self.spec
-            .name
-            .starts_with("sendgrid.email_send")
-            .then(|| workforce_agent::tools::SurfaceEffect::email(input))
+        use workforce_agent::tools::SurfaceEffect;
+        match self.spec.name {
+            "sendgrid.api" => SurfaceEffect::email_api(input),
+            name => name
+                .starts_with("sendgrid.email_send")
+                .then(|| SurfaceEffect::email(input)),
+        }
     }
 }
 
