@@ -455,13 +455,16 @@ struct FloorQuery {
 }
 
 /// How far before now the person's day may start: a midnight in any
-/// timezone, a day longer for DST.
-const DAY_REACH: Duration = Duration::hours(48);
+/// timezone, an hour longer on a day DST ends.
+const DAY_REACH: Duration = Duration::hours(25);
+
+/// How far the clock of the Desk that names the day may be from the hub's.
+const CLOCK_SKEW: Duration = Duration::minutes(5);
 
 /// The person's local midnight, read from `day`.
 fn day_of(day: Option<&str>, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
     let day = DateTime::parse_from_rfc3339(day?).ok()?.to_utc();
-    (day <= now && day >= now - DAY_REACH).then_some(day)
+    (day <= now + CLOCK_SKEW && day >= now - DAY_REACH - CLOCK_SKEW).then_some(day)
 }
 
 async fn floor_view(State(r): S, headers: HeaderMap, Query(q): Query<FloorQuery>) -> Response {
@@ -1125,6 +1128,15 @@ mod tests {
         assert_eq!(day_of(Some("yesterday"), now), None);
         assert_eq!(day_of(Some("2026-10-30T00:00:00Z"), now), None, "tomorrow");
         assert_eq!(day_of(Some("2026-10-26T00:00:00Z"), now), None, "days ago");
+        assert_eq!(
+            day_of(Some("2026-10-28T00:00:00Z"), now),
+            None,
+            "yesterday's midnight"
+        );
+        assert!(
+            day_of(Some("2026-10-29T16:44:00Z"), now).is_some(),
+            "a Desk whose clock runs a little ahead"
+        );
     }
 
     fn reading(login: LoginRef) -> Reading {
