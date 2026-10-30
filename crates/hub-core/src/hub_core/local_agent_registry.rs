@@ -477,6 +477,11 @@ impl LocalAgentRegistry {
     ) -> Result<Registered, RegisterRefusal> {
         check_key(&hello)?;
         let key = hello.key;
+        if self.taken_elsewhere(&key, &identity_id).await {
+            return Err(RegisterRefusal::Taken(key));
+        }
+        let connection = self.connections.fetch_add(1, Ordering::Relaxed);
+        let listener = self.listen(&key, connection).await;
         let mut nodes = self.nodes.write().await;
         if nodes
             .get(&key)
@@ -484,8 +489,6 @@ impl LocalAgentRegistry {
         {
             return Err(RegisterRefusal::Taken(key));
         }
-        let connection = self.connections.fetch_add(1, Ordering::Relaxed);
-        let listener = self.listen(&key, connection).await;
         info!(node = %key, name = %hello.name, identity = %identity_id, "Registering node");
         let replaced = nodes.remove(&key);
         let calls = match &hello.kind {
@@ -523,6 +526,20 @@ impl LocalAgentRegistry {
             connection,
             awaiting,
         })
+    }
+
+    /// Whether another person's local agent is online as `key`, here or on
+    /// another instance. Unreadable presence leaves it to this instance.
+    async fn taken_elsewhere(&self, key: &str, identity_id: &str) -> bool {
+        match self.presence().agents(None).await {
+            Ok(agents) => agents
+                .iter()
+                .any(|agent| agent.key == key && agent.identity_id != identity_id),
+            Err(e) => {
+                warn!(node = %key, error = %e, "Presence unreadable; checking this instance's nodes alone");
+                false
+            }
+        }
     }
 
     /// The relay's listener for `key`'s `connection`, with NATS.
@@ -1820,6 +1837,26 @@ mod tests {
                 PresenceKind::Desk { .. } => None,
             }))
         }
+    }
+
+    /// An id another person's node holds on another instance is refused,
+    /// and theirs is kept.
+    #[tokio::test]
+    async fn a_node_id_another_person_holds_on_another_instance_is_refused() {
+        let presence = SharedPresence {
+            rows: Arc::default(),
+            instance: "",
+        };
+        let (a, b) = (LocalAgentRegistry::new(), LocalAgentRegistry::new());
+        a.attach(None, Some(presence.on("hub-a")));
+        b.attach(None, Some(presence.on("hub-b")));
+        let (alices, _rx) = connect(&a, "studio", "alice", vec![]).await;
+        alices.unwrap();
+        let (bobs, _bob_rx) = connect(&b, "studio", "bob", vec![]).await;
+        assert_eq!(bobs, Err(RegisterRefusal::Taken("studio".into())));
+        assert!(b.is_bound_to("studio", "alice").await);
+        let (again, _rx) = connect(&b, "studio", "alice", vec![]).await;
+        assert!(again.is_ok(), "her own node moves instances");
     }
 
     /// Instances of one hub on a real NATS server, sharing presence:

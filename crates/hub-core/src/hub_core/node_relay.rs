@@ -139,8 +139,7 @@ impl NodeRelay {
         key: &str,
         connection: u64,
     ) -> Result<JoinHandle<()>> {
-        let sub = self.nats.subscribe(subjects::node(key)).await?;
-        self.nats.flush().await?;
+        let sub = self.subscribed(subjects::node(key)).await?;
         let (relay, key) = (self.clone(), key.to_string());
         Ok(tokio::spawn(relay.pump(registry, sub, key, connection)))
     }
@@ -274,8 +273,10 @@ impl NodeRelay {
         control: &NodeControl,
     ) -> Result<mpsc::Receiver<NodeEvent>, CallError> {
         let subject = subjects::node_reply(checked(request_id)?);
-        let mut events = self.nats.subscribe(subject).await.map_err(relay_error)?;
-        self.nats.flush().await.map_err(relay_error)?;
+        let mut events = self.subscribed(subject).await.map_err(|e| {
+            warn!(node = %key, error = %e, "Listening for a node call's events failed");
+            CallError::Offline(key.to_string())
+        })?;
         self.request(key, control).await?;
         let (tx, rx) = mpsc::channel(CALL_EVENTS);
         tokio::spawn(async move {
@@ -301,6 +302,18 @@ impl NodeRelay {
             }
         });
         Ok(rx)
+    }
+
+    /// A subscription to `subject` the server has registered, within
+    /// [`ACCEPT_TIMEOUT`]: a bus that doesn't answer holds up nothing.
+    async fn subscribed(&self, subject: String) -> Result<async_nats::Subscriber> {
+        tokio::time::timeout(ACCEPT_TIMEOUT, async {
+            let sub = self.nats.subscribe(subject).await?;
+            self.nats.flush().await?;
+            Ok::<_, eyre::Report>(sub)
+        })
+        .await
+        .map_err(|_| eyre::eyre!("the bus did not answer in time"))?
     }
 
     async fn request(&self, key: &str, control: &NodeControl) -> Result<(), CallError> {
