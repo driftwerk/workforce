@@ -456,12 +456,18 @@ impl Tool for HeartbeatUpdateTool {
         if let Some(tags) = params.tags {
             check.meta.tags = tags;
         }
-        check.meta.deliver_to = desk_origin().or(check.meta.deliver_to.take());
-        stamp_creator(
-            self.ctx.signer.as_deref(),
-            &mut check,
-            crate::user_config::current_identity_id().as_deref(),
-        );
+        // Where the check reports is its creator's: an edit by someone
+        // else, who becomes its creator, keeps none of the old one's.
+        let editor = crate::user_config::current_identity_id();
+        let kept = check.meta.deliver_to.take().filter(|_| {
+            check.meta.creator.as_deref()
+                == workforce_common::subscription::Payer::classify(editor.as_deref())
+                    .person()
+                    .map(|person| person.to_string())
+                    .as_deref()
+        });
+        check.meta.deliver_to = desk_origin().or(kept);
+        stamp_creator(self.ctx.signer.as_deref(), &mut check, editor.as_deref());
 
         match heartbeat_check::save_heartbeat_check(&self.ctx.workspace, &check) {
             Ok(()) => {
@@ -747,6 +753,61 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("Original body"));
+    }
+
+    /// An edit by the check's creator keeps where it reports; an edit by
+    /// anyone else, who becomes its creator, does not.
+    #[tokio::test]
+    async fn only_its_creator_s_edit_keeps_where_a_check_reports() {
+        use workforce_common::channels::desk::{DeskPlace, DeskTarget};
+        use workforce_common::delivery::DeliveryTarget;
+        let ctx = test_ctx();
+        let (alice, bob) = (
+            uuid::Uuid::new_v4().to_string(),
+            uuid::Uuid::new_v4().to_string(),
+        );
+        let reports =
+            DeliveryTarget::desk(DeskTarget::of_turn(&DeskPlace::Dm, "desk", None, false));
+        let check = HeartbeatCheck {
+            id: "inbox".into(),
+            meta: HeartbeatCheckMeta {
+                name: "Inbox".into(),
+                enabled: true,
+                schedule: None,
+                priority: 2,
+                tags: vec![],
+                timezone: None,
+                cooldown_secs: None,
+                take_action: false,
+                tools: None,
+                creator: Some(alice.clone()),
+                creator_sig: None,
+                deliver_to: Some(reports.clone()),
+            },
+            body: "Check the inbox.".into(),
+        };
+        heartbeat_check::save_heartbeat_check(&ctx.workspace, &check).unwrap();
+        let update = HeartbeatUpdateTool::new(ctx.clone());
+        let edit = |who: String| {
+            let update = &update;
+            workforce_agent::runner::CURRENT_USER_ID.scope(who, async move {
+                let edited = update
+                    .execute(serde_json::json!({ "check_id": "inbox", "priority": 1 }))
+                    .await
+                    .unwrap();
+                assert!(edited.success, "{:?}", edited.error);
+            })
+        };
+        let reported = || {
+            heartbeat_check::load_heartbeat_check(&ctx.workspace, "inbox")
+                .unwrap()
+                .meta
+                .deliver_to
+        };
+        edit(alice.clone()).await;
+        assert_eq!(reported(), Some(reports));
+        edit(bob).await;
+        assert_eq!(reported(), None);
     }
 
     #[tokio::test]
