@@ -16,7 +16,7 @@ use workforce_common::channels::{
 };
 
 use crate::adapters::messaging_routing::{
-    channel_hint_from_input, invalidate_if_channel_not_found, platform_arg,
+    channel_arg, channel_hint_from_input, invalidate_if_channel_not_found, platform_arg,
     schema_platform_property, schema_workspace_property, writes,
 };
 use crate::adapters::utils::{coerce_to_u64, decode_upload_content};
@@ -195,13 +195,8 @@ impl Tool for MessagingSendTool {
     async fn execute(&self, input: serde_json::Value) -> Result<ToolResult> {
         let start = std::time::Instant::now();
 
-        let channel = input["channel"]
-            .as_str()
-            .or_else(|| {
-                (platform_arg(&input) == workforce_common::channels::desk::DESK_PLATFORM)
-                    .then_some("")
-            })
-            .ok_or_else(|| eyre::eyre!("Missing 'channel' parameter"))?;
+        let channel =
+            channel_arg(&input).ok_or_else(|| eyre::eyre!("Missing 'channel' parameter"))?;
         let text = input["text"]
             .as_str()
             .ok_or_else(|| eyre::eyre!("Missing 'text' parameter"))?;
@@ -1255,7 +1250,9 @@ impl Tool for MessagingUploadFileTool {
     }
 
     fn description(&self) -> &str {
-        "Upload a file to a channel"
+        "Upload a file to a Slack or Teams channel, or a Desk conversation. In a Desk \
+         conversation, with no platform it posts to Desk: no channel is this conversation, \
+         \"dm\" the person's DM, \"#<room name>\" one of their rooms."
     }
 
     fn input_schema(&self) -> serde_json::Value {
@@ -1264,7 +1261,8 @@ impl Tool for MessagingUploadFileTool {
             "properties": {
                 "channel": {
                     "type": "string",
-                    "description": "Channel ID to upload to"
+                    "description": "Channel ID to upload to. Required outside a Desk \
+                                    conversation; in one it defaults to that conversation."
                 },
                 "filename": {
                     "type": "string",
@@ -1289,16 +1287,15 @@ impl Tool for MessagingUploadFileTool {
                 "platform": schema_platform_property(),
                 "workspace_id": schema_workspace_property()
             },
-            "required": ["channel", "filename"]
+            "required": ["filename"]
         })
     }
 
     async fn execute(&self, input: serde_json::Value) -> Result<ToolResult> {
         let start = std::time::Instant::now();
 
-        let channel = input["channel"]
-            .as_str()
-            .ok_or_else(|| eyre::eyre!("Missing 'channel' parameter"))?;
+        let channel =
+            channel_arg(&input).ok_or_else(|| eyre::eyre!("Missing 'channel' parameter"))?;
         let filename = input["filename"]
             .as_str()
             .ok_or_else(|| eyre::eyre!("Missing 'filename' parameter"))?;
@@ -1398,10 +1395,13 @@ impl Tool for MessagingSendFileTool {
 
     fn description(&self) -> &str {
         "Send a file that is already staged as an artifact — e.g. the artifact_id from a \
-         generate_image, view_attachment, or export_xlsx result — to a Slack channel or a user's \
-         DM. Use this to DM a generated image to someone, or post a file in another channel. \
-         Provide exactly one of `channel` (a channel id) or `user` (a Slack user id or an email \
-         to DM). Sending a file outside the current conversation asks the user for approval first."
+         generate_image, view_attachment, or export_xlsx result — to a Slack channel, a user's \
+         DM, or a Desk conversation. Use this to DM a generated image to someone, or post a file \
+         in another channel. Provide exactly one of `channel` (a channel id) or `user` (a Slack \
+         user id or an email to DM); in a Desk conversation, with no platform it posts to Desk: \
+         no destination is this conversation, \"dm\" the person's DM, \"#<room name>\" one of \
+         their rooms. Sending a file outside the current conversation asks the user for approval \
+         first."
     }
 
     fn input_schema(&self) -> serde_json::Value {
@@ -1415,7 +1415,8 @@ impl Tool for MessagingSendFileTool {
                 },
                 "channel": {
                     "type": "string",
-                    "description": "Destination channel id. Mutually exclusive with `user`."
+                    "description": "Destination channel id. Mutually exclusive with `user`. In \
+                                    a Desk conversation it defaults to that conversation."
                 },
                 "user": {
                     "type": "string",
@@ -1456,14 +1457,15 @@ impl Tool for MessagingSendFileTool {
                 ms(),
             ));
         };
-        let channel_in = input["channel"]
-            .as_str()
-            .map(str::trim)
-            .filter(|s| !s.is_empty());
         let user_in = input["user"]
             .as_str()
             .map(str::trim)
             .filter(|s| !s.is_empty());
+        let channel_in = input["channel"]
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .or_else(|| user_in.is_none().then(|| channel_arg(&input)).flatten());
         if channel_in.is_some() == user_in.is_some() {
             return Ok(ToolResult::failure(
                 "send_file needs exactly one destination: 'channel' or 'user'",
@@ -2537,10 +2539,7 @@ mod tests {
         let tool = MessagingUploadFileTool::new(registry);
         assert_eq!(tool.name(), "messaging.upload_file");
         let schema = tool.input_schema();
-        assert_eq!(
-            schema["required"],
-            serde_json::json!(["channel", "filename"])
-        );
+        assert_eq!(schema["required"], serde_json::json!(["filename"]));
     }
 
     #[tokio::test]
@@ -2784,6 +2783,34 @@ mod tests {
                 platform: "slack".into(),
                 destination: "C1".into()
             })
+        );
+    }
+
+    /// A file uploaded with no channel goes to the Desk conversation the
+    /// run answers to; anywhere else a channel is still required.
+    #[tokio::test]
+    async fn an_upload_with_no_channel_goes_to_the_desk_conversation_and_fails_elsewhere() {
+        use workforce_common::channels::desk::{DeskPlace, DeskScope, DeskTarget};
+        let mut registry = SurfaceRegistry::new();
+        registry.register(SurfaceKey::platform("slack"), MockSurface::new("slack"));
+        registry.register_session_surface("desk", MockSurface::new("desk"));
+        let tool = MessagingUploadFileTool::new(Arc::new(RwLock::new(registry)));
+        let upload = || serde_json::json!({"filename": "notes.txt", "content_text": "hello"});
+
+        let outside = tool.execute(upload()).await.unwrap_err();
+        assert!(outside.to_string().contains("Missing 'channel' parameter"));
+
+        let scope = DeskScope {
+            target: DeskTarget::of_turn(&DeskPlace::Dm, "desk", None, false),
+            attended: true,
+        };
+        let on_desk = workforce_agent::runner::with_desk(Some(scope), tool.execute(upload()))
+            .await
+            .unwrap();
+        assert!(on_desk.success, "{on_desk:?}");
+        assert_eq!(
+            (&on_desk.output["platform"], &on_desk.output["channel"]),
+            (&serde_json::json!("desk"), &serde_json::json!(""))
         );
     }
 }

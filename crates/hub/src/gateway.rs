@@ -205,6 +205,11 @@ pub struct WsQuery {
     /// `1` declares a Desk client on a Desk channel: it sends structured
     /// turns and reads the frames only Desk is sent. Ignored elsewhere.
     pub desk: Option<u8>,
+    /// The media types a `/ws` client shows, comma-separated
+    /// (`image/*,application/pdf,video/*`, or `*/*`): the files agents
+    /// deliver that it is sent. Images alone, inline, when omitted. See
+    /// [`workforce_gateway_client::protocol::MediaAccept`].
+    pub accept: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -399,6 +404,16 @@ pub fn router(state: Arc<GatewayState>) -> Router {
         .route(
             "/api/sessions/{id}/files/{name}",
             get(crate::session_handlers::session_file_get),
+        )
+        .route(
+            "/api/agents/{id}/attachments",
+            post(crate::desk_attachments::upload)
+                // The handler caps the file as it streams it to disk.
+                .layer(axum::extract::DefaultBodyLimit::disable()),
+        )
+        .route(
+            "/api/agents/{id}/attachments/{artifact}",
+            get(crate::desk_attachments::download),
         )
         .route("/api/models/health", get(model_health))
         .route("/api/models/aliases", get(model_aliases))
@@ -1321,6 +1336,8 @@ async fn ws_handler(
         Some(channel) => return invalid_ws_channel(channel),
     };
     let rich = workforce_common::rich::RichFeatures::from_names(query.rich.as_deref());
+    let accept =
+        workforce_gateway_client::protocol::MediaAccept::from_names(query.accept.as_deref());
     let declared =
         query.desk == Some(1) && workforce_common::channels::is_desk_conversation(&anchor_channel);
     let caller = match authenticate_ws(&state, query.token.as_deref().unwrap_or_default()).await {
@@ -1334,6 +1351,7 @@ async fn ws_handler(
             state,
             anchor_channel,
             rich,
+            accept,
             declared,
             agent_id,
             caller,
@@ -1514,7 +1532,7 @@ mod desk_frame_tests {
                 filename: "c.png".into(),
                 mime_type: "image/png".into(),
                 data: "iVBO".into(),
-                artifact_id: None,
+                ..Attachment::default()
             }],
         );
         let user_message = BroadcastMessage {
@@ -1850,6 +1868,7 @@ async fn handle_ws(
     state: Arc<GatewayState>,
     anchor_channel: String,
     rich: workforce_common::rich::RichFeatures,
+    accept: workforce_gateway_client::protocol::MediaAccept,
     declared: bool,
     agent_id: Option<String>,
     caller: WsCaller,
@@ -1989,8 +2008,18 @@ async fn handle_ws(
             ) {
                 continue;
             }
-
-            let Some(server_msg) = server_frame(msg, declared) else {
+            // Only the files this client shows, shaped as it expects them;
+            // a frame that only carried files it doesn't is not sent.
+            let attachments = match msg.attachments {
+                Some(files) => match accept.shape(files) {
+                    Some(shown) => Some(shown),
+                    None if msg.msg_type == "image" => continue,
+                    None => None,
+                },
+                None => None,
+            };
+            let Some(server_msg) = server_frame(BroadcastMessage { attachments, ..msg }, declared)
+            else {
                 continue;
             };
             if sender
@@ -3083,6 +3112,11 @@ pub(crate) async fn forward_local_progress(
                 stamp = Some(snapshot.stamp.clone());
                 Some(BroadcastMessage::turn_snapshot(sid.clone(), snapshot))
             }
+            ProgressEvent::File(file) => Some(crate::desk_attachments::frame(
+                &sid,
+                std::slice::from_ref(&file),
+                file.caption.clone(),
+            )),
         };
 
         // Track the heartbeat's in-flight
@@ -3329,7 +3363,7 @@ pub(crate) async fn steer(
 /// acts in it (a new turn, a stop, an approval answer) only when its sender
 /// is the person that session's turns run as; an unknown or unreadable
 /// session is nobody's.
-fn owns_session(
+pub(crate) fn owns_session(
     sessions: &dyn workforce_common::session::SessionStore,
     session_id: &str,
     owner: &str,
@@ -3589,6 +3623,11 @@ pub(crate) fn chat_progress_to_broadcast(
         ChatProgress::Snapshot(snapshot) => {
             Some(BroadcastMessage::turn_snapshot(session_id, snapshot))
         }
+        ChatProgress::File(file) => Some(crate::desk_attachments::frame(
+            session_id,
+            std::slice::from_ref(&file),
+            file.caption.clone(),
+        )),
         ChatProgress::TurnEnd(end) => Some(BroadcastMessage::turn_end(session_id, end)),
     }
 }
@@ -14072,6 +14111,55 @@ mod chat_progress_tests {
             .collect()
     }
 
+    /// A file a live Desk turn delivered is the `image` frame that shows it,
+    /// named by the turn, from a local turn and over NATS alike.
+    #[tokio::test]
+    async fn a_delivered_file_is_an_image_frame_of_its_turn() {
+        let file = workforce_common::channels::desk::DeskFile {
+            artifact_id: "art_1".into(),
+            agent_id: "scout".into(),
+            filename: "report.pdf".into(),
+            media_type: "application/pdf".into(),
+            size: 9,
+            width: None,
+            height: None,
+            caption: Some("the report".into()),
+        };
+        let stamp = TurnStamp {
+            turn_ref: Some("ref-1".into()),
+            reply_id: "reply-1".into(),
+        };
+        let (progress_tx, progress_rx) = tokio::sync::mpsc::channel(8);
+        let (tx, mut rx) = broadcast::channel(16);
+        progress_tx
+            .send(ProgressEvent::File(file.clone()))
+            .await
+            .unwrap();
+        drop(progress_tx);
+        forward_local_progress(progress_rx, tx, "s-1".into(), false, None, Some(stamp)).await;
+        let local = rx.try_recv().unwrap();
+        let nats = chat_progress_to_broadcast(ChatProgress::File(file), "s-1", false).unwrap();
+        for frame in [&local, &nats] {
+            assert_eq!(
+                (frame.msg_type.as_str(), frame.content.as_str()),
+                ("image", "the report")
+            );
+            let sent = frame.attachments.as_ref().unwrap();
+            assert_eq!(
+                (
+                    sent[0].artifact_id.as_deref(),
+                    sent[0].size,
+                    sent[0].data.as_str()
+                ),
+                (Some("art_1"), Some(9), "")
+            );
+        }
+        assert_eq!(
+            (local.turn_ref.as_deref(), local.id.as_deref()),
+            (Some("ref-1"), Some("reply-1"))
+        );
+    }
+
     #[tokio::test]
     async fn an_interrupted_discard_broadcasts_stream_discard() {
         let discards =
@@ -14727,6 +14815,7 @@ mod session_visibility_tests {
             channel: None,
             rich: None,
             desk: None,
+            accept: None,
         });
         chat_handler(
             headers.clone(),

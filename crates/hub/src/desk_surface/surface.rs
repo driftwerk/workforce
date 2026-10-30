@@ -16,7 +16,8 @@ use workforce_common::channels::{
 };
 use workforce_common::session::SessionStore;
 
-use super::deliver::{deliver, Delivery};
+use super::deliver::{deliver, deliver_file, Delivery};
+use crate::desk_attachments::StagedFile;
 use crate::serve::AgentService;
 
 /// How many of a person's sessions with an agent are searched for a room.
@@ -111,6 +112,28 @@ impl DeskSurface {
             service: Arc::downgrade(service),
         }
     }
+
+    /// The agent, the person the run is for, and the conversation of theirs
+    /// `channel` and `thread` name (see [`resolve_place`]).
+    fn addressed(
+        &self,
+        channel: &str,
+        thread: Option<&str>,
+    ) -> Result<(Arc<AgentService>, String, DeskTarget)> {
+        let service = self
+            .service
+            .upgrade()
+            .ok_or_else(|| eyre!("the agent is gone"))?;
+        let owner = CURRENT_USER_ID
+            .try_with(Clone::clone)
+            .ok()
+            .filter(|owner| !owner.is_empty())
+            .ok_or_else(|| eyre!("a Desk message is someone's: this run is for nobody"))?;
+        let rooms = rooms_of(service.sessions.as_ref(), &owner)?;
+        let target = resolve_place(current_desk().as_ref(), channel, thread, &rooms)
+            .map_err(|e| eyre!(e))?;
+        Ok((service, owner, target))
+    }
 }
 
 #[async_trait]
@@ -123,6 +146,7 @@ impl ChannelSurface for DeskSurface {
         ChannelCapabilities {
             send_message: true,
             threads: true,
+            file_upload: true,
             ..ChannelCapabilities::default()
         }
     }
@@ -147,23 +171,8 @@ impl ChannelSurface for DeskSurface {
     }
 
     async fn send_message(&self, message: &OutboundMessage) -> Result<SentMessage> {
-        let service = self
-            .service
-            .upgrade()
-            .ok_or_else(|| eyre!("the agent is gone"))?;
-        let owner = CURRENT_USER_ID
-            .try_with(Clone::clone)
-            .ok()
-            .filter(|owner| !owner.is_empty())
-            .ok_or_else(|| eyre!("a Desk message is someone's: this run is for nobody"))?;
-        let rooms = rooms_of(service.sessions.as_ref(), &owner)?;
-        let target = resolve_place(
-            current_desk().as_ref(),
-            &message.channel,
-            message.thread_id.as_deref(),
-            &rooms,
-        )
-        .map_err(|e| eyre!(e))?;
+        let (service, owner, target) =
+            self.addressed(&message.channel, message.thread_id.as_deref())?;
         let delivered = deliver(
             &service,
             &owner,
@@ -177,6 +186,23 @@ impl ChannelSurface for DeskSurface {
             thread_id: message.thread_id.clone(),
             platform: DESK_PLATFORM.to_string(),
         })
+    }
+
+    async fn upload_file(
+        &self,
+        channel: &str,
+        filename: &str,
+        content: &[u8],
+        message: Option<&str>,
+        thread_id: Option<&str>,
+    ) -> Result<String> {
+        let (service, owner, target) = self.addressed(channel, thread_id)?;
+        let agent = service.agent_id.as_str();
+        let file = StagedFile::stage(agent, filename, content.to_vec(), message)?;
+        let link =
+            workforce_common::channels::desk::download_path(agent, file.artifact_id.as_str());
+        deliver_file(&service, &owner, &target, file).await?;
+        Ok(link)
     }
 }
 

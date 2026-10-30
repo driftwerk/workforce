@@ -1441,6 +1441,9 @@ pub enum ProgressEvent {
     /// two of its events, so every consumer carries it in order with the
     /// deltas around it.
     Snapshot(workforce_common::channels::desk::TurnSnapshot),
+    /// A file a tool delivered into the live Desk turn, which the turn's
+    /// surface shows in it.
+    File(workforce_common::channels::desk::DeskFile),
 }
 
 /// A follow-up user message absorbed into a run, reported on [`RunResult`]
@@ -1979,6 +1982,17 @@ impl Drop for Withdraws<'_> {
     }
 }
 
+/// The files `invocations` staged for delivery: what the image sink was
+/// handed for the turn's surface.
+pub fn generated_files(
+    invocations: &[ToolInvocation],
+) -> impl Iterator<Item = crate::tools::image_gen::GeneratedImageRef> + '_ {
+    invocations
+        .iter()
+        .filter(|inv| inv.success)
+        .flat_map(|inv| crate::tools::image_gen::parse_generated_images(&inv.output))
+}
+
 /// Deliver the media `invocations` generated to the surface `ctx` names. A
 /// failed delivery is logged, never fatal to the turn.
 pub async fn deliver_generated(
@@ -1986,11 +2000,7 @@ pub async fn deliver_generated(
     ctx: &SessionContext,
     invocations: &[ToolInvocation],
 ) {
-    for img in invocations
-        .iter()
-        .filter(|inv| inv.success)
-        .flat_map(|inv| crate::tools::image_gen::parse_generated_images(&inv.output))
-    {
+    for img in generated_files(invocations) {
         if let Err(e) = sink
             .deliver(
                 ctx,
@@ -10294,6 +10304,7 @@ mod tests {
                 ProgressEvent::CheckIn { .. } => "check_in",
                 ProgressEvent::ConnectRequired { .. } => "connect_required",
                 ProgressEvent::Snapshot(_) => "snapshot",
+                ProgressEvent::File(_) => "file",
             })
             .collect();
 

@@ -658,6 +658,13 @@ pub struct SessionAttachment {
     pub artifact_id: Option<String>,
 }
 
+/// A file delivered into a Desk conversation, by reference.
+impl From<&crate::channels::desk::DeskFile> for SessionAttachment {
+    fn from(file: &crate::channels::desk::DeskFile) -> Self {
+        Self::from_artifact(&file.filename, &file.media_type, &file.artifact_id)
+    }
+}
+
 impl SessionAttachment {
     /// Build a by-reference attachment: the payload was already written to
     /// the artifact store and consumers resolve it from there.

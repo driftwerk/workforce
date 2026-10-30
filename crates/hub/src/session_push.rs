@@ -11,7 +11,7 @@ use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 use tracing::warn;
-use workforce_common::channels::desk::DeskDelivered;
+use workforce_common::channels::desk::{DeskDelivered, DeskFile};
 
 use crate::broadcast::BroadcastMessage;
 
@@ -27,6 +27,8 @@ enum Relayed {
         text: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         id: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        files: Vec<DeskFile>,
     },
     Delivered {
         owner: String,
@@ -41,9 +43,17 @@ impl Relayed {
                 session_id,
                 text,
                 id,
+                files,
             } => BroadcastMessage {
                 id,
-                ..BroadcastMessage::new(session_id, "message", text)
+                ..match files.is_empty() {
+                    true => BroadcastMessage::new(session_id, "message", text),
+                    false => crate::desk_attachments::frame(
+                        &session_id,
+                        &files,
+                        (!text.is_empty()).then_some(text),
+                    ),
+                }
             },
             Self::Delivered { owner, delivered } => {
                 BroadcastMessage::desk_delivered(&owner, delivered)
@@ -100,16 +110,24 @@ impl SessionPush {
     /// the answer is in the session already, and a client that misses the
     /// push reads it from there.
     pub async fn deliver(&self, session_id: &str, text: &str) {
-        self.message(session_id, text, None).await;
+        self.message(session_id, text, None, &[]).await;
     }
 
     /// [`Self::deliver`] for a message saved under `id`, which the pushed
-    /// frame carries.
-    pub async fn message(&self, session_id: &str, text: &str, id: Option<&str>) {
+    /// frame carries; one carrying `files` is pushed as the frame that
+    /// shows them.
+    pub async fn message(
+        &self,
+        session_id: &str,
+        text: &str,
+        id: Option<&str>,
+        files: &[DeskFile],
+    ) {
         self.relay(Relayed::Appended {
             session_id: session_id.to_string(),
             text: text.to_string(),
             id: id.map(str::to_string),
+            files: files.to_vec(),
         })
         .await;
     }
@@ -210,7 +228,7 @@ mod tests {
     async fn a_delivery_is_a_message_with_its_id_and_a_signal_to_its_owner() {
         let (tx, mut rx) = broadcast::channel(8);
         let push = SessionPush::new(None, tx);
-        push.message("s1", "a reminder", Some("m1")).await;
+        push.message("s1", "a reminder", Some("m1"), &[]).await;
         push.delivered("person-1", delivered()).await;
         let message = rx.recv().await.unwrap();
         assert_eq!(
@@ -224,12 +242,63 @@ mod tests {
         assert!(signal.session_id.is_empty());
     }
 
+    /// A delivery that carries a file is pushed as the frame that shows it,
+    /// with the id it was saved under, on every replica.
+    #[tokio::test]
+    async fn a_delivered_file_is_pushed_as_the_frame_that_shows_it() {
+        let (tx, mut rx) = broadcast::channel(8);
+        let report = DeskFile {
+            artifact_id: "art_1".into(),
+            agent_id: "scout".into(),
+            filename: "report.pdf".into(),
+            media_type: "application/pdf".into(),
+            size: 9,
+            width: None,
+            height: None,
+            caption: None,
+        };
+        SessionPush::new(None, tx)
+            .message(
+                "s1",
+                "the report",
+                Some("m1"),
+                std::slice::from_ref(&report),
+            )
+            .await;
+        let pushed = rx.recv().await.unwrap();
+        assert_eq!(
+            (
+                pushed.msg_type.as_str(),
+                pushed.content.as_str(),
+                pushed.id.as_deref(),
+                pushed.agent_id.as_deref()
+            ),
+            ("image", "the report", Some("m1"), Some("scout"))
+        );
+        let sent = pushed.attachments.unwrap();
+        assert_eq!(
+            (sent[0].artifact_id.as_deref(), sent[0].size),
+            (Some("art_1"), Some(9))
+        );
+        let relayed = Relayed::Appended {
+            session_id: "s1".into(),
+            text: String::new(),
+            id: Some("m1".into()),
+            files: vec![report],
+        };
+        assert_eq!(
+            serde_json::from_slice::<Relayed>(&serde_json::to_vec(&relayed).unwrap()).unwrap(),
+            relayed
+        );
+    }
+
     #[test]
     fn pushes_read_the_same_on_every_replica_old_and_new() {
         let appended = Relayed::Appended {
             session_id: "s1".into(),
             text: "the answer".into(),
             id: None,
+            files: Vec::new(),
         };
         let wire = serde_json::to_value(&appended).unwrap();
         assert_eq!(

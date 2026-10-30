@@ -237,6 +237,24 @@ pub(crate) fn add_redacted_assistant_message(
     }
 }
 
+/// The files a live Desk turn's `invocations` delivered, on the answer it
+/// just saved in `session`, so a Desk that missed them live reads them with
+/// it.
+pub(crate) fn carry_delivered_files(
+    session: &mut Session,
+    invocations: &[workforce_agent::runner::ToolInvocation],
+) {
+    let files = crate::desk_attachments::delivered_in(&session.agent_id, invocations);
+    if files.is_empty() {
+        return;
+    }
+    let Some(reply) = session.messages.last_mut() else {
+        return;
+    };
+    reply.attachments = Some(files.iter().map(Into::into).collect());
+    reply.desk.get_or_insert_with(Default::default).files = files;
+}
+
 /// The id and Desk mark a turn's answer in a session on `channel` is saved
 /// with: for a live Desk turn, the id its client was promised and its
 /// place; for a turn re-run in a Desk conversation nobody is attending (an
@@ -275,6 +293,9 @@ pub(crate) fn settle_served(
     desk: Option<&workforce_common::channels::desk::DeskTurnContext>,
 ) -> Option<&'static str> {
     add_redacted_assistant_message(session, &result.response, desk);
+    if desk.is_some() {
+        carry_delivered_files(session, &result.tool_invocations);
+    }
     if !route.is_cli() {
         record_observed_usage(session, result, reserved);
     }

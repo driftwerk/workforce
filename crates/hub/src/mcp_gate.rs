@@ -861,11 +861,14 @@ pub(crate) fn media_sinks(service: &AgentService) -> crate::mcp_gate::MediaSinks
             service.video_frames(),
             service.workspace.clone(),
         ));
-    let deliver = Arc::new(crate::image_sink::HubImageSink::new(
-        Arc::clone(&service.surface_registry),
-        service.agent_id.as_str(),
-        service.image_broadcast.read().clone(),
-    ));
+    let deliver = Arc::new(
+        crate::image_sink::HubImageSink::new(
+            Arc::clone(&service.surface_registry),
+            service.agent_id.as_str(),
+            service.image_broadcast.read().clone(),
+        )
+        .with_sessions(Arc::clone(&service.sessions)),
+    );
     crate::mcp_gate::MediaSinks { view, deliver }
 }
 

@@ -7,13 +7,34 @@
 
 use uuid::Uuid;
 use workforce_common::channels::desk::{
-    DeliveryKind, DeskDelivered, DeskMark, DeskPlace, DeskTarget, DESK_CHANNEL,
+    DeliveryKind, DeskDelivered, DeskFile, DeskMark, DeskPlace, DeskTarget, DESK_CHANNEL,
 };
-use workforce_common::session::{
-    estimate_tokens, MessageRole, Session, SessionAttachment, SessionStore,
-};
+use workforce_common::session::{estimate_tokens, MessageRole, Session, SessionStore};
 
+use crate::desk_attachments::{into_desk_conversation, DeskConversation, StagedFile};
 use crate::serve::AgentService;
+
+/// Whose Desk conversations a delivery lands in: an agent, by its sessions.
+#[derive(Clone, Copy)]
+pub(crate) struct Outbox<'a> {
+    pub agent_id: &'a str,
+    pub sessions: &'a dyn SessionStore,
+}
+
+impl<'a> From<&'a AgentService> for Outbox<'a> {
+    fn from(service: &'a AgentService) -> Self {
+        Self {
+            agent_id: service.agent_id.as_str(),
+            sessions: service.sessions.as_ref(),
+        }
+    }
+}
+
+impl<'a> From<&'a std::sync::Arc<AgentService>> for Outbox<'a> {
+    fn from(service: &'a std::sync::Arc<AgentService>) -> Self {
+        service.as_ref().into()
+    }
+}
 
 /// Session metadata a room's conversation is stamped with once the room is
 /// gone: `{"at", "name", "copied": [message ids]}`.
@@ -24,7 +45,7 @@ pub(crate) const CLOSED_KEY: &str = "desk_closed";
 pub(crate) struct Delivery {
     pub kind: DeliveryKind,
     pub text: String,
-    pub attachments: Vec<SessionAttachment>,
+    pub files: Vec<DeskFile>,
     pub request_id: Option<String>,
 }
 
@@ -33,7 +54,7 @@ impl Delivery {
         Self {
             kind,
             text: text.into(),
-            attachments: Vec::new(),
+            files: Vec::new(),
             request_id: None,
         }
     }
@@ -79,34 +100,37 @@ pub(crate) fn closed_room(
     }))
 }
 
-/// Deliver `delivery` to `owner`'s conversation with `service`'s agent at
-/// `target`. Once the message is saved it is durable, so a failed push is
+/// Deliver `delivery` to `owner`'s conversation with the agent of `outbox`
+/// at `target`. Once the message is saved it is durable, so a failed push is
 /// logged rather than returned: the person's Desk drains it from the session.
-pub(crate) async fn deliver(
-    service: &AgentService,
+pub(crate) async fn deliver<'a>(
+    outbox: impl Into<Outbox<'a>>,
     owner: &str,
     target: &DeskTarget,
     delivery: Delivery,
 ) -> eyre::Result<Delivered> {
-    let sessions = service.sessions.as_ref();
+    let outbox = outbox.into();
+    let sessions = outbox.sessions;
     let closed = closed_room(sessions, &target.channel, owner)?;
     let (target, note) = routed(target, closed.as_deref());
     let text = workforce_common::redact::redact_secrets(&match note {
         Some(note) => format!("{note} {}", delivery.text),
         None => delivery.text,
     });
-    let mut session = sessions.get_or_create(&target.channel, owner, service.agent_id.as_str())?;
+    let mut session = sessions.get_or_create(&target.channel, owner, outbox.agent_id)?;
     let message_id = Uuid::new_v4().to_string();
     session.add_assistant_message_with_id(message_id.clone(), &text, estimate_tokens(&text));
     let Some(message) = session.messages.last_mut() else {
         eyre::bail!("a delivery was not appended to its session");
     };
+    message.attachments =
+        (!delivery.files.is_empty()).then(|| delivery.files.iter().map(Into::into).collect());
     message.desk = Some(DeskMark {
         delivery: Some(delivery.kind),
         request_id: delivery.request_id,
+        files: delivery.files,
         ..target.place.mark()
     });
-    message.attachments = (!delivery.attachments.is_empty()).then_some(delivery.attachments);
     let message = message.clone();
     sessions.save(&session)?;
     if let Err(e) = sessions.append_to_archive(&session.id, &message) {
@@ -116,20 +140,65 @@ pub(crate) async fn deliver(
         session_id: session.id,
         message_id,
     };
-    announce(service, owner, &target, &delivered, &text, delivery.kind).await;
+    let files = message.desk.map(|mark| mark.files).unwrap_or_default();
+    announce(
+        outbox,
+        owner,
+        &target,
+        &delivered,
+        &text,
+        delivery.kind,
+        &files,
+    )
+    .await;
     Ok(delivered)
 }
 
-/// Tell whoever watches the conversation that `delivered` landed in it, and
-/// the person's Desk hub links on every replica. Best effort: the message
-/// is saved already, and a Desk drains it whenever it connects.
+/// Deliver `file`, staged in the store of the agent of `outbox`, into
+/// `owner`'s conversation at `target` as a message of its own, captioned,
+/// and keep it there for the conversation's history.
+pub(crate) async fn deliver_file<'a>(
+    outbox: impl Into<Outbox<'a>>,
+    owner: &str,
+    target: &DeskTarget,
+    file: StagedFile,
+) -> eyre::Result<Delivered> {
+    let outbox = outbox.into();
+    let delivered = deliver(
+        outbox,
+        owner,
+        target,
+        Delivery {
+            files: vec![file.delivered(outbox.agent_id)],
+            ..Delivery::text(DeliveryKind::File, file.caption.clone().unwrap_or_default())
+        },
+    )
+    .await?;
+    into_desk_conversation(
+        outbox.sessions,
+        &DeskConversation {
+            agent_id: outbox.agent_id.to_string(),
+            session_id: delivered.session_id.clone(),
+            message: Some(delivered.message_id.clone()),
+        },
+        &[file],
+    )
+    .await;
+    Ok(delivered)
+}
+
+/// Tell whoever watches the conversation that `delivered`, `text` with
+/// `files`, landed in it, and the person's Desk hub links on every replica.
+/// Best effort: the message is saved already, and a Desk drains it whenever
+/// it connects.
 pub(crate) async fn announce(
-    service: &AgentService,
+    outbox: Outbox<'_>,
     owner: &str,
     target: &DeskTarget,
     delivered: &Delivered,
     text: &str,
     kind: DeliveryKind,
+    files: &[DeskFile],
 ) {
     let Some(push) = crate::session_push::installed() else {
         return;
@@ -138,12 +207,13 @@ pub(crate) async fn announce(
         &delivered.session_id,
         &super::shown(text),
         Some(&delivered.message_id),
+        files,
     )
     .await;
     push.delivered(
         owner,
         DeskDelivered {
-            agent_id: service.agent_id.to_string(),
+            agent_id: outbox.agent_id.to_string(),
             channel: target.channel.clone(),
             session_id: delivered.session_id.clone(),
             message_id: delivered.message_id.clone(),
@@ -192,12 +262,13 @@ pub(crate) async fn resumed(
             message_id,
         };
         announce(
-            service,
+            service.into(),
             owner,
             &target,
             &delivered,
             &text,
             DeliveryKind::Resumed,
+            &[],
         )
         .await;
     }

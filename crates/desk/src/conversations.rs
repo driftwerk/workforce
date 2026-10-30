@@ -81,7 +81,7 @@ impl Speaker {
 /// One message of the conversation. `text` is what the live `desk` channel
 /// delivers as a finished reply's `content`: its rich blocks are fenced
 /// inside it, and secrets read as they read live.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Said {
     pub id: String,
     /// `user` or `agent`, as the transcript has it; [`Said::author`] says
@@ -98,6 +98,11 @@ pub struct Said {
     /// said it, and why it was delivered outside a turn.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mark: Option<DeskMark>,
+    /// The files it carries. An agent's file its turn didn't answer with
+    /// is a message of its own: no text, its files, and an id that is no
+    /// transcript message's (`file:<artifact_id>`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<crate::attachments::Attachment>,
 }
 
 /// Where a page of a conversation sits.
@@ -136,7 +141,7 @@ pub struct Closed {
 
 /// A page of the conversation, oldest first; `more` when messages remain
 /// beyond it in the direction it was read.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct Page {
     pub messages: Vec<Said>,
     pub more: bool,
@@ -364,6 +369,7 @@ mod tests {
                     at: "2026-10-28T09:00:00Z".parse().unwrap(),
                     desk: None,
                     mark: None,
+                    attachments: Vec::new(),
                 }],
                 more: true,
             })

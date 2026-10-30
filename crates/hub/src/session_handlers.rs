@@ -137,7 +137,7 @@ fn resolve_service(
 /// tidy it; a turn runs as the session's owner, on the owner's private prompt
 /// and credentials, so only the owner may start one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SessionAccess {
+pub(crate) enum SessionAccess {
     Read,
     Write,
     RunTurn,
@@ -167,7 +167,7 @@ impl SessionAccess {
 /// session but not run a turn in it gets 403. Returns 500 on store failure.
 /// Emits an `AccessAuditEvent` for every Allow / DeniedOwnerMismatch outcome;
 /// mirrors `authorise_session_read` in `crate::gateway`.
-fn lookup_owned_session(
+pub(crate) fn lookup_owned_session(
     sessions: &dyn SessionStore,
     caller: &CallerContext,
     session_id: &str,
@@ -790,21 +790,21 @@ pub async fn upload_session_file(
 /// A multipart field streamed to disk, plus enough to hand it to
 /// [`workforce_agent::artifacts::ArtifactStore::write_from_path`] (which
 /// consumes the file by rename) or clean it up on a failed store write.
-struct SpooledUpload {
-    path: std::path::PathBuf,
-    bytes: u64,
+pub(crate) struct SpooledUpload {
+    pub(crate) path: std::path::PathBuf,
+    pub(crate) bytes: u64,
     /// Owns the tempdir in the OS-temp fallback so it outlives the store
     /// write; `None` when spooling into the store's staging dir.
     _tmpdir: Option<tempfile::TempDir>,
 }
 
 impl SpooledUpload {
-    fn cleanup(&self) {
+    pub(crate) fn cleanup(&self) {
         let _ = std::fs::remove_file(&self.path);
     }
 }
 
-enum SpoolError {
+pub(crate) enum SpoolError {
     TooLarge,
     Io(eyre::Report),
 }
@@ -839,10 +839,35 @@ impl Drop for SpoolGuard {
 /// never buffered in memory, which is what lets the upload cap sit at
 /// video scale.
 async fn spool_field_to_disk(
-    mut field: axum::extract::multipart::Field<'_>,
+    field: axum::extract::multipart::Field<'_>,
     staging_root: Option<&std::path::Path>,
     filename: &str,
 ) -> Result<SpooledUpload, SpoolError> {
+    spool_to_disk(
+        Box::pin(field),
+        staging_root,
+        filename,
+        MAX_FILE_UPLOAD_BYTES,
+    )
+    .await
+}
+
+/// Stream `chunks` to a spool file chunk by chunk, failing as soon as more
+/// than `cap` bytes have arrived without reading further. The file lands in
+/// `staging_root` (the store's staging dir, so storing it is a rename) or
+/// an OS temp dir, and is removed if the stream fails or is dropped.
+pub(crate) async fn spool_to_disk<S, B, E>(
+    mut chunks: S,
+    staging_root: Option<&std::path::Path>,
+    filename: &str,
+    cap: u64,
+) -> Result<SpooledUpload, SpoolError>
+where
+    S: futures::Stream<Item = Result<B, E>> + Unpin,
+    B: AsRef<[u8]>,
+    E: std::fmt::Display,
+{
+    use futures::StreamExt;
     use tokio::io::AsyncWriteExt;
 
     let (dir, tmpdir) = match staging_root {
@@ -857,22 +882,15 @@ async fn spool_field_to_disk(
     let mut guard = SpoolGuard(Some(path.clone()));
     let mut written: u64 = 0;
 
-    loop {
-        match field.chunk().await {
-            Ok(Some(chunk)) => {
-                written += chunk.len() as u64;
-                if written > MAX_FILE_UPLOAD_BYTES {
-                    return Err(SpoolError::TooLarge);
-                }
-                file.write_all(&chunk).await?;
-            }
-            Ok(None) => break,
-            Err(e) => {
-                return Err(SpoolError::Io(eyre::eyre!(
-                    "multipart read failed for `{filename}`: {e}"
-                )));
-            }
+    while let Some(chunk) = chunks.next().await {
+        let chunk = chunk
+            .map_err(|e| SpoolError::Io(eyre::eyre!("upload read failed for `{filename}`: {e}")))?;
+        let chunk = chunk.as_ref();
+        written += chunk.len() as u64;
+        if written > cap {
+            return Err(SpoolError::TooLarge);
         }
+        file.write_all(chunk).await?;
     }
     file.flush().await?;
     drop(file);

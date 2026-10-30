@@ -148,6 +148,7 @@ const CLAIMS: &[(&str, &str, &str, Claim)] = &[
         "owner_instance",
         NotPersonal(INSTANCE),
     ),
+    ("desk", "attachments", "owner", By(C::Sessions)),
     (
         "desk",
         "rooms",

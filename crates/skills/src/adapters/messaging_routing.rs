@@ -37,6 +37,14 @@ fn default_platform() -> &'static str {
     }
 }
 
+/// The channel a posting call names; with none, the current conversation
+/// when it posts to Desk (`""`), else `None`.
+pub fn channel_arg(input: &serde_json::Value) -> Option<&str> {
+    input["channel"].as_str().or_else(|| {
+        (platform_arg(input) == workforce_common::channels::desk::DESK_PLATFORM).then_some("")
+    })
+}
+
 /// What a messaging call that posts does to its surface: writes to the
 /// channel it names on the platform it resolves to.
 pub fn writes(input: &serde_json::Value) -> workforce_agent::tools::SurfaceEffect {

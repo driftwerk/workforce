@@ -1254,8 +1254,17 @@ impl Desk {
     /// before you speak again.
     pub async fn post(&self, id: Uuid, new: NewMessage) -> Result<RoomMessage, DeskError> {
         let room = self.room_of(id)?;
-        if new.content.trim().is_empty() {
+        if new.content.trim().is_empty() && new.attachments.is_empty() {
             return Err(DeskError::Invalid("the message is empty".into()));
+        }
+        if new.attachments.len() > crate::attachments::MAX_PER_MESSAGE {
+            return Err(DeskError::Invalid(format!(
+                "a message carries at most {} files",
+                crate::attachments::MAX_PER_MESSAGE
+            )));
+        }
+        if let Some(why) = new.attachments.iter().find_map(|a| a.invalid()) {
+            return Err(DeskError::Invalid(why));
         }
         let is_agent = new.author != YOU && new.author != DESK;
         if is_agent && !room.members.iter().any(|m| m.key() == new.author) {
@@ -1292,6 +1301,7 @@ impl Desk {
             content: new.content,
             hop: if is_agent { new.hop.max(0) } else { 0 },
             created_at: Utc::now(),
+            attachments: new.attachments,
         };
         self.0.store.add_message(&message).await?;
         let _ = self.0.events.send(DeskEvent::RoomMessage {
@@ -2509,8 +2519,63 @@ mod tests {
                 content: "on it".into(),
                 thread_id: None,
                 hop,
+                attachments: Vec::new(),
             };
             d.post(room.id, post(YOU, 0)).await.unwrap();
+            // Files may stand in for text, and come back with the message.
+            let report: crate::attachments::Attachment =
+                serde_json::from_value(serde_json::json!({
+                    "artifact_id": "art_1", "media_type": "application/pdf",
+                    "filename": "report.pdf", "size": 9, "hub": "dw", "agent": "allan",
+                }))
+                .unwrap();
+            let filed = d
+                .post(
+                    room.id,
+                    NewMessage {
+                        content: String::new(),
+                        attachments: vec![report.clone()],
+                        ..post(YOU, 0)
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                d.room_messages(room.id, None, None, 50)
+                    .await
+                    .unwrap()
+                    .last()
+                    .unwrap()
+                    .attachments,
+                vec![report.clone()]
+            );
+            assert_eq!(filed.attachments, vec![report.clone()]);
+            assert!(matches!(
+                d.post(
+                    room.id,
+                    NewMessage {
+                        content: String::new(),
+                        ..post(YOU, 0)
+                    }
+                )
+                .await,
+                Err(DeskError::Invalid(_))
+            ));
+            let unnamed = crate::attachments::Attachment {
+                filename: String::new(),
+                ..report
+            };
+            assert!(matches!(
+                d.post(
+                    room.id,
+                    NewMessage {
+                        attachments: vec![unnamed],
+                        ..post(YOU, 0)
+                    }
+                )
+                .await,
+                Err(DeskError::Invalid(_))
+            ));
             assert!(matches!(
                 d.post(room.id, post("dw/nobody", 0)).await,
                 Err(DeskError::Invalid(_))

@@ -8,29 +8,37 @@
 //!     surface and perform a native `files.upload` to the channel/thread.
 //!   - **Gateway / iOS** (no Slack channel): emit a `ServerMessage::image`
 //!     over the in-process broadcast, filtered to the session by the WS
-//!     forwarder. An image rides inline as base64, which both the web UI and
-//!     iOS render; any other file rides by `artifact_id`, which the web UI
-//!     offers as a download through the session file route and iOS ignores.
+//!     forwarder. Every file carries its `artifact_id` and size, and an image
+//!     rides inline as base64 too. Each connection is sent the files of the
+//!     types it declared at connect (`accept`); one that declared none (iOS)
+//!     is sent images alone, inline, as before. In a Desk DM or room the
+//!     file is also kept for the conversation's history.
 //!     NATS-only (distributed) deployments have no in-process broadcast
 //!     wired, so there the bytes stay staged as an artifact.
+//!   - **Desk, live**: a turn a Desk connection attends sends the file down
+//!     its own progress stream instead, which reaches that connection on
+//!     any instance, ordered with the turn's text; the answer carries it.
+//!   - **Desk, unattended** (a job, workflow or check made from Desk): the
+//!     file is delivered into that Desk conversation as a message of its
+//!     own.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use base64::engine::general_purpose::STANDARD as BASE64;
-use base64::Engine;
 use eyre::{eyre, Result};
 use tokio::sync::{broadcast, RwLock};
 use tracing::{debug, info};
 
 use workforce_agent::artifacts::store::global_store;
 use workforce_agent::artifacts::types::{ArtifactBody, ArtifactId};
-use workforce_agent::runner::SessionContext;
+use workforce_agent::runner::{ProgressEvent, SessionContext};
 use workforce_agent::tools::image_gen::ImageSink;
+use workforce_common::channels::desk::DeskTarget;
 use workforce_common::channels::{ChannelHint, SurfaceRegistry};
+use workforce_common::session::SessionStore;
 
 use crate::broadcast::BroadcastMessage;
-use workforce_gateway_client::protocol::Attachment;
+use crate::desk_attachments::{into_desk_conversation, DeskConversation, StagedFile};
 
 pub struct HubImageSink {
     surface_registry: Arc<RwLock<SurfaceRegistry>>,
@@ -40,6 +48,9 @@ pub struct HubImageSink {
     /// In-process broadcast sender for gateway/iOS delivery. `None` when the
     /// gateway channel isn't wired (e.g. NATS-only deployments).
     broadcast: Option<broadcast::Sender<BroadcastMessage>>,
+    /// The agent's sessions, to tell a Desk conversation's files (kept for
+    /// its history) from any other app's.
+    sessions: Option<Arc<dyn SessionStore>>,
 }
 
 impl HubImageSink {
@@ -52,7 +63,48 @@ impl HubImageSink {
             surface_registry,
             agent_id: agent_id.into(),
             broadcast,
+            sessions: None,
         }
+    }
+
+    /// Keeps the files delivered into a Desk conversation of `sessions`'
+    /// for its history.
+    pub fn with_sessions(mut self, sessions: Arc<dyn SessionStore>) -> Self {
+        self.sessions = Some(sessions);
+        self
+    }
+
+    /// `file`, delivered by a run nobody is attending that answers to the
+    /// Desk conversation `target`: a message of its own there, for the
+    /// person the run is for.
+    async fn deliver_to_desk(
+        &self,
+        ctx: &SessionContext,
+        target: &DeskTarget,
+        file: StagedFile,
+    ) -> Result<()> {
+        let sessions = self
+            .sessions
+            .as_deref()
+            .ok_or_else(|| eyre!("no sessions to deliver a Desk conversation's file into"))?;
+        let owner = ctx
+            .user_id
+            .as_deref()
+            .filter(|owner| !owner.is_empty())
+            .ok_or_else(|| {
+                eyre!("a Desk conversation's file is someone's: this run is for nobody")
+            })?;
+        let outbox = crate::desk_surface::Outbox {
+            agent_id: &self.agent_id,
+            sessions,
+        };
+        let delivered = crate::desk_surface::deliver_file(outbox, owner, target, file).await?;
+        info!(
+            session = %delivered.session_id,
+            message_id = %delivered.message_id,
+            "delivered attachment to a Desk conversation"
+        );
+        Ok(())
     }
 
     /// Read the staged attachment bytes from the artifact store.
@@ -67,6 +119,15 @@ impl HubImageSink {
             )),
         }
     }
+}
+
+/// The name a staged file is delivered under: its producer's, else one
+/// made from its media type.
+pub(crate) fn delivered_name(filename: Option<&str>, media_type: &str) -> String {
+    filename
+        .filter(|f| !f.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("generated.{}", extension_for(media_type)))
 }
 
 /// File extension for a generated attachment, from its media type. Used only
@@ -97,10 +158,7 @@ impl ImageSink for HubImageSink {
         filename: Option<&str>,
         caption: Option<&str>,
     ) -> Result<()> {
-        let filename = filename
-            .filter(|f| !f.is_empty())
-            .map(str::to_string)
-            .unwrap_or_else(|| format!("generated.{}", extension_for(media_type)));
+        let filename = delivered_name(filename, media_type);
 
         // A Slack channel id in the session context means the turn came from
         // Slack — deliver as a native file upload. CURRENT_CHANNEL_ID is only
@@ -131,16 +189,43 @@ impl ImageSink for HubImageSink {
             return Ok(());
         }
 
-        // Gateway / iOS path: emit a `ServerMessage::image` over the in-process
-        // broadcast, filtered to this session by the WS forwarder. An image
-        // rides inline as base64 (iOS renders `image/*` only, see
-        // `ingestServerImageAttachments`); anything else rides by reference so
-        // the web UI can fetch it from the session file route.
+        let file = StagedFile::of(&self.agent_id, artifact_id, media_type, &filename, caption);
+        if let Some(scope) = ctx.desk.as_ref().filter(|scope| !scope.attended) {
+            return self.deliver_to_desk(ctx, &scope.target, file).await;
+        }
         let Some(session_id) = ctx.id.as_deref().filter(|s| !s.is_empty()) else {
             return Err(eyre!(
                 "no session id in context; cannot route generated image to a gateway client"
             ));
         };
+        if let Some(sessions) = &self.sessions {
+            into_desk_conversation(
+                sessions.as_ref(),
+                &DeskConversation {
+                    agent_id: self.agent_id.clone(),
+                    session_id: session_id.to_string(),
+                    message: None,
+                },
+                std::slice::from_ref(&file),
+            )
+            .await;
+        }
+        let delivered = file.delivered(&self.agent_id);
+        // A live Desk turn shows its files in its own stream, ordered with
+        // its text, on whichever instance its connection is.
+        if let Some(progress) = ctx
+            .desk
+            .as_ref()
+            .and_then(|_| workforce_agent::runner::current_progress_tx())
+        {
+            if progress
+                .send(ProgressEvent::File(delivered.clone()))
+                .await
+                .is_ok()
+            {
+                return Ok(());
+            }
+        }
         let Some(tx) = self.broadcast.as_ref() else {
             // NATS-only / unwired deployment: bytes remain staged as an artifact.
             debug!(
@@ -150,23 +235,10 @@ impl ImageSink for HubImageSink {
             );
             return Ok(());
         };
-
-        let inline = media_type.starts_with("image/");
-        let attachment = Attachment {
-            filename,
-            mime_type: media_type.to_string(),
-            data: if inline {
-                BASE64.encode(self.read_bytes(artifact_id)?)
-            } else {
-                String::new()
-            },
-            artifact_id: (!inline).then(|| artifact_id.as_str().to_string()),
-        };
-        let msg = BroadcastMessage::image(
+        let msg = crate::desk_attachments::frame(
             session_id,
-            ctx.agent_id.clone(),
-            caption.map(str::to_string),
-            vec![attachment],
+            std::slice::from_ref(&delivered),
+            delivered.caption.clone(),
         );
         // `send` errors only when there are no subscribers — not fatal.
         match tx.send(msg) {
@@ -174,7 +246,6 @@ impl ImageSink for HubImageSink {
                 session = session_id,
                 artifact_id = artifact_id.as_str(),
                 media_type,
-                inline,
                 subscribers = n,
                 "broadcast generated attachment to gateway client(s)"
             ),

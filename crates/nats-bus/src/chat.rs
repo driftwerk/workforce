@@ -181,6 +181,8 @@ pub enum ChatProgress {
     SlowModelFailover { model: String, elapsed_secs: u64 },
     /// The live Desk turn as it stands.
     Snapshot(workforce_core::desk::TurnSnapshot),
+    /// A file a tool delivered into the live Desk turn.
+    File(workforce_core::desk::DeskFile),
     /// The Desk turn ended; its closing events have all gone out.
     TurnEnd(workforce_core::desk::TurnEnd),
 }
@@ -281,6 +283,33 @@ mod tests {
             end,
             serde_json::json!({"type": "turn_end", "turn_ref": "ref-1"})
         );
+    }
+
+    #[test]
+    fn a_delivered_file_reads_flat() {
+        let delivered = workforce_core::desk::DeskFile {
+            artifact_id: "art_1".into(),
+            agent_id: "scout".into(),
+            filename: "chart.png".into(),
+            media_type: "image/png".into(),
+            size: 9,
+            width: Some(4),
+            height: Some(3),
+            caption: None,
+        };
+        let wire = serde_json::to_value(ChatProgress::File(delivered.clone())).unwrap();
+        assert_eq!(
+            wire,
+            serde_json::json!({
+                "type": "file", "artifact_id": "art_1", "agent_id": "scout",
+                "filename": "chart.png", "media_type": "image/png", "size": 9,
+                "width": 4, "height": 3,
+            })
+        );
+        assert!(matches!(
+            serde_json::from_value::<ChatProgress>(wire).unwrap(),
+            ChatProgress::File(read) if read == delivered
+        ));
     }
 
     #[test]

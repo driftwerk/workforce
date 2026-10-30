@@ -364,6 +364,36 @@ pub struct DeskMark {
     pub delivery: Option<DeliveryKind>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
+    /// The files the message carries.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<DeskFile>,
+}
+
+/// A file delivered into a Desk conversation, by reference: the artifact
+/// holding its bytes in the store of the agent that delivered it, and what
+/// is cheap to know about it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeskFile {
+    pub artifact_id: String,
+    pub agent_id: String,
+    pub filename: String,
+    pub media_type: String,
+    /// Bytes.
+    #[serde(default)]
+    pub size: u64,
+    /// Pixels, for an image.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub width: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub height: Option<u32>,
+    /// The line its producer gave it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caption: Option<String>,
+}
+
+/// The download path of `artifact_id` in `agent`'s store, on its hub.
+pub fn download_path(agent: &str, artifact_id: &str) -> String {
+    format!("/api/agents/{agent}/attachments/{artifact_id}")
 }
 
 /// A Desk turn as the turn loop runs it: what Desk sent, where its later

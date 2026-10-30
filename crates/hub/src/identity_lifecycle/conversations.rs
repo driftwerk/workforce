@@ -134,6 +134,14 @@ impl Holding for Sessions {
                         .collect::<Result<Vec<_>>>()?,
                 };
                 for session in moved {
+                    if apply {
+                        crate::desk_attachments::move_session_files(
+                            &session.session_id,
+                            &to,
+                            &session.channel,
+                        )
+                        .await?;
+                    }
                     if session.renamed {
                         tally.conflicts.push(format!(
                             "{}: both had a conversation open here; theirs continues on {}",
@@ -185,6 +193,7 @@ impl Holding for Sessions {
                     .map(|full| driver_homes(&full))
                     .unwrap_or_default();
                 sessions.delete(&session.id)?;
+                crate::desk_attachments::forget_session_files(&session.id).await?;
                 for driver in drivers {
                     remove_path(&homes.join(format!(".codex-{driver}")))?;
                 }

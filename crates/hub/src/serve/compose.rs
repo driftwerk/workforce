@@ -3308,9 +3308,11 @@ fn register_messaging_tools(
     tools.register(Arc::new(MessagingReadThreadTool::new(Arc::clone(
         surface_registry,
     ))));
-    tools.register(Arc::new(ViewAttachmentTool::new(Arc::clone(
-        surface_registry,
-    ))));
+    tools.register(Arc::new(
+        ViewAttachmentTool::new(Arc::clone(surface_registry)).with_conversation_files(Arc::new(
+            crate::desk_attachments::SessionFiles::new(agent_id.as_str(), Arc::clone(sessions)),
+        )),
+    ));
     tools.register(Arc::new(GetUserPhotoTool::new(Arc::clone(
         surface_registry,
     ))));

@@ -43,8 +43,9 @@ const HUB_NOTES: &[&str] = &[
 /// What a transcript entry shows in the conversation, if it is one of its
 /// messages: said by the person or by `agent`, not tool chatter, a system
 /// prompt or a note the hub left for the model. The text is what the live
-/// channel sends: secret markers as previews, credentials redacted. A
-/// person's message is theirs until [`with_authors`] says otherwise.
+/// channel sends: secret markers as previews, credentials redacted; the
+/// files its mark names are its attachments. A person's message is theirs
+/// until [`with_authors`] says otherwise.
 fn said(entry: &TranscriptEntry, agent: &Speaker) -> Option<Said> {
     let (from, author) = match entry.role {
         MessageRole::User => (Author::User, Speaker::you()),
@@ -59,6 +60,11 @@ fn said(entry: &TranscriptEntry, agent: &Speaker) -> Option<Said> {
         return None;
     }
     let text = shown(&entry.content);
+    let mut mark = entry.desk.clone();
+    let files = mark
+        .as_mut()
+        .map(|mark| std::mem::take(&mut mark.files))
+        .unwrap_or_default();
     Some(Said {
         id: entry.id.clone(),
         from,
@@ -66,21 +72,32 @@ fn said(entry: &TranscriptEntry, agent: &Speaker) -> Option<Said> {
         text,
         at: entry.timestamp,
         desk: None,
-        mark: entry.desk.clone(),
+        mark,
+        attachments: files.iter().map(Into::into).collect(),
     })
 }
 
+/// The time a page of a conversation covers, which the files that are
+/// messages of their own are placed in: from its first message when older
+/// ones remain before it, else from the start; up to the message after its
+/// last, else to now.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct Span {
+    pub after: Option<DateTime<Utc>>,
+    pub before: Option<DateTime<Utc>>,
+}
+
 /// `owner`'s conversation on the Desk `channel` with `agent` in `store`: at
-/// most `limit` messages at `cursor`, oldest first. Reads only: it never
-/// creates the session or rolls it over.
-pub(crate) fn page(
+/// most `limit` messages at `cursor`, oldest first, and the time they
+/// cover. Reads only: it never creates the session or rolls it over.
+pub(crate) fn read(
     store: &dyn SessionStore,
     agent: &Speaker,
     owner: &str,
     channel: &str,
     cursor: Cursor<'_>,
     limit: usize,
-) -> Result<Page, ConversationError> {
+) -> Result<(Page, Span), ConversationError> {
     let internal = |e: eyre::Report| ConversationError::Internal(format!("{e:#}"));
     if !is_desk_conversation(channel) {
         return Err(ConversationError::Invalid(format!(
@@ -88,20 +105,22 @@ pub(crate) fn page(
         )));
     }
     let Some(head) = store.find(channel, owner).map_err(internal)? else {
-        return Ok(Page::default());
+        return Ok((Page::default(), Span::default()));
     };
     let unknown = |side: &str| {
         ConversationError::Invalid(format!("{side} names no message of this conversation"))
     };
-    let (mut read_from, after) = match cursor {
-        Cursor::Newest => (None, None),
+    let (mut read_from, after, mut cursor_at) = match cursor {
+        Cursor::Newest => (None, None, None),
         Cursor::Before(id) => {
             match crate::desk_surface::message_in_chain(store, &head.id, id).map_err(internal)? {
-                Some((session, _)) => (Some((session, id.to_string())), None),
+                Some((session, entry)) => {
+                    (Some((session, id.to_string())), None, Some(entry.timestamp))
+                }
                 None => return Err(unknown("before")),
             }
         }
-        Cursor::After(id) => (None, Some(id)),
+        Cursor::After(id) => (None, Some(id), None),
     };
     // Newest first while gathering: past the limit, or reaching the message
     // a forward page starts after, ends it.
@@ -124,6 +143,13 @@ pub(crate) fn page(
             .take_while(|e| Some(e.id.as_str()) != after)
             .collect();
         reached = after.is_some() && newer.len() < read.messages.len();
+        if reached {
+            cursor_at = read
+                .messages
+                .iter()
+                .rfind(|e| Some(e.id.as_str()) == after)
+                .map(|e| e.timestamp);
+        }
         gathered.extend(newer.into_iter().filter_map(|e| said(e, agent)));
         let oldest = read.messages.first();
         exhausted = !read.has_more || oldest.is_none();
@@ -140,11 +166,34 @@ pub(crate) fn page(
         Some(_) => gathered.len() > limit,
         None => gathered.len() > limit || !exhausted,
     };
-    let messages = match after {
+    let messages: Vec<Said> = match after {
         Some(_) => gathered.into_iter().take(limit).collect(),
         None => gathered.split_off(gathered.len().saturating_sub(limit)),
     };
-    Ok(Page { messages, more })
+    let bound = |m: Option<&Said>| m.filter(|_| more).map(|m| m.at);
+    let span = match after {
+        Some(_) => Span {
+            after: cursor_at,
+            before: bound(messages.last()),
+        },
+        None => Span {
+            after: bound(messages.first()),
+            before: cursor_at,
+        },
+    };
+    Ok((Page { messages, more }, span))
+}
+
+/// [`read`]'s page alone.
+pub(crate) fn page(
+    store: &dyn SessionStore,
+    agent: &Speaker,
+    owner: &str,
+    channel: &str,
+    cursor: Cursor<'_>,
+    limit: usize,
+) -> Result<Page, ConversationError> {
+    read(store, agent, owner, channel, cursor, limit).map(|(page, _)| page)
 }
 
 /// What the agent's messages on `page` mention to act on in place, as the
@@ -269,7 +318,7 @@ impl Conversations for HubConversations {
             agent,
             &service.display_name().unwrap_or_else(|| agent.to_string()),
         );
-        let mut page = page(
+        let (mut page, span) = read(
             service.sessions.as_ref(),
             &speaker,
             &owner,
@@ -280,6 +329,15 @@ impl Conversations for HubConversations {
         if let Some(crew) = crate::desk_crew::for_state(&self.0) {
             with_extras(crew.desk(), &mut page).await;
             with_authors(crew.desk(), &mut page).await;
+            crate::desk_attachments::with_attachments(
+                crew.desk(),
+                &speaker,
+                channel,
+                &owner,
+                &mut page,
+                span,
+            )
+            .await;
         }
         Ok(page)
     }
@@ -573,6 +631,82 @@ mod tests {
 
     /// A room's conversation pages forward after a message Desk already
     /// placed, across a rollover, and each message carries its place.
+    /// Each page covers the time between its neighbours, so the files that
+    /// are messages of their own are each read on exactly one page.
+    #[test]
+    fn a_page_spans_the_time_between_its_neighbours() {
+        let store = InMemorySessionStore::new();
+        for n in 0..5 {
+            exchange(&store, n);
+        }
+        let read_at = |cursor| read(&store, &scout(), ME, DESK_CHANNEL, cursor, 4).unwrap();
+        let (newest, span) = read_at(Cursor::Newest);
+        assert_eq!(
+            span,
+            Span {
+                after: Some(newest.messages[0].at),
+                before: None
+            }
+        );
+        let (older, span) = read_at(Cursor::Before(&newest.messages[0].id));
+        assert_eq!(
+            span,
+            Span {
+                after: Some(older.messages[0].at),
+                before: Some(newest.messages[0].at)
+            }
+        );
+        let (oldest, span) = read_at(Cursor::Before(&older.messages[0].id));
+        assert_eq!(
+            span.after, None,
+            "the oldest page reaches back to the start"
+        );
+        let (forward, span) = read_at(Cursor::After(&oldest.messages[0].id));
+        assert!(forward.more);
+        assert_eq!(
+            span,
+            Span {
+                after: Some(oldest.messages[0].at),
+                before: Some(forward.messages[3].at)
+            }
+        );
+    }
+
+    /// A message's files ride on it as its attachments, not in its mark.
+    #[test]
+    fn a_message_s_files_are_its_attachments() {
+        use workforce_common::channels::desk::{DeliveryKind, DeskFile, DeskMark};
+        let store = InMemorySessionStore::new();
+        let mut session = store.get_or_create(DESK_CHANNEL, ME, "scout").unwrap();
+        session.add_assistant_message("your report", 3);
+        let report = DeskFile {
+            artifact_id: "art_1".into(),
+            agent_id: "scout".into(),
+            filename: "report.pdf".into(),
+            media_type: "application/pdf".into(),
+            size: 9,
+            width: None,
+            height: None,
+            caption: None,
+        };
+        session.messages.last_mut().unwrap().desk = Some(DeskMark {
+            delivery: Some(DeliveryKind::File),
+            files: vec![report.clone()],
+            ..DeskMark::default()
+        });
+        store.save(&session).unwrap();
+        let read = page(&store, &scout(), ME, DESK_CHANNEL, Cursor::Newest, 10).unwrap();
+        let said = &read.messages[0];
+        assert_eq!(said.attachments, vec![(&report).into()]);
+        assert_eq!(
+            said.mark,
+            Some(DeskMark {
+                delivery: Some(DeliveryKind::File),
+                ..DeskMark::default()
+            })
+        );
+    }
+
     #[test]
     fn a_room_reads_forward_after_a_message_across_the_seam() {
         use workforce_common::channels::desk::{DeliveryKind, DeskMark};
@@ -655,9 +789,9 @@ mod tests {
         .unwrap();
         assert_ne!(successor.id, old.id, "the DM rolled over");
         exchange(&store, 1);
-        let page = page(&store, &scout(), ME, DESK_CHANNEL, Cursor::Newest, 200).unwrap();
+        let newest = page(&store, &scout(), ME, DESK_CHANNEL, Cursor::Newest, 200).unwrap();
         assert_eq!(
-            texts(&page),
+            texts(&newest),
             [
                 ("question 0", Author::User),
                 ("answer 0", Author::Agent),
@@ -665,12 +799,12 @@ mod tests {
                 ("answer 1", Author::Agent),
             ]
         );
-        let older = super::page(
+        let older = page(
             &store,
             &scout(),
             ME,
             DESK_CHANNEL,
-            Cursor::Before(&page.messages[2].id),
+            Cursor::Before(&newest.messages[2].id),
             200,
         )
         .unwrap();

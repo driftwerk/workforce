@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use tokio_postgres::Row;
 use uuid::Uuid;
 
+use crate::attachments::Attachment;
 use crate::store::DeskStore;
 
 /// Agent-to-agent hand-offs allowed from one message of yours.
@@ -54,6 +55,9 @@ pub struct RoomMessage {
     pub content: String,
     pub hop: i16,
     pub created_at: DateTime<Utc>,
+    /// Its files, each naming the hub and agent whose store holds it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<Attachment>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -93,6 +97,10 @@ pub struct NewMessage {
     pub thread_id: Option<Uuid>,
     #[serde(default)]
     pub hop: i16,
+    /// Files it carries: an agent's answer's, or what you uploaded to the
+    /// agents you sent it to. A message with files may have no text.
+    #[serde(default)]
+    pub attachments: Vec<Attachment>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -142,10 +150,12 @@ fn message(row: &Row) -> Result<RoomMessage> {
         content: row.try_get("content")?,
         hop: row.try_get("hop")?,
         created_at: row.try_get("created_at")?,
+        attachments: serde_json::from_value(row.try_get("attachments")?)?,
     })
 }
 
-const MESSAGE_COLUMNS: &str = "id, room_id, thread_id, author, content, hop, created_at";
+const MESSAGE_COLUMNS: &str =
+    "id, room_id, thread_id, author, content, hop, created_at, attachments";
 
 impl DeskStore {
     pub async fn rooms(&self) -> Result<Vec<Room>> {
@@ -211,9 +221,19 @@ impl DeskStore {
         let client = self.pool().get().await?;
         client
             .execute(
-                "INSERT INTO room_messages (id, room_id, thread_id, author, content, hop, created_at) \
-                 VALUES ($1,$2,$3,$4,$5,$6,$7)",
-                &[&m.id, &m.room_id, &m.thread_id, &m.author, &m.content, &m.hop, &m.created_at],
+                "INSERT INTO room_messages \
+                 (id, room_id, thread_id, author, content, hop, created_at, attachments) \
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
+                &[
+                    &m.id,
+                    &m.room_id,
+                    &m.thread_id,
+                    &m.author,
+                    &m.content,
+                    &m.hop,
+                    &m.created_at,
+                    &serde_json::to_value(&m.attachments)?,
+                ],
             )
             .await
             .context("saving room message")?;
@@ -335,6 +355,7 @@ mod tests {
             content: content.into(),
             hop: 0,
             created_at: at,
+            attachments: Vec::new(),
         }
     }
 

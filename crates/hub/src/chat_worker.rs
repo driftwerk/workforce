@@ -388,6 +388,7 @@ fn chat_progress(
             elapsed_secs,
         }),
         ProgressEvent::Snapshot(snapshot) => desk.then_some(ChatProgress::Snapshot(snapshot)),
+        ProgressEvent::File(file) => desk.then_some(ChatProgress::File(file)),
         ProgressEvent::SecretConsumed { .. } => None,
         ProgressEvent::ApprovalResolved { .. } => None,
         ProgressEvent::ConnectRequired { prompt } => Some(ChatProgress::ConnectPrompt { prompt }),

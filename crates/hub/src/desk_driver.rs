@@ -43,6 +43,17 @@ use crate::vault::Vault;
 /// The hub's one desk, once `[desk]` has started it.
 static DESK: OnceLock<Desk> = OnceLock::new();
 
+/// The hub's desk, when `[desk]` started one.
+pub(crate) fn desk() -> Option<&'static Desk> {
+    DESK.get()
+}
+
+/// Makes `desk` the hub's, as `[desk]` would; whether it was the first.
+#[cfg(test)]
+pub(crate) fn install_desk_for_test(desk: Desk) -> bool {
+    DESK.set(desk).is_ok()
+}
+
 /// Gives `service` the `desk.*` tools when desk sessions are on. Called for
 /// every agent at boot and for agents spawned later.
 pub fn register_tools(service: &AgentService) {
