@@ -273,25 +273,37 @@ fn read_head(path: &Path, max: usize) -> Option<Vec<u8>> {
 /// The width of a PDF thumbnail's longer side.
 const THUMBNAIL_PX: &str = "480";
 
+/// The longest a PDF's first page may take to render.
+const THUMBNAIL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How many PDFs render at once.
+static THUMBNAILS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+
 /// The first page of a PDF as a PNG, by the `pdftoppm` the hub already
-/// renders PDFs with; `None` when it is not installed or the PDF won't
-/// render.
-fn pdf_thumbnail(pdf: &Path) -> Option<Vec<u8>> {
+/// renders PDFs with, a few at a time and killed if it takes too long;
+/// `None` when it is not installed or the PDF won't render.
+async fn pdf_thumbnail(pdf: &Path) -> Option<Vec<u8>> {
+    let _turn = THUMBNAILS.acquire().await.ok()?;
     let dir = tempfile::TempDir::new().ok()?;
-    let out = dir.path().join("thumb");
-    let status = std::process::Command::new("pdftoppm")
+    let mut render = tokio::process::Command::new("pdftoppm")
         .args(["-png", "-singlefile", "-f", "1", "-l", "1", "-scale-to"])
         .arg(THUMBNAIL_PX)
         .arg(pdf)
-        .arg(&out)
+        .arg(dir.path().join("thumb"))
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .status()
+        .kill_on_drop(true)
+        .spawn()
+        .ok()?;
+    let status = tokio::time::timeout(THUMBNAIL_TIMEOUT, render.wait())
+        .await
+        .inspect_err(|_| debug!("a PDF's first page took too long to render"))
+        .ok()?
         .ok()?;
     if !status.success() {
         return None;
     }
-    std::fs::read(dir.path().join("thumb.png")).ok()
+    tokio::fs::read(dir.path().join("thumb.png")).await.ok()
 }
 
 // ── Kept in the desk store ───────────────────────────────────────────────
@@ -360,11 +372,7 @@ mod kept {
             return;
         };
         if media_type == "application/pdf" {
-            let Some(png) = tokio::task::spawn_blocking(move || pdf_thumbnail(&path))
-                .await
-                .ok()
-                .flatten()
-            else {
+            let Some(png) = pdf_thumbnail(&path).await else {
                 return;
             };
             let descriptor = ArtifactDescriptor {
