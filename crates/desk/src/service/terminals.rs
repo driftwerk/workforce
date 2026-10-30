@@ -4,7 +4,7 @@
 //! environment, in Postgres: a terminal the holder kept is taken back as it
 //! is after a hub restart; one a reboot ended is reopened where it was.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -629,6 +629,10 @@ impl Desk {
             background: Default::default(),
             baseline: Default::default(),
             prompts: 0,
+            denials: Vec::new(),
+            asked: None,
+            allowed: HashSet::new(),
+            interrupted: false,
         };
         if existing.is_some_and(|id| self.0.state.lock().live.contains_key(&id)) {
             // Already running here: nothing to take back.
@@ -660,7 +664,8 @@ impl Desk {
                     branch: None,
                     origin: Origin::Desk,
                     state: SessionState::Starting,
-                    approvals: Approvals::Desk,
+                    // Its terminal asks, until the person says Desk answers.
+                    approvals: Approvals::Terminal,
                     cli_session_id: cli,
                     transcript: None,
                     last_prompt: None,
@@ -736,6 +741,10 @@ impl Desk {
                             background: Default::default(),
                             baseline: Default::default(),
                             prompts: 0,
+                            denials: Vec::new(),
+                            asked: None,
+                            allowed: HashSet::new(),
+                            interrupted: false,
                         },
                     );
                     self.publish(id);
@@ -1107,6 +1116,15 @@ mod tests {
             );
             assert!(d.stop(s.id, None).is_err(), "ended in its terminal, not by Desk");
 
+            // Its terminal asks, until the person has Desk answer.
+            let asked = hook("PermissionRequest", "cc-1",
+                serde_json::json!({ "tool_name": "Bash", "tool_input": { "command": "cargo build" } }));
+            assert_eq!(d.terminal_hook(tid, &token, &asked).await, Some(claude::ask_in_terminal()));
+            assert!(!d.view(s.id).unwrap().pending.unwrap().answerable);
+            // Answered there: the tool ran.
+            d.terminal_hook(tid, &token, &hook("PostToolUse", "cc-1", serde_json::json!({}))).await.unwrap();
+            d.update(s.id, crate::model::SessionPatch { approvals: Some(Approvals::Desk), ..Default::default() }).unwrap();
+
             // An approval goes round Desk as a launched session's does.
             let waiting = tokio::spawn({
                 let d = d.clone();
@@ -1165,6 +1183,81 @@ mod tests {
             // The terminal going ends what ran in it.
             pty.kill();
             wait_until(|| d.list().iter().all(|v| !v.live)).await;
+        })
+        .await;
+    }
+
+    /// A tracked session started in terminal `tid`, as its SessionStart
+    /// registers it.
+    async fn tracked(d: &Desk, tid: Uuid, token: &str, cli: &str) -> crate::model::SessionView {
+        d.terminal_hook(
+            tid,
+            token,
+            &hook("SessionStart", cli, serde_json::json!({})),
+        )
+        .await
+        .unwrap();
+        d.list()
+            .into_iter()
+            .find(|s| s.terminal_id == Some(tid))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_tracked_session_answered_in_desk_goes_back_to_its_terminal_when_switched_back() {
+        with_test_pool(build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let d = shell_desk(pool, dir.path()).await;
+            let (tid, token) = open(&d, dir.path()).await;
+            let s = tracked(&d, tid, &token, "cc-back").await;
+            assert_eq!(s.approvals, Approvals::Terminal, "its terminal asks by default");
+            d.update(s.id, crate::model::SessionPatch { approvals: Some(Approvals::Desk), ..Default::default() }).unwrap();
+            let waiting = tokio::spawn({
+                let (d, token) = (d.clone(), token.clone());
+                async move {
+                    let body = hook("PermissionRequest", "cc-back",
+                        serde_json::json!({ "tool_name": "Bash", "tool_input": { "command": "git push" } }));
+                    d.terminal_hook(tid, &token, &body).await.unwrap()
+                }
+            });
+            wait_until(|| d.view(s.id).unwrap().pending.is_some_and(|p| p.answerable)).await;
+
+            d.update(s.id, crate::model::SessionPatch { approvals: Some(Approvals::Terminal), ..Default::default() }).unwrap();
+            assert_eq!(waiting.await.unwrap(), claude::ask_in_terminal(), "Claude Code shows its own dialog");
+            let p = d.view(s.id).unwrap().pending.unwrap();
+            assert!(!p.answerable);
+            assert!(d.decide(s.id, p.id, crate::model::Decision::Allow, None).is_err(), "nothing is answered for it");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn interrupting_a_tracked_session_is_esc_in_its_terminal_and_leaves_the_shell() {
+        with_test_pool(build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let d = shell_desk(pool, dir.path()).await;
+            let (tid, token) = open(&d, dir.path()).await;
+            let s = tracked(&d, tid, &token, "cc-esc").await;
+            let pty = d.attach_terminal(tid).unwrap();
+            // What the shell reads next, byte by byte, in hex.
+            pty.write(b"stty raw -echo; head -c 1 | od -An -tx1; stty sane; echo read-$((40+2))\n").unwrap();
+            tokio::time::sleep(Duration::from_millis(300)).await;
+
+            let idle = d.interrupt(s.id, None).unwrap();
+            assert_eq!(idle.state, SessionState::Idle, "not working: nothing to interrupt");
+
+            let tool = hook("PreToolUse", "cc-esc",
+                serde_json::json!({ "tool_name": "Bash", "tool_input": { "command": "cargo test" } }));
+            d.terminal_hook(tid, &token, &tool).await.unwrap();
+            assert_eq!(d.view(s.id).unwrap().state, SessionState::Working);
+            let v = d.interrupt(s.id, None).unwrap();
+            crate::pty::tests::wait_for(&pty, "1b").await;
+            crate::pty::tests::wait_for(&pty, "read-42").await;
+            assert_eq!((v.state, v.live, v.current_tool), (SessionState::Done, true, None));
+            assert!(d.terminal(tid).unwrap().pid.is_some(), "its shell runs on");
+
+            let refused = d.stop(s.id, None).unwrap_err().to_string();
+            assert!(refused.contains("desk.interrupt"), "{refused}");
         })
         .await;
     }

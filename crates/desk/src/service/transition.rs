@@ -6,7 +6,8 @@ use std::collections::HashSet;
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
-use crate::crew;
+use crate::asking::{self, Asked, Reading};
+use crate::crew::{self, ItemQuestion};
 use crate::floor::{Answer, DecideRef, Outcome, Place, Subject, Turn, TurnOp, Wait};
 use crate::model::{PendingApproval, SessionState, SessionView};
 
@@ -39,6 +40,15 @@ pub(super) enum Transition<'a> {
     Finished {
         reply: &'a str,
     },
+    /// Its turn ended waiting on the person: on what `asked` says.
+    Asked {
+        reply: &'a str,
+        asked: &'a Asked,
+    },
+    /// Its turn was ended from Desk before it finished.
+    Halted,
+    /// What it asked was left unanswered: it is done.
+    Dismissed,
     /// Its turn is done but waits on `count` pieces of the work it
     /// started, `from` before (none: it no longer waits).
     Background {
@@ -88,11 +98,20 @@ impl<'a> Transition<'a> {
                     .as_ref()
                     .map(|pending| Self::Blocked { pending })
             }
-            S::Working if matches!(before.state, S::Done | S::Idle | S::Starting) && prompted => {
+            S::Working
+                if matches!(before.state, S::Done | S::Idle | S::Starting | S::Asking)
+                    && prompted =>
+            {
                 now.last_prompt
                     .as_deref()
                     .map(|prompt| Self::Prompted { prompt })
             }
+            S::Done if now.interrupted && !before.interrupted => Some(Self::Halted),
+            S::Done if before.state == S::Asking => Some(Self::Dismissed),
+            S::Asking if before.state != S::Asking => now.asked.as_ref().map(|asked| Self::Asked {
+                reply: now.last_reply.as_deref().unwrap_or_default(),
+                asked,
+            }),
             S::Done
                 if now.waiting_on() == 0
                     && (before.state != S::Done || before.waiting_on() > 0) =>
@@ -128,6 +147,8 @@ impl<'a> Transition<'a> {
                     Some(
                         Self::Prompted { .. }
                             | Self::Finished { .. }
+                            | Self::Asked { .. }
+                            | Self::Halted
                             | Self::Stopped { .. }
                             | Self::Interrupted
                     )
@@ -249,7 +270,7 @@ pub(super) fn turn_ops(
                 if let Some(id) = open.take() {
                     ops.push(end(
                         id,
-                        crew::outcome_of(Ok(now.last_reply.as_deref().unwrap_or_default())),
+                        finished(now.last_reply.as_deref().unwrap_or_default(), now),
                     ));
                 }
                 let (op, id) = begin(true, Some(prompt));
@@ -287,9 +308,20 @@ pub(super) fn turn_ops(
             }
             Transition::Finished { reply } => {
                 let turn = working(&mut ops, &mut open);
-                ops.push(end(turn, crew::outcome_of(Ok(reply))));
+                ops.push(end(turn, finished(reply, now)));
                 open = None;
             }
+            Transition::Asked { reply, asked } => {
+                let turn = working(&mut ops, &mut open);
+                ops.push(end(turn, asking_outcome(reply, asked)));
+                open = None;
+            }
+            Transition::Halted => {
+                if let Some(id) = open.take() {
+                    ops.push(end(id, (Outcome::Stopped, None, None)));
+                }
+            }
+            Transition::Dismissed => ops.push(settle()),
             Transition::Stopped { .. } | Transition::Interrupted => {
                 let outcome = match t {
                     Transition::Interrupted => Outcome::Interrupted,
@@ -315,6 +347,38 @@ pub(super) fn turn_ops(
 
 /// How long a turn's task line is kept.
 const TASK_CHARS: usize = 120;
+
+/// How a turn that ended on `reply` without asking the person ended:
+/// finished, or on its usage limit. A session in another terminal, whose
+/// turns Desk reads from its transcript and not its hooks, is read for an
+/// ask here, by the rules alone.
+pub(super) fn finished(
+    reply: &str,
+    now: &SessionView,
+) -> (Outcome, Option<String>, Option<ItemQuestion>) {
+    match (asking::read(reply), crew::outcome_of(Ok(reply))) {
+        (_, (Outcome::Limit, line, _)) => (Outcome::Limit, line, None),
+        (Reading::Asks(asked), _) if now.state == SessionState::Idle => {
+            asking_outcome(reply, &asked)
+        }
+        (_, (_, line, _)) => (Outcome::Finished, line, None),
+    }
+}
+
+/// A turn that ended asking the person what `asked` says.
+pub(super) fn asking_outcome(
+    reply: &str,
+    asked: &Asked,
+) -> (Outcome, Option<String>, Option<ItemQuestion>) {
+    (
+        Outcome::Asked,
+        crew::outcome_of(Ok(reply)).1,
+        Some(ItemQuestion {
+            text: asked.ask.clone(),
+            options: asked.options.clone(),
+        }),
+    )
+}
 
 /// A pending request as the wait it makes.
 fn wait_of(session: Uuid, p: &PendingApproval) -> Wait {
@@ -548,6 +612,18 @@ mod tests {
         use crate::crew::Kind;
         let now = view(SessionState::Working);
         let p = pending("Bash(cargo test)");
+        let asked = Asked {
+            ask: "Ship it?".into(),
+            why: "asked you a question".into(),
+            options: None,
+            denied: None,
+        };
+        let refused = Asked::refused(&[crate::asking::Denied::from_hook(
+            "Bash",
+            Some(&serde_json::json!({ "command": "git push --force" })),
+            "[Git Destructive]",
+        )])
+        .unwrap();
         let cases: Vec<(Transition<'_>, Option<(Kind, &str)>)> = vec![
             (Transition::Started, Some((Kind::Started, "started"))),
             (
@@ -588,8 +664,24 @@ mod tests {
                 Transition::Finished {
                     reply: "Done. Ship it?",
                 },
+                Some((Kind::Finished, "finished · Done.")),
+            ),
+            (
+                Transition::Asked {
+                    reply: "Done. Ship it?",
+                    asked: &asked,
+                },
                 Some((Kind::Question, "asked “Ship it?”")),
             ),
+            (
+                Transition::Asked {
+                    reply: "Blocked.",
+                    asked: &refused,
+                },
+                Some((Kind::Question, "stopped: Bash was not allowed")),
+            ),
+            (Transition::Halted, None),
+            (Transition::Dismissed, None),
             (
                 Transition::Finished {
                     reply: "You've hit your usage limit.",
@@ -787,8 +879,43 @@ mod tests {
         else {
             unreachable!()
         };
+        assert_eq!(
+            (*outcome, question),
+            (Outcome::Finished, &None),
+            "a session's hooks read its turn's end: one that finished asks nothing"
+        );
+
+        let asked = Asked {
+            ask: "Ship it?".into(),
+            why: "asked you a question".into(),
+            options: None,
+            denied: None,
+        };
+        let (o, after) = ops(
+            &[Transition::Asked {
+                reply: "Done. Ship it?",
+                asked: &asked,
+            }],
+            &working,
+            open,
+        );
+        assert_eq!((kinds(&o), after), (vec!["end"], None));
+        let TurnOp::End {
+            outcome, question, ..
+        } = &o[0]
+        else {
+            unreachable!()
+        };
         assert_eq!(*outcome, Outcome::Asked);
         assert_eq!(question.as_ref().unwrap().text, "Ship it?");
+        let (o, after) = ops(&[Transition::Halted], &working, open);
+        assert_eq!((kinds(&o), after), (vec!["end"], None));
+        let TurnOp::End { outcome, .. } = &o[0] else {
+            unreachable!()
+        };
+        assert_eq!(*outcome, Outcome::Stopped, "interrupted, not finished");
+        let (o, _) = ops(&[Transition::Dismissed], &working, None);
+        assert_eq!(kinds(&o), ["settle"]);
 
         let (o, after) = ops(&[Transition::Stopped { closed: false }], &working, open);
         assert_eq!((kinds(&o), after), (vec!["end", "settle"], None));
