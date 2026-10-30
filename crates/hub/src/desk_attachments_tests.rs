@@ -550,6 +550,68 @@ async fn a_file_a_workflow_run_delivers_into_desk_is_served_to_its_person() {
     assert_eq!(status, StatusCode::NOT_FOUND, "nor anyone else's");
 }
 
+/// A conversation's files for `view_attachment` are those its people
+/// attached: a message that names another person's upload, or some other
+/// tool's artifact, lists neither.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_conversation_s_files_are_what_its_people_attached_not_what_a_message_names() {
+    use workforce_common::session::SessionAttachment;
+    use workforce_skills::adapters::image_view::ConversationFiles as _;
+    let dir = tempfile::tempdir().unwrap();
+    let (scout, _llm) = agent(dir.path(), "scout", "ok", Duration::ZERO).await;
+    let mut dm = scout
+        .sessions
+        .get_or_create(DESK_CHANNEL, "alice", "scout")
+        .unwrap();
+    let upload = |by: &str, session: &str| {
+        let descriptor = ArtifactDescriptor {
+            session_id: Some(session.to_string()),
+            user_id: Some(by.to_string()),
+            ..ArtifactDescriptor::from_context(
+                SESSION_UPLOAD_PRODUCER,
+                ContentType::OctetStream,
+                "scout",
+            )
+            .with_file_meta("photo.png", "image/png")
+        };
+        store()
+            .write(
+                "scout",
+                descriptor,
+                workforce_agent::artifacts::ArtifactBody::Bytes(png(1, 1)),
+            )
+            .unwrap()
+            .id
+    };
+    let hers = upload("alice", &dm.id);
+    let his = upload("bob", "bob-dm");
+    let report = staged(
+        "scout",
+        Some("elsewhere"),
+        b"%PDF-1.7",
+        "application/pdf",
+        "r.pdf",
+    );
+    dm.add_user_message_with_attachments(
+        "look at these",
+        None,
+        Some(
+            [&hers, &his, &report]
+                .map(|id| SessionAttachment::from_artifact("f", "image/png", id.as_str()))
+                .to_vec(),
+        ),
+    );
+    scout.sessions.save(&dm).unwrap();
+    let listed = SessionFiles::new("scout", Arc::clone(&scout.sessions))
+        .files(&dm.id)
+        .await
+        .unwrap();
+    assert_eq!(
+        listed.iter().map(|f| f.id.as_str()).collect::<Vec<_>>(),
+        [hers.as_str()]
+    );
+}
+
 /// A Desk turn whose tool delivers a file is sent it in the turn's own
 /// stream, named by the turn, and its answer carries it.
 #[tokio::test(flavor = "multi_thread")]

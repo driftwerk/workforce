@@ -1277,6 +1277,20 @@ impl SessionFiles {
         }
         Ok(chain)
     }
+
+    /// Whether `id` names a file `sender` attached to a message in
+    /// `session`, as a turn would read it: a message names an id its client
+    /// gave, which is no read of whatever that id is.
+    fn attached(&self, id: &str, sender: &str, session: &str) -> bool {
+        ArtifactId::parse(id)
+            .ok()
+            .zip(global_store())
+            .and_then(|(id, store)| store.metadata(&self.agent_id, &id).ok().flatten())
+            .is_some_and(|descriptor| {
+                workforce_agent::attachments::attached_by(&descriptor, Some(sender), Some(session))
+                    .is_ok()
+            })
+    }
 }
 
 const INLINE: &str = "inline:";
@@ -1299,9 +1313,11 @@ impl workforce_skills::adapters::image_view::ConversationFiles for SessionFiles 
                 .iter()
                 .filter(|m| m.role == MessageRole::User)
             {
+                let sender = message.actor.as_deref().unwrap_or(&session.owner);
                 for (i, a) in message.attachments.iter().flatten().enumerate() {
                     let id = match &a.artifact_id {
-                        Some(id) => id.clone(),
+                        Some(id) if self.attached(id, sender, &session.id) => id.clone(),
+                        Some(_) => continue,
                         None if !a.data.is_empty() => {
                             format!("{INLINE}{}:{}:{i}", session.id, message.id)
                         }
