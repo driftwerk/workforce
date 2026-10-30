@@ -1,7 +1,8 @@
 //! Deciding a routed approval, however the approver answers: a button in a
 //! Slack DM, or Desk's `POST /api/approvals/{request_id}/decision`. The
 //! first decision wins; it rewrites the approvers' Slack cards and resumes
-//! the run that asked.
+//! the run that asked once the decision is answered: the resumed run is a
+//! whole turn, which no answer waits on and no caller hanging up can stop.
 
 use std::sync::Arc;
 
@@ -115,8 +116,11 @@ pub(crate) async fn decide(
         return Ok(Decided::AlreadyResolved(row));
     }
     super::approvers_changed(targets.iter().map(|t| t.approver_id.as_str()));
-    super::slack::rewrite_all_targets(&svc, &store, &row, outcome, &resolver_id).await;
-    super::resume::launch_resume(registry, &row, outcome, &decider.display(&svc)).await;
+    let (registry, resolved, display) = (Arc::clone(registry), row.clone(), decider.display(&svc));
+    tokio::spawn(async move {
+        super::slack::rewrite_all_targets(&svc, &store, &resolved, outcome, &resolver_id).await;
+        super::resume::launch_resume(&registry, &resolved, outcome, &display).await;
+    });
     Ok(Decided::Resolved(row))
 }
 
