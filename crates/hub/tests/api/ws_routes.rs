@@ -355,6 +355,18 @@ async fn a_desk_connection_sends_turns_the_agent_reads_in_their_place() {
         (&refused["type"], &refused["turn_ref"]),
         (&json!("error"), &json!("ref-wrong"))
     );
+    send(
+        &mut desk,
+        json!({"type": "chat", "content": "and the release?", "turn_ref": "ref-unread",
+               "desk": {"place": {"kind": "stage"}, "speaker": {"kind": "person"}}}),
+    )
+    .await;
+    let unread = next_frame(&mut desk).await;
+    assert_eq!(
+        (&unread["type"], &unread["turn_ref"]),
+        (&json!("error"), &json!("ref-unread")),
+        "a turn this hub can't read is ended, not dropped: {unread}"
+    );
 
     send(
         &mut desk,

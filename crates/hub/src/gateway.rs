@@ -1487,6 +1487,19 @@ fn desk_turn_of(
     }
 }
 
+/// The `turn_ref` a frame that is not a [`ClientMessage`] still names, so
+/// the turn it would have started can be ended.
+fn unread_turn_ref(text: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(text)
+        .ok()?
+        .get("turn_ref")?
+        .as_str()
+        .filter(|r| {
+            !r.is_empty() && r.chars().count() <= workforce_gateway_client::protocol::TURN_REF_MAX
+        })
+        .map(str::to_string)
+}
+
 /// The frame a connection is sent for `msg`. A connection that did not
 /// declare itself Desk's (iOS, the web UI, an old Desk) gets exactly the
 /// frame it always did: no turn ref, no reply id, and none of Desk's own
@@ -2109,6 +2122,20 @@ async fn handle_ws(
                         Ok(m) => m,
                         Err(e) => {
                             warn!("Invalid WS message: {}", e);
+                            // A Desk turn that can't be read still ends: its
+                            // client is told why, under the ref it sent.
+                            if let Some(turn_ref) = unread_turn_ref(&text) {
+                                let session =
+                                    conn_session_recv.lock().await.clone().unwrap_or_default();
+                                let _ = broadcast_tx.send(BroadcastMessage {
+                                    turn_ref: Some(turn_ref),
+                                    ..BroadcastMessage::new(
+                                        session,
+                                        "error",
+                                        format!("That message couldn't be read: {e}"),
+                                    )
+                                });
+                            }
                             continue;
                         }
                     };
@@ -2124,18 +2151,21 @@ async fn handle_ws(
 
                     match client_msg.msg_type.as_str() {
                         "chat" => {
+                            let turn_ref = client_msg.turn_ref.clone();
+                            let refused = |session: String, why: String| BroadcastMessage {
+                                turn_ref: turn_ref.clone(),
+                                ..BroadcastMessage::new(session, "error", why)
+                            };
                             // Scope enforcement for device tokens
                             if let Some(ref scopes) = ws_device_scopes {
                                 if !crate::jwt::has_scope(scopes, crate::jwt::SCOPE_CHAT) {
-                                    let _ = broadcast_tx.send(BroadcastMessage::new(
+                                    let _ = broadcast_tx.send(refused(
                                         String::new(),
-                                        "error",
-                                        "Access denied: device does not have 'chat' scope",
+                                        "Access denied: device does not have 'chat' scope".into(),
                                     ));
                                     continue;
                                 }
                             }
-                            let turn_ref = client_msg.turn_ref.clone();
                             let desk_turn = match desk_turn_of(
                                 declared,
                                 client_msg.desk,
@@ -2146,10 +2176,7 @@ async fn handle_ws(
                                 Err(refusal) => {
                                     let session =
                                         conn_session_recv.lock().await.clone().unwrap_or_default();
-                                    let _ = broadcast_tx.send(BroadcastMessage {
-                                        turn_ref,
-                                        ..BroadcastMessage::new(session, "error", refusal)
-                                    });
+                                    let _ = broadcast_tx.send(refused(session, refusal));
                                     continue;
                                 }
                             };
@@ -2221,9 +2248,8 @@ async fn handle_ws(
                             let service = match registry.get(&agent_id_str) {
                                 Some(s) => s,
                                 None => {
-                                    let _ = broadcast_tx.send(BroadcastMessage::new(
+                                    let _ = broadcast_tx.send(refused(
                                         String::new(),
-                                        "error",
                                         format!("Unknown agent: {}", agent_id_str),
                                     ));
                                     continue;
@@ -2259,9 +2285,8 @@ async fn handle_ws(
                                     .clone()
                                     .or_else(|| client_msg.session_id.clone())
                                     .unwrap_or_default();
-                                let _ = broadcast_tx.send(BroadcastMessage::new(
+                                let _ = broadcast_tx.send(refused(
                                     deny_session,
-                                    "error",
                                     message.unwrap_or_else(|| {
                                         "Access denied by this agent's policy.".to_string()
                                     }),
@@ -2298,11 +2323,7 @@ async fn handle_ws(
                                             .clone()
                                             .or_else(|| client_msg.session_id.clone())
                                             .unwrap_or_default();
-                                        let _ = broadcast_tx.send(BroadcastMessage::new(
-                                            deny_session,
-                                            "error",
-                                            canned,
-                                        ));
+                                        let _ = broadcast_tx.send(refused(deny_session, canned));
                                         continue;
                                     }
                                 }
@@ -2314,10 +2335,9 @@ async fn handle_ws(
                             {
                                 Some(o) => o,
                                 None => {
-                                    let _ = broadcast_tx.send(BroadcastMessage::new(
+                                    let _ = broadcast_tx.send(refused(
                                         String::new(),
-                                        "error",
-                                        "Unauthenticated WebSocket message rejected",
+                                        "Unauthenticated WebSocket message rejected".into(),
                                     ));
                                     warn!("WS message rejected: no identity or device in scope");
                                     continue;
@@ -2473,14 +2493,10 @@ async fn handle_ws(
                                 )
                                 .await;
                                 if steered == Applied::Busy {
-                                    let _ = broadcast_tx.send(BroadcastMessage {
-                                        turn_ref: turn_ref.clone(),
-                                        ..BroadcastMessage::new(
-                                            effective_session_id.clone(),
-                                            "error",
-                                            REFUSED_BUSY,
-                                        )
-                                    });
+                                    let _ = broadcast_tx.send(refused(
+                                        effective_session_id.clone(),
+                                        REFUSED_BUSY.into(),
+                                    ));
                                     continue;
                                 }
                                 if steered.applied() {
