@@ -116,7 +116,7 @@ impl GovernedInvoker {
         Self::new(
             Arc::clone(&service.tools),
             Arc::clone(&service.policy),
-            Arc::new(move || gates.tool_gates()),
+            Arc::new(move || gates.tool_gates(crate::desk_surface::allows())),
             Arc::new(move || service.tool_access_snapshot()),
             adapters,
         )

@@ -195,7 +195,7 @@ async fn serve(
     let surface = remote.surface_for(&service);
     let executor = GatedExecutor {
         site: CallSite {
-            gates: service.tool_gates(),
+            gates: service.tool_gates(crate::desk_surface::allows()),
             policy: Arc::clone(&service.policy),
             surface: Surface::Fixed(Arc::clone(&surface)),
             access: service.tool_access_snapshot(),
