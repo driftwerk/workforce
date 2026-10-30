@@ -109,6 +109,8 @@ kinds! {
     Dismissed => "dismissed",
     Summary => "summary",
     Assigned => "assigned",
+    Replied => "replied",
+    Delivered => "delivered",
 }
 
 /// One thing that happened on the crew.
@@ -136,6 +138,12 @@ pub struct Event {
     /// the question and its choices. Not on the wire.
     #[serde(skip)]
     pub detail: Option<Value>,
+    /// Where in Desk it happened, when in a room.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub place: Option<crate::floor::Place>,
+    /// The room message it is about.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<uuid::Uuid>,
 }
 
 /// Now, to the microsecond Postgres keeps.
@@ -160,7 +168,20 @@ impl Event {
             approval_id: None,
             hop: 0,
             detail: None,
+            place: None,
+            message: None,
         }
+    }
+
+    /// The event, where in Desk it happened and the message it is about.
+    pub fn at_place(
+        mut self,
+        place: Option<crate::floor::Place>,
+        message: Option<uuid::Uuid>,
+    ) -> Self {
+        self.place = place;
+        self.message = message;
+        self
     }
 
     pub fn detail(mut self, detail: Value) -> Self {

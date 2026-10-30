@@ -449,6 +449,57 @@ fn comma_list<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<Has>, D::Error> {
         .collect()
 }
 
+/// What Activity records of a post when nothing else will: a delivery with
+/// no turn behind it (a local agent's reminder or approval, anything from
+/// another hub's agent) and another hub's agent's answer. A local agent's
+/// answer, job and workflow come out of turns the crew logs already; your
+/// messages, Desk's notes and copies are none of Activity's.
+pub fn post_activity(m: &RoomMessage) -> Option<crate::crew::Event> {
+    use crate::crew::{Event, Kind, Party};
+    if m.copy_of.is_some() {
+        return None;
+    }
+    let member = Member::parse(&m.author)?;
+    let local = member.hub == LOCAL_HUB;
+    let (kind, text) = match m.delivery {
+        Some(kind @ (DeliveryKind::Reminder | DeliveryKind::Approval)) => {
+            (Kind::Delivered, delivered(kind))
+        }
+        Some(kind) if !local => (Kind::Delivered, delivered(kind)),
+        None if !local => (Kind::Replied, "replied"),
+        _ => return None,
+    };
+    let party = match local {
+        true => Party::agent(&member.agent, &member.agent),
+        false => Party::agent(&m.author, &member.agent),
+    };
+    let event = Event::new(kind, party.clone(), Some(party), text).at_place(
+        Some(crate::floor::Place::Room {
+            room: m.room_id,
+            thread: m.thread_id,
+        }),
+        Some(m.id),
+    );
+    Some(match (&m.request_id, kind) {
+        (Some(request), Kind::Delivered) => event.approval(request),
+        _ => event,
+    })
+}
+
+/// What a delivery's event says the agent did.
+fn delivered(kind: DeliveryKind) -> &'static str {
+    match kind {
+        DeliveryKind::Reminder => "sent a reminder",
+        DeliveryKind::Approval => "asks you to approve",
+        DeliveryKind::Job => "sent a job's answer",
+        DeliveryKind::Workflow => "sent a workflow's update",
+        DeliveryKind::CheckIn => "checked in",
+        DeliveryKind::File => "sent a file",
+        DeliveryKind::Resumed => "answered after a restart",
+        DeliveryKind::Notice | DeliveryKind::Other => "sent a note",
+    }
+}
+
 /// Why `steps` can't go on a message, when they can't: only an agent's
 /// answer from a turn (`turn`) carries them, at most [`MAX_STEPS`], each
 /// tool named in at most [`STEP_TOOL_CHARS`].
@@ -1505,6 +1556,63 @@ pub(crate) mod tests {
             assert!(!f.is_empty());
         })
         .await;
+    }
+
+    #[test]
+    fn a_post_is_activity_only_when_no_turn_records_it() {
+        use crate::crew::Kind;
+        let r = room_fixture("atlas launch");
+        let delivered = |author: &str, kind| RoomMessage {
+            delivery: Some(kind),
+            request_id: Some("req-1".into()),
+            ..msg(&r, author, "x", t0())
+        };
+        let event = post_activity(&delivered("local/scout", DeliveryKind::Approval)).unwrap();
+        assert_eq!(
+            (
+                event.kind,
+                event.text.as_str(),
+                event.approval_id.as_deref()
+            ),
+            (Kind::Delivered, "asks you to approve", Some("req-1"))
+        );
+        assert_eq!(
+            (event.actor.id.as_str(), event.actor.name.as_str()),
+            ("scout", "scout")
+        );
+        assert_eq!(
+            event.place,
+            Some(crate::floor::Place::Room {
+                room: r.id,
+                thread: None
+            })
+        );
+        assert!(post_activity(&delivered("local/scout", DeliveryKind::Reminder)).is_some());
+        assert!(
+            post_activity(&delivered("local/scout", DeliveryKind::Job)).is_none(),
+            "its turn is logged already"
+        );
+        let job = post_activity(&delivered("dw/allan", DeliveryKind::Job)).unwrap();
+        assert_eq!(
+            (job.kind, job.actor.id.as_str()),
+            (Kind::Delivered, "dw/allan")
+        );
+        let mut answer = msg(&r, "dw/allan", "the migration", t0());
+        answer.thread_id = Some(Uuid::from_u128(5));
+        let replied = post_activity(&answer).unwrap();
+        assert_eq!(
+            (replied.kind, replied.message),
+            (Kind::Replied, Some(answer.id))
+        );
+        assert_eq!(replied.approval_id, None);
+        assert!(post_activity(&msg(&r, "local/scout", "an answer", t0())).is_none());
+        assert!(post_activity(&msg(&r, YOU, "mine", t0())).is_none());
+        assert!(post_activity(&msg(&r, DESK, "a note", t0())).is_none());
+        assert!(post_activity(&RoomMessage {
+            copy_of: Some(Uuid::from_u128(5)),
+            ..msg(&r, "dw/allan", "copied", t0())
+        })
+        .is_none());
     }
 
     #[test]

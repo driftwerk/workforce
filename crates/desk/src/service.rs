@@ -2051,6 +2051,9 @@ impl Desk {
             let _ = self.0.events.send(DeskEvent::RoomMessage {
                 message: Box::new(posted.message.clone()),
             });
+            if let Some(event) = crate::rooms::post_activity(&posted.message) {
+                self.note(event);
+            }
             // The reply is kept: a copy that fails is said, not returned, so
             // a retry doesn't post the reply twice; Post to room copies it.
             if new.also_in_room && posted.message.thread_id.is_some() {
