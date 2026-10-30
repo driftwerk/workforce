@@ -26,8 +26,9 @@ use workforce_common::subscription::SubscriptionKind;
 use workforce_desk::local::{self, Server};
 use workforce_desk::providers::Group;
 use workforce_desk::{
-    AccountError, Accounts, Audio, Authorize, Desk, DeskStore, Fields, HolderOptions, KeySource,
-    Options, Provider, Realtime, RestorePolicy, Speak, SpeakError, Spec, Speech, Standing,
+    AccountError, Accounts, Audio, Authorize, Desk, DeskStore, Fields, HolderOptions, HubTurns,
+    KeySource, Options, Provider, Realtime, RestorePolicy, Speak, SpeakError, Spec, Speech,
+    Standing,
 };
 
 use crate::agent_llm::vault_provider_name;
@@ -36,6 +37,7 @@ use crate::desk_tools::DeskTool;
 use crate::gateway::{resolve_caller_context, GatewayState};
 use crate::hub_core::formatting::normalize_for_tts;
 use crate::hub_core::logins::store as login_store;
+use crate::projects::layout::WorkRoots;
 use crate::serve::AgentService;
 use crate::skill_loader::CredScope;
 use crate::vault::Vault;
@@ -456,7 +458,30 @@ fn options(config: &WorkforceConfig) -> Options {
         adopt_every: (desk.adopt_interval_secs > 0)
             .then(|| Duration::from_secs(desk.adopt_interval_secs)),
         holder: holder_options(desk),
+        hub_turns: hub_turns(config),
     }
+}
+
+/// Where this hub's agent turns run Claude Code: its sessions there are the
+/// hub's own, not the person's for Desk to adopt.
+fn hub_turns(config: &WorkforceConfig) -> HubTurns {
+    use crate::coding_sandbox::absolutise_data_dir;
+    let roots = WorkRoots::from_hub(&config.hub);
+    let roots = WorkRoots {
+        data_dir: absolutise_data_dir(roots.data_dir),
+        hot: roots.hot.map(absolutise_data_dir),
+    };
+    // As `claude agents` reports a cwd: with its links resolved.
+    let resolved = WorkRoots {
+        data_dir: std::fs::canonicalize(&roots.data_dir).unwrap_or(roots.data_dir.clone()),
+        hot: roots
+            .hot
+            .as_ref()
+            .map(|h| std::fs::canonicalize(h).unwrap_or(h.clone())),
+    };
+    HubTurns::new(move |cwd| {
+        crate::agent_turn::runs_in(&roots, cwd) || crate::agent_turn::runs_in(&resolved, cwd)
+    })
 }
 
 /// The PTY holder, when `[desk]` names its socket and a token.

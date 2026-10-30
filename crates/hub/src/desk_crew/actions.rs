@@ -38,6 +38,10 @@ pub(crate) enum Action {
     Stop {
         session: Uuid,
     },
+    /// End the turn it is on (Esc in its terminal); it runs on.
+    Interrupt {
+        session: Uuid,
+    },
     Resume {
         session: Uuid,
         prompt: Option<String>,
@@ -118,6 +122,9 @@ impl Action {
             "crew.stop" => Self::Stop {
                 session: session()?,
             },
+            "crew.interrupt" => Self::Interrupt {
+                session: session()?,
+            },
             "crew.resume" => Self::Resume {
                 session: session()?,
                 prompt: blank_none(i.prompt),
@@ -158,7 +165,10 @@ impl Action {
             }
             Self::StartSession { goal, .. } => goal.as_str(),
             Self::Assign { task, .. } => task.as_str(),
-            Self::Approve { .. } | Self::Deny { .. } | Self::Stop { .. } => "",
+            Self::Approve { .. }
+            | Self::Deny { .. }
+            | Self::Stop { .. }
+            | Self::Interrupt { .. } => "",
         };
         outward(said)
     }
@@ -301,6 +311,7 @@ impl CrewHub {
                     true
                 }
             }
+            Action::Interrupt { .. } => o.act.interrupt,
             Action::Deny { .. } | Action::Stop { .. } => false,
         };
         if allowed {
@@ -339,6 +350,7 @@ impl CrewHub {
             | Action::Approve { session: s, .. }
             | Action::Deny { session: s, .. }
             | Action::Stop { session: s }
+            | Action::Interrupt { session: s }
             | Action::Resume { session: s, .. }
             | Action::Restart { session: s, .. } => {
                 self.desk.view(*s).ok().map(|v| Party::session(&v))
@@ -381,6 +393,9 @@ impl CrewHub {
                 format!("Deny {}: {}", self.session_name(*session), request(session))
             }
             Action::Stop { session } => format!("Stop {}", self.session_name(*session)),
+            Action::Interrupt { session } => {
+                format!("Interrupt {}", self.session_name(*session))
+            }
             Action::Resume { session, prompt } => match prompt {
                 Some(p) => format!(
                     "Resume {} with “{}”",
@@ -466,8 +481,16 @@ impl CrewHub {
                 Ok(format!("denied {}", v.label()))
             }
             Action::Stop { session } => {
+                // The shell a tracked session runs in is the person's.
+                if d.view(*session).is_ok_and(|v| v.terminal_id.is_some()) {
+                    return Err("That session runs in the person's own Desk terminal, so it can't be stopped; crew.interrupt ends its turn and leaves the shell theirs.".into());
+                }
                 let v = d.stop(*session, Some(by)).map_err(plain)?;
                 Ok(format!("stopped {}", v.label()))
+            }
+            Action::Interrupt { session } => {
+                let v = d.interrupt(*session, Some(by)).map_err(plain)?;
+                Ok(format!("interrupted {}", v.label()))
             }
             Action::Resume { session, prompt } => {
                 let v = d

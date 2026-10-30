@@ -23,9 +23,10 @@ enum Verb {
     Wait,
     Approve,
     Stop,
+    Interrupt,
 }
 
-const VERBS: [Verb; 7] = [
+const VERBS: [Verb; 8] = [
     Verb::List,
     Verb::Start,
     Verb::Prompt,
@@ -33,9 +34,10 @@ const VERBS: [Verb; 7] = [
     Verb::Wait,
     Verb::Approve,
     Verb::Stop,
+    Verb::Interrupt,
 ];
 
-pub const NAMES: [&str; 7] = [
+pub const NAMES: [&str; 8] = [
     "desk.sessions",
     "desk.start",
     "desk.prompt",
@@ -43,6 +45,7 @@ pub const NAMES: [&str; 7] = [
     "desk.wait",
     "desk.approve",
     "desk.stop",
+    "desk.interrupt",
 ];
 
 const MAX_WAIT: Duration = Duration::from_secs(30 * 60);
@@ -198,6 +201,10 @@ impl DeskTool {
                 let i: IdInput = parse(input)?;
                 out(d.stop(i.session_id, caller())?)
             }
+            Verb::Interrupt => {
+                let i: IdInput = parse(input)?;
+                out(d.interrupt(i.session_id, caller())?)
+            }
         }
     }
 }
@@ -210,13 +217,14 @@ impl Tool for DeskTool {
 
     fn description(&self) -> &str {
         match self.verb {
-            Verb::List => "List the person's Claude Code and Codex sessions on this machine: displayName (what the person calls it — use it first), name (the hub's), cwd, group (the sidebar group it is in), goal, state (working, blocked = needs an answer, done, idle, interrupted, stopped), last prompt and reply. With query, only the sessions it names: matched on the person's names, the hub's, the folder and the group, ignoring case and on parts of words (\"ledger\", \"the Atlas sessions\").",
+            Verb::List => "List the person's Claude Code and Codex sessions on this machine: displayName (what the person calls it — use it first), name (the hub's), cwd, group (the sidebar group it is in), goal, state (working, blocked = needs an answer, asking = its turn ended asking the person something, done, idle, interrupted, stopped), last prompt and reply. With query, only the sessions it names: matched on the person's names, the hub's, the folder and the group, ignoring case and on parts of words (\"ledger\", \"the Atlas sessions\").",
             Verb::Start => "Start a Claude Code (default) or Codex session in a folder on this machine, optionally on a new git worktree branch and with a first prompt. It runs in a real terminal the person can watch in Desk.",
             Verb::Prompt => "Type a prompt into a running session and submit it, as the person would.",
             Verb::Read => "Read one session's state, last prompt and last reply; with terminal=true also the end of its terminal as plain text.",
             Verb::Wait => "Wait until a session finishes its turn, needs an answer, or stops (default 10 minutes, at most 30). Returns its state either way.",
             Verb::Approve => "Answer a session's pending approval (from desk.read's pending.id) with allow or deny. Only for approvals the person asked you to handle.",
-            Verb::Stop => "Stop a running session. Its conversation is kept and can be resumed in Desk.",
+            Verb::Stop => "Stop a running session. Its conversation is kept and can be resumed in Desk. A session the person started in a Desk terminal can't be stopped (the shell is theirs): interrupt it instead.",
+            Verb::Interrupt => "End the turn a working session is on, as the person pressing Esc in its terminal would. The session and its terminal keep running, and a session the person started in a Desk terminal can be interrupted too; the shell stays theirs. Does nothing to a session that isn't working.",
         }
     }
 
@@ -264,7 +272,7 @@ impl Tool for DeskTool {
                 },
                 "required": ["session_id", "approval_id", "allow"]
             }),
-            Verb::Stop => json!({
+            Verb::Stop | Verb::Interrupt => json!({
                 "type": "object",
                 "properties": { "session_id": id_schema() },
                 "required": ["session_id"]

@@ -29,6 +29,7 @@ mod actions;
 mod deliver;
 mod extras;
 mod observe;
+mod reading;
 mod tools;
 mod watcher;
 
@@ -351,6 +352,10 @@ impl Crew for CrewHub {
                 tracing::warn!(target: "floor", error = %format!("{e:#}"), "the floor's needs are unavailable")
             })
             .ok()
+    }
+
+    async fn asks(&self, reply: &str) -> Option<bool> {
+        self.read_reply(reply).await
     }
 }
 

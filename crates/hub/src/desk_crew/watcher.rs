@@ -30,7 +30,13 @@ use crate::serve::AgentService;
 
 /// The `desk.*` tools that act on sessions: the overseer acts through its
 /// gated `crew.*` tools instead.
-const DESK_ACTIONS: [&str; 4] = ["desk.start", "desk.prompt", "desk.approve", "desk.stop"];
+const DESK_ACTIONS: [&str; 5] = [
+    "desk.start",
+    "desk.prompt",
+    "desk.approve",
+    "desk.stop",
+    "desk.interrupt",
+];
 
 const MORNING_JOB: &str = "crew-summary-morning";
 const EVENING_JOB: &str = "crew-summary-evening";
