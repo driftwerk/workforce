@@ -98,7 +98,7 @@ pub(crate) async fn handler(
     };
     let listener = Listener {
         holds: crate::desk_floor::holds_the_hub(
-            &state,
+            state.identity_store.as_ref(),
             crate::desk_driver::desk().is_some(),
             Some(&identity),
         ),
@@ -227,6 +227,31 @@ mod tests {
                 "a hub's own change is only its holder's"
             );
         }
+    }
+
+    #[test]
+    fn the_device_of_a_desk_hubs_administrator_hears_its_sessions_change() {
+        use workforce_identity::store::IdentityStore;
+        use workforce_identity::types::{Identity, IdentityRole};
+        let store = workforce_identity::sqlite::SqliteIdentityStore::in_memory().unwrap();
+        let admin = Identity::new("Admin", IdentityRole::SystemAdmin);
+        let member = Identity::new("Member", IdentityRole::Member);
+        store.create(&admin).unwrap();
+        store.create(&member).unwrap();
+        let store: Arc<dyn IdentityStore> = Arc::new(store);
+        let link = |who: &Identity| {
+            let identity = who.id.to_string();
+            Listener {
+                holds: crate::desk_floor::holds_the_hub(Some(&store), true, Some(&identity)),
+                identity,
+            }
+        };
+        let sessions = BroadcastMessage::desk_signal(DeskSignal::Floor, None);
+        assert_eq!(
+            heard(&sessions, &link(&admin)),
+            Some(serde_json::json!({"type": "floor_changed"}))
+        );
+        assert_eq!(heard(&sessions, &link(&member)), None);
     }
 
     #[test]

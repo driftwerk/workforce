@@ -29,6 +29,7 @@ use workforce_desk::floor::{
 use workforce_desk::model::Decision;
 use workforce_desk::usage::MacSignIns;
 use workforce_desk::{Desk, DeskError};
+use workforce_identity::store::IdentityStore;
 
 use crate::approvals::resume::APPROVAL_DIRECTIVE;
 use crate::approvals::PendingApproval;
@@ -113,11 +114,15 @@ pub(crate) fn by_person_of(o: &Origin<'_>) -> bool {
 /// Whether `identity` holds this hub: on a hub running Desk, its sessions
 /// are the person's who administers it, however they connect (the Desk app
 /// reads its own hub with its device).
-pub(crate) fn holds_the_hub(state: &GatewayState, has_desk: bool, identity: Option<&str>) -> bool {
+pub(crate) fn holds_the_hub(
+    identities: Option<&Arc<dyn IdentityStore>>,
+    has_desk: bool,
+    identity: Option<&str>,
+) -> bool {
     has_desk
         && identity
             .and_then(|id| Uuid::parse_str(id).ok())
-            .zip(state.identity_store.as_ref())
+            .zip(identities)
             .and_then(|(id, store)| store.get_by_id(id).ok().flatten())
             .is_some_and(|i| crate::authz::is_effective_admin(i.role, i.status))
 }
@@ -426,7 +431,11 @@ async fn reader(
     let caller = resolve_caller_context(&routes.state, headers, token).await;
     let sources = routes.sources.clone();
     let has_desk = sources.as_ref().is_some_and(|s| (s.desk)().is_some());
-    let holds = holds_the_hub(&routes.state, has_desk, caller.identity_id.as_deref());
+    let holds = holds_the_hub(
+        routes.state.identity_store.as_ref(),
+        has_desk,
+        caller.identity_id.as_deref(),
+    );
     let caller = FloorCaller::of(&caller, holds).map_err(|refused| match refused {
         Refused::Unauthorized => refusal(StatusCode::UNAUTHORIZED, "unauthorized"),
         Refused::Unavailable => refusal(StatusCode::SERVICE_UNAVAILABLE, "unavailable"),
@@ -1035,6 +1044,32 @@ mod tests {
             ..caller(Some("u1"), None, false)
         };
         assert_eq!(FloorCaller::of(&failed, true), Err(Refused::Unavailable));
+    }
+
+    #[test]
+    fn a_desk_hub_is_held_by_whoever_administers_it_however_they_connect() {
+        use workforce_identity::types::{Identity, IdentityRole, IdentityStatus};
+        let store = workforce_identity::sqlite::SqliteIdentityStore::in_memory().unwrap();
+        let admin = Identity::new("Admin", IdentityRole::SystemAdmin);
+        let member = Identity::new("Member", IdentityRole::Member);
+        let suspended = Identity::new("Former", IdentityRole::SystemAdmin)
+            .with_status(IdentityStatus::Suspended);
+        for i in [&admin, &member, &suspended] {
+            store.create(i).unwrap();
+        }
+        let store: Arc<dyn IdentityStore> = Arc::new(store);
+        let holds = |desk, who: Option<&Identity>| {
+            holds_the_hub(Some(&store), desk, who.map(|i| i.id.to_string()).as_deref())
+        };
+        assert!(holds(true, Some(&admin)));
+        assert!(
+            !holds(false, Some(&admin)),
+            "a hub without Desk has no sessions to hold"
+        );
+        assert!(!holds(true, Some(&member)));
+        assert!(!holds(true, Some(&suspended)));
+        assert!(!holds(true, None), "a device paired to nobody");
+        assert!(!holds_the_hub(None, true, Some(&admin.id.to_string())));
     }
 
     #[test]
