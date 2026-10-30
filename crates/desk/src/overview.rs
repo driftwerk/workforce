@@ -41,8 +41,12 @@ fn session_item(
     midnight: DateTime<Utc>,
     quiet_minutes: u32,
 ) -> Item {
-    let mut state = crew::session_state(v.state);
-    if state == ItemState::Working && is_quiet(v.updated_at, now, quiet_minutes) {
+    let waiting = v.waiting_on() > 0;
+    let mut state = match waiting {
+        true => ItemState::Working,
+        false => crew::session_state(v.state),
+    };
+    if state == ItemState::Working && !waiting && is_quiet(v.updated_at, now, quiet_minutes) {
         state = ItemState::Quiet;
     }
     if state == ItemState::Done && v.updated_at < midnight {
@@ -52,8 +56,12 @@ fn session_item(
         .filter(|g| !g.is_empty())
         .map(str::to_string)
         .or_else(|| v.last_prompt.as_deref().map(|p| crew::one_line(p, 120)));
-    let detail = match v.state {
-        SessionState::Done | SessionState::Idle => {
+    let detail = match (v.state, v.background) {
+        (SessionState::Done, Some(b)) if waiting => Some(match b.count {
+            1 => "Waiting on 1 background task".to_string(),
+            n => format!("Waiting on {n} background tasks"),
+        }),
+        (SessionState::Done | SessionState::Idle, _) => {
             v.last_reply.as_deref().map(|r| crew::one_line(r, 140))
         }
         _ => v.current_tool.as_ref().map(|t| format!("● {t}")),
@@ -89,7 +97,8 @@ fn session_item(
             id: p.id.to_string(),
             summary: crew::approval_summary(&p.tool, &p.detail),
         }),
-        question,
+        question: question.filter(|_| !waiting),
+        background: v.background.filter(|_| waiting),
     }
 }
 
@@ -124,6 +133,7 @@ fn agent_item(
         last_activity: None,
         approval: None,
         question: None,
+        background: None,
     };
     if let Some(live) = &a.live {
         item.state = if is_quiet(live.last_activity, now, quiet_minutes) {
@@ -486,6 +496,7 @@ mod tests {
             last_activity: Some(since),
             approval: None,
             question: None,
+            background: None,
         }
     }
 

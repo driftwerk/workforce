@@ -39,6 +39,12 @@ pub(super) enum Transition<'a> {
     Finished {
         reply: &'a str,
     },
+    /// Its turn is done but waits on `count` pieces of the work it
+    /// started, `from` before (none: it no longer waits).
+    Background {
+        from: u32,
+        count: u32,
+    },
     Stopped {
         closed: bool,
     },
@@ -84,9 +90,14 @@ impl<'a> Transition<'a> {
                     .as_deref()
                     .map(|prompt| Self::Prompted { prompt })
             }
-            S::Done if before.state != S::Done => Some(Self::Finished {
-                reply: now.last_reply.as_deref().unwrap_or_default(),
-            }),
+            S::Done
+                if now.waiting_on() == 0
+                    && (before.state != S::Done || before.waiting_on() > 0) =>
+            {
+                Some(Self::Finished {
+                    reply: now.last_reply.as_deref().unwrap_or_default(),
+                })
+            }
             S::Stopped | S::Closed if before.state.is_running() => Some(Self::Stopped {
                 closed: now.state == S::Closed,
             }),
@@ -121,6 +132,10 @@ impl<'a> Transition<'a> {
                         .is_some_and(|b| b.id == p.id && b.answerable)
             })
             .map(|pending| Self::ToTerminal { pending });
+        let background = (now.waiting_on() != before.waiting_on()).then(|| Self::Background {
+            from: before.waiting_on(),
+            count: now.waiting_on(),
+        });
         let tool = now
             .current_tool
             .as_deref()
@@ -128,6 +143,7 @@ impl<'a> Transition<'a> {
             .map(|tool| Self::Tool { tool });
         unblocked
             .into_iter()
+            .chain(background)
             .chain(state)
             .chain(spoke)
             .chain(to_terminal)
@@ -170,6 +186,7 @@ pub(super) fn turn_ops(
             question: None,
             settled_at: None,
             waits: vec![],
+            idle: vec![],
             token: None,
             instance: None,
         };
@@ -233,6 +250,10 @@ pub(super) fn turn_ops(
                     turn,
                     wait: wait_of(now.id, pending),
                 });
+            }
+            Transition::Background { count, .. } => {
+                let turn = working(&mut ops, &mut open);
+                ops.push(TurnOp::Background { turn, count, at });
             }
             Transition::Unblocked { pending, .. } => {
                 if let Some(turn) = open {
@@ -581,6 +602,7 @@ mod tests {
                 TurnOp::Wait { .. } => "wait",
                 TurnOp::Unwait { .. } => "unwait",
                 TurnOp::End { .. } => "end",
+                TurnOp::Background { .. } => "background",
                 TurnOp::Settle { .. } => "settle",
             })
             .collect()
@@ -741,6 +763,60 @@ mod tests {
             [Transition::ToTerminal {
                 pending: handed.pending.as_ref().unwrap()
             }]
+        );
+    }
+
+    #[test]
+    fn a_turn_done_with_work_still_running_waits_on_it_until_it_ends() {
+        use crate::floor::Background;
+        use SessionState as S;
+        let none = HashSet::new();
+        let since = Utc::now();
+        let with = |state, count: Option<u32>| SessionView {
+            background: count.map(|count| Background { count, since }),
+            last_reply: Some("Launched it.".into()),
+            ..view(state)
+        };
+        let working = with(S::Working, Some(2));
+        let waiting = with(S::Done, Some(2));
+        assert_eq!(
+            Transition::of(Some(&working), &waiting, &none),
+            [Transition::Background { from: 0, count: 2 }],
+            "not finished"
+        );
+        assert_eq!(
+            Transition::of(Some(&waiting), &with(S::Done, Some(1)), &none),
+            [Transition::Background { from: 2, count: 1 }]
+        );
+        assert_eq!(
+            Transition::of(Some(&waiting), &with(S::Done, None), &none),
+            [
+                Transition::Background { from: 2, count: 0 },
+                Transition::Finished {
+                    reply: "Launched it."
+                }
+            ],
+            "the last of it ended"
+        );
+        assert_eq!(
+            Transition::of(Some(&waiting), &with(S::Working, Some(1)), &none),
+            [Transition::Background { from: 2, count: 0 }],
+            "it went on working"
+        );
+        assert_eq!(
+            Transition::of(Some(&with(S::Working, None)), &with(S::Done, None), &none),
+            [Transition::Finished {
+                reply: "Launched it."
+            }]
+        );
+        let (o, after) = ops(
+            &[Transition::Background { from: 0, count: 2 }],
+            &waiting,
+            Some(Uuid::from_u128(99)),
+        );
+        assert_eq!(
+            (kinds(&o), after),
+            (vec!["background"], Some(Uuid::from_u128(99)))
         );
     }
 }

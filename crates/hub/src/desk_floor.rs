@@ -649,6 +649,7 @@ mod tests {
             question: None,
             settled_at: None,
             waits: vec![],
+            idle: vec![],
             token: token.map(str::to_string),
             instance: instance.map(str::to_string),
         }

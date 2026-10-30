@@ -434,6 +434,7 @@ mod tests {
             last_activity: None,
             approval: None,
             question: None,
+            background: None,
         }
     }
 

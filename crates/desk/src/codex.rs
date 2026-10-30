@@ -99,6 +99,10 @@ pub struct AppServer {
 }
 
 impl AppServer {
+    pub fn pid(&self) -> Option<u32> {
+        self._child.id()
+    }
+
     pub async fn start(
         program: &Path,
         socket: PathBuf,
@@ -138,6 +142,8 @@ pub enum CodexEvent {
     Prompt(String),
     Tool(String),
     Reply(String),
+    /// A sub-agent thread it started.
+    Child(String),
 }
 
 /// What happened, and on which thread.
@@ -159,6 +165,16 @@ pub fn interpret(method: &str, params: &Value) -> Option<Seen> {
     };
     let seen = |thread: Option<String>, event| thread.map(|thread| Seen { thread, event });
     match method {
+        "thread/started"
+            if params
+                .pointer("/thread/parentThreadId")
+                .is_some_and(|p| !p.is_null()) =>
+        {
+            seen(
+                s("/thread/parentThreadId"),
+                CodexEvent::Child(s("/thread/id")?),
+            )
+        }
         "thread/started" => {
             let ephemeral =
                 params.pointer("/thread/ephemeral").and_then(Value::as_bool) == Some(true);
@@ -420,6 +436,17 @@ mod tests {
             Some(CodexEvent::Tool("Bash(cargo test)".into()))
         );
         assert_eq!(interpret("item/agentMessage/delta", &json!({})), None);
+        assert_eq!(
+            interpret(
+                "thread/started",
+                &json!({"thread": {"id": "t2", "parentThreadId": "t1", "environments": [{"cwd": "/repo"}]}})
+            ),
+            Some(Seen {
+                thread: "t1".into(),
+                event: CodexEvent::Child("t2".into())
+            }),
+            "a sub-agent's thread is its parent's"
+        );
     }
 
     #[test]

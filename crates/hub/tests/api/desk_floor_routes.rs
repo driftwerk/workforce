@@ -37,6 +37,7 @@ fn turn(owner: &str, agent: &str, started: DateTime<Utc>) -> Turn {
         question: None,
         settled_at: None,
         waits: vec![],
+        idle: vec![],
         token: None,
         instance: None,
     }

@@ -525,7 +525,7 @@ impl Desk {
             (_, Some(id)) => id,
         };
         let ending = matches!(hook, Hook::SessionEnd);
-        let answer = self.apply_hook(id, hook).await;
+        let answer = self.apply_hook(id, hook, claude::agent_of(body)).await;
         if ending {
             self.end_terminal_session(id, true);
         }
@@ -597,6 +597,8 @@ impl Desk {
             stopping: false,
             _codex: None,
             terminal: Some(terminal),
+            background: Default::default(),
+            baseline: Default::default(),
         };
         if existing.is_some_and(|id| self.0.state.lock().live.contains_key(&id)) {
             // Already running here: nothing to take back.
@@ -701,6 +703,8 @@ impl Desk {
                             stopping: false,
                             _codex: None,
                             terminal: Some(terminal),
+                            background: Default::default(),
+                            baseline: Default::default(),
                         },
                     );
                     self.publish(id);

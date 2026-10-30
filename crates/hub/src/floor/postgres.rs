@@ -39,7 +39,7 @@ const SEARCH_PATH: &str = "SET search_path TO floor, public";
 const PRUNE_BATCH: i64 = 5_000;
 
 const COLUMNS: &str = "id, owner, subject_doc, name, place, task, doing, started_at, heard_at, \
-                       ended_at, outcome, answer, question, settled_at, waits, token, instance";
+                       ended_at, outcome, answer, question, settled_at, waits, token, instance, idle";
 
 pub struct PgFloorStore {
     pool: PostgresPool,
@@ -288,7 +288,7 @@ async fn insert(db: &impl GenericClient, t: &Turn) -> Result<()> {
     db.execute(
         &format!(
             "INSERT INTO turns ({COLUMNS}, subject) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19) \
              ON CONFLICT (id) DO NOTHING"
         ),
         &[
@@ -309,6 +309,7 @@ async fn insert(db: &impl GenericClient, t: &Turn) -> Result<()> {
             &serde_json::to_value(&t.waits)?,
             &t.token,
             &t.instance,
+            &serde_json::to_value(&t.idle)?,
             &t.subject.key().as_str(),
         ],
     )
@@ -320,7 +321,7 @@ async fn insert(db: &impl GenericClient, t: &Turn) -> Result<()> {
 async fn update(db: &impl GenericClient, t: &Turn) -> Result<()> {
     db.execute(
         "UPDATE turns SET doing = $2, heard_at = $3, ended_at = $4, outcome = $5, \
-             answer = $6, question = $7, waits = $8 \
+             answer = $6, question = $7, waits = $8, idle = $9 \
          WHERE id = $1",
         &[
             &t.id,
@@ -331,6 +332,7 @@ async fn update(db: &impl GenericClient, t: &Turn) -> Result<()> {
             &t.answer,
             &t.question.as_ref().map(serde_json::to_value).transpose()?,
             &serde_json::to_value(&t.waits)?,
+            &serde_json::to_value(&t.idle)?,
         ],
     )
     .await?;
@@ -362,6 +364,7 @@ fn turn_of(row: &Row) -> Result<Turn> {
         waits: serde_json::from_value(row.get("waits"))?,
         token: row.get("token"),
         instance: row.get("instance"),
+        idle: serde_json::from_value(row.get("idle"))?,
     })
 }
 
@@ -397,6 +400,7 @@ mod tests {
             question: None,
             settled_at: None,
             waits: vec![],
+            idle: vec![],
             token: Some("tok".into()),
             instance: Some("hub-1".into()),
         }
@@ -481,6 +485,11 @@ mod tests {
                         ..wait
                     },
                 },
+                TurnOp::Background {
+                    turn: second.id,
+                    count: 2,
+                    at: at("2026-10-29T09:07:00Z"),
+                },
                 asks(&second, "2026-10-29T09:10:00Z"),
             ];
             for op in &ops {
@@ -498,6 +507,7 @@ mod tests {
             assert!(!mine[0].asking(), "the newer question settled the earlier");
             assert!(mine[1].asking());
             assert_eq!(mine[1].waits[1].to, Some(at("2026-10-29T09:10:00Z")));
+            assert_eq!(mine[1].idle[0].to, Some(at("2026-10-29T09:10:00Z")));
             let theirs_now = store.relevant(&scope("u2"), since).await.unwrap();
             assert!(theirs_now[0].asking(), "only u1's questions settled");
         })

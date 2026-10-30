@@ -323,6 +323,9 @@ pub struct Item {
     pub last_activity: Option<DateTime<Utc>>,
     pub approval: Option<ItemApproval>,
     pub question: Option<ItemQuestion>,
+    /// Work it started that still runs after its turn: it is working.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background: Option<crate::floor::Background>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

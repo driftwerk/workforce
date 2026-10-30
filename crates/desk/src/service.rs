@@ -15,6 +15,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::adopt::{self, External};
+use crate::background::{Background, TaskKind};
 use crate::claude::{self, Hook};
 use crate::codex::{self, AppServer, CodexEvent, Seen};
 use crate::crew::{self, By, Event, Kind, Party};
@@ -24,6 +25,7 @@ use crate::model::{
     Approvals, Decision, DeskEvent, Engine, NewSession, Origin, PendingApproval, SessionPatch,
     SessionRecord, SessionState, SessionView,
 };
+use crate::procs;
 use crate::pty::{Exit, Pty};
 use crate::rooms::{
     slug_for, Member, NewMessage, NewRoom, Room, RoomMessage, RoomPatch, SearchHit, DESK, MAX_HOPS,
@@ -106,6 +108,10 @@ pub(crate) struct Live {
     /// The Desk terminal it runs in: its PTY is the terminal's, which
     /// outlives it.
     terminal: Option<Uuid>,
+    /// What it started that still runs.
+    background: Background,
+    /// What already ran under its Codex app-server when its turn began.
+    baseline: Option<HashSet<u32>>,
 }
 
 impl Live {
@@ -132,6 +138,13 @@ impl Server {
         match self {
             Self::Local(s) => s.socket.clone(),
             Self::Held(_) => fallback.to_path_buf(),
+        }
+    }
+
+    fn pid(&self) -> Option<u32> {
+        match self {
+            Self::Local(s) => s.pid(),
+            Self::Held(pty) => pty.pid(),
         }
     }
 }
@@ -193,6 +206,9 @@ pub struct Floor {
     pub turns: Option<Arc<dyn TurnLog>>,
     pub plans: Option<Arc<dyn PlanSink>>,
 }
+
+/// How often sessions' background work is looked at.
+const LOOK_EVERY: Duration = Duration::from_secs(10);
 
 /// How often this Mac's sign-ins are read again.
 const SIGN_INS_EVERY: Duration = Duration::from_secs(60 * 60);
@@ -288,6 +304,14 @@ fn plugin_dirs(theirs: Option<&String>, ours: Option<&String>) -> Option<String>
         }
     }
     (!dirs.is_empty()).then(|| dirs.join(":"))
+}
+
+/// "1 background task", "2 background tasks".
+fn background_tasks(count: u32) -> String {
+    match count {
+        1 => "1 background task".into(),
+        n => format!("{n} background tasks"),
+    }
 }
 
 /// How a session's pending request reads in Activity.
@@ -412,6 +436,7 @@ impl Desk {
         }));
         tokio::spawn(persist_loop(store, floor.turns, persist_rx));
         tokio::spawn(desk.clone().read_sign_ins());
+        tokio::spawn(desk.clone().watch_background());
         recovered.into_iter().for_each(|r| desk.save(r));
         desk.adopt_held(held).await;
 
@@ -548,6 +573,8 @@ impl Desk {
                     stopping: false,
                     _codex: codex,
                     terminal: None,
+                    background: Default::default(),
+                    baseline: Default::default(),
                 },
             );
             tokio::spawn(self.clone().on_exit(id, exit));
@@ -578,6 +605,7 @@ impl Desk {
             live.and_then(|l| l.pending.clone()),
         );
         view.group = Self::group_ref(&state.layout, &groups::session_item(r.id));
+        view.background = live.and_then(|l| l.background.view());
         view
     }
 
@@ -717,6 +745,95 @@ impl Desk {
         }
     }
 
+    /// The process a session's own background work runs under: its
+    /// app-server for Codex; for Claude Code, the CLI, or the terminal's
+    /// shell it runs in.
+    fn root_of(l: &Live, engine: Engine) -> Option<u32> {
+        match engine {
+            Engine::Claude => l.pty.pid(),
+            Engine::Codex => l._codex.as_ref()?.server.pid(),
+        }
+    }
+
+    /// What already runs under a session's own process, as its turn begins.
+    async fn already_running(&self, id: Uuid) -> Option<HashSet<u32>> {
+        let root = {
+            let st = self.0.state.lock();
+            let engine = st.records.get(&id)?.engine;
+            Self::root_of(st.live.get(&id)?, engine)?
+        };
+        let table = procs::table().await?;
+        Some(procs::under(&table, root).iter().map(|p| p.pid).collect())
+    }
+
+    /// Looks at what runs under each of `ids` whose turn is done and that
+    /// has background work, or may have it unreported: Claude Code's tool
+    /// shells; for Codex, what its turn started and left running.
+    async fn look_at_background(&self, ids: &[Uuid]) {
+        let due: Vec<(Uuid, u32, Option<HashSet<u32>>, Engine)> = {
+            let st = self.0.state.lock();
+            ids.iter()
+                .filter_map(|id| {
+                    let r = st.records.get(id)?;
+                    let l = st.live.get(id)?;
+                    (r.state == SessionState::Done && l.background.worth_a_look()).then_some(())?;
+                    Some((
+                        *id,
+                        Self::root_of(l, r.engine)?,
+                        l.baseline.clone(),
+                        r.engine,
+                    ))
+                })
+                .collect()
+        };
+        if due.is_empty() {
+            return;
+        }
+        let Some(table) = procs::table().await else {
+            return;
+        };
+        for (id, root, baseline, engine) in due {
+            let running = procs::under(&table, root)
+                .into_iter()
+                .filter(|p| match (engine, &baseline) {
+                    (Engine::Claude, _) => procs::is_tool_shell(p),
+                    (Engine::Codex, Some(before)) => !before.contains(&p.pid),
+                    (Engine::Codex, None) => false,
+                })
+                .count();
+            let now = Utc::now();
+            let looked = {
+                let st = self.0.state.lock();
+                st.live
+                    .get(&id)
+                    .map(|l| (l.background.clone().looked(running, now), &l.background))
+                    .filter(|(after, before)| after != *before)
+                    .map(|(after, _)| after)
+            };
+            if let Some(after) = looked {
+                self.change(id, |_, l| {
+                    if let Some(l) = l {
+                        l.background = after;
+                    }
+                });
+            }
+        }
+    }
+
+    /// Looks at every session's background work every [`LOOK_EVERY`],
+    /// until the desk stops.
+    async fn watch_background(self) {
+        let mut tick = tokio::time::interval(LOOK_EVERY);
+        loop {
+            tokio::select! {
+                _ = self.0.cancel.cancelled() => return,
+                _ = tick.tick() => {}
+            }
+            let ids: Vec<Uuid> = self.0.state.lock().live.keys().copied().collect();
+            self.look_at_background(&ids).await;
+        }
+    }
+
     /// The environment a CLI Desk starts runs in: the base, with what Desk
     /// added, the person's own plugin folders kept ahead of Desk's.
     fn with_added(&self, added: &BTreeMap<String, String>) -> BTreeMap<String, String> {
@@ -795,6 +912,12 @@ impl Desk {
                             "stopped"
                         }
                         .into(),
+                    )
+                }),
+                Transition::Background { from, count } => (from == 0 && count > 0).then(|| {
+                    own(
+                        Kind::Working,
+                        format!("is waiting on {}", background_tasks(count)),
                     )
                 }),
                 Transition::Interrupted => {
@@ -1596,6 +1719,8 @@ impl Desk {
                 stopping: false,
                 _codex: codex,
                 terminal: None,
+                background: Default::default(),
+                baseline: Default::default(),
             },
         );
         tokio::spawn(self.clone().on_exit(r.id, exit));
@@ -1685,11 +1810,27 @@ impl Desk {
                 return Some(Value::Object(Default::default()));
             }
         };
-        Some(self.apply_hook(id, hook).await)
+        Some(self.apply_hook(id, hook, claude::agent_of(body)).await)
     }
 
-    async fn apply_hook(&self, id: Uuid, hook: Hook) -> Value {
+    /// Applies one hook, fired inside the sub-agent `inside` when it says:
+    /// a sub-agent's tool calls while the session's own turn is done are
+    /// its background work, not the session working.
+    async fn apply_hook(&self, id: Uuid, hook: Hook, inside: Option<String>) -> Value {
         let empty = || Value::Object(Default::default());
+        if let Some(agent) = &inside {
+            let idle = {
+                let mut st = self.0.state.lock();
+                let done = st.records.get(&id).map(|r| r.state) == Some(SessionState::Done);
+                if let Some(l) = st.live.get_mut(&id) {
+                    l.background = std::mem::take(&mut l.background).heard(agent, Utc::now());
+                }
+                done
+            };
+            if idle && matches!(hook, Hook::ToolStart(_) | Hook::ToolEnd) {
+                return empty();
+            }
+        }
         match hook {
             Hook::SessionStart {
                 session_id,
@@ -1738,7 +1879,37 @@ impl Desk {
                     });
                 }
             }),
-            Hook::Stop { transcript, reply } => {
+            Hook::Woken => self.change(id, |r, l| {
+                r.state = SessionState::Working;
+                if let Some(l) = l {
+                    l.pending = None;
+                }
+            }),
+            Hook::SubagentStart(agent) => self.change(id, |_, l| {
+                if let Some(l) = l {
+                    l.background = std::mem::take(&mut l.background).started(
+                        &agent,
+                        TaskKind::Agent,
+                        Utc::now(),
+                    );
+                }
+            }),
+            Hook::SubagentStop(agent) => self.change(id, |r, l| {
+                if let Some(l) = l {
+                    let before = l.background.count();
+                    l.background = std::mem::take(&mut l.background).ended(&agent, Utc::now());
+                    // Claude Code goes on by itself once the last of it ends;
+                    // its next Stop says whether the turn is done.
+                    if r.state == SessionState::Done && before > 0 && l.background.count() == 0 {
+                        r.state = SessionState::Working;
+                    }
+                }
+            }),
+            Hook::Stop {
+                transcript,
+                reply,
+                background,
+            } => {
                 let path = transcript.or_else(|| self.record(id).ok().and_then(|r| r.transcript));
                 // The hook fires before the transcript has the reply, so the
                 // transcript is only a fallback for older CLIs.
@@ -1764,8 +1935,11 @@ impl Desk {
                         l.current_tool = None;
                         l.pending = None;
                         l.answer = None;
+                        l.background =
+                            std::mem::take(&mut l.background).reported(background, Utc::now());
                     }
                 });
+                self.look_at_background(&[id]).await;
             }
             Hook::SessionEnd => {
                 if let Some(l) = self.0.state.lock().live.get_mut(&id) {
@@ -1836,11 +2010,44 @@ impl Desk {
 
     async fn codex_loop(self, id: Uuid, mut rx: mpsc::Receiver<Seen>) {
         let home = self.0.env.get("HOME").map(PathBuf::from);
+        let mut children = HashSet::new();
         while let Some(Seen { thread, event }) = rx.recv().await {
             let ours = self.record(id).ok().and_then(|r| r.cli_session_id);
+            let child = match &event {
+                CodexEvent::Child(child) if ours.as_deref().is_none_or(|t| t == thread) => {
+                    children.insert(child.clone());
+                    Some((child.clone(), true))
+                }
+                CodexEvent::Working { .. } if children.contains(&thread) => {
+                    Some((thread.clone(), true))
+                }
+                CodexEvent::Idle if children.contains(&thread) => Some((thread.clone(), false)),
+                _ => None,
+            };
+            if let Some((child, running)) = child {
+                self.change(id, |_, l| {
+                    if let Some(l) = l {
+                        let now = Utc::now();
+                        let b = std::mem::take(&mut l.background);
+                        l.background = match running {
+                            true => b.started(&child, TaskKind::Agent, now),
+                            false => b.ended(&child, now),
+                        };
+                    }
+                });
+                continue;
+            }
             if ours.as_deref().is_some_and(|t| t != thread) {
                 continue;
             }
+            let turn_begins = matches!(event, CodexEvent::Working { .. })
+                && self.record(id).is_ok_and(|r| {
+                    !matches!(r.state, SessionState::Working | SessionState::Blocked)
+                });
+            let baseline = match turn_begins {
+                true => self.already_running(id).await,
+                false => None,
+            };
             let tail = match &event {
                 CodexEvent::Idle => {
                     let rollout = self
@@ -1864,7 +2071,7 @@ impl Desk {
                 }
                 _ => None,
             };
-            self.change(id, |r, l| {
+            self.change(id, |r, mut l| {
                 r.cli_session_id.get_or_insert_with(|| thread.clone());
                 match event {
                     CodexEvent::Thread { rollout } => {
@@ -1874,6 +2081,9 @@ impl Desk {
                         }
                     }
                     CodexEvent::Working { waiting } => {
+                        if let Some(l) = l.as_deref_mut().filter(|_| baseline.is_some()) {
+                            l.baseline = baseline;
+                        }
                         r.state = if waiting {
                             SessionState::Blocked
                         } else {
@@ -1916,6 +2126,7 @@ impl Desk {
                         }
                     }
                     CodexEvent::Reply(text) => r.last_reply = Some(transcript::clip(&text)),
+                    CodexEvent::Child(_) => {}
                 }
             });
         }
@@ -2624,6 +2835,177 @@ mod tests {
                 )
                 .await
                 .is_err());
+        })
+        .await;
+    }
+
+    /// Keeps every op the desk logs.
+    #[derive(Default)]
+    struct Logged(Mutex<Vec<TurnOp>>);
+
+    #[async_trait::async_trait]
+    impl TurnLog for Logged {
+        fn send(&self, op: TurnOp) {
+            self.0.lock().push(op);
+        }
+
+        async fn relevant(
+            &self,
+            _: &crate::floor::Scope,
+            _: DateTime<Utc>,
+        ) -> eyre::Result<Vec<crate::floor::Turn>> {
+            Ok(vec![])
+        }
+    }
+
+    /// Whether what `logged` holds comes to satisfy `f`.
+    async fn logs(logged: &Logged, f: impl Fn(&[TurnOp]) -> bool) -> bool {
+        for _ in 0..200 {
+            if f(&logged.0.lock()) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        false
+    }
+
+    /// A stand-in for Claude Code that leaves one of its Bash tool shells
+    /// running, its pid where the test reads it.
+    fn shell_cli(dir: &Path) -> PathBuf {
+        let path = dir.join("shell-cli");
+        std::fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\n/bin/sh -c 'sleep 60; true' {dir}/shell-snapshots/snapshot-zsh-1.sh &\n\
+                 echo $! > \"{dir}/shell-$$\"\nexec sleep 60\n",
+                dir = dir.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    #[tokio::test]
+    async fn work_a_turn_left_running_keeps_it_from_done_until_the_last_of_it_ends() {
+        with_test_pool(build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            DeskStore::migrate(&pool).await.unwrap();
+            let logged = Arc::new(Logged::default());
+            let d = Desk::start(
+                DeskStore::from_pool(pool),
+                Options {
+                    claude: shell_cli(dir.path()),
+                    ..options(dir.path())
+                },
+                Floor {
+                    turns: Some(logged.clone()),
+                    plans: None,
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            let shell_of = |id: Uuid| {
+                let cli = d.0.state.lock().live[&id].pty.pid().unwrap();
+                let file = dir.path().join(format!("shell-{cli}"));
+                (0..200)
+                    .find_map(|_| {
+                        let pid = std::fs::read_to_string(&file)
+                            .ok()
+                            .and_then(|p| p.trim().parse::<i32>().ok());
+                        if pid.is_none() {
+                            std::thread::sleep(Duration::from_millis(25));
+                        }
+                        pid
+                    })
+                    .expect("the shell started")
+            };
+
+            let s = new_session(&d, dir.path()).await;
+            let shell = shell_of(s.id);
+            post(&d, s.id, json!({"hook_event_name": "UserPromptSubmit", "prompt": "start the server and a check"})).await;
+            post(&d, s.id, json!({"hook_event_name": "Stop", "last_assistant_message": "Started both.",
+                "background_tasks": [
+                    {"id": "a1", "type": "subagent", "status": "running"},
+                    {"id": "b1", "type": "shell", "status": "running"}],
+                "session_crons": []})).await;
+            let v = d.view(s.id).unwrap();
+            assert_eq!((v.state, v.waiting_on()), (SessionState::Done, 2), "not done");
+            let ended = || {
+                logged
+                    .0
+                    .lock()
+                    .iter()
+                    .filter(|op| matches!(op, TurnOp::End { .. }))
+                    .count()
+            };
+            assert!(
+                logs(&logged, |ops| ops
+                    .iter()
+                    .any(|op| matches!(op, TurnOp::Background { count: 2, .. })))
+                .await
+            );
+            assert_eq!(ended(), 0);
+
+            post(&d, s.id, json!({"hook_event_name": "PreToolUse", "agent_id": "a1", "tool_name": "Bash", "tool_input": {"command": "cargo test"}})).await;
+            assert_eq!(
+                d.view(s.id).unwrap().state,
+                SessionState::Done,
+                "the sub-agent's tool is its own, not the session working"
+            );
+            unsafe { libc::kill(shell, libc::SIGKILL) };
+            for _ in 0..200 {
+                d.look_at_background(&[s.id]).await;
+                if d.view(s.id).unwrap().waiting_on() == 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            assert_eq!(d.view(s.id).unwrap().waiting_on(), 1, "the shell is gone");
+
+            post(&d, s.id, json!({"hook_event_name": "SubagentStop", "agent_id": "a1"})).await;
+            assert_eq!(
+                d.view(s.id).unwrap().state,
+                SessionState::Working,
+                "Claude Code goes on once the last of it ends"
+            );
+            post(&d, s.id, json!({"hook_event_name": "UserPromptSubmit",
+                "prompt": "<task-notification>\n<task-id>a1</task-id>\n<status>completed</status>\n</task-notification>"})).await;
+            assert_eq!(
+                d.view(s.id).unwrap().last_prompt.as_deref(),
+                Some("start the server and a check"),
+                "its own prompt is not the person's"
+            );
+            assert_eq!(ended(), 0);
+            post(&d, s.id, json!({"hook_event_name": "Stop", "last_assistant_message": "Both done.",
+                "background_tasks": []})).await;
+            let v = d.view(s.id).unwrap();
+            assert_eq!((v.state, v.background), (SessionState::Done, None));
+            assert!(
+                logs(&logged, |ops| ops.iter().any(|op| matches!(op, TurnOp::End { .. }))).await,
+                "the turn ended"
+            );
+            assert_eq!(ended(), 1, "one turn, ended once");
+            assert_eq!(
+                logged
+                    .0
+                    .lock()
+                    .iter()
+                    .filter(|op| matches!(op, TurnOp::Begin { .. }))
+                    .count(),
+                1
+            );
+
+            let older = new_session(&d, dir.path()).await;
+            shell_of(older.id);
+            post(&d, older.id, json!({"hook_event_name": "UserPromptSubmit", "prompt": "serve it"})).await;
+            post(&d, older.id, json!({"hook_event_name": "Stop", "last_assistant_message": "Serving."})).await;
+            assert_eq!(
+                d.view(older.id).unwrap().waiting_on(),
+                1,
+                "a CLI that reports nothing: its shell is found running"
+            );
         })
         .await;
     }

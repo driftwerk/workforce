@@ -71,6 +71,7 @@ impl AgentTurn {
             question: None,
             settled_at: None,
             waits: vec![],
+            idle: vec![],
             token: token.map(str::to_string),
             instance: Some(workforce_common::instance::process_instance_id().to_string()),
         };

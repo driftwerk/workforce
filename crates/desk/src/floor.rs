@@ -142,6 +142,21 @@ pub struct Wait {
     pub answer: Answer,
 }
 
+/// Work a turn started that runs on while the turn itself waits for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Background {
+    pub count: u32,
+    pub since: DateTime<Utc>,
+}
+
+/// A stretch the turn spent idle while its background work ran.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Idle {
+    pub from: DateTime<Utc>,
+    pub to: Option<DateTime<Utc>>,
+    pub count: u32,
+}
+
 /// One turn of work, as the log keeps it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Turn {
@@ -163,6 +178,8 @@ pub struct Turn {
     /// When its question stopped needing the person.
     pub settled_at: Option<DateTime<Utc>>,
     pub waits: Vec<Wait>,
+    /// Where it waited on its own background work.
+    pub idle: Vec<Idle>,
     /// The session's turn token (agents), for liveness.
     pub token: Option<String>,
     /// The hub instance running it (agents), for liveness.
@@ -190,6 +207,33 @@ impl Turn {
             .iter_mut()
             .filter(|w| w.to.is_none())
             .for_each(|w| w.to = Some(at));
+        self.idled(0, at);
+    }
+
+    /// Its main turn is idle with `count` pieces of background work
+    /// running, from `at`; none closes the stretch.
+    fn idled(&mut self, count: u32, at: DateTime<Utc>) {
+        match (self.idle.iter_mut().find(|i| i.to.is_none()), count) {
+            (Some(open), 0) => open.to = Some(at),
+            (Some(open), count) => open.count = count,
+            (None, 0) => {}
+            (None, count) => self.idle.push(Idle {
+                from: at,
+                to: None,
+                count,
+            }),
+        }
+    }
+
+    /// The background work it is waiting on now.
+    pub fn background(&self) -> Option<Background> {
+        self.idle
+            .iter()
+            .find(|i| i.to.is_none())
+            .map(|i| Background {
+                count: i.count,
+                since: i.from,
+            })
     }
 }
 
@@ -214,6 +258,13 @@ pub enum TurnOp {
     Unwait {
         turn: Uuid,
         key: String,
+        at: DateTime<Utc>,
+    },
+    /// The turn is idle with `count` pieces of its background work running
+    /// (none: it is not).
+    Background {
+        turn: Uuid,
+        count: u32,
         at: DateTime<Utc>,
     },
     End {
@@ -244,6 +295,7 @@ impl TurnOp {
             Self::Progress { turn, .. }
             | Self::Wait { turn, .. }
             | Self::Unwait { turn, .. }
+            | Self::Background { turn, .. }
             | Self::End { turn, .. } => Some(*turn),
             Self::Begin { .. } | Self::Settle { .. } => None,
         }
@@ -356,6 +408,11 @@ pub fn apply(mut turns: Vec<Turn>, op: &TurnOp) -> Vec<Turn> {
                     .for_each(|w| w.to = Some(*at));
             }
         }
+        TurnOp::Background { turn, count, at } => {
+            if let Some(t) = open_turn(&mut turns, *turn) {
+                t.idled(*count, *at);
+            }
+        }
         TurnOp::End {
             turn,
             at,
@@ -448,6 +505,8 @@ pub struct Work {
     pub heard_at: DateTime<Utc>,
     pub ended_at: Option<DateTime<Utc>>,
     pub outcome: Option<Outcome>,
+    /// What it is waiting on of its own work, while it is.
+    pub background: Option<Background>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -455,6 +514,8 @@ pub struct Work {
 pub enum SpanKind {
     Working,
     Waiting,
+    /// Idle while its background work ran.
+    Background,
 }
 
 /// A stretch of a lane; `to: None` runs to now.
@@ -560,6 +621,7 @@ fn work(t: &Turn, what: Option<&String>) -> Work {
         heard_at: t.heard_at,
         ended_at: t.ended_at,
         outcome: t.outcome,
+        background: t.background(),
     }
 }
 
@@ -612,7 +674,12 @@ fn spans_of(t: &Turn) -> impl Iterator<Item = Span> + '_ {
             from,
             to: t.settled_at,
         });
-    std::iter::once(run).chain(waits).chain(asked)
+    let idle = t.idle.iter().map(|i| Span {
+        kind: SpanKind::Background,
+        from: i.from,
+        to: i.to,
+    });
+    std::iter::once(run).chain(waits).chain(asked).chain(idle)
 }
 
 /// `spans` clipped to start no earlier than `day`, merged per kind where
@@ -748,6 +815,7 @@ mod tests {
             question: None,
             settled_at: None,
             waits: vec![],
+            idle: vec![],
             token: None,
             instance: None,
         }
@@ -1190,6 +1258,10 @@ mod tests {
             heard_at: at("2026-10-29T16:01:00Z"),
             ended_at: None,
             outcome: None,
+            background: Some(Background {
+                count: 2,
+                since: at("2026-10-29T16:30:00Z"),
+            }),
         };
         assert_eq!(
             serde_json::to_value(work).unwrap(),
@@ -1197,8 +1269,71 @@ mod tests {
                 "who": {"kind": "agent", "id": "scout", "name": "Scout", "engine": null},
                 "what": "● Bash cargo test", "place": {"kind": "dm"},
                 "since": "2026-10-29T16:00:00Z", "heardAt": "2026-10-29T16:01:00Z",
-                "endedAt": null, "outcome": null
+                "endedAt": null, "outcome": null,
+                "background": {"count": 2, "since": "2026-10-29T16:30:00Z"}
             })
+        );
+    }
+
+    #[test]
+    fn a_turn_waiting_on_its_background_work_is_working_until_it_ends() {
+        let t = turn(agent("scout", "dm"), Some("u1"), "2026-10-29T08:00:00Z");
+        let id = t.id;
+        let idle = |count, when: &str| TurnOp::Background {
+            turn: id,
+            count,
+            at: at(when),
+        };
+        let log = [
+            idle(2, "2026-10-29T08:10:00Z"),
+            idle(1, "2026-10-29T08:20:00Z"),
+            idle(0, "2026-10-29T08:25:00Z"),
+            idle(1, "2026-10-29T08:30:00Z"),
+        ]
+        .iter()
+        .fold(vec![t], apply);
+        let running = working(&log);
+        assert_eq!(
+            running[0].background,
+            Some(Background {
+                count: 1,
+                since: at("2026-10-29T08:30:00Z")
+            })
+        );
+        assert!(
+            done(&log, at("2026-10-29T00:00:00Z")).is_empty(),
+            "not done"
+        );
+        let now = at("2026-10-29T09:00:00Z");
+        assert_eq!(
+            lanes(&log, at("2026-10-29T00:00:00Z"), now)[0]
+                .spans
+                .iter()
+                .filter(|s| s.kind == SpanKind::Background)
+                .map(|s| (s.from, s.to))
+                .collect::<Vec<_>>(),
+            [
+                (at("2026-10-29T08:10:00Z"), Some(at("2026-10-29T08:25:00Z"))),
+                (at("2026-10-29T08:30:00Z"), None)
+            ]
+        );
+        let ended = apply(
+            log,
+            &TurnOp::End {
+                turn: id,
+                at: at("2026-10-29T08:40:00Z"),
+                outcome: Outcome::Finished,
+                answer: None,
+                question: None,
+            },
+        );
+        assert_eq!(ended[0].background(), None);
+        assert_eq!(ended[0].idle[1].to, Some(at("2026-10-29T08:40:00Z")));
+        assert_eq!(
+            view(&ended, vec![], at("2026-10-29T00:00:00Z"), now)
+                .counts
+                .done_today,
+            1
         );
     }
 }

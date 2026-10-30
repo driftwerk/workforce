@@ -4,6 +4,7 @@
 
 mod adopt;
 pub mod api;
+mod background;
 mod claude;
 mod codex;
 pub mod conversations;
@@ -16,6 +17,7 @@ pub mod holder;
 pub mod local;
 pub mod model;
 pub mod overview;
+mod procs;
 pub mod providers;
 mod pty;
 pub mod realtime;
