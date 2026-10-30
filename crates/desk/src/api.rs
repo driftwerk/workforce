@@ -350,6 +350,16 @@ async fn reopen_terminal(State(s): S, h: HeaderMap, Query(q): Q, Path(id): Path<
     s.desk.reopen_terminal(id).await.map(Json).into_response()
 }
 
+async fn terminal_programs(
+    State(s): S,
+    h: HeaderMap,
+    Query(q): Q,
+    Path(id): Path<Uuid>,
+) -> Response {
+    guarded!(s, h, q);
+    s.desk.terminal_programs(id).await.map(Json).into_response()
+}
+
 async fn terminal_pty(
     State(s): S,
     h: HeaderMap,
@@ -644,6 +654,7 @@ pub fn sessions_router(desk: Desk, auth: Arc<dyn Authorize>) -> Router {
             patch(update_terminal).delete(close_terminal),
         )
         .route("/api/desk/terminals/{id}/reopen", post(reopen_terminal))
+        .route("/api/desk/terminals/{id}/programs", get(terminal_programs))
         .route("/api/desk/terminals/{id}/pty", get(terminal_pty))
         .route("/api/desk/restore", post(restore))
         .route("/api/desk/restore/dismiss", post(dismiss_restore))

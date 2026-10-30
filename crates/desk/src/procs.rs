@@ -11,6 +11,17 @@ pub struct Proc {
     pub args: String,
 }
 
+impl Proc {
+    /// The program it runs: its command's file name, without a login
+    /// shell's leading `-`.
+    fn program(&self) -> Option<String> {
+        let command = self.args.split_whitespace().next()?;
+        let name = command.rsplit('/').next().unwrap_or(command);
+        let name = name.strip_prefix('-').unwrap_or(name);
+        (!name.is_empty()).then(|| name.to_string())
+    }
+}
+
 /// Every process, from `ps -A -ww -o pid=,ppid=,args=`.
 pub fn parse(listing: &str) -> Vec<Proc> {
     listing
@@ -52,6 +63,29 @@ pub fn under(all: &[Proc], root: u32) -> Vec<&Proc> {
 pub fn children(all: &[Proc], parent: u32) -> impl Iterator<Item = &Proc> {
     all.iter()
         .filter(move |p| p.ppid == parent && p.pid != parent)
+}
+
+/// What runs in a terminal whose shell is `root`, by program: the shell,
+/// then each generation under it, outermost first and in pid order within
+/// one. Empty when `root` isn't listed.
+pub fn programs(all: &[Proc], root: u32) -> Vec<String> {
+    let Some(shell) = all.iter().find(|p| p.pid == root) else {
+        return Vec::new();
+    };
+    let mut depth = HashMap::from([(root, 0usize)]);
+    let mut found: Vec<(usize, &Proc)> = under(all, root)
+        .into_iter()
+        .map(|p| {
+            let d = depth[&p.ppid] + 1;
+            depth.insert(p.pid, d);
+            (d, p)
+        })
+        .collect();
+    found.sort_by_key(|(d, p)| (*d, p.pid));
+    std::iter::once(shell)
+        .chain(found.into_iter().map(|(_, p)| p))
+        .filter_map(Proc::program)
+        .collect()
 }
 
 /// Whether a process is one of Claude Code's Bash tool shells, which source
@@ -106,9 +140,28 @@ mod tests {
     }
 
     #[test]
+    fn a_terminal_lists_its_shell_then_each_generation_in_pid_order() {
+        let all = parse(
+            "    1     0 /sbin/launchd\n\
+                400     1 /usr/local/bin/desk-helper\n\
+                501   400 -zsh\n\
+                640   620 /bin/sh -c npm test\n\
+                620   501 /home/sarah/.local/bin/claude --session-id s1\n\
+                610   501 node server.js\n\
+                641   640 npm test\n\
+                521   400 /bin/bash -l\n\
+                junk line\n",
+        );
+        assert_eq!(programs(&all, 501), ["zsh", "node", "claude", "sh", "npm"]);
+        assert_eq!(programs(&all, 521), ["bash"]);
+        assert!(programs(&all, 9999).is_empty());
+    }
+
+    #[test]
     fn a_listing_read_mid_reuse_still_ends() {
         let all = parse("100 1 claude\n101 100 sh\n100 101 sh\n");
         assert_eq!(under(&all, 100).len(), 1);
+        assert_eq!(programs(&all, 100), ["claude", "sh"]);
     }
 
     #[tokio::test]
