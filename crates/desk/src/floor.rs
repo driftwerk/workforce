@@ -400,6 +400,7 @@ pub fn apply(mut turns: Vec<Turn>, op: &TurnOp) -> Vec<Turn> {
         }
         TurnOp::Wait { turn, wait } => {
             if let Some(t) = open_turn(&mut turns, *turn) {
+                t.heard_at = t.heard_at.max(wait.from);
                 match t.waits.iter_mut().find(|w| w.key == wait.key) {
                     Some(w) => {
                         w.ask = wait.ask.clone();
@@ -411,6 +412,7 @@ pub fn apply(mut turns: Vec<Turn>, op: &TurnOp) -> Vec<Turn> {
         }
         TurnOp::Unwait { turn, key, at } => {
             if let Some(t) = open_turn(&mut turns, *turn) {
+                t.heard_at = t.heard_at.max(*at);
                 t.waits
                     .iter_mut()
                     .filter(|w| &w.key == key && w.to.is_none())
@@ -864,6 +866,33 @@ mod tests {
                 approval_id: Uuid::nil(),
             },
         }
+    }
+
+    #[test]
+    fn a_turn_that_waits_on_the_person_was_heard_from_then() {
+        let t = turn(agent("scout", "s1"), Some("u1"), "2026-10-29T09:00:00Z");
+        let waited = apply(
+            vec![t.clone()],
+            &TurnOp::Wait {
+                turn: t.id,
+                wait: wait("r1", "2026-10-29T09:10:00Z", None, decide()),
+            },
+        );
+        assert_eq!(waited[0].heard_at, at("2026-10-29T09:10:00Z"));
+        let answered = apply(
+            waited,
+            &TurnOp::Unwait {
+                turn: t.id,
+                key: "r1".into(),
+                at: at("2026-10-29T09:12:00Z"),
+            },
+        );
+        assert_eq!(answered[0].heard_at, at("2026-10-29T09:12:00Z"));
+        let lost = settle(answered, &HashSet::new());
+        assert!(
+            lost[0].waits.iter().all(|w| w.to >= Some(w.from)),
+            "a turn lost after it waited never shows a wait ending before it began"
+        );
     }
 
     #[test]
