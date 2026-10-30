@@ -46,17 +46,23 @@ pub fn channel_arg(input: &serde_json::Value) -> Option<&str> {
 }
 
 /// What a messaging call that posts does to its surface: writes to the
-/// channel it names on the platform it resolves to.
+/// channel it names, or the person (`@`), on the platform it resolves to, in
+/// the workspace it names.
 pub fn writes(input: &serde_json::Value) -> workforce_agent::tools::SurfaceEffect {
-    let to = input["channel"]
-        .as_str()
-        .or(input["user"].as_str())
+    let named = |key: &str| input[key].as_str().filter(|v| !v.trim().is_empty());
+    let to = named("channel")
+        .map(str::to_string)
+        .or_else(|| named("user").map(|user| format!("@{}", user.trim_start_matches('@'))))
         .unwrap_or_default();
+    let to = match named("thread_id") {
+        Some(thread) => format!("{to} › thread {thread}"),
+        None => to,
+    };
     workforce_agent::tools::SurfaceEffect::Writes {
         platform: platform_arg(input).to_string(),
-        destination: match input["thread_id"].as_str().filter(|t| !t.is_empty()) {
-            Some(thread) => format!("{to} › thread {thread}"),
-            None => to.to_string(),
+        destination: match named("workspace_id") {
+            Some(workspace) => format!("{to} in {workspace}"),
+            None => to,
         },
     }
 }
@@ -183,6 +189,24 @@ mod tests {
             Some("ops › thread 1700.1")
         );
         assert_ne!(channel, thread);
+    }
+
+    #[test]
+    fn a_write_to_a_person_or_another_workspace_is_not_to_the_channel() {
+        let to = |input| writes(&input).destination();
+        let channel =
+            to(serde_json::json!({"platform": "slack", "channel": "alice", "text": "hi"}));
+        let person = to(serde_json::json!({"platform": "slack", "user": "alice", "text": "hi"}));
+        let elsewhere = to(serde_json::json!({
+            "platform": "slack", "channel": "alice", "workspace_id": "T2", "text": "hi"
+        }));
+        assert_eq!(person.as_ref().map(|d| d.target.as_str()), Some("@alice"));
+        assert_eq!(
+            elsewhere.as_ref().map(|d| d.target.as_str()),
+            Some("alice in t2")
+        );
+        assert_ne!(channel, person);
+        assert_ne!(channel, elsewhere);
     }
 
     #[test]

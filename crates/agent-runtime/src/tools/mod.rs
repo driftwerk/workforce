@@ -114,7 +114,7 @@ pub enum SurfaceEffect {
 
 /// Where a write lands, as an "Always allow" for it is kept: the platform
 /// and the destination, written one way however a call writes it (`#ops`,
-/// `ops` and `OPS` are one channel).
+/// `ops` and `OPS` are one channel; `@ops` is a person, not that channel).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Destination {
     pub platform: String,
@@ -124,8 +124,8 @@ pub struct Destination {
 impl Destination {
     /// `target` on `platform`; none for a write that names no destination.
     pub fn of(platform: &str, target: &str) -> Option<Self> {
-        let target = target.trim().trim_start_matches(['#', '@']).trim();
-        (!target.is_empty()).then(|| Self {
+        let target = target.trim().trim_start_matches('#').trim();
+        (!target.trim_start_matches('@').trim().is_empty()).then(|| Self {
             platform: platform.trim().to_lowercase(),
             target: target.to_lowercase(),
         })

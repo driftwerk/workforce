@@ -1763,8 +1763,14 @@ mod tests {
         let ops = Destination::of("Slack", "#Ops").unwrap();
         assert_eq!(Destination::of("slack", " ops "), Some(ops.clone()));
         assert_ne!(Destination::of("slack", "#ops-2"), Some(ops.clone()));
-        assert_ne!(Destination::of("teams", "ops"), Some(ops));
+        assert_ne!(Destination::of("teams", "ops"), Some(ops.clone()));
+        assert_ne!(
+            Destination::of("slack", "@ops"),
+            Some(ops),
+            "a person is not the channel of their name"
+        );
         assert_eq!(Destination::of("slack", " # "), None);
+        assert_eq!(Destination::of("slack", "@"), None);
     }
 
     #[tokio::test]
