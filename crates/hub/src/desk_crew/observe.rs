@@ -247,15 +247,15 @@ impl Watch {
     }
 
     /// The turn ran to an outcome other than an answer: it was skipped, or
-    /// stopped for want of the person's standing.
+    /// stopped for want of the person's standing; the floor says why.
     fn unanswered(self, outcome: &TurnOutcome) {
         let Self { track, floor } = self;
         if let Some(mut track) = track {
             track.done = true;
             track.crew.running.lock().remove(&track.key);
         }
-        if let (Some(floor), TurnOutcome::Stopped(stop)) = (floor, outcome) {
-            floor.end(Err(&stop.reason()));
+        if let Some(floor) = floor {
+            floor.end(Err(&outcome.clone().into_reply()));
         }
     }
 }
@@ -658,5 +658,50 @@ impl<T: TurnHost> TurnHost for Observed<T> {
         self.0
             .admit_turn_or_deny(service, identity, channel_id)
             .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use workforce_desk::floor::{TurnLog, TurnOp};
+
+    use super::*;
+    use crate::floor::agents::tests::Recorded;
+    use crate::serve::Skip;
+
+    #[test]
+    fn a_turn_that_did_not_run_says_why_on_the_floor() {
+        let recorded = Arc::new(Recorded::default());
+        let log: Arc<dyn TurnLog> = recorded.clone();
+        let origin = Origin {
+            channel: "desk",
+            user: "u1",
+            run_as: None,
+            message: "Deploy main.",
+            channel_id: None,
+            thread_id: None,
+            desk: None,
+            answers_to: None,
+        };
+        let watch = Watch {
+            track: None,
+            floor: AgentTurn::begin(&log, "scout", "Scout".into(), &origin, None, None, crew::now()),
+        };
+        watch.unanswered(&TurnOutcome::Skipped(Skip::NoLogin));
+        let ended: Vec<_> = recorded
+            .0
+            .lock()
+            .iter()
+            .filter_map(|op| match op {
+                TurnOp::End {
+                    outcome, answer, ..
+                } => Some((*outcome, answer.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            ended,
+            [(Outcome::Failed, Some("no login to run on".to_string()))]
+        );
     }
 }
