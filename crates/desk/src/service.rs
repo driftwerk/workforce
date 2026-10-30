@@ -30,14 +30,15 @@ use crate::procs;
 use crate::pty::{Exit, Pty};
 use crate::rooms::{
     channel_for, place_in_timeline, slug_for, steps_refused, Member, NewMessage, NewRoom, Page,
-    Posted, Room, RoomMessage, RoomPatch, SearchHit, Span, DESK, MAX_HOPS, THREAD_GONE,
-    TURN_BUDGET, YOU,
+    Posted, Room, RoomMessage, RoomPatch, SearchFilters, SearchHit, Span, DESK, MAX_HOPS,
+    THREAD_GONE, TURN_BUDGET, YOU,
 };
 use crate::store::DeskStore;
 use crate::transcript;
 use crate::usage::{self, MacPlan, MacSignIns, PlanSink};
 use crate::worktree;
 
+mod copies;
 mod groups;
 #[cfg(test)]
 mod rooms_tests;
@@ -1957,6 +1958,11 @@ impl Desk {
         }
         let is_agent = new.author != YOU && new.author != DESK;
         let delivered = new.delivery.is_some();
+        if new.also_in_room && (new.author != YOU || new.thread_id.is_none()) {
+            return Err(DeskError::Invalid(
+                "only your reply in a thread is also posted to the room".into(),
+            ));
+        }
         if let Some(why) = steps_refused(&new.steps, is_agent && !delivered) {
             return Err(DeskError::Invalid(why));
         }
@@ -2036,6 +2042,7 @@ impl Desk {
                 delivery: new.delivery,
                 in_reply_to: new.in_reply_to,
                 steps: new.steps,
+                copy_of: None,
                 replies: None,
                 reading: None,
             })
@@ -2044,15 +2051,18 @@ impl Desk {
             let _ = self.0.events.send(DeskEvent::RoomMessage {
                 message: Box::new(posted.message.clone()),
             });
+            if new.also_in_room && posted.message.thread_id.is_some() {
+                self.copy_to_room(id, posted.message.id).await?;
+            }
         }
         Ok(posted)
     }
 
-    pub async fn search(&self, query: &str) -> Result<Vec<SearchHit>, DeskError> {
-        if query.trim().is_empty() {
+    pub async fn search(&self, filters: &SearchFilters) -> Result<Vec<SearchHit>, DeskError> {
+        if filters.is_empty() {
             return Ok(vec![]);
         }
-        Ok(self.0.store.search(query, 50).await?)
+        Ok(self.0.store.search(filters).await?)
     }
 
     async fn launch(

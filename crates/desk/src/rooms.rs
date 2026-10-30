@@ -123,6 +123,10 @@ pub struct RoomMessage {
     /// The tools the agent's turn ran, in order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub steps: Vec<Step>,
+    /// The thread message this main-timeline copy was posted to the room
+    /// from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub copy_of: Option<Uuid>,
     /// On a main-timeline message as read back, its thread's replies.
     #[serde(flatten, skip_serializing_if = "Option::is_none")]
     pub replies: Option<Replies>,
@@ -139,6 +143,9 @@ pub struct Reading {
     /// A form you have answered.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub answered: bool,
+    /// A thread message with a copy in the room's timeline.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub posted_to_room: bool,
 }
 
 /// How many replies a message's thread has, when the last came, and who
@@ -362,6 +369,9 @@ pub struct NewMessage {
     /// The tools an agent's turn ran on the way to it.
     #[serde(default)]
     pub steps: Vec<Step>,
+    /// A thread reply of yours also posted to the room's timeline.
+    #[serde(default)]
+    pub also_in_room: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -369,6 +379,74 @@ pub struct NewMessage {
 pub struct SearchHit {
     pub room_id: Uuid,
     pub message: RoomMessage,
+    /// The text around the matches, each match between [`MATCH_START`] and
+    /// [`MATCH_END`].
+    pub snippet: String,
+}
+
+/// What a snippet brackets each match with: private-use characters, so a
+/// snippet is never markup and no message can forge one.
+pub const MATCH_START: char = '\u{E000}';
+pub const MATCH_END: char = '\u{E001}';
+
+/// What a search may narrow by besides its text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Has {
+    File,
+    Approval,
+}
+
+/// A search of the rooms: its text, and what it is narrowed to.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchFilters {
+    #[serde(default)]
+    pub q: String,
+    pub room: Option<Uuid>,
+    /// An author key: `you`, `desk` or `hub/agent`.
+    pub from: Option<String>,
+    #[serde(default, deserialize_with = "comma_list")]
+    pub has: Vec<Has>,
+    #[serde(default)]
+    pub in_thread: bool,
+    pub after: Option<DateTime<Utc>>,
+    pub before: Option<DateTime<Utc>>,
+    pub limit: Option<i64>,
+}
+
+/// Results a search answers at most, and when it doesn't say.
+pub const SEARCH_MAX: i64 = 100;
+pub const SEARCH_DEFAULT: i64 = 50;
+
+impl SearchFilters {
+    /// No text and nothing to narrow by: a search that finds nothing.
+    pub fn is_empty(&self) -> bool {
+        self.q.trim().is_empty()
+            && self.room.is_none()
+            && self.from.is_none()
+            && self.has.is_empty()
+            && !self.in_thread
+            && self.after.is_none()
+            && self.before.is_none()
+    }
+
+    fn has(&self, h: Has) -> bool {
+        self.has.contains(&h)
+    }
+}
+
+/// `has=file,approval` as a list.
+fn comma_list<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<Has>, D::Error> {
+    String::deserialize(d)?
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            serde_json::from_value(serde_json::Value::String(s.into()))
+                .map_err(|_| serde::de::Error::custom(format!("has:{s} is nothing to search by")))
+        })
+        .collect()
 }
 
 /// Why `steps` can't go on a message, when they can't: only an agent's
@@ -443,6 +521,7 @@ fn message(row: &Row) -> Result<RoomMessage> {
         request_id: row.try_get("request_id")?,
         in_reply_to: row.try_get("in_reply_to")?,
         steps: serde_json::from_value(row.try_get("steps")?)?,
+        copy_of: row.try_get("copy_of")?,
         replies: match row.try_get::<_, Option<Uuid>>("thread_id")? {
             Some(_) => None,
             None => Some(Replies {
@@ -454,6 +533,7 @@ fn message(row: &Row) -> Result<RoomMessage> {
         reading: Some(Reading {
             for_you: row.try_get("for_you")?,
             answered: row.try_get("answered")?,
+            posted_to_room: row.try_get("posted_to_room")?,
         }),
     })
 }
@@ -469,8 +549,9 @@ fn delivery_name(kind: Option<DeliveryKind>) -> Result<Option<String>> {
 /// Whether a message is for you, over `room_messages`' columns unqualified:
 /// what Desk wrote, and an agent's that answers one of yours or is a
 /// delivery addressed to you. An answer from a hub too old to say what it
-/// answers is yours when nobody handed it on (hop 0).
-pub(crate) const FOR_YOU: &str = "(author = 'desk' OR (author <> 'you' AND ( \
+/// answers is yours when nobody handed it on (hop 0). A copy posted from a
+/// thread is none of these.
+pub(crate) const FOR_YOU: &str = "(author = 'desk' OR (author <> 'you' AND copy_of IS NULL AND ( \
      COALESCE(delivery IN ('reminder', 'job', 'workflow', 'check_in', 'approval', 'file', 'resumed'), false) \
      OR (delivery IS NULL AND CASE \
        WHEN in_reply_to IS NOT NULL THEN EXISTS (SELECT 1 FROM room_messages q \
@@ -482,7 +563,7 @@ pub(crate) const FOR_YOU: &str = "(author = 'desk' OR (author <> 'you' AND ( \
 fn message_columns() -> String {
     format!(
         "id, room_id, thread_id, author, content, hop, created_at, attachments, source, delivery, \
-         request_id, in_reply_to, steps, \
+         request_id, in_reply_to, steps, copy_of, \
          (SELECT count(*) FROM room_messages r WHERE r.thread_id = room_messages.id) AS reply_count, \
          (SELECT max(r.created_at) FROM room_messages r WHERE r.thread_id = room_messages.id) \
            AS last_reply_at, \
@@ -490,7 +571,9 @@ fn message_columns() -> String {
            GROUP BY r.author ORDER BY max(r.created_at) DESC LIMIT 3) AS reply_authors, \
          {FOR_YOU} AS for_you, \
          EXISTS (SELECT 1 FROM room_messages a WHERE a.in_reply_to = room_messages.id \
-           AND a.author = 'you') AS answered"
+           AND a.author = 'you') AS answered, \
+         EXISTS (SELECT 1 FROM room_messages c WHERE c.copy_of = room_messages.id) \
+           AS posted_to_room"
     )
 }
 
@@ -499,10 +582,14 @@ static MESSAGE_COLUMNS: std::sync::LazyLock<String> = std::sync::LazyLock::new(m
 /// What a message is kept once by.
 enum Once<'a> {
     Source(&'a str),
+    Copy(Uuid),
 }
 
 fn once(m: &RoomMessage) -> Option<Once<'_>> {
-    m.source.as_deref().map(Once::Source)
+    m.source
+        .as_deref()
+        .map(Once::Source)
+        .or(m.copy_of.map(Once::Copy))
 }
 
 impl DeskStore {
@@ -577,8 +664,8 @@ impl DeskStore {
                 &format!(
                     "INSERT INTO room_messages \
                      (id, room_id, thread_id, author, content, hop, created_at, attachments, \
-                     source, delivery, request_id, in_reply_to, steps) \
-                     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) \
+                     source, delivery, request_id, in_reply_to, steps, copy_of) \
+                     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) \
                      ON CONFLICT DO NOTHING RETURNING {cols}"
                 ),
                 &[
@@ -595,6 +682,7 @@ impl DeskStore {
                     &m.request_id,
                     &m.in_reply_to,
                     &serde_json::to_value(&m.steps)?,
+                    &m.copy_of,
                 ],
             )
             .await
@@ -607,6 +695,7 @@ impl DeskStore {
         }
         let kept = match once(m) {
             Some(Once::Source(source)) => self.by_source(source).await?,
+            Some(Once::Copy(original)) => self.copy_of(original).await?,
             None => None,
         };
         Ok(Posted {
@@ -614,6 +703,23 @@ impl DeskStore {
                 .ok_or_else(|| eyre::eyre!("room message {} was neither kept nor found", m.id))?,
             created: false,
         })
+    }
+
+    /// The copy in the room's timeline of the thread message `original`.
+    pub async fn copy_of(&self, original: Uuid) -> Result<Option<RoomMessage>> {
+        let client = self.pool().get().await?;
+        client
+            .query_opt(
+                &format!(
+                    "SELECT {} FROM room_messages WHERE copy_of = $1",
+                    *MESSAGE_COLUMNS
+                ),
+                &[&original],
+            )
+            .await?
+            .as_ref()
+            .map(message)
+            .transpose()
     }
 
     /// The message kept under `source`, if any.
@@ -787,7 +893,7 @@ impl DeskStore {
             .query_one(
                 "SELECT count(*) FROM room_messages WHERE room_id = $1 \
                  AND thread_id IS NOT DISTINCT FROM $2 AND author NOT IN ('you', 'desk') \
-                 AND delivery IS NULL \
+                 AND delivery IS NULL AND copy_of IS NULL \
                  AND created_at > COALESCE((SELECT max(created_at) FROM room_messages \
                    WHERE room_id = $1 AND thread_id IS NOT DISTINCT FROM $2 AND author = 'you'), \
                    '-infinity'::timestamptz)",
@@ -797,18 +903,52 @@ impl DeskStore {
         Ok(row.get(0))
     }
 
-    pub async fn search(&self, query: &str, limit: i64) -> Result<Vec<SearchHit>> {
+    /// Messages of every room (or one) matching `f`: by rank, then newest,
+    /// when it has text, newest alone when it narrows by filters only. Each
+    /// with a snippet of its text, matches bracketed.
+    pub async fn search(&self, f: &SearchFilters) -> Result<Vec<SearchHit>> {
         let client = self.pool().get().await?;
+        let sentinels = format!("{MATCH_START}{MATCH_END}");
+        let options = format!(
+            "StartSel={MATCH_START}, StopSel={MATCH_END}, MaxFragments=2, MinWords=8, \
+             MaxWords=24, FragmentDelimiter=\" … \""
+        );
+        let q = f.q.trim();
+        let limit = f.limit.unwrap_or(SEARCH_DEFAULT).clamp(1, SEARCH_MAX);
         let rows = client
             .query(
                 &format!(
-                    "SELECT {} FROM room_messages \
-                     WHERE search @@ websearch_to_tsquery('english', $1) \
-                     ORDER BY ts_rank(search, websearch_to_tsquery('english', $1)) DESC, created_at DESC \
-                     LIMIT $2",
+                    "SELECT {}, CASE WHEN $1 = '' THEN left(translate(content, $9, ''), 200) \
+                       ELSE ts_headline('english', translate(content, $9, ''), \
+                         websearch_to_tsquery('english', $1), $10) END AS snippet \
+                     FROM room_messages \
+                     WHERE ($1 = '' OR search @@ websearch_to_tsquery('english', $1)) \
+                     AND ($2::uuid IS NULL OR room_id = $2) \
+                     AND ($3::text IS NULL OR author = $3) \
+                     AND (NOT $4 OR attachments <> '[]') \
+                     AND (NOT $5 OR delivery = 'approval') \
+                     AND (NOT $6 OR thread_id IS NOT NULL) \
+                     AND ($7::timestamptz IS NULL OR created_at >= $7) \
+                     AND ($8::timestamptz IS NULL OR created_at < $8) \
+                     ORDER BY CASE WHEN $1 = '' THEN 0 \
+                       ELSE ts_rank(search, websearch_to_tsquery('english', $1)) END DESC, \
+                       created_at DESC, id DESC \
+                     LIMIT $11",
                     *MESSAGE_COLUMNS
                 ),
-                &[&query, &limit],
+                &[
+                    &q,
+                    &f.room,
+                    &f.from,
+                    &f.has(Has::File),
+                    &f.has(Has::Approval),
+                    &f.in_thread,
+                    &f.after,
+                    &f.before,
+                    &sentinels,
+                    &options,
+                    &limit,
+                ],
             )
             .await?;
         rows.iter()
@@ -817,6 +957,7 @@ impl DeskStore {
                 Ok(SearchHit {
                     room_id: m.room_id,
                     message: m,
+                    snippet: r.try_get("snippet")?,
                 })
             })
             .collect()
@@ -868,6 +1009,7 @@ pub(crate) mod tests {
             request_id: None,
             in_reply_to: None,
             steps: Vec::new(),
+            copy_of: None,
             replies: None,
             reading: None,
         }
@@ -1241,6 +1383,122 @@ pub(crate) mod tests {
         .await;
     }
 
+    fn search(q: &str) -> SearchFilters {
+        SearchFilters {
+            q: q.into(),
+            ..SearchFilters::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn search_filters_narrow_by_room_author_files_approvals_threads_and_dates() {
+        with_test_pool(build_pool, |pool| async move {
+            DeskStore::migrate(&pool).await.unwrap();
+            let store = DeskStore::from_pool(pool);
+            let atlas = room_fixture("atlas launch");
+            let web = room_fixture("acme-web");
+            store.put_room(&atlas).await.unwrap();
+            store.put_room(&web).await.unwrap();
+            let at = |s: i64| t0() + chrono::Duration::seconds(s);
+            let ask = msg(&atlas, YOU, "is the launch page ready?", at(0));
+            store.add_message(&ask).await.unwrap();
+            let mut reply = msg(&atlas, "dw/allan", "the launch page is ready", at(10));
+            reply.thread_id = Some(ask.id);
+            store.add_message(&reply).await.unwrap();
+            let mut approval = msg(&atlas, "dw/allan", "may I publish the launch page?", at(20));
+            approval.delivery = Some(DeliveryKind::Approval);
+            store.add_message(&approval).await.unwrap();
+            let mut file: RoomMessage = msg(&web, "local/scout", "launch page screenshot", at(30));
+            file.attachments = serde_json::from_value(serde_json::json!([{
+                "hub": "local", "agent": "scout", "artifact_id": "a1", "filename": "page.png",
+                "media_type": "image/png", "size": 10
+            }]))
+            .unwrap();
+            store.add_message(&file).await.unwrap();
+            let ids =
+                |hits: Vec<SearchHit>| hits.into_iter().map(|h| h.message.id).collect::<Vec<_>>();
+
+            assert_eq!(ids(store.search(&search("launch")).await.unwrap()).len(), 4);
+            let mut f = search("launch");
+            f.room = Some(web.id);
+            assert_eq!(ids(store.search(&f).await.unwrap()), [file.id]);
+            let mut f = search("launch");
+            f.from = Some("dw/allan".into());
+            f.in_thread = true;
+            assert_eq!(ids(store.search(&f).await.unwrap()), [reply.id]);
+            let mut f = search("");
+            f.has = vec![Has::Approval];
+            assert_eq!(ids(store.search(&f).await.unwrap()), [approval.id]);
+            let mut f = search("");
+            f.has = vec![Has::File];
+            assert_eq!(ids(store.search(&f).await.unwrap()), [file.id]);
+            let mut f = search("launch");
+            f.after = Some(at(10));
+            f.before = Some(at(30));
+            assert_eq!(
+                ids(store.search(&f).await.unwrap()),
+                [approval.id, reply.id]
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_snippet_brackets_its_matches_with_the_sentinels() {
+        with_test_pool(build_pool, |pool| async move {
+            DeskStore::migrate(&pool).await.unwrap();
+            let store = DeskStore::from_pool(pool);
+            let r = room_fixture("atlas launch");
+            store.put_room(&r).await.unwrap();
+            let forged =
+                format!("the migration is done {MATCH_START}not a match{MATCH_END} at last");
+            store
+                .add_message(&msg(&r, "dw/allan", &forged, t0()))
+                .await
+                .unwrap();
+            let hits = store.search(&search("migration")).await.unwrap();
+            assert_eq!(
+                hits[0].snippet,
+                format!("the {MATCH_START}migration{MATCH_END} is done not a match at last")
+            );
+            assert_eq!(
+                serde_json::to_value(&hits[0]).unwrap()["roomId"],
+                serde_json::json!(r.id)
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn filters_alone_search_newest_first() {
+        with_test_pool(build_pool, |pool| async move {
+            DeskStore::migrate(&pool).await.unwrap();
+            let store = DeskStore::from_pool(pool);
+            let r = room_fixture("atlas launch");
+            store.put_room(&r).await.unwrap();
+            let long = "x".repeat(300);
+            let older = msg(&r, "dw/allan", &long, t0());
+            let newer = msg(&r, "dw/allan", "later", t0() + chrono::Duration::seconds(1));
+            store.add_message(&older).await.unwrap();
+            store.add_message(&newer).await.unwrap();
+            store
+                .add_message(&msg(&r, YOU, "mine", t0()))
+                .await
+                .unwrap();
+            let mut f = search("");
+            f.from = Some("dw/allan".into());
+            let hits = store.search(&f).await.unwrap();
+            assert_eq!(
+                hits.iter().map(|h| h.message.id).collect::<Vec<_>>(),
+                [newer.id, older.id]
+            );
+            assert_eq!(hits[1].snippet.chars().count(), 200);
+            assert!(SearchFilters::default().is_empty());
+            assert!(!f.is_empty());
+        })
+        .await;
+    }
+
     #[test]
     fn slugs_are_channel_safe() {
         assert_eq!(slug_for("Release 0.9!"), "release-0-9");
@@ -1453,7 +1711,8 @@ pub(crate) mod tests {
                     None,
                     Reading {
                         for_you: true,
-                        answered: false
+                        answered: false,
+                        posted_to_room: false,
                     }
                 )]
             );
@@ -1490,6 +1749,7 @@ pub(crate) mod tests {
                 Reading {
                     for_you: true,
                     answered: false,
+                    posted_to_room: false,
                 },
             );
             assert_eq!(first.message, sourced);
@@ -1503,7 +1763,13 @@ pub(crate) mod tests {
                 .unwrap();
             assert_eq!((again.created, again.message), (false, sourced));
 
-            let hits = store.search("migrations", 10).await.unwrap();
+            let hits = store
+                .search(&SearchFilters {
+                    q: "migrations".into(),
+                    ..SearchFilters::default()
+                })
+                .await
+                .unwrap();
             assert_eq!(hits.len(), 2);
             assert!(store.delete_room(r.id).await.unwrap());
             assert!(newest(&store, &r, None).await.is_empty());

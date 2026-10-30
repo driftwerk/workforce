@@ -173,8 +173,8 @@ fn read(row: &Row) -> Result<Read> {
 }
 
 /// What counts as unread in a room or a thread, over `room_messages`
-/// unaliased: anyone's message but yours.
-pub(crate) const COUNTED: &str = "room_messages.author <> 'you'";
+/// unaliased: anyone's message but yours, and no copy of a thread's.
+pub(crate) const COUNTED: &str = "room_messages.author <> 'you' AND room_messages.copy_of IS NULL";
 
 impl DeskStore {
     /// Every point `owner` keeps.
@@ -662,6 +662,7 @@ mod tests {
             request_id: None,
             in_reply_to: None,
             steps: Vec::new(),
+            copy_of: None,
             replies: None,
             reading: None,
         }
