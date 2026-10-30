@@ -43,10 +43,10 @@ pub(crate) fn prune_contract(store: &dyn PendingApprovalStore) {
         core.request_id
     };
     let long_ago = now - chrono::Duration::days(40);
-    let approved = request("alice", long_ago);
+    let approved = request("alice", now + chrono::Duration::hours(1));
     let expired = request("alice", long_ago);
     let lapsed_but_pending = request("alice", long_ago);
-    let recent = request("alice", now - chrono::Duration::days(1));
+    let recent = request("alice", now + chrono::Duration::days(3));
     store
         .claim(&approved, ApprovalOutcome::Approved, "dave")
         .unwrap();
@@ -55,7 +55,7 @@ pub(crate) fn prune_contract(store: &dyn PendingApprovalStore) {
         .claim(&recent, ApprovalOutcome::Denied, "dave")
         .unwrap();
 
-    let cutoff = now - chrono::Duration::days(30);
+    let cutoff = now + chrono::Duration::days(1);
     assert_eq!(
         store
             .prune_resolved(long_ago - chrono::Duration::days(1))
@@ -100,7 +100,8 @@ const HOLDER_ROWS: &str =
      UNION ALL SELECT approver_id, COUNT(*) FROM pending_approval_targets GROUP BY approver_id";
 
 /// What every backend's listing of an approver's requests must do alike:
-/// only pending, unexpired requests naming them, each one they may decide.
+/// only pending, unexpired requests naming them, each one they may decide,
+/// and one past its expiry only expired.
 #[cfg(test)]
 pub(crate) fn pending_for_contract(store: &dyn PendingApprovalStore) {
     let core = |requester: &str| PendingApprovalCore {
@@ -158,6 +159,15 @@ pub(crate) fn pending_for_contract(store: &dyn PendingApprovalStore) {
         );
     }
     assert!(store.pending_for("dave", now).unwrap().is_empty());
+    for decided in [ApprovalOutcome::Approved, ApprovalOutcome::Denied] {
+        assert!(
+            !store.claim(&lapsed.request_id, decided, "alice").unwrap(),
+            "a request past its expiry is not decided"
+        );
+    }
+    assert!(store
+        .claim(&lapsed.request_id, ApprovalOutcome::Expired, "system")
+        .unwrap());
 }
 
 /// What every backend's identity operations must do alike.

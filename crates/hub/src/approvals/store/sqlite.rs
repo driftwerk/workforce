@@ -241,7 +241,8 @@ impl PendingApprovalStore for SqlitePendingApprovalStore {
             .execute(
                 "UPDATE pending_approvals
                  SET status = ?2, resolved_by = ?3, resolved_at = ?4
-                 WHERE request_id = ?1 AND status = 'pending'",
+                 WHERE request_id = ?1 AND status = 'pending'
+                   AND (?2 = 'expired' OR expires_at > ?4)",
                 params![
                     request_id,
                     outcome.as_str(),
@@ -487,7 +488,7 @@ mod tests {
         resolved.request_id = "resolved".to_string();
         store.insert_core(&resolved, None, None, past).unwrap();
         store
-            .claim("resolved", ApprovalOutcome::Approved, "bob")
+            .claim("resolved", ApprovalOutcome::Expired, "system")
             .unwrap();
 
         let due = store.due_for_expiry(Utc::now()).unwrap();

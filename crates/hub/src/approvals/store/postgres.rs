@@ -253,7 +253,8 @@ impl PendingApprovalStore for PostgresPendingApprovalStore {
                 .execute(
                     "UPDATE pending_approvals
                      SET status = $2, resolved_by = $3, resolved_at = $4
-                     WHERE request_id = $1 AND status = 'pending'",
+                     WHERE request_id = $1 AND status = 'pending'
+                       AND ($2 = 'expired' OR expires_at > $4)",
                     &[&request_id, &status, &resolver_id, &Utc::now()],
                 )
                 .await?;
