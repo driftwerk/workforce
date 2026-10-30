@@ -27,6 +27,7 @@ pub mod store;
 #[cfg(test)]
 mod testing;
 mod transcript;
+pub mod usage;
 mod vt;
 mod worktree;
 

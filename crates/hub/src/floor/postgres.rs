@@ -8,6 +8,7 @@ use deadpool_postgres::GenericClient;
 use eyre::{Context, Result};
 use tokio_postgres::Row;
 use uuid::Uuid;
+use workforce_common::usage::{LoginRef, PlanKind, Reading};
 use workforce_desk::floor::{self, Outcome, Scope, Settling, Target, Turn, TurnOp};
 use workforce_postgres::{
     MigrationRun, MigrationRunner, MigrationSet, PostgresConfig, PostgresError, PostgresPool,
@@ -155,11 +156,61 @@ impl PgFloorStore {
         }
     }
 
+    /// Keeps `r` as its login's latest reading.
+    pub async fn record(&self, r: &Reading) -> Result<()> {
+        let owner = match &r.login {
+            LoginRef::Hub { owner, .. } => owner.clone(),
+            LoginRef::Mac => None,
+        };
+        let conn = self.pool.get().await?;
+        // Replicas write as they see readings: only a later one replaces
+        // what is kept, so the newest any of them saw is what all serve.
+        conn.execute(
+            "INSERT INTO plan_readings (login, kind, owner, account, plan, windows, observed_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7) \
+             ON CONFLICT (login) DO UPDATE SET kind = EXCLUDED.kind, owner = EXCLUDED.owner, \
+                 account = COALESCE(EXCLUDED.account, plan_readings.account), \
+                 plan = COALESCE(EXCLUDED.plan, plan_readings.plan), \
+                 windows = EXCLUDED.windows, observed_at = EXCLUDED.observed_at \
+             WHERE plan_readings.observed_at < EXCLUDED.observed_at",
+            &[
+                &login_key(r),
+                &r.kind.as_str(),
+                &owner,
+                &r.account,
+                &r.plan,
+                &serde_json::to_value(&r.windows)?,
+                &r.observed_at,
+            ],
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Every login's latest reading.
+    pub async fn readings(&self) -> Result<Vec<Reading>> {
+        let conn = self.pool.get().await?;
+        let rows = conn
+            .query(
+                "SELECT login, kind, owner, account, plan, windows, observed_at \
+                 FROM plan_readings ORDER BY observed_at DESC",
+                &[],
+            )
+            .await?;
+        Ok(rows.iter().filter_map(reading_of).collect())
+    }
+
     /// Removes turns started before `before`, except questions still
-    /// waiting on the person; returns how many went.
+    /// waiting on the person, and readings older than it; returns how many
+    /// went.
     pub async fn prune(&self, before: DateTime<Utc>) -> Result<u64> {
         let conn = self.pool.get().await?;
-        let mut removed = 0;
+        let mut removed = conn
+            .execute(
+                "DELETE FROM plan_readings WHERE observed_at < $1",
+                &[&before],
+            )
+            .await?;
         loop {
             let batch = conn
                 .execute(
@@ -176,6 +227,36 @@ impl PgFloorStore {
             }
         }
     }
+}
+
+/// The key a reading is kept under: `hub:<login>`, or `mac:<kind>`.
+pub(super) fn login_key(r: &Reading) -> String {
+    match &r.login {
+        LoginRef::Hub { login, .. } => format!("hub:{login}"),
+        LoginRef::Mac => format!("mac:{}", r.kind.as_str()),
+    }
+}
+
+/// A kept reading; `None` for one this hub can't read.
+fn reading_of(row: &Row) -> Option<Reading> {
+    let key: String = row.get("login");
+    let owner: Option<String> = row.get("owner");
+    let login = match key.split_once(':') {
+        Some(("mac", _)) => LoginRef::Mac,
+        Some(("hub", login)) => LoginRef::Hub {
+            login: login.to_string(),
+            owner,
+        },
+        _ => return None,
+    };
+    Some(Reading {
+        kind: PlanKind::parse(row.get("kind"))?,
+        login,
+        account: row.get("account"),
+        plan: row.get("plan"),
+        windows: serde_json::from_value(row.get("windows")).ok()?,
+        observed_at: row.get("observed_at"),
+    })
 }
 
 async fn settle(db: &impl GenericClient, s: &Settling) -> Result<()> {
@@ -529,6 +610,63 @@ mod tests {
                     .unwrap()),
                 [unanswered.id, recent.id]
             );
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_logins_reading_only_moves_forward_and_keeps_what_it_knew() {
+        use workforce_common::usage::{LoginRef, PlanKind, Reading, Window};
+        with_test_pool(PgFloorStore::build_pool, |pool| async move {
+            let store = store(pool).await;
+            let reading = |used: f64, when: &str, plan: Option<&str>| Reading {
+                kind: PlanKind::Chatgpt,
+                login: LoginRef::Hub {
+                    login: "k1".into(),
+                    owner: Some("u1".into()),
+                },
+                account: plan.map(|_| "acct".to_string()),
+                plan: plan.map(str::to_string),
+                windows: vec![Window {
+                    used_percent: used,
+                    resets_at: Some(at("2026-10-29T19:10:00Z")),
+                    minutes: 300,
+                }],
+                observed_at: at(when),
+            };
+            store
+                .record(&reading(40.0, "2026-10-29T16:00:00Z", Some("pro")))
+                .await
+                .unwrap();
+            store
+                .record(&reading(10.0, "2026-10-29T15:00:00Z", Some("plus")))
+                .await
+                .unwrap();
+            store
+                .record(&reading(45.0, "2026-10-29T16:05:00Z", None))
+                .await
+                .unwrap();
+            let mac = Reading {
+                login: LoginRef::Mac,
+                kind: PlanKind::Claude,
+                ..reading(5.0, "2026-10-29T16:01:00Z", None)
+            };
+            store.record(&mac).await.unwrap();
+            let kept = store.readings().await.unwrap();
+            assert_eq!(kept.len(), 2);
+            let hub = &kept[0];
+            assert_eq!(
+                hub.windows[0].used_percent, 45.0,
+                "an older reading never wins"
+            );
+            assert_eq!(
+                (hub.plan.as_deref(), hub.account.as_deref()),
+                (Some("pro"), Some("acct")),
+                "a reading that doesn't say keeps what was known"
+            );
+            assert_eq!(kept[1], mac);
+            assert_eq!(store.prune(at("2026-10-29T16:02:00Z")).await.unwrap(), 1);
+            assert_eq!(store.readings().await.unwrap().len(), 1);
         })
         .await;
     }

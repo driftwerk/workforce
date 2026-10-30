@@ -31,6 +31,7 @@ use crate::rooms::{
 };
 use crate::store::DeskStore;
 use crate::transcript;
+use crate::usage::{self, MacPlan, MacSignIns, PlanSink};
 use crate::worktree;
 
 mod groups;
@@ -165,6 +166,8 @@ struct State {
     decided: HashSet<Uuid>,
     /// The turn each session has open in the floor's log.
     turns: HashMap<Uuid, OpenTurn>,
+    /// What Desk last asked its sessions' environment to add.
+    session_env: BTreeMap<String, String>,
     terminals: HashMap<Uuid, TerminalRecord>,
     terminal_ptys: HashMap<Uuid, Arc<Pty>>,
     /// The sidebar's groups.
@@ -184,11 +187,17 @@ struct OpenTurn {
 }
 
 /// Where the desk reports what it sees beyond its own registry: the floor's
-/// turn log.
+/// turn log, and this Mac's plan readings.
 #[derive(Clone, Default)]
 pub struct Floor {
     pub turns: Option<Arc<dyn TurnLog>>,
+    pub plans: Option<Arc<dyn PlanSink>>,
 }
+
+/// How often this Mac's sign-ins are read again.
+const SIGN_INS_EVERY: Duration = Duration::from_secs(60 * 60);
+/// How long a CLI may take to say who it is signed in as.
+const SIGN_IN_WAIT: Duration = Duration::from_secs(20);
 
 enum Persist {
     Terminal(Box<TerminalRecord>),
@@ -211,6 +220,8 @@ struct Inner {
     cancel: CancellationToken,
     holder: Mutex<Option<Holder>>,
     layout_write: tokio::sync::Mutex<()>,
+    plans: Option<Arc<dyn PlanSink>>,
+    sign_ins: Mutex<MacSignIns>,
 }
 
 #[derive(Clone)]
@@ -228,6 +239,55 @@ fn hub_secret(name: &str) -> bool {
         && name
             .split('_')
             .any(|part| SECRET.iter().any(|s| part.starts_with(s)))
+}
+
+/// The variable Desk puts its hook plugin's folder in; ours is added to
+/// any the login environment already has (`:`-separated, as Claude Code
+/// splits it).
+const PLUGIN_DIRS: &str = "CLAUDE_CODE_PLUGIN_DIRS";
+/// Most variables Desk may add to a CLI's environment.
+const MAX_ENV: usize = 64;
+const MAX_ENV_VALUE: usize = 32 * 1024;
+
+fn check_env(env: &BTreeMap<String, String>) -> Result<(), DeskError> {
+    if env.len() > MAX_ENV {
+        return Err(DeskError::Invalid(format!(
+            "an environment adds at most {MAX_ENV} variables"
+        )));
+    }
+    for (k, v) in env {
+        let name_ok = k
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+        if !name_ok {
+            return Err(DeskError::Invalid(format!(
+                "{k:?} is not an environment variable name"
+            )));
+        }
+        if v.len() > MAX_ENV_VALUE || v.contains('\0') {
+            return Err(DeskError::Invalid(format!("{k}'s value is not usable")));
+        }
+    }
+    Ok(())
+}
+
+/// The person's plugin folders, then Desk's, each once; `None` for none.
+fn plugin_dirs(theirs: Option<&String>, ours: Option<&String>) -> Option<String> {
+    let mut dirs: Vec<&str> = Vec::new();
+    for dir in [theirs, ours]
+        .into_iter()
+        .flatten()
+        .flat_map(|v| v.split(':'))
+        .map(str::trim)
+        .filter(|d| !d.is_empty())
+    {
+        if !dirs.contains(&dir) {
+            dirs.push(dir);
+        }
+    }
+    (!dirs.is_empty()).then(|| dirs.join(":"))
 }
 
 /// How a session's pending request reads in Activity.
@@ -347,8 +407,11 @@ impl Desk {
             cancel: cancel.clone(),
             holder: Mutex::new(holder),
             layout_write: tokio::sync::Mutex::new(()),
+            plans: floor.plans,
+            sign_ins: Mutex::new(MacSignIns::default()),
         }));
         tokio::spawn(persist_loop(store, floor.turns, persist_rx));
+        tokio::spawn(desk.clone().read_sign_ins());
         recovered.into_iter().for_each(|r| desk.save(r));
         desk.adopt_held(held).await;
 
@@ -601,6 +664,71 @@ impl Desk {
         self.0.state.lock().turns.values().map(|t| t.id).collect()
     }
 
+    /// Who this Mac's Claude Code and Codex are signed in as, as last read.
+    pub fn sign_ins(&self) -> MacSignIns {
+        self.0.sign_ins.lock().clone()
+    }
+
+    /// Reads this Mac's sign-ins now and every [`SIGN_INS_EVERY`], until
+    /// the desk stops.
+    async fn read_sign_ins(self) {
+        let mut tick = tokio::time::interval(SIGN_INS_EVERY);
+        loop {
+            tokio::select! {
+                _ = self.0.cancel.cancelled() => return,
+                _ = tick.tick() => {}
+            }
+            let (claude, codex) = tokio::join!(
+                self.cli_says(&self.0.opts.claude, &["auth", "status", "--json"]),
+                self.cli_says(&self.0.opts.codex, &["login", "status"]),
+            );
+            *self.0.sign_ins.lock() = MacSignIns {
+                claude: claude.and_then(|(out, _)| usage::claude_sign_in(&out)),
+                // Codex says it on stderr.
+                codex: codex.is_some_and(|(out, err)| {
+                    usage::codex_signed_in(&out) || usage::codex_signed_in(&err)
+                }),
+            };
+        }
+    }
+
+    /// What `program args` prints, on stdout and on stderr, run as the
+    /// person's sessions are; `None` when it can't be run or doesn't answer
+    /// in time.
+    async fn cli_says(&self, program: &Path, args: &[&str]) -> Option<(String, String)> {
+        let run = tokio::process::Command::new(program)
+            .args(args)
+            .env_clear()
+            .envs(&self.0.env)
+            .stdin(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .output();
+        let out = tokio::time::timeout(SIGN_IN_WAIT, run).await.ok()?.ok()?;
+        let text = |bytes: &[u8]| String::from_utf8_lossy(bytes).into_owned();
+        Some((text(&out.stdout), text(&out.stderr)))
+    }
+
+    /// Passes the plan's rate limits a Claude Code session on this Mac
+    /// reported to the hub.
+    fn report_usage(&self, limits: Value) {
+        if let Some(plans) = &self.0.plans {
+            let account = self.sign_ins().claude.unwrap_or_default();
+            plans.mac(MacPlan::Claude, limits, account);
+        }
+    }
+
+    /// The environment a CLI Desk starts runs in: the base, with what Desk
+    /// added, the person's own plugin folders kept ahead of Desk's.
+    fn with_added(&self, added: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+        let mut env = self.0.env.clone();
+        env.extend(added.clone());
+        match plugin_dirs(self.0.opts.env.get(PLUGIN_DIRS), added.get(PLUGIN_DIRS)) {
+            Some(dirs) => env.insert(PLUGIN_DIRS.into(), dirs),
+            None => env.remove(PLUGIN_DIRS),
+        };
+        env
+    }
+
     /// Tells every Desk watching.
     pub(crate) fn announce(&self, event: DeskEvent) {
         let _ = self.0.events.send(event);
@@ -814,6 +942,10 @@ impl Desk {
         let name = new.name.trim();
         if name.is_empty() {
             return Err(DeskError::Invalid("a session needs a name".into()));
+        }
+        check_env(&new.env)?;
+        if !new.env.is_empty() {
+            self.0.state.lock().session_env = new.env.clone();
         }
         let cwd = PathBuf::from(&new.cwd);
         if !cwd.is_dir() {
@@ -1397,6 +1529,7 @@ impl Desk {
         if !cwd.is_dir() {
             return Err(DeskError::Conflict(format!("{} no longer exists", r.cwd)));
         }
+        let env = self.with_added(&self.0.state.lock().session_env.clone());
         let (spec, codex) = match r.engine {
             Engine::Claude => {
                 let session_id = r.cli_session_id.as_deref().unwrap_or_default();
@@ -1413,7 +1546,7 @@ impl Desk {
                     prompt,
                     hook_url: &hook_url,
                     approval_timeout_secs: self.0.opts.approval_timeout.as_secs(),
-                    env: &self.0.env,
+                    env: &env,
                 });
                 (spec, None)
             }
@@ -1429,7 +1562,7 @@ impl Desk {
                         _ => codex::Launch::New,
                     },
                     prompt,
-                    env: &self.0.env,
+                    env: &env,
                 });
                 let link = self.observe_codex(r.id, server, socket);
                 (spec, Some(link))
@@ -1500,8 +1633,9 @@ impl Desk {
         tokio::spawn({
             let socket = server.socket(&socket);
             let watch = watch.clone();
+            let plans = self.0.plans.clone();
             async move {
-                if let Err(e) = codex::observe(socket, tx, watch).await {
+                if let Err(e) = codex::observe(socket, tx, plans, watch).await {
                     tracing::warn!(error = %e, "codex observer stopped");
                 }
             }
@@ -1641,6 +1775,7 @@ impl Desk {
             Hook::Permission { tool, detail } => {
                 return self.await_permission(id, tool, detail).await
             }
+            Hook::Usage(limits) => self.report_usage(limits),
             Hook::Other => {}
         }
         empty()
@@ -2118,6 +2253,7 @@ mod tests {
                 worktree: None,
                 prompt: None,
                 approvals: None,
+                env: Default::default(),
             },
             None,
         )
@@ -2128,6 +2264,33 @@ mod tests {
     async fn post(d: &Desk, id: Uuid, body: Value) -> Value {
         let t = token(d, id);
         d.hook(id, &t, body.to_string().as_bytes()).await.unwrap()
+    }
+
+    #[test]
+    fn environment_names_are_checked() {
+        let env = |k: &str| BTreeMap::from([(k.to_string(), "v".to_string())]);
+        assert!(check_env(&env("CLAUDE_CODE_PLUGIN_DIRS")).is_ok());
+        assert!(check_env(&env("_X1")).is_ok());
+        for bad in ["", "1X", "A-B", "A B"] {
+            assert!(check_env(&env(bad)).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn plugin_dirs_are_the_persons_then_desks_each_once() {
+        let v = |s: &str| Some(s.to_string());
+        let dirs = |a: Option<String>, b: Option<String>| plugin_dirs(a.as_ref(), b.as_ref());
+        assert_eq!(dirs(v("/mine:/also"), None), v("/mine:/also"));
+        assert_eq!(dirs(None, v("/plugins/desk")), v("/plugins/desk"));
+        assert_eq!(
+            dirs(v("/mine"), v("/plugins/desk")),
+            v("/mine:/plugins/desk")
+        );
+        assert_eq!(
+            dirs(v("/mine:/plugins/desk"), v("/plugins/desk:/mine")),
+            v("/mine:/plugins/desk")
+        );
+        assert_eq!(dirs(v(" : "), v("")), None);
     }
 
     #[test]
@@ -2332,6 +2495,139 @@ mod tests {
         .await;
     }
 
+    /// Keeps every reading the desk passes on.
+    #[derive(Default)]
+    struct Readings(Mutex<Vec<(MacPlan, Value, crate::usage::MacAccount)>>);
+
+    impl PlanSink for Readings {
+        fn mac(&self, plan: MacPlan, payload: Value, account: crate::usage::MacAccount) {
+            self.0.lock().push((plan, payload, account));
+        }
+    }
+
+    /// A stand-in for both CLIs that answers who it is signed in as, and
+    /// otherwise keeps its environment where the test reads it.
+    fn signed_in_cli(dir: &Path) -> PathBuf {
+        let path = dir.join("signed-in-cli");
+        std::fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\ncase \"$1 $2\" in\n\
+                 'auth status') echo '{{\"loggedIn\":true,\"authMethod\":\"claude.ai\",\"orgId\":\"org-1\",\"email\":\"person@example.com\",\"subscriptionType\":\"max\"}}' ;;\n\
+                 'login status') echo 'Logged in using ChatGPT' >&2 ;;\n\
+                 *) env > \"{}/env-$$\"; exec sleep 60 ;;\n\
+                 esac\n",
+                dir.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    #[tokio::test]
+    async fn this_macs_plan_readings_reach_the_hub_as_its_sign_in() {
+        with_test_pool(build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            DeskStore::migrate(&pool).await.unwrap();
+            let readings = Arc::new(Readings::default());
+            let cli = signed_in_cli(dir.path());
+            let d = Desk::start(
+                DeskStore::from_pool(pool),
+                Options {
+                    claude: cli.clone(),
+                    codex: cli,
+                    ..options(dir.path())
+                },
+                Floor {
+                    turns: None,
+                    plans: Some(readings.clone()),
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            let max = crate::usage::MacAccount {
+                ids: vec!["org-1".into(), "person@example.com".into()],
+                plan: Some("max".into()),
+            };
+            for _ in 0..200 {
+                if d.sign_ins().claude.is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            assert_eq!(
+                d.sign_ins(),
+                MacSignIns {
+                    claude: Some(max.clone()),
+                    codex: true
+                }
+            );
+
+            let s = d
+                .create(
+                    NewSession {
+                        engine: Engine::Claude,
+                        name: "auth-fix".into(),
+                        cwd: dir.path().to_string_lossy().into_owned(),
+                        goal: String::new(),
+                        worktree: None,
+                        prompt: None,
+                        approvals: None,
+                        env: BTreeMap::from([(PLUGIN_DIRS.into(), "/plugins/desk".into())]),
+                    },
+                    None,
+                )
+                .await
+                .unwrap();
+            let spawned = loop {
+                let found = std::fs::read_dir(dir.path())
+                    .unwrap()
+                    .flatten()
+                    .find(|e| e.file_name().to_string_lossy().starts_with("env-"))
+                    .and_then(|e| std::fs::read_to_string(e.path()).ok())
+                    .filter(|env| env.contains("DESK_USAGE_URL"));
+                if let Some(env) = found {
+                    break env;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            };
+            assert!(
+                spawned.contains(&format!("DESK_USAGE_URL=http://127.0.0.1:{}/hook/{}/", d.0.hook_port, s.id)),
+                "{spawned}"
+            );
+            assert!(spawned.contains("CLAUDE_CODE_PLUGIN_DIRS=/plugins/desk"), "{spawned}");
+
+            let limits = json!([{"kind": "five_hour", "percentUsed": 62, "resetsAt": "2026-10-29T19:10:00Z"}]);
+            post(&d, s.id, json!({"hook_event_name": "DeskUsage", "rate_limits": limits})).await;
+            assert_eq!(
+                readings.0.lock().clone(),
+                [(MacPlan::Claude, limits, max)],
+                "the reading is the session's sign-in's"
+            );
+            assert_eq!(d.view(s.id).unwrap().state, SessionState::Starting, "and changes nothing of it");
+
+            assert!(d
+                .create(
+                    NewSession {
+                        engine: Engine::Claude,
+                        name: "bad".into(),
+                        cwd: dir.path().to_string_lossy().into_owned(),
+                        goal: String::new(),
+                        worktree: None,
+                        prompt: None,
+                        approvals: None,
+                        env: BTreeMap::from([("NOT A NAME".into(), "x".into())]),
+                    },
+                    None,
+                )
+                .await
+                .is_err());
+        })
+        .await;
+    }
+
     #[tokio::test]
     async fn hooks_drive_the_session_through_its_states() {
         with_test_pool(build_pool, |pool| async move {
@@ -2433,6 +2729,7 @@ mod tests {
                         worktree: None,
                         prompt: None,
                         approvals: None,
+                        env: Default::default(),
                     },
                     Some(By::you()),
                 )

@@ -503,6 +503,7 @@ impl CrewHub {
                             worktree: None,
                             prompt: Some(goal.clone()),
                             approvals: None,
+                            env: Default::default(),
                         },
                         Some(by),
                     )

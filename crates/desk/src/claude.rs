@@ -77,13 +77,18 @@ pub fn spawn(s: &ClaudeSpawn<'_>) -> Spawn {
         hook_settings(s.hook_url, s.approval_timeout_secs).to_string(),
     ]);
     args.extend(s.prompt.map(str::to_string));
+    let mut env = s.env.clone();
+    env.insert(USAGE_URL.into(), s.hook_url.to_string());
     Spawn {
         program: s.program.to_path_buf(),
         args,
         cwd: s.cwd.to_path_buf(),
-        env: s.env.clone(),
+        env,
     }
 }
+
+/// Where Desk's plugin posts the plan's rate limits from.
+pub const USAGE_URL: &str = "DESK_USAGE_URL";
 
 #[derive(Debug, Deserialize)]
 struct Payload {
@@ -97,6 +102,7 @@ struct Payload {
     notification_type: Option<String>,
     message: Option<String>,
     last_assistant_message: Option<String>,
+    rate_limits: Option<Value>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -119,6 +125,8 @@ pub enum Hook {
         reply: Option<String>,
     },
     SessionEnd,
+    /// Desk's plugin reporting the plan's rate limits (`DeskUsage`).
+    Usage(Value),
     Other,
 }
 
@@ -151,6 +159,7 @@ pub fn parse_hook(body: &[u8]) -> eyre::Result<Hook> {
             reply: p.last_assistant_message.filter(|m| !m.trim().is_empty()),
         },
         "SessionEnd" => Hook::SessionEnd,
+        "DeskUsage" => Hook::Usage(p.rate_limits.unwrap_or(Value::Null)),
         _ => Hook::Other,
     })
 }
@@ -241,6 +250,11 @@ mod tests {
         };
         let new = spawn(&base(Launch::New { session_id: "abc" }));
         assert_eq!(&new.args[..4], ["--session-id", "abc", "-n", "auth-fix"]);
+        assert_eq!(
+            new.env.get(USAGE_URL).map(String::as_str),
+            Some("http://h"),
+            "Desk's plugin posts the plan's usage to the session's hooks"
+        );
         assert_eq!(new.args.last().unwrap(), "continue");
         let resumed = spawn(&base(Launch::Resume { session_id: "abc" }));
         assert_eq!(&resumed.args[..2], ["--resume", "abc"]);
@@ -272,6 +286,11 @@ mod tests {
                 transcript: Some("/t.jsonl".into()),
                 reply: Some("desk-e2e-dir".into())
             }
+        );
+        let usage = br#"{"hook_event_name":"DeskUsage","rate_limits":[{"kind":"five_hour","percentUsed":62}]}"#;
+        assert_eq!(
+            parse_hook(usage).unwrap(),
+            Hook::Usage(json!([{"kind": "five_hour", "percentUsed": 62}]))
         );
         let idle = br#"{"hook_event_name":"Notification","notification_type":"idle_prompt","message":"waiting"}"#;
         assert_eq!(parse_hook(idle).unwrap(), Hook::Other);

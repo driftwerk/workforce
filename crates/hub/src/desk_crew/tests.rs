@@ -219,6 +219,7 @@ async fn new_session(d: &Desk, dir: &Path, name: &str) -> workforce_desk::model:
             worktree: None,
             prompt: None,
             approvals: None,
+            env: Default::default(),
         },
         Some(By::you()),
     )
@@ -1015,6 +1016,7 @@ mod floor {
                     dir.path(),
                     workforce_desk::Floor {
                         turns: Some(Arc::clone(&installed.log)),
+                        plans: None,
                     },
                 )
                 .await;

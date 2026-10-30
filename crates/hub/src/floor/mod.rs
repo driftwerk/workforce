@@ -2,6 +2,9 @@
 //! through one ordered writer, pruned on a timer. What it holds and how it
 //! reads is `workforce_desk::floor`.
 
+#[cfg(feature = "postgres")]
+use std::sync::Arc;
+
 use workforce_common::settings::WorkforceConfig;
 
 #[cfg(feature = "postgres")]
@@ -9,16 +12,20 @@ pub(crate) mod agents;
 #[cfg(feature = "postgres")]
 mod log;
 #[cfg(feature = "postgres")]
+pub mod plans;
+#[cfg(feature = "postgres")]
 pub mod postgres;
 
 #[cfg(feature = "postgres")]
 pub use log::{installed, turns, Installed};
 
-/// What the desk reports to: the installed log.
+/// What the desk reports to: the installed log and plan readings.
 #[cfg(feature = "postgres")]
 pub fn desk_floor() -> workforce_desk::Floor {
+    let installed = installed();
     workforce_desk::Floor {
-        turns: turns().cloned(),
+        turns: installed.map(|i| Arc::clone(&i.log)),
+        plans: installed.map(|i| Arc::clone(&i.plans) as Arc<dyn workforce_desk::usage::PlanSink>),
     }
 }
 

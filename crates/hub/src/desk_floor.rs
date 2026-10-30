@@ -1,7 +1,8 @@
 //! The floor as the hub composes it for a person: their turns from the
 //! log, live or not by who still runs them, named as they are now; the
-//! needs they make; and the routes that read and answer them
-//! (`GET /api/desk/floor`, `POST /api/desk/needs/decide`).
+//! needs they make; their plans' readings; and the routes that read and
+//! answer them (`GET /api/desk/floor`, `POST /api/desk/needs/decide`,
+//! `GET /api/desk/usage`).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -12,14 +13,16 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::{DateTime, Duration, Utc};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use uuid::Uuid;
 use workforce_common::channels::{is_platform, DESK_CHANNEL};
-use workforce_common::subscription::is_automated_source;
+use workforce_common::subscription::{is_automated_source, split_per_user_key, SubscriptionKind};
+use workforce_common::usage::{LoginRef, PlanKind, Reading, Window};
 use workforce_desk::crew::By;
 use workforce_desk::floor::{self, DecideRef, Need, Place, Scope, Subject, Turn};
 use workforce_desk::model::Decision;
+use workforce_desk::usage::MacSignIns;
 use workforce_desk::{Desk, DeskError};
 
 use crate::desk_crew::CHECK_IN;
@@ -275,6 +278,7 @@ pub fn router(state: Arc<GatewayState>, sources: Option<Sources>) -> Router {
     Router::new()
         .route("/api/desk/floor", get(floor_view))
         .route("/api/desk/needs/decide", post(decide))
+        .route("/api/desk/usage", get(usage))
         .with_state(Arc::new(Routes { state, sources }))
 }
 
@@ -412,6 +416,145 @@ async fn decide(
         Ok(Err(Unanswered::Unknown)) => refusal(StatusCode::NOT_FOUND, "unknown"),
         Err(e) => failed(e),
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum Where {
+    Mac,
+    Hub,
+}
+
+/// Whether the person is signed in to a kind of plan, here or on this Mac.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LoginView {
+    kind: PlanKind,
+    #[serde(rename = "where")]
+    at: Where,
+    signed_in: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ReadingView {
+    kind: PlanKind,
+    #[serde(rename = "where")]
+    at: Where,
+    account: Option<String>,
+    plan: Option<String>,
+    windows: Vec<Window>,
+    observed_at: DateTime<Utc>,
+}
+
+/// `GET /api/desk/usage`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UsageView {
+    as_of: DateTime<Utc>,
+    logins: Vec<LoginView>,
+    readings: Vec<ReadingView>,
+}
+
+const PLAN_KINDS: [PlanKind; 2] = [PlanKind::Claude, PlanKind::Chatgpt];
+
+/// Whether a reading is of `caller`'s plan: on their own hub every login it
+/// holds and this Mac's are; elsewhere only their own per-user logins, as
+/// one an agent or the hub shares is not their plan.
+fn plan_scope(login: &LoginRef, caller: &FloorCaller) -> bool {
+    caller.personal || matches!(login, LoginRef::Hub { owner: Some(o), .. } if *o == caller.id)
+}
+
+/// The kinds of plan `caller` holds a login to among `keys`, a vault's.
+fn signed_in(keys: impl IntoIterator<Item = String>, caller: &FloorCaller) -> HashSet<PlanKind> {
+    keys.into_iter()
+        .filter(|key| {
+            caller.personal || split_per_user_key(key).is_some_and(|(uid, _)| uid == caller.id)
+        })
+        .filter_map(|key| {
+            SubscriptionKind::of_vault_key(&key).map(|kind| match kind {
+                SubscriptionKind::Claude => PlanKind::Claude,
+                SubscriptionKind::ChatGpt => PlanKind::Chatgpt,
+            })
+        })
+        .collect()
+}
+
+/// What `caller` is shown of their plans: their logins here, this Mac's
+/// sign-ins (`mac`, on their own hub), and each reading of theirs.
+fn usage_of(
+    readings: Vec<Reading>,
+    held: &HashSet<PlanKind>,
+    mac: Option<&MacSignIns>,
+    caller: &FloorCaller,
+    now: DateTime<Utc>,
+) -> UsageView {
+    let hub = PLAN_KINDS.iter().map(|&kind| LoginView {
+        kind,
+        at: Where::Hub,
+        signed_in: held.contains(&kind),
+    });
+    let mac = mac.into_iter().flat_map(|m| {
+        [
+            LoginView {
+                kind: PlanKind::Claude,
+                at: Where::Mac,
+                signed_in: m.claude.is_some(),
+            },
+            LoginView {
+                kind: PlanKind::Chatgpt,
+                at: Where::Mac,
+                signed_in: m.codex,
+            },
+        ]
+    });
+    UsageView {
+        as_of: now,
+        logins: hub.chain(mac).collect(),
+        readings: readings
+            .into_iter()
+            .filter(|r| plan_scope(&r.login, caller))
+            .map(|r| ReadingView {
+                kind: r.kind,
+                at: match r.login {
+                    LoginRef::Mac => Where::Mac,
+                    LoginRef::Hub { .. } => Where::Hub,
+                },
+                account: r.account,
+                plan: r.plan,
+                windows: r.windows,
+                observed_at: r.observed_at,
+            })
+            .collect(),
+    }
+}
+
+async fn usage(State(r): S, headers: HeaderMap, Query(q): Query<TokenQuery>) -> Response {
+    let (caller, sources) = match reader(&r, &headers, q.token.as_deref()).await {
+        Ok(found) => found,
+        Err(refused) => return refused,
+    };
+    let readings = match sources.floor.store.readings().await {
+        Ok(readings) => readings,
+        Err(e) => return failed(e),
+    };
+    let keys = crate::gateway::login_vaults(&r.state)
+        .iter()
+        .flat_map(|v| v.list(None))
+        .collect::<Vec<_>>();
+    let mac = caller
+        .personal
+        .then(|| (sources.desk)())
+        .flatten()
+        .map(|d| d.sign_ins());
+    Json(usage_of(
+        readings,
+        &signed_in(keys, &caller),
+        mac.as_ref(),
+        &caller,
+        Utc::now(),
+    ))
+    .into_response()
 }
 
 #[cfg(test)]
@@ -608,5 +751,108 @@ mod tests {
         assert_eq!(day_of(Some("yesterday"), now), None);
         assert_eq!(day_of(Some("2026-10-30T00:00:00Z"), now), None, "tomorrow");
         assert_eq!(day_of(Some("2026-10-26T00:00:00Z"), now), None, "days ago");
+    }
+
+    fn reading(login: LoginRef) -> Reading {
+        Reading {
+            kind: PlanKind::Claude,
+            login,
+            account: None,
+            plan: None,
+            windows: vec![],
+            observed_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn a_plan_is_the_persons_on_their_hub_and_their_own_logins_elsewhere() {
+        let mine = |personal| FloorCaller {
+            id: "u1".into(),
+            personal,
+        };
+        let hub = |owner: Option<&str>| LoginRef::Hub {
+            login: "k".into(),
+            owner: owner.map(str::to_string),
+        };
+        for (login, personal, shown) in [
+            (LoginRef::Mac, true, true),
+            (hub(None), true, true),
+            (hub(Some("u2")), true, true),
+            (LoginRef::Mac, false, false),
+            (hub(None), false, false),
+            (hub(Some("u2")), false, false),
+            (hub(Some("u1")), false, true),
+        ] {
+            assert_eq!(
+                plan_scope(&login, &mine(personal)),
+                shown,
+                "{login:?} {personal}"
+            );
+        }
+        let keys = || {
+            [
+                "claude_code/oauth_token",
+                "users/u2/codex/auth_json",
+                "users/u1/claude_code/oauth_token",
+                "github/token",
+            ]
+            .map(str::to_string)
+        };
+        assert_eq!(
+            signed_in(keys(), &mine(false)),
+            HashSet::from([PlanKind::Claude])
+        );
+        assert_eq!(
+            signed_in(keys(), &mine(true)),
+            HashSet::from([PlanKind::Claude, PlanKind::Chatgpt])
+        );
+    }
+
+    #[test]
+    fn usage_has_the_wire_shape_desk_reads() {
+        let at = DateTime::parse_from_rfc3339("2026-10-29T16:42:00Z")
+            .unwrap()
+            .to_utc();
+        let mac = Reading {
+            account: Some("3f1c".into()),
+            plan: Some("max".into()),
+            windows: vec![Window {
+                used_percent: 62.0,
+                resets_at: Some(at),
+                minutes: 300,
+            }],
+            observed_at: at,
+            ..reading(LoginRef::Mac)
+        };
+        let view = usage_of(
+            vec![mac],
+            &HashSet::from([PlanKind::Claude]),
+            Some(&MacSignIns {
+                claude: Some(Default::default()),
+                codex: false,
+            }),
+            &FloorCaller {
+                id: "u1".into(),
+                personal: true,
+            },
+            at,
+        );
+        assert_eq!(
+            serde_json::to_value(view).unwrap(),
+            json!({
+                "asOf": "2026-10-29T16:42:00Z",
+                "logins": [
+                    {"kind": "claude", "where": "hub", "signedIn": true},
+                    {"kind": "chatgpt", "where": "hub", "signedIn": false},
+                    {"kind": "claude", "where": "mac", "signedIn": true},
+                    {"kind": "chatgpt", "where": "mac", "signedIn": false}
+                ],
+                "readings": [{
+                    "kind": "claude", "where": "mac", "account": "3f1c", "plan": "max",
+                    "windows": [{"usedPercent": 62.0, "resetsAt": "2026-10-29T16:42:00Z", "minutes": 300}],
+                    "observedAt": "2026-10-29T16:42:00Z"
+                }]
+            })
+        );
     }
 }

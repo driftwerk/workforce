@@ -880,6 +880,7 @@ fn result_of(
             .failure
             .as_deref()
             .and_then(|failure| codex_limit_text(failure, chrono::Utc::now())),
+        plan_usage: Vec::new(),
         job: None,
     }
 }

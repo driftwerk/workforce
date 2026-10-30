@@ -9,11 +9,14 @@ use tracing::warn;
 use workforce_common::settings::WorkforceConfig;
 use workforce_desk::floor::{Scope, Turn, TurnLog, TurnOp};
 
+use super::plans::Plans;
 use super::postgres::PgFloorStore;
+use crate::hub_core::logins::plan_usage::observe_with;
 
 /// How often the log is pruned.
 const PRUNE_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
-/// How long a turn is kept, unless it still asks the person something.
+/// How long a turn and a reading are kept, unless the turn still asks the
+/// person something.
 const KEPT_DAYS: i64 = 8;
 /// Ops waiting for the writer before new ones are dropped.
 const BACKLOG: usize = 1024;
@@ -23,10 +26,11 @@ const DROP_WARN_EVERY: Duration = Duration::from_secs(60);
 static INSTALLED: OnceLock<Installed> = OnceLock::new();
 
 /// The floor's store as the hub runs it: the log written through its one
-/// writer, and the store it reads from.
+/// writer, the plan readings kept beside it, and the store both read from.
 #[derive(Clone)]
 pub struct Installed {
     pub log: Arc<dyn TurnLog>,
+    pub plans: Arc<Plans>,
     pub store: Arc<PgFloorStore>,
 }
 
@@ -36,6 +40,7 @@ impl Installed {
         let store = Arc::new(store);
         Self {
             log: Arc::new(Logged::start(Arc::clone(&store))),
+            plans: Plans::new(Arc::clone(&store)),
             store,
         }
     }
@@ -62,6 +67,7 @@ pub(super) async fn install(config: &WorkforceConfig) {
                 Ok(store) => {
                     let installed = Installed::open(store);
                     tokio::spawn(prune_forever(Arc::clone(&installed.store)));
+                    observe_with(installed.plans.clone());
                     let _ = INSTALLED.set(installed);
                 }
                 Err(e) => warn!(

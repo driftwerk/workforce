@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -256,6 +258,10 @@ pub struct NewSession {
     pub prompt: Option<String>,
     #[serde(default)]
     pub approvals: Option<Approvals>,
+    /// Added to the CLI's environment, as a terminal's is: Desk's plugin
+    /// folder in `CLAUDE_CODE_PLUGIN_DIRS`.
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

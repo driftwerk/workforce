@@ -228,6 +228,67 @@ async fn a_hub_without_a_floor_says_so_and_a_session_need_is_not_a_remote_caller
     .await;
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn a_persons_plans_are_their_own_logins_and_any_replica_serves_the_newest() {
+    use workforce_common::usage::{LoginRef, PlanKind, Reading, Window};
+    with_test_pool(PgFloorStore::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let gateway = Gateway::new(vec![("scout", agent_service(dir.path()).await)], None);
+        let alice = gateway.admin.id.to_string();
+        let writer = Installed::open(PgFloorStore::with_pool(pool.clone()).await.unwrap());
+        let reader = Installed::open(PgFloorStore::with_pool(pool).await.unwrap());
+        let reading = |login: &str, owner: Option<&str>, used: f64| Reading {
+            kind: PlanKind::Claude,
+            login: LoginRef::Hub {
+                login: login.into(),
+                owner: owner.map(str::to_string),
+            },
+            account: None,
+            plan: None,
+            windows: vec![Window {
+                used_percent: used,
+                resets_at: None,
+                minutes: 300,
+            }],
+            observed_at: Utc::now(),
+        };
+        writer
+            .store
+            .record(&reading("theirs", Some(&alice), 62.0))
+            .await
+            .unwrap();
+        writer
+            .store
+            .record(&reading("shared", None, 90.0))
+            .await
+            .unwrap();
+        let addr = serve_floor(
+            Arc::clone(&gateway.state),
+            Some(Sources::new(reader, Arc::new(|| None))),
+        )
+        .await;
+        let (status, usage) = get(addr, "/api/desk/usage", Some(&token_for(&gateway.admin))).await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            usage["readings"],
+            json!([{"kind": "claude", "where": "hub", "account": null, "plan": null,
+                "windows": [{"usedPercent": 62.0, "resetsAt": null, "minutes": 300}],
+                "observedAt": usage["readings"][0]["observedAt"]}]),
+            "a login the hub shares is not the person's plan"
+        );
+        assert_eq!(
+            usage["logins"],
+            json!([
+                {"kind": "claude", "where": "hub", "signedIn": false},
+                {"kind": "chatgpt", "where": "hub", "signedIn": false}
+            ]),
+            "no Mac on a hub that isn't theirs"
+        );
+        assert_eq!(get(addr, "/api/desk/usage", None).await.0, 401);
+    })
+    .await;
+}
+
 async fn serve_floor(
     state: Arc<workforce_hub::gateway::GatewayState>,
     sources: Option<Sources>,
