@@ -124,8 +124,9 @@ tokio::task_local! {
     pub static CURRENT_THREAD_ID: String;
     /// The Desk conversation the current run answers to: a live Desk turn's,
     /// attended, or the one a job, workflow or heartbeat check made from Desk
-    /// was stamped with, unattended. Unset everywhere else, Slack included.
-    pub static CURRENT_DESK: workforce_common::channels::desk::DeskScope;
+    /// was stamped with, unattended. `None` or unset everywhere else, Slack
+    /// included.
+    pub static CURRENT_DESK: Option<workforce_common::channels::desk::DeskScope>;
     /// Current agent ID — set during agent runs so tools (e.g., WASM skill
     /// tools) can identify which agent invoked them.
     pub static CURRENT_AGENT_ID: String;
@@ -470,18 +471,16 @@ pub fn current_progress_tx() -> Option<tokio::sync::mpsc::Sender<ProgressEvent>>
 
 /// The Desk conversation the current run answers to, if it answers to one.
 pub fn current_desk() -> Option<workforce_common::channels::desk::DeskScope> {
-    CURRENT_DESK.try_with(Clone::clone).ok()
+    CURRENT_DESK.try_with(Clone::clone).ok().flatten()
 }
 
-/// Run `fut` answering to `desk`, or as it is when there is none.
+/// Run `fut` answering to `desk`, or to no Desk conversation when there is
+/// none, whatever its caller answers to.
 pub async fn with_desk<F: std::future::Future>(
     desk: Option<workforce_common::channels::desk::DeskScope>,
     fut: F,
 ) -> F::Output {
-    match desk {
-        Some(desk) => CURRENT_DESK.scope(desk, fut).await,
-        None => fut.await,
-    }
+    CURRENT_DESK.scope(desk, fut).await
 }
 
 /// The approval ledger of the turn a tool runs in; `None` where nobody can
@@ -981,10 +980,7 @@ impl SessionContext {
             Some(log) => CURRENT_SERVED.sync_scope(log, outer),
             None => outer(),
         };
-        let outer = move || match desk {
-            Some(desk) => CURRENT_DESK.sync_scope(desk, outer),
-            None => outer(),
-        };
+        let outer = move || CURRENT_DESK.sync_scope(desk, outer);
         let outer = move || match artifact_store {
             Some(store) => CURRENT_ARTIFACT_STORE.sync_scope(store, outer),
             None => outer(),
@@ -7519,6 +7515,26 @@ mod tests {
             matched_rule: None,
             evaluation_time_us: 0,
         }
+    }
+
+    #[tokio::test]
+    async fn a_run_scoped_to_no_desk_conversation_answers_to_none_its_caller_does() {
+        use workforce_common::channels::desk::{DeskPlace, DeskScope, DeskTarget};
+        let scope = DeskScope {
+            target: DeskTarget::of_turn(&DeskPlace::Dm, "desk", None, false),
+            owner: "person-1".into(),
+            attended: true,
+        };
+        let (outer, inner) = with_desk(Some(scope.clone()), async {
+            (
+                current_desk(),
+                with_desk(None, async { current_desk() }).await,
+            )
+        })
+        .await;
+        assert_eq!(outer, Some(scope));
+        assert_eq!(inner, None);
+        assert_eq!(current_desk(), None);
     }
 
     #[tokio::test]

@@ -571,7 +571,7 @@ mod tests {
             tokio::task::spawn_blocking(move || {
                 let permission = permission("slack.send", &[]);
                 let on_desk = workforce_agent::runner::CURRENT_DESK
-                    .sync_scope(desk, || invoker.invoke(&ctx(), &permission, &args));
+                    .sync_scope(Some(desk), || invoker.invoke(&ctx(), &permission, &args));
                 let elsewhere = invoker.invoke(&ctx(), &permission, &args);
                 (on_desk, elsewhere)
             })
