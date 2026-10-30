@@ -144,21 +144,52 @@ impl SurfaceEffect {
         }
     }
 
-    /// A write of an email to whom `input` addresses it.
+    /// A write of an email to everyone `input` addresses it to: the `to`,
+    /// `cc` and `bcc` (in any case) of the call and of each message it
+    /// batches (`messages`, `personalizations`), each address once.
     pub fn email(input: &serde_json::Value) -> Self {
-        let to = match &input["to"] {
-            serde_json::Value::String(to) => to.clone(),
-            serde_json::Value::Array(to) => to
-                .iter()
-                .filter_map(serde_json::Value::as_str)
-                .collect::<Vec<_>>()
-                .join(", "),
-            _ => String::new(),
-        };
+        let batched = ["messages", "personalizations"]
+            .into_iter()
+            .flat_map(|key| input[key].as_array().into_iter().flatten());
+        let recipients: std::collections::BTreeSet<String> = std::iter::once(input)
+            .chain(batched)
+            .filter_map(serde_json::Value::as_object)
+            .flat_map(|message| {
+                message
+                    .iter()
+                    .filter(|(key, _)| ["to", "cc", "bcc"].contains(&key.to_lowercase().as_str()))
+                    .flat_map(|(_, addressed)| addresses(addressed))
+            })
+            .collect();
         Self::Writes {
             platform: "email".to_string(),
-            destination: to,
+            destination: recipients.into_iter().collect::<Vec<_>>().join(", "),
         }
+    }
+}
+
+/// The addresses `value` names: a comma-separated string (`Name <a@b>` as
+/// `a@b`), a list, or `{email}` objects, each lowercased.
+fn addresses(value: &serde_json::Value) -> Vec<String> {
+    match value {
+        serde_json::Value::String(list) => list
+            .split(',')
+            .map(|one| {
+                let one = one.trim();
+                one.rsplit_once('<')
+                    .and_then(|(_, address)| address.split_once('>'))
+                    .map_or(one, |(address, _)| address.trim())
+                    .to_lowercase()
+            })
+            .filter(|one| !one.is_empty())
+            .collect(),
+        serde_json::Value::Array(items) => items.iter().flat_map(addresses).collect(),
+        serde_json::Value::Object(named) => named
+            .iter()
+            .filter(|(key, _)| key.eq_ignore_ascii_case("email"))
+            .flat_map(|(_, address)| addresses(address))
+            .collect(),
+        _ => Vec::new(),
     }
 }
 

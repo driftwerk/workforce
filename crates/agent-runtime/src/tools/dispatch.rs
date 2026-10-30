@@ -1759,6 +1759,42 @@ mod tests {
     }
 
     #[test]
+    fn an_email_is_to_everyone_it_addresses_however_its_tool_names_them() {
+        let to = |input: Value| SurfaceEffect::email(&input).destination();
+        let alice = to(serde_json::json!({"to": "Alice@x.com", "subject": "hi"}));
+        assert_eq!(
+            alice.as_ref().map(|d| d.target.as_str()),
+            Some("alice@x.com")
+        );
+        assert_ne!(
+            to(serde_json::json!({"to": "alice@x.com", "bcc": "anyone@evil.example"})),
+            alice,
+            "a blind copy is a recipient too"
+        );
+        assert_eq!(
+            to(serde_json::json!({
+                "To": "Alice <alice@x.com>, bob@x.com",
+                "Cc": "carol@x.com"
+            }))
+            .map(|d| d.target),
+            Some("alice@x.com, bob@x.com, carol@x.com".to_string())
+        );
+        assert_eq!(
+            to(serde_json::json!({
+                "messages": [{"to": [{"email": "bob@x.com"}]}, {"to": "alice@x.com"}]
+            }))
+            .map(|d| d.target),
+            Some("alice@x.com, bob@x.com".to_string())
+        );
+        assert_eq!(
+            to(serde_json::json!({"cc": ["dan@x.com"], "to": {"email": "Carol@x.com", "name": "C"}}))
+                .map(|d| d.target),
+            Some("carol@x.com, dan@x.com".to_string())
+        );
+        assert_eq!(to(serde_json::json!({"subject": "nobody"})), None);
+    }
+
+    #[test]
     fn a_destination_is_one_however_a_call_writes_it() {
         let ops = Destination::of("Slack", "#Ops").unwrap();
         assert_eq!(Destination::of("slack", " ops "), Some(ops.clone()));
