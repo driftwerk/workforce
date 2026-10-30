@@ -10,7 +10,9 @@ use uuid::Uuid;
 use workforce_common::channels::desk::{
     DeliveryKind, DeskDelivered, DeskFile, DeskMark, DeskPlace, DeskTarget, DESK_CHANNEL,
 };
-use workforce_common::session::{estimate_tokens, MessageRole, Session, SessionStore};
+use workforce_common::session::{
+    estimate_tokens, MessageRole, Session, SessionMessage, SessionStore,
+};
 
 use crate::desk_attachments::{into_desk_conversation, DeskConversation, StagedFile};
 use crate::serve::AgentService;
@@ -101,6 +103,30 @@ pub(crate) fn closed_room(
     }))
 }
 
+/// How often a delivery is saved again when its conversation rolled over as
+/// it was saved.
+const HEAD_ATTEMPTS: usize = 3;
+
+/// Save `message` in the conversation whose head `head` reads. One saved as
+/// a rollover sealed that session is saved again in its successor, where the
+/// conversation goes on and is read from. Returns the session it landed in.
+fn save_on_head(
+    sessions: &dyn SessionStore,
+    head: impl Fn() -> eyre::Result<Session>,
+    message: &SessionMessage,
+) -> eyre::Result<String> {
+    for _ in 0..HEAD_ATTEMPTS {
+        let mut session = head()?;
+        session.total_tokens += u64::from(message.tokens);
+        session.push_message(message.clone());
+        sessions.save(&session)?;
+        if !sessions.get(&session.id)?.is_some_and(|s| s.is_sealed()) {
+            return Ok(session.id);
+        }
+    }
+    eyre::bail!("the conversation kept rolling over as a delivery was saved to it")
+}
+
 /// Deliver `delivery` to `owner`'s conversation with the agent of `outbox`
 /// at `target`. Once the message is saved it is durable, so a failed push is
 /// logged rather than returned: the person's Desk drains it from the session.
@@ -118,28 +144,36 @@ pub(crate) async fn deliver<'a>(
         Some(note) => format!("{note} {}", delivery.text),
         None => delivery.text,
     });
-    let mut session = sessions.get_or_create(&target.channel, owner, outbox.agent_id)?;
-    let message_id = Uuid::new_v4().to_string();
-    session.add_assistant_message_with_id(message_id.clone(), &text, estimate_tokens(&text));
-    let Some(message) = session.messages.last_mut() else {
-        eyre::bail!("a delivery was not appended to its session");
+    let message = SessionMessage {
+        id: Uuid::new_v4().to_string(),
+        role: MessageRole::Assistant,
+        content: text.clone(),
+        tool_data: None,
+        timestamp: chrono::Utc::now(),
+        tokens: estimate_tokens(&text),
+        external_id: None,
+        attachments: (!delivery.files.is_empty())
+            .then(|| delivery.files.iter().map(Into::into).collect()),
+        trust_level: None,
+        actor: None,
+        desk: Some(DeskMark {
+            delivery: Some(delivery.kind),
+            request_id: delivery.request_id,
+            files: delivery.files,
+            ..target.place.mark()
+        }),
     };
-    message.attachments =
-        (!delivery.files.is_empty()).then(|| delivery.files.iter().map(Into::into).collect());
-    message.desk = Some(DeskMark {
-        delivery: Some(delivery.kind),
-        request_id: delivery.request_id,
-        files: delivery.files,
-        ..target.place.mark()
-    });
-    let message = message.clone();
-    sessions.save(&session)?;
-    if let Err(e) = sessions.append_to_archive(&session.id, &message) {
-        tracing::warn!(session_id = %session.id, error = %e, "archiving a Desk delivery");
+    let session_id = save_on_head(
+        sessions,
+        || sessions.get_or_create(&target.channel, owner, outbox.agent_id),
+        &message,
+    )?;
+    if let Err(e) = sessions.append_to_archive(&session_id, &message) {
+        tracing::warn!(%session_id, error = %e, "archiving a Desk delivery");
     }
     let delivered = Delivered {
-        session_id: session.id,
-        message_id,
+        session_id,
+        message_id: message.id.clone(),
     };
     let mark = message.desk.unwrap_or_default();
     announce(
@@ -349,6 +383,56 @@ pub(crate) async fn resumed(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A delivery saved to a session a rollover sealed as it saved lands in
+    /// the successor, where the conversation is read from.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_delivery_racing_a_rollover_lands_in_the_successor() {
+        use workforce_common::session_postgres::PostgresSessionStore;
+        workforce_postgres::test_support::with_test_pool(
+            PostgresSessionStore::build_pool,
+            |pool| async move {
+                let store = PostgresSessionStore::with_pool(pool, "scout")
+                    .await
+                    .expect("store");
+                let store: &dyn SessionStore = store.as_ref();
+                let mut first = store.get_or_create(DESK_CHANNEL, "p1", "scout").unwrap();
+                first.add_user_message("hello", None);
+                store.save(&first).unwrap();
+                let loaded = store.get(&first.id).unwrap().unwrap();
+                let successor = workforce_agent::rollover::roll_if_stale(
+                    store,
+                    loaded.clone(),
+                    &workforce_common::session::CompactionConfig::default(),
+                    chrono::Utc::now() + chrono::Duration::days(3),
+                )
+                .unwrap();
+                assert_ne!(successor.id, first.id, "the conversation rolled over");
+                let stale = std::sync::atomic::AtomicBool::new(true);
+                let mut scratch = Session::new(DESK_CHANNEL, "p1", "scout");
+                scratch.add_assistant_message("a reminder", 1);
+                let message = scratch.messages.pop().unwrap();
+                let landed = save_on_head(
+                    store,
+                    || match stale.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                        true => Ok(loaded.clone()),
+                        false => store.get_or_create(DESK_CHANNEL, "p1", "scout"),
+                    },
+                    &message,
+                )
+                .unwrap();
+                assert_eq!(landed, successor.id);
+                assert!(store
+                    .get(&successor.id)
+                    .unwrap()
+                    .unwrap()
+                    .messages
+                    .iter()
+                    .any(|m| m.id == message.id));
+            },
+        )
+        .await;
+    }
 
     fn room() -> DeskTarget {
         DeskTarget {
