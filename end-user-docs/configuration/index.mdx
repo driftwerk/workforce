@@ -66,7 +66,7 @@ default = true
 Place this file in your project root and run:
 
 ```bash
-workforce start
+workforce serve
 ```
 
 ## Subscription providers
@@ -86,7 +86,7 @@ shared_serves = "anyone"          # owner | agent_users | anyone (default)
 
 [subscription]                    # install-wide; read at start-up
 chatgpt_direct = false            # allow the chatgpt provider (off by default)
-operator = "<identity uuid>"      # whose plan pays for the hub's own work
+operator = "00000000-0000-0000-0000-000000000000"      # whose plan pays for the hub's own work
 max_concurrent_cli_turns = 4      # CLI agent turns at once; 0 = unbounded
 max_concurrent_completions = 4    # one-shot CLI calls at once; 0 = unbounded
 ```
