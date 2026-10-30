@@ -364,7 +364,7 @@ const PICTURE_BODY_LIMIT: usize = crate::pictures::MAX_BYTES + 64 * 1024;
 
 /// Build the gateway router.
 pub fn router(state: Arc<GatewayState>) -> Router {
-    Router::new()
+    let app = Router::new()
         .route("/", get(static_index))
         .route("/ws", get(ws_handler))
         .route("/ws/agent", get(ws_local_agent_handler))
@@ -1176,12 +1176,18 @@ pub fn router(state: Arc<GatewayState>) -> Router {
         .route("/api/budget/overrides/clear", axum::routing::post(crate::api_handlers::budget::clear_override))
         .with_state(Arc::clone(&state))
         .merge(desk_routes(state))
-        .fallback(static_fallback)
-        // Audit F2 (2026-05-15).
+        .fallback(static_fallback);
+    hardened(app)
+}
+
+/// `routes` with the security headers every response of the gateway carries
+/// (audit F2, 2026-05-15) and its 1 MiB body limit (audit F3), which a route
+/// raises for itself where it takes more.
+pub(crate) fn hardened(routes: Router) -> Router {
+    routes
         .layer(axum::middleware::from_fn(
             crate::security::security_headers_middleware,
         ))
-        // Audit F3 (2026-05-15); per-route override on /api/sessions/{id}/upload.
         .layer(axum::extract::DefaultBodyLimit::max(1024 * 1024))
 }
 

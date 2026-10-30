@@ -499,3 +499,44 @@ async fn eventually<T>(mut check: impl AsyncFnMut() -> Option<T>) -> T {
     }
     panic!("the floor never showed it");
 }
+
+/// The floor's and the allow list's routes, mounted beside the gateway's,
+/// answer with the security headers every gateway response carries and
+/// refuse a body past its limit.
+#[tokio::test]
+async fn the_desk_routes_mounted_beside_the_gateway_are_hardened_like_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let gateway = Gateway::new(vec![("scout", agent_service(dir.path()).await)], None);
+    let app = workforce_hub::desk_driver::mount(
+        axum::Router::new(),
+        &gateway.state,
+        &workforce_common::settings::WorkforceConfig::default(),
+        tokio_util::sync::CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = reqwest::Client::new();
+    for path in ["/api/desk/allows", "/api/desk/floor"] {
+        let response = client
+            .get(format!("http://{addr}{path}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.headers()["x-frame-options"],
+            "DENY",
+            "{path} carries the gateway's headers"
+        );
+    }
+    let response = client
+        .post(format!("http://{addr}/api/desk/needs/decide"))
+        .header("content-type", "application/json")
+        .body(vec![b' '; 2 * 1024 * 1024])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 413, "a body past the gateway's limit");
+}
