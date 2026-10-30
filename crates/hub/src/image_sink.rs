@@ -115,25 +115,12 @@ pub(crate) fn delivered_name(filename: Option<&str>, media_type: &str) -> String
     filename
         .filter(|f| !f.is_empty())
         .map(str::to_string)
-        .unwrap_or_else(|| format!("generated.{}", extension_for(media_type)))
-}
-
-/// File extension for a generated attachment, from its media type. Used only
-/// to synthesise a filename when the producer didn't supply one.
-fn extension_for(media_type: &str) -> &'static str {
-    match media_type {
-        "image/jpeg" | "image/jpg" => "jpg",
-        "image/webp" => "webp",
-        "image/gif" => "gif",
-        "application/pdf" => "pdf",
-        "video/mp4" => "mp4",
-        "video/webm" => "webm",
-        "audio/mpeg" | "audio/mp3" => "mp3",
-        "audio/wav" | "audio/x-wav" => "wav",
-        "audio/mp4" => "m4a",
-        "audio/ogg" | "audio/opus" => "ogg",
-        _ => "png",
-    }
+        .unwrap_or_else(|| {
+            format!(
+                "generated.{}",
+                workforce_skills::adapters::utils::extension_for_mime(media_type)
+            )
+        })
 }
 
 #[async_trait]

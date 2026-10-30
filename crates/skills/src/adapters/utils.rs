@@ -257,14 +257,24 @@ pub fn sniff_mime(bytes: &[u8]) -> Option<&'static str> {
 pub fn extension_for_mime(mime: &str) -> &'static str {
     match mime {
         "image/png" => "png",
-        "image/jpeg" => "jpg",
+        "image/jpeg" | "image/jpg" => "jpg",
         "image/gif" => "gif",
         "image/webp" => "webp",
+        "image/heic" => "heic",
+        "image/avif" => "avif",
         "application/pdf" => "pdf",
         "application/zip" => "zip",
         "text/csv" => "csv",
         "application/json" => "json",
         "text/plain" => "txt",
+        "video/mp4" => "mp4",
+        "video/quicktime" => "mov",
+        "video/webm" => "webm",
+        "audio/mpeg" | "audio/mp3" => "mp3",
+        "audio/wav" | "audio/x-wav" => "wav",
+        "audio/mp4" => "m4a",
+        "audio/ogg" | "audio/opus" => "ogg",
+        "audio/flac" => "flac",
         _ => "bin",
     }
 }
@@ -577,6 +587,8 @@ mod tests {
         assert_eq!(extension_for_mime("text/csv"), "csv");
         assert_eq!(extension_for_mime("application/octet-stream"), "bin");
         assert_eq!(extension_for_mime("who/knows"), "bin");
+        assert_eq!(extension_for_mime("video/quicktime"), "mov");
+        assert_eq!(extension_for_mime("audio/mpeg"), "mp3");
     }
 
     // ---- coerce_to_id_string ----
