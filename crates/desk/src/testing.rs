@@ -12,9 +12,13 @@ pub(crate) struct Bearer;
 
 #[async_trait]
 impl Authorize for Bearer {
-    async fn authorize(&self, h: &HeaderMap, _: Option<&str>) -> Result<(), StatusCode> {
+    async fn authorize(
+        &self,
+        h: &HeaderMap,
+        _: Option<&str>,
+    ) -> Result<Option<String>, StatusCode> {
         match h.get("authorization").and_then(|v| v.to_str().ok()) {
-            Some("Bearer hub-token") => Ok(()),
+            Some("Bearer hub-token") => Ok(None),
             _ => Err(StatusCode::UNAUTHORIZED),
         }
     }
@@ -42,18 +46,22 @@ impl Speech for Mute {
     }
 }
 
-struct Fixed(Result<(), StatusCode>);
+struct Fixed(Result<Option<String>, StatusCode>);
 
 #[async_trait]
 impl Authorize for Fixed {
-    async fn authorize(&self, _: &HeaderMap, _: Option<&str>) -> Result<(), StatusCode> {
-        self.0
+    async fn authorize(
+        &self,
+        _: &HeaderMap,
+        _: Option<&str>,
+    ) -> Result<Option<String>, StatusCode> {
+        self.0.clone()
     }
 }
 
 /// Lets everyone in.
 pub(crate) fn allow_all() -> std::sync::Arc<dyn Authorize> {
-    std::sync::Arc::new(Fixed(Ok(())))
+    std::sync::Arc::new(Fixed(Ok(None)))
 }
 
 /// Lets no one in.

@@ -204,8 +204,12 @@ struct Anyone;
 
 #[async_trait::async_trait]
 impl Authorize for Anyone {
-    async fn authorize(&self, _: &HeaderMap, _: Option<&str>) -> Result<(), StatusCode> {
-        Ok(())
+    async fn authorize(
+        &self,
+        _: &HeaderMap,
+        _: Option<&str>,
+    ) -> Result<Option<String>, StatusCode> {
+        Ok(None)
     }
 }
 
@@ -276,7 +280,7 @@ async fn an_agents_turns_are_activity_and_its_question_needs_you() {
             )
         );
         assert_eq!(events[0].actor.kind, PartyKind::Agent);
-        let overview = d.overview(crew.as_ref()).await.unwrap();
+        let overview = d.overview(crew.as_ref(), None).await.unwrap();
         let item = overview.items.iter().find(|i| i.id == "scout").unwrap();
         assert_eq!(item.state, ItemState::NeedsYou);
         assert_eq!(item.task.as_deref(), Some("Prepare the staging deploy."));
@@ -511,7 +515,7 @@ async fn a_blocked_session_wakes_the_overseer_and_its_answer_offers_the_approval
         .await;
         assert_eq!(needs.text, "wants to run npm install @acme/ds@4.2.0");
         assert_eq!(needs.approval_id, Some(pending.id.to_string()));
-        let overview = d.overview(crew.as_ref()).await.unwrap();
+        let overview = d.overview(crew.as_ref(), None).await.unwrap();
         let item = overview.items.iter().find(|i| i.id == s.id.to_string()).unwrap();
         assert_eq!(item.state, ItemState::NeedsYou);
         assert_eq!(
@@ -563,7 +567,7 @@ async fn a_blocked_session_wakes_the_overseer_and_its_answer_offers_the_approval
             s.id.to_string()
         );
         // Its first paragraph is the brief.
-        let brief = d.overview(crew.as_ref()).await.unwrap().brief.unwrap();
+        let brief = d.overview(crew.as_ref(), None).await.unwrap().brief.unwrap();
         assert_eq!(
             brief.text,
             "acme-web is waiting on you to run npm install. It is upgrading the date picker, so it looks expected."
@@ -751,7 +755,12 @@ async fn summaries_are_scheduled_as_set_and_run_in_the_dm() {
         .await;
         assert_eq!(summary.text, "sent your morning summary");
         assert_eq!(summary.subject, None);
-        let brief = d.overview(crew.as_ref()).await.unwrap().brief.unwrap();
+        let brief = d
+            .overview(crew.as_ref(), None)
+            .await
+            .unwrap()
+            .brief
+            .unwrap();
         assert_eq!(brief.text, "Quiet night: nothing needs you.");
         assert_eq!(
             d.store().wake_ups_since(crew.midnight()).await.unwrap(),
@@ -1202,11 +1211,11 @@ mod floor {
                     );
                     assert_eq!(second.id, format!("question:{}", later.id));
 
-                    let overview = d.overview(crew.as_ref()).await.unwrap();
+                    let overview = d.overview(crew.as_ref(), None).await.unwrap();
                     assert_eq!(overview.counts.needs_you, 1);
                     let item = overview.items.iter().find(|i| i.id == "scout").unwrap();
                     assert_eq!(item.state, ItemState::NeedsYou);
-                    let page = d.needs_you(crew.as_ref(), None, 10).await.unwrap();
+                    let page = d.needs_you(crew.as_ref(), None, None, 10).await.unwrap();
                     assert_eq!(
                         page.events
                             .iter()
@@ -1218,6 +1227,22 @@ mod floor {
                         )],
                         "an old Desk's “Needs you” is the one open question"
                     );
+                    let another = uuid::Uuid::new_v4().to_string();
+                    assert_eq!(
+                        d.overview(crew.as_ref(), Some(&another))
+                            .await
+                            .unwrap()
+                            .counts
+                            .needs_you,
+                        0,
+                        "another administrator's needs are theirs, not this person's"
+                    );
+                    assert!(d
+                        .needs_you(crew.as_ref(), Some(&another), None, 10)
+                        .await
+                        .unwrap()
+                        .events
+                        .is_empty());
                 })
                 .await;
             },

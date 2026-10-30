@@ -863,7 +863,7 @@ mod tests {
                 }
                 assert!(d.find_sessions("payments").is_empty());
 
-                let o = d.overview(&NoCrew).await.unwrap();
+                let o = d.overview(&NoCrew, None).await.unwrap();
                 assert_eq!(o.groups, vec!["Atlas".to_string()]);
                 let item = o.items.iter().find(|i| i.id == id.to_string()).unwrap();
                 assert_eq!(

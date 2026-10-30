@@ -181,6 +181,7 @@ async fn guard(s: &StateApi, headers: &HeaderMap, token: Option<&str>) -> Result
     s.auth
         .authorize(headers, token)
         .await
+        .map(drop)
         .map_err(|status| (status, Json(json!({ "error": "not allowed" }))).into_response())
 }
 

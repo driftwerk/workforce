@@ -36,7 +36,12 @@ fn failed(e: eyre::Report) -> Response {
     )
 }
 
-async fn guard(s: &CrewApi, h: &HeaderMap, token: Option<&str>) -> Result<(), Response> {
+/// Who a request is from, when it may read the crew.
+async fn guard(
+    s: &CrewApi,
+    h: &HeaderMap,
+    token: Option<&str>,
+) -> Result<Option<String>, Response> {
     s.auth
         .authorize(h, token)
         .await
@@ -53,13 +58,18 @@ struct ActivityQuery {
 }
 
 async fn activity(State(s): S, h: HeaderMap, Query(q): Query<ActivityQuery>) -> Response {
-    if let Err(r) = guard(&s, &h, q.token.as_deref()).await {
-        return r;
-    }
+    let person = match guard(&s, &h, q.token.as_deref()).await {
+        Ok(person) => person,
+        Err(r) => return r,
+    };
     let limit = q.limit.unwrap_or(100).clamp(1, 500);
     let before = q.before.as_deref().filter(|b| !b.trim().is_empty());
     let page = match q.filter {
-        Filter::NeedsYou => s.desk.needs_you(&*s.crew, before, limit).await,
+        Filter::NeedsYou => {
+            s.desk
+                .needs_you(&*s.crew, person.as_deref(), before, limit)
+                .await
+        }
         filter => s.desk.activity(filter, before, limit).await,
     };
     match page {
@@ -74,10 +84,11 @@ struct TokenQuery {
 }
 
 async fn overview(State(s): S, h: HeaderMap, Query(q): Query<TokenQuery>) -> Response {
-    if let Err(r) = guard(&s, &h, q.token.as_deref()).await {
-        return r;
-    }
-    match s.desk.overview(&*s.crew).await {
+    let person = match guard(&s, &h, q.token.as_deref()).await {
+        Ok(person) => person,
+        Err(r) => return r,
+    };
+    match s.desk.overview(&*s.crew, person.as_deref()).await {
         Ok(o) => Json(o).into_response(),
         Err(e) => failed(e),
     }

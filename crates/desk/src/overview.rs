@@ -273,10 +273,11 @@ impl Desk {
     pub async fn needs_you(
         &self,
         crew: &dyn Crew,
+        person: Option<&str>,
         before: Option<&str>,
         limit: i64,
     ) -> Result<crew::ActivityPage> {
-        let Some(needs) = crew.open_needs().await else {
+        let Some(needs) = crew.open_needs(person).await else {
             return self.activity(crew::Filter::NeedsYou, before, limit).await;
         };
         if needs.is_empty() {
@@ -309,8 +310,8 @@ impl Desk {
         })
     }
 
-    /// The overview as of now.
-    pub async fn overview(&self, crew: &dyn Crew) -> Result<Overview> {
+    /// The overview as of now, its needs `person`'s.
+    pub async fn overview(&self, crew: &dyn Crew, person: Option<&str>) -> Result<Overview> {
         let now = Utc::now();
         let overseer = crew.overseer();
         let quiet = overseer
@@ -331,7 +332,7 @@ impl Desk {
                 .map(|g| g.name.clone());
             item
         }));
-        let needs = crew.open_needs().await;
+        let needs = crew.open_needs(person).await;
         if let Some(needs) = &needs {
             items = items
                 .into_iter()

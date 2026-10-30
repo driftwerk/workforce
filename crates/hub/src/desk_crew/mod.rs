@@ -332,13 +332,17 @@ impl Crew for CrewHub {
         self.me().perform(&action, by).await.map(drop)
     }
 
-    /// The needs of the person whose Desk this is, as the floor counts them.
-    async fn open_needs(&self) -> Option<Vec<Need>> {
+    /// The needs of `person`, else of the person whose Desk this is, as the
+    /// floor counts them.
+    async fn open_needs(&self, person: Option<&str>) -> Option<Vec<Need>> {
         let floor = crate::floor::installed()?.clone();
         let desk = self.desk.clone();
         let sources = crate::desk_floor::Sources::new(floor, Arc::new(move || Some(desk.clone())));
         let caller = crate::desk_floor::FloorCaller {
-            id: self.person(None).unwrap_or_default(),
+            id: person
+                .map(str::to_string)
+                .or_else(|| self.person(None))
+                .unwrap_or_default(),
             personal: true,
         };
         crate::desk_floor::open_needs(&self.state, &sources, &caller)

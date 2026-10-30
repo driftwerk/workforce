@@ -73,10 +73,10 @@ impl Authorize for SystemAdmins {
         &self,
         headers: &HeaderMap,
         query_token: Option<&str>,
-    ) -> Result<(), StatusCode> {
+    ) -> Result<Option<String>, StatusCode> {
         let caller = resolve_caller_context(&self.0, headers, query_token).await;
         match caller {
-            c if c.is_admin => Ok(()),
+            c if c.is_admin => Ok(c.identity_id),
             c if c.identity_id.is_some() || c.device_id.is_some() => Err(StatusCode::FORBIDDEN),
             _ => Err(StatusCode::UNAUTHORIZED),
         }

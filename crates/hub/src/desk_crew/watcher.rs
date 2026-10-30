@@ -211,7 +211,7 @@ impl CrewHub {
         o: &Oversight,
         noted: &mut HashSet<String>,
     ) -> Vec<Trigger> {
-        let Ok(overview) = self.desk.overview(self).await else {
+        let Ok(overview) = self.desk.overview(self, None).await else {
             return Vec::new();
         };
         let now = Utc::now();

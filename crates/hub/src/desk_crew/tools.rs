@@ -167,7 +167,11 @@ impl CrewTool {
         };
         match self.name {
             "crew.overview" => {
-                let o = crew.desk.overview(crew.as_ref()).await.map_err(internal)?;
+                let o = crew
+                    .desk
+                    .overview(crew.as_ref(), None)
+                    .await
+                    .map_err(internal)?;
                 Ok(json!({
                     "counts": o.counts,
                     "table": table(&o.items, &o.groups),

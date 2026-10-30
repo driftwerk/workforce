@@ -480,9 +480,9 @@ pub trait Crew: Send + Sync {
     /// Does what `suggestion` proposed, as you; what went wrong in plain
     /// words.
     async fn accept(&self, suggestion: &Suggestion) -> Result<(), String>;
-    /// What still needs the person, from the floor; `None` where the hub
-    /// keeps none.
-    async fn open_needs(&self) -> Option<Vec<Need>> {
+    /// What still needs `person` (the desk's own person when none is
+    /// named), from the floor; `None` where the hub keeps none.
+    async fn open_needs(&self, _person: Option<&str>) -> Option<Vec<Need>> {
         None
     }
 }

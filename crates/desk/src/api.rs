@@ -27,14 +27,16 @@ use crate::rooms::{NewMessage, NewRoom, RoomPatch};
 use crate::service::{Desk, DeskError, Import, Layout, NewTerminal, TerminalPatch};
 use crate::speech::{Speak, SpeakError, Speech};
 
-/// Decides whether a request may use the desk. Implemented by the hub.
+/// Decides whether a request may use the desk, and says who it is from: the
+/// person its token names, none for one that names no one. Implemented by
+/// the hub.
 #[async_trait]
 pub trait Authorize: Send + Sync {
     async fn authorize(
         &self,
         headers: &HeaderMap,
         query_token: Option<&str>,
-    ) -> Result<(), StatusCode>;
+    ) -> Result<Option<String>, StatusCode>;
 }
 
 struct ApiState {
@@ -65,6 +67,7 @@ impl IntoResponse for DeskError {
 async fn guard(auth: &dyn Authorize, headers: &HeaderMap, q: &TokenQuery) -> Result<(), Response> {
     auth.authorize(headers, q.token.as_deref())
         .await
+        .map(drop)
         .map_err(|status| (status, Json(json!({ "error": "not allowed" }))).into_response())
 }
 
