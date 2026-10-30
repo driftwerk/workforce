@@ -5649,8 +5649,30 @@ async fn a_streamed_turn_answers_to_the_desk_scope_it_was_started_in() {
             attended: false,
         }),
         service.process_message_with_progress(
-            "desk", "owner-1", None, "and the release?", None, None, None, None, None, None,
-            None, None, None, None, None, None, None, None, None, None, None, None, None, None,
+            "desk",
+            "owner-1",
+            None,
+            "and the release?",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
         ),
     )
     .await
@@ -5733,8 +5755,28 @@ async fn a_check_made_in_desk_checks_in_there_and_stays_its_creators_when_moved(
         Some(DeliveryKind::CheckIn)
     );
 
+    let room_id = service
+        .sessions
+        .find(&target.channel, BOB)
+        .unwrap()
+        .expect("the room's conversation")
+        .id;
+    let mut room_conversation = service.sessions.get(&room_id).unwrap().unwrap();
+    room_conversation.set_desk_origin(&target);
+    service.sessions.save(&room_conversation).unwrap();
     let moved = crate::desk_surface::retarget(&service, BOB, "device-1").await;
     assert!(moved.contains(&"inbox".to_string()), "{moved:?}");
+    assert!(moved.contains(&room_conversation.id), "{moved:?}");
+    assert_eq!(
+        service
+            .sessions
+            .get(&room_conversation.id)
+            .unwrap()
+            .unwrap()
+            .desk_origin(),
+        Some(target.dm()),
+        "a run resumed in the room answers in the DM"
+    );
     let check = load_heartbeat_check(&service.workspace, "inbox").unwrap();
     assert_eq!(
         check.meta.deliver_to,
