@@ -382,6 +382,18 @@ async fn a_person_linked_to_slack_gets_their_slack_picture_and_loses_it_when_unl
         identities.update(&sam).unwrap();
         refresher.refresh(Utc::now()).await.unwrap();
         assert!(store.kept_for(&owner).await.unwrap().is_empty());
+
+        let gone = Owner::identity(unlinked.id.to_string());
+        store
+            .put_slack(&gone, &slack_picture(3, "member:U3"))
+            .await
+            .unwrap();
+        identities.delete(unlinked.id).unwrap();
+        refresher.refresh(Utc::now()).await.unwrap();
+        assert!(
+            store.kept_for(&gone).await.unwrap().is_empty(),
+            "a person the store no longer knows loses their Slack picture"
+        );
     })
     .await;
 }

@@ -123,18 +123,30 @@ impl Refresher {
             let face = self.slack.agent(&id).await;
             agents.push((id, face));
         }
-        self.refresh_kind(Kind::Agent, agents, now).await?;
-        let people = match &self.identities {
-            Some(identities) => linked_people(identities.as_ref())?,
-            None => Vec::new(),
+        self.refresh_kind(Kind::Agent, agents, |_| true, now).await?;
+        let Some(identities) = &self.identities else {
+            return Ok(());
         };
-        self.refresh_kind(Kind::Identity, people, now).await
+        // People are read a page at a time while others come and go, so one
+        // not read is gone only once the store says so.
+        let gone = |id: &str| {
+            uuid::Uuid::parse_str(id)
+                .ok()
+                .and_then(|id| identities.get_by_id(id).ok())
+                .is_some_and(|found| found.is_none())
+        };
+        self.refresh_kind(Kind::Identity, linked_people(identities.as_ref())?, gone, now)
+            .await
     }
 
+    /// Fetches what is due of `wanted`, and removes the Slack pictures of
+    /// those with none any more and of the owners not wanted that are
+    /// `gone`.
     async fn refresh_kind(
         &self,
         kind: Kind,
         wanted: Vec<(String, Option<SlackFace>)>,
+        gone: impl Fn(&str) -> bool,
         now: DateTime<Utc>,
     ) -> Result<()> {
         let held = self.store.kept(kind).await?;
@@ -170,7 +182,7 @@ impl Refresher {
                 kind,
                 id: id.clone(),
             };
-            if slack_of(id).is_some() {
+            if slack_of(id).is_some() && gone(id) {
                 self.store.remove(&owner, Source::Slack).await?;
             }
         }
