@@ -5629,11 +5629,11 @@ async fn a_desk_room_turn_is_told_where_it_is_and_keeps_its_place() {
 }
 
 /// A check made in a Desk thread tells its creator what it found there, as
-/// a check-in; once its room is gone it reports to their DM and still runs
-/// as them; a hand edit of where it reports stops it running as anyone.
+/// a check-in; once the device holding its room is unpaired it reports to
+/// their DM and still runs as them; a hand edit of where it reports stops it
+/// running as anyone.
 #[tokio::test]
 async fn a_check_made_in_desk_checks_in_there_and_stays_its_creators_when_moved() {
-    use crate::desk_surface::Matches;
     use workforce_common::channels::desk::{DeliveryKind, DeskPlace, DeskScope, DeskTarget};
     use workforce_common::heartbeat_check::{load_heartbeat_check, save_heartbeat_check};
 
@@ -5693,8 +5693,7 @@ async fn a_check_made_in_desk_checks_in_there_and_stays_its_creators_when_moved(
         Some(DeliveryKind::CheckIn)
     );
 
-    let moved =
-        crate::desk_surface::retarget(&service, BOB, Matches::Channel(&target.channel)).await;
+    let moved = crate::desk_surface::retarget(&service, BOB, "device-1").await;
     assert!(moved.contains(&"inbox".to_string()), "{moved:?}");
     let check = load_heartbeat_check(&service.workspace, "inbox").unwrap();
     assert_eq!(

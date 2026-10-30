@@ -6233,6 +6233,48 @@ mod tests {
         assert!(slack.sent().is_empty(), "nothing went to Slack");
     }
 
+    /// A reminder set in a room that is deleted before it fires lands in the
+    /// person's DM, naming the room; the room's conversation gains nothing.
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn a_reminder_for_a_room_deleted_before_it_fires_lands_in_the_dm_naming_it() {
+        let sched = test_scheduler().await;
+        let service = sched.service();
+        let scope = desk_thread();
+        let mut head = service
+            .sessions
+            .get_or_create(&scope.target.channel, "user-A", service.agent_id.as_str())
+            .unwrap();
+        head.set_desk_origin(&scope.target);
+        service.sessions.save(&head).unwrap();
+        let id = add_job_on_desk(&sched, Some("user-A"), scope.clone(), reminder_payload()).await;
+        crate::desk_surface::close(&service, "user-A", &scope.target.channel, &[])
+            .await
+            .unwrap();
+
+        assert!(sched.run_job_now(&id).await.unwrap().delivered);
+        let dm = service
+            .sessions
+            .find("desk", "user-A")
+            .unwrap()
+            .expect("the DM");
+        let said = dm.messages.last().unwrap();
+        assert_eq!(
+            said.content,
+            "(for #Planning, which was deleted) \u{1f514} Reminder: stretch"
+        );
+        assert_eq!(
+            said.desk.as_ref().and_then(|mark| mark.delivery),
+            Some(DeliveryKind::Reminder)
+        );
+        let room = service
+            .sessions
+            .find(&scope.target.channel, "user-A")
+            .unwrap()
+            .unwrap();
+        assert_eq!(room.messages.len(), head.messages.len());
+    }
+
     #[tokio::test]
     async fn a_desk_job_answers_in_its_conversation_and_one_with_nowhere_to_go_is_not_delivered() {
         let tmp = tempfile::tempdir().unwrap();

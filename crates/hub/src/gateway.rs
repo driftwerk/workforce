@@ -8145,12 +8145,7 @@ async fn pair_device_revoke_self(
 /// their DM instead, with every agent.
 async fn retarget_device(state: &GatewayState, owner: &str, device: &str) {
     for service in state.registry.all_services() {
-        crate::desk_surface::retarget(
-            &service,
-            owner,
-            crate::desk_surface::Matches::Device(device),
-        )
-        .await;
+        crate::desk_surface::retarget(&service, owner, device).await;
     }
 }
 

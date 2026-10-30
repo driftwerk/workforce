@@ -1,13 +1,13 @@
-//! A room Desk deleted: its conversation is stamped closed, what was set up
-//! to deliver there is pointed at the person's DM, and the messages its Desk
-//! never showed are copied there.
+//! A room Desk deleted: its conversation is stamped closed, so whatever was
+//! set up to deliver there (a reminder, a job, a check-in, a workflow run)
+//! is sent to the person's DM when it fires, naming the room; and the
+//! messages its Desk never showed are copied there.
 
 use serde_json::{json, Value};
 use workforce_common::channels::desk::{DeliveryKind, DeskAnchor, DeskPlace, DeskTarget};
 use workforce_common::session::{MessageRole, Session, SessionStore, TranscriptEntry};
 
 use super::deliver::{deliver, Delivery, CLOSED_KEY};
-use super::retarget::{retarget, Matches};
 use crate::serve::AgentService;
 
 /// What a room is called in a note about it: the name its latest turn gave,
@@ -64,9 +64,10 @@ pub(crate) fn is_room(channel: &str) -> bool {
 }
 
 /// Close `owner`'s conversation on the room `channel` ([`is_room`]) with
-/// `service`'s agent: stamp it closed, point what delivers there at the DM,
-/// and copy the agent's messages in `undelivered` there. A message already
-/// copied is not copied again. Returns how many were copied now.
+/// `service`'s agent: stamp it closed, which sends what delivers there to the
+/// DM from now on, and copy the agent's messages in `undelivered` there. A
+/// message already copied is not copied again. Returns how many were copied
+/// now.
 pub(crate) async fn close(
     service: &AgentService,
     owner: &str,
@@ -91,7 +92,6 @@ pub(crate) async fn close(
     if let Some(head) = &head {
         sessions.merge_metadata(&head.id, stamp(&copied), &[])?;
     }
-    retarget(service, owner, Matches::Channel(channel)).await;
     let Some(head) = head else {
         return Ok(0);
     };

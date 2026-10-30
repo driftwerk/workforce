@@ -18,7 +18,7 @@ use workforce_common::trust::TrustLevel;
 pub(crate) use close::{close, is_room, message_in_chain};
 pub(crate) use context::{desk_context, person_name};
 pub(crate) use deliver::{deliver, deliver_file, resumed, Delivery, Outbox};
-pub(crate) use retarget::{retarget, Matches};
+pub(crate) use retarget::retarget;
 pub(crate) use surface::DeskSurface;
 
 /// A message's text as a live channel sends it: secret markers as previews,
