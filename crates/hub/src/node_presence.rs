@@ -6,6 +6,7 @@
 
 use std::sync::Arc;
 
+use eyre::Result;
 use tracing::warn;
 use workforce_common::settings::WorkforceConfig;
 
@@ -29,6 +30,34 @@ pub async fn open(config: &WorkforceConfig) -> Option<Arc<dyn NodePresence>> {
     }
     let _ = config;
     None
+}
+
+/// Move the presence of the nodes `names` held to `into`, a person merged
+/// into another. A node still connected puts its row again as the person it
+/// connected as, until it reconnects.
+pub async fn reassign_person(config: &WorkforceConfig, names: &[String], into: &str) -> Result<()> {
+    #[cfg(feature = "postgres")]
+    if let Some(pg) = config.postgres.as_ref().filter(|p| p.enabled) {
+        return postgres::PostgresPresence::new(pg)
+            .await?
+            .reassign(names, into)
+            .await;
+    }
+    let _ = (config, names, into);
+    Ok(())
+}
+
+/// Remove the presence of every node `names` held: a person removed.
+pub async fn forget_person(config: &WorkforceConfig, names: &[String]) -> Result<()> {
+    #[cfg(feature = "postgres")]
+    if let Some(pg) = config.postgres.as_ref().filter(|p| p.enabled) {
+        return postgres::PostgresPresence::new(pg)
+            .await?
+            .forget_people(names)
+            .await;
+    }
+    let _ = (config, names);
+    Ok(())
 }
 
 #[cfg(feature = "postgres")]
@@ -100,6 +129,32 @@ pub mod postgres {
             .await
             .context("running node presence migrations")?;
             Ok(Self { pool, instance_id })
+        }
+    }
+
+    impl PostgresPresence {
+        pub async fn reassign(&self, names: &[String], into: &str) -> Result<()> {
+            self.pool
+                .get()
+                .await?
+                .execute(
+                    "UPDATE presence SET identity_id = $2 WHERE identity_id = ANY($1)",
+                    &[&names, &into],
+                )
+                .await?;
+            Ok(())
+        }
+
+        pub async fn forget_people(&self, names: &[String]) -> Result<()> {
+            self.pool
+                .get()
+                .await?
+                .execute(
+                    "DELETE FROM presence WHERE identity_id = ANY($1)",
+                    &[&names],
+                )
+                .await?;
+            Ok(())
         }
     }
 
@@ -355,6 +410,30 @@ pub mod postgres {
                 assert!(b.agents(None).await.unwrap().is_empty());
                 a.put("studio", "sarah", &agent("Studio")).await.unwrap();
                 assert_eq!(b.agents(None).await.unwrap().len(), 1, "put again");
+            })
+            .await;
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_persons_nodes_follow_a_merge_and_go_with_a_removal() {
+            with_test_pool(PostgresPresence::build_pool, |pool| async move {
+                let (a, _b) = instances(pool).await;
+                a.put("studio", "sarah-old", &agent("Studio"))
+                    .await
+                    .unwrap();
+                a.put("desk:d1", "sarah-old", &desk("d1", "MacBook Pro", true))
+                    .await
+                    .unwrap();
+                a.put("bench", "bob", &agent("Bench")).await.unwrap();
+                a.reassign(&["sarah-old".into()], "sarah").await.unwrap();
+                assert_eq!(a.agents(Some("sarah")).await.unwrap().len(), 1);
+                assert_eq!(a.desks_of("sarah").await.unwrap().online.len(), 1);
+                assert!(a.desks_of("sarah-old").await.unwrap().known.is_empty());
+
+                a.forget_people(&["sarah".into()]).await.unwrap();
+                assert!(a.agents(Some("sarah")).await.unwrap().is_empty());
+                assert!(a.desks_of("sarah").await.unwrap().known.is_empty());
+                assert_eq!(a.agents(None).await.unwrap().len(), 1, "Bob's stays");
             })
             .await;
         }

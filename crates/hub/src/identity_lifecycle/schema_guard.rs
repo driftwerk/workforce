@@ -251,6 +251,7 @@ const CLAIMS: &[(&str, &str, &str, Claim)] = &[
     ),
     ("hub", "plan_readings", "owner", By(C::Signals)),
     ("hub", "allows", "person", By(C::PermissionRules)),
+    ("hub", "presence", "identity_id", By(C::Devices)),
     (
         "hub",
         "pending_approvals",

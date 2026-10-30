@@ -189,7 +189,7 @@ impl Holding for Devices {
     }
 
     /// A device is the person's own, so it follows its link to the
-    /// identity merged into. Where that identity already links a device of
+    /// identity merged into, and its node's presence with it. Where that identity already links a device of
     /// the same kind, it keeps its own and the source's is revoked: a token
     /// linked to nobody must not stay live.
     async fn merge(
@@ -226,6 +226,10 @@ impl Holding for Devices {
             }
             tally.item(device.device_name);
         }
+        if apply {
+            crate::node_presence::reassign_person(&cx.hub()?.config, &from.names, &into.key())
+                .await?;
+        }
         Ok(tally)
     }
 
@@ -241,6 +245,9 @@ impl Holding for Devices {
             for device in &paired {
                 devices.revoke(&device.id)?;
             }
+        }
+        if apply {
+            crate::node_presence::forget_person(&cx.hub()?.config, &who.names).await?;
         }
         Ok(Tally::of(paired.into_iter().map(|d| d.device_name)))
     }
