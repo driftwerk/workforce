@@ -111,37 +111,43 @@ impl Holding for Sessions {
         for service in cx.services() {
             let sessions = service.sessions.as_ref();
             for name in from.names.iter().filter(|name| **name != to) {
-                let moved = match apply {
-                    true => sessions.reassign_owner(name, &to, &from.tag())?,
-                    false => sessions
-                        .list_for_owner(name, SESSION_PAGE)?
-                        .into_iter()
-                        .map(|session| {
-                            let renamed = !session.is_sealed()
-                                && sessions.find(&session.channel, &to)?.is_some();
-                            Ok(workforce_common::session::Reassigned {
-                                channel: match renamed {
-                                    true => workforce_common::session::reassigned_channel(
-                                        &session.channel,
-                                        &from.tag(),
-                                    ),
-                                    false => session.channel,
-                                },
-                                session_id: session.id,
-                                renamed,
-                            })
+                let planned = sessions
+                    .list_for_owner(name, SESSION_PAGE)?
+                    .into_iter()
+                    .map(|session| {
+                        let renamed =
+                            !session.is_sealed() && sessions.find(&session.channel, &to)?.is_some();
+                        Ok(workforce_common::session::Reassigned {
+                            channel: match renamed {
+                                true => workforce_common::session::reassigned_channel(
+                                    &session.channel,
+                                    &from.tag(),
+                                ),
+                                false => session.channel,
+                            },
+                            session_id: session.id,
+                            renamed,
                         })
-                        .collect::<Result<Vec<_>>>()?,
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                // The files move first, each with its session, so a pass that
+                // fails between them finds the sessions still to move; any
+                // past the page, or moved elsewhere than planned, follow.
+                let moved = match apply {
+                    true => {
+                        move_files(&planned, &to).await?;
+                        let moved = sessions.reassign_owner(name, &to, &from.tag())?;
+                        let unplanned: Vec<_> = moved
+                            .iter()
+                            .filter(|session| !planned.contains(session))
+                            .cloned()
+                            .collect();
+                        move_files(&unplanned, &to).await?;
+                        moved
+                    }
+                    false => planned,
                 };
                 for session in moved {
-                    if apply {
-                        crate::desk_attachments::move_session_files(
-                            &session.session_id,
-                            &to,
-                            &session.channel,
-                        )
-                        .await?;
-                    }
                     if session.renamed {
                         tally.conflicts.push(format!(
                             "{}: both had a conversation open here; theirs continues on {}",
@@ -192,8 +198,10 @@ impl Holding for Sessions {
                     .get(&session.id)?
                     .map(|full| driver_homes(&full))
                     .unwrap_or_default();
-                sessions.delete(&session.id)?;
+                // Its files go first: a pass that fails between the two
+                // finds the session again and finishes.
                 crate::desk_attachments::forget_session_files(&session.id).await?;
+                sessions.delete(&session.id)?;
                 for driver in drivers {
                     remove_path(&homes.join(format!(".codex-{driver}")))?;
                 }
@@ -201,6 +209,15 @@ impl Holding for Sessions {
         }
         Ok(tally)
     }
+}
+
+/// Move the files of each of `sessions` to `owner`, on its channel.
+async fn move_files(sessions: &[workforce_common::session::Reassigned], owner: &str) -> Result<()> {
+    for session in sessions {
+        crate::desk_attachments::move_session_files(&session.session_id, owner, &session.channel)
+            .await?;
+    }
+    Ok(())
 }
 
 /// The Codex homes a session's coding rounds kept, which hold the login of
