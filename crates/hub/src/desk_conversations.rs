@@ -42,9 +42,10 @@ const HUB_NOTES: &[&str] = &[
 
 /// What a transcript entry shows in the conversation, if it is one of its
 /// messages: said by the person or by `agent`, not tool chatter, a system
-/// prompt or a note the hub left for the model. The text is what the live
-/// channel sends: secret markers as previews, credentials redacted; the
-/// files its mark names are its attachments. A person's message is theirs
+/// prompt or a note the hub left for the model; a file delivered without a
+/// caption is one, with no text. The text is what the live channel sends:
+/// secret markers as previews, credentials redacted; the files its mark
+/// names are its attachments. A person's message is theirs
 /// until [`with_authors`] says otherwise.
 fn said(entry: &TranscriptEntry, agent: &Speaker) -> Option<Said> {
     let (from, author) = match entry.role {
@@ -53,8 +54,12 @@ fn said(entry: &TranscriptEntry, agent: &Speaker) -> Option<Said> {
         MessageRole::System | MessageRole::Tool => return None,
     };
     let text = entry.content.trim();
+    let carries_files = entry
+        .desk
+        .as_ref()
+        .is_some_and(|mark| !mark.files.is_empty());
     if entry.tool_metadata.is_some()
-        || text.is_empty()
+        || (text.is_empty() && !carries_files)
         || HUB_NOTES.iter().any(|note| text.starts_with(note))
     {
         return None;
@@ -695,7 +700,27 @@ mod tests {
             ..DeskMark::default()
         });
         store.save(&session).unwrap();
+        session.add_assistant_message("", 0);
+        session.messages.last_mut().unwrap().desk = Some(DeskMark {
+            delivery: Some(DeliveryKind::File),
+            files: vec![report.clone()],
+            ..DeskMark::default()
+        });
+        session.add_assistant_message("", 0);
+        store.save(&session).unwrap();
         let read = page(&store, &scout(), ME, DESK_CHANNEL, Cursor::Newest, 10).unwrap();
+        assert_eq!(
+            read.messages.len(),
+            2,
+            "an uncaptioned file is a message, an empty one isn't"
+        );
+        assert_eq!(
+            (
+                read.messages[1].text.as_str(),
+                read.messages[1].attachments.len()
+            ),
+            ("", 1)
+        );
         let said = &read.messages[0];
         assert_eq!(said.attachments, vec![(&report).into()]);
         assert_eq!(
