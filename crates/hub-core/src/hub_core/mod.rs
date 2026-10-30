@@ -29,6 +29,7 @@ pub mod local_agent_registry;
 pub mod logins;
 pub mod memory;
 pub mod monitors;
+pub mod node_relay;
 pub mod origins;
 pub mod owners;
 pub mod permissions_audit;

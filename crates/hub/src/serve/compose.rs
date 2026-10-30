@@ -870,9 +870,7 @@ pub(super) async fn build_inner(
         local_agents: if let Some(shared) = shared_local_agents {
             Some(shared)
         } else if config.local_agents.enabled {
-            Some(Arc::new(
-                crate::hub_core::local_agent_registry::LocalAgentRegistry::new(),
-            ))
+            Some(crate::hub_core::local_agent_registry::LocalAgentRegistry::new())
         } else {
             None
         },

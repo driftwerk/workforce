@@ -5052,6 +5052,15 @@ rules:
                 )
                 .spawn(leader_flag.clone(), background_cancel.clone());
             }
+            // A person's nodes reach their turns on every instance: presence
+            // is kept in Postgres, and calls go over NATS.
+            let local_agents = shared_local_agents
+                .clone()
+                .unwrap_or_else(workforce_hub::local_agent_registry::LocalAgentRegistry::new);
+            let _node_upkeep = local_agents.attach(
+                nats_for_gateway.clone(),
+                workforce_hub::node_presence::open(&wf_config).await,
+            );
             let gateway_state = Arc::new(workforce_hub::gateway::GatewayState {
                 registry: Arc::clone(&registry),
                 nats: nats_for_gateway.clone(),
@@ -5065,11 +5074,7 @@ rules:
                 drain_token: drain_token.clone(),
                 node_invoke_pending,
                 orchestrator,
-                local_agents: shared_local_agents.clone().unwrap_or_else(|| {
-                    std::sync::Arc::new(
-                        workforce_hub::local_agent_registry::LocalAgentRegistry::new(),
-                    )
-                }),
+                local_agents,
                 voice_listeners: Arc::clone(&voice_listeners),
                 vault: global_vault.clone(),
                 artifact_store: workforce_hub::serve::shared_artifact_store(&wf_config).await,

@@ -83,7 +83,7 @@ impl GatewayParts {
             drain_token: tokio_util::sync::CancellationToken::new(),
             node_invoke_pending: Arc::default(),
             orchestrator: None,
-            local_agents: Arc::new(workforce_hub::local_agent_registry::LocalAgentRegistry::new()),
+            local_agents: workforce_hub::local_agent_registry::LocalAgentRegistry::new(),
             voice_listeners: Arc::new(workforce_hub::voice_announce::VoiceListeners::default()),
             vault: self.vault,
             artifact_store: None,

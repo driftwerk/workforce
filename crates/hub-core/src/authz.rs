@@ -1492,14 +1492,15 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
         registry
             .register(
-                NodeHello {
-                    id: "authz-mac".into(),
-                    name: "Mac".into(),
-                    capabilities: vec![],
-                    tools: vec![tool("files_read", true), tool("desk_start", false)],
-                },
+                NodeHello::agent(
+                    "authz-mac".into(),
+                    "Mac".into(),
+                    vec![],
+                    vec![tool("files_read", true), tool("desk_start", false)],
+                ),
                 "alice".into(),
                 tx,
+                vec![],
             )
             .await
             .unwrap();

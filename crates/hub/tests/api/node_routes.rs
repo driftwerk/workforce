@@ -13,7 +13,7 @@ use workforce_agent::runner::CURRENT_USER_ID;
 use workforce_agent::tools::Tool;
 use workforce_hub::agent_registry::AgentRegistry;
 use workforce_hub::gateway::GatewayState;
-use workforce_hub::local_agent_tool::NodeTool;
+use workforce_hub::local_agent_tool::{LocalAgentExecTool, NodeTool};
 use workforce_identity::sqlite::SqliteIdentityStore;
 use workforce_identity::store::IdentityStore;
 use workforce_identity::types::{Identity, IdentityRole, IdentityStatus};
@@ -345,4 +345,56 @@ async fn a_node_replaces_its_tools_with_an_update() {
         .offered(&hub.alice, "node.studio.desk_start")
         .await
         .is_some());
+}
+
+/// The hub's own `exec.run`, which a selected node stands in for.
+struct HubExec;
+
+#[async_trait::async_trait]
+impl Tool for HubExec {
+    fn name(&self) -> &str {
+        "exec.run"
+    }
+    fn description(&self) -> &str {
+        "Run on the hub"
+    }
+    fn input_schema(&self) -> Value {
+        json!({"type": "object"})
+    }
+    async fn execute(&self, _: Value) -> eyre::Result<workforce_agent::tools::ToolResult> {
+        Ok(workforce_agent::tools::ToolResult::success(
+            json!("ran on the hub"),
+            0,
+        ))
+    }
+}
+
+/// A command for the selected node runs there over the socket, and its
+/// output comes back as the call's.
+#[tokio::test]
+async fn an_exec_runs_on_the_selected_node_over_the_socket() {
+    let hub = Hub::new().await;
+    let (mut node, _) = hub.node(&hub.tokens[0], "studio", json!([])).await;
+    let exec = LocalAgentExecTool::new(
+        Arc::clone(&hub.state.local_agents),
+        "studio".into(),
+        Arc::new(HubExec),
+    );
+    let call = tokio::spawn(CURRENT_USER_ID.scope(hub.alice.id.to_string(), async move {
+        exec.execute(json!({"command": "npm test", "workdir": "~/dev/acme-web"}))
+            .await
+    }));
+    let asked = next(&mut node).await.unwrap();
+    assert_eq!(asked["type"], "local_exec");
+    assert_eq!(asked["command"], "npm test");
+    send(
+        &mut node,
+        json!({"type": "local_exec_result", "request_id": asked["request_id"], "ok": true,
+               "stdout": "12 passed", "exit_code": 0}),
+    )
+    .await;
+    let ran = call.await.unwrap().unwrap();
+    assert!(ran.success, "{:?}", ran.error);
+    assert_eq!(ran.output["stdout"], "12 passed");
+    assert_eq!(ran.output["agent_id"], "studio");
 }

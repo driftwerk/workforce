@@ -21,6 +21,7 @@ fn main() {
     workforce_build_support::track_dir("migrations_floor");
     workforce_build_support::track_dir("migrations_pictures");
     workforce_build_support::track_dir("migrations_surface");
+    workforce_build_support::track_dir("migrations_nodes");
     let dist = Path::new("../../ui/dist");
     if !dist.exists() {
         let _ = std::fs::create_dir_all(dist);

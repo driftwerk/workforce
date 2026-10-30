@@ -1069,6 +1069,47 @@ pub struct NodeToolResult {
     pub error: Option<String>,
 }
 
+/// What a resumable node is doing with a call it holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NodeToolState {
+    /// Waiting for its person to decide on the node.
+    Asking,
+    Running,
+}
+
+/// Node → Gateway: a call it holds moved on, before its result.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeToolStatus {
+    #[serde(rename = "type")]
+    pub msg_type: String,
+    pub request_id: String,
+    pub state: NodeToolState,
+    /// What its person is asked, while `asking`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ask: Option<String>,
+}
+
+/// Node → Gateway: the latest line a running call printed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeToolProgress {
+    #[serde(rename = "type")]
+    pub msg_type: String,
+    pub request_id: String,
+    pub line: String,
+    /// How many lines it has printed so far.
+    pub lines: u32,
+}
+
+/// Gateway → Node: send everything about a call it holds again, from the
+/// start: someone waits for it anew.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeToolCollect {
+    #[serde(rename = "type")]
+    pub msg_type: String,
+    pub request_id: String,
+}
+
 /// Gateway → Local Agent: the connection is refused, and why. The gateway
 /// closes it next; connecting again the same way is refused the same way.
 #[derive(Debug, Clone, Serialize, Deserialize)]

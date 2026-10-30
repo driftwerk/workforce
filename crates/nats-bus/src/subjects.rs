@@ -123,6 +123,22 @@ pub fn turn_control(agent_id: &str, session_id: &str) -> String {
     format!("workforce.hub.control.{agent_id}.{session_id}")
 }
 
+// ── Node subjects ───────────────────────────────────────────────────
+
+/// Subject for reaching a person's node (request/reply). Only the instance
+/// holding the node's connection subscribes, so a request with nobody
+/// holding it fails fast with no responders. Outside every stream, as
+/// [`turn_control`] is.
+pub fn node(key: &str) -> String {
+    format!("workforce.hub.node.{key}")
+}
+
+/// Subject the holder of a node publishes one call's events to. The caller
+/// mints the request id, a UUID, and subscribes before it sends the call.
+pub fn node_reply(request_id: &str) -> String {
+    format!("workforce.hub.node.reply.{request_id}")
+}
+
 // ── Voice subjects ──────────────────────────────────────────────────
 
 /// Subject for voice announcements (request/reply pattern). Every hub
@@ -169,10 +185,7 @@ pub fn all_system_messages() -> String {
 mod tests {
     use super::*;
 
-    #[test]
-    fn turn_control_is_outside_every_stream() {
-        let subject = turn_control("dev-1", "sess-1");
-        assert_eq!(subject, "workforce.hub.control.dev-1.sess-1");
+    fn assert_outside_every_stream(subject: &str) {
         crate::streams::STREAMED_SUBJECTS
             .iter()
             .map(|wildcard| wildcard.trim_end_matches('>'))
@@ -182,6 +195,30 @@ mod tests {
                     "{subject} is captured by {root}>"
                 )
             });
+    }
+
+    #[test]
+    fn turn_control_is_outside_every_stream() {
+        let subject = turn_control("dev-1", "sess-1");
+        assert_eq!(subject, "workforce.hub.control.dev-1.sess-1");
+        assert_outside_every_stream(&subject);
+    }
+
+    #[test]
+    fn node_subjects_are_outside_every_stream() {
+        let request_id = "6f1c2e4a-0b7d-4c1e-9a55-3f2d8e9b1a00";
+        assert_eq!(node("studio"), "workforce.hub.node.studio");
+        assert_eq!(
+            node_reply(request_id),
+            format!("workforce.hub.node.reply.{request_id}")
+        );
+        for subject in [
+            node("studio"),
+            node("desk:0b6a5f3e-1c2d-4e5f-8a9b-0c1d2e3f4a5b"),
+            node_reply(request_id),
+        ] {
+            assert_outside_every_stream(&subject);
+        }
     }
 
     #[test]

@@ -49,7 +49,7 @@ pub(crate) fn fixture_with(enabled: bool, bind_tokens: bool) -> Fixture {
         drain_token: tokio_util::sync::CancellationToken::new(),
         node_invoke_pending: Arc::default(),
         orchestrator: None,
-        local_agents: Arc::new(crate::local_agent_registry::LocalAgentRegistry::new()),
+        local_agents: crate::local_agent_registry::LocalAgentRegistry::new(),
         voice_listeners: Arc::new(crate::voice_announce::VoiceListeners::default()),
         vault: None,
         artifact_store: None,
