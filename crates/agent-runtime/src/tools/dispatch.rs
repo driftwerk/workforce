@@ -28,12 +28,13 @@ use crate::tools::registry::ToolRegistry;
 use crate::tools::{Destination, RateLimit, SurfaceEffect};
 use workforce_common::channels::CHAT_SURFACE_PLATFORMS;
 
-/// The destinations each person has said an agent may always write to from
-/// their Desk turns without asking: the surface gate's own allow list, kept
-/// apart from the permission system so it holds with that system off.
+/// The writes each person has said an agent may always make from their
+/// Desk turns without asking, each one tool's to one destination: the
+/// surface gate's own allow list, kept apart from the permission system so
+/// it holds with that system off.
 pub trait SurfaceAllows: Send + Sync {
-    fn allows(&self, person: &str, agent: &str, to: &Destination) -> bool;
-    fn allow(&self, person: &str, agent: &str, to: &Destination) -> eyre::Result<()>;
+    fn allows(&self, person: &str, agent: &str, tool: &str, to: &Destination) -> bool;
+    fn allow(&self, person: &str, agent: &str, tool: &str, to: &Destination) -> eyre::Result<()>;
 }
 
 /// The authorisation inputs a tool call is gated with, detached from the
@@ -125,6 +126,7 @@ pub fn gate_tool_call(
                 gates.surface_allows.as_deref(),
                 current_user_id().as_deref(),
                 gates.agent_id.as_str(),
+                tool_name,
                 to.as_ref(),
             ))
         },
@@ -472,15 +474,17 @@ pub enum Kept {
     Unkeepable,
 }
 
-/// What `person` has kept on `allows` for `agent` writing to `to`.
+/// What `person` has kept on `allows` for `agent` writing to `to` with
+/// `tool`.
 pub fn kept(
     allows: Option<&dyn SurfaceAllows>,
     person: Option<&str>,
     agent: &str,
+    tool: &str,
     to: Option<&Destination>,
 ) -> Kept {
     match (allows, person, to) {
-        (Some(allows), Some(person), Some(to)) => match allows.allows(person, agent, to) {
+        (Some(allows), Some(person), Some(to)) => match allows.allows(person, agent, tool, to) {
             true => Kept::Allowed,
             false => Kept::NotYet,
         },
@@ -1726,23 +1730,30 @@ mod tests {
         ));
     }
 
-    /// An allow list keyed as the store would: person, agent, destination.
+    /// An allow list keyed as the store would: person, agent, tool,
+    /// destination.
     #[derive(Default)]
-    struct Allows(Mutex<std::collections::HashSet<(String, String, Destination)>>);
+    struct Allows(Mutex<std::collections::HashSet<(String, String, String, Destination)>>);
 
     impl SurfaceAllows for Allows {
-        fn allows(&self, person: &str, agent: &str, to: &Destination) -> bool {
+        fn allows(&self, person: &str, agent: &str, tool: &str, to: &Destination) -> bool {
             self.0
                 .lock()
                 .unwrap()
-                .contains(&(person.into(), agent.into(), to.clone()))
+                .contains(&(person.into(), agent.into(), tool.into(), to.clone()))
         }
 
-        fn allow(&self, person: &str, agent: &str, to: &Destination) -> eyre::Result<()> {
+        fn allow(
+            &self,
+            person: &str,
+            agent: &str,
+            tool: &str,
+            to: &Destination,
+        ) -> eyre::Result<()> {
             self.0
                 .lock()
                 .unwrap()
-                .insert((person.into(), agent.into(), to.clone()));
+                .insert((person.into(), agent.into(), tool.into(), to.clone()));
             Ok(())
         }
     }
@@ -1764,21 +1775,16 @@ mod tests {
             surface_allows: Some(allows.clone()),
             ..gates(&calls, None, CascadeState::Allow)
         };
-        let gate = |g: &ToolGates, user: &'static str| {
+        let gate_with = |g: &ToolGates, user: &'static str, tool: &'static str| {
             let post = serde_json::json!({"channel": "C1", "text": "hi"});
             let g = g.clone();
             crate::runner::with_desk(Some(desk(true)), async move {
                 CURRENT_USER_ID.sync_scope(user.to_string(), || {
-                    gate_tool_call(
-                        &g,
-                        &permissive_policy(),
-                        &surfaced_tools(),
-                        "messaging.send",
-                        &post,
-                    )
+                    gate_tool_call(&g, &permissive_policy(), &surfaced_tools(), tool, &post)
                 })
             })
         };
+        let gate = |g: &ToolGates, user: &'static str| gate_with(g, user, "messaging.send");
         let first = gate(&g, "alice").await;
         let GateOutcome::RequireApproval {
             allow_save_allow,
@@ -1791,11 +1797,20 @@ mod tests {
         assert!(allow_save_allow, "Always allow is offered where it is kept");
         let to = holds.expect("the destination Always allow would keep");
         assert_eq!(to, Destination::of("slack", "C1").unwrap());
-        allows.allow("alice", "agent", &to).unwrap();
+        allows
+            .allow("alice", "agent", "messaging.send", &to)
+            .unwrap();
         assert!(matches!(
             gate(&g, "alice").await,
             GateOutcome::Execute { .. }
         ));
+        assert!(
+            matches!(
+                gate_with(&g, "alice", "slack.update_message").await,
+                GateOutcome::RequireApproval { .. }
+            ),
+            "nor another tool's writes there"
+        );
         assert!(
             matches!(gate(&g, "bob").await, GateOutcome::RequireApproval { .. }),
             "another person's allow is not theirs"

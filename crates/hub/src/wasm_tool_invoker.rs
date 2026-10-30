@@ -252,6 +252,7 @@ impl HubSkillToolInvoker {
                     crate::desk_surface::allows().as_deref(),
                     ctx.user_id.as_deref(),
                     &ctx.agent_id,
+                    tool,
                     effect.as_ref().and_then(|e| e.destination()).as_ref(),
                 )
             },

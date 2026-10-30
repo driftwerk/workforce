@@ -421,7 +421,9 @@ async fn a_person_sees_and_revokes_their_own_always_allows_alone() {
             .unwrap();
         let store = Arc::new(PgSurfaceAllows::with_pool(pool).await.unwrap());
         let ops = Destination::of("slack", "#ops").unwrap();
-        store.allow(&alice.id.to_string(), "scout", &ops).unwrap();
+        store
+            .allow(&alice.id.to_string(), "scout", "slack.send", &ops)
+            .unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let app = workforce_hub::surface_allows::router(Arc::clone(&gateway.state), Some(store));
@@ -434,10 +436,16 @@ async fn a_person_sees_and_revokes_their_own_always_allows_alone() {
         assert_eq!(
             (
                 &allows[0]["agentId"],
+                &allows[0]["tool"],
                 &allows[0]["platform"],
                 &allows[0]["destination"]
             ),
-            (&json!("scout"), &json!("slack"), &json!("ops"))
+            (
+                &json!("scout"),
+                &json!("slack.send"),
+                &json!("slack"),
+                &json!("ops")
+            )
         );
         let id = allows[0]["id"].as_str().unwrap().to_string();
         let (_, theirs) = get(addr, "/api/desk/allows", Some(&token_for(&bob))).await;

@@ -2067,8 +2067,8 @@ pub async fn render_viewed(
 /// answered runs, so the cascade re-evaluating that call already sees it.
 /// What a person is asked of a call the gates hold, and where an "Always"
 /// answer is kept. A write the surface gate holds offers no Always deny, and
-/// its Always allow is kept on the allow list for its destination and this
-/// agent; any other call's choice is the permission system's.
+/// its Always allow is kept on the allow list for its tool, its destination
+/// and this agent; any other call's choice is the permission system's.
 pub fn held_prompt(
     allow_save_allow: bool,
     holds: Option<crate::tools::Destination>,
@@ -2097,8 +2097,8 @@ pub fn held_prompt(
 }
 
 /// Where "Always allow" on a write the surface gate held is kept: on the
-/// person's allow list, for the write's destination and this agent alone.
-/// No other choice is kept for it.
+/// person's allow list, for the write's tool and destination and this agent
+/// alone. No other choice is kept for it.
 struct KeepAllowed {
     allows: Arc<dyn crate::tools::dispatch::SurfaceAllows>,
     agent: String,
@@ -2110,12 +2110,12 @@ impl PermissionWriter for KeepAllowed {
     async fn persist_user_choice(
         &self,
         user_id: &str,
-        _tool_name: &str,
+        tool_name: &str,
         choice: workforce_core::policy::PermissionChoice,
     ) -> eyre::Result<()> {
         match choice {
             workforce_core::policy::PermissionChoice::AllowAlways => {
-                self.allows.allow(user_id, &self.agent, &self.to)
+                self.allows.allow(user_id, &self.agent, tool_name, &self.to)
             }
             _ => Ok(()),
         }
@@ -7538,22 +7538,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn always_allowing_a_held_write_keeps_its_destination_and_nothing_else() {
+    async fn always_allowing_a_held_write_keeps_its_tool_and_destination_and_nothing_else() {
+        type Allowed = (String, String, String, crate::tools::Destination);
         #[derive(Default)]
-        struct Kept(parking_lot::Mutex<Vec<(String, String, crate::tools::Destination)>>);
+        struct Kept(parking_lot::Mutex<Vec<Allowed>>);
         impl crate::tools::dispatch::SurfaceAllows for Kept {
-            fn allows(&self, _: &str, _: &str, _: &crate::tools::Destination) -> bool {
+            fn allows(&self, _: &str, _: &str, _: &str, _: &crate::tools::Destination) -> bool {
                 false
             }
             fn allow(
                 &self,
                 person: &str,
                 agent: &str,
+                tool: &str,
                 to: &crate::tools::Destination,
             ) -> eyre::Result<()> {
                 self.0
                     .lock()
-                    .push((person.into(), agent.into(), to.clone()));
+                    .push((person.into(), agent.into(), tool.into(), to.clone()));
                 Ok(())
             }
         }
@@ -7578,7 +7580,12 @@ mod tests {
         .await;
         assert_eq!(
             *kept.0.lock(),
-            vec![("alice".to_string(), "scout".to_string(), to)]
+            vec![(
+                "alice".to_string(),
+                "scout".to_string(),
+                "messaging.send".to_string(),
+                to
+            )]
         );
     }
 

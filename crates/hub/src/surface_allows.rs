@@ -1,7 +1,7 @@
-//! The surface gate's allow list: the destinations a person has said an
-//! agent may always write to from their Desk turns without asking, kept per
-//! person, agent, platform and destination in its own table (schema
-//! `surface`), apart from the permission system so it holds with that off.
+//! The surface gate's allow list: the writes a person has said an agent may
+//! always make from their Desk turns without asking, kept per person, agent,
+//! tool, platform and destination in its own table (schema `surface`), apart
+//! from the permission system so it holds with that off.
 //! A person sees and revokes their own through `GET /api/desk/allows` and
 //! `DELETE /api/desk/allows/{id}`.
 
@@ -48,12 +48,13 @@ impl MigrationRun for Migrations {
     }
 }
 
-/// One destination a person always allows an agent to write to.
+/// One tool's writes to one destination a person always allows an agent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Allow {
     pub id: Uuid,
     pub agent_id: String,
+    pub tool: String,
     pub platform: String,
     pub destination: String,
     pub created_at: DateTime<Utc>,
@@ -63,6 +64,7 @@ fn allow_of(row: &Row) -> Result<Allow> {
     Ok(Allow {
         id: row.try_get("id")?,
         agent_id: row.try_get("agent_id")?,
+        tool: row.try_get("tool")?,
         platform: row.try_get("platform")?,
         destination: row.try_get("destination")?,
         created_at: row.try_get("created_at")?,
@@ -98,27 +100,48 @@ impl PgSurfaceAllows {
         Ok(Self { pool })
     }
 
-    /// Whether `person` always allows `agent` to write to `to`.
-    pub async fn allowed(&self, person: &str, agent: &str, to: &Destination) -> Result<bool> {
+    /// Whether `person` always allows `agent` to write to `to` with `tool`.
+    pub async fn allowed(
+        &self,
+        person: &str,
+        agent: &str,
+        tool: &str,
+        to: &Destination,
+    ) -> Result<bool> {
         let conn = self.pool.get().await?;
         let row = conn
             .query_opt(
                 "SELECT 1 FROM allows \
-                 WHERE person = $1 AND agent_id = $2 AND platform = $3 AND destination = $4",
-                &[&person, &agent, &to.platform, &to.target],
+                 WHERE person = $1 AND agent_id = $2 AND tool = $3 \
+                   AND platform = $4 AND destination = $5",
+                &[&person, &agent, &tool, &to.platform, &to.target],
             )
             .await?;
         Ok(row.is_some())
     }
 
-    /// `person` always allows `agent` to write to `to` from now on.
-    pub async fn keep(&self, person: &str, agent: &str, to: &Destination) -> Result<()> {
+    /// `person` always allows `agent` to write to `to` with `tool` from now
+    /// on.
+    pub async fn keep(
+        &self,
+        person: &str,
+        agent: &str,
+        tool: &str,
+        to: &Destination,
+    ) -> Result<()> {
         let conn = self.pool.get().await?;
         conn.execute(
-            "INSERT INTO allows (id, person, agent_id, platform, destination, created_at) \
-             VALUES ($1, $2, $3, $4, $5, now()) \
-             ON CONFLICT (person, agent_id, platform, destination) DO NOTHING",
-            &[&Uuid::new_v4(), &person, &agent, &to.platform, &to.target],
+            "INSERT INTO allows (id, person, agent_id, tool, platform, destination, created_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, now()) \
+             ON CONFLICT (person, agent_id, tool, platform, destination) DO NOTHING",
+            &[
+                &Uuid::new_v4(),
+                &person,
+                &agent,
+                &tool,
+                &to.platform,
+                &to.target,
+            ],
         )
         .await?;
         Ok(())
@@ -128,7 +151,7 @@ impl PgSurfaceAllows {
     pub async fn of(&self, person: &str) -> Result<Vec<Allow>> {
         let conn = self.pool.get().await?;
         conn.query(
-            "SELECT id, agent_id, platform, destination, created_at FROM allows \
+            "SELECT id, agent_id, tool, platform, destination, created_at FROM allows \
              WHERE person = $1 ORDER BY created_at DESC",
             &[&person],
         )
@@ -180,14 +203,14 @@ impl PgSurfaceAllows {
 
 impl SurfaceAllows for PgSurfaceAllows {
     /// A lookup that fails is no allow: the write is asked about.
-    fn allows(&self, person: &str, agent: &str, to: &Destination) -> bool {
-        self.block_on(self.allowed(person, agent, to))
+    fn allows(&self, person: &str, agent: &str, tool: &str, to: &Destination) -> bool {
+        self.block_on(self.allowed(person, agent, tool, to))
             .inspect_err(|e| warn!(error = %format!("{e:#}"), "reading the surface allows failed"))
             .unwrap_or(false)
     }
 
-    fn allow(&self, person: &str, agent: &str, to: &Destination) -> Result<()> {
-        self.block_on(self.keep(person, agent, to))
+    fn allow(&self, person: &str, agent: &str, tool: &str, to: &Destination) -> Result<()> {
+        self.block_on(self.keep(person, agent, tool, to))
     }
 }
 
@@ -317,42 +340,48 @@ mod tests {
     use super::*;
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn an_allow_is_one_persons_for_one_agent_and_destination_until_revoked() {
+    async fn an_allow_is_one_persons_for_one_agent_tool_and_destination_until_revoked() {
         with_test_pool(PgSurfaceAllows::build_pool, |pool| async move {
             let store = PgSurfaceAllows::with_pool(pool).await.unwrap();
             let ops = Destination::of("slack", "#ops").unwrap();
             let other = Destination::of("slack", "#general").unwrap();
-            assert!(!store.allows("alice", "scout", &ops));
-            store.allow("alice", "scout", &ops).unwrap();
-            store.allow("alice", "scout", &ops).unwrap();
-            assert!(store.allows("alice", "scout", &ops));
+            let send = "slack.send";
+            assert!(!store.allows("alice", "scout", send, &ops));
+            store.allow("alice", "scout", send, &ops).unwrap();
+            store.allow("alice", "scout", send, &ops).unwrap();
+            assert!(store.allows("alice", "scout", send, &ops));
             assert!(
-                !store.allows("alice", "scout", &other),
+                !store.allows("alice", "scout", "slack.archive_channel", &ops),
+                "another tool"
+            );
+            assert!(
+                !store.allows("alice", "scout", send, &other),
                 "another destination"
             );
-            assert!(!store.allows("alice", "atlas", &ops), "another agent");
-            assert!(!store.allows("bob", "scout", &ops), "another person");
+            assert!(!store.allows("alice", "atlas", send, &ops), "another agent");
+            assert!(!store.allows("bob", "scout", send, &ops), "another person");
             let kept = store.of("alice").await.unwrap();
             assert_eq!(kept.len(), 1, "kept once");
             assert_eq!(
                 (
                     kept[0].agent_id.as_str(),
+                    kept[0].tool.as_str(),
                     kept[0].platform.as_str(),
                     kept[0].destination.as_str()
                 ),
-                ("scout", "slack", "ops")
+                ("scout", send, "slack", "ops")
             );
             assert!(store.of("bob").await.unwrap().is_empty());
             assert!(
                 !store.revoke("bob", kept[0].id).await.unwrap(),
                 "not bob's to revoke"
             );
-            assert!(store.allows("alice", "scout", &ops));
+            assert!(store.allows("alice", "scout", send, &ops));
             assert!(store.revoke("alice", kept[0].id).await.unwrap());
-            assert!(!store.allows("alice", "scout", &ops));
-            store.allow("alice", "scout", &ops).unwrap();
-            store.allow("alice", "atlas", &other).unwrap();
-            store.allow("bob", "scout", &ops).unwrap();
+            assert!(!store.allows("alice", "scout", send, &ops));
+            store.allow("alice", "scout", send, &ops).unwrap();
+            store.allow("alice", "atlas", send, &other).unwrap();
+            store.allow("bob", "scout", send, &ops).unwrap();
             assert_eq!(
                 store.holders().await.unwrap(),
                 std::collections::BTreeMap::from([
@@ -362,7 +391,7 @@ mod tests {
             );
             assert_eq!(store.forget("alice").await.unwrap(), 2);
             assert!(store.of("alice").await.unwrap().is_empty());
-            assert!(store.allows("bob", "scout", &ops), "another's stay");
+            assert!(store.allows("bob", "scout", send, &ops), "another's stay");
         })
         .await;
     }
