@@ -764,6 +764,10 @@ const COMPACTION_SUMMARY_PREFIX: &str = "[Compaction Summary";
 /// Session metadata key holding [`Session::desk_origin`].
 const DESK_ORIGIN_KEY: &str = "desk_origin";
 
+/// Session metadata a Desk room's conversation is stamped with once the room
+/// is gone: `{"at", "name", "copied": [message ids]}`.
+pub const DESK_CLOSED_KEY: &str = "desk_closed";
+
 /// Sentinel prefix for the `owner` of a shared (multi-human) conversation. A
 /// shared session is keyed by thread rather than by a single user, so its
 /// `owner` is `shared:{thread_root}` — a value no real identity or device id
@@ -1183,6 +1187,7 @@ impl Session {
     pub fn adopt_conversation_mode(&mut self, from: &Session) {
         for key in [
             DESK_ORIGIN_KEY,
+            DESK_CLOSED_KEY,
             "voice_mode",
             "voice_turn",
             "tts_provider",
@@ -6731,6 +6736,15 @@ mod tests {
         });
         let mut successor = Session::new("ios", "u", "agent");
         successor.adopt_conversation_mode(&from);
+        let mut room = Session::new("desk:planning", "u", "agent");
+        room.metadata = serde_json::json!({ DESK_CLOSED_KEY: {"name": "Planning"} });
+        let mut room_successor = Session::new("desk:planning", "u", "agent");
+        room_successor.adopt_conversation_mode(&room);
+        assert_eq!(
+            room_successor.metadata.get(DESK_CLOSED_KEY),
+            room.metadata.get(DESK_CLOSED_KEY),
+            "a room deleted stays closed in what follows on"
+        );
 
         assert!(successor.is_voice());
         assert!(successor.is_voice_turn());

@@ -39,9 +39,7 @@ impl<'a> From<&'a std::sync::Arc<AgentService>> for Outbox<'a> {
     }
 }
 
-/// Session metadata a room's conversation is stamped with once the room is
-/// gone: `{"at", "name", "copied": [message ids]}`.
-pub(crate) const CLOSED_KEY: &str = "desk_closed";
+pub(crate) use workforce_common::session::DESK_CLOSED_KEY as CLOSED_KEY;
 
 /// One message to deliver.
 #[derive(Debug, Clone)]
