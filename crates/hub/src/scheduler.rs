@@ -23,12 +23,28 @@ pub use crate::hub_core::schedules::{
 use crate::serve::AgentService;
 use workforce_common::channels::desk::DeliveryKind;
 
-/// Whether `job` was made in a Desk conversation, which its output goes to.
-fn desk_targeted(job: &ScheduledJob) -> bool {
+/// The Slack channel `job` names for its result, if it names one.
+fn named_channel(job: &ScheduledJob) -> Option<&str> {
+    match &job.payload {
+        JobPayload::AgentTurn { channel_id, .. } | JobPayload::SystemEvent { channel_id, .. } => {
+            channel_id.as_deref().filter(|c| !c.is_empty())
+        }
+        _ => None,
+    }
+}
+
+/// The Desk conversation `job` was made in, which its output goes to unless
+/// it names a Slack channel of its own.
+fn desk_target(job: &ScheduledJob) -> Option<&workforce_common::channels::desk::DeskTarget> {
     job.deliver_to
         .as_ref()
         .and_then(DeliveryTarget::desk_target)
-        .is_some()
+        .filter(|_| named_channel(job).is_none())
+}
+
+/// Whether `job`'s output goes to the Desk conversation it was made in.
+fn desk_targeted(job: &ScheduledJob) -> bool {
+    desk_target(job).is_some()
 }
 
 /// [`ScheduledJob::edited_by`] for a save through the scheduler tool in a
@@ -1608,12 +1624,7 @@ impl Scheduler {
     /// connects, so Desk being closed is no failure. `false` for a job made
     /// elsewhere, or when the conversation could not be written.
     async fn deliver_via_desk(&self, job: &ScheduledJob, kind: DeliveryKind, text: &str) -> bool {
-        let (Some(target), Some(owner)) = (
-            job.deliver_to
-                .as_ref()
-                .and_then(DeliveryTarget::desk_target),
-            job.owner(),
-        ) else {
+        let (Some(target), Some(owner)) = (desk_target(job), job.owner()) else {
             return false;
         };
         match crate::desk_surface::deliver(
@@ -6254,6 +6265,48 @@ mod tests {
         for id in [upserted, ensured] {
             assert_eq!(sched.get_job(&id).await.unwrap().deliver_to, None);
         }
+    }
+
+    /// A job made in Desk that names a Slack channel for its result posts
+    /// it there, as the person asked; one that names none answers in Desk.
+    #[tokio::test]
+    async fn a_desk_job_naming_a_slack_channel_posts_its_result_there() {
+        let sched = test_scheduler().await;
+        let slack = crate::serve::testing::SentToSlack::on(&sched.service()).await;
+        let scope = desk_thread();
+        let event = |channel_id: Option<&str>| JobPayload::SystemEvent {
+            text: "the build is green".into(),
+            channel_id: channel_id.map(str::to_string),
+            thread_id: None,
+            user_id: None,
+        };
+        let to_ops =
+            add_job_on_desk(&sched, Some("user-A"), scope.clone(), event(Some("C_OPS"))).await;
+        assert!(sched.run_job_now(&to_ops).await.unwrap().delivered);
+        assert_eq!(
+            slack
+                .sent()
+                .iter()
+                .map(|(channel, _, text)| (channel.as_str(), text.as_str()))
+                .collect::<Vec<_>>(),
+            [("C_OPS", "the build is green")]
+        );
+        assert!(sched
+            .service()
+            .sessions
+            .find(&scope.target.channel, "user-A")
+            .unwrap()
+            .is_none());
+
+        let here = add_job_on_desk(&sched, Some("user-A"), scope.clone(), event(None)).await;
+        assert!(sched.run_job_now(&here).await.unwrap().delivered);
+        assert_eq!(slack.sent().len(), 1, "nothing more went to Slack");
+        assert!(sched
+            .service()
+            .sessions
+            .find(&scope.target.channel, "user-A")
+            .unwrap()
+            .is_some());
     }
 
     #[tokio::test]
