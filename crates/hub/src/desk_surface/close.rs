@@ -63,11 +63,40 @@ pub(crate) fn is_room(channel: &str) -> bool {
     )
 }
 
+/// The most messages one close copies: what a room's Desk never showed is a
+/// handful, and each is looked up through the conversation's chain.
+const MOST_COPIED: usize = 200;
+
+/// How often a stamp is saved again when a concurrent save won the session.
+const STAMP_ATTEMPTS: usize = 5;
+
+/// Stamps session `id` with `closed` through a versioned save, so a save
+/// loaded before it keeps the stamp rather than writing its metadata back;
+/// saved again while a concurrent save won.
+fn stamp(sessions: &dyn SessionStore, id: &str, closed: &Value) -> eyre::Result<()> {
+    for _ in 0..STAMP_ATTEMPTS {
+        let Some(mut head) = sessions.get(id)? else {
+            eyre::bail!("the room's conversation {id} is gone");
+        };
+        if head.metadata.get(CLOSED_KEY) == Some(closed) {
+            return Ok(());
+        }
+        match head.metadata.as_object_mut() {
+            Some(metadata) => {
+                metadata.insert(CLOSED_KEY.to_string(), closed.clone());
+            }
+            None => head.metadata = json!({ CLOSED_KEY: closed }),
+        }
+        sessions.save(&head)?;
+    }
+    eyre::bail!("the room's conversation {id} kept changing while it was closed")
+}
+
 /// Close `owner`'s conversation on the room `channel` ([`is_room`]) with
 /// `service`'s agent: stamp it closed, which sends what delivers there to the
-/// DM from now on, and copy the agent's messages in `undelivered` there. A
-/// message already copied is not copied again. Returns how many were copied
-/// now.
+/// DM from now on, and copy the agent's messages in `undelivered` there, up
+/// to [`MOST_COPIED`]. A message already copied is not copied again. Returns
+/// how many were copied now.
 pub(crate) async fn close(
     service: &AgentService,
     owner: &str,
@@ -75,26 +104,19 @@ pub(crate) async fn close(
     undelivered: &[String],
 ) -> eyre::Result<usize> {
     let sessions = service.sessions.as_ref();
-    let head = sessions.find(channel, owner)?;
-    let name = room_name(head.as_ref(), channel);
+    let Some(head) = sessions.find(channel, owner)? else {
+        return Ok(0);
+    };
+    let name = room_name(Some(&head), channel);
     let mut copied: Vec<String> = head
-        .as_ref()
-        .and_then(|h| h.metadata.get(CLOSED_KEY))
+        .metadata
+        .get(CLOSED_KEY)
         .and_then(|closed| closed.get("copied"))
         .and_then(|ids| serde_json::from_value(ids.clone()).ok())
         .unwrap_or_default();
-    let stamp = |copied: &[String]| {
-        serde_json::Map::from_iter([(
-            CLOSED_KEY.to_string(),
-            json!({ "at": chrono::Utc::now(), "name": name, "copied": copied }),
-        )])
-    };
-    if let Some(head) = &head {
-        sessions.merge_metadata(&head.id, stamp(&copied), &[])?;
-    }
-    let Some(head) = head else {
-        return Ok(0);
-    };
+    let closed =
+        |copied: &[String]| json!({ "at": chrono::Utc::now(), "name": name, "copied": copied });
+    stamp(sessions, &head.id, &closed(&copied))?;
     let room = head.desk_origin().unwrap_or_else(|| DeskTarget {
         place: DeskPlace::LegacyRoom {
             slug: channel.trim_start_matches("desk:").to_string(),
@@ -106,6 +128,7 @@ pub(crate) async fn close(
     let pending: Vec<&String> = undelivered
         .iter()
         .filter(|id| !copied.contains(id))
+        .take(MOST_COPIED)
         .collect();
     let mut fresh = 0;
     for id in pending {
@@ -124,7 +147,7 @@ pub(crate) async fn close(
         .await?;
         copied.push(id.clone());
         fresh += 1;
-        sessions.merge_metadata(&head.id, stamp(&copied), &[])?;
+        stamp(sessions, &head.id, &closed(&copied))?;
     }
     Ok(fresh)
 }
@@ -153,6 +176,34 @@ mod tests {
         assert!(is_room("desk:planning"));
         assert!(is_room(&format!("desk:{}", Uuid::from_u128(1))));
         assert!(!is_room(DESK_CHANNEL) && !is_room("desk:tuple") && !is_room("ios"));
+    }
+
+    /// A delivery or a turn that loaded the conversation before the room
+    /// closed saves after it without writing the stamp away.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_save_loaded_before_the_close_keeps_the_room_closed() {
+        use workforce_common::session_postgres::PostgresSessionStore;
+        workforce_postgres::test_support::with_test_pool(
+            PostgresSessionStore::build_pool,
+            |pool| async move {
+                let store = PostgresSessionStore::with_pool(pool, "scout")
+                    .await
+                    .expect("store");
+                let store: &dyn SessionStore = store.as_ref();
+                let mut head = store.get_or_create("desk:planning", "p1", "scout").unwrap();
+                head.add_user_message("hello", None);
+                store.save(&head).unwrap();
+                let mut loaded = store.get(&head.id).unwrap().unwrap();
+                let closed = json!({ "name": "Planning", "copied": [] });
+                stamp(store, &head.id, &closed).unwrap();
+                loaded.add_assistant_message("delivered", 1);
+                store.save(&loaded).unwrap();
+                let saved = store.get(&head.id).unwrap().unwrap();
+                assert_eq!(saved.metadata.get(CLOSED_KEY), Some(&closed));
+                assert_eq!(saved.messages.len(), 2, "the late save's message is kept");
+            },
+        )
+        .await;
     }
 
     #[test]
