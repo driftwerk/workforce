@@ -349,6 +349,9 @@ pub enum DeliveryKind {
     File,
     Resumed,
     Notice,
+    /// One a newer hub or Desk names, read by one that doesn't know it.
+    #[serde(other)]
+    Other,
 }
 
 /// What a session message is in a Desk conversation, beyond its text.
@@ -781,5 +784,11 @@ mod tests {
         let target: DeskTarget =
             serde_json::from_value(json!({"place": {"kind": "dm"}, "channel": "desk"})).unwrap();
         assert_eq!(target, DeskTarget::dm_of(false));
+        let newer: DeskMark = serde_json::from_value(json!({"delivery": "digest"})).unwrap();
+        assert_eq!(
+            newer.delivery,
+            Some(DeliveryKind::Other),
+            "a kind named later is still read"
+        );
     }
 }
