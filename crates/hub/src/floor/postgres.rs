@@ -333,7 +333,29 @@ fn reading_of(row: &Row) -> Option<Reading> {
     })
 }
 
+/// Holds, to the end of the transaction, the questions of the owner and
+/// subject `s` settles, so two replicas settling one subject at once each
+/// see the other's question.
+async fn lock_subject(db: &impl GenericClient, s: &Settling) -> Result<()> {
+    let key: Option<(Option<String>, String)> = match &s.target {
+        Target::Subject { subject, owner } => Some((owner.clone(), subject.as_str().to_string())),
+        Target::EarlierThan(id) => db
+            .query_opt("SELECT owner, subject FROM turns WHERE id = $1", &[id])
+            .await?
+            .map(|row| (row.get(0), row.get(1))),
+    };
+    if let Some((owner, subject)) = key {
+        db.execute(
+            "SELECT pg_advisory_xact_lock(hashtextextended(coalesce($1, '') || '/' || $2, 0))",
+            &[&owner, &subject],
+        )
+        .await?;
+    }
+    Ok(())
+}
+
 async fn settle(db: &impl GenericClient, s: &Settling) -> Result<()> {
+    lock_subject(db, s).await?;
     match &s.target {
         Target::Subject { subject, owner } => {
             db.execute(
