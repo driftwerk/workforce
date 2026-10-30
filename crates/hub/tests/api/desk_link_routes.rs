@@ -50,7 +50,7 @@ fn delivered(session: &str) -> DeskDelivered {
 async fn a_link_hears_its_persons_deliveries_and_no_one_elses() {
     let data = tempfile::tempdir().unwrap();
     let service = agent_service(data.path()).await;
-    let identities = SqliteIdentityStore::in_memory().unwrap();
+    let identities = Arc::new(SqliteIdentityStore::in_memory().unwrap());
     let person = Identity::new("Person", IdentityRole::Member);
     let other = Identity::new("Other", IdentityRole::Member);
     identities.create(&person).unwrap();
@@ -69,7 +69,7 @@ async fn a_link_hears_its_persons_deliveries_and_no_one_elses() {
                 [("scout".to_string(), service)].into_iter().collect(),
                 "scout".into(),
             ),
-            Arc::new(identities) as Arc<dyn IdentityStore>,
+            Arc::clone(&identities) as Arc<dyn IdentityStore>,
             std::path::PathBuf::from("/tmp/desk-link-test-skills"),
         )
     }
@@ -116,6 +116,26 @@ async fn a_link_hears_its_persons_deliveries_and_no_one_elses() {
         .await
         .unwrap();
     assert_eq!(next(&mut mine).await, json!({"type": "pong"}));
+    identities
+        .update(&Identity {
+            status: workforce_identity::types::IdentityStatus::Suspended,
+            ..person.clone()
+        })
+        .unwrap();
+    workforce_hub_core::hub_core::standing::forget(person.id);
+    mine.send(tungstenite::Message::Text(r#"{"type":"ping"}"#.into()))
+        .await
+        .unwrap();
+    let ended = tokio::time::timeout(std::time::Duration::from_secs(10), mine.next())
+        .await
+        .expect("the link answers in time");
+    assert!(
+        matches!(
+            ended,
+            None | Some(Ok(tungstenite::Message::Close(_))) | Some(Err(_))
+        ),
+        "a person suspended while linked is heard no more: {ended:?}"
+    );
 
     let (_, pending) = reqwest_json(
         addr,

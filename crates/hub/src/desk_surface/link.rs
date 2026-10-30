@@ -97,15 +97,30 @@ pub(crate) async fn handler(
             .into_response();
     };
     let listener = Listener {
-        holds: crate::desk_floor::holds_the_hub(
-            state.identity_store.as_ref(),
-            crate::desk_driver::desk().is_some(),
-            Some(&identity),
-        ),
+        holds: holds(&state, &identity),
         identity,
     };
-    ws.on_upgrade(move |socket| run(socket, state, listener))
+    let token = query.token.unwrap_or_default();
+    ws.on_upgrade(move |socket| run(socket, state, listener, token))
         .into_response()
+}
+
+/// Whether `identity` holds this hub now.
+fn holds(state: &GatewayState, identity: &str) -> bool {
+    crate::desk_floor::holds_the_hub(
+        state.identity_store.as_ref(),
+        crate::desk_driver::desk().is_some(),
+        Some(identity),
+    )
+}
+
+/// Whether `token` still names `listener`'s person, read again on each ping
+/// so a revoked device, an expired token or a suspension ends their link;
+/// and, when it does, whether they hold the hub now.
+async fn still_theirs(state: &GatewayState, token: &str, listener: &Listener) -> Option<bool> {
+    let caller = authenticate_ws(state, token).await.ok()?;
+    (caller.identity_id.as_deref() == Some(listener.identity.as_str()))
+        .then(|| holds(state, &listener.identity))
 }
 
 async fn send(
@@ -124,7 +139,7 @@ async fn send(
 /// Serve one link until either side ends it. A link that falls behind the
 /// broadcast is closed rather than left silently short of signals: the Desk
 /// reconnects and drains what changed since.
-async fn run(socket: WebSocket, state: Arc<GatewayState>, listener: Listener) {
+async fn run(socket: WebSocket, state: Arc<GatewayState>, mut listener: Listener, token: String) {
     let (mut sender, mut receiver) = socket.split();
     let mut broadcasts = state.broadcast_tx.subscribe();
     let hello = LinkFrame::Hello {
@@ -153,9 +168,10 @@ async fn run(socket: WebSocket, state: Arc<GatewayState>, listener: Listener) {
             incoming = receiver.next() => match incoming {
                 Some(Ok(Message::Text(text))) => match serde_json::from_str::<LinkRequest>(&text) {
                     Ok(LinkRequest::Ping) => {
-                        if crate::standing::suspended(state.identity_store.as_ref(), &listener.identity).is_some() {
+                        let Some(holds) = still_theirs(&state, &token, &listener).await else {
                             return;
-                        }
+                        };
+                        listener.holds = holds;
                         if !send(&mut sender, &LinkFrame::Pong).await {
                             return;
                         }
