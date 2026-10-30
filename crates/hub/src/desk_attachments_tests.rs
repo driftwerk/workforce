@@ -495,6 +495,61 @@ async fn a_desk_turn_s_file_rides_its_stream_and_an_unattended_run_s_lands_in_it
     );
 }
 
+/// A file a workflow run delivers into its person's Desk conversation is
+/// served to them, though the run filed it under its own instance.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_file_a_workflow_run_delivers_into_desk_is_served_to_its_person() {
+    use workforce_common::channels::desk::{DeskPlace, DeskScope, DeskTarget};
+    let dir = tempfile::tempdir().unwrap();
+    let (scout, _llm) = agent(dir.path(), "scout", "ok", Duration::ZERO).await;
+    let (state, [(alice_id, alice), (_, bob)]) = gateway(&scout);
+    let sink = crate::mcp_gate::media_sinks(&scout).deliver;
+    let report = workforce_agent::runner::CURRENT_ARTIFACT_SCOPE.sync_scope(
+        "workflow:instance-1".to_string(),
+        || {
+            workforce_agent::runner::CURRENT_USER_ID.sync_scope(alice_id.clone(), || {
+                let descriptor = ArtifactDescriptor::from_context(
+                    "export.csv",
+                    ContentType::OctetStream,
+                    "scout",
+                )
+                .with_file_meta("report.csv", "text/csv");
+                store()
+                    .write(
+                        "scout",
+                        descriptor,
+                        workforce_agent::artifacts::ArtifactBody::Bytes(b"a,b\n1,2\n".to_vec()),
+                    )
+                    .unwrap()
+                    .id
+            })
+        },
+    );
+    sink.deliver(
+        &workforce_agent::runner::SessionContext {
+            user_id: Some(alice_id.clone()),
+            desk: Some(DeskScope {
+                target: DeskTarget::of_turn(&DeskPlace::Dm, DESK_CHANNEL, None, false),
+                attended: false,
+                owner: alice_id.clone(),
+            }),
+            ..context("workflow:instance-1", "scout")
+        },
+        &report,
+        "text/csv",
+        Some("report.csv"),
+        Some("your report"),
+    )
+    .await
+    .unwrap();
+    let uri = format!("/api/agents/scout/attachments/{}", report.as_str());
+    let (status, _, body) = call(&state, get(&uri, Some(&alice), None)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, b"a,b\n1,2\n");
+    let (status, ..) = call(&state, get(&uri, Some(&bob), None)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "nor anyone else's");
+}
+
 /// A Desk turn whose tool delivers a file is sent it in the turn's own
 /// stream, named by the turn, and its answer carries it.
 #[tokio::test(flavor = "multi_thread")]

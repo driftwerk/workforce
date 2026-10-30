@@ -3,8 +3,9 @@
 //!
 //! - **Download**: `GET /api/agents/{id}/attachments/{artifact}` serves a
 //!   file of a conversation the caller may see, by artifact id, with Range
-//!   for seeking. The artifact must belong to a session; the caller must be
-//!   allowed to read that session (its owner, or the hub's admin).
+//!   for seeking. The artifact must belong to a session the caller is
+//!   allowed to read (its owner, or the hub's admin), or have been made by a
+//!   run for the caller.
 //! - **Upload**: `POST /api/agents/{id}/attachments?channel=desk` stages one
 //!   file (multipart, or the raw body with `?filename=`) for the caller's
 //!   conversation with that agent, its type sniffed from its bytes and its
@@ -839,20 +840,28 @@ pub async fn download(
         }
     };
     // Only a file of a conversation is served: whoever may read the
-    // conversation may read its files.
-    let Some(session_id) = descriptor.session_id.as_deref() else {
-        return not_found();
-    };
-    if let Err(refusal) = lookup_owned_session(
-        service.sessions.as_ref(),
-        &caller,
-        session_id,
-        SessionAccess::Read,
-    ) {
-        return match refusal.0 {
-            StatusCode::FORBIDDEN => refusal.into_response(),
-            _ => not_found(),
+    // conversation may read its files, and the person a run made it for
+    // theirs, wherever the run filed it (a workflow files its outputs under
+    // its instance, a job under its own session).
+    let made_for_caller = descriptor
+        .user_id
+        .as_deref()
+        .is_some_and(|user| caller.owns(user));
+    if !made_for_caller {
+        let Some(session_id) = descriptor.session_id.as_deref() else {
+            return not_found();
         };
+        if let Err(refusal) = lookup_owned_session(
+            service.sessions.as_ref(),
+            &caller,
+            session_id,
+            SessionAccess::Read,
+        ) {
+            return match refusal.0 {
+                StatusCode::FORBIDDEN => refusal.into_response(),
+                _ => not_found(),
+            };
+        }
     }
     serve(
         store.as_ref(),
