@@ -1994,6 +1994,8 @@ impl Setup {
         crate::decide::install_from_config(&config.decision)?;
         crate::decision_store::install(config).await;
         crate::floor::install(config).await;
+        #[cfg(feature = "postgres")]
+        crate::surface_allows::install(config).await;
         let effective_memory = resolved_at_build.memory.clone();
 
         // Capture pre-resolution spec before the block below overwrites

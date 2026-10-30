@@ -2680,6 +2680,7 @@ impl AgentService {
             role: None,
             capability_gate: self.capability_gate.read().clone(),
             permission_gate: self.permission_gate.read().clone(),
+            surface_allows: None,
             arguments: self.config.tools.validation.mode,
         }
     }

@@ -3664,6 +3664,7 @@ rules:
                 trace_writer: None,
                 trace_tags: Default::default(),
                 permission_writer: None,
+                surface_allows: None,
                 permission_gate: None,
                 arguments: workforce_agent::tools::arguments::ArgumentValidation::default(),
                 tool_loading: workforce_agent::tools::loading::ToolLoading::default(),

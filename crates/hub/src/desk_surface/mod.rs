@@ -21,6 +21,20 @@ pub(crate) use deliver::{deliver, deliver_file, resumed, Delivery, Outbox};
 pub(crate) use retarget::retarget;
 pub(crate) use surface::DeskSurface;
 
+/// The hub's surface allow list, where it keeps one: what each person
+/// always allows an agent to write to from their Desk turns.
+pub(crate) fn allows() -> Option<std::sync::Arc<dyn workforce_agent::tools::dispatch::SurfaceAllows>>
+{
+    #[cfg(feature = "postgres")]
+    {
+        crate::surface_allows::installed()
+    }
+    #[cfg(not(feature = "postgres"))]
+    {
+        None
+    }
+}
+
 /// A message's text as a live channel sends it: secret markers as previews,
 /// credentials redacted.
 pub(crate) fn shown(content: &str) -> String {

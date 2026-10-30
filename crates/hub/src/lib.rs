@@ -213,6 +213,8 @@ pub mod store;
 pub mod store_api;
 pub mod store_bridge;
 pub mod store_tool;
+#[cfg(feature = "postgres")]
+pub mod surface_allows;
 
 /// Re-export parse_relative_time for CLI use.
 pub use scheduler_tool::parse_relative_time as scheduler_tool_parse_relative_time;

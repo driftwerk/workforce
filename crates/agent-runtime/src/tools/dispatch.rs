@@ -25,8 +25,16 @@ use crate::tools::arguments::{
     check_arguments, render_argument_problems, summarise_argument_problems, ArgumentValidation,
 };
 use crate::tools::registry::ToolRegistry;
-use crate::tools::{RateLimit, SurfaceEffect};
+use crate::tools::{Destination, RateLimit, SurfaceEffect};
 use workforce_common::channels::CHAT_SURFACE_PLATFORMS;
+
+/// The destinations each person has said an agent may always write to from
+/// their Desk turns without asking: the surface gate's own allow list, kept
+/// apart from the permission system so it holds with that system off.
+pub trait SurfaceAllows: Send + Sync {
+    fn allows(&self, person: &str, agent: &str, to: &Destination) -> bool;
+    fn allow(&self, person: &str, agent: &str, to: &Destination) -> eyre::Result<()>;
+}
 
 /// The authorisation inputs a tool call is gated with, detached from the
 /// rest of [`RunnerConfig`] so callers without a runner can gate too.
@@ -37,6 +45,7 @@ pub struct ToolGates {
     pub role: Option<String>,
     pub capability_gate: Option<Arc<dyn CapabilityGate>>,
     pub permission_gate: Option<Arc<dyn PermissionGate>>,
+    pub surface_allows: Option<Arc<dyn SurfaceAllows>>,
     pub arguments: ArgumentValidation,
 }
 
@@ -48,6 +57,7 @@ impl From<&RunnerConfig> for ToolGates {
             role: config.role.clone(),
             capability_gate: config.capability_gate.clone(),
             permission_gate: config.permission_gate.clone(),
+            surface_allows: config.surface_allows.clone(),
             arguments: config.arguments,
         }
     }
@@ -72,6 +82,9 @@ pub enum GateOutcome {
     RequireApproval {
         reason: String,
         allow_save_allow: bool,
+        /// The destination of a write the surface gate holds: "Always
+        /// allow" keeps it on the person's allow list, not as a rule.
+        holds: Option<Destination>,
     },
 }
 
@@ -99,12 +112,24 @@ pub fn gate_tool_call(
     let response = apply_capability_gate(gates, response, tool_name, input);
     let response = apply_cascade_gate(gates, response, tool_name);
     let response = apply_tool_requirement(tools, response, tool_name);
+    let effect = surface_effect_of(tools, tool_name, input);
+    let to = effect.as_ref().and_then(SurfaceEffect::destination);
+    let mut held = None;
     let response = apply_surface_gate(
         response,
-        surface_effect_of(tools, tool_name, input).as_ref(),
+        effect.as_ref(),
         crate::runner::current_desk().as_ref(),
         input,
+        || {
+            *held.insert(kept(
+                gates.surface_allows.as_deref(),
+                current_user_id().as_deref(),
+                gates.agent_id.as_str(),
+                to.as_ref(),
+            ))
+        },
     );
+    let holds = to.filter(|_| held == Some(Kept::NotYet));
     if let PolicyDecision::Deny { reason } = response.decision {
         return GateOutcome::Blocked {
             message: format!("Policy denied: {reason}"),
@@ -132,6 +157,7 @@ pub fn gate_tool_call(
             None => GateOutcome::RequireApproval {
                 reason,
                 allow_save_allow,
+                holds,
             },
             Some(missing) => incomplete_call(tool_name, &missing),
         },
@@ -434,27 +460,65 @@ pub fn surface_effect_of(
 /// The longest stretch of what a held write would say that its prompt shows.
 const PREVIEW_CHARS: usize = 200;
 
+/// What the person has said of a write's destination, for the surface gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kept {
+    /// They always allow it.
+    Allowed,
+    /// Not yet; their "Always allow" would be kept.
+    NotYet,
+    /// Nothing can be kept for it: no allow list, no one to keep it for, or
+    /// a write that names no destination.
+    Unkeepable,
+}
+
+/// What `person` has kept on `allows` for `agent` writing to `to`.
+pub fn kept(
+    allows: Option<&dyn SurfaceAllows>,
+    person: Option<&str>,
+    agent: &str,
+    to: Option<&Destination>,
+) -> Kept {
+    match (allows, person, to) {
+        (Some(allows), Some(person), Some(to)) => match allows.allows(person, agent, to) {
+            true => Kept::Allowed,
+            false => Kept::NotYet,
+        },
+        _ => Kept::Unkeepable,
+    }
+}
+
 /// Hold a write to any surface but Desk, made during a Desk turn a person
 /// is attending, for that person's say: an agent asked in Desk posts on
-/// Slack or sends an email only when they want it to. "Always allow" stays
-/// open, so a destination they post to often costs one click once. Only
-/// ever escalates an `Allow`; a run nobody attends, and any turn not from
-/// Desk, is untouched.
+/// Slack or sends an email only when they want it to. The person's allow
+/// list is the authority for these writes: a destination they always allow
+/// passes, and "Always allow" is offered where it can be kept. Only ever
+/// escalates an `Allow`; a run nobody attends, and any turn not from Desk,
+/// is untouched. `kept` is asked only of a write the gate would hold.
 pub fn apply_surface_gate(
     response: PolicyResponse,
     effect: Option<&SurfaceEffect>,
     desk: Option<&workforce_common::channels::desk::DeskScope>,
     input: &Value,
+    kept: impl FnOnce() -> Kept,
 ) -> PolicyResponse {
-    match (&response.decision, effect, desk) {
-        (
-            PolicyDecision::Allow,
-            Some(SurfaceEffect::Writes {
-                platform,
-                destination,
-            }),
-            Some(scope),
-        ) if scope.attended && platform != workforce_common::channels::desk::DESK_PLATFORM => {
+    let (
+        PolicyDecision::Allow,
+        Some(SurfaceEffect::Writes {
+            platform,
+            destination,
+        }),
+        Some(scope),
+    ) = (&response.decision, effect, desk)
+    else {
+        return response;
+    };
+    if !scope.attended || platform == workforce_common::channels::desk::DESK_PLATFORM {
+        return response;
+    }
+    match kept() {
+        Kept::Allowed => response,
+        kept => {
             let preview: String = ["text", "message", "body", "subject", "content"]
                 .iter()
                 .find_map(|field| input[*field].as_str())
@@ -467,12 +531,11 @@ pub fn apply_surface_gate(
                     reason: format!(
                         "Posts outside Desk, to {platform} {destination}: \"{preview}\""
                     ),
-                    allow_save_allow: true,
+                    allow_save_allow: kept == Kept::NotYet,
                 },
                 ..response
             }
         }
-        _ => response,
     }
 }
 
@@ -755,6 +818,7 @@ mod tests {
                 calls: Arc::clone(calls),
                 state: cascade,
             })),
+            surface_allows: None,
             arguments: ArgumentValidation::default(),
         }
     }
@@ -1220,6 +1284,7 @@ mod tests {
             GateOutcome::RequireApproval {
                 reason,
                 allow_save_allow,
+                ..
             } => {
                 assert_eq!(reason, "Required by permission cascade");
                 assert!(!allow_save_allow);
@@ -1597,7 +1662,13 @@ mod tests {
             platform: platform.into(),
             destination: "C1".into(),
         };
-        let gated = apply_surface_gate(allowed(), Some(&to("slack")), Some(&desk(true)), &input);
+        let gated = apply_surface_gate(
+            allowed(),
+            Some(&to("slack")),
+            Some(&desk(true)),
+            &input,
+            || Kept::NotYet,
+        );
         match gated.decision {
             PolicyDecision::RequireApproval {
                 reason,
@@ -1611,7 +1682,13 @@ mod tests {
             }
             other => panic!("expected an approval, got {other:?}"),
         }
-        let email = apply_surface_gate(allowed(), Some(&to("email")), Some(&desk(true)), &input);
+        let email = apply_surface_gate(
+            allowed(),
+            Some(&to("email")),
+            Some(&desk(true)),
+            &input,
+            || Kept::NotYet,
+        );
         assert!(matches!(
             email.decision,
             PolicyDecision::RequireApproval { .. }
@@ -1624,7 +1701,10 @@ mod tests {
             (None, Some(desk(true))),
         ] {
             let decision =
-                apply_surface_gate(allowed(), effect.as_ref(), scope.as_ref(), &input).decision;
+                apply_surface_gate(allowed(), effect.as_ref(), scope.as_ref(), &input, || {
+                    Kept::NotYet
+                })
+                .decision;
             assert_eq!(decision, PolicyDecision::Allow, "{effect:?} {scope:?}");
         }
         let denied = PolicyResponse {
@@ -1634,9 +1714,147 @@ mod tests {
             ..allowed()
         };
         assert!(matches!(
-            apply_surface_gate(denied, Some(&to("slack")), Some(&desk(true)), &input).decision,
+            apply_surface_gate(
+                denied,
+                Some(&to("slack")),
+                Some(&desk(true)),
+                &input,
+                || Kept::NotYet
+            )
+            .decision,
             PolicyDecision::Deny { .. }
         ));
+    }
+
+    /// An allow list keyed as the store would: person, agent, destination.
+    #[derive(Default)]
+    struct Allows(Mutex<std::collections::HashSet<(String, String, Destination)>>);
+
+    impl SurfaceAllows for Allows {
+        fn allows(&self, person: &str, agent: &str, to: &Destination) -> bool {
+            self.0
+                .lock()
+                .unwrap()
+                .contains(&(person.into(), agent.into(), to.clone()))
+        }
+
+        fn allow(&self, person: &str, agent: &str, to: &Destination) -> eyre::Result<()> {
+            self.0
+                .lock()
+                .unwrap()
+                .insert((person.into(), agent.into(), to.clone()));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_destination_is_one_however_a_call_writes_it() {
+        let ops = Destination::of("Slack", "#Ops").unwrap();
+        assert_eq!(Destination::of("slack", " ops "), Some(ops.clone()));
+        assert_ne!(Destination::of("slack", "#ops-2"), Some(ops.clone()));
+        assert_ne!(Destination::of("teams", "ops"), Some(ops));
+        assert_eq!(Destination::of("slack", " # "), None);
+    }
+
+    #[tokio::test]
+    async fn a_destination_the_person_always_allows_passes_and_only_that_one() {
+        let calls = Arc::new(Calls::default());
+        let allows = Arc::new(Allows::default());
+        let g = ToolGates {
+            surface_allows: Some(allows.clone()),
+            ..gates(&calls, None, CascadeState::Allow)
+        };
+        let gate = |g: &ToolGates, user: &'static str| {
+            let post = serde_json::json!({"channel": "C1", "text": "hi"});
+            let g = g.clone();
+            crate::runner::with_desk(Some(desk(true)), async move {
+                CURRENT_USER_ID.sync_scope(user.to_string(), || {
+                    gate_tool_call(
+                        &g,
+                        &permissive_policy(),
+                        &surfaced_tools(),
+                        "messaging.send",
+                        &post,
+                    )
+                })
+            })
+        };
+        let first = gate(&g, "alice").await;
+        let GateOutcome::RequireApproval {
+            allow_save_allow,
+            holds,
+            ..
+        } = first
+        else {
+            panic!("held: {first:?}")
+        };
+        assert!(allow_save_allow, "Always allow is offered where it is kept");
+        let to = holds.expect("the destination Always allow would keep");
+        assert_eq!(to, Destination::of("slack", "C1").unwrap());
+        allows.allow("alice", "agent", &to).unwrap();
+        assert!(matches!(
+            gate(&g, "alice").await,
+            GateOutcome::Execute { .. }
+        ));
+        assert!(
+            matches!(gate(&g, "bob").await, GateOutcome::RequireApproval { .. }),
+            "another person's allow is not theirs"
+        );
+        let other_agent = ToolGates {
+            agent_id: AgentId::new("other"),
+            ..g.clone()
+        };
+        assert!(
+            matches!(
+                gate(&other_agent, "alice").await,
+                GateOutcome::RequireApproval { .. }
+            ),
+            "nor another agent's"
+        );
+        let unkept = gate(&gates(&calls, None, CascadeState::Allow), "alice").await;
+        assert!(
+            matches!(
+                unkept,
+                GateOutcome::RequireApproval {
+                    allow_save_allow: false,
+                    holds: None,
+                    ..
+                }
+            ),
+            "with no allow list, Always allow is not offered: {unkept:?}"
+        );
+    }
+
+    #[test]
+    fn a_kept_allow_never_relaxes_another_gate() {
+        let input = serde_json::json!({"channel": "C1", "text": "hi"});
+        let to = SurfaceEffect::Writes {
+            platform: "slack".into(),
+            destination: "C1".into(),
+        };
+        let asked = PolicyResponse {
+            decision: PolicyDecision::RequireApproval {
+                reason: "Required by permission cascade".into(),
+                allow_save_allow: true,
+            },
+            ..allowed()
+        };
+        assert_eq!(
+            apply_surface_gate(asked.clone(), Some(&to), Some(&desk(true)), &input, || {
+                Kept::Allowed
+            })
+            .decision,
+            asked.decision
+        );
+        let mut asked_of = 0;
+        apply_surface_gate(allowed(), Some(&to), None, &input, || {
+            asked_of += 1;
+            Kept::NotYet
+        });
+        assert_eq!(
+            asked_of, 0,
+            "the list is read only for a write the gate would hold"
+        );
     }
 
     #[tokio::test]

@@ -232,8 +232,11 @@ impl HubSkillToolInvoker {
         }
 
         // A write a skill makes outside the Desk conversation a person is in
-        // needs their say, as the model's own call would; a skill cannot ask
-        // for it, so it is refused like any call that needs an approval.
+        // needs their say, as the model's own call would: a destination they
+        // always allow passes, and otherwise, as a skill cannot ask, it is
+        // refused like any call that needs an approval.
+        let effect =
+            workforce_agent::tools::dispatch::surface_effect_of(&self.registry, tool, args);
         let policy_response = workforce_agent::tools::dispatch::apply_surface_gate(
             self.policy.evaluate(&PolicyRequest {
                 agent_id: AgentId::new(&ctx.agent_id),
@@ -241,10 +244,17 @@ impl HubSkillToolInvoker {
                 parameters: args.clone(),
                 context: PolicyContext::empty(),
             }),
-            workforce_agent::tools::dispatch::surface_effect_of(&self.registry, tool, args)
-                .as_ref(),
+            effect.as_ref(),
             workforce_agent::runner::current_desk().as_ref(),
             args,
+            || {
+                workforce_agent::tools::dispatch::kept(
+                    crate::desk_surface::allows().as_deref(),
+                    ctx.user_id.as_deref(),
+                    &ctx.agent_id,
+                    effect.as_ref().and_then(|e| e.destination()).as_ref(),
+                )
+            },
         );
         match policy_response.decision {
             PolicyDecision::Allow => {}

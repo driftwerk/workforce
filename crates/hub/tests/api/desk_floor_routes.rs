@@ -399,6 +399,68 @@ async fn a_persons_plans_are_their_own_logins_and_any_replica_serves_the_newest(
     .await;
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn a_person_sees_and_revokes_their_own_always_allows_alone() {
+    use workforce_agent::tools::dispatch::SurfaceAllows;
+    use workforce_agent::tools::Destination;
+    use workforce_hub::surface_allows::PgSurfaceAllows;
+    with_test_pool(PgSurfaceAllows::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let gateway = Gateway::new(vec![("scout", agent_service(dir.path()).await)], None);
+        let alice = gateway.admin.clone();
+        let bob = Identity::new("Bob", IdentityRole::Member);
+        gateway
+            .state
+            .identity_store
+            .as_ref()
+            .unwrap()
+            .create(&bob)
+            .unwrap();
+        let store = Arc::new(PgSurfaceAllows::with_pool(pool).await.unwrap());
+        let ops = Destination::of("slack", "#ops").unwrap();
+        store.allow(&alice.id.to_string(), "scout", &ops).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = workforce_hub::surface_allows::router(Arc::clone(&gateway.state), Some(store));
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let (status, mine) = get(addr, "/api/desk/allows", Some(&token_for(&alice))).await;
+        assert_eq!(status, 200);
+        let allows = mine["allows"].as_array().unwrap();
+        assert_eq!(allows.len(), 1);
+        assert_eq!(
+            (
+                &allows[0]["agentId"],
+                &allows[0]["platform"],
+                &allows[0]["destination"]
+            ),
+            (&json!("scout"), &json!("slack"), &json!("ops"))
+        );
+        let id = allows[0]["id"].as_str().unwrap().to_string();
+        let (_, theirs) = get(addr, "/api/desk/allows", Some(&token_for(&bob))).await;
+        assert_eq!(theirs, json!({"allows": []}));
+        let revoke = |bearer: String| {
+            let url = format!("http://{addr}/api/desk/allows/{id}");
+            async move {
+                reqwest::Client::new()
+                    .delete(url)
+                    .bearer_auth(bearer)
+                    .send()
+                    .await
+                    .unwrap()
+                    .status()
+                    .as_u16()
+            }
+        };
+        assert_eq!(revoke(token_for(&bob)).await, 404, "not bob's to revoke");
+        assert_eq!(revoke(token_for(&alice)).await, 204);
+        let (_, after) = get(addr, "/api/desk/allows", Some(&token_for(&alice))).await;
+        assert_eq!(after, json!({"allows": []}));
+        assert_eq!(get(addr, "/api/desk/allows", None).await.0, 401);
+    })
+    .await;
+}
+
 async fn serve_floor(
     state: Arc<workforce_hub::gateway::GatewayState>,
     sources: Option<Sources>,

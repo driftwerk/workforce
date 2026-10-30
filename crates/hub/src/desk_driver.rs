@@ -485,6 +485,7 @@ pub async fn mount(
     config: &WorkforceConfig,
     cancel: CancellationToken,
 ) -> Result<Router> {
+    let app = app.merge(crate::surface_allows::routes(Arc::clone(state)));
     let app = app.merge(crate::desk_floor::router(
         Arc::clone(state),
         crate::desk_floor::Sources::installed(),

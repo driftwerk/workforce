@@ -112,7 +112,38 @@ pub enum SurfaceEffect {
     },
 }
 
+/// Where a write lands, as an "Always allow" for it is kept: the platform
+/// and the destination, written one way however a call writes it (`#ops`,
+/// `ops` and `OPS` are one channel).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Destination {
+    pub platform: String,
+    pub target: String,
+}
+
+impl Destination {
+    /// `target` on `platform`; none for a write that names no destination.
+    pub fn of(platform: &str, target: &str) -> Option<Self> {
+        let target = target.trim().trim_start_matches(['#', '@']).trim();
+        (!target.is_empty()).then(|| Self {
+            platform: platform.trim().to_lowercase(),
+            target: target.to_lowercase(),
+        })
+    }
+}
+
 impl SurfaceEffect {
+    /// Where it writes, if it writes somewhere it names.
+    pub fn destination(&self) -> Option<Destination> {
+        match self {
+            Self::Reads => None,
+            Self::Writes {
+                platform,
+                destination,
+            } => Destination::of(platform, destination),
+        }
+    }
+
     /// A write of an email to whom `input` addresses it.
     pub fn email(input: &serde_json::Value) -> Self {
         let to = match &input["to"] {

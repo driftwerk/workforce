@@ -48,13 +48,16 @@ pub fn channel_arg(input: &serde_json::Value) -> Option<&str> {
 /// What a messaging call that posts does to its surface: writes to the
 /// channel it names on the platform it resolves to.
 pub fn writes(input: &serde_json::Value) -> workforce_agent::tools::SurfaceEffect {
+    let to = input["channel"]
+        .as_str()
+        .or(input["user"].as_str())
+        .unwrap_or_default();
     workforce_agent::tools::SurfaceEffect::Writes {
         platform: platform_arg(input).to_string(),
-        destination: input["channel"]
-            .as_str()
-            .or(input["user"].as_str())
-            .unwrap_or_default()
-            .to_string(),
+        destination: match input["thread_id"].as_str().filter(|t| !t.is_empty()) {
+            Some(thread) => format!("{to} › thread {thread}"),
+            None => to.to_string(),
+        },
     }
 }
 
@@ -165,6 +168,21 @@ mod tests {
         })
         .await;
         assert_eq!(named, "slack");
+    }
+
+    #[test]
+    fn a_write_into_a_thread_is_to_that_thread_of_its_channel() {
+        let to = |input| writes(&input).destination();
+        let channel = to(serde_json::json!({"platform": "slack", "channel": "#Ops", "text": "hi"}));
+        let thread = to(serde_json::json!({
+            "platform": "slack", "channel": "#ops", "thread_id": "1700.1", "text": "hi"
+        }));
+        assert_eq!(channel.as_ref().map(|d| d.target.as_str()), Some("ops"));
+        assert_eq!(
+            thread.as_ref().map(|d| d.target.as_str()),
+            Some("ops › thread 1700.1")
+        );
+        assert_ne!(channel, thread);
     }
 
     #[test]

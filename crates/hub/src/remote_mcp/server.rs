@@ -640,6 +640,7 @@ mod tests {
                         None => Arc::new(RevocableCapability(Arc::clone(&bridge.revoked))),
                     }),
                     permission_gate: Some(Arc::new(FixedCascade(cascade))),
+                    surface_allows: None,
                     arguments: workforce_agent::tools::arguments::ArgumentValidation::default(),
                 },
                 policy: Arc::new(

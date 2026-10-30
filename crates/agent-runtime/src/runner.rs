@@ -1108,6 +1108,10 @@ pub struct RunnerConfig {
     /// the runner still honours the choice for the in-flight call but
     /// never saves it (legacy behaviour).
     pub permission_writer: Option<Arc<dyn PermissionWriter>>,
+    /// The surface gate's allow list: what each person always allows an
+    /// agent to write to from their Desk turns. `None` keeps no such
+    /// choice, and "Always allow" is not offered for those writes.
+    pub surface_allows: Option<Arc<dyn crate::tools::dispatch::SurfaceAllows>>,
     /// Cascade gate consulted *after* the PolicyEngine. Can only further
     /// restrict the PolicyEngine decision — never relax it. When `None`
     /// (the `[permissions] enabled = false` case) the cascade arm is a
@@ -1186,6 +1190,7 @@ impl Default for RunnerConfig {
             trace_writer: None,
             trace_tags: Default::default(),
             permission_writer: None,
+            surface_allows: None,
             permission_gate: None,
             arguments: crate::tools::arguments::ArgumentValidation::default(),
             tool_loading: crate::tools::loading::ToolLoading::default(),
@@ -2064,6 +2069,63 @@ pub async fn render_viewed(
 
 /// Persist an Always-* choice as the requester's own rule before the call it
 /// answered runs, so the cascade re-evaluating that call already sees it.
+/// What a person is asked of a call the gates hold, and where an "Always"
+/// answer is kept. A write the surface gate holds offers no Always deny, and
+/// its Always allow is kept on the allow list for its destination and this
+/// agent; any other call's choice is the permission system's.
+pub fn held_prompt(
+    allow_save_allow: bool,
+    holds: Option<crate::tools::Destination>,
+    agent: &str,
+    allows: Option<Arc<dyn crate::tools::dispatch::SurfaceAllows>>,
+    writer: Option<Arc<dyn PermissionWriter>>,
+) -> (
+    workforce_core::policy::PermissionPromptOptions,
+    Option<Arc<dyn PermissionWriter>>,
+) {
+    let options = workforce_core::policy::PermissionPromptOptions::ask(allow_save_allow);
+    match (holds, allows) {
+        (Some(to), Some(allows)) => (
+            workforce_core::policy::PermissionPromptOptions {
+                deny_always: false,
+                ..options
+            },
+            Some(Arc::new(KeepAllowed {
+                allows,
+                agent: agent.to_string(),
+                to,
+            })),
+        ),
+        _ => (options, writer),
+    }
+}
+
+/// Where "Always allow" on a write the surface gate held is kept: on the
+/// person's allow list, for the write's destination and this agent alone.
+/// No other choice is kept for it.
+struct KeepAllowed {
+    allows: Arc<dyn crate::tools::dispatch::SurfaceAllows>,
+    agent: String,
+    to: crate::tools::Destination,
+}
+
+#[async_trait::async_trait]
+impl PermissionWriter for KeepAllowed {
+    async fn persist_user_choice(
+        &self,
+        user_id: &str,
+        _tool_name: &str,
+        choice: workforce_core::policy::PermissionChoice,
+    ) -> eyre::Result<()> {
+        match choice {
+            workforce_core::policy::PermissionChoice::AllowAlways => {
+                self.allows.allow(user_id, &self.agent, &self.to)
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
 async fn persist_choice(
     writer: Option<&dyn PermissionWriter>,
     user: Option<&str>,
@@ -5737,9 +5799,15 @@ impl AgentRunner {
                     GateOutcome::RequireApproval {
                         reason,
                         allow_save_allow,
+                        holds,
                     } => {
-                        let prompt_options =
-                            workforce_core::policy::PermissionPromptOptions::ask(allow_save_allow);
+                        let (prompt_options, keeper) = held_prompt(
+                            allow_save_allow,
+                            holds,
+                            self.config.agent_id.as_str(),
+                            self.config.surface_allows.clone(),
+                            self.config.permission_writer.clone(),
+                        );
                         let agent_id_str = self.config.agent_id.to_string();
                         let acting_user_id = CURRENT_USER_ID
                             .try_with(|u| u.clone())
@@ -5841,8 +5909,6 @@ impl AgentRunner {
                                             .with_user_comm(&last_user_comm);
                                         let call =
                                             self.call_for(&mut round_calls, &tool_use_id, &input);
-                                        let permission_writer =
-                                            self.config.permission_writer.clone();
                                         let policy = Arc::clone(&self.policy);
                                         let access = Arc::clone(&access_snapshot);
                                         join_set.spawn(async move {
@@ -5855,7 +5921,7 @@ impl AgentRunner {
                                                     reason: &reason,
                                                     round: rounds,
                                                     options: prompt_options,
-                                                    writer: permission_writer.as_deref(),
+                                                    writer: keeper.as_deref(),
                                                     requester: acting_user_id.as_deref(),
                                                 },
                                                 &ledger,
@@ -7455,6 +7521,51 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn always_allowing_a_held_write_keeps_its_destination_and_nothing_else() {
+        #[derive(Default)]
+        struct Kept(parking_lot::Mutex<Vec<(String, String, crate::tools::Destination)>>);
+        impl crate::tools::dispatch::SurfaceAllows for Kept {
+            fn allows(&self, _: &str, _: &str, _: &crate::tools::Destination) -> bool {
+                false
+            }
+            fn allow(
+                &self,
+                person: &str,
+                agent: &str,
+                to: &crate::tools::Destination,
+            ) -> eyre::Result<()> {
+                self.0
+                    .lock()
+                    .push((person.into(), agent.into(), to.clone()));
+                Ok(())
+            }
+        }
+        use workforce_core::policy::PermissionChoice as C;
+        let kept = Arc::new(Kept::default());
+        let to = crate::tools::Destination::of("slack", "#ops").unwrap();
+        let keeper = KeepAllowed {
+            allows: kept.clone(),
+            agent: "scout".into(),
+            to: to.clone(),
+        };
+        for choice in [C::AllowOnce, C::DenyOnce, C::DenyAlways] {
+            persist_choice(Some(&keeper), Some("alice"), "messaging.send", Some(choice)).await;
+        }
+        assert!(kept.0.lock().is_empty(), "only Always allow is kept");
+        persist_choice(
+            Some(&keeper),
+            Some("alice"),
+            "messaging.send",
+            Some(C::AllowAlways),
+        )
+        .await;
+        assert_eq!(
+            *kept.0.lock(),
+            vec![("alice".to_string(), "scout".to_string(), to)]
+        );
+    }
+
     /// Tools run in a spawned task, and task-locals do not cross a spawn —
     /// they survive only because [`SessionContext`] carries them by hand. A
     /// local missing from that list is silently empty inside every tool, which
@@ -8521,6 +8632,7 @@ mod tests {
             trace_writer: None,
             trace_tags: Default::default(),
             permission_writer: None,
+            surface_allows: None,
             permission_gate: None,
             arguments: crate::tools::arguments::ArgumentValidation::default(),
             tool_loading: crate::tools::loading::ToolLoading::default(),
@@ -8568,6 +8680,7 @@ mod tests {
             trace_writer: None,
             trace_tags: Default::default(),
             permission_writer: None,
+            surface_allows: None,
             permission_gate: None,
             arguments: crate::tools::arguments::ArgumentValidation::default(),
             tool_loading: crate::tools::loading::ToolLoading::default(),
@@ -14594,6 +14707,7 @@ issue?"#;
             trace_writer: None,
             trace_tags: Default::default(),
             permission_writer: None,
+            surface_allows: None,
             permission_gate: None,
             arguments: crate::tools::arguments::ArgumentValidation::default(),
             tool_loading: crate::tools::loading::ToolLoading::default(),
