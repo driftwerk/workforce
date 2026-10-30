@@ -5999,6 +5999,65 @@ mod tests {
         assert!(sched.get_job(&id).await.unwrap().deliver_to.is_none());
     }
 
+    /// What a Slack turn sets up reaches Slack exactly as it did before Desk
+    /// was a surface: nothing is stamped for Desk, a reminder goes to the
+    /// person's Slack DM, and a job's answer to the channel it names.
+    #[tokio::test]
+    async fn what_a_slack_turn_sets_up_reaches_slack_as_it_always_did() {
+        use workforce_agent::runner::{CURRENT_CHANNEL_ID, CURRENT_THREAD_ID, CURRENT_USER_ID};
+        let tmp = tempfile::tempdir().unwrap();
+        let (sched, slack, _server) = delivering_scheduler(tmp.path(), |_| {}).await;
+        let soon = || Schedule::At {
+            at: Utc::now() + chrono::Duration::seconds(30),
+        };
+        let in_slack = |payload: JobPayload| {
+            CURRENT_CHANNEL_ID.scope(
+                "C-ops".to_string(),
+                CURRENT_THREAD_ID.scope(
+                    "1700.1".to_string(),
+                    CURRENT_USER_ID.scope(
+                        "U1".to_string(),
+                        sched.add_job_with_desc("from slack", None, soon(), payload),
+                    ),
+                ),
+            )
+        };
+        let reminder = in_slack(JobPayload::Reminder {
+            text: "stretch".into(),
+            user_id: "U1".into(),
+        })
+        .await
+        .unwrap();
+        let job = in_slack(JobPayload::AgentTurn {
+            message: "status".into(),
+            channel: None,
+            channel_id: Some("C-ops".into()),
+            thread_id: Some("1700.1".into()),
+            model: None,
+            user_id: None,
+            max_rounds: Some(1),
+            agent_owns_delivery: false,
+            tools: None,
+        })
+        .await
+        .unwrap();
+        for id in [&reminder, &job] {
+            assert_eq!(sched.get_job(id).await.unwrap().deliver_to, None);
+            assert!(sched.run_job_now(id).await.unwrap().delivered);
+        }
+        assert_eq!(
+            slack.sent(),
+            [
+                (
+                    "D-U1".to_string(),
+                    None,
+                    "\u{1f514} *Reminder:* stretch".to_string()
+                ),
+                ("C-ops".to_string(), None, "done".to_string()),
+            ]
+        );
+    }
+
     /// A job created outside any turn (REST, system registration) carries no
     /// task-locals at all and must not fall over reading them.
     #[tokio::test]
