@@ -58,6 +58,14 @@ pub struct SpillConfig {
     pub skip_tools: Vec<String>,
 }
 
+/// Whether a session on `session_channel` is on `channel` or a channel under
+/// it (`<channel>:…`).
+fn is_on(session_channel: &str, channel: &str) -> bool {
+    session_channel
+        .strip_prefix(channel)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with(':'))
+}
+
 fn default_spill_enabled() -> bool {
     true
 }
@@ -2904,6 +2912,23 @@ pub trait SessionStore: Send + Sync {
         sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
         sessions.truncate(limit);
         Ok(sessions)
+    }
+
+    /// [`SessionStore::list_for_owner`], of the sessions on `channel` or on a
+    /// channel under it (`<channel>:…`) alone, so another surface's sessions
+    /// never crowd them out of `limit`.
+    fn list_for_owner_on(
+        &self,
+        owner: &str,
+        channel: &str,
+        limit: usize,
+    ) -> eyre::Result<Vec<Session>> {
+        Ok(self
+            .list_for_owner(owner, 10_000)?
+            .into_iter()
+            .filter(|s| is_on(&s.channel, channel))
+            .take(limit)
+            .collect())
     }
 
     /// How many sessions each owner holds, sealed ones included: what an

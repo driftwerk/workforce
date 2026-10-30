@@ -27,7 +27,7 @@ const ROOMS_SEARCHED: usize = 500;
 /// as the latest turn in each was asked.
 pub(crate) fn rooms_of(sessions: &dyn SessionStore, owner: &str) -> Result<Vec<DeskTarget>> {
     Ok(sessions
-        .list_for_owner(owner, ROOMS_SEARCHED)?
+        .list_for_owner_on(owner, DESK_CHANNEL, ROOMS_SEARCHED)?
         .into_iter()
         .filter(|s| is_desk_room(&s.channel) && !s.is_sealed())
         .filter(|s| s.metadata.get(super::deliver::CLOSED_KEY).is_none())

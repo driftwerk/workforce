@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use axum::http::HeaderMap;
 use chrono::{DateTime, Utc};
 use workforce_agent::rollover::CARRYOVER_PREFIX;
-use workforce_common::channels::is_desk_conversation;
+use workforce_common::channels::{is_desk_conversation, DESK_CHANNEL};
 use workforce_common::session::{MessageRole, SessionStore, TranscriptEntry};
 use workforce_desk::{
     Active, Author, Close, Closed, ConversationError, Conversations, Cursor, Page, Said, Speaker,
@@ -400,7 +400,7 @@ fn active_of(
     since: Option<DateTime<Utc>>,
 ) -> eyre::Result<Vec<Active>> {
     Ok(store
-        .list_for_owner(owner, ACTIVE_SEARCHED)?
+        .list_for_owner_on(owner, DESK_CHANNEL, ACTIVE_SEARCHED)?
         .into_iter()
         .take_while(|s| since.is_none_or(|since| s.updated_at > since))
         .filter(|s| is_desk_conversation(&s.channel) && !s.is_sealed())
@@ -415,7 +415,7 @@ fn active_of(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use workforce_common::channels::DESK_CHANNEL;
+
     use workforce_common::session::{InMemorySessionStore, JsonlSessionStore, SessionMessage};
 
     const ME: &str = "identity-1";

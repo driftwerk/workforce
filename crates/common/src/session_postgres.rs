@@ -1153,24 +1153,11 @@ impl SessionStore for PostgresSessionStore {
     }
 
     fn list_for_owner(&self, owner: &str, limit: usize) -> Result<Vec<Session>> {
-        let owner = owner.to_string();
-        let limit = limit as i64;
-        self.block_on(async move {
-            let mut conn = self.pool.get().await?;
-            let scoped = self.scope(&mut conn).await?;
-            let rows = scoped
-                .query(
-                    &format!(
-                        "SELECT {SHELL_COLUMNS} FROM sessions
-                         WHERE agent_id = $1 AND owner = $2 AND tenant_id = $4
-                         ORDER BY updated_at DESC LIMIT $3"
-                    ),
-                    &[&self.agent_id, &owner, &limit, &self.tenant_id()],
-                )
-                .await?;
-            scoped.finish().await?;
-            rows.iter().map(row_to_shell).collect()
-        })
+        self.owned(owner, None, limit)
+    }
+
+    fn list_for_owner_on(&self, owner: &str, channel: &str, limit: usize) -> Result<Vec<Session>> {
+        self.owned(owner, Some(channel), limit)
     }
 
     fn owners(&self) -> Result<std::collections::BTreeMap<String, usize>> {
@@ -1852,6 +1839,32 @@ impl SessionStore for PostgresSessionStore {
 }
 
 impl PostgresSessionStore {
+    /// `owner`'s sessions, newest-updated first, at most `limit`: those on
+    /// `channel` or a channel under it alone, when it is named.
+    fn owned(&self, owner: &str, channel: Option<&str>, limit: usize) -> Result<Vec<Session>> {
+        let owner = owner.to_string();
+        let channel = channel.map(str::to_string);
+        let limit = limit as i64;
+        self.block_on(async move {
+            let mut conn = self.pool.get().await?;
+            let scoped = self.scope(&mut conn).await?;
+            let rows = scoped
+                .query(
+                    &format!(
+                        "SELECT {SHELL_COLUMNS} FROM sessions
+                         WHERE agent_id = $1 AND owner = $2 AND tenant_id = $4
+                           AND ($5::text IS NULL OR channel = $5
+                                OR starts_with(channel, $5 || ':'))
+                         ORDER BY updated_at DESC LIMIT $3"
+                    ),
+                    &[&self.agent_id, &owner, &limit, &self.tenant_id(), &channel],
+                )
+                .await?;
+            scoped.finish().await?;
+            rows.iter().map(row_to_shell).collect()
+        })
+    }
+
     /// The shared body of `save`/`save_refreshing`: persist the session and
     /// return the row's post-write revision so callers can refresh their CAS
     /// baseline without a follow-up read.
@@ -2938,6 +2951,37 @@ pub(crate) mod tests {
                 "another instance's claim survives the bulk release"
             );
             assert_eq!(mine.release_owned_turn_claims().unwrap(), 0, "idempotent");
+        })
+        .await;
+    }
+
+    /// An owner's sessions on one surface are listed by its channel, however
+    /// many of theirs on others are newer.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_owners_sessions_on_a_channel_are_listed_past_newer_ones_elsewhere() {
+        with_store(|store| async move {
+            let s: Arc<dyn SessionStore> = store;
+            for channel in [
+                "desk",
+                "desk:planning",
+                "deskmate",
+                "slack:T1:C1",
+                "slack:T1:C2",
+            ] {
+                let mut session = s.get_or_create(channel, "u", "agent-a").unwrap();
+                session.messages.push(user_msg(channel));
+                s.save(&session).unwrap();
+            }
+            let mut on: Vec<String> = s
+                .list_for_owner_on("u", "desk", 10)
+                .unwrap()
+                .into_iter()
+                .map(|session| session.channel)
+                .collect();
+            on.sort();
+            assert_eq!(on, ["desk", "desk:planning"]);
+            assert_eq!(s.list_for_owner_on("u", "desk", 1).unwrap().len(), 1);
+            assert_eq!(s.list_for_owner("u", 10).unwrap().len(), 5);
         })
         .await;
     }
