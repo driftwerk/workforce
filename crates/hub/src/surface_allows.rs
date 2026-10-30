@@ -196,6 +196,14 @@ impl PgSurfaceAllows {
             .await?)
     }
 
+    /// Withdraws every allow anyone kept for `agent`; how many went.
+    pub async fn forget_agent(&self, agent: &str) -> Result<u64> {
+        let conn = self.pool.get().await?;
+        Ok(conn
+            .execute("DELETE FROM allows WHERE agent_id = $1", &[&agent])
+            .await?)
+    }
+
     fn block_on<T>(&self, fut: impl std::future::Future<Output = Result<T>>) -> Result<T> {
         tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(fut))
     }
@@ -392,6 +400,16 @@ mod tests {
             assert_eq!(store.forget("alice").await.unwrap(), 2);
             assert!(store.of("alice").await.unwrap().is_empty());
             assert!(store.allows("bob", "scout", send, &ops), "another's stay");
+            store.allow("bob", "atlas", send, &ops).unwrap();
+            assert_eq!(store.forget_agent("scout").await.unwrap(), 1);
+            assert!(
+                !store.allows("bob", "scout", send, &ops),
+                "the agent's went"
+            );
+            assert!(
+                store.allows("bob", "atlas", send, &ops),
+                "another agent's stay"
+            );
         })
         .await;
     }

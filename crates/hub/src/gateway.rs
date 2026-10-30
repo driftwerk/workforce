@@ -6418,10 +6418,17 @@ async fn delete_agent(
         None => false,
     };
 
-    // A new agent given this id later starts with no picture.
+    // A new agent given this id later starts with no picture, and with
+    // nothing anyone always allowed this one.
     if let Some(store) = state.pictures.as_ref() {
         if let Err(e) = store.forget(&crate::pictures::Owner::agent(&id)).await {
             warn!(agent_id = %id, error = %format!("{e:#}"), "Failed to remove the agent's pictures");
+        }
+    }
+    #[cfg(feature = "postgres")]
+    if let Some(store) = crate::surface_allows::store() {
+        if let Err(e) = store.forget_agent(&id).await {
+            warn!(agent_id = %id, error = %format!("{e:#}"), "Failed to remove the agent's always-allows");
         }
     }
 
