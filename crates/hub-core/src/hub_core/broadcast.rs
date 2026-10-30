@@ -79,7 +79,16 @@ pub struct BroadcastMessage {
     /// are told of; routing metadata like the target fields.
     #[serde(skip_serializing)]
     pub delivered: Option<workforce_core::desk::DeskDelivered>,
+    /// On a `turn_snapshot`, the live Desk turn as it stands.
+    #[serde(skip_serializing)]
+    pub snapshot: Option<workforce_core::desk::TurnSnapshot>,
 }
+
+/// The frame that closes a Desk turn's frames.
+pub const TURN_END: &str = "turn_end";
+
+/// The frame a Desk that connects mid-turn is sent the turn's state in.
+pub const TURN_SNAPSHOT: &str = "turn_snapshot";
 
 /// The frame telling a person's Desk that a conversation of theirs gained a
 /// message outside a live turn.
@@ -114,6 +123,7 @@ impl BroadcastMessage {
             target_channel: None,
             target_identity: None,
             delivered: None,
+            snapshot: None,
         }
     }
 
@@ -181,6 +191,7 @@ impl BroadcastMessage {
             target_channel: None,
             target_identity: None,
             delivered: None,
+            snapshot: None,
         }
     }
 
@@ -191,6 +202,42 @@ impl BroadcastMessage {
         Self {
             target_identity: Some(owner.to_string()),
             ..Self::silent("", "node_invoke", request)
+        }
+    }
+
+    /// This frame as one of the Desk turn `stamp` names: its client's turn
+    /// id and the id its answer is saved under. Unchanged without one.
+    pub fn stamped(self, stamp: Option<&workforce_core::desk::TurnStamp>) -> Self {
+        match stamp {
+            Some(stamp) => Self {
+                turn_ref: stamp.turn_ref.clone(),
+                id: Some(stamp.reply_id.clone()),
+                ..self
+            },
+            None => self,
+        }
+    }
+
+    /// Build the snapshot of a live Desk turn for `session_id`'s watchers.
+    pub fn turn_snapshot(
+        session_id: impl Into<String>,
+        snapshot: workforce_core::desk::TurnSnapshot,
+    ) -> Self {
+        let stamp = snapshot.stamp.clone();
+        Self {
+            snapshot: Some(snapshot),
+            ..Self::silent(session_id, TURN_SNAPSHOT, String::new())
+        }
+        .stamped(Some(&stamp))
+    }
+
+    /// Build the frame closing a Desk turn in `session_id`; its `id` is the
+    /// saved answer's, when one was saved.
+    pub fn turn_end(session_id: impl Into<String>, end: workforce_core::desk::TurnEnd) -> Self {
+        Self {
+            turn_ref: end.turn_ref,
+            id: end.reply_id,
+            ..Self::silent(session_id, TURN_END, String::new())
         }
     }
 

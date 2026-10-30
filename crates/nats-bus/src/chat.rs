@@ -68,6 +68,9 @@ pub enum TurnControl {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         choice: Option<workforce_core::policy::PermissionChoice>,
     },
+    /// Put a snapshot of the live Desk turn into its own progress stream,
+    /// for a Desk that connected mid-turn.
+    Snapshot,
 }
 
 /// The owning instance's answer to a [`TurnControl`].
@@ -171,6 +174,15 @@ pub enum ChatProgress {
     },
     /// An error occurred.
     Error { message: String },
+    /// The model call was rate-limited; the turn retries after a wait. Sent
+    /// for Desk turns only, as every variant below is.
+    RateLimited { wait_secs: u64, attempt: u32 },
+    /// The model was silent too long and the turn switches to the next one.
+    SlowModelFailover { model: String, elapsed_secs: u64 },
+    /// The live Desk turn as it stands.
+    Snapshot(workforce_core::desk::TurnSnapshot),
+    /// The Desk turn ended; its closing events have all gone out.
+    TurnEnd(workforce_core::desk::TurnEnd),
 }
 
 fn default_prompt_options() -> workforce_core::policy::PermissionPromptOptions {
@@ -202,6 +214,7 @@ mod tests {
                 user: "u1".into(),
                 choice: Some(PermissionChoice::AllowAlways),
             },
+            TurnControl::Snapshot,
         ]
         .into_iter()
         .for_each(|control| {
@@ -233,6 +246,41 @@ mod tests {
                 reason: workforce_core::types::StreamDiscardReason::Interrupted
             }
         ));
+    }
+
+    #[test]
+    fn a_desk_turn_s_snapshot_and_end_read_flat() {
+        let stamp = workforce_core::desk::TurnStamp {
+            turn_ref: Some("ref-1".into()),
+            reply_id: "reply-1".into(),
+        };
+        let snapshot = ChatProgress::Snapshot(workforce_core::desk::TurnSnapshot {
+            stamp,
+            since: "2026-10-29T09:00:00Z".parse().unwrap(),
+            status: workforce_core::desk::TurnPhase::Writing,
+            text: "Hel".into(),
+        });
+        let wire = serde_json::to_value(&snapshot).unwrap();
+        assert_eq!(
+            wire,
+            serde_json::json!({
+                "type": "snapshot", "turn_ref": "ref-1", "reply_id": "reply-1",
+                "since": "2026-10-29T09:00:00Z", "status": "writing", "text": "Hel",
+            })
+        );
+        assert!(matches!(
+            serde_json::from_value::<ChatProgress>(wire).unwrap(),
+            ChatProgress::Snapshot(_)
+        ));
+        let end = serde_json::to_value(ChatProgress::TurnEnd(workforce_core::desk::TurnEnd {
+            turn_ref: Some("ref-1".into()),
+            reply_id: None,
+        }))
+        .unwrap();
+        assert_eq!(
+            end,
+            serde_json::json!({"type": "turn_end", "turn_ref": "ref-1"})
+        );
     }
 
     #[test]

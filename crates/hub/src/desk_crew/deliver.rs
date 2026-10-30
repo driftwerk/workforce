@@ -106,7 +106,7 @@ impl CrewHub {
         let forward = {
             let (tx, sid) = (tx.clone(), session_id.clone());
             let mentions = crate::gateway::mentions_for(service, &sid);
-            move |rx| crate::gateway::forward_local_progress(rx, tx, sid, false, mentions)
+            move |rx| crate::gateway::forward_local_progress(rx, tx, sid, false, mentions, None)
         };
         let conducted = crate::live_turns::conduct(&mut live, service, progress, forward).await;
         let answer = match &conducted.ending {

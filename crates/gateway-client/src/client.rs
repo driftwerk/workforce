@@ -1150,6 +1150,9 @@ mod tests {
             author: None,
             features: None,
             turn_ref: None,
+            status: None,
+            since: None,
+            text: None,
         };
         assert_eq!(msg.kind(), ServerMessageKind::StreamDelta);
         assert!(msg.is_stream_delta());
@@ -1183,6 +1186,9 @@ mod tests {
             author: None,
             features: None,
             turn_ref: None,
+            status: None,
+            since: None,
+            text: None,
         };
         let json = serde_json::to_string(&msg).unwrap();
         let parsed: ServerMessage = serde_json::from_str(&json).unwrap();
@@ -1218,6 +1224,9 @@ mod tests {
             author: None,
             features: None,
             turn_ref: None,
+            status: None,
+            since: None,
+            text: None,
         };
         assert_eq!(start.kind(), ServerMessageKind::ToolStart);
         assert_eq!(start.text(), Some("filesystem.read"));
@@ -1247,6 +1256,9 @@ mod tests {
             author: None,
             features: None,
             turn_ref: None,
+            status: None,
+            since: None,
+            text: None,
         };
         assert_eq!(end.kind(), ServerMessageKind::ToolEnd);
     }
@@ -1278,6 +1290,9 @@ mod tests {
             author: None,
             features: None,
             turn_ref: None,
+            status: None,
+            since: None,
+            text: None,
         };
         assert!(msg.is_error());
         assert_eq!(msg.error.as_deref(), Some("Rate limit exceeded"));
@@ -1310,6 +1325,9 @@ mod tests {
             author: None,
             features: None,
             turn_ref: None,
+            status: None,
+            since: None,
+            text: None,
         };
         assert_eq!(msg.kind(), ServerMessageKind::Reminder);
     }
@@ -1412,6 +1430,9 @@ mod tests {
             author: None,
             features: None,
             turn_ref: None,
+            status: None,
+            since: None,
+            text: None,
         };
         assert!(msg.is_stream_start());
         assert_eq!(msg.kind(), ServerMessageKind::StreamStart);
@@ -1446,6 +1467,9 @@ mod tests {
             author: None,
             features: None,
             turn_ref: None,
+            status: None,
+            since: None,
+            text: None,
         };
         assert!(msg.is_stream_end());
         assert_eq!(msg.kind(), ServerMessageKind::StreamEnd);
@@ -1495,6 +1519,9 @@ mod tests {
                 author: None,
                 features: None,
                 turn_ref: None,
+                status: None,
+                since: None,
+                text: None,
             };
             assert_eq!(
                 msg.kind(),
@@ -1532,6 +1559,9 @@ mod tests {
             author: None,
             features: None,
             turn_ref: None,
+            status: None,
+            since: None,
+            text: None,
         };
         let json = serde_json::to_string(&msg).unwrap();
         let parsed: ServerMessage = serde_json::from_str(&json).unwrap();

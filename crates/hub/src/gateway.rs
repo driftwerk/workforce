@@ -15,10 +15,10 @@ use tokio::sync::broadcast;
 use tokio::task::AbortHandle;
 use tokio_util::sync::CancellationToken;
 use tower_http::cors::{AllowOrigin, CorsLayer};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use workforce_agent::runner::ProgressEvent;
 use workforce_agent::tools::approval::SelfServe;
-use workforce_common::channels::desk::{DeskPlace, DeskTurn};
+use workforce_common::channels::desk::{DeskPlace, DeskTurn, TurnStamp};
 use workforce_nats::chat::{
     ChatProgress, NatsChatAttachment, NatsChatRequest, TurnControl, TurnControlReply, REFUSED_BUSY,
 };
@@ -1384,11 +1384,16 @@ fn forward_admits(
 /// What a Desk connection is told it may use: structured turns, and the
 /// hub link with its conversation drain.
 const DESK_PLACE: &str = "desk.place";
+const DESK_STREAM: &str = "desk.stream";
 const DESK_DELIVERIES: &str = "desk.deliveries";
 
 /// Frames only a Desk connection is sent; any other connection is sent the
 /// frames it always was.
-const DESK_ONLY_FRAMES: &[&str] = &["turn_end", "turn_snapshot", "desk_delivered"];
+const DESK_ONLY_FRAMES: &[&str] = &[
+    crate::broadcast::TURN_END,
+    crate::broadcast::TURN_SNAPSHOT,
+    crate::broadcast::DESK_DELIVERED,
+];
 
 /// What a declared Desk connection is offered, on its `connected`. The hub
 /// link and the drain are for a person's conversations and need the
@@ -1396,7 +1401,8 @@ const DESK_ONLY_FRAMES: &[&str] = &["turn_end", "turn_snapshot", "desk_delivered
 /// that serves them, is offered deliveries.
 pub(crate) fn desk_features(of_a_person: bool) -> Vec<String> {
     let deliveries = cfg!(feature = "postgres") && of_a_person;
-    std::iter::once(DESK_PLACE)
+    [DESK_PLACE, DESK_STREAM]
+        .into_iter()
         .chain(deliveries.then_some(DESK_DELIVERIES))
         .map(str::to_string)
         .collect()
@@ -1440,6 +1446,7 @@ fn server_frame(msg: BroadcastMessage, declared: bool) -> Option<ServerMessage> 
     let id = msg
         .id
         .filter(|_| declared || msg.msg_type == crate::broadcast::USER_MESSAGE);
+    let snapshot = msg.snapshot.filter(|_| declared);
     Some(ServerMessage {
         content: Some(msg.content),
         session_id: (!msg.session_id.is_empty()).then_some(msg.session_id),
@@ -1464,6 +1471,9 @@ fn server_frame(msg: BroadcastMessage, declared: bool) -> Option<ServerMessage> 
         author: msg.author,
         features: None,
         turn_ref: msg.turn_ref.filter(|_| declared),
+        status: snapshot.as_ref().map(|s| s.status),
+        since: snapshot.as_ref().map(|s| s.since.to_rfc3339()),
+        text: snapshot.map(|s| s.text),
         msg_type: msg.msg_type,
     })
 }
@@ -1576,6 +1586,47 @@ mod desk_frame_tests {
             (Some("ref-1"), Some("reply-1"))
         );
         assert!(server_frame(BroadcastMessage::new("s1", "turn_end", ""), true).is_some());
+    }
+
+    #[test]
+    fn a_snapshot_and_a_turn_end_reach_desk_alone_with_their_ids() {
+        use workforce_common::channels::desk::{TurnEnd, TurnPhase, TurnSnapshot};
+        let snapshot = BroadcastMessage::turn_snapshot(
+            "s1",
+            TurnSnapshot {
+                stamp: TurnStamp {
+                    turn_ref: Some("ref-1".into()),
+                    reply_id: "reply-1".into(),
+                },
+                since: "2026-10-29T09:00:00Z".parse().unwrap(),
+                status: TurnPhase::Writing,
+                text: "Hel".into(),
+            },
+        );
+        assert_eq!(
+            serde_json::to_value(server_frame(snapshot.clone(), true).unwrap()).unwrap(),
+            serde_json::json!({
+                "type": "turn_snapshot", "content": "", "session_id": "s1", "speakable": false,
+                "id": "reply-1", "turn_ref": "ref-1", "status": "writing",
+                "since": "2026-10-29T09:00:00+00:00", "text": "Hel",
+            })
+        );
+        assert!(server_frame(snapshot, false).is_none());
+        let end = BroadcastMessage::turn_end(
+            "s1",
+            TurnEnd {
+                turn_ref: Some("ref-1".into()),
+                reply_id: Some("reply-1".into()),
+            },
+        );
+        assert_eq!(
+            serde_json::to_value(server_frame(end.clone(), true).unwrap()).unwrap(),
+            serde_json::json!({
+                "type": "turn_end", "content": "", "session_id": "s1", "speakable": false,
+                "id": "reply-1", "turn_ref": "ref-1",
+            })
+        );
+        assert!(server_frame(end, false).is_none());
     }
 
     #[test]
@@ -1829,7 +1880,10 @@ async fn handle_ws(
     let conn_identity_send = identity_id.clone();
     let conn_owner_send = identity_id.clone().or_else(|| device_id.clone());
 
-    let resolved_id = agent_id.as_deref().unwrap_or(state.registry.default_id());
+    let resolved_id = agent_id
+        .clone()
+        .unwrap_or_else(|| state.registry.default_id().to_string());
+    let resolved_id = resolved_id.as_str();
 
     // Eagerly resolve the connection's anchor session so the client receives
     // a session_id on connect, and so per-message dispatch has a stable
@@ -1876,12 +1930,41 @@ async fn handle_ws(
         author: None,
         features: declared.then(|| desk_features(identity_id.is_some())),
         turn_ref: None,
+        status: None,
+        since: None,
+        text: None,
     };
     let _ = sender
         .send(Message::Text(
             serde_json::to_string(&connected_msg).unwrap().into(),
         ))
         .await;
+
+    // A Desk connection hears its session's progress whichever instance runs
+    // the turn, and, joining mid-turn, is sent the turn as it stands: the
+    // turn's relay puts a snapshot between two of its events, so the deltas
+    // after it carry on from its text.
+    let mut _watching = None;
+    if let (true, Some(sid), Some(service)) = (
+        declared,
+        anchored_session_id.as_deref(),
+        state.registry.get(resolved_id),
+    ) {
+        if let Some(nats) = state.nats.as_ref() {
+            _watching = Some(
+                state
+                    .progress_forwarders
+                    .watch(
+                        nats,
+                        workforce_nats::subjects::agent_progress(resolved_id, sid),
+                        sid,
+                        state.broadcast_tx.clone(),
+                    )
+                    .await,
+            );
+        }
+        steer(state.nats.as_ref(), &service, sid, TurnControl::Snapshot).await;
+    }
 
     // Spawn broadcast forwarder — only forward messages for this connection's session.
     let mut send_task = tokio::spawn(async move {
@@ -2235,6 +2318,7 @@ async fn handle_ws(
                                     uuid::Uuid::new_v4().to_string(),
                                 )
                             });
+                            let stamp = desk.as_ref().map(TurnStamp::from);
                             // Which voice BRIDGE (if any) this turn was spoken
                             // on, decided here and carried with the turn. The
                             // session cannot answer it: one WebSocket anchor
@@ -2331,24 +2415,30 @@ async fn handle_ws(
 
                             // A `typing` opens a model call on clients, so a
                             // follow-up steered into a live call must not send one.
-                            let _ = broadcast_tx.send(BroadcastMessage::new(
-                                effective_session_id.clone(),
-                                "typing",
-                                String::new(),
-                            ));
+                            let _ = broadcast_tx.send(
+                                BroadcastMessage::new(
+                                    effective_session_id.clone(),
+                                    "typing",
+                                    String::new(),
+                                )
+                                .stamped(stamp.as_ref()),
+                            );
 
-                            if let Some(ref nats) = nats {
-                                // ── NATS mode: publish request, subscribe to progress ──
-
-                                // Drain gate: match the standalone branch below.
-                                if state.drain_token.is_cancelled() {
-                                    let _ = broadcast_tx.send(BroadcastMessage::new(
+                            // Drain gate: reject new tasks during graceful shutdown.
+                            if state.drain_token.is_cancelled() {
+                                let _ = broadcast_tx.send(
+                                    BroadcastMessage::new(
                                         effective_session_id.clone(),
                                         "error",
                                         "Server is shutting down — please reconnect",
-                                    ));
-                                    continue;
-                                }
+                                    )
+                                    .stamped(stamp.as_ref()),
+                                );
+                                continue;
+                            }
+
+                            if let Some(ref nats) = nats {
+                                // ── NATS mode: publish request, subscribe to progress ──
 
                                 let nats_attachments: Vec<NatsChatAttachment> = client_msg
                                     .attachments
@@ -2404,6 +2494,7 @@ async fn handle_ws(
                                         &effective_session_id,
                                         broadcast_tx.clone(),
                                         tts_normalize,
+                                        stamp.clone(),
                                     )
                                     .await;
 
@@ -2415,11 +2506,14 @@ async fn handle_ws(
                                             state
                                                 .progress_forwarders
                                                 .withdraw(&effective_session_id, forwarding);
-                                            let _ = broadcast_tx.send(BroadcastMessage::new(
-                                                effective_session_id.clone(),
-                                                "error",
-                                                format!("Failed to route message: {}", e),
-                                            ));
+                                            let _ = broadcast_tx.send(
+                                                BroadcastMessage::new(
+                                                    effective_session_id.clone(),
+                                                    "error",
+                                                    format!("Failed to route message: {}", e),
+                                                )
+                                                .stamped(stamp.as_ref()),
+                                            );
                                             continue;
                                         }
                                     }
@@ -2433,16 +2527,18 @@ async fn handle_ws(
                                 }
                             } else {
                                 // ── Standalone mode: direct call (no NATS) ──
-
-                                // Drain gate: reject new tasks during graceful shutdown
-                                if state.drain_token.is_cancelled() {
-                                    let _ = broadcast_tx.send(BroadcastMessage::new(
-                                        effective_session_id.clone(),
-                                        "error",
-                                        "Server is shutting down — please reconnect",
-                                    ));
-                                    continue;
-                                }
+                                // A Desk turn's frames close with its end,
+                                // however it went.
+                                let turn_end = |session_id: &str| {
+                                    desk.as_ref().map(|desk| {
+                                        BroadcastMessage::turn_end(
+                                            session_id,
+                                            crate::desk_surface::turn_end(
+                                                &service, session_id, desk,
+                                            ),
+                                        )
+                                    })
+                                };
 
                                 // Convert protocol attachments to session attachments
                                 let session_attachments = client_msg.attachments.map(|atts| {
@@ -2460,17 +2556,23 @@ async fn handle_ws(
                                     .begin_live_turn(
                                         &effective_session_id,
                                         SelfServe::answerable_if(answers_approvals),
-                                        desk.as_ref().map(|d| d.turn.place.clone()),
+                                        desk.as_ref(),
                                     )
                                     .await
                                 {
                                     Ok(begun) => begun,
                                     Err(busy) => {
-                                        let _ = broadcast_tx.send(BroadcastMessage::new(
+                                        let refused = BroadcastMessage::new(
                                             effective_session_id.clone(),
                                             "error",
                                             busy.to_string(),
-                                        ));
+                                        )
+                                        .stamped(stamp.as_ref());
+                                        std::iter::once(refused)
+                                            .chain(turn_end(&effective_session_id))
+                                            .for_each(|frame| {
+                                                let _ = broadcast_tx.send(frame);
+                                            });
                                         continue;
                                     }
                                 };
@@ -2538,10 +2640,12 @@ async fn handle_ws(
                                         // branch above (DW-571).
                                         let tts_normalize = voice_turn;
                                         let service = Arc::clone(&service);
+                                        let (desk, stamp) = (desk.clone(), stamp.clone());
                                         tokio::spawn(async move {
                                             let forward = {
                                                 let (tx, sid) = (tx.clone(), sid.clone());
                                                 let mentions = mentions_for(&service, &sid);
+                                                let stamp = stamp.clone();
                                                 move |rx| {
                                                     forward_local_progress(
                                                         rx,
@@ -2549,6 +2653,7 @@ async fn handle_ws(
                                                         sid,
                                                         tts_normalize,
                                                         mentions,
+                                                        stamp,
                                                     )
                                                 }
                                             };
@@ -2556,6 +2661,14 @@ async fn handle_ws(
                                                 &mut live, &service, progress, forward,
                                             )
                                             .await;
+                                            let end = desk.as_ref().map(|desk| {
+                                                BroadcastMessage::turn_end(
+                                                    &sid,
+                                                    crate::desk_surface::turn_end(
+                                                        &service, &sid, desk,
+                                                    ),
+                                                )
+                                            });
                                             conducted
                                                 .closing(&service)
                                                 .into_iter()
@@ -2564,6 +2677,8 @@ async fn handle_ws(
                                                         progress, &sid, false,
                                                     )
                                                 })
+                                                .map(|message| message.stamped(stamp.as_ref()))
+                                                .chain(end)
                                                 .for_each(|message| {
                                                     let _ = tx.send(message);
                                                 });
@@ -2572,11 +2687,20 @@ async fn handle_ws(
                                     }
                                     Err(_) if live.is_cancelled() => {}
                                     Err(e) => {
-                                        let _ = broadcast_tx.send(BroadcastMessage::new(
-                                            "",
-                                            "error",
-                                            e.to_string(),
-                                        ));
+                                        // A Desk turn's failure is its own
+                                        // session's; anyone else's goes as ever.
+                                        let session = match desk {
+                                            Some(_) => effective_session_id.clone(),
+                                            None => String::new(),
+                                        };
+                                        let failed =
+                                            BroadcastMessage::new(session, "error", e.to_string())
+                                                .stamped(stamp.as_ref());
+                                        std::iter::once(failed)
+                                            .chain(turn_end(&effective_session_id))
+                                            .for_each(|frame| {
+                                                let _ = broadcast_tx.send(frame);
+                                            });
                                     }
                                 }
                             }
@@ -2750,7 +2874,10 @@ pub(crate) async fn forward_local_progress(
     sid: String,
     tts_normalize: bool,
     mentions: Option<Mentions>,
+    stamp: Option<TurnStamp>,
 ) {
+    // The Desk turn the frames belong to, named again by each snapshot.
+    let mut stamp = stamp;
     let mut delivery = crate::chat_worker::AnswerDelivery::default();
     // What has streamed of the answer, for what it mentions.
     let mut said = String::new();
@@ -2780,7 +2907,7 @@ pub(crate) async fn forward_local_progress(
                             b,
                             activity_started,
                         ),
-                    ));
+                    ).stamped(stamp.as_ref()));
                 }
                 continue;
             }
@@ -2925,11 +3052,7 @@ pub(crate) async fn forward_local_progress(
             ProgressEvent::RateLimited { wait_secs, attempt } => Some(BroadcastMessage::new(
                 sid.clone(),
                 "rate_limited",
-                if attempt == 0 {
-                    format!("pacing under provider rate limit, ~{wait_secs}s wait")
-                } else {
-                    format!("rate-limited, retry #{attempt} in {wait_secs}s")
-                },
+                rate_limited_line(wait_secs, attempt),
             )),
             ProgressEvent::SlowModelFailover {
                 model,
@@ -2937,7 +3060,7 @@ pub(crate) async fn forward_local_progress(
             } => Some(BroadcastMessage::new(
                 sid.clone(),
                 "slow_model_failover",
-                format!("{model} produced nothing for {elapsed_secs}s — switching model"),
+                slow_model_line(&model, elapsed_secs),
             )),
             ProgressEvent::SubActivity { source, detail } => Some(BroadcastMessage::silent(
                 sid.clone(),
@@ -2956,6 +3079,10 @@ pub(crate) async fn forward_local_progress(
             ProgressEvent::CheckIn { note } => {
                 Some(BroadcastMessage::new(sid.clone(), "message", note))
             }
+            ProgressEvent::Snapshot(snapshot) => {
+                stamp = Some(snapshot.stamp.clone());
+                Some(BroadcastMessage::turn_snapshot(sid.clone(), snapshot))
+            }
         };
 
         // Track the heartbeat's in-flight
@@ -2973,27 +3100,56 @@ pub(crate) async fn forward_local_progress(
         }
 
         if let Some(msg) = broadcast {
-            let _ = tx.send(msg);
+            let _ = tx.send(msg.stamped(stamp.as_ref()));
         }
     }
 }
 
 /// The NATS progress forwarder of each session on this instance. Every
 /// connection shares one broadcast channel, so one forwarder serves all of a
-/// session's requests in flight here, ending after one `Done` per request.
+/// session's requests in flight here, ending after one `Done` per request,
+/// and the Desk connections watching it, for as long as they watch. It also
+/// keeps the ids of the Desk turn the session is streaming, which its frames
+/// carry.
 #[derive(Default)]
 pub struct ProgressForwarders(parking_lot::Mutex<HashMap<String, Forwarder>>);
 
 struct Forwarder {
     generation: u64,
     pending: usize,
+    watchers: usize,
+    stamp: Option<TurnStamp>,
     task: Option<AbortHandle>,
 }
 
+/// Why a forwarder is joined: a request published here, or a Desk
+/// connection watching the session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Join {
+    Request,
+    Watch,
+}
+
+/// A Desk connection's hold on its session's progress: the session's frames
+/// reach this instance for as long as it is held, whichever instance's
+/// request they answer.
+pub(crate) struct WatchGuard {
+    forwarders: Arc<ProgressForwarders>,
+    session_id: String,
+    generation: u64,
+}
+
+impl Drop for WatchGuard {
+    fn drop(&mut self) {
+        self.forwarders.unwatch(&self.session_id, self.generation);
+    }
+}
+
 impl ProgressForwarders {
-    /// Count one more request on `session_id`, subscribing a forwarder to
-    /// `subject` when none runs. Called before the request is published, so
-    /// none of its progress can slip past.
+    /// Count one more request on `session_id`, the Desk turn `stamp` names
+    /// if it is one, subscribing a forwarder to `subject` when none runs.
+    /// Called before the request is published, so none of its progress can
+    /// slip past.
     async fn expect(
         self: &Arc<Self>,
         nats: &async_nats::Client,
@@ -3001,8 +3157,43 @@ impl ProgressForwarders {
         session_id: &str,
         tx: broadcast::Sender<BroadcastMessage>,
         tts_normalize: bool,
+        stamp: Option<TurnStamp>,
     ) -> u64 {
-        let (generation, lead) = self.admit(session_id);
+        let generation = self
+            .join(nats, subject, session_id, tx, tts_normalize, Join::Request)
+            .await;
+        self.set_stamp(session_id, stamp);
+        generation
+    }
+
+    /// Hold `session_id`'s progress on this instance for a Desk connection.
+    pub(crate) async fn watch(
+        self: &Arc<Self>,
+        nats: &async_nats::Client,
+        subject: String,
+        session_id: &str,
+        tx: broadcast::Sender<BroadcastMessage>,
+    ) -> WatchGuard {
+        let generation = self
+            .join(nats, subject, session_id, tx, false, Join::Watch)
+            .await;
+        WatchGuard {
+            forwarders: Arc::clone(self),
+            session_id: session_id.to_string(),
+            generation,
+        }
+    }
+
+    async fn join(
+        self: &Arc<Self>,
+        nats: &async_nats::Client,
+        subject: String,
+        session_id: &str,
+        tx: broadcast::Sender<BroadcastMessage>,
+        tts_normalize: bool,
+        join: Join,
+    ) -> u64 {
+        let (generation, lead) = self.admit(session_id, join);
         if lead {
             match nats.subscribe(subject).await {
                 Ok(sub) => {
@@ -3018,34 +3209,40 @@ impl ProgressForwarders {
                 }
                 Err(e) => {
                     warn!(session_id, error = %e, "Failed to subscribe to progress");
-                    self.withdraw(session_id, generation);
+                    match join {
+                        Join::Request => self.withdraw(session_id, generation),
+                        Join::Watch => self.unwatch(session_id, generation),
+                    };
                 }
             }
         }
         generation
     }
 
-    fn admit(&self, session_id: &str) -> (u64, bool) {
+    fn admit(&self, session_id: &str, join: Join) -> (u64, bool) {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let mut forwarders = self.0.lock();
-        match forwarders.get_mut(session_id) {
-            Some(forwarder) => {
-                forwarder.pending += 1;
-                (forwarder.generation, false)
-            }
+        let (forwarder, lead) = match forwarders.get_mut(session_id) {
+            Some(forwarder) => (forwarder, false),
             None => {
                 let generation = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                forwarders.insert(
-                    session_id.to_string(),
-                    Forwarder {
+                let forwarder = forwarders
+                    .entry(session_id.to_string())
+                    .or_insert(Forwarder {
                         generation,
-                        pending: 1,
+                        pending: 0,
+                        watchers: 0,
+                        stamp: None,
                         task: None,
-                    },
-                );
-                (generation, true)
+                    });
+                (forwarder, true)
             }
+        };
+        match join {
+            Join::Request => forwarder.pending += 1,
+            Join::Watch => forwarder.watchers += 1,
         }
+        (forwarder.generation, lead)
     }
 
     fn attach(&self, session_id: &str, generation: u64, task: AbortHandle) {
@@ -3056,8 +3253,17 @@ impl ProgressForwarders {
     }
 
     /// One request is over — its `Done` arrived or it was never published.
-    /// `true` once the forwarder carries none, which ends it.
+    /// `true` once the forwarder carries no request and no watcher, which
+    /// ends it.
     fn withdraw(&self, session_id: &str, generation: u64) -> bool {
+        self.leave(session_id, generation, Join::Request)
+    }
+
+    fn unwatch(&self, session_id: &str, generation: u64) -> bool {
+        self.leave(session_id, generation, Join::Watch)
+    }
+
+    fn leave(&self, session_id: &str, generation: u64, join: Join) -> bool {
         let mut forwarders = self.0.lock();
         let Some(forwarder) = forwarders
             .get_mut(session_id)
@@ -3065,14 +3271,31 @@ impl ProgressForwarders {
         else {
             return true;
         };
-        forwarder.pending = forwarder.pending.saturating_sub(1);
-        if forwarder.pending > 0 {
+        match join {
+            Join::Request => forwarder.pending = forwarder.pending.saturating_sub(1),
+            Join::Watch => forwarder.watchers = forwarder.watchers.saturating_sub(1),
+        }
+        if forwarder.pending > 0 || forwarder.watchers > 0 {
             return false;
         }
         if let Some(task) = forwarders.remove(session_id).and_then(|f| f.task) {
             task.abort();
         }
         true
+    }
+
+    /// The Desk turn `session_id` is streaming, as its frames name it.
+    fn stamp(&self, session_id: &str) -> Option<TurnStamp> {
+        self.0
+            .lock()
+            .get(session_id)
+            .and_then(|forwarder| forwarder.stamp.clone())
+    }
+
+    fn set_stamp(&self, session_id: &str, stamp: Option<TurnStamp>) {
+        if let Some(forwarder) = self.0.lock().get_mut(session_id) {
+            forwarder.stamp = stamp;
+        }
     }
 
     fn stop(&self, session_id: &str) {
@@ -3207,15 +3430,31 @@ async fn forward_nats_progress(
     generation: u64,
 ) {
     while let Some(msg) = sub.next().await {
+        // An event a later build sends and this one cannot read is skipped,
+        // never the end of the stream.
         let progress: ChatProgress = match serde_json::from_slice(&msg.payload) {
             Ok(p) => p,
-            Err(_) => continue,
+            Err(e) => {
+                debug!(session_id = %session_id, error = %e, "Skipping an unreadable progress event");
+                continue;
+            }
         };
 
         let done = matches!(progress, ChatProgress::Done { .. });
+        let stamp = match &progress {
+            ChatProgress::Snapshot(snapshot) => {
+                forwarders.set_stamp(&session_id, Some(snapshot.stamp.clone()));
+                Some(snapshot.stamp.clone())
+            }
+            ChatProgress::TurnEnd(_) => {
+                forwarders.set_stamp(&session_id, None);
+                None
+            }
+            _ => forwarders.stamp(&session_id),
+        };
 
         if let Some(broadcast) = chat_progress_to_broadcast(progress, &session_id, tts_normalize) {
-            let _ = tx.send(broadcast);
+            let _ = tx.send(broadcast.stamped(stamp.as_ref()));
         }
 
         if done && forwarders.withdraw(&session_id, generation) {
@@ -3334,7 +3573,37 @@ pub(crate) fn chat_progress_to_broadcast(
         ChatProgress::Error { message } => {
             Some(BroadcastMessage::new(session_id, "error", message))
         }
+        ChatProgress::RateLimited { wait_secs, attempt } => Some(BroadcastMessage::new(
+            session_id,
+            "rate_limited",
+            rate_limited_line(wait_secs, attempt),
+        )),
+        ChatProgress::SlowModelFailover {
+            model,
+            elapsed_secs,
+        } => Some(BroadcastMessage::new(
+            session_id,
+            "slow_model_failover",
+            slow_model_line(&model, elapsed_secs),
+        )),
+        ChatProgress::Snapshot(snapshot) => {
+            Some(BroadcastMessage::turn_snapshot(session_id, snapshot))
+        }
+        ChatProgress::TurnEnd(end) => Some(BroadcastMessage::turn_end(session_id, end)),
     }
+}
+
+/// What a `rate_limited` frame says.
+fn rate_limited_line(wait_secs: u64, attempt: u32) -> String {
+    match attempt {
+        0 => format!("pacing under provider rate limit, ~{wait_secs}s wait"),
+        _ => format!("rate-limited, retry #{attempt} in {wait_secs}s"),
+    }
+}
+
+/// What a `slow_model_failover` frame says.
+fn slow_model_line(model: &str, elapsed_secs: u64) -> String {
+    format!("{model} produced nothing for {elapsed_secs}s — switching model")
 }
 
 // ── Local Agent WebSocket (DW-324) ─────────────────────────────────────────
@@ -13797,7 +14066,7 @@ mod chat_progress_tests {
             .await
             .unwrap();
         drop(progress_tx);
-        forward_local_progress(progress_rx, tx, "s-1".into(), false, None).await;
+        forward_local_progress(progress_rx, tx, "s-1".into(), false, None, None).await;
         std::iter::from_fn(|| rx.try_recv().ok())
             .filter(|message| message.msg_type == "stream_discard")
             .collect()
@@ -16141,13 +16410,44 @@ mod turn_control_tests {
         );
     }
 
+    /// A Desk connection watching a session keeps its forwarder through
+    /// every request's end, so it hears the next turn too, from any
+    /// instance; the forwarder ends with the last watcher and request.
+    #[test]
+    fn a_watched_session_s_forwarder_outlives_its_requests() {
+        let forwarders = ProgressForwarders::default();
+        let (generation, lead) = forwarders.admit("s1", Join::Watch);
+        assert!(lead);
+        assert_eq!(forwarders.admit("s1", Join::Request), (generation, false));
+        assert!(
+            !forwarders.withdraw("s1", generation),
+            "the watcher keeps it after the request's Done"
+        );
+        forwarders.set_stamp(
+            "s1",
+            Some(TurnStamp {
+                turn_ref: Some("ref-1".into()),
+                reply_id: "reply-1".into(),
+            }),
+        );
+        assert_eq!(
+            forwarders.stamp("s1").and_then(|s| s.turn_ref),
+            Some("ref-1".into())
+        );
+        assert!(
+            forwarders.unwatch("s1", generation),
+            "the last watcher ends it"
+        );
+        assert_eq!(forwarders.stamp("s1"), None);
+    }
+
     #[test]
     fn a_session_forwarder_ends_after_every_request_it_carries() {
         let forwarders = ProgressForwarders::default();
-        let (generation, lead) = forwarders.admit("s1");
+        let (generation, lead) = forwarders.admit("s1", Join::Request);
         assert!(lead);
         assert_eq!(
-            forwarders.admit("s1"),
+            forwarders.admit("s1", Join::Request),
             (generation, false),
             "joins the running forwarder"
         );
@@ -16156,7 +16456,7 @@ mod turn_control_tests {
             "one request still out"
         );
         assert!(forwarders.withdraw("s1", generation));
-        let (next, lead) = forwarders.admit("s1");
+        let (next, lead) = forwarders.admit("s1", Join::Request);
         assert!(
             lead && next != generation,
             "a fresh forwarder after the last Done"

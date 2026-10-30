@@ -244,6 +244,14 @@ pub async fn agent_service(data_dir: &std::path::Path) -> Arc<AgentService> {
 pub async fn agent_on_mock_llm(
     data_dir: &std::path::Path,
 ) -> (Arc<AgentService>, wiremock::MockServer) {
+    agent_on_slow_mock_llm(data_dir, std::time::Duration::ZERO).await
+}
+
+/// [`agent_on_mock_llm`] whose model takes `delay` to answer.
+pub async fn agent_on_slow_mock_llm(
+    data_dir: &std::path::Path,
+    delay: std::time::Duration,
+) -> (Arc<AgentService>, wiremock::MockServer) {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -263,7 +271,8 @@ pub async fn agent_on_mock_llm(
         .respond_with(
             ResponseTemplate::new(200)
                 .insert_header("content-type", "text/event-stream")
-                .set_body_string(sse),
+                .set_body_string(sse)
+                .set_delay(delay),
         )
         .mount(&server)
         .await;

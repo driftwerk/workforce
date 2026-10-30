@@ -420,6 +420,61 @@ pub struct DeskDelivered {
     pub spoken: bool,
 }
 
+/// The ids a live Desk turn's frames carry: the client's own for the turn,
+/// and the id its answer is saved under.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnStamp {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_ref: Option<String>,
+    pub reply_id: String,
+}
+
+impl From<&DeskTurnContext> for TurnStamp {
+    fn from(desk: &DeskTurnContext) -> Self {
+        Self {
+            turn_ref: desk.turn_ref.clone(),
+            reply_id: desk.reply_id.clone(),
+        }
+    }
+}
+
+/// What a live turn is doing, as a reconnecting Desk shows it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnPhase {
+    /// Waiting on the model.
+    Thinking,
+    /// Streaming its answer.
+    Writing,
+    /// Running a tool.
+    Working,
+    /// Compacting its context.
+    Tidying,
+    /// Held by a rate limit or switching model.
+    Waiting,
+}
+
+/// A live turn as it stands: what a Desk that connects mid-turn replaces
+/// its draft with, so the deltas after it carry on from the same text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnSnapshot {
+    #[serde(flatten)]
+    pub stamp: TurnStamp,
+    pub since: chrono::DateTime<chrono::Utc>,
+    pub status: TurnPhase,
+    pub text: String,
+}
+
+/// How a live Desk turn ended: its client's id, and the id its answer was
+/// saved under when one was.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnEnd {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_id: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1437,6 +1437,10 @@ pub enum ProgressEvent {
     ConnectRequired {
         prompt: workforce_common::subscription::ConnectPrompt,
     },
+    /// A live Desk turn as it stands, emitted by the turn's own relay between
+    /// two of its events, so every consumer carries it in order with the
+    /// deltas around it.
+    Snapshot(workforce_common::channels::desk::TurnSnapshot),
 }
 
 /// A follow-up user message absorbed into a run, reported on [`RunResult`]
@@ -10289,6 +10293,7 @@ mod tests {
                 ProgressEvent::SubActivity { .. } => "sub_activity",
                 ProgressEvent::CheckIn { .. } => "check_in",
                 ProgressEvent::ConnectRequired { .. } => "connect_required",
+                ProgressEvent::Snapshot(_) => "snapshot",
             })
             .collect();
 

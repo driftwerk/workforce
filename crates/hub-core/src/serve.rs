@@ -2393,13 +2393,13 @@ impl AgentService {
         &self,
         session_id: &str,
         self_serve: workforce_agent::tools::approval::SelfServe,
-        place: Option<workforce_common::channels::desk::DeskPlace>,
+        desk: Option<&workforce_common::channels::desk::DeskTurnContext>,
     ) -> Result<
         (crate::hub_core::live_turns::LiveTurn, TurnInbox),
         crate::hub_core::live_turns::TurnBusy,
     > {
         self.live_turns
-            .begin(session_id, self_serve, place, self.nats())
+            .begin(session_id, self_serve, desk, self.nats())
             .await
     }
 

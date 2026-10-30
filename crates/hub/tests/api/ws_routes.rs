@@ -332,7 +332,7 @@ async fn a_desk_connection_sends_turns_the_agent_reads_in_their_place() {
         connect(addr, &format!("token={token}&channel={channel}&desk=1")).await;
     assert_eq!(
         connected["features"],
-        json!(["desk.place", "desk.deliveries"]),
+        json!(["desk.place", "desk.stream", "desk.deliveries"]),
         "a person's Desk is offered the hub link too"
     );
 
@@ -361,7 +361,7 @@ async fn a_desk_connection_sends_turns_the_agent_reads_in_their_place() {
         json!({"type": "chat", "content": "and the release?", "turn_ref": "ref-1", "desk": turn(room)}),
     )
     .await;
-    let frames = frames_until(&mut desk, "stream_end").await;
+    let frames = frames_until(&mut desk, "turn_end").await;
     assert!(frames.iter().any(|f| f["content"] == "done"), "{frames:?}");
 
     let asked = llm.received_requests().await.unwrap();
@@ -385,6 +385,82 @@ async fn a_desk_connection_sends_turns_the_agent_reads_in_their_place() {
     assert_eq!(
         user.desk.as_ref().and_then(|mark| mark.thread),
         Some(thread)
+    );
+    let reply = session.messages.last().unwrap();
+    assert_eq!(reply.content, "done");
+    assert!(
+        frames
+            .iter()
+            .all(|f| f["turn_ref"] == "ref-1" && f["id"] == reply.id.as_str()),
+        "every frame of the turn names it and its reply: {frames:?}"
+    );
+    assert_eq!(
+        frames.last().unwrap()["id"],
+        reply.id.as_str(),
+        "the turn ends naming the reply it saved"
+    );
+}
+
+/// A Desk that reconnects while its turn runs is told where the turn is,
+/// then hears it out to its end.
+#[tokio::test]
+async fn a_desk_reconnecting_mid_turn_is_told_where_the_turn_is() {
+    let data = tempfile::tempdir().unwrap();
+    let (service, _llm) =
+        crate::support::agent_on_slow_mock_llm(data.path(), std::time::Duration::from_secs(2))
+            .await;
+    let gateway = Gateway::new(vec![("default", service.clone())], None);
+    let token = gateway.admin_token();
+    let addr = serve(gateway.state.clone()).await;
+    let query = format!("token={token}&channel=desk&desk=1");
+    let (mut first, _) = connect(addr, &query).await;
+    send(
+        &mut first,
+        json!({"type": "chat", "content": "what's next?", "turn_ref": "ref-1",
+               "desk": {"place": {"kind": "dm"}, "speaker": {"kind": "person"}}}),
+    )
+    .await;
+    let opening = frames_until(&mut first, "turn_snapshot").await;
+    let reply_id = opening.last().unwrap()["id"].clone();
+    drop(first);
+
+    let (mut again, _) = connect(addr, &query).await;
+    let snapshot = frames_until(&mut again, "turn_snapshot")
+        .await
+        .pop()
+        .unwrap();
+    assert_eq!(
+        (&snapshot["turn_ref"], &snapshot["id"]),
+        (&json!("ref-1"), &reply_id)
+    );
+    assert!(snapshot["since"].is_string() && snapshot["status"].is_string());
+    let rest = frames_until(&mut again, "turn_end").await;
+    assert!(rest.iter().any(|f| f["content"] == "done"), "{rest:?}");
+    assert_eq!(rest.last().unwrap()["id"], reply_id);
+}
+
+/// A connection that declares nothing is sent a turn's frames as before:
+/// no turn names, no snapshots, no turn end.
+#[tokio::test]
+async fn an_undeclared_connection_hears_a_turn_as_before() {
+    let data = tempfile::tempdir().unwrap();
+    let (service, _llm) = crate::support::agent_on_mock_llm(data.path()).await;
+    let gateway = Gateway::new(vec![("default", service)], None);
+    let token = gateway.admin_token();
+    let addr = serve(gateway.state.clone()).await;
+    let (mut old, _) = connect(addr, &format!("token={token}&channel=desk")).await;
+    send(
+        &mut old,
+        json!({"type": "chat", "content": "what's next?", "turn_ref": "ref-1"}),
+    )
+    .await;
+    let frames = frames_until(&mut old, "stream_end").await;
+    assert!(frames.iter().any(|f| f["content"] == "done"), "{frames:?}");
+    assert!(
+        frames.iter().all(|f| f.get("turn_ref").is_none()
+            && f["type"] != "turn_snapshot"
+            && f["type"] != "turn_end"),
+        "{frames:?}"
     );
 }
 

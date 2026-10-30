@@ -327,6 +327,15 @@ pub struct ServerMessage {
     /// to, as it sent it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_ref: Option<String>,
+    /// On a `turn_snapshot`: what the live turn is doing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<workforce_core::desk::TurnPhase>,
+    /// On a `turn_snapshot`: when the turn began, RFC 3339.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since: Option<String>,
+    /// On a `turn_snapshot`: what the turn has streamed of its answer so far.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
 }
 
 fn default_speakable() -> bool {
@@ -461,6 +470,9 @@ impl ServerMessage {
             author: None,
             features: None,
             turn_ref: None,
+            status: None,
+            since: None,
+            text: None,
         }
     }
 }

@@ -21,7 +21,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::warn;
 use workforce_agent::runner::{InjectedMessage, ProgressEvent, RunResult};
 use workforce_agent::tools::approval::SelfServe;
-use workforce_core::desk::DeskPlace;
+use workforce_core::desk::{DeskPlace, DeskTurnContext, TurnPhase, TurnSnapshot, TurnStamp};
 use workforce_nats::chat::{TurnControl, TurnControlReply, REFUSED_BUSY};
 
 use crate::serve::TurnInbox;
@@ -75,6 +75,8 @@ impl std::error::Error for TurnStopped {}
 #[derive(Debug)]
 pub enum Control {
     Cancel,
+    /// Put a snapshot of the live Desk turn into its progress stream.
+    Snapshot,
     Inject(InjectedMessage),
     /// A person's follow-up, from the Desk place it names, if any.
     FollowUp {
@@ -87,6 +89,7 @@ impl From<TurnControl> for Control {
     fn from(control: TurnControl) -> Self {
         match control {
             TurnControl::Cancel => Self::Cancel,
+            TurnControl::Snapshot => Self::Snapshot,
             TurnControl::FollowUp { text, user, place } => Self::FollowUp {
                 message: InjectedMessage::UserMessage {
                     text,
@@ -146,7 +149,77 @@ struct Entry {
     settled: CancellationToken,
     answered: Arc<AtomicBool>,
     inject: mpsc::Sender<InjectedMessage>,
-    place: Option<DeskPlace>,
+    desk: Option<Arc<DeskLive>>,
+}
+
+/// A live turn asked from Desk: its place, and the mirror its relay keeps of
+/// what it has said, which a Desk connecting mid-turn is sent.
+struct DeskLive {
+    place: DeskPlace,
+    mirror: Mutex<TurnMirror>,
+    asked: tokio::sync::Notify,
+}
+
+/// What a live Desk turn has streamed of its answer and what it is doing,
+/// folded from its progress events in order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnMirror {
+    stamp: TurnStamp,
+    since: chrono::DateTime<chrono::Utc>,
+    status: TurnPhase,
+    text: String,
+    /// Where the stream segment now being written starts in `text`.
+    segment: usize,
+}
+
+impl TurnMirror {
+    pub fn new(stamp: TurnStamp) -> Self {
+        Self {
+            stamp,
+            since: chrono::Utc::now(),
+            status: TurnPhase::Thinking,
+            text: String::new(),
+            segment: 0,
+        }
+    }
+
+    /// Fold `event` in: the deltas build the text, a retracted stream
+    /// takes back its own segment, and each kind of work names the phase.
+    pub fn observe(&mut self, event: &ProgressEvent) {
+        match event {
+            ProgressEvent::LlmCall { .. } | ProgressEvent::CompactEnd => {
+                self.status = TurnPhase::Thinking
+            }
+            ProgressEvent::ToolStart { .. } | ProgressEvent::SubActivity { .. } => {
+                self.status = TurnPhase::Working
+            }
+            ProgressEvent::StreamStart => {
+                self.segment = self.text.len();
+                self.status = TurnPhase::Writing;
+            }
+            ProgressEvent::StreamDelta { text } => {
+                self.text.push_str(text);
+                self.status = TurnPhase::Writing;
+            }
+            ProgressEvent::StreamDiscard { reason } if reason.retracts() => {
+                self.text.truncate(self.segment);
+            }
+            ProgressEvent::CompactStart => self.status = TurnPhase::Tidying,
+            ProgressEvent::RateLimited { .. } | ProgressEvent::SlowModelFailover { .. } => {
+                self.status = TurnPhase::Waiting
+            }
+            _ => {}
+        }
+    }
+
+    pub fn snapshot(&self) -> TurnSnapshot {
+        TurnSnapshot {
+            stamp: self.stamp.clone(),
+            since: self.since,
+            status: self.status,
+            text: self.text.clone(),
+        }
+    }
 }
 
 impl Entry {
@@ -189,15 +262,15 @@ impl LiveTurns {
         })
     }
 
-    /// Register a turn for `session_id`, asked at the Desk `place` if it came
-    /// from Desk, or refuse while one is live, with the inbox the turn must
-    /// run on. With `nats`, the turn also answers control requests from other
+    /// Register a turn for `session_id`, the Desk turn `desk` if it came from
+    /// Desk, or refuse while one is live, with the inbox the turn must run
+    /// on. With `nats`, the turn also answers control requests from other
     /// instances.
     pub async fn begin(
         self: &Arc<Self>,
         session_id: &str,
         self_serve: SelfServe,
-        place: Option<DeskPlace>,
+        desk: Option<&DeskTurnContext>,
         nats: Option<async_nats::Client>,
     ) -> Result<(LiveTurn, TurnInbox), TurnBusy> {
         let (inject, rx) = mpsc::channel(INBOX_BUFFER);
@@ -207,7 +280,13 @@ impl LiveTurns {
             settled: CancellationToken::new(),
             answered: Arc::new(AtomicBool::new(false)),
             inject,
-            place,
+            desk: desk.map(|desk| {
+                Arc::new(DeskLive {
+                    place: desk.turn.place.clone(),
+                    mirror: Mutex::new(TurnMirror::new(TurnStamp::from(desk))),
+                    asked: tokio::sync::Notify::new(),
+                })
+            }),
         };
         {
             let mut turns = self.turns.lock();
@@ -237,9 +316,16 @@ impl LiveTurns {
         };
         match control {
             Control::Cancel => entry.stop().await,
+            Control::Snapshot => match &entry.desk {
+                Some(desk) => {
+                    desk.asked.notify_one();
+                    Applied::Injected
+                }
+                None => Applied::NotLive,
+            },
             Control::FollowUp {
                 place: Some(place), ..
-            } if entry.place.as_ref().is_some_and(|live| live != &place) => Applied::Busy,
+            } if entry.desk.as_ref().is_some_and(|live| live.place != place) => Applied::Busy,
             Control::FollowUp { message, .. } | Control::Inject(message) => {
                 entry.inject(message).await
             }
@@ -262,12 +348,32 @@ impl LiveTurns {
 pub struct TurnWatch {
     cancel: CancellationToken,
     answered: Arc<AtomicBool>,
+    desk: Option<Arc<DeskLive>>,
 }
 
 impl TurnWatch {
     fn note(&self, event: &ProgressEvent) {
         if matches!(event, ProgressEvent::AnswerSettled) {
             self.answered.store(true, Ordering::Release);
+        }
+        if let Some(desk) = &self.desk {
+            desk.mirror.lock().observe(event);
+        }
+    }
+
+    /// The Desk turn as it stands, if it is one.
+    fn snapshot(&self) -> Option<ProgressEvent> {
+        self.desk
+            .as_ref()
+            .map(|desk| ProgressEvent::Snapshot(desk.mirror.lock().snapshot()))
+    }
+
+    /// Resolves when a snapshot of the Desk turn is asked for; never for
+    /// any other turn.
+    async fn asked(&self) {
+        match &self.desk {
+            Some(desk) => desk.asked.notified().await,
+            None => std::future::pending().await,
         }
     }
 
@@ -304,6 +410,7 @@ impl LiveTurn {
         TurnWatch {
             cancel: self.entry.cancel.clone(),
             answered: Arc::clone(&self.entry.answered),
+            desk: self.entry.desk.clone(),
         }
     }
 
@@ -391,22 +498,35 @@ fn ending(joined: Result<eyre::Result<RunResult>, JoinError>, stopped: bool) -> 
 }
 
 /// Pass the turn's progress on, noting when its answer settles, until a stop
-/// before that answer silences it.
+/// before that answer silences it. A Desk turn's stream opens with a
+/// snapshot, which names it to every consumer, and carries one more between
+/// two events whenever one is asked for.
 pub async fn relay(
     mut progress_rx: mpsc::Receiver<ProgressEvent>,
     relay_tx: mpsc::Sender<ProgressEvent>,
     watch: TurnWatch,
 ) {
+    if let Some(snapshot) = watch.snapshot() {
+        if relay_tx.send(snapshot).await.is_err() {
+            return;
+        }
+    }
     loop {
         let event = tokio::select! {
             biased;
             () = watch.stopped() => return,
+            () = watch.asked() => match watch.snapshot() {
+                Some(snapshot) => snapshot,
+                None => continue,
+            },
             event = progress_rx.recv() => match event {
-                Some(event) => event,
+                Some(event) => {
+                    watch.note(&event);
+                    event
+                }
                 None => return,
             },
         };
-        watch.note(&event);
         if relay_tx.send(event).await.is_err() {
             return;
         }
@@ -708,11 +828,141 @@ mod tests {
         }
     }
 
+    fn asked_in(place: DeskPlace) -> DeskTurnContext {
+        let turn = workforce_core::desk::DeskTurn {
+            place,
+            speaker: workforce_core::desk::DeskSpeaker::Person,
+            hop: 0,
+            context: Vec::new(),
+            message: None,
+            spoken: false,
+        };
+        DeskTurnContext::new(
+            turn,
+            "desk:room",
+            None,
+            false,
+            Some("ref-1".into()),
+            "reply-1".into(),
+        )
+    }
+
+    #[test]
+    fn the_mirror_follows_deltas_retractions_and_what_the_turn_is_doing() {
+        use workforce_core::types::StreamDiscardReason;
+        let mut mirror = TurnMirror::new(TurnStamp {
+            turn_ref: Some("ref-1".into()),
+            reply_id: "reply-1".into(),
+        });
+        let phase = |mirror: &TurnMirror| mirror.snapshot().status;
+        assert_eq!(phase(&mirror), TurnPhase::Thinking);
+        for event in [
+            ProgressEvent::StreamStart,
+            ProgressEvent::StreamDelta {
+                text: "Checking ".into(),
+            },
+            ProgressEvent::StreamEnd,
+            ProgressEvent::ToolStart {
+                name: "github.search".into(),
+                round: 1,
+                detail: String::new(),
+            },
+        ] {
+            mirror.observe(&event);
+        }
+        assert_eq!(phase(&mirror), TurnPhase::Working);
+        for event in [
+            ProgressEvent::StreamStart,
+            ProgressEvent::StreamDelta {
+                text: "a draft".into(),
+            },
+            ProgressEvent::StreamDiscard {
+                reason: StreamDiscardReason::Interrupted,
+            },
+            ProgressEvent::RateLimited {
+                wait_secs: 3,
+                attempt: 1,
+            },
+        ] {
+            mirror.observe(&event);
+        }
+        assert_eq!(phase(&mirror), TurnPhase::Waiting);
+        mirror.observe(&ProgressEvent::StreamStart);
+        mirror.observe(&ProgressEvent::StreamDelta {
+            text: "the answer".into(),
+        });
+        let snapshot = mirror.snapshot();
+        assert_eq!(snapshot.text, "Checking the answer");
+        assert_eq!(snapshot.status, TurnPhase::Writing);
+        assert_eq!(snapshot.stamp.reply_id, "reply-1");
+    }
+
+    /// A Desk turn's relay opens with a snapshot, and puts one in between
+    /// two events when asked; another turn's relay never does.
+    #[tokio::test]
+    async fn a_desk_turn_s_relay_carries_its_snapshots_in_order() {
+        let turns = LiveTurns::new("allan");
+        let (turn, _inbox) = turns
+            .begin(
+                "s1",
+                SelfServe::Answerable,
+                Some(&asked_in(DeskPlace::Dm)),
+                None,
+            )
+            .await
+            .unwrap();
+        let (progress_tx, progress_rx) = mpsc::channel(8);
+        let (relay_tx, mut relayed) = mpsc::channel(8);
+        let relaying = tokio::spawn(relay(progress_rx, relay_tx, turn.watch()));
+        progress_tx
+            .send(ProgressEvent::StreamDelta { text: "Hel".into() })
+            .await
+            .unwrap();
+        let opening = relayed.recv().await.unwrap();
+        assert!(
+            matches!(&opening, ProgressEvent::Snapshot(s) if s.text.is_empty()),
+            "{opening:?}"
+        );
+        assert!(matches!(
+            relayed.recv().await.unwrap(),
+            ProgressEvent::StreamDelta { .. }
+        ));
+        assert_eq!(
+            turns.apply("s1", Control::Snapshot).await,
+            Applied::Injected
+        );
+        let asked = relayed.recv().await.unwrap();
+        assert!(
+            matches!(&asked, ProgressEvent::Snapshot(s) if s.text == "Hel"),
+            "{asked:?}"
+        );
+        drop(progress_tx);
+        relaying.await.unwrap();
+
+        let (plain, _inbox) = begin(&turns, "s2").await;
+        assert_eq!(turns.apply("s2", Control::Snapshot).await, Applied::NotLive);
+        let (progress_tx, progress_rx) = mpsc::channel(8);
+        let (relay_tx, mut relayed) = mpsc::channel(8);
+        let relaying = tokio::spawn(relay(progress_rx, relay_tx, plain.watch()));
+        progress_tx.send(ProgressEvent::StreamStart).await.unwrap();
+        drop(progress_tx);
+        assert!(matches!(
+            relayed.recv().await.unwrap(),
+            ProgressEvent::StreamStart
+        ));
+        relaying.await.unwrap();
+    }
+
     #[tokio::test]
     async fn a_follow_up_from_another_place_is_refused_as_busy() {
         let turns = LiveTurns::new("allan");
         let (_turn, mut inbox) = turns
-            .begin("s1", SelfServe::Answerable, Some(room_thread(2)), None)
+            .begin(
+                "s1",
+                SelfServe::Answerable,
+                Some(&asked_in(room_thread(2))),
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -789,7 +1039,7 @@ mod tests {
             .begin(
                 "s1",
                 SelfServe::Answerable,
-                Some(room_thread(2)),
+                Some(&asked_in(room_thread(2))),
                 Some(nats.clone()),
             )
             .await

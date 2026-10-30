@@ -53,6 +53,26 @@ pub(crate) fn origin() -> Option<workforce_common::delivery::DeliveryTarget> {
         })
 }
 
+/// How the Desk turn `desk` in `session_id` ended: its client's id, and
+/// its reply id when an answer was saved under it. A turn answered by a slash
+/// command, refused by the budget or stopped saved none.
+pub(crate) fn turn_end(
+    service: &crate::serve::AgentService,
+    session_id: &str,
+    desk: &workforce_common::channels::desk::DeskTurnContext,
+) -> workforce_common::channels::desk::TurnEnd {
+    let saved = service
+        .sessions
+        .get(session_id)
+        .ok()
+        .flatten()
+        .is_some_and(|session| session.messages.iter().any(|m| m.id == desk.reply_id));
+    workforce_common::channels::desk::TurnEnd {
+        turn_ref: desk.turn_ref.clone(),
+        reply_id: saved.then(|| desk.reply_id.clone()),
+    }
+}
+
 /// The trust a turn runs at: another agent's hand-off is that agent's
 /// output, not the person's, so it is held to [`TrustLevel::Paired`] and
 /// scanned as such.
