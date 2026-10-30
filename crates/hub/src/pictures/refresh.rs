@@ -58,6 +58,9 @@ impl SlackFace {
 /// The hub's Slack, as the refresher uses it.
 #[async_trait]
 pub trait SlackDirectory: Send + Sync {
+    /// Whether the hub's Slack has started: until it has, no agent seems to
+    /// have a Slack identity, which must not be taken as theirs gone.
+    async fn ready(&self) -> bool;
     /// Where agent `agent_id`'s Slack picture comes from, if it has one.
     /// Asks Slack nothing.
     async fn agent(&self, agent_id: &str) -> Option<SlackFace>;
@@ -112,6 +115,9 @@ impl Refresher {
     /// Fetches every Slack picture due at `now`, and removes those whose
     /// owner has no Slack picture any more.
     pub async fn refresh(&self, now: DateTime<Utc>) -> Result<()> {
+        if !self.slack.ready().await {
+            return Ok(());
+        }
         let mut agents = Vec::new();
         for id in (self.agents)() {
             let face = self.slack.agent(&id).await;
@@ -119,21 +125,7 @@ impl Refresher {
         }
         self.refresh_kind(Kind::Agent, agents, now).await?;
         let people = match &self.identities {
-            Some(identities) => identities
-                .list(&IdentityFilter::default())?
-                .into_iter()
-                .map(|identity| {
-                    let face = identity
-                        .linked_ids
-                        .get("slack")
-                        .filter(|id| !id.is_empty())
-                        .map(|user_id| SlackFace::Member {
-                            user_id: user_id.clone(),
-                            workspace: None,
-                        });
-                    (identity.id.to_string(), face)
-                })
-                .collect(),
+            Some(identities) => linked_people(identities.as_ref())?,
             None => Vec::new(),
         };
         self.refresh_kind(Kind::Identity, people, now).await
@@ -248,6 +240,37 @@ impl Refresher {
     }
 }
 
+/// Identities read per page.
+const PAGE: usize = 500;
+
+/// Every identity, with where its Slack picture comes from when it's
+/// linked to a Slack account.
+fn linked_people(identities: &dyn IdentityStore) -> Result<Vec<(String, Option<SlackFace>)>> {
+    let mut people = Vec::new();
+    loop {
+        let page = identities.list(&IdentityFilter {
+            limit: Some(PAGE),
+            offset: Some(people.len()),
+            ..IdentityFilter::default()
+        })?;
+        let read = page.len();
+        people.extend(page.into_iter().map(|identity| {
+            let face = identity
+                .linked_ids
+                .get("slack")
+                .filter(|id| !id.is_empty())
+                .map(|user_id| SlackFace::Member {
+                    user_id: user_id.clone(),
+                    workspace: None,
+                });
+            (identity.id.to_string(), face)
+        }));
+        if read < PAGE {
+            return Ok(people);
+        }
+    }
+}
+
 /// Whether the hub fetches a picture from `url`: only over https.
 pub fn fetchable(url: &str) -> bool {
     reqwest::Url::parse(url).is_ok_and(|u| u.scheme() == "https" && u.host().is_some())
@@ -293,6 +316,10 @@ impl HubSlack {
 
 #[async_trait]
 impl SlackDirectory for HubSlack {
+    async fn ready(&self) -> bool {
+        self.slack.get().is_some()
+    }
+
     async fn agent(&self, agent_id: &str) -> Option<SlackFace> {
         let bot = match self.registry.get(agent_id) {
             Some(service) => {

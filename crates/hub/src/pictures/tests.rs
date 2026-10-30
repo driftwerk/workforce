@@ -186,6 +186,7 @@ async fn a_merge_hands_over_a_chosen_picture_unless_the_target_chose_one() {
 /// Slack as the refresher sees it, set by the test.
 #[derive(Default)]
 struct FakeSlack {
+    starting: AtomicBool,
     faces: Mutex<HashMap<String, SlackFace>>,
     failing: AtomicBool,
     fetches: AtomicUsize,
@@ -208,6 +209,10 @@ impl FakeSlack {
 
 #[async_trait]
 impl SlackDirectory for FakeSlack {
+    async fn ready(&self) -> bool {
+        !self.starting.load(Ordering::SeqCst)
+    }
+
     async fn agent(&self, agent_id: &str) -> Option<SlackFace> {
         self.faces.lock().unwrap().get(agent_id).cloned()
     }
@@ -377,6 +382,56 @@ async fn a_person_linked_to_slack_gets_their_slack_picture_and_loses_it_when_unl
         identities.update(&sam).unwrap();
         refresher.refresh(Utc::now()).await.unwrap();
         assert!(store.kept_for(&owner).await.unwrap().is_empty());
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn nothing_is_fetched_or_removed_before_slack_has_started() {
+    with_store(|store| async move {
+        let slack = Arc::new(FakeSlack::default());
+        let allan = Owner::agent("allan");
+        store
+            .put_slack(&allan, &slack_picture(7, "member:acme:U1"))
+            .await
+            .unwrap();
+        slack.starting.store(true, Ordering::SeqCst);
+        let refresher = refresher(&store, &slack, None);
+
+        refresher.refresh(Utc::now()).await.unwrap();
+        assert_eq!(
+            face(store.as_ref(), &allan).await.unwrap().unwrap().source,
+            Source::Slack,
+            "kept while Slack starts"
+        );
+        assert_eq!(slack.fetches(), 0);
+
+        slack.starting.store(false, Ordering::SeqCst);
+        refresher.refresh(Utc::now()).await.unwrap();
+        assert_eq!(
+            face(store.as_ref(), &allan).await.unwrap(),
+            None,
+            "allan has no Slack identity once it's up"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn everyone_linked_to_slack_gets_a_picture_however_many_there_are() {
+    with_store(|store| async move {
+        let identities = Arc::new(SqliteIdentityStore::in_memory().unwrap());
+        for n in 0..505 {
+            let mut person = Identity::new(format!("Person {n}"), IdentityRole::Member);
+            person.linked_ids.insert("slack".into(), format!("U{n}"));
+            identities.create(&person).unwrap();
+        }
+        let slack = Arc::new(FakeSlack::default());
+        refresher(&store, &slack, Some(identities as Arc<dyn IdentityStore>))
+            .refresh(Utc::now())
+            .await
+            .unwrap();
+        assert_eq!(store.kept(Kind::Identity).await.unwrap().len(), 505);
     })
     .await;
 }
