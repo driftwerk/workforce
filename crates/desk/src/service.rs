@@ -112,6 +112,8 @@ pub(crate) struct Live {
     background: Background,
     /// What already ran under its Codex app-server when its turn began.
     baseline: Option<HashSet<u32>>,
+    /// How many prompts the person has given it while it ran here.
+    prompts: u64,
 }
 
 impl Live {
@@ -582,6 +584,7 @@ impl Desk {
                     terminal: None,
                     background: Default::default(),
                     baseline: Default::default(),
+                    prompts: 0,
                 },
             );
             tokio::spawn(self.clone().on_exit(id, exit));
@@ -613,6 +616,7 @@ impl Desk {
         );
         view.group = Self::group_ref(&state.layout, &groups::session_item(r.id));
         view.background = live.and_then(|l| l.background.view());
+        view.prompts = live.map_or(0, |l| l.prompts);
         view
     }
 
@@ -1810,6 +1814,7 @@ impl Desk {
                 terminal: None,
                 background: Default::default(),
                 baseline: Default::default(),
+                prompts: 0,
             },
         );
         tokio::spawn(self.clone().on_exit(r.id, exit));
@@ -1940,6 +1945,7 @@ impl Desk {
                 r.restore_offer = false;
                 if let Some(l) = l {
                     l.pending = None;
+                    l.prompts += 1;
                 }
             }),
             Hook::ToolStart(tool) => self.change(id, |r, l| {
@@ -2214,7 +2220,12 @@ impl Desk {
                                 std::mem::take(&mut l.background).looked_if(running, Utc::now());
                         }
                     }
-                    CodexEvent::Prompt(p) => r.last_prompt = Some(p),
+                    CodexEvent::Prompt(p) => {
+                        r.last_prompt = Some(p);
+                        if let Some(l) = l {
+                            l.prompts += 1;
+                        }
+                    }
                     CodexEvent::Tool(t) => {
                         r.state = SessionState::Working;
                         if let Some(l) = l {

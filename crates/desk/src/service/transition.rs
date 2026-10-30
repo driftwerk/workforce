@@ -68,6 +68,12 @@ impl<'a> Transition<'a> {
             return vec![Self::Started];
         };
         let pending_id = |v: &SessionView| v.pending.as_ref().map(|p| p.id);
+        // Running here, each prompt is counted; elsewhere only its words
+        // are seen.
+        let prompted = match now.live {
+            true => now.prompts != before.prompts,
+            false => now.last_prompt != before.last_prompt,
+        };
         let unblocked = before
             .pending
             .as_ref()
@@ -82,10 +88,7 @@ impl<'a> Transition<'a> {
                     .as_ref()
                     .map(|pending| Self::Blocked { pending })
             }
-            S::Working
-                if matches!(before.state, S::Done | S::Idle | S::Starting)
-                    && now.last_prompt != before.last_prompt =>
-            {
+            S::Working if matches!(before.state, S::Done | S::Idle | S::Starting) && prompted => {
                 now.last_prompt
                     .as_deref()
                     .map(|prompt| Self::Prompted { prompt })
@@ -98,6 +101,10 @@ impl<'a> Transition<'a> {
                     reply: now.last_reply.as_deref().unwrap_or_default(),
                 })
             }
+            // Another terminal's session, gone quiet: its turn is done.
+            S::Idle if matches!(before.state, S::Working | S::Blocked) => Some(Self::Finished {
+                reply: now.last_reply.as_deref().unwrap_or_default(),
+            }),
             S::Stopped | S::Closed if before.state.is_running() => Some(Self::Stopped {
                 closed: now.state == S::Closed,
             }),
@@ -115,9 +122,19 @@ impl<'a> Transition<'a> {
         let spoke = now
             .last_prompt
             .as_deref()
-            .filter(|_| !matches!(state, Some(Self::Prompted { .. })))
             .filter(|_| {
-                now.last_prompt != before.last_prompt
+                !matches!(
+                    state,
+                    Some(
+                        Self::Prompted { .. }
+                            | Self::Finished { .. }
+                            | Self::Stopped { .. }
+                            | Self::Interrupted
+                    )
+                )
+            })
+            .filter(|_| {
+                prompted
                     || (now.state == S::Working && matches!(before.state, S::Starting | S::Idle))
             })
             .map(|prompt| Self::Spoke { prompt });
@@ -230,19 +247,22 @@ pub(super) fn turn_ops(
             Transition::Started | Transition::Resumed => {}
             Transition::Prompted { prompt } => {
                 if let Some(id) = open.take() {
-                    ops.push(end(id, (Outcome::Interrupted, None, None)));
+                    ops.push(end(
+                        id,
+                        crew::outcome_of(Ok(now.last_reply.as_deref().unwrap_or_default())),
+                    ));
                 }
                 let (op, id) = begin(true, Some(prompt));
                 ops.push(op);
                 open = Some(id);
             }
             Transition::Spoke { prompt } => match open {
-                Some(_) => ops.push(settle()),
-                None => {
+                None if matches!(now.state, SessionState::Working | SessionState::Blocked) => {
                     let (op, id) = begin(true, Some(prompt));
                     ops.push(op);
                     open = Some(id);
                 }
+                _ => ops.push(settle()),
             },
             Transition::Blocked { pending } | Transition::ToTerminal { pending } => {
                 let turn = working(&mut ops, &mut open);
@@ -389,6 +409,7 @@ mod tests {
         );
         let prompted = SessionView {
             last_prompt: Some("now the docs".into()),
+            prompts: 1,
             ..working.clone()
         };
         assert_eq!(
@@ -400,7 +421,40 @@ mod tests {
         assert_eq!(
             Transition::of(Some(&done), &working, &none),
             [],
-            "the same prompt again is no new prompt"
+            "no prompt, no new prompt"
+        );
+        let again = SessionView {
+            prompts: 1,
+            ..working.clone()
+        };
+        assert_eq!(
+            Transition::of(Some(&done), &again, &none),
+            [Transition::Prompted {
+                prompt: "fix the login"
+            }],
+            "the same words said again are a new prompt"
+        );
+        let reread = SessionView {
+            last_prompt: Some("the rollout's words".into()),
+            ..done.clone()
+        };
+        assert_eq!(
+            Transition::of(Some(&working), &reread, &none),
+            [Transition::Finished {
+                reply: "All green."
+            }],
+            "words read back as the turn ends are no prompt"
+        );
+        let said_as_it_ended = SessionView {
+            prompts: 1,
+            ..reread.clone()
+        };
+        assert_eq!(
+            Transition::of(Some(&working), &said_as_it_ended, &none),
+            [Transition::Finished {
+                reply: "All green."
+            }],
+            "a turn that ends begins none"
         );
 
         let p = pending("Bash(cargo test)");
@@ -627,13 +681,28 @@ mod tests {
             (Some("fix it"), None, &Place::Session)
         );
 
-        let (o, after) = ops(&[Transition::Prompted { prompt: "again" }], &working, open);
+        let waited = SessionView {
+            last_reply: Some("Launched it.".into()),
+            ..working.clone()
+        };
+        let (o, after) = ops(&[Transition::Prompted { prompt: "again" }], &waited, open);
         assert_eq!(
             kinds(&o),
             ["end", "begin by person"],
             "a turn left open ends"
         );
         assert_eq!(after, Some(Uuid::from_u128(1)));
+        let TurnOp::End {
+            outcome, answer, ..
+        } = &o[0]
+        else {
+            unreachable!()
+        };
+        assert_eq!(
+            (*outcome, answer.as_deref()),
+            (Outcome::Finished, Some("Launched it.")),
+            "it had answered, and waited on its work"
+        );
 
         let (o, after) = ops(&[Transition::Spoke { prompt: "and docs" }], &working, open);
         assert_eq!(
@@ -730,6 +799,39 @@ mod tests {
     }
 
     #[test]
+    fn another_terminals_session_ends_its_turn_as_it_goes_quiet() {
+        use SessionState as S;
+        let none = HashSet::new();
+        let elsewhere = |state, prompt: &str| SessionView {
+            live: false,
+            origin: Origin::External,
+            last_prompt: Some(prompt.into()),
+            last_reply: Some("Done.".into()),
+            ..view(state)
+        };
+        let busy = elsewhere(S::Working, "fix the login");
+        let quiet = elsewhere(S::Idle, "fix the login");
+        assert_eq!(
+            Transition::of(Some(&busy), &quiet, &none),
+            [Transition::Finished { reply: "Done." }]
+        );
+        assert_eq!(
+            Transition::of(Some(&quiet), &elsewhere(S::Working, "and docs"), &none),
+            [Transition::Prompted { prompt: "and docs" }],
+            "its words are all there is to go by"
+        );
+        let whole_turn_unseen = elsewhere(S::Idle, "and docs");
+        let seen = Transition::of(Some(&quiet), &whole_turn_unseen, &none);
+        assert_eq!(seen, [Transition::Spoke { prompt: "and docs" }]);
+        let (o, after) = ops(&seen, &whole_turn_unseen, None);
+        assert_eq!(
+            (kinds(&o), after),
+            (vec!["settle"], None),
+            "spoken to while quiet: it answered, and nothing runs"
+        );
+    }
+
+    #[test]
     fn the_persons_prompt_reaching_it_otherwise_is_spoken() {
         use SessionState as S;
         let none = HashSet::new();
@@ -744,6 +846,7 @@ mod tests {
         );
         let typed = SessionView {
             last_prompt: Some("and the docs".into()),
+            prompts: 1,
             ..first.clone()
         };
         assert_eq!(

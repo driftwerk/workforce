@@ -599,6 +599,7 @@ impl Desk {
             terminal: Some(terminal),
             background: Default::default(),
             baseline: Default::default(),
+            prompts: 0,
         };
         if existing.is_some_and(|id| self.0.state.lock().live.contains_key(&id)) {
             // Already running here: nothing to take back.
@@ -705,6 +706,7 @@ impl Desk {
                             terminal: Some(terminal),
                             background: Default::default(),
                             baseline: Default::default(),
+                            prompts: 0,
                         },
                     );
                     self.publish(id);

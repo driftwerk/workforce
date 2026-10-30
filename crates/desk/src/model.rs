@@ -134,6 +134,10 @@ pub struct SessionView {
     pub group: Option<GroupRef>,
     /// Work it started that still runs: while it is done, it waits on it.
     pub background: Option<crate::floor::Background>,
+    /// How many prompts the person has given it while it ran here, so the
+    /// same words said again are told from none.
+    #[serde(skip)]
+    pub prompts: u64,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -206,6 +210,7 @@ impl SessionView {
             display_name: r.display_name.clone(),
             group: None,
             background: None,
+            prompts: 0,
             created_at: r.created_at,
             updated_at: r.updated_at,
         }
