@@ -123,7 +123,8 @@ impl Refresher {
             let face = self.slack.agent(&id).await;
             agents.push((id, face));
         }
-        self.refresh_kind(Kind::Agent, agents, |_| true, now).await?;
+        self.refresh_kind(Kind::Agent, agents, |_| true, now)
+            .await?;
         let Some(identities) = &self.identities else {
             return Ok(());
         };
@@ -135,8 +136,13 @@ impl Refresher {
                 .and_then(|id| identities.get_by_id(id).ok())
                 .is_some_and(|found| found.is_none())
         };
-        self.refresh_kind(Kind::Identity, linked_people(identities.as_ref())?, gone, now)
-            .await
+        self.refresh_kind(
+            Kind::Identity,
+            linked_people(identities.as_ref())?,
+            gone,
+            now,
+        )
+        .await
     }
 
     /// Fetches what is due of `wanted`, and removes the Slack pictures of
@@ -314,7 +320,7 @@ impl HubSlack {
                     }
                 }))
                 .build()
-                .unwrap_or_default(),
+                .expect("a client that follows only https redirects"),
         }
     }
 
