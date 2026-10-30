@@ -75,6 +75,34 @@ pub struct Options {
     /// The PTY holder that keeps terminals across hub restarts; without
     /// one (or while it can't be reached) they are the hub's own children.
     pub holder: Option<HolderOptions>,
+    /// Where the hub's own CLI turns run: never adopted.
+    pub hub_turns: HubTurns,
+}
+
+/// Which folders the hub's own CLI turns run in (an agent's turns on a
+/// person's subscription): a `claude` running in one is the hub's, never a
+/// session of the person's to adopt.
+#[derive(Clone, Default)]
+pub struct HubTurns(Option<Arc<dyn Fn(&Path) -> bool + Send + Sync>>);
+
+impl HubTurns {
+    pub fn new(holds: impl Fn(&Path) -> bool + Send + Sync + 'static) -> Self {
+        Self(Some(Arc::new(holds)))
+    }
+
+    fn hold(&self, cwd: &str) -> bool {
+        self.0.as_ref().is_some_and(|holds| holds(Path::new(cwd)))
+    }
+}
+
+impl std::fmt::Debug for HubTurns {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.is_some() {
+            "HubTurns(..)"
+        } else {
+            "HubTurns(none)"
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -117,8 +145,6 @@ pub(crate) struct Live {
     prompts: u64,
     /// What auto mode refused in the turn it is on.
     denials: Vec<Denied>,
-    /// What its turn ended asking the person, while it asks.
-    asked: Option<Asked>,
     /// Tool calls the person allowed for the rest of the session.
     allowed: HashSet<Call>,
     /// Its turn was ended from Desk (Esc), which Claude Code reports no
@@ -629,7 +655,6 @@ impl Desk {
                     baseline: Default::default(),
                     prompts: 0,
                     denials: Vec::new(),
-                    asked: None,
                     allowed: HashSet::new(),
                     interrupted: false,
                 },
@@ -663,9 +688,6 @@ impl Desk {
         );
         view.group = Self::group_ref(&state.layout, &groups::session_item(r.id));
         view.background = live.and_then(|l| l.background.view());
-        view.asked = live
-            .and_then(|l| l.asked.clone())
-            .filter(|_| r.state == SessionState::Asking);
         view.interrupted = live.is_some_and(|l| l.interrupted);
         view.prompts = live.map_or(0, |l| l.prompts);
         view
@@ -1227,6 +1249,7 @@ impl Desk {
             restore_offer: false,
             terminal_id: None,
             display_name: None,
+            asked: None,
             created_at: now,
             updated_at: now,
         };
@@ -1612,26 +1635,31 @@ impl Desk {
     /// hook answers the same call `allow` from then on, which runs it
     /// without the classifier. The person's alone to do.
     pub fn allow_asked(&self, id: Uuid, by: Option<By>) -> Result<SessionView, DeskError> {
-        let denied = {
-            let mut st = self.0.state.lock();
-            let asking = st.records.get(&id).map(|r| r.state) == Some(SessionState::Asking);
-            let live = st
-                .live
-                .get_mut(&id)
-                .filter(|_| asking)
-                .ok_or_else(|| DeskError::Conflict("it isn't asking anything".into()))?;
+        let mut denied = None;
+        let mut refusal = None;
+        self.change(id, |r, l| {
+            let Some(l) = l.filter(|_| r.state == SessionState::Asking) else {
+                refusal = Some("it isn't asking anything");
+                return;
+            };
             // Taken: allowed once, it isn't offered again.
-            let denied = live
+            match r
                 .asked
                 .as_mut()
                 .and_then(|a| a.denied.take_if(|d| d.allowable))
-                .ok_or_else(|| {
-                    DeskError::Conflict("there is no refused tool Desk can allow".into())
-                })?;
-            live.allowed.insert(denied.call.clone());
-            denied
+            {
+                Some(d) => {
+                    l.allowed.insert(d.call.clone());
+                    denied = Some(d);
+                }
+                None => refusal = Some("there is no refused tool Desk can allow"),
+            }
+        });
+        let Some(denied) = denied else {
+            return Err(DeskError::Conflict(
+                refusal.unwrap_or("session is not running").into(),
+            ));
         };
-        self.publish(id);
         let what = match denied.call.input.as_deref() {
             Some(input) => format!("{} `{input}`", denied.name()),
             None => denied.name().to_string(),
@@ -1663,11 +1691,9 @@ impl Desk {
         if self.record(id)?.state != SessionState::Asking {
             return Err(DeskError::Conflict("it isn't asking anything".into()));
         }
-        self.change(id, |r, l| {
+        self.change(id, |r, _| {
             r.state = SessionState::Done;
-            if let Some(l) = l {
-                l.asked = None;
-            }
+            r.asked = None;
         });
         let view = self.view(id)?;
         if let Some(by) = by {
@@ -2031,7 +2057,6 @@ impl Desk {
                 baseline: Default::default(),
                 prompts: 0,
                 denials: Vec::new(),
-                asked: None,
                 allowed: HashSet::new(),
                 interrupted: false,
             },
@@ -2184,16 +2209,20 @@ impl Desk {
                     l.pending = None;
                     l.prompts += 1;
                     l.denials.clear();
-                    l.asked = None;
+                    r.asked = None;
                     l.interrupted = false;
                 }
             }),
             Hook::ToolStart { tool, .. } => self.change(id, |r, l| {
                 r.state = SessionState::Working;
+                r.asked = None;
                 if let Some(l) = l {
                     l.current_tool = Some(tool);
-                    l.asked = None;
                     l.interrupted = false;
+                    // It did something after a transient refusal.
+                    if inside.is_none() {
+                        asking::went_on(&mut l.denials, false);
+                    }
                 }
             }),
             Hook::Denied(denied) => {
@@ -2210,6 +2239,10 @@ impl Desk {
                     l.current_tool = None;
                     l.pending = None;
                     l.answer = None;
+                    // A tool ran: the turn got past what it was refused.
+                    if inside.is_none() {
+                        asking::went_on(&mut l.denials, true);
+                    }
                 }
             }),
             Hook::NeedsInput(message) => self.change(id, |r, l| {
@@ -2229,7 +2262,7 @@ impl Desk {
                 if let Some(l) = l {
                     l.pending = None;
                     l.denials.clear();
-                    l.asked = None;
+                    r.asked = None;
                 }
             }),
             Hook::SubagentStart(agent) => self.change(id, |_, l| {
@@ -2252,7 +2285,7 @@ impl Desk {
                         && l.background.count() == 0
                     {
                         r.state = SessionState::Working;
-                        l.asked = None;
+                        r.asked = None;
                     }
                 }
             }),
@@ -2305,12 +2338,12 @@ impl Desk {
                     if let Some(reply) = said {
                         r.last_reply = Some(transcript::clip(&reply));
                     }
+                    r.asked = asked;
                     if let Some(l) = l {
                         l.current_tool = None;
                         l.pending = None;
                         l.answer = None;
                         l.denials.clear();
-                        l.asked = asked;
                         l.background = std::mem::take(&mut l.background)
                             .reported(background, Utc::now())
                             .looked_if(running, Utc::now());
@@ -2503,7 +2536,7 @@ impl Desk {
                         };
                         r.restore_offer = false;
                         if let Some(l) = l {
-                            l.asked = None;
+                            r.asked = None;
                             // A repeated notice is the same request, still asked.
                             let asked = l.pending.take();
                             l.pending = waiting.then(|| {
@@ -2530,10 +2563,10 @@ impl Desk {
                             r.last_prompt = t.last_prompt.or(r.last_prompt.take());
                             r.last_reply = t.last_reply.or(r.last_reply.take());
                         }
+                        r.asked = asked;
                         if let Some(l) = l {
                             l.current_tool = None;
                             l.pending = None;
-                            l.asked = asked;
                             l.background =
                                 std::mem::take(&mut l.background).looked_if(running, Utc::now());
                         }
@@ -2592,7 +2625,11 @@ impl Desk {
             )
         };
         let mut present = HashSet::new();
-        for ext in found.into_iter().filter(|e| !ours.contains(&e.session_id)) {
+        let hub_turns = self.0.opts.hub_turns.clone();
+        for ext in found
+            .into_iter()
+            .filter(|e| !ours.contains(&e.session_id) && !hub_turns.hold(&e.cwd))
+        {
             let id = by_cli.get(&ext.session_id).copied();
             let transcript = id
                 .and_then(|id| self.record(id).ok()?.transcript)
@@ -2657,6 +2694,7 @@ impl Desk {
                         restore_offer: false,
                         terminal_id: None,
                         display_name: None,
+                        asked: None,
                         created_at: now,
                         updated_at: now,
                     };
@@ -2860,6 +2898,7 @@ mod tests {
             restore: RestorePolicy::Ask,
             adopt_every: None,
             holder: None,
+            hub_turns: HubTurns::default(),
         }
     }
 
@@ -4124,6 +4163,41 @@ mod tests {
             d.reconcile_external(vec![]).await;
             assert_eq!(d.view(s.id).unwrap().state, SessionState::Closed);
             assert!(d.list().iter().all(|v| v.id != s.id));
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn the_hubs_own_cli_turns_are_never_adopted() {
+        with_test_pool(build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            DeskStore::migrate(&pool).await.unwrap();
+            let turns = PathBuf::from("/data/agents/scout/projects/_agent-turn/work/session");
+            let d = Desk::start(
+                DeskStore::from_pool(pool),
+                Options {
+                    hub_turns: HubTurns::new(move |cwd| cwd.starts_with(&turns)),
+                    ..options(dir.path())
+                },
+                Default::default(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            let found = adopt::parse(
+                json!([
+                    { "pid": std::process::id(), "cwd": "/data/agents/scout/projects/_agent-turn/work/session/at-dm-d4774cbb6c89-2e",
+                      "kind": "interactive", "sessionId": "hub-1", "name": "at-dm-d4774cbb6c89-2e", "status": "busy" },
+                    { "pid": std::process::id(), "cwd": "/Users/k/dev/vellev", "kind": "interactive",
+                      "sessionId": "mine-1", "name": "vellev-36", "status": "busy" }
+                ])
+                .to_string()
+                .as_bytes(),
+            )
+            .unwrap();
+            d.reconcile_external(found).await;
+            let names: Vec<String> = d.list().into_iter().map(|s| s.name).collect();
+            assert_eq!(names, ["vellev-36"], "the person's, not the hub's");
         })
         .await;
     }

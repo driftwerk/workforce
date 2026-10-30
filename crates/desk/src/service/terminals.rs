@@ -630,7 +630,6 @@ impl Desk {
             baseline: Default::default(),
             prompts: 0,
             denials: Vec::new(),
-            asked: None,
             allowed: HashSet::new(),
             interrupted: false,
         };
@@ -674,6 +673,7 @@ impl Desk {
                     restore_offer: false,
                     terminal_id: Some(terminal),
                     display_name: None,
+                    asked: None,
                     created_at: now,
                     updated_at: now,
                 });
@@ -742,7 +742,6 @@ impl Desk {
                             baseline: Default::default(),
                             prompts: 0,
                             denials: Vec::new(),
-                            asked: None,
                             allowed: HashSet::new(),
                             interrupted: false,
                         },

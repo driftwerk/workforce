@@ -15,7 +15,7 @@
 
 use std::collections::HashMap;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::claude::tool_summary;
@@ -24,7 +24,7 @@ use crate::crew;
 /// One tool call as an allow matches it: the tool, and, for one whose input
 /// says what it does (a command, a file, a URL), that input exactly. Other
 /// tools match whole.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Call {
     pub tool: String,
     pub input: Option<String>,
@@ -53,7 +53,7 @@ impl Call {
 }
 
 /// A tool auto mode refused in the turn.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Denied {
     /// Its label: `Bash(security find-generic-password …)`.
@@ -66,12 +66,21 @@ pub struct Denied {
     /// terminal, can.
     pub allowable: bool,
     /// What allowing it allows.
-    #[serde(skip)]
     pub call: Call,
+    /// Auto mode gave no verdict (its check failed, not the call): the
+    /// turn stopped on it only if it was the last thing the turn did.
+    #[serde(default)]
+    pub transient: bool,
 }
 
 impl Denied {
-    pub fn new(tool: &str, input: Option<&Value>, reason: &str, allowable: bool) -> Self {
+    pub fn new(
+        tool: &str,
+        input: Option<&Value>,
+        reason: &str,
+        allowable: bool,
+        transient: bool,
+    ) -> Self {
         let (label, detail) = tool_summary(tool, input);
         Self {
             tool: label,
@@ -79,13 +88,16 @@ impl Denied {
             reason: crew::clip(reason, 160),
             allowable,
             call: Call::of(tool, input),
+            transient,
         }
     }
 
     /// From a `PermissionDenied` hook: allowable when the classifier gave a
-    /// verdict.
+    /// verdict, transient when it gave none.
     pub fn from_hook(tool: &str, input: Option<&Value>, reason: &str) -> Self {
-        Self::new(tool, input, reason, is_verdict(reason))
+        let verdict = is_verdict(reason);
+        let transient = !verdict && !reason.contains("safety check");
+        Self::new(tool, input, reason, verdict, transient)
     }
 
     /// The tool's name: `Bash`, `workforce · memory_recall`.
@@ -102,11 +114,22 @@ fn is_verdict(reason: &str) -> bool {
     !r.is_empty()
         && !r.starts_with("Auto mode could not evaluate")
         && r != "Classifier unavailable"
+        && !r.contains("no verdict")
         && !r.contains("safety check")
 }
 
+/// What still stands of a turn's refusals once it went on: one the turn
+/// got past (a tool ran after it) doesn't, nor a transient one it did
+/// anything after.
+pub fn went_on(denials: &mut Vec<Denied>, ran: bool) {
+    match ran {
+        true => denials.clear(),
+        false => denials.retain(|d| !d.transient),
+    }
+}
+
 /// Why a session's turn waits on the person, as Desk shows it.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Asked {
     /// What it needs: "Stopped: Bash was not allowed", or its question.
@@ -162,8 +185,9 @@ pub enum Reading {
 }
 
 /// The tools auto mode refused in the turn `lines` (a transcript's JSONL,
-/// oldest first) ends on: after the person's last prompt, in the session's
-/// own thread (not a sub-agent's).
+/// oldest first) ends on, that it stopped on: after the person's last
+/// prompt, in the session's own thread (not a sub-agent's), with nothing
+/// run after them; a transient one only when nothing at all came after it.
 pub fn denials_in<'a>(lines: impl Iterator<Item = &'a str>) -> Vec<Denied> {
     let mut calls: HashMap<String, (String, Value)> = HashMap::new();
     let mut out = Vec::new();
@@ -179,6 +203,7 @@ pub fn denials_in<'a>(lines: impl Iterator<Item = &'a str>) -> Vec<Denied> {
         match v.get("type").and_then(Value::as_str) {
             Some("assistant") => {
                 for b in blocks.iter().filter(|b| b["type"] == "tool_use") {
+                    went_on(&mut out, false);
                     if let (Some(id), Some(name)) = (b["id"].as_str(), b["name"].as_str()) {
                         calls.insert(id.into(), (name.into(), b["input"].clone()));
                     }
@@ -199,6 +224,10 @@ pub fn denials_in<'a>(lines: impl Iterator<Item = &'a str>) -> Vec<Denied> {
                         Some(id),
                     ) = (kind, b["tool_use_id"].as_str())
                     else {
+                        // A call that ran: the turn got past what came before.
+                        if b["is_error"] != true {
+                            went_on(&mut out, true);
+                        }
                         continue;
                     };
                     let (name, input) = calls
@@ -210,6 +239,7 @@ pub fn denials_in<'a>(lines: impl Iterator<Item = &'a str>) -> Vec<Denied> {
                         input,
                         &reason_in(&text, kind),
                         kind == "automode-blocked",
+                        kind == "automode-unavailable",
                     ));
                 }
             }
@@ -539,6 +569,13 @@ mod tests {
         v
     }
 
+    /// A call that ran.
+    fn ran(id: &str, text: &str) -> Value {
+        json!({ "type": "user", "message": { "role": "user", "content": [
+            { "type": "tool_result", "tool_use_id": id, "content": text }
+        ] } })
+    }
+
     fn reply(text: &str) -> Value {
         json!({ "type": "assistant", "message": { "role": "assistant", "content": [
             { "type": "text", "text": text }
@@ -625,6 +662,81 @@ mod tests {
         );
         assert!(!Denied::from_hook("Bash", None, "Classifier unavailable").allowable);
         assert!(Denied::from_hook("Bash", None, "[Data Exfiltration]").allowable);
+    }
+
+    const NO_VERDICT: &str = "The server-side auto mode classifier gave no verdict (error), so auto mode cannot determine the safety of Bash. This is a transient failure of the check.";
+
+    #[test]
+    fn a_refusal_the_turn_got_past_is_not_what_it_stopped_on() {
+        let worked_around = turn(&[
+            prompt("Check the production config."),
+            tool_use(
+                "t1",
+                "Bash",
+                json!({ "command": "kubectl get configmap app -n prod" }),
+            ),
+            result("t1", REFUSED, Some("automode-blocked")),
+            reply("I shouldn't read production; checking staging instead."),
+            tool_use(
+                "t2",
+                "Bash",
+                json!({ "command": "kubectl get configmap app -n staging" }),
+            ),
+            ran("t2", "data: ..."),
+            reply("Staging's config is fine."),
+        ]);
+        assert!(
+            denials_in(worked_around.lines()).is_empty(),
+            "worked around: done"
+        );
+        let refused_again = turn(&[
+            prompt("Check the production config."),
+            tool_use("t1", "Bash", json!({ "command": "ls" })),
+            ran("t1", "ok"),
+            tool_use(
+                "t2",
+                "Bash",
+                json!({ "command": "kubectl get configmap app -n prod" }),
+            ),
+            result("t2", REFUSED, Some("automode-blocked")),
+            reply("I couldn't read it."),
+        ]);
+        assert_eq!(
+            denials_in(refused_again.lines()).len(),
+            1,
+            "what ran before doesn't count"
+        );
+    }
+
+    #[test]
+    fn auto_mode_giving_no_verdict_stops_the_turn_only_when_it_is_the_last_thing() {
+        let retried = turn(&[
+            prompt("Run the tests."),
+            tool_use("t1", "Bash", json!({ "command": "cargo test" })),
+            result("t1", NO_VERDICT, Some("automode-unavailable")),
+            tool_use("t2", "Bash", json!({ "command": "cargo test" })),
+            result("t2", NO_VERDICT, Some("automode-blocked")),
+        ]);
+        let left = denials_in(retried.lines());
+        assert_eq!(
+            left.len(),
+            1,
+            "the transient one was followed by another call"
+        );
+        assert!(!left[0].transient);
+        let last = turn(&[
+            prompt("Run the tests."),
+            tool_use("t1", "Bash", json!({ "command": "cargo test" })),
+            result("t1", NO_VERDICT, Some("automode-unavailable")),
+            reply("Auto mode couldn't check the command; try again in a moment."),
+        ]);
+        let left = denials_in(last.lines());
+        assert_eq!(left.len(), 1);
+        assert!(left[0].transient && !left[0].allowable);
+        let mut hooked = vec![Denied::from_hook("Bash", None, "Classifier unavailable")];
+        assert!(hooked[0].transient);
+        went_on(&mut hooked, false);
+        assert!(hooked.is_empty(), "it called a tool after it");
     }
 
     #[test]

@@ -91,6 +91,8 @@ pub struct SessionRecord {
     pub terminal_id: Option<Uuid>,
     /// What the person calls it in Desk, when they renamed it.
     pub display_name: Option<String>,
+    /// While it is asking: what, and why Desk read it so.
+    pub asked: Option<crate::asking::Asked>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -217,7 +219,7 @@ impl SessionView {
             display_name: r.display_name.clone(),
             group: None,
             background: None,
-            asked: None,
+            asked: r.asked.clone().filter(|_| r.state == SessionState::Asking),
             prompts: 0,
             interrupted: false,
             created_at: r.created_at,
