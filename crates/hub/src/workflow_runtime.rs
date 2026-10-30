@@ -499,7 +499,7 @@ pub(crate) enum Destination<'a> {
         channel: &'a str,
         thread: Option<&'a str>,
     },
-    Desk(DeskTarget),
+    Desk(DeskScope),
     Dark,
 }
 
@@ -513,7 +513,7 @@ pub(crate) fn destination_of<'a>(
             channel,
             thread: thread_id,
         },
-        (None, Some(desk)) => Destination::Desk(desk.target),
+        (None, Some(desk)) => Destination::Desk(desk),
         (None, None) => Destination::Dark,
     }
 }
@@ -6694,8 +6694,8 @@ impl WorkflowRuntime {
             workforce_agent::runner::current_desk(),
         ) {
             Destination::Slack { channel, thread } => (channel, thread),
-            Destination::Desk(target) => {
-                self.say_on_desk(&target, text, agent_id, fallback_agent_id)
+            Destination::Desk(scope) => {
+                self.say_on_desk(&scope, text, agent_id, fallback_agent_id)
                     .await;
                 return None;
             }
@@ -6763,21 +6763,17 @@ impl WorkflowRuntime {
         Some(first)
     }
 
-    /// Say `text` in the Desk conversation `target` the run reports to, as
-    /// the person the run acts as, in the conversation with the agent that
-    /// started it. Desk's surface is append-only: each says once what Slack
-    /// would show by editing a card.
+    /// Say `text` in the Desk conversation the run reports to (`scope`), to
+    /// its person, in the conversation with the agent that started it.
+    /// Desk's surface is append-only: each says once what Slack would show
+    /// by editing a card.
     async fn say_on_desk(
         &self,
-        target: &DeskTarget,
+        scope: &DeskScope,
         text: &str,
         agent_id: Option<&str>,
         fallback_agent_id: Option<&str>,
     ) {
-        let Some(owner) = crate::user_config::current_identity_id() else {
-            warn!("A workflow message for Desk has nobody to go to — not sent");
-            return;
-        };
         let service = self
             .agent_registry
             .get()
@@ -6790,8 +6786,8 @@ impl WorkflowRuntime {
             .unwrap_or_else(|| Arc::clone(&self.service));
         if let Err(e) = crate::desk_surface::deliver(
             &service,
-            &owner,
-            target,
+            &scope.owner,
+            &scope.target,
             crate::desk_surface::Delivery::text(
                 DeliveryKind::Workflow,
                 crate::redact::redact_secrets(text),
@@ -6888,8 +6884,8 @@ impl WorkflowRuntime {
             workforce_agent::runner::current_desk(),
         ) {
             Destination::Slack { channel, .. } => channel,
-            Destination::Desk(target) => {
-                self.say_on_desk(&target, &text, agent_id, fallback_agent_id)
+            Destination::Desk(scope) => {
+                self.say_on_desk(&scope, &text, agent_id, fallback_agent_id)
                     .await;
                 return;
             }
@@ -9075,7 +9071,7 @@ mod tests {
         );
         assert_eq!(
             destination_of(None, Some("1.0"), desk()),
-            Destination::Desk(DeskTarget::of_turn(&DeskPlace::Dm, "desk", None, false))
+            Destination::Desk(desk().unwrap())
         );
         assert_eq!(destination_of(None, None, None), Destination::Dark);
     }
