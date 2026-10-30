@@ -153,6 +153,18 @@ pub(crate) async fn deliver<'a>(
     )
     .await;
     #[cfg(feature = "postgres")]
+    if let Some(log) = crate::floor::turns() {
+        crate::floor::agents::delivered(
+            log.as_ref(),
+            outbox.agent_id,
+            owner,
+            &delivered.session_id,
+            &target.place,
+            delivery.kind,
+            &text,
+        );
+    }
+    #[cfg(feature = "postgres")]
     if let Some(desk) = crate::desk_driver::desk() {
         let posted = into_own_room(desk, outbox.agent_id, &target, &delivered, &text, &mark).await;
         if let Err(e) = posted {

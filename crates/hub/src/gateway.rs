@@ -2863,25 +2863,26 @@ async fn handle_ws(
                             )) else {
                                 continue;
                             };
-                            if !owns_session(service.sessions.as_ref(), &sid, &owner) {
-                                warn!(
+                            match crate::prompt_answer::answer(
+                                nats.as_ref(),
+                                &service,
+                                &owner,
+                                &sid,
+                                &request_id,
+                                choice,
+                            )
+                            .await
+                            {
+                                Ok(()) => {}
+                                Err(crate::prompt_answer::Unanswered::NotYours) => warn!(
                                     session_id = %sid,
                                     "permission_response for a non-owned session — dropping"
-                                );
-                                continue;
-                            }
-                            let answer = TurnControl::Approval {
-                                request_id: request_id.clone(),
-                                approved: choice.is_allow(),
-                                user: owner,
-                                choice: Some(choice),
-                            };
-                            if !steer(nats.as_ref(), &service, &sid, answer).await.applied() {
-                                warn!(
+                                ),
+                                Err(crate::prompt_answer::Unanswered::NotLive) => warn!(
                                     session_id = %sid,
                                     request_id = %request_id,
                                     "permission_response for inactive session — dropping"
-                                );
+                                ),
                             }
                         }
                         _ => {}

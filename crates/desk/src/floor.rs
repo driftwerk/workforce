@@ -129,7 +129,16 @@ pub enum Answer {
     rename_all_fields = "camelCase"
 )]
 pub enum DecideRef {
+    /// A Desk session's tool request.
     Session { session_id: Uuid, approval_id: Uuid },
+    /// An agent's prompt in its live turn.
+    Prompt {
+        agent_id: String,
+        session_id: String,
+        request_id: String,
+    },
+    /// A routed approval the person is an approver of.
+    Routed { request_id: String },
 }
 
 /// A stretch of a turn that waited on the person: one per ask.
@@ -607,7 +616,11 @@ pub fn open_needs(turns: &[Turn]) -> Vec<Need> {
             answer: Answer::Reply,
         })
     });
-    let mut needs: Vec<Need> = waits.chain(questions).collect();
+    longest_waiting(waits.chain(questions).collect())
+}
+
+/// `needs` in the order they are shown: longest waiting first.
+pub fn longest_waiting(mut needs: Vec<Need>) -> Vec<Need> {
     needs.sort_by(|a, b| a.since.cmp(&b.since).then_with(|| a.id.cmp(&b.id)));
     needs
 }

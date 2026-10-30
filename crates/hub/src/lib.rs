@@ -223,6 +223,7 @@ pub mod memory_erasure;
 pub mod memory_mirror;
 pub mod memory_shadow;
 pub mod promotion;
+pub(crate) mod prompt_answer;
 pub mod redacting_vault;
 pub mod retention;
 pub mod retrieve_tool;

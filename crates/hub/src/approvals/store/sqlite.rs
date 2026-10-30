@@ -279,6 +279,20 @@ impl PendingApprovalStore for SqlitePendingApprovalStore {
             .wrap_err("recently_resolved failed")
     }
 
+    fn pending_for(&self, approver: &str, now: DateTime<Utc>) -> Result<Vec<PendingApproval>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {SELECT_COLS} FROM pending_approvals
+             WHERE status = 'pending' AND expires_at > ?2
+               AND request_id IN (SELECT request_id FROM pending_approval_targets
+                                  WHERE approver_id = ?1)
+             ORDER BY created_at"
+        ))?;
+        let rows = stmt.query_map(params![approver, now.to_rfc3339()], parse_approval)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .wrap_err("pending_for failed")
+    }
+
     fn requested_by(&self, requester: &str) -> Result<Vec<PendingApproval>> {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(&format!(
@@ -349,6 +363,13 @@ impl PendingApprovalStore for SqlitePendingApprovalStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn what_waits_on_an_approver_is_their_pending_unexpired_requests() {
+        crate::approvals::store::pending_for_contract(
+            &SqlitePendingApprovalStore::in_memory().unwrap(),
+        );
+    }
 
     #[test]
     fn resolved_requests_are_pruned_past_their_window() {

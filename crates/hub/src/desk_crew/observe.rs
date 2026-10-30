@@ -415,6 +415,7 @@ impl<T: TurnHost> TurnHost for Observed<T> {
         trust_level: Option<workforce_common::trust::TrustLevel>,
         run_as: Option<&str>,
     ) -> Result<String> {
+        let scope = workforce_agent::runner::current_desk();
         let origin = Origin {
             channel,
             user,
@@ -422,6 +423,8 @@ impl<T: TurnHost> TurnHost for Observed<T> {
             message,
             channel_id,
             thread_id,
+            desk: None,
+            answers_to: scope.as_ref().map(|s| &s.target.place),
         };
         let mut watch = Watch::new(service, &origin, None);
         watch.begin_floor(service, &origin, None, None, crew::now());
@@ -484,6 +487,7 @@ impl<T: TurnHost> TurnHost for Observed<T> {
         desk: Option<&workforce_common::channels::desk::DeskTurnContext>,
     ) -> Result<MessageProgress> {
         let started = crew::now();
+        let scope = workforce_agent::runner::current_desk();
         let origin = Origin {
             channel,
             user,
@@ -491,6 +495,8 @@ impl<T: TurnHost> TurnHost for Observed<T> {
             message,
             channel_id,
             thread_id,
+            desk,
+            answers_to: scope.as_ref().map(|s| &s.target.place),
         };
         let mut watch = Watch::new(service, &origin, session_id);
         let bind = Bind::starting(service, channel, desk.map(|d| d.reply_id.as_str()));
@@ -564,6 +570,7 @@ impl<T: TurnHost> TurnHost for Observed<T> {
         run_as: Option<&str>,
         author: RunAuthor,
     ) -> Result<TurnOutcome> {
+        let scope = workforce_agent::runner::current_desk();
         let origin = Origin {
             channel,
             user,
@@ -571,6 +578,8 @@ impl<T: TurnHost> TurnHost for Observed<T> {
             message,
             channel_id,
             thread_id,
+            desk: None,
+            answers_to: scope.as_ref().map(|s| &s.target.place),
         };
         let mut watch = Watch::new(service, &origin, None);
         watch.begin_floor(service, &origin, None, None, crew::now());

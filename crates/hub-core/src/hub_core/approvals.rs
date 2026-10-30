@@ -122,6 +122,10 @@ pub trait PendingApprovalStore: Send + Sync {
     /// boot reconciliation pass. Bounded; ordered most-recent first.
     fn recently_resolved(&self, limit: usize) -> Result<Vec<PendingApproval>>;
 
+    /// Requests still pending at `now` that name `approver` among their
+    /// approvers, oldest first: what waits on them.
+    fn pending_for(&self, approver: &str, now: DateTime<Utc>) -> Result<Vec<PendingApproval>>;
+
     /// Every request `requester` raised, resolved or not, newest first.
     fn requested_by(&self, requester: &str) -> Result<Vec<PendingApproval>>;
 

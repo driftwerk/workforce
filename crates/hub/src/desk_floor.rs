@@ -16,18 +16,27 @@ use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use uuid::Uuid;
+use workforce_agent::runner::approval_detail;
+use workforce_common::channels::desk::{DeskPlace, DeskSpeaker, DeskTurnContext};
 use workforce_common::channels::{is_platform, DESK_CHANNEL};
 use workforce_common::subscription::{is_automated_source, split_per_user_key, SubscriptionKind};
 use workforce_common::usage::{LoginRef, PlanKind, Reading, Window};
-use workforce_desk::crew::By;
-use workforce_desk::floor::{self, DecideRef, Need, Place, Scope, Subject, Turn};
+use workforce_core::policy::PermissionChoice;
+use workforce_desk::crew::{self, By, PartyKind};
+use workforce_desk::floor::{
+    self, Answer, DecideRef, Need, NeedKind, Place, Scope, Subject, Turn, Who,
+};
 use workforce_desk::model::Decision;
 use workforce_desk::usage::MacSignIns;
 use workforce_desk::{Desk, DeskError};
 
+use crate::approvals::resume::APPROVAL_DIRECTIVE;
+use crate::approvals::PendingApproval;
 use crate::desk_crew::CHECK_IN;
 use crate::floor::Installed;
-use crate::gateway::{resolve_caller_context, AuthFailure, CallerContext, GatewayState};
+use crate::gateway::{
+    owns_session, resolve_caller_context, AuthFailure, CallerContext, GatewayState,
+};
 use crate::slack_manager::RESUME_PROMPT;
 
 /// What an agent's turn came in as.
@@ -39,6 +48,10 @@ pub(crate) struct Origin<'a> {
     pub message: &'a str,
     pub channel_id: Option<&'a str>,
     pub thread_id: Option<&'a str>,
+    /// The Desk turn it is, when Desk asked it.
+    pub desk: Option<&'a DeskTurnContext>,
+    /// Where on Desk a run made there answers (a job, a workflow step).
+    pub answers_to: Option<&'a DeskPlace>,
 }
 
 impl Origin<'_> {
@@ -48,8 +61,24 @@ impl Origin<'_> {
     }
 }
 
+/// Where in Desk something said at `place` is found. A room an older Desk
+/// knows only by its slug has no id to open, and its answers go to the DM.
+pub(crate) fn place_in_desk(place: &DeskPlace) -> Place {
+    match place {
+        DeskPlace::Dm | DeskPlace::LegacyRoom { .. } => Place::Dm,
+        DeskPlace::Room { room, thread, .. } => Place::Room {
+            room: *room,
+            thread: *thread,
+        },
+        DeskPlace::Call => Place::Call,
+    }
+}
+
 /// Where a turn, and anything it asks, can be found.
 pub(crate) fn place_of(o: &Origin<'_>) -> Place {
+    if let Some(place) = o.desk.map(|d| &d.turn.place).or(o.answers_to) {
+        return place_in_desk(place);
+    }
     if o.channel == DESK_CHANNEL {
         return Place::Dm;
     }
@@ -69,12 +98,15 @@ pub(crate) fn place_of(o: &Origin<'_>) -> Place {
 
 /// Whether the person started the turn themselves, which settles what the
 /// agent asked them: not a scheduled job, a workflow step, another agent's
-/// hand-off, Desk's own check-in, or a turn resumed after a restart.
+/// hand-off, Desk's own check-in, a turn resumed after a restart, or one
+/// resumed once an approval it asked for was decided.
 pub(crate) fn by_person_of(o: &Origin<'_>) -> bool {
-    !is_automated_source(o.user)
+    o.desk.is_none_or(|d| d.turn.speaker == DeskSpeaker::Person)
+        && !is_automated_source(o.user)
         && !o.user.starts_with("agent:")
         && !o.user.starts_with("system")
         && !o.message.starts_with(RESUME_PROMPT)
+        && !o.message.starts_with(APPROVAL_DIRECTIVE)
         && !o.message.starts_with(CHECK_IN)
 }
 
@@ -262,9 +294,84 @@ async fn turns(
     ))
 }
 
-/// What still needs the person: the one source every count is a count of.
-fn needs_of(turns: &[Turn]) -> Vec<Need> {
-    floor::open_needs(turns)
+/// A routed approval waiting on its approver, as a need: the call it asks
+/// about (`detail`, as the approver's card shows it), where the run that
+/// asked was made, and the agent that asked (`name`).
+fn routed_need(row: &PendingApproval, detail: &str, place: Place, name: String) -> Need {
+    Need {
+        id: format!("routed:{}", row.request_id),
+        kind: NeedKind::Approval,
+        who: Who {
+            kind: PartyKind::Agent,
+            id: row.agent_id.clone(),
+            name,
+            engine: None,
+        },
+        ask: crew::approval_summary(&row.tool_name, detail),
+        options: None,
+        since: row.created_at,
+        place,
+        answer: Answer::Decide {
+            at: DecideRef::Routed {
+                request_id: row.request_id.clone(),
+            },
+        },
+    }
+}
+
+/// The routed approvals waiting on `caller` now, each where its run was
+/// made (the DM, when that is not known).
+fn routed_needs(
+    state: &GatewayState,
+    caller: &FloorCaller,
+    now: DateTime<Utc>,
+) -> eyre::Result<Vec<Need>> {
+    let Some(store) = state
+        .registry
+        .resolve(None)
+        .and_then(|svc| svc.pending_approval_store.read().clone())
+    else {
+        return Ok(Vec::new());
+    };
+    Ok(store
+        .pending_for(&caller.id, now)?
+        .iter()
+        .map(|row| {
+            let service = crate::approvals::resume::resume_service(&state.registry, row);
+            let detail = service
+                .as_ref()
+                .map(|s| approval_detail(&s.tools, &row.tool_name, &row.tool_input))
+                .unwrap_or_default();
+            let place = service
+                .as_ref()
+                .and_then(|s| s.sessions.find(&row.session_key, &row.requester_id).ok())
+                .flatten()
+                .and_then(|session| session.desk_origin())
+                .map_or(Place::Dm, |target| place_in_desk(&target.place));
+            let name = service
+                .as_ref()
+                .filter(|s| s.agent_id.as_str() == row.agent_id)
+                .map_or_else(|| row.agent_id.clone(), |s| crate::desk_crew::name_of(s));
+            routed_need(row, &detail, place, name)
+        })
+        .collect())
+}
+
+/// What still needs the person: what their turns wait on and ask, and the
+/// routed approvals waiting on them. The one source every count is a count
+/// of.
+fn needs_of(
+    state: &GatewayState,
+    caller: &FloorCaller,
+    turns: &[Turn],
+    now: DateTime<Utc>,
+) -> eyre::Result<Vec<Need>> {
+    Ok(floor::longest_waiting(
+        floor::open_needs(turns)
+            .into_iter()
+            .chain(routed_needs(state, caller, now)?)
+            .collect(),
+    ))
 }
 
 /// How far back the floor looks for the last day's finished work.
@@ -276,8 +383,13 @@ pub(crate) async fn open_needs(
     sources: &Sources,
     caller: &FloorCaller,
 ) -> eyre::Result<Vec<Need>> {
-    let since = Utc::now() - RECENT;
-    Ok(needs_of(&turns(state, sources, caller, since).await?))
+    let now = Utc::now();
+    needs_of(
+        state,
+        caller,
+        &turns(state, sources, caller, now - RECENT).await?,
+        now,
+    )
 }
 
 struct Routes {
@@ -348,8 +460,13 @@ async fn floor_view(State(r): S, headers: HeaderMap, Query(q): Query<FloorQuery>
     let Some(day) = day_of(q.day.as_deref(), now) else {
         return refusal(StatusCode::BAD_REQUEST, "bad_day");
     };
-    match turns(&r.state, &sources, &caller, day.min(now - RECENT)).await {
-        Ok(turns) => Json(floor::view(&turns, needs_of(&turns), day, now)).into_response(),
+    let read = async {
+        let turns = turns(&r.state, &sources, &caller, day.min(now - RECENT)).await?;
+        let needs = needs_of(&r.state, &caller, &turns, now)?;
+        eyre::Ok(floor::view(&turns, needs, day, now))
+    };
+    match read.await {
+        Ok(view) => Json(view).into_response(),
         Err(e) => failed(e),
     }
 }
@@ -359,6 +476,17 @@ async fn floor_view(State(r): S, headers: HeaderMap, Query(q): Query<FloorQuery>
 pub(crate) enum Choice {
     Allow,
     Deny,
+}
+
+impl Choice {
+    /// The answer to a prompt this is: for this call alone, as a quick
+    /// action never writes a standing rule.
+    fn permission(self) -> PermissionChoice {
+        match self {
+            Self::Allow => PermissionChoice::AllowOnce,
+            Self::Deny => PermissionChoice::DenyOnce,
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -383,17 +511,65 @@ pub(crate) enum Unanswered {
 
 /// Answers the need `at` points to with `choice`, as `caller`, through the
 /// function that answers it everywhere else.
-pub(crate) fn answer(
+pub(crate) async fn answer(
+    state: &GatewayState,
     sources: &Sources,
     caller: &FloorCaller,
     at: &DecideRef,
     choice: Choice,
 ) -> eyre::Result<Result<(), Unanswered>> {
-    let decision = match choice {
-        Choice::Allow => Decision::Allow,
-        Choice::Deny => Decision::Deny,
-    };
     match at {
+        DecideRef::Prompt {
+            agent_id,
+            session_id,
+            request_id,
+        } => {
+            let Some(service) = state.registry.get(agent_id) else {
+                return Ok(Err(Unanswered::Unknown));
+            };
+            if !owns_session(service.sessions.as_ref(), session_id, &caller.id) {
+                return Ok(Err(Unanswered::NotYours));
+            }
+            // A live turn takes any answer it is sent, so whether the prompt
+            // still waits is the floor's to say.
+            let waiting = open_needs(state, sources, caller)
+                .await?
+                .iter()
+                .any(|need| matches!(&need.answer, Answer::Decide { at: open } if open == at));
+            if !waiting {
+                return Ok(Err(Unanswered::AlreadyAnswered));
+            }
+            let answered = crate::prompt_answer::answer(
+                state.nats.as_ref(),
+                &service,
+                &caller.id,
+                session_id,
+                request_id,
+                choice.permission(),
+            )
+            .await;
+            Ok(answered.map_err(|why| match why {
+                crate::prompt_answer::Unanswered::NotYours => Unanswered::NotYours,
+                crate::prompt_answer::Unanswered::NotLive => Unanswered::AlreadyAnswered,
+            }))
+        }
+        DecideRef::Routed { request_id } => {
+            use crate::approvals::decide::{decide, DecideError, Decided, Decider};
+            match decide(
+                &state.registry,
+                request_id,
+                Decider::Person(&caller.id),
+                choice.permission(),
+            )
+            .await
+            {
+                Ok(Decided::Resolved(_)) => Ok(Ok(())),
+                Ok(Decided::AlreadyResolved(_)) => Ok(Err(Unanswered::AlreadyAnswered)),
+                Err(DecideError::NotAnApprover) => Ok(Err(Unanswered::NotYours)),
+                Err(DecideError::Unknown) => Ok(Err(Unanswered::Unknown)),
+                Err(DecideError::Failed(e)) => Err(e),
+            }
+        }
         DecideRef::Session {
             session_id,
             approval_id,
@@ -403,6 +579,10 @@ pub(crate) fn answer(
             }
             let Some(desk) = (sources.desk)() else {
                 return Ok(Err(Unanswered::Unknown));
+            };
+            let decision = match choice {
+                Choice::Allow => Decision::Allow,
+                Choice::Deny => Decision::Deny,
             };
             match desk.decide(*session_id, *approval_id, decision, Some(By::you())) {
                 Ok(_) => Ok(Ok(())),
@@ -424,7 +604,7 @@ async fn decide(
         Ok(found) => found,
         Err(refused) => return refused,
     };
-    match answer(&sources, &caller, &body.at, body.choice) {
+    match answer(&r.state, &sources, &caller, &body.at, body.choice).await {
         Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
         Ok(Err(Unanswered::AlreadyAnswered)) => refusal(StatusCode::CONFLICT, "already_answered"),
         Ok(Err(Unanswered::NotYours)) => refusal(StatusCode::FORBIDDEN, "not_yours"),
@@ -584,6 +764,8 @@ mod tests {
             message,
             channel_id: None,
             thread_id: None,
+            desk: None,
+            answers_to: None,
         }
     }
 
@@ -610,6 +792,106 @@ mod tests {
         assert_eq!(place_of(&origin("ios", "u1", "hi")), Place::Elsewhere);
     }
 
+    fn asked_from(place: DeskPlace, speaker: DeskSpeaker, channel: &str) -> DeskTurnContext {
+        DeskTurnContext::new(
+            workforce_common::channels::desk::DeskTurn {
+                place,
+                speaker,
+                hop: 0,
+                context: vec![],
+                message: None,
+                spoken: false,
+            },
+            channel,
+            None,
+            false,
+            None,
+            "reply-1".into(),
+        )
+    }
+
+    #[test]
+    fn a_desk_turn_is_found_in_its_room_thread_or_call() {
+        let (room, thread) = (Uuid::new_v4(), Uuid::new_v4());
+        let channel = format!("desk:{room}");
+        let in_thread = asked_from(
+            DeskPlace::Room {
+                room,
+                name: "Release".into(),
+                thread: Some(thread),
+            },
+            DeskSpeaker::Person,
+            &channel,
+        );
+        let at = |desk: &DeskTurnContext, channel: &str| {
+            place_of(&Origin {
+                desk: Some(desk),
+                ..origin(channel, "u1", "hi")
+            })
+        };
+        assert_eq!(
+            at(&in_thread, &channel),
+            Place::Room {
+                room,
+                thread: Some(thread)
+            }
+        );
+        let call = asked_from(DeskPlace::Call, DeskSpeaker::Person, "desk:tuple");
+        assert_eq!(at(&call, "desk:tuple"), Place::Call);
+        let legacy = asked_from(
+            DeskPlace::LegacyRoom {
+                slug: "release".into(),
+            },
+            DeskSpeaker::Person,
+            "desk:release",
+        );
+        assert_eq!(
+            at(&legacy, "desk:release"),
+            Place::Dm,
+            "a room known only by its slug is answered in the DM"
+        );
+        let job = DeskPlace::Room {
+            room,
+            name: "Release".into(),
+            thread: None,
+        };
+        assert_eq!(
+            place_of(&Origin {
+                answers_to: Some(&job),
+                ..origin("scheduler:j1", "scheduler", "report")
+            }),
+            Place::Room { room, thread: None },
+            "a job made in a room is found there"
+        );
+    }
+
+    #[test]
+    fn another_agents_hand_off_in_a_room_is_not_the_persons() {
+        let room = Uuid::new_v4();
+        let channel = format!("desk:{room}");
+        let place = || DeskPlace::Room {
+            room,
+            name: "Release".into(),
+            thread: None,
+        };
+        let handed = asked_from(
+            place(),
+            DeskSpeaker::Agent {
+                name: "Scout".into(),
+            },
+            &channel,
+        );
+        let asked = asked_from(place(), DeskSpeaker::Person, &channel);
+        let by = |desk: &DeskTurnContext| {
+            by_person_of(&Origin {
+                desk: Some(desk),
+                ..origin(&channel, "u1", "over to you")
+            })
+        };
+        assert!(!by(&handed));
+        assert!(by(&asked));
+    }
+
     #[test]
     fn only_the_persons_own_message_is_theirs() {
         assert!(by_person_of(&origin("desk", "u1", "deploy it")));
@@ -630,6 +912,14 @@ mod tests {
         )));
         assert!(!by_person_of(&origin("desk", "agent:scout", "over to you")));
         assert!(!by_person_of(&origin("desk", "u1", RESUME_PROMPT)));
+        assert!(
+            !by_person_of(&origin(
+                "desk",
+                "u1",
+                &format!("{APPROVAL_DIRECTIVE}Ada approved your request")
+            )),
+            "a turn resumed on an approval is not the person speaking"
+        );
         assert!(!by_person_of(&origin(
             "desk",
             "u1",

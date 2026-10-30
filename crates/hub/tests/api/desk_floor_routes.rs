@@ -229,6 +229,115 @@ async fn a_hub_without_a_floor_says_so_and_a_session_need_is_not_a_remote_caller
     .await;
 }
 
+async fn decide(
+    addr: std::net::SocketAddr,
+    bearer: &str,
+    at: &Value,
+    choice: &str,
+) -> (u16, Value) {
+    let response = reqwest::Client::new()
+        .post(format!("http://{addr}/api/desk/needs/decide"))
+        .bearer_auth(bearer)
+        .json(&json!({"at": at, "choice": choice}))
+        .send()
+        .await
+        .unwrap();
+    let status = response.status().as_u16();
+    (
+        status,
+        response.json::<Value>().await.unwrap_or(Value::Null),
+    )
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_routed_approval_needs_its_approver_alone_and_is_decided_once() {
+    use workforce_hub::approvals::{PendingApprovalStore, SqlitePendingApprovalStore};
+    with_test_pool(PgFloorStore::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (scout, _model) = crate::support::agent_on_mock_llm(dir.path()).await;
+        let store: Arc<dyn PendingApprovalStore> =
+            Arc::new(SqlitePendingApprovalStore::in_memory().unwrap());
+        scout.set_pending_approval_store(Arc::clone(&store));
+        let gateway = Gateway::new(vec![("scout", scout)], None);
+        let alice = gateway.admin.clone();
+        let bob = Identity::new("Bob", IdentityRole::Member);
+        gateway
+            .state
+            .identity_store
+            .as_ref()
+            .unwrap()
+            .create(&bob)
+            .unwrap();
+        let installed = Installed::open(PgFloorStore::with_pool(pool).await.unwrap());
+        let addr = serve_floor(
+            Arc::clone(&gateway.state),
+            Some(Sources::new(installed, Arc::new(|| None))),
+        )
+        .await;
+        let request = Uuid::new_v4().to_string();
+        store
+            .insert_core(
+                &workforce_agent::runner::PendingApprovalCore {
+                    request_id: request.clone(),
+                    agent_id: "scout".into(),
+                    session_key: "scheduler:j1".into(),
+                    channel_id: String::new(),
+                    requester_user_id: alice.id.to_string(),
+                    tool_name: "slack.send".into(),
+                    tool_input: json!({"channel": "#ops", "text": "deploy done"}),
+                    reason: "Posts outside Desk".into(),
+                    allow_self_approval: true,
+                    approver_user_ids: vec![alice.id.to_string()],
+                    ttl: Duration::from_secs(3600),
+                },
+                None,
+                None,
+                Utc::now() + chrono::Duration::hours(1),
+            )
+            .unwrap();
+        store
+            .add_target(&request, &alice.id.to_string(), "")
+            .unwrap();
+        let path = day_path(Utc::now() - chrono::Duration::hours(1));
+        let (status, floor) = get(addr, &path, Some(&token_for(&alice))).await;
+        assert_eq!(status, 200);
+        let needs = floor["needs"].as_array().unwrap();
+        assert_eq!(needs.len(), 1, "{floor}");
+        let at = json!({"kind": "routed", "requestId": request});
+        assert_eq!(needs[0]["id"], json!(format!("routed:{request}")));
+        assert_eq!(needs[0]["kind"], json!("approval"));
+        assert_eq!(needs[0]["who"]["id"], json!("scout"));
+        assert_eq!(needs[0]["place"], json!({"kind": "dm"}));
+        assert_eq!(needs[0]["answer"], json!({"kind": "decide", "at": at}));
+        assert_eq!(floor["counts"]["needsYou"], json!(1));
+
+        let (_, theirs) = get(addr, &path, Some(&token_for(&bob))).await;
+        assert_eq!(theirs["needs"], json!([]), "nobody else's to decide");
+        assert_eq!(
+            decide(addr, &token_for(&bob), &at, "allow").await,
+            (403, json!({"error": "not_yours"}))
+        );
+        assert_eq!(decide(addr, &token_for(&alice), &at, "deny").await.0, 204);
+        assert_eq!(
+            decide(addr, &token_for(&alice), &at, "deny").await,
+            (409, json!({"error": "already_answered"}))
+        );
+        let (_, after) = get(addr, &path, Some(&token_for(&alice))).await;
+        assert_eq!(after["needs"], json!([]));
+        assert_eq!(
+            decide(
+                addr,
+                &token_for(&alice),
+                &json!({"kind": "routed", "requestId": Uuid::new_v4().to_string()}),
+                "allow"
+            )
+            .await,
+            (404, json!({"error": "unknown"}))
+        );
+    })
+    .await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_persons_plans_are_their_own_logins_and_any_replica_serves_the_newest() {
     use workforce_common::usage::{LoginRef, PlanKind, Reading, Window};

@@ -99,6 +99,67 @@ const HOLDER_ROWS: &str =
     "SELECT requester_id, COUNT(*) FROM pending_approvals GROUP BY requester_id \
      UNION ALL SELECT approver_id, COUNT(*) FROM pending_approval_targets GROUP BY approver_id";
 
+/// What every backend's listing of an approver's requests must do alike:
+/// only pending, unexpired requests naming them, each one they may decide.
+#[cfg(test)]
+pub(crate) fn pending_for_contract(store: &dyn PendingApprovalStore) {
+    let core = |requester: &str| PendingApprovalCore {
+        request_id: uuid::Uuid::new_v4().to_string(),
+        agent_id: "agent".into(),
+        session_key: "scheduler:j1".into(),
+        channel_id: String::new(),
+        requester_user_id: requester.into(),
+        tool_name: "slack.send".into(),
+        tool_input: serde_json::json!({"channel": "#ops"}),
+        reason: "Posts outside Desk".into(),
+        allow_self_approval: true,
+        approver_user_ids: vec![],
+        ttl: std::time::Duration::from_secs(3600),
+    };
+    let now = Utc::now();
+    let later = now + chrono::Duration::hours(1);
+    let first = core("alice");
+    let second = core("bob");
+    let resolved = core("alice");
+    let lapsed = core("alice");
+    let theirs = core("carol");
+    for (request, expires) in [
+        (&first, later),
+        (&second, later),
+        (&resolved, later),
+        (&lapsed, now - chrono::Duration::minutes(1)),
+        (&theirs, later),
+    ] {
+        store.insert_core(request, None, None, expires).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    for request in [&first, &second, &resolved, &lapsed] {
+        store.add_target(&request.request_id, "alice", "").unwrap();
+    }
+    store.add_target(&theirs.request_id, "carol", "U3").unwrap();
+    store
+        .claim(&resolved.request_id, ApprovalOutcome::Denied, "alice")
+        .unwrap();
+
+    let waiting = store.pending_for("alice", now).unwrap();
+    assert_eq!(
+        waiting
+            .iter()
+            .map(|r| r.request_id.as_str())
+            .collect::<Vec<_>>(),
+        [first.request_id.as_str(), second.request_id.as_str()],
+        "pending and unexpired, oldest first"
+    );
+    for row in &waiting {
+        let targets = store.targets(&row.request_id).unwrap();
+        assert!(
+            crate::approvals::decide::Decider::Person("alice").eligible(&targets),
+            "every request listed is one they may decide"
+        );
+    }
+    assert!(store.pending_for("dave", now).unwrap().is_empty());
+}
+
 /// What every backend's identity operations must do alike.
 #[cfg(test)]
 pub(crate) fn identity_operations_contract(store: &dyn PendingApprovalStore) {

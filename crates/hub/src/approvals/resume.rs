@@ -130,19 +130,22 @@ async fn run_turn(
     .await
 }
 
+/// What every turn resumed on a decided approval is told first.
+pub(crate) const APPROVAL_DIRECTIVE: &str = "[Approval] ";
+
 fn directive_for(row: &PendingApproval, outcome: ApprovalOutcome, resolver: &str) -> String {
     let tool = &row.tool_name;
     match outcome {
         ApprovalOutcome::Approved => format!(
-            "[Approval] {resolver} approved your request to run `{tool}`; the action has been \
+            "{APPROVAL_DIRECTIVE}{resolver} approved your request to run `{tool}`; the action has been \
              carried out — its result is above. Continue from that result."
         ),
         ApprovalOutcome::Denied => format!(
-            "[Approval] {resolver} denied your request to run `{tool}`; do not perform it. \
+            "{APPROVAL_DIRECTIVE}{resolver} denied your request to run `{tool}`; do not perform it. \
              Inform the user and proceed accordingly."
         ),
         ApprovalOutcome::Expired => format!(
-            "[Approval] your request to run `{tool}` expired without approval and was not \
+            "{APPROVAL_DIRECTIVE}your request to run `{tool}` expired without approval and was not \
              carried out. Inform the user and pick another path if appropriate."
         ),
     }

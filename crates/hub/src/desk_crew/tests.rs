@@ -1063,13 +1063,13 @@ mod floor {
                     "another hub's caller never sees this hub's sessions"
                 );
                 assert_eq!(
-                    answer(&sources, &me(false), &at, Choice::Allow).unwrap(),
+                    answer(&state, &sources, &me(false), &at, Choice::Allow).await.unwrap(),
                     Err(Unanswered::NotYours)
                 );
-                assert_eq!(answer(&sources, &me(true), &at, Choice::Allow).unwrap(), Ok(()));
+                assert_eq!(answer(&state, &sources, &me(true), &at, Choice::Allow).await.unwrap(), Ok(()));
                 assert_eq!(behaviour(&asked.await.unwrap()), "allow");
                 assert_eq!(
-                    answer(&sources, &me(true), &at, Choice::Allow).unwrap(),
+                    answer(&state, &sources, &me(true), &at, Choice::Allow).await.unwrap(),
                     Err(Unanswered::AlreadyAnswered)
                 );
                 eventually("the answered need to go", async || {
