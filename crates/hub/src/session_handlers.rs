@@ -259,6 +259,7 @@ pub async fn delete_session(
         };
     match service.sessions.delete(&session_id) {
         Ok(()) => {
+            crate::desk_attachments::session_ended(&session_id).await;
             info!(session_id = %session_id, "Session deleted via API");
             Json(serde_json::json!({
                 "deleted": true,
@@ -291,6 +292,7 @@ pub async fn reset_session(
         };
     match service.sessions.reset_session(&session_id) {
         Ok(()) => {
+            crate::desk_attachments::session_ended(&session_id).await;
             info!(session_id = %session_id, "Session reset via API");
             Json(serde_json::json!({
                 "reset": true,

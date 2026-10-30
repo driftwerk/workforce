@@ -1097,6 +1097,24 @@ async fn a_desk_dms_files_ride_on_its_messages_and_are_served_to_their_reader_al
             listed.iter().any(|f| f.id == pdf.as_str()),
             "and the agent's PDF"
         );
+
+        // Deleted, the conversation takes its files with it: none shows in
+        // the one that follows on its channel.
+        let (status, ..) = call(
+            &state,
+            axum::http::Request::delete(format!("/api/sessions/{}", current.id))
+                .header("authorization", format!("Bearer {alice}"))
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        for gone in [pdf.as_str(), late.as_str(), photo.as_str()] {
+            assert!(
+                d.store().attachment(gone).await.unwrap().is_none(),
+                "{gone}"
+            );
+        }
     })
     .await;
 }

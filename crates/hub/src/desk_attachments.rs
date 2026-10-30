@@ -574,6 +574,14 @@ pub(crate) async fn forget_session_files(session_id: &str) -> eyre::Result<()> {
     Ok(())
 }
 
+/// Session `session_id` is gone, or emptied: the files the desk kept for it
+/// go too, so no later conversation on its channel shows them.
+pub(crate) async fn session_ended(session_id: &str) {
+    if let Err(e) = forget_session_files(session_id).await {
+        warn!(error = %e, session_id, "forgetting a gone session's files failed");
+    }
+}
+
 /// A Desk conversation files go into: a DM, room or thread session of the
 /// agent whose turn delivered them.
 #[derive(Debug, Clone, PartialEq, Eq)]
