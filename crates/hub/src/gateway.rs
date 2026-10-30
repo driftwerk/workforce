@@ -2379,9 +2379,12 @@ async fn handle_ws(
                                 // A Desk turn is placed in its connection's
                                 // conversation, so it runs in no other.
                                 Some(sid) => {
-                                    let honoured =
-                                        owned_session(service.sessions.as_ref(), sid, session_owner)
-                                            .is_some_and(|s| !declared || s.channel == anchor_channel);
+                                    let honoured = owned_session(
+                                        service.sessions.as_ref(),
+                                        sid,
+                                        session_owner,
+                                    )
+                                    .is_some_and(|s| !declared || s.channel == anchor_channel);
                                     if honoured {
                                         sid.to_string()
                                     } else {
@@ -3224,6 +3227,9 @@ struct Forwarder {
     watchers: usize,
     stamp: Option<TurnStamp>,
     task: Option<AbortHandle>,
+    /// A stopped turn's tail is not passed on while the session is watched,
+    /// until that turn ends or a request is made here.
+    silenced: bool,
 }
 
 /// Why a forwarder is joined: a request published here, or a Desk
@@ -3338,12 +3344,16 @@ impl ProgressForwarders {
                         watchers: 0,
                         stamp: None,
                         task: None,
+                        silenced: false,
                     });
                 (forwarder, true)
             }
         };
         match join {
-            Join::Request => forwarder.pending += 1,
+            Join::Request => {
+                forwarder.pending += 1;
+                forwarder.silenced = false;
+            }
             Join::Watch => forwarder.watchers += 1,
         }
         (forwarder.generation, lead)
@@ -3402,9 +3412,34 @@ impl ProgressForwarders {
         }
     }
 
+    /// Silence the turn `session_id` is streaming: its requests here are
+    /// over, and its tail is not passed on. A session Desk watches keeps its
+    /// forwarder, so the next turn, from any instance, is still heard.
     fn stop(&self, session_id: &str) {
-        if let Some(task) = self.0.lock().remove(session_id).and_then(|f| f.task) {
-            task.abort();
+        let mut forwarders = self.0.lock();
+        match forwarders.get_mut(session_id) {
+            Some(forwarder) if forwarder.watchers > 0 => {
+                forwarder.pending = 0;
+                forwarder.silenced = true;
+            }
+            _ => {
+                if let Some(task) = forwarders.remove(session_id).and_then(|f| f.task) {
+                    task.abort();
+                }
+            }
+        }
+    }
+
+    /// Whether a frame of `session_id`'s stream is passed on: any, unless a
+    /// stopped turn is silenced, whose end (`ends`) is passed on and lifts
+    /// the silence.
+    fn passes(&self, session_id: &str, ends: bool) -> bool {
+        match self.0.lock().get_mut(session_id) {
+            Some(forwarder) if forwarder.silenced => {
+                forwarder.silenced = !ends;
+                ends
+            }
+            _ => true,
         }
     }
 }
@@ -3554,6 +3589,10 @@ async fn forward_nats_progress(
         };
 
         let done = matches!(progress, ChatProgress::Done { .. });
+        let passes = forwarders.passes(
+            &session_id,
+            done || matches!(progress, ChatProgress::TurnEnd(_)),
+        );
         let stamp = match &progress {
             ChatProgress::Snapshot(snapshot) => {
                 forwarders.set_stamp(&session_id, Some(snapshot.stamp.clone()));
@@ -3566,7 +3605,9 @@ async fn forward_nats_progress(
             _ => forwarders.stamp(&session_id),
         };
 
-        if let Some(broadcast) = chat_progress_to_broadcast(progress, &session_id, tts_normalize) {
+        if let Some(broadcast) =
+            chat_progress_to_broadcast(progress, &session_id, tts_normalize).filter(|_| passes)
+        {
             let _ = tx.send(broadcast.stamped(stamp.as_ref()));
         }
 
@@ -16658,6 +16699,27 @@ mod turn_control_tests {
             "the last watcher ends it"
         );
         assert_eq!(forwarders.stamp("s1"), None);
+    }
+
+    /// Stopping a turn on a session Desk watches silences that turn's tail
+    /// and keeps the watch: the turn's end, and every turn after, is heard.
+    #[test]
+    fn a_stopped_turn_is_silenced_without_ending_the_watch() {
+        let forwarders = ProgressForwarders::default();
+        let (generation, _) = forwarders.admit("s1", Join::Watch);
+        forwarders.admit("s1", Join::Request);
+        forwarders.stop("s1");
+        assert!(!forwarders.passes("s1", false), "the stopped turn's tail");
+        assert!(forwarders.passes("s1", true), "its end");
+        assert!(forwarders.passes("s1", false), "the next turn");
+        forwarders.stop("s1");
+        forwarders.admit("s1", Join::Request);
+        assert!(forwarders.passes("s1", false), "a request made here");
+        assert!(
+            !forwarders.withdraw("s1", generation),
+            "still watched after the stop"
+        );
+        assert!(forwarders.unwatch("s1", generation));
     }
 
     #[test]
