@@ -106,15 +106,21 @@ impl PlanUsage for Plans {
             Credential::ChatGpt(auth) => auth.account_id().and_then(|id| account_key(kind, &[id])),
             Credential::Token(_) => None,
         };
-        let Some(key) = account_key(kind, std::slice::from_ref(&login.key.fingerprint)) else {
+        // A login is its credential in its slot: one credential two people
+        // keep, a shared Team account's say, is two plans' readings.
+        let owner = per_user(login);
+        let Some(key) = account_key(
+            kind,
+            &[
+                login.key.fingerprint.clone(),
+                owner.clone().unwrap_or_default(),
+            ],
+        ) else {
             return;
         };
         self.keep(Reading {
             kind,
-            login: LoginRef::Hub {
-                login: key,
-                owner: per_user(login),
-            },
+            login: LoginRef::Hub { login: key, owner },
             account,
             plan: plan.map(str::to_string),
             windows,
@@ -192,6 +198,11 @@ mod tests {
             };
             plans.observe(&theirs, None, vec![window(62.0, 100)]);
             plans.observe(&claude_login("shared-token"), None, vec![window(90.0, 100)]);
+            let someone_else = Login {
+                owner: LoginOwner::Person(uuid::Uuid::new_v4()),
+                ..theirs.clone()
+            };
+            plans.observe(&someone_else, None, vec![window(5.0, 100)]);
             plans.observe(&theirs, None, vec![]);
             plans.mac(
                 MacPlan::Codex,
@@ -204,7 +215,7 @@ mod tests {
             plans.mac(MacPlan::Claude, serde_json::json!([]), MacAccount::default());
             let kept = loop {
                 let kept = store.readings().await.unwrap();
-                if kept.len() == 3 {
+                if kept.len() == 4 {
                     break kept;
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
@@ -220,6 +231,10 @@ mod tests {
                 })
                 .collect();
             assert!(owners.contains(&(PlanKind::Claude, Some(person.to_string()))));
+            assert!(
+                owners.contains(&(PlanKind::Claude, per_user(&someone_else))),
+                "one credential in two people's slots is two readings, each theirs"
+            );
             assert!(owners.contains(&(PlanKind::Claude, None)), "a shared login is no one's");
             let told = tokio::time::timeout(Duration::from_secs(10), async {
                 loop {
