@@ -481,6 +481,7 @@ mod kept {
             .store()
             .bind_turn(
                 service.agent_id.as_str(),
+                &last.owner,
                 &sessions,
                 since,
                 answer.as_deref(),

@@ -305,13 +305,14 @@ impl DeskStore {
             .transpose()
     }
 
-    /// A turn of `agent_id`'s in `sessions` (the session it ran in, and the
-    /// one it rolled over to) ended. The files it delivered since `since`
-    /// ride on its `answer`, when it gave one; the person's files ride on
-    /// the messages that carried them.
+    /// A turn of `agent_id`'s with `owner` in `sessions` (the session it ran
+    /// in, and the one it rolled over to) ended. The files it delivered since
+    /// `since` ride on its `answer`, when it gave one; the person's own files
+    /// ride on the messages that carried them.
     pub async fn bind_turn(
         &self,
         agent_id: &str,
+        owner: &str,
         sessions: &[String],
         since: DateTime<Utc>,
         answer: Option<&str>,
@@ -333,8 +334,9 @@ impl DeskStore {
             client
                 .execute(
                     "UPDATE attachments SET message_id = $1 WHERE agent_id = $2 \
-                     AND artifact_id = ANY($3) AND origin = 'you' AND message_id IS NULL",
-                    &[message, &agent_id, ids],
+                     AND artifact_id = ANY($3) AND owner = $4 AND origin = 'you' \
+                     AND message_id IS NULL",
+                    &[message, &agent_id, ids, &owner],
                 )
                 .await
                 .context("putting the person's files on their message")?;
@@ -510,6 +512,14 @@ mod tests {
                 .put_attachment(&file("unsent", Origin::You, "s1", at(1)))
                 .await
                 .unwrap();
+            // Someone else's upload, which a message of this person's names.
+            store
+                .put_attachment(&Kept {
+                    owner: "identity-2".into(),
+                    ..file("theirs", Origin::You, "s9", at(1))
+                })
+                .await
+                .unwrap();
             // Keeping it again changes nothing.
             store
                 .put_attachment(&file("report", Origin::Agent, "s2", at(3)))
@@ -519,10 +529,14 @@ mod tests {
             store
                 .bind_turn(
                     "scout",
+                    "identity-1",
                     &["s1".to_string()],
                     at(1),
                     Some("answer-1"),
-                    &[("question-1".to_string(), vec!["mine".to_string()])],
+                    &[(
+                        "question-1".to_string(),
+                        vec!["mine".to_string(), "theirs".to_string()],
+                    )],
                 )
                 .await
                 .unwrap();
@@ -533,7 +547,14 @@ mod tests {
             assert_eq!(on["answer-1"].len(), 1);
             assert_eq!(on["answer-1"][0].artifact_id, "report");
             assert_eq!(on["answer-1"][0].session_id, "s1");
-            assert_eq!(on["question-1"][0].artifact_id, "mine");
+            assert_eq!(
+                on["question-1"]
+                    .iter()
+                    .map(|k| k.artifact_id.as_str())
+                    .collect::<Vec<_>>(),
+                ["mine"],
+                "another person's upload is never put on this person's message"
+            );
 
             let loose = store
                 .loose_attachments("scout", "desk", "identity-1", None, None)
