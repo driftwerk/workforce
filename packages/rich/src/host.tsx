@@ -23,6 +23,11 @@ export interface RichHost {
   submitForm?(summary: string, values: Record<string, SubmitValue>): Promise<boolean>;
   /** Open a link from rendered markdown. Absent, links open in a new tab. */
   openUrl?(url: string): void;
+  /** Link schemes kept besides the web's (http, https, mailto), opened through
+   *  `openUrl`. Every other scheme is stripped from agent markdown. */
+  linkSchemes?: readonly string[];
+  /** The form was answered already, here or before: it shows locked and says so. */
+  answered?: boolean;
   /** Save a file the block generated (CSV, PNG, Excalidraw scene). Absent, the
    *  browser's anchor download is used. */
   saveFile?(blob: Blob, filename: string): void;
@@ -39,9 +44,19 @@ interface HostHandle {
   tables: boolean;
   files: boolean;
   forms: boolean;
+  answered: boolean;
+  /** `linkSchemes`, joined, so a host rebuilt with the same list keeps its renderers. */
+  schemes: string;
 }
 
-const NO_HOST: HostHandle = { latest: { current: {} }, tables: false, files: false, forms: false };
+const NO_HOST: HostHandle = {
+  latest: { current: {} },
+  tables: false,
+  files: false,
+  forms: false,
+  answered: false,
+  schemes: "",
+};
 
 const HostContext = createContext<HostHandle>(NO_HOST);
 
@@ -51,7 +66,12 @@ export function RichHostProvider({ host, children }: { host: RichHost; children:
   const tables = !!host.fetchTablePage;
   const files = !!host.fetchFile;
   const forms = !!host.submitForm;
-  const handle = useMemo(() => ({ latest, tables, files, forms }), [tables, files, forms]);
+  const answered = !!host.answered;
+  const schemes = (host.linkSchemes ?? []).join(",");
+  const handle = useMemo(
+    () => ({ latest, tables, files, forms, answered, schemes }),
+    [tables, files, forms, answered, schemes],
+  );
   return <HostContext.Provider value={handle}>{children}</HostContext.Provider>;
 }
 

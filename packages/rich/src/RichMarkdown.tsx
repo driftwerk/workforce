@@ -2,11 +2,12 @@
 // other fenced code highlighted. Agent output is untrusted, so the markdown is
 // sanitized, and code is highlighted only after that, from the sanitized text,
 // into React text; wide tables are wrapped to scroll instead of overflowing,
-// and links open through the host when it can, otherwise in a new tab.
+// and links open through the host when it can, otherwise in a new tab. A link
+// keeps a scheme beyond the web's only when the host declares it.
 
 import { useMemo, useRef, type ComponentProps } from "react";
-import Markdown, { type Components, type ExtraProps } from "react-markdown";
-import rehypeSanitize from "rehype-sanitize";
+import Markdown, { defaultUrlTransform, type Components, type ExtraProps, type Options } from "react-markdown";
+import rehypeSanitize, { defaultSchema } from "rehype-sanitize";
 import remarkGfm from "remark-gfm";
 
 import { CodeBlock } from "./CodeBlock";
@@ -46,6 +47,41 @@ const MD_COMPONENTS: Components = {
   a: Link,
 };
 
+/** Schemes that run or embed content: never kept, whatever a host declares. */
+const NEVER = new Set(["javascript", "vbscript", "data", "file"]);
+
+const schemeOf = (url: string): string | null => {
+  const colon = url.indexOf(":");
+  if (colon < 1 || /[/?#]/.test(url.slice(0, colon))) return null;
+  return url.slice(0, colon).toLowerCase();
+};
+
+/** The sanitizer and URL transform that keep `schemes` (comma-joined) on links,
+ *  besides the defaults. */
+function linkPolicy(schemes: string): {
+  rehypePlugins: NonNullable<Options["rehypePlugins"]>;
+  urlTransform: (url: string) => string;
+} {
+  const kept = schemes
+    ? schemes
+        .split(",")
+        .map((s) => s.toLowerCase())
+        .filter((s) => !NEVER.has(s))
+    : [];
+  if (kept.length === 0) return { rehypePlugins: [rehypeSanitize], urlTransform: defaultUrlTransform };
+  const schema = {
+    ...defaultSchema,
+    protocols: { ...defaultSchema.protocols, href: [...(defaultSchema.protocols?.href ?? []), ...kept] },
+  };
+  return {
+    rehypePlugins: [[rehypeSanitize, schema]],
+    urlTransform: (url) => {
+      const scheme = schemeOf(url);
+      return scheme && kept.includes(scheme) ? url : defaultUrlTransform(url);
+    },
+  };
+}
+
 /** Render `text` as markdown, drawing each enabled wf-* fence as its block.
  *  `features` should be a stable object: a new one rebuilds the renderers and
  *  remounts every block. */
@@ -66,6 +102,8 @@ export function RichMarkdown({
   // from skeleton to its code-block fallback.
   const streamingRef = useRef(streaming);
   streamingRef.current = streaming;
+  const { schemes } = useHost();
+  const links = useMemo(() => linkPolicy(schemes), [schemes]);
   const components = useMemo<Components>(
     () => ({
       ...MD_COMPONENTS,
@@ -90,7 +128,12 @@ export function RichMarkdown({
   );
   return (
     <div className="wf-md">
-      <Markdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeSanitize]} components={components}>
+      <Markdown
+        remarkPlugins={[remarkGfm]}
+        rehypePlugins={links.rehypePlugins}
+        urlTransform={links.urlTransform}
+        components={components}
+      >
         {balanceFences(text)}
       </Markdown>
     </div>
