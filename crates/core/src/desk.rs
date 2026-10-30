@@ -452,6 +452,41 @@ pub struct DeskDelivered {
     pub spoken: bool,
 }
 
+/// What else the hub link tells a Desk changed of its person's: what needs
+/// them and what runs (the floor), or their plans' usage. A signal only:
+/// the Desk reads the route again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeskSignal {
+    Floor,
+    Usage,
+}
+
+impl DeskSignal {
+    /// The frame the link sends it as.
+    pub fn frame(self) -> &'static str {
+        match self {
+            Self::Floor => "floor_changed",
+            Self::Usage => "usage_changed",
+        }
+    }
+
+    /// The feature a hub that sends it declares.
+    pub fn feature(self) -> &'static str {
+        match self {
+            Self::Floor => "desk.floor",
+            Self::Usage => "desk.usage",
+        }
+    }
+
+    /// The signal a frame is, if it is one.
+    pub fn of_frame(frame: &str) -> Option<Self> {
+        [Self::Floor, Self::Usage]
+            .into_iter()
+            .find(|s| s.frame() == frame)
+    }
+}
+
 /// The ids a live Desk turn's frames carry: the client's own for the turn,
 /// and the id its answer is saved under.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

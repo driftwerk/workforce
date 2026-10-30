@@ -141,6 +141,17 @@ pub enum LoginRef {
     Mac,
 }
 
+impl LoginRef {
+    /// The person the login is per-user for; none for a shared login or
+    /// this Mac's.
+    pub fn owner(&self) -> Option<&str> {
+        match self {
+            Self::Hub { owner, .. } => owner.as_deref(),
+            Self::Mac => None,
+        }
+    }
+}
+
 /// How full a plan's windows were when it was last used.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Reading {

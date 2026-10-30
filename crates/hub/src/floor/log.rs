@@ -6,11 +6,13 @@ use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
 use tracing::warn;
+use workforce_common::channels::desk::DeskSignal;
 use workforce_common::settings::WorkforceConfig;
 use workforce_desk::floor::{Scope, Turn, TurnLog, TurnOp};
 
 use super::plans::Plans;
 use super::postgres::PgFloorStore;
+use super::signal::Signals;
 use crate::hub_core::logins::plan_usage::observe_with;
 
 /// How often the log is pruned.
@@ -26,22 +28,26 @@ const DROP_WARN_EVERY: Duration = Duration::from_secs(60);
 static INSTALLED: OnceLock<Installed> = OnceLock::new();
 
 /// The floor's store as the hub runs it: the log written through its one
-/// writer, the plan readings kept beside it, and the store both read from.
+/// writer, the plan readings kept beside it, the store both read from, and
+/// the signals that tell a person's links what changed.
 #[derive(Clone)]
 pub struct Installed {
     pub log: Arc<dyn TurnLog>,
     pub plans: Arc<Plans>,
     pub store: Arc<PgFloorStore>,
+    pub signals: Signals,
 }
 
 impl Installed {
     /// Starts the writer over `store`.
     pub fn open(store: PgFloorStore) -> Self {
         let store = Arc::new(store);
+        let signals = Signals::start();
         Self {
-            log: Arc::new(Logged::start(Arc::clone(&store))),
-            plans: Plans::new(Arc::clone(&store)),
+            log: Arc::new(Logged::start(Arc::clone(&store), signals.clone())),
+            plans: Plans::new(Arc::clone(&store), signals.clone()),
             store,
+            signals,
         }
     }
 }
@@ -80,8 +86,9 @@ pub(super) async fn install(config: &WorkforceConfig) {
         .await;
 }
 
-/// The log as the hub writes it: every op through one writer, in order.
-/// A turn's correctness never waits on it; a full backlog drops the op.
+/// The log as the hub writes it: every op through one writer, in order, the
+/// owner of each that changes what the floor lists told. A turn's
+/// correctness never waits on it; a full backlog drops the op.
 struct Logged {
     tx: mpsc::Sender<TurnOp>,
     store: Arc<PgFloorStore>,
@@ -89,13 +96,19 @@ struct Logged {
 }
 
 impl Logged {
-    fn start(store: Arc<PgFloorStore>) -> Self {
+    fn start(store: Arc<PgFloorStore>, signals: Signals) -> Self {
         let (tx, mut rx) = mpsc::channel::<TurnOp>(BACKLOG);
         let writer = Arc::clone(&store);
         tokio::spawn(async move {
             while let Some(op) = rx.recv().await {
-                if let Err(e) = writer.apply(&op).await {
-                    warn!(target: "floor", error = %format!("{e:#}"), "recording a turn failed");
+                match writer.apply(&op).await {
+                    Ok(Some(owner)) if op.lists() => {
+                        signals.send(DeskSignal::Floor, owner.as_deref())
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        warn!(target: "floor", error = %format!("{e:#}"), "recording a turn failed")
+                    }
                 }
             }
         });

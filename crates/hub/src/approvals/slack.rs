@@ -125,6 +125,7 @@ pub async fn deliver_routed_approval(
             tracing::warn!(error = %e, request = %request_id, "failed to persist approval target");
             continue;
         }
+        super::approvers_changed([approver_id.as_str()]);
         let dm_channel = match surface.open_conversation(&slack_id).await {
             Ok(c) => c,
             Err(e) => {

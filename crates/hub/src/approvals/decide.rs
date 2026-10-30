@@ -114,6 +114,7 @@ pub(crate) async fn decide(
     if !won {
         return Ok(Decided::AlreadyResolved(row));
     }
+    super::approvers_changed(targets.iter().map(|t| t.approver_id.as_str()));
     super::slack::rewrite_all_targets(&svc, &store, &row, outcome, &resolver_id).await;
     super::resume::launch_resume(registry, &row, outcome, &decider.display(&svc)).await;
     Ok(Decided::Resolved(row))

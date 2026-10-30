@@ -251,6 +251,22 @@ impl BroadcastMessage {
         }
     }
 
+    /// Build the signal that `signal` changed for `owner`, for their Desk
+    /// hub links alone; with no owner, for the links of whoever holds this
+    /// hub (its Desk sessions, its shared logins).
+    pub fn desk_signal(signal: workforce_core::desk::DeskSignal, owner: Option<&str>) -> Self {
+        Self {
+            target_identity: owner.map(str::to_string),
+            ..Self::silent("", signal.frame(), String::new())
+        }
+    }
+
+    /// Whether only a Desk hub link may hear it, never a chat connection.
+    pub fn for_links_only(&self) -> bool {
+        self.msg_type == DESK_DELIVERED
+            || workforce_core::desk::DeskSignal::of_frame(&self.msg_type).is_some()
+    }
+
     /// Build a spoken announcement targeted at the voice-bridge connection(s)
     /// registered for `channel` and belonging to `target_identity` — the
     /// delivery half of a voice reminder. Session-less by design: routing runs

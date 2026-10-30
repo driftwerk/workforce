@@ -37,6 +37,7 @@ pub(crate) async fn deliver_routed_approval(
         tracing::warn!(error = %e, request = %row.request_id, "failed to record the Desk approver");
         return false;
     }
+    super::approvers_changed([row.requester_id.as_str()]);
     let delivery = crate::desk_surface::Delivery {
         request_id: Some(row.request_id.clone()),
         ..crate::desk_surface::Delivery::text(DeliveryKind::Approval, asking(row, detail))

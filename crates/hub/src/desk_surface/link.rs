@@ -1,11 +1,14 @@
 //! `/ws/desk`: a Desk's hub link, one socket per paired hub, over which the
 //! hub tells the person's Desk that one of their conversations gained a
-//! message outside a live turn. It anchors no session and takes no chat; the
-//! Desk drains the conversation it names through the conversation routes.
+//! message outside a live turn, and that their floor or their plans' usage
+//! changed. It anchors no session and takes no chat; the Desk drains the
+//! conversation it names through the conversation routes, and reads the
+//! floor's routes again.
 //!
 //! Server → client: `{"type": "hello", "features": [...]}` once, then
 //! `{"type": "desk_delivered", "agent_id", "channel", "session_id",
-//! "message_id", "kind", "place", "spoken"}` per delivery, and
+//! "message_id", "kind", "place", "spoken"}` per delivery,
+//! `{"type": "floor_changed"}` / `{"type": "usage_changed"}` per change, and
 //! `{"type": "pong"}` for each `{"type": "ping"}`.
 
 use std::sync::Arc;
@@ -17,7 +20,7 @@ use axum::response::{IntoResponse, Response};
 use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast::error::RecvError;
-use workforce_common::channels::desk::DeskDelivered;
+use workforce_common::channels::desk::{DeskDelivered, DeskSignal};
 
 use crate::broadcast::{BroadcastMessage, DESK_DELIVERED};
 use crate::gateway::{authenticate_ws, desk_features, GatewayState};
@@ -33,7 +36,26 @@ pub(crate) struct LinkQuery {
 enum LinkFrame<'a> {
     Hello { features: Vec<String> },
     DeskDelivered(&'a DeskDelivered),
+    FloorChanged,
+    UsageChanged,
     Pong,
+}
+
+impl LinkFrame<'_> {
+    fn signal(signal: DeskSignal) -> Self {
+        match signal {
+            DeskSignal::Floor => Self::FloorChanged,
+            DeskSignal::Usage => Self::UsageChanged,
+        }
+    }
+}
+
+/// Whose link it is: a person, and whether they hold this hub, so hear
+/// what changed of its own (its Desk sessions, its shared logins).
+#[derive(Debug, Clone)]
+struct Listener {
+    identity: String,
+    holds: bool,
 }
 
 /// What a client sends on a link.
@@ -43,11 +65,17 @@ enum LinkRequest {
     Ping,
 }
 
-/// The delivery a broadcast tells the link of `identity`, if it is theirs.
-fn admitted<'a>(msg: &'a BroadcastMessage, identity: &str) -> Option<&'a DeskDelivered> {
-    (msg.msg_type == DESK_DELIVERED && msg.target_identity.as_deref() == Some(identity))
-        .then_some(msg.delivered.as_ref())
-        .flatten()
+/// What a broadcast tells `listener`'s link, if it is for them.
+fn admitted<'a>(msg: &'a BroadcastMessage, listener: &Listener) -> Option<LinkFrame<'a>> {
+    let theirs = msg.target_identity.as_deref() == Some(listener.identity.as_str());
+    match DeskSignal::of_frame(&msg.msg_type) {
+        Some(signal) => (theirs || (msg.target_identity.is_none() && listener.holds))
+            .then(|| LinkFrame::signal(signal)),
+        None => (msg.msg_type == DESK_DELIVERED && theirs)
+            .then_some(msg.delivered.as_ref())
+            .flatten()
+            .map(LinkFrame::DeskDelivered),
+    }
 }
 
 /// Upgrade a hub link. It is a person's: a device paired to nobody, or a
@@ -68,7 +96,15 @@ pub(crate) async fn handler(
         )
             .into_response();
     };
-    ws.on_upgrade(move |socket| run(socket, state, identity))
+    let listener = Listener {
+        holds: crate::desk_floor::holds_the_hub(
+            &state,
+            crate::desk_driver::desk().is_some(),
+            Some(&identity),
+        ),
+        identity,
+    };
+    ws.on_upgrade(move |socket| run(socket, state, listener))
         .into_response()
 }
 
@@ -88,7 +124,7 @@ async fn send(
 /// Serve one link until either side ends it. A link that falls behind the
 /// broadcast is closed rather than left silently short of signals: the Desk
 /// reconnects and drains what changed since.
-async fn run(socket: WebSocket, state: Arc<GatewayState>, identity: String) {
+async fn run(socket: WebSocket, state: Arc<GatewayState>, listener: Listener) {
     let (mut sender, mut receiver) = socket.split();
     let mut broadcasts = state.broadcast_tx.subscribe();
     let hello = LinkFrame::Hello {
@@ -101,8 +137,8 @@ async fn run(socket: WebSocket, state: Arc<GatewayState>, identity: String) {
         tokio::select! {
             broadcast = broadcasts.recv() => match broadcast {
                 Ok(msg) => {
-                    if let Some(delivered) = admitted(&msg, &identity) {
-                        if !send(&mut sender, &LinkFrame::DeskDelivered(delivered)).await {
+                    if let Some(frame) = admitted(&msg, &listener) {
+                        if !send(&mut sender, &frame).await {
                             return;
                         }
                     }
@@ -117,7 +153,7 @@ async fn run(socket: WebSocket, state: Arc<GatewayState>, identity: String) {
             incoming = receiver.next() => match incoming {
                 Some(Ok(Message::Text(text))) => match serde_json::from_str::<LinkRequest>(&text) {
                     Ok(LinkRequest::Ping) => {
-                        if crate::standing::suspended(state.identity_store.as_ref(), &identity).is_some() {
+                        if crate::standing::suspended(state.identity_store.as_ref(), &listener.identity).is_some() {
                             return;
                         }
                         if !send(&mut sender, &LinkFrame::Pong).await {
@@ -150,13 +186,47 @@ mod tests {
         }
     }
 
+    fn listener(identity: &str, holds: bool) -> Listener {
+        Listener {
+            identity: identity.into(),
+            holds,
+        }
+    }
+
+    fn heard(msg: &BroadcastMessage, listener: &Listener) -> Option<serde_json::Value> {
+        admitted(msg, listener).map(|frame| serde_json::to_value(frame).unwrap())
+    }
+
     #[test]
     fn a_link_hears_only_its_own_persons_deliveries() {
         let signal = BroadcastMessage::desk_delivered("person-1", delivered());
-        assert_eq!(admitted(&signal, "person-1"), Some(&delivered()));
-        assert_eq!(admitted(&signal, "person-2"), None);
+        assert_eq!(
+            heard(&signal, &listener("person-1", false)),
+            Some(serde_json::to_value(LinkFrame::DeskDelivered(&delivered())).unwrap())
+        );
+        assert_eq!(heard(&signal, &listener("person-2", true)), None);
         let message = BroadcastMessage::new("s1", "message", "hi");
-        assert_eq!(admitted(&message, "person-1"), None);
+        assert_eq!(heard(&message, &listener("person-1", true)), None);
+    }
+
+    #[test]
+    fn a_link_hears_its_persons_changes_and_its_hubs_own_when_they_hold_it() {
+        for (signal, frame) in [
+            (DeskSignal::Floor, "floor_changed"),
+            (DeskSignal::Usage, "usage_changed"),
+        ] {
+            let theirs = BroadcastMessage::desk_signal(signal, Some("person-1"));
+            let hubs = BroadcastMessage::desk_signal(signal, None);
+            let said = Some(serde_json::json!({ "type": frame }));
+            assert_eq!(heard(&theirs, &listener("person-1", false)), said);
+            assert_eq!(heard(&theirs, &listener("person-2", true)), None);
+            assert_eq!(heard(&hubs, &listener("person-1", true)), said);
+            assert_eq!(
+                heard(&hubs, &listener("person-1", false)),
+                None,
+                "a hub's own change is only its holder's"
+            );
+        }
     }
 
     #[test]

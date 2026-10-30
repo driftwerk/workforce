@@ -72,15 +72,20 @@ impl PgFloorStore {
 
     /// Writes `op` with the log's semantics ([`floor::apply`]): settling in
     /// SQL across the subject, the turn itself read, changed and written back
-    /// under its row lock.
-    pub async fn apply(&self, op: &TurnOp) -> Result<()> {
+    /// under its row lock. Whose turns it wrote, if it wrote any: an op only
+    /// ever touches one owner's (`None`, a personal hub's Desk sessions).
+    pub async fn apply(&self, op: &TurnOp) -> Result<Option<Option<String>>> {
         let mut conn = self.pool.get().await?;
         let tx = conn.transaction().await?;
         if let Some(settling) = floor::settles(op) {
             settle(&tx, &settling).await?;
         }
-        match (op, op.turn()) {
-            (TurnOp::Begin { turn, .. }, _) => insert(&tx, turn).await?,
+        let whose = match (op, op.turn()) {
+            (TurnOp::Begin { turn, .. }, _) => {
+                insert(&tx, turn).await?;
+                Some(turn.owner.clone())
+            }
+            (TurnOp::Settle { owner, .. }, _) => Some(owner.clone()),
             (_, Some(id)) => {
                 let row = tx
                     .query_opt(
@@ -90,16 +95,20 @@ impl PgFloorStore {
                         &[&id],
                     )
                     .await?;
-                if let Some(turn) = row.as_ref().map(turn_of).transpose()? {
-                    if let Some(changed) = floor::apply(vec![turn], op).pop() {
-                        update(&tx, &changed).await?;
-                    }
+                let changed = row
+                    .as_ref()
+                    .map(turn_of)
+                    .transpose()?
+                    .and_then(|turn| floor::apply(vec![turn], op).pop());
+                if let Some(changed) = &changed {
+                    update(&tx, changed).await?;
                 }
+                changed.map(|t| t.owner)
             }
-            (_, None) => {}
-        }
+            (_, None) => None,
+        };
         tx.commit().await?;
-        Ok(())
+        Ok(whose)
     }
 
     /// Turns of `scope` started since `since`, every open one, and every
@@ -156,16 +165,14 @@ impl PgFloorStore {
         }
     }
 
-    /// Keeps `r` as its login's latest reading.
-    pub async fn record(&self, r: &Reading) -> Result<()> {
-        let owner = match &r.login {
-            LoginRef::Hub { owner, .. } => owner.clone(),
-            LoginRef::Mac => None,
-        };
+    /// Keeps `r` as its login's latest reading; whether it was later than
+    /// the one kept.
+    pub async fn record(&self, r: &Reading) -> Result<bool> {
+        let owner = r.login.owner().map(str::to_string);
         let conn = self.pool.get().await?;
         // Replicas write as they see readings: only a later one replaces
         // what is kept, so the newest any of them saw is what all serve.
-        conn.execute(
+        let kept = conn.execute(
             "INSERT INTO plan_readings (login, kind, owner, account, plan, windows, observed_at) \
              VALUES ($1, $2, $3, $4, $5, $6, $7) \
              ON CONFLICT (login) DO UPDATE SET kind = EXCLUDED.kind, owner = EXCLUDED.owner, \
@@ -184,7 +191,7 @@ impl PgFloorStore {
             ],
         )
         .await?;
-        Ok(())
+        Ok(kept == 1)
     }
 
     /// Every login's latest reading.
@@ -493,8 +500,19 @@ mod tests {
                 asks(&second, "2026-10-29T09:10:00Z"),
             ];
             for op in &ops {
-                store.apply(op).await.unwrap();
+                let whose = store.apply(op).await.unwrap();
+                assert!(whose.is_some(), "every op here writes a turn: {op:?}");
             }
+            let ended = TurnOp::Unwait {
+                turn: first.id,
+                key: "r1".into(),
+                at: at("2026-10-29T10:00:00Z"),
+            };
+            assert_eq!(
+                store.apply(&ended).await.unwrap(),
+                None,
+                "an ended turn is not written to, so nobody's floor changed"
+            );
             let expected = ops.iter().fold(Vec::new(), floor::apply);
             let since = at("2026-10-29T00:00:00Z");
             let mine = store.relevant(&scope("u1"), since).await.unwrap();
@@ -644,18 +662,21 @@ mod tests {
                 }],
                 observed_at: at(when),
             };
-            store
+            assert!(store
                 .record(&reading(40.0, "2026-10-29T16:00:00Z", Some("pro")))
                 .await
-                .unwrap();
-            store
-                .record(&reading(10.0, "2026-10-29T15:00:00Z", Some("plus")))
-                .await
-                .unwrap();
-            store
+                .unwrap());
+            assert!(
+                !store
+                    .record(&reading(10.0, "2026-10-29T15:00:00Z", Some("plus")))
+                    .await
+                    .unwrap(),
+                "an older reading is not kept"
+            );
+            assert!(store
                 .record(&reading(45.0, "2026-10-29T16:05:00Z", None))
                 .await
-                .unwrap();
+                .unwrap());
             let mac = Reading {
                 login: LoginRef::Mac,
                 kind: PlanKind::Claude,

@@ -15,6 +15,8 @@ mod log;
 pub mod plans;
 #[cfg(feature = "postgres")]
 pub mod postgres;
+#[cfg(feature = "postgres")]
+pub mod signal;
 
 #[cfg(feature = "postgres")]
 pub use log::{installed, turns, Installed};

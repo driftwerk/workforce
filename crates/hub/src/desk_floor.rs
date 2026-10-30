@@ -78,6 +78,18 @@ pub(crate) fn by_person_of(o: &Origin<'_>) -> bool {
         && !o.message.starts_with(CHECK_IN)
 }
 
+/// Whether `identity` holds this hub: on a hub running Desk, its sessions
+/// are the person's who administers it, however they connect (the Desk app
+/// reads its own hub with its device).
+pub(crate) fn holds_the_hub(state: &GatewayState, has_desk: bool, identity: Option<&str>) -> bool {
+    has_desk
+        && identity
+            .and_then(|id| Uuid::parse_str(id).ok())
+            .zip(state.identity_store.as_ref())
+            .and_then(|(id, store)| store.get_by_id(id).ok().flatten())
+            .is_some_and(|i| crate::authz::is_effective_admin(i.role, i.status))
+}
+
 /// Who the floor is read for: a person (their identity, else their paired
 /// device), and whether this hub is theirs, with its Desk sessions.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -94,7 +106,9 @@ enum Refused {
 }
 
 impl FloorCaller {
-    fn of(caller: &CallerContext, has_desk: bool) -> Result<Self, Refused> {
+    /// `holds`: whether the caller's identity holds the hub
+    /// ([`holds_the_hub`]).
+    fn of(caller: &CallerContext, holds: bool) -> Result<Self, Refused> {
         match caller.auth_failure {
             Some(AuthFailure::InvalidCredentials) => return Err(Refused::Unauthorized),
             Some(AuthFailure::StoreError) => return Err(Refused::Unavailable),
@@ -107,7 +121,7 @@ impl FloorCaller {
             .ok_or(Refused::Unauthorized)?;
         Ok(Self {
             id,
-            personal: has_desk && caller.is_admin,
+            personal: holds,
         })
     }
 
@@ -300,7 +314,8 @@ async fn reader(
     let caller = resolve_caller_context(&routes.state, headers, token).await;
     let sources = routes.sources.clone();
     let has_desk = sources.as_ref().is_some_and(|s| (s.desk)().is_some());
-    let caller = FloorCaller::of(&caller, has_desk).map_err(|refused| match refused {
+    let holds = holds_the_hub(&routes.state, has_desk, caller.identity_id.as_deref());
+    let caller = FloorCaller::of(&caller, holds).map_err(|refused| match refused {
         Refused::Unauthorized => refusal(StatusCode::UNAUTHORIZED, "unauthorized"),
         Refused::Unavailable => refusal(StatusCode::SERVICE_UNAVAILABLE, "unavailable"),
     })?;
@@ -705,23 +720,20 @@ mod tests {
             auth_failure: None,
         };
         assert_eq!(
-            FloorCaller::of(&caller(Some("u1"), Some("d1"), true), true),
+            FloorCaller::of(&caller(Some("u1"), Some("d1"), false), true),
             Ok(FloorCaller {
                 id: "u1".into(),
                 personal: true
-            })
+            }),
+            "the device of the person who holds the hub"
         );
         assert_eq!(
-            FloorCaller::of(&caller(None, Some("d1"), true), false),
+            FloorCaller::of(&caller(None, Some("d1"), false), false),
             Ok(FloorCaller {
                 id: "d1".into(),
                 personal: false
             }),
-            "a device-only pairing, on a hub without Desk"
-        );
-        assert_eq!(
-            FloorCaller::of(&caller(Some("u1"), None, false), true).map(|c| c.personal),
-            Ok(false)
+            "a device-only pairing"
         );
         assert_eq!(
             FloorCaller::of(&caller(None, None, true), true),

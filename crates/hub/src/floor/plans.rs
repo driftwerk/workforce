@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use chrono::Utc;
 use parking_lot::Mutex;
 use serde_json::Value;
+use workforce_common::channels::desk::DeskSignal;
 use workforce_common::subscription::{CredentialTier, LoginOwner, SubscriptionKind};
 use workforce_common::usage::{
     account_key, claude_mod_usage, codex_usage, LoginRef, PlanKind, Reading, Window,
@@ -15,6 +16,7 @@ use workforce_common::usage::{
 use workforce_desk::usage::{MacAccount, MacPlan, PlanSink};
 
 use super::postgres::PgFloorStore;
+use super::signal::Signals;
 use crate::hub_core::logins::plan_usage::PlanUsage;
 use crate::hub_core::logins::resolve::{Credential, Login};
 
@@ -24,9 +26,10 @@ const REWRITE_EVERY: Duration = Duration::from_secs(60);
 const MOVED: f64 = 1.0;
 
 /// Keeps readings in the floor's store, each login's no more often than it
-/// says something new.
+/// says something new, telling whose plan it is when one is kept.
 pub struct Plans {
     store: Arc<PgFloorStore>,
+    signals: Signals,
     written: Mutex<HashMap<String, (Vec<Window>, Instant)>>,
 }
 
@@ -47,9 +50,10 @@ fn worth_writing(last: Option<&(Vec<Window>, Instant)>, windows: &[Window]) -> b
 }
 
 impl Plans {
-    pub fn new(store: Arc<PgFloorStore>) -> Arc<Self> {
+    pub fn new(store: Arc<PgFloorStore>, signals: Signals) -> Arc<Self> {
         Arc::new(Self {
             store,
+            signals,
             written: Mutex::new(HashMap::new()),
         })
     }
@@ -64,9 +68,14 @@ impl Plans {
             written.insert(key, (reading.windows.clone(), Instant::now()));
         }
         let store = Arc::clone(&self.store);
+        let signals = self.signals.clone();
         tokio::spawn(async move {
-            if let Err(e) = store.record(&reading).await {
-                tracing::warn!(target: "floor", error = %format!("{e:#}"), "keeping a plan reading failed");
+            match store.record(&reading).await {
+                Ok(true) => signals.send(DeskSignal::Usage, reading.login.owner()),
+                Ok(false) => {}
+                Err(e) => {
+                    tracing::warn!(target: "floor", error = %format!("{e:#}"), "keeping a plan reading failed")
+                }
             }
         });
     }
@@ -173,7 +182,8 @@ mod tests {
         use workforce_postgres::test_support::with_test_pool;
         with_test_pool(PgFloorStore::build_pool, |pool| async move {
             let store = Arc::new(PgFloorStore::with_pool(pool).await.unwrap());
-            let plans = Plans::new(Arc::clone(&store));
+            let mut pushed = crate::session_push::subscribe_for_tests();
+            let plans = Plans::new(Arc::clone(&store), crate::floor::signal::Signals::start());
             let person = uuid::Uuid::new_v4();
             let theirs = Login {
                 tier: CredentialTier::GlobalUser,
@@ -211,6 +221,19 @@ mod tests {
                 .collect();
             assert!(owners.contains(&(PlanKind::Claude, Some(person.to_string()))));
             assert!(owners.contains(&(PlanKind::Claude, None)), "a shared login is no one's");
+            let told = tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    let frame = pushed.recv().await.unwrap();
+                    if frame.msg_type == "usage_changed"
+                        && frame.target_identity.as_deref() == Some(person.to_string().as_str())
+                    {
+                        break frame;
+                    }
+                }
+            })
+            .await
+            .expect("the person is told their plan's usage changed");
+            assert!(told.for_links_only(), "the person whose plan it is is told");
             let mac = kept.iter().find(|r| r.login == LoginRef::Mac).unwrap();
             assert_eq!(
                 (mac.kind, mac.plan.as_deref(), mac.account.clone()),

@@ -1379,7 +1379,7 @@ fn forward_admits(
     conn_identity: Option<&str>,
     conn_owner: Option<&str>,
 ) -> bool {
-    if msg.msg_type == crate::broadcast::DESK_DELIVERED {
+    if msg.for_links_only() {
         return false;
     }
     match (
@@ -1416,14 +1416,29 @@ const DESK_ONLY_FRAMES: &[&str] = &[
 /// What a declared Desk connection is offered, on its `connected`. The hub
 /// link and the drain are for a person's conversations and need the
 /// conversation routes, so only a connection that is a person's, on a hub
-/// that serves them, is offered deliveries.
+/// that serves them, is offered deliveries; and the link's floor and usage
+/// signals where the hub keeps a floor.
 pub(crate) fn desk_features(of_a_person: bool) -> Vec<String> {
     let deliveries = cfg!(feature = "postgres") && of_a_person;
+    let signals = deliveries.then(floor_signals).into_iter().flatten();
     [DESK_PLACE, DESK_STREAM]
         .into_iter()
         .chain(deliveries.then_some(DESK_DELIVERIES))
+        .chain(signals)
         .map(str::to_string)
         .collect()
+}
+
+/// The features of the link's signals, when this hub keeps a floor.
+fn floor_signals() -> Vec<&'static str> {
+    #[cfg(feature = "postgres")]
+    if crate::floor::installed().is_some() {
+        use workforce_common::channels::desk::DeskSignal;
+        return [DeskSignal::Floor, DeskSignal::Usage]
+            .map(DeskSignal::feature)
+            .to_vec();
+    }
+    Vec::new()
 }
 
 /// The Desk turn a chat frame is: the one a declared Desk connection sent,
@@ -1818,6 +1833,23 @@ mod voice_forward_tests {
             !forward_admits(&signal, Some("sess-1"), None, Some("uid-1"), Some("uid-1")),
             "a Desk delivery signal is for the hub link, never a chat connection"
         );
+        for signal in [
+            workforce_common::channels::desk::DeskSignal::Floor,
+            workforce_common::channels::desk::DeskSignal::Usage,
+        ] {
+            for owner in [Some("uid-1"), None] {
+                assert!(
+                    !forward_admits(
+                        &BroadcastMessage::desk_signal(signal, owner),
+                        None,
+                        None,
+                        Some("uid-1"),
+                        Some("uid-1")
+                    ),
+                    "a floor or usage signal is for the hub link: {signal:?} {owner:?}"
+                );
+            }
+        }
 
         let unlinked = BroadcastMessage::node_invoke("device-1", "{}");
         assert!(forward_admits(

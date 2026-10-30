@@ -1,6 +1,7 @@
 //! Pushing what lands in a session outside a live turn to whoever is watching
 //! it: an answer a resumed turn saved, or a delivery to a Desk conversation,
-//! with its signal to the person's Desk hub links. The turn or delivery runs
+//! with its signal to the person's Desk hub links; and the links' signals
+//! that a person's floor or plans' usage changed. The turn or delivery runs
 //! on whichever replica ran it, while the page or app waiting on it may be
 //! connected to any replica, so the push goes over NATS to every replica's
 //! gateway broadcast.
@@ -11,7 +12,7 @@ use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 use tracing::warn;
-use workforce_common::channels::desk::{DeskDelivered, DeskFile};
+use workforce_common::channels::desk::{DeskDelivered, DeskFile, DeskSignal};
 
 use crate::broadcast::BroadcastMessage;
 
@@ -33,6 +34,10 @@ enum Relayed {
     Delivered {
         owner: String,
         delivered: DeskDelivered,
+    },
+    Signal {
+        signal: DeskSignal,
+        owner: Option<String>,
     },
 }
 
@@ -57,6 +62,9 @@ impl Relayed {
             },
             Self::Delivered { owner, delivered } => {
                 BroadcastMessage::desk_delivered(&owner, delivered)
+            }
+            Self::Signal { signal, owner } => {
+                BroadcastMessage::desk_signal(signal, owner.as_deref())
             }
         }
     }
@@ -138,6 +146,16 @@ impl SessionPush {
         self.relay(Relayed::Delivered {
             owner: owner.to_string(),
             delivered,
+        })
+        .await;
+    }
+
+    /// Tell every Desk hub link of `owner`'s, on every replica, that
+    /// `signal` changed; with no owner, the links of whoever holds this hub.
+    pub async fn signal(&self, signal: DeskSignal, owner: Option<&str>) {
+        self.relay(Relayed::Signal {
+            signal,
+            owner: owner.map(str::to_string),
         })
         .await;
     }
@@ -318,6 +336,31 @@ mod tests {
             relayed.message().target_identity.as_deref(),
             Some("person-1")
         );
+    }
+
+    #[test]
+    fn a_signal_reads_as_itself_on_every_replica() {
+        for signal in [DeskSignal::Floor, DeskSignal::Usage] {
+            for owner in [Some("person-1".to_string()), None] {
+                let relayed = Relayed::Signal {
+                    signal,
+                    owner: owner.clone(),
+                };
+                let read: Relayed =
+                    serde_json::from_slice(&serde_json::to_vec(&relayed).unwrap()).unwrap();
+                assert_eq!(read, relayed);
+                let message = read.message();
+                assert_eq!(message.msg_type, signal.frame());
+                assert_eq!(message.target_identity, owner);
+                assert!(message.for_links_only());
+            }
+        }
+        let wire = serde_json::to_value(Relayed::Signal {
+            signal: DeskSignal::Usage,
+            owner: None,
+        })
+        .unwrap();
+        assert_eq!(wire, serde_json::json!({"signal": "usage", "owner": null}));
     }
 
     /// A delivery made on one replica reaches the hub links on another,
