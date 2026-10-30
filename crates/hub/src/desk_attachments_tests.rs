@@ -76,6 +76,8 @@ fn a_file_name_keeps_no_directories() {
     assert_eq!(safe_filename("  "), "upload");
     assert_eq!(safe_filename("a\u{7}b.pdf"), "ab.pdf");
     assert_eq!(safe_filename(".."), "upload");
+    assert_eq!(safe_filename("..\\..\\Windows\\win.ini"), "win.ini");
+    assert_eq!(safe_filename("reports/q3/"), "q3");
 }
 
 #[test]

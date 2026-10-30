@@ -618,7 +618,7 @@ impl StagedFile {
         Self {
             artifact_id: artifact_id.clone(),
             media_type: media_type.to_string(),
-            filename: filename.to_string(),
+            filename: safe_filename(filename),
             caption: caption.map(str::to_string),
             described: global_store()
                 .map(|store| describe(store.as_ref(), agent, artifact_id, media_type))
@@ -1035,17 +1035,19 @@ pub struct UploadQuery {
 
 /// A name safe to keep: no directories, nothing blank, not too long.
 fn safe_filename(name: &str) -> String {
-    let base = Path::new(name.trim())
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or_default()
+    let base: String = name
         .trim()
-        .to_string();
-    let base: String = base.chars().filter(|c| !c.is_control()).take(255).collect();
-    if base.is_empty() || base == "." || base == ".." {
-        "upload".into()
-    } else {
-        base
+        .trim_end_matches(['/', '\\'])
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or_default()
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(255)
+        .collect();
+    match base.trim() {
+        "" | "." | ".." => "upload".into(),
+        base => base.to_string(),
     }
 }
 
