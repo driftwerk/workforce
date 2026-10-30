@@ -43,6 +43,7 @@ mod groups;
 mod rooms_tests;
 mod terminals;
 mod transition;
+mod unread;
 
 use transition::Transition;
 
@@ -512,6 +513,7 @@ impl Desk {
             records.insert(r.id, r);
         }
         let layout = prune_layout(&store, layout, &records).await;
+        let state_since = store.state_times().await?;
 
         let listener = hook_listener(held.hook_port).await?;
         let hook_port = listener.local_addr()?.port();
@@ -528,6 +530,7 @@ impl Desk {
                 rooms,
                 layout,
                 session_env,
+                state_since,
                 ..State::default()
             }),
             events: broadcast::channel(256).0,
@@ -1517,7 +1520,7 @@ impl Desk {
         let _ = self.0.persist.send(Persist::Delete(id));
         let _ = self.0.events.send(DeskEvent::Removed { id });
         self.drop_from_layout(id).await;
-        Ok(())
+        self.forget_session_read(id).await
     }
 
     pub fn decide(
@@ -1880,6 +1883,7 @@ impl Desk {
             return Err(DeskError::NotFound);
         }
         self.0.state.lock().rooms.remove(&id);
+        self.forget_room_reads(id).await?;
         let _ = self.0.events.send(DeskEvent::RoomRemoved { id });
         Ok(())
     }

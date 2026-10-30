@@ -23,6 +23,7 @@ pub mod overview;
 mod procs;
 pub mod providers;
 mod pty;
+pub mod reads;
 pub mod realtime;
 pub mod rooms;
 mod service;

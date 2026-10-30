@@ -269,6 +269,34 @@ impl Page {
     }
 }
 
+/// What is unread in one place of a room, after its read point.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Unread {
+    pub count: i64,
+    pub for_you: i64,
+    /// The earliest unread message, to jump to when it isn't loaded.
+    pub first: Option<Uuid>,
+    pub last_at: Option<DateTime<Utc>>,
+}
+
+/// A thread with something unread: its first message, and what.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadUnread {
+    pub parent: RoomMessage,
+    pub unread: Unread,
+}
+
+/// What is unread in a room: its timeline, and its threads with any.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RoomSummary {
+    pub room_id: Uuid,
+    pub main: Unread,
+    pub threads: Vec<ThreadUnread>,
+}
+
 /// A message as posting left it: kept now, or kept before under the same
 /// source.
 #[derive(Debug, Clone, PartialEq)]
@@ -621,6 +649,24 @@ impl DeskStore {
             .transpose()
     }
 
+    /// The messages with these ids, wherever they are.
+    pub async fn messages_by_id(&self, ids: &[Uuid]) -> Result<Vec<RoomMessage>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let client = self.pool().get().await?;
+        let rows = client
+            .query(
+                &format!(
+                    "SELECT {} FROM room_messages WHERE id = ANY($1)",
+                    *MESSAGE_COLUMNS
+                ),
+                &[&ids],
+            )
+            .await?;
+        rows.iter().map(message).collect()
+    }
+
     /// Where `id` sits in `room`'s order, and in which thread: none when
     /// it isn't a message of that room.
     pub async fn cursor(
@@ -778,7 +824,7 @@ impl DeskStore {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::store::build_pool;
     use workforce_postgres::test_support::with_test_pool;
