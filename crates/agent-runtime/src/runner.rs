@@ -2063,8 +2063,6 @@ pub async fn render_viewed(
     blocks
 }
 
-/// Persist an Always-* choice as the requester's own rule before the call it
-/// answered runs, so the cascade re-evaluating that call already sees it.
 /// What a person is asked of a call the gates hold, and where an "Always"
 /// answer is kept. A write the surface gate holds offers no Always deny, and
 /// its Always allow is kept on the allow list for its tool, its destination
@@ -2122,6 +2120,8 @@ impl PermissionWriter for KeepAllowed {
     }
 }
 
+/// Persist an Always-* choice as the requester's own rule before the call it
+/// answered runs, so the cascade re-evaluating that call already sees it.
 async fn persist_choice(
     writer: Option<&dyn PermissionWriter>,
     user: Option<&str>,
