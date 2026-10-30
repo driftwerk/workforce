@@ -1620,17 +1620,18 @@ impl Desk {
                 .get_mut(&id)
                 .filter(|_| asking)
                 .ok_or_else(|| DeskError::Conflict("it isn't asking anything".into()))?;
+            // Taken: allowed once, it isn't offered again.
             let denied = live
                 .asked
-                .as_ref()
-                .and_then(|a| a.denied.clone())
-                .filter(|d| d.allowable)
+                .as_mut()
+                .and_then(|a| a.denied.take_if(|d| d.allowable))
                 .ok_or_else(|| {
                     DeskError::Conflict("there is no refused tool Desk can allow".into())
                 })?;
             live.allowed.insert(denied.call.clone());
             denied
         };
+        self.publish(id);
         let what = match denied.call.input.as_deref() {
             Some(input) => format!("{} `{input}`", denied.name()),
             None => denied.name().to_string(),
@@ -4222,7 +4223,7 @@ mod tests {
 
             // Allowed and continued: the same call runs without asking from then on.
             d.allow_asked(s.id, Some(By::you())).unwrap();
-            assert!(d.allow_asked(s.id, None).is_ok(), "still asking until it hears the prompt");
+            assert!(d.allow_asked(s.id, None).is_err(), "allowed once");
             post(&d, s.id, json!({"hook_event_name": "UserPromptSubmit", "prompt": "I allowed it, run it again"})).await;
             let v = d.view(s.id).unwrap();
             assert_eq!((v.state, v.asked), (SessionState::Working, None), "the prompt answered it");
