@@ -561,10 +561,12 @@ impl Holding for GameTallies {
     }
 }
 
-/// Relationship and lesson events, and the prompt excerpts on cost and task
-/// rows. A move renames them all, an erase removes or unnames the events and
-/// clears the excerpts; every tally is the rows read or changed, by the one
-/// definition telemetry counts and changes them by.
+/// Relationship and lesson events, the prompt excerpts on cost and task
+/// rows, and the floor's log of the person's turns with their plans'
+/// readings. A move renames them all, an erase removes or unnames the events,
+/// clears the excerpts and removes the floor's rows; every tally is the rows
+/// read or changed, by the one definition their store counts and changes
+/// them by.
 pub struct Signals;
 
 impl Signals {
@@ -589,6 +591,25 @@ impl Signals {
         tally
     }
 
+    /// What the floor keeps of a person, by every name they go by: the log
+    /// of their turns, and their own plans' latest readings.
+    async fn floor(who: &Person) -> Result<Tally> {
+        let mut tally = Tally::default();
+        for name in &who.names {
+            let (turns, readings) = crate::floor::held(name).await?;
+            for (what, count) in [("turns on the floor", turns), ("plan readings", readings)] {
+                if count > 0 {
+                    tally.absorb(Tally {
+                        count: usize::try_from(count).unwrap_or_default(),
+                        items: vec![format!("{what}: {count}")],
+                        ..Tally::default()
+                    });
+                }
+            }
+        }
+        Ok(tally)
+    }
+
     /// `each` for every name the person goes by, tallied.
     fn per_name(
         who: &Person,
@@ -606,14 +627,16 @@ impl Signals {
 #[async_trait]
 impl Holding for Signals {
     async fn owners(&self, cx: &Context<'_>) -> Result<Owners> {
-        Ok(Owners::counted(
-            cx.hub()?.telemetry_store.identity_signal_holders()?,
-        ))
+        let mut owners = Owners::counted(cx.hub()?.telemetry_store.identity_signal_holders()?);
+        owners.absorb(Owners::counted(crate::floor::holders().await?));
+        Ok(owners)
     }
 
     async fn held(&self, cx: &Context<'_>, who: &Person) -> Result<Tally> {
         let telemetry = &cx.hub()?.telemetry_store;
-        Self::per_name(who, |name| telemetry.identity_signals(name))
+        let mut tally = Self::per_name(who, |name| telemetry.identity_signals(name))?;
+        tally.absorb(Self::floor(who).await?);
+        Ok(tally)
     }
 
     async fn merge(
@@ -628,10 +651,15 @@ impl Holding for Signals {
         }
         let telemetry = &cx.hub()?.telemetry_store;
         let into = into.key();
-        Self::per_name(from, |name| match name == into {
+        let mut tally = Self::per_name(from, |name| match name == into {
             true => Ok(Default::default()),
             false => telemetry.reassign_identity_signals(name, &into),
-        })
+        })?;
+        tally.absorb(Self::floor(from).await?);
+        for name in from.names.iter().filter(|name| **name != into) {
+            crate::floor::reassign(name, &into).await?;
+        }
+        Ok(tally)
     }
 
     async fn delete(
@@ -645,7 +673,12 @@ impl Holding for Signals {
             return self.held(cx, who).await;
         }
         let telemetry = &cx.hub()?.telemetry_store;
-        Self::per_name(who, |name| telemetry.forget_identity_signals(name))
+        let mut tally = Self::per_name(who, |name| telemetry.forget_identity_signals(name))?;
+        tally.absorb(Self::floor(who).await?);
+        for name in &who.names {
+            crate::floor::forget(name).await?;
+        }
+        Ok(tally)
     }
 }
 

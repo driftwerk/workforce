@@ -207,6 +207,71 @@ impl PgFloorStore {
         Ok(rows.iter().filter_map(reading_of).collect())
     }
 
+    /// For everyone the floor keeps turns or plan readings of, how many.
+    pub async fn holders(&self) -> Result<std::collections::BTreeMap<String, usize>> {
+        let conn = self.pool.get().await?;
+        let rows = conn
+            .query(
+                "SELECT owner, count(*) FROM (SELECT owner FROM turns \
+                 UNION ALL SELECT owner FROM plan_readings) kept \
+                 WHERE owner IS NOT NULL GROUP BY owner",
+                &[],
+            )
+            .await?;
+        Ok(rows
+            .iter()
+            .map(|row| {
+                let held: i64 = row.get(1);
+                (row.get(0), usize::try_from(held).unwrap_or_default())
+            })
+            .collect())
+    }
+
+    /// How many turns and plan readings `person` has.
+    pub async fn held(&self, person: &str) -> Result<(u64, u64)> {
+        let conn = self.pool.get().await?;
+        let row = conn
+            .query_one(
+                "SELECT (SELECT count(*) FROM turns WHERE owner = $1), \
+                        (SELECT count(*) FROM plan_readings WHERE owner = $1)",
+                &[&person],
+            )
+            .await?;
+        let count = |i| u64::try_from(row.get::<_, i64>(i)).unwrap_or_default();
+        Ok((count(0), count(1)))
+    }
+
+    /// Makes `from`'s turns and plan readings `into`'s; how many moved.
+    pub async fn reassign(&self, from: &str, into: &str) -> Result<u64> {
+        let mut conn = self.pool.get().await?;
+        let tx = conn.transaction().await?;
+        let mut moved = 0;
+        for table in ["turns", "plan_readings"] {
+            moved += tx
+                .execute(
+                    &format!("UPDATE {table} SET owner = $2 WHERE owner = $1"),
+                    &[&from, &into],
+                )
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(moved)
+    }
+
+    /// Removes `person`'s turns and plan readings; how many went.
+    pub async fn forget(&self, person: &str) -> Result<u64> {
+        let mut conn = self.pool.get().await?;
+        let tx = conn.transaction().await?;
+        let mut removed = 0;
+        for table in ["turns", "plan_readings"] {
+            removed += tx
+                .execute(&format!("DELETE FROM {table} WHERE owner = $1"), &[&person])
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(removed)
+    }
+
     /// Removes turns started before `before`, except questions still
     /// waiting on the person, and readings older than it; returns how many
     /// went.
@@ -442,6 +507,52 @@ mod tests {
 
     async fn store(pool: PostgresPool) -> PgFloorStore {
         PgFloorStore::with_pool(pool).await.expect("store")
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_persons_turns_and_readings_move_with_them_and_go_when_they_do() {
+        use workforce_common::usage::{LoginRef, PlanKind, Reading};
+        with_test_pool(PgFloorStore::build_pool, |pool| async move {
+            let store = store(pool).await;
+            for (owner, from) in [
+                (Some("u1"), "2026-10-29T08:00:00Z"),
+                (Some("u1"), "2026-10-29T09:00:00Z"),
+                (Some("u2"), "2026-10-29T09:30:00Z"),
+                (None, "2026-10-29T10:00:00Z"),
+            ] {
+                store
+                    .apply(&begin(&turn("scout", owner, from), false))
+                    .await
+                    .unwrap();
+            }
+            store
+                .record(&Reading {
+                    kind: PlanKind::Claude,
+                    login: LoginRef::Hub {
+                        login: "k1".into(),
+                        owner: Some("u1".into()),
+                    },
+                    account: None,
+                    plan: None,
+                    windows: vec![],
+                    observed_at: at("2026-10-29T10:00:00Z"),
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                store.holders().await.unwrap(),
+                std::collections::BTreeMap::from([("u1".to_string(), 3), ("u2".to_string(), 1)]),
+                "a personal hub's own sessions are no one's"
+            );
+            assert_eq!(store.held("u1").await.unwrap(), (2, 1));
+            assert_eq!(store.reassign("u1", "u3").await.unwrap(), 3);
+            assert_eq!(store.held("u1").await.unwrap(), (0, 0));
+            assert_eq!(store.held("u3").await.unwrap(), (2, 1));
+            assert_eq!(store.forget("u3").await.unwrap(), 3);
+            assert_eq!(store.held("u3").await.unwrap(), (0, 0));
+            assert_eq!(store.held("u2").await.unwrap(), (1, 0));
+        })
+        .await;
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -235,6 +235,21 @@ const CLAIMS: &[(&str, &str, &str, Claim)] = &[
     ("hub", "interventions", "person", By(C::DecisionRecords)),
     ("hub", "interventions", "actor", By(C::DecisionRecords)),
     ("hub", "pending_approvals", "requester_id", By(C::Approvals)),
+    ("hub", "turns", "owner", By(C::Signals)),
+    (
+        "hub",
+        "turns",
+        "subject",
+        NotPersonal("the agent or Desk session a turn is of"),
+    ),
+    (
+        "hub",
+        "turns",
+        "subject_doc",
+        NotPersonal("the agent or Desk session a turn is of"),
+    ),
+    ("hub", "plan_readings", "owner", By(C::Signals)),
+    ("hub", "allows", "person", By(C::PermissionRules)),
     (
         "hub",
         "pending_approvals",

@@ -150,6 +150,29 @@ impl PgSurfaceAllows {
         Ok(removed == 1)
     }
 
+    /// For everyone with allows, how many.
+    pub async fn holders(&self) -> Result<std::collections::BTreeMap<String, usize>> {
+        let conn = self.pool.get().await?;
+        let rows = conn
+            .query("SELECT person, count(*) FROM allows GROUP BY person", &[])
+            .await?;
+        Ok(rows
+            .iter()
+            .map(|row| {
+                let held: i64 = row.get(1);
+                (row.get(0), usize::try_from(held).unwrap_or_default())
+            })
+            .collect())
+    }
+
+    /// Withdraws every allow of `person`'s; how many went.
+    pub async fn forget(&self, person: &str) -> Result<u64> {
+        let conn = self.pool.get().await?;
+        Ok(conn
+            .execute("DELETE FROM allows WHERE person = $1", &[&person])
+            .await?)
+    }
+
     fn block_on<T>(&self, fut: impl std::future::Future<Output = Result<T>>) -> Result<T> {
         tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(fut))
     }
@@ -172,9 +195,12 @@ static INSTALLED: OnceLock<Arc<PgSurfaceAllows>> = OnceLock::new();
 
 /// The hub's allow list, once [`install`] opened it.
 pub fn installed() -> Option<Arc<dyn SurfaceAllows>> {
-    INSTALLED
-        .get()
-        .map(|store| Arc::clone(store) as Arc<dyn SurfaceAllows>)
+    store().map(|store| store as Arc<dyn SurfaceAllows>)
+}
+
+/// The hub's allow list as its store, for what reads or changes it by person.
+pub fn store() -> Option<Arc<PgSurfaceAllows>> {
+    INSTALLED.get().cloned()
 }
 
 /// Opens the allow list once when the hub has Postgres.
@@ -216,7 +242,7 @@ pub fn router(state: Arc<GatewayState>, store: Option<Arc<PgSurfaceAllows>>) -> 
 
 /// The hub's own routes, over its installed list.
 pub fn routes(state: Arc<GatewayState>) -> Router {
-    router(state, INSTALLED.get().cloned())
+    router(state, store())
 }
 
 #[derive(Deserialize)]
@@ -324,6 +350,19 @@ mod tests {
             assert!(store.allows("alice", "scout", &ops));
             assert!(store.revoke("alice", kept[0].id).await.unwrap());
             assert!(!store.allows("alice", "scout", &ops));
+            store.allow("alice", "scout", &ops).unwrap();
+            store.allow("alice", "atlas", &other).unwrap();
+            store.allow("bob", "scout", &ops).unwrap();
+            assert_eq!(
+                store.holders().await.unwrap(),
+                std::collections::BTreeMap::from([
+                    ("alice".to_string(), 2),
+                    ("bob".to_string(), 1)
+                ])
+            );
+            assert_eq!(store.forget("alice").await.unwrap(), 2);
+            assert!(store.of("alice").await.unwrap().is_empty());
+            assert!(store.allows("bob", "scout", &ops), "another's stay");
         })
         .await;
     }
