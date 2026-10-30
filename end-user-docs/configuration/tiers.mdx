@@ -208,9 +208,7 @@ default_model = "openrouter:deepseek:powerful"
 max_tokens = 32000
 
 # Failover chain for this agent
-[agents.llm.failover]
-- "anthropic:standard"
-- "openrouter:deepseek:cheap"
+failover = ["anthropic:standard", "openrouter:deepseek:cheap"]
 
 # Vision fallback (for non-vision-capable primary models)
 [agents.llm.vision]
