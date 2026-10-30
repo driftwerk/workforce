@@ -2,7 +2,7 @@
 //! finished, and what still needs the person, folded from a log of turns.
 //! Types and pure functions only; the log itself is the hub's.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::crew::{Counts, ItemQuestion, PartyKind};
+use crate::gist::{self, Doing, Gist, Happening, Paragraph, Said};
 use crate::model::{text_enum, Engine};
 
 /// Whose work a turn is: an agent's (any of its sessions) or one of Desk's
@@ -43,6 +44,11 @@ impl SubjectKey {
 
     pub fn session(id: Uuid) -> Self {
         Self(format!("session:{id}"))
+    }
+
+    /// A key as the log keeps it.
+    pub fn kept(key: impl Into<String>) -> Self {
+        Self(key.into())
     }
 
     pub fn as_str(&self) -> &str {
@@ -518,6 +524,21 @@ pub struct Work {
     pub outcome: Option<Outcome>,
     /// What it is waiting on of its own work, while it is.
     pub background: Option<Background>,
+    /// What its agent or session is for and doing, in plain words.
+    pub gist: Option<Said>,
+}
+
+impl Work {
+    /// Where it stands, as its gist says it.
+    pub fn doing(&self) -> Doing {
+        match (self.ended_at, self.outcome, self.background) {
+            (None, _, Some(b)) => Doing::Waiting(b.count),
+            (None, _, None) => Doing::Working,
+            (Some(_), Some(Outcome::Failed), _) => Doing::Failed,
+            (Some(_), Some(Outcome::Limit), _) => Doing::Limit,
+            (Some(_), _, _) => Doing::Finished,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -561,7 +582,12 @@ pub struct FloorView {
     pub lanes: Vec<Lane>,
     pub counts: Counts,
     pub more: More,
+    /// The floor in one paragraph, when one has been written.
+    pub summary: Option<Paragraph>,
 }
+
+/// Each subject's gist, as kept.
+pub type Gists = HashMap<SubjectKey, Gist>;
 
 /// How many finished turns the floor lists.
 pub const DONE_CAP: usize = 50;
@@ -627,7 +653,50 @@ pub fn longest_waiting(mut needs: Vec<Need>) -> Vec<Need> {
     needs
 }
 
-fn work(t: &Turn, what: Option<&String>) -> Work {
+/// What each subject was first asked, of `turns`.
+fn first_asks(turns: &[Turn]) -> HashMap<SubjectKey, &str> {
+    let mut asked: Vec<&Turn> = turns.iter().filter(|t| t.task.is_some()).collect();
+    asked.sort_by_key(|t| std::cmp::Reverse(t.started_at));
+    asked
+        .into_iter()
+        .filter_map(|t| Some((t.subject.key(), t.task.as_deref()?)))
+        .collect()
+}
+
+/// Where `t` stands.
+fn doing_of(t: &Turn) -> Doing {
+    match (t.ended_at, t.outcome, t.background()) {
+        (None, _, Some(b)) => Doing::Waiting(b.count),
+        (None, _, None) => Doing::Working,
+        (Some(_), Some(Outcome::Failed), _) => Doing::Failed,
+        (Some(_), Some(Outcome::Limit), _) => Doing::Limit,
+        (Some(_), _, _) => Doing::Finished,
+    }
+}
+
+/// `t`'s gist: its subject's as kept, unless that was written before `t`
+/// began; else said plainly from `t`, keeping the purpose kept.
+fn gist_of(t: &Turn, gists: &Gists, first: Option<&str>) -> Said {
+    let kept = gists.get(&t.subject.key());
+    if let Some(g) = kept.filter(|g| g.turn == t.id || g.now_at >= t.started_at) {
+        return g.said();
+    }
+    let asks: Vec<String> = first.map(str::to_string).into_iter().collect();
+    let (purpose, now) = gist::plainly(&gist::Input {
+        asks: &asks,
+        ask: t.task.as_deref(),
+        reply: t.answer.as_deref(),
+        doing: Some(doing_of(t)),
+        ..Default::default()
+    });
+    Said {
+        purpose: kept.and_then(|g| g.purpose.clone()).or(purpose),
+        now,
+        at: t.ended_at.unwrap_or(t.heard_at),
+    }
+}
+
+fn work(t: &Turn, what: Option<&String>, gist: Said) -> Work {
     Work {
         who: t.subject.who(&t.name),
         what: what.or(t.task.as_ref()).cloned().unwrap_or_default(),
@@ -637,15 +706,20 @@ fn work(t: &Turn, what: Option<&String>) -> Work {
         ended_at: t.ended_at,
         outcome: t.outcome,
         background: t.background(),
+        gist: Some(gist),
     }
 }
 
 /// The turns running now, newest first.
-pub fn working(turns: &[Turn]) -> Vec<Work> {
+pub fn working(turns: &[Turn], gists: &Gists) -> Vec<Work> {
+    let firsts = first_asks(turns);
     let mut out: Vec<Work> = turns
         .iter()
         .filter(|t| t.ended_at.is_none())
-        .map(|t| work(t, t.doing.as_ref()))
+        .map(|t| {
+            let gist = gist_of(t, gists, firsts.get(&t.subject.key()).copied());
+            work(t, t.doing.as_ref(), gist)
+        })
         .collect();
     out.sort_by(|a, b| b.since.cmp(&a.since));
     out
@@ -653,7 +727,8 @@ pub fn working(turns: &[Turn]) -> Vec<Work> {
 
 /// The turns that finished, failed or hit a limit since `from`, newest
 /// first.
-pub fn done(turns: &[Turn], from: DateTime<Utc>) -> Vec<Work> {
+pub fn done(turns: &[Turn], from: DateTime<Utc>, gists: &Gists) -> Vec<Work> {
+    let firsts = first_asks(turns);
     let mut out: Vec<Work> = turns
         .iter()
         .filter(|t| {
@@ -662,7 +737,10 @@ pub fn done(turns: &[Turn], from: DateTime<Utc>) -> Vec<Work> {
                 Some(Outcome::Finished | Outcome::Failed | Outcome::Limit)
             ) && t.ended_at.is_some_and(|at| at >= from)
         })
-        .map(|t| work(t, t.answer.as_ref()))
+        .map(|t| {
+            let gist = gist_of(t, gists, firsts.get(&t.subject.key()).copied());
+            work(t, t.answer.as_ref(), gist)
+        })
         .collect();
     out.sort_by(|a, b| b.ended_at.cmp(&a.ended_at));
     out
@@ -768,12 +846,18 @@ pub fn counts(needs: &[Need], working: &[Work], done: &[Work], day: DateTime<Utc
     }
 }
 
-/// The floor as of `now` for the person's `day`, from settled `turns` and
-/// the `needs` they and the hub's other sources make.
-pub fn view(turns: &[Turn], needs: Vec<Need>, day: DateTime<Utc>, now: DateTime<Utc>) -> FloorView {
-    let working = working(turns);
+/// The floor as of `now` for the person's `day`, from settled `turns`, the
+/// `needs` they and the hub's other sources make, and the subjects' `gists`.
+pub fn view(
+    turns: &[Turn],
+    needs: Vec<Need>,
+    gists: &Gists,
+    day: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> FloorView {
+    let working = working(turns, gists);
     let recent = now - chrono::Duration::hours(24);
-    let finished = done(turns, day.min(recent));
+    let finished = done(turns, day.min(recent), gists);
     let counts = counts(&needs, &working, &finished, day);
     let done: Vec<Work> = finished
         .into_iter()
@@ -792,7 +876,48 @@ pub fn view(turns: &[Turn], needs: Vec<Need>, day: DateTime<Utc>, now: DateTime<
         lanes: lanes.into_iter().take(LANE_CAP).collect(),
         counts,
         more,
+        summary: None,
     }
+}
+
+/// What's happening on the floor: one entry per subject working, waiting
+/// on its background work, or finished within [`gist::DONE_FOR`]; working
+/// first, then waiting, then finished, each most recently said first.
+pub fn happening(view: &FloorView, now: DateTime<Utc>) -> Vec<Happening> {
+    let recent = now - gist::DONE_FOR;
+    let lately = view
+        .done
+        .iter()
+        .filter(|w| w.ended_at.is_some_and(|at| at >= recent));
+    let mut by: HashMap<(PartyKind, &str), (Happening, DateTime<Utc>)> = HashMap::new();
+    for w in view.working.iter().chain(lately) {
+        let entry = Happening {
+            who: w.who.clone(),
+            doing: w.doing(),
+            gist: w.gist.clone().unwrap_or_else(|| Said {
+                purpose: None,
+                now: w.what.clone(),
+                at: w.ended_at.unwrap_or(w.heard_at),
+            }),
+        };
+        let at = w.ended_at.unwrap_or(w.since);
+        let rank = |e: &Happening, at: DateTime<Utc>| (e.doing.rank(), std::cmp::Reverse(at));
+        match by.get(&(w.who.kind, w.who.id.as_str())) {
+            Some((have, have_at)) if rank(have, *have_at) <= rank(&entry, at) => {}
+            _ => {
+                by.insert((w.who.kind, w.who.id.as_str()), (entry, at));
+            }
+        }
+    }
+    let mut out: Vec<Happening> = by.into_values().map(|(e, _)| e).collect();
+    out.sort_by(|a, b| {
+        (a.doing.rank(), std::cmp::Reverse(a.gist.at), &a.who.name).cmp(&(
+            b.doing.rank(),
+            std::cmp::Reverse(b.gist.at),
+            &b.who.name,
+        ))
+    });
+    out
 }
 
 #[cfg(test)]
@@ -988,12 +1113,12 @@ mod tests {
             Outcome::Finished,
         );
         let turns = [running, quiet, finished, failed, stopped, old];
-        let w = working(&turns);
+        let w = working(&turns, &Gists::new());
         assert_eq!(
             w.iter().map(|w| w.what.as_str()).collect::<Vec<_>>(),
             ["Compare spend.", "● Bash cargo test"]
         );
-        let d = done(&turns, at("2026-10-29T00:00:00Z"));
+        let d = done(&turns, at("2026-10-29T00:00:00Z"), &Gists::new());
         assert_eq!(
             d.iter().map(|w| w.outcome).collect::<Vec<_>>(),
             [Some(Outcome::Failed), Some(Outcome::Finished)]
@@ -1086,7 +1211,7 @@ mod tests {
             "2026-10-29T08:00:00Z",
             Outcome::Finished,
         );
-        let v = view(&[last_night, this_morning], vec![], day, now);
+        let v = view(&[last_night, this_morning], vec![], &Gists::new(), day, now);
         assert_eq!(v.done.len(), 2);
         assert_eq!(v.counts.done_today, 1);
         assert_eq!(v.more, More::default());
@@ -1110,7 +1235,13 @@ mod tests {
                 t
             })
             .collect();
-        let v = view(&turns, vec![], at("2026-10-29T00:00:00Z"), now);
+        let v = view(
+            &turns,
+            vec![],
+            &Gists::new(),
+            at("2026-10-29T00:00:00Z"),
+            now,
+        );
         assert_eq!(
             (v.done.len(), v.more.done),
             (DONE_CAP, LANE_CAP + 3 - DONE_CAP)
@@ -1304,6 +1435,11 @@ mod tests {
                 count: 2,
                 since: at("2026-10-29T16:30:00Z"),
             }),
+            gist: Some(Said {
+                purpose: Some("Speeding up the test run.".into()),
+                now: "Running the tests again.".into(),
+                at: at("2026-10-29T16:02:00Z"),
+            }),
         };
         assert_eq!(
             serde_json::to_value(work).unwrap(),
@@ -1312,7 +1448,11 @@ mod tests {
                 "what": "● Bash cargo test", "place": {"kind": "dm"},
                 "since": "2026-10-29T16:00:00Z", "heardAt": "2026-10-29T16:01:00Z",
                 "endedAt": null, "outcome": null,
-                "background": {"count": 2, "since": "2026-10-29T16:30:00Z"}
+                "background": {"count": 2, "since": "2026-10-29T16:30:00Z"},
+                "gist": {
+                    "purpose": "Speeding up the test run.", "now": "Running the tests again.",
+                    "at": "2026-10-29T16:02:00Z"
+                }
             })
         );
     }
@@ -1334,7 +1474,7 @@ mod tests {
         ]
         .iter()
         .fold(vec![t], apply);
-        let running = working(&log);
+        let running = working(&log, &Gists::new());
         assert_eq!(
             running[0].background,
             Some(Background {
@@ -1343,7 +1483,7 @@ mod tests {
             })
         );
         assert!(
-            done(&log, at("2026-10-29T00:00:00Z")).is_empty(),
+            done(&log, at("2026-10-29T00:00:00Z"), &Gists::new()).is_empty(),
             "not done"
         );
         let now = at("2026-10-29T09:00:00Z");
@@ -1372,10 +1512,142 @@ mod tests {
         assert_eq!(ended[0].background(), None);
         assert_eq!(ended[0].idle[1].to, Some(at("2026-10-29T08:40:00Z")));
         assert_eq!(
-            view(&ended, vec![], at("2026-10-29T00:00:00Z"), now)
-                .counts
-                .done_today,
+            view(
+                &ended,
+                vec![],
+                &Gists::new(),
+                at("2026-10-29T00:00:00Z"),
+                now
+            )
+            .counts
+            .done_today,
             1
+        );
+    }
+
+    fn kept(turn: Uuid, now: &str, written: &str) -> Gist {
+        Gist {
+            purpose: Some("Getting the release out to the team.".into()),
+            purpose_at: Some(at("2026-10-29T08:00:00Z")),
+            now: now.into(),
+            now_at: at(written),
+            turn,
+            by_model: true,
+        }
+    }
+
+    #[test]
+    fn the_floor_carries_each_subjects_gist_or_says_it_plainly() {
+        let now = at("2026-10-29T12:00:00Z");
+        let day = at("2026-10-29T00:00:00Z");
+        let mut running = turn(agent("scout", "dm"), Some("u1"), "2026-10-29T11:00:00Z");
+        running.task = Some("Look at #12 again".into());
+        let finished = ended(
+            turn(agent("lens", "dm"), Some("u1"), "2026-10-29T09:00:00Z"),
+            "2026-10-29T09:30:00Z",
+            Outcome::Finished,
+        );
+        let gists = Gists::from([
+            (
+                SubjectKey::agent("scout"),
+                kept(Uuid::nil(), "Was tidying up.", "2026-10-29T10:00:00Z"),
+            ),
+            (
+                SubjectKey::agent("lens"),
+                kept(
+                    finished.id,
+                    "Compared the spend; it is flat.",
+                    "2026-10-29T09:31:00Z",
+                ),
+            ),
+        ]);
+        let v = view(&[running, finished], vec![], &gists, day, now);
+        assert_eq!(
+            v.done[0].gist,
+            Some(Said {
+                purpose: Some("Getting the release out to the team.".into()),
+                now: "Compared the spend; it is flat.".into(),
+                at: at("2026-10-29T09:31:00Z"),
+            })
+        );
+        assert_eq!(
+            v.working[0].gist,
+            Some(Said {
+                purpose: Some("Getting the release out to the team.".into()),
+                now: "Working on it now.".into(),
+                at: at("2026-10-29T11:00:00Z"),
+            }),
+            "a gist written before this turn began is not this turn's: it is said plainly"
+        );
+        let plain = view(
+            &[turn(
+                agent("scout", "dm"),
+                Some("u1"),
+                "2026-10-29T11:00:00Z",
+            )],
+            vec![],
+            &Gists::new(),
+            day,
+            now,
+        );
+        assert_eq!(
+            plain.working[0].gist.as_ref().map(|g| g.purpose.as_deref()),
+            Some(Some("Compare spend.")),
+            "without a gist the purpose is its first ask"
+        );
+        assert_eq!(v.summary, None);
+    }
+
+    #[test]
+    fn what_is_happening_is_one_entry_per_subject_working_then_waiting_then_done() {
+        let now = at("2026-10-29T12:00:00Z");
+        let day = at("2026-10-29T00:00:00Z");
+        let older = ended(
+            turn(agent("scout", "dm"), Some("u1"), "2026-10-29T10:00:00Z"),
+            "2026-10-29T10:30:00Z",
+            Outcome::Finished,
+        );
+        let newer = ended(
+            turn(agent("scout", "slack"), Some("u1"), "2026-10-29T11:00:00Z"),
+            "2026-10-29T11:30:00Z",
+            Outcome::Failed,
+        );
+        let gone_by = ended(
+            turn(agent("old", "dm"), Some("u1"), "2026-10-29T08:00:00Z"),
+            "2026-10-29T09:30:00Z",
+            Outcome::Finished,
+        );
+        let mut waiting = turn(agent("lens", "dm"), Some("u1"), "2026-10-29T11:40:00Z");
+        waiting.idle = vec![Idle {
+            from: at("2026-10-29T11:50:00Z"),
+            to: None,
+            count: 2,
+        }];
+        let lens_done = ended(
+            turn(agent("lens", "job"), Some("u1"), "2026-10-29T11:00:00Z"),
+            "2026-10-29T11:55:00Z",
+            Outcome::Finished,
+        );
+        let working = turn(agent("atlas", "dm"), Some("u1"), "2026-10-29T11:00:00Z");
+        let v = view(
+            &[older, newer, gone_by, waiting, lens_done, working],
+            vec![],
+            &Gists::new(),
+            day,
+            now,
+        );
+        let entries = happening(&v, now);
+        assert_eq!(
+            entries
+                .iter()
+                .map(|e| (e.who.id.as_str(), e.doing))
+                .collect::<Vec<_>>(),
+            [
+                ("atlas", Doing::Working),
+                ("lens", Doing::Waiting(2)),
+                ("scout", Doing::Failed),
+            ],
+            "one each, the latest of what ended; two hours ago is gone by"
         );
     }
 }

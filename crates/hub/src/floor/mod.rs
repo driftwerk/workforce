@@ -10,6 +10,8 @@ use workforce_common::settings::WorkforceConfig;
 #[cfg(feature = "postgres")]
 pub(crate) mod agents;
 #[cfg(feature = "postgres")]
+pub mod gists;
+#[cfg(feature = "postgres")]
 mod log;
 #[cfg(feature = "postgres")]
 pub mod plans;

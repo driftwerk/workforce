@@ -479,7 +479,15 @@ async fn floor_view(State(r): S, headers: HeaderMap, Query(q): Query<FloorQuery>
     let read = async {
         let turns = turns(&r.state, &sources, &caller, day.min(now - RECENT)).await?;
         let needs = needs_of(&r.state, &caller, &turns, now)?;
-        eyre::Ok(floor::view(&turns, needs, day, now))
+        let scope = caller.scope();
+        let gists = sources.floor.store.gists(&scope).await.unwrap_or_else(|e| {
+            tracing::warn!(target: "floor", error = %format!("{e:#}"), "reading the gists failed");
+            floor::Gists::new()
+        });
+        let mut view = floor::view(&turns, needs, &gists, day, now);
+        let happening = floor::happening(&view, now);
+        view.summary = sources.floor.gists.summary(&scope, happening, now).await;
+        eyre::Ok(view)
     };
     match read.await {
         Ok(view) => Json(view).into_response(),

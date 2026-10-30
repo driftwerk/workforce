@@ -513,6 +513,8 @@ pub enum Origin {
     Knowledge,
     McpTool,
     VoiceSummary,
+    /// Desk's floor saying what its agents and sessions are doing.
+    Floor,
 }
 
 /// The channel prefix of memory-consolidation sessions, which marks their
@@ -543,6 +545,7 @@ impl Origin {
             Self::Knowledge => "knowledge",
             Self::McpTool => "mcp_tool",
             Self::VoiceSummary => "voice_summary",
+            Self::Floor => "floor",
         }
     }
 

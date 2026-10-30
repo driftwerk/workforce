@@ -10,7 +10,10 @@ use tokio_postgres::Row;
 use uuid::Uuid;
 use workforce_common::session_postgres::{PostgresSessionStore, HEARTBEAT_STALE_SECS};
 use workforce_common::usage::{LoginRef, PlanKind, Reading};
-use workforce_desk::floor::{self, Outcome, Scope, Settling, Target, Turn, TurnOp};
+use workforce_desk::floor::{
+    self, Gists, Outcome, Scope, Settling, SubjectKey, Target, Turn, TurnOp,
+};
+use workforce_desk::gist::{Gist, Paragraph};
 use workforce_postgres::{
     MigrationRun, MigrationRunner, MigrationSet, PostgresConfig, PostgresError, PostgresPool,
 };
@@ -41,6 +44,12 @@ const PRUNE_BATCH: i64 = 5_000;
 
 const COLUMNS: &str = "id, owner, subject_doc, name, place, task, doing, started_at, heard_at, \
                        ended_at, outcome, answer, question, settled_at, waits, token, instance, idle";
+
+const GIST_COLUMNS: &str = "purpose, purpose_at, now_text, now_at, turn, by_model";
+
+/// How many of a subject's first and latest asks its purpose is read from.
+const FIRST_ASKS: i64 = 2;
+const LATEST_ASKS: i64 = 4;
 
 pub struct PgFloorStore {
     pool: PostgresPool,
@@ -140,6 +149,162 @@ impl PgFloorStore {
             .collect())
     }
 
+    /// One turn, as logged.
+    pub async fn turn(&self, id: Uuid) -> Result<Option<Turn>> {
+        let conn = self.pool.get().await?;
+        let row = conn
+            .query_opt(
+                &format!("SELECT {COLUMNS} FROM turns WHERE id = $1"),
+                &[&id],
+            )
+            .await?;
+        row.as_ref().map(turn_of).transpose()
+    }
+
+    /// What `owner`'s `subject` was asked: its first asks and its latest,
+    /// oldest first.
+    pub async fn asks(&self, owner: Option<&str>, subject: &SubjectKey) -> Result<Vec<String>> {
+        let conn = self.pool.get().await?;
+        let rows = conn
+            .query(
+                "SELECT task FROM ( \
+                     (SELECT task, started_at FROM turns \
+                      WHERE owner IS NOT DISTINCT FROM $1 AND subject = $2 AND task IS NOT NULL \
+                      ORDER BY started_at LIMIT $3) \
+                     UNION \
+                     (SELECT task, started_at FROM turns \
+                      WHERE owner IS NOT DISTINCT FROM $1 AND subject = $2 AND task IS NOT NULL \
+                      ORDER BY started_at DESC LIMIT $4)) asked \
+                 ORDER BY started_at",
+                &[&owner, &subject.as_str(), &FIRST_ASKS, &LATEST_ASKS],
+            )
+            .await?;
+        let mut asks: Vec<String> = rows.iter().map(|row| row.get(0)).collect();
+        asks.dedup();
+        Ok(asks)
+    }
+
+    /// The gists of `scope`'s subjects.
+    pub async fn gists(&self, scope: &Scope) -> Result<Gists> {
+        let conn = self.pool.get().await?;
+        let rows = conn
+            .query(
+                &format!(
+                    "SELECT subject, {GIST_COLUMNS} FROM gists \
+                     WHERE owner = $1 OR ($2 AND owner IS NULL)"
+                ),
+                &[&scope.owner, &scope.personal],
+            )
+            .await?;
+        Ok(rows
+            .iter()
+            .map(|row| {
+                (
+                    SubjectKey::kept(row.get::<_, String>("subject")),
+                    gist_of(row),
+                )
+            })
+            .collect())
+    }
+
+    /// `owner`'s gist of `subject`.
+    pub async fn gist(&self, owner: Option<&str>, subject: &SubjectKey) -> Result<Option<Gist>> {
+        let conn = self.pool.get().await?;
+        let row = conn
+            .query_opt(
+                &format!(
+                    "SELECT {GIST_COLUMNS} FROM gists \
+                     WHERE owner IS NOT DISTINCT FROM $1 AND subject = $2"
+                ),
+                &[&owner, &subject.as_str()],
+            )
+            .await?;
+        Ok(row.as_ref().map(gist_of))
+    }
+
+    /// Keeps `gist` as `owner`'s of `subject`, unless the one kept was
+    /// written later: replicas each write what they saw.
+    pub async fn put_gist(
+        &self,
+        owner: Option<&str>,
+        subject: &SubjectKey,
+        gist: &Gist,
+    ) -> Result<()> {
+        let conn = self.pool.get().await?;
+        conn.execute(
+            &format!(
+                "INSERT INTO gists (owner, subject, {GIST_COLUMNS}) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
+                 ON CONFLICT ((coalesce(owner, '')), subject) DO UPDATE SET \
+                     purpose = EXCLUDED.purpose, purpose_at = EXCLUDED.purpose_at, \
+                     now_text = EXCLUDED.now_text, now_at = EXCLUDED.now_at, \
+                     turn = EXCLUDED.turn, by_model = EXCLUDED.by_model \
+                 WHERE gists.now_at <= EXCLUDED.now_at"
+            ),
+            &[
+                &owner,
+                &subject.as_str(),
+                &gist.purpose,
+                &gist.purpose_at,
+                &gist.now,
+                &gist.now_at,
+                &gist.turn,
+                &gist.by_model,
+            ],
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// The floor's paragraph for `owner` (`personal`: with their hub's own
+    /// sessions), and the mark of what it was written from.
+    pub async fn summary(&self, owner: &str, personal: bool) -> Result<Option<(Paragraph, i64)>> {
+        let conn = self.pool.get().await?;
+        let row = conn
+            .query_opt(
+                "SELECT paragraph, written_at, fingerprint FROM summaries \
+                 WHERE owner = $1 AND personal = $2",
+                &[&owner, &personal],
+            )
+            .await?;
+        Ok(row.map(|row| {
+            (
+                Paragraph {
+                    text: row.get(0),
+                    at: row.get(1),
+                },
+                row.get(2),
+            )
+        }))
+    }
+
+    /// Keeps `paragraph` as `owner`'s, unless the one kept was written later.
+    pub async fn put_summary(
+        &self,
+        owner: &str,
+        personal: bool,
+        paragraph: &Paragraph,
+        fingerprint: i64,
+    ) -> Result<()> {
+        let conn = self.pool.get().await?;
+        conn.execute(
+            "INSERT INTO summaries (owner, personal, paragraph, written_at, fingerprint) \
+             VALUES ($1, $2, $3, $4, $5) \
+             ON CONFLICT (owner, personal) DO UPDATE SET paragraph = EXCLUDED.paragraph, \
+                 written_at = EXCLUDED.written_at, fingerprint = EXCLUDED.fingerprint \
+             WHERE summaries.written_at <= EXCLUDED.written_at",
+            &[
+                &owner,
+                &personal,
+                &paragraph.text,
+                &paragraph.at,
+                &fingerprint,
+            ],
+        )
+        .await?;
+        Ok(())
+    }
+
     /// Which of `instances` still run: their heartbeat in the sessions'
     /// roster is fresh. An instance's id is new on every boot, so one whose
     /// beat went stale, was pruned, or never came has gone.
@@ -215,7 +380,8 @@ impl PgFloorStore {
         let rows = conn
             .query(
                 "SELECT owner, count(*) FROM (SELECT owner FROM turns \
-                 UNION ALL SELECT owner FROM plan_readings) kept \
+                 UNION ALL SELECT owner FROM plan_readings \
+                 UNION ALL SELECT owner FROM gists UNION ALL SELECT owner FROM summaries) kept \
                  WHERE owner IS NOT NULL GROUP BY owner",
                 &[],
             )
@@ -243,12 +409,22 @@ impl PgFloorStore {
         Ok((count(0), count(1)))
     }
 
-    /// Makes `from`'s turns and plan readings `into`'s; how many moved.
+    /// Makes `from`'s turns, plan readings and gists `into`'s; how many
+    /// moved. Where both have a gist of one subject, `into`'s stays; their
+    /// paragraphs are written again.
     pub async fn reassign(&self, from: &str, into: &str) -> Result<u64> {
         let mut conn = self.pool.get().await?;
         let tx = conn.transaction().await?;
+        tx.execute(
+            "DELETE FROM gists g WHERE owner = $1 \
+             AND EXISTS (SELECT 1 FROM gists h WHERE h.owner = $2 AND h.subject = g.subject)",
+            &[&from, &into],
+        )
+        .await?;
+        tx.execute("DELETE FROM summaries WHERE owner = $1", &[&from])
+            .await?;
         let mut moved = 0;
-        for table in ["turns", "plan_readings"] {
+        for table in ["turns", "plan_readings", "gists"] {
             moved += tx
                 .execute(
                     &format!("UPDATE {table} SET owner = $2 WHERE owner = $1"),
@@ -260,12 +436,13 @@ impl PgFloorStore {
         Ok(moved)
     }
 
-    /// Removes `person`'s turns and plan readings; how many went.
+    /// Removes `person`'s turns, plan readings, gists and paragraphs; how
+    /// many went.
     pub async fn forget(&self, person: &str) -> Result<u64> {
         let mut conn = self.pool.get().await?;
         let tx = conn.transaction().await?;
         let mut removed = 0;
-        for table in ["turns", "plan_readings"] {
+        for table in ["turns", "plan_readings", "gists", "summaries"] {
             removed += tx
                 .execute(&format!("DELETE FROM {table} WHERE owner = $1"), &[&person])
                 .await?;
@@ -275,16 +452,18 @@ impl PgFloorStore {
     }
 
     /// Removes turns started before `before`, except questions still
-    /// waiting on the person, and readings older than it; returns how many
-    /// went.
+    /// waiting on the person, and readings, gists and paragraphs older than
+    /// it; returns how many went.
     pub async fn prune(&self, before: DateTime<Utc>) -> Result<u64> {
         let conn = self.pool.get().await?;
-        let mut removed = conn
-            .execute(
-                "DELETE FROM plan_readings WHERE observed_at < $1",
-                &[&before],
-            )
-            .await?;
+        let mut removed = 0;
+        for older in [
+            "DELETE FROM plan_readings WHERE observed_at < $1",
+            "DELETE FROM gists WHERE now_at < $1",
+            "DELETE FROM summaries WHERE written_at < $1",
+        ] {
+            removed += conn.execute(older, &[&before]).await?;
+        }
         loop {
             let batch = conn
                 .execute(
@@ -433,6 +612,17 @@ async fn update(db: &impl GenericClient, t: &Turn) -> Result<()> {
     )
     .await?;
     Ok(())
+}
+
+fn gist_of(row: &Row) -> Gist {
+    Gist {
+        purpose: row.get("purpose"),
+        purpose_at: row.get("purpose_at"),
+        now: row.get("now_text"),
+        now_at: row.get("now_at"),
+        turn: row.get("turn"),
+        by_model: row.get("by_model"),
+    }
 }
 
 fn turn_of(row: &Row) -> Result<Turn> {
@@ -881,6 +1071,115 @@ mod tests {
             assert_eq!(kept[1], mac);
             assert_eq!(store.prune(at("2026-10-29T16:02:00Z")).await.unwrap(), 1);
             assert_eq!(store.readings().await.unwrap().len(), 1);
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_subjects_gist_is_kept_latest_first_and_goes_with_its_person() {
+        with_test_pool(PgFloorStore::build_pool, |pool| async move {
+            let store = store(pool).await;
+            let scout = SubjectKey::agent("scout");
+            let gist = |now: &str, when: &str| Gist {
+                purpose: Some("Getting the release out.".into()),
+                purpose_at: Some(at("2026-10-29T08:00:00Z")),
+                now: now.into(),
+                now_at: at(when),
+                turn: Uuid::nil(),
+                by_model: true,
+            };
+            store
+                .put_gist(
+                    Some("u1"),
+                    &scout,
+                    &gist("Testing it.", "2026-10-29T09:00:00Z"),
+                )
+                .await
+                .unwrap();
+            store
+                .put_gist(
+                    Some("u1"),
+                    &scout,
+                    &gist("Earlier.", "2026-10-29T08:30:00Z"),
+                )
+                .await
+                .unwrap();
+            store
+                .put_gist(
+                    None,
+                    &SubjectKey::session(Uuid::nil()),
+                    &gist("Mine.", "2026-10-29T09:00:00Z"),
+                )
+                .await
+                .unwrap();
+            store
+                .put_gist(Some("u2"), &scout, &gist("Theirs.", "2026-10-29T09:00:00Z"))
+                .await
+                .unwrap();
+            assert_eq!(
+                store.gist(Some("u1"), &scout).await.unwrap(),
+                Some(gist("Testing it.", "2026-10-29T09:00:00Z")),
+                "an earlier gist never replaces a later one"
+            );
+            let personal = Scope {
+                personal: true,
+                ..scope("u1")
+            };
+            let mine = store.gists(&personal).await.unwrap();
+            assert_eq!(mine.len(), 2);
+            assert_eq!(mine[&SubjectKey::session(Uuid::nil())].now, "Mine.");
+            assert_eq!(store.gists(&scope("u1")).await.unwrap().len(), 1);
+
+            for (i, task) in [
+                "Plan it", "Build it", "Build it", "Test it", "Ship it", "Tidy up", "Rest",
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let mut t = turn("scout", Some("u1"), "2026-10-29T08:00:00Z");
+                t.started_at += chrono::Duration::minutes(i as i64);
+                t.task = Some(task.into());
+                store.apply(&begin(&t, false)).await.unwrap();
+            }
+            assert_eq!(
+                store.asks(Some("u1"), &scout).await.unwrap(),
+                ["Plan it", "Build it", "Test it", "Ship it", "Tidy up", "Rest"],
+                "its first asks and its latest, in order, once each"
+            );
+
+            let paragraph = |text: &str, when: &str| Paragraph {
+                text: text.into(),
+                at: at(when),
+            };
+            store
+                .put_summary("u1", true, &paragraph("Now.", "2026-10-29T09:00:00Z"), 7)
+                .await
+                .unwrap();
+            store
+                .put_summary("u1", true, &paragraph("Before.", "2026-10-29T08:00:00Z"), 6)
+                .await
+                .unwrap();
+            assert_eq!(
+                store.summary("u1", true).await.unwrap(),
+                Some((paragraph("Now.", "2026-10-29T09:00:00Z"), 7))
+            );
+            assert_eq!(store.summary("u1", false).await.unwrap(), None);
+
+            store
+                .put_gist(Some("u3"), &scout, &gist("Kept.", "2026-10-29T07:00:00Z"))
+                .await
+                .unwrap();
+            store.reassign("u1", "u3").await.unwrap();
+            assert_eq!(
+                store.gist(Some("u3"), &scout).await.unwrap().map(|g| g.now),
+                Some("Kept.".into()),
+                "where both had one, the one moved into stays"
+            );
+            assert_eq!(store.summary("u1", true).await.unwrap(), None);
+            assert_eq!(store.forget("u3").await.unwrap(), 8);
+            assert_eq!(store.gist(Some("u3"), &scout).await.unwrap(), None);
+            assert_eq!(store.prune(at("2026-10-30T00:00:00Z")).await.unwrap(), 2);
+            assert!(store.gists(&personal).await.unwrap().is_empty());
         })
         .await;
     }
