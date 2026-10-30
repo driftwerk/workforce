@@ -77,6 +77,8 @@ impl SqlitePendingApprovalStore {
             );
             CREATE INDEX IF NOT EXISTS idx_pending_approval_targets_slack
                 ON pending_approval_targets(request_id, slack_user_id);
+            CREATE INDEX IF NOT EXISTS idx_pending_approval_targets_approver
+                ON pending_approval_targets(approver_id);
             ",
         )
         .wrap_err("Failed to initialise pending-approval schema")?;
