@@ -3145,12 +3145,9 @@ pub(crate) async fn forward_local_progress(
                 reason,
                 options,
             )),
-            ProgressEvent::Done { .. } => None,
-            ProgressEvent::InjectedMessage { count } => Some(BroadcastMessage::new(
-                sid.clone(),
-                "injected",
-                format!("{} message(s) absorbed", count),
-            )),
+            // A follow-up's `injected` is the gateway's, sent once as it is
+            // steered in, as it is for a turn on another instance.
+            ProgressEvent::Done { .. } | ProgressEvent::InjectedMessage { .. } => None,
             ProgressEvent::RateLimited { wait_secs, attempt } => Some(BroadcastMessage::new(
                 sid.clone(),
                 "rate_limited",
@@ -14227,6 +14224,21 @@ mod chat_progress_tests {
         std::iter::from_fn(|| rx.try_recv().ok())
             .filter(|message| message.msg_type == "stream_discard")
             .collect()
+    }
+
+    /// A local run absorbing a follow-up sends no frame of its own: the
+    /// gateway said `injected` once when it steered the follow-up in.
+    #[tokio::test]
+    async fn a_local_run_absorbing_a_follow_up_sends_no_second_injected() {
+        let (progress_tx, progress_rx) = tokio::sync::mpsc::channel(8);
+        let (tx, mut rx) = broadcast::channel(16);
+        progress_tx
+            .send(ProgressEvent::InjectedMessage { count: 1 })
+            .await
+            .unwrap();
+        drop(progress_tx);
+        forward_local_progress(progress_rx, tx, "s-1".into(), false, None, None).await;
+        assert!(std::iter::from_fn(|| rx.try_recv().ok()).all(|m| m.msg_type != "injected"));
     }
 
     /// A file a live Desk turn delivered is the `image` frame that shows it,
