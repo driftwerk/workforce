@@ -5622,7 +5622,14 @@ async fn a_desk_room_turn_is_told_where_it_is_and_keeps_its_place() {
         (reply.role.clone(), reply.id.as_str()),
         (MessageRole::Assistant, "reply-1")
     );
-    assert_eq!(reply.desk, Some(turn.place.mark()));
+    assert_eq!(
+        reply.desk,
+        Some(workforce_common::channels::desk::DeskMark {
+            in_reply_to: turn.message,
+            ..turn.place.mark()
+        }),
+        "the answer names the message it answers"
+    );
     assert_eq!(session.desk_origin(), Some(desk.target.clone()));
     assert_eq!(session.context_type, Some(SessionContextType::Dm));
     assert!(!session.is_shared_conversation());
