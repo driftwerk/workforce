@@ -2051,8 +2051,17 @@ impl Desk {
             let _ = self.0.events.send(DeskEvent::RoomMessage {
                 message: Box::new(posted.message.clone()),
             });
+            // The reply is kept: a copy that fails is said, not returned, so
+            // a retry doesn't post the reply twice; Post to room copies it.
             if new.also_in_room && posted.message.thread_id.is_some() {
-                self.copy_to_room(id, posted.message.id).await?;
+                if let Err(e) = self.copy_to_room(id, posted.message.id).await {
+                    tracing::warn!(
+                        room = %id,
+                        message = %posted.message.id,
+                        error = %e,
+                        "couldn't also post a thread reply to its room"
+                    );
+                }
             }
         }
         Ok(posted)
