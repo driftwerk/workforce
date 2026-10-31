@@ -153,6 +153,11 @@ pub(crate) struct Live {
     /// Its turn was ended from Desk (Esc), which Claude Code reports no
     /// hook for.
     interrupted: bool,
+    /// How many of its turns have ended while it ran here.
+    ends: u64,
+    /// The turn end whose reply the hub's model is reading, while it is:
+    /// its turn stays open on the floor until the model says.
+    reading: Option<u64>,
 }
 
 impl Live {
@@ -255,10 +260,11 @@ pub struct Floor {
     pub plans: Option<Arc<dyn PlanSink>>,
 }
 
-/// How long a model may take to read whether a turn's reply asks the
-/// person something; Claude Code waits on the Stop hook for it, and gives
-/// up on the hook after 10 seconds.
-const READ_WAIT: Duration = Duration::from_secs(4);
+/// How long the hub's model may take to read whether a turn's reply asks
+/// the person something. It reads after the turn has ended (a subscription
+/// CLI's call rarely answers in the seconds a hook can wait), so a yes
+/// moves a done session to asking.
+const READ_LATER: Duration = Duration::from_secs(45);
 
 /// How often sessions' background work is looked at.
 const LOOK_EVERY: Duration = Duration::from_secs(10);
@@ -296,6 +302,8 @@ struct Inner {
     /// Reads a turn's last reply where the rules can't tell whether it
     /// asks: the hub's crew, once its routes are mounted.
     reader: Mutex<Option<Weak<dyn crew::Crew>>>,
+    /// How long it may take ([`READ_LATER`]; shorter in tests).
+    read_wait: Mutex<Duration>,
 }
 
 #[derive(Clone)]
@@ -380,6 +388,21 @@ fn plugin_dirs(theirs: Option<&String>, ours: Option<&String>) -> Option<String>
         }
     }
     (!dirs.is_empty()).then(|| dirs.join(":"))
+}
+
+/// What a turn that ended on `reply` waits on the person for, as far as can
+/// be told at once: what auto mode refused in it, else what the rules read
+/// in the reply; and whether the rules couldn't tell, so the hub's model is
+/// to read it.
+fn asked_at_end(denials: &[Denied], reply: Option<&str>) -> (Option<Asked>, bool) {
+    if let Some(refused) = Asked::refused(denials) {
+        return (Some(refused), false);
+    }
+    match reply.map(asking::read) {
+        Some(Reading::Asks(asked)) => (Some(asked), false),
+        Some(Reading::Unsure) => (None, true),
+        Some(Reading::Done) | None => (None, false),
+    }
 }
 
 /// "1 background task", "2 background tasks".
@@ -514,6 +537,7 @@ impl Desk {
             plans: floor.plans,
             sign_ins: Mutex::new(MacSignIns::default()),
             reader: Mutex::new(None),
+            read_wait: Mutex::new(READ_LATER),
         }));
         tokio::spawn(persist_loop(store, floor.turns, persist_rx));
         tokio::spawn(desk.clone().read_sign_ins());
@@ -660,6 +684,8 @@ impl Desk {
                     denials: Vec::new(),
                     allowed: HashSet::new(),
                     interrupted: false,
+                    ends: 0,
+                    reading: None,
                 },
             );
             tokio::spawn(self.clone().on_exit(id, exit));
@@ -692,6 +718,7 @@ impl Desk {
         view.group = Self::group_ref(&state.layout, &groups::session_item(r.id));
         view.background = live.and_then(|l| l.background.view());
         view.interrupted = live.is_some_and(|l| l.interrupted);
+        view.reading = live.is_some_and(|l| l.reading.is_some());
         view.prompts = live.map_or(0, |l| l.prompts);
         view
     }
@@ -2062,6 +2089,8 @@ impl Desk {
                 denials: Vec::new(),
                 allowed: HashSet::new(),
                 interrupted: false,
+                ends: 0,
+                reading: None,
             },
         );
         tokio::spawn(self.clone().on_exit(r.id, exit));
@@ -2212,6 +2241,7 @@ impl Desk {
                     l.pending = None;
                     l.prompts += 1;
                     l.denials.clear();
+                    l.reading = None;
                     r.asked = None;
                     l.interrupted = false;
                 }
@@ -2222,6 +2252,7 @@ impl Desk {
                 if let Some(l) = l {
                     l.current_tool = Some(tool);
                     l.interrupted = false;
+                    l.reading = None;
                     // It did something after a transient refusal.
                     if inside.is_none() {
                         asking::went_on(&mut l.denials, false);
@@ -2265,6 +2296,7 @@ impl Desk {
                 if let Some(l) = l {
                     l.pending = None;
                     l.denials.clear();
+                    l.reading = None;
                     r.asked = None;
                 }
             }),
@@ -2328,15 +2360,23 @@ impl Desk {
                     .unwrap_or_default(),
                     _ => heard,
                 };
-                let asked = self.asked_of(id, &denials, said.as_deref()).await;
+                let (asked, unsure) = asked_at_end(&denials, said.as_deref());
+                let said_whole = said.clone().filter(|_| unsure);
+                let reader = unsure.then(|| self.reader()).flatten();
                 let running = self.running_now(id).await;
-                self.change(id, |r, l| {
+                let mut read = None;
+                self.change(id, |r, mut l| {
                     // The person spoke while it was read: that answers it.
                     let asked = asked.filter(|_| l.as_ref().is_some_and(|l| l.prompts == prompts));
                     r.state = match asked {
                         Some(_) => SessionState::Asking,
                         None => SessionState::Done,
                     };
+                    if let Some(l) = l.as_deref_mut() {
+                        l.ends += 1;
+                        l.reading = reader.as_ref().map(|_| l.ends);
+                        read = l.reading;
+                    }
                     r.transcript = path.or(r.transcript.take());
                     if let Some(reply) = said {
                         r.last_reply = Some(transcript::clip(&reply));
@@ -2352,6 +2392,9 @@ impl Desk {
                             .looked_if(running, Utc::now());
                     }
                 });
+                if let (Some(reader), Some(end), Some(reply)) = (reader, read, said_whole) {
+                    self.read_later(id, end, reader, reply);
+                }
             }
             Hook::SessionEnd => {
                 if let Some(l) = self.0.state.lock().live.get_mut(&id) {
@@ -2367,30 +2410,48 @@ impl Desk {
         answer()
     }
 
-    /// What a turn that ended on `reply` waits on the person for, if
-    /// anything: what auto mode refused in it; else what the rules read in
-    /// the reply; else, where they can't tell, what the hub's model reads
-    /// in [`READ_WAIT`]. Whatever can't be told is done.
-    async fn asked_of(&self, id: Uuid, denials: &[Denied], reply: Option<&str>) -> Option<Asked> {
-        if let Some(refused) = Asked::refused(denials) {
-            return Some(refused);
-        }
-        let reply = reply?;
-        match asking::read(reply) {
-            Reading::Asks(asked) => Some(asked),
-            Reading::Done => None,
-            Reading::Unsure => {
-                let reader = self.0.reader.lock().as_ref().and_then(Weak::upgrade)?;
-                match tokio::time::timeout(READ_WAIT, reader.asks(reply)).await {
-                    Ok(Some(true)) => Some(Asked::read_by_model(reply)),
-                    Ok(_) => None,
-                    Err(_) => {
-                        tracing::info!(%id, "reading a turn's reply took too long; it is done");
-                        None
-                    }
+    /// The hub's crew, to read replies with, while it is there.
+    fn reader(&self) -> Option<Arc<dyn crew::Crew>> {
+        self.0.reader.lock().as_ref().and_then(Weak::upgrade)
+    }
+
+    /// Has the hub's model read the reply turn end `end` left, which the
+    /// rules couldn't tell about, for up to [`READ_LATER`]. A yes moves the
+    /// session to asking, if it is still done on that turn (nobody has
+    /// spoken, and it hasn't worked or ended again since); anything else
+    /// leaves it done.
+    fn read_later(&self, id: Uuid, end: u64, reader: Arc<dyn crew::Crew>, reply: String) {
+        let desk = self.clone();
+        let wait = *self.0.read_wait.lock();
+        tokio::spawn(async move {
+            let yes = match tokio::time::timeout(wait, reader.asks(&reply)).await {
+                Ok(said) => said == Some(true),
+                Err(_) => {
+                    tracing::info!(%id, "reading a turn's reply took too long; it is done");
+                    false
                 }
+            };
+            drop(reader);
+            let still = desk
+                .0
+                .state
+                .lock()
+                .live
+                .get(&id)
+                .is_some_and(|l| l.reading == Some(end));
+            if !still {
+                return;
             }
-        }
+            desk.change(id, |r, l| {
+                if let Some(l) = l {
+                    l.reading = None;
+                }
+                if yes && r.state == SessionState::Done {
+                    r.state = SessionState::Asking;
+                    r.asked = Some(Asked::read_by_model(&reply));
+                }
+            });
+        });
     }
 
     async fn await_permission(&self, id: Uuid, tool: String, detail: String) -> Value {
@@ -2515,10 +2576,16 @@ impl Desk {
             };
             // Its turn's end, read as Claude Code's is: whether it asks.
             let prompts = self.0.state.lock().live.get(&id).map(|l| l.prompts);
-            let asked = match &tail {
-                Some((_, t)) => self.asked_of(id, &[], t.said.as_deref()).await,
-                None => None,
+            let (asked, unsure) = match &tail {
+                Some((_, t)) => asked_at_end(&[], t.said.as_deref()),
+                None => (None, false),
             };
+            let reader = unsure.then(|| self.reader()).flatten();
+            let said_whole = tail
+                .as_ref()
+                .and_then(|(_, t)| t.said.clone())
+                .filter(|_| reader.is_some());
+            let mut read = None;
             self.change(id, |r, mut l| {
                 r.cli_session_id.get_or_insert_with(|| thread.clone());
                 match event {
@@ -2560,6 +2627,11 @@ impl Desk {
                                 Some(_) => SessionState::Asking,
                                 None => SessionState::Done,
                             };
+                            if let Some(l) = l.as_deref_mut() {
+                                l.ends += 1;
+                                l.reading = reader.as_ref().map(|_| l.ends);
+                                read = l.reading;
+                            }
                         }
                         if let Some((path, t)) = tail {
                             r.transcript = Some(path.to_string_lossy().into_owned());
@@ -2590,6 +2662,9 @@ impl Desk {
                     CodexEvent::Child(_) => {}
                 }
             });
+            if let (Some(reader), Some(end), Some(reply)) = (reader, read, said_whole) {
+                self.read_later(id, end, reader, reply);
+            }
         }
     }
 
@@ -4425,99 +4500,168 @@ mod tests {
         .await;
     }
 
+    /// Ends a turn on `reply`, after a prompt.
+    async fn turn_ending(d: &Desk, id: Uuid, prompt: &str, reply: &str) {
+        post(
+            d,
+            id,
+            json!({"hook_event_name": "UserPromptSubmit", "prompt": prompt}),
+        )
+        .await;
+        post(
+            d,
+            id,
+            json!({"hook_event_name": "Stop", "last_assistant_message": reply}),
+        )
+        .await;
+    }
+
+    /// Waits for `id` to be in `state`, up to two seconds.
+    async fn comes_to(d: &Desk, id: Uuid, state: SessionState) -> bool {
+        for _ in 0..200 {
+            if d.view(id).unwrap().state == state {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        false
+    }
+
+    const UNSURE: &str = "Pushed the branch. Let me know if you want me to open the PR.";
+
     #[tokio::test]
-    async fn what_the_rules_cant_tell_a_model_reads_and_one_too_slow_leaves_it_done() {
+    async fn a_slow_yes_from_the_model_moves_a_done_turn_to_asking() {
         with_test_pool(build_pool, |pool| async move {
             let dir = tempfile::tempdir().unwrap();
-            let d = desk(pool, dir.path()).await;
-            let unsure = "Pushed the branch. Let me know if you want me to open the PR.";
+            let (d, logged) = logged_desk(pool, dir.path(), fake_cli(dir.path())).await;
             let s = new_session(&d, dir.path()).await;
-
-            post(
-                &d,
-                s.id,
-                json!({"hook_event_name": "Stop", "last_assistant_message": unsure}),
-            )
-            .await;
+            turn_ending(&d, s.id, "push it", UNSURE).await;
             assert_eq!(
                 d.view(s.id).unwrap().state,
                 SessionState::Done,
                 "no model: done"
             );
+            assert!(
+                logs(&logged, |ops| last_question(ops)
+                    == Some((Outcome::Finished, None)))
+                .await
+            );
 
             let yes: Arc<dyn crew::Crew> = Arc::new(Reader {
                 asks: Some(true),
-                wait: Duration::ZERO,
+                wait: Duration::from_millis(300),
             });
             d.read_replies_with(&yes);
-            post(
-                &d,
-                s.id,
-                json!({"hook_event_name": "UserPromptSubmit", "prompt": "push it"}),
-            )
-            .await;
-            post(
-                &d,
-                s.id,
-                json!({"hook_event_name": "Stop", "last_assistant_message": unsure}),
-            )
-            .await;
-            let v = d.view(s.id).unwrap();
-            assert_eq!(v.state, SessionState::Asking);
-            assert_eq!(v.asked.unwrap().why, "asked you something");
-
-            let slow: Arc<dyn crew::Crew> = Arc::new(Reader {
-                asks: Some(true),
-                wait: READ_WAIT * 3,
-            });
-            d.read_replies_with(&slow);
-            post(
-                &d,
-                s.id,
-                json!({"hook_event_name": "UserPromptSubmit", "prompt": "again"}),
-            )
-            .await;
             let at = std::time::Instant::now();
+            turn_ending(&d, s.id, "push it again", UNSURE).await;
+            assert!(
+                at.elapsed() < Duration::from_millis(300),
+                "the hook doesn't wait for the model"
+            );
+            let v = d.view(s.id).unwrap();
+            assert_eq!(
+                (v.state, v.asked),
+                (SessionState::Done, None),
+                "done until the model says"
+            );
+            assert!(comes_to(&d, s.id, SessionState::Asking).await);
+            assert_eq!(
+                d.view(s.id).unwrap().asked.unwrap().why,
+                "asked you something"
+            );
+            assert!(
+                logs(&logged, |ops| matches!(
+                    last_question(ops),
+                    Some((Outcome::Asked, Some(_)))
+                ))
+                .await,
+                "its turn ends asking, as a turn the rules read so"
+            );
+            let ends = logged
+                .0
+                .lock()
+                .iter()
+                .filter(|op| matches!(op, TurnOp::End { .. }))
+                .count();
+            assert_eq!(ends, 2, "the turn the model read ended once");
+            assert!(
+                recorded(&d, 4)
+                    .await
+                    .iter()
+                    .any(|(k, text, _)| *k == crew::Kind::Question && text.starts_with("asked")),
+                "asked, so the overseer hears of it"
+            );
+            drop(yes);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_yes_after_the_person_spoke_changes_nothing_and_a_timeout_leaves_it_done() {
+        with_test_pool(build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let (d, logged) = logged_desk(pool, dir.path(), fake_cli(dir.path())).await;
+            let s = new_session(&d, dir.path()).await;
+            let yes: Arc<dyn crew::Crew> = Arc::new(Reader {
+                asks: Some(true),
+                wait: Duration::from_millis(300),
+            });
+            d.read_replies_with(&yes);
+            turn_ending(&d, s.id, "push it", UNSURE).await;
             post(
                 &d,
                 s.id,
-                json!({"hook_event_name": "Stop", "last_assistant_message": unsure}),
+                json!({"hook_event_name": "UserPromptSubmit", "prompt": "open the PR"}),
             )
             .await;
-            assert!(
-                at.elapsed() < READ_WAIT + Duration::from_secs(2),
-                "held the hook {:?}",
-                at.elapsed()
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            let v = d.view(s.id).unwrap();
+            assert_eq!(
+                (v.state, v.asked),
+                (SessionState::Working, None),
+                "the person answered first"
             );
+            assert!(
+                logs(&logged, |ops| last_question(ops)
+                    == Some((Outcome::Finished, None)))
+                .await,
+                "the turn they spoke after finished"
+            );
+
+            *d.0.read_wait.lock() = Duration::from_millis(100);
+            post(
+                &d,
+                s.id,
+                json!({"hook_event_name": "Stop", "last_assistant_message": UNSURE}),
+            )
+            .await;
+            tokio::time::sleep(Duration::from_millis(600)).await;
             assert_eq!(
                 d.view(s.id).unwrap().state,
                 SessionState::Done,
                 "timed out: done, never a false need"
             );
+            let ends = logged
+                .0
+                .lock()
+                .iter()
+                .filter(|op| matches!(op, TurnOp::End { .. }))
+                .count();
+            assert_eq!(ends, 2, "its turn ended as finished once the model gave up");
 
             let unsaid: Arc<dyn crew::Crew> = Arc::new(Reader {
                 asks: None,
                 wait: Duration::ZERO,
             });
             d.read_replies_with(&unsaid);
-            post(
-                &d,
-                s.id,
-                json!({"hook_event_name": "UserPromptSubmit", "prompt": "again"}),
-            )
-            .await;
-            post(
-                &d,
-                s.id,
-                json!({"hook_event_name": "Stop", "last_assistant_message": unsure}),
-            )
-            .await;
+            turn_ending(&d, s.id, "again", UNSURE).await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
             assert_eq!(
                 d.view(s.id).unwrap().state,
                 SessionState::Done,
                 "the model couldn't say: done"
             );
-            drop((yes, slow, unsaid));
+            drop((yes, unsaid));
         })
         .await;
     }

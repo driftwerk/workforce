@@ -632,6 +632,8 @@ impl Desk {
             denials: Vec::new(),
             allowed: HashSet::new(),
             interrupted: false,
+            ends: 0,
+            reading: None,
         };
         if existing.is_some_and(|id| self.0.state.lock().live.contains_key(&id)) {
             // Already running here: nothing to take back.
@@ -744,6 +746,8 @@ impl Desk {
                             denials: Vec::new(),
                             allowed: HashSet::new(),
                             interrupted: false,
+                            ends: 0,
+                            reading: None,
                         },
                     );
                     self.publish(id);

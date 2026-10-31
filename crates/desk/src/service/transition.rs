@@ -108,13 +108,15 @@ impl<'a> Transition<'a> {
             }
             S::Done if now.interrupted && !before.interrupted => Some(Self::Halted),
             S::Done if before.state == S::Asking => Some(Self::Dismissed),
+            // Its turn ends when the hub's model has read its reply.
+            S::Done if now.reading => None,
             S::Asking if before.state != S::Asking => now.asked.as_ref().map(|asked| Self::Asked {
                 reply: now.last_reply.as_deref().unwrap_or_default(),
                 asked,
             }),
             S::Done
                 if now.waiting_on() == 0
-                    && (before.state != S::Done || before.waiting_on() > 0) =>
+                    && (before.state != S::Done || before.waiting_on() > 0 || before.reading) =>
             {
                 Some(Self::Finished {
                     reply: now.last_reply.as_deref().unwrap_or_default(),

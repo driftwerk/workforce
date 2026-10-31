@@ -146,6 +146,10 @@ pub struct SessionView {
     /// Its turn was ended from Desk, not finished.
     #[serde(skip)]
     pub interrupted: bool,
+    /// The hub's model is reading whether its turn's reply asks the person:
+    /// the turn isn't over until it says.
+    #[serde(skip)]
+    pub reading: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -222,6 +226,7 @@ impl SessionView {
             asked: r.asked.clone().filter(|_| r.state == SessionState::Asking),
             prompts: 0,
             interrupted: false,
+            reading: false,
             created_at: r.created_at,
             updated_at: r.updated_at,
         }
