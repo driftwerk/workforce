@@ -21,8 +21,9 @@ pub const PURPOSE_EVERY: chrono::Duration = chrono::Duration::minutes(30);
 pub const SUMMARY_EVERY: chrono::Duration = chrono::Duration::minutes(10);
 /// How long a subject that finished stays in what's happening.
 pub const DONE_FOR: chrono::Duration = chrono::Duration::hours(2);
-/// How long a model is given to write a gist or the paragraph.
-pub const WRITE_WITHIN: Duration = Duration::from_secs(3);
+/// How long a model is given to write a gist or the paragraph: off any
+/// turn's path, long enough for a plan's command-line round.
+pub const WRITE_WITHIN: Duration = Duration::from_secs(45);
 
 /// A subject's gist as kept.
 #[derive(Debug, Clone, PartialEq)]
@@ -186,6 +187,8 @@ pub const GIST_SYSTEM: &str = concat!(
     "PURPOSE: <one sentence>\n",
     "CHANGED: <yes or no: whether the purpose changed direction from the previous one>\n",
     "NOW: <one to three sentences>\n\n",
+    "The two notes below show the form only, about made-up work: never reuse their words or ",
+    "facts.\n\n",
     "A good note:\n",
     "PURPOSE: Getting Desk ready for its first release to the team, so co-workers on Mac and ",
     "Windows can use it.\n",
@@ -291,6 +294,8 @@ pub const SUMMARY_SYSTEM: &str = concat!(
     "branch names, or tool and command names. If one matters, say what it is in plain words.\n",
     "- No lists, headings, quotes or markdown, and no history.\n",
     "- Don't mention what waits on the person: that is shown on its own.\n\n",
+    "The two paragraphs below show the form only, about made-up work: never reuse their ",
+    "words or facts.\n",
     "A good paragraph: The release shipped this morning; the Rooms and unread work is under ",
     "way, and the Windows support is being moved onto the released code.\n",
     "A bad paragraph, never write one like it: auth-fix running Bash; merged PR #12; scout ",
@@ -680,6 +685,7 @@ mod tests {
             "two to four in all",
             "A good note:\nPURPOSE: Getting Desk ready for its first release",
             "A bad note, never write one like it:",
+            "show the form only, about made-up work: never reuse their words or facts",
             "NOW: Merged PR #5 and rebased #2–#4",
         ] {
             assert!(GIST_SYSTEM.contains(rule), "the gist prompt says {rule:?}");

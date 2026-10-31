@@ -568,6 +568,19 @@ fn engine_name(engine: Engine) -> &'static str {
     }
 }
 
+/// The model a gist is written on for an agent on `tier_key`: its
+/// provider's cheap tier (a Claude plan's is Haiku), never the agent's main
+/// or compaction model; none where the provider maps no cheap one.
+fn floor_model(
+    tiers: &workforce_agent::llm::tiers::TierRegistry,
+    tier_key: &str,
+) -> Option<String> {
+    let (routing, model) = tiers.resolve_routed_model("cheap", tier_key);
+    (model != "cheap").then(|| {
+        workforce_agent::llm::tiers::TierRegistry::format_routed(routing.as_deref(), model)
+    })
+}
+
 /// The hub's own model: an agent's turn's gist on that agent's cheap
 /// model, a Desk session's and the floor's paragraph on the hub's default
 /// agent's, each call costed to the person it is for.
@@ -597,7 +610,8 @@ impl Model for HubModel {
         }
         .or_else(|| registry.default_agent())
         .ok_or_else(|| eyre::eyre!("no agent to write with"))?;
-        let model = crate::turn_loop::cheap_model(&service);
+        let model = floor_model(&service.tier_registry(), &service.tier_key.read())
+            .unwrap_or_else(|| crate::turn_loop::cheap_model(&service));
         let (response, served) =
             with_served_log(with_reasoning_suppressed(service.llm.create_message(
                 Some(system),
@@ -890,17 +904,17 @@ mod tests {
         settle().await;
         assert!(memory.written.lock()[1].by_model);
 
-        let slow = Scripted::new(NOTE, Duration::from_secs(10));
-        let (gists, memory, _) = self::gists(slow);
+        let stuck = Scripted::new(NOTE, Duration::from_secs(60));
+        let (gists, memory, _) = self::gists(stuck);
         gists.saw(&TurnOp::Begin {
             turn: Box::new(started(id)),
             by_person: true,
         });
-        tokio::time::sleep(Duration::from_secs(4)).await;
+        tokio::time::sleep(Duration::from_secs(46)).await;
         settle().await;
         assert!(
             !memory.written.lock()[0].by_model,
-            "past three seconds it is said plainly"
+            "past its time it is said plainly"
         );
         memory
             .gists
@@ -910,13 +924,51 @@ mod tests {
         let before = memory.written.lock().len();
         tokio::time::sleep(Duration::from_secs(3 * 60)).await;
         gists.saw(&step(id, "● Bash cargo test"));
-        tokio::time::sleep(Duration::from_secs(11)).await;
+        tokio::time::sleep(Duration::from_secs(61)).await;
         settle().await;
         assert_eq!(
             memory.written.lock().len(),
             before,
             "a step the model can't say leaves its gist of this turn as it was"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_plan_still_writes_the_gist_and_the_turn_never_waits_for_it() {
+        let model = Scripted::new(NOTE, Duration::from_secs(10));
+        let (gists, memory, _) = gists(Arc::clone(&model));
+        let id = Uuid::new_v4();
+        let before = Instant::now();
+        gists.saw(&TurnOp::Begin {
+            turn: Box::new(started(id)),
+            by_person: true,
+        });
+        for i in 0..2 * BACKLOG {
+            gists.saw(&step(id, &format!("● step {i}")));
+        }
+        assert_eq!(
+            Instant::now(),
+            before,
+            "what the turn hands over is taken without waiting, however slow the model"
+        );
+        settle().await;
+        assert!(
+            memory.written.lock().is_empty(),
+            "the model is still writing"
+        );
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        settle().await;
+        let written = memory.written.lock()[0].clone();
+        assert!(written.by_model, "ten seconds is within its time");
+        assert_eq!(written.now, "Testing the build.");
+    }
+
+    #[test]
+    fn a_gist_is_written_on_the_providers_cheap_tier() {
+        let tiers = workforce_agent::llm::tiers::TierRegistry::from_defaults().unwrap();
+        assert_eq!(floor_model(&tiers, "claude-code").as_deref(), Some("haiku"));
+        assert_eq!(floor_model(&tiers, "codex").as_deref(), Some("gpt-6-luna"));
+        assert_eq!(floor_model(&tiers, "no-such-provider"), None);
     }
 
     #[tokio::test(start_paused = true)]
