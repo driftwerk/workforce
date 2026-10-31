@@ -1612,6 +1612,42 @@ pub(super) mod tests {
             assert_eq!(tool.runs(), [entry("figma")]);
         }
 
+        /// A turn's prompt is shown, and answered, only while its agent is
+        /// one the caller may reach: once its policy shuts them out, the
+        /// prompt reads as one on an agent that isn't there.
+        #[tokio::test]
+        async fn a_turn_prompt_is_neither_shown_nor_answered_once_its_agent_shuts_the_caller_out() {
+            let tool = Arc::new(RecordingTool::default());
+            let model = ScriptedModel::new([serde_json::json!({})], entry("figma"), 4);
+            let (ctx, opened, _data) = open_gated_chat(model, &tool).await;
+            let prompts = approvals(&opened);
+            assert_eq!(prompts.len(), 1, "{}", opened.output);
+            let request_id = prompts[0]["request_id"].as_str().unwrap();
+            ctx.gateway.access_gate.upsert(
+                "agent".into(),
+                workforce_common::settings::AgentAccessConfig {
+                    mode: workforce_common::settings::AccessMode::Allowlist,
+                    allow: vec!["someone-else".into()],
+                    ..Default::default()
+                },
+            );
+            let status = approval_tools(Arc::clone(&ctx))
+                .into_iter()
+                .find(|tool| tool.name() == "approval.status")
+                .expect("approval.status");
+            let shown = as_member(status.execute(serde_json::json!({
+                "request_id": request_id,
+                "turn_id": turn_id(&opened),
+            })))
+            .await
+            .expect("approval.status answers");
+            let error = shown.error.unwrap_or_default();
+            assert!(error.starts_with("unknown agent \"agent\""), "{error}");
+            let decided = decide(&ctx, turn_id(&opened), request_id, "allow_once").await;
+            assert!(!decided.success, "{}", decided.output);
+            assert!(tool.runs().is_empty());
+        }
+
         #[tokio::test]
         async fn denying_a_turn_prompt_completes_the_turn_without_a_new_prompt() {
             let tool = Arc::new(RecordingTool::default());

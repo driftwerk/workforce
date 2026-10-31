@@ -96,6 +96,9 @@ impl RemoteMcpState {
     }
 }
 
+/// The hub tool kept off every remote surface, see [`curated_surface`].
+const HIDDEN_AGENT_SHOW: &str = "agent.show";
+
 /// `tools` and `extra` filtered by `patterns` as `build_mcp_registry` reads
 /// them, with `["*"]` meaning everything.
 pub fn curated_surface(
@@ -105,6 +108,10 @@ pub fn curated_surface(
 ) -> ToolRegistry {
     let everything = patterns.iter().any(|p| p == EXPOSE_ALL);
     let surface = build_mcp_registry(tools, if everything { &[] } else { patterns });
+    // The hub's `agent.show` shows any agent, its prompt among it, whatever
+    // the agent's access policy: remotely, `agent.list` names the agents a
+    // caller may reach, and nothing names the others.
+    surface.unregister(HIDDEN_AGENT_SHOW);
     extra
         .iter()
         .filter(|tool| everything || matches_any(tool.name(), patterns))
@@ -410,6 +417,25 @@ mod tests {
         );
         let without = curated_surface(&source, &extra, &["workflow".to_string()]);
         assert_eq!(without.names(), ["workflow"]);
+    }
+
+    /// `agent.show` would name an agent the caller may not reach, with its
+    /// prompt: it is on no remote surface, even one that exposes everything.
+    #[test]
+    fn the_hub_s_agent_show_is_never_on_the_remote_surface() {
+        let source = registry(&["agent.show", "agent.create", "workflow"]);
+        let extra: Vec<Arc<dyn Tool>> = vec![Arc::new(Named("agent.list"))];
+        for patterns in [
+            RemoteMcpConfig::default().tools_allow,
+            vec!["*".to_string()],
+            vec!["agent.show".to_string()],
+        ] {
+            let names = curated_surface(&source, &extra, &patterns).names();
+            assert!(
+                !names.iter().any(|n| n == "agent.show"),
+                "{patterns:?}: {names:?}"
+            );
+        }
     }
 
     #[test]
