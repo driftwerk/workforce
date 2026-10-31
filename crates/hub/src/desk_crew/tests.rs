@@ -887,12 +887,18 @@ async fn summaries_are_scheduled_as_set_and_run_in_the_dm() {
     .await;
 }
 
+/// The overseer's messages to the crew's agents keep to the loop guard. Its
+/// own `crew.nudge` and `crew.assign` only suggest them now (see the test
+/// below), so they are sent here as an action done as the overseer.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_overseer_messages_the_crew_within_the_loop_guard() {
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
         let (scout, _s) = agent(dir.path(), "scout", "Nearly done.").await;
-        let dm = scout.sessions.get_or_create(DESK_CHANNEL, PERSON, "scout").unwrap();
+        let dm = scout
+            .sessions
+            .get_or_create(DESK_CHANNEL, PERSON, "scout")
+            .unwrap();
         scout.sessions.save(&dm).unwrap();
         let (overseer, crew, d, _llm) = overseeing(
             dir.path(),
@@ -902,20 +908,25 @@ async fn the_overseer_messages_the_crew_within_the_loop_guard() {
             &[Arc::clone(&scout)],
         )
         .await;
-        eventually("the overseer's tools", async || overseer.tools.has("crew.nudge").then_some(())).await;
-        let tool = overseer.tools.get("crew.nudge").unwrap();
-        let nudge = || {
-            tool.execute(
-                json!({"agent_id": "scout", "message": "How is the staging check going?", "reason": "Quiet for 40 min."}),
-            )
+        eventually("the overseer's tools", async || {
+            overseer.tools.has("crew.nudge").then_some(())
+        })
+        .await;
+        let action = super::actions::Action::Nudge {
+            to: super::actions::Target::Agent("scout".into()),
+            message: "How is the staging check going?".into(),
         };
+        let nudge = || crew.perform(&action, crew.by_overseer("Quiet for 40 min.").unwrap());
         let mut frames = crew.state.broadcast_tx.subscribe();
-        let done = nudge().await.unwrap();
-        assert_eq!(done.output["done"], "asked scout", "{done:?}");
+        let done = nudge().await;
+        assert_eq!(done.as_deref(), Ok("asked scout"), "{done:?}");
         // The overseer's message goes out live to Scout's open DM before the
         // answer starts, and is the overseer's in the DM's history.
         let (said, before) = relayed_frame(&mut frames, &dm.id).await;
-        assert!(!before.iter().any(|t| t.starts_with("stream")), "{before:?}");
+        assert!(
+            !before.iter().any(|t| t.starts_with("stream")),
+            "{before:?}"
+        );
         assert_eq!(said.content, "desk asks: How is the staging check going?");
         assert_eq!(
             said.author,
@@ -927,10 +938,15 @@ async fn the_overseer_messages_the_crew_within_the_loop_guard() {
         assert_eq!(item["text"], said.content);
         let started = eventually("Scout's turn", async || {
             let page = d.activity(Filter::All, None, 20).await.unwrap();
-            page.events.into_iter().find(|e| e.kind == Kind::Started && e.actor.id == "scout")
+            page.events
+                .into_iter()
+                .find(|e| e.kind == Kind::Started && e.actor.id == "scout")
         })
         .await;
-        assert_eq!(started.text, "started “desk asks: How is the staging check going?”");
+        assert_eq!(
+            started.text,
+            "started “desk asks: How is the staging check going?”"
+        );
         assert_eq!(started.hop, 1, "a hand-off from the overseer");
         let asked = d
             .activity(Filter::Manager, None, 5)
@@ -944,13 +960,83 @@ async fn the_overseer_messages_the_crew_within_the_loop_guard() {
         assert_eq!(asked.reason.as_deref(), Some("Quiet for 40 min."));
 
         for _ in 1..super::TURN_BUDGET {
-            assert!(nudge().await.unwrap().success);
+            assert!(nudge().await.is_ok());
         }
-        let held = nudge().await.unwrap();
-        assert!(!held.success);
-        assert!(format!("{:?}", held).contains("Loop guard"), "{held:?}");
+        let held = nudge().await.unwrap_err();
+        assert!(held.contains("Loop guard"), "{held}");
         crew.person_spoke();
-        assert!(nudge().await.unwrap().success, "the person spoke again");
+        assert!(nudge().await.is_ok(), "the person spoke again");
+    })
+    .await;
+}
+
+/// At level act the overseer hands an agent nothing on its own, however it
+/// words it: an agent acts on a message under its own permissions, which can
+/// reach outside Desk unasked. What it sends a session Desk started goes at
+/// once, as what the session does next still waits on the person.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_overseer_only_suggests_what_it_would_have_an_agent_do() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (scout, _s) = agent(dir.path(), "scout", "On it.").await;
+        let dm = scout.sessions.get_or_create(DESK_CHANNEL, PERSON, "scout").unwrap();
+        scout.sessions.save(&dm).unwrap();
+        let (overseer, _crew, d, _llm) = overseeing(
+            dir.path(),
+            pool,
+            "ok",
+            "[oversight]\nenabled = true\nlevel = \"act\"\nact = { hand_out_work = true, read_only_approvals = true }\n",
+            &[Arc::clone(&scout)],
+        )
+        .await;
+        eventually("the overseer's tools", async || overseer.tools.has("crew.assign").then_some(())).await;
+        let tool = |name: &str| overseer.tools.get(name).unwrap();
+        for message in [
+            "Share it in #general",
+            "Upload the report",
+            "Open a PR for the date picker",
+            "Notify the customer it is fixed",
+            "Submit it",
+            "How is the staging check going?",
+        ] {
+            let nudged = tool("crew.nudge")
+                .execute(json!({"agent_id": "scout", "message": message, "reason": "Quiet."}))
+                .await
+                .unwrap();
+            assert!(nudged.output["suggested"].is_string(), "{message}: {nudged:?}");
+            let assigned = tool("crew.assign")
+                .execute(json!({"agent_id": "scout", "task": message, "reason": "Next up."}))
+                .await
+                .unwrap();
+            assert!(assigned.output["suggested"].is_string(), "{message}: {assigned:?}");
+        }
+        assert!(
+            !d.activity(Filter::All, None, 50)
+                .await
+                .unwrap()
+                .events
+                .iter()
+                .any(|e| e.actor.id == "scout"),
+            "scout was sent nothing"
+        );
+
+        let s = new_session(&d, dir.path(), "web").await;
+        let nudged = tool("crew.nudge")
+            .execute(json!({"session_id": s.id.to_string(), "message": "Open a PR for the date picker", "reason": "Done."}))
+            .await
+            .unwrap();
+        assert_eq!(nudged.output["done"], "asked web", "{nudged:?}");
+        // What that leads to waits on the person: running it is no read.
+        let url = hook_url(dir.path(), s.id).await;
+        let _asked = tokio::spawn(async move {
+            hook(&url, json!({"hook_event_name": "PermissionRequest", "tool_name": "Bash", "tool_input": {"command": "gh pr create --fill"}})).await
+        });
+        let pending = eventually("the request", async || d.view(s.id).unwrap().pending).await;
+        let approved = tool("crew.approve")
+            .execute(json!({"session_id": s.id.to_string(), "approval_id": pending.id.to_string(), "reason": "As asked."}))
+            .await
+            .unwrap();
+        assert!(approved.output["suggested"].is_string(), "{approved:?}");
     })
     .await;
 }

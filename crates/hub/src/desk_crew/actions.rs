@@ -2,16 +2,17 @@
 //! doing it — for the overseer's tools, and for the person accepting one of
 //! its suggestions.
 
-use std::path::{Component, Path};
+use std::path::Path;
 
 use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
 use workforce_common::oversight::{Level, Oversight};
 use workforce_desk::crew::{self, By, Kind, Party};
-use workforce_desk::model::{Engine, NewSession, PendingApproval};
+use workforce_desk::model::{Engine, NewSession, Origin};
 use workforce_desk::Speaker;
 
+use super::read_only::read_only_in;
 use super::CrewHub;
 
 /// Who a nudge goes to.
@@ -155,8 +156,10 @@ impl Action {
         Self::parse(tool, &action["input"])
     }
 
-    /// Whether doing it could push code, delete something, or reach outside
-    /// Desk: never done without the person, whatever the settings.
+    /// Whether what it says reads as pushing code, deleting something, or
+    /// reaching outside Desk. A hint only, which can make an action the
+    /// person's call but never lets one run: what may run is decided by
+    /// [`CrewHub::contained`].
     fn outward(&self) -> bool {
         let said = match self {
             Self::Nudge { message, .. } => message.as_str(),
@@ -180,90 +183,13 @@ const OUTWARD: &[&str] = &[
     "message", "pay", "purchase", "buy",
 ];
 
-/// Whether `text` asks for something that pushes, deletes or sends.
+/// Whether `text` names something that pushes, deletes or sends. Words
+/// can't say all that a message leads to, so this only ever narrows what
+/// runs.
 pub(crate) fn outward(text: &str) -> bool {
     text.to_lowercase()
         .split(|c: char| !c.is_alphanumeric())
         .any(|w| OUTWARD.contains(&w))
-}
-
-const READ_TOOLS: &[&str] = &["Read", "Grep", "Glob", "LS", "NotebookRead"];
-const READ_COMMANDS: &[&str] = &[
-    "ls", "cat", "head", "tail", "wc", "grep", "rg", "find", "pwd", "tree", "file", "stat", "du",
-    "diff", "git",
-];
-const READ_GIT: &[&str] = &[
-    "status",
-    "diff",
-    "log",
-    "show",
-    "branch",
-    "rev-parse",
-    "ls-files",
-    "blame",
-];
-
-/// Whether `path` (as a request names it) stays inside `cwd`.
-fn inside(cwd: &Path, path: &str) -> bool {
-    let p = Path::new(path);
-    if p.components().any(|c| c == Component::ParentDir) || path.starts_with('~') {
-        return false;
-    }
-    !p.is_absolute() || p.starts_with(cwd)
-}
-
-/// Whether a session's request only reads, and only inside its folder.
-/// Anything Desk can't see all of (a clipped command) is not.
-pub(crate) fn read_only_in(cwd: &str, pending: &PendingApproval) -> bool {
-    let cwd = Path::new(cwd);
-    let detail = pending.detail.trim();
-    if detail.ends_with('…') {
-        return false;
-    }
-    let name = pending.tool.split('(').next().unwrap_or_default().trim();
-    if READ_TOOLS.contains(&name) {
-        return detail.split_whitespace().all(|w| inside(cwd, w));
-    }
-    if name != "Bash" || detail.is_empty() {
-        return false;
-    }
-    if detail
-        .chars()
-        .any(|c| matches!(c, ';' | '&' | '|' | '>' | '<' | '`' | '$' | '\n' | '\\'))
-    {
-        return false;
-    }
-    let words: Vec<&str> = detail.split_whitespace().collect();
-    let Some(program) = words.first() else {
-        return false;
-    };
-    if !READ_COMMANDS.contains(program) {
-        return false;
-    }
-    if *program == "git" && !words.get(1).is_some_and(|sub| READ_GIT.contains(sub)) {
-        return false;
-    }
-    if *program == "find"
-        && words.iter().any(|w| {
-            matches!(
-                *w,
-                "-delete"
-                    | "-exec"
-                    | "-execdir"
-                    | "-ok"
-                    | "-okdir"
-                    | "-fprint"
-                    | "-fprintf"
-                    | "-fls"
-            )
-        })
-    {
-        return false;
-    }
-    words[1..]
-        .iter()
-        .filter(|w| !w.starts_with('-'))
-        .all(|w| inside(cwd, w.trim_matches(|c| c == '"' || c == '\'')))
 }
 
 /// Whether the overseer may do it now, or should suggest it instead.
@@ -283,6 +209,11 @@ impl CrewHub {
             Level::Watch => return Gate::Refuse,
             Level::Suggest => return Gate::Suggest("you suggest; the person decides"),
             Level::Act => {}
+        }
+        if !self.contained(action) {
+            return Gate::Suggest(
+                "what it leads to wouldn't wait on the person: an agent acts on a message under its own permissions, and a session Desk didn't start may not ask before it acts",
+            );
         }
         if action.outward() {
             return Gate::Suggest(
@@ -318,6 +249,46 @@ impl CrewHub {
             Gate::Run
         } else {
             Gate::Suggest("the person hasn't let you do that without asking")
+        }
+    }
+
+    /// Whether everything `action` leads to still waits on a gate the
+    /// overseer can't pass, so that it may be done without the person. An
+    /// allowlist, matched in full, of what is known to be held:
+    ///
+    /// - What a session Desk started does next waits on its approvals, which
+    ///   reach the person in Desk or in its terminal, and which the overseer
+    ///   may answer only for reads inside the session's folder.
+    /// - Approving is judged by what it allows ([`read_only_in`]); denying,
+    ///   stopping and interrupting reach nothing.
+    ///
+    /// An agent's turn runs under its own permissions, which can let it act
+    /// outside Desk (open a pull request, file an issue, call an API)
+    /// without asking, and a session started in another terminal may have
+    /// been started not to ask: messages to either are the person's call.
+    pub(crate) fn contained(&self, action: &Action) -> bool {
+        let started_here = |session: &Uuid| {
+            self.desk
+                .view(*session)
+                .is_ok_and(|v| v.origin == Origin::Desk)
+        };
+        match action {
+            Action::Nudge {
+                to: Target::Session(s),
+                ..
+            }
+            | Action::Resume { session: s, .. }
+            | Action::Restart { session: s, .. } => started_here(s),
+            Action::StartSession { .. } => true,
+            Action::Approve { .. }
+            | Action::Deny { .. }
+            | Action::Stop { .. }
+            | Action::Interrupt { .. } => true,
+            Action::Nudge {
+                to: Target::Agent(_),
+                ..
+            }
+            | Action::Assign { .. } => false,
         }
     }
 
@@ -657,48 +628,6 @@ impl CrewHub {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn pending(tool: &str, detail: &str) -> PendingApproval {
-        PendingApproval {
-            id: Uuid::new_v4(),
-            tool: tool.into(),
-            detail: detail.into(),
-            since: chrono::Utc::now(),
-            answerable: true,
-        }
-    }
-
-    #[test]
-    fn only_reads_inside_the_folder_are_read_only() {
-        let cwd = "/Users/k/dev/web";
-        for (tool, detail) in [
-            (
-                "Read(/Users/k/dev/web/src/a.ts)",
-                "/Users/k/dev/web/src/a.ts",
-            ),
-            ("Bash(git status)", "git status"),
-            ("Bash(ls src)", "ls src"),
-            ("Bash(rg TODO src)", "rg TODO src"),
-            ("Grep(TODO)", "TODO"),
-        ] {
-            assert!(read_only_in(cwd, &pending(tool, detail)), "{detail}");
-        }
-        for (tool, detail) in [
-            ("Read(/etc/passwd)", "/etc/passwd"),
-            ("Read(../secrets)", "../secrets"),
-            ("Bash(git push)", "git push"),
-            ("Bash(rm -rf target)", "rm -rf target"),
-            ("Bash(cat a | sh)", "cat a | sh"),
-            ("Bash(ls > out)", "ls > out"),
-            ("Bash(find . -delete)", "find . -delete"),
-            ("Bash(cat ~/.ssh/id)", "cat ~/.ssh/id"),
-            ("Bash(npm install)", "npm install"),
-            ("Edit(src/a.ts)", "src/a.ts"),
-            ("Bash(ls aaaa…)", "ls aaaa…"),
-        ] {
-            assert!(!read_only_in(cwd, &pending(tool, detail)), "{detail}");
-        }
-    }
 
     #[test]
     fn pushing_deleting_and_sending_are_outward() {
