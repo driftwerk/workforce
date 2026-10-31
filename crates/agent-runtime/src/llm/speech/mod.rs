@@ -18,6 +18,7 @@
 
 pub mod elevenlabs;
 pub mod fish;
+pub mod markup;
 pub mod openai;
 pub mod piper;
 pub mod soniox;
@@ -27,6 +28,8 @@ use std::path::Path;
 use eyre::{bail, Result};
 use workforce_common::secret::KeySlot;
 use workforce_common::settings::LlmSpeechConfig;
+
+pub use markup::{Markup, MarkupStream};
 
 /// One synthesis request. Model/format are provider construction-time choices
 /// from config; `speed` is per-clip (the model chooses), and `voice` is the
@@ -60,6 +63,45 @@ pub trait SpeechProvider: Send + Sync {
     /// Canonical provider id ("builtin", "fish_audio", "elevenlabs", "openai",
     /// "soniox").
     fn provider_id(&self) -> &'static str;
+    /// The voice directions it performs.
+    fn markup(&self) -> Markup {
+        Markup::Plain
+    }
+}
+
+/// A provider that is only ever handed directions it performs: the rest are
+/// removed (or rewritten as it takes them) before it sees the text, so no
+/// voice reads `(pensive)` aloud.
+struct Marked(Box<dyn SpeechProvider>);
+
+#[async_trait::async_trait]
+impl SpeechProvider for Marked {
+    async fn synthesize(&self, req: &SpeechRequest<'_>) -> Result<SpeechOutput> {
+        let text = self.0.markup().apply(req.text);
+        let text = text.trim();
+        if text.is_empty() {
+            bail!("nothing is left to speak once the voice directions are removed");
+        }
+        self.0
+            .synthesize(&SpeechRequest {
+                text,
+                speed: req.speed,
+                voice: req.voice.clone(),
+            })
+            .await
+    }
+
+    fn voice_label(&self) -> String {
+        self.0.voice_label()
+    }
+
+    fn provider_id(&self) -> &'static str {
+        self.0.provider_id()
+    }
+
+    fn markup(&self) -> Markup {
+        self.0.markup()
+    }
 }
 
 /// Normalize the configured provider id, tolerating the spelling variants the
@@ -94,8 +136,17 @@ pub fn extension_for_speech(media_type: &str) -> &'static str {
 /// the provider it names reads its key on every request; a missing one still
 /// registers the tool, whose call then fails saying so rather than sending an
 /// empty bearer token. `enabled = false` is an error so callers treat it as
-/// "no provider", mirroring image.
+/// "no provider", mirroring image. Whatever it builds checks voice
+/// directions before it speaks (see [`markup`]).
 pub fn provider_from_config(
+    cfg: &LlmSpeechConfig,
+    speech_home: &Path,
+    key: impl Fn(&'static str) -> KeySlot,
+) -> Result<Box<dyn SpeechProvider>> {
+    Ok(Box::new(Marked(provider(cfg, speech_home, key)?)))
+}
+
+fn provider(
     cfg: &LlmSpeechConfig,
     speech_home: &Path,
     key: impl Fn(&'static str) -> KeySlot,
@@ -160,6 +211,73 @@ mod tests {
         assert_eq!(canonical_speech_provider("Soniox"), Some("soniox"));
         assert_eq!(canonical_speech_provider("kokoro"), None);
         assert_eq!(canonical_speech_provider("system"), None);
+    }
+
+    /// Says back what it was handed, as its bytes.
+    struct Echo(Markup);
+
+    #[async_trait::async_trait]
+    impl SpeechProvider for Echo {
+        async fn synthesize(&self, req: &SpeechRequest<'_>) -> Result<SpeechOutput> {
+            Ok(SpeechOutput {
+                bytes: req.text.as_bytes().to_vec(),
+                media_type: "audio/mpeg",
+            })
+        }
+        fn voice_label(&self) -> String {
+            "echo".into()
+        }
+        fn provider_id(&self) -> &'static str {
+            "echo"
+        }
+        fn markup(&self) -> Markup {
+            self.0
+        }
+    }
+
+    async fn heard(markup: Markup, text: &str) -> Result<String> {
+        let out = Marked(Box::new(Echo(markup)))
+            .synthesize(&SpeechRequest {
+                text,
+                ..Default::default()
+            })
+            .await?;
+        Ok(String::from_utf8(out.bytes).unwrap())
+    }
+
+    #[tokio::test]
+    async fn a_voice_is_handed_only_the_directions_it_performs() {
+        let said = "(excited) Found it. (pensive) Hmm.";
+        assert_eq!(
+            heard(Markup::FishS1, said).await.unwrap(),
+            "(excited) Found it. Hmm."
+        );
+        assert_eq!(heard(Markup::Plain, said).await.unwrap(), "Found it. Hmm.");
+        assert!(heard(Markup::Plain, " (pensive) ").await.is_err());
+    }
+
+    #[test]
+    fn built_providers_know_their_markup() {
+        let mut fish = cfg("fish_audio");
+        assert_eq!(
+            provider_from_config(&fish, Path::new("/tmp"), no_key)
+                .unwrap()
+                .markup(),
+            Markup::FishS1
+        );
+        fish.model = Some("s2-pro".into());
+        assert_eq!(
+            provider_from_config(&fish, Path::new("/tmp"), no_key)
+                .unwrap()
+                .markup(),
+            Markup::FishS2
+        );
+        assert_eq!(
+            provider_from_config(&cfg("openai"), Path::new("/tmp"), no_key)
+                .unwrap()
+                .markup(),
+            Markup::Plain
+        );
     }
 
     #[test]

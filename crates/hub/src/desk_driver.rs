@@ -134,7 +134,10 @@ impl Speech for VaultKeys {
         };
         let speaker = provider_from_config(&config, Path::new(""), |_| KeySlot::fixed(&*key))
             .map_err(|e| SpeakError::Invalid(e.to_string()))?;
-        let text = normalize_for_tts(&request.text);
+        // The voice directions it performs are kept; the speaker would drop
+        // the rest anyway, but a text that was nothing else is the caller's
+        // mistake, not the provider's.
+        let text = speaker.markup().apply(&normalize_for_tts(&request.text));
         let text = text.trim();
         if text.is_empty() {
             return Err(SpeakError::Invalid(
