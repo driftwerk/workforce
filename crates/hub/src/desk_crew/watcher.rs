@@ -151,6 +151,13 @@ fn tracked(o: &Oversight, subject: &Party) -> bool {
     }
 }
 
+/// `report`, the words of sessions and agents as the crew relays them,
+/// fenced as data for the overseer to read: they choose their own words, so
+/// nothing in them is the person's instruction.
+fn reported(report: &str, from: &str) -> String {
+    workforce_agent::security::external_content::wrap_external_content(report, from).wrapped_content
+}
+
 fn who(p: &Party) -> String {
     match (p.kind, p.engine) {
         (PartyKind::Session, Some(engine)) => format!(
@@ -455,7 +462,7 @@ impl CrewHub {
              Tell the person briefly, in plain words, what needs them and what you did or suggest — what needs \
              them first. Name sessions and agents as above. {}",
             o.level.as_str(),
-            lines.join("\n"),
+            reported(&lines.join("\n"), "the crew's sessions and agents"),
             Self::level_hint(o.level),
         );
         let hop = triggers.iter().map(|t| t.hop).max().unwrap_or(0);
@@ -475,8 +482,9 @@ impl CrewHub {
         };
         let prompt = format!(
             "{CHECK_IN} Your own scheduled check-in, going through your check-in list (HEARTBEAT.md), found \
-             something that needs the person:\n\n{found}\n\nTell them briefly, in plain words, what needs them \
-             and what you suggest."
+             something that needs the person:\n\n{}\n\nTell them briefly, in plain words, what needs them \
+             and what you suggest.",
+            reported(found, "your scheduled check-in")
         );
         self.check_in(service, &owner, "heartbeat", &prompt, 0, None)
             .await
@@ -561,7 +569,11 @@ impl CrewHub {
              Use crew.overview for where everyone is now. Start with one short paragraph that says what \
              matters most (it is shown on its own as the brief), then anything else worth knowing. {}",
             if evening { "today" } else { "since yesterday evening" },
-            if lines.is_empty() { "- nothing recorded".to_string() } else { lines.join("\n") },
+            if lines.is_empty() {
+                "- nothing recorded".to_string()
+            } else {
+                reported(&lines.join("\n"), "the crew's activity")
+            },
             Self::level_hint(o.level),
         );
         let reply = self

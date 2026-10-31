@@ -34,7 +34,18 @@ const PERSON: &str = "person-1";
 
 /// An agent `id` whose model answers everything with `reply`.
 async fn agent(dir: &Path, id: &str, reply: &str) -> (Arc<AgentService>, wiremock::MockServer) {
-    use wiremock::matchers::{body_partial_json, method, path};
+    agent_calling(dir, id, reply, &[]).await
+}
+
+/// [`agent`], whose model answers the first request carrying each
+/// `(marker, tool)`'s marker with a call to that tool.
+async fn agent_calling(
+    dir: &Path,
+    id: &str,
+    reply: &str,
+    calls: &[(&str, &str)],
+) -> (Arc<AgentService>, wiremock::MockServer) {
+    use wiremock::matchers::{body_partial_json, body_string_contains, method, path};
     use wiremock::{Mock, ResponseTemplate};
     let (config, server) = crate::serve::testing::mock_llm_config(&dir.join(id), |c| {
         c.agents = vec![AgentConfig {
@@ -44,6 +55,32 @@ async fn agent(dir: &Path, id: &str, reply: &str) -> (Arc<AgentService>, wiremoc
     })
     .await;
     let chunk = |body: Value| format!("data: {body}\n\n");
+    for (marker, tool) in calls {
+        let call = [
+            chunk(json!({"id": "c0", "object": "chat.completion.chunk", "model": "mock",
+                "choices": [{"index": 0, "delta": {"role": "assistant", "tool_calls": [{"index": 0,
+                    "id": "call_1", "type": "function", "function": {"name": tool, "arguments": "{}"}}]},
+                    "finish_reason": null}]})),
+            chunk(json!({"id": "c0", "object": "chat.completion.chunk", "model": "mock",
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}})),
+            "data: [DONE]\n\n".to_string(),
+        ]
+        .concat();
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(body_string_contains(*marker))
+            .and(body_partial_json(json!({"stream": true})))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(call),
+            )
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+    }
     let sse = [
         chunk(json!({"id": "c1", "object": "chat.completion.chunk", "model": "mock",
             "choices": [{"index": 0, "delta": {"role": "assistant", "content": reply}, "finish_reason": null}]})),
@@ -61,7 +98,7 @@ async fn agent(dir: &Path, id: &str, reply: &str) -> (Arc<AgentService>, wiremoc
                 .insert_header("content-type", "text/event-stream")
                 .set_body_string(sse),
         )
-        .with_priority(1)
+        .with_priority(2)
         .mount(&server)
         .await;
     Mock::given(method("POST"))
@@ -71,7 +108,7 @@ async fn agent(dir: &Path, id: &str, reply: &str) -> (Arc<AgentService>, wiremoc
             "choices": [{"index": 0, "message": {"role": "assistant", "content": reply}, "finish_reason": "stop"}],
             "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
         })))
-        .with_priority(2)
+        .with_priority(3)
         .mount(&server)
         .await;
     let service = AgentService::from_config(config, None).await.unwrap();
@@ -531,6 +568,30 @@ async fn a_blocked_session_wakes_the_overseer_and_its_answer_offers_the_approval
         .await;
         assert!(answer.prompt.starts_with(super::CHECK_IN));
         assert!(answer.prompt.contains("has waited on you"), "{}", answer.prompt);
+        // What the session reported is fenced as data, not read as the
+        // person's words, and the check-in itself is no message of theirs.
+        let at = |needle: &str| answer.prompt.find(needle).unwrap_or_else(|| panic!("{needle} in {}", answer.prompt));
+        assert!(
+            at("<<<EXTERNAL_UNTRUSTED_CONTENT_") < at("Run npm install")
+                && at("Run npm install") < at("<<</EXTERNAL_UNTRUSTED_CONTENT_"),
+            "{}",
+            answer.prompt
+        );
+        assert!(
+            at("<<</EXTERNAL_UNTRUSTED_CONTENT_") < at("Tell the person"),
+            "the overseer's own instructions stay outside the fence: {}",
+            answer.prompt
+        );
+        let dm_now = overseer.sessions.get(&dm.id).unwrap().unwrap();
+        let check_in = dm_now
+            .messages
+            .iter()
+            .find(|m| m.content.starts_with(super::CHECK_IN))
+            .expect("the check-in is in the DM");
+        assert_eq!(
+            check_in.trust_level,
+            Some(workforce_common::trust::TrustLevel::Paired)
+        );
         let mut offered = None;
         while let Ok(frame) = frames.try_recv() {
             if frame.session_id == dm.id && frame.msg_type == "stream_end" {
@@ -951,6 +1012,149 @@ async fn the_overseer_messages_the_crew_within_the_loop_guard() {
         assert!(format!("{:?}", held).contains("Loop guard"), "{held:?}");
         crew.person_spoke();
         assert!(nudge().await.unwrap().success, "the person spoke again");
+    })
+    .await;
+}
+
+/// Reports where the turn it runs in answers to: its Desk conversation and
+/// the platform a messaging call that names none goes to.
+struct Where(Arc<parking_lot::Mutex<Option<(Option<String>, String)>>>);
+
+#[async_trait::async_trait]
+impl workforce_agent::tools::Tool for Where {
+    fn name(&self) -> &str {
+        "probe.where"
+    }
+    fn description(&self) -> &str {
+        "where the turn answers to"
+    }
+    fn input_schema(&self) -> Value {
+        json!({"type": "object"})
+    }
+    async fn execute(&self, _input: Value) -> eyre::Result<workforce_agent::tools::ToolResult> {
+        let desk = workforce_agent::runner::current_desk()
+            .map(|d| format!("{:?} for {}", d.target.place, d.owner));
+        let platform =
+            workforce_skills::adapters::messaging_routing::platform_arg(&json!({})).to_string();
+        *self.0.lock() = Some((desk, platform));
+        Ok(workforce_agent::tools::ToolResult::success(json!({}), 0))
+    }
+}
+
+/// A post to Slack's #general, counting the times it runs.
+struct PostsToSlack(Arc<std::sync::atomic::AtomicUsize>);
+
+#[async_trait::async_trait]
+impl workforce_agent::tools::Tool for PostsToSlack {
+    fn name(&self) -> &str {
+        "probe.post"
+    }
+    fn description(&self) -> &str {
+        "posts to #general"
+    }
+    fn input_schema(&self) -> Value {
+        json!({"type": "object"})
+    }
+    fn surface_effect(&self, _input: &Value) -> Option<workforce_agent::tools::SurfaceEffect> {
+        Some(workforce_agent::tools::SurfaceEffect::Writes {
+            platform: "slack".into(),
+            destination: "#general".into(),
+        })
+    }
+    async fn execute(&self, _input: Value) -> eyre::Result<workforce_agent::tools::ToolResult> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(workforce_agent::tools::ToolResult::success(
+            json!({"posted": true}),
+            0,
+        ))
+    }
+}
+
+/// A turn the crew runs in an agent's DM answers to that DM, though no one
+/// typed it: messaging goes to Desk by default, a post anywhere else waits
+/// on the person (and so is refused, as no one is there to answer), and the
+/// prompt is read at paired trust.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_crew_turn_answers_to_its_dm_and_does_not_post_elsewhere_unasked() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (scout, _s) = agent_calling(
+            dir.path(),
+            "scout",
+            "Done.",
+            &[("WHERE-ARE-YOU", "probe_where"), ("SHARE-IT", "probe_post")],
+        )
+        .await;
+        let seen = Arc::new(parking_lot::Mutex::new(None));
+        let posts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        scout.tools.register(Arc::new(Where(Arc::clone(&seen))));
+        scout
+            .tools
+            .register(Arc::new(PostsToSlack(Arc::clone(&posts))));
+        let (_overseer, crew, _d, _llm) = overseeing(
+            dir.path(),
+            pool,
+            "ok",
+            "[oversight]\nenabled = true\nlevel = \"act\"\n",
+            &[Arc::clone(&scout)],
+        )
+        .await;
+
+        let (sid, _) = crew
+            .run_dm_turn(&scout, PERSON, "desk asks: WHERE-ARE-YOU?", 1, None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            seen.lock().clone(),
+            Some((Some(format!("Dm for {PERSON}")), "desk".to_string())),
+            "the turn answers to the DM"
+        );
+        crew.run_dm_turn(
+            &scout,
+            PERSON,
+            "desk asks: SHARE-IT in #general",
+            1,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            posts.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a post outside Desk is not made unasked"
+        );
+        let dm = scout.sessions.get(&sid).unwrap().unwrap();
+        let post = dm
+            .messages
+            .iter()
+            .filter_map(|m| m.tool_data.as_ref())
+            .find(|t| t["name"] == "probe.post")
+            .expect("the model's post call is in the DM");
+        assert_eq!(post["success"], false, "{post}");
+        assert!(
+            post.to_string().contains("did not run"),
+            "the post reached the gate and was refused for want of an answer: {post}"
+        );
+        let prompts: Vec<_> = dm
+            .messages
+            .iter()
+            .filter(|m| m.role == workforce_common::session::MessageRole::User)
+            .map(|m| (m.content.as_str(), m.trust_level))
+            .collect();
+        assert_eq!(
+            prompts,
+            [
+                (
+                    "desk asks: WHERE-ARE-YOU?",
+                    Some(workforce_common::trust::TrustLevel::Paired)
+                ),
+                (
+                    "desk asks: SHARE-IT in #general",
+                    Some(workforce_common::trust::TrustLevel::Paired)
+                ),
+            ]
+        );
     })
     .await;
 }
