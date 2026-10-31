@@ -21,6 +21,10 @@ pub use tool::{ChartTool, CHART_TOOL_NAME};
 #[cfg(test)]
 mod goldens;
 
+/// The media type of a chart's validated spec staged as a file: what a reader
+/// that draws charts itself is shown in place of the picture.
+pub const CHART_SPEC_MEDIA_TYPE: &str = "application/vnd.workforce.chart+json";
+
 /// What a chart is delivered as: PNG is the one chat and email show inline,
 /// SVG the vector original.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

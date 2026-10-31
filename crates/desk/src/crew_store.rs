@@ -46,6 +46,12 @@ fn event(row: &Row) -> Result<Event> {
         approval_id: row.try_get("approval_id")?,
         hop: row.try_get("hop")?,
         detail: row.try_get("detail")?,
+        place: row
+            .try_get::<_, Option<Value>>("place")?
+            .map(serde_json::from_value)
+            .transpose()
+            .context("reading an event's place")?,
+        message: row.try_get("message")?,
     })
 }
 
@@ -81,8 +87,8 @@ impl DeskStore {
         client
             .execute(
                 "INSERT INTO activity (id, at, kind, actor, subject, text, reason, suggestion_id, \
-                 approval_id, hop, detail) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) \
-                 ON CONFLICT (id) DO NOTHING",
+                 approval_id, hop, detail, place, message) \
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) ON CONFLICT (id) DO NOTHING",
                 &[
                     &e.id,
                     &e.at,
@@ -95,6 +101,8 @@ impl DeskStore {
                     &e.approval_id,
                     &e.hop,
                     &e.detail,
+                    &e.place.as_ref().map(serde_json::to_value).transpose()?,
+                    &e.message,
                 ],
             )
             .await
@@ -415,6 +423,52 @@ mod tests {
     use crate::crew::{Party, Suggestion};
     use crate::store::build_pool;
     use workforce_postgres::test_support::with_test_pool;
+
+    /// An event's place in Desk and its message are kept; one written
+    /// before Activity kept them reads with neither.
+    #[tokio::test]
+    async fn an_events_place_and_message_round_trip() {
+        with_test_pool(build_pool, |pool| async move {
+            DeskStore::migrate(&pool).await.unwrap();
+            let store = DeskStore::from_pool(pool);
+            let allan = Party::agent("dw/allan", "allan");
+            let room = uuid::Uuid::new_v4();
+            let message = uuid::Uuid::new_v4();
+            let placed = Event::new(Kind::Replied, allan.clone(), Some(allan.clone()), "replied")
+                .at_place(
+                    Some(crate::floor::Place::Room { room, thread: None }),
+                    Some(message),
+                );
+            let plain = Event::new(Kind::Finished, allan.clone(), Some(allan), "finished");
+            store.add_event(&placed).await.unwrap();
+            store.add_event(&plain).await.unwrap();
+            let client = store.pool().get().await.unwrap();
+            let read = |id: String| {
+                let client = &client;
+                async move {
+                    event(
+                        &client
+                            .query_one("SELECT * FROM activity WHERE id = $1", &[&id])
+                            .await
+                            .unwrap(),
+                    )
+                    .unwrap()
+                }
+            };
+            let back = read(placed.id.clone()).await;
+            assert_eq!(
+                (back.place, back.message),
+                (placed.place.clone(), Some(message))
+            );
+            let back = read(plain.id.clone()).await;
+            assert_eq!((back.place, back.message), (None, None));
+            assert_eq!(
+                serde_json::to_value(&placed).unwrap()["place"],
+                serde_json::json!({ "kind": "room", "room": room, "thread": null })
+            );
+        })
+        .await;
+    }
 
     #[tokio::test]
     async fn activity_pages_newest_first_by_filter_and_cursor() {

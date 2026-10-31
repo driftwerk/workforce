@@ -27,7 +27,7 @@ env:
   POSTGRESQL_VERSION: "=17.9.0"
   # The vellev node the `vellev-node` job tests against, by digest so a
   # re-pushed tag can't change what is tested.
-  VELLEV_IMAGE: kingsleyh/vellev:sha-1b8c17d78a897bd2cd5b06cce59e91def319e805@sha256:94b9bb8932d6c055b03dd4cf94f70578e8693672695d11e0fc4e2eae3171724d
+  VELLEV_IMAGE: kingsleyh/vellev:sha-ada7a63ef132d18049d3c7342f6076a249a69979@sha256:e2e1d95ba0b733737a03ac6ebf47119e6356e8b6f49eb03fe1aa2de5a72ca080
   # The Weaviate the `vellev-node` job runs the memory shadow's end-to-end
   # test against, as Weaviate's release archive for linux-amd64, pinned by
   # the sha256 Weaviate publishes beside it. Moving it is these two lines.

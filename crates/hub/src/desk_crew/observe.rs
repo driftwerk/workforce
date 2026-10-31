@@ -15,7 +15,7 @@ use workforce_agent::runner::ProgressEvent;
 use workforce_common::channels::DESK_CHANNEL;
 use workforce_common::session::SessionAttachment;
 use workforce_desk::crew::{self, Event, Kind, Party};
-use workforce_desk::floor::Outcome;
+use workforce_desk::floor::{Outcome, Place};
 
 use super::{CrewHub, Running, CHECK_IN};
 use crate::desk_floor::Origin;
@@ -36,6 +36,10 @@ pub(super) struct Track {
     /// The overseer's own turn in its DM: not activity, but what its
     /// answer mentions is kept.
     manager_session: Option<String>,
+    /// The room the turn was asked in (or answers to), and the message it
+    /// answers, stamped on each of its events.
+    place: Option<Place>,
+    message: Option<uuid::Uuid>,
     done: bool,
 }
 
@@ -53,6 +57,7 @@ impl CrewHub {
         user: &str,
         message: &str,
         session_id: Option<&str>,
+        (place, asked): (Option<Place>, Option<uuid::Uuid>),
     ) -> Option<Track> {
         // Housekeeping: heartbeat checks and monitors report to their own
         // channels; they are not the crew's work.
@@ -80,6 +85,8 @@ impl CrewHub {
                 task: None,
                 hop,
                 manager_session: Some(sid),
+                place,
+                message: asked,
                 done: false,
             });
         }
@@ -110,7 +117,8 @@ impl CrewHub {
                 },
             )
             .hop(hop)
-            .detail(json!({ "task": task })),
+            .detail(json!({ "task": task }))
+            .at_place(place.clone(), asked),
         );
         Some(Track {
             crew: self.me(),
@@ -119,6 +127,8 @@ impl CrewHub {
             task,
             hop,
             manager_session: None,
+            place,
+            message: asked,
             done: false,
         })
     }
@@ -159,7 +169,8 @@ impl Track {
             Some(self.party.clone()),
             text,
         )
-        .detail(json!({ "task": self.task, "answer": answer, "question": question }));
+        .detail(json!({ "task": self.task, "answer": answer, "question": question }))
+        .at_place(self.place.clone(), self.message);
         crew.desk.note(event.hop(self.hop));
     }
 }
@@ -182,8 +193,18 @@ impl Drop for Track {
                 Some(self.party.clone()),
                 "was stopped",
             )
-            .hop(self.hop),
+            .hop(self.hop)
+            .at_place(self.place.clone(), self.message),
         );
+    }
+}
+
+/// The room a turn was asked in, or that an unattended run answers to,
+/// and the room message a live turn answers; neither off a room.
+fn room_of(origin: &Origin<'_>) -> (Option<Place>, Option<uuid::Uuid>) {
+    match crate::desk_floor::place_of(origin) {
+        place @ Place::Room { .. } => (Some(place), origin.desk.and_then(|d| d.turn.message)),
+        _ => (None, None),
     }
 }
 
@@ -204,6 +225,7 @@ impl Watch {
                     origin.user,
                     origin.message,
                     session_id,
+                    room_of(origin),
                 )
             }),
             floor: None,

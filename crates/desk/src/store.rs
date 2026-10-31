@@ -104,13 +104,16 @@ impl DeskStore {
             .execute(
                 "INSERT INTO sessions (id, engine, name, goal, cwd, branch, origin, state, \
                  approvals, cli_session_id, transcript, last_prompt, last_reply, external_pid, \
-                 restore_offer, created_at, updated_at, terminal_id, display_name, asked) \
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20) \
+                 restore_offer, created_at, updated_at, terminal_id, display_name, asked, \
+                 state_at) \
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20, \
+                 $17) \
                  ON CONFLICT (id) DO UPDATE SET engine = $2, name = $3, goal = $4, cwd = $5, \
                  branch = $6, origin = $7, state = $8, approvals = $9, cli_session_id = $10, \
                  transcript = $11, last_prompt = $12, last_reply = $13, external_pid = $14, \
                  restore_offer = $15, updated_at = $17, terminal_id = $18, display_name = $19, \
-                 asked = $20",
+                 asked = $20, \
+                 state_at = CASE WHEN sessions.state = $8 THEN sessions.state_at ELSE $17 END",
                 &[
                     &r.id,
                     &r.engine.as_str(),

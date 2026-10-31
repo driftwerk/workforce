@@ -66,4 +66,16 @@ describe("golden chart validation", () => {
       expect(roundTrip(validateChart(input))).toStrictEqual(golden!.result);
     });
   }
+
+  // The hub stages a chart's spec as it normalised it — exactly the golden
+  // `spec` — and a reader draws that file through this validator again, so a
+  // normalised spec must come back unchanged.
+  for (const [name, golden] of charts) {
+    const result = golden.result as { ok: boolean; spec?: unknown };
+    if (!result.ok) continue;
+    it(`${name}'s normalised spec, as the hub stages it, validates unchanged`, () => {
+      const staged = JSON.parse(JSON.stringify(result.spec));
+      expect(JSON.parse(JSON.stringify(validateChart(staged)))).toStrictEqual({ ok: true, spec: result.spec });
+    });
+  }
 });

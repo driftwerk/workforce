@@ -66,6 +66,10 @@ export interface ChartSeries {
   data: number[] | [number, number][];
 }
 
+/** The media type of a chart's validated spec delivered as a file: a host
+ *  that receives one draws it with {@link validateChart} and the chart block. */
+export const CHART_SPEC_MEDIA_TYPE = "application/vnd.workforce.chart+json";
+
 export interface ChartSpec {
   kind: ChartKind;
   title?: string;

@@ -244,7 +244,7 @@ pub(crate) fn carry_turn(
     session: &mut Session,
     invocations: &[workforce_agent::runner::ToolInvocation],
 ) {
-    let files = crate::desk_attachments::delivered_in(&session.agent_id, invocations);
+    let files = crate::desk_attachments::delivered_in(session, invocations);
     let steps = steps_of(invocations);
     if files.is_empty() && steps.is_empty() {
         return;

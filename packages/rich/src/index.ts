@@ -1,6 +1,7 @@
 export { RichBlock } from "./RichBlock";
 export { RichMarkdown } from "./RichMarkdown";
 export { RichHostProvider, TableExpired, type RichHost } from "./host";
+export { chartTable } from "./chartTable";
 export { refreshRichTheme } from "./theme";
 export {
   ALL_RICH_FEATURES,
@@ -14,6 +15,7 @@ export {
 } from "./fence";
 export { tableQueryString, type TableFilterParam, type TableParams } from "./tableParams";
 export {
+  CHART_SPEC_MEDIA_TYPE,
   MAX_COLUMNS,
   MAX_EDGES,
   MAX_FORM_FIELDS,

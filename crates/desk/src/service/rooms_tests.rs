@@ -176,3 +176,120 @@ async fn a_page_around_a_message_in_another_place_is_refused() {
     })
     .await;
 }
+
+#[tokio::test]
+async fn a_thread_message_is_copied_to_the_room_once_outside_the_loop_guard() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let room = release(&d).await;
+        let ask = d
+            .post(room.id, said(YOU, "what's left?"))
+            .await
+            .unwrap()
+            .message;
+        let steps = vec![Step::of("web.search", true, 840)];
+        let answer = d
+            .post(
+                room.id,
+                NewMessage {
+                    thread_id: Some(ask.id),
+                    in_reply_to: Some(ask.id),
+                    steps: steps.clone(),
+                    ..said("dw/allan", "@scout the migration is the last thing")
+                },
+            )
+            .await
+            .unwrap()
+            .message;
+        let (_, mut events) = d.subscribe();
+        let copy = d.copy_to_room(room.id, answer.id).await.unwrap();
+        assert!(copy.created);
+        let m = &copy.message;
+        assert_eq!(
+            (
+                m.thread_id,
+                m.copy_of,
+                m.hop,
+                &m.author,
+                &m.content,
+                &m.steps
+            ),
+            (
+                None,
+                Some(answer.id),
+                MAX_HOPS,
+                &answer.author,
+                &answer.content,
+                &steps
+            )
+        );
+        assert_eq!(
+            (m.source.as_ref(), m.delivery, m.in_reply_to),
+            (None, None, None)
+        );
+        assert!(!m.reading.unwrap().for_you, "a copy is only new");
+        assert!(matches!(
+            events.try_recv(),
+            Ok(DeskEvent::RoomMessage { .. })
+        ));
+        let again = d.copy_to_room(room.id, answer.id).await.unwrap();
+        assert_eq!((again.created, again.message.id), (false, m.id));
+        assert!(events.try_recv().is_err(), "kept once, told once");
+        assert!(
+            d.room_message(room.id, answer.id)
+                .await
+                .unwrap()
+                .reading
+                .unwrap()
+                .posted_to_room
+        );
+        assert_eq!(
+            d.0.store.agent_run(room.id, None).await.unwrap(),
+            0,
+            "no agent's turn"
+        );
+        assert!(matches!(
+            d.copy_to_room(room.id, ask.id).await,
+            Err(DeskError::Invalid(_))
+        ));
+        assert!(matches!(
+            d.copy_to_room(room.id, m.id).await,
+            Err(DeskError::Invalid(_))
+        ));
+
+        let reply = d
+            .post(
+                room.id,
+                NewMessage {
+                    thread_id: Some(ask.id),
+                    also_in_room: true,
+                    ..said(YOU, "Let's ship it Friday.")
+                },
+            )
+            .await
+            .unwrap()
+            .message;
+        let main = d
+            .room_messages(room.id, Page::newest(None, 50))
+            .await
+            .unwrap();
+        assert_eq!(
+            main.last().unwrap().copy_of,
+            Some(reply.id),
+            "also in the room"
+        );
+        assert!(matches!(
+            d.post(
+                room.id,
+                NewMessage {
+                    also_in_room: true,
+                    ..said(YOU, "in the timeline")
+                }
+            )
+            .await,
+            Err(DeskError::Invalid(_))
+        ));
+    })
+    .await;
+}

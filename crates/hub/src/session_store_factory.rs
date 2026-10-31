@@ -52,6 +52,15 @@ pub async fn build_session_store(
     }
 }
 
+/// Whether this hub's sessions are in Postgres, beside which a person's
+/// Desk read points are kept.
+pub(crate) fn keeps_desk_reads() -> bool {
+    #[cfg(feature = "postgres")]
+    return SESSIONS_POOL.initialized();
+    #[cfg(not(feature = "postgres"))]
+    false
+}
+
 #[cfg(feature = "postgres")]
 async fn build_postgres_session_store(
     config: &WorkforceConfig,

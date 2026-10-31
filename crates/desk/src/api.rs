@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use axum::body::Bytes;
-use axum::extract::rejection::JsonRejection;
+use axum::extract::rejection::{JsonRejection, QueryRejection};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
@@ -23,7 +23,7 @@ use crate::model::{Decision, NewSession, SessionPatch};
 use crate::providers::{self, AccountError, Accounts, Catalog, ConnectBody, Entry};
 use crate::pty::Frame;
 use crate::realtime::{Engine, Realtime, RealtimeError};
-use crate::rooms::{Bound, NewMessage, NewRoom, Page, RoomPatch};
+use crate::rooms::{Bound, NewMessage, NewRoom, Page, RoomPatch, SearchFilters};
 use crate::service::{Desk, DeskError, Import, Layout, NewTerminal, TerminalPatch};
 use crate::speech::{Speak, SpeakError, Speech};
 
@@ -630,6 +630,26 @@ async fn room_message(
         .into_response()
 }
 
+async fn copy_message(
+    State(s): S,
+    h: HeaderMap,
+    Query(q): Q,
+    Path((id, message)): Path<(Uuid, Uuid)>,
+) -> Response {
+    guarded!(s, h, q);
+    s.desk
+        .copy_to_room(id, message)
+        .await
+        .map(|posted| {
+            let status = match posted.created {
+                true => StatusCode::CREATED,
+                false => StatusCode::OK,
+            };
+            (status, Json(posted.message))
+        })
+        .into_response()
+}
+
 async fn post_message(
     State(s): S,
     h: HeaderMap,
@@ -651,16 +671,18 @@ async fn post_message(
         .into_response()
 }
 
-#[derive(Deserialize)]
-struct SearchQuery {
-    token: Option<String>,
-    q: String,
-}
-
-async fn search(State(s): S, h: HeaderMap, Query(sq): Query<SearchQuery>) -> Response {
-    let q = TokenQuery { token: sq.token };
+async fn search(
+    State(s): S,
+    h: HeaderMap,
+    Query(q): Q,
+    filters: Result<Query<SearchFilters>, QueryRejection>,
+) -> Response {
     guarded!(s, h, q);
-    s.desk.search(&sq.q).await.map(Json).into_response()
+    let Query(filters) = match filters {
+        Ok(filters) => filters,
+        Err(e) => return DeskError::Invalid(e.body_text()).into_response(),
+    };
+    s.desk.search(&filters).await.map(Json).into_response()
 }
 
 /// The sessions' and rooms' routes and the events socket alone.
@@ -717,6 +739,10 @@ pub fn sessions_router(desk: Desk, auth: Arc<dyn Authorize>) -> Router {
             get(room_messages).post(post_message),
         )
         .route("/api/desk/rooms/{id}/messages/{message}", get(room_message))
+        .route(
+            "/api/desk/rooms/{id}/messages/{message}/copy",
+            post(copy_message),
+        )
         .with_state(Arc::new(ApiState { desk, auth }))
 }
 
@@ -1370,6 +1396,40 @@ mod tests {
                 (status, &v["error"]),
                 (400, &json!("ask for one of before, after or around"))
             );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn search_takes_its_filters_from_the_query_and_a_thread_message_is_copied_once() {
+        with_test_pool(build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let store = DeskStore::with_pool(pool).await.unwrap();
+            let desk = crate::Desk::start(store, options(dir.path()), Default::default(), tokio_util::sync::CancellationToken::new())
+                .await
+                .unwrap();
+            let app = super::sessions_router(desk, allow_all());
+            let (_, room) = call(&app, "POST", "/api/desk/rooms", Some(json!({ "name": "Atlas launch" }))).await;
+            let id = room["id"].as_str().unwrap();
+            let uri = format!("/api/desk/rooms/{id}/messages");
+            let (_, ask) = call(&app, "POST", &uri, Some(json!({ "author": "you", "content": "is the launch page ready?" }))).await;
+            let (_, reply) = call(&app, "POST", &uri, Some(json!({ "author": "you", "content": "the launch page is ready", "threadId": ask["id"] }))).await;
+            let (status, hits) = call(&app, "GET", &format!("/api/desk/rooms/search?q=launch&room={id}&from=you&inThread=true"), None).await;
+            assert_eq!((status, hits.as_array().unwrap().len()), (200, 1));
+            assert_eq!(hits[0]["message"]["id"], reply["id"]);
+            assert!(hits[0]["snippet"].as_str().unwrap().contains('\u{E000}'));
+            let (_, none) = call(&app, "GET", "/api/desk/rooms/search?q=", None).await;
+            assert_eq!(none, json!([]));
+            let (status, _) = call(&app, "GET", "/api/desk/rooms/search?has=nothing", None).await;
+            assert_eq!(status, 400);
+
+            let copy = format!("{uri}/{}/copy", reply["id"].as_str().unwrap());
+            let (status, first) = call(&app, "POST", &copy, None).await;
+            assert_eq!((status, &first["copyOf"]), (201, &reply["id"]));
+            let (status, again) = call(&app, "POST", &copy, None).await;
+            assert_eq!((status, &again["id"]), (200, &first["id"]));
+            let (status, _) = call(&app, "POST", &format!("{uri}/{}/copy", ask["id"].as_str().unwrap()), None).await;
+            assert_eq!(status, 400, "it is in the room already");
         })
         .await;
     }

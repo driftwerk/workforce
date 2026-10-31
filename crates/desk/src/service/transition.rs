@@ -192,6 +192,19 @@ impl<'a> Transition<'a> {
     }
 }
 
+/// Whether `t` is worth the person's attention, what a session is unread
+/// by: its turn ended by itself, or it stopped unexpectedly, or it stopped
+/// or closed with nobody's action in Desk behind it (`acted`). Not their
+/// prompt, a turn ended or an ask dismissed from Desk, its work, nor what it
+/// asks (a need, which the floor counts).
+pub(super) fn wants_attention(t: &Transition<'_>, acted: bool) -> bool {
+    match t {
+        Transition::Finished { .. } | Transition::Interrupted => true,
+        Transition::Stopped { .. } => !acted,
+        _ => false,
+    }
+}
+
 /// The turn log's writes for `transitions` of `now`, at `at`, given the turn
 /// it has open; and the turn open after them. A turn begins on the person's
 /// prompt, or (not theirs to settle anything) when work is seen without one.
@@ -1062,5 +1075,39 @@ mod tests {
             (vec![], None),
             "work seen after its turn ended begins none"
         );
+    }
+
+    #[test]
+    fn what_wants_your_attention_is_what_a_session_did_by_itself() {
+        let pending = PendingApproval {
+            id: Uuid::nil(),
+            tool: "Bash".into(),
+            detail: String::new(),
+            since: Utc::now(),
+            answerable: true,
+        };
+        for t in [
+            Transition::Finished { reply: "" },
+            Transition::Interrupted,
+            Transition::Stopped { closed: true },
+        ] {
+            assert!(wants_attention(&t, false), "{t:?}");
+        }
+        assert!(
+            !wants_attention(&Transition::Stopped { closed: false }, true),
+            "stopped from Desk"
+        );
+        for t in [
+            Transition::Started,
+            Transition::Prompted { prompt: "go" },
+            Transition::Tool { tool: "Bash" },
+            Transition::Blocked { pending: &pending },
+            Transition::Halted,
+            Transition::Dismissed,
+            Transition::Resumed,
+            Transition::Background { from: 0, count: 1 },
+        ] {
+            assert!(!wants_attention(&t, false), "{t:?}");
+        }
     }
 }
