@@ -1064,3 +1064,46 @@ fn the_slack_messaging_context_is_unchanged() {
     );
     assert!(surface_context(&TurnSurface::of(None, None, None), "ios", "s", "u", None).is_none());
 }
+
+/// A live Desk turn's answer says which room message it answers; one re-run
+/// with nobody attending answers no ask, so it says none and runs no steps.
+#[tokio::test]
+async fn a_desk_answer_names_the_message_its_turn_answers_and_a_resumed_one_none() {
+    use workforce_common::channels::desk::{
+        DeliveryKind, DeskPlace, DeskScope, DeskSpeaker, DeskTarget, DeskTurn, DeskTurnContext,
+    };
+    let room = uuid::Uuid::new_v4();
+    let asked = uuid::Uuid::new_v4();
+    let channel = format!("desk:{room}");
+    let place = DeskPlace::Room {
+        room,
+        name: "Atlas launch".into(),
+        thread: None,
+    };
+    let turn = DeskTurn {
+        place: place.clone(),
+        speaker: DeskSpeaker::Person,
+        hop: 0,
+        context: Vec::new(),
+        message: Some(asked),
+        spoken: false,
+    };
+    let live = DeskTurnContext::new(turn, &channel, None, false, None, "reply-1".into());
+    let (id, mark) = crate::turn_loop::records::reply_slot(Some(&live), &channel);
+    let mark = mark.unwrap();
+    assert_eq!(id.as_deref(), Some("reply-1"));
+    assert_eq!((mark.room, mark.in_reply_to), (Some(room), Some(asked)));
+
+    let scope = DeskScope {
+        target: DeskTarget::of_turn(&place, &channel, None, false),
+        owner: "person-1".into(),
+        attended: false,
+    };
+    let (_, resumed) = workforce_agent::runner::with_desk(Some(scope), async {
+        crate::turn_loop::records::reply_slot(None, &channel)
+    })
+    .await;
+    let resumed = resumed.unwrap();
+    assert_eq!(resumed.delivery, Some(DeliveryKind::Resumed));
+    assert_eq!((resumed.in_reply_to, resumed.steps.len()), (None, 0));
+}

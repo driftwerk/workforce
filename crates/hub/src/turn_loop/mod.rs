@@ -51,7 +51,7 @@ pub(crate) use recall::{
     recall_injection_suppressed, stash_injected_lessons,
 };
 #[cfg(test)]
-pub(crate) use records::carry_delivered_files;
+pub(crate) use records::carry_turn;
 pub(crate) use records::{
     add_redacted_assistant_message, begin_turn_record, observe_replay_prefix,
     observe_system_prefix, origin_default_max_rounds, record_task_telemetry_from_result,
