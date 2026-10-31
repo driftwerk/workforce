@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, SubsecRound, Utc};
 use uuid::Uuid;
 
 use super::{Desk, DeskError};
@@ -15,9 +15,11 @@ use crate::reads::{
 };
 use crate::rooms::{RoomSummary, ThreadUnread, YOU};
 
-/// What a session's state since `since` leaves unread after `point`: done
-/// answered your goal; interrupted, stopped, or closed with a reply is new.
-/// A blocked one is a need, which the floor counts.
+/// What a session that last did something worth your attention at `since`
+/// leaves unread after `point`, by the state it is in: done answered your
+/// goal; interrupted, stopped, or closed with a reply is new. A blocked one
+/// is a need, which the floor counts. Points are kept to the microsecond,
+/// so `since` is compared to the microsecond too: one read through it is.
 pub fn session_unread(
     id: Uuid,
     state: SessionState,
@@ -26,7 +28,7 @@ pub fn session_unread(
     point: Option<&ReadPoint>,
     floor: DateTime<Utc>,
 ) -> Option<SessionUnread> {
-    if since <= effective(point, floor) {
+    if since.trunc_subsecs(6) <= effective(point, floor) {
         return None;
     }
     let urgency = match state {
@@ -110,7 +112,7 @@ impl Desk {
                     r.id,
                     r.state,
                     r.last_reply.is_some(),
-                    st.state_since.get(&r.id).copied().unwrap_or(r.updated_at),
+                    *st.attention.get(&r.id)?,
                     points.get(&ReadPlace::Session(r.id)),
                     floor,
                 )
@@ -261,7 +263,7 @@ mod tests {
     }
 
     #[test]
-    fn a_session_is_unread_by_the_state_it_came_into_after_its_point() {
+    fn a_session_is_unread_by_the_state_it_is_in_after_its_point() {
         let id = Uuid::from_u128(1);
         let point = ReadPoint {
             at: at(10),
@@ -299,6 +301,15 @@ mod tests {
             "a need, the floor's"
         );
         assert_eq!(urgency(SessionState::Working, false, at(11)), None);
+        assert_eq!(
+            urgency(
+                SessionState::Done,
+                false,
+                at(10) + chrono::Duration::nanoseconds(400)
+            ),
+            None,
+            "read through it, as a point is kept: to the microsecond"
+        );
         assert_eq!(
             session_unread(id, SessionState::Done, false, at(5), None, at(6)),
             None,

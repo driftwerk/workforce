@@ -222,6 +222,9 @@ struct State {
     seen_transcripts: HashMap<Uuid, SystemTime>,
     /// When each session came into the state it is in.
     state_since: HashMap<Uuid, DateTime<Utc>>,
+    /// When each session last did something worth the person's attention:
+    /// what it is unread by.
+    attention: HashMap<Uuid, DateTime<Utc>>,
     /// When each session's last `working` event was recorded.
     working_noted: HashMap<Uuid, std::time::Instant>,
     /// Sessions whose next stop or resume someone's action already recorded.
@@ -283,6 +286,7 @@ enum Persist {
     Terminal(Box<TerminalRecord>),
     DeleteTerminal(Uuid),
     Put(Box<SessionRecord>),
+    Attention(Uuid, DateTime<Utc>),
     Delete(Uuid),
     Event(Box<Event>),
     Turn(Box<TurnOp>),
@@ -515,6 +519,7 @@ impl Desk {
         }
         let layout = prune_layout(&store, layout, &records).await;
         let state_since = store.state_times().await?;
+        let attention = store.attention_times().await?;
 
         let listener = hook_listener(held.hook_port).await?;
         let hook_port = listener.local_addr()?.port();
@@ -532,6 +537,7 @@ impl Desk {
                 layout,
                 session_env,
                 state_since,
+                attention,
                 ..State::default()
             }),
             events: broadcast::channel(256).0,
@@ -746,6 +752,12 @@ impl Desk {
             st.state_since.insert(r.id, view.updated_at);
         }
         let transitions = Transition::of(before.as_ref(), &view, &st.decided);
+        let noticed = transitions
+            .iter()
+            .any(|t| transition::wants_attention(t, st.acted.contains(&r.id)));
+        if noticed {
+            st.attention.insert(r.id, view.updated_at);
+        }
         transitions.iter().for_each(|t| {
             if let Transition::Unblocked { pending, .. } = t {
                 st.decided.remove(&pending.id);
@@ -753,7 +765,11 @@ impl Desk {
         });
         let events = Self::session_events(st, &transitions, &view);
         let ops = Self::turn_ops(st, &transitions, &view);
+        let id = r.id;
         let _ = self.0.persist.send(Persist::Put(Box::new(r)));
+        if noticed {
+            let _ = self.0.persist.send(Persist::Attention(id, view.updated_at));
+        }
         let _ = self.0.events.send(DeskEvent::Session {
             session: Box::new(view),
         });
@@ -1112,6 +1128,11 @@ impl Desk {
     /// hub's cheap model), for as long as it is there.
     pub fn read_replies_with(&self, crew: &Arc<dyn crew::Crew>) {
         *self.0.reader.lock() = Some(Arc::downgrade(crew));
+    }
+
+    /// When the session last did something worth the person's attention.
+    pub fn attention_at(&self, id: Uuid) -> Option<DateTime<Utc>> {
+        self.0.state.lock().attention.get(&id).copied()
     }
 
     /// When the session came into the state it is in.
@@ -1510,6 +1531,7 @@ impl Desk {
             st.records.remove(&id);
             st.seen_transcripts.remove(&id);
             st.state_since.remove(&id);
+            st.attention.remove(&id);
             st.working_noted.remove(&id);
             st.acted.remove(&id);
             st.live.remove(&id)
@@ -3001,6 +3023,7 @@ async fn persist_loop(
     while let Some(op) = rx.recv().await {
         let result = match op {
             Persist::Put(r) => store.put(&r).await,
+            Persist::Attention(id, at) => store.set_attention(id, at).await,
             Persist::Delete(id) => store.delete(id).await,
             Persist::Event(e) => store.add_event(&e).await,
             Persist::Terminal(t) => store.put_terminal(&t).await,
@@ -3022,6 +3045,7 @@ async fn persist_loop(
 mod tests {
     use super::*;
     use crate::store::{build_pool, tests::record_fixture};
+    use chrono::SubsecRound;
     use serde_json::json;
     use std::os::unix::fs::PermissionsExt;
     use workforce_postgres::test_support::with_test_pool;
@@ -3793,6 +3817,51 @@ mod tests {
             assert_eq!((v.state, v.last_reply.as_deref(), v.current_tool), (SessionState::Done, Some("Pushed."), None));
 
             assert!(d.hook(s.id, "wrong-token", b"{}").await.is_none());
+        })
+        .await;
+    }
+
+    /// What a session is unread by: its turn ending by itself, not your
+    /// prompt, its work, your Stop, nor a restart that lost it.
+    #[tokio::test]
+    async fn a_session_is_unread_by_what_it_did_not_by_what_was_done_to_it() {
+        with_test_pool(build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let d = desk(pool.clone(), dir.path()).await;
+            let s = new_session(&d, dir.path()).await;
+            post(&d, s.id, json!({"hook_event_name": "SessionStart", "session_id": s.id.to_string()})).await;
+            post(&d, s.id, json!({"hook_event_name": "UserPromptSubmit", "prompt": "run the tests"})).await;
+            post(&d, s.id, json!({"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {"command": "cargo test"}})).await;
+            assert_eq!(d.attention_at(s.id), None, "starting and working are not");
+
+            post(&d, s.id, json!({"hook_event_name": "Stop", "last_assistant_message": "All green."})).await;
+            let finished = d.attention_at(s.id).expect("its turn ended");
+            assert_eq!(d.view(s.id).unwrap().state, SessionState::Done);
+
+            post(&d, s.id, json!({"hook_event_name": "UserPromptSubmit", "prompt": "push it"})).await;
+            post(&d, s.id, json!({"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {"command": "git push"}})).await;
+            assert_eq!(d.attention_at(s.id), Some(finished), "your prompt and its work are not");
+
+            d.stop(s.id, Some(By::you())).unwrap();
+            for _ in 0..100 {
+                if !d.view(s.id).unwrap().live {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert_eq!(d.view(s.id).unwrap().state, SessionState::Stopped);
+            assert_eq!(d.attention_at(s.id), Some(finished), "your Stop is not");
+
+            // Kept across a restart, to the microsecond.
+            let kept = loop {
+                if let Some(at) = d.store().attention_times().await.unwrap().get(&s.id) {
+                    break *at;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            };
+            assert_eq!(kept, finished.trunc_subsecs(6));
+            let again = desk(pool, dir.path()).await;
+            assert_eq!(again.attention_at(s.id), Some(kept));
         })
         .await;
     }
