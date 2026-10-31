@@ -405,6 +405,10 @@ impl Desk {
         let Some(r) = self.session_record(id).await else {
             return;
         };
+        // An agent's turn is its agent's spend, in its hub's own records.
+        if self.0.opts.hub_turns.hold(&r.cwd) || ledger::agent_turn(&r.cwd, &r.name) {
+            return;
+        }
         let records = {
             let desk = self.clone();
             let r = r.clone();
@@ -694,8 +698,16 @@ mod tests {
             let mut forked = record_fixture("acme-web fork");
             forked.state = crate::model::SessionState::Closed;
             forked.transcript = Some(fork.to_string_lossy().into_owned());
+            // A hub's agent's turn, adopted from another terminal: its
+            // agent's spend, never the person's.
+            let turn_transcript = dir.path().join("turn.jsonl");
+            std::fs::write(&turn_transcript, line("msg_turn", 9_000_000)).unwrap();
+            let mut turn = record_fixture("at-dm-d4774cbb6c89-2e");
+            turn.cwd = "/data/agents/scout/projects/_agent-turn/work/session".into();
+            turn.transcript = Some(turn_transcript.to_string_lossy().into_owned());
             store.put(&web).await.unwrap();
             store.put(&forked).await.unwrap();
+            store.put(&turn).await.unwrap();
             let d = Desk::start(
                 store,
                 crate::testing::options(dir.path()),
@@ -733,6 +745,7 @@ mod tests {
             d.spend_read(web.id);
             d.spend_read(web.id);
             d.spend_read(forked.id);
+            d.spend_read(turn.id);
             let v = until_calls(&d, 4).await;
             tokio::time::sleep(Duration::from_millis(200)).await;
             assert_eq!(spent(&d, Filter::default()).await.total.calls, 4);

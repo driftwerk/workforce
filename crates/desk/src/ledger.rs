@@ -293,6 +293,27 @@ pub fn once_each(spends: Vec<Spend>) -> Vec<Spend> {
     out
 }
 
+/// Whether a session in `cwd`, called `name`, is a turn a hub ran one of
+/// its agents' as (any hub's, on this computer): its folder is under an
+/// agent's `_agent-turn` (`…/agents/<agent>/projects/_agent-turn/…` or
+/// `…/work/<agent>/_agent-turn/…`), or Claude Code named it after one
+/// (`at-dm-d4774cbb6c89-2e`). Its spend is that agent's, kept by its hub:
+/// never the person's.
+pub fn agent_turn(cwd: &str, name: &str) -> bool {
+    let parts: Vec<&str> = cwd.split(['/', '\\']).collect();
+    let under_turn = parts
+        .iter()
+        .rposition(|p| *p == "_agent-turn")
+        .is_some_and(|at| {
+            let back = |n: usize| at.checked_sub(n).and_then(|i| parts.get(i)).copied();
+            (back(1) == Some("projects")
+                && back(3) == Some("agents")
+                && back(2).is_some_and(|a| !a.is_empty()))
+                || (back(2) == Some("work") && back(1).is_some_and(|a| !a.is_empty()))
+        });
+    under_turn || crate::gist::agent_turn_folder(name.trim())
+}
+
 text_enum!(Period {
     FiveHours => "five_hours",
     Day => "day",
@@ -778,6 +799,21 @@ mod tests {
         assert_eq!(accounts.rows[0].label, "allan@example.com");
         let engines = fold(&cells, SpendBy::Engine, label, 10, from, to);
         assert_eq!(engines.rows[0].label, "Claude Code");
+    }
+
+    #[test]
+    fn a_hubs_agent_turns_are_told_from_the_persons_sessions() {
+        assert!(agent_turn(
+            "/data/agents/scout/projects/_agent-turn/work/session",
+            "x"
+        ));
+        assert!(agent_turn("/data/work/scout/_agent-turn/s1", "x"));
+        assert!(agent_turn(
+            "/Users/allan/dev/acme-web",
+            "at-dm-d4774cbb6c89-2e"
+        ));
+        assert!(!agent_turn("/Users/allan/dev/acme-web", "acme-web"));
+        assert!(!agent_turn("/Users/allan/_agent-turn", "notes"));
     }
 
     #[test]
