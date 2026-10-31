@@ -30,6 +30,7 @@ mod deliver;
 mod extras;
 mod observe;
 mod reading;
+mod spend;
 mod tools;
 mod watcher;
 

@@ -28,7 +28,7 @@ impl HubPricer {
     }
 
     #[cfg(test)]
-    fn with(tracker: Arc<CostTracker>) -> Self {
+    pub(crate) fn with(tracker: Arc<CostTracker>) -> Self {
         Self {
             tracker: Box::new(move || Some(Arc::clone(&tracker))),
         }
