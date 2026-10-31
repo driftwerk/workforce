@@ -200,7 +200,7 @@ impl DeskStore {
     }
 }
 
-fn record(row: &Row) -> Result<SessionRecord> {
+pub(crate) fn record(row: &Row) -> Result<SessionRecord> {
     Ok(SessionRecord {
         id: row.try_get("id")?,
         engine: Engine::parse(row.try_get("engine")?)?,

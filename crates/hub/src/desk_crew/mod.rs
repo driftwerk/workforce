@@ -31,6 +31,7 @@ mod extras;
 mod observe;
 mod read_only;
 mod reading;
+mod spend;
 mod tools;
 mod watcher;
 
@@ -314,11 +315,14 @@ impl Crew for CrewHub {
             .collect()
     }
 
-    fn midnight(&self) -> DateTime<Utc> {
-        let tz = self
-            .services()
+    fn timezone(&self) -> chrono_tz::Tz {
+        self.services()
             .first()
-            .map_or(chrono_tz::UTC, |s| s.config.user_timezone());
+            .map_or(chrono_tz::UTC, |s| s.config.user_timezone())
+    }
+
+    fn midnight(&self) -> DateTime<Utc> {
+        let tz = self.timezone();
         let today = Utc::now().with_timezone(&tz).date_naive();
         today
             .and_hms_opt(0, 0, 0)

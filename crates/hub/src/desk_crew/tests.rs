@@ -1756,6 +1756,7 @@ mod floor {
                     workforce_desk::Floor {
                         turns: Some(Arc::clone(&installed.log)),
                         plans: None,
+                        pricer: None,
                     },
                 )
                 .await;
@@ -2168,6 +2169,95 @@ async fn a_reply_the_rules_cant_tell_is_read_by_the_overseers_cheap_model() {
             let crew = CrewHub::start(state, d.clone(), FAST, CancellationToken::new());
             assert_eq!(crew.asks(reply).await, read, "{says}");
         }
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_overseer_answers_which_session_spends_most_from_the_ledger_at_watch() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, _llm) = agent(dir.path(), "desk", "ok").await;
+        write_config(&overseer, "[oversight]\nenabled = true\nlevel = \"watch\"\n");
+        let state = hub(std::slice::from_ref(&overseer));
+        let transcript = dir.path().join("acme-web.jsonl");
+        std::fs::write(
+            &transcript,
+            include_str!("../../../desk/fixtures/ledger/claude.jsonl"),
+        )
+        .unwrap();
+        let store = DeskStore::with_pool(pool.clone()).await.unwrap();
+        let now = chrono::Utc::now();
+        let session = workforce_desk::model::SessionRecord {
+            id: uuid::Uuid::new_v4(),
+            engine: Engine::Claude,
+            view: workforce_desk::model::View::Terminal,
+            engine_version: None,
+            name: "acme-web".into(),
+            goal: "Fix the login race".into(),
+            cwd: "/Users/allan/dev/acme-web".into(),
+            branch: None,
+            origin: workforce_desk::model::Origin::Desk,
+            state: workforce_desk::model::SessionState::Stopped,
+            approvals: workforce_desk::model::Approvals::Desk,
+            cli_session_id: Some("5b1f0c2e".into()),
+            transcript: Some(transcript.to_string_lossy().into_owned()),
+            last_prompt: None,
+            last_reply: None,
+            external_pid: None,
+            restore_offer: false,
+            terminal_id: None,
+            display_name: None,
+            asked: None,
+            created_at: now,
+            updated_at: now,
+        };
+        store.put(&session).await.unwrap();
+        let table = workforce_common::cost::CostTracker::new();
+        table.load_pricing_toml(workforce_agent::llm::DEFAULT_PRICING_TOML, None);
+        let d = desk_with(
+            pool,
+            dir.path(),
+            workforce_desk::Floor {
+                pricer: Some(Arc::new(crate::desk_ledger::HubPricer::with(Arc::new(table)))),
+                ..Default::default()
+            },
+        )
+        .await;
+        let _crew = CrewHub::start(state, d.clone(), FAST, CancellationToken::new());
+        eventually("the overseer's reading tools", async || {
+            overseer.tools.has("crew.spend").then_some(())
+        })
+        .await;
+        assert!(
+            !overseer.tools.has("crew.nudge"),
+            "it only watches, and reads spend all the same"
+        );
+        let spend = overseer.tools.get("crew.spend").unwrap();
+        let answer = eventually("the transcript's calls in the ledger", async || {
+            let r = spend
+                .execute(json!({ "by": "session", "since": "2026-10-30", "limit": 5 }))
+                .await
+                .unwrap();
+            (r.success && r.output["total"]["calls"] == 2).then_some(r.output)
+        })
+        .await;
+        let row = &answer["rows"][0];
+        assert_eq!(row["name"], "acme-web");
+        assert_eq!(row["session_id"], session.id.to_string());
+        assert_eq!(row["engine"], "Claude Code");
+        assert_eq!(
+            row["tokens"],
+            json!({ "input": 20, "output": 440, "cache_read": 20000, "cache_write": 20400, "total": 40860 })
+        );
+        // Opus 5.5 at $4 in, $20 out, $0.20 cache read and $5 cache write per million.
+        let usd = (20.0 * 4.0 + 440.0 * 20.0 + 20000.0 * 0.20 + 20400.0 * 5.0) / 1e6;
+        assert_eq!(row["usd_api_equivalent"], (usd * 100.0_f64).round() / 100.0);
+        assert_eq!(row["share_of_spend_percent"], 100.0);
+        assert_eq!(row["plan"], json!([]), "no plan reading to share");
+        assert!(answer["usd_means"].as_str().unwrap().contains("API-equivalent"));
+        let refused = spend.execute(json!({ "by": "planet" })).await.unwrap();
+        assert!(!refused.success);
     })
     .await;
 }

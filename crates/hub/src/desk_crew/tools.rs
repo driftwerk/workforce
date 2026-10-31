@@ -18,7 +18,12 @@ use super::watcher::reported;
 use super::CrewHub;
 
 /// Every `crew.*` tool: the reading ones first.
-pub const READ: [&str; 3] = ["crew.overview", "crew.activity", "crew.history"];
+pub const READ: [&str; 4] = [
+    "crew.overview",
+    "crew.activity",
+    "crew.history",
+    super::spend::NAME,
+];
 pub const ACT: [&str; 9] = [
     "crew.nudge",
     "crew.approve",
@@ -280,6 +285,7 @@ impl CrewTool {
                     "messages": reported(&messages.to_string(), &format!("{agent}'s Desk DM")),
                 }))
             }
+            super::spend::NAME => crew.spend(input).await,
             _ => Err("not a reading tool".into()),
         }
     }
@@ -325,7 +331,8 @@ impl Tool for CrewTool {
 
     fn description(&self) -> &str {
         match self.name {
-            "crew.overview" => "Everyone on the crew now: the person's agents and their Claude Code and Codex sessions, each with its state (needs you, working, quiet, done today, idle, failed, stopped), what it's doing, what it asks (with approval ids), and since when.",
+            "crew.overview" => "Everyone on the crew now: the person's agents and their Claude Code and Codex sessions, each with its state (needs you, working, quiet, done today, idle, failed, stopped), what it's doing, what it asks (with approval ids), and since when. For what sessions spent (tokens, cost), use crew.spend.",
+            super::spend::NAME => super::spend::DESCRIPTION,
             "crew.activity" => "What happened on the crew, newest first: turns started and finished, questions, requests, failures, and what you and the person did. Filter to one agent or session with subject_id.",
             "crew.history" => "The recent messages of one agent's Desk DM with the person (agent_id), or one session's last prompt, reply, pending request and terminal (session_id).",
             "crew.nudge" => "Send a short message to an agent's DM (agent_id) or type it into a running session (session_id): a check-in, a hint, a correction.",
@@ -351,6 +358,7 @@ impl Tool for CrewTool {
         let props = |v: Value| v.as_object().cloned().unwrap_or_default();
         match self.name {
             "crew.overview" => json!({ "type": "object", "properties": {} }),
+            super::spend::NAME => super::spend::schema(),
             "crew.activity" => json!({ "type": "object", "properties": {
                 "subject_id": { "type": "string", "description": "An agent or session id" },
                 "limit": { "type": "integer", "minimum": 1, "maximum": 100 }

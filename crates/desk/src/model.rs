@@ -286,6 +286,10 @@ pub enum DeskEvent {
         place: crate::reads::ReadPlace,
         point: crate::reads::ReadPoint,
     },
+    /// What a session spent changed: its engine's record was read.
+    Spend {
+        session: Uuid,
+    },
     /// A key of Desk's own state changed; `value` is `null` once removed.
     State {
         key: String,

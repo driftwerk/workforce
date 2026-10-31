@@ -97,6 +97,8 @@ pub mod desk_conversations;
 pub mod desk_crew;
 #[cfg(feature = "postgres")]
 pub mod desk_driver;
+#[cfg(feature = "postgres")]
+pub mod desk_ledger;
 pub(crate) mod desk_reads;
 pub(crate) mod desk_surface;
 #[cfg(feature = "postgres")]
