@@ -95,9 +95,10 @@ pub struct Act {
     /// Ending a session's turn (Esc in its terminal).
     pub interrupt: bool,
     /// Nudging an agent (with `nudge`), or handing it a task. Its turn
-    /// answers to its Desk DM at the trust of a paired device, so what it
-    /// would post or send anywhere but Desk waits on the person; its other
-    /// tools run under its own permissions, as in any turn.
+    /// answers to its Desk DM, relayed, at the trust of a paired device, so
+    /// what it would post or send anywhere but Desk, delete, remember or
+    /// hand on waits on the person (#64); its other tools run under its own
+    /// permissions, as in any turn.
     pub message_agents: bool,
     /// Nudging a session started in another terminal (with `nudge`), which
     /// may have been started not to ask before it acts.
