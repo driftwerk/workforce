@@ -393,6 +393,20 @@ impl DeskStore {
             .await?;
         Ok(row.try_get("n")?)
     }
+
+    /// When each wake-up since `since` was, earliest first.
+    pub async fn wakes_since(&self, since: DateTime<Utc>) -> Result<Vec<DateTime<Utc>>> {
+        let client = self.pool().get().await?;
+        let rows = client
+            .query(
+                "SELECT at FROM check_ins WHERE kind = 'wake' AND at >= $1 ORDER BY at",
+                &[&since],
+            )
+            .await?;
+        rows.iter()
+            .map(|r| r.try_get("at").map_err(Into::into))
+            .collect()
+    }
 }
 
 #[cfg(test)]
