@@ -14424,7 +14424,13 @@ mod chat_progress_tests {
         let types: Vec<&str> = sent.iter().map(|m| m.msg_type.as_str()).collect();
         assert_eq!(
             types,
-            ["stream_delta", "stream_delta", "stream_delta", "stream_end", "message"]
+            [
+                "stream_delta",
+                "stream_delta",
+                "stream_delta",
+                "stream_end",
+                "message"
+            ]
         );
     }
 
