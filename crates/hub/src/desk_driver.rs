@@ -491,6 +491,11 @@ pub async fn mount(
             crate::desk_floor::Sources::installed(),
         )),
     ));
+    if let Some(floor) = crate::floor::installed() {
+        floor.gists.serve(Arc::new(crate::floor::gists::HubModel {
+            state: Arc::clone(state),
+        }));
+    }
     if !config.desk.enabled {
         return Ok(app);
     }

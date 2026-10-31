@@ -250,6 +250,14 @@ const CLAIMS: &[(&str, &str, &str, Claim)] = &[
         NotPersonal("the agent or Desk session a turn is of"),
     ),
     ("hub", "plan_readings", "owner", By(C::Signals)),
+    ("hub", "gists", "owner", By(C::Signals)),
+    (
+        "hub",
+        "gists",
+        "subject",
+        NotPersonal("the agent or Desk session a gist is of"),
+    ),
+    ("hub", "summaries", "owner", By(C::Signals)),
     ("hub", "allows", "person", By(C::PermissionRules)),
     ("hub", "presence", "identity_id", By(C::Devices)),
     (

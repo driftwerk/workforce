@@ -10,6 +10,7 @@ use workforce_common::channels::desk::DeskSignal;
 use workforce_common::settings::WorkforceConfig;
 use workforce_desk::floor::{Scope, Turn, TurnLog, TurnOp};
 
+use super::gists::Gists;
 use super::plans::Plans;
 use super::postgres::PgFloorStore;
 use super::signal::Signals;
@@ -28,12 +29,14 @@ const DROP_WARN_EVERY: Duration = Duration::from_secs(60);
 static INSTALLED: OnceLock<Installed> = OnceLock::new();
 
 /// The floor's store as the hub runs it: the log written through its one
-/// writer, the plan readings kept beside it, the store both read from, and
-/// the signals that tell a person's links what changed.
+/// writer, the plan readings kept beside it, the gists written as the log
+/// is, the store they all read from, and the signals that tell a person's
+/// links what changed.
 #[derive(Clone)]
 pub struct Installed {
     pub log: Arc<dyn TurnLog>,
     pub plans: Arc<Plans>,
+    pub gists: Gists,
     pub store: Arc<PgFloorStore>,
     pub signals: Signals,
 }
@@ -43,9 +46,19 @@ impl Installed {
     pub fn open(store: PgFloorStore) -> Self {
         let store = Arc::new(store);
         let signals = Signals::start();
+        let told = signals.clone();
+        let gists = Gists::start(
+            Arc::clone(&store) as Arc<dyn super::gists::Kept>,
+            Arc::new(move |owner| told.send(DeskSignal::Floor, owner)),
+        );
         Self {
-            log: Arc::new(Logged::start(Arc::clone(&store), signals.clone())),
+            log: Arc::new(Logged::start(
+                Arc::clone(&store),
+                signals.clone(),
+                gists.clone(),
+            )),
             plans: Plans::new(Arc::clone(&store), signals.clone()),
+            gists,
             store,
             signals,
         }
@@ -87,8 +100,9 @@ pub(super) async fn install(config: &WorkforceConfig) {
 }
 
 /// The log as the hub writes it: every op through one writer, in order, the
-/// owner of each that changes what the floor lists told. A turn's
-/// correctness never waits on it; a full backlog drops the op.
+/// owner of each that changes what the floor lists told, and each shown to
+/// the gists. A turn's correctness never waits on it; a full backlog drops
+/// the op.
 struct Logged {
     tx: mpsc::Sender<TurnOp>,
     store: Arc<PgFloorStore>,
@@ -96,16 +110,19 @@ struct Logged {
 }
 
 impl Logged {
-    fn start(store: Arc<PgFloorStore>, signals: Signals) -> Self {
+    fn start(store: Arc<PgFloorStore>, signals: Signals, gists: Gists) -> Self {
         let (tx, mut rx) = mpsc::channel::<TurnOp>(BACKLOG);
         let writer = Arc::clone(&store);
         tokio::spawn(async move {
             while let Some(op) = rx.recv().await {
                 match writer.apply(&op).await {
-                    Ok(Some(owner)) if op.lists() => {
-                        signals.send(DeskSignal::Floor, owner.as_deref())
+                    Ok(Some(owner)) => {
+                        gists.saw(&op);
+                        if op.lists() {
+                            signals.send(DeskSignal::Floor, owner.as_deref())
+                        }
                     }
-                    Ok(_) => {}
+                    Ok(None) => {}
                     Err(e) => {
                         warn!(target: "floor", error = %format!("{e:#}"), "recording a turn failed")
                     }
