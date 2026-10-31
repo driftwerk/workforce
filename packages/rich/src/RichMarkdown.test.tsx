@@ -87,3 +87,47 @@ describe("RichMarkdown", () => {
     expect(fireEvent.click(link)).toBe(true);
   });
 });
+
+describe("RichMarkdown links", () => {
+  const LINKS = "[the message](desk://room/r1/msg/m1) and [a trap](javascript:alert(1)) and [docs](https://example.com)";
+  const hrefs = (container: HTMLElement) => [...container.querySelectorAll("a")].map((a) => a.getAttribute("href"));
+
+  it("keeps a declared scheme and opens it through the host", () => {
+    const openUrl = vi.fn();
+    const { container } = render(
+      <RichHostProvider host={{ openUrl, linkSchemes: ["desk"] }}>
+        <RichMarkdown text={LINKS} />
+      </RichHostProvider>,
+    );
+    expect(hrefs(container)).toContain("desk://room/r1/msg/m1");
+    fireEvent.click(screen.getByText("the message"));
+    expect(openUrl).toHaveBeenCalledWith("desk://room/r1/msg/m1");
+  });
+
+  it("reads a declared scheme however it is written", () => {
+    const { container } = render(
+      <RichHostProvider host={{ linkSchemes: [" Desk: "] }}>
+        <RichMarkdown text={LINKS} />
+      </RichHostProvider>,
+    );
+    expect(hrefs(container)).toContain("desk://room/r1/msg/m1");
+  });
+
+  it("strips a scheme no host declared", () => {
+    const { container } = render(<RichMarkdown text={LINKS} />);
+    expect(hrefs(container)).not.toContain("desk://room/r1/msg/m1");
+    expect(hrefs(container)).toContain("https://example.com");
+  });
+
+  it("never keeps javascript:, declared or not", () => {
+    for (const linkSchemes of [["desk"], ["desk", "javascript"]]) {
+      const { container, unmount } = render(
+        <RichHostProvider host={{ linkSchemes }}>
+          <RichMarkdown text={LINKS} />
+        </RichHostProvider>,
+      );
+      expect(hrefs(container).some((h) => h?.toLowerCase().startsWith("javascript"))).toBe(false);
+      unmount();
+    }
+  });
+});

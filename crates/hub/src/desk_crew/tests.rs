@@ -293,6 +293,72 @@ async fn an_agents_turns_are_activity_and_its_question_needs_you() {
     .await;
 }
 
+/// A turn run for a room (here a job answering to one, unattended) names
+/// the room on each of its events, so Activity opens it; a turn off Desk
+/// names none.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_room_turns_events_carry_its_room_and_a_turn_off_desk_none() {
+    use workforce_common::channels::desk::{DeskPlace, DeskScope, DeskTarget};
+    use workforce_desk::floor::Place;
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (scout, _llm) = agent(dir.path(), "scout", "The launch page is ready.").await;
+        let state = hub(std::slice::from_ref(&scout));
+        let d = desk(pool, dir.path()).await;
+        let _crew = CrewHub::start(state, d.clone(), FAST, CancellationToken::new());
+        let room = uuid::Uuid::new_v4();
+        let thread = uuid::Uuid::new_v4();
+        let place = DeskPlace::Room {
+            room,
+            name: "Atlas launch".into(),
+            thread: Some(thread),
+        };
+        let channel = format!("desk:{room}");
+        let scope = DeskScope {
+            target: DeskTarget::of_turn(&place, &channel, None, false),
+            owner: PERSON.into(),
+            attended: false,
+        };
+        let ask = |text: &'static str| {
+            let scout = scout.clone();
+            async move {
+                scout
+                    .process_message(
+                        "web", PERSON, text, None, None, None, None, None, None, None, None, None,
+                        None,
+                    )
+                    .await
+                    .unwrap()
+            }
+        };
+        workforce_agent::runner::with_desk(Some(scope), ask("Check the launch page.")).await;
+        ask("Anything else?").await;
+        let events = eventually("both turns' events", async || {
+            let page = d.activity(Filter::All, None, 10).await.unwrap();
+            (page.events.len() >= 4).then_some(page.events)
+        })
+        .await;
+        let roomed: Vec<_> = events
+            .iter()
+            .filter(|e| {
+                e.place
+                    == Some(Place::Room {
+                        room,
+                        thread: Some(thread),
+                    })
+            })
+            .map(|e| e.kind)
+            .collect();
+        assert_eq!(roomed, [Kind::Finished, Kind::Started], "{events:?}");
+        assert_eq!(events.iter().filter(|e| e.place.is_none()).count(), 2);
+        assert!(
+            events.iter().all(|e| e.message.is_none()),
+            "no live turn, no message"
+        );
+    })
+    .await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn one_agent_oversees_and_has_the_tools_its_level_allows() {
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {

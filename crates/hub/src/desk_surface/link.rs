@@ -38,14 +38,20 @@ enum LinkFrame<'a> {
     DeskDelivered(&'a DeskDelivered),
     FloorChanged,
     UsageChanged,
+    ReadChanged { agent_id: &'a str, channel: &'a str },
     Pong,
 }
 
-impl LinkFrame<'_> {
-    fn signal(signal: DeskSignal) -> Self {
+impl<'a> LinkFrame<'a> {
+    /// The frame `signal`, as `msg` carries it, is sent as.
+    fn signal(signal: DeskSignal, msg: &'a BroadcastMessage) -> Self {
         match signal {
             DeskSignal::Floor => Self::FloorChanged,
             DeskSignal::Usage => Self::UsageChanged,
+            DeskSignal::Read => Self::ReadChanged {
+                agent_id: msg.agent_id.as_deref().unwrap_or_default(),
+                channel: &msg.content,
+            },
         }
     }
 }
@@ -69,8 +75,9 @@ enum LinkRequest {
 fn admitted<'a>(msg: &'a BroadcastMessage, listener: &Listener) -> Option<LinkFrame<'a>> {
     let theirs = msg.target_identity.as_deref() == Some(listener.identity.as_str());
     match DeskSignal::of_frame(&msg.msg_type) {
+        Some(DeskSignal::Read) => theirs.then(|| LinkFrame::signal(DeskSignal::Read, msg)),
         Some(signal) => (theirs || (msg.target_identity.is_none() && listener.holds))
-            .then(|| LinkFrame::signal(signal)),
+            .then(|| LinkFrame::signal(signal, msg)),
         None => (msg.msg_type == DESK_DELIVERED && theirs)
             .then_some(msg.delivered.as_ref())
             .flatten()
@@ -222,6 +229,23 @@ mod tests {
 
     fn heard(msg: &BroadcastMessage, listener: &Listener) -> Option<serde_json::Value> {
         admitted(msg, listener).map(|frame| serde_json::to_value(frame).unwrap())
+    }
+
+    #[test]
+    fn a_read_moved_is_heard_by_its_persons_links_alone_and_names_the_conversation() {
+        let moved = BroadcastMessage::desk_read_changed("person-1", "allan", "desk");
+        assert_eq!(
+            heard(&moved, &listener("person-1", false)),
+            Some(
+                serde_json::json!({ "type": "read_changed", "agent_id": "allan", "channel": "desk" })
+            )
+        );
+        assert_eq!(
+            heard(&moved, &listener("person-2", true)),
+            None,
+            "not even the holder's"
+        );
+        assert!(moved.for_links_only());
     }
 
     #[test]

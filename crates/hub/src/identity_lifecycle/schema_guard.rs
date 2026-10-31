@@ -101,6 +101,7 @@ const CLAIMS: &[(&str, &str, &str, Claim)] = &[
         "claimed_by",
         NotPersonal(INSTANCE),
     ),
+    ("common", "desk_reads", "owner", By(C::Sessions)),
     ("common", "sessions", "owner", By(C::Sessions)),
     ("common", "sessions", "turn_run_as", By(C::Sessions)),
     ("common", "sessions", "turn_bill_to", By(C::Sessions)),
@@ -149,6 +150,12 @@ const CLAIMS: &[(&str, &str, &str, Claim)] = &[
         NotPersonal(INSTANCE),
     ),
     ("desk", "attachments", "owner", By(C::Sessions)),
+    (
+        "desk",
+        "reads",
+        "owner",
+        NotPersonal("`you`, the one person of the Desk whose own hub this is"),
+    ),
     (
         "desk",
         "rooms",

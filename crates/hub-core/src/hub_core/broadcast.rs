@@ -261,6 +261,16 @@ impl BroadcastMessage {
         }
     }
 
+    /// Build the signal that how far `owner` has read their conversation
+    /// with `agent` on `channel` moved, for their Desk hub links alone.
+    pub fn desk_read_changed(owner: &str, agent: &str, channel: &str) -> Self {
+        Self {
+            target_identity: Some(owner.to_string()),
+            agent_id: Some(agent.to_string()),
+            ..Self::silent("", workforce_core::desk::DeskSignal::Read.frame(), channel)
+        }
+    }
+
     /// Whether only a Desk hub link may hear it, never a chat connection.
     pub fn for_links_only(&self) -> bool {
         self.msg_type == DESK_DELIVERED

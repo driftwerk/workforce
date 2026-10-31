@@ -764,7 +764,7 @@ fn a_desk_turn_s_answer_carries_the_files_it_delivered() {
     };
     let mut session = Session::new(DESK_CHANNEL, "person-1", "scout");
     session.add_assistant_message("Here it is.", 3);
-    crate::turn_loop::carry_delivered_files(&mut session, &[invocation(true), invocation(false)]);
+    crate::turn_loop::carry_turn(&mut session, &[invocation(true), invocation(false)]);
     let reply = session.messages.last().unwrap();
     let files = &reply.desk.as_ref().unwrap().files;
     assert_eq!(files.len(), 1, "only what a tool that succeeded delivered");
@@ -773,6 +773,55 @@ fn a_desk_turn_s_answer_carries_the_files_it_delivered() {
         (chart.as_str(), Some(4))
     );
     assert_eq!(reply.attachments.as_ref().unwrap().len(), 1);
+    let steps: Vec<_> = reply
+        .desk
+        .as_ref()
+        .unwrap()
+        .steps
+        .iter()
+        .map(|s| s.ok)
+        .collect();
+    assert_eq!(
+        steps,
+        [true, false],
+        "every tool it ran is a step, failed ones too"
+    );
+}
+
+/// The tools a live Desk turn ran go on its answer as steps, their names
+/// clipped and their number capped, the first kept.
+#[test]
+fn a_desk_turn_s_answer_carries_the_steps_it_ran() {
+    use workforce_common::channels::desk::{MAX_STEPS, STEP_TOOL_CHARS};
+    let ran = |name: String, ms: u64| workforce_agent::runner::ToolInvocation {
+        tool_name: name,
+        input: json!({}),
+        output: json!({}),
+        success: true,
+        policy_decision: "allow".into(),
+        duration_ms: ms,
+        denial_reason: None,
+        error: None,
+    };
+    let mut invocations = vec![ran("x".repeat(300), 7)];
+    invocations.extend((1..=MAX_STEPS as u64 + 5).map(|i| ran("web.search".into(), i)));
+    let mut session = Session::new(DESK_CHANNEL, "person-1", "scout");
+    session.add_assistant_message("Done.", 1);
+    crate::turn_loop::carry_turn(&mut session, &invocations);
+    let reply = session.messages.last().unwrap();
+    let steps = &reply.desk.as_ref().unwrap().steps;
+    assert_eq!(steps.len(), MAX_STEPS);
+    assert_eq!(
+        (steps[0].tool.chars().count(), steps[0].ms),
+        (STEP_TOOL_CHARS, 7)
+    );
+    assert_eq!(steps[MAX_STEPS - 1].ms, MAX_STEPS as u64 - 1);
+    assert!(reply.attachments.is_none(), "no files, none carried");
+
+    let mut quiet = Session::new(DESK_CHANNEL, "person-1", "scout");
+    quiet.add_assistant_message("Nothing to run.", 1);
+    crate::turn_loop::carry_turn(&mut quiet, &[]);
+    assert!(quiet.messages.last().unwrap().desk.is_none());
 }
 
 fn base64_of(bytes: &[u8]) -> String {

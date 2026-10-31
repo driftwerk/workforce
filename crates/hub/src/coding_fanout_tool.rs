@@ -1510,7 +1510,9 @@ mod tests {
                 self.append(
                     &coder_call(index),
                     chrono::Utc::now(),
-                    JournalStep::Finished { message: row },
+                    JournalStep::Finished {
+                        message: Box::new(row),
+                    },
                 );
             }
 

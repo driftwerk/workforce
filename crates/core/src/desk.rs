@@ -370,6 +370,54 @@ pub struct DeskMark {
     /// The files the message carries.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub files: Vec<DeskFile>,
+    /// The Desk room message the turn that said it answers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub in_reply_to: Option<Uuid>,
+    /// The tools that turn ran, in order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub steps: Vec<DeskStep>,
+}
+
+/// How far a person has read a place: through `at`, the item seen last
+/// when there is one (a message's id, an event's, a version).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReadPoint {
+    pub at: chrono::DateTime<chrono::Utc>,
+    #[serde(default)]
+    pub message: Option<String>,
+}
+
+/// How a write moves a read point: never back, or exactly here (marking
+/// something unread).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Mark {
+    Advance,
+    Set,
+}
+
+/// One tool an agent's turn ran: what it was, whether it worked, how long.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeskStep {
+    pub tool: String,
+    pub ok: bool,
+    pub ms: u64,
+}
+
+/// Steps kept on one message, the first ones.
+pub const MAX_STEPS: usize = 100;
+/// The longest tool name a step keeps.
+pub const STEP_TOOL_CHARS: usize = 120;
+
+impl DeskStep {
+    /// The step a tool's run makes, its name clipped to [`STEP_TOOL_CHARS`].
+    pub fn of(tool: &str, ok: bool, ms: u64) -> Self {
+        Self {
+            tool: clip(tool, STEP_TOOL_CHARS),
+            ok,
+            ms,
+        }
+    }
 }
 
 /// A file delivered into a Desk conversation, by reference: the artifact
@@ -463,6 +511,9 @@ pub struct DeskDelivered {
 pub enum DeskSignal {
     Floor,
     Usage,
+    /// How far the person has read one of their conversations moved; its
+    /// frame names the conversation.
+    Read,
 }
 
 impl DeskSignal {
@@ -471,6 +522,7 @@ impl DeskSignal {
         match self {
             Self::Floor => "floor_changed",
             Self::Usage => "usage_changed",
+            Self::Read => "read_changed",
         }
     }
 
@@ -479,12 +531,13 @@ impl DeskSignal {
         match self {
             Self::Floor => "desk.floor",
             Self::Usage => "desk.usage",
+            Self::Read => "desk.reads",
         }
     }
 
     /// The signal a frame is, if it is one.
     pub fn of_frame(frame: &str) -> Option<Self> {
-        [Self::Floor, Self::Usage]
+        [Self::Floor, Self::Usage, Self::Read]
             .into_iter()
             .find(|s| s.frame() == frame)
     }
@@ -784,6 +837,28 @@ mod tests {
         let target: DeskTarget =
             serde_json::from_value(json!({"place": {"kind": "dm"}, "channel": "desk"})).unwrap();
         assert_eq!(target, DeskTarget::dm_of(false));
+        let answer = DeskMark {
+            in_reply_to: Some(thread),
+            steps: vec![DeskStep::of("web.search", true, 840)],
+            ..in_room(None).mark()
+        };
+        let written = json!({
+            "room": ROOM,
+            "in_reply_to": thread,
+            "steps": [{"tool": "web.search", "ok": true, "ms": 840}],
+        });
+        assert_eq!(serde_json::to_value(&answer).unwrap(), written);
+        assert_eq!(serde_json::from_value::<DeskMark>(written).unwrap(), answer);
+        let before: DeskMark = serde_json::from_value(json!({"room": ROOM})).unwrap();
+        assert_eq!(
+            before,
+            in_room(None).mark(),
+            "a mark kept before answers reads as it was"
+        );
+        assert_eq!(
+            DeskStep::of(&"t".repeat(200), false, 1).tool.len(),
+            STEP_TOOL_CHARS
+        );
         let newer: DeskMark = serde_json::from_value(json!({"delivery": "digest"})).unwrap();
         assert_eq!(
             newer.delivery,

@@ -97,7 +97,7 @@ fn a_desk_turn_s_answer_carries_the_chart_its_reader_draws() {
     ] {
         let mut session = reading(DESK_CHANNEL, rendered);
         session.add_assistant_message("Here it is.", 3);
-        crate::turn_loop::carry_delivered_files(&mut session, std::slice::from_ref(&invocation));
+        crate::turn_loop::carry_turn(&mut session, std::slice::from_ref(&invocation));
         let files = &session
             .messages
             .last()

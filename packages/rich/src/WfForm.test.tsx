@@ -163,3 +163,16 @@ describe("WfForm", () => {
     expect(screen.queryByRole("combobox")).toBeNull();
   });
 });
+
+describe("WfForm answered", () => {
+  it("shows locked and Submitted when the host says it was answered", () => {
+    const spec = validSpec({ title: "Pick", fields: [{ name: "a", type: "text", label: "A" }] });
+    const submitForm = vi.fn().mockResolvedValue(true);
+    const { form } = renderForm(spec, { submitForm, answered: true });
+    const button = form.querySelector<HTMLButtonElement>(".wf-form-submit")!;
+    expect(button.disabled).toBe(true);
+    expect(button.textContent).toBe("Submitted");
+    fireEvent.submit(form);
+    expect(submitForm).not.toHaveBeenCalled();
+  });
+});

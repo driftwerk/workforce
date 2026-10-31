@@ -424,14 +424,15 @@ function FieldRow({
 }
 
 export default function WfForm({ spec }: { spec: FormSpec }): ReactNode {
-  const { latest, forms } = useHost();
+  const { latest, forms, answered } = useHost();
   const [state, setState] = useState<Record<string, FieldState>>(() => initialFormState(spec));
   // Labels resolved by an options_ref typeahead, so the summary reads the chosen
   // row's label rather than its raw id.
   const [resolved, setResolved] = useState<Record<string, Record<string, string>>>({});
   const [showErrors, setShowErrors] = useState(false);
   const [submitted, setSubmitted] = useState(false);
-  const locked = submitted || !forms;
+  const done = submitted || answered;
+  const locked = done || !forms;
 
   const setField = (name: string, value: FieldState) =>
     setState((s) => ({ ...s, [name]: value }));
@@ -444,7 +445,7 @@ export default function WfForm({ spec }: { spec: FormSpec }): ReactNode {
   const onSubmit = async (e: FormEvent) => {
     e.preventDefault();
     const host = latest.current;
-    if (submitted || !host.submitForm) return;
+    if (done || !host.submitForm) return;
     setShowErrors(true);
     if (!formValid(spec, state)) return;
     setSubmitted(true);
@@ -478,7 +479,7 @@ export default function WfForm({ spec }: { spec: FormSpec }): ReactNode {
           className="wf-form-submit"
           disabled={locked || (showErrors && !valid)}
         >
-          {submitted ? "Submitted" : spec.submitLabel}
+          {done ? "Submitted" : spec.submitLabel}
         </button>
       </div>
     </form>

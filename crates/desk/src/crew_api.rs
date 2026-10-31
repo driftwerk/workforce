@@ -1,6 +1,7 @@
 //! `/api/desk/activity`, `/overview`, `/manager` and `/suggestions`: the
 //! crew as Floor and the overseer's DM read it, and the person's answers to
-//! the overseer's suggestions.
+//! the overseer's suggestions. `/unread` and `/reads`: what is unread on this
+//! Desk, and how far the person has read each place.
 
 use std::sync::Arc;
 
@@ -14,7 +15,9 @@ use serde_json::json;
 
 use crate::api::Authorize;
 use crate::crew::{By, Crew, Filter, Kind, ManagerView, SuggestionState};
-use crate::service::Desk;
+use crate::reads::{AllScope, Read, ReadPut};
+use crate::rooms::YOU;
+use crate::service::{Desk, DeskError};
 
 struct CrewApi {
     desk: Desk,
@@ -181,6 +184,61 @@ async fn answer(
     Json(suggestion).into_response()
 }
 
+#[derive(Deserialize)]
+struct Puts {
+    puts: Vec<ReadPut>,
+}
+
+#[derive(Deserialize)]
+struct All {
+    scope: AllScope,
+}
+
+fn reads(result: Result<Vec<Read>, DeskError>) -> Response {
+    match result {
+        Ok(reads) => Json(json!({ "reads": reads })).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+async fn unread(State(s): S, h: HeaderMap, Query(q): Query<TokenQuery>) -> Response {
+    if let Err(r) = guard(&s, &h, q.token.as_deref()).await {
+        return r;
+    }
+    s.desk.unread(&*s.crew, YOU).await.map(Json).into_response()
+}
+
+async fn read_points(State(s): S, h: HeaderMap, Query(q): Query<TokenQuery>) -> Response {
+    if let Err(r) = guard(&s, &h, q.token.as_deref()).await {
+        return r;
+    }
+    reads(s.desk.reads(YOU).await)
+}
+
+async fn put_reads(
+    State(s): S,
+    h: HeaderMap,
+    Query(q): Query<TokenQuery>,
+    Json(body): Json<Puts>,
+) -> Response {
+    if let Err(r) = guard(&s, &h, q.token.as_deref()).await {
+        return r;
+    }
+    reads(s.desk.put_reads(YOU, &body.puts).await)
+}
+
+async fn all_read(
+    State(s): S,
+    h: HeaderMap,
+    Query(q): Query<TokenQuery>,
+    Json(body): Json<All>,
+) -> Response {
+    if let Err(r) = guard(&s, &h, q.token.as_deref()).await {
+        return r;
+    }
+    reads(s.desk.mark_all(&*s.crew, YOU, body.scope).await)
+}
+
 pub(crate) fn crew_router(desk: Desk, auth: Arc<dyn Authorize>, crew: Arc<dyn Crew>) -> Router {
     Router::new()
         .route("/api/desk/activity", get(activity))
@@ -188,6 +246,9 @@ pub(crate) fn crew_router(desk: Desk, auth: Arc<dyn Authorize>, crew: Arc<dyn Cr
         .route("/api/desk/manager", get(manager))
         .route("/api/desk/suggestions", get(suggestions))
         .route("/api/desk/suggestions/{id}/{answer}", post(answer))
+        .route("/api/desk/unread", get(unread))
+        .route("/api/desk/reads", get(read_points).put(put_reads))
+        .route("/api/desk/reads/all", post(all_read))
         .with_state(Arc::new(CrewApi { desk, auth, crew }))
 }
 
@@ -419,6 +480,69 @@ mod tests {
             assert_eq!(dismissed["text"], "dismissed the suggestion about Scout");
             let (status, _) = call(&app, "POST", "/api/desk/suggestions/nope/dismiss").await;
             assert_eq!(status, StatusCode::NOT_FOUND);
+        })
+        .await;
+    }
+
+    async fn send(app: &Router, method: &str, uri: &str, body: Value) -> (StatusCode, Value) {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header("authorization", "Bearer hub-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        )
+    }
+
+    #[tokio::test]
+    async fn the_summary_route_answers_each_room_and_reads_move_through_their_routes() {
+        with_test_pool(build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let d = desk(pool, dir.path()).await;
+            let hub = Arc::new(Hub::default());
+            let app = crew_router(d.clone(), Arc::new(Bearer), hub.clone());
+            let room = d
+                .create_room(crate::rooms::NewRoom {
+                    name: "Atlas launch".into(),
+                    members: vec![],
+                    default_member: None,
+                })
+                .await
+                .unwrap();
+            let (status, summary) = call(&app, "GET", "/api/desk/unread").await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(summary["rooms"][0]["roomId"], json!(room.id));
+            assert_eq!(summary["rooms"][0]["main"]["count"], json!(0));
+            assert_eq!(summary["activity"], json!({ "count": 0, "lastAt": null }));
+            assert!(summary["floor"].is_string());
+
+            let place = format!("room:{}", room.id);
+            let put = json!({ "puts": [{ "place": place, "point": { "at": "2026-10-30T10:00:00Z", "message": null }, "mark": "advance" }] });
+            let (status, changed) = send(&app, "PUT", "/api/desk/reads", put.clone()).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(changed, json!({ "reads": [{ "place": place, "at": "2026-10-30T10:00:00Z", "message": null }] }));
+            let (_, again) = send(&app, "PUT", "/api/desk/reads", put).await;
+            assert_eq!(again, json!({ "reads": [] }), "no point moved");
+            let (_, reads) = call(&app, "GET", "/api/desk/reads").await;
+            assert!(reads["reads"].as_array().unwrap().iter().any(|r| r["place"] == json!(place)));
+            let (status, _) = send(&app, "PUT", "/api/desk/reads", json!({ "puts": [{ "place": "floor", "point": { "at": "2026-10-30T10:00:00Z" }, "mark": "set" }] })).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "the floor is Desk's own");
+            let (status, all) = send(&app, "POST", "/api/desk/reads/all", json!({ "scope": { "room": room.id } })).await;
+            assert_eq!((status, all), (StatusCode::OK, json!({ "reads": [] })));
+            let (status, _) = send(&app, "POST", "/api/desk/reads/all", json!({ "scope": "everything" })).await;
+            assert_eq!(status, StatusCode::OK);
         })
         .await;
     }

@@ -237,22 +237,41 @@ pub(crate) fn add_redacted_assistant_message(
     }
 }
 
-/// The files a live Desk turn's `invocations` delivered, on the answer it
-/// just saved in `session`, so a Desk that missed them live reads them with
-/// it.
-pub(crate) fn carry_delivered_files(
+/// What a live Desk turn's `invocations` leave on the answer it just saved
+/// in `session`: the files they delivered, so a Desk that missed them live
+/// reads them with it, and the tools they ran, as steps.
+pub(crate) fn carry_turn(
     session: &mut Session,
     invocations: &[workforce_agent::runner::ToolInvocation],
 ) {
     let files = crate::desk_attachments::delivered_in(session, invocations);
-    if files.is_empty() {
+    let steps = steps_of(invocations);
+    if files.is_empty() && steps.is_empty() {
         return;
     }
     let Some(reply) = session.messages.last_mut() else {
         return;
     };
-    reply.attachments = Some(files.iter().map(Into::into).collect());
-    reply.desk.get_or_insert_with(Default::default).files = files;
+    if !files.is_empty() {
+        reply.attachments = Some(files.iter().map(Into::into).collect());
+    }
+    let mark = reply.desk.get_or_insert_with(Default::default);
+    mark.files = files;
+    mark.steps = steps;
+}
+
+/// The steps a turn's tool runs make, at most
+/// [`workforce_common::channels::desk::MAX_STEPS`] of them, the first kept.
+pub(crate) fn steps_of(
+    invocations: &[workforce_agent::runner::ToolInvocation],
+) -> Vec<workforce_common::channels::desk::DeskStep> {
+    invocations
+        .iter()
+        .take(workforce_common::channels::desk::MAX_STEPS)
+        .map(|i| {
+            workforce_common::channels::desk::DeskStep::of(&i.tool_name, i.success, i.duration_ms)
+        })
+        .collect()
 }
 
 /// The id and Desk mark a turn's answer in a session on `channel` is saved
@@ -267,7 +286,13 @@ pub(crate) fn reply_slot(
     Option<workforce_common::channels::desk::DeskMark>,
 ) {
     match desk {
-        Some(desk) => (Some(desk.reply_id.clone()), Some(desk.turn.place.mark())),
+        Some(desk) => (
+            Some(desk.reply_id.clone()),
+            Some(workforce_common::channels::desk::DeskMark {
+                in_reply_to: desk.turn.message,
+                ..desk.turn.place.mark()
+            }),
+        ),
         None => (
             None,
             workforce_agent::runner::current_desk()
@@ -294,7 +319,7 @@ pub(crate) fn settle_served(
 ) -> Option<&'static str> {
     add_redacted_assistant_message(session, &result.response, desk);
     if desk.is_some() {
-        carry_delivered_files(session, &result.tool_invocations);
+        carry_turn(session, &result.tool_invocations);
     }
     if !route.is_cli() {
         record_observed_usage(session, result, reserved);

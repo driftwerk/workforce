@@ -2628,7 +2628,7 @@ pub enum JournalStep {
     /// collecting resumes from the latest mark rather than deciding again.
     Checkpoint { mark: String },
     /// The call returned; `message` is its row as the session holds it.
-    Finished { message: SessionMessage },
+    Finished { message: Box<SessionMessage> },
 }
 
 impl JournalEntry {
@@ -3118,6 +3118,45 @@ pub trait SessionStore: Send + Sync {
             messages.extend(slice);
         }
         Ok(ArchivePage { messages, has_more })
+    }
+
+    /// How far `owner` has read their Desk conversation with this store's
+    /// agent on `channel`, when this store keeps read points.
+    fn desk_read(
+        &self,
+        _owner: &str,
+        _channel: &str,
+    ) -> eyre::Result<Option<crate::channels::desk::ReadPoint>> {
+        Ok(None)
+    }
+
+    /// Moves `owner`'s point on `channel`: an advance never back, a set
+    /// exactly there. Answers the point when it changed. A store that keeps
+    /// no points refuses.
+    fn put_desk_read(
+        &self,
+        _owner: &str,
+        _channel: &str,
+        _point: &crate::channels::desk::ReadPoint,
+        _mark: crate::channels::desk::Mark,
+    ) -> eyre::Result<Option<crate::channels::desk::ReadPoint>> {
+        eyre::bail!("this hub keeps no read points: its sessions are not in Postgres")
+    }
+
+    /// When `owner`'s read points began on this hub, set the first time it
+    /// is asked for; none when this store keeps no points.
+    fn desk_read_floor(&self, _owner: &str) -> eyre::Result<Option<DateTime<Utc>>> {
+        Ok(None)
+    }
+
+    /// Forgets every read point of `owner`'s, their floor included.
+    fn forget_desk_reads(&self, _owner: &str) -> eyre::Result<u64> {
+        Ok(0)
+    }
+
+    /// Gives `from`'s read points to `into`, the later of two kept.
+    fn move_desk_reads(&self, _from: &str, _into: &str) -> eyre::Result<u64> {
+        Ok(0)
     }
 }
 
@@ -5232,7 +5271,7 @@ pub(crate) fn assert_turn_journal_contract(store: &dyn SessionStore, session_id:
         call: call.into(),
         at: Utc::now(),
         step: JournalStep::Finished {
-            message: SessionMessage {
+            message: Box::new(SessionMessage {
                 id: call.into(),
                 ..SessionMessage::tool(
                     "shell",
@@ -5242,7 +5281,7 @@ pub(crate) fn assert_turn_journal_contract(store: &dyn SessionStore, session_id:
                     5,
                     None,
                 )
-            },
+            }),
         },
     };
     let pending = JournalEntry {
