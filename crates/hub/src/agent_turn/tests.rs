@@ -4036,3 +4036,49 @@ async fn the_install_switch_keeps_frames_off_a_streamed_turn() {
 
     assert_eq!(sent_frames(&hub.claude), (0, 0));
 }
+
+#[tokio::test]
+async fn a_served_rounds_plan_reading_is_kept_as_its_logins() {
+    use crate::hub_core::logins::plan_usage::{observe_with, PlanUsage};
+    use workforce_common::usage::Window;
+
+    /// A login's kind and its windows' lengths and fullness.
+    type Reading = (SubscriptionKind, Vec<(u32, f64)>);
+    #[derive(Default)]
+    struct Seen(parking_lot::Mutex<Vec<Reading>>);
+    impl PlanUsage for Seen {
+        fn observe(
+            &self,
+            login: &crate::subscription::Login,
+            _: Option<&str>,
+            windows: Vec<Window>,
+        ) {
+            let windows = windows
+                .iter()
+                .map(|w| (w.minutes, w.used_percent))
+                .collect();
+            self.0.lock().push((login.kind, windows));
+        }
+    }
+    let seen = Arc::new(Seen::default());
+    observe_with(seen.clone());
+    let hub = hub(claude_first).await;
+    hub.claude_login(ALICE);
+    let mut events = vec![json!({
+        "type": "rate_limit_event",
+        "rate_limit_info": {"status": "allowed", "unifiedWindows": {
+            "five_hour": {"utilization": 0.06, "resetsAt": 1_790_676_600},
+            "seven_day": {"utilization": 0.69, "resetsAt": 1_790_956_800}}},
+    })];
+    events.extend(answer(SKY));
+    hub.claude.reply(None, &events);
+
+    assert_eq!(hub.ask(ALICE, "why is the sky blue?").await.unwrap(), SKY);
+    assert!(
+        seen.0
+            .lock()
+            .contains(&(SubscriptionKind::Claude, vec![(300, 6.0), (10_080, 69.0)])),
+        "a round that served the turn reports how full its plan is: {:?}",
+        seen.0.lock()
+    );
+}

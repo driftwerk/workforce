@@ -2,14 +2,17 @@
 //! jobs, one overseer at a time), and waking it: what happened on the crew
 //! becomes a turn in its Desk DM — something waiting on the person too
 //! long, work gone quiet, work finished or failed — gathered for a minute
-//! into one check-in, at most so many a day, never about its own doing,
-//! and held to the rooms' loop guard.
+//! into one check-in, never about its own doing, and held to the rooms'
+//! loop guard. Check-ins are spent from a rolling hour, under a ceiling for
+//! the day; while they are spent what happens is held for the next one, and
+//! the person is told until when. A question already raised wakes it again
+//! only as a reminder, after a while.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use tokio::sync::broadcast::error::RecvError;
 use tokio_util::sync::CancellationToken;
 use workforce_common::oversight::{Level, Oversight};
@@ -32,12 +35,103 @@ const DESK_ACTIONS: [&str; 4] = ["desk.start", "desk.prompt", "desk.approve", "d
 const MORNING_JOB: &str = "crew-summary-morning";
 const EVENING_JOB: &str = "crew-summary-evening";
 
+/// Where the open questions the overseer raised are kept, and when each
+/// last was, so a restart doesn't raise them again.
+const RAISED: &str = "hub.crew.raised";
+/// How long a raised question is remembered.
+const RAISED_FOR: chrono::TimeDelta = chrono::TimeDelta::days(1);
+/// The most check-in lines held while check-ins are spent; older go.
+const MAX_HELD: usize = 30;
+
 /// One thing worth waking the overseer for.
 #[derive(Debug, Clone)]
 pub(super) struct Trigger {
     pub line: String,
     pub approvals: Vec<MentionedApproval>,
     pub hop: i16,
+    /// The open question it is about (a session's question, an approval,
+    /// something waiting on the person), the same however it is noticed.
+    pub about: Option<String>,
+}
+
+/// What the overseer may spend on check-ins now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Budget {
+    Open,
+    /// Spent until `until`: the hour's budget, or the day's ceiling.
+    Spent {
+        until: DateTime<Utc>,
+        daily: bool,
+    },
+}
+
+/// `o`'s check-in budget at `now`, given when the check-ins since the
+/// start of the day (`midnight`, the next `tomorrow`) or of the last
+/// `hour`, whichever is earlier, were.
+pub(super) fn budget(
+    o: &Oversight,
+    wakes: &[DateTime<Utc>],
+    now: DateTime<Utc>,
+    hour: chrono::TimeDelta,
+    (midnight, tomorrow): (DateTime<Utc>, DateTime<Utc>),
+) -> Budget {
+    let today = wakes.iter().filter(|at| **at >= midnight).count();
+    if today >= o.max_checkins_per_day as usize {
+        return Budget::Spent {
+            until: tomorrow,
+            daily: true,
+        };
+    }
+    let mut in_hour: Vec<DateTime<Utc>> = wakes
+        .iter()
+        .copied()
+        .filter(|at| *at > now - hour)
+        .collect();
+    in_hour.sort();
+    let per_hour = o.max_checkins_per_hour as usize;
+    if in_hour.len() >= per_hour {
+        // Free again once enough of them are an hour old.
+        return Budget::Spent {
+            until: in_hour[in_hour.len() - per_hour] + hour,
+            daily: false,
+        };
+    }
+    Budget::Open
+}
+
+/// Whether `t` is worth a check-in given the questions `raised` and when:
+/// anything not about one is, as is one never raised; one raised before
+/// only as a reminder, `remind` after it was.
+pub(super) fn fresh(
+    t: &mut Trigger,
+    raised: &HashMap<String, DateTime<Utc>>,
+    remind: Option<chrono::TimeDelta>,
+    now: DateTime<Utc>,
+) -> bool {
+    let Some(at) = t.about.as_ref().and_then(|k| raised.get(k)) else {
+        return true;
+    };
+    if remind.is_some_and(|r| now - *at >= r) {
+        t.line = format!("Reminder, still open: {}", t.line);
+        return true;
+    }
+    false
+}
+
+/// Adds `found` to what is `pending`: each line once, each open question
+/// once (its latest), the latest [`MAX_HELD`].
+pub(super) fn hold(pending: &mut Vec<Trigger>, found: Vec<Trigger>) {
+    for t in found {
+        pending.retain(|p| p.line != t.line && (t.about.is_none() || p.about != t.about));
+        pending.push(t);
+    }
+    let over = pending.len().saturating_sub(MAX_HELD);
+    pending.drain(..over);
+}
+
+/// The key an open question is raised by: whose, and what it asks.
+fn question_key(subject: &str, kind: &str, mark: &str) -> String {
+    format!("{kind}:{subject}:{}", crew::one_line(mark, 200))
 }
 
 fn tracked(o: &Oversight, subject: &Party) -> bool {
@@ -195,16 +289,28 @@ impl CrewHub {
             Kind::Failed | Kind::Limit => o.wake.on_failure,
             _ => false,
         };
+        let about = (event.kind == Kind::Question).then(|| {
+            let asked = event
+                .detail
+                .as_ref()
+                .and_then(|d| d.pointer("/question/text"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(&event.text);
+            question_key(&subject.id, "asked", asked)
+        });
         wanted.then(|| Trigger {
             line: format!("{} {}", who(subject), event.text),
             approvals: Vec::new(),
             hop: event.hop,
+            about,
         })
     }
 
     /// What has waited on the person, or gone quiet, past the overseer's
-    /// thresholds; each once (keys already in `noted` are left out, and
-    /// `noted` keeps only what still holds).
+    /// thresholds. What waits is said each time, about its open question
+    /// ([`fresh`] says whether it is worth raising); work gone quiet once
+    /// (keys already in `noted` are left out, and `noted` keeps only what
+    /// still holds).
     pub(super) async fn thresholds(
         &self,
         overseer: &str,
@@ -244,21 +350,29 @@ impl CrewHub {
                         .since
                         .map(|s| (now - s).num_minutes().max(1))
                         .unwrap_or(1);
-                    let (asks, mark, approvals) = match (&item.approval, &item.question) {
+                    let (asks, about, approvals) = match (&item.approval, &item.question) {
                         (Some(a), _) => (
                             format!("{} (approval {})", a.summary, a.id),
-                            a.id.clone(),
+                            question_key(&item.id, "approval", &a.id),
                             vec![MentionedApproval {
                                 session_id: item.id.clone(),
                                 approval_id: a.id.clone(),
                                 summary: a.summary.clone(),
                             }],
                         ),
-                        (None, Some(q)) => (format!("asks “{}”", q.text), q.text.clone(), vec![]),
-                        (None, None) => ("is waiting on you".into(), String::new(), vec![]),
+                        (None, Some(q)) => (
+                            format!("asks “{}”", q.text),
+                            question_key(&item.id, "asked", &q.text),
+                            vec![],
+                        ),
+                        (None, None) => (
+                            "is waiting on you".into(),
+                            question_key(&item.id, "waiting", ""),
+                            vec![],
+                        ),
                     };
                     (
-                        format!("waiting:{}:{mark}", item.id),
+                        about.clone(),
                         Trigger {
                             line: format!(
                                 "{} has waited on you for {waited} min: {asks}",
@@ -266,6 +380,7 @@ impl CrewHub {
                             ),
                             approvals,
                             hop: 0,
+                            about: Some(about),
                         },
                     )
                 }
@@ -296,13 +411,14 @@ impl CrewHub {
                             ),
                             approvals: vec![],
                             hop: 0,
+                            about: None,
                         },
                     )
                 }
                 _ => continue,
             };
             holding.insert(key.clone());
-            if noted.insert(key) {
+            if trigger.about.is_some() || noted.insert(key) {
                 out.push(trigger);
             }
         }
@@ -456,14 +572,86 @@ impl CrewHub {
         Ok(reply)
     }
 
-    /// Whether the overseer may check in again today.
-    async fn under_cap(&self, o: &Oversight) -> bool {
-        match self.desk.store().wake_ups_since(self.midnight()).await {
-            Ok(n) => n < i64::from(o.max_checkins_per_day),
+    /// An hour, as this crew's minutes run.
+    fn hour(&self) -> chrono::TimeDelta {
+        chrono::Duration::from_std(self.timing.minute * 60).unwrap_or(chrono::TimeDelta::hours(1))
+    }
+
+    /// The person's time zone.
+    fn tz(&self) -> chrono_tz::Tz {
+        self.services()
+            .first()
+            .map_or(chrono_tz::UTC, |s| s.config.user_timezone())
+    }
+
+    /// The start of the next day, in the person's time zone.
+    fn tomorrow(&self) -> DateTime<Utc> {
+        let tz = self.tz();
+        Utc::now()
+            .with_timezone(&tz)
+            .date_naive()
+            .succ_opt()
+            .and_then(|d| d.and_hms_opt(0, 0, 0))
+            .and_then(|m| m.and_local_timezone(tz).earliest())
+            .map_or_else(
+                || Utc::now() + chrono::TimeDelta::hours(24),
+                |m| m.with_timezone(&Utc),
+            )
+    }
+
+    /// What the overseer may spend on check-ins now.
+    pub(super) async fn budget(&self, o: &Oversight) -> eyre::Result<Budget> {
+        let now = Utc::now();
+        let midnight = self.midnight();
+        let wakes = self
+            .desk
+            .store()
+            .wakes_since(midnight.min(now - self.hour()))
+            .await?;
+        Ok(budget(
+            o,
+            &wakes,
+            now,
+            self.hour(),
+            (midnight, self.tomorrow()),
+        ))
+    }
+
+    /// Tells the person, where they look, that the overseer holds its
+    /// check-ins until `until`, and why.
+    fn paused(&self, service: &AgentService, until: DateTime<Utc>, daily: bool) {
+        let why = if daily { "daily" } else { "hourly" };
+        let text = format!(
+            "paused check-ins until {}: {why} limit reached",
+            until.with_timezone(&self.tz()).format("%H:%M")
+        );
+        tracing::warn!(agent = %service.agent_id, %until, "the overseer {text}");
+        let me = Party::manager(service.agent_id.as_str(), &name_of(service));
+        self.desk.note(Event::new(Kind::Quiet, me, None, text));
+    }
+
+    /// The open questions raised and when, as kept.
+    pub(super) async fn raised(&self) -> HashMap<String, DateTime<Utc>> {
+        match self.desk.store().state(RAISED).await {
+            Ok(kept) => kept
+                .and_then(|e| serde_json::from_value(e.value).ok())
+                .unwrap_or_default(),
             Err(e) => {
-                tracing::warn!(error = %e, "counting today's check-ins failed");
-                false
+                tracing::warn!(error = %e, "reading the questions the overseer raised failed");
+                HashMap::new()
             }
+        }
+    }
+
+    /// Keeps `raised` for the next start.
+    async fn keep_raised(&self, raised: &HashMap<String, DateTime<Utc>>) {
+        if let Err(e) = self
+            .desk
+            .store()
+            .put_state(RAISED, &serde_json::json!(raised))
+            .await
+        {
+            tracing::warn!(error = %e, "keeping the questions the overseer raised failed");
         }
     }
 }
@@ -489,6 +677,10 @@ pub(super) async fn wake_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
     let mut window: Option<Instant> = None;
     let mut noted: HashSet<String> = HashSet::new();
     let mut firing: Option<tokio::task::JoinHandle<()>> = None;
+    let mut raised = crew.raised().await;
+    // Until when check-ins are spent, and the pause the person was told of.
+    let mut held_until: Option<DateTime<Utc>> = None;
+    let mut told: Option<DateTime<Utc>> = None;
     loop {
         let mut found = Vec::new();
         tokio::select! {
@@ -509,8 +701,18 @@ pub(super) async fn wake_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
             }
         }
         if !found.is_empty() {
+            if let Some((_, o)) = crew.overseer_service() {
+                let remind = (o.wake.remind_minutes > 0).then(|| {
+                    chrono::Duration::from_std(crew.timing.minute * o.wake.remind_minutes)
+                        .unwrap_or(RAISED_FOR)
+                });
+                let now = Utc::now();
+                found.retain_mut(|t| fresh(t, &raised, remind, now));
+            }
+        }
+        if !found.is_empty() {
             window.get_or_insert_with(Instant::now);
-            pending.extend(found);
+            hold(&mut pending, found);
         }
         if firing.as_ref().is_some_and(|f| f.is_finished()) {
             firing = None;
@@ -519,16 +721,168 @@ pub(super) async fn wake_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
         if !due || firing.is_some() || pending.is_empty() {
             continue;
         }
-        window = None;
-        let triggers = std::mem::take(&mut pending);
-        let Some((_, o)) = crew.overseer_service() else {
+        if held_until.is_some_and(|until| Utc::now() < until) {
+            continue;
+        }
+        let Some((service, o)) = crew.overseer_service() else {
+            window = None;
+            pending.clear();
             continue;
         };
-        if !crew.under_cap(&o).await {
-            tracing::info!("the overseer has checked in as often as it may today");
-            continue;
+        match crew.budget(&o).await {
+            Ok(Budget::Open) => held_until = None,
+            Ok(Budget::Spent { until, daily }) => {
+                held_until = Some(until);
+                if told != Some(until) {
+                    told = Some(until);
+                    crew.paused(&service, until, daily);
+                }
+                continue;
+            }
+            Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"), "counting the overseer's check-ins failed");
+                held_until = chrono::Duration::from_std(crew.timing.coalesce)
+                    .ok()
+                    .map(|d| Utc::now() + d);
+                continue;
+            }
+        }
+        window = None;
+        let triggers = std::mem::take(&mut pending);
+        let now = Utc::now();
+        raised.retain(|_, at| now - *at < RAISED_FOR);
+        let asked: Vec<&String> = triggers.iter().filter_map(|t| t.about.as_ref()).collect();
+        if !asked.is_empty() {
+            for key in asked {
+                raised.insert(key.clone(), now);
+            }
+            crew.keep_raised(&raised).await;
         }
         let crew = Arc::clone(&crew);
         firing = Some(tokio::spawn(async move { crew.wake(triggers).await }));
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+    use chrono::TimeDelta;
+
+    fn oversight(per_hour: u32, per_day: u32) -> Oversight {
+        Oversight {
+            max_checkins_per_hour: per_hour,
+            max_checkins_per_day: per_day,
+            ..Oversight::default()
+        }
+    }
+
+    #[test]
+    fn check_ins_are_spent_from_a_rolling_hour_under_a_ceiling_for_the_day() {
+        let now = Utc::now();
+        let hour = TimeDelta::hours(1);
+        let day = (now - TimeDelta::hours(10), now + TimeDelta::hours(14));
+        let ago = |m: i64| now - TimeDelta::minutes(m);
+        let wakes = [ago(200), ago(50), ago(10)];
+        assert_eq!(
+            budget(&oversight(3, 100), &wakes, now, hour, day),
+            Budget::Open
+        );
+        assert_eq!(
+            budget(&oversight(2, 100), &wakes, now, hour, day),
+            Budget::Spent {
+                until: ago(50) + hour,
+                daily: false
+            },
+            "free again once the hour's oldest is an hour old"
+        );
+        assert_eq!(
+            budget(&oversight(1, 100), &wakes, now, hour, day),
+            Budget::Spent {
+                until: ago(10) + hour,
+                daily: false
+            }
+        );
+        assert_eq!(
+            budget(&oversight(6, 3), &wakes, now, hour, day),
+            Budget::Spent {
+                until: day.1,
+                daily: true
+            },
+            "the day's ceiling holds until the next day"
+        );
+        let yesterday = (now + TimeDelta::minutes(5), now + TimeDelta::days(1));
+        assert_eq!(
+            budget(&oversight(6, 1), &wakes, now, hour, yesterday),
+            Budget::Open,
+            "yesterday's check-ins are not today's"
+        );
+    }
+
+    fn asking(about: &str) -> Trigger {
+        Trigger {
+            line: format!("web asks “{about}”"),
+            approvals: vec![],
+            hop: 0,
+            about: Some(about.into()),
+        }
+    }
+
+    #[test]
+    fn a_raised_question_wakes_it_again_only_as_a_reminder() {
+        let now = Utc::now();
+        let raised = HashMap::from([("ship".to_string(), now - TimeDelta::minutes(30))]);
+        let mut news = Trigger {
+            about: None,
+            ..asking("x")
+        };
+        assert!(
+            fresh(&mut news, &raised, None, now),
+            "news is always worth it"
+        );
+        assert!(
+            fresh(&mut asking("merge"), &raised, None, now),
+            "a new question"
+        );
+        assert!(
+            !fresh(&mut asking("ship"), &raised, None, now),
+            "never reminded"
+        );
+        assert!(!fresh(
+            &mut asking("ship"),
+            &raised,
+            Some(TimeDelta::hours(2)),
+            now
+        ));
+        let mut due = asking("ship");
+        assert!(fresh(&mut due, &raised, Some(TimeDelta::minutes(20)), now));
+        assert!(
+            due.line.starts_with("Reminder, still open: "),
+            "{}",
+            due.line
+        );
+    }
+
+    #[test]
+    fn what_is_held_is_each_thing_once_and_the_latest() {
+        let mut pending = vec![asking("ship")];
+        let mut again = asking("ship");
+        again.line = "web has waited on you for 9 min: asks “ship”".into();
+        hold(&mut pending, vec![again.clone(), asking("merge")]);
+        assert_eq!(
+            pending.iter().map(|t| t.line.as_str()).collect::<Vec<_>>(),
+            [again.line.as_str(), "web asks “merge”"]
+        );
+        let many = (0..MAX_HELD + 5)
+            .map(|n| Trigger {
+                about: None,
+                ..asking(&n.to_string())
+            })
+            .collect();
+        hold(&mut pending, many);
+        assert_eq!(pending.len(), MAX_HELD);
+        assert_eq!(
+            pending.last().unwrap().line,
+            format!("web asks “{}”", MAX_HELD + 4)
+        );
     }
 }

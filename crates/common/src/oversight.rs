@@ -7,11 +7,17 @@
 //! enabled = true
 //! level = "watch" # watch | suggest | act
 //! track = { crew = true, desk_sessions = true, external_sessions = true, workspaces = false }
-//! wake = { waiting_minutes = 5, quiet_minutes = 30, on_finish = true, on_failure = true }
+//! wake = { waiting_minutes = 5, quiet_minutes = 30, remind_minutes = 120, on_finish = true, on_failure = true }
 //! summaries = { morning = "09:00", evening = "" }
-//! max_checkins_per_day = 40
+//! max_checkins_per_hour = 6
+//! max_checkins_per_day = 100
 //! act = { nudge = true, resume_restart = true, read_only_approvals = false, hand_out_work = false }
 //! ```
+//!
+//! Check-ins are spent from a rolling hour, `max_checkins_per_day` the
+//! ceiling over a day; what happens while they are spent waits for the next
+//! one. Something waiting on the person, or a question a session asked,
+//! wakes it once, and again only after `remind_minutes`.
 //!
 //! The table is read leniently by serde (it is kept as a raw value) and
 //! checked here, so what is wrong with it is said in plain words, without
@@ -57,6 +63,9 @@ pub struct Track {
 pub struct Wake {
     pub waiting_minutes: u32,
     pub quiet_minutes: u32,
+    /// How long before a question it already raised, still open and
+    /// unchanged, is raised again; 0 never.
+    pub remind_minutes: u32,
     pub on_finish: bool,
     pub on_failure: bool,
 }
@@ -85,6 +94,9 @@ pub struct Oversight {
     pub track: Track,
     pub wake: Wake,
     pub summaries: Summaries,
+    /// Check-ins in any hour.
+    pub max_checkins_per_hour: u32,
+    /// Check-ins in a day, the ceiling over the hourly budget.
     pub max_checkins_per_day: u32,
     pub act: Act,
 }
@@ -93,6 +105,8 @@ pub struct Oversight {
 pub const MAX_MINUTES: i64 = 1440;
 /// The most check-ins a day may allow.
 pub const MAX_CHECKINS: i64 = 500;
+/// The most check-ins an hour may allow: one a minute.
+pub const MAX_CHECKINS_PER_HOUR: i64 = 60;
 
 impl Default for Oversight {
     fn default() -> Self {
@@ -108,6 +122,7 @@ impl Default for Oversight {
             wake: Wake {
                 waiting_minutes: 5,
                 quiet_minutes: 30,
+                remind_minutes: 120,
                 on_finish: true,
                 on_failure: true,
             },
@@ -115,7 +130,8 @@ impl Default for Oversight {
                 morning: Some((9, 0)),
                 evening: None,
             },
-            max_checkins_per_day: 40,
+            max_checkins_per_hour: 6,
+            max_checkins_per_day: 100,
             act: Act {
                 nudge: true,
                 resume_restart: true,
@@ -262,6 +278,11 @@ impl Oversight {
                     "something waiting on you",
                 )?,
                 quiet_minutes: minutes("quiet_minutes", d.wake.quiet_minutes, "work gone quiet")?,
+                remind_minutes: minutes(
+                    "remind_minutes",
+                    d.wake.remind_minutes,
+                    "a question it already raised",
+                )?,
                 on_finish: switch(
                     wake,
                     "on_finish",
@@ -279,6 +300,15 @@ impl Oversight {
                 morning: time(summaries, "morning", d.summaries.morning, "morning")?,
                 evening: time(summaries, "evening", d.summaries.evening, "evening")?,
             },
+            max_checkins_per_hour: whole(
+                root,
+                "max_checkins_per_hour",
+                d.max_checkins_per_hour,
+                1..=MAX_CHECKINS_PER_HOUR,
+                &format!(
+                    "The most check-ins an hour must be a whole number from 1 to {MAX_CHECKINS_PER_HOUR}."
+                ),
+            )?,
             max_checkins_per_day: whole(
                 root,
                 "max_checkins_per_day",
@@ -337,14 +367,16 @@ mod tests {
     fn inline_and_sub_tables_read_the_same() {
         let inline = parse(
             "[oversight]\nenabled = true\nlevel = \"act\"\n\
-             wake = { waiting_minutes = 0, quiet_minutes = 12, on_finish = false }\n\
+             wake = { waiting_minutes = 0, quiet_minutes = 12, remind_minutes = 0, on_finish = false }\n\
+             max_checkins_per_hour = 3\n\
              summaries = { morning = \"\", evening = \"18:30\" }\n\
              act = { read_only_approvals = true }\n",
         )
         .unwrap();
         let tables = parse(
             "[oversight]\nenabled = true\nlevel = \"act\"\n\n\
-             [oversight.wake]\nwaiting_minutes = 0\nquiet_minutes = 12\non_finish = false\n\n\
+             max_checkins_per_hour = 3\n\n\
+             [oversight.wake]\nwaiting_minutes = 0\nquiet_minutes = 12\nremind_minutes = 0\non_finish = false\n\n\
              [oversight.summaries]\nmorning = \"\"\nevening = \"18:30\"\n\n\
              [oversight.act]\nread_only_approvals = true\n",
         )
@@ -352,8 +384,16 @@ mod tests {
         assert_eq!(inline, tables);
         assert_eq!(inline.level, Level::Act);
         assert_eq!(
-            (inline.wake.waiting_minutes, inline.wake.quiet_minutes),
-            (0, 12)
+            (
+                inline.wake.waiting_minutes,
+                inline.wake.quiet_minutes,
+                inline.wake.remind_minutes
+            ),
+            (0, 12, 0)
+        );
+        assert_eq!(
+            (inline.max_checkins_per_hour, inline.max_checkins_per_day),
+            (3, 100)
         );
         assert!(!inline.wake.on_finish && inline.wake.on_failure);
         assert_eq!(inline.summaries.morning, None);
@@ -385,6 +425,11 @@ mod tests {
                 "09:00",
             ),
             ("[oversight]\nmax_checkins_per_day = 0\n", "from 1 to 500"),
+            ("[oversight]\nmax_checkins_per_hour = 61\n", "from 1 to 60"),
+            (
+                "[oversight]\nwake = { remind_minutes = 1441 }\n",
+                "a question it already raised",
+            ),
             ("[oversight]\ntrack = true\n", "group of settings"),
             ("oversight = 3\n", "group of settings"),
         ] {
@@ -395,6 +440,7 @@ mod tests {
                 "enabled",
                 "quiet_minutes",
                 "waiting_minutes",
+                "remind_minutes",
                 "max_checkins",
                 "track",
                 "oversight",

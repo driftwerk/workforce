@@ -619,6 +619,9 @@ impl AgentTurnRig {
                 }
                 return Err(failure);
             }
+            // What a served round says of its login too: how full the plan's
+            // windows are, kept as its reading.
+            login.settle(&result.round_end(), service.agent_id.as_str());
             tally.add(&result);
             transcript.resume |= transcript.keeps();
             let (follow_ups, stop) = drain(inbox.as_mut(), &mut pending);

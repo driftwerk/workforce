@@ -702,12 +702,127 @@ async fn what_happens_together_is_one_check_in_and_the_day_has_a_cap() {
         assert!(first.prompt.contains("acme-web") && first.prompt.contains("workforce-e7"), "{}", first.prompt);
         let s = session_party("dw-676");
         d.note(Event::new(Kind::Finished, s.clone(), Some(s), "finished · merged"));
+        let told = eventually("the pause on the Floor", async || {
+            let page = d.activity(Filter::Manager, None, 10).await.unwrap();
+            page.events.into_iter().find(|e| e.kind == Kind::Quiet)
+        })
+        .await;
+        assert!(
+            told.text.starts_with("paused check-ins until ") && told.text.ends_with(": daily limit reached"),
+            "{}",
+            told.text
+        );
+        assert_eq!(told.subject, None);
         tokio::time::sleep(Duration::from_millis(800)).await;
         assert_eq!(
             d.store().wake_ups_since(chrono::Utc::now() - chrono::Duration::hours(1)).await.unwrap(),
             1,
             "a day's check-ins are capped"
         );
+        let page = d.activity(Filter::Manager, None, 10).await.unwrap();
+        assert_eq!(
+            page.events.iter().filter(|e| e.kind == Kind::Quiet).count(),
+            1,
+            "the person is told once a pause"
+        );
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn past_the_hours_check_ins_what_happens_waits_for_the_next() {
+    use workforce_desk::crew::Event;
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, _crew, d, _llm) = overseeing(
+            dir.path(),
+            pool,
+            "Noted.",
+            "[oversight]\nenabled = true\nmax_checkins_per_hour = 1\nwake = { waiting_minutes = 0, quiet_minutes = 0 }\n",
+            &[],
+        )
+        .await;
+        let web = session_party("acme-web");
+        d.note(Event::new(Kind::Finished, web.clone(), Some(web), "finished · all green"));
+        eventually("a check-in", async || {
+            d.store().latest_check_in("desk").await.unwrap()
+        })
+        .await;
+        let dw = session_party("dw-676");
+        d.note(Event::new(Kind::Finished, dw.clone(), Some(dw), "finished · merged"));
+        let told = eventually("the pause on the Floor", async || {
+            let page = d.activity(Filter::Manager, None, 10).await.unwrap();
+            page.events.into_iter().find(|e| e.kind == Kind::Quiet)
+        })
+        .await;
+        assert!(told.text.ends_with(": hourly limit reached"), "{}", told.text);
+        let later = eventually("the held check-in, once the hour has room", async || {
+            d.store()
+                .latest_check_in("desk")
+                .await
+                .unwrap()
+                .filter(|c| c.prompt.contains("dw-676"))
+        })
+        .await;
+        assert!(later.prompt.contains("merged"), "{}", later.prompt);
+        assert_eq!(
+            d.store().wake_ups_since(chrono::Utc::now() - chrono::Duration::hours(1)).await.unwrap(),
+            2,
+            "what waited is told, not dropped"
+        );
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unchanged_question_wakes_the_overseer_once_and_what_it_raised_is_kept() {
+    use workforce_desk::crew::Event;
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, crew, d, _llm) = overseeing(
+            dir.path(),
+            pool,
+            "It asks whether to ship.",
+            "[oversight]\nenabled = true\nwake = { waiting_minutes = 0, quiet_minutes = 0 }\n",
+            &[],
+        )
+        .await;
+        let web = session_party("acme-web");
+        let ask = |text: &str| {
+            Event::new(
+                Kind::Question,
+                web.clone(),
+                Some(web.clone()),
+                format!("asked “{text}”"),
+            )
+            .detail(json!({"question": {"text": text, "options": []}}))
+        };
+        d.note(ask("Ship it?"));
+        eventually("a check-in", async || {
+            d.store().latest_check_in("desk").await.unwrap()
+        })
+        .await;
+        d.note(ask("Ship it?"));
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert_eq!(
+            d.store()
+                .wake_ups_since(chrono::Utc::now() - chrono::Duration::hours(1))
+                .await
+                .unwrap(),
+            1,
+            "the same open question doesn't wake it again"
+        );
+        let raised = crew.raised().await;
+        assert_eq!(raised.len(), 1, "what it raised is kept: {raised:?}");
+        d.note(ask("Ship it to everyone?"));
+        eventually("a check-in about the new question", async || {
+            d.store()
+                .latest_check_in("desk")
+                .await
+                .unwrap()
+                .filter(|c| c.prompt.contains("everyone"))
+        })
+        .await;
     })
     .await;
 }
