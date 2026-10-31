@@ -16,6 +16,12 @@
 //! sharing one pool across stores with different schemas would mean
 //! fighting Postgres' per-session `search_path`.
 //!
+//! So that the pools fit the server between them: a store is built once
+//! per process (a hub's agents share it), a store that is seldom asked
+//! takes [`PostgresConfig::small`], every pool closes the connections it
+//! has not used for [`IDLE_TIMEOUT`], and [`check_budget`] says at startup
+//! how many the pools may open against the server's `max_connections`.
+//!
 //! ## Why this is its own crate (not a module of `workforce-common`)
 //!
 //! `workforce-common` already depends on `workforce-pairing` for the
@@ -26,7 +32,7 @@
 //! without creating a cycle. Hence: a separate, dependency-free crate.
 
 mod config;
-pub use config::{default_backend_connect_timeout_secs, PostgresConfig, SslMode};
+pub use config::{default_backend_connect_timeout_secs, PostgresConfig, SslMode, SMALL_POOL_SIZE};
 
 #[cfg(feature = "postgres")]
 mod error;
@@ -40,7 +46,7 @@ pub use error::PostgresError;
 #[cfg(feature = "postgres")]
 pub use migrations::{MigrationRun, MigrationRunner, MigrationSet};
 #[cfg(feature = "postgres")]
-pub use pool::PostgresPool;
+pub use pool::{check_budget, PoolBudget, PoolShare, PostgresPool, IDLE_TIMEOUT};
 
 /// Session statement that makes every transaction on a connection
 /// read-only: for offline readers that must not change a live install.

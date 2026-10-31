@@ -88,6 +88,25 @@ fn default_pool_size() -> usize {
     DEFAULT_POOL_SIZE
 }
 
+/// The most connections a store that is seldom asked opens
+/// ([`PostgresConfig::small`]).
+pub const SMALL_POOL_SIZE: usize = 4;
+
+impl PostgresConfig {
+    /// These settings for a store that is seldom asked: at most
+    /// [`SMALL_POOL_SIZE`] connections, fewer when `pool_size` says so, and
+    /// never fewer than two, since migrations hold one for their lock and
+    /// ask for another. Every store's pool otherwise took `pool_size`, and
+    /// between them a hub's pools could open far more than the server's
+    /// `max_connections`.
+    pub fn small(&self) -> Self {
+        Self {
+            pool_size: self.pool_size.clamp(2, SMALL_POOL_SIZE),
+            ..self.clone()
+        }
+    }
+}
+
 /// Shared default startup connection budget (seconds) for the real backends.
 pub fn default_backend_connect_timeout_secs() -> u64 {
     300
@@ -168,6 +187,21 @@ impl PostgresConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_small_store_takes_at_most_four_connections_and_at_least_two() {
+        let sized = |pool_size| {
+            PostgresConfig {
+                pool_size,
+                ..PostgresConfig::default()
+            }
+            .small()
+            .pool_size
+        };
+        assert_eq!(sized(16), SMALL_POOL_SIZE);
+        assert_eq!(sized(3), 3);
+        assert_eq!(sized(1), 2);
+    }
 
     #[test]
     fn default_pool_size_is_sensible() {

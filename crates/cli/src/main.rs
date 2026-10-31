@@ -2823,9 +2823,7 @@ async fn build_permission_store(
         OptionalStoreBackend::Postgres => {
             let pg_cfg = pg.expect("postgres backend implies an enabled [postgres] pool");
             tracing::info!("Using Postgres permission store");
-            let store = workforce_permissions::postgres::PostgresPermissionStore::new(pg_cfg)
-                .await
-                .context("constructing PostgresPermissionStore")?;
+            let store = postgres_permission_store(pg_cfg).await?;
             Ok(Some(
                 store as Arc<dyn workforce_permissions::store::PermissionStore>,
             ))
@@ -2841,6 +2839,25 @@ async fn build_permission_store(
             Ok(Some(Arc::new(store)))
         }
     }
+}
+
+/// The process's Postgres permission store, which is its capability store
+/// too: one pool for both, where each opened its own.
+async fn postgres_permission_store(
+    pg_cfg: &workforce_common::postgres::PostgresConfig,
+) -> Result<Arc<workforce_permissions::postgres::PostgresPermissionStore>> {
+    use eyre::WrapErr;
+    static STORE: tokio::sync::OnceCell<
+        Arc<workforce_permissions::postgres::PostgresPermissionStore>,
+    > = tokio::sync::OnceCell::const_new();
+    STORE
+        .get_or_try_init(|| async {
+            workforce_permissions::postgres::PostgresPermissionStore::new(pg_cfg)
+                .await
+                .context("constructing PostgresPermissionStore")
+        })
+        .await
+        .cloned()
 }
 
 /// Build the capability-override store backing the admin-editable matrix.
@@ -2864,9 +2881,7 @@ async fn build_capability_store(
     {
         let pg_cfg = pg.expect("postgres backend implies an enabled [postgres] pool");
         tracing::info!("Using Postgres capability store");
-        let store = workforce_permissions::postgres::PostgresPermissionStore::new(pg_cfg)
-            .await
-            .context("constructing PostgresPermissionStore for the capability store")?;
+        let store = postgres_permission_store(pg_cfg).await?;
         return Ok(store as Arc<dyn workforce_permissions::CapabilityStore>);
     }
 
@@ -6111,6 +6126,10 @@ rules:
                 }
             };
             let gateway_app = gateway_app.merge(teams_router);
+
+            // Every store is open: say what the Postgres pools may open
+            // between them against what the server allows.
+            workforce_postgres::check_budget().await;
 
             // Run admin API, gateway, and Slack concurrently
             let admin_listener = tokio::net::TcpListener::bind(admin_addr).await?;

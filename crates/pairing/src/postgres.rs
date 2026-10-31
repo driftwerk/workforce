@@ -40,7 +40,10 @@ impl PostgresPairingStore {
     /// connection it hands out has its `search_path` pinned to the
     /// pairing schema.
     pub fn build_pool(config: &PostgresConfig) -> Result<PostgresPool, PostgresError> {
-        PostgresPool::from_config_with_session_init(config, &["SET search_path TO pairing, public"])
+        PostgresPool::from_config_with_session_init(
+            &config.small(),
+            &["SET search_path TO pairing, public"],
+        )
     }
 
     /// Build a pool from config, run pending migrations, and return a
