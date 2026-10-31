@@ -54,14 +54,14 @@ fn current_turn_user() -> Option<String> {
 }
 
 /// Provider-specific guidance folded into the tool description, mirroring the
-/// gateway voice-mode directive so the model writes text that speaks well.
-fn provider_phrasing_rules(provider_id: &str) -> &'static str {
-    match provider_id {
-        "fish_audio" => {
-            "This provider supports emotion tags in parentheses at sentence starts, e.g. \
-             \"(excited) Boa! You got it!\" — common tags: excited, thoughtful, concerned, \
-             confident, curious, amused, serious."
-        }
+/// gateway voice-mode directive so the model writes text that speaks well. A
+/// voice that takes directions gets exactly the ones it performs, from the
+/// same table its text is checked against.
+fn provider_phrasing_rules(provider: &dyn SpeechProvider) -> String {
+    if let Some(guidance) = provider.markup().guidance() {
+        return guidance.split_whitespace().collect::<Vec<_>>().join(" ");
+    }
+    match provider.provider_id() {
         "elevenlabs" => {
             "Write clean, natural sentences — the voice model handles emotion automatically; \
              no special tags."
@@ -76,6 +76,7 @@ fn provider_phrasing_rules(provider_id: &str) -> &'static str {
         }
         _ => "Write clean, natural sentences; no special tags.",
     }
+    .to_string()
 }
 
 pub struct SpeechGenerationTool {
@@ -112,7 +113,7 @@ impl SpeechGenerationTool {
              default per-user scope. If synthesis fails with a missing/invalid key, relay \
              that exact remedy — do NOT delete or modify stored secrets.",
             label = provider.voice_label(),
-            rules = provider_phrasing_rules(provider.provider_id()),
+            rules = provider_phrasing_rules(provider.as_ref()),
             provider_id = provider.provider_id(),
         );
         Self {
@@ -427,6 +428,9 @@ mod tests {
         fn provider_id(&self) -> &'static str {
             "fish_audio"
         }
+        fn markup(&self) -> crate::llm::speech::Markup {
+            crate::llm::speech::Markup::FishS1
+        }
     }
 
     fn no_key(_: &'static str) -> KeySlot {
@@ -488,8 +492,12 @@ mod tests {
     #[test]
     fn description_carries_provider_phrasing_rules() {
         let tool = SpeechGenerationTool::new(Arc::new(FakeSpeech), "agent", None, None);
-        assert!(tool.description().contains("fake/voice"));
-        assert!(tool.description().contains("emotion tags"));
+        let description = tool.description();
+        assert!(description.contains("fake/voice"));
+        assert!(description.contains("(excited)") && description.contains("(soft tone)"));
+        for unsupported in ["thoughtful", "concerned", "amused", "serious"] {
+            assert!(!description.contains(unsupported), "offers {unsupported}");
+        }
     }
 
     #[tokio::test]

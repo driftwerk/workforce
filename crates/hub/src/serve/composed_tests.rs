@@ -5555,6 +5555,7 @@ async fn a_desk_room_turn_is_told_where_it_is_and_keeps_its_place() {
         }],
         message: Some(asked),
         spoken: false,
+        voice: None,
     };
     let desk = DeskTurnContext::new(
         turn.clone().validated(&channel).unwrap(),
@@ -5654,6 +5655,7 @@ async fn a_streamed_turn_answers_to_the_desk_scope_it_was_started_in() {
             target: target.clone(),
             owner: "owner-1".into(),
             attended: false,
+            relayed: false,
         }),
         service.process_message_with_progress(
             "desk",
@@ -5729,6 +5731,7 @@ async fn a_check_made_in_desk_checks_in_there_and_stays_its_creators_when_moved(
             target: target.clone(),
             owner: BOB.into(),
             attended: true,
+            relayed: false,
         }),
         heartbeat_check(&service, "inbox", Some(BOB)),
     )

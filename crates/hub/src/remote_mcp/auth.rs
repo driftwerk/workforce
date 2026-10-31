@@ -15,9 +15,15 @@ use workforce_identity::types::{Identity, IdentityStatus};
 use crate::authz::Principal;
 use crate::gateway::GatewayState;
 
+use super::tokens::TOKEN_SCOPE;
+
 /// `last_used_at` is refreshed at most this often, so a busy client does not
 /// turn every call into a store write.
 const LAST_USED_REFRESH: Duration = Duration::minutes(5);
+
+/// Every scope this hub can enforce. `remote_mcp` is the whole remote
+/// surface and the only scope minted so far.
+const KNOWN_SCOPES: &[&str] = &[TOKEN_SCOPE];
 
 /// The user a remote MCP request acts as, resolved live on every request so a
 /// suspension or role change takes effect on the next call.
@@ -31,6 +37,9 @@ pub struct RemoteCaller {
 pub enum AuthError {
     Unauthenticated,
     NotActive,
+    /// The token's scopes don't grant the remote surface, or name one this
+    /// hub can't enforce.
+    OutOfScope,
     Unavailable,
 }
 
@@ -44,6 +53,11 @@ impl IntoResponse for AuthError {
             )
                 .into_response(),
             Self::NotActive => (StatusCode::FORBIDDEN, "identity is not active").into_response(),
+            Self::OutOfScope => (
+                StatusCode::FORBIDDEN,
+                "this token's scopes do not cover remote MCP on this hub",
+            )
+                .into_response(),
             Self::Unavailable => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 "remote MCP token store unavailable",
@@ -76,6 +90,9 @@ pub fn authenticate(state: &GatewayState, headers: &HeaderMap) -> Result<RemoteC
         })?
         .filter(|t| t.is_live(now))
         .ok_or(AuthError::Unauthenticated)?;
+    if !covers_remote_surface(&token.scopes) {
+        return Err(AuthError::OutOfScope);
+    }
     let identity = identities
         .get_by_id(token.identity_id)
         .map_err(|e| {
@@ -105,6 +122,15 @@ pub fn authenticate(state: &GatewayState, headers: &HeaderMap) -> Result<RemoteC
         identity,
         principal,
     })
+}
+
+/// Whether a token with `scopes` may use the whole remote surface: it must
+/// carry `remote_mcp`, and nothing this hub doesn't know. A scope it doesn't
+/// know may be one meant to narrow the token, so the token is refused
+/// rather than given everything.
+fn covers_remote_surface(scopes: &[String]) -> bool {
+    scopes.iter().any(|s| s == TOKEN_SCOPE)
+        && scopes.iter().all(|s| KNOWN_SCOPES.contains(&s.as_str()))
 }
 
 #[cfg(test)]
@@ -245,6 +271,30 @@ mod tests {
             after(stale_id).unwrap() > stale_at,
             "a stale use is refreshed"
         );
+    }
+
+    #[test]
+    fn a_token_is_held_to_its_scopes() {
+        let fx = fixture(true);
+        let who = active(&fx, IdentityRole::Member);
+        let scoped = |scopes: &[&str]| {
+            issue(
+                &fx,
+                &who,
+                TokenShape {
+                    scopes: scopes.iter().map(|s| s.to_string()).collect(),
+                    ..Default::default()
+                },
+            )
+        };
+        assert!(authenticate(&fx.state, &bearer(&scoped(&[TOKEN_SCOPE]))).is_ok());
+        for scopes in [&[][..], &["agent.chat"], &[TOKEN_SCOPE, "read_only"]] {
+            assert_eq!(
+                authenticate(&fx.state, &bearer(&scoped(scopes))).err(),
+                Some(AuthError::OutOfScope),
+                "{scopes:?}"
+            );
+        }
     }
 
     #[test]

@@ -142,6 +142,7 @@ mod tests {
                     .collect(),
                 message: None,
                 spoken: false,
+                voice: None,
             },
             target: DeskTarget {
                 place: DeskPlace::Dm,

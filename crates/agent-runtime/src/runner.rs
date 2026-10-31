@@ -7515,6 +7515,7 @@ mod tests {
             target: DeskTarget::of_turn(&DeskPlace::Dm, "desk", None, false),
             owner: "person-1".into(),
             attended: true,
+            relayed: false,
         };
         let (outer, inner) = with_desk(Some(scope.clone()), async {
             (
@@ -8291,6 +8292,7 @@ mod tests {
                     spoken: false,
                 },
                 attended: true,
+                relayed: false,
                 owner: "person-1".into(),
             }),
         };

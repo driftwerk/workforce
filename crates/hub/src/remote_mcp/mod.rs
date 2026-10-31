@@ -3,6 +3,7 @@
 //! token. Distinct from the session MCP that serves hub-spawned Claude Code
 //! (`crate::mcp_session`) and from the upstream MCP client (`crate::mcp_servers`).
 
+pub mod access;
 pub mod agent_tools;
 pub mod approvals;
 pub mod auth;

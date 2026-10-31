@@ -1844,6 +1844,7 @@ impl Scheduler {
                     target: target.clone(),
                     owner: owner.to_string(),
                     attended: false,
+                    relayed: false,
                 },
             );
         workforce_agent::runner::with_desk(desk, self.execute_job_as(job)).await
@@ -6214,6 +6215,7 @@ mod tests {
             ),
             owner: "person-1".into(),
             attended: true,
+            relayed: false,
         }
     }
 
@@ -6391,6 +6393,7 @@ mod tests {
         let dm = || workforce_common::channels::desk::DeskScope {
             target: desk_thread().target.dm(),
             attended: true,
+            relayed: false,
             owner: "person-1".into(),
         };
         let owned = add_job_on_desk(&sched, Some("owner"), dm(), turn_payload()).await;

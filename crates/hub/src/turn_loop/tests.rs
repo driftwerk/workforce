@@ -1,7 +1,9 @@
 //! Tests of the turn loop's prompt, recall and routing pieces.
 
 use crate::serve::*;
-use crate::turn_loop::prompt::{format_named_secret_block, VoiceSurface, FOOTER_TOTAL_MAX_BYTES};
+use crate::turn_loop::prompt::{
+    format_named_secret_block, VoiceSurface, DICTATED_TURN_NOTE, FOOTER_TOTAL_MAX_BYTES,
+};
 use crate::turn_loop::{
     adapter_contributes_worker_reads, add_redacted_assistant_message, apply_recall_recency_boost,
     classify_context_type, code_context_eligible, dedupe_recall_keep_best, digest_turn_admits,
@@ -272,7 +274,7 @@ fn post_answer_reviews_skip_voice_and_workflow_turns() {
 /// device listening to an empty room.
 #[test]
 fn a_satellite_is_told_how_to_end_the_conversation() {
-    let directive = voice_mode_directive("fishaudio", "voice-pe");
+    let directive = voice_mode_directive("fishaudio", None, "voice-pe");
     assert!(directive.contains("<end_conversation>"), "{directive}");
     // Vague guidance is what failed: "a natural end" never matched
     // "playing music" in practice, so the rule names the case.
@@ -289,7 +291,7 @@ fn a_satellite_is_told_how_to_end_the_conversation() {
 #[test]
 fn voice_replies_are_told_to_check_the_time_rather_than_recall_it() {
     for channel in ["voice-pe", "ios"] {
-        let directive = voice_mode_directive("fishaudio", channel);
+        let directive = voice_mode_directive("fishaudio", None, channel);
         assert!(
             directive.contains("check it with a tool before answering"),
             "{channel}: {directive}"
@@ -302,7 +304,7 @@ fn voice_replies_are_told_to_check_the_time_rather_than_recall_it() {
 /// twice.
 #[test]
 fn the_agent_is_told_to_end_on_a_goodbye() {
-    let directive = voice_mode_directive("fishaudio", "voice-pe");
+    let directive = voice_mode_directive("fishaudio", None, "voice-pe");
     assert!(directive.contains("catch you later"), "{directive}");
     assert!(directive.contains("do not wait to"), "{directive}");
 }
@@ -311,7 +313,7 @@ fn the_agent_is_told_to_end_on_a_goodbye() {
 /// guidance has to say which way to err.
 #[test]
 fn the_agent_is_told_to_err_towards_leaving_it_open() {
-    let directive = voice_mode_directive("fishaudio", "voice-pe");
+    let directive = voice_mode_directive("fishaudio", None, "voice-pe");
     assert!(
         directive.contains("When in doubt, leave it open"),
         "{directive}"
@@ -322,7 +324,7 @@ fn the_agent_is_told_to_err_towards_leaving_it_open() {
 /// meaningless and the agent should not be told to emit it.
 #[test]
 fn a_screen_surface_is_not_told_about_the_marker() {
-    let directive = voice_mode_directive("fishaudio", "ios");
+    let directive = voice_mode_directive("fishaudio", None, "ios");
     assert!(!directive.contains("<end_conversation>"), "{directive}");
 }
 
@@ -358,13 +360,13 @@ fn pinned_memories_carry_the_date_they_were_pinned() {
 /// against, so exactness has to be asked for explicitly.
 #[test]
 fn voice_replies_are_told_to_keep_exact_values_exact() {
-    let directive = voice_mode_directive("fishaudio", "voice-pe");
+    let directive = voice_mode_directive("fishaudio", None, "voice-pe");
     assert!(
         directive.contains("Say exact values exactly"),
         "{directive}"
     );
     // Applies on a phone too: the reply is spoken there as well.
-    let phone = voice_mode_directive("fishaudio", "ios");
+    let phone = voice_mode_directive("fishaudio", None, "ios");
     assert!(phone.contains("Say exact values exactly"), "{phone}");
 }
 
@@ -372,7 +374,7 @@ fn voice_replies_are_told_to_keep_exact_values_exact() {
 /// listener with detail they cannot recover.
 #[test]
 fn a_satellite_is_told_there_is_no_screen() {
-    let directive = voice_mode_directive("fishaudio", "voice-pe");
+    let directive = voice_mode_directive("fishaudio", None, "voice-pe");
     assert!(directive.contains("no screen"), "{directive}");
     assert!(directive.contains("cannot re-read"), "{directive}");
 }
@@ -381,7 +383,7 @@ fn a_satellite_is_told_there_is_no_screen() {
 /// and telling the agent otherwise would make it needlessly vague.
 #[test]
 fn a_phone_is_told_the_reply_is_also_on_screen() {
-    let directive = voice_mode_directive("fishaudio", "ios");
+    let directive = voice_mode_directive("fishaudio", None, "ios");
     assert!(directive.contains("on screen"), "{directive}");
     assert!(!directive.contains("no screen"), "{directive}");
 }
@@ -401,12 +403,71 @@ fn an_unknown_surface_is_assumed_to_have_no_screen() {
 /// synthesizer, and the same synthesizer serves both surfaces.
 #[test]
 fn the_surface_and_the_provider_are_both_described() {
-    let directive = voice_mode_directive("fishaudio", "voice-pe");
-    assert!(directive.contains("emotion tags"), "provider rules missing");
+    let directive = voice_mode_directive("fishaudio", None, "voice-pe");
+    assert!(directive.contains("(excited)"), "provider rules missing");
     assert!(
         directive.contains("speaker in a room"),
         "surface rules missing"
     );
+}
+
+/// The agent was offered tags S1 doesn't perform ("thoughtful", "concerned",
+/// "amused", "serious") and went on to invent its own ("pensive"), which S1
+/// reads aloud. It is now given exactly the configured model's set.
+#[test]
+fn a_fish_voice_is_offered_exactly_what_its_model_performs() {
+    let s1 = voice_mode_directive("fish_audio", Some("s1"), "desk");
+    assert!(
+        s1.contains("(excited)") && s1.contains("(soft tone)"),
+        "{s1}"
+    );
+    for unsupported in ["thoughtful", "concerned", "amused", "serious", "(emphasis)"] {
+        assert!(!s1.contains(unsupported), "offers {unsupported}: {s1}");
+    }
+    assert_eq!(s1, voice_mode_directive("fishaudio", None, "desk"));
+    let s2 = voice_mode_directive("fish_audio", Some("s2-pro"), "desk");
+    assert!(
+        s2.contains("[excited]") && !s2.contains("(excited)"),
+        "{s2}"
+    );
+}
+
+#[test]
+fn a_voice_without_directions_is_told_to_use_none() {
+    for provider in ["kokoro", "elevenlabs", "system", "gpt-live"] {
+        let directive = voice_mode_directive(provider, None, "desk");
+        assert!(
+            directive.contains("No voice directions"),
+            "{provider}: {directive}"
+        );
+        assert!(!directive.contains("(excited)"), "{provider}: {directive}");
+    }
+}
+
+/// Spoken to, the agent talks like a person: what only reads well (code,
+/// links, paths) is described, never recited, on a screen surface too.
+#[test]
+fn a_spoken_reply_never_recites_what_only_reads() {
+    for channel in ["desk", "ios", "voice-pe"] {
+        let directive = voice_mode_directive("kokoro", None, channel);
+        assert!(
+            directive.contains(
+                "Never read out code, symbols, punctuation marks, markdown, URLs or file"
+            ),
+            "{channel}: {directive}"
+        );
+        assert!(
+            directive.contains("offer to put the details in the chat"),
+            "{channel}"
+        );
+        assert!(!directive.contains("normal detail is safe"), "{channel}");
+    }
+}
+
+#[test]
+fn a_dictated_turn_is_read_not_heard() {
+    assert!(DICTATED_TURN_NOTE.contains("transcribed"));
+    assert!(DICTATED_TURN_NOTE.contains("reply in writing"));
 }
 
 #[test]
@@ -1087,6 +1148,7 @@ async fn a_desk_answer_names_the_message_its_turn_answers_and_a_resumed_one_none
         context: Vec::new(),
         message: Some(asked),
         spoken: false,
+        voice: None,
     };
     let live = DeskTurnContext::new(turn, &channel, None, false, None, "reply-1".into());
     let (id, mark) = crate::turn_loop::records::reply_slot(Some(&live), &channel);
@@ -1098,6 +1160,7 @@ async fn a_desk_answer_names_the_message_its_turn_answers_and_a_resumed_one_none
         target: DeskTarget::of_turn(&place, &channel, None, false),
         owner: "person-1".into(),
         attended: false,
+        relayed: false,
     };
     let (_, resumed) = workforce_agent::runner::with_desk(Some(scope), async {
         crate::turn_loop::records::reply_slot(None, &channel)

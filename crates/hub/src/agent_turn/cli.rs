@@ -34,7 +34,6 @@ use crate::coding_sandbox::{
     clean_up_detached, CodingSandbox, EmptyScope, HomeSpec, SandboxCommand, SandboxLauncher,
 };
 use crate::mcp_turn::{ClientTimeout, McpExposure, RoundTools};
-use crate::projects::layout::{self, WorkRoots};
 use crate::serve::AgentService;
 use crate::subscription::completion::failure_of;
 use crate::subscription::pools::{HeldSlot, TurnSlot};
@@ -44,24 +43,6 @@ use crate::turn_loop::tools::TurnTools;
 /// The project every agent turn's workspace is made under: no repos, so
 /// the CLI starts in an empty directory of the turn's own.
 const AGENT_TURN_PROJECT: &str = "_agent-turn";
-
-/// Whether `cwd` is inside a workspace the hub's agent turns run their CLI
-/// in: a session of an agent's [`AGENT_TURN_PROJECT`], in whichever of its
-/// work trees it is (`roots` absolute, as the sandbox makes them).
-pub fn runs_in(roots: &WorkRoots, cwd: &Path) -> bool {
-    let bases = [Some(roots.data_dir.join("agents")), roots.hot.clone()];
-    bases.into_iter().flatten().any(|base| {
-        let Ok(rest) = cwd.strip_prefix(&base) else {
-            return false;
-        };
-        let Some(std::path::Component::Normal(agent)) = rest.components().next() else {
-            return false;
-        };
-        layout::work_trees(roots, &agent.to_string_lossy(), AGENT_TURN_PROJECT)
-            .iter()
-            .any(|tree| cwd.starts_with(layout::sessions_dir_of(tree)))
-    })
-}
 
 /// How the agent's tools are named to Claude Code, which reaches them over
 /// MCP.

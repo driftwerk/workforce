@@ -38,6 +38,7 @@ pub mod usage;
 mod vt;
 mod worktree;
 
+pub use adopt::HubInternal;
 pub use api::{router, sessions_router, Authorize};
 pub use conversations::{
     Active, Author, Close, Closed, ConversationError, ConversationRead, ConversationUnread,
@@ -47,9 +48,9 @@ pub use crew_store::CheckIn;
 pub use providers::{AccountError, Accounts, Fields, Spec, Standing};
 pub use realtime::{KeySource, Provider, Realtime};
 pub use service::{
-    local_agent_item, session_item, Desk, DeskError, Floor, Group, HolderOptions, HubTurns, Import,
-    Imported, Layout, NewTerminal, Options, RestorePolicy, TerminalPatch, TerminalState,
-    TerminalView, Ungrouped, UNGROUPED,
+    local_agent_item, session_item, Desk, DeskError, Floor, Group, HolderOptions, Import, Imported,
+    Layout, NewTerminal, Options, RestorePolicy, TerminalPatch, TerminalState, TerminalView,
+    Ungrouped, UNGROUPED,
 };
 pub use speech::{Audio, Speak, SpeakError, Speech, SpeechProvider};
 pub use store::DeskStore;

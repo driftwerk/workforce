@@ -11289,6 +11289,7 @@ pub async fn resume_turn(
                         target,
                         owner: session.owner.clone(),
                         attended: false,
+                        relayed: false,
                     }
                 });
                 workforce_agent::runner::with_desk(

@@ -11,6 +11,12 @@ use dashmap::DashMap;
 pub trait Ephemeral: Send + Sync + 'static {
     fn owner(&self) -> &str;
     fn started(&self) -> Instant;
+    /// Whether dropping the entry to make room loses nothing but the entry:
+    /// a busy one is never dropped for capacity, so whatever admits it must
+    /// bound it.
+    fn idle(&self) -> bool {
+        true
+    }
     /// Runs when the entry is dropped for age or capacity, never on an
     /// explicit `remove`.
     fn evict(&self) {}
@@ -32,7 +38,8 @@ impl<T: Ephemeral> EphemeralRegistry<T> {
     }
 
     /// Register an entry under a fresh id. Expired entries are swept first;
-    /// if the owner is at their cap the oldest is evicted to make room.
+    /// if the owner is at their cap their oldest idle entries are evicted to
+    /// make room.
     pub fn insert(&self, entry: Arc<T>) -> String {
         let id = uuid::Uuid::new_v4().to_string();
         self.insert_as(id.clone(), entry);
@@ -42,18 +49,22 @@ impl<T: Ephemeral> EphemeralRegistry<T> {
     /// Register an entry under a caller-chosen id (an approval request id).
     pub fn insert_as(&self, id: String, entry: Arc<T>) {
         self.sweep(Instant::now());
-        let mut owned: Vec<(String, Instant)> = self
+        let owned = self
             .entries
             .iter()
             .filter(|e| e.value().owner() == entry.owner())
+            .count();
+        let mut idle: Vec<(String, Instant)> = self
+            .entries
+            .iter()
+            .filter(|e| e.value().owner() == entry.owner() && e.value().idle())
             .map(|e| (e.key().clone(), e.value().started()))
             .collect();
-        owned.sort_by_key(|(_, started)| *started);
-        for (id, _) in owned.iter().take(
-            owned
-                .len()
-                .saturating_sub(self.per_identity.saturating_sub(1)),
-        ) {
+        idle.sort_by_key(|(_, started)| *started);
+        for (id, _) in idle
+            .iter()
+            .take(owned.saturating_sub(self.per_identity.saturating_sub(1)))
+        {
             self.evict(id);
         }
         self.entries.insert(id, entry);

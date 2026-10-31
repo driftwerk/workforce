@@ -769,6 +769,7 @@ mod tests {
                 TurnOp::End { .. } => "end",
                 TurnOp::Background { .. } => "background",
                 TurnOp::Settle { .. } => "settle",
+                TurnOp::Forget { .. } => "forget",
             })
             .collect()
     }

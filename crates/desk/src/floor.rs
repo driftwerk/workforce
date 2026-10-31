@@ -296,6 +296,11 @@ pub enum TurnOp {
         owner: Option<String>,
         at: DateTime<Utc>,
     },
+    /// The subjects were never the person's (sessions the hub ran
+    /// itself): every turn and gist of theirs goes.
+    Forget {
+        subjects: Vec<SubjectKey>,
+    },
 }
 
 impl TurnOp {
@@ -312,7 +317,7 @@ impl TurnOp {
             | Self::Unwait { turn, .. }
             | Self::Background { turn, .. }
             | Self::End { turn, .. } => Some(*turn),
-            Self::Begin { .. } | Self::Settle { .. } => None,
+            Self::Begin { .. } | Self::Settle { .. } | Self::Forget { .. } => None,
         }
     }
 }
@@ -442,6 +447,7 @@ pub fn apply(mut turns: Vec<Turn>, op: &TurnOp) -> Vec<Turn> {
             }
         }
         TurnOp::Settle { .. } => {}
+        TurnOp::Forget { subjects } => turns.retain(|t| !subjects.contains(&t.subject.key())),
     }
     turns
 }
@@ -1328,6 +1334,28 @@ mod tests {
             },
         );
         assert!(open_needs(&cleared).is_empty());
+    }
+
+    #[test]
+    fn a_forgotten_subjects_turns_go_and_the_rest_stay() {
+        let hubs = Uuid::new_v4();
+        let session = |id| Subject::Session {
+            id,
+            engine: Engine::Claude,
+        };
+        let log = vec![
+            turn(session(hubs), None, "2026-10-29T08:00:00Z"),
+            turn(session(Uuid::new_v4()), None, "2026-10-29T08:01:00Z"),
+            turn(agent("scout", "dm"), Some("u1"), "2026-10-29T08:02:00Z"),
+            turn(session(hubs), None, "2026-10-29T08:03:00Z"),
+        ];
+        let kept = apply(
+            log.clone(),
+            &TurnOp::Forget {
+                subjects: vec![SubjectKey::session(hubs)],
+            },
+        );
+        assert_eq!(kept, log[1..3]);
     }
 
     #[test]

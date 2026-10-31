@@ -291,6 +291,7 @@ mod tests {
         let scope = |attended, owner: &str| DeskScope {
             target: DeskTarget::of_turn(&DeskPlace::Dm, "desk", None, false),
             attended,
+            relayed: false,
             owner: owner.into(),
         };
         let ttl = Duration::from_secs(60);
@@ -402,6 +403,7 @@ mod tests {
         let scope = DeskScope {
             target: DeskTarget::of_turn(&DeskPlace::Dm, "desk", None, false),
             attended: false,
+            relayed: false,
             owner: uid.clone(),
         };
         let routed = workforce_agent::runner::with_desk(Some(scope), async {

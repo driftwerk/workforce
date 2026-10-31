@@ -80,7 +80,7 @@ pub(crate) fn options(dir: &std::path::Path) -> crate::service::Options {
         restore: crate::service::RestorePolicy::Ask,
         adopt_every: None,
         holder: None,
-        hub_turns: Default::default(),
+        hub_internal: Default::default(),
     }
 }
 
