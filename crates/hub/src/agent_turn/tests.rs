@@ -4042,8 +4042,10 @@ async fn a_served_rounds_plan_reading_is_kept_as_its_logins() {
     use crate::hub_core::logins::plan_usage::{observe_with, PlanUsage};
     use workforce_common::usage::Window;
 
+    /// A login's kind and its windows' lengths and fullness.
+    type Reading = (SubscriptionKind, Vec<(u32, f64)>);
     #[derive(Default)]
-    struct Seen(parking_lot::Mutex<Vec<(SubscriptionKind, Vec<(u32, f64)>)>>);
+    struct Seen(parking_lot::Mutex<Vec<Reading>>);
     impl PlanUsage for Seen {
         fn observe(
             &self,
