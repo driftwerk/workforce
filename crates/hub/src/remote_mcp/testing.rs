@@ -99,10 +99,20 @@ pub(crate) fn fixture_with(enabled: bool, bind_tokens: bool) -> Fixture {
     }
 }
 
+/// Register one plain agent under each of `ids` on the fixture's registry,
+/// whose default agent is `default`.
+pub(crate) async fn with_agents(fixture: &Fixture, data_dir: &std::path::Path, ids: &[&str]) {
+    let service = crate::serve::testing::plain_service(data_dir).await;
+    for id in ids {
+        fixture.state.registry.insert(id, Arc::clone(&service));
+    }
+}
+
 pub(crate) struct TokenShape {
     pub expires_at: DateTime<Utc>,
     pub last_used_at: Option<DateTime<Utc>>,
     pub revoked_at: Option<DateTime<Utc>>,
+    pub scopes: Vec<String>,
 }
 
 impl Default for TokenShape {
@@ -111,6 +121,7 @@ impl Default for TokenShape {
             expires_at: Utc::now() + Duration::days(90),
             last_used_at: None,
             revoked_at: None,
+            scopes: vec![super::tokens::TOKEN_SCOPE.to_string()],
         }
     }
 }
@@ -126,7 +137,7 @@ pub(crate) fn issue(fixture: &Fixture, identity: &Identity, shape: TokenShape) -
             label: "test".to_string(),
             token_hash: minted.hash,
             token_prefix: minted.prefix,
-            scopes: vec![super::tokens::TOKEN_SCOPE.to_string()],
+            scopes: shape.scopes,
             created_at: Utc::now(),
             expires_at: shape.expires_at,
             last_used_at: shape.last_used_at,
