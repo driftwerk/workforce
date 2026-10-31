@@ -222,6 +222,11 @@ impl Gists {
         turns: &mut HashMap<Uuid, Whose>,
     ) {
         match op {
+            // An agent's turn run as a Claude Code session is the agent's,
+            // whose own turn has a gist.
+            TurnOp::Begin { turn, .. }
+                if matches!(turn.subject, Subject::Session { .. })
+                    && gist::agent_turn_folder(&turn.name) => {}
             TurnOp::Begin { turn, by_person } => {
                 let whose = (turn.owner.clone(), turn.subject.key());
                 let r = subjects.entry(whose.clone()).or_insert_with(|| Running {
@@ -912,6 +917,28 @@ mod tests {
             before,
             "a step the model can't say leaves its gist of this turn as it was"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_agents_turn_run_as_a_session_gets_no_gist_of_its_own() {
+        let model = Scripted::new(NOTE, Duration::ZERO);
+        let (gists, memory, _) = gists(Arc::clone(&model));
+        let turn = Turn {
+            owner: None,
+            subject: Subject::Session {
+                id: Uuid::new_v4(),
+                engine: Engine::Claude,
+            },
+            name: "at-dm-d4774cbb6c89-2e".into(),
+            ..started(Uuid::new_v4())
+        };
+        gists.saw(&TurnOp::Begin {
+            turn: Box::new(turn),
+            by_person: false,
+        });
+        settle().await;
+        assert!(memory.written.lock().is_empty());
+        assert!(model.asked.lock().is_empty());
     }
 
     #[tokio::test(start_paused = true)]

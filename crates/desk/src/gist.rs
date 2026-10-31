@@ -395,6 +395,15 @@ const DANGLING: &[&str] = &[
     "via", "as", "by",
 ];
 
+/// Whether `name` is the folder a hub ran an agent's turn in as a Claude
+/// Code session (`at-dm-d4774cbb6c89-2e`): that agent's work, not a session
+/// of the person's.
+pub fn agent_turn_folder(name: &str) -> bool {
+    ["at-dm-", "at-ses-", "at-wf-"]
+        .iter()
+        .any(|p| name.to_ascii_lowercase().starts_with(p))
+}
+
 /// Whether `word` (its punctuation off) is an identifier, not a word.
 fn identifier(word: &str) -> bool {
     let has = |p: &str| word.contains(p);
@@ -412,6 +421,7 @@ fn identifier(word: &str) -> bool {
         && digits > 0
         && word.chars().any(|c| c.is_ascii_alphabetic());
     word.starts_with('●')
+        || agent_turn_folder(word)
         || word.starts_with('#')
         || word
             .char_indices()
@@ -743,6 +753,7 @@ mod tests {
                 "Mac and Windows/Linux support see",
             ),
             ("Ran `make_gist()` twice", "Ran twice"),
+            ("Waiting on at-dm-d4774cbb6c89-2e now", "Waiting on now"),
             (
                 "Shipping Desk to the team in 2026.",
                 "Shipping Desk to the team in 2026.",

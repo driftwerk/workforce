@@ -890,7 +890,9 @@ pub fn happening(view: &FloorView, now: DateTime<Utc>) -> Vec<Happening> {
         .iter()
         .filter(|w| w.ended_at.is_some_and(|at| at >= recent));
     let mut by: HashMap<(PartyKind, &str), (Happening, DateTime<Utc>)> = HashMap::new();
-    for w in view.working.iter().chain(lately) {
+    let theirs =
+        |w: &&Work| w.who.kind == PartyKind::Session && gist::agent_turn_folder(&w.who.name);
+    for w in view.working.iter().chain(lately).filter(|w| !theirs(w)) {
         let entry = Happening {
             who: w.who.clone(),
             doing: w.doing(),
@@ -1629,8 +1631,21 @@ mod tests {
             Outcome::Finished,
         );
         let working = turn(agent("atlas", "dm"), Some("u1"), "2026-10-29T11:00:00Z");
+        let agents_own = Turn {
+            name: "at-dm-d4774cbb6c89-2e".into(),
+            ..turn(
+                Subject::Session {
+                    id: Uuid::new_v4(),
+                    engine: Engine::Claude,
+                },
+                None,
+                "2026-10-29T11:50:00Z",
+            )
+        };
         let v = view(
-            &[older, newer, gone_by, waiting, lens_done, working],
+            &[
+                older, newer, gone_by, waiting, lens_done, working, agents_own,
+            ],
             vec![],
             &Gists::new(),
             day,
@@ -1647,7 +1662,8 @@ mod tests {
                 ("lens", Doing::Waiting(2)),
                 ("scout", Doing::Failed),
             ],
-            "one each, the latest of what ended; two hours ago is gone by"
+            "one each, the latest of what ended; two hours ago is gone by; an agent's \
+             turn's own session is the agent's"
         );
     }
 }
