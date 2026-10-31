@@ -27,6 +27,7 @@ use crate::mcp::{build_mcp_registry, matches_any, McpEndpoint, Surface};
 use crate::mcp_gate::{ApprovalMode, CallAudit, CallOrigin, CallSite, GatedExecutor, PendingCalls};
 use crate::serve::AgentService;
 
+use super::access::{reachable, Unreachable};
 use super::agent_tools::{agent_tools, AgentToolsContext, ChatTurns};
 use super::approvals::approval_tools;
 use super::auth::authenticate;
@@ -61,7 +62,7 @@ impl RemoteMcpState {
         let pending_calls = Arc::new(PendingCalls::default());
         let routed = gateway.registry.routed_delivery();
         let ctx = Arc::new(AgentToolsContext {
-            registry: Arc::clone(&gateway.registry),
+            gateway: Arc::clone(&gateway),
             turns: Arc::new(ChatTurns::default()),
             pending_calls: Arc::clone(&pending_calls),
             routed: routed.clone(),
@@ -180,8 +181,20 @@ async fn serve(
     if let Err(retry_after) = check_action_rate_limit(gateway.action_limiter.as_ref(), &limited) {
         return too_many_requests_err(retry_after).into_response();
     }
-    let Some(service) = gateway.registry.resolve(agent_id) else {
-        return (StatusCode::NOT_FOUND, "unknown agent").into_response();
+    let service = match reachable(gateway, &identity_id, agent_id) {
+        Ok(service) => service,
+        // The plain route serves the default agent: one that does not admit
+        // the caller leaves them nothing to call through it.
+        Err(Unreachable::Denied(_)) if agent_id.is_none() => {
+            return (
+                StatusCode::FORBIDDEN,
+                "this hub's default agent does not admit you; connect to /mcp/agents/{agent_id} for an agent you can use",
+            )
+                .into_response()
+        }
+        // A named agent the caller may not use reads as one that is not
+        // there, so ids cannot be probed.
+        Err(_) => return (StatusCode::NOT_FOUND, "unknown agent").into_response(),
     };
     let ctx = match crate::remote_mcp::session_context::session_context(&service, &identity_id)
         .await
@@ -284,7 +297,6 @@ mod tests {
     use workforce_common::settings::RemoteMcpConfig;
     use workforce_policy::engine::PolicyEngine;
 
-    use crate::agent_registry::AgentRegistry;
     use crate::mcp_turn::testing::text_of;
     use async_trait::async_trait;
     use uuid::Uuid;
@@ -518,6 +530,88 @@ mod tests {
         assert_eq!(&body[..], b"unknown agent");
     }
 
+    /// A hub serving the default agent and `private`, where `private` (or,
+    /// with `default_too`, the default agent as well) admits only `member`.
+    async fn hub_with_a_private_agent(
+        data_dir: &std::path::Path,
+        default_too: bool,
+    ) -> (crate::remote_mcp::testing::Fixture, Identity, Identity) {
+        use workforce_common::settings::{AccessMode, AgentAccessConfig};
+        let fx = fixture(true);
+        crate::remote_mcp::testing::with_agents(&fx, data_dir, &["default", "private"]).await;
+        let member = Identity::new("Member", IdentityRole::Member);
+        let other = Identity::new("Other", IdentityRole::Member);
+        fx.identities.create(&member).unwrap();
+        fx.identities.create(&other).unwrap();
+        let only_member = AgentAccessConfig {
+            mode: AccessMode::Allowlist,
+            allow: vec![member.id.to_string()],
+            ..Default::default()
+        };
+        fx.state
+            .access_gate
+            .upsert("private".into(), only_member.clone());
+        if default_too {
+            fx.state.access_gate.upsert("default".into(), only_member);
+        }
+        (fx, member, other)
+    }
+
+    async fn status_and_body(app: &Router, uri: &str, token: &str) -> (StatusCode, String) {
+        let resp = app
+            .clone()
+            .oneshot(request("POST", uri, Some(token)))
+            .await
+            .unwrap();
+        let status = resp.status();
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        (status, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    #[tokio::test]
+    async fn an_agent_whose_policy_excludes_the_caller_reads_as_unknown() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (fx, member, other) = hub_with_a_private_agent(tmp.path(), false).await;
+        let app = router(RemoteMcpState::new(Arc::clone(&fx.state)));
+        let admitted = issue(&fx, &member, TokenShape::default());
+        let excluded = issue(&fx, &other, TokenShape::default());
+
+        let (status, _) = status_and_body(&app, "/mcp/agents/private", &admitted).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            status_and_body(&app, "/mcp/agents/private", &excluded).await,
+            (StatusCode::NOT_FOUND, "unknown agent".to_string())
+        );
+        let (status, _) = status_and_body(&app, "/mcp", &excluded).await;
+        assert_eq!(status, StatusCode::OK, "the default agent admits everyone");
+    }
+
+    #[tokio::test]
+    async fn a_mistyped_agent_never_reaches_the_default_agent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (fx, member, _) = hub_with_a_private_agent(tmp.path(), false).await;
+        let app = router(RemoteMcpState::new(Arc::clone(&fx.state)));
+        let token = issue(&fx, &member, TokenShape::default());
+        assert_eq!(
+            status_and_body(&app, "/mcp/agents/defualt", &token).await,
+            (StatusCode::NOT_FOUND, "unknown agent".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn the_plain_route_refuses_a_caller_the_default_agent_excludes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (fx, member, other) = hub_with_a_private_agent(tmp.path(), true).await;
+        let app = router(RemoteMcpState::new(Arc::clone(&fx.state)));
+        let (status, _) =
+            status_and_body(&app, "/mcp", &issue(&fx, &member, TokenShape::default())).await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, body) =
+            status_and_body(&app, "/mcp", &issue(&fx, &other, TokenShape::default())).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(body.contains("/mcp/agents/"), "{body}");
+    }
+
     struct FixedCapability(Option<&'static str>);
 
     impl CapabilityGate for FixedCapability {
@@ -569,10 +663,7 @@ mod tests {
         fn tools(&self) -> Arc<[Arc<dyn Tool>]> {
             Arc::clone(self.tools.get_or_init(|| {
                 approval_tools(Arc::new(AgentToolsContext {
-                    registry: Arc::new(AgentRegistry::from_parts(
-                        Default::default(),
-                        "agent".into(),
-                    )),
+                    gateway: Arc::clone(&fixture(true).state),
                     turns: Arc::new(ChatTurns::default()),
                     pending_calls: Arc::clone(&self.pending_calls),
                     routed: self.routed.clone(),

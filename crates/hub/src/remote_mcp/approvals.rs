@@ -15,7 +15,9 @@ use workforce_core::policy::PermissionChoice;
 
 use crate::mcp_gate::{choice_name, offered, PendingCall, DECIDE_NEXT};
 
-use super::agent_tools::{caller, turn_result, unwrap_or_result, AgentToolsContext, ChatTurn};
+use super::agent_tools::{
+    caller, reach_agent, turn_result, unwrap_or_result, AgentToolsContext, ChatTurn,
+};
 
 pub fn not_offered(choice: PermissionChoice) -> ToolResult {
     ToolResult::failure(
@@ -64,6 +66,7 @@ impl DecideTool {
         if let Some((turn_id, turn)) =
             turn_awaiting(&self.ctx, &uid, args.turn_id.as_deref(), &args.request_id)
         {
+            reach_agent(&self.ctx, &uid, Some(&turn.agent_id))?;
             turn.answer(&args.request_id, args.choice, &uid)?;
             turn.wait(self.ctx.turn_wait(args.wait_seconds)).await;
             return Ok(turn_result(&self.ctx, &turn, Some(turn_id)));
@@ -127,6 +130,7 @@ impl DecideTool {
     async fn persist_choice(&self, uid: &str, call: &PendingCall, choice: PermissionChoice) {
         let writer = self
             .ctx
+            .gateway
             .registry
             .get(call.agent_id())
             .and_then(|svc| svc.permission_writer.read().clone());
@@ -254,8 +258,9 @@ fn routed_row(
     uid: &str,
 ) -> Option<crate::hub_core::approvals::PendingApproval> {
     let store = ctx
+        .gateway
         .registry
-        .resolve(None)
+        .default_agent()
         .and_then(|svc| svc.pending_approval_store.read().clone())?;
     store
         .get(request_id)
