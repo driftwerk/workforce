@@ -161,6 +161,7 @@ pub mod message_router;
 pub mod metabase_sync;
 pub mod monitor;
 pub mod node_invoke_tool;
+pub mod node_presence;
 pub mod notes_tool;
 #[cfg(feature = "oidc")]
 pub mod oidc;

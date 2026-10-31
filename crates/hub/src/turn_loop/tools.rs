@@ -225,15 +225,13 @@ async fn session_registry(
     if !is_own_conversation(session) {
         return Arc::clone(&service.tools);
     }
-    let selected = match session
+    let online = agents.agents_of(&person).await;
+    let selected = session
         .metadata
         .get("selected_local_agent")
         .and_then(|v| v.as_str())
-    {
-        Some(node) if agents.is_bound_to(node, &person).await => Some(node),
-        _ => None,
-    };
-    let node_tools = agents.tools_for(&person).await;
+        .filter(|node| online.iter().any(|agent| agent.key == *node));
+    let node_tools: Vec<_> = online.iter().flat_map(|agent| agent.offered()).collect();
     if selected.is_none() && node_tools.is_empty() {
         return Arc::clone(&service.tools);
     }
@@ -410,19 +408,20 @@ pub(crate) mod tests {
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
         agents
             .register(
-                NodeHello {
-                    id: "studio".into(),
-                    name: "Studio".into(),
-                    capabilities: vec![],
-                    tools: vec![NodeToolSpec {
+                NodeHello::agent(
+                    "studio".into(),
+                    "Studio".into(),
+                    vec![],
+                    vec![NodeToolSpec {
                         name: "desk_sessions".into(),
                         description: "List desk sessions".into(),
                         input_schema: serde_json::json!({"type": "object"}),
                         read_only: false,
                     }],
-                },
+                ),
                 "alice".into(),
                 tx,
+                vec![],
             )
             .await
             .unwrap();

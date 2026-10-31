@@ -15,9 +15,9 @@ use serde::Deserialize;
 use tracing::{info, warn};
 
 use workforce_agent::tools::{Tool, ToolResult};
-use workforce_gateway_client::protocol::LocalExecRequest;
+use workforce_gateway_client::protocol::{LocalExecRequest, LocalExecResult};
 
-use crate::local_agent_registry::{LocalAgentRegistry, OfferedTool};
+use crate::local_agent_registry::{node_of, outcome, LocalAgentRegistry, NodeCall, OfferedTool};
 
 /// Protected paths that must always execute on the gateway (DW-327).
 ///
@@ -132,12 +132,13 @@ impl Tool for LocalAgentExecTool {
             workdir: exec_input.workdir.clone(),
             timeout_secs: exec_input.timeout_secs,
         };
-        let rx = match self
+        let call = NodeCall::Exec(request);
+        let mut events = match self
             .local_agents
-            .send_exec(&self.target_agent_id, &caller, request)
+            .call(&self.target_agent_id, &caller, call)
             .await
         {
-            Ok(rx) => rx,
+            Ok(events) => events,
             Err(e) => {
                 warn!(agent = %self.target_agent_id, error = %e, "Local exec not sent");
                 return Ok(ToolResult::failure(
@@ -147,8 +148,11 @@ impl Tool for LocalAgentExecTool {
             }
         };
         let timeout = Duration::from_secs(exec_input.timeout_secs.unwrap_or(300));
-        match tokio::time::timeout(timeout, rx).await {
-            Ok(Ok(result)) if result.ok => {
+        let ran = tokio::time::timeout(timeout, outcome(&mut events))
+            .await
+            .map(|reply| reply.map(exec_result));
+        match ran {
+            Ok(Some(Ok(result))) if result.ok => {
                 info!(
                     agent = %self.target_agent_id,
                     request_id = %request_id,
@@ -164,7 +168,7 @@ impl Tool for LocalAgentExecTool {
                 });
                 Ok(ToolResult::success(output, elapsed()))
             }
-            Ok(Ok(result)) => {
+            Ok(Some(Ok(result))) => {
                 let error = result
                     .error
                     .unwrap_or_else(|| "Unknown local agent error".to_string());
@@ -187,7 +191,11 @@ impl Tool for LocalAgentExecTool {
                 }
                 Ok(ToolResult::failure(detail, elapsed()))
             }
-            Ok(Err(_)) => {
+            Ok(Some(Err(error))) => {
+                warn!(agent = %self.target_agent_id, request_id = %request_id, %error, "Local exec failed");
+                Ok(ToolResult::failure(error, elapsed()))
+            }
+            Ok(None) => {
                 warn!(agent = %self.target_agent_id, "Local agent disconnected during exec");
                 Ok(ToolResult::failure(
                     "The local agent disconnected before the command finished; it may have run \
@@ -203,7 +211,7 @@ impl Tool for LocalAgentExecTool {
                     "Local exec timed out"
                 );
                 self.local_agents
-                    .cancel_exec(&self.target_agent_id, &request_id)
+                    .cancel(&self.target_agent_id, &request_id)
                     .await;
                 Ok(ToolResult::failure(
                     format!(
@@ -214,6 +222,18 @@ impl Tool for LocalAgentExecTool {
                 ))
             }
         }
+    }
+}
+
+/// An exec call's outcome: the command's result, or why there is none.
+fn exec_result(
+    reply: workforce_gateway_client::protocol::NodeToolResult,
+) -> Result<LocalExecResult, String> {
+    match (reply.result, reply.error) {
+        (_, Some(error)) => Err(error),
+        (Some(result), None) => serde_json::from_value(result)
+            .map_err(|e| format!("The local agent's result was unreadable: {e}")),
+        (None, None) => Err("The local agent answered without a result".to_string()),
     }
 }
 
@@ -262,17 +282,20 @@ impl Tool for NodeTool {
                 elapsed(),
             ));
         };
+        let Some(node) = node_of(name) else {
+            return Ok(ToolResult::failure(
+                format!("{name} is not a node tool"),
+                elapsed(),
+            ));
+        };
         let request_id = uuid::Uuid::new_v4().to_string();
-        let rx = match self
-            .local_agents
-            .call_tool(name, &caller, &request_id, input)
-            .await
-        {
-            Ok(rx) => rx,
+        let call = NodeCall::tool(request_id.clone(), self.offered.spec.name.clone(), input);
+        let mut events = match self.local_agents.call(node, &caller, call).await {
+            Ok(events) => events,
             Err(e) => return Ok(ToolResult::failure(format!("Not run: {e}."), elapsed())),
         };
-        match tokio::time::timeout(NODE_TOOL_TIMEOUT, rx).await {
-            Ok(Ok(reply)) => Ok(match (reply.result, reply.error) {
+        match tokio::time::timeout(NODE_TOOL_TIMEOUT, outcome(&mut events)).await {
+            Ok(Some(reply)) => Ok(match (reply.result, reply.error) {
                 (Some(result), None) if !is_error(&result) => {
                     ToolResult::success(result, elapsed())
                 }
@@ -283,7 +306,7 @@ impl Tool for NodeTool {
                     elapsed(),
                 ),
             }),
-            Ok(Err(_)) => Ok(ToolResult::failure(
+            Ok(None) => Ok(ToolResult::failure(
                 format!(
                     "{} disconnected before {name} finished; it may have run in part.",
                     self.offered.node_name
@@ -291,7 +314,7 @@ impl Tool for NodeTool {
                 elapsed(),
             )),
             Err(_) => {
-                self.local_agents.cancel_tool_call(name, &request_id).await;
+                self.local_agents.cancel(node, &request_id).await;
                 Ok(ToolResult::failure(
                     format!(
                         "{} did not answer {name} within {} seconds.",

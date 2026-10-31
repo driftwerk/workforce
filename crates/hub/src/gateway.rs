@@ -47,7 +47,7 @@ use workforce_common::sentinel_config::SentinelConfig;
 use workforce_orchestrator::workflow_store::RunAsWrite;
 // Brings the artifact CRUD/search methods into scope for the `/api/artifacts`
 // handlers (`store` is a concrete `KnowledgeStore`; the methods are trait fns).
-use workforce_gateway_client::protocol::{LocalAgentHello, LocalExecResult};
+use workforce_gateway_client::protocol::LocalAgentHello;
 use workforce_orchestrator::artifact_store::ArtifactBackend as _;
 use workforce_pairing::{ChannelPairingService, DevicePairingService};
 
@@ -3909,18 +3909,19 @@ async fn handle_local_agent_ws(socket: WebSocket, state: Arc<GatewayState>, iden
     let registered = state
         .local_agents
         .register(
-            crate::local_agent_registry::NodeHello {
-                id: hello.agent_node_id,
-                name: hello.name,
-                capabilities: hello.capabilities,
-                tools: hello.tools,
-            },
+            crate::local_agent_registry::NodeHello::agent(
+                hello.agent_node_id,
+                hello.name,
+                hello.capabilities,
+                hello.tools,
+            ),
             identity_id,
             request_tx,
+            Vec::new(),
         )
         .await;
     let connection = match registered {
-        Ok(connection) => connection,
+        Ok(registered) => registered.connection,
         Err(refusal) => {
             warn!(agent_id = %agent_id, %refusal, "Local agent refused");
             let refused = workforce_gateway_client::protocol::LocalAgentRefused {
@@ -3971,7 +3972,9 @@ async fn handle_local_agent_ws(socket: WebSocket, state: Arc<GatewayState>, iden
                             continue;
                         }
                     };
-                    receive_from_node(&local_agents_read, &agent_id_read, connection, parsed).await;
+                    local_agents_read
+                        .receive_from_node(&agent_id_read, connection, parsed)
+                        .await;
                 }
                 Message::Close(_) => break,
                 _ => {}
@@ -3992,54 +3995,6 @@ async fn handle_local_agent_ws(socket: WebSocket, state: Arc<GatewayState>, iden
     // Step 6: Deregister on disconnect
     state.local_agents.deregister(&agent_id, connection).await;
     info!(agent_id = %agent_id, "Local agent disconnected");
-}
-
-/// Act on one message from node `agent_id`'s `connection`.
-async fn receive_from_node(
-    registry: &crate::local_agent_registry::LocalAgentRegistry,
-    agent_id: &str,
-    connection: u64,
-    message: serde_json::Value,
-) {
-    use workforce_gateway_client::protocol::{NodeToolResult, NodeTools};
-    fn parsed<T: serde::de::DeserializeOwned>(
-        agent_id: &str,
-        kind: &str,
-        message: serde_json::Value,
-    ) -> Option<T> {
-        serde_json::from_value(message)
-            .inspect_err(|e| warn!(agent_id, kind, "Failed to parse a local agent message: {e}"))
-            .ok()
-    }
-    let kind = message
-        .get("type")
-        .and_then(|t| t.as_str())
-        .map(str::to_owned);
-    match kind.as_deref() {
-        Some(kind @ "local_exec_result") => {
-            if let Some(result) = parsed::<LocalExecResult>(agent_id, kind, message) {
-                registry.fulfill_result(agent_id, connection, result).await;
-            }
-        }
-        Some(kind @ "node_tool_result") => {
-            if let Some(result) = parsed::<NodeToolResult>(agent_id, kind, message) {
-                registry
-                    .fulfill_tool_result(agent_id, connection, result)
-                    .await;
-            }
-        }
-        Some(kind @ "node_tools") => {
-            if let Some(update) = parsed::<NodeTools>(agent_id, kind, message) {
-                registry.set_tools(agent_id, connection, update.tools).await;
-            }
-        }
-        // Progress is informational, and a pong is a keepalive.
-        Some("local_exec_progress" | "pong") => {}
-        Some(other) => {
-            tracing::debug!(agent_id, msg_type = %other, "Unknown message type from local agent");
-        }
-        None => warn!(agent_id, "Local agent message missing 'type' field"),
-    }
 }
 
 /// List connected local agents (REST API).
@@ -8276,6 +8231,7 @@ async fn pair_revoke_device(
     match pairing.revoke_async(device_id.clone()).await {
         Ok(()) => {
             retarget_device(&state, &owner, &device_id).await;
+            state.local_agents.forget_desk(&device_id).await;
             Ok(Json(serde_json::json!({ "revoked": true })))
         }
         Err(e) => {
@@ -8312,6 +8268,7 @@ async fn pair_device_revoke_self(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
     retarget_device(&state, &owner, &device.id).await;
+    state.local_agents.forget_desk(&device.id).await;
     Ok(Json(serde_json::json!({ "revoked": true })))
 }
 
