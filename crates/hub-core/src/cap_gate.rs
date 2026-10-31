@@ -698,6 +698,8 @@ mod tests {
             "desk.start",
             "desk.prompt",
             "desk.read",
+            "desk.interrupt",
+            "crew.interrupt",
             // Compiles a project on the host — the wasm-skill *lifecycle* tools
             // are member-level (`skills_author`); only the compile is not.
             "wasm_skill.build",

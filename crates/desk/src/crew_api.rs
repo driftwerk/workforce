@@ -256,6 +256,7 @@ mod tests {
                 restore: crate::service::RestorePolicy::Off,
                 adopt_every: None,
                 holder: None,
+                hub_turns: Default::default(),
             },
             Default::default(),
             CancellationToken::new(),

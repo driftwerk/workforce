@@ -342,11 +342,13 @@ async fn a_client_that_declared_nothing_is_never_sent_a_pdf() {
         async move { tokio_tungstenite::connect_async(url).await.unwrap().0 }
     };
     let mut ios = connect("").await;
-    let mut desk = connect("&accept=*/*").await;
+    // Its session made before the second client asks for it: two clients
+    // connecting at once can each make one.
     let session = frame(&mut ios).await["session_id"]
         .as_str()
         .unwrap()
         .to_string();
+    let mut desk = connect("&accept=*/*").await;
     assert_eq!(frame(&mut desk).await["session_id"], session.as_str());
 
     let sink = crate::mcp_gate::media_sinks(&scout).deliver;

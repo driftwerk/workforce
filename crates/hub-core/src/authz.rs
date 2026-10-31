@@ -686,6 +686,7 @@ impl Capability {
                 "desk.wait",
                 "desk.approve",
                 "desk.stop",
+                "desk.interrupt",
                 "crew.overview",
                 "crew.activity",
                 "crew.history",
@@ -693,6 +694,7 @@ impl Capability {
                 "crew.approve",
                 "crew.deny",
                 "crew.stop",
+                "crew.interrupt",
                 "crew.resume",
                 "crew.restart",
                 "crew.start_session",
@@ -1038,10 +1040,10 @@ pub fn tool_capability(tool: &str, input: &serde_json::Value) -> Option<Capabili
         // reads them — the same host reach.
         "exec.run" | "code.cargo" | "code.build" | "code.test" | "code.lint" | "code.git"
         | "coding.claude" | "coding.session" | "desk.sessions" | "desk.start" | "desk.prompt"
-        | "desk.read" | "desk.wait" | "desk.approve" | "desk.stop"
+        | "desk.read" | "desk.wait" | "desk.approve" | "desk.stop" | "desk.interrupt"
         // The crew overseer reads and drives the same terminals.
         | "crew.overview" | "crew.activity" | "crew.history" | "crew.nudge" | "crew.approve"
-        | "crew.deny" | "crew.stop" | "crew.resume" | "crew.restart" | "crew.start_session"
+        | "crew.deny" | "crew.stop" | "crew.interrupt" | "crew.resume" | "crew.restart" | "crew.start_session"
         | "crew.assign" => Some(Capability::ShellExec),
         // A language server loads the project the way a build does (build
         // scripts, proc macros, compiler plugins), so every `code.refactor`

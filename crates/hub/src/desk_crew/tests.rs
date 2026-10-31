@@ -145,6 +145,7 @@ async fn desk_with(
             restore: RestorePolicy::Off,
             adopt_every: None,
             holder: None,
+            hub_turns: Default::default(),
         },
         floor,
         CancellationToken::new(),
@@ -1377,4 +1378,189 @@ mod floor {
         .await
         .unwrap()
     }
+}
+
+/// A Claude Code session started by hand in Desk terminal `tid` (token
+/// `token`), registered by its SessionStart and working on a tool.
+async fn tracked(
+    d: &Desk,
+    dir: &Path,
+    cli: &str,
+) -> (uuid::Uuid, String, workforce_desk::model::SessionView) {
+    let token = format!("token-{cli}");
+    let t = d
+        .create_terminal(workforce_desk::NewTerminal {
+            id: None,
+            name: Some("web".into()),
+            cwd: dir.to_string_lossy().into_owned(),
+            env: BTreeMap::from([("DESK_HOOK_TOKEN".into(), token.clone())]),
+        })
+        .await
+        .unwrap();
+    let start = json!({"hook_event_name": "SessionStart", "session_id": cli,
+        "cwd": dir.to_string_lossy()});
+    d.terminal_hook(t.id, &token, start.to_string().as_bytes())
+        .await
+        .unwrap();
+    let s = d
+        .list()
+        .into_iter()
+        .find(|s| s.terminal_id == Some(t.id))
+        .unwrap();
+    (t.id, token, s)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_overseer_interrupts_a_tracked_session_once_let_and_never_stops_it() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, _llm) = agent(dir.path(), "desk", "ok").await;
+        write_config(&overseer, "[oversight]\nenabled = true\nlevel = \"act\"\n");
+        let state = hub(std::slice::from_ref(&overseer));
+        let d = desk(pool, dir.path()).await;
+        let crew = CrewHub::start(state, d.clone(), FAST, CancellationToken::new());
+        eventually("the overseer's tools", async || {
+            overseer.tools.has("crew.interrupt").then_some(())
+        })
+        .await;
+        assert!(
+            !overseer.tools.has("desk.interrupt"),
+            "it acts through crew.interrupt"
+        );
+        let (tid, token, s) = tracked(&d, dir.path(), "cc-web").await;
+        let working = json!({"hook_event_name": "PreToolUse", "session_id": "cc-web",
+            "tool_name": "Bash", "tool_input": {"command": "npm test"}});
+        d.terminal_hook(tid, &token, working.to_string().as_bytes())
+            .await
+            .unwrap();
+        let tool = |name: &str| overseer.tools.get(name).unwrap();
+        let interrupt =
+            json!({"session_id": s.id.to_string(), "reason": "It is looping on the same test."});
+
+        // Off by default: a suggestion.
+        let suggested = tool("crew.interrupt")
+            .execute(interrupt.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            suggested.output["suggested"], "Interrupt web",
+            "{suggested:?}"
+        );
+        assert_eq!(
+            d.view(s.id).unwrap().state,
+            workforce_desk::model::SessionState::Working
+        );
+
+        // Stopping it, even accepted, is refused: the shell is the person's.
+        tool("crew.stop")
+            .execute(json!({"session_id": s.id.to_string(), "reason": "Stuck."}))
+            .await
+            .unwrap();
+        let stop = d
+            .store()
+            .suggestions(10)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|g| g.text == "Stop web")
+            .unwrap();
+        let refused = crew.accept(&stop).await.unwrap_err();
+        assert!(refused.contains("crew.interrupt"), "{refused}");
+        assert!(d.view(s.id).unwrap().live);
+
+        // Let: it runs.
+        std::thread::sleep(Duration::from_millis(1100));
+        write_config(
+            &overseer,
+            "[oversight]\nenabled = true\nlevel = \"act\"\n[oversight.act]\ninterrupt = true\n",
+        );
+        let done = tool("crew.interrupt").execute(interrupt).await.unwrap();
+        assert!(
+            done.success && done.output["suggested"].is_null(),
+            "{done:?}"
+        );
+        let v = d.view(s.id).unwrap();
+        assert_eq!(
+            (v.state, v.live),
+            (workforce_desk::model::SessionState::Done, true)
+        );
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_overseer_approves_for_a_tracked_session_answered_in_desk() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, _llm) = agent(dir.path(), "desk", "ok").await;
+        write_config(
+            &overseer,
+            "[oversight]\nenabled = true\nlevel = \"act\"\nact = { read_only_approvals = true }\n",
+        );
+        let state = hub(std::slice::from_ref(&overseer));
+        let d = desk(pool, dir.path()).await;
+        let _crew = CrewHub::start(state, d.clone(), FAST, CancellationToken::new());
+        eventually("the overseer's tools", async || {
+            overseer.tools.has("crew.approve").then_some(())
+        })
+        .await;
+        let (tid, token, s) = tracked(&d, dir.path(), "cc-api").await;
+        d.update(
+            s.id,
+            workforce_desk::model::SessionPatch {
+                approvals: Some(workforce_desk::model::Approvals::Desk),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let asked = tokio::spawn({
+            let d = d.clone();
+            async move {
+                let body = json!({"hook_event_name": "PermissionRequest", "session_id": "cc-api",
+                    "tool_name": "Bash", "tool_input": {"command": "git status"}});
+                d.terminal_hook(tid, &token, body.to_string().as_bytes()).await.unwrap()
+            }
+        });
+        let pending = eventually("the request", async || {
+            d.view(s.id).unwrap().pending.filter(|p| p.answerable)
+        })
+        .await;
+        let done = overseer
+            .tools
+            .get("crew.approve")
+            .unwrap()
+            .execute(json!({"session_id": s.id.to_string(), "approval_id": pending.id.to_string(), "reason": "It only reads."}))
+            .await
+            .unwrap();
+        assert!(done.success && done.output["suggested"].is_null(), "{done:?}");
+        assert_eq!(
+            asked.await.unwrap()["hookSpecificOutput"]["decision"]["behavior"],
+            "allow"
+        );
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reply_the_rules_cant_tell_is_read_by_the_overseers_cheap_model() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let reply = "Pushed the branch. Let me know if you want me to open the PR.";
+        for (says, read) in [
+            ("YES", Some(true)),
+            ("No.", Some(false)),
+            ("It depends.", None),
+        ] {
+            let (overseer, _llm) = agent(&dir.path().join(says), "desk", says).await;
+            write_config(
+                &overseer,
+                "[oversight]\nenabled = true\nlevel = \"watch\"\n",
+            );
+            let state = hub(std::slice::from_ref(&overseer));
+            let crew = CrewHub::start(state, d.clone(), FAST, CancellationToken::new());
+            assert_eq!(crew.asks(reply).await, read, "{says}");
+        }
+    })
+    .await;
 }

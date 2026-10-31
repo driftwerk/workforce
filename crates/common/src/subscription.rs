@@ -515,6 +515,8 @@ pub enum Origin {
     VoiceSummary,
     /// Desk's floor saying what its agents and sessions are doing.
     Floor,
+    /// Reading whether a Desk session's turn ended asking the person.
+    DeskReading,
 }
 
 /// The channel prefix of memory-consolidation sessions, which marks their
@@ -546,6 +548,7 @@ impl Origin {
             Self::McpTool => "mcp_tool",
             Self::VoiceSummary => "voice_summary",
             Self::Floor => "floor",
+            Self::DeskReading => "desk_reading",
         }
     }
 
@@ -837,7 +840,12 @@ mod tests {
 
     #[test]
     fn origin_and_tier_strings_match_their_serde_names() {
-        for origin in [Origin::SelfLearning, Origin::ApiTask, Origin::VoiceSummary] {
+        for origin in [
+            Origin::SelfLearning,
+            Origin::ApiTask,
+            Origin::VoiceSummary,
+            Origin::DeskReading,
+        ] {
             assert_eq!(
                 serde_json::to_value(origin).unwrap(),
                 serde_json::Value::String(origin.as_str().into())

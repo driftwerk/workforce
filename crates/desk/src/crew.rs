@@ -99,6 +99,7 @@ kinds! {
     Limit => "limit",
     Quiet => "quiet",
     Stopped => "stopped",
+    Interrupted => "interrupted",
     Resumed => "resumed",
     Restarted => "restarted",
     Nudged => "nudged",
@@ -485,6 +486,12 @@ pub trait Crew: Send + Sync {
     async fn open_needs(&self, _person: Option<&str>) -> Option<Vec<Need>> {
         None
     }
+    /// Whether a session's last reply asks the person to decide, answer,
+    /// approve or do something, as a cheap model reads it; `None` where the
+    /// hub has no model to ask, or it couldn't say.
+    async fn asks(&self, _reply: &str) -> Option<bool> {
+        None
+    }
 }
 
 // ── Words ────────────────────────────────────────────────────────────────
@@ -738,7 +745,7 @@ pub fn approval_summary(tool: &str, detail: &str) -> String {
 /// The overview's word for a session's state.
 pub fn session_state(state: SessionState) -> ItemState {
     match state {
-        SessionState::Blocked => ItemState::NeedsYou,
+        SessionState::Blocked | SessionState::Asking => ItemState::NeedsYou,
         SessionState::Starting | SessionState::Working => ItemState::Working,
         SessionState::Done => ItemState::Done,
         SessionState::Idle => ItemState::Idle,
