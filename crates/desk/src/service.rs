@@ -30,19 +30,21 @@ use crate::procs;
 use crate::pty::{Exit, Pty};
 use crate::rooms::{
     channel_for, place_in_timeline, slug_for, steps_refused, Member, NewMessage, NewRoom, Page,
-    Posted, Room, RoomMessage, RoomPatch, SearchHit, Span, DESK, MAX_HOPS, THREAD_GONE,
-    TURN_BUDGET, YOU,
+    Posted, Room, RoomMessage, RoomPatch, SearchFilters, SearchHit, Span, DESK, MAX_HOPS,
+    THREAD_GONE, TURN_BUDGET, YOU,
 };
 use crate::store::DeskStore;
 use crate::transcript;
 use crate::usage::{self, MacPlan, MacSignIns, PlanSink};
 use crate::worktree;
 
+mod copies;
 mod groups;
 #[cfg(test)]
 mod rooms_tests;
 mod terminals;
 mod transition;
+mod unread;
 
 use transition::Transition;
 
@@ -512,6 +514,7 @@ impl Desk {
             records.insert(r.id, r);
         }
         let layout = prune_layout(&store, layout, &records).await;
+        let state_since = store.state_times().await?;
 
         let listener = hook_listener(held.hook_port).await?;
         let hook_port = listener.local_addr()?.port();
@@ -528,6 +531,7 @@ impl Desk {
                 rooms,
                 layout,
                 session_env,
+                state_since,
                 ..State::default()
             }),
             events: broadcast::channel(256).0,
@@ -1517,7 +1521,7 @@ impl Desk {
         let _ = self.0.persist.send(Persist::Delete(id));
         let _ = self.0.events.send(DeskEvent::Removed { id });
         self.drop_from_layout(id).await;
-        Ok(())
+        self.forget_session_read(id).await
     }
 
     pub fn decide(
@@ -1880,6 +1884,7 @@ impl Desk {
             return Err(DeskError::NotFound);
         }
         self.0.state.lock().rooms.remove(&id);
+        self.forget_room_reads(id).await?;
         let _ = self.0.events.send(DeskEvent::RoomRemoved { id });
         Ok(())
     }
@@ -1953,6 +1958,11 @@ impl Desk {
         }
         let is_agent = new.author != YOU && new.author != DESK;
         let delivered = new.delivery.is_some();
+        if new.also_in_room && (new.author != YOU || new.thread_id.is_none()) {
+            return Err(DeskError::Invalid(
+                "only your reply in a thread is also posted to the room".into(),
+            ));
+        }
         if let Some(why) = steps_refused(&new.steps, is_agent && !delivered) {
             return Err(DeskError::Invalid(why));
         }
@@ -2032,6 +2042,7 @@ impl Desk {
                 delivery: new.delivery,
                 in_reply_to: new.in_reply_to,
                 steps: new.steps,
+                copy_of: None,
                 replies: None,
                 reading: None,
             })
@@ -2040,15 +2051,30 @@ impl Desk {
             let _ = self.0.events.send(DeskEvent::RoomMessage {
                 message: Box::new(posted.message.clone()),
             });
+            if let Some(event) = crate::rooms::post_activity(&posted.message) {
+                self.note(event);
+            }
+            // The reply is kept: a copy that fails is said, not returned, so
+            // a retry doesn't post the reply twice; Post to room copies it.
+            if new.also_in_room && posted.message.thread_id.is_some() {
+                if let Err(e) = self.copy_to_room(id, posted.message.id).await {
+                    tracing::warn!(
+                        room = %id,
+                        message = %posted.message.id,
+                        error = %e,
+                        "couldn't also post a thread reply to its room"
+                    );
+                }
+            }
         }
         Ok(posted)
     }
 
-    pub async fn search(&self, query: &str) -> Result<Vec<SearchHit>, DeskError> {
-        if query.trim().is_empty() {
+    pub async fn search(&self, filters: &SearchFilters) -> Result<Vec<SearchHit>, DeskError> {
+        if filters.is_empty() {
             return Ok(vec![]);
         }
-        Ok(self.0.store.search(query, 50).await?)
+        Ok(self.0.store.search(filters).await?)
     }
 
     async fn launch(

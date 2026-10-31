@@ -272,6 +272,11 @@ pub enum DeskEvent {
     Activity {
         event: Box<crate::crew::Event>,
     },
+    /// A read point moved: every window hears it.
+    Read {
+        place: crate::reads::ReadPlace,
+        point: crate::reads::ReadPoint,
+    },
     /// A key of Desk's own state changed; `value` is `null` once removed.
     State {
         key: String,

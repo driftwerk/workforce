@@ -196,3 +196,53 @@ async fn reqwest_json(
     let status = response.status().as_u16();
     (status, response.json().await.unwrap_or(Value::Null))
 }
+
+/// How far a person has read a conversation moved: every link of theirs
+/// hears which conversation, and no one else's link hears it.
+#[tokio::test]
+async fn a_read_moved_is_heard_by_every_link_of_its_person_and_no_one_elses() {
+    let data = tempfile::tempdir().unwrap();
+    let service = agent_service(data.path()).await;
+    let identities = Arc::new(SqliteIdentityStore::in_memory().unwrap());
+    let person = Identity::new("Person", IdentityRole::Member);
+    let other = Identity::new("Other", IdentityRole::Member);
+    identities.create(&person).unwrap();
+    identities.create(&other).unwrap();
+    let state = GatewayParts::new(
+        AgentRegistry::from_parts(
+            [("scout".to_string(), service)].into_iter().collect(),
+            "scout".into(),
+        ),
+        Arc::clone(&identities) as Arc<dyn IdentityStore>,
+        std::path::PathBuf::from("/tmp/desk-link-test-skills"),
+    )
+    .state();
+    let addr = serve(Arc::clone(&state)).await;
+    let link = |token: String| async move {
+        let (mut socket, _) =
+            tokio_tungstenite::connect_async(format!("ws://{addr}/ws/desk?token={token}"))
+                .await
+                .expect("the link connects");
+        assert_eq!(next(&mut socket).await["type"], "hello");
+        socket
+    };
+    let mut studio = link(token_for(&person)).await;
+    let mut laptop = link(token_for(&person)).await;
+    let mut theirs = link(token_for(&other)).await;
+
+    state
+        .broadcast_tx
+        .send(BroadcastMessage::desk_read_changed(
+            &person.id.to_string(),
+            "scout",
+            "desk",
+        ))
+        .unwrap();
+    for desk in [&mut studio, &mut laptop] {
+        assert_eq!(
+            next(desk).await,
+            json!({"type": "read_changed", "agent_id": "scout", "channel": "desk"})
+        );
+    }
+    quiet(&mut theirs).await;
+}

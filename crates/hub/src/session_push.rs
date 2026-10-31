@@ -39,6 +39,13 @@ enum Relayed {
         signal: DeskSignal,
         owner: Option<String>,
     },
+    /// How far `owner` has read their conversation with `agent_id` on
+    /// `channel` moved.
+    ReadChanged {
+        owner: String,
+        agent_id: String,
+        channel: String,
+    },
 }
 
 impl Relayed {
@@ -66,6 +73,11 @@ impl Relayed {
             Self::Signal { signal, owner } => {
                 BroadcastMessage::desk_signal(signal, owner.as_deref())
             }
+            Self::ReadChanged {
+                owner,
+                agent_id,
+                channel,
+            } => BroadcastMessage::desk_read_changed(&owner, &agent_id, &channel),
         }
     }
 }
@@ -156,6 +168,17 @@ impl SessionPush {
         self.relay(Relayed::Signal {
             signal,
             owner: owner.map(str::to_string),
+        })
+        .await;
+    }
+
+    /// Tell every Desk hub link of `owner`'s, on every replica, that how far
+    /// they have read their conversation with `agent` on `channel` moved.
+    pub async fn read_changed(&self, owner: &str, agent: &str, channel: &str) {
+        self.relay(Relayed::ReadChanged {
+            owner: owner.to_string(),
+            agent_id: agent.to_string(),
+            channel: channel.to_string(),
         })
         .await;
     }
@@ -361,6 +384,31 @@ mod tests {
         })
         .unwrap();
         assert_eq!(wire, serde_json::json!({"signal": "usage", "owner": null}));
+    }
+
+    /// A read moved on one replica is read as itself on another, never as
+    /// a signal or a delivery, and is heard by its person's links alone.
+    #[test]
+    fn a_read_moved_reads_as_itself_on_every_replica() {
+        let relayed = Relayed::ReadChanged {
+            owner: "person-1".into(),
+            agent_id: "scout".into(),
+            channel: "desk".into(),
+        };
+        let wire = serde_json::to_vec(&relayed).unwrap();
+        let read: Relayed = serde_json::from_slice(&wire).unwrap();
+        assert_eq!(read, relayed);
+        let message = read.message();
+        assert_eq!(
+            (
+                message.msg_type.as_str(),
+                message.target_identity.as_deref(),
+                message.agent_id.as_deref(),
+                message.content.as_str()
+            ),
+            ("read_changed", Some("person-1"), Some("scout"), "desk")
+        );
+        assert!(message.for_links_only());
     }
 
     /// A delivery made on one replica reaches the hub links on another,

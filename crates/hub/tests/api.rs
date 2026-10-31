@@ -20,6 +20,10 @@ mod authz_routes;
 mod caller_identity_routes;
 
 #[cfg(feature = "postgres")]
+#[path = "api/desk_activity_routes.rs"]
+mod desk_activity_routes;
+
+#[cfg(feature = "postgres")]
 #[path = "api/desk_conversation_routes.rs"]
 mod desk_conversation_routes;
 

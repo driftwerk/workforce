@@ -378,6 +378,24 @@ pub struct DeskMark {
     pub steps: Vec<DeskStep>,
 }
 
+/// How far a person has read a place: through `at`, the item seen last
+/// when there is one (a message's id, an event's, a version).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReadPoint {
+    pub at: chrono::DateTime<chrono::Utc>,
+    #[serde(default)]
+    pub message: Option<String>,
+}
+
+/// How a write moves a read point: never back, or exactly here (marking
+/// something unread).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Mark {
+    Advance,
+    Set,
+}
+
 /// One tool an agent's turn ran: what it was, whether it worked, how long.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeskStep {
@@ -493,6 +511,9 @@ pub struct DeskDelivered {
 pub enum DeskSignal {
     Floor,
     Usage,
+    /// How far the person has read one of their conversations moved; its
+    /// frame names the conversation.
+    Read,
 }
 
 impl DeskSignal {
@@ -501,6 +522,7 @@ impl DeskSignal {
         match self {
             Self::Floor => "floor_changed",
             Self::Usage => "usage_changed",
+            Self::Read => "read_changed",
         }
     }
 
@@ -509,12 +531,13 @@ impl DeskSignal {
         match self {
             Self::Floor => "desk.floor",
             Self::Usage => "desk.usage",
+            Self::Read => "desk.reads",
         }
     }
 
     /// The signal a frame is, if it is one.
     pub fn of_frame(frame: &str) -> Option<Self> {
-        [Self::Floor, Self::Usage]
+        [Self::Floor, Self::Usage, Self::Read]
             .into_iter()
             .find(|s| s.frame() == frame)
     }

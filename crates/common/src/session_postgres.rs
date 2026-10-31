@@ -1160,6 +1160,138 @@ impl SessionStore for PostgresSessionStore {
         self.owned(owner, Some(channel), limit)
     }
 
+    fn desk_read(
+        &self,
+        owner: &str,
+        channel: &str,
+    ) -> Result<Option<crate::channels::desk::ReadPoint>> {
+        self.block_on(async move {
+            let mut conn = self.pool.get().await?;
+            let scoped = self.scope(&mut conn).await?;
+            let row = scoped
+                .query_opt(
+                    "SELECT at, message_id FROM desk_reads
+                     WHERE tenant_id = $1 AND owner = $2 AND agent_id = $3 AND channel = $4",
+                    &[&self.tenant_id(), &owner, &self.agent_id, &channel],
+                )
+                .await?;
+            scoped.finish().await?;
+            Ok(row.map(|r| crate::channels::desk::ReadPoint {
+                at: r.get(0),
+                message: r.get(1),
+            }))
+        })
+    }
+
+    fn put_desk_read(
+        &self,
+        owner: &str,
+        channel: &str,
+        point: &crate::channels::desk::ReadPoint,
+        mark: crate::channels::desk::Mark,
+    ) -> Result<Option<crate::channels::desk::ReadPoint>> {
+        if channel.is_empty() {
+            eyre::bail!("a read point is of a conversation's channel");
+        }
+        let only_forward = match mark {
+            crate::channels::desk::Mark::Advance => " WHERE excluded.at > desk_reads.at",
+            crate::channels::desk::Mark::Set => "",
+        };
+        self.block_on(async move {
+            let mut conn = self.pool.get().await?;
+            let scoped = self.scope(&mut conn).await?;
+            let row = scoped
+                .query_opt(
+                    &format!(
+                        "INSERT INTO desk_reads
+                           (tenant_id, owner, agent_id, channel, at, message_id, updated_at)
+                         VALUES ($1, $2, $3, $4, $5, $6, now())
+                         ON CONFLICT (tenant_id, owner, agent_id, channel) DO UPDATE
+                         SET at = excluded.at, message_id = excluded.message_id,
+                             updated_at = now(){only_forward}
+                         RETURNING at, message_id"
+                    ),
+                    &[
+                        &self.tenant_id(),
+                        &owner,
+                        &self.agent_id,
+                        &channel,
+                        &point.at,
+                        &point.message,
+                    ],
+                )
+                .await?;
+            scoped.finish().await?;
+            Ok(row.map(|r| crate::channels::desk::ReadPoint {
+                at: r.get(0),
+                message: r.get(1),
+            }))
+        })
+    }
+
+    fn desk_read_floor(&self, owner: &str) -> Result<Option<DateTime<Utc>>> {
+        self.block_on(async move {
+            let mut conn = self.pool.get().await?;
+            let scoped = self.scope(&mut conn).await?;
+            scoped
+                .execute(
+                    "INSERT INTO desk_reads
+                       (tenant_id, owner, agent_id, channel, at, updated_at)
+                     VALUES ($1, $2, '', '', now(), now()) ON CONFLICT DO NOTHING",
+                    &[&self.tenant_id(), &owner],
+                )
+                .await?;
+            let row = scoped
+                .query_one(
+                    "SELECT at FROM desk_reads
+                     WHERE tenant_id = $1 AND owner = $2 AND agent_id = '' AND channel = ''",
+                    &[&self.tenant_id(), &owner],
+                )
+                .await?;
+            scoped.finish().await?;
+            Ok(Some(row.get(0)))
+        })
+    }
+
+    fn forget_desk_reads(&self, owner: &str) -> Result<u64> {
+        self.block_on(async move {
+            let mut conn = self.pool.get().await?;
+            let scoped = self.scope(&mut conn).await?;
+            let n = scoped
+                .execute(
+                    "DELETE FROM desk_reads
+                     WHERE tenant_id = $1 AND owner = $2 AND agent_id IN ($3, '')",
+                    &[&self.tenant_id(), &owner, &self.agent_id],
+                )
+                .await?;
+            scoped.finish().await?;
+            Ok(n)
+        })
+    }
+
+    fn move_desk_reads(&self, from: &str, into: &str) -> Result<u64> {
+        self.block_on(async move {
+            let mut conn = self.pool.get().await?;
+            let scoped = self.scope(&mut conn).await?;
+            let n = scoped
+                .execute(
+                    "WITH moved AS (DELETE FROM desk_reads
+                       WHERE tenant_id = $1 AND owner = $2 AND agent_id IN ($4, '')
+                       RETURNING agent_id, channel, at, message_id)
+                     INSERT INTO desk_reads
+                       (tenant_id, owner, agent_id, channel, at, message_id, updated_at)
+                     SELECT $1, $3, agent_id, channel, at, message_id, now() FROM moved
+                     ON CONFLICT (tenant_id, owner, agent_id, channel) DO UPDATE
+                     SET at = excluded.at, message_id = excluded.message_id, updated_at = now()
+                     WHERE excluded.at > desk_reads.at",
+                    &[&self.tenant_id(), &from, &into, &self.agent_id],
+                )
+                .await?;
+            scoped.finish().await?;
+            Ok(n)
+        })
+    }
+
     fn owners(&self) -> Result<std::collections::BTreeMap<String, usize>> {
         self.block_on(async move {
             let mut conn = self.pool.get().await?;
@@ -3885,6 +4017,62 @@ pub(crate) mod tests {
 
             successor.end_turn(&sess.id, &interrupted[0].token).unwrap();
             assert!(successor.interrupted_turns().unwrap().is_empty());
+        })
+        .await;
+    }
+
+    /// A person's Desk read points: an advance never back, a set exactly
+    /// there, each person's and tenant's their own, the floor set once, and
+    /// what a merge or a delete does with them.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn desk_read_points_advance_set_and_belong_to_their_person_and_tenant() {
+        use crate::channels::desk::{Mark, ReadPoint};
+        with_embedded_pg_pool(|pool| async move {
+            let allan = PostgresSessionStore::with_pool(pool.clone(), "allan")
+                .await
+                .expect("run migrations");
+            let other =
+                PostgresSessionStore::with_shared_pool_in_tenant(pool.clone(), "acme", "allan");
+            let at = |s: i64| {
+                chrono::DateTime::parse_from_rfc3339("2026-10-30T10:00:00Z")
+                    .unwrap()
+                    .to_utc()
+                    + chrono::Duration::seconds(s)
+            };
+            let point = |s: i64| ReadPoint {
+                at: at(s),
+                message: Some(format!("m-{s}")),
+            };
+            assert!(allan.desk_read("sarah", "desk").unwrap().is_none());
+            assert!(allan
+                .put_desk_read("sarah", "desk", &point(10), Mark::Advance)
+                .unwrap()
+                .is_some());
+            assert!(allan
+                .put_desk_read("sarah", "desk", &point(5), Mark::Advance)
+                .unwrap()
+                .is_none());
+            assert_eq!(allan.desk_read("sarah", "desk").unwrap(), Some(point(10)));
+            assert_eq!(
+                allan
+                    .put_desk_read("sarah", "desk", &point(5), Mark::Set)
+                    .unwrap(),
+                Some(point(5))
+            );
+            assert!(
+                allan.desk_read("allan-owner", "desk").unwrap().is_none(),
+                "another person's"
+            );
+            assert!(
+                other.desk_read("sarah", "desk").unwrap().is_none(),
+                "another tenant's"
+            );
+            let floor = allan.desk_read_floor("sarah").unwrap().unwrap();
+            assert_eq!(allan.desk_read_floor("sarah").unwrap(), Some(floor));
+            assert_eq!(allan.move_desk_reads("sarah", "sarah-2").unwrap(), 2);
+            assert_eq!(allan.desk_read("sarah-2", "desk").unwrap(), Some(point(5)));
+            assert!(allan.forget_desk_reads("sarah-2").unwrap() >= 1);
+            assert!(allan.desk_read("sarah-2", "desk").unwrap().is_none());
         })
         .await;
     }

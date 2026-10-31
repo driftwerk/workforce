@@ -137,6 +137,7 @@ impl Holding for Sessions {
                     true => {
                         move_files(&planned, &to).await?;
                         let moved = sessions.reassign_owner(name, &to, &from.tag())?;
+                        sessions.move_desk_reads(name, &to)?;
                         let unplanned: Vec<_> = moved
                             .iter()
                             .filter(|session| !planned.contains(session))
@@ -204,6 +205,11 @@ impl Holding for Sessions {
                 sessions.delete(&session.id)?;
                 for driver in drivers {
                     remove_path(&homes.join(format!(".codex-{driver}")))?;
+                }
+            }
+            if apply {
+                for name in &who.names {
+                    sessions.forget_desk_reads(name)?;
                 }
             }
         }
