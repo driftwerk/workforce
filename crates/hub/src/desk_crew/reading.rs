@@ -35,12 +35,10 @@ pub(super) fn verdict(text: &str) -> Option<bool> {
 }
 
 impl CrewHub {
-    /// The service whose model reads replies: the overseer's, else the
-    /// hub's first agent's.
+    /// The service whose model reads replies: the overseer's. Without one
+    /// nobody has asked for it, so nothing is spent and the rules decide.
     fn reader(&self) -> Option<Arc<AgentService>> {
-        self.overseer_service()
-            .map(|(s, _)| s)
-            .or_else(|| self.services().into_iter().next())
+        self.overseer_service().map(|(s, _)| s)
     }
 
     pub(super) async fn read_reply(&self, reply: &str) -> Option<bool> {
