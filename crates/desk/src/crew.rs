@@ -499,6 +499,10 @@ pub trait Crew: Send + Sync {
     fn agents(&self) -> Vec<CrewAgent>;
     /// The start of today, in the person's time.
     fn midnight(&self) -> DateTime<Utc>;
+    /// The person's timezone, which days and weeks of spend are counted in.
+    fn timezone(&self) -> chrono_tz::Tz {
+        chrono_tz::UTC
+    }
     /// Does what `suggestion` proposed, as you; what went wrong in plain
     /// words.
     async fn accept(&self, suggestion: &Suggestion) -> Result<(), String>;

@@ -144,6 +144,8 @@ pub enum CodexEvent {
     Reply(String),
     /// A sub-agent thread it started.
     Child(String),
+    /// A model call's tokens, as the app-server reported them.
+    Usage(crate::ledger::Spend),
 }
 
 /// What happened, and on which thread.
@@ -229,6 +231,10 @@ pub fn interpret(method: &str, params: &Value) -> Option<Seen> {
             };
             seen(s("/threadId"), event)
         }
+        "thread/tokenUsage/updated" => seen(
+            s("/threadId"),
+            CodexEvent::Usage(crate::ledger::codex_spend(params, chrono::Utc::now())?),
+        ),
         "item/completed"
             if params.pointer("/item/type").and_then(Value::as_str) == Some("agentMessage") =>
         {

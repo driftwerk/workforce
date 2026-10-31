@@ -73,6 +73,23 @@ pub async fn create(cwd: &Path, branch: &str) -> Result<PathBuf> {
     Ok(path)
 }
 
+/// The project a session's folder belongs to: the repo for one of Desk's
+/// own worktrees (`<repo>/.worktrees/<slug>`, as [`create`] makes them),
+/// else the folder itself.
+pub fn project_of(cwd: &str) -> &str {
+    match cwd.rfind("/.worktrees/") {
+        Some(at)
+            if at > 0
+                && !cwd[at + "/.worktrees/".len()..]
+                    .trim_matches('/')
+                    .contains('/') =>
+        {
+            &cwd[..at]
+        }
+        _ => cwd,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -111,5 +128,22 @@ mod tests {
         );
         assert!(create(repo, "desk/auth-fix").await.is_err());
         assert!(create(repo, "bad..name").await.is_err());
+    }
+
+    #[test]
+    fn a_desk_worktree_is_its_repos_project() {
+        assert_eq!(
+            super::project_of("/dev/acme-web/.worktrees/login-race"),
+            "/dev/acme-web"
+        );
+        assert_eq!(
+            super::project_of("/dev/acme-web/.worktrees/login-race/"),
+            "/dev/acme-web"
+        );
+        assert_eq!(
+            super::project_of("/dev/acme-web/.worktrees/x/crates"),
+            "/dev/acme-web/.worktrees/x/crates"
+        );
+        assert_eq!(super::project_of("/dev/atlas"), "/dev/atlas");
     }
 }

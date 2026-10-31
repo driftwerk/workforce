@@ -87,6 +87,119 @@ async fn list(State(s): S, h: HeaderMap, Query(q): Q) -> Response {
     Json(s.desk.list()).into_response()
 }
 
+/// Which spend a route asks for: a period (`day`, `week`, `month`,
+/// `five_hours`, in the person's timezone) or `from`/`to`, grouped `by`.
+#[derive(Debug, Deserialize)]
+struct SpendParams {
+    period: Option<String>,
+    from: Option<chrono::DateTime<chrono::Utc>>,
+    to: Option<chrono::DateTime<chrono::Utc>>,
+    by: Option<String>,
+    limit: Option<usize>,
+    session: Option<Uuid>,
+    engine: Option<String>,
+    account: Option<String>,
+    /// The ledger's page to go on from: a page's `next`.
+    before: Option<String>,
+}
+
+/// Most rows a spend view returns.
+const MAX_SPEND_ROWS: usize = 500;
+
+impl SpendParams {
+    fn window(
+        &self,
+        desk: &Desk,
+    ) -> Result<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>), DeskError> {
+        let now = chrono::Utc::now();
+        let to = self.to.unwrap_or(now);
+        let from = match (&self.period, self.from) {
+            (Some(p), _) => {
+                let period = crate::ledger::Period::parse(p).map_err(|_| {
+                    DeskError::Invalid("period is day, week, month or five_hours".into())
+                })?;
+                desk.period_start(period, now)
+            }
+            (None, Some(from)) => from,
+            (None, None) => desk.period_start(crate::ledger::Period::Day, now),
+        };
+        if from > to {
+            return Err(DeskError::Invalid("from is after to".into()));
+        }
+        Ok((from, to))
+    }
+
+    fn filter(&self) -> Result<crate::ledger_store::Filter, DeskError> {
+        Ok(crate::ledger_store::Filter {
+            engine: self
+                .engine
+                .as_deref()
+                .map(crate::engine::Engine::parse)
+                .transpose()
+                .map_err(|_| DeskError::Invalid("that isn't an engine".into()))?,
+            account: self.account.clone(),
+            session: self.session,
+        })
+    }
+}
+
+fn spend_params(p: Result<Query<SpendParams>, QueryRejection>) -> Result<SpendParams, DeskError> {
+    p.map(|Query(p)| p)
+        .map_err(|e| DeskError::Invalid(e.body_text()))
+}
+
+/// What sessions spent, summed and grouped.
+async fn spend(
+    State(s): S,
+    h: HeaderMap,
+    Query(q): Q,
+    p: Result<Query<SpendParams>, QueryRejection>,
+) -> Response {
+    guarded!(s, h, q);
+    let run = async {
+        let p = spend_params(p)?;
+        let (from, to) = p.window(&s.desk)?;
+        let by =
+            crate::ledger::SpendBy::parse(p.by.as_deref().unwrap_or("session")).map_err(|_| {
+                DeskError::Invalid("by is session, project, day, engine or account".into())
+            })?;
+        s.desk
+            .spend(&crate::service::SpendQuery {
+                by,
+                from,
+                to,
+                limit: p.limit.unwrap_or(50).clamp(1, MAX_SPEND_ROWS),
+                filter: p.filter()?,
+            })
+            .await
+    };
+    run.await.map(Json).into_response()
+}
+
+/// The ledger's calls themselves, newest first, a page at a time.
+async fn ledger(
+    State(s): S,
+    h: HeaderMap,
+    Query(q): Q,
+    p: Result<Query<SpendParams>, QueryRejection>,
+) -> Response {
+    guarded!(s, h, q);
+    let run = async {
+        let p = spend_params(p)?;
+        let (from, to) = match (p.period.is_some(), p.from) {
+            (false, None) => (
+                chrono::DateTime::<chrono::Utc>::UNIX_EPOCH,
+                p.to.unwrap_or_else(chrono::Utc::now),
+            ),
+            _ => p.window(&s.desk)?,
+        };
+        s.desk
+            .ledger_page(from, to, &p.filter()?, p.before.as_deref())
+            .await
+    };
+    run.await.map(Json).into_response()
+}
+
 /// Every engine: its program, version and sign-in, and where Desk runs it.
 async fn engines(State(s): S, h: HeaderMap, Query(q): Q) -> Response {
     guarded!(s, h, q);
@@ -696,6 +809,8 @@ pub fn sessions_router(desk: Desk, auth: Arc<dyn Authorize>) -> Router {
     Router::new()
         .route("/api/desk/sessions", get(list).post(create))
         .route("/api/desk/engines", get(engines))
+        .route("/api/desk/spend", get(spend))
+        .route("/api/desk/ledger", get(ledger))
         .route("/api/desk/sessions/{id}", patch(update).delete(forget))
         .route("/api/desk/sessions/{id}/stop", post(stop))
         .route("/api/desk/sessions/{id}/interrupt", post(interrupt))
@@ -1218,6 +1333,66 @@ mod tests {
                 refused.to_string().contains("in its desk view"),
                 "{refused}"
             );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn spend_and_the_ledger_are_read_through_their_routes() {
+        with_test_pool(build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let transcript = dir.path().join("t.jsonl");
+            std::fs::write(&transcript, include_str!("../fixtures/ledger/claude.jsonl")).unwrap();
+            DeskStore::migrate(&pool).await.unwrap();
+            let store = DeskStore::from_pool(pool);
+            let mut r = crate::store::tests::record_fixture("acme-web");
+            r.transcript = Some(transcript.to_string_lossy().into_owned());
+            store.put(&r).await.unwrap();
+            let desk = crate::Desk::start(
+                store,
+                options(dir.path()),
+                Default::default(),
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            let app = super::sessions_router(desk, allow_all());
+            let uri =
+                "/api/desk/spend?from=2026-10-31T00:00:00Z&to=2026-11-01T00:00:00Z&by=session";
+            let mut view = Value::Null;
+            for _ in 0..200 {
+                view = call(&app, "GET", uri, None).await.1;
+                if view["total"]["calls"] == 2 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            assert_eq!(view["total"]["calls"], 2, "{view}");
+            assert_eq!(view["rows"][0]["label"], "acme-web");
+            assert_eq!(view["rows"][0]["session"], r.id.to_string());
+            assert_eq!(view["total"]["tokens"]["cacheRead"], 20000);
+            assert_eq!(
+                view["total"]["unpricedModels"],
+                json!(["claude-opus-5-5"]),
+                "no pricer here"
+            );
+            let (status, page) = call(
+                &app,
+                "GET",
+                &format!("/api/desk/ledger?session={}", r.id),
+                None,
+            )
+            .await;
+            assert_eq!(status, 200);
+            assert_eq!(page["rows"].as_array().unwrap().len(), 2);
+            assert_eq!(page["rows"][0]["key"], "msg_02");
+            assert_eq!(page["next"], Value::Null);
+            let (status, _) = call(&app, "GET", "/api/desk/spend?period=fortnight", None).await;
+            assert_eq!(status, 400);
+            let (status, _) = call(&app, "GET", "/api/desk/spend?by=planet", None).await;
+            assert_eq!(status, 400);
+            let (status, _) = call(&app, "GET", "/api/desk/ledger?before=nonsense", None).await;
+            assert_eq!(status, 400);
         })
         .await;
     }

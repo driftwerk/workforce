@@ -108,6 +108,16 @@ pub enum Resume {
     None,
 }
 
+/// What a session's engine records of what it spent, for the ledger.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum UsageSource {
+    /// Tokens per model call, as they happen (Claude Code's transcript,
+    /// Codex's rollout and app-server).
+    Tokens,
+    None,
+}
+
 /// How Desk ends the turn a session is working on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -126,6 +136,7 @@ pub struct Caps {
     pub approvals: Answerer,
     pub resume: Resume,
     pub interrupt: Interrupt,
+    pub usage: UsageSource,
     /// Whose plan's windows its sessions report, for the Floor's plan cards.
     pub plan: Option<LocalPlan>,
     /// What the person reads beside it, in the new session dialog and on
@@ -141,6 +152,7 @@ impl Caps {
             approvals: Answerer::None,
             resume: Resume::None,
             interrupt: Interrupt::None,
+            usage: UsageSource::None,
             plan: None,
             notes: Vec::new(),
         }
@@ -187,6 +199,7 @@ pub fn caps(engine: Engine, view: View) -> Caps {
             approvals: Answerer::Desk,
             resume: Resume::ById,
             interrupt: Interrupt::Keys,
+            usage: UsageSource::Tokens,
             plan: Some(LocalPlan::Claude),
             notes: Vec::new(),
         },
@@ -196,6 +209,7 @@ pub fn caps(engine: Engine, view: View) -> Caps {
             approvals: Answerer::Terminal,
             resume: Resume::ById,
             interrupt: Interrupt::Keys,
+            usage: UsageSource::Tokens,
             plan: Some(LocalPlan::Codex),
             notes: vec!["Codex asks its approvals in its own terminal."],
         },
@@ -634,6 +648,7 @@ mod tests {
         assert_eq!(json["signIn"]["via"], "plan");
         assert!(!json.to_string().contains("org-9"), "{json}");
         assert_eq!(json["caps"]["terminal"]["approvals"], "desk");
+        assert_eq!(json["caps"]["terminal"]["usage"], "tokens");
         let unread = view_of(Engine::Gemini, Some(Path::new("gemini")), None);
         assert_eq!(
             (unread.installed, unread.views.len(), unread.caps.len()),

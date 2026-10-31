@@ -30,6 +30,7 @@ pub fn desk_floor() -> workforce_desk::Floor {
     workforce_desk::Floor {
         turns: installed.map(|i| Arc::clone(&i.log)),
         plans: installed.map(|i| Arc::clone(&i.plans) as Arc<dyn workforce_desk::usage::PlanSink>),
+        pricer: None,
     }
 }
 

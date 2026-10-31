@@ -41,6 +41,7 @@ use crate::worktree;
 
 mod copies;
 mod groups;
+mod ledger;
 #[cfg(test)]
 mod rooms_tests;
 mod terminals;
@@ -53,6 +54,7 @@ pub use groups::{
     local_agent_item, session_item, Group, Import, Imported, Layout, Ungrouped, UNGROUPED,
 };
 
+pub use ledger::{LedgerPage, SpendQuery};
 pub use terminals::{NewTerminal, TerminalPatch, TerminalRecord, TerminalState, TerminalView};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -277,6 +279,8 @@ struct OpenTurn {
 pub struct Floor {
     pub turns: Option<Arc<dyn TurnLog>>,
     pub plans: Option<Arc<dyn PlanSink>>,
+    /// Prices the ledger's calls: the hub's price table.
+    pub pricer: Option<Arc<dyn crate::ledger::Pricer>>,
 }
 
 /// How long the hub's model may take to read whether a turn's reply asks
@@ -321,6 +325,7 @@ struct Inner {
     /// What each engine's program said of its version and sign-in, as
     /// last read.
     engines: Mutex<BTreeMap<Engine, Installed>>,
+    ledger: ledger::LedgerRun,
     /// Reads a turn's last reply where the rules can't tell whether it
     /// asks: the hub's crew, once its routes are mounted.
     reader: Mutex<Option<Weak<dyn crew::Crew>>>,
@@ -548,6 +553,7 @@ impl Desk {
         let hook_base = format!("http://127.0.0.1:{hook_port}");
         let (persist, persist_rx) = mpsc::unbounded_channel();
         let env = cli_env(&opts.env);
+        let (ledger, ledger_jobs) = ledger::LedgerRun::new(floor.pricer.clone());
         let desk = Self(Arc::new(Inner {
             shell: terminals::login_shell(&env, terminals::account_shell, |p| p.is_file()),
             env,
@@ -571,11 +577,13 @@ impl Desk {
             layout_write: tokio::sync::Mutex::new(()),
             plans: floor.plans,
             engines: Mutex::new(BTreeMap::new()),
+            ledger,
             reader: Mutex::new(None),
             read_wait: Mutex::new(READ_LATER),
         }));
         tokio::spawn(persist_loop(store, floor.turns, persist_rx));
         tokio::spawn(desk.clone().read_engines());
+        tokio::spawn(desk.clone().ledger_loop(ledger_jobs));
         tokio::spawn(desk.clone().watch_background());
         recovered.into_iter().for_each(|r| desk.save(r));
         for (id, at) in failed {
@@ -878,6 +886,12 @@ impl Desk {
             .collect()
     }
 
+    /// The person's timezone, as the hub's crew says it (UTC before its
+    /// routes are mounted).
+    pub fn timezone(&self) -> chrono_tz::Tz {
+        self.reader().map_or(chrono_tz::UTC, |c| c.timezone())
+    }
+
     /// `engine`'s program, when the hub names one.
     fn program(&self, engine: Engine) -> Option<&Path> {
         self.0.opts.programs.get(&engine).map(PathBuf::as_path)
@@ -909,6 +923,7 @@ impl Desk {
             let read: BTreeMap<Engine, Installed> =
                 futures::future::join_all(reads).await.into_iter().collect();
             *self.0.engines.lock() = read;
+            self.spend_signed_in();
         }
     }
 
@@ -2397,6 +2412,7 @@ impl Desk {
         let clean = live.ended || live.stopping;
         live.end();
         drop(live);
+        self.spend_read(id);
         self.change(id, |r, _| {
             r.state = if clean {
                 SessionState::Stopped
@@ -2513,18 +2529,21 @@ impl Desk {
                     }
                 }
             }
-            Hook::ToolEnd => self.change(id, |r, l| {
-                r.state = SessionState::Working;
-                if let Some(l) = l {
-                    l.current_tool = None;
-                    l.pending = None;
-                    l.answer = None;
-                    // A tool ran: the turn got past what it was refused.
-                    if inside.is_none() {
-                        asking::went_on(&mut l.denials, true);
+            Hook::ToolEnd => {
+                self.change(id, |r, l| {
+                    r.state = SessionState::Working;
+                    if let Some(l) = l {
+                        l.current_tool = None;
+                        l.pending = None;
+                        l.answer = None;
+                        // A tool ran: the turn got past what it was refused.
+                        if inside.is_none() {
+                            asking::went_on(&mut l.denials, true);
+                        }
                     }
-                }
-            }),
+                });
+                self.spend_read_while_working(id);
+            }
             Hook::NeedsInput(message) => self.change(id, |r, l| {
                 if let Some(l) = l.filter(|l| l.pending.is_none()) {
                     r.state = SessionState::Blocked;
@@ -2641,11 +2660,14 @@ impl Desk {
                 if let (Some(reader), Some(end), Some(reply)) = (reader, read, said_whole) {
                     self.read_later(id, end, reader, reply);
                 }
+                // The turn's calls are in its transcript now.
+                self.spend_read(id);
             }
             Hook::SessionEnd => {
                 if let Some(l) = self.0.state.lock().live.get_mut(&id) {
                     l.ended = true;
                 }
+                self.spend_read(id);
             }
             Hook::Permission { tool, detail } => {
                 return self.await_permission(id, tool, detail).await
@@ -2757,6 +2779,11 @@ impl Desk {
         let home = self.0.env.get("HOME").map(PathBuf::from);
         let mut children = HashSet::new();
         while let Some(Seen { thread, event }) = rx.recv().await {
+            // A call of its own thread's or a sub-agent's is the session's spend.
+            if let CodexEvent::Usage(spend) = event {
+                self.spend_live(id, spend);
+                continue;
+            }
             let ours = self.record(id).ok().and_then(|r| r.cli_session_id);
             let child = match &event {
                 CodexEvent::Child(child) if ours.as_deref().is_none_or(|t| t == thread) => {
@@ -2784,6 +2811,10 @@ impl Desk {
             }
             if ours.as_deref().is_some_and(|t| t != thread) {
                 continue;
+            }
+            if matches!(event, CodexEvent::Idle) {
+                // Its rollout has the turn's calls, with their model.
+                self.spend_read(id);
             }
             let turn_begins = matches!(event, CodexEvent::Working { .. })
                 && self.record(id).is_ok_and(|r| {
@@ -2905,7 +2936,7 @@ impl Desk {
                         }
                     }
                     CodexEvent::Reply(text) => r.last_reply = Some(transcript::clip(&text)),
-                    CodexEvent::Child(_) => {}
+                    CodexEvent::Child(_) | CodexEvent::Usage(_) => {}
                 }
             });
             if let (Some(reader), Some(end), Some(reply)) = (reader, read, said_whole) {
@@ -3056,6 +3087,9 @@ impl Desk {
                 return None;
             }
             st.seen_transcripts.insert(id, mtime);
+            drop(st);
+            // A session in another terminal: what it did is read as it changes.
+            self.spend_read(id);
         }
         transcript::read_tail(path).ok()
     }
@@ -3580,6 +3614,7 @@ mod tests {
                 Floor {
                     turns: None,
                     plans: Some(readings.clone()),
+                    pricer: None,
                 },
                 CancellationToken::new(),
             )
@@ -3689,6 +3724,7 @@ mod tests {
             let no_floor = || Floor {
                 turns: None,
                 plans: None,
+                pricer: None,
             };
             let d = Desk::start(
                 DeskStore::from_pool(pool.clone()),
@@ -3797,6 +3833,7 @@ mod tests {
                 Floor {
                     turns: Some(logged.clone()),
                     plans: None,
+                    pricer: None,
                 },
                 CancellationToken::new(),
             )
@@ -3918,6 +3955,7 @@ mod tests {
                 Floor {
                     turns: Some(logged.clone()),
                     plans: None,
+                    pricer: None,
                 },
                 CancellationToken::new(),
             )
@@ -4620,6 +4658,7 @@ mod tests {
             Floor {
                 turns: Some(logged.clone()),
                 plans: None,
+                pricer: None,
             },
             CancellationToken::new(),
         )

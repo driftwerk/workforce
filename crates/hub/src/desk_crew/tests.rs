@@ -1218,6 +1218,7 @@ mod floor {
                     workforce_desk::Floor {
                         turns: Some(Arc::clone(&installed.log)),
                         plans: None,
+                        pricer: None,
                     },
                 )
                 .await;

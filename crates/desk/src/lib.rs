@@ -18,6 +18,8 @@ pub mod engine;
 pub mod floor;
 pub mod gist;
 pub mod holder;
+pub mod ledger;
+pub mod ledger_store;
 pub mod local;
 pub mod model;
 pub mod overview;
@@ -48,8 +50,8 @@ pub use providers::{AccountError, Accounts, Fields, Spec, Standing};
 pub use realtime::{KeySource, Provider, Realtime};
 pub use service::{
     local_agent_item, session_item, Desk, DeskError, Floor, Group, HolderOptions, HubTurns, Import,
-    Imported, Layout, NewTerminal, Options, RestorePolicy, TerminalPatch, TerminalState,
-    TerminalView, Ungrouped, UNGROUPED,
+    Imported, Layout, LedgerPage, NewTerminal, Options, RestorePolicy, SpendQuery, TerminalPatch,
+    TerminalState, TerminalView, Ungrouped, UNGROUPED,
 };
 pub use speech::{Audio, Speak, SpeakError, Speech, SpeechProvider};
 pub use store::DeskStore;

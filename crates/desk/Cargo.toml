@@ -12,6 +12,7 @@ async-trait = { workspace = true }
 axum = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }
+chrono-tz = "0.10"
 deadpool-postgres = { workspace = true }
 eyre = { workspace = true }
 futures = { workspace = true }
