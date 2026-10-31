@@ -83,7 +83,10 @@ pub struct Options {
 /// person's subscription): a `claude` running in one is the hub's, never a
 /// session of the person's to adopt.
 #[derive(Clone, Default)]
-pub struct HubTurns(Option<Arc<dyn Fn(&Path) -> bool + Send + Sync>>);
+pub struct HubTurns(Option<Arc<HoldsTurns>>);
+
+/// Whether a folder is one of the hub's own turns'.
+type HoldsTurns = dyn Fn(&Path) -> bool + Send + Sync;
 
 impl HubTurns {
     pub fn new(holds: impl Fn(&Path) -> bool + Send + Sync + 'static) -> Self {
