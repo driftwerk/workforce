@@ -386,6 +386,31 @@ mod tests {
         assert_eq!(wire, serde_json::json!({"signal": "usage", "owner": null}));
     }
 
+    /// A read moved on one replica is read as itself on another, never as
+    /// a signal or a delivery, and is heard by its person's links alone.
+    #[test]
+    fn a_read_moved_reads_as_itself_on_every_replica() {
+        let relayed = Relayed::ReadChanged {
+            owner: "person-1".into(),
+            agent_id: "scout".into(),
+            channel: "desk".into(),
+        };
+        let wire = serde_json::to_vec(&relayed).unwrap();
+        let read: Relayed = serde_json::from_slice(&wire).unwrap();
+        assert_eq!(read, relayed);
+        let message = read.message();
+        assert_eq!(
+            (
+                message.msg_type.as_str(),
+                message.target_identity.as_deref(),
+                message.agent_id.as_deref(),
+                message.content.as_str()
+            ),
+            ("read_changed", Some("person-1"), Some("scout"), "desk")
+        );
+        assert!(message.for_links_only());
+    }
+
     /// A delivery made on one replica reaches the hub links on another,
     /// against a real NATS server: `WORKFORCE_TEST_NATS_URL=nats://localhost:4222`.
     #[tokio::test]

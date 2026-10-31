@@ -420,8 +420,10 @@ impl Conversations for HubConversations {
         }
         let store = service.sessions.as_ref();
         let unkept = |e: eyre::Report| ConversationError::Unavailable(format!("{e:#}"));
+        // Never later than now: a point from a clock running ahead would
+        // count everything until then as read.
         let point = workforce_common::channels::desk::ReadPoint {
-            at: put.at,
+            at: put.at.min(Utc::now()),
             message: put.message,
         };
         let moved = store
@@ -444,13 +446,19 @@ impl Conversations for HubConversations {
 /// changed after `since`, and their DM whenever it has something unread, so
 /// a Desk that starts cold gets every count. The DM says how far it is read
 /// on a hub that keeps read points; a count that can't be read leaves it
-/// listed as before.
+/// listed as before. The person's floor is set at their first listing,
+/// whether or not they have a DM yet, so a delivery that starts one later
+/// is unread.
 fn active_of(
     store: &dyn SessionStore,
     agent: &str,
     owner: &str,
     since: Option<DateTime<Utc>>,
 ) -> eyre::Result<Vec<Active>> {
+    let floor = store.desk_read_floor(owner).unwrap_or_else(|e| {
+        tracing::warn!(agent, error = %e, "reading where a person's DM reads begin failed");
+        None
+    });
     let mut active = Vec::new();
     for s in store
         .list_for_owner_on(owner, DESK_CHANNEL, ACTIVE_SEARCHED)?
@@ -458,16 +466,15 @@ fn active_of(
         .filter(|s| is_desk_conversation(&s.channel) && !s.is_sealed())
     {
         let changed = since.is_none_or(|since| s.updated_at > since);
-        let (read, unread) = match s.channel == DESK_CHANNEL {
-            true => match crate::desk_reads::dm_unread(store, agent, owner) {
-                Ok(Some((read, unread))) => (read, Some(unread)),
-                Ok(None) => (None, None),
+        let (read, unread) = match (s.channel == DESK_CHANNEL, floor) {
+            (true, Some(floor)) => match crate::desk_reads::dm_unread(store, agent, owner, floor) {
+                Ok((read, unread)) => (read, Some(unread)),
                 Err(e) => {
                     tracing::warn!(agent, error = %e, "counting a DM's unread failed");
                     (None, None)
                 }
             },
-            false => (None, None),
+            _ => (None, None),
         };
         if changed || unread.as_ref().is_some_and(|u| u.count > 0) {
             active.push(Active {
@@ -674,7 +681,12 @@ mod tests {
                 let store = PostgresSessionStore::with_pool(pool, "scout")
                     .await
                     .expect("store");
-                assert!(store.desk_read_floor(ME).unwrap().is_some());
+                assert!(
+                    active_of(store.as_ref(), "scout", ME, None)
+                        .unwrap()
+                        .is_empty(),
+                    "no DM yet, and the first listing sets where reads begin"
+                );
                 tokio::time::sleep(std::time::Duration::from_millis(5)).await;
                 exchange(store.as_ref(), 0);
                 exchange(store.as_ref(), 1);

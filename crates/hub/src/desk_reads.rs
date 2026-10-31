@@ -54,15 +54,13 @@ pub(crate) fn unread_of(
 const COUNT_READ: usize = 200;
 
 /// `owner`'s point on their DM with `agent` in `store`, and what is unread
-/// after it; neither when the store keeps no points.
+/// after it, or after `floor` when it is later.
 pub(crate) fn dm_unread(
     store: &dyn SessionStore,
     agent: &str,
     owner: &str,
-) -> eyre::Result<Option<(Option<ConversationRead>, ConversationUnread)>> {
-    let Some(floor) = store.desk_read_floor(owner)? else {
-        return Ok(None);
-    };
+    floor: DateTime<Utc>,
+) -> eyre::Result<(Option<ConversationRead>, ConversationUnread)> {
     let point = store.desk_read(owner, DESK_CHANNEL)?;
     let page = crate::desk_conversations::page(
         store,
@@ -73,10 +71,10 @@ pub(crate) fn dm_unread(
         COUNT_READ,
     )
     .map_err(|e| eyre::eyre!("{e}"))?;
-    Ok(Some((
+    Ok((
         point.as_ref().map(ConversationRead::of),
         unread_of(&page, point.as_ref(), floor),
-    )))
+    ))
 }
 
 #[cfg(test)]
