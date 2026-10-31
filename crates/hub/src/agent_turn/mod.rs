@@ -17,7 +17,7 @@ mod round;
 pub(crate) mod tests;
 pub(crate) mod tool_loop;
 
-pub use cli::{runs_in, AgentTurnRig};
+pub use cli::AgentTurnRig;
 pub use round::TOOL_SEARCH;
 pub use tool_loop::{ProviderLoop, ToolLoop, UsageFn};
 

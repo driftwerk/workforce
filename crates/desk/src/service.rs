@@ -14,13 +14,13 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::adopt::{self, External};
+use crate::adopt::{self, External, HubInternal};
 use crate::asking::{self, Asked, Call, Denied, Reading};
 use crate::background::{Background, TaskKind};
 use crate::claude::{self, Hook};
 use crate::codex::{self, AppServer, CodexEvent, Seen};
 use crate::crew::{self, By, Event, Kind, Party};
-use crate::floor::{Outcome, TurnLog, TurnOp};
+use crate::floor::{Outcome, SubjectKey, TurnLog, TurnOp};
 use crate::holder::{Held, Holder};
 use crate::model::{
     Approvals, Decision, DeskEvent, Engine, NewSession, Origin, PendingApproval, SessionPatch,
@@ -80,37 +80,8 @@ pub struct Options {
     /// The PTY holder that keeps terminals across hub restarts; without
     /// one (or while it can't be reached) they are the hub's own children.
     pub holder: Option<HolderOptions>,
-    /// Where the hub's own CLI turns run: never adopted.
-    pub hub_turns: HubTurns,
-}
-
-/// Which folders the hub's own CLI turns run in (an agent's turns on a
-/// person's subscription): a `claude` running in one is the hub's, never a
-/// session of the person's to adopt.
-#[derive(Clone, Default)]
-pub struct HubTurns(Option<Arc<HoldsTurns>>);
-
-/// Whether a folder is one of the hub's own turns'.
-type HoldsTurns = dyn Fn(&Path) -> bool + Send + Sync;
-
-impl HubTurns {
-    pub fn new(holds: impl Fn(&Path) -> bool + Send + Sync + 'static) -> Self {
-        Self(Some(Arc::new(holds)))
-    }
-
-    fn hold(&self, cwd: &str) -> bool {
-        self.0.as_ref().is_some_and(|holds| holds(Path::new(cwd)))
-    }
-}
-
-impl std::fmt::Debug for HubTurns {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(if self.0.is_some() {
-            "HubTurns(..)"
-        } else {
-            "HubTurns(none)"
-        })
-    }
+    /// What the hub runs `claude` in and as itself: never adopted.
+    pub hub_internal: HubInternal,
 }
 
 #[derive(Debug, Clone)]
@@ -288,6 +259,9 @@ enum Persist {
     Put(Box<SessionRecord>),
     Attention(Uuid, DateTime<Utc>),
     Delete(Uuid),
+    /// Sessions that were never the person's, forgotten with all Activity
+    /// says of them.
+    ForgetNotTheirs(Vec<Uuid>),
     Event(Box<Event>),
     Turn(Box<TurnOp>),
 }
@@ -476,6 +450,45 @@ async fn prune_layout(
     }
 }
 
+/// Forgets every session of the hub's own that an earlier hub took for the
+/// person's, closed ones too: its record, how far it was read and its
+/// turns and gists on the floor. Only another terminal's sessions are
+/// looked at; one started in Desk is the person's wherever it runs.
+async fn forget_hub_internal(store: &DeskStore, hub: &HubInternal, turns: Option<&dyn TurnLog>) {
+    let places = match store.external_places().await {
+        Ok(places) => places,
+        Err(e) => {
+            tracing::warn!(error = %e, "couldn't look for the hub's own sessions to forget");
+            return;
+        }
+    };
+    let ids: Vec<Uuid> = places
+        .into_iter()
+        .filter(|(_, cwd)| hub.holds(Path::new(cwd)))
+        .map(|(id, _)| id)
+        .collect();
+    if ids.is_empty() {
+        return;
+    }
+    match store.forget_sessions(&ids, YOU).await {
+        Ok(forgotten) => {
+            tracing::info!(
+                forgotten,
+                "forgot the hub's own sessions taken for the person's"
+            )
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "couldn't forget the hub's own sessions");
+            return;
+        }
+    }
+    if let Some(turns) = turns {
+        turns.send(TurnOp::Forget {
+            subjects: ids.into_iter().map(SubjectKey::session).collect(),
+        });
+    }
+}
+
 impl Desk {
     /// Loads the registry, marks what was running as interrupted or stopped
     /// (its processes did not survive the hub), and starts the hook endpoint
@@ -487,6 +500,7 @@ impl Desk {
         cancel: CancellationToken,
     ) -> Result<Self> {
         let store = Arc::new(store);
+        forget_hub_internal(&store, &opts.hub_internal, floor.turns.as_deref()).await;
         let layout = store.layout().await?;
         let session_env = kept_session_env(&store).await;
         let (holder, held) = connect_holder(opts.holder.as_ref()).await;
@@ -1556,6 +1570,32 @@ impl Desk {
         let _ = self.0.events.send(DeskEvent::Removed { id });
         self.drop_from_layout(id).await;
         self.forget_session_read(id).await
+    }
+
+    /// Whether `r` is a session the hub ran itself: one found in another
+    /// terminal, running in one of the hub's own folders.
+    fn hubs_own(hub: &HubInternal, r: &SessionRecord) -> bool {
+        r.origin == Origin::External && hub.holds(Path::new(&r.cwd))
+    }
+
+    /// Whether session `id` is one the hub ran itself, never the person's.
+    pub fn hub_internal(&self, id: Uuid) -> bool {
+        let st = self.0.state.lock();
+        st.records
+            .get(&id)
+            .is_some_and(|r| Self::hubs_own(&self.0.opts.hub_internal, r))
+    }
+
+    /// Forgets a session the hub ran itself as any is forgotten, and its
+    /// turns and gists on the floor with it: it was never the person's.
+    async fn forget_hubs_own(&self, id: Uuid) {
+        if let Err(e) = self.forget(id).await {
+            tracing::warn!(%id, error = %e, "couldn't forget one of the hub's own sessions");
+        }
+        let _ = self.0.persist.send(Persist::ForgetNotTheirs(vec![id]));
+        self.log_turns(vec![TurnOp::Forget {
+            subjects: vec![SubjectKey::session(id)],
+        }]);
     }
 
     pub fn decide(
@@ -2790,6 +2830,31 @@ impl Desk {
     }
 
     async fn reconcile_external(&self, found: Vec<External>) {
+        let hub = &self.0.opts.hub_internal;
+        let held: Vec<Uuid> = self
+            .0
+            .state
+            .lock()
+            .records
+            .values()
+            .filter(|r| Self::hubs_own(hub, r))
+            .map(|r| r.id)
+            .collect();
+        for id in held {
+            self.forget_hubs_own(id).await;
+        }
+        let found: Vec<External> = found
+            .into_iter()
+            .filter(|e| !hub.holds(Path::new(&e.cwd)))
+            .collect();
+        let table = if hub.knows_its_own() && found.iter().any(|e| e.pid.is_some()) {
+            procs::table().await.unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let found = found
+            .into_iter()
+            .filter(|e| !e.pid.is_some_and(|pid| hub.started(&table, pid)));
         let home = self.0.env.get("HOME").map(PathBuf::from);
         let (ours, by_cli): (HashSet<String>, HashMap<String, Uuid>) = {
             let st = self.0.state.lock();
@@ -2809,11 +2874,7 @@ impl Desk {
             )
         };
         let mut present = HashSet::new();
-        let hub_turns = self.0.opts.hub_turns.clone();
-        for ext in found
-            .into_iter()
-            .filter(|e| !ours.contains(&e.session_id) && !hub_turns.hold(&e.cwd))
-        {
+        for ext in found.filter(|e| !ours.contains(&e.session_id)) {
             let id = by_cli.get(&ext.session_id).copied();
             let transcript = id
                 .and_then(|id| self.record(id).ok()?.transcript)
@@ -3037,6 +3098,7 @@ async fn persist_loop(
             Persist::Put(r) => store.put(&r).await,
             Persist::Attention(id, at) => store.set_attention(id, at).await,
             Persist::Delete(id) => store.delete(id).await,
+            Persist::ForgetNotTheirs(ids) => store.forget_sessions(&ids, YOU).await.map(drop),
             Persist::Event(e) => store.add_event(&e).await,
             Persist::Terminal(t) => store.put_terminal(&t).await,
             Persist::DeleteTerminal(id) => store.delete_terminal(id).await,
@@ -3084,7 +3146,7 @@ mod tests {
             restore: RestorePolicy::Ask,
             adopt_every: None,
             holder: None,
-            hub_turns: HubTurns::default(),
+            hub_internal: HubInternal::default(),
         }
     }
 
@@ -4418,16 +4480,21 @@ mod tests {
         .await;
     }
 
+    /// An external session at `cwd`, as `claude agents` lists it.
+    fn found(id: &str, cwd: &str, name: &str) -> serde_json::Value {
+        json!({ "pid": std::process::id(), "cwd": cwd, "kind": "interactive",
+                "sessionId": id, "name": name, "status": "busy" })
+    }
+
     #[tokio::test]
-    async fn the_hubs_own_cli_turns_are_never_adopted() {
+    async fn the_hubs_own_cli_runs_are_never_adopted() {
         with_test_pool(build_pool, |pool| async move {
             let dir = tempfile::tempdir().unwrap();
             DeskStore::migrate(&pool).await.unwrap();
-            let turns = PathBuf::from("/data/agents/scout/projects/_agent-turn/work/session");
             let d = Desk::start(
                 DeskStore::from_pool(pool),
                 Options {
-                    hub_turns: HubTurns::new(move |cwd| cwd.starts_with(&turns)),
+                    hub_internal: HubInternal::new([PathBuf::from("/data")], None),
                     ..options(dir.path())
                 },
                 Default::default(),
@@ -4437,10 +4504,11 @@ mod tests {
             .unwrap();
             let found = adopt::parse(
                 json!([
-                    { "pid": std::process::id(), "cwd": "/data/agents/scout/projects/_agent-turn/work/session/at-dm-d4774cbb6c89-2e",
-                      "kind": "interactive", "sessionId": "hub-1", "name": "at-dm-d4774cbb6c89-2e", "status": "busy" },
-                    { "pid": std::process::id(), "cwd": "/Users/k/dev/vellev", "kind": "interactive",
-                      "sessionId": "mine-1", "name": "vellev-36", "status": "busy" }
+                    found("hub-1", "/data/cli-completions/b369e00e-c276-4ae0-8394-6d83707380a0",
+                        "b369e00e-c276-4ae0-8394-6d83707380a0-c2"),
+                    found("hub-2", "/data/agents/scout/projects/_agent-turn/work/session/at-dm-d4774cbb6c89-2e",
+                        "at-dm-d4774cbb6c89-2e"),
+                    found("mine-1", "/Users/k/dev/app", "app-36"),
                 ])
                 .to_string()
                 .as_bytes(),
@@ -4448,7 +4516,207 @@ mod tests {
             .unwrap();
             d.reconcile_external(found).await;
             let names: Vec<String> = d.list().into_iter().map(|s| s.name).collect();
-            assert_eq!(names, ["vellev-36"], "the person's, not the hub's");
+            assert_eq!(names, ["app-36"], "the person's, not the hub's");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_session_the_hub_started_itself_is_never_adopted_wherever_it_runs() {
+        with_test_pool(build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            DeskStore::migrate(&pool).await.unwrap();
+            let mut child = tokio::process::Command::new("sleep")
+                .arg("30")
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            let d = Desk::start(
+                DeskStore::from_pool(pool),
+                Options {
+                    hub_internal: HubInternal::default().started_by(std::process::id()),
+                    ..options(dir.path())
+                },
+                Default::default(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            let mut hubs = found("hub-1", "/elsewhere", "hub-run");
+            hubs["pid"] = json!(child.id().unwrap());
+            let found = adopt::parse(
+                json!([hubs, found("mine-1", "/Users/k/dev/app", "app-36")])
+                    .to_string()
+                    .as_bytes(),
+            )
+            .unwrap();
+            d.reconcile_external(found).await;
+            let names: Vec<String> = d.list().into_iter().map(|s| s.name).collect();
+            assert_eq!(names, ["app-36"]);
+            child.kill().await.unwrap();
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn the_hubs_own_sessions_taken_before_are_forgotten_and_only_those() {
+        with_test_pool(build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            DeskStore::migrate(&pool).await.unwrap();
+            let store = DeskStore::from_pool(pool.clone());
+            let external = |name: &str, cwd: &str, state| SessionRecord {
+                origin: Origin::External,
+                state,
+                cwd: cwd.into(),
+                ..record_fixture(name)
+            };
+            let closed = external(
+                "b369e00e-c276-4ae0-8394-6d83707380a0-c2",
+                "/data/cli-completions/b369e00e-c276-4ae0-8394-6d83707380a0",
+                SessionState::Closed,
+            );
+            let idle = external(
+                "at-dm-d4774cbb6c89-2e",
+                "/data/agents/scout/projects/_agent-turn/work/session/at-dm-d4774cbb6c89-2e",
+                SessionState::Idle,
+            );
+            let mine = external("app-36", "/Users/k/dev/app", SessionState::Idle);
+            let mine_closed = external("app-35", "/Users/k/dev/app", SessionState::Closed);
+            let desks = SessionRecord {
+                cwd: "/data/agents/scout".into(),
+                state: SessionState::Idle,
+                ..record_fixture("started in desk")
+            };
+            for r in [&closed, &idle, &mine, &mine_closed, &desks] {
+                store.put(r).await.unwrap();
+            }
+            store
+                .put_reads(
+                    YOU,
+                    &[closed.id, mine.id].map(|id| crate::reads::ReadPut {
+                        place: crate::reads::ReadPlace::Session(id),
+                        point: crate::reads::ReadPoint {
+                            at: Utc::now(),
+                            message: None,
+                        },
+                        mark: crate::reads::Mark::Advance,
+                    }),
+                )
+                .await
+                .unwrap();
+
+            let logged = Arc::new(Logged::default());
+            let d = Desk::start(
+                DeskStore::from_pool(pool),
+                Options {
+                    hub_internal: HubInternal::new([PathBuf::from("/data")], None),
+                    ..options(dir.path())
+                },
+                Floor {
+                    turns: Some(logged.clone()),
+                    plans: None,
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+            for gone in [&closed, &idle] {
+                assert!(store.get(gone.id).await.unwrap().is_none(), "{}", gone.name);
+            }
+            for kept in [&mine, &mine_closed, &desks] {
+                assert!(store.get(kept.id).await.unwrap().is_some(), "{}", kept.name);
+            }
+            let mut listed: Vec<String> = d.list().into_iter().map(|s| s.name).collect();
+            listed.sort();
+            assert_eq!(listed, ["app-36", "started in desk"]);
+            let read: Vec<_> = store
+                .reads(YOU)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|r| r.place)
+                .collect();
+            assert_eq!(read, [crate::reads::ReadPlace::Session(mine.id)]);
+            let forgot: Vec<SubjectKey> = logged
+                .0
+                .lock()
+                .iter()
+                .flat_map(|op| match op {
+                    TurnOp::Forget { subjects } => subjects.clone(),
+                    _ => vec![],
+                })
+                .collect();
+            let mut expected = vec![SubjectKey::session(closed.id), SubjectKey::session(idle.id)];
+            expected.sort();
+            let mut forgot = forgot;
+            forgot.sort();
+            assert_eq!(forgot, expected, "their turns and gists go too");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn one_of_the_hubs_own_taken_while_the_hub_runs_is_forgotten_on_the_next_look() {
+        with_test_pool(build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            DeskStore::migrate(&pool).await.unwrap();
+            let logged = Arc::new(Logged::default());
+            let d = Desk::start(
+                DeskStore::from_pool(pool),
+                Options {
+                    hub_internal: HubInternal::new([PathBuf::from("/data")], None),
+                    ..options(dir.path())
+                },
+                Floor {
+                    turns: Some(logged.clone()),
+                    plans: None,
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            // As one that slipped in: taken while the hub ran, by a rule
+            // that didn't know the folder.
+            let taken = SessionRecord {
+                origin: Origin::External,
+                state: SessionState::Working,
+                cwd: "/data/cli-completions/u".into(),
+                ..record_fixture("u-c2")
+            };
+            let id = taken.id;
+            d.save(taken);
+            let mine = SessionRecord {
+                origin: Origin::External,
+                state: SessionState::Idle,
+                cwd: "/Users/k/dev/app".into(),
+                ..record_fixture("app-36")
+            };
+            d.save(mine.clone());
+            assert!(d.hub_internal(id));
+            assert!(!d.hub_internal(mine.id));
+
+            let found = adopt::parse(
+                json!([found(
+                    mine.cli_session_id.as_deref().unwrap(),
+                    "/Users/k/dev/app",
+                    "app-36"
+                )])
+                .to_string()
+                .as_bytes(),
+            )
+            .unwrap();
+            d.reconcile_external(found).await;
+            assert!(d.view(id).is_err());
+            let names: Vec<String> = d.list().into_iter().map(|s| s.name).collect();
+            assert_eq!(names, ["app-36"]);
+            assert!(
+                logs(&logged, |ops| ops.iter().any(|op| matches!(
+                    op,
+                    TurnOp::Forget { subjects } if subjects == &[SubjectKey::session(id)]
+                )))
+                .await
+            );
         })
         .await;
     }
