@@ -45,6 +45,10 @@ pub trait Model: Send + Sync {
 
     /// What a Desk session was started to do.
     fn goal(&self, subject: &Subject) -> Option<String>;
+
+    /// Whether `subject` is a session the hub ran itself (a completion, an
+    /// agent's turn), never the person's to say what it does.
+    fn hub_internal(&self, subject: &Subject) -> bool;
 }
 
 /// Where gists and paragraphs are kept.
@@ -227,6 +231,13 @@ impl Gists {
             TurnOp::Begin { turn, .. }
                 if matches!(turn.subject, Subject::Session { .. })
                     && gist::agent_turn_folder(&turn.name) => {}
+            // Nor is a session the hub ran itself the person's.
+            TurnOp::Begin { turn, .. }
+                if self
+                    .0
+                    .model
+                    .get()
+                    .is_some_and(|m| m.hub_internal(&turn.subject)) => {}
             TurnOp::Begin { turn, by_person } => {
                 let whose = (turn.owner.clone(), turn.subject.key());
                 let r = subjects.entry(whose.clone()).or_insert_with(|| Running {
@@ -648,6 +659,13 @@ impl Model for HubModel {
             .map(|v| v.goal)
             .filter(|g| !g.trim().is_empty())
     }
+
+    fn hub_internal(&self, subject: &Subject) -> bool {
+        let Subject::Session { id, .. } = subject else {
+            return false;
+        };
+        crate::desk_driver::desk().is_some_and(|d| d.hub_internal(*id))
+    }
 }
 
 #[cfg(test)]
@@ -733,6 +751,8 @@ mod tests {
         say: Mutex<String>,
         slow: Duration,
         asked: Mutex<Vec<String>>,
+        /// The sessions the hub ran itself.
+        hubs: Mutex<Vec<Uuid>>,
     }
 
     impl Scripted {
@@ -741,6 +761,7 @@ mod tests {
                 say: Mutex::new(say.into()),
                 slow,
                 asked: Mutex::new(vec![]),
+                hubs: Mutex::new(vec![]),
             })
         }
     }
@@ -765,6 +786,10 @@ mod tests {
 
         fn goal(&self, _: &Subject) -> Option<String> {
             None
+        }
+
+        fn hub_internal(&self, subject: &Subject) -> bool {
+            matches!(subject, Subject::Session { id, .. } if self.hubs.lock().contains(id))
         }
     }
 
@@ -991,6 +1016,41 @@ mod tests {
         settle().await;
         assert!(memory.written.lock().is_empty());
         assert!(model.asked.lock().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_session_the_hub_ran_itself_gets_no_gist_whatever_it_is_called() {
+        let model = Scripted::new(NOTE, Duration::ZERO);
+        let (gists, memory, _) = gists(Arc::clone(&model));
+        let session = |id| Turn {
+            owner: None,
+            subject: Subject::Session {
+                id,
+                engine: Engine::Claude,
+            },
+            name: "b369e00e-c276-4ae0-8394-6d83707380a0-c2".into(),
+            ..started(Uuid::new_v4())
+        };
+        let hubs = Uuid::new_v4();
+        model.hubs.lock().push(hubs);
+        gists.saw(&TurnOp::Begin {
+            turn: Box::new(session(hubs)),
+            by_person: false,
+        });
+        settle().await;
+        assert!(memory.written.lock().is_empty());
+        assert!(model.asked.lock().is_empty());
+
+        gists.saw(&TurnOp::Begin {
+            turn: Box::new(session(Uuid::new_v4())),
+            by_person: true,
+        });
+        settle().await;
+        assert_eq!(
+            memory.written.lock().len(),
+            1,
+            "the person's own is written"
+        );
     }
 
     #[tokio::test(start_paused = true)]

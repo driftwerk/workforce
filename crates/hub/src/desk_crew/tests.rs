@@ -145,7 +145,7 @@ async fn desk_with(
             restore: RestorePolicy::Off,
             adopt_every: None,
             holder: None,
-            hub_turns: Default::default(),
+            hub_internal: Default::default(),
         },
         floor,
         CancellationToken::new(),

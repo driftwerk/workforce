@@ -96,6 +96,7 @@ impl PgFloorStore {
                 Some(turn.owner.clone())
             }
             (TurnOp::Settle { owner, .. }, _) => Some(owner.clone()),
+            (TurnOp::Forget { subjects }, _) => forget_subjects(&tx, subjects).await?,
             (_, Some(id)) => {
                 let row = tx
                     .query_opt(
@@ -510,6 +511,24 @@ fn reading_of(row: &Row) -> Option<Reading> {
         windows: serde_json::from_value(row.get("windows")).ok()?,
         observed_at: row.get("observed_at"),
     })
+}
+
+/// Removes `subjects`' turns and gists; whose turns went, if any did (a
+/// session's are its Desk's, kept as no one's).
+async fn forget_subjects(
+    db: &impl GenericClient,
+    subjects: &[SubjectKey],
+) -> Result<Option<Option<String>>> {
+    let keys: Vec<&str> = subjects.iter().map(SubjectKey::as_str).collect();
+    db.execute("DELETE FROM gists WHERE subject = ANY($1)", &[&keys])
+        .await?;
+    let owners = db
+        .query(
+            "DELETE FROM turns WHERE subject = ANY($1) RETURNING owner",
+            &[&keys],
+        )
+        .await?;
+    Ok(owners.first().map(|row| row.get("owner")))
 }
 
 /// Holds, to the end of the transaction, the questions of the owner and
@@ -1180,6 +1199,76 @@ mod tests {
             assert_eq!(store.gist(Some("u3"), &scout).await.unwrap(), None);
             assert_eq!(store.prune(at("2026-10-30T00:00:00Z")).await.unwrap(), 2);
             assert!(store.gists(&personal).await.unwrap().is_empty());
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_forgotten_sessions_turns_and_gists_go_and_no_one_elses_do() {
+        with_test_pool(PgFloorStore::build_pool, |pool| async move {
+            let store = store(pool).await;
+            let session = |id| Turn {
+                owner: None,
+                subject: Subject::Session {
+                    id,
+                    engine: workforce_desk::model::Engine::Claude,
+                },
+                ..turn("x", None, "2026-10-29T11:00:00Z")
+            };
+            let (hubs, mine) = (Uuid::new_v4(), Uuid::new_v4());
+            let agents = turn("scout", Some("u1"), "2026-10-29T11:00:00Z");
+            for t in [session(hubs), session(hubs), session(mine), agents.clone()] {
+                store.apply(&begin(&t, false)).await.unwrap();
+            }
+            let gist = Gist {
+                purpose: None,
+                purpose_at: None,
+                now: "Working.".into(),
+                now_at: at("2026-10-29T11:05:00Z"),
+                turn: Uuid::nil(),
+                by_model: true,
+            };
+            for (owner, subject) in [
+                (None, SubjectKey::session(hubs)),
+                (None, SubjectKey::session(mine)),
+                (Some("u1"), agents.subject.key()),
+            ] {
+                store.put_gist(owner, &subject, &gist).await.unwrap();
+            }
+
+            let whose = store
+                .apply(&TurnOp::Forget {
+                    subjects: vec![SubjectKey::session(hubs)],
+                })
+                .await
+                .unwrap();
+            assert_eq!(whose, Some(None), "the personal floor is told");
+            let personal = Scope {
+                personal: true,
+                ..scope("u1")
+            };
+            let since = at("2026-10-29T00:00:00Z");
+            let left: Vec<SubjectKey> = store
+                .relevant(&personal, since)
+                .await
+                .unwrap()
+                .iter()
+                .map(|t| t.subject.key())
+                .collect();
+            assert_eq!(left.len(), 2);
+            assert!(!left.contains(&SubjectKey::session(hubs)));
+            let gists = store.gists(&personal).await.unwrap();
+            assert!(!gists.contains_key(&SubjectKey::session(hubs)));
+            assert!(gists.contains_key(&SubjectKey::session(mine)));
+            assert!(gists.contains_key(&agents.subject.key()));
+
+            let again = store
+                .apply(&TurnOp::Forget {
+                    subjects: vec![SubjectKey::session(hubs)],
+                })
+                .await
+                .unwrap();
+            assert_eq!(again, None, "nothing left to go, no one to tell");
         })
         .await;
     }
