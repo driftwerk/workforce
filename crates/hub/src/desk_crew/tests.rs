@@ -355,6 +355,7 @@ async fn a_room_turns_events_carry_its_room_and_a_turn_off_desk_none() {
             target: DeskTarget::of_turn(&place, &channel, None, false),
             owner: PERSON.into(),
             attended: false,
+            relayed: false,
         };
         let ask = |text: &'static str| {
             let scout = scout.clone();
