@@ -255,6 +255,14 @@ const DELIVERED_TEXT_MAX_BYTES: usize = 32_768;
 /// Session metadata key holding the rich blocks the speaking client renders.
 const RICH_RENDERED_KEY: &str = "rich";
 
+/// Session metadata: whether the turn now arriving was dictated (see
+/// [`Session::is_dictated_turn`]).
+pub const DICTATED_TURN_KEY: &str = "dictated_turn";
+
+/// Session metadata: the speech model answers are read aloud with (see
+/// [`Session::tts_model`]).
+pub const TTS_MODEL_KEY: &str = "tts_model";
+
 fn default_max_compaction_passes() -> u32 {
     3
 }
@@ -1128,6 +1136,23 @@ impl Session {
             .unwrap_or(false)
     }
 
+    /// Whether the turn now arriving was dictated: spoken by the person and
+    /// transcribed, with its answer to be read, not heard. Rewritten by the
+    /// gateway on every inbound message, like [`Self::is_voice_turn`]; never
+    /// true together with it.
+    pub fn is_dictated_turn(&self) -> bool {
+        self.metadata
+            .get(DICTATED_TURN_KEY)
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+    }
+
+    /// The speech model the client reads answers aloud with, when it said
+    /// (Desk does; the mobile app names only its `tts_provider`).
+    pub fn tts_model(&self) -> Option<&str> {
+        self.metadata.get(TTS_MODEL_KEY).and_then(|v| v.as_str())
+    }
+
     /// The rich blocks the client now speaking on this session renders, as
     /// it declared them. Rewritten by the gateway on every inbound message,
     /// like [`Self::is_voice_turn`], since one session can be reached from
@@ -1190,7 +1215,9 @@ impl Session {
             DESK_CLOSED_KEY,
             "voice_mode",
             "voice_turn",
+            DICTATED_TURN_KEY,
             "tts_provider",
+            TTS_MODEL_KEY,
             RICH_RENDERED_KEY,
         ] {
             if let Some(v) = from.metadata.get(key) {
@@ -6736,6 +6763,26 @@ mod tests {
         s.metadata = serde_json::json!({ "voice_mode": true, "voice_turn": false });
         assert!(s.is_voice());
         assert!(!s.is_voice_turn());
+    }
+
+    #[test]
+    fn a_dictated_turn_and_the_speech_model_read_from_metadata() {
+        let mut s = Session::new("desk", "u", "agent");
+        assert!(!s.is_dictated_turn());
+        assert_eq!(s.tts_model(), None);
+        s.metadata = serde_json::json!({
+            DICTATED_TURN_KEY: true,
+            "tts_provider": "fish_audio",
+            TTS_MODEL_KEY: "s1",
+        });
+        assert!(s.is_dictated_turn());
+        assert!(!s.is_voice_turn());
+        assert_eq!(s.tts_model(), Some("s1"));
+
+        let mut next = Session::new("desk", "u", "agent");
+        next.adopt_conversation_mode(&s);
+        assert!(next.is_dictated_turn());
+        assert_eq!(next.tts_model(), Some("s1"));
     }
 
     #[test]
