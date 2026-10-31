@@ -31,7 +31,8 @@ refinery = { workspace = true, optional = true }
 tokio-postgres-rustls = { version = "0.13", optional = true }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
 
-# Test-support dependencies — only pulled in when the `test-support`
+# tokio closes each pool's idle connections (`postgres`). The rest are
+# test-support dependencies — only pulled in when the `test-support`
 # feature is enabled, which downstream test crates do via
 # `[dev-dependencies] workforce-postgres = { features = ["test-support"] }`.
 tokio = { workspace = true, optional = true }
@@ -42,7 +43,7 @@ libc = { version = "0.2", optional = true }
 
 [features]
 default = []
-postgres = ["dep:tokio-postgres", "dep:deadpool-postgres", "dep:refinery", "dep:tokio-postgres-rustls", "dep:rustls"]
+postgres = ["dep:tokio-postgres", "dep:deadpool-postgres", "dep:refinery", "dep:tokio-postgres-rustls", "dep:rustls", "dep:tokio"]
 # Shared parity-test harness used by every store crate's tests. Spins
 # up an embedded Postgres (via `postgresql_embedded`) the first time a
 # test asks for it, or honours `WORKFORCE_TEST_POSTGRES_URL` for an

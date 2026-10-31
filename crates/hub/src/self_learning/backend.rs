@@ -105,21 +105,31 @@ fn open_sqlite(cfg: &SelfLearningConfig, wf: &WorkforceConfig) -> Option<Curatio
     }
 }
 
+/// The process's Postgres self-learning store: the hub's agents share it,
+/// where each agent built (and each hot-enable) opened a pool of its own.
+#[cfg(feature = "postgres")]
+static POSTGRES_STORES: tokio::sync::OnceCell<CurationStores> = tokio::sync::OnceCell::const_new();
+
 #[cfg(feature = "postgres")]
 async fn open_postgres(wf: &WorkforceConfig) -> Result<CurationStores> {
-    let pg = wf
-        .postgres
-        .as_ref()
-        .filter(|p| p.enabled)
-        .ok_or_else(|| eyre::eyre!("[postgres] not configured"))?;
-    let store = workforce_self_learning::postgres::PostgresSelfLearningStore::new(pg)
+    POSTGRES_STORES
+        .get_or_try_init(|| async {
+            let pg = wf
+                .postgres
+                .as_ref()
+                .filter(|p| p.enabled)
+                .ok_or_else(|| eyre::eyre!("[postgres] not configured"))?;
+            let store = workforce_self_learning::postgres::PostgresSelfLearningStore::new(pg)
+                .await
+                .context("constructing PostgresSelfLearningStore")?;
+            tracing::info!("Self-learning store opened (postgres)");
+            Ok::<_, eyre::Report>(CurationStores {
+                self_learning: store.clone(),
+                deep_expertise: store,
+            })
+        })
         .await
-        .context("constructing PostgresSelfLearningStore")?;
-    tracing::info!("Self-learning store opened (postgres)");
-    Ok(CurationStores {
-        self_learning: store.clone(),
-        deep_expertise: store,
-    })
+        .cloned()
 }
 
 #[cfg(not(feature = "postgres"))]

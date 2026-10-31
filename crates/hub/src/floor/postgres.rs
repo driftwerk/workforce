@@ -50,7 +50,7 @@ impl PgFloorStore {
     pub const SCHEMA: &'static str = "floor";
 
     pub fn build_pool(config: &PostgresConfig) -> Result<PostgresPool, PostgresError> {
-        PostgresPool::from_config_with_session_init(config, &[SEARCH_PATH])
+        PostgresPool::from_config_with_session_init(&config.small(), &[SEARCH_PATH])
     }
 
     pub async fn new(config: &PostgresConfig) -> Result<Self> {

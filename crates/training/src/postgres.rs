@@ -35,7 +35,7 @@ impl PostgresTrainingStore {
 
     pub fn build_pool(config: &PostgresConfig) -> Result<PostgresPool, PostgresError> {
         PostgresPool::from_config_with_session_init(
-            config,
+            &config.small(),
             &["SET search_path TO training, public"],
         )
     }

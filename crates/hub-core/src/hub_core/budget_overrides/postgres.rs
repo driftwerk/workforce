@@ -26,7 +26,10 @@ impl PostgresBudgetOverrideStore {
     pub const SCHEMA: &'static str = "budget";
 
     pub fn build_pool(config: &PostgresConfig) -> Result<PostgresPool, PostgresError> {
-        PostgresPool::from_config_with_session_init(config, &["SET search_path TO budget, public"])
+        PostgresPool::from_config_with_session_init(
+            &config.small(),
+            &["SET search_path TO budget, public"],
+        )
     }
 
     pub async fn new(config: &PostgresConfig) -> Result<Arc<Self>> {

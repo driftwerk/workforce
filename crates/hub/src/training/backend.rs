@@ -72,18 +72,29 @@ fn open_sqlite(wf: &WorkforceConfig) -> Option<Arc<dyn TrainingStore>> {
     }
 }
 
+/// The process's Postgres training store: the hub's agents share it, where
+/// each agent built opened a pool of its own.
+#[cfg(feature = "postgres")]
+static POSTGRES_STORE: tokio::sync::OnceCell<Arc<dyn TrainingStore>> =
+    tokio::sync::OnceCell::const_new();
+
 #[cfg(feature = "postgres")]
 async fn open_postgres(wf: &WorkforceConfig) -> Result<Arc<dyn TrainingStore>> {
-    let pg = wf
-        .postgres
-        .as_ref()
-        .filter(|p| p.enabled)
-        .ok_or_else(|| eyre::eyre!("[postgres] not configured"))?;
-    let store = workforce_training::postgres::PostgresTrainingStore::new(pg)
+    POSTGRES_STORE
+        .get_or_try_init(|| async {
+            let pg = wf
+                .postgres
+                .as_ref()
+                .filter(|p| p.enabled)
+                .ok_or_else(|| eyre::eyre!("[postgres] not configured"))?;
+            let store = workforce_training::postgres::PostgresTrainingStore::new(pg)
+                .await
+                .context("constructing PostgresTrainingStore")?;
+            tracing::info!("Training store opened (postgres)");
+            Ok::<_, eyre::Report>(store as Arc<dyn TrainingStore>)
+        })
         .await
-        .context("constructing PostgresTrainingStore")?;
-    tracing::info!("Training store opened (postgres)");
-    Ok(store as Arc<dyn TrainingStore>)
+        .cloned()
 }
 
 #[cfg(not(feature = "postgres"))]

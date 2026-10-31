@@ -19,7 +19,10 @@ mod embedded {
 pub const SCHEMA: &str = "desk";
 
 pub fn build_pool(config: &PostgresConfig) -> Result<PostgresPool, PostgresError> {
-    PostgresPool::from_config_with_session_init(config, &["SET search_path TO desk, public"])
+    PostgresPool::from_config_with_session_init(
+        &config.small(),
+        &["SET search_path TO desk, public"],
+    )
 }
 
 pub struct DeskStore {
