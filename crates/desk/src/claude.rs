@@ -10,6 +10,7 @@ use std::path::Path;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use crate::asking::{Call, Denied};
 use crate::background::TaskKind;
 use crate::pty::Spawn;
 
@@ -30,7 +31,13 @@ pub struct ClaudeSpawn<'a> {
     pub env: &'a BTreeMap<String, String>,
 }
 
-const TOOL_EVENTS: [&str; 3] = ["PreToolUse", "PermissionRequest", "PostToolUse"];
+const TOOL_EVENTS: [&str; 4] = [
+    "PreToolUse",
+    "PermissionRequest",
+    "PostToolUse",
+    // Auto mode refused a tool: the turn may end stuck on it.
+    "PermissionDenied",
+];
 const PLAIN_EVENTS: [&str; 6] = [
     "UserPromptSubmit",
     "Notification",
@@ -112,6 +119,7 @@ struct Payload {
     last_assistant_message: Option<String>,
     rate_limits: Option<Value>,
     agent_id: Option<String>,
+    reason: Option<String>,
     background_tasks: Option<Vec<BackgroundTask>>,
 }
 
@@ -136,7 +144,12 @@ pub enum Hook {
         resumed: bool,
     },
     Prompt(String),
-    ToolStart(String),
+    ToolStart {
+        tool: String,
+        call: Call,
+    },
+    /// Auto mode refused a tool call.
+    Denied(Denied),
     Permission {
         tool: String,
         detail: String,
@@ -183,7 +196,18 @@ pub fn parse_hook(body: &[u8]) -> eyre::Result<Hook> {
             }
             prompt => Hook::Prompt(prompt),
         },
-        "PreToolUse" => Hook::ToolStart(tool().0),
+        "PreToolUse" => Hook::ToolStart {
+            tool: tool().0,
+            call: Call::of(
+                p.tool_name.as_deref().unwrap_or("tool"),
+                p.tool_input.as_ref(),
+            ),
+        },
+        "PermissionDenied" => Hook::Denied(Denied::from_hook(
+            p.tool_name.as_deref().unwrap_or("tool"),
+            p.tool_input.as_ref(),
+            p.reason.as_deref().unwrap_or_default(),
+        )),
         "PermissionRequest" => {
             let (tool, detail) = tool();
             Hook::Permission { tool, detail }
@@ -263,6 +287,14 @@ pub fn allow() -> Value {
 pub fn deny() -> Value {
     json!({ "hookSpecificOutput": { "hookEventName": "PermissionRequest",
         "decision": { "behavior": "deny", "message": "Denied from Desk." } } })
+}
+
+/// A tool call the person allowed for the session: it runs without a
+/// prompt, and in auto mode without the classifier (verified on 2.1.314).
+pub fn allow_call() -> Value {
+    json!({ "hookSpecificOutput": { "hookEventName": "PreToolUse",
+        "permissionDecision": "allow",
+        "permissionDecisionReason": "Allowed for this session in Desk." } })
 }
 
 /// No decision: Claude Code shows its own permission dialog in the terminal.
@@ -370,6 +402,29 @@ mod tests {
         );
         let inside = br#"{"hook_event_name":"PreToolUse","agent_id":"a471","agent_type":"general-purpose","tool_name":"Bash","tool_input":{"command":"sleep 20"}}"#;
         assert_eq!(agent_of(inside).as_deref(), Some("a471"));
+        assert_eq!(
+            parse_hook(inside).unwrap(),
+            Hook::ToolStart {
+                tool: "Bash(sleep 20)".into(),
+                call: Call {
+                    tool: "Bash".into(),
+                    input: Some("sleep 20".into())
+                }
+            }
+        );
+        // As Claude Code 2.1.314 sends it in auto mode.
+        let refused = br#"{"session_id":"s1","permission_mode":"auto","hook_event_name":"PermissionDenied","tool_name":"Bash","tool_input":{"command":"security find-generic-password -s deploy -w","description":"Read the password"},"tool_use_id":"toolu_01","reason":"[Credential Exploration]"}"#;
+        let Hook::Denied(d) = parse_hook(refused).unwrap() else {
+            panic!("not a refusal")
+        };
+        assert_eq!(
+            (d.tool.as_str(), d.reason.as_str(), d.allowable),
+            (
+                "Bash(security find-generic-password -s deploy -w)",
+                "[Credential Exploration]",
+                true
+            )
+        );
         assert_eq!(
             parse_hook(br#"{"hook_event_name":"SubagentStop","agent_id":"a471"}"#).unwrap(),
             Hook::SubagentStop("a471".into())

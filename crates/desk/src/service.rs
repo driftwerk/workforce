@@ -3,7 +3,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::{Duration, SystemTime};
 
 use chrono::{DateTime, Utc};
@@ -15,6 +15,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::adopt::{self, External};
+use crate::asking::{self, Asked, Call, Denied, Reading};
 use crate::background::{Background, TaskKind};
 use crate::claude::{self, Hook};
 use crate::codex::{self, AppServer, CodexEvent, Seen};
@@ -74,6 +75,37 @@ pub struct Options {
     /// The PTY holder that keeps terminals across hub restarts; without
     /// one (or while it can't be reached) they are the hub's own children.
     pub holder: Option<HolderOptions>,
+    /// Where the hub's own CLI turns run: never adopted.
+    pub hub_turns: HubTurns,
+}
+
+/// Which folders the hub's own CLI turns run in (an agent's turns on a
+/// person's subscription): a `claude` running in one is the hub's, never a
+/// session of the person's to adopt.
+#[derive(Clone, Default)]
+pub struct HubTurns(Option<Arc<HoldsTurns>>);
+
+/// Whether a folder is one of the hub's own turns'.
+type HoldsTurns = dyn Fn(&Path) -> bool + Send + Sync;
+
+impl HubTurns {
+    pub fn new(holds: impl Fn(&Path) -> bool + Send + Sync + 'static) -> Self {
+        Self(Some(Arc::new(holds)))
+    }
+
+    fn hold(&self, cwd: &str) -> bool {
+        self.0.as_ref().is_some_and(|holds| holds(Path::new(cwd)))
+    }
+}
+
+impl std::fmt::Debug for HubTurns {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.is_some() {
+            "HubTurns(..)"
+        } else {
+            "HubTurns(none)"
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -114,6 +146,18 @@ pub(crate) struct Live {
     baseline: Option<HashSet<u32>>,
     /// How many prompts the person has given it while it ran here.
     prompts: u64,
+    /// What auto mode refused in the turn it is on.
+    denials: Vec<Denied>,
+    /// Tool calls the person allowed for the rest of the session.
+    allowed: HashSet<Call>,
+    /// Its turn was ended from Desk (Esc), which Claude Code reports no
+    /// hook for.
+    interrupted: bool,
+    /// How many of its turns have ended while it ran here.
+    ends: u64,
+    /// The turn end whose reply the hub's model is reading, while it is:
+    /// its turn stays open on the floor until the model says.
+    reading: Option<u64>,
 }
 
 impl Live {
@@ -216,6 +260,12 @@ pub struct Floor {
     pub plans: Option<Arc<dyn PlanSink>>,
 }
 
+/// How long the hub's model may take to read whether a turn's reply asks
+/// the person something. It reads after the turn has ended (a subscription
+/// CLI's call rarely answers in the seconds a hook can wait), so a yes
+/// moves a done session to asking.
+const READ_LATER: Duration = Duration::from_secs(45);
+
 /// How often sessions' background work is looked at.
 const LOOK_EVERY: Duration = Duration::from_secs(10);
 
@@ -249,6 +299,11 @@ struct Inner {
     layout_write: tokio::sync::Mutex<()>,
     plans: Option<Arc<dyn PlanSink>>,
     sign_ins: Mutex<MacSignIns>,
+    /// Reads a turn's last reply where the rules can't tell whether it
+    /// asks: the hub's crew, once its routes are mounted.
+    reader: Mutex<Option<Weak<dyn crew::Crew>>>,
+    /// How long it may take ([`READ_LATER`]; shorter in tests).
+    read_wait: Mutex<Duration>,
 }
 
 #[derive(Clone)]
@@ -333,6 +388,21 @@ fn plugin_dirs(theirs: Option<&String>, ours: Option<&String>) -> Option<String>
         }
     }
     (!dirs.is_empty()).then(|| dirs.join(":"))
+}
+
+/// What a turn that ended on `reply` waits on the person for, as far as can
+/// be told at once: what auto mode refused in it, else what the rules read
+/// in the reply; and whether the rules couldn't tell, so the hub's model is
+/// to read it.
+fn asked_at_end(denials: &[Denied], reply: Option<&str>) -> (Option<Asked>, bool) {
+    if let Some(refused) = Asked::refused(denials) {
+        return (Some(refused), false);
+    }
+    match reply.map(asking::read) {
+        Some(Reading::Asks(asked)) => (Some(asked), false),
+        Some(Reading::Unsure) => (None, true),
+        Some(Reading::Done) | None => (None, false),
+    }
 }
 
 /// "1 background task", "2 background tasks".
@@ -466,6 +536,8 @@ impl Desk {
             layout_write: tokio::sync::Mutex::new(()),
             plans: floor.plans,
             sign_ins: Mutex::new(MacSignIns::default()),
+            reader: Mutex::new(None),
+            read_wait: Mutex::new(READ_LATER),
         }));
         tokio::spawn(persist_loop(store, floor.turns, persist_rx));
         tokio::spawn(desk.clone().read_sign_ins());
@@ -609,6 +681,11 @@ impl Desk {
                     background: Default::default(),
                     baseline: Default::default(),
                     prompts: 0,
+                    denials: Vec::new(),
+                    allowed: HashSet::new(),
+                    interrupted: false,
+                    ends: 0,
+                    reading: None,
                 },
             );
             tokio::spawn(self.clone().on_exit(id, exit));
@@ -640,6 +717,8 @@ impl Desk {
         );
         view.group = Self::group_ref(&state.layout, &groups::session_item(r.id));
         view.background = live.and_then(|l| l.background.view());
+        view.interrupted = live.is_some_and(|l| l.interrupted);
+        view.reading = live.is_some_and(|l| l.reading.is_some());
         view.prompts = live.map_or(0, |l| l.prompts);
         view
     }
@@ -843,8 +922,9 @@ impl Desk {
             let st = self.0.state.lock();
             ids.iter()
                 .filter(|id| {
-                    st.records.get(id).map(|r| r.state) == Some(SessionState::Done)
-                        && st.live.get(id).is_some_and(|l| l.background.worth_a_look())
+                    st.records.get(id).is_some_and(|r| {
+                        matches!(r.state, SessionState::Done | SessionState::Asking)
+                    }) && st.live.get(id).is_some_and(|l| l.background.worth_a_look())
                 })
                 .filter_map(|id| Some((*id, Self::look_of(&st, *id)?)))
                 .collect()
@@ -950,7 +1030,23 @@ impl Desk {
                 Transition::Unblocked { by_desk: true, .. }
                 | Transition::Spoke { .. }
                 | Transition::ToTerminal { .. } => None,
-                Transition::Finished { reply } => Some(match crew::outcome_of(Ok(reply)) {
+                Transition::Asked { asked, .. } => {
+                    let text = match &asked.denied {
+                        Some(d) => format!("stopped: {} was not allowed", d.name()),
+                        None => format!("asked “{}”", asked.ask),
+                    };
+                    let question = crew::ItemQuestion {
+                        text: asked.ask.clone(),
+                        options: asked.options.clone(),
+                    };
+                    Some(
+                        own(Kind::Question, text)
+                            .detail(serde_json::json!({ "question": question, "why": asked.why })),
+                    )
+                }
+                // Whoever did it recorded it.
+                Transition::Halted | Transition::Dismissed => None,
+                Transition::Finished { reply } => Some(match transition::finished(reply, now) {
                     (Outcome::Limit, _, _) => own(Kind::Limit, "hit its usage limit".into()),
                     (Outcome::Asked, _, Some(q)) => {
                         own(Kind::Question, format!("asked “{}”", q.text))
@@ -1003,6 +1099,12 @@ impl Desk {
     /// The registry and the crew's tables.
     pub fn store(&self) -> &DeskStore {
         &self.0.store
+    }
+
+    /// Reads the replies the rules can't tell about through `crew` (the
+    /// hub's cheap model), for as long as it is there.
+    pub fn read_replies_with(&self, crew: &Arc<dyn crew::Crew>) {
+        *self.0.reader.lock() = Some(Arc::downgrade(crew));
     }
 
     /// When the session came into the state it is in.
@@ -1177,6 +1279,7 @@ impl Desk {
             restore_offer: false,
             terminal_id: None,
             display_name: None,
+            asked: None,
             created_at: now,
             updated_at: now,
         };
@@ -1212,9 +1315,21 @@ impl Desk {
                 "a name is at most 200 characters".into(),
             ));
         }
-        self.change(id, |r, _| {
+        self.change(id, |r, l| {
             if let Some(n) = patch.name {
                 r.name = n.trim().to_string();
+            }
+            // Back to the terminal while Desk holds a request: the terminal
+            // asks it, as Claude Code's own dialog.
+            if patch.approvals == Some(Approvals::Terminal) {
+                if let Some(l) = l {
+                    if let Some(answer) = l.answer.take() {
+                        let _ = answer.send(claude::ask_in_terminal());
+                    }
+                    if let Some(p) = l.pending.as_mut() {
+                        p.answerable = false;
+                    }
+                }
             }
             if let Some(g) = patch.goal {
                 r.goal = g.trim().to_string();
@@ -1238,7 +1353,8 @@ impl Desk {
                 .ok_or_else(|| DeskError::Conflict("session is not running".into()))?;
             if live.terminal.is_some() {
                 return Err(DeskError::Conflict(
-                    "this session runs in a terminal; end it there".into(),
+                    "this session runs in a terminal; end it there, or interrupt its turn (desk.interrupt)"
+                        .into(),
                 ));
             }
             live.stopping = true;
@@ -1508,6 +1624,118 @@ impl Desk {
         Ok(view)
     }
 
+    /// Ends the turn a running session is working on, as Esc in its terminal
+    /// does, for Claude Code and Codex alike. Its process (and a tracked
+    /// one's shell) goes on. Not working, it does nothing.
+    pub fn interrupt(&self, id: Uuid, by: Option<By>) -> Result<SessionView, DeskError> {
+        let pty = {
+            let st = self.0.state.lock();
+            let live = st
+                .live
+                .get(&id)
+                .ok_or_else(|| DeskError::Conflict("session is not running".into()))?;
+            let working = st.records.get(&id).map(|r| r.state) == Some(SessionState::Working);
+            working.then(|| Arc::clone(&live.pty))
+        };
+        let Some(pty) = pty else {
+            return self.view(id);
+        };
+        pty.write(b"\x1b")?;
+        // Claude Code runs no hook for an interrupted turn.
+        self.change(id, |r, l| {
+            if let Some(l) = l.filter(|_| r.state == SessionState::Working) {
+                r.state = SessionState::Done;
+                l.current_tool = None;
+                l.interrupted = true;
+            }
+        });
+        let view = self.view(id)?;
+        if let Some(by) = by {
+            self.note(by.event(
+                Kind::Interrupted,
+                Some(Party::session(&view)),
+                format!("interrupted {}", view.label()),
+            ));
+        }
+        Ok(view)
+    }
+
+    /// Allows the tool call auto mode refused, that its turn stopped on, for
+    /// the rest of the session, and tells it to carry on. Desk's PreToolUse
+    /// hook answers the same call `allow` from then on, which runs it
+    /// without the classifier. The person's alone to do.
+    pub fn allow_asked(&self, id: Uuid, by: Option<By>) -> Result<SessionView, DeskError> {
+        let mut denied = None;
+        let mut refusal = None;
+        self.change(id, |r, l| {
+            let Some(l) = l.filter(|_| r.state == SessionState::Asking) else {
+                refusal = Some("it isn't asking anything");
+                return;
+            };
+            // Taken: allowed once, it isn't offered again.
+            match r
+                .asked
+                .as_mut()
+                .and_then(|a| a.denied.take_if(|d| d.allowable))
+            {
+                Some(d) => {
+                    l.allowed.insert(d.call.clone());
+                    denied = Some(d);
+                }
+                None => refusal = Some("there is no refused tool Desk can allow"),
+            }
+        });
+        let Some(denied) = denied else {
+            return Err(DeskError::Conflict(
+                refusal.unwrap_or("session is not running").into(),
+            ));
+        };
+        let what = match denied.call.input.as_deref() {
+            Some(input) => format!("{} `{input}`", denied.name()),
+            None => denied.name().to_string(),
+        };
+        self.prompt(
+            id,
+            &format!(
+                "I allowed {what} for the rest of this session from Desk. Run it again exactly as before, then carry on."
+            ),
+            None,
+        )?;
+        let view = self.view(id)?;
+        if let Some(by) = by {
+            self.note(by.event(
+                Kind::Approved,
+                Some(Party::session(&view)),
+                format!(
+                    "allowed {} to use {} for the session",
+                    view.label(),
+                    crew::clip(&denied.tool, 120)
+                ),
+            ));
+        }
+        Ok(view)
+    }
+
+    /// Leaves what a session asked unanswered: it is done.
+    pub fn dismiss_asked(&self, id: Uuid, by: Option<By>) -> Result<SessionView, DeskError> {
+        if self.record(id)?.state != SessionState::Asking {
+            return Err(DeskError::Conflict("it isn't asking anything".into()));
+        }
+        self.change(id, |r, _| {
+            r.state = SessionState::Done;
+            r.asked = None;
+        });
+        let view = self.view(id)?;
+        if let Some(by) = by {
+            self.note(by.event(
+                Kind::Dismissed,
+                Some(Party::session(&view)),
+                format!("dismissed what {} asked", view.label()),
+            ));
+        }
+        Ok(view)
+    }
+
     /// Waits until the session reaches one of `states` (or stops running),
     /// up to `timeout`; returns where it is either way.
     pub async fn wait_for(
@@ -1517,7 +1745,12 @@ impl Desk {
         timeout: Duration,
     ) -> Result<SessionView, DeskError> {
         let mut rx = self.0.events.subscribe();
-        let settled = |v: &SessionView| states.contains(&v.state) || !v.live;
+        // A turn that ended asking is a finished one, to whoever waits for it.
+        let settled = |v: &SessionView| {
+            states.contains(&v.state)
+                || (v.state == SessionState::Asking && states.contains(&SessionState::Done))
+                || !v.live
+        };
         let now = self.view(id)?;
         if settled(&now) {
             return Ok(now);
@@ -1853,6 +2086,11 @@ impl Desk {
                 background: Default::default(),
                 baseline: Default::default(),
                 prompts: 0,
+                denials: Vec::new(),
+                allowed: HashSet::new(),
+                interrupted: false,
+                ends: 0,
+                reading: None,
             },
         );
         tokio::spawn(self.clone().on_exit(r.id, exit));
@@ -1950,17 +2188,35 @@ impl Desk {
     /// its background work, not the session working.
     async fn apply_hook(&self, id: Uuid, hook: Hook, inside: Option<String>) -> Value {
         let empty = || Value::Object(Default::default());
+        // A call the person allowed for the session runs without asking.
+        let allowed = match &hook {
+            Hook::ToolStart { call, .. } => self
+                .0
+                .state
+                .lock()
+                .live
+                .get(&id)
+                .is_some_and(|l| l.allowed.contains(call)),
+            _ => false,
+        };
+        let answer = move || match allowed {
+            true => claude::allow_call(),
+            false => empty(),
+        };
         if let Some(agent) = &inside {
             let idle = {
                 let mut st = self.0.state.lock();
-                let done = st.records.get(&id).map(|r| r.state) == Some(SessionState::Done);
+                let done = st
+                    .records
+                    .get(&id)
+                    .is_some_and(|r| matches!(r.state, SessionState::Done | SessionState::Asking));
                 if let Some(l) = st.live.get_mut(&id) {
                     l.background = std::mem::take(&mut l.background).heard(agent, Utc::now());
                 }
                 done
             };
-            if idle && matches!(hook, Hook::ToolStart(_) | Hook::ToolEnd) {
-                return empty();
+            if idle && matches!(hook, Hook::ToolStart { .. } | Hook::ToolEnd) {
+                return answer();
             }
         }
         match hook {
@@ -1984,20 +2240,43 @@ impl Desk {
                 if let Some(l) = l {
                     l.pending = None;
                     l.prompts += 1;
+                    l.denials.clear();
+                    l.reading = None;
+                    r.asked = None;
+                    l.interrupted = false;
                 }
             }),
-            Hook::ToolStart(tool) => self.change(id, |r, l| {
+            Hook::ToolStart { tool, .. } => self.change(id, |r, l| {
                 r.state = SessionState::Working;
+                r.asked = None;
                 if let Some(l) = l {
                     l.current_tool = Some(tool);
+                    l.interrupted = false;
+                    l.reading = None;
+                    // It did something after a transient refusal.
+                    if inside.is_none() {
+                        asking::went_on(&mut l.denials, false);
+                    }
                 }
             }),
+            Hook::Denied(denied) => {
+                // A sub-agent's refusal is its own to work around.
+                if inside.is_none() {
+                    if let Some(l) = self.0.state.lock().live.get_mut(&id) {
+                        l.denials.push(denied);
+                    }
+                }
+            }
             Hook::ToolEnd => self.change(id, |r, l| {
                 r.state = SessionState::Working;
                 if let Some(l) = l {
                     l.current_tool = None;
                     l.pending = None;
                     l.answer = None;
+                    // A tool ran: the turn got past what it was refused.
+                    if inside.is_none() {
+                        asking::went_on(&mut l.denials, true);
+                    }
                 }
             }),
             Hook::NeedsInput(message) => self.change(id, |r, l| {
@@ -2016,6 +2295,9 @@ impl Desk {
                 r.state = SessionState::Working;
                 if let Some(l) = l {
                     l.pending = None;
+                    l.denials.clear();
+                    l.reading = None;
+                    r.asked = None;
                 }
             }),
             Hook::SubagentStart(agent) => self.change(id, |_, l| {
@@ -2033,8 +2315,12 @@ impl Desk {
                     l.background = std::mem::take(&mut l.background).ended(&agent, Utc::now());
                     // Claude Code goes on by itself once the last of it ends;
                     // its next Stop says whether the turn is done.
-                    if r.state == SessionState::Done && before > 0 && l.background.count() == 0 {
+                    if matches!(r.state, SessionState::Done | SessionState::Asking)
+                        && before > 0
+                        && l.background.count() == 0
+                    {
                         r.state = SessionState::Working;
+                        r.asked = None;
                     }
                 }
             }),
@@ -2046,34 +2332,69 @@ impl Desk {
                 let path = transcript.or_else(|| self.record(id).ok().and_then(|r| r.transcript));
                 // The hook fires before the transcript has the reply, so the
                 // transcript is only a fallback for older CLIs.
-                let reply = match (reply, path.clone()) {
-                    (Some(r), _) => Some(transcript::clip(&r)),
+                let said = match (reply, path.clone()) {
+                    (Some(r), _) => Some(r),
                     (None, Some(p)) => tokio::task::spawn_blocking(move || {
                         transcript::read_tail(Path::new(&p))
                             .ok()
-                            .and_then(|t| t.last_reply)
+                            .and_then(|t| t.said)
                     })
                     .await
                     .ok()
                     .flatten(),
                     (None, None) => None,
                 };
+                let (heard, prompts) = {
+                    let st = self.0.state.lock();
+                    st.live
+                        .get(&id)
+                        .map_or((Vec::new(), 0), |l| (l.denials.clone(), l.prompts))
+                };
+                // The refusals its hooks didn't report (an older plugin, an
+                // older CLI) are in the transcript.
+                let denials = match (heard.is_empty(), path.clone()) {
+                    (true, Some(p)) => tokio::task::spawn_blocking(move || {
+                        transcript::denials(Path::new(&p)).unwrap_or_default()
+                    })
+                    .await
+                    .unwrap_or_default(),
+                    _ => heard,
+                };
+                let (asked, unsure) = asked_at_end(&denials, said.as_deref());
+                let said_whole = said.clone().filter(|_| unsure);
+                let reader = unsure.then(|| self.reader()).flatten();
                 let running = self.running_now(id).await;
-                self.change(id, |r, l| {
-                    r.state = SessionState::Done;
-                    r.transcript = path.or(r.transcript.take());
-                    if let Some(reply) = reply {
-                        r.last_reply = Some(reply);
+                let mut read = None;
+                self.change(id, |r, mut l| {
+                    // The person spoke while it was read: that answers it.
+                    let asked = asked.filter(|_| l.as_ref().is_some_and(|l| l.prompts == prompts));
+                    r.state = match asked {
+                        Some(_) => SessionState::Asking,
+                        None => SessionState::Done,
+                    };
+                    if let Some(l) = l.as_deref_mut() {
+                        l.ends += 1;
+                        l.reading = reader.as_ref().map(|_| l.ends);
+                        read = l.reading;
                     }
+                    r.transcript = path.or(r.transcript.take());
+                    if let Some(reply) = said {
+                        r.last_reply = Some(transcript::clip(&reply));
+                    }
+                    r.asked = asked;
                     if let Some(l) = l {
                         l.current_tool = None;
                         l.pending = None;
                         l.answer = None;
+                        l.denials.clear();
                         l.background = std::mem::take(&mut l.background)
                             .reported(background, Utc::now())
                             .looked_if(running, Utc::now());
                     }
                 });
+                if let (Some(reader), Some(end), Some(reply)) = (reader, read, said_whole) {
+                    self.read_later(id, end, reader, reply);
+                }
             }
             Hook::SessionEnd => {
                 if let Some(l) = self.0.state.lock().live.get_mut(&id) {
@@ -2086,7 +2407,51 @@ impl Desk {
             Hook::Usage(limits) => self.report_usage(limits),
             Hook::Other => {}
         }
-        empty()
+        answer()
+    }
+
+    /// The hub's crew, to read replies with, while it is there.
+    fn reader(&self) -> Option<Arc<dyn crew::Crew>> {
+        self.0.reader.lock().as_ref().and_then(Weak::upgrade)
+    }
+
+    /// Has the hub's model read the reply turn end `end` left, which the
+    /// rules couldn't tell about, for up to [`READ_LATER`]. A yes moves the
+    /// session to asking, if it is still done on that turn (nobody has
+    /// spoken, and it hasn't worked or ended again since); anything else
+    /// leaves it done.
+    fn read_later(&self, id: Uuid, end: u64, reader: Arc<dyn crew::Crew>, reply: String) {
+        let desk = self.clone();
+        let wait = *self.0.read_wait.lock();
+        tokio::spawn(async move {
+            let yes = match tokio::time::timeout(wait, reader.asks(&reply)).await {
+                Ok(said) => said == Some(true),
+                Err(_) => {
+                    tracing::info!(%id, "reading a turn's reply took too long; it is done");
+                    false
+                }
+            };
+            drop(reader);
+            let still = desk
+                .0
+                .state
+                .lock()
+                .live
+                .get(&id)
+                .is_some_and(|l| l.reading == Some(end));
+            if !still {
+                return;
+            }
+            desk.change(id, |r, l| {
+                if let Some(l) = l {
+                    l.reading = None;
+                }
+                if yes && r.state == SessionState::Done {
+                    r.state = SessionState::Asking;
+                    r.asked = Some(Asked::read_by_model(&reply));
+                }
+            });
+        });
     }
 
     async fn await_permission(&self, id: Uuid, tool: String, detail: String) -> Value {
@@ -2209,6 +2574,18 @@ impl Desk {
                 }
                 _ => None,
             };
+            // Its turn's end, read as Claude Code's is: whether it asks.
+            let prompts = self.0.state.lock().live.get(&id).map(|l| l.prompts);
+            let (asked, unsure) = match &tail {
+                Some((_, t)) => asked_at_end(&[], t.said.as_deref()),
+                None => (None, false),
+            };
+            let reader = unsure.then(|| self.reader()).flatten();
+            let said_whole = tail
+                .as_ref()
+                .and_then(|(_, t)| t.said.clone())
+                .filter(|_| reader.is_some());
+            let mut read = None;
             self.change(id, |r, mut l| {
                 r.cli_session_id.get_or_insert_with(|| thread.clone());
                 match event {
@@ -2229,6 +2606,7 @@ impl Desk {
                         };
                         r.restore_offer = false;
                         if let Some(l) = l {
+                            r.asked = None;
                             // A repeated notice is the same request, still asked.
                             let asked = l.pending.take();
                             l.pending = waiting.then(|| {
@@ -2243,14 +2621,24 @@ impl Desk {
                         }
                     }
                     CodexEvent::Idle => {
+                        let asked = asked.filter(|_| l.as_deref().map(|l| l.prompts) == prompts);
                         if r.state != SessionState::Starting {
-                            r.state = SessionState::Done;
+                            r.state = match asked {
+                                Some(_) => SessionState::Asking,
+                                None => SessionState::Done,
+                            };
+                            if let Some(l) = l.as_deref_mut() {
+                                l.ends += 1;
+                                l.reading = reader.as_ref().map(|_| l.ends);
+                                read = l.reading;
+                            }
                         }
                         if let Some((path, t)) = tail {
                             r.transcript = Some(path.to_string_lossy().into_owned());
                             r.last_prompt = t.last_prompt.or(r.last_prompt.take());
                             r.last_reply = t.last_reply.or(r.last_reply.take());
                         }
+                        r.asked = asked;
                         if let Some(l) = l {
                             l.current_tool = None;
                             l.pending = None;
@@ -2274,6 +2662,9 @@ impl Desk {
                     CodexEvent::Child(_) => {}
                 }
             });
+            if let (Some(reader), Some(end), Some(reply)) = (reader, read, said_whole) {
+                self.read_later(id, end, reader, reply);
+            }
         }
     }
 
@@ -2312,7 +2703,11 @@ impl Desk {
             )
         };
         let mut present = HashSet::new();
-        for ext in found.into_iter().filter(|e| !ours.contains(&e.session_id)) {
+        let hub_turns = self.0.opts.hub_turns.clone();
+        for ext in found
+            .into_iter()
+            .filter(|e| !ours.contains(&e.session_id) && !hub_turns.hold(&e.cwd))
+        {
             let id = by_cli.get(&ext.session_id).copied();
             let transcript = id
                 .and_then(|id| self.record(id).ok()?.transcript)
@@ -2377,6 +2772,7 @@ impl Desk {
                         restore_offer: false,
                         terminal_id: None,
                         display_name: None,
+                        asked: None,
                         created_at: now,
                         updated_at: now,
                     };
@@ -2580,6 +2976,7 @@ mod tests {
             restore: RestorePolicy::Ask,
             adopt_every: None,
             holder: None,
+            hub_turns: HubTurns::default(),
         }
     }
 
@@ -3844,6 +4241,470 @@ mod tests {
             d.reconcile_external(vec![]).await;
             assert_eq!(d.view(s.id).unwrap().state, SessionState::Closed);
             assert!(d.list().iter().all(|v| v.id != s.id));
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn the_hubs_own_cli_turns_are_never_adopted() {
+        with_test_pool(build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            DeskStore::migrate(&pool).await.unwrap();
+            let turns = PathBuf::from("/data/agents/scout/projects/_agent-turn/work/session");
+            let d = Desk::start(
+                DeskStore::from_pool(pool),
+                Options {
+                    hub_turns: HubTurns::new(move |cwd| cwd.starts_with(&turns)),
+                    ..options(dir.path())
+                },
+                Default::default(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            let found = adopt::parse(
+                json!([
+                    { "pid": std::process::id(), "cwd": "/data/agents/scout/projects/_agent-turn/work/session/at-dm-d4774cbb6c89-2e",
+                      "kind": "interactive", "sessionId": "hub-1", "name": "at-dm-d4774cbb6c89-2e", "status": "busy" },
+                    { "pid": std::process::id(), "cwd": "/Users/k/dev/vellev", "kind": "interactive",
+                      "sessionId": "mine-1", "name": "vellev-36", "status": "busy" }
+                ])
+                .to_string()
+                .as_bytes(),
+            )
+            .unwrap();
+            d.reconcile_external(found).await;
+            let names: Vec<String> = d.list().into_iter().map(|s| s.name).collect();
+            assert_eq!(names, ["vellev-36"], "the person's, not the hub's");
+        })
+        .await;
+    }
+
+    /// A desk whose floor log is `logged`, its sessions run as `cli`.
+    async fn logged_desk(
+        pool: workforce_postgres::PostgresPool,
+        dir: &Path,
+        cli: PathBuf,
+    ) -> (Desk, Arc<Logged>) {
+        DeskStore::migrate(&pool).await.unwrap();
+        let logged = Arc::new(Logged::default());
+        let d = Desk::start(
+            DeskStore::from_pool(pool),
+            Options {
+                claude: cli,
+                ..options(dir)
+            },
+            Floor {
+                turns: Some(logged.clone()),
+                plans: None,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        (d, logged)
+    }
+
+    /// How the last turn `ops` end ended, and the question it left.
+    fn last_question(ops: &[TurnOp]) -> Option<(Outcome, Option<crew::ItemQuestion>)> {
+        ops.iter().rev().find_map(|op| match op {
+            TurnOp::End {
+                outcome, question, ..
+            } => Some((*outcome, question.clone())),
+            _ => None,
+        })
+    }
+
+    /// A crew whose model reads every reply as `asks`, after `wait`.
+    struct Reader {
+        asks: Option<bool>,
+        wait: Duration,
+    }
+
+    #[async_trait::async_trait]
+    impl crew::Crew for Reader {
+        fn overseer(&self) -> Option<crew::Overseer> {
+            None
+        }
+        fn agents(&self) -> Vec<crew::CrewAgent> {
+            vec![]
+        }
+        fn midnight(&self) -> DateTime<Utc> {
+            Utc::now()
+        }
+        async fn accept(&self, _: &crew::Suggestion) -> Result<(), String> {
+            Ok(())
+        }
+        async fn asks(&self, _: &str) -> Option<bool> {
+            tokio::time::sleep(self.wait).await;
+            self.asks
+        }
+    }
+
+    #[tokio::test]
+    async fn a_turn_stopped_on_a_refused_tool_asks_until_the_person_answers_and_can_be_allowed_on()
+    {
+        with_test_pool(build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let (d, logged) = logged_desk(pool, dir.path(), fake_cli(dir.path())).await;
+            let s = new_session(&d, dir.path()).await;
+            let lookup = json!({"command": "security find-generic-password -s deploy -w"});
+            post(&d, s.id, json!({"hook_event_name": "UserPromptSubmit", "prompt": "do the steps in TODO.md"})).await;
+            assert_eq!(post(&d, s.id, json!({"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": lookup})).await, json!({}));
+            // A sub-agent's refusal is its own.
+            post(&d, s.id, json!({"hook_event_name": "PermissionDenied", "agent_id": "a1", "tool_name": "WebFetch",
+                "tool_input": {"url": "https://example.com"}, "reason": "[Data Exfiltration]"})).await;
+            post(&d, s.id, json!({"hook_event_name": "PermissionDenied", "tool_name": "Bash", "tool_input": lookup,
+                "tool_use_id": "toolu_1", "reason": "[Credential Exploration]"})).await;
+            post(&d, s.id, json!({"hook_event_name": "Stop", "last_assistant_message": "I couldn't read the password: the lookup was blocked."})).await;
+
+            let v = d.view(s.id).unwrap();
+            assert_eq!(v.state, SessionState::Asking, "not done: stuck on what it wasn't allowed");
+            let asked = v.asked.clone().unwrap();
+            assert_eq!(asked.ask, "Stopped: Bash was not allowed");
+            assert_eq!(asked.why, "auto mode refused Bash ([Credential Exploration])");
+            assert!(asked.denied.as_ref().unwrap().allowable);
+            assert!(logs(&logged, |ops| last_question(ops).is_some()).await);
+            assert_eq!(
+                last_question(&logged.0.lock()),
+                Some((Outcome::Asked, Some(crew::ItemQuestion { text: "Stopped: Bash was not allowed".into(), options: None })))
+            );
+            assert!(recorded(&d, 3).await.iter().any(|(k, text, _)| *k == crew::Kind::Question && text == "stopped: Bash was not allowed"));
+            let item = crate::overview::session_item_of(&v);
+            assert_eq!(item.state, crew::ItemState::NeedsYou);
+
+            // Allowed and continued: the same call runs without asking from then on.
+            d.allow_asked(s.id, Some(By::you())).unwrap();
+            assert!(d.allow_asked(s.id, None).is_err(), "allowed once");
+            post(&d, s.id, json!({"hook_event_name": "UserPromptSubmit", "prompt": "I allowed it, run it again"})).await;
+            let v = d.view(s.id).unwrap();
+            assert_eq!((v.state, v.asked), (SessionState::Working, None), "the prompt answered it");
+            assert_eq!(
+                post(&d, s.id, json!({"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": lookup})).await,
+                claude::allow_call()
+            );
+            assert_eq!(
+                post(&d, s.id, json!({"hook_event_name": "PreToolUse", "tool_name": "Bash",
+                    "tool_input": {"command": "security find-generic-password -s other -w"}})).await,
+                json!({}),
+                "only the call allowed"
+            );
+            assert!(d.allow_asked(s.id, None).is_err(), "nothing asked now");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_refusal_only_the_transcript_holds_is_read_from_it() {
+        with_test_pool(build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let d = desk(pool, dir.path()).await;
+            let s = new_session(&d, dir.path()).await;
+            let transcript = dir.path().join("t.jsonl");
+            let lines = [
+                json!({"type": "user", "message": {"role": "user", "content": "clean up the build"}}),
+                json!({"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {"command": "rm -rf \"$OUT\"/*"}}]}}),
+                json!({"type": "user", "toolDenialKind": "permission-rule", "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "is_error": true,
+                    "content": "Permission for this command was denied by a built-in Claude Code safety check, not by the user."}]}}),
+            ];
+            std::fs::write(&transcript, lines.map(|l| l.to_string()).join("\n")).unwrap();
+            post(&d, s.id, json!({"hook_event_name": "UserPromptSubmit", "prompt": "clean up the build"})).await;
+            post(&d, s.id, json!({"hook_event_name": "Stop", "transcript_path": transcript, "last_assistant_message": "I left the removal to you."})).await;
+            let v = d.view(s.id).unwrap();
+            assert_eq!(v.state, SessionState::Asking);
+            let denied = v.asked.unwrap().denied.unwrap();
+            assert!(!denied.allowable, "only the person can get past a safety check");
+            assert!(d.allow_asked(s.id, None).is_err());
+            d.dismiss_asked(s.id, Some(By::you())).unwrap();
+            let v = d.view(s.id).unwrap();
+            assert_eq!((v.state, v.asked), (SessionState::Done, None));
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_reply_that_asks_is_asking_and_a_rhetorical_one_is_done() {
+        with_test_pool(build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let (d, logged) = logged_desk(pool, dir.path(), fake_cli(dir.path())).await;
+            let s = new_session(&d, dir.path()).await;
+            post(&d, s.id, json!({"hook_event_name": "UserPromptSubmit", "prompt": "fix the flaky test"})).await;
+            post(&d, s.id, json!({"hook_event_name": "Stop", "last_assistant_message":
+                "There are two fixes. Which do you prefer?\n\n1. Raise the timeout\n2. Mock the clock"})).await;
+            let v = d.view(s.id).unwrap();
+            assert_eq!(v.state, SessionState::Asking);
+            assert_eq!(v.asked.unwrap().why, "asked you to choose between 2 options");
+            assert!(logs(&logged, |ops| matches!(last_question(ops), Some((Outcome::Asked, Some(_))))).await);
+
+            post(&d, s.id, json!({"hook_event_name": "UserPromptSubmit", "prompt": "mock the clock"})).await;
+            assert_eq!(d.view(s.id).unwrap().state, SessionState::Working, "answered");
+            post(&d, s.id, json!({"hook_event_name": "Stop", "last_assistant_message":
+                "Mocked the clock, and all 214 pass. Not bad for a one-line change, right?"})).await;
+            let v = d.view(s.id).unwrap();
+            assert_eq!((v.state, v.asked), (SessionState::Done, None));
+            assert!(logs(&logged, |ops| last_question(ops) == Some((Outcome::Finished, None))).await);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn asking_beats_background_and_its_work_shows_again_once_answered() {
+        with_test_pool(build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let (d, _) = logged_desk(pool, dir.path(), shell_cli(dir.path())).await;
+            let s = new_session(&d, dir.path()).await;
+            // Its tool shell runs before its turn ends.
+            let cli = d.0.state.lock().live[&s.id].pty.pid().unwrap();
+            let shell = dir.path().join(format!("shell-{cli}"));
+            for _ in 0..200 {
+                if std::fs::read_to_string(&shell).is_ok_and(|p| !p.trim().is_empty()) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            post(
+                &d,
+                s.id,
+                json!({"hook_event_name": "UserPromptSubmit", "prompt": "start the server"}),
+            )
+            .await;
+            post(
+                &d,
+                s.id,
+                json!({"hook_event_name": "Stop",
+                "last_assistant_message": "The server is starting. Should I seed the database too?",
+                "background_tasks": [{"id": "b1", "type": "shell", "status": "running"}]}),
+            )
+            .await;
+            let v = d.view(s.id).unwrap();
+            assert_eq!(
+                (v.state, v.waiting_on()),
+                (SessionState::Asking, 0),
+                "it needs the person"
+            );
+            let item = crate::overview::session_item_of(&v);
+            assert_eq!(item.state, crew::ItemState::NeedsYou);
+            assert_eq!(
+                item.question.unwrap().text,
+                "Should I seed the database too?"
+            );
+            assert_ne!(item.detail.as_deref(), Some("Waiting on 1 background task"));
+
+            d.dismiss_asked(s.id, None).unwrap();
+            assert_eq!(
+                d.view(s.id).unwrap().waiting_on(),
+                1,
+                "its work, still running, shows again"
+            );
+        })
+        .await;
+    }
+
+    /// Ends a turn on `reply`, after a prompt.
+    async fn turn_ending(d: &Desk, id: Uuid, prompt: &str, reply: &str) {
+        post(
+            d,
+            id,
+            json!({"hook_event_name": "UserPromptSubmit", "prompt": prompt}),
+        )
+        .await;
+        post(
+            d,
+            id,
+            json!({"hook_event_name": "Stop", "last_assistant_message": reply}),
+        )
+        .await;
+    }
+
+    /// Waits for `id` to be in `state`, up to ten seconds.
+    async fn comes_to(d: &Desk, id: Uuid, state: SessionState) -> bool {
+        for _ in 0..1000 {
+            if d.view(id).unwrap().state == state {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        false
+    }
+
+    const UNSURE: &str = "Pushed the branch. Let me know if you want me to open the PR.";
+
+    #[tokio::test]
+    async fn a_slow_yes_from_the_model_moves_a_done_turn_to_asking() {
+        with_test_pool(build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let (d, logged) = logged_desk(pool, dir.path(), fake_cli(dir.path())).await;
+            let s = new_session(&d, dir.path()).await;
+            turn_ending(&d, s.id, "push it", UNSURE).await;
+            assert_eq!(
+                d.view(s.id).unwrap().state,
+                SessionState::Done,
+                "no model: done"
+            );
+            assert!(
+                logs(&logged, |ops| last_question(ops)
+                    == Some((Outcome::Finished, None)))
+                .await
+            );
+
+            let model = Duration::from_secs(3);
+            let yes: Arc<dyn crew::Crew> = Arc::new(Reader {
+                asks: Some(true),
+                wait: model,
+            });
+            d.read_replies_with(&yes);
+            let at = std::time::Instant::now();
+            turn_ending(&d, s.id, "push it again", UNSURE).await;
+            assert!(at.elapsed() < model, "the hook doesn't wait for the model");
+            let v = d.view(s.id).unwrap();
+            assert_eq!(
+                (v.state, v.asked),
+                (SessionState::Done, None),
+                "done until the model says"
+            );
+            assert!(comes_to(&d, s.id, SessionState::Asking).await);
+            assert_eq!(
+                d.view(s.id).unwrap().asked.unwrap().why,
+                "asked you something"
+            );
+            assert!(
+                logs(&logged, |ops| matches!(
+                    last_question(ops),
+                    Some((Outcome::Asked, Some(_)))
+                ))
+                .await,
+                "its turn ends asking, as a turn the rules read so"
+            );
+            let ends = logged
+                .0
+                .lock()
+                .iter()
+                .filter(|op| matches!(op, TurnOp::End { .. }))
+                .count();
+            assert_eq!(ends, 2, "the turn the model read ended once");
+            assert!(
+                // Started, prompted, finished, prompted, asked.
+                recorded(&d, 5)
+                    .await
+                    .iter()
+                    .any(|(k, text, _)| *k == crew::Kind::Question && text.starts_with("asked")),
+                "asked, so the overseer hears of it"
+            );
+            drop(yes);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_yes_after_the_person_spoke_changes_nothing_and_a_timeout_leaves_it_done() {
+        with_test_pool(build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let (d, logged) = logged_desk(pool, dir.path(), fake_cli(dir.path())).await;
+            let s = new_session(&d, dir.path()).await;
+            let yes: Arc<dyn crew::Crew> = Arc::new(Reader {
+                asks: Some(true),
+                wait: Duration::from_millis(300),
+            });
+            d.read_replies_with(&yes);
+            turn_ending(&d, s.id, "push it", UNSURE).await;
+            post(
+                &d,
+                s.id,
+                json!({"hook_event_name": "UserPromptSubmit", "prompt": "open the PR"}),
+            )
+            .await;
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            let v = d.view(s.id).unwrap();
+            assert_eq!(
+                (v.state, v.asked),
+                (SessionState::Working, None),
+                "the person answered first"
+            );
+            assert!(
+                logs(&logged, |ops| last_question(ops)
+                    == Some((Outcome::Finished, None)))
+                .await,
+                "the turn they spoke after finished"
+            );
+
+            *d.0.read_wait.lock() = Duration::from_millis(100);
+            post(
+                &d,
+                s.id,
+                json!({"hook_event_name": "Stop", "last_assistant_message": UNSURE}),
+            )
+            .await;
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            assert_eq!(
+                d.view(s.id).unwrap().state,
+                SessionState::Done,
+                "timed out: done, never a false need"
+            );
+            let ends = logged
+                .0
+                .lock()
+                .iter()
+                .filter(|op| matches!(op, TurnOp::End { .. }))
+                .count();
+            assert_eq!(ends, 2, "its turn ended as finished once the model gave up");
+
+            let unsaid: Arc<dyn crew::Crew> = Arc::new(Reader {
+                asks: None,
+                wait: Duration::ZERO,
+            });
+            d.read_replies_with(&unsaid);
+            turn_ending(&d, s.id, "again", UNSURE).await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            assert_eq!(
+                d.view(s.id).unwrap().state,
+                SessionState::Done,
+                "the model couldn't say: done"
+            );
+            drop((yes, unsaid));
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn interrupting_ends_the_turn_with_esc_and_does_nothing_while_idle() {
+        with_test_pool(build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            // A CLI that prints, in hex, the first byte it is sent.
+            let cli = dir.path().join("esc-cli");
+            std::fs::write(
+                &cli,
+                "#!/bin/sh\nstty raw -echo\nhead -c 1 | od -An -tx1\nexec sleep 60\n",
+            )
+            .unwrap();
+            std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let (d, logged) = logged_desk(pool, dir.path(), cli).await;
+            let s = new_session(&d, dir.path()).await;
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert_eq!(
+                d.interrupt(s.id, None).unwrap().state,
+                SessionState::Starting,
+                "not working"
+            );
+
+            post(
+                &d,
+                s.id,
+                json!({"hook_event_name": "UserPromptSubmit", "prompt": "run the suite"}),
+            )
+            .await;
+            let v = d.interrupt(s.id, Some(By::you())).unwrap();
+            crate::pty::tests::wait_for(&d.attach(s.id).unwrap(), "1b").await;
+            assert_eq!((v.state, v.live), (SessionState::Done, true));
+            assert!(
+                logs(&logged, |ops| last_question(ops)
+                    == Some((Outcome::Stopped, None)))
+                .await,
+                "the turn ended, not finished"
+            );
+            // Started, prompted, interrupted.
+            assert!(recorded(&d, 3).await.iter().any(
+                |(k, text, _)| *k == crew::Kind::Interrupted && text == "interrupted auth-fix"
+            ));
         })
         .await;
     }

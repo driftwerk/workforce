@@ -121,6 +121,30 @@ async fn stop(State(s): S, h: HeaderMap, Query(q): Q, Path(id): Path<Uuid>) -> R
     s.desk.stop(id, Some(By::you())).map(Json).into_response()
 }
 
+async fn interrupt(State(s): S, h: HeaderMap, Query(q): Q, Path(id): Path<Uuid>) -> Response {
+    guarded!(s, h, q);
+    s.desk
+        .interrupt(id, Some(By::you()))
+        .map(Json)
+        .into_response()
+}
+
+async fn allow_asked(State(s): S, h: HeaderMap, Query(q): Q, Path(id): Path<Uuid>) -> Response {
+    guarded!(s, h, q);
+    s.desk
+        .allow_asked(id, Some(By::you()))
+        .map(Json)
+        .into_response()
+}
+
+async fn dismiss_asked(State(s): S, h: HeaderMap, Query(q): Q, Path(id): Path<Uuid>) -> Response {
+    guarded!(s, h, q);
+    s.desk
+        .dismiss_asked(id, Some(By::you()))
+        .map(Json)
+        .into_response()
+}
+
 #[derive(Deserialize, Default)]
 struct ResumeBody {
     prompt: Option<String>,
@@ -625,6 +649,9 @@ pub fn sessions_router(desk: Desk, auth: Arc<dyn Authorize>) -> Router {
         .route("/api/desk/sessions", get(list).post(create))
         .route("/api/desk/sessions/{id}", patch(update).delete(forget))
         .route("/api/desk/sessions/{id}/stop", post(stop))
+        .route("/api/desk/sessions/{id}/interrupt", post(interrupt))
+        .route("/api/desk/sessions/{id}/asked/allow", post(allow_asked))
+        .route("/api/desk/sessions/{id}/asked/dismiss", post(dismiss_asked))
         .route("/api/desk/sessions/{id}/resume", post(resume))
         .route("/api/desk/sessions/{id}/approvals/{approval}", post(decide))
         .route("/api/desk/sessions/{id}/pty", get(pty))
@@ -680,6 +707,7 @@ pub fn router(
     accounts: Arc<dyn Accounts>,
     crew: Arc<dyn crate::crew::Crew>,
 ) -> Router {
+    desk.read_replies_with(&crew);
     sessions_router(desk.clone(), Arc::clone(&auth))
         .merge(crate::state::router(desk.clone(), Arc::clone(&auth)))
         .merge(crate::crew_api::crew_router(desk, Arc::clone(&auth), crew))

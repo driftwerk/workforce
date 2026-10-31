@@ -18,11 +18,12 @@ use super::CrewHub;
 
 /// Every `crew.*` tool: the reading ones first.
 pub const READ: [&str; 3] = ["crew.overview", "crew.activity", "crew.history"];
-pub const ACT: [&str; 8] = [
+pub const ACT: [&str; 9] = [
     "crew.nudge",
     "crew.approve",
     "crew.deny",
     "crew.stop",
+    "crew.interrupt",
     "crew.resume",
     "crew.restart",
     "crew.start_session",
@@ -322,7 +323,8 @@ impl Tool for CrewTool {
             "crew.nudge" => "Send a short message to an agent's DM (agent_id) or type it into a running session (session_id): a check-in, a hint, a correction.",
             "crew.approve" => "Allow a session's pending request (session_id, approval_id from crew.overview).",
             "crew.deny" => "Deny a session's pending request (session_id, approval_id from crew.overview).",
-            "crew.stop" => "Stop a running Desk session; its conversation is kept.",
+            "crew.stop" => "Stop a running Desk session; its conversation is kept. A session the person started in a Desk terminal can't be stopped (the shell is theirs): interrupt it instead.",
+            "crew.interrupt" => "End the turn a working session is on, as Esc in its terminal: it, and the terminal it runs in, keep running, and the shell stays the person's. Works for sessions started in a Desk terminal too.",
             "crew.resume" => "Resume a stopped session, optionally with a prompt. A session in another terminal can only be resumed once it has ended there.",
             "crew.restart" => "Stop a session and resume it with a new prompt, e.g. to get it unstuck.",
             "crew.start_session" => "Start a Claude Code (default) or Codex session in a project folder with a goal.",
@@ -365,7 +367,7 @@ impl Tool for CrewTool {
                 })),
                 &["session_id", "approval_id"],
             ),
-            "crew.stop" => act(
+            "crew.stop" | "crew.interrupt" => act(
                 props(json!({ "session_id": session_schema() })),
                 &["session_id"],
             ),

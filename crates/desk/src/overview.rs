@@ -61,18 +61,18 @@ fn session_item(
             1 => "Waiting on 1 background task".to_string(),
             n => format!("Waiting on {n} background tasks"),
         }),
-        (SessionState::Done | SessionState::Idle, _) => {
+        (SessionState::Done | SessionState::Idle | SessionState::Asking, _) => {
             v.last_reply.as_deref().map(|r| crew::one_line(r, 140))
         }
         _ => v.current_tool.as_ref().map(|t| format!("● {t}")),
     };
-    let question = (v.state == SessionState::Done)
-        .then_some(v.last_reply.as_deref())
-        .flatten()
-        .and_then(|reply| {
-            let text = crew::question_in(reply)?;
-            let options = crew::options_in(reply, &text);
-            Some(ItemQuestion { text, options })
+    let question = v
+        .asked
+        .as_ref()
+        .filter(|_| v.state == SessionState::Asking)
+        .map(|a| ItemQuestion {
+            text: a.ask.clone(),
+            options: a.options.clone(),
         });
     Item {
         kind: ItemKind::Session,
@@ -100,6 +100,13 @@ fn session_item(
         question: question.filter(|_| !waiting),
         background: v.background.filter(|_| waiting),
     }
+}
+
+/// `v` as the overview shows it now, today's.
+#[cfg(test)]
+pub(crate) fn session_item_of(v: &SessionView) -> Item {
+    let now = Utc::now();
+    session_item(v, None, now, now - Duration::days(1), DEFAULT_QUIET_MINUTES)
 }
 
 fn text_of(detail: Option<&Value>, key: &str) -> Option<String> {

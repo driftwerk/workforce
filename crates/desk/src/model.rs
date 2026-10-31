@@ -41,6 +41,7 @@ text_enum!(SessionState {
     Starting => "starting",
     Working => "working",
     Blocked => "blocked",
+    Asking => "asking",
     Done => "done",
     Idle => "idle",
     Interrupted => "interrupted",
@@ -53,7 +54,7 @@ impl SessionState {
     pub fn is_running(self) -> bool {
         matches!(
             self,
-            Self::Starting | Self::Working | Self::Blocked | Self::Done | Self::Idle
+            Self::Starting | Self::Working | Self::Blocked | Self::Asking | Self::Done | Self::Idle
         )
     }
 
@@ -62,7 +63,7 @@ impl SessionState {
     pub fn after_loss(self) -> Self {
         match self {
             Self::Starting | Self::Working | Self::Blocked => Self::Interrupted,
-            Self::Done | Self::Idle => Self::Stopped,
+            Self::Asking | Self::Done | Self::Idle => Self::Stopped,
             other => other,
         }
     }
@@ -90,6 +91,8 @@ pub struct SessionRecord {
     pub terminal_id: Option<Uuid>,
     /// What the person calls it in Desk, when they renamed it.
     pub display_name: Option<String>,
+    /// While it is asking: what, and why Desk read it so.
+    pub asked: Option<crate::asking::Asked>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -134,17 +137,27 @@ pub struct SessionView {
     pub group: Option<GroupRef>,
     /// Work it started that still runs: while it is done, it waits on it.
     pub background: Option<crate::floor::Background>,
+    /// While it is asking: what, and why Desk read it so.
+    pub asked: Option<crate::asking::Asked>,
     /// How many prompts the person has given it while it ran here, so the
     /// same words said again are told from none.
     #[serde(skip)]
     pub prompts: u64,
+    /// Its turn was ended from Desk, not finished.
+    #[serde(skip)]
+    pub interrupted: bool,
+    /// The hub's model is reading whether its turn's reply asks the person:
+    /// the turn isn't over until it says.
+    #[serde(skip)]
+    pub reading: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
 
 impl SessionView {
     /// What it waits on of its own work while its turn is done; none while
-    /// it works.
+    /// it works, or while it asks the person something (asking beats
+    /// background: it needs them either way).
     pub fn waiting_on(&self) -> u32 {
         match (self.state, self.background) {
             (SessionState::Done, Some(b)) => b.count,
@@ -210,7 +223,10 @@ impl SessionView {
             display_name: r.display_name.clone(),
             group: None,
             background: None,
+            asked: r.asked.clone().filter(|_| r.state == SessionState::Asking),
             prompts: 0,
+            interrupted: false,
+            reading: false,
             created_at: r.created_at,
             updated_at: r.updated_at,
         }
@@ -330,6 +346,7 @@ mod tests {
             SessionState::Interrupted
         );
         assert_eq!(SessionState::Done.after_loss(), SessionState::Stopped);
+        assert_eq!(SessionState::Asking.after_loss(), SessionState::Stopped);
         assert_eq!(SessionState::Idle.after_loss(), SessionState::Stopped);
         assert_eq!(SessionState::Closed.after_loss(), SessionState::Closed);
     }
@@ -340,6 +357,7 @@ mod tests {
             SessionState::Starting,
             SessionState::Working,
             SessionState::Blocked,
+            SessionState::Asking,
             SessionState::Done,
             SessionState::Idle,
             SessionState::Interrupted,

@@ -11,7 +11,7 @@
 //! summaries = { morning = "09:00", evening = "" }
 //! max_checkins_per_hour = 6
 //! max_checkins_per_day = 100
-//! act = { nudge = true, resume_restart = true, read_only_approvals = false, hand_out_work = false }
+//! act = { nudge = true, resume_restart = true, read_only_approvals = false, hand_out_work = false, interrupt = false }
 //! ```
 //!
 //! Check-ins are spent from a rolling hour, `max_checkins_per_day` the
@@ -84,6 +84,8 @@ pub struct Act {
     pub resume_restart: bool,
     pub read_only_approvals: bool,
     pub hand_out_work: bool,
+    /// Ending a session's turn (Esc in its terminal).
+    pub interrupt: bool,
 }
 
 /// An agent's `[oversight]`, every default filled in.
@@ -137,6 +139,7 @@ impl Default for Oversight {
                 resume_restart: true,
                 read_only_approvals: false,
                 hand_out_work: false,
+                interrupt: false,
             },
         }
     }
@@ -338,6 +341,12 @@ impl Oversight {
                     d.act.hand_out_work,
                     "handing out work without asking",
                 )?,
+                interrupt: switch(
+                    act,
+                    "interrupt",
+                    d.act.interrupt,
+                    "interrupting a session without asking",
+                )?,
             },
         })
     }
@@ -399,6 +408,16 @@ mod tests {
         assert_eq!(inline.summaries.morning, None);
         assert_eq!(inline.summaries.evening, Some((18, 30)));
         assert!(inline.act.read_only_approvals && inline.act.nudge);
+        assert!(
+            !inline.act.interrupt,
+            "interrupting is the person's until they say"
+        );
+        let interrupts =
+            parse("[oversight]\nenabled = true\n[oversight.act]\ninterrupt = true\n").unwrap();
+        assert!(interrupts.act.interrupt);
+        assert!(parse("[oversight]\nact = { interrupt = \"yes\" }\n")
+            .unwrap_err()
+            .contains("interrupting a session without asking"));
     }
 
     #[test]

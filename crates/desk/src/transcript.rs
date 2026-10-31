@@ -7,6 +7,8 @@ use std::path::Path;
 
 use serde_json::Value;
 
+use crate::asking::Denied;
+
 const TAIL_BYTES: u64 = 512 * 1024;
 const REPLY_MAX: usize = 600;
 
@@ -15,9 +17,13 @@ pub struct Tail {
     pub title: Option<String>,
     pub last_prompt: Option<String>,
     pub last_reply: Option<String>,
+    /// The last reply whole, for reading whether it asks the person
+    /// something.
+    pub said: Option<String>,
 }
 
-pub fn read_tail(path: &Path) -> std::io::Result<Tail> {
+/// The whole lines of the end of a transcript.
+fn tail_lines(path: &Path) -> std::io::Result<String> {
     let mut file = std::fs::File::open(path)?;
     let len = file.metadata()?.len();
     let start = len.saturating_sub(TAIL_BYTES);
@@ -26,10 +32,23 @@ pub fn read_tail(path: &Path) -> std::io::Result<Tail> {
     file.take(TAIL_BYTES).read_to_end(&mut raw)?;
     let buf = String::from_utf8_lossy(&raw);
     // Starting mid-file means the first line is partial.
-    let lines = buf.lines().skip(usize::from(start > 0));
-    Ok(lines
+    Ok(buf
+        .lines()
+        .skip(usize::from(start > 0))
+        .collect::<Vec<_>>()
+        .join("\n"))
+}
+
+pub fn read_tail(path: &Path) -> std::io::Result<Tail> {
+    Ok(tail_lines(path)?
+        .lines()
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
         .fold(Tail::default(), |tail, v| absorb(tail, &v)))
+}
+
+/// What auto mode refused in the turn a Claude Code transcript ends on.
+pub fn denials(path: &Path) -> std::io::Result<Vec<Denied>> {
+    Ok(crate::asking::denials_in(tail_lines(path)?.lines()))
 }
 
 fn absorb(mut tail: Tail, v: &Value) -> Tail {
@@ -54,7 +73,9 @@ fn absorb(mut tail: Tail, v: &Value) -> Tail {
                 .filter_map(|b| b.get("text").and_then(Value::as_str))
                 .collect();
             if !text.is_empty() {
-                tail.last_reply = Some(clip(&text.join("\n")));
+                let said = text.join("\n");
+                tail.last_reply = Some(clip(&said));
+                tail.said = Some(said);
             }
         }
         _ => {}
@@ -65,16 +86,8 @@ fn absorb(mut tail: Tail, v: &Value) -> Tail {
 /// The same for a Codex rollout: the last prompt the person typed and the
 /// last thing Codex said when a turn completed.
 pub fn read_codex_tail(path: &Path) -> std::io::Result<Tail> {
-    let mut file = std::fs::File::open(path)?;
-    let len = file.metadata()?.len();
-    let start = len.saturating_sub(TAIL_BYTES);
-    file.seek(SeekFrom::Start(start))?;
-    let mut raw = Vec::new();
-    file.take(TAIL_BYTES).read_to_end(&mut raw)?;
-    let buf = String::from_utf8_lossy(&raw);
-    Ok(buf
+    Ok(tail_lines(path)?
         .lines()
-        .skip(usize::from(start > 0))
         .filter_map(|l| serde_json::from_str::<Value>(l).ok())
         .fold(Tail::default(), |mut tail, v| {
             let payload = &v["payload"];
@@ -85,6 +98,7 @@ pub fn read_codex_tail(path: &Path) -> std::io::Result<Tail> {
                         .filter(|m| !m.trim().is_empty())
                     {
                         tail.last_reply = Some(clip(m));
+                        tail.said = Some(m.to_string());
                     }
                 }
                 (Some("response_item"), Some("message")) if payload["role"] == "user" => {
@@ -139,6 +153,7 @@ mod tests {
                 title: Some("Auth race fix".into()),
                 last_prompt: Some("now open a PR".into()),
                 last_reply: Some("Done, tests pass.".into()),
+                said: Some("Done, tests pass.".into()),
             }
         );
     }
