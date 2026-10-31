@@ -17,7 +17,8 @@ use workforce_agent::rollover::CARRYOVER_PREFIX;
 use workforce_common::channels::{is_desk_conversation, DESK_CHANNEL};
 use workforce_common::session::{MessageRole, SessionStore, TranscriptEntry};
 use workforce_desk::{
-    Active, Author, Close, Closed, ConversationError, Conversations, Cursor, Page, Said, Speaker,
+    Active, Author, Close, Closed, ConversationError, ConversationRead, Conversations, Cursor,
+    Page, PutRead, Said, Speaker,
 };
 
 use crate::desk_surface::shown;
@@ -399,27 +400,86 @@ impl Conversations for HubConversations {
             .map(|copied| Closed { copied })
             .map_err(|e| ConversationError::Internal(format!("{e:#}")))
     }
+
+    /// The point is the caller's own, so no one moves another's; every
+    /// other Desk of theirs is told it moved.
+    async fn put_read(
+        &self,
+        headers: &HeaderMap,
+        token: Option<&str>,
+        agent: &str,
+        put: PutRead,
+    ) -> Result<ConversationRead, ConversationError> {
+        let owner = self.person(headers, token).await?;
+        let service = self.agent(agent)?;
+        if !is_desk_conversation(&put.channel) {
+            return Err(ConversationError::Invalid(format!(
+                "{:?} is not a Desk conversation",
+                put.channel
+            )));
+        }
+        let store = service.sessions.as_ref();
+        let unkept = |e: eyre::Report| ConversationError::Unavailable(format!("{e:#}"));
+        let point = workforce_common::channels::desk::ReadPoint {
+            at: put.at,
+            message: put.message,
+        };
+        let moved = store
+            .put_desk_read(&owner, &put.channel, &point, put.mark)
+            .map_err(unkept)?;
+        if moved.is_some() {
+            if let Some(push) = crate::session_push::installed() {
+                push.read_changed(&owner, agent, &put.channel).await;
+            }
+        }
+        store
+            .desk_read(&owner, &put.channel)
+            .map_err(unkept)?
+            .map(|p| ConversationRead::of(&p))
+            .ok_or_else(|| ConversationError::Internal("the read point was not kept".into()))
+    }
 }
 
 /// The Desk conversations `owner` holds with `agent` in `store` whose head
-/// changed after `since`.
+/// changed after `since`, and their DM whenever it has something unread, so
+/// a Desk that starts cold gets every count. The DM says how far it is read
+/// on a hub that keeps read points; a count that can't be read leaves it
+/// listed as before.
 fn active_of(
     store: &dyn SessionStore,
     agent: &str,
     owner: &str,
     since: Option<DateTime<Utc>>,
 ) -> eyre::Result<Vec<Active>> {
-    Ok(store
+    let mut active = Vec::new();
+    for s in store
         .list_for_owner_on(owner, DESK_CHANNEL, ACTIVE_SEARCHED)?
         .into_iter()
-        .take_while(|s| since.is_none_or(|since| s.updated_at > since))
         .filter(|s| is_desk_conversation(&s.channel) && !s.is_sealed())
-        .map(|s| Active {
-            agent_id: agent.to_string(),
-            channel: s.channel,
-            updated_at: s.updated_at,
-        })
-        .collect())
+    {
+        let changed = since.is_none_or(|since| s.updated_at > since);
+        let (read, unread) = match s.channel == DESK_CHANNEL {
+            true => match crate::desk_reads::dm_unread(store, agent, owner) {
+                Ok(Some((read, unread))) => (read, Some(unread)),
+                Ok(None) => (None, None),
+                Err(e) => {
+                    tracing::warn!(agent, error = %e, "counting a DM's unread failed");
+                    (None, None)
+                }
+            },
+            false => (None, None),
+        };
+        if changed || unread.as_ref().is_some_and(|u| u.count > 0) {
+            active.push(Active {
+                agent_id: agent.to_string(),
+                channel: s.channel,
+                updated_at: s.updated_at,
+                read,
+                unread,
+            });
+        }
+    }
+    Ok(active)
 }
 
 #[cfg(test)]
@@ -601,6 +661,65 @@ mod tests {
 
     /// The hub's own store: pages walk back the same whether the messages
     /// are in the archive yet or only in the session.
+    /// The DM's listing says what is unread after the person's point, and
+    /// once they read it, nothing; a hub whose sessions keep no points says
+    /// neither, and a room's conversation never.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_dm_is_listed_with_its_unread_until_its_point_passes_it() {
+        use workforce_common::channels::desk::{Mark, ReadPoint};
+        use workforce_common::session_postgres::PostgresSessionStore;
+        workforce_postgres::test_support::with_test_pool(
+            PostgresSessionStore::build_pool,
+            |pool| async move {
+                let store = PostgresSessionStore::with_pool(pool, "scout")
+                    .await
+                    .expect("store");
+                assert!(store.desk_read_floor(ME).unwrap().is_some());
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                exchange(store.as_ref(), 0);
+                exchange(store.as_ref(), 1);
+                let listed = active_of(store.as_ref(), "scout", ME, None).unwrap();
+                let dm = listed.iter().find(|a| a.channel == DESK_CHANNEL).unwrap();
+                let unread = dm.unread.clone().unwrap();
+                assert_eq!(
+                    (unread.count, unread.for_you, dm.read.clone()),
+                    (2, 2, None)
+                );
+                let last = unread.last.unwrap();
+                store
+                    .put_desk_read(
+                        ME,
+                        DESK_CHANNEL,
+                        &ReadPoint {
+                            at: last.at,
+                            message: last.message_id.clone(),
+                        },
+                        Mark::Advance,
+                    )
+                    .unwrap();
+                let later = Utc::now();
+                let listed = active_of(store.as_ref(), "scout", ME, Some(later)).unwrap();
+                assert!(listed.is_empty(), "read, and unchanged since: not listed");
+                let listed = active_of(store.as_ref(), "scout", ME, None).unwrap();
+                let dm = &listed[0];
+                assert_eq!(dm.unread.as_ref().unwrap().count, 0);
+                assert_eq!(dm.read.as_ref().unwrap().message_id, last.message_id);
+                assert_eq!(
+                    serde_json::to_value(dm).unwrap()["unread"]["last"]["message_id"],
+                    serde_json::json!(last.message_id)
+                );
+            },
+        )
+        .await;
+        let memory = InMemorySessionStore::new();
+        exchange(&memory, 0);
+        let listed = active_of(&memory, "scout", ME, None).unwrap();
+        assert_eq!(
+            (listed[0].read.clone(), listed[0].unread.clone()),
+            (None, None)
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn on_postgres_pages_walk_back_from_the_archive_or_the_live_session() {
         use workforce_common::session_postgres::PostgresSessionStore;

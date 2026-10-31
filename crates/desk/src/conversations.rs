@@ -19,7 +19,7 @@ use axum::{Json, Router};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use workforce_core::desk::{DeskMark, DESK_CHANNEL};
+use workforce_core::desk::{DeskMark, Mark, ReadPoint, DESK_CHANNEL};
 
 /// The most messages one page holds, and how many a page holds unasked.
 pub const PAGE_MAX: usize = 200;
@@ -117,12 +117,62 @@ pub enum Cursor<'a> {
     After(&'a str),
 }
 
-/// A conversation of the caller's that changed since they last looked.
+/// A conversation of the caller's that changed since they last looked, or
+/// has something unread. A DM says how far it is read, and what is unread
+/// after that, on a hub that keeps read points.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Active {
     pub agent_id: String,
     pub channel: String,
     pub updated_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read: Option<ConversationRead>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unread: Option<ConversationUnread>,
+}
+
+/// How far a person has read a conversation: through the message at `at`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConversationRead {
+    pub at: DateTime<Utc>,
+    pub message_id: Option<String>,
+}
+
+impl ConversationRead {
+    pub fn of(point: &ReadPoint) -> Self {
+        Self {
+            at: point.at,
+            message_id: point.message.clone(),
+        }
+    }
+}
+
+/// What is unread in a DM after its point: the agent's messages, of them
+/// those for you (a notice is only new), the earliest, and the agent's
+/// newest message, which marking it read moves to. `capped` when the count
+/// stopped before reaching the point.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct ConversationUnread {
+    pub count: i64,
+    pub for_you: i64,
+    pub first: Option<String>,
+    pub last: Option<ConversationRead>,
+    pub capped: bool,
+}
+
+/// A read written to a conversation's point.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct PutRead {
+    #[serde(default = "dm")]
+    pub channel: String,
+    pub at: DateTime<Utc>,
+    #[serde(default)]
+    pub message: Option<String>,
+    pub mark: Mark,
+}
+
+fn dm() -> String {
+    DESK_CHANNEL.to_string()
 }
 
 /// A room's conversation to close: the room is gone, and the ids of its
@@ -218,6 +268,20 @@ pub trait Conversations: Send + Sync {
         agent: &str,
         close: Close,
     ) -> Result<Closed, ConversationError>;
+
+    /// Moves the caller's point in their conversation with `agent`, and
+    /// answers it as it stands.
+    async fn put_read(
+        &self,
+        _headers: &HeaderMap,
+        _token: Option<&str>,
+        _agent: &str,
+        _put: PutRead,
+    ) -> Result<ConversationRead, ConversationError> {
+        Err(ConversationError::Unavailable(
+            "this hub keeps no read points".into(),
+        ))
+    }
 }
 
 #[derive(Deserialize)]
@@ -291,12 +355,29 @@ async fn close(
         .into_response()
 }
 
+async fn put_read(
+    State(c): State<Arc<dyn Conversations>>,
+    headers: HeaderMap,
+    Path(agent): Path<String>,
+    Query(q): Query<TokenQuery>,
+    Json(body): Json<PutRead>,
+) -> Response {
+    c.put_read(&headers, q.token.as_deref(), &agent, body)
+        .await
+        .map(|read| Json(json!({ "read": read })))
+        .into_response()
+}
+
 /// The Desk conversation routes on `conversations`.
 pub fn router(conversations: Arc<dyn Conversations>) -> Router {
     Router::new()
         .route("/api/desk/conversations", get(active))
         .route("/api/desk/conversations/{agent}", get(conversation))
         .route("/api/desk/conversations/{agent}/close", post(close))
+        .route(
+            "/api/desk/conversations/{agent}/read",
+            axum::routing::put(put_read),
+        )
         .with_state(conversations)
 }
 
@@ -385,6 +466,8 @@ mod tests {
             self.check(headers, token)?;
             self.0.lock().unwrap().push(Ask::Active(since));
             Ok(vec![Active {
+                read: None,
+                unread: None,
                 agent_id: "scout".into(),
                 channel: "desk".into(),
                 updated_at: "2026-10-28T09:00:00Z".parse().unwrap(),

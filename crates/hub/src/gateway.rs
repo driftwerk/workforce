@@ -1446,10 +1446,13 @@ const DESK_ONLY_FRAMES: &[&str] = &[
 pub(crate) fn desk_features(of_a_person: bool) -> Vec<String> {
     let deliveries = cfg!(feature = "postgres") && of_a_person;
     let signals = deliveries.then(floor_signals).into_iter().flatten();
+    let reads = (deliveries && crate::session_store_factory::keeps_desk_reads())
+        .then(|| workforce_common::channels::desk::DeskSignal::Read.feature());
     [DESK_PLACE, DESK_STREAM]
         .into_iter()
         .chain(deliveries.then_some(DESK_DELIVERIES))
         .chain(signals)
+        .chain(reads)
         .map(str::to_string)
         .collect()
 }

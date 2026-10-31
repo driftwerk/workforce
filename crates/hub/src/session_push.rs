@@ -39,6 +39,13 @@ enum Relayed {
         signal: DeskSignal,
         owner: Option<String>,
     },
+    /// How far `owner` has read their conversation with `agent_id` on
+    /// `channel` moved.
+    ReadChanged {
+        owner: String,
+        agent_id: String,
+        channel: String,
+    },
 }
 
 impl Relayed {
@@ -66,6 +73,11 @@ impl Relayed {
             Self::Signal { signal, owner } => {
                 BroadcastMessage::desk_signal(signal, owner.as_deref())
             }
+            Self::ReadChanged {
+                owner,
+                agent_id,
+                channel,
+            } => BroadcastMessage::desk_read_changed(&owner, &agent_id, &channel),
         }
     }
 }
@@ -156,6 +168,17 @@ impl SessionPush {
         self.relay(Relayed::Signal {
             signal,
             owner: owner.map(str::to_string),
+        })
+        .await;
+    }
+
+    /// Tell every Desk hub link of `owner`'s, on every replica, that how far
+    /// they have read their conversation with `agent` on `channel` moved.
+    pub async fn read_changed(&self, owner: &str, agent: &str, channel: &str) {
+        self.relay(Relayed::ReadChanged {
+            owner: owner.to_string(),
+            agent_id: agent.to_string(),
+            channel: channel.to_string(),
         })
         .await;
     }

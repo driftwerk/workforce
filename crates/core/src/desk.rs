@@ -511,6 +511,9 @@ pub struct DeskDelivered {
 pub enum DeskSignal {
     Floor,
     Usage,
+    /// How far the person has read one of their conversations moved; its
+    /// frame names the conversation.
+    Read,
 }
 
 impl DeskSignal {
@@ -519,6 +522,7 @@ impl DeskSignal {
         match self {
             Self::Floor => "floor_changed",
             Self::Usage => "usage_changed",
+            Self::Read => "read_changed",
         }
     }
 
@@ -527,12 +531,13 @@ impl DeskSignal {
         match self {
             Self::Floor => "desk.floor",
             Self::Usage => "desk.usage",
+            Self::Read => "desk.reads",
         }
     }
 
     /// The signal a frame is, if it is one.
     pub fn of_frame(frame: &str) -> Option<Self> {
-        [Self::Floor, Self::Usage]
+        [Self::Floor, Self::Usage, Self::Read]
             .into_iter()
             .find(|s| s.frame() == frame)
     }

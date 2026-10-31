@@ -101,6 +101,7 @@ const CLAIMS: &[(&str, &str, &str, Claim)] = &[
         "claimed_by",
         NotPersonal(INSTANCE),
     ),
+    ("common", "desk_reads", "owner", By(C::Sessions)),
     ("common", "sessions", "owner", By(C::Sessions)),
     ("common", "sessions", "turn_run_as", By(C::Sessions)),
     ("common", "sessions", "turn_bill_to", By(C::Sessions)),

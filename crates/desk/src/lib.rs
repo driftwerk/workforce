@@ -39,8 +39,8 @@ mod worktree;
 
 pub use api::{router, sessions_router, Authorize};
 pub use conversations::{
-    Active, Author, Close, Closed, ConversationError, Conversations, Cursor, Page, Said, Speaker,
-    SpeakerKind,
+    Active, Author, Close, Closed, ConversationError, ConversationRead, ConversationUnread,
+    Conversations, Cursor, Page, PutRead, Said, Speaker, SpeakerKind,
 };
 pub use crew_store::CheckIn;
 pub use providers::{AccountError, Accounts, Fields, Spec, Standing};
