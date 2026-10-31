@@ -53,6 +53,7 @@ describe("WfChart", () => {
     fireEvent.click(screen.getByRole("button", { name: "Show data" }));
     const plot = container.querySelector<HTMLElement>(".wf-chart-plot")!;
     expect(plot.hidden).toBe(true);
+    await waitFor(() => expect(container.querySelector("table")).not.toBeNull(), { timeout: 5000 });
     const headers = [...container.querySelectorAll("th")].map((th) => th.textContent ?? "");
     expect(headers.some((h) => h.includes("March")) && headers.some((h) => h.includes("April"))).toBe(true);
     expect(container.textContent).toContain("420");

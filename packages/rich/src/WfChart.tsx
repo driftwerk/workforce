@@ -4,7 +4,7 @@
 // numbers as a table, and copy or save the chart as a picture of what is on
 // screen, in the host's theme.
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
 
 import { initChart, type EChart } from "./echarts";
 import { buildOption, chartAriaLabel } from "./chartOption";
@@ -12,9 +12,13 @@ import { chartTable } from "./chartTable";
 import { useSaveFile } from "./host";
 import { readInk } from "./palette";
 import { rasterize, standaloneSvg } from "./svgExport";
+import { retryImport } from "./lazyRetry";
 import { useThemeVersion } from "./theme";
 import type { ChartSpec } from "./spec";
-import WfTable from "./WfTable";
+
+// The table is its own chunk, the one the table block loads: most readers
+// never ask for a chart's data.
+const WfTable = lazy(() => retryImport(() => import("./WfTable")));
 
 const slug = (s: string) =>
   s
@@ -120,7 +124,11 @@ export default function WfChart({ spec }: { spec: ChartSpec }) {
         aria-label={chartAriaLabel(spec)}
         hidden={asTable}
       />
-      {table && <WfTable spec={table} />}
+      {table && (
+        <Suspense fallback={<div className="wf-skel wf-skel-table" role="status" />}>
+          <WfTable spec={table} />
+        </Suspense>
+      )}
       <div className="wf-chart-actions">
         <button
           type="button"
