@@ -244,7 +244,7 @@ pub(crate) fn carry_delivered_files(
     session: &mut Session,
     invocations: &[workforce_agent::runner::ToolInvocation],
 ) {
-    let files = crate::desk_attachments::delivered_in(&session.agent_id, invocations);
+    let files = crate::desk_attachments::delivered_in(session, invocations);
     if files.is_empty() {
         return;
     }

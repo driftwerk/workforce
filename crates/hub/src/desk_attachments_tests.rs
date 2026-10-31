@@ -1120,3 +1120,6 @@ async fn a_desk_dms_files_ride_on_its_messages_and_are_served_to_their_reader_al
     })
     .await;
 }
+
+#[path = "desk_charts_tests.rs"]
+mod charts;

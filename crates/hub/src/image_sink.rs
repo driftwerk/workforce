@@ -21,6 +21,10 @@
 //!   - **Desk, unattended** (a job, workflow or check made from Desk): the
 //!     file is delivered into that Desk conversation as a message of its
 //!     own.
+//!
+//! Off Slack, a file staged with what it was drawn from (a chart and its
+//! spec) is delivered as that instead where the conversation's reader
+//! draws it itself (see [`crate::desk_attachments::shown_to`]).
 
 use std::sync::Arc;
 
@@ -32,13 +36,13 @@ use tracing::{debug, info};
 use workforce_agent::artifacts::store::global_store;
 use workforce_agent::artifacts::types::{ArtifactBody, ArtifactId};
 use workforce_agent::runner::{ProgressEvent, SessionContext};
-use workforce_agent::tools::image_gen::ImageSink;
+use workforce_agent::tools::image_gen::{GeneratedImageRef, ImageSink};
 use workforce_common::channels::desk::DeskScope;
 use workforce_common::channels::{ChannelHint, SurfaceRegistry};
 use workforce_common::session::SessionStore;
 
 use crate::broadcast::BroadcastMessage;
-use crate::desk_attachments::{into_desk_conversation, DeskConversation, StagedFile};
+use crate::desk_attachments::{into_desk_conversation, shown_to, DeskConversation, StagedFile};
 
 pub struct HubImageSink {
     surface_registry: Arc<RwLock<SurfaceRegistry>>,
@@ -125,6 +129,34 @@ pub(crate) fn delivered_name(filename: Option<&str>, media_type: &str) -> String
 
 #[async_trait]
 impl ImageSink for HubImageSink {
+    /// `file`, or what it was drawn from where the conversation it lands in
+    /// draws that itself (see [`shown_to`]): the session a turn answers in,
+    /// or the Desk conversation a run nobody attends delivers into. A Slack
+    /// turn is always sent the file.
+    async fn deliver_file(&self, ctx: &SessionContext, file: &GeneratedImageRef) -> Result<()> {
+        let on_slack = ctx.channel_id.as_deref().is_some_and(|c| !c.is_empty());
+        let reader = match (&self.sessions, file.spec.is_some() && !on_slack) {
+            (Some(sessions), true) => match ctx.desk.as_ref().filter(|scope| !scope.attended) {
+                Some(scope) => sessions.find(&scope.target.channel, &scope.owner),
+                None => ctx.id.as_deref().map_or(Ok(None), |id| sessions.get(id)),
+            }
+            .unwrap_or_else(|e| {
+                debug!(error = %e, "the conversation a file lands in is unknown; sending the file");
+                None
+            }),
+            _ => None,
+        };
+        let shown = shown_to(reader.as_ref(), file);
+        self.deliver(
+            ctx,
+            &shown.artifact_id,
+            &shown.media_type,
+            shown.filename.as_deref(),
+            shown.caption.as_deref(),
+        )
+        .await
+    }
+
     async fn deliver(
         &self,
         ctx: &SessionContext,

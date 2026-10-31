@@ -22,6 +22,11 @@ pub struct RichFeatures {
     pub maps: bool,
     pub diagrams: bool,
     pub images: bool,
+    /// The reader draws a chart the `chart` tool made from its spec, shown
+    /// in place of the picture. Only a client declares it: it is not a
+    /// fence, so it is never taught, and an agent's `[rich]` cannot set it.
+    #[serde(skip)]
+    pub chart_specs: bool,
 }
 
 impl RichFeatures {
@@ -33,6 +38,7 @@ impl RichFeatures {
         maps: true,
         diagrams: true,
         images: true,
+        chart_specs: false,
     };
 
     /// The features named in `names` — flag names such as `tables`, as a
@@ -69,13 +75,18 @@ impl RichFeatures {
             maps: self.maps && other.maps,
             diagrams: self.diagrams && other.diagrams,
             images: self.images && other.images,
+            chart_specs: self.chart_specs && other.chart_specs,
         }
     }
 
     /// The system-prompt block teaching these features, or `None` when they
     /// are all off.
     pub fn system_block(self) -> Option<String> {
-        if self.is_empty() {
+        let fences = Self {
+            chart_specs: false,
+            ..self
+        };
+        if fences.is_empty() {
             return None;
         }
         let mut block = String::from(HEADER);
@@ -94,7 +105,7 @@ impl RichFeatures {
         Some(block)
     }
 
-    fn flags(self) -> [(&'static str, bool); 6] {
+    fn flags(self) -> [(&'static str, bool); 7] {
         [
             ("tables", self.tables),
             ("charts", self.charts),
@@ -102,6 +113,7 @@ impl RichFeatures {
             ("maps", self.maps),
             ("diagrams", self.diagrams),
             ("images", self.images),
+            ("chart_specs", self.chart_specs),
         ]
     }
 
@@ -113,6 +125,7 @@ impl RichFeatures {
             "maps" => Some(&mut self.maps),
             "diagrams" => Some(&mut self.diagrams),
             "images" => Some(&mut self.images),
+            "chart_specs" => Some(&mut self.chart_specs),
             _ => None,
         }
     }
@@ -451,6 +464,27 @@ mod tests {
         );
         assert!(agent.intersect(RichFeatures::default()).is_empty());
         assert_eq!(RichFeatures::ALL.intersect(client), client);
+    }
+
+    /// A reader that draws chart specs says so with the blocks it renders;
+    /// the session keeps it, but it teaches nothing and no agent can set it.
+    #[test]
+    fn chart_specs_is_a_readers_flag_never_a_fence() {
+        let desk = RichFeatures::from_names(["tables,charts,chart_specs"]);
+        assert!(desk.chart_specs && desk.charts);
+        assert_eq!(desk.names(), ["tables", "charts", "chart_specs"]);
+        assert_eq!(RichFeatures::from_names(desk.names()), desk);
+        assert_eq!(only("chart_specs").system_block(), None, "nothing to teach");
+        assert_eq!(
+            desk.system_block(),
+            RichFeatures::from_names(["tables,charts"]).system_block()
+        );
+        let config: RichFeatures = toml::from_str("chart_specs = true\ncharts = true").unwrap();
+        assert!(!config.chart_specs && config.charts);
+        assert!(
+            !RichFeatures::ALL.intersect(desk).chart_specs,
+            "an agent with every block on still never has it"
+        );
     }
 
     #[test]

@@ -126,6 +126,34 @@ pub struct GeneratedImageRef {
     /// One-line text posted with the file (Slack's `initial_comment`, the
     /// gateway message body) — a chart's takeaway, a report's title.
     pub caption: Option<String>,
+    /// What the file was drawn from, staged as a file of its own (a chart's
+    /// validated spec), for a reader that draws it itself in its place.
+    pub spec: Option<Box<GeneratedImageRef>>,
+}
+
+/// Marker key naming, on a staged file's marker, the file it was drawn from.
+pub const SPEC_KEY: &str = "spec";
+
+fn generated_file(e: &Value) -> Option<GeneratedImageRef> {
+    let id = ArtifactId::parse(e.get("artifact_id")?.as_str()?).ok()?;
+    let media_type = e
+        .get("media_type")
+        .and_then(Value::as_str)
+        .unwrap_or("image/png")
+        .to_string();
+    let text = |key: &str| {
+        e.get(key)
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    Some(GeneratedImageRef {
+        artifact_id: id,
+        media_type,
+        filename: text("filename"),
+        caption: text("caption"),
+        spec: e.get(SPEC_KEY).and_then(generated_file).map(Box::new),
+    })
 }
 
 /// Extract the staged-attachment handles from a tool result's output. Returns
@@ -135,29 +163,7 @@ pub fn parse_generated_images(output: &serde_json::Value) -> Vec<GeneratedImageR
     let Some(entries) = output.get(GENERATED_IMAGES_KEY).and_then(Value::as_array) else {
         return Vec::new();
     };
-    entries
-        .iter()
-        .filter_map(|e| {
-            let id = ArtifactId::parse(e.get("artifact_id")?.as_str()?).ok()?;
-            let media_type = e
-                .get("media_type")
-                .and_then(Value::as_str)
-                .unwrap_or("image/png")
-                .to_string();
-            let text = |key: &str| {
-                e.get(key)
-                    .and_then(Value::as_str)
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_string)
-            };
-            Some(GeneratedImageRef {
-                artifact_id: id,
-                media_type,
-                filename: text("filename"),
-                caption: text("caption"),
-            })
-        })
-        .collect()
+    entries.iter().filter_map(generated_file).collect()
 }
 
 /// Delivers a generated image to the surface the current turn originates from.
@@ -183,6 +189,24 @@ pub trait ImageSink: Send + Sync {
         filename: Option<&str>,
         caption: Option<&str>,
     ) -> eyre::Result<()>;
+
+    /// Deliver `file` as its producer described it. A sink that can show a
+    /// reader what the file was drawn from (its [`GeneratedImageRef::spec`])
+    /// overrides this; every other sink delivers the file itself.
+    async fn deliver_file(
+        &self,
+        ctx: &SessionContext,
+        file: &GeneratedImageRef,
+    ) -> eyre::Result<()> {
+        self.deliver(
+            ctx,
+            &file.artifact_id,
+            &file.media_type,
+            file.filename.as_deref(),
+            file.caption.as_deref(),
+        )
+        .await
+    }
 }
 
 pub struct ImageGenerationTool {
@@ -555,6 +579,24 @@ mod tests {
             (refs[1].filename.as_deref(), refs[1].caption.as_deref()),
             (None, None)
         );
+    }
+
+    #[test]
+    fn parse_reads_the_spec_a_file_was_drawn_from() {
+        let (png, spec) = (ArtifactId::fresh(), ArtifactId::fresh());
+        let output = json!({ GENERATED_IMAGES_KEY: [
+            { "artifact_id": png.as_str(), "filename": "q3.png", SPEC_KEY: {
+                "artifact_id": spec.as_str(), "media_type": "application/vnd.workforce.chart+json",
+                "filename": "q3.json"
+            } },
+            { "artifact_id": png.as_str(), SPEC_KEY: { "artifact_id": "not-an-art-id" } },
+        ] });
+        let refs = parse_generated_images(&output);
+        let drawn = refs[0].spec.as_deref().expect("a spec");
+        assert_eq!(drawn.artifact_id, spec);
+        assert_eq!(drawn.media_type, "application/vnd.workforce.chart+json");
+        assert_eq!(drawn.filename.as_deref(), Some("q3.json"));
+        assert!(refs[1].spec.is_none(), "an unreadable spec is no spec");
     }
 
     #[test]
