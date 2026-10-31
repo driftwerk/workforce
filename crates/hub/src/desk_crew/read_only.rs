@@ -28,6 +28,9 @@ struct Flags {
     /// Short flags taking a value: the next word, or the rest of the word
     /// (`-A3`, `-rnA3`).
     short_valued: &'static str,
+    /// Short flags whose value is optional, and attached when given
+    /// (`git diff -U3`): the next word is never theirs.
+    short_optional: &'static str,
     /// Long flags taking no value, by name, space-separated.
     long: &'static str,
     /// Long flags taking a value: `--name=value` or the next word.
@@ -45,6 +48,7 @@ struct Flags {
 const LS: Flags = Flags {
     short: "1aAdFhilLnRrSt",
     short_valued: "",
+    short_optional: "",
     long:
         "all almost-all human-readable recursive reverse classify directory inode dereference size",
     long_valued: "",
@@ -55,6 +59,7 @@ const LS: Flags = Flags {
 const CAT: Flags = Flags {
     short: "AbeEnstTuv",
     short_valued: "",
+    short_optional: "",
     long: "number number-nonblank show-all show-ends show-tabs squeeze-blank show-nonprinting",
     long_valued: "",
     long_optional: "",
@@ -65,6 +70,7 @@ const CAT: Flags = Flags {
 const HEAD_TAIL: Flags = Flags {
     short: "qvr",
     short_valued: "nc",
+    short_optional: "",
     long: "quiet silent verbose",
     long_valued: "lines bytes",
     long_optional: "",
@@ -74,6 +80,7 @@ const HEAD_TAIL: Flags = Flags {
 const WC: Flags = Flags {
     short: "clmwL",
     short_valued: "",
+    short_optional: "",
     long: "bytes chars lines words max-line-length",
     long_valued: "",
     long_optional: "",
@@ -83,15 +90,17 @@ const WC: Flags = Flags {
 const GREP: Flags = Flags {
     short: "rRniIlLcvwxEFGPohHsqaz",
     short_valued: "ABCemdD",
+    short_optional: "",
     long: "recursive dereference-recursive line-number ignore-case files-with-matches files-without-match count invert-match word-regexp line-regexp extended-regexp fixed-strings basic-regexp perl-regexp only-matching no-filename with-filename no-messages quiet silent text null null-data byte-offset",
-    long_valued: "include exclude exclude-dir regexp max-count after-context before-context context directories devices binary-files label",
-    long_optional: "color colour",
+    long_valued: "include exclude exclude-dir regexp max-count after-context before-context directories devices binary-files label",
+    long_optional: "context color colour",
     counts: false,
     operands: true,
 };
 const RG: Flags = Flags {
     short: "iSsnNlcvwxFUuoHhqL0.",
     short_valued: "egtTABCmMjdEr",
+    short_optional: "",
     long: "ignore-case smart-case case-sensitive line-number no-line-number files-with-matches files-without-match count count-matches invert-match word-regexp line-regexp fixed-strings multiline unrestricted only-matching hidden no-ignore no-ignore-vcs no-heading heading with-filename no-filename files type-list json vimgrep column trim quiet follow null stats no-messages binary text crlf one-file-system passthru pretty",
     long_valued: "regexp glob iglob type type-not after-context before-context context max-count max-depth max-filesize max-columns encoding threads sort sortr replace",
     long_optional: "color",
@@ -101,6 +110,7 @@ const RG: Flags = Flags {
 const PWD: Flags = Flags {
     short: "LP",
     short_valued: "",
+    short_optional: "",
     long: "",
     long_valued: "",
     long_optional: "",
@@ -111,6 +121,7 @@ const PWD: Flags = Flags {
 const TREE: Flags = Flags {
     short: "adfiFpsughDCnNJXQrt",
     short_valued: "LIP",
+    short_optional: "",
     long: "noreport dirsfirst gitignore du prune matchdirs ignore-case",
     long_valued: "filelimit charset sort timefmt",
     long_optional: "",
@@ -122,6 +133,7 @@ const TREE: Flags = Flags {
 const FILE: Flags = Flags {
     short: "bhiLkNnrs",
     short_valued: "",
+    short_optional: "",
     long: "brief mime mime-type mime-encoding dereference no-dereference keep-going no-pad raw special-files",
     long_valued: "",
     long_optional: "",
@@ -131,6 +143,7 @@ const FILE: Flags = Flags {
 const STAT: Flags = Flags {
     short: "LtxlsrqnF",
     short_valued: "c",
+    short_optional: "",
     long: "dereference terse file-system",
     long_valued: "format printf",
     long_optional: "",
@@ -140,6 +153,7 @@ const STAT: Flags = Flags {
 const DU: Flags = Flags {
     short: "shkmcax",
     short_valued: "dB",
+    short_optional: "",
     long: "summarize human-readable total all one-file-system apparent-size bytes si",
     long_valued: "max-depth block-size exclude threshold",
     long_optional: "",
@@ -149,6 +163,7 @@ const DU: Flags = Flags {
 const DIFF: Flags = Flags {
     short: "ucrNqiwbBysaEpTt",
     short_valued: "UCxFIW",
+    short_optional: "",
     long: "recursive new-file brief ignore-case ignore-all-space ignore-space-change ignore-blank-lines side-by-side report-identical-files text expand-tabs minimal show-c-function suppress-common-lines strip-trailing-cr ignore-tab-expansion",
     long_valued: "exclude ignore-matching-lines show-function-line width label",
     long_optional: "unified context color",
@@ -179,6 +194,7 @@ fn read_only_program(name: &str) -> Option<&'static Flags> {
 const GIT_STATUS: Flags = Flags {
     short: "sbvz",
     short_valued: "",
+    short_optional: "",
     long: "short branch long verbose show-stash no-renames ahead-behind no-ahead-behind",
     long_valued: "",
     long_optional: "porcelain untracked-files ignored ignore-submodules column",
@@ -189,7 +205,8 @@ const GIT_STATUS: Flags = Flags {
 /// program, and never into a file (`--output`).
 const GIT_DIFF: Flags = Flags {
     short: "pusRwbaz",
-    short_valued: "U",
+    short_valued: "",
+    short_optional: "U",
     long: "stat shortstat numstat name-only name-status patch no-patch raw cached staged no-color ignore-all-space ignore-space-change ignore-blank-lines no-renames summary check minimal patience histogram full-index binary no-ext-diff no-textconv text merge-base exit-code quiet compact-summary no-prefix",
     long_valued: "diff-filter inter-hunk-context diff-algorithm stat-width",
     long_optional: "unified color word-diff dirstat relative abbrev",
@@ -200,10 +217,11 @@ const GIT_DIFF: Flags = Flags {
 /// limits as `git diff`.
 const GIT_LOG: Flags = Flags {
     short: "pusRwbaz",
-    short_valued: "USGn",
+    short_valued: "SGn",
+    short_optional: "U",
     long: "oneline graph all reverse first-parent merges no-merges abbrev-commit no-abbrev-commit follow date-order topo-order author-date-order left-right boundary source full-history no-decorate stat shortstat numstat name-only name-status patch no-patch no-color summary no-renames no-ext-diff no-textconv mailmap use-mailmap children parents ignore-all-space quiet",
-    long_valued: "max-count skip since after until before author committer grep min-parents max-parents diff-filter",
-    long_optional: "decorate color pretty format abbrev date branches tags remotes unified relative",
+    long_valued: "max-count skip since after until before author committer grep diff-filter",
+    long_optional: "min-parents max-parents decorate color pretty format abbrev date branches tags remotes unified relative",
     counts: true,
     operands: true,
 };
@@ -212,6 +230,7 @@ const GIT_LOG: Flags = Flags {
 const GIT_BRANCH: Flags = Flags {
     short: "arv",
     short_valued: "",
+    short_optional: "",
     long: "list all remotes verbose show-current no-color",
     long_valued: "",
     long_optional: "",
@@ -221,6 +240,7 @@ const GIT_BRANCH: Flags = Flags {
 const GIT_REV_PARSE: Flags = Flags {
     short: "q",
     short_valued: "",
+    short_optional: "",
     long: "show-toplevel show-prefix show-cdup git-dir git-common-dir absolute-git-dir is-inside-work-tree is-inside-git-dir is-bare-repository verify quiet symbolic symbolic-full-name all branches tags remotes",
     long_valued: "",
     long_optional: "abbrev-ref short",
@@ -230,6 +250,7 @@ const GIT_REV_PARSE: Flags = Flags {
 const GIT_LS_FILES: Flags = Flags {
     short: "cdmoskuvfzt",
     short_valued: "x",
+    short_optional: "",
     long: "cached deleted modified others ignored stage killed unmerged full-name error-unmatch exclude-standard directory no-empty-directory eol deduplicate",
     long_valued: "exclude",
     long_optional: "",
@@ -239,6 +260,7 @@ const GIT_LS_FILES: Flags = Flags {
 const GIT_BLAME: Flags = Flags {
     short: "lstfnwep",
     short_valued: "L",
+    short_optional: "",
     long: "porcelain line-porcelain incremental show-name show-number show-email root show-stats",
     long_valued: "date since",
     long_optional: "",
@@ -327,6 +349,9 @@ fn operands<'a>(flags: &Flags, args: &'a [String]) -> Option<Vec<&'a str>> {
                 continue;
             }
             for (at, flag) in short.char_indices() {
+                if flags.short_optional.contains(flag) {
+                    break;
+                }
                 if flags.short_valued.contains(flag) {
                     // The rest of the word is its value, or the next word is.
                     if at + flag.len_utf8() == short.len() {
@@ -354,6 +379,32 @@ fn inside(cwd: &Path, path: &str) -> bool {
     !p.is_absolute() || p.starts_with(cwd)
 }
 
+/// Whether the shell would make more of `command` than the words it splits
+/// into: a glob (`*`, `?`, `[`), a brace list (`{a,b}`), a zsh glob
+/// qualifier (`(…)`) or `=program`, a leading tilde, or a comment (`#`,
+/// which an interactive zsh doesn't take as one). Each would run words
+/// Desk never read: `{--pre=sh,.}` is a flag, `*` can match a file named
+/// `--output=x`, and bash's `.*` matches `..`. Quoted, they are the
+/// program's to read.
+fn expands(command: &str) -> bool {
+    let mut quote = None;
+    let mut word_start = true;
+    for c in command.chars() {
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => {}
+            None => match c {
+                '\'' | '"' => quote = Some(c),
+                '*' | '?' | '[' | '{' | '}' | '(' | ')' | '#' => return true,
+                '=' | '~' if word_start => return true,
+                _ => {}
+            },
+        }
+        word_start = quote.is_none() && c.is_whitespace();
+    }
+    false
+}
+
 /// Whether a session's request only reads, and only inside its folder: a
 /// read tool on paths inside it, or a command whose program, subcommand and
 /// every flag are known to only read, on operands inside it. Anything Desk
@@ -361,20 +412,28 @@ fn inside(cwd: &Path, path: &str) -> bool {
 /// doesn't know, is not.
 pub(crate) fn read_only_in(cwd: &str, pending: &PendingApproval) -> bool {
     let cwd = Path::new(cwd);
+    if !cwd.is_absolute() {
+        return false;
+    }
     let detail = pending.detail.trim();
     if detail.ends_with('…') {
         return false;
     }
     let name = pending.tool.split('(').next().unwrap_or_default().trim();
     if READ_TOOLS.contains(&name) {
-        return detail.split_whitespace().all(|w| inside(cwd, w));
+        // The one path it reads; a request that names none is not one Desk
+        // can judge.
+        return !detail.is_empty() && inside(cwd, detail);
     }
     if name != "Bash" || detail.is_empty() {
         return false;
     }
-    if detail
-        .chars()
-        .any(|c| matches!(c, ';' | '&' | '|' | '>' | '<' | '`' | '$' | '\n' | '\\'))
+    if detail.chars().any(|c| {
+        matches!(
+            c,
+            ';' | '&' | '|' | '>' | '<' | '`' | '$' | '\n' | '\r' | '\\'
+        )
+    }) || expands(detail)
     {
         return false;
     }
@@ -425,8 +484,16 @@ mod tests {
                 "rg -g '*.ts' 'fix me' src",
             ),
             (
-                "Bash(grep -rnA3 --include=*.rs TODO src)",
-                "grep -rnA3 --include=*.rs TODO src",
+                "Bash(grep -rnA3 --include='*.rs' TODO src)",
+                "grep -rnA3 --include='*.rs' TODO src",
+            ),
+            ("Bash(git diff -U5 HEAD~1)", "git diff -U5 HEAD~1"),
+            ("Bash(git log --min-parents=2)", "git log --min-parents=2"),
+            ("Bash(grep -C 2 TODO src)", "grep -C 2 TODO src"),
+            ("Bash(ls 'src/*.ts')", "ls 'src/*.ts'"),
+            (
+                "Bash(rg 'a{2,3}' \"src/[a-z]*\")",
+                "rg 'a{2,3}' \"src/[a-z]*\"",
             ),
             ("Bash(head -20 src/a.ts)", "head -20 src/a.ts"),
             ("Bash(tail -n 5 log.txt)", "tail -n 5 log.txt"),
@@ -495,5 +562,74 @@ mod tests {
             let tool = format!("Bash({detail})");
             assert!(!read_only_in(cwd, &pending(&tool, detail)), "{detail}");
         }
+    }
+
+    /// A flag whose value is optional takes none from the next word, so
+    /// that word is read as git or grep will read it: as a flag, or as a
+    /// path.
+    #[test]
+    fn an_optional_value_is_never_the_next_word() {
+        let cwd = "/Users/k/dev/web";
+        for detail in [
+            "git diff -U --output=out.txt",
+            "git log -U --output=out.txt",
+            "git show -pU --output=out.txt HEAD",
+            "git log --min-parents --output=out.txt",
+            "git log --max-parents --output out.txt",
+            "grep -e secret --context /etc/passwd",
+        ] {
+            let tool = format!("Bash({detail})");
+            assert!(!read_only_in(cwd, &pending(&tool, detail)), "{detail}");
+        }
+    }
+
+    /// What the shell expands, unquoted, makes words Desk never split: a
+    /// brace list that is a flag or a path outside, a glob that matches a
+    /// file named as a flag, or `..`, a zsh qualifier that runs code, a
+    /// comment an interactive zsh reads on.
+    #[test]
+    fn what_the_shell_would_expand_is_not_read_only() {
+        let cwd = "/Users/k/dev/web";
+        for detail in [
+            "rg -e x {--pre=sh,.}",
+            "git log {--output=out.txt,HEAD}",
+            "cat {/etc/passwd,a}",
+            "ls {..,src}",
+            "rg x *",
+            "find * -name x",
+            "grep -r secret .*",
+            "cat src/?",
+            "ls [.][.]",
+            "ls *(e:'touch x':)",
+            "cat =ls",
+            "cat ~/.ssh/id_rsa",
+            "rg x #a --pre=sh",
+            "ls src\rrm -rf x",
+        ] {
+            let tool = format!("Bash({detail})");
+            assert!(!read_only_in(cwd, &pending(&tool, detail)), "{detail}");
+        }
+    }
+
+    /// A read tool is judged by the one path it names; one that names none,
+    /// or a session whose folder Desk doesn't know, can't be judged.
+    #[test]
+    fn a_read_with_no_path_or_folder_is_not_read_only() {
+        assert!(!read_only_in(
+            "/Users/k/dev/web",
+            &pending("NotebookRead", "")
+        ));
+        assert!(!read_only_in(
+            "",
+            &pending("Read(/etc/passwd)", "/etc/passwd")
+        ));
+        assert!(!read_only_in("src", &pending("Bash(ls)", "ls")));
+        assert!(!read_only_in(
+            "/Users/k/dev/web",
+            &pending(
+                "Read(/Users/k/dev/web/a ../../../etc/passwd)",
+                "/Users/k/dev/web/a ../../../etc/passwd"
+            )
+        ));
     }
 }
