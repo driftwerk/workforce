@@ -6,8 +6,9 @@
 //!
 //! It answers to that DM as a Desk turn does: what it posts goes to Desk
 //! unless it names a platform, and a write anywhere else is held for the
-//! person, which (no one being on the turn to answer) refuses it. Its prompt
-//! is not the person's own words, so it is read at paired trust.
+//! person, which (no one being on the turn to answer) refuses it, even to a
+//! place the person always allows from their own turns. Its prompt is not
+//! the person's own words, so it is read at paired trust.
 
 use std::sync::Arc;
 
@@ -76,6 +77,7 @@ impl CrewHub {
             target: DeskTarget::of_turn(&DeskPlace::Dm, DESK_CHANNEL, None, false),
             owner: owner.to_string(),
             attended: true,
+            relayed: true,
         };
         let progress = workforce_agent::runner::with_desk(
             Some(scope),

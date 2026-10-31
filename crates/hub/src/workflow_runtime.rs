@@ -4304,6 +4304,7 @@ impl WorkflowRuntime {
                 target,
                 owner,
                 attended: false,
+                relayed: false,
             });
         let result = self
             .run_scoped(
@@ -6540,6 +6541,7 @@ impl WorkflowRuntime {
                 target,
                 owner,
                 attended: false,
+                relayed: false,
             });
         self.run_scoped(
             principal,
@@ -9059,6 +9061,7 @@ mod tests {
             Some(DeskScope {
                 target: DeskTarget::of_turn(&DeskPlace::Dm, "desk", None, false),
                 attended: false,
+                relayed: false,
                 owner: "person-1".into(),
             })
         };
@@ -9133,6 +9136,7 @@ mod tests {
                     Some(DeskScope {
                         target: target.clone(),
                         attended: true,
+                        relayed: false,
                         owner: "person-1".into(),
                     }),
                     Arc::clone(&runtime).start_workflow(

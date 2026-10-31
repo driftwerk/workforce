@@ -154,7 +154,7 @@ fn tracked(o: &Oversight, subject: &Party) -> bool {
 /// `report`, the words of sessions and agents as the crew relays them,
 /// fenced as data for the overseer to read: they choose their own words, so
 /// nothing in them is the person's instruction.
-fn reported(report: &str, from: &str) -> String {
+pub(super) fn reported(report: &str, from: &str) -> String {
     workforce_agent::security::external_content::wrap_external_content(report, from).wrapped_content
 }
 

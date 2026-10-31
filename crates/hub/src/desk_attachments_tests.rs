@@ -423,6 +423,7 @@ async fn a_desk_turn_s_file_rides_its_stream_and_an_unattended_run_s_lands_in_it
         desk: Some(DeskScope {
             target: dm.clone(),
             attended,
+            relayed: false,
             owner: person.clone(),
         }),
         ..context(session, "scout")
@@ -535,6 +536,7 @@ async fn a_file_a_workflow_run_delivers_into_desk_is_served_to_its_person() {
             desk: Some(DeskScope {
                 target: DeskTarget::of_turn(&DeskPlace::Dm, DESK_CHANNEL, None, false),
                 attended: false,
+                relayed: false,
                 owner: alice_id.clone(),
             }),
             ..context("workflow:instance-1", "scout")
@@ -713,6 +715,7 @@ async fn a_file_uploaded_to_desk_is_delivered_into_the_conversation() {
     let scope = DeskScope {
         target: DeskTarget::of_turn(&DeskPlace::Dm, DESK_CHANNEL, None, false),
         attended: true,
+        relayed: false,
         owner: person.clone(),
     };
     let surface = crate::desk_surface::DeskSurface::new(&scout);
