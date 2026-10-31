@@ -237,6 +237,8 @@ struct Inner {
     opts: Options,
     store: Arc<DeskStore>,
     env: BTreeMap<String, String>,
+    /// The shell terminals run.
+    shell: String,
     state: Mutex<State>,
     events: broadcast::Sender<DeskEvent>,
     persist: mpsc::UnboundedSender<Persist>,
@@ -423,8 +425,10 @@ impl Desk {
         let hook_port = listener.local_addr()?.port();
         let hook_base = format!("http://127.0.0.1:{hook_port}");
         let (persist, persist_rx) = mpsc::unbounded_channel();
+        let env = cli_env(&opts.env);
         let desk = Self(Arc::new(Inner {
-            env: cli_env(&opts.env),
+            shell: terminals::login_shell(&env, terminals::account_shell, |p| p.is_file()),
+            env,
             opts,
             store: Arc::clone(&store),
             state: Mutex::new(State {

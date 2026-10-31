@@ -11881,6 +11881,7 @@ dependencies = [
  "eyre",
  "futures",
  "libc",
+ "nix 0.31.3",
  "parking_lot",
  "portable-pty",
  "refinery",

@@ -23,6 +23,7 @@ use crate::claude::{self, Hook};
 use crate::holder::{Held, Holder};
 use crate::model::DeskEvent;
 use crate::model::{Approvals, Engine, Origin, SessionRecord, SessionState};
+use crate::procs;
 use crate::pty::{Exit, Pty, Spawn};
 use crate::store::DeskStore;
 
@@ -144,6 +145,32 @@ fn folder_name(cwd: &str) -> String {
         .map_or_else(|| cwd.to_string(), |n| n.to_string_lossy().into_owned())
 }
 
+/// The shell terminals run: the login environment's `SHELL`, else the
+/// account's shell in the password database, else `/bin/sh`; the first of
+/// them that is a file.
+pub(super) fn login_shell(
+    env: &BTreeMap<String, String>,
+    account_shell: impl FnOnce() -> Option<PathBuf>,
+    is_file: impl Fn(&Path) -> bool,
+) -> String {
+    env.get("SHELL")
+        .map(PathBuf::from)
+        .filter(|shell| is_file(shell))
+        .or_else(|| account_shell().filter(|shell| is_file(shell)))
+        .map_or_else(
+            || "/bin/sh".into(),
+            |shell| shell.to_string_lossy().into_owned(),
+        )
+}
+
+/// The shell the password database gives the account the hub runs as.
+pub(super) fn account_shell() -> Option<PathBuf> {
+    nix::unistd::User::from_uid(nix::unistd::getuid())
+        .ok()
+        .flatten()
+        .map(|user| user.shell)
+}
+
 impl DeskStore {
     pub async fn terminals(&self) -> Result<Vec<TerminalRecord>> {
         let client = self.pool().get().await?;
@@ -255,6 +282,18 @@ impl Desk {
             .ok_or_else(|| DeskError::Conflict("terminal is not running".into()))
     }
 
+    /// What is running in terminal `id`, its shell first.
+    pub async fn terminal_programs(&self, id: Uuid) -> Result<Vec<String>, DeskError> {
+        let shell = self
+            .terminal(id)?
+            .pid
+            .ok_or_else(|| DeskError::Conflict("terminal is not running".into()))?;
+        let all = procs::table()
+            .await
+            .ok_or_else(|| eyre::eyre!("ps could not list this machine's processes"))?;
+        Ok(procs::programs(&all, shell))
+    }
+
     /// Opens a login shell in `cwd`.
     pub async fn create_terminal(&self, new: NewTerminal) -> Result<TerminalView, DeskError> {
         if !Path::new(&new.cwd).is_dir() {
@@ -281,7 +320,7 @@ impl Desk {
                 .unwrap_or_else(|| folder_name(&new.cwd)),
             cwd: new.cwd,
             env,
-            shell: self.login_shell(),
+            shell: self.0.shell.clone(),
             state: TerminalState::Running,
             exit_code: None,
             created_at: now,
@@ -348,16 +387,6 @@ impl Desk {
         let _ = self.0.persist.send(Persist::DeleteTerminal(id));
         self.announce(DeskEvent::TerminalRemoved { id });
         Ok(())
-    }
-
-    /// The shell terminals run: the login environment's `SHELL`.
-    fn login_shell(&self) -> String {
-        self.0
-            .env
-            .get("SHELL")
-            .filter(|s| Path::new(s).is_file())
-            .cloned()
-            .unwrap_or_else(|| "/bin/zsh".into())
     }
 
     fn terminal_spawn(&self, r: &TerminalRecord) -> Spawn {
@@ -767,6 +796,77 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
         panic!("never happened");
+    }
+
+    #[test]
+    fn a_terminal_runs_the_first_shell_that_is_a_file() {
+        let env = |shell: &str| BTreeMap::from([("SHELL".to_string(), shell.to_string())]);
+        let files = |p: &Path| {
+            ["/bin/fish", "/usr/bin/zsh"]
+                .iter()
+                .any(|f| p == Path::new(f))
+        };
+        let account = || Some(PathBuf::from("/usr/bin/zsh"));
+        assert_eq!(login_shell(&env("/bin/fish"), account, files), "/bin/fish");
+        assert_eq!(
+            login_shell(&env("/bin/gone"), account, files),
+            "/usr/bin/zsh"
+        );
+        assert_eq!(
+            login_shell(&BTreeMap::new(), account, files),
+            "/usr/bin/zsh"
+        );
+        assert_eq!(
+            login_shell(&BTreeMap::new(), || Some("/bin/gone".into()), files),
+            "/bin/sh"
+        );
+        assert_eq!(login_shell(&env("/bin/gone"), || None, files), "/bin/sh");
+    }
+
+    #[test]
+    fn the_account_has_a_shell() {
+        assert!(account_shell().is_some_and(|shell| shell.is_absolute()));
+    }
+
+    #[tokio::test]
+    async fn a_terminal_lists_what_runs_in_it_shell_first() {
+        with_test_pool(build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let d = shell_desk(pool, dir.path()).await;
+            let t = d
+                .create_terminal(NewTerminal {
+                    id: None,
+                    name: None,
+                    cwd: dir.path().to_string_lossy().into_owned(),
+                    env: BTreeMap::new(),
+                })
+                .await
+                .unwrap();
+            assert_eq!(d.terminal_programs(t.id).await.unwrap(), ["sh"]);
+            let pty = d.attach_terminal(t.id).unwrap();
+            pty.write(b"sleep 30\n").unwrap();
+            let mut programs = Vec::new();
+            for _ in 0..200 {
+                programs = d.terminal_programs(t.id).await.unwrap();
+                if programs.len() > 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            assert_eq!(programs, ["sh", "sleep"]);
+            assert!(matches!(
+                d.terminal_programs(Uuid::new_v4()).await,
+                Err(DeskError::NotFound)
+            ));
+            pty.write(b"\x03exit\n").unwrap();
+            wait_until(|| d.terminal(t.id).unwrap().state == TerminalState::Exited).await;
+            assert!(matches!(
+                d.terminal_programs(t.id).await,
+                Err(DeskError::Conflict(_))
+            ));
+            d.close_terminal(t.id).unwrap();
+        })
+        .await;
     }
 
     /// A terminal Desk opens without its plugin folder still loads the

@@ -17,6 +17,7 @@ eyre = { workspace = true }
 futures = { workspace = true }
 parking_lot = { workspace = true }
 libc = "0.2"
+nix = { version = "0.31", features = ["user"] }
 portable-pty = "0.9"
 refinery = { workspace = true }
 reqwest = { workspace = true }
