@@ -149,6 +149,7 @@ impl DeskTool {
                     .create(
                         NewSession {
                             engine: i.engine.unwrap_or(Engine::Claude),
+                            view: None,
                             name: i.name,
                             cwd: i.cwd,
                             goal: i.goal.unwrap_or_default(),
@@ -239,7 +240,7 @@ impl Tool for DeskTool {
             Verb::Start => json!({
                 "type": "object",
                 "properties": {
-                    "engine": { "type": "string", "enum": ["claude", "codex"] },
+                    "engine": { "type": "string", "enum": workforce_desk::engine::startable() },
                     "name": { "type": "string", "description": "Short name, e.g. auth-fix" },
                     "cwd": { "type": "string", "description": "Absolute path of the repo or folder" },
                     "goal": { "type": "string", "description": "What the session is for, shown on its card" },

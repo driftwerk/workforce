@@ -665,6 +665,21 @@ pub struct DeskConfig {
     /// The Codex CLI, as a path or a name looked up on `PATH`.
     #[serde(default = "default_desk_codex")]
     pub codex: String,
+    /// The Gemini CLI, as a path or a name looked up on `PATH`.
+    #[serde(default = "default_desk_gemini")]
+    pub gemini: String,
+    /// GitHub's Copilot CLI, as a path or a name looked up on `PATH`.
+    #[serde(default = "default_desk_copilot")]
+    pub copilot: String,
+    /// The OpenCode CLI, as a path or a name looked up on `PATH`.
+    #[serde(default = "default_desk_opencode")]
+    pub opencode: String,
+    /// The Cursor CLI (`agent`), as a path or a name looked up on `PATH`.
+    #[serde(default = "default_desk_cursor")]
+    pub cursor: String,
+    /// The Devin CLI, as a path or a name looked up on `PATH`.
+    #[serde(default = "default_desk_devin")]
+    pub devin: String,
     /// What happens to sessions that were running when the hub stopped:
     /// offer them back (`ask`), resume them (`auto`), or neither (`off`).
     #[serde(default)]
@@ -711,6 +726,11 @@ impl Default for DeskConfig {
             enabled: false,
             claude: default_desk_claude(),
             codex: default_desk_codex(),
+            gemini: default_desk_gemini(),
+            copilot: default_desk_copilot(),
+            opencode: default_desk_opencode(),
+            cursor: default_desk_cursor(),
+            devin: default_desk_devin(),
             restore: DeskRestore::default(),
             approval_timeout_secs: default_desk_approval_timeout_secs(),
             scrollback_kb: default_desk_scrollback_kb(),
@@ -737,6 +757,26 @@ fn default_desk_claude() -> String {
 
 fn default_desk_codex() -> String {
     "codex".into()
+}
+
+fn default_desk_gemini() -> String {
+    "gemini".into()
+}
+
+fn default_desk_copilot() -> String {
+    "copilot".into()
+}
+
+fn default_desk_opencode() -> String {
+    "opencode".into()
+}
+
+fn default_desk_cursor() -> String {
+    "agent".into()
+}
+
+fn default_desk_devin() -> String {
+    "devin".into()
 }
 
 fn default_desk_approval_timeout_secs() -> u64 {

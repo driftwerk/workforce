@@ -19,7 +19,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::claude::tool_summary;
 use crate::pty::Spawn;
-use crate::usage::{MacAccount, MacPlan, PlanSink};
+use crate::usage::{LocalAccount, LocalPlan, PlanSink};
 
 pub enum Launch<'a> {
     New,
@@ -272,14 +272,14 @@ pub fn merge_limits(prev: Option<&Value>, msg: &Value) -> Option<Value> {
 }
 
 /// Who a snapshot's account is, and its plan.
-fn account_of(snapshot: &Value) -> MacAccount {
+fn account_of(snapshot: &Value) -> LocalAccount {
     let text = |p: &str| {
         snapshot
             .pointer(p)
             .and_then(Value::as_str)
             .map(str::to_string)
     };
-    MacAccount {
+    LocalAccount {
         ids: text("/accountId").into_iter().collect(),
         plan: text("/rateLimits/planType").filter(|p| p != "unknown"),
     }
@@ -330,7 +330,7 @@ pub async fn observe(
                     &plans,
                     reported.and_then(|r| merge_limits(limits.as_ref(), r)),
                 ) {
-                    plans.mac(MacPlan::Codex, merged.clone(), account_of(&merged));
+                    plans.local(LocalPlan::Codex, merged.clone(), account_of(&merged));
                     limits = Some(merged);
                 }
                 // Server requests (approvals) belong to the TUI; never answered here.
@@ -467,7 +467,7 @@ mod tests {
         let first = merge_limits(None, &read).unwrap();
         assert_eq!(
             account_of(&first),
-            MacAccount {
+            LocalAccount {
                 ids: vec!["acct-1".into()],
                 plan: Some("pro".into())
             }

@@ -156,10 +156,7 @@ fn who(p: &Party) -> String {
         (PartyKind::Session, Some(engine)) => format!(
             "{} ({} session {}{})",
             p.name,
-            match engine {
-                workforce_desk::model::Engine::Claude => "Claude Code",
-                workforce_desk::model::Engine::Codex => "Codex",
-            },
+            engine.title(),
             p.id,
             if p.origin == Some(Origin::External) {
                 ", in another terminal"

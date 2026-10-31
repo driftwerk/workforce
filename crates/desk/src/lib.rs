@@ -14,6 +14,7 @@ pub mod crew;
 mod crew_api;
 mod crew_store;
 mod cwd;
+pub mod engine;
 pub mod floor;
 pub mod gist;
 pub mod holder;

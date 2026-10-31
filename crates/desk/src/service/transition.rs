@@ -420,7 +420,7 @@ mod tests {
     use chrono::Utc;
 
     use super::*;
-    use crate::model::{Approvals, Engine, Origin, SessionRecord};
+    use crate::model::{Approvals, Engine, Origin, SessionRecord, View};
 
     fn view(state: SessionState) -> SessionView {
         let now = Utc::now();
@@ -428,6 +428,8 @@ mod tests {
             &SessionRecord {
                 id: Uuid::nil(),
                 engine: Engine::Claude,
+                view: View::Terminal,
+                engine_version: None,
                 name: "auth-fix".into(),
                 goal: String::new(),
                 cwd: "/repo".into(),

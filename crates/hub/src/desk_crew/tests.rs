@@ -136,8 +136,10 @@ async fn desk_with(
     Desk::start(
         DeskStore::with_pool(pool).await.unwrap(),
         Options {
-            claude: cli.clone(),
-            codex: cli,
+            programs: BTreeMap::from([
+                (workforce_desk::engine::Engine::Claude, cli.clone()),
+                (workforce_desk::engine::Engine::Codex, cli),
+            ]),
             env: BTreeMap::from([("PATH".into(), "/usr/bin:/bin".into())]),
             run_dir: dir.join("run"),
             scrollback_bytes: 4096,
@@ -218,6 +220,7 @@ async fn new_session(d: &Desk, dir: &Path, name: &str) -> workforce_desk::model:
     d.create(
         NewSession {
             engine: Engine::Claude,
+            view: None,
             name: name.into(),
             cwd: dir.to_string_lossy().into_owned(),
             goal: "Upgrade the date picker".into(),

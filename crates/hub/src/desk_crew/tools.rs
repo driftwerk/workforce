@@ -383,7 +383,7 @@ impl Tool for CrewTool {
                     "path": { "type": "string", "description": "Absolute path of the project folder" },
                     "goal": { "type": "string" },
                     "name": { "type": "string" },
-                    "engine": { "type": "string", "enum": ["claude", "codex"] }
+                    "engine": { "type": "string", "enum": workforce_desk::engine::startable() }
                 })),
                 &["path", "goal"],
             ),

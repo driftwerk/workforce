@@ -4,6 +4,7 @@
 //! credentials of the providers a Desk agent thinks with, and the `/api/desk`
 //! routes on the gateway.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -23,6 +24,7 @@ use workforce_common::settings::{
     is_claude_oat, DeskRestore, LlmSpeechConfig, VaultActor, WorkforceConfig,
 };
 use workforce_common::subscription::SubscriptionKind;
+use workforce_desk::engine::Engine;
 use workforce_desk::local::{self, Server};
 use workforce_desk::providers::Group;
 use workforce_desk::{
@@ -444,8 +446,7 @@ impl Accounts for HubAccounts {
 fn options(config: &WorkforceConfig) -> Options {
     let desk = &config.desk;
     Options {
-        claude: desk.claude.clone().into(),
-        codex: desk.codex.clone().into(),
+        programs: programs(desk),
         env: std::env::vars().collect(),
         run_dir: std::env::temp_dir().join("wf-desk"),
         scrollback_bytes: desk.scrollback_kb.saturating_mul(1024),
@@ -460,6 +461,27 @@ fn options(config: &WorkforceConfig) -> Options {
         holder: holder_options(desk),
         hub_turns: hub_turns(config),
     }
+}
+
+/// Each engine's program as `[desk]` names it. A custom command names its
+/// own, so it has none here.
+fn programs(desk: &workforce_common::settings::DeskConfig) -> BTreeMap<Engine, PathBuf> {
+    Engine::ALL
+        .into_iter()
+        .filter_map(|engine| {
+            let program = match engine {
+                Engine::Claude => &desk.claude,
+                Engine::Codex => &desk.codex,
+                Engine::Gemini => &desk.gemini,
+                Engine::Copilot => &desk.copilot,
+                Engine::OpenCode => &desk.opencode,
+                Engine::Cursor => &desk.cursor,
+                Engine::Devin => &desk.devin,
+                Engine::Custom => return None,
+            };
+            Some((engine, PathBuf::from(program)))
+        })
+        .collect()
 }
 
 /// Where this hub's agent turns run Claude Code: its sessions there are the
@@ -596,6 +618,15 @@ mod tests {
         let h = with(Some("/run/desk/pty.sock"), Some("s3cret-token-value")).unwrap();
         assert_eq!(h.socket, std::path::PathBuf::from("/run/desk/pty.sock"));
         assert!(options(&WorkforceConfig::default()).holder.is_none());
+    }
+
+    #[test]
+    fn every_engine_but_a_custom_command_has_its_program_from_desk_config() {
+        let programs = options(&WorkforceConfig::default()).programs;
+        assert_eq!(programs.len(), Engine::ALL.len() - 1);
+        assert_eq!(programs[&Engine::Claude], PathBuf::from("claude"));
+        assert_eq!(programs[&Engine::Cursor], PathBuf::from("agent"));
+        assert!(!programs.contains_key(&Engine::Custom));
     }
 
     #[test]

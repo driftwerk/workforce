@@ -87,6 +87,12 @@ async fn list(State(s): S, h: HeaderMap, Query(q): Q) -> Response {
     Json(s.desk.list()).into_response()
 }
 
+/// Every engine: its program, version and sign-in, and where Desk runs it.
+async fn engines(State(s): S, h: HeaderMap, Query(q): Q) -> Response {
+    guarded!(s, h, q);
+    Json(s.desk.engines()).into_response()
+}
+
 async fn create(State(s): S, h: HeaderMap, Query(q): Q, Json(new): Json<NewSession>) -> Response {
     guarded!(s, h, q);
     s.desk
@@ -689,6 +695,7 @@ async fn search(
 pub fn sessions_router(desk: Desk, auth: Arc<dyn Authorize>) -> Router {
     Router::new()
         .route("/api/desk/sessions", get(list).post(create))
+        .route("/api/desk/engines", get(engines))
         .route("/api/desk/sessions/{id}", patch(update).delete(forget))
         .route("/api/desk/sessions/{id}/stop", post(stop))
         .route("/api/desk/sessions/{id}/interrupt", post(interrupt))
@@ -1160,6 +1167,59 @@ mod tests {
             status,
             serde_json::from_slice(&bytes).unwrap_or(Value::Null),
         )
+    }
+
+    #[tokio::test]
+    async fn every_engine_is_listed_and_one_desk_cant_start_is_refused_in_plain_words() {
+        with_test_pool(build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let desk = crate::testing::desk_on(pool, dir.path()).await;
+            let app = super::sessions_router(desk, allow_all());
+            let (status, engines) = call(&app, "GET", "/api/desk/engines", None).await;
+            assert_eq!(status, 200);
+            let names: Vec<&str> = engines
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|e| e["engine"].as_str().unwrap())
+                .collect();
+            assert_eq!(
+                names,
+                ["claude", "codex", "gemini", "copilot", "opencode", "cursor", "devin", "custom"]
+            );
+            assert_eq!(engines[0]["views"], json!(["terminal"]));
+            assert_eq!(engines[0]["caps"]["terminal"]["state"], "hooks");
+            assert_eq!(engines[2]["views"], json!([]));
+            assert_eq!(engines[7]["program"], Value::Null);
+            let cwd = dir.path().to_string_lossy().into_owned();
+            let (status, refused) = call(
+                &app,
+                "POST",
+                "/api/desk/sessions",
+                Some(json!({ "engine": "gemini", "name": "atlas", "cwd": cwd })),
+            )
+            .await;
+            assert_eq!(status, 400);
+            assert!(
+                refused
+                    .to_string()
+                    .contains("Desk can't start Gemini CLI sessions yet"),
+                "{refused}"
+            );
+            let (status, refused) = call(
+                &app,
+                "POST",
+                "/api/desk/sessions",
+                Some(json!({ "engine": "claude", "view": "desk", "name": "atlas", "cwd": cwd })),
+            )
+            .await;
+            assert_eq!(status, 400);
+            assert!(
+                refused.to_string().contains("in its desk view"),
+                "{refused}"
+            );
+        })
+        .await;
     }
 
     #[tokio::test]
