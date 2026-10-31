@@ -392,7 +392,10 @@ mod tests {
                 (main.room_id, main.main.count, main.main.for_you),
                 (room.id, 1, 1)
             );
-            assert_eq!(summary.activity.count, 1, "not your own");
+            assert_eq!(
+                summary.activity.count, 2,
+                "the turn and another hub's answer, not your own"
+            );
             assert_eq!(summary.brief, None);
 
             let ahead = d
