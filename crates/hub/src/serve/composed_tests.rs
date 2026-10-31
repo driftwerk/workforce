@@ -5555,6 +5555,7 @@ async fn a_desk_room_turn_is_told_where_it_is_and_keeps_its_place() {
         }],
         message: Some(asked),
         spoken: false,
+        voice: None,
     };
     let desk = DeskTurnContext::new(
         turn.clone().validated(&channel).unwrap(),
