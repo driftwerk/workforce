@@ -519,7 +519,16 @@ impl Desk {
         }
         let layout = prune_layout(&store, layout, &records).await;
         let state_since = store.state_times().await?;
-        let attention = store.attention_times().await?;
+        let mut attention = store.attention_times().await?;
+        // One lost while it worked failed: worth your attention, as one
+        // that stops unexpectedly while the hub runs is. One lost while
+        // done or idle isn't.
+        let failed: Vec<(Uuid, DateTime<Utc>)> = recovered
+            .iter()
+            .filter(|r| r.state == SessionState::Interrupted)
+            .map(|r| (r.id, r.updated_at))
+            .collect();
+        attention.extend(failed.iter().copied());
 
         let listener = hook_listener(held.hook_port).await?;
         let hook_port = listener.local_addr()?.port();
@@ -556,6 +565,9 @@ impl Desk {
         tokio::spawn(desk.clone().read_sign_ins());
         tokio::spawn(desk.clone().watch_background());
         recovered.into_iter().for_each(|r| desk.save(r));
+        for (id, at) in failed {
+            let _ = desk.0.persist.send(Persist::Attention(id, at));
+        }
         desk.adopt_held(held).await;
 
         let hooks = crate::api::hook_router(desk.clone());
@@ -3828,6 +3840,9 @@ mod tests {
         with_test_pool(build_pool, |pool| async move {
             let dir = tempfile::tempdir().unwrap();
             let d = desk(pool.clone(), dir.path()).await;
+            // Desk begins keeping read points: what's older counts as read.
+            let crew = super::unread::tests::NoCrew;
+            d.unread(&crew, YOU).await.unwrap();
             let s = new_session(&d, dir.path()).await;
             post(&d, s.id, json!({"hook_event_name": "SessionStart", "session_id": s.id.to_string()})).await;
             post(&d, s.id, json!({"hook_event_name": "UserPromptSubmit", "prompt": "run the tests"})).await;
@@ -3852,9 +3867,37 @@ mod tests {
             assert_eq!(d.view(s.id).unwrap().state, SessionState::Stopped);
             assert_eq!(d.attention_at(s.id), Some(finished), "your Stop is not");
 
+            // The summary counts it from its turn's end, not from your Stop,
+            // and once that's read your Stop leaves it read.
+            let listed = d.unread(&crew, YOU).await.unwrap().sessions;
+            assert_eq!(
+                listed.iter().map(|u| (u.id, u.since)).collect::<Vec<_>>(),
+                vec![(s.id, finished)]
+            );
+            d.put_reads(
+                YOU,
+                &[crate::reads::ReadPut {
+                    place: crate::reads::ReadPlace::Session(s.id),
+                    point: crate::reads::ReadPoint {
+                        at: finished,
+                        message: None,
+                    },
+                    mark: crate::reads::Mark::Advance,
+                }],
+            )
+            .await
+            .unwrap();
+            assert!(d.unread(&crew, YOU).await.unwrap().sessions.is_empty());
+
+            // Another, lost while it works when the hub restarts, failed.
+            let lost = new_session(&d, dir.path()).await;
+            post(&d, lost.id, json!({"hook_event_name": "UserPromptSubmit", "prompt": "migrate"})).await;
             // Kept across a restart, to the microsecond.
             let kept = loop {
-                if let Some(at) = d.store().attention_times().await.unwrap().get(&s.id) {
+                let working = d.store().get(lost.id).await.unwrap().map(|r| r.state);
+                if let (Some(at), Some(SessionState::Working)) =
+                    (d.store().attention_times().await.unwrap().get(&s.id), working)
+                {
                     break *at;
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
@@ -3862,6 +3905,8 @@ mod tests {
             assert_eq!(kept, finished.trunc_subsecs(6));
             let again = desk(pool, dir.path()).await;
             assert_eq!(again.attention_at(s.id), Some(kept));
+            assert_eq!(again.view(lost.id).unwrap().state, SessionState::Interrupted);
+            assert!(again.attention_at(lost.id).is_some(), "work lost is");
         })
         .await;
     }

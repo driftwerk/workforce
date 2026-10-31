@@ -247,7 +247,7 @@ fn advance(place: ReadPlace, point: ReadPoint) -> ReadPut {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::crew::Party;
     use crate::rooms::{Member, NewMessage, NewRoom};
@@ -318,7 +318,7 @@ mod tests {
     }
 
     /// No overseer: what the crew answers when it isn't one.
-    struct NoCrew;
+    pub(crate) struct NoCrew;
 
     #[async_trait::async_trait]
     impl Crew for NoCrew {
