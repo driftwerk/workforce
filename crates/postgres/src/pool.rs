@@ -289,10 +289,20 @@ pub async fn check_budget() -> Option<PoolBudget> {
         let pools = POOLS.lock().unwrap_or_else(|e| e.into_inner());
         pools.iter().find_map(|(_, pool)| pool.upgrade())?
     };
-    let allowed = match allowed_connections(&pool).await {
-        Ok(allowed) => allowed,
-        Err(e) => {
+    // Bounded: on a server already full, the pool would wait for ever and
+    // the hub would never start listening.
+    let asked = tokio::time::timeout(BUDGET_WAIT, allowed_connections(&pool)).await;
+    let allowed = match asked {
+        Ok(Ok(allowed)) => allowed,
+        Ok(Err(e)) => {
             tracing::warn!(error = %e, "the Postgres connection budget could not be checked");
+            return None;
+        }
+        Err(_) => {
+            tracing::warn!(
+                waited = ?BUDGET_WAIT,
+                "the Postgres connection budget could not be checked: no connection was free"
+            );
             return None;
         }
     };
@@ -316,6 +326,9 @@ pub async fn check_budget() -> Option<PoolBudget> {
     }
     Some(budget)
 }
+
+/// How long [`check_budget`] waits to ask the server.
+const BUDGET_WAIT: Duration = Duration::from_secs(5);
 
 /// `max_connections` less `superuser_reserved_connections`.
 async fn allowed_connections(pool: &Pool) -> Result<usize, PostgresError> {
