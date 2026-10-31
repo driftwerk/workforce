@@ -194,7 +194,7 @@ Agents connected to a Slack workspace can call the following tools.
 * **slack.lookup_user_by_email** — Look up a user by an exact email address (requires the `users:read.email` scope).
 * **slack.list_channel_members** — List user IDs in a channel.
 * **slack.list_user_conversations** — See what channels a given user is in.
-* **slack.search_messages** — Search for messages across the workspace (requires a per‑user xoxp-… token on a paid Slack plan). Each user must register their token via `workforce slack.user_token_set workspace_id=<workspace> user_token=<xoxp-…>` before searching.
+* **slack.search_messages** — Search for messages across the workspace (requires a per‑user xoxp-… token on a paid Slack plan). Each user must register their token by calling the `slack.user_token_set` tool (arguments `workspace_id` and `user_token`) before searching.
 
 ### Channel management tools
 
@@ -223,10 +223,7 @@ Agents connected to a Slack workspace can call the following tools.
 
 The `slack.search_messages` tool requires a per‑user (xoxp-…) token, because Slack enforces that search results reflect the caller’s personal view (including private channels they belong to).
 
-To set up search for a user, register their token with the command:
-```bash
-workforce slack.user_token_set workspace_id=<workspace> user_token=<xoxp-…>
-```
+To set up search for a user, have them call the `slack.user_token_set` tool with `workspace_id=<workspace>` and `user_token=<xoxp-…>`.
 
 Each user’s token is stored separately and never shared. Calls to `slack.search_messages` will automatically use the token belonging to the user making the request.
 
