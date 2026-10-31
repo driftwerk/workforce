@@ -104,6 +104,15 @@ describe("RichMarkdown links", () => {
     expect(openUrl).toHaveBeenCalledWith("desk://room/r1/msg/m1");
   });
 
+  it("reads a declared scheme however it is written", () => {
+    const { container } = render(
+      <RichHostProvider host={{ linkSchemes: [" Desk: "] }}>
+        <RichMarkdown text={LINKS} />
+      </RichHostProvider>,
+    );
+    expect(hrefs(container)).toContain("desk://room/r1/msg/m1");
+  });
+
   it("strips a scheme no host declared", () => {
     const { container } = render(<RichMarkdown text={LINKS} />);
     expect(hrefs(container)).not.toContain("desk://room/r1/msg/m1");

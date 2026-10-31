@@ -65,8 +65,8 @@ function linkPolicy(schemes: string): {
   const kept = schemes
     ? schemes
         .split(",")
-        .map((s) => s.toLowerCase())
-        .filter((s) => !NEVER.has(s))
+        .map((s) => s.trim().toLowerCase().replace(/:$/, ""))
+        .filter((s) => /^[a-z][a-z0-9+.-]*$/.test(s) && !NEVER.has(s))
     : [];
   if (kept.length === 0) return { rehypePlugins: [rehypeSanitize], urlTransform: defaultUrlTransform };
   const schema = {
