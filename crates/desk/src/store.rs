@@ -10,7 +10,7 @@ use workforce_postgres::{
     MigrationRun, MigrationRunner, MigrationSet, PostgresConfig, PostgresError, PostgresPool,
 };
 
-use crate::model::{Approvals, Engine, Origin, SessionRecord, SessionState};
+use crate::model::{Approvals, Engine, Origin, SessionRecord, SessionState, View};
 use crate::reads::ReadPlace;
 
 mod embedded {
@@ -106,14 +106,14 @@ impl DeskStore {
                 "INSERT INTO sessions (id, engine, name, goal, cwd, branch, origin, state, \
                  approvals, cli_session_id, transcript, last_prompt, last_reply, external_pid, \
                  restore_offer, created_at, updated_at, terminal_id, display_name, asked, \
-                 state_at) \
+                 state_at, view, engine_version) \
                  VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20, \
-                 $17) \
+                 $17, $21, $22) \
                  ON CONFLICT (id) DO UPDATE SET engine = $2, name = $3, goal = $4, cwd = $5, \
                  branch = $6, origin = $7, state = $8, approvals = $9, cli_session_id = $10, \
                  transcript = $11, last_prompt = $12, last_reply = $13, external_pid = $14, \
                  restore_offer = $15, updated_at = $17, terminal_id = $18, display_name = $19, \
-                 asked = $20, \
+                 asked = $20, view = $21, engine_version = $22, \
                  state_at = CASE WHEN sessions.state = $8 THEN sessions.state_at ELSE $17 END",
                 &[
                     &r.id,
@@ -136,6 +136,8 @@ impl DeskStore {
                     &r.terminal_id,
                     &r.display_name,
                     &r.asked.as_ref().map(serde_json::to_value).transpose()?,
+                    &r.view.as_str(),
+                    &r.engine_version,
                 ],
             )
             .await
@@ -202,6 +204,8 @@ fn record(row: &Row) -> Result<SessionRecord> {
     Ok(SessionRecord {
         id: row.try_get("id")?,
         engine: Engine::parse(row.try_get("engine")?)?,
+        view: View::parse(row.try_get("view")?)?,
+        engine_version: row.try_get("engine_version")?,
         name: row.try_get("name")?,
         goal: row.try_get("goal")?,
         cwd: row.try_get("cwd")?,
@@ -250,6 +254,8 @@ pub(crate) mod tests {
         SessionRecord {
             id: Uuid::new_v4(),
             engine: Engine::Claude,
+            view: View::Terminal,
+            engine_version: Some("2.1.300".into()),
             name: name.into(),
             goal: "fix the auth race".into(),
             cwd: "/tmp/repo".into(),

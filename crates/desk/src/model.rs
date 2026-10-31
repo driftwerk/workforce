@@ -6,7 +6,7 @@ use uuid::Uuid;
 
 macro_rules! text_enum {
     ($name:ident { $($variant:ident => $text:literal),+ $(,)? }) => {
-        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, ::serde::Serialize, ::serde::Deserialize)]
         #[serde(rename_all = "lowercase")]
         pub enum $name {
             $($variant),+
@@ -31,7 +31,7 @@ macro_rules! text_enum {
 
 pub(crate) use text_enum;
 
-text_enum!(Engine { Claude => "claude", Codex => "codex" });
+pub use crate::engine::{Engine, View};
 
 text_enum!(Origin { Desk => "desk", External => "external" });
 
@@ -74,6 +74,10 @@ impl SessionState {
 pub struct SessionRecord {
     pub id: Uuid,
     pub engine: Engine,
+    /// Where it runs: a terminal, or Desk's own view of it.
+    pub view: View,
+    /// The engine's version when it last started, as it reported it.
+    pub engine_version: Option<String>,
     pub name: String,
     pub goal: String,
     pub cwd: String,
@@ -116,6 +120,9 @@ pub struct PendingApproval {
 pub struct SessionView {
     pub id: Uuid,
     pub engine: Engine,
+    pub view: View,
+    /// What Desk can do with it ([`crate::engine::caps`]).
+    pub caps: crate::engine::Caps,
     pub name: String,
     pub goal: String,
     pub cwd: String,
@@ -206,6 +213,8 @@ impl SessionView {
         Self {
             id: r.id,
             engine: r.engine,
+            view: r.view,
+            caps: crate::engine::caps(r.engine, r.view),
             name: r.name.clone(),
             goal: r.goal.clone(),
             cwd: r.cwd.clone(),
@@ -288,6 +297,10 @@ pub enum DeskEvent {
 #[serde(rename_all = "camelCase")]
 pub struct NewSession {
     pub engine: Engine,
+    /// Where it runs; the engine's default view ([`crate::engine::views`])
+    /// when not said.
+    #[serde(default)]
+    pub view: Option<View>,
     pub name: String,
     pub cwd: String,
     #[serde(default)]
@@ -371,6 +384,6 @@ mod tests {
         ] {
             assert_eq!(SessionState::parse(s.as_str()).unwrap(), s);
         }
-        assert!(Engine::parse("gemini").is_err());
+        assert!(Engine::parse("grok").is_err());
     }
 }

@@ -72,8 +72,7 @@ pub(crate) fn deny_all() -> std::sync::Arc<dyn Authorize> {
 /// Options for a desk whose CLIs never run.
 pub(crate) fn options(dir: &std::path::Path) -> crate::service::Options {
     crate::service::Options {
-        claude: "/bin/false".into(),
-        codex: "/bin/false".into(),
+        programs: crate::testing::programs("/bin/false".into(), "/bin/false".into()),
         env: Default::default(),
         run_dir: dir.join("run"),
         scrollback_bytes: 1024,
@@ -99,4 +98,16 @@ pub(crate) async fn desk_on(
     )
     .await
     .unwrap()
+}
+
+/// Programs for Claude Code and Codex, as a test's desk runs them.
+pub(crate) fn programs(
+    claude: std::path::PathBuf,
+    codex: std::path::PathBuf,
+) -> std::collections::BTreeMap<crate::model::Engine, std::path::PathBuf> {
+    [
+        (crate::model::Engine::Claude, claude),
+        (crate::model::Engine::Codex, codex),
+    ]
+    .into()
 }

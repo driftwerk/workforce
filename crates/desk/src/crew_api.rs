@@ -308,8 +308,7 @@ mod tests {
         Desk::start(
             DeskStore::from_pool(pool),
             crate::service::Options {
-                claude: "/bin/false".into(),
-                codex: "/bin/false".into(),
+                programs: crate::testing::programs("/bin/false".into(), "/bin/false".into()),
                 env: BTreeMap::new(),
                 run_dir: dir.join("run"),
                 scrollback_bytes: 1024,

@@ -564,6 +564,7 @@ impl CrewHub {
                     .create(
                         NewSession {
                             engine: engine.unwrap_or(Engine::Claude),
+                            view: None,
                             name: name.clone().unwrap_or(folder),
                             cwd: path.clone(),
                             goal: goal.clone(),

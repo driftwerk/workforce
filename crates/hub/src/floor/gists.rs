@@ -417,7 +417,7 @@ impl Gists {
         let input = gist::Input {
             name: &job.name,
             session: match job.subject {
-                Subject::Session { engine, .. } => Some(engine_name(engine)),
+                Subject::Session { engine, .. } => Some(Engine::title(engine)),
                 Subject::Agent { .. } => None,
             },
             goal: goal.as_deref(),
@@ -569,13 +569,6 @@ fn doing_at_end(outcome: Outcome) -> Doing {
         Outcome::Failed => Doing::Failed,
         Outcome::Limit => Doing::Limit,
         _ => Doing::Finished,
-    }
-}
-
-fn engine_name(engine: Engine) -> &'static str {
-    match engine {
-        Engine::Claude => "Claude Code",
-        Engine::Codex => "Codex",
     }
 }
 

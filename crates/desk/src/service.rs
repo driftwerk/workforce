@@ -20,6 +20,7 @@ use crate::background::{Background, TaskKind};
 use crate::claude::{self, Hook};
 use crate::codex::{self, AppServer, CodexEvent, Seen};
 use crate::crew::{self, By, Event, Kind, Party};
+use crate::engine::{self, Installed, SignIns, View};
 use crate::floor::{Outcome, SubjectKey, TurnLog, TurnOp};
 use crate::holder::{Held, Holder};
 use crate::model::{
@@ -35,7 +36,7 @@ use crate::rooms::{
 };
 use crate::store::DeskStore;
 use crate::transcript;
-use crate::usage::{self, MacPlan, MacSignIns, PlanSink};
+use crate::usage::{LocalPlan, PlanSink};
 use crate::worktree;
 
 mod copies;
@@ -63,8 +64,9 @@ pub enum RestorePolicy {
 
 #[derive(Debug, Clone)]
 pub struct Options {
-    pub claude: PathBuf,
-    pub codex: PathBuf,
+    /// Each engine's program, as a path or a name looked up on `PATH`. An
+    /// engine without one is not installed.
+    pub programs: BTreeMap<Engine, PathBuf>,
     /// Environment the CLIs run with: the user's login environment.
     /// `CLAUDE*` variables are removed before use.
     pub env: BTreeMap<String, String>,
@@ -82,6 +84,15 @@ pub struct Options {
     pub holder: Option<HolderOptions>,
     /// What the hub runs `claude` in and as itself: never adopted.
     pub hub_internal: HubInternal,
+}
+
+#[cfg(test)]
+impl Options {
+    /// These options with `engine` run as `program`.
+    pub(crate) fn with_program(mut self, engine: Engine, program: PathBuf) -> Self {
+        self.programs.insert(engine, program);
+        self
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -248,9 +259,9 @@ const READ_LATER: Duration = Duration::from_secs(45);
 /// How often sessions' background work is looked at.
 const LOOK_EVERY: Duration = Duration::from_secs(10);
 
-/// How often this Mac's sign-ins are read again.
-const SIGN_INS_EVERY: Duration = Duration::from_secs(60 * 60);
-/// How long a CLI may take to say who it is signed in as.
+/// How often the engines' versions and sign-ins are read again.
+const ENGINES_EVERY: Duration = Duration::from_secs(60 * 60);
+/// How long a CLI may take to say its version or who it is signed in as.
 const SIGN_IN_WAIT: Duration = Duration::from_secs(20);
 
 enum Persist {
@@ -281,7 +292,9 @@ struct Inner {
     holder: Mutex<Option<Holder>>,
     layout_write: tokio::sync::Mutex<()>,
     plans: Option<Arc<dyn PlanSink>>,
-    sign_ins: Mutex<MacSignIns>,
+    /// What each engine's program said of its version and sign-in, as
+    /// last read.
+    engines: Mutex<BTreeMap<Engine, Installed>>,
     /// Reads a turn's last reply where the rules can't tell whether it
     /// asks: the hub's crew, once its routes are mounted.
     reader: Mutex<Option<Weak<dyn crew::Crew>>>,
@@ -571,12 +584,12 @@ impl Desk {
             holder: Mutex::new(holder),
             layout_write: tokio::sync::Mutex::new(()),
             plans: floor.plans,
-            sign_ins: Mutex::new(MacSignIns::default()),
+            engines: Mutex::new(BTreeMap::new()),
             reader: Mutex::new(None),
             read_wait: Mutex::new(READ_LATER),
         }));
         tokio::spawn(persist_loop(store, floor.turns, persist_rx));
-        tokio::spawn(desk.clone().read_sign_ins());
+        tokio::spawn(desk.clone().read_engines());
         tokio::spawn(desk.clone().watch_background());
         recovered.into_iter().for_each(|r| desk.save(r));
         for (id, at) in failed {
@@ -855,32 +868,93 @@ impl Desk {
         self.0.state.lock().turns.values().map(|t| t.id).collect()
     }
 
-    /// Who this Mac's Claude Code and Codex are signed in as, as last read.
-    pub fn sign_ins(&self) -> MacSignIns {
-        self.0.sign_ins.lock().clone()
+    /// Who each engine on this computer is signed in as, as last read.
+    pub fn sign_ins(&self) -> SignIns {
+        SignIns {
+            by_engine: self
+                .0
+                .engines
+                .lock()
+                .iter()
+                .map(|(e, i)| (*e, i.sign_in.clone()))
+                .collect(),
+        }
     }
 
-    /// Reads this Mac's sign-ins now and every [`SIGN_INS_EVERY`], until
-    /// the desk stops.
-    async fn read_sign_ins(self) {
-        let mut tick = tokio::time::interval(SIGN_INS_EVERY);
+    /// Every engine as Settings → Engines and the new session dialog show
+    /// it: its program, whether it is installed, its version and sign-in,
+    /// and where Desk runs it.
+    pub fn engines(&self) -> Vec<engine::EngineView> {
+        let read = self.0.engines.lock().clone();
+        Engine::ALL
+            .into_iter()
+            .map(|e| engine::view_of(e, self.program(e), read.get(&e)))
+            .collect()
+    }
+
+    /// `engine`'s program, when the hub names one.
+    fn program(&self, engine: Engine) -> Option<&Path> {
+        self.0.opts.programs.get(&engine).map(PathBuf::as_path)
+    }
+
+    /// `engine`'s program, which a session of it can't start without.
+    fn program_of(&self, engine: Engine) -> Result<&Path, DeskError> {
+        self.program(engine).ok_or_else(|| {
+            DeskError::Invalid(format!("this hub names no program for {}", engine.title()))
+        })
+    }
+
+    /// Reads every engine's version and sign-in now and every
+    /// [`ENGINES_EVERY`], until the desk stops.
+    async fn read_engines(self) {
+        let mut tick = tokio::time::interval(ENGINES_EVERY);
         loop {
             tokio::select! {
                 _ = self.0.cancel.cancelled() => return,
                 _ = tick.tick() => {}
             }
-            let (claude, codex) = tokio::join!(
-                self.cli_says(&self.0.opts.claude, &["auth", "status", "--json"]),
-                self.cli_says(&self.0.opts.codex, &["login", "status"]),
-            );
-            *self.0.sign_ins.lock() = MacSignIns {
-                claude: claude.and_then(|(out, _)| usage::claude_sign_in(&out)),
-                // Codex says it on stderr.
-                codex: codex.is_some_and(|(out, err)| {
-                    usage::codex_signed_in(&out) || usage::codex_signed_in(&err)
-                }),
-            };
+            let reads = Engine::ALL
+                .into_iter()
+                .filter_map(|e| Some((e, self.program(e)?.to_path_buf())))
+                .map(|(e, program)| {
+                    let desk = self.clone();
+                    async move { (e, desk.read_engine(e, &program).await) }
+                });
+            let read: BTreeMap<Engine, Installed> =
+                futures::future::join_all(reads).await.into_iter().collect();
+            *self.0.engines.lock() = read;
         }
+    }
+
+    /// What `engine`'s `program` says of its version and its sign-in.
+    async fn read_engine(&self, engine: Engine, program: &Path) -> Installed {
+        let args = engine.version_args().unwrap_or_default();
+        let version = self.cli_says(program, args).await.and_then(|(out, err)| {
+            engine::Version::read(&out).or_else(|| engine::Version::read(&err))
+        });
+        let sign_in = match (engine, version) {
+            (_, None) => engine::SignIn::Unknown,
+            (Engine::Claude, Some(_)) => self
+                .cli_says(program, &["auth", "status", "--json"])
+                .await
+                .map_or(engine::SignIn::Unknown, |(out, _)| {
+                    engine::claude_sign_in(&out)
+                }),
+            // Codex says it on stderr.
+            (Engine::Codex, Some(_)) => self.cli_says(program, &["login", "status"]).await.map_or(
+                engine::SignIn::Unknown,
+                |(out, err)| match engine::codex_sign_in(&out) {
+                    engine::SignIn::Unknown => engine::codex_sign_in(&err),
+                    known => known,
+                },
+            ),
+            (Engine::Devin, Some(_)) => engine::devin_sign_in(&self.0.env, Path::is_file),
+            (Engine::Copilot, Some(_)) => engine::copilot_sign_in(&self.0.env),
+            (Engine::Gemini | Engine::OpenCode | Engine::Cursor | Engine::Custom, Some(_)) => {
+                engine::SignIn::Unknown
+            }
+        };
+        Installed { version, sign_in }
     }
 
     /// What `program args` prints, on stdout and on stderr, run as the
@@ -903,8 +977,12 @@ impl Desk {
     /// reported to the hub.
     fn report_usage(&self, limits: Value) {
         if let Some(plans) = &self.0.plans {
-            let account = self.sign_ins().claude.unwrap_or_default();
-            plans.mac(MacPlan::Claude, limits, account);
+            let account = self
+                .sign_ins()
+                .of(Engine::Claude)
+                .plan_account()
+                .unwrap_or_default();
+            plans.local(LocalPlan::Claude, limits, account);
         }
     }
 
@@ -915,6 +993,13 @@ impl Desk {
         match engine {
             Engine::Claude => l.pty.pid(),
             Engine::Codex => l._codex.as_ref()?.server.pid(),
+            // Desk doesn't run these yet ([`engine::views`]).
+            Engine::Gemini
+            | Engine::Copilot
+            | Engine::OpenCode
+            | Engine::Cursor
+            | Engine::Devin
+            | Engine::Custom => None,
         }
     }
 
@@ -954,6 +1039,15 @@ impl Desk {
                 .filter(|p| !before.contains(&p.pid))
                 .count(),
             (Engine::Codex, None) => 0,
+            (
+                Engine::Gemini
+                | Engine::Copilot
+                | Engine::OpenCode
+                | Engine::Cursor
+                | Engine::Devin
+                | Engine::Custom,
+                _,
+            ) => 0,
         }
     }
 
@@ -1277,6 +1371,21 @@ impl Desk {
             return Err(DeskError::Invalid("a session needs a name".into()));
         }
         check_env(&new.env)?;
+        let view = new
+            .view
+            .or_else(|| engine::views(new.engine).first().copied())
+            .filter(|&v| engine::runs(new.engine, v))
+            .ok_or_else(|| {
+                DeskError::Invalid(match new.view {
+                    Some(v) => format!(
+                        "Desk can't start {} sessions in its {} view",
+                        new.engine.title(),
+                        v.as_str()
+                    ),
+                    None => format!("Desk can't start {} sessions yet", new.engine.title()),
+                })
+            })?;
+        self.program_of(new.engine)?;
         let changed = !new.env.is_empty() && {
             let mut st = self.0.state.lock();
             let changed = st.session_env != new.env;
@@ -1312,19 +1421,23 @@ impl Desk {
         };
         let now = Utc::now();
         let id = Uuid::new_v4();
+        let caps = engine::caps(new.engine, view);
         let record = SessionRecord {
             id,
             engine: new.engine,
+            view,
+            engine_version: self.version_of(new.engine),
             name: name.to_string(),
             goal: new.goal.trim().to_string(),
             cwd: cwd.to_string_lossy().into_owned(),
             branch,
             origin: Origin::Desk,
             state: SessionState::Starting,
-            approvals: match new.engine {
-                Engine::Claude => new.approvals.unwrap_or(Approvals::Desk),
-                Engine::Codex => Approvals::Terminal,
+            approvals: match caps.approvals {
+                engine::Answerer::Desk => new.approvals.unwrap_or(Approvals::Desk),
+                engine::Answerer::Terminal | engine::Answerer::None => Approvals::Terminal,
             },
+            // Claude Code takes the id Desk gives it; Codex says its thread's.
             cli_session_id: (new.engine == Engine::Claude).then(|| id.to_string()),
             transcript: None,
             last_prompt: new.prompt.clone(),
@@ -1388,7 +1501,10 @@ impl Desk {
             if let Some(g) = patch.goal {
                 r.goal = g.trim().to_string();
             }
-            if let Some(a) = patch.approvals.filter(|_| r.engine == Engine::Claude) {
+            if let Some(a) = patch
+                .approvals
+                .filter(|_| engine::caps(r.engine, r.view).approvals == engine::Answerer::Desk)
+            {
                 r.approvals = a;
             }
             if let Some(n) = display_name {
@@ -1715,13 +1831,16 @@ impl Desk {
                 .live
                 .get(&id)
                 .ok_or_else(|| DeskError::Conflict("session is not running".into()))?;
-            let working = st.records.get(&id).map(|r| r.state) == Some(SessionState::Working);
-            working.then(|| Arc::clone(&live.pty))
+            let record = st.records.get(&id);
+            let keys = record.and_then(|r| engine::interrupt_keys(r.engine));
+            let working = record.map(|r| r.state) == Some(SessionState::Working);
+            keys.filter(|_| working)
+                .map(|keys| (Arc::clone(&live.pty), keys))
         };
-        let Some(pty) = pty else {
+        let Some((pty, keys)) = pty else {
             return self.view(id);
         };
-        pty.write(b"\x1b")?;
+        pty.write(keys)?;
         // Claude Code runs no hook for an interrupted turn.
         self.change(id, |r, l| {
             if let Some(l) = l.filter(|_| r.state == SessionState::Working) {
@@ -2168,7 +2287,7 @@ impl Desk {
                 let session_id = r.cli_session_id.as_deref().unwrap_or_default();
                 let hook_url = format!("{}/hook/{}/{token}", self.0.hook_base, r.id);
                 let spec = claude::spawn(&claude::ClaudeSpawn {
-                    program: &self.0.opts.claude,
+                    program: self.program_of(Engine::Claude)?,
                     cwd,
                     name: &r.name,
                     launch: if resume {
@@ -2187,7 +2306,7 @@ impl Desk {
                 let socket = self.0.opts.run_dir.join(format!("{}.sock", r.id.simple()));
                 let server = self.start_app_server(r.id, &socket).await?;
                 let spec = codex::spawn(&codex::CodexSpawn {
-                    program: &self.0.opts.codex,
+                    program: self.program_of(Engine::Codex)?,
                     cwd,
                     socket: &socket,
                     launch: match (resume, r.cli_session_id.as_deref()) {
@@ -2199,6 +2318,17 @@ impl Desk {
                 });
                 let link = self.observe_codex(r.id, server, socket);
                 (spec, Some(link))
+            }
+            Engine::Gemini
+            | Engine::Copilot
+            | Engine::OpenCode
+            | Engine::Cursor
+            | Engine::Devin
+            | Engine::Custom => {
+                return Err(DeskError::Invalid(format!(
+                    "Desk can't start {} sessions yet",
+                    r.engine.title()
+                )))
             }
         };
         let meta = serde_json::json!({
@@ -2240,19 +2370,29 @@ impl Desk {
             },
         );
         tokio::spawn(self.clone().on_exit(r.id, exit));
+        let version = self.version_of(r.engine);
+        if version.is_some() && version != r.engine_version {
+            self.change(r.id, |r, _| r.engine_version = version);
+        }
         Ok(())
+    }
+
+    /// `engine`'s version as last read, as a session records it.
+    fn version_of(&self, engine: Engine) -> Option<String> {
+        let read = self.0.engines.lock();
+        read.get(&engine)?.version.map(|v| v.to_string())
     }
 
     /// Starts a Codex session's app-server on `socket`: in the holder when
     /// there is one, so it outlives the hub with the TUI attached to it.
     async fn start_app_server(&self, id: Uuid, socket: &Path) -> Result<Server, DeskError> {
+        let program = self.program_of(Engine::Codex)?;
         let Some(holder) = self.holder().await else {
-            let server =
-                AppServer::start(&self.0.opts.codex, socket.to_path_buf(), &self.0.env).await?;
+            let server = AppServer::start(program, socket.to_path_buf(), &self.0.env).await?;
             return Ok(Server::Local(server));
         };
         codex::prepare_socket(socket).await?;
-        let spec = codex::app_server(&self.0.opts.codex, socket, &self.0.env);
+        let spec = codex::app_server(program, socket, &self.0.env);
         let meta = serde_json::json!({
             "kind": "codex-app-server",
             "session": id,
@@ -2822,7 +2962,10 @@ impl Desk {
                 _ = self.0.cancel.cancelled() => return,
                 _ = tick.tick() => {}
             }
-            match adopt::list(&self.0.opts.claude, &self.0.env).await {
+            let Some(claude) = self.program(Engine::Claude) else {
+                return;
+            };
+            match adopt::list(claude, &self.0.env).await {
                 Ok(found) => self.reconcile_external(found).await,
                 Err(e) => tracing::debug!(error = %e, "could not list other Claude Code sessions"),
             }
@@ -2920,6 +3063,8 @@ impl Desk {
                     let r = SessionRecord {
                         id: Uuid::new_v4(),
                         engine: Engine::Claude,
+                        view: View::Terminal,
+                        engine_version: None,
                         name: ext
                             .name
                             .clone()
@@ -3134,8 +3279,7 @@ mod tests {
 
     pub(super) fn options(dir: &Path) -> Options {
         Options {
-            claude: fake_cli(dir),
-            codex: fake_cli(dir),
+            programs: crate::testing::programs(fake_cli(dir), fake_cli(dir)),
             env: BTreeMap::from([
                 ("PATH".into(), "/usr/bin:/bin".into()),
                 ("CLAUDE_CODE_CHILD_SESSION".into(), "1".into()),
@@ -3170,6 +3314,7 @@ mod tests {
         d.create(
             NewSession {
                 engine: Engine::Claude,
+                view: None,
                 name: "auth-fix".into(),
                 cwd: dir.to_string_lossy().into_owned(),
                 goal: "fix the race".into(),
@@ -3452,10 +3597,10 @@ mod tests {
 
     /// Keeps every reading the desk passes on.
     #[derive(Default)]
-    struct Readings(Mutex<Vec<(MacPlan, Value, crate::usage::MacAccount)>>);
+    struct Readings(Mutex<Vec<(LocalPlan, Value, crate::usage::LocalAccount)>>);
 
     impl PlanSink for Readings {
-        fn mac(&self, plan: MacPlan, payload: Value, account: crate::usage::MacAccount) {
+        fn local(&self, plan: LocalPlan, payload: Value, account: crate::usage::LocalAccount) {
             self.0.lock().push((plan, payload, account));
         }
     }
@@ -3468,6 +3613,7 @@ mod tests {
             &path,
             format!(
                 "#!/bin/sh\ncase \"$1 $2\" in\n\
+                 '--version ') echo '2.1.300 (Claude Code)' ;;\n\
                  'auth status') echo '{{\"loggedIn\":true,\"authMethod\":\"claude.ai\",\"orgId\":\"org-1\",\"email\":\"person@example.com\",\"subscriptionType\":\"max\"}}' ;;\n\
                  'login status') echo 'Logged in using ChatGPT' >&2 ;;\n\
                  *) env > \"{}/env-$$\"; exec sleep 60 ;;\n\
@@ -3490,8 +3636,7 @@ mod tests {
             let d = Desk::start(
                 DeskStore::from_pool(pool),
                 Options {
-                    claude: cli.clone(),
-                    codex: cli,
+                    programs: crate::testing::programs(cli.clone(), cli),
                     ..options(dir.path())
                 },
                 Floor {
@@ -3502,28 +3647,37 @@ mod tests {
             )
             .await
             .unwrap();
-            let max = crate::usage::MacAccount {
+            let max = crate::usage::LocalAccount {
                 ids: vec!["org-1".into(), "person@example.com".into()],
                 plan: Some("max".into()),
             };
             for _ in 0..200 {
-                if d.sign_ins().claude.is_some() {
+                if d.sign_ins().of(Engine::Codex).on_plan() {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(25)).await;
             }
+            let ins = d.sign_ins();
+            assert_eq!(ins.of(Engine::Claude).plan_account(), Some(max.clone()));
+            assert!(ins.of(Engine::Codex).on_plan(), "Codex says it on stderr");
+            let engines = d.engines();
+            let claude = engines.iter().find(|e| e.engine == Engine::Claude).unwrap();
             assert_eq!(
-                d.sign_ins(),
-                MacSignIns {
-                    claude: Some(max.clone()),
-                    codex: true
-                }
+                (claude.installed, claude.version.map(|v| v.to_string())),
+                (Some(true), Some("2.1.300".to_string()))
+            );
+            let gemini = engines.iter().find(|e| e.engine == Engine::Gemini).unwrap();
+            assert_eq!(
+                (gemini.installed, gemini.views.len()),
+                (None, 0),
+                "no program named, never run"
             );
 
             let s = d
                 .create(
                     NewSession {
                         engine: Engine::Claude,
+                        view: None,
                         name: "auth-fix".into(),
                         cwd: dir.path().to_string_lossy().into_owned(),
                         goal: String::new(),
@@ -3558,7 +3712,7 @@ mod tests {
             post(&d, s.id, json!({"hook_event_name": "DeskUsage", "rate_limits": limits})).await;
             assert_eq!(
                 readings.0.lock().clone(),
-                [(MacPlan::Claude, limits, max)],
+                [(LocalPlan::Claude, limits, max)],
                 "the reading is the session's sign-in's"
             );
             assert_eq!(d.view(s.id).unwrap().state, SessionState::Starting, "and changes nothing of it");
@@ -3567,6 +3721,7 @@ mod tests {
                 .create(
                     NewSession {
                         engine: Engine::Claude,
+                        view: None,
                         name: "bad".into(),
                         cwd: dir.path().to_string_lossy().into_owned(),
                         goal: String::new(),
@@ -3590,8 +3745,7 @@ mod tests {
             DeskStore::migrate(&pool).await.unwrap();
             let cli = signed_in_cli(dir.path());
             let opts = || Options {
-                claude: cli.clone(),
-                codex: cli.clone(),
+                programs: crate::testing::programs(cli.clone(), cli.clone()),
                 ..options(dir.path())
             };
             let no_floor = || Floor {
@@ -3610,6 +3764,7 @@ mod tests {
             d.create(
                 NewSession {
                     engine: Engine::Claude,
+                    view: None,
                     name: "auth-fix".into(),
                     cwd: dir.path().to_string_lossy().into_owned(),
                     goal: String::new(),
@@ -3700,10 +3855,7 @@ mod tests {
             let logged = Arc::new(Logged::default());
             let d = Desk::start(
                 DeskStore::from_pool(pool),
-                Options {
-                    claude: shell_cli(dir.path()),
-                    ..options(dir.path())
-                },
+                options(dir.path()).with_program(Engine::Claude, shell_cli(dir.path())),
                 Floor {
                     turns: Some(logged.clone()),
                     plans: None,
@@ -4033,6 +4185,7 @@ mod tests {
                 .create(
                     NewSession {
                         engine: Engine::Claude,
+                        view: None,
                         name: "acme-web".into(),
                         cwd: dir.path().to_string_lossy().into_owned(),
                         goal: "upgrade the date picker".into(),
@@ -4731,10 +4884,7 @@ mod tests {
         let logged = Arc::new(Logged::default());
         let d = Desk::start(
             DeskStore::from_pool(pool),
-            Options {
-                claude: cli,
-                ..options(dir)
-            },
+            options(dir).with_program(Engine::Claude, cli),
             Floor {
                 turns: Some(logged.clone()),
                 plans: None,

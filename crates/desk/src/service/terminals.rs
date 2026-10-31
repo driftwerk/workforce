@@ -22,7 +22,7 @@ use super::{check_env, Desk, DeskError, Live, Persist, RestorePolicy};
 use crate::claude::{self, Hook};
 use crate::holder::{Held, Holder};
 use crate::model::DeskEvent;
-use crate::model::{Approvals, Engine, Origin, SessionRecord, SessionState};
+use crate::model::{Approvals, Engine, Origin, SessionRecord, SessionState, View};
 use crate::procs;
 use crate::pty::{Exit, Pty, Spawn};
 use crate::store::DeskStore;
@@ -659,6 +659,8 @@ impl Desk {
                 self.save(SessionRecord {
                     id,
                     engine: Engine::Claude,
+                    view: View::Terminal,
+                    engine_version: self.version_of(Engine::Claude),
                     name: term.map_or_else(|| folder_name(&cwd), |t| t.name),
                     goal: String::new(),
                     cwd,
@@ -1041,7 +1043,7 @@ mod tests {
         let cli = dir.join("fake-claude");
         std::fs::write(&cli, "#!/bin/sh\nexec sleep 60\n").unwrap();
         std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
-        opts.claude = cli;
+        opts = opts.with_program(Engine::Claude, cli);
         opts.env = BTreeMap::from([
             ("PATH".into(), "/usr/bin:/bin".into()),
             ("SHELL".into(), "/bin/sh".into()),

@@ -13,7 +13,7 @@ use workforce_common::subscription::{CredentialTier, LoginOwner, SubscriptionKin
 use workforce_common::usage::{
     account_key, claude_mod_usage, codex_usage, LoginRef, PlanKind, Reading, Window,
 };
-use workforce_desk::usage::{MacAccount, MacPlan, PlanSink};
+use workforce_desk::usage::{LocalAccount, LocalPlan, PlanSink};
 
 use super::postgres::PgFloorStore;
 use super::signal::Signals;
@@ -130,10 +130,10 @@ impl PlanUsage for Plans {
 }
 
 impl PlanSink for Plans {
-    fn mac(&self, plan: MacPlan, payload: Value, account: MacAccount) {
+    fn local(&self, plan: LocalPlan, payload: Value, account: LocalAccount) {
         let (kind, windows) = match plan {
-            MacPlan::Claude => (PlanKind::Claude, claude_mod_usage(&payload)),
-            MacPlan::Codex => (PlanKind::Chatgpt, codex_usage(&payload)),
+            LocalPlan::Claude => (PlanKind::Claude, claude_mod_usage(&payload)),
+            LocalPlan::Codex => (PlanKind::Chatgpt, codex_usage(&payload)),
         };
         if windows.is_empty() {
             return;
@@ -204,15 +204,15 @@ mod tests {
             };
             plans.observe(&someone_else, None, vec![window(5.0, 100)]);
             plans.observe(&theirs, None, vec![]);
-            plans.mac(
-                MacPlan::Codex,
+            plans.local(
+                LocalPlan::Codex,
                 serde_json::json!({"rateLimits": {"primary": {"usedPercent": 12, "windowDurationMins": 300}}}),
-                MacAccount {
+                LocalAccount {
                     ids: vec!["acct-1".into()],
                     plan: Some("pro".into()),
                 },
             );
-            plans.mac(MacPlan::Claude, serde_json::json!([]), MacAccount::default());
+            plans.local(LocalPlan::Claude, serde_json::json!([]), LocalAccount::default());
             let kept = loop {
                 let kept = store.readings().await.unwrap();
                 if kept.len() == 4 {

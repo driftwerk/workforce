@@ -173,8 +173,10 @@ async fn desk_with(
     Desk::start(
         DeskStore::with_pool(pool).await.unwrap(),
         Options {
-            claude: cli.clone(),
-            codex: cli,
+            programs: BTreeMap::from([
+                (workforce_desk::engine::Engine::Claude, cli.clone()),
+                (workforce_desk::engine::Engine::Codex, cli),
+            ]),
             env: BTreeMap::from([("PATH".into(), "/usr/bin:/bin".into())]),
             run_dir: dir.join("run"),
             scrollback_bytes: 4096,
@@ -255,6 +257,7 @@ async fn new_session(d: &Desk, dir: &Path, name: &str) -> workforce_desk::model:
     d.create(
         NewSession {
             engine: Engine::Claude,
+            view: None,
             name: name.into(),
             cwd: dir.to_string_lossy().into_owned(),
             goal: "Upgrade the date picker".into(),
@@ -1183,6 +1186,8 @@ async fn messaging_agents_and_terminal_sessions_is_the_persons_to_switch_on() {
         let terminal = workforce_desk::model::SessionRecord {
             id: uuid::Uuid::new_v4(),
             engine: Engine::Claude,
+            engine_version: None,
+            view: workforce_desk::model::View::Terminal,
             name: "elsewhere".into(),
             goal: String::new(),
             cwd: dir.path().to_string_lossy().into_owned(),

@@ -23,11 +23,11 @@ use workforce_common::subscription::{is_automated_source, split_per_user_key, Su
 use workforce_common::usage::{LoginRef, PlanKind, Reading, Window};
 use workforce_core::policy::PermissionChoice;
 use workforce_desk::crew::{self, By, PartyKind};
+use workforce_desk::engine::{Engine, SignIns};
 use workforce_desk::floor::{
     self, Answer, DecideRef, Need, NeedKind, Place, Scope, Subject, Turn, Who,
 };
 use workforce_desk::model::Decision;
-use workforce_desk::usage::MacSignIns;
 use workforce_desk::{Desk, DeskError};
 use workforce_identity::store::IdentityStore;
 
@@ -704,7 +704,7 @@ fn signed_in(keys: impl IntoIterator<Item = String>, caller: &FloorCaller) -> Ha
 fn usage_of(
     readings: Vec<Reading>,
     held: &HashSet<PlanKind>,
-    mac: Option<&MacSignIns>,
+    mac: Option<&SignIns>,
     caller: &FloorCaller,
     now: DateTime<Utc>,
 ) -> UsageView {
@@ -718,12 +718,12 @@ fn usage_of(
             LoginView {
                 kind: PlanKind::Claude,
                 at: Where::Mac,
-                signed_in: m.claude.is_some(),
+                signed_in: m.of(Engine::Claude).on_plan(),
             },
             LoginView {
                 kind: PlanKind::Chatgpt,
                 at: Where::Mac,
-                signed_in: m.codex,
+                signed_in: m.of(Engine::Codex).on_plan(),
             },
         ]
     });
@@ -1222,9 +1222,14 @@ mod tests {
         let view = usage_of(
             vec![mac],
             &HashSet::from([PlanKind::Claude]),
-            Some(&MacSignIns {
-                claude: Some(Default::default()),
-                codex: false,
+            Some(&SignIns {
+                by_engine: [(
+                    Engine::Claude,
+                    workforce_desk::engine::claude_sign_in(
+                        r#"{"loggedIn":true,"authMethod":"oauth_token"}"#,
+                    ),
+                )]
+                .into(),
             }),
             &FloorCaller {
                 id: "u1".into(),
