@@ -198,6 +198,7 @@ impl StatusTool {
         if let Some((turn_id, turn)) =
             turn_awaiting(&self.ctx, &uid, args.turn_id.as_deref(), request_id)
         {
+            reach_agent(&self.ctx, &uid, Some(&turn.agent_id))?;
             let prompt = turn.prompt(request_id);
             return Ok(ToolResult::success(
                 serde_json::json!({

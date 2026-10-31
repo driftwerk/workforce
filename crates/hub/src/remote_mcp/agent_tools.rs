@@ -94,11 +94,12 @@ pub(super) fn reach_agent(
     agent_id: Option<&str>,
 ) -> Result<Arc<AgentService>, ToolResult> {
     reachable(&ctx.gateway, uid, agent_id).map_err(|refused| {
+        let which = match refused.asked() {
+            "" => "no default agent you can reach".to_string(),
+            asked => format!("unknown agent {asked:?}"),
+        };
         ToolResult::failure(
-            format!(
-                "unknown agent {:?}; call agent.list for the agents you can reach on this hub",
-                refused.agent()
-            ),
+            format!("{which}; call agent.list for the agents you can reach on this hub"),
             0,
         )
     })
@@ -175,7 +176,10 @@ pub struct ChatTurn {
 
 impl ChatTurn {
     /// Follow the turn `progress` reports on; `slot` is held until it
-    /// settles.
+    /// settles, or until it has run the slot's whole life: then it is
+    /// cancelled and the slot freed, whether or not anyone kept the turn for
+    /// polling, so a turn that never ends can't hold one of its owner's
+    /// slots for good.
     fn spawn(
         owner: String,
         agent_id: String,
@@ -208,7 +212,19 @@ impl ChatTurn {
                     collector.observe(event, &routed);
                 }
             };
-            let (run, ()) = tokio::join!(handle, drain);
+            let settled = async { tokio::join!(handle, drain) };
+            tokio::pin!(settled);
+            let ttl = slot.ttl;
+            let mut slot = Some(slot);
+            let (run, ()) = tokio::select! {
+                done = &mut settled => done,
+                () = tokio::time::sleep(ttl) => {
+                    tracing::warn!(owner = %collector.owner, agent = %collector.agent_id, "remote MCP: a turn outlived its time and is cancelled");
+                    collector.cancel.cancel();
+                    slot = None;
+                    settled.await
+                }
+            };
             let outcome = match run {
                 Ok(Ok(result)) => Ok(result.response),
                 Ok(Err(e)) => Err(e.to_string()),
@@ -403,6 +419,8 @@ impl Ephemeral for ChatTurn {
 pub struct TurnSlot {
     running: Arc<Mutex<HashMap<String, usize>>>,
     owner: String,
+    /// The longest its turn may hold it.
+    ttl: Duration,
 }
 
 impl Drop for TurnSlot {
@@ -423,6 +441,7 @@ pub struct ChatTurns {
     held: EphemeralRegistry<ChatTurn>,
     running: Arc<Mutex<HashMap<String, usize>>>,
     per_identity: usize,
+    ttl: Duration,
 }
 
 impl Default for ChatTurns {
@@ -437,6 +456,7 @@ impl ChatTurns {
             held: EphemeralRegistry::bounded(per_identity, ttl),
             running: Arc::default(),
             per_identity,
+            ttl,
         }
     }
 
@@ -460,6 +480,7 @@ impl ChatTurns {
         Ok(TurnSlot {
             running: Arc::clone(&self.running),
             owner: owner.to_string(),
+            ttl: self.ttl,
         })
     }
 
@@ -1074,6 +1095,22 @@ pub(super) mod tests {
         );
     }
 
+    /// A turn that never ends, kept for polling or not, is cancelled when
+    /// its time is up and gives its slot back: its owner is never locked out.
+    #[tokio::test]
+    async fn a_turn_that_never_ends_frees_its_slot_when_its_time_is_up() {
+        let turns = ChatTurns::bounded(1, Duration::from_millis(200));
+        let live = live_turn_in(&turns);
+        assert!(turns.admit("alice").is_err(), "the one slot is held");
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(live.turn.cancel.is_cancelled(), "the turn was cancelled");
+        assert!(
+            turns.admit("alice").is_ok(),
+            "its slot is free though the stub never settled"
+        );
+        drop(live.finish);
+    }
+
     #[test]
     fn expired_turns_are_swept_on_insert() {
         let turns = ChatTurns::bounded(8, Duration::from_secs(60));
@@ -1149,6 +1186,10 @@ pub(super) mod tests {
     /// A turn whose runner is a stub: it emits whatever the test pushes and
     /// settles (with an error) when told to finish.
     fn live_turn() -> LiveTurn {
+        live_turn_in(&ChatTurns::default())
+    }
+
+    fn live_turn_in(turns: &ChatTurns) -> LiveTurn {
         let (progress_tx, progress_rx) = mpsc::channel(8);
         let (finish, finished) = tokio::sync::oneshot::channel::<()>();
         let handle = tokio::spawn(async move {
@@ -1173,7 +1214,7 @@ pub(super) mod tests {
             CancellationToken::new(),
             inject_tx,
             routed_tx,
-            ChatTurns::default().admit("alice").unwrap(),
+            turns.admit("alice").unwrap(),
         );
         LiveTurn {
             turn,
@@ -1734,6 +1775,7 @@ pub(super) mod tests {
             for (tool, agent) in [
                 ("agent.chat", "private"),
                 ("agent.history", "private"),
+                ("agent.chat", "PRIVATE"),
                 ("agent.chat", "privat"),
                 ("agent.history", "removed"),
             ] {

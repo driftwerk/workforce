@@ -14,9 +14,10 @@ use crate::agent_registry::canonical_agent_id;
 use crate::gateway::{AgentViewer, CallerContext, GatewayState};
 use crate::serve::AgentService;
 
-/// Why a caller cannot reach the agent they named. Both read the same to the
-/// caller, so an agent the caller may not use cannot be told from one that
-/// does not exist.
+/// Why a caller cannot reach the agent they named, holding what they asked
+/// for as they typed it (blank for the default agent). Both read the same to
+/// the caller, so an agent the caller may not use cannot be told from one
+/// that does not exist, not even by the casing of its id.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Unreachable {
     /// No agent on this hub has that id.
@@ -27,8 +28,9 @@ pub enum Unreachable {
 }
 
 impl Unreachable {
-    /// The agent id the caller asked for, or the default agent's.
-    pub fn agent(&self) -> &str {
+    /// The agent id the caller asked for, as they typed it; blank when they
+    /// named none.
+    pub fn asked(&self) -> &str {
         match self {
             Self::Unknown(id) | Self::Denied(id) => id,
         }
@@ -51,23 +53,26 @@ pub fn reachable(
     agent_id: Option<&str>,
 ) -> Result<Arc<AgentService>, Unreachable> {
     let registry = &gateway.registry;
-    let id = match agent_id.map(str::trim).filter(|id| !id.is_empty()) {
-        Some(wanted) => {
-            let live: Vec<String> = registry.agent_ids().iter().map(|a| a.to_string()).collect();
-            canonical_agent_id(wanted, &live)
-                .map(str::to_string)
-                .ok_or_else(|| Unreachable::Unknown(wanted.to_string()))?
-        }
-        None => registry.default_id().to_string(),
+    let asked = agent_id.map(str::trim).unwrap_or_default();
+    // The caller's view of the roster is built whether or not the id names
+    // an agent, so the two refusals take the same work.
+    let viewer = viewer(gateway, identity_id);
+    let id = if asked.is_empty() {
+        registry.default_id().to_string()
+    } else {
+        let live: Vec<String> = registry.agent_ids().iter().map(|a| a.to_string()).collect();
+        canonical_agent_id(asked, &live)
+            .map(str::to_string)
+            .ok_or_else(|| Unreachable::Unknown(asked.to_string()))?
     };
     let service = registry
         .get(&id)
-        .ok_or_else(|| Unreachable::Unknown(id.clone()))?;
-    if admits(gateway, &viewer(gateway, identity_id), identity_id, &id) {
+        .ok_or_else(|| Unreachable::Unknown(asked.to_string()))?;
+    if admits(gateway, &viewer, identity_id, &id) {
         Ok(service)
     } else {
         info!(agent = %id, identity = %identity_id, "remote MCP: agent's access policy does not admit the caller");
-        Err(Unreachable::Denied(id))
+        Err(Unreachable::Denied(asked.to_string()))
     }
 }
 
@@ -144,6 +149,25 @@ mod tests {
         assert_eq!(reachable_ids(&fx.state, "bob"), ["default"]);
     }
 
+    /// A refusal holds the id as the caller typed it, so one in another
+    /// case can't confirm that an agent exists, or spell its real id.
+    #[tokio::test]
+    async fn a_refusal_says_back_only_what_was_asked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fx = fixture(true);
+        with_agents(&fx, tmp.path(), &["default", "private"]).await;
+        fx.state.access_gate.upsert("private".into(), only("alice"));
+
+        assert_eq!(
+            reachable(&fx.state, "bob", Some(" PRIVATE ")).err(),
+            Some(Unreachable::Denied("PRIVATE".into()))
+        );
+        assert_eq!(
+            reachable(&fx.state, "bob", Some("NOPE")).err(),
+            Some(Unreachable::Unknown("NOPE".into()))
+        );
+    }
+
     #[tokio::test]
     async fn the_default_agent_is_held_to_its_policy_too() {
         let tmp = tempfile::tempdir().unwrap();
@@ -154,7 +178,7 @@ mod tests {
         assert!(reachable(&fx.state, "alice", None).is_ok());
         assert_eq!(
             reachable(&fx.state, "bob", None).err(),
-            Some(Unreachable::Denied("default".into()))
+            Some(Unreachable::Denied(String::new()))
         );
     }
 
