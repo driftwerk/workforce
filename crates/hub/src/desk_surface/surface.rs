@@ -231,6 +231,7 @@ mod tests {
         DeskScope {
             target,
             attended: true,
+            relayed: false,
             owner: "person-1".into(),
         }
     }

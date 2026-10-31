@@ -26,7 +26,7 @@ use crate::skill_consent::{
     SkillGrants, Surface, Target, ToolsGrant, TransferOutcome, ValueAction, VisibilityChange,
 };
 
-use super::agent_tools::{caller, resolve_agent, unwrap_or_result, AgentToolsContext};
+use super::agent_tools::{caller, reach_agent, unwrap_or_result, AgentToolsContext};
 
 const CONTRACT_NOTE: &str = "Grants pin the skill's consent contract (capabilities, network \
     hosts, credentials, permissions): changing it invalidates this grant until it is \
@@ -67,7 +67,7 @@ fn consent(ctx: &AgentToolsContext) -> Result<Consent, ToolResult> {
         .try_with(|a| a.clone())
         .ok()
         .filter(|a| !a.is_empty());
-    let service = resolve_agent(ctx, agent.as_deref())?;
+    let service = reach_agent(ctx, &uid, agent.as_deref())?;
     Ok(Consent::for_service(&service, &uid, Surface::RemoteMcp))
 }
 

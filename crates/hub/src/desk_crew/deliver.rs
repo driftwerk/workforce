@@ -3,13 +3,21 @@
 //! suggestion) sends the crew. It runs in the DM's own session, so it is in
 //! the conversation's history, and goes out live to a DM the person has
 //! open, as a typed message's answer does.
+//!
+//! It answers to that DM as a Desk turn does: what it posts goes to Desk
+//! unless it names a platform, and a write anywhere else is held for the
+//! person, which (no one being on the turn to answer) refuses it, even to a
+//! place the person always allows from their own turns. Its prompt is not
+//! the person's own words, so it is read at paired trust.
 
 use std::sync::Arc;
 
 use eyre::{bail, Result};
 use workforce_agent::tools::approval::SelfServe;
+use workforce_common::channels::desk::{DeskPlace, DeskScope, DeskTarget};
 use workforce_common::channels::DESK_CHANNEL;
 use workforce_common::session::MessageRole;
+use workforce_common::trust::TrustLevel;
 use workforce_desk::crew::MentionedApproval;
 use workforce_desk::Speaker;
 
@@ -65,8 +73,15 @@ impl CrewHub {
             }
         };
         let _ = tx.send(BroadcastMessage::new(sid.clone(), "typing", String::new()));
-        let progress = service
-            .process_message_with_progress(
+        let scope = DeskScope {
+            target: DeskTarget::of_turn(&DeskPlace::Dm, DESK_CHANNEL, None, false),
+            owner: owner.to_string(),
+            attended: true,
+            relayed: true,
+        };
+        let progress = workforce_agent::runner::with_desk(
+            Some(scope),
+            service.process_message_with_progress(
                 DESK_CHANNEL,
                 owner,
                 None,
@@ -87,12 +102,13 @@ impl CrewHub {
                 None,
                 None,
                 None,
-                None,
+                Some(TrustLevel::Paired),
                 Some(live.cancel_token()),
                 None,
                 None,
-            )
-            .await?;
+            ),
+        )
+        .await?;
         let session_id = progress.session_id.clone();
         let tx = if session_id == sid {
             tx
@@ -106,7 +122,9 @@ impl CrewHub {
         let forward = {
             let (tx, sid) = (tx.clone(), session_id.clone());
             let mentions = crate::gateway::mentions_for(service, &sid);
-            move |rx| crate::gateway::forward_local_progress(rx, tx, sid, false, mentions, None)
+            move |rx| {
+                crate::gateway::forward_local_progress(rx, tx, sid, false, None, mentions, None)
+            }
         };
         let conducted = crate::live_turns::conduct(&mut live, service, progress, forward).await;
         let answer = match &conducted.ending {

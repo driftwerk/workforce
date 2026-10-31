@@ -11,8 +11,16 @@
 //! summaries = { morning = "09:00", evening = "" }
 //! max_checkins_per_hour = 6
 //! max_checkins_per_day = 100
-//! act = { nudge = true, resume_restart = true, read_only_approvals = false, hand_out_work = false, interrupt = false }
+//! act = { nudge = true, resume_restart = true, read_only_approvals = false, hand_out_work = false, interrupt = false, message_agents = false, message_terminal_sessions = false }
 //! ```
+//!
+//! What the overseer sends an agent, or a session started in another
+//! terminal, may lead to something done without asking: an agent acts under
+//! its own permissions, and such a session may have been started not to ask.
+//! So at level `act` it only suggests them, unless `message_agents` (nudges
+//! and tasks to agents) or `message_terminal_sessions` (nudges to those
+//! sessions) is on. Words that read as pushing, deleting or sending still
+//! make any action a suggestion.
 //!
 //! Check-ins are spent from a rolling hour, `max_checkins_per_day` the
 //! ceiling over a day; what happens while they are spent waits for the next
@@ -86,6 +94,15 @@ pub struct Act {
     pub hand_out_work: bool,
     /// Ending a session's turn (Esc in its terminal).
     pub interrupt: bool,
+    /// Nudging an agent (with `nudge`), or handing it a task. Its turn
+    /// answers to its Desk DM, relayed, at the trust of a paired device, so
+    /// what it would post or send anywhere but Desk, delete, remember or
+    /// hand on waits on the person (#64); its other tools run under its own
+    /// permissions, as in any turn.
+    pub message_agents: bool,
+    /// Nudging a session started in another terminal (with `nudge`), which
+    /// may have been started not to ask before it acts.
+    pub message_terminal_sessions: bool,
 }
 
 /// An agent's `[oversight]`, every default filled in.
@@ -140,6 +157,8 @@ impl Default for Oversight {
                 read_only_approvals: false,
                 hand_out_work: false,
                 interrupt: false,
+                message_agents: false,
+                message_terminal_sessions: false,
             },
         }
     }
@@ -347,6 +366,18 @@ impl Oversight {
                     d.act.interrupt,
                     "interrupting a session without asking",
                 )?,
+                message_agents: switch(
+                    act,
+                    "message_agents",
+                    d.act.message_agents,
+                    "messaging agents without asking",
+                )?,
+                message_terminal_sessions: switch(
+                    act,
+                    "message_terminal_sessions",
+                    d.act.message_terminal_sessions,
+                    "messaging sessions started in another terminal without asking",
+                )?,
             },
         })
     }
@@ -418,6 +449,37 @@ mod tests {
         assert!(parse("[oversight]\nact = { interrupt = \"yes\" }\n")
             .unwrap_err()
             .contains("interrupting a session without asking"));
+    }
+
+    /// Messaging agents and sessions started in another terminal are each
+    /// the person's to switch on, and off until they do.
+    #[test]
+    fn messaging_agents_and_terminal_sessions_are_off_until_switched_on() {
+        let d = parse("[oversight]\nenabled = true\nlevel = \"act\"\n").unwrap();
+        assert!(!d.act.message_agents && !d.act.message_terminal_sessions);
+        let agents =
+            parse("[oversight]\nlevel = \"act\"\nact = { message_agents = true }\n").unwrap();
+        assert!(agents.act.message_agents && !agents.act.message_terminal_sessions);
+        let terminals =
+            parse("[oversight]\n[oversight.act]\nmessage_terminal_sessions = true\n").unwrap();
+        assert!(!terminals.act.message_agents && terminals.act.message_terminal_sessions);
+        for (source, says) in [
+            (
+                "[oversight]\nact = { message_agents = 1 }\n",
+                "messaging agents without asking",
+            ),
+            (
+                "[oversight]\nact = { message_terminal_sessions = \"on\" }\n",
+                "messaging sessions started in another terminal without asking",
+            ),
+        ] {
+            let e = parse(source).unwrap_err();
+            assert!(
+                e.contains(says) && e.contains("true or false"),
+                "{source} → {e}"
+            );
+            assert!(!e.contains("message_"), "{source} → {e} names the key");
+        }
     }
 
     #[test]

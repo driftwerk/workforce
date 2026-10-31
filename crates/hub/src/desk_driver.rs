@@ -28,7 +28,7 @@ use workforce_desk::engine::Engine;
 use workforce_desk::local::{self, Server};
 use workforce_desk::providers::Group;
 use workforce_desk::{
-    AccountError, Accounts, Audio, Authorize, Desk, DeskStore, Fields, HolderOptions, HubTurns,
+    AccountError, Accounts, Audio, Authorize, Desk, DeskStore, Fields, HolderOptions, HubInternal,
     KeySource, Options, Provider, Realtime, RestorePolicy, Speak, SpeakError, Spec, Speech,
     Standing,
 };
@@ -136,7 +136,10 @@ impl Speech for VaultKeys {
         };
         let speaker = provider_from_config(&config, Path::new(""), |_| KeySlot::fixed(&*key))
             .map_err(|e| SpeakError::Invalid(e.to_string()))?;
-        let text = normalize_for_tts(&request.text);
+        // The voice directions it performs are kept; the speaker would drop
+        // the rest anyway, but a text that was nothing else is the caller's
+        // mistake, not the provider's.
+        let text = speaker.markup().apply(&normalize_for_tts(&request.text));
         let text = text.trim();
         if text.is_empty() {
             return Err(SpeakError::Invalid(
@@ -459,7 +462,7 @@ fn options(config: &WorkforceConfig) -> Options {
         adopt_every: (desk.adopt_interval_secs > 0)
             .then(|| Duration::from_secs(desk.adopt_interval_secs)),
         holder: holder_options(desk),
-        hub_turns: hub_turns(config),
+        hub_internal: hub_internal(config),
     }
 }
 
@@ -484,26 +487,35 @@ fn programs(desk: &workforce_common::settings::DeskConfig) -> BTreeMap<Engine, P
         .collect()
 }
 
-/// Where this hub's agent turns run Claude Code: its sessions there are the
-/// hub's own, not the person's for Desk to adopt.
-fn hub_turns(config: &WorkforceConfig) -> HubTurns {
+/// What this hub runs Claude Code in and as itself: its own folders and its
+/// own process. Its sessions there are the hub's (a completion, an agent's
+/// turn, a coding round), never the person's for Desk to adopt.
+fn hub_internal(config: &WorkforceConfig) -> HubInternal {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    HubInternal::new(
+        hub_dirs(
+            Path::new(&config.hub.data_dir),
+            config.hub.worktree_root_path(),
+        ),
+        home.as_deref(),
+    )
+    .started_by(std::process::id())
+}
+
+/// The folders only the hub writes, made absolute: its data directory
+/// (completions, agents' work trees, worktrees, everything else it keeps),
+/// and with a `worktree_root` its hot work trees and checked-out worktrees
+/// there — never that root itself, which may be shared.
+fn hub_dirs(data_dir: &Path, worktree_root: Option<&Path>) -> Vec<PathBuf> {
     use crate::coding_sandbox::absolutise_data_dir;
-    let roots = WorkRoots::from_hub(&config.hub);
-    let roots = WorkRoots {
-        data_dir: absolutise_data_dir(roots.data_dir),
-        hot: roots.hot.map(absolutise_data_dir),
-    };
-    // As `claude agents` reports a cwd: with its links resolved.
-    let resolved = WorkRoots {
-        data_dir: std::fs::canonicalize(&roots.data_dir).unwrap_or(roots.data_dir.clone()),
-        hot: roots
-            .hot
-            .as_ref()
-            .map(|h| std::fs::canonicalize(h).unwrap_or(h.clone())),
-    };
-    HubTurns::new(move |cwd| {
-        crate::agent_turn::runs_in(&roots, cwd) || crate::agent_turn::runs_in(&resolved, cwd)
-    })
+    let roots = WorkRoots::new(data_dir.to_path_buf(), worktree_root);
+    let worktrees =
+        worktree_root.map(|_| crate::code::worktree::worktrees_dir(data_dir, worktree_root));
+    std::iter::once(roots.data_dir)
+        .chain(roots.hot)
+        .chain(worktrees)
+        .map(absolutise_data_dir)
+        .collect()
 }
 
 /// The PTY holder, when `[desk]` names its socket and a token.
@@ -605,6 +617,48 @@ mod tests {
 
     fn vault(dir: &std::path::Path) -> Arc<Vault> {
         Arc::new(Vault::open(&dir.join("global"), "test-key").unwrap())
+    }
+
+    #[test]
+    fn the_hubs_own_folders_are_its_data_and_its_hot_trees_never_their_root() {
+        assert_eq!(hub_dirs(Path::new("/data"), None), [PathBuf::from("/data")]);
+        assert_eq!(
+            hub_dirs(Path::new("/data"), Some(Path::new("/fast"))),
+            [
+                PathBuf::from("/data"),
+                PathBuf::from("/fast/work"),
+                PathBuf::from("/fast/worktrees")
+            ]
+        );
+        let relative = hub_dirs(Path::new("data"), None);
+        assert!(relative[0].is_absolute() && relative[0].ends_with("data"));
+    }
+
+    /// What the hub runs in its own folders is never adopted; the person's
+    /// folders are, the one the hub's data sits in included.
+    #[test]
+    fn the_hubs_own_sessions_are_told_from_the_persons() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = std::fs::canonicalize(root.path()).unwrap();
+        let mut config = WorkforceConfig::default();
+        config.hub.data_dir = repo.join("data").to_string_lossy().into_owned();
+        config.hub.worktree_root = Some(repo.join("fast").to_string_lossy().into_owned());
+        let hub = options(&config).hub_internal;
+        let holds = |p: PathBuf| hub.holds(&p);
+        assert!(holds(repo.join(
+            "data/cli-completions/b369e00e-c276-4ae0-8394-6d83707380a0"
+        )));
+        assert!(holds(repo.join(
+            "data/agents/scout/projects/_agent-turn/work/session/at-dm-d4774cbb6c89-2e"
+        )));
+        assert!(holds(
+            repo.join("fast/work/scout/_agent-turn/session/at-dm-1")
+        ));
+        assert!(holds(repo.join("fast/worktrees/fix-1")));
+        assert!(!holds(repo.clone()), "the folder the hub's data sits in");
+        assert!(!holds(repo.join("src")));
+        assert!(!holds(repo.join("fast/notes")), "the worktree root itself");
+        assert!(!holds(repo.join("data-old/x")));
     }
 
     #[test]

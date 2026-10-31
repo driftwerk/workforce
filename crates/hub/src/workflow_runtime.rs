@@ -1753,6 +1753,33 @@ impl WorkflowRuntime {
             (None, None) => Arc::clone(&self.service),
         };
         let agent_id = service.agent_id.as_str().to_string();
+        // A step runs as the run's identity, so it may use only an agent a
+        // chat as them could: a workflow is no way round an agent's access
+        // policy. Refused as an unregistered one is, so a run can't learn
+        // which agents exist. A service with no gate wired (embedded and test
+        // contexts) has no policy to keep.
+        if let Some(identity) = crate::user_config::current_identity_id() {
+            let admitted = service.access_gate.read().as_ref().is_none_or(|gate| {
+                matches!(
+                    gate.check(crate::access_gate::AccessRequest {
+                        agent_id: &agent_id,
+                        identity_id: Some(&identity),
+                        surface_ids: &[],
+                        is_external: false,
+                    }),
+                    workforce_common::settings::AccessDecision::Allow
+                )
+            });
+            if !admitted {
+                tracing::info!(agent = %agent_id, identity = %identity, "workflow step refused: the agent's access policy does not admit the run's identity");
+                return Err(match declared {
+                    Some(agent_id) => {
+                        format!("names agent '{agent_id}', which is not a registered agent")
+                    }
+                    None => "runs on the default agent, which this run may not use".to_string(),
+                });
+            }
+        }
         Ok((service, agent_id))
     }
 
@@ -4304,6 +4331,7 @@ impl WorkflowRuntime {
                 target,
                 owner,
                 attended: false,
+                relayed: false,
             });
         let result = self
             .run_scoped(
@@ -6540,6 +6568,7 @@ impl WorkflowRuntime {
                 target,
                 owner,
                 attended: false,
+                relayed: false,
             });
         self.run_scoped(
             principal,
@@ -9059,6 +9088,7 @@ mod tests {
             Some(DeskScope {
                 target: DeskTarget::of_turn(&DeskPlace::Dm, "desk", None, false),
                 attended: false,
+                relayed: false,
                 owner: "person-1".into(),
             })
         };
@@ -9133,6 +9163,7 @@ mod tests {
                     Some(DeskScope {
                         target: target.clone(),
                         attended: true,
+                        relayed: false,
                         owner: "person-1".into(),
                     }),
                     Arc::clone(&runtime).start_workflow(
@@ -9241,6 +9272,66 @@ mod tests {
             err.contains("example"),
             "the error must name the agent, got: {err}"
         );
+    }
+
+    /// A step runs only on an agent whose access policy admits the run's
+    /// identity, and one it doesn't is refused in the words an unregistered
+    /// agent is.
+    #[tokio::test]
+    async fn a_step_never_runs_on_an_agent_the_run_may_not_use() {
+        use workforce_common::settings::{AccessMode, AgentAccessConfig};
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime = test_runtime().await;
+        let gate = crate::access_gate::AccessGate::new(std::collections::HashMap::new());
+        let mut agents = std::collections::HashMap::new();
+        for id in ["default", "private"] {
+            let dir = tmp.path().join(id);
+            let mut config = workforce_common::settings::WorkforceConfig::default();
+            config.hub.data_dir = dir.to_string_lossy().to_string();
+            config.memory.db_path = dir.join("memory.db").to_string_lossy().into_owned();
+            config.llm.api_key = Some("test-key".into());
+            config.agents = vec![workforce_common::settings::AgentConfig {
+                id: id.into(),
+                ..Default::default()
+            }];
+            let service = AgentService::from_config(config, None).await.unwrap();
+            assert_eq!(service.agent_id.as_str(), id);
+            service.set_access_gate(Arc::clone(&gate));
+            agents.insert(id.to_string(), service);
+        }
+        // After each service has published its own (open) policy.
+        gate.upsert(
+            "private".into(),
+            AgentAccessConfig {
+                mode: AccessMode::Allowlist,
+                allow: vec!["alice".into()],
+                ..Default::default()
+            },
+        );
+        let registry = Arc::new(crate::agent_registry::AgentRegistry::from_parts(
+            agents,
+            "default".into(),
+        ));
+        runtime.set_agent_registry(registry);
+        let as_ = |who: &'static str, agent: Option<&'static str>| {
+            let runtime = Arc::clone(&runtime);
+            workforce_agent::runner::CURRENT_USER_ID.scope(who.to_string(), async move {
+                runtime.resolve_step_service(agent).map(|(_, id)| id)
+            })
+        };
+        assert_eq!(
+            as_("alice", Some("private")).await.as_deref(),
+            Ok("private")
+        );
+        assert_eq!(
+            as_("bob", Some("private")).await.unwrap_err(),
+            as_("bob", Some("nobody"))
+                .await
+                .unwrap_err()
+                .replace("nobody", "private"),
+            "refused as an agent that isn't there"
+        );
+        assert_eq!(as_("bob", None).await.as_deref(), Ok("default"));
     }
 
     /// Seats every workspace in the temp dir and keeps what each asked for:

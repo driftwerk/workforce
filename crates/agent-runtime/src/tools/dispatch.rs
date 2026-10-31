@@ -131,6 +131,7 @@ pub fn gate_tool_call(
             ))
         },
     );
+    let response = apply_relayed_gate(response, tool_name, crate::runner::current_desk().as_ref());
     let holds = to.filter(|_| held == Some(Kept::NotYet));
     if let PolicyDecision::Deny { reason } = response.decision {
         return GateOutcome::Blocked {
@@ -520,7 +521,14 @@ pub fn apply_surface_gate(
     if !scope.attended || platform == workforce_common::channels::desk::DESK_PLATFORM {
         return response;
     }
-    match kept() {
+    // A relayed turn's write is the person's call each time: what they
+    // always allow is for their own words.
+    let kept = if scope.relayed {
+        Kept::Unkeepable
+    } else {
+        kept()
+    };
+    match kept {
         Kept::Allowed => response,
         kept => {
             let preview: String = preview_of(input).chars().take(PREVIEW_CHARS).collect();
@@ -534,6 +542,47 @@ pub fn apply_surface_gate(
                 ..response
             }
         }
+    }
+}
+
+/// Besides a write off Desk, what a turn relayed to an agent (the
+/// overseer's nudges and tasks) never does without the person: delete
+/// anything (any tool [`is_destructive`] names, built-in, skill or MCP),
+/// change what the agent remembers, or hand work on. Other tools run under
+/// the agent's own permissions, as in any turn.
+///
+/// [`is_destructive`]: workforce_policy::rules::is_destructive
+pub fn held_when_relayed(tool_name: &str) -> bool {
+    workforce_policy::rules::is_destructive(tool_name)
+        || matches!(
+            tool_name,
+            "memory.remember" | "memory.forget" | "memory.write" | "handoff.request"
+        )
+}
+
+/// Hold what [`held_when_relayed`] names, in a relayed Desk turn, for the
+/// person's say, which (no one being on the turn to answer) refuses it.
+/// Only ever escalates an `Allow`.
+pub fn apply_relayed_gate(
+    response: PolicyResponse,
+    tool_name: &str,
+    desk: Option<&workforce_common::channels::desk::DeskScope>,
+) -> PolicyResponse {
+    match (&response.decision, desk) {
+        (PolicyDecision::Allow, Some(scope))
+            if scope.attended && scope.relayed && held_when_relayed(tool_name) =>
+        {
+            PolicyResponse {
+                decision: PolicyDecision::RequireApproval {
+                    reason: format!(
+                        "{tool_name} was asked for by a message relayed to this agent, not by the person"
+                    ),
+                    allow_save_allow: false,
+                },
+                ..response
+            }
+        }
+        _ => response,
     }
 }
 
@@ -1633,6 +1682,7 @@ mod tests {
             target: DeskTarget::of_turn(&DeskPlace::Dm, "desk", None, false),
             owner: "person-1".into(),
             attended,
+            relayed: false,
         }
     }
 
@@ -1667,6 +1717,89 @@ mod tests {
             effect("slack.anything_added_later"),
             Some(SurfaceEffect::Writes { .. })
         ));
+    }
+
+    /// A turn the overseer relayed holds every write off Desk, to a place
+    /// the person always allows too, and offers no "Always allow".
+    #[test]
+    fn a_relayed_turn_s_write_off_desk_is_held_whatever_the_person_allows() {
+        let input = serde_json::json!({"channel": "C1", "text": "shipped"});
+        let to = SurfaceEffect::Writes {
+            platform: "slack".into(),
+            destination: "C1".into(),
+        };
+        let relayed = workforce_common::channels::desk::DeskScope {
+            relayed: true,
+            ..desk(true)
+        };
+        let asked = std::cell::Cell::new(false);
+        let gated = apply_surface_gate(allowed(), Some(&to), Some(&relayed), &input, || {
+            asked.set(true);
+            Kept::Allowed
+        });
+        assert!(
+            matches!(
+                gated.decision,
+                PolicyDecision::RequireApproval {
+                    allow_save_allow: false,
+                    ..
+                }
+            ),
+            "{:?}",
+            gated.decision
+        );
+        assert!(!asked.get(), "the person's allow list isn't read for it");
+        let own = apply_surface_gate(allowed(), Some(&to), Some(&desk(true)), &input, || {
+            Kept::Allowed
+        });
+        assert_eq!(own.decision, PolicyDecision::Allow, "their own turn passes");
+    }
+
+    /// A relayed turn deletes nothing, changes no memory and hands nothing
+    /// on by itself; what else it calls, and anything in the person's own
+    /// turn, is left to policy.
+    #[test]
+    fn a_relayed_turn_holds_deletes_memory_writes_and_hand_offs() {
+        let relayed = workforce_common::channels::desk::DeskScope {
+            relayed: true,
+            ..desk(true)
+        };
+        for tool in [
+            "github.branch_delete",
+            "jira.delete_issue",
+            "fs.remove",
+            "notion__delete_page",
+            "memory.remember",
+            "memory.forget",
+            "handoff.request",
+        ] {
+            let gated = apply_relayed_gate(allowed(), tool, Some(&relayed));
+            assert!(
+                matches!(
+                    gated.decision,
+                    PolicyDecision::RequireApproval {
+                        allow_save_allow: false,
+                        ..
+                    }
+                ),
+                "{tool}: {:?}",
+                gated.decision
+            );
+            for scope in [Some(desk(true)), None] {
+                assert_eq!(
+                    apply_relayed_gate(allowed(), tool, scope.as_ref()).decision,
+                    PolicyDecision::Allow,
+                    "{tool} in the person's own turn"
+                );
+            }
+        }
+        for tool in ["github.get_file", "memory.recall", "jira.search"] {
+            assert_eq!(
+                apply_relayed_gate(allowed(), tool, Some(&relayed)).decision,
+                PolicyDecision::Allow,
+                "{tool}"
+            );
+        }
     }
 
     #[test]

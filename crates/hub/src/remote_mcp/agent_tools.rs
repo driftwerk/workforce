@@ -3,6 +3,7 @@
 //! agent's own registry. The caller is always the identity in
 //! `CURRENT_USER_ID`, which the remote route scopes before dispatch.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -23,7 +24,7 @@ use workforce_common::trust::{classify_trust_with_role, ContentSource};
 use workforce_core::policy::{PermissionChoice, PermissionPromptOptions};
 use workforce_identity::store::IdentityStore;
 
-use crate::agent_registry::AgentRegistry;
+use crate::gateway::GatewayState;
 use crate::serve::{AgentService, MessageProgress};
 
 use crate::approvals::slack::hand_off;
@@ -31,6 +32,7 @@ use crate::ephemeral::{Ephemeral, EphemeralRegistry};
 use crate::hosts::RoutedApproval;
 use crate::mcp_gate::{choice_names, offered, PendingCalls, DECIDE_NEXT};
 
+use super::access::{reachable, reachable_ids};
 use super::approvals::not_offered;
 use super::server::session_channel;
 use super::stream;
@@ -42,7 +44,9 @@ const TURN_TTL: Duration = Duration::from_secs(60 * 60);
 const INJECT_BUFFER: usize = 32;
 
 pub struct AgentToolsContext {
-    pub registry: Arc<AgentRegistry>,
+    /// The hub whose agents, and whose access rules for them, the tools
+    /// act through.
+    pub gateway: Arc<GatewayState>,
     pub turns: Arc<ChatTurns>,
     pub pending_calls: Arc<PendingCalls>,
     pub routed: mpsc::Sender<RoutedApproval>,
@@ -81,16 +85,21 @@ pub(super) fn caller() -> Result<String, ToolResult> {
         .ok_or_else(|| ToolResult::failure("no caller identity in scope", 0))
 }
 
-pub(super) fn resolve_agent(
+/// The agent `agent_id` names (the default agent when it names none), if
+/// `uid` may reach it. An agent they may not use is refused exactly as one
+/// that does not exist.
+pub(super) fn reach_agent(
     ctx: &AgentToolsContext,
+    uid: &str,
     agent_id: Option<&str>,
 ) -> Result<Arc<AgentService>, ToolResult> {
-    ctx.registry.resolve(agent_id).ok_or_else(|| {
+    reachable(&ctx.gateway, uid, agent_id).map_err(|refused| {
+        let which = match refused.asked() {
+            "" => "no default agent you can reach".to_string(),
+            asked => format!("unknown agent {asked:?}"),
+        };
         ToolResult::failure(
-            format!(
-                "unknown agent {:?}; call agent.list for the agents on this hub",
-                agent_id.unwrap_or("<default>")
-            ),
+            format!("{which}; call agent.list for the agents you can reach on this hub"),
             0,
         )
     })
@@ -166,6 +175,11 @@ pub struct ChatTurn {
 }
 
 impl ChatTurn {
+    /// Follow the turn `progress` reports on; `slot` is held until it
+    /// settles, or until it has run the slot's whole life: then it is
+    /// cancelled and the slot freed, whether or not anyone kept the turn for
+    /// polling, so a turn that never ends can't hold one of its owner's
+    /// slots for good.
     fn spawn(
         owner: String,
         agent_id: String,
@@ -173,6 +187,7 @@ impl ChatTurn {
         cancel: CancellationToken,
         inject: mpsc::Sender<InjectedMessage>,
         routed: mpsc::Sender<RoutedApproval>,
+        slot: TurnSlot,
     ) -> Arc<Self> {
         let turn = Arc::new(Self {
             owner,
@@ -197,12 +212,27 @@ impl ChatTurn {
                     collector.observe(event, &routed);
                 }
             };
-            let (run, ()) = tokio::join!(handle, drain);
+            let settled = async { tokio::join!(handle, drain) };
+            tokio::pin!(settled);
+            let ttl = slot.ttl;
+            let mut slot = Some(slot);
+            let (run, ()) = tokio::select! {
+                done = &mut settled => done,
+                () = tokio::time::sleep(ttl) => {
+                    tracing::warn!(owner = %collector.owner, agent = %collector.agent_id, "remote MCP: a turn outlived its time and is cancelled");
+                    collector.cancel.cancel();
+                    slot = None;
+                    settled.await
+                }
+            };
             let outcome = match run {
                 Ok(Ok(result)) => Ok(result.response),
                 Ok(Err(e)) => Err(e.to_string()),
                 Err(e) => Err(format!("turn task failed: {e}")),
             };
+            // Freed first, so a caller who sees the outcome may start
+            // another turn at once.
+            drop(slot);
             collector.state.send_modify(|s| s.outcome = Some(outcome));
         });
         turn
@@ -374,17 +404,112 @@ impl Ephemeral for ChatTurn {
         self.started
     }
 
+    /// A settled turn holds only its reply, which its session keeps too.
+    fn idle(&self) -> bool {
+        self.state.borrow().outcome.is_some()
+    }
+
     fn evict(&self) {
         self.cancel.cancel();
     }
 }
 
-/// Turns still running after their caller stopped waiting.
-pub type ChatTurns = EphemeralRegistry<ChatTurn>;
+/// One of a caller's running turns, held from before the turn starts until
+/// it settles.
+pub struct TurnSlot {
+    running: Arc<Mutex<HashMap<String, usize>>>,
+    owner: String,
+    /// The longest its turn may hold it.
+    ttl: Duration,
+}
+
+impl Drop for TurnSlot {
+    fn drop(&mut self) {
+        let mut running = self.running.lock();
+        if let Some(count) = running.get_mut(&self.owner) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                running.remove(&self.owner);
+            }
+        }
+    }
+}
+
+/// Each caller's running turns, at most `per_identity` at once, and the
+/// turns that outlived their caller's wait, kept for `agent.poll`.
+pub struct ChatTurns {
+    held: EphemeralRegistry<ChatTurn>,
+    running: Arc<Mutex<HashMap<String, usize>>>,
+    per_identity: usize,
+    ttl: Duration,
+}
 
 impl Default for ChatTurns {
     fn default() -> Self {
         Self::bounded(TURNS_PER_IDENTITY, TURN_TTL)
+    }
+}
+
+impl ChatTurns {
+    pub fn bounded(per_identity: usize, ttl: Duration) -> Self {
+        Self {
+            held: EphemeralRegistry::bounded(per_identity, ttl),
+            running: Arc::default(),
+            per_identity,
+            ttl,
+        }
+    }
+
+    /// A slot for one more of `owner`'s turns, taken before the turn starts.
+    /// Refused while they already have `per_identity` running: a new turn
+    /// never cancels one of theirs.
+    pub(super) fn admit(&self, owner: &str) -> Result<TurnSlot, ToolResult> {
+        let mut running = self.running.lock();
+        let count = running.entry(owner.to_string()).or_default();
+        if *count >= self.per_identity {
+            return Err(ToolResult::failure(
+                format!(
+                    "too many turns running: you already have {} agent.chat turns running on this hub. \
+                     Wait for one to finish (agent.poll reports on each) and try again.",
+                    self.per_identity
+                ),
+                0,
+            ));
+        }
+        *count += 1;
+        Ok(TurnSlot {
+            running: Arc::clone(&self.running),
+            owner: owner.to_string(),
+            ttl: self.ttl,
+        })
+    }
+
+    /// Keep a turn for `agent.poll`, under a fresh id. Room is made only
+    /// from the owner's settled turns: their running ones are already
+    /// bounded by [`ChatTurns::admit`].
+    pub(super) fn insert(&self, turn: Arc<ChatTurn>) -> String {
+        self.held.insert(turn)
+    }
+
+    pub(super) fn get(&self, id: &str, owner: &str) -> Option<Arc<ChatTurn>> {
+        self.held.get(id, owner)
+    }
+
+    pub(super) fn find(
+        &self,
+        owner: &str,
+        pick: impl Fn(&ChatTurn) -> bool,
+    ) -> Option<(String, Arc<ChatTurn>)> {
+        self.held.find(owner, pick)
+    }
+
+    pub(super) fn remove(&self, id: &str) {
+        self.held.remove(id);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.held.len()
     }
 }
 
@@ -448,12 +573,18 @@ impl Tool for ListTool {
     }
 
     async fn execute(&self, _input: serde_json::Value) -> eyre::Result<ToolResult> {
-        let default_id = self.ctx.registry.default_id();
-        let mut agents: Vec<(String, Vec<String>)> = self.ctx.registry.list_all();
-        agents.sort_by(|a, b| a.0.cmp(&b.0));
-        let agents: Vec<serde_json::Value> = agents
+        let uid = match caller() {
+            Ok(uid) => uid,
+            Err(failure) => return Ok(failure),
+        };
+        let registry = &self.ctx.gateway.registry;
+        let default_id = registry.default_id();
+        let agents: Vec<serde_json::Value> = reachable_ids(&self.ctx.gateway, &uid)
             .iter()
-            .map(|(id, tools)| agent_summary(id, *id == default_id, tools))
+            .filter_map(|id| {
+                let tools = registry.get(id)?.tools.names();
+                Some(agent_summary(id, id == default_id, &tools))
+            })
             .collect();
         Ok(ToolResult::success(
             serde_json::json!({ "agents": agents }),
@@ -533,7 +664,8 @@ impl ChatTool {
 
     async fn run(&self, args: ChatArgs) -> Result<ToolResult, ToolResult> {
         let uid = caller()?;
-        let service = resolve_agent(&self.ctx, args.agent_id.as_deref())?;
+        let service = reach_agent(&self.ctx, &uid, args.agent_id.as_deref())?;
+        let slot = self.ctx.turns.admit(&uid)?;
         let channel = session_channel(&uid);
         let resume = match args.session_choice() {
             SessionChoice::Continue => None,
@@ -590,13 +722,16 @@ impl ChatTool {
             cancel,
             inject_tx,
             args.wait_seconds,
+            slot,
         )
         .await)
     }
 }
 
 /// Follow a started turn for its caller: collect its progress, wait up to the
-/// caller's patience, and report where it stands.
+/// caller's patience, and report where it stands. `slot` is the turn's place
+/// among the caller's running turns, held until it settles.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn open_turn(
     ctx: &AgentToolsContext,
     owner: String,
@@ -605,6 +740,7 @@ pub(super) async fn open_turn(
     cancel: CancellationToken,
     inject: mpsc::Sender<InjectedMessage>,
     wait_seconds: Option<u64>,
+    slot: TurnSlot,
 ) -> ToolResult {
     let turn = ChatTurn::spawn(
         owner,
@@ -613,6 +749,7 @@ pub(super) async fn open_turn(
         cancel,
         inject,
         ctx.routed.clone(),
+        slot,
     );
     turn.wait(ctx.turn_wait(wait_seconds)).await;
     turn_result(ctx, &turn, None)
@@ -724,10 +861,13 @@ impl Tool for PollTool {
             Err(e) => return Ok(ToolResult::failure(format!("invalid arguments: {e}"), 0)),
         };
         let step = caller().and_then(|uid| {
-            self.ctx
+            let turn = self
+                .ctx
                 .turns
                 .get(&args.turn_id, &uid)
-                .ok_or_else(|| ToolResult::failure(UNKNOWN_TURN, 0))
+                .ok_or_else(|| ToolResult::failure(UNKNOWN_TURN, 0))?;
+            reach_agent(&self.ctx, &uid, Some(&turn.agent_id))?;
+            Ok(turn)
         });
         Ok(match step {
             Ok(turn) => turn_result(&self.ctx, &turn, Some(args.turn_id)),
@@ -755,7 +895,7 @@ struct HistoryTool {
 impl HistoryTool {
     fn run(&self, args: HistoryArgs) -> Result<ToolResult, ToolResult> {
         let uid = caller()?;
-        let service = resolve_agent(&self.ctx, args.agent_id.as_deref())?;
+        let service = reach_agent(&self.ctx, &uid, args.agent_id.as_deref())?;
         let channel = session_channel(&uid);
         let session = match args.session_id.as_deref() {
             Some(id) => own_session(&service, id, &uid, &channel)?,
@@ -905,19 +1045,19 @@ pub(super) mod tests {
         assert!(turns.get("nope", "alice").is_none());
     }
 
+    /// Room for a turn kept for `agent.poll` is made from its owner's
+    /// settled turns only: a running one is never cancelled for it.
     #[test]
-    fn the_oldest_turn_is_evicted_at_the_per_identity_cap() {
+    fn a_settled_turn_makes_room_and_a_running_one_is_never_evicted() {
         let turns = ChatTurns::bounded(2, Duration::from_secs(3600));
         let now = Instant::now();
-        let oldest = turns.insert(ChatTurn::settled(
-            "alice",
-            now - Duration::from_secs(30),
-            None,
-        ));
-        let middle = turns.insert(ChatTurn::settled(
+        let running = ChatTurn::settled("alice", now - Duration::from_secs(30), None);
+        let cancel = running.cancel.clone();
+        let oldest = turns.insert(running);
+        let settled = turns.insert(ChatTurn::settled(
             "alice",
             now - Duration::from_secs(20),
-            None,
+            Some(Ok("done".into())),
         ));
         let bobs = turns.insert(ChatTurn::settled(
             "bob",
@@ -925,11 +1065,50 @@ pub(super) mod tests {
             None,
         ));
         let newest = turns.insert(ChatTurn::settled("alice", now, None));
-        assert!(turns.get(&oldest, "alice").is_none(), "oldest evicted");
-        assert!(turns.get(&middle, "alice").is_some());
+        assert!(
+            turns.get(&settled, "alice").is_none(),
+            "the settled turn made room"
+        );
+        assert!(
+            turns.get(&oldest, "alice").is_some(),
+            "the running turn stays"
+        );
+        assert!(!cancel.is_cancelled(), "and keeps running");
         assert!(turns.get(&newest, "alice").is_some());
         assert!(turns.get(&bobs, "bob").is_some(), "other owners untouched");
         assert_eq!(turns.len(), 3);
+    }
+
+    #[test]
+    fn a_turn_past_the_per_identity_cap_is_refused_rather_than_cancelling_one() {
+        let turns = ChatTurns::bounded(2, Duration::from_secs(3600));
+        let first = turns.admit("alice").unwrap();
+        let _second = turns.admit("alice").unwrap();
+        let refused = turns.admit("alice").err().expect("a third is refused");
+        let error = refused.error.unwrap_or_default();
+        assert!(error.starts_with("too many turns running"), "{error}");
+        assert!(turns.admit("bob").is_ok(), "other callers are not held up");
+        drop(first);
+        assert!(
+            turns.admit("alice").is_ok(),
+            "a settled turn frees its slot"
+        );
+    }
+
+    /// A turn that never ends, kept for polling or not, is cancelled when
+    /// its time is up and gives its slot back: its owner is never locked out.
+    #[tokio::test]
+    async fn a_turn_that_never_ends_frees_its_slot_when_its_time_is_up() {
+        let turns = ChatTurns::bounded(1, Duration::from_millis(200));
+        let live = live_turn_in(&turns);
+        assert!(turns.admit("alice").is_err(), "the one slot is held");
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(live.turn.cancel.is_cancelled(), "the turn was cancelled");
+        assert!(
+            turns.admit("alice").is_ok(),
+            "its slot is free though the stub never settled"
+        );
+        drop(live.finish);
     }
 
     #[test]
@@ -947,11 +1126,11 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn evicting_a_turn_cancels_it() {
-        let turns = ChatTurns::bounded(1, Duration::from_secs(3600));
-        let first = ChatTurn::settled("alice", Instant::now() - Duration::from_secs(5), None);
-        let cancel = first.cancel.clone();
-        turns.insert(first);
+    fn a_turn_past_its_age_is_cancelled() {
+        let turns = ChatTurns::bounded(8, Duration::from_secs(60));
+        let stale = ChatTurn::settled("alice", Instant::now() - Duration::from_secs(120), None);
+        let cancel = stale.cancel.clone();
+        turns.insert(stale);
         turns.insert(ChatTurn::settled("alice", Instant::now(), None));
         assert!(cancel.is_cancelled());
     }
@@ -981,8 +1160,12 @@ pub(super) mod tests {
     }
 
     pub(in crate::remote_mcp) fn test_ctx() -> Arc<AgentToolsContext> {
+        ctx_on(&crate::remote_mcp::testing::fixture(true))
+    }
+
+    fn ctx_on(fx: &crate::remote_mcp::testing::Fixture) -> Arc<AgentToolsContext> {
         Arc::new(AgentToolsContext {
-            registry: Arc::new(AgentRegistry::from_parts(Default::default(), "a".into())),
+            gateway: Arc::clone(&fx.state),
             turns: Arc::new(ChatTurns::default()),
             pending_calls: Arc::new(PendingCalls::default()),
             routed: mpsc::channel(4).0,
@@ -1003,6 +1186,10 @@ pub(super) mod tests {
     /// A turn whose runner is a stub: it emits whatever the test pushes and
     /// settles (with an error) when told to finish.
     fn live_turn() -> LiveTurn {
+        live_turn_in(&ChatTurns::default())
+    }
+
+    fn live_turn_in(turns: &ChatTurns) -> LiveTurn {
         let (progress_tx, progress_rx) = mpsc::channel(8);
         let (finish, finished) = tokio::sync::oneshot::channel::<()>();
         let handle = tokio::spawn(async move {
@@ -1027,6 +1214,7 @@ pub(super) mod tests {
             CancellationToken::new(),
             inject_tx,
             routed_tx,
+            turns.admit("alice").unwrap(),
         );
         LiveTurn {
             turn,
@@ -1326,12 +1514,17 @@ pub(super) mod tests {
             serde_json::json!({ "name": name })
         }
 
-        /// Start a real gated runner under the bridge, as `agent.chat` does.
+        /// Start a real gated runner under the bridge, as `agent.chat` does,
+        /// on a hub where its agent is registered; the hub's data lives as
+        /// long as the returned directory.
         async fn open_gated_chat(
             model: ScriptedModel,
             tool: &Arc<RecordingTool>,
-        ) -> (Arc<AgentToolsContext>, ToolResult) {
-            let ctx = test_ctx();
+        ) -> (Arc<AgentToolsContext>, ToolResult, tempfile::TempDir) {
+            let data = tempfile::tempdir().unwrap();
+            let fx = crate::remote_mcp::testing::fixture(true);
+            crate::remote_mcp::testing::with_agents(&fx, data.path(), &["agent"]).await;
+            let ctx = ctx_on(&fx);
             let runner = gated_runner(model, Arc::clone(tool));
             let (progress_tx, progress_rx) = mpsc::channel(64);
             let (inject_tx, inject_rx) = mpsc::channel(INJECT_BUFFER);
@@ -1367,9 +1560,10 @@ pub(super) mod tests {
                 cancel,
                 inject_tx,
                 Some(PATIENCE),
+                ctx.turns.admit(MEMBER).unwrap(),
             )
             .await;
-            (ctx, opened)
+            (ctx, opened, data)
         }
 
         fn turn_id(result: &ToolResult) -> &str {
@@ -1407,7 +1601,7 @@ pub(super) mod tests {
         async fn approving_a_turn_prompt_runs_the_call_once_and_the_turn_completes() {
             let tool = Arc::new(RecordingTool::default());
             let model = ScriptedModel::new([serde_json::json!({})], entry("figma"), 4);
-            let (ctx, opened) = open_gated_chat(model, &tool).await;
+            let (ctx, opened, _data) = open_gated_chat(model, &tool).await;
             let prompts = approvals(&opened);
             assert_eq!(prompts.len(), 1, "{}", opened.output);
             assert_eq!(prompts[0]["detail"], "figma", "{}", opened.output);
@@ -1418,11 +1612,47 @@ pub(super) mod tests {
             assert_eq!(tool.runs(), [entry("figma")]);
         }
 
+        /// A turn's prompt is shown, and answered, only while its agent is
+        /// one the caller may reach: once its policy shuts them out, the
+        /// prompt reads as one on an agent that isn't there.
+        #[tokio::test]
+        async fn a_turn_prompt_is_neither_shown_nor_answered_once_its_agent_shuts_the_caller_out() {
+            let tool = Arc::new(RecordingTool::default());
+            let model = ScriptedModel::new([serde_json::json!({})], entry("figma"), 4);
+            let (ctx, opened, _data) = open_gated_chat(model, &tool).await;
+            let prompts = approvals(&opened);
+            assert_eq!(prompts.len(), 1, "{}", opened.output);
+            let request_id = prompts[0]["request_id"].as_str().unwrap();
+            ctx.gateway.access_gate.upsert(
+                "agent".into(),
+                workforce_common::settings::AgentAccessConfig {
+                    mode: workforce_common::settings::AccessMode::Allowlist,
+                    allow: vec!["someone-else".into()],
+                    ..Default::default()
+                },
+            );
+            let status = approval_tools(Arc::clone(&ctx))
+                .into_iter()
+                .find(|tool| tool.name() == "approval.status")
+                .expect("approval.status");
+            let shown = as_member(status.execute(serde_json::json!({
+                "request_id": request_id,
+                "turn_id": turn_id(&opened),
+            })))
+            .await
+            .expect("approval.status answers");
+            let error = shown.error.unwrap_or_default();
+            assert!(error.starts_with("unknown agent \"agent\""), "{error}");
+            let decided = decide(&ctx, turn_id(&opened), request_id, "allow_once").await;
+            assert!(!decided.success, "{}", decided.output);
+            assert!(tool.runs().is_empty());
+        }
+
         #[tokio::test]
         async fn denying_a_turn_prompt_completes_the_turn_without_a_new_prompt() {
             let tool = Arc::new(RecordingTool::default());
             let model = ScriptedModel::new([entry("figma")], entry("figma"), 4);
-            let (ctx, opened) = open_gated_chat(model, &tool).await;
+            let (ctx, opened, _data) = open_gated_chat(model, &tool).await;
             let prompts = approvals(&opened);
             assert_eq!(prompts.len(), 1, "{}", opened.output);
 
@@ -1450,7 +1680,7 @@ pub(super) mod tests {
         async fn an_unknown_request_id_leaves_the_turn_prompt_answerable() {
             let tool = Arc::new(RecordingTool::default());
             let model = ScriptedModel::new([entry("figma")], entry("figma"), 4);
-            let (ctx, opened) = open_gated_chat(model, &tool).await;
+            let (ctx, opened, _data) = open_gated_chat(model, &tool).await;
             let prompts = approvals(&opened);
             assert_eq!(prompts.len(), 1, "{}", opened.output);
             let request_id = prompts[0]["request_id"].as_str().unwrap();
@@ -1470,7 +1700,7 @@ pub(super) mod tests {
         async fn two_prompts_in_one_turn_are_answered_independently() {
             let tool = Arc::new(RecordingTool::default());
             let model = ScriptedModel::new([entry("figma"), entry("probe")], entry("figma"), 4);
-            let (ctx, opened) = open_gated_chat(model, &tool).await;
+            let (ctx, opened, _data) = open_gated_chat(model, &tool).await;
             let turn = ctx.turns.get(turn_id(&opened), MEMBER).expect("the turn");
             let state = state_once(&turn, |s| s.pending.len() == 2).await;
             assert_eq!(state.pending.len(), 2, "{state:?}");
@@ -1504,7 +1734,6 @@ pub(super) mod tests {
         for tool in agent_tools(Arc::clone(&ctx))
             .into_iter()
             .chain(approval_tools(ctx))
-            .filter(|t| t.name() != "agent.list")
         {
             let input = serde_json::json!({
                 "message": "hi", "turn_id": "t", "request_id": "r", "choice": "allow_once"
@@ -1516,6 +1745,127 @@ pub(super) mod tests {
                 tool.name()
             );
             assert_eq!(result.error.as_deref(), Some("no caller identity in scope"));
+        }
+    }
+
+    mod reach {
+        use super::*;
+        use crate::remote_mcp::testing::{fixture, with_agents};
+        use workforce_common::settings::{AccessMode, AgentAccessConfig};
+
+        /// A hub with the default agent and `private`, which admits alice
+        /// only.
+        async fn hub(data_dir: &std::path::Path) -> Arc<AgentToolsContext> {
+            let fx = fixture(true);
+            with_agents(&fx, data_dir, &["default", "private"]).await;
+            fx.state.access_gate.upsert(
+                "private".into(),
+                AgentAccessConfig {
+                    mode: AccessMode::Allowlist,
+                    allow: vec!["alice".into()],
+                    ..Default::default()
+                },
+            );
+            ctx_on(&fx)
+        }
+
+        async fn call(
+            ctx: &Arc<AgentToolsContext>,
+            who: &str,
+            tool: &str,
+            input: serde_json::Value,
+        ) -> ToolResult {
+            let tool = agent_tools(Arc::clone(ctx))
+                .into_iter()
+                .find(|t| t.name() == tool)
+                .expect("the tool");
+            CURRENT_USER_ID
+                .scope(who.to_string(), tool.execute(input))
+                .await
+                .expect("the tool answers")
+        }
+
+        fn listed(result: &ToolResult) -> Vec<String> {
+            result.output["agents"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|a| a["id"].as_str().unwrap().to_string())
+                .collect()
+        }
+
+        #[tokio::test]
+        async fn the_list_shows_only_agents_whose_policy_admits_the_caller() {
+            let tmp = tempfile::tempdir().unwrap();
+            let ctx = hub(tmp.path()).await;
+            let all = call(&ctx, "alice", "agent.list", serde_json::json!({})).await;
+            assert_eq!(listed(&all), ["default", "private"]);
+            let some = call(&ctx, "bob", "agent.list", serde_json::json!({})).await;
+            assert_eq!(listed(&some), ["default"]);
+        }
+
+        #[tokio::test]
+        async fn chat_and_history_refuse_an_agent_the_caller_may_not_use_or_that_is_not_there() {
+            let tmp = tempfile::tempdir().unwrap();
+            let ctx = hub(tmp.path()).await;
+            for (tool, agent) in [
+                ("agent.chat", "private"),
+                ("agent.history", "private"),
+                ("agent.chat", "PRIVATE"),
+                ("agent.chat", "privat"),
+                ("agent.history", "removed"),
+            ] {
+                let input = serde_json::json!({ "message": "hi", "agent_id": agent });
+                let refused = call(&ctx, "bob", tool, input).await;
+                assert_eq!(
+                    refused.error.as_deref(),
+                    Some(
+                        format!(
+                            "unknown agent {agent:?}; call agent.list for the agents you can reach on this hub"
+                        )
+                        .as_str()
+                    ),
+                    "{tool} {agent}"
+                );
+            }
+            let default = ctx.gateway.registry.default_agent().unwrap();
+            assert!(
+                default
+                    .sessions
+                    .get_or_create(&session_channel("bob"), "bob", default.agent_id.as_str())
+                    .unwrap()
+                    .messages
+                    .iter()
+                    .all(|m| m.role != MessageRole::User),
+                "nothing reached the default agent"
+            );
+            let history = call(
+                &ctx,
+                "alice",
+                "agent.history",
+                serde_json::json!({ "agent_id": "private" }),
+            )
+            .await;
+            assert!(history.success, "{:?}", history.error);
+        }
+
+        #[tokio::test]
+        async fn a_chat_past_the_running_cap_is_refused_before_it_starts() {
+            let tmp = tempfile::tempdir().unwrap();
+            let ctx = hub(tmp.path()).await;
+            let _held: Vec<TurnSlot> = (0..TURNS_PER_IDENTITY)
+                .map(|_| ctx.turns.admit("alice").unwrap())
+                .collect();
+            let refused = call(
+                &ctx,
+                "alice",
+                "agent.chat",
+                serde_json::json!({ "message": "hi" }),
+            )
+            .await;
+            let error = refused.error.unwrap_or_default();
+            assert!(error.starts_with("too many turns running"), "{error}");
+            assert_eq!(ctx.turns.len(), 0, "no turn was started or kept");
         }
     }
 }

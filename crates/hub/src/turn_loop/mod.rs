@@ -44,7 +44,7 @@ pub(crate) use prompt::{
     format_thread_history, named_secret_context, relative_date, render_available_skills,
     render_connected_skills, render_loadable_skills, render_loaded_skills,
     render_mcp_workspace_note, should_inject_session_intro, voice_mode_directive,
-    without_request_unless, SLACK_FORMATTING_GUIDANCE,
+    without_request_unless, DICTATED_TURN_NOTE, SLACK_FORMATTING_GUIDANCE,
 };
 pub(crate) use recall::{
     apply_recall_recency_boost, dedupe_recall_keep_best, fuse_recall_query,
@@ -2161,6 +2161,9 @@ pub(crate) async fn build_enhanced_prompt_with_context(
     // answering typed questions as if they were going to be read aloud —
     // short, chatty, unformatted — long after the user stopped speaking.
     // `tts_provider` stays session-level; it is the engine, not the mode.
+    //
+    // A dictated turn (Desk: spoken in, the answer read) gets a short note
+    // instead, and is otherwise a typed one.
     if let Some(session) = session_id.and_then(|sid| service.sessions.get(sid).ok().flatten()) {
         if session.is_voice_turn() {
             let provider = session
@@ -2169,7 +2172,14 @@ pub(crate) async fn build_enhanced_prompt_with_context(
                 .and_then(|v| v.as_str())
                 .unwrap_or("system");
             turn_context.push_str("\n\n");
-            turn_context.push_str(&voice_mode_directive(provider, &session.channel));
+            turn_context.push_str(&voice_mode_directive(
+                provider,
+                session.tts_model(),
+                &session.channel,
+            ));
+        } else if session.is_dictated_turn() {
+            turn_context.push_str("\n\n");
+            turn_context.push_str(DICTATED_TURN_NOTE);
         }
     }
 
@@ -5070,6 +5080,7 @@ pub(crate) async fn stream_admitted(
             target: d.target.clone(),
             owner: session.owner.clone(),
             attended: true,
+            relayed: false,
         })
         .or_else(workforce_agent::runner::current_desk);
     let origin_for_task = Origin::of_turn(user, channel, session.is_voice_turn());

@@ -825,6 +825,7 @@ mod tests {
                 context: vec![],
                 message: None,
                 spoken: false,
+                voice: None,
             },
             channel,
             None,

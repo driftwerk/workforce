@@ -488,8 +488,10 @@ impl VoiceSurface {
         match self {
             Self::Screen => {
                 "\
-- Their phone or laptop, so your reply is on screen as well as spoken. A name,
-  number, or spelling they miss can be re-read, so normal detail is safe."
+- Their phone or computer, so your reply is on screen as well as spoken. A name,
+  number or spelling they miss can be re-read, so say those as you would to
+  anyone; what is only readable (code, a command, a link, a path) is still never
+  read out — see above."
             }
             Self::Speaker => {
                 "\
@@ -523,53 +525,59 @@ impl VoiceSurface {
 
 /// Build the voice-mode system prompt directive.
 ///
-/// Injected into the dynamic portion of the system prompt when the client
-/// signals `voice_mode: true`. Contains general conversational rules, where the
-/// person is listening, and provider-specific formatting guidance.
-pub(crate) fn voice_mode_directive(provider: &str, channel: &str) -> String {
-    let provider_rules = match provider {
-        "fishaudio" | "fish_audio" => {
-            "\
-TTS provider: Fish Audio
-- Add emotion tags in parentheses at sentence starts for natural expression.
-  Examples: \"(excited) Hey, found something cool!\"
-            \"(thoughtful) Hmm, this might be tricky.\"
-  Common tags: excited, thoughtful, concerned, confident, curious, amused, serious"
-        }
-        "elevenlabs" => {
-            "\
+/// Injected into the dynamic portion of the system prompt when the turn was
+/// spoken and its answer will be heard. Contains general conversational
+/// rules, where the person is listening, and what the voice reading it
+/// (`provider` speaking `model`, when the client said) can do — for a voice
+/// that takes directions, exactly the ones it performs, from the table its
+/// text is checked against before it is spoken.
+pub(crate) fn voice_mode_directive(provider: &str, model: Option<&str>, channel: &str) -> String {
+    let markup = workforce_agent::llm::speech::Markup::of(provider, model);
+    let provider_rules = markup.guidance().unwrap_or_else(|| {
+        let rules = match workforce_agent::llm::speech::canonical_speech_provider(provider) {
+            Some("elevenlabs") => {
+                "\
 TTS provider: ElevenLabs
-- Keep text clean and natural — the voice model handles emotion automatically.
-  No special tags needed, just use a conversational tone."
-        }
-        "kokoro" => {
-            "\
-TTS provider: Kokoro
-- Plain text, simple sentence structure. No special tags."
-        }
-        "soniox" => {
-            "\
+- Keep text clean and natural — the voice model handles emotion automatically."
+            }
+            Some("soniox") => {
+                "\
 TTS provider: Soniox
-- Keep text clean and natural — no special tags. Numbers, email addresses, and
-  codes are pronounced accurately as written."
-        }
-        _ => {
-            "\
+- Keep text clean and natural. Numbers, email addresses, and codes are
+  pronounced accurately as written."
+            }
+            _ if provider == "kokoro" => {
+                "\
+TTS provider: Kokoro
+- Plain text, simple sentence structure."
+            }
+            _ => {
+                "\
 TTS provider: System TTS
 - Plain text only. Use simple sentence structure for best clarity."
-        }
-    };
+            }
+        };
+        format!(
+            "{rules}\n- No voice directions in parentheses or brackets: this voice performs \
+             none, so they would be removed before you are heard."
+        )
+    });
 
     format!(
         "[VOICE MODE ACTIVE — User is listening via TTS. Adapt your responses:]\n\n\
          General voice formatting:\n\
-         - No emojis, symbols, or special characters\n\
-         - No markdown formatting, bullet lists, headers, or code blocks\n\
-         - Short, natural sentences — write conversationally like spoken English\n\
+         - Talk the way you would to someone across the table: warm, natural and \
+           conversational, in short spoken sentences. Contractions are fine.\n\
+         - Never read out code, symbols, punctuation marks, markdown, URLs or file \
+           paths. Say what they are in words instead — \"the settings file in your \
+           home folder\", \"the link to the pull request\" — and summarise code by \
+           what it does, never line by line.\n\
+         - When the detail itself matters (a command to run, the code, a list to \
+           keep), give the gist aloud and offer to put the details in the chat.\n\
+         - No emojis, markdown, bullet lists, headers, tables or code blocks\n\
          - Use proper punctuation for natural pauses\n\
          - Avoid abbreviations and acronyms that read badly aloud\n\
          - Keep responses concise and flowing\n\
-         - No tables, numbered lists, or structured formatting\n\
          - If you need to convey a list, say it naturally: \
            \"There are three things — first X, then Y, and finally Z\"\n\
          - Say exact values exactly: times, dates, numbers, prices, names and \
@@ -589,6 +597,12 @@ TTS provider: System TTS
         surface_rules = VoiceSurface::of(channel).rules()
     )
 }
+
+/// The note on a dictated turn: the person spoke it and reads the answer.
+pub(crate) const DICTATED_TURN_NOTE: &str = "[DICTATED — the person spoke this message and \
+     it was transcribed, so a word may be misheard: read past slips, and ask when something \
+     that matters is ambiguous. They will read your answer, not hear it: reply in writing as \
+     you normally would.]";
 
 pub(crate) fn relative_date(
     ts: chrono::DateTime<chrono::Utc>,
