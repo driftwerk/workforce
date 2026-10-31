@@ -277,11 +277,15 @@ impl CliCompletion {
         }
     }
 
-    /// `result` when the round answered; else why not, after cooling a login
-    /// at its limit or marking one refused for good.
+    /// `result` when the round answered, its plan reading kept; else why
+    /// not, after cooling a login at its limit or marking one refused for
+    /// good.
     fn served(&self, login: &Login, result: ClaudeCodeResult) -> Result<ClaudeCodeResult> {
         match result.completion {
-            Completion::Success => Ok(result),
+            Completion::Success => {
+                login.settle(&result.round_end(), self.plans.scope().caller());
+                Ok(result)
+            }
             _ => Err(failure_of(
                 login,
                 self.plans.scope().caller(),

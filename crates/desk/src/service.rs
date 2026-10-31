@@ -270,6 +270,9 @@ fn hub_secret(name: &str) -> bool {
 /// any the login environment already has (`:`-separated, as Claude Code
 /// splits it).
 const PLUGIN_DIRS: &str = "CLAUDE_CODE_PLUGIN_DIRS";
+/// Where what Desk last asked its sessions' environment to add is kept, so
+/// a session the hub starts or resumes after a restart still has it.
+const SESSION_ENV: &str = "hub.sessions.env";
 /// Most variables Desk may add to a CLI's environment.
 const MAX_ENV: usize = 64;
 const MAX_ENV_VALUE: usize = 32 * 1024;
@@ -296,6 +299,21 @@ fn check_env(env: &BTreeMap<String, String>) -> Result<(), DeskError> {
         }
     }
     Ok(())
+}
+
+/// What Desk last asked its sessions' environment to add, as kept; none
+/// when nothing usable is.
+async fn kept_session_env(store: &DeskStore) -> BTreeMap<String, String> {
+    let kept = match store.state(SESSION_ENV).await {
+        Ok(kept) => kept,
+        Err(e) => {
+            tracing::warn!(error = %e, "couldn't read what Desk adds to its sessions' environment");
+            None
+        }
+    };
+    kept.and_then(|e| serde_json::from_value::<BTreeMap<String, String>>(e.value).ok())
+        .filter(|env| check_env(env).is_ok())
+        .unwrap_or_default()
 }
 
 /// The person's plugin folders, then Desk's, each once; `None` for none.
@@ -389,6 +407,7 @@ impl Desk {
     ) -> Result<Self> {
         let store = Arc::new(store);
         let layout = store.layout().await?;
+        let session_env = kept_session_env(&store).await;
         let (holder, held) = connect_holder(opts.holder.as_ref()).await;
         let rooms = store
             .rooms()
@@ -431,6 +450,7 @@ impl Desk {
                 records,
                 rooms,
                 layout,
+                session_env,
                 ..State::default()
             }),
             events: broadcast::channel(256).0,
@@ -1097,8 +1117,20 @@ impl Desk {
             return Err(DeskError::Invalid("a session needs a name".into()));
         }
         check_env(&new.env)?;
-        if !new.env.is_empty() {
-            self.0.state.lock().session_env = new.env.clone();
+        let changed = !new.env.is_empty() && {
+            let mut st = self.0.state.lock();
+            let changed = st.session_env != new.env;
+            st.session_env.clone_from(&new.env);
+            changed
+        };
+        if changed {
+            let store = Arc::clone(&self.0.store);
+            let env = serde_json::json!(new.env);
+            tokio::spawn(async move {
+                if let Err(e) = store.put_state(SESSION_ENV, &env).await {
+                    tracing::warn!(error = %e, "couldn't keep what Desk adds to its sessions' environment");
+                }
+            });
         }
         let cwd = PathBuf::from(&new.cwd);
         if !cwd.is_dir() {
@@ -2976,6 +3008,68 @@ mod tests {
                 )
                 .await
                 .is_err());
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn what_desk_adds_to_sessions_outlives_the_hub() {
+        with_test_pool(build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            DeskStore::migrate(&pool).await.unwrap();
+            let cli = signed_in_cli(dir.path());
+            let opts = || Options {
+                claude: cli.clone(),
+                codex: cli.clone(),
+                ..options(dir.path())
+            };
+            let no_floor = || Floor {
+                turns: None,
+                plans: None,
+            };
+            let d = Desk::start(
+                DeskStore::from_pool(pool.clone()),
+                opts(),
+                no_floor(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            let added = BTreeMap::from([(PLUGIN_DIRS.to_string(), "/plugins/desk".to_string())]);
+            d.create(
+                NewSession {
+                    engine: Engine::Claude,
+                    name: "auth-fix".into(),
+                    cwd: dir.path().to_string_lossy().into_owned(),
+                    goal: String::new(),
+                    worktree: None,
+                    prompt: None,
+                    approvals: None,
+                    env: added.clone(),
+                },
+                None,
+            )
+            .await
+            .unwrap();
+            let store = DeskStore::from_pool(pool.clone());
+            for _ in 0..200 {
+                if !kept_session_env(&store).await.is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            assert_eq!(kept_session_env(&store).await, added);
+
+            let again = Desk::start(store, opts(), no_floor(), CancellationToken::new())
+                .await
+                .unwrap();
+            assert_eq!(
+                again
+                    .with_added(&again.0.state.lock().session_env.clone())
+                    .get(PLUGIN_DIRS),
+                Some(&"/plugins/desk".to_string()),
+                "a session the hub starts or resumes after a restart loads Desk's plugin"
+            );
         })
         .await;
     }
