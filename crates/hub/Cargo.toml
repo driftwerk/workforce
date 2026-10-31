@@ -96,6 +96,7 @@ quick-xml = { workspace = true }
 pulldown-cmark = { workspace = true }
 pdf-extract = "0.12"
 parking_lot = { workspace = true }
+shlex = { workspace = true }
 semver = { workspace = true }
 tempfile = "3"
 bytes = { workspace = true }
