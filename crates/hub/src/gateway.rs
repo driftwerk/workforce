@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::spoken_text::SpokenText;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, State};
 use axum::http::header::{AUTHORIZATION, CONTENT_TYPE};
@@ -16,9 +17,11 @@ use tokio::task::AbortHandle;
 use tokio_util::sync::CancellationToken;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tracing::{debug, info, warn};
+use workforce_agent::llm::speech::Markup;
 use workforce_agent::runner::ProgressEvent;
 use workforce_agent::tools::approval::SelfServe;
 use workforce_common::channels::desk::{DeskPlace, DeskTurn, TurnStamp};
+use workforce_common::session::{DICTATED_TURN_KEY, TTS_MODEL_KEY};
 use workforce_nats::chat::{
     ChatProgress, NatsChatAttachment, NatsChatRequest, TurnControl, TurnControlReply, REFUSED_BUSY,
 };
@@ -2424,7 +2427,18 @@ async fn handle_ws(
                             // that one, so typing after speaking drops back off
                             // `[llm] voice_model`.
                             let voice_turn = client_msg.voice_mode.unwrap_or(false)
-                                || desk_turn.as_ref().is_some_and(|turn| turn.spoken);
+                                || desk_turn.as_ref().is_some_and(DeskTurn::heard);
+                            // Dictated: spoken in, its answer read. Desk says
+                            // so; nothing else dictates.
+                            let dictated =
+                                !voice_turn && desk_turn.as_ref().is_some_and(DeskTurn::dictated);
+                            // The voice that reads the answer: the one a Desk
+                            // turn names, else the mobile app's engine.
+                            let tts = desk_turn
+                                .as_ref()
+                                .and_then(DeskTurn::speech)
+                                .map(|s| (s.provider.clone(), s.model.clone()))
+                                .or_else(|| client_msg.tts_provider.clone().map(|p| (p, None)));
                             let desk = desk_turn.map(|turn| {
                                 workforce_common::channels::desk::DeskTurnContext::new(
                                     turn,
@@ -2449,6 +2463,14 @@ async fn handle_ws(
                             let voice_channel = (voice_turn
                                 && !workforce_common::channels::is_conversational(&channel))
                             .then(|| channel.clone());
+                            // The voice a spoken turn's answer is read
+                            // in: what this message named, else what the
+                            // session last did. The stream carries only the
+                            // directions it performs.
+                            let mut speech = voice_turn.then(|| match &tts {
+                                Some((provider, model)) => Markup::of(provider, model.as_deref()),
+                                None => Markup::Plain,
+                            });
                             if let Ok(Some(mut session)) =
                                 service.sessions.get(&effective_session_id)
                             {
@@ -2456,10 +2478,9 @@ async fn handle_ws(
                                 // per message like `voice_turn`: the session
                                 // may last have been spoken to elsewhere.
                                 let mut changed = session.set_rendered_rich(rich);
-                                let turn_changed = session.is_voice_turn() != voice_turn;
-                                if turn_changed
-                                    || client_msg.voice_mode.is_some()
-                                    || client_msg.tts_provider.is_some()
+                                let turn_changed = session.is_voice_turn() != voice_turn
+                                    || session.is_dictated_turn() != dictated;
+                                if turn_changed || client_msg.voice_mode.is_some() || tts.is_some()
                                 {
                                     // New sessions start with Null metadata — promote to object
                                     if session.metadata.is_null() {
@@ -2470,20 +2491,46 @@ async fn handle_ws(
                                             "voice_turn".into(),
                                             serde_json::json!(voice_turn),
                                         );
+                                        obj.insert(
+                                            DICTATED_TURN_KEY.into(),
+                                            serde_json::json!(dictated),
+                                        );
                                         if let Some(vm) = client_msg.voice_mode {
                                             obj.insert("voice_mode".into(), serde_json::json!(vm));
                                         }
-                                        if let Some(ref tp) = client_msg.tts_provider {
+                                        // Provider and model together: a
+                                        // provider named without one (the
+                                        // mobile app) speaks its default.
+                                        if let Some((provider, model)) = &tts {
                                             obj.insert(
                                                 "tts_provider".into(),
-                                                serde_json::json!(tp),
+                                                serde_json::json!(provider),
                                             );
+                                            match model {
+                                                Some(m) => {
+                                                    obj.insert(
+                                                        TTS_MODEL_KEY.into(),
+                                                        serde_json::json!(m),
+                                                    );
+                                                }
+                                                None => {
+                                                    obj.remove(TTS_MODEL_KEY);
+                                                }
+                                            }
                                         }
                                         changed = true;
                                     }
                                 }
                                 if changed {
                                     let _ = service.sessions.save(&session);
+                                }
+                                if voice_turn {
+                                    let provider = session
+                                        .metadata
+                                        .get("tts_provider")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or_default();
+                                    speech = Some(Markup::of(provider, session.tts_model()));
                                 }
                             }
 
@@ -2607,6 +2654,7 @@ async fn handle_ws(
                                         &effective_session_id,
                                         broadcast_tx.clone(),
                                         tts_normalize,
+                                        speech,
                                         stamp.clone(),
                                     )
                                     .await;
@@ -2765,6 +2813,7 @@ async fn handle_ws(
                                                         tx,
                                                         sid,
                                                         tts_normalize,
+                                                        speech,
                                                         mentions,
                                                         stamp,
                                                     )
@@ -2987,11 +3036,13 @@ pub(crate) async fn forward_local_progress(
     tx: broadcast::Sender<BroadcastMessage>,
     sid: String,
     tts_normalize: bool,
+    speech: Option<Markup>,
     mentions: Option<Mentions>,
     stamp: Option<TurnStamp>,
 ) {
     // The Desk turn the frames belong to, named again by each snapshot.
     let mut stamp = stamp;
+    let mut spoken = SpokenText::new(speech);
     let mut delivery = crate::chat_worker::AnswerDelivery::default();
     // What has streamed of the answer, for what it mentions.
     let mut said = String::new();
@@ -3065,14 +3116,26 @@ pub(crate) async fn forward_local_progress(
                 if mentions.is_some() {
                     said.push_str(&text);
                 }
+                let text = spoken.delta(&text);
                 let content = if tts_normalize {
                     crate::formatting::normalize_delta_for_tts(&text)
                 } else {
                     text
                 };
-                Some(BroadcastMessage::new(sid.clone(), "stream_delta", content))
+                (!content.is_empty())
+                    .then(|| BroadcastMessage::new(sid.clone(), "stream_delta", content))
             }
             ProgressEvent::StreamEnd => {
+                let tail = spoken.end();
+                if !tail.is_empty() {
+                    let content = if tts_normalize {
+                        crate::formatting::normalize_delta_for_tts(&tail)
+                    } else {
+                        tail
+                    };
+                    let delta = BroadcastMessage::new(sid.clone(), "stream_delta", content);
+                    let _ = tx.send(delta.stamped(stamp.as_ref()));
+                }
                 let mut end = BroadcastMessage::silent(sid.clone(), "stream_end", String::new());
                 if let Some(mentions) = &mentions {
                     end.desk = mentions(said.clone()).await;
@@ -3088,6 +3151,7 @@ pub(crate) async fn forward_local_progress(
             ProgressEvent::AnswerSettled => None,
             ProgressEvent::StreamDiscard { reason } => {
                 said.clear();
+                spoken.discard();
                 reason.retracts().then(|| {
                     BroadcastMessage::silent(sid.clone(), "stream_discard", reason.as_str())
                 })
@@ -3108,6 +3172,7 @@ pub(crate) async fn forward_local_progress(
                     } else {
                         rendered
                     };
+                    let text = spoken.whole(&text);
                     let content = if tts_normalize {
                         crate::formatting::normalize_for_tts(&text)
                     } else {
@@ -3187,9 +3252,11 @@ pub(crate) async fn forward_local_progress(
             // durable message so gateway/iOS users hear
             // it too. (The Pause button is Slack-only;
             // here a reply interrupts the run.)
-            ProgressEvent::CheckIn { note } => {
-                Some(BroadcastMessage::new(sid.clone(), "message", note))
-            }
+            ProgressEvent::CheckIn { note } => Some(BroadcastMessage::new(
+                sid.clone(),
+                "message",
+                spoken.whole(&note),
+            )),
             ProgressEvent::Snapshot(snapshot) => {
                 stamp = Some(snapshot.stamp.clone());
                 Some(BroadcastMessage::turn_snapshot(sid.clone(), snapshot))
@@ -3235,6 +3302,9 @@ struct Forwarder {
     pending: usize,
     watchers: usize,
     stamp: Option<TurnStamp>,
+    /// The voice the spoken turn requested here is read aloud in; `None`
+    /// while no spoken turn is in flight.
+    speech: Option<Markup>,
     task: Option<AbortHandle>,
     /// A stopped turn's tail is not passed on while the session is watched,
     /// until that turn ends or a request is made here.
@@ -3266,9 +3336,11 @@ impl Drop for WatchGuard {
 
 impl ProgressForwarders {
     /// Count one more request on `session_id`, the Desk turn `stamp` names
-    /// if it is one, subscribing a forwarder to `subject` when none runs.
+    /// if it is one and the voice `speech` its answer is read aloud in if it
+    /// is spoken, subscribing a forwarder to `subject` when none runs.
     /// Called before the request is published, so none of its progress can
     /// slip past.
+    #[allow(clippy::too_many_arguments)]
     async fn expect(
         self: &Arc<Self>,
         nats: &async_nats::Client,
@@ -3276,12 +3348,14 @@ impl ProgressForwarders {
         session_id: &str,
         tx: broadcast::Sender<BroadcastMessage>,
         tts_normalize: bool,
+        speech: Option<Markup>,
         stamp: Option<TurnStamp>,
     ) -> u64 {
         let generation = self
             .join(nats, subject, session_id, tx, tts_normalize, Join::Request)
             .await;
         self.set_stamp(session_id, stamp);
+        self.set_speech(session_id, speech);
         generation
     }
 
@@ -3352,6 +3426,7 @@ impl ProgressForwarders {
                         pending: 0,
                         watchers: 0,
                         stamp: None,
+                        speech: None,
                         task: None,
                         silenced: false,
                     });
@@ -3398,6 +3473,11 @@ impl ProgressForwarders {
             Join::Request => forwarder.pending = forwarder.pending.saturating_sub(1),
             Join::Watch => forwarder.watchers = forwarder.watchers.saturating_sub(1),
         }
+        if forwarder.pending == 0 {
+            // What a watching Desk sees next was asked elsewhere, and says
+            // nothing of how it's heard.
+            forwarder.speech = None;
+        }
         if forwarder.pending > 0 || forwarder.watchers > 0 {
             return false;
         }
@@ -3418,6 +3498,20 @@ impl ProgressForwarders {
     fn set_stamp(&self, session_id: &str, stamp: Option<TurnStamp>) {
         if let Some(forwarder) = self.0.lock().get_mut(session_id) {
             forwarder.stamp = stamp;
+        }
+    }
+
+    /// The voice the spoken turn `session_id` is streaming is read in.
+    fn speech(&self, session_id: &str) -> Option<Markup> {
+        self.0
+            .lock()
+            .get(session_id)
+            .and_then(|forwarder| forwarder.speech)
+    }
+
+    fn set_speech(&self, session_id: &str, speech: Option<Markup>) {
+        if let Some(forwarder) = self.0.lock().get_mut(session_id) {
+            forwarder.speech = speech;
         }
     }
 
@@ -3586,6 +3680,7 @@ async fn forward_nats_progress(
     forwarders: Arc<ProgressForwarders>,
     generation: u64,
 ) {
+    let mut spoken = SpokenText::default();
     while let Some(msg) = sub.next().await {
         // An event a later build sends and this one cannot read is skipped,
         // never the end of the stream.
@@ -3614,15 +3709,47 @@ async fn forward_nats_progress(
             _ => forwarders.stamp(&session_id),
         };
 
-        if let Some(broadcast) =
-            chat_progress_to_broadcast(progress, &session_id, tts_normalize).filter(|_| passes)
-        {
-            let _ = tx.send(broadcast.stamped(stamp.as_ref()));
+        spoken.follow(forwarders.speech(&session_id));
+        for progress in spoken_progress(&mut spoken, progress) {
+            if let Some(broadcast) =
+                chat_progress_to_broadcast(progress, &session_id, tts_normalize).filter(|_| passes)
+            {
+                let _ = tx.send(broadcast.stamped(stamp.as_ref()));
+            }
         }
 
         if done && forwarders.withdraw(&session_id, generation) {
             break;
         }
+    }
+}
+
+/// `progress` with a spoken turn's voice directions checked (see
+/// [`SpokenText`]): a stream's held-back tail goes out as a last delta before
+/// its end, and a piece with nothing to pass on yet goes nowhere.
+fn spoken_progress(spoken: &mut SpokenText, progress: ChatProgress) -> Vec<ChatProgress> {
+    match progress {
+        ChatProgress::StreamDelta { text } => {
+            let text = spoken.delta(&text);
+            if text.is_empty() {
+                Vec::new()
+            } else {
+                vec![ChatProgress::StreamDelta { text }]
+            }
+        }
+        ChatProgress::StreamEnd => {
+            let text = spoken.end();
+            let tail = (!text.is_empty()).then_some(ChatProgress::StreamDelta { text });
+            tail.into_iter().chain([ChatProgress::StreamEnd]).collect()
+        }
+        ChatProgress::StreamDiscard { reason } => {
+            spoken.discard();
+            vec![ChatProgress::StreamDiscard { reason }]
+        }
+        ChatProgress::Message { text } => vec![ChatProgress::Message {
+            text: spoken.whole(&text),
+        }],
+        other => vec![other],
     }
 }
 
@@ -14223,6 +14350,104 @@ mod schedule_auth_tests {
 mod chat_progress_tests {
     use super::*;
 
+    /// What a client is streamed of a spoken turn's text, as one string.
+    fn streamed(messages: &[BroadcastMessage]) -> String {
+        messages
+            .iter()
+            .filter(|m| matches!(m.msg_type.as_str(), "stream_delta" | "message"))
+            .map(|m| m.content.as_str())
+            .collect()
+    }
+
+    /// A spoken turn's stream carries only the directions its voice
+    /// performs, a direction split across deltas included, and what was held
+    /// back goes out before the stream ends.
+    #[tokio::test]
+    async fn a_spoken_turn_streams_only_what_its_voice_performs() {
+        let (progress_tx, progress_rx) = tokio::sync::mpsc::channel(16);
+        let (tx, mut rx) = broadcast::channel(32);
+        for event in [
+            ProgressEvent::StreamStart,
+            ProgressEvent::StreamDelta {
+                text: "(excited) Found it! (pen".into(),
+            },
+            ProgressEvent::StreamDelta {
+                text: "sive) It was (laugh".into(),
+            },
+            ProgressEvent::StreamEnd,
+        ] {
+            progress_tx.send(event).await.unwrap();
+        }
+        drop(progress_tx);
+        forward_local_progress(
+            progress_rx,
+            tx,
+            "s-1".into(),
+            false,
+            Some(Markup::FishS1),
+            None,
+            None,
+        )
+        .await;
+        let sent: Vec<BroadcastMessage> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert_eq!(streamed(&sent), "(excited) Found it! It was (laugh");
+        assert_eq!(
+            sent.last().map(|m| m.msg_type.as_str()),
+            Some("stream_end"),
+            "the held-back tail goes before the end"
+        );
+    }
+
+    #[test]
+    fn a_spoken_turn_over_nats_streams_only_what_its_voice_performs() {
+        let mut spoken = SpokenText::new(Some(Markup::Plain));
+        let sent: Vec<BroadcastMessage> = [
+            ChatProgress::StreamDelta {
+                text: "(excited) Found ".into(),
+            },
+            ChatProgress::StreamDelta {
+                text: "it. Well (sigh".into(),
+            },
+            ChatProgress::StreamDelta {
+                text: "ing) yes".into(),
+            },
+            ChatProgress::StreamEnd,
+            ChatProgress::Message {
+                text: "(pensive) Also this.".into(),
+            },
+        ]
+        .into_iter()
+        .flat_map(|progress| spoken_progress(&mut spoken, progress))
+        .filter_map(|progress| chat_progress_to_broadcast(progress, "s-1", false))
+        .collect();
+        assert_eq!(streamed(&sent), "Found it. Well yesAlso this.");
+        let types: Vec<&str> = sent.iter().map(|m| m.msg_type.as_str()).collect();
+        assert_eq!(
+            types,
+            [
+                "stream_delta",
+                "stream_delta",
+                "stream_delta",
+                "stream_end",
+                "message"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_typed_turn_streams_as_written() {
+        let mut spoken = SpokenText::new(None);
+        let out = spoken_progress(
+            &mut spoken,
+            ChatProgress::StreamDelta {
+                text: "(see below) ok".into(),
+            },
+        );
+        assert!(
+            matches!(&out[..], [ChatProgress::StreamDelta { text }] if text == "(see below) ok")
+        );
+    }
+
     /// The `stream_discard` broadcasts a local run's discard for `reason` makes.
     async fn local_discards(
         reason: workforce_agent::runner::StreamDiscardReason,
@@ -14234,7 +14459,7 @@ mod chat_progress_tests {
             .await
             .unwrap();
         drop(progress_tx);
-        forward_local_progress(progress_rx, tx, "s-1".into(), false, None, None).await;
+        forward_local_progress(progress_rx, tx, "s-1".into(), false, None, None, None).await;
         std::iter::from_fn(|| rx.try_recv().ok())
             .filter(|message| message.msg_type == "stream_discard")
             .collect()
@@ -14251,7 +14476,7 @@ mod chat_progress_tests {
             .await
             .unwrap();
         drop(progress_tx);
-        forward_local_progress(progress_rx, tx, "s-1".into(), false, None, None).await;
+        forward_local_progress(progress_rx, tx, "s-1".into(), false, None, None, None).await;
         assert!(std::iter::from_fn(|| rx.try_recv().ok()).all(|m| m.msg_type != "injected"));
     }
 
@@ -14280,7 +14505,16 @@ mod chat_progress_tests {
             .await
             .unwrap();
         drop(progress_tx);
-        forward_local_progress(progress_rx, tx, "s-1".into(), false, None, Some(stamp)).await;
+        forward_local_progress(
+            progress_rx,
+            tx,
+            "s-1".into(),
+            false,
+            None,
+            None,
+            Some(stamp),
+        )
+        .await;
         let local = rx.try_recv().unwrap();
         let nats = chat_progress_to_broadcast(ChatProgress::File(file), "s-1", false).unwrap();
         for frame in [&local, &nats] {

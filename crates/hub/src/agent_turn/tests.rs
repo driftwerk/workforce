@@ -4082,28 +4082,3 @@ async fn a_served_rounds_plan_reading_is_kept_as_its_logins() {
         seen.0.lock()
     );
 }
-
-#[test]
-fn the_workspaces_agent_turns_run_in_are_told_from_everything_else() {
-    let roots = WorkRoots::new(PathBuf::from("/data"), Some(std::path::Path::new("/hot")));
-    let turn = |p: &str| super::runs_in(&roots, std::path::Path::new(p));
-    assert!(turn(
-        "/data/agents/scout/projects/_agent-turn/work/session/at-dm-d4774cbb6c89-2e"
-    ));
-    assert!(turn(
-        "/hot/work/scout/_agent-turn/session/at-dm-d4774cbb6c89-2e/sub"
-    ));
-    assert!(
-        !turn("/data/agents/scout/projects/_agent-turn/work/clones/x"),
-        "not a session"
-    );
-    assert!(
-        !turn("/data/agents/scout/projects/acme/work/session/s1"),
-        "another project"
-    );
-    assert!(
-        !turn("/Users/k/dev/_agent-turn/work/session/at-1"),
-        "outside the hub's data"
-    );
-    assert!(!turn("/data/agents"));
-}

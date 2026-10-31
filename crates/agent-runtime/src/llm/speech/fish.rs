@@ -10,7 +10,7 @@ use serde_json::json;
 use workforce_common::secret::{scrub, KeySlot};
 use workforce_common::settings::LlmSpeechConfig;
 
-use super::{SpeechOutput, SpeechProvider, SpeechRequest};
+use super::{Markup, SpeechOutput, SpeechProvider, SpeechRequest};
 
 const DEFAULT_BASE_URL: &str = "https://api.fish.audio";
 const DEFAULT_MODEL: &str = "s1";
@@ -112,6 +112,10 @@ impl SpeechProvider for FishAudioSpeech {
 
     fn provider_id(&self) -> &'static str {
         "fish_audio"
+    }
+
+    fn markup(&self) -> Markup {
+        Markup::of("fish_audio", Some(&self.model))
     }
 }
 

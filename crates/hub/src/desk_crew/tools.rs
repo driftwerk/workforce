@@ -14,6 +14,7 @@ use workforce_agent::tools::{Tool, ToolResult};
 use workforce_desk::crew::{self, Filter, Item, ItemState};
 
 use super::actions::{Action, Gate};
+use super::watcher::reported;
 use super::CrewHub;
 
 /// Every `crew.*` tool: the reading ones first.
@@ -180,7 +181,7 @@ impl CrewTool {
                     .map_err(internal)?;
                 Ok(json!({
                     "counts": o.counts,
-                    "table": table(&o.items, &o.groups),
+                    "table": reported(&table(&o.items, &o.groups), "the crew's sessions and agents"),
                 }))
             }
             "crew.activity" => {
@@ -231,7 +232,7 @@ impl CrewTool {
                         )
                     })
                     .collect();
-                Ok(json!({ "events": lines }))
+                Ok(json!({ "events": reported(&lines.join("\n"), "the crew's activity") }))
             }
             "crew.history" => {
                 let limit = input["limit"].as_u64().unwrap_or(20).clamp(1, 100) as usize;
@@ -244,11 +245,15 @@ impl CrewTool {
                         .view(id)
                         .map_err(|_| "That session isn’t there any more.".to_string())?;
                     let terminal = crew.desk.terminal_text(id, 3000).ok();
-                    return Ok(json!({
+                    let said = json!({
                         "name": v.label(), "hub_name": v.name, "group": v.group.map(|g| g.name),
-                        "goal": v.goal, "state": v.state, "cwd": v.cwd,
+                        "goal": v.goal, "cwd": v.cwd,
                         "last_prompt": v.last_prompt, "last_reply": v.last_reply,
                         "pending": v.pending, "terminal": terminal,
+                    });
+                    return Ok(json!({
+                        "state": v.state,
+                        "session": reported(&said.to_string(), "the session"),
                     }));
                 }
                 let agent = input["agent_id"]
@@ -273,9 +278,12 @@ impl CrewTool {
                 )
                 .map_err(|e| e.to_string())?;
                 crate::desk_conversations::with_authors(&crew.desk, &mut page).await;
-                Ok(json!({ "messages": page.messages.iter().map(|m| json!({
+                let messages = json!(page.messages.iter().map(|m| json!({
                     "from": m.from, "author": m.author, "text": crew::clip(&m.text, 1500), "at": m.at,
-                })).collect::<Vec<_>>() }))
+                })).collect::<Vec<_>>());
+                Ok(json!({
+                    "messages": reported(&messages.to_string(), &format!("{agent}'s Desk DM")),
+                }))
             }
             super::spend::NAME => crew.spend(input).await,
             _ => Err("not a reading tool".into()),

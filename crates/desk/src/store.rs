@@ -11,6 +11,7 @@ use workforce_postgres::{
 };
 
 use crate::model::{Approvals, Engine, Origin, SessionRecord, SessionState, View};
+use crate::reads::ReadPlace;
 
 mod embedded {
     refinery::embed_migrations!("migrations");
@@ -151,6 +152,52 @@ impl DeskStore {
             .await?;
         Ok(())
     }
+
+    /// Every session found running in another terminal, closed ones too:
+    /// its id and the folder it ran in.
+    pub async fn external_places(&self) -> Result<Vec<(Uuid, String)>> {
+        let client = self.pool.get().await?;
+        let rows = client
+            .query(
+                "SELECT id, cwd FROM sessions WHERE origin = $1",
+                &[&Origin::External.as_str()],
+            )
+            .await?;
+        rows.iter()
+            .map(|row| Ok((row.try_get("id")?, row.try_get("cwd")?)))
+            .collect()
+    }
+
+    /// Forgets sessions that were never the person's (the hub's own runs),
+    /// all at once: their records, how far `owner` read each, and what
+    /// Activity says they or anyone did to them. How many records went.
+    pub async fn forget_sessions(&self, ids: &[Uuid], owner: &str) -> Result<u64> {
+        let places: Vec<String> = ids
+            .iter()
+            .map(|id| ReadPlace::Session(*id).to_string())
+            .collect();
+        let parties: Vec<String> = ids.iter().map(Uuid::to_string).collect();
+        let mut client = self.pool.get().await?;
+        let tx = client.transaction().await?;
+        tx.execute(
+            "DELETE FROM activity \
+             WHERE (subject ->> 'kind' = 'session' AND subject ->> 'id' = ANY($1)) \
+             OR (actor ->> 'kind' = 'session' AND actor ->> 'id' = ANY($1))",
+            &[&parties],
+        )
+        .await?;
+        tx.execute(
+            "DELETE FROM reads WHERE owner = $1 \
+             AND EXISTS (SELECT 1 FROM unnest($2::text[]) p WHERE left(place, length(p)) = p)",
+            &[&owner, &places],
+        )
+        .await?;
+        let gone = tx
+            .execute("DELETE FROM sessions WHERE id = ANY($1)", &[&ids])
+            .await?;
+        tx.commit().await?;
+        Ok(gone)
+    }
 }
 
 pub(crate) fn record(row: &Row) -> Result<SessionRecord> {
@@ -265,6 +312,96 @@ pub(crate) mod tests {
 
             store.delete(r.id).await.unwrap();
             assert!(store.get(r.id).await.unwrap().is_none());
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn sessions_are_forgotten_at_once_with_how_far_they_were_read() {
+        with_test_pool(build_pool, |pool| async move {
+            DeskStore::migrate(&pool).await.unwrap();
+            let store = DeskStore::from_pool(pool);
+            let mut gone = record_fixture("gone");
+            gone.origin = Origin::External;
+            gone.state = SessionState::Closed;
+            let mut open = record_fixture("open");
+            open.origin = Origin::External;
+            let kept = record_fixture("kept");
+            for r in [&gone, &open, &kept] {
+                store.put(r).await.unwrap();
+            }
+            let mut places = store.external_places().await.unwrap();
+            places.sort();
+            let mut expected = vec![(gone.id, gone.cwd.clone()), (open.id, open.cwd.clone())];
+            expected.sort();
+            assert_eq!(
+                places, expected,
+                "closed ones too, and only another terminal's"
+            );
+
+            let read = |id| crate::reads::ReadPut {
+                place: ReadPlace::Session(id),
+                point: crate::reads::ReadPoint {
+                    at: Utc::now(),
+                    message: None,
+                },
+                mark: crate::reads::Mark::Advance,
+            };
+            store
+                .put_reads("you", &[read(gone.id), read(kept.id)])
+                .await
+                .unwrap();
+            let party = |r: &SessionRecord| crate::crew::Party {
+                kind: crate::crew::PartyKind::Session,
+                id: r.id.to_string(),
+                name: r.name.clone(),
+                engine: Some(r.engine),
+                origin: Some(r.origin),
+            };
+            for r in [&gone, &kept] {
+                let started = crate::crew::Event::new(
+                    crate::crew::Kind::Started,
+                    party(r),
+                    Some(party(r)),
+                    "started",
+                );
+                store.add_event(&started).await.unwrap();
+            }
+            let stopped = crate::crew::Event::new(
+                crate::crew::Kind::Stopped,
+                crate::crew::Party::you(),
+                Some(party(&open)),
+                "stopped it",
+            );
+            store.add_event(&stopped).await.unwrap();
+
+            assert_eq!(
+                store
+                    .forget_sessions(&[gone.id, open.id], "you")
+                    .await
+                    .unwrap(),
+                2
+            );
+            assert!(store.get(gone.id).await.unwrap().is_none());
+            assert!(store.get(open.id).await.unwrap().is_none());
+            assert!(store.get(kept.id).await.unwrap().is_some());
+            let places: Vec<ReadPlace> = store
+                .reads("you")
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|r| r.place)
+                .collect();
+            assert_eq!(places, [ReadPlace::Session(kept.id)]);
+            let (events, _) = store
+                .events(crate::crew::Filter::All, None, 50)
+                .await
+                .unwrap();
+            let about: Vec<String> = events
+                .into_iter()
+                .filter_map(|e| e.subject.map(|s| s.name))
+                .collect();
+            assert_eq!(about, ["kept"], "what Activity says of them goes with them");
         })
         .await;
     }

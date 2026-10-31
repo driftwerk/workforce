@@ -133,6 +133,7 @@ pub mod provider_status;
 pub mod shutdown;
 pub mod skill_cmd;
 pub mod skill_consent;
+pub mod spoken_text;
 pub mod spotify_oauth_callback;
 pub mod workflow_cmd;
 // Lifted to the shared workforce-lessons crate (the edge runs the same

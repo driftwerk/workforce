@@ -135,6 +135,7 @@ async fn the_sink_delivers_a_chart_s_spec_where_the_conversation_draws_it() {
         desk: Some(DeskScope {
             target: dm.clone(),
             attended,
+            relayed: false,
             owner: person.clone(),
         }),
         ..context(session, "scout")
@@ -201,6 +202,7 @@ async fn the_sink_delivers_the_picture_where_the_conversation_does_not_draw_char
         desk: Some(DeskScope {
             target: DeskTarget::of_turn(&DeskPlace::Dm, DESK_CHANNEL, None, false),
             attended: true,
+            relayed: false,
             owner: "person-2".into(),
         }),
         ..context(&conversation.id, "scout")

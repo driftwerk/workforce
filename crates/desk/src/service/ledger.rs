@@ -406,7 +406,9 @@ impl Desk {
             return;
         };
         // An agent's turn is its agent's spend, in its hub's own records.
-        if self.0.opts.hub_turns.hold(&r.cwd) || ledger::agent_turn(&r.cwd, &r.name) {
+        if self.0.opts.hub_internal.holds(std::path::Path::new(&r.cwd))
+            || ledger::agent_turn(&r.cwd, &r.name)
+        {
             return;
         }
         let records = {

@@ -167,6 +167,38 @@ impl DeskLine {
     }
 }
 
+/// How the answer to a spoken turn comes back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeskReply {
+    /// Read aloud: the person is listening.
+    Spoken,
+    /// Shown: the person dictated, and reads the answer.
+    Written,
+}
+
+/// The voice an answer will be read aloud in, as Desk names it: a hub speech
+/// provider (`fish_audio`, `elevenlabs`, `openai`, `soniox`), Desk's own
+/// `kokoro`, or a live engine (`gpt-live`, `gemini-live`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeskSpeech {
+    pub provider: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+}
+
+/// A turn said rather than typed: how its answer comes back, and when it is
+/// heard, the voice that speaks it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeskVoice {
+    pub reply: DeskReply,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speech: Option<DeskSpeech>,
+}
+
+/// The longest provider or model name a turn's voice keeps.
+const SPEECH_NAME_CHARS: usize = 64;
+
 /// One turn as Desk sends it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeskTurn {
@@ -179,10 +211,15 @@ pub struct DeskTurn {
     /// The Desk room message this turn answers.
     #[serde(default)]
     pub message: Option<Uuid>,
-    /// Spoken rather than typed: the agent's voice model and thinking budget
-    /// apply to this message alone.
+    /// Its answer is heard: the agent's voice model and thinking budget
+    /// apply to this message alone. A Desk that sends `voice` sets this to
+    /// match it, so a hub that predates `voice` still reads it right.
     #[serde(default)]
     pub spoken: bool,
+    /// Said rather than typed, and how the answer comes back. Absent from a
+    /// typed turn, and from a Desk that predates it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub voice: Option<DeskVoice>,
 }
 
 /// Why a turn Desk sent cannot run on the conversation it names.
@@ -226,8 +263,41 @@ impl DeskTurn {
                 person => person,
             },
             context: clamp(self.context),
+            voice: self.voice.map(|voice| DeskVoice {
+                speech: voice.speech.map(|speech| DeskSpeech {
+                    provider: clip(speech.provider.trim(), SPEECH_NAME_CHARS),
+                    model: speech
+                        .model
+                        .map(|m| clip(m.trim(), SPEECH_NAME_CHARS))
+                        .filter(|m| !m.is_empty()),
+                }),
+                ..voice
+            }),
             ..self
         })
+    }
+
+    /// Whether the answer is heard: `voice` says when it's there, `spoken`
+    /// otherwise.
+    pub fn heard(&self) -> bool {
+        self.voice
+            .as_ref()
+            .map_or(self.spoken, |v| v.reply == DeskReply::Spoken)
+    }
+
+    /// Whether the person dictated it: spoken in, and the answer read.
+    pub fn dictated(&self) -> bool {
+        self.voice
+            .as_ref()
+            .is_some_and(|v| v.reply == DeskReply::Written)
+    }
+
+    /// The voice that reads the answer aloud, when it is heard and Desk said.
+    pub fn speech(&self) -> Option<&DeskSpeech> {
+        self.voice
+            .as_ref()
+            .filter(|_| self.heard())
+            .and_then(|v| v.speech.as_ref())
     }
 
     /// The turn a Desk too old to describe it sent on `anchor`: the person,
@@ -247,6 +317,7 @@ impl DeskTurn {
             context: Vec::new(),
             message: None,
             spoken: false,
+            voice: None,
         })
     }
 
@@ -487,6 +558,11 @@ pub struct DeskScope {
     /// The person (or paired device) whose conversation `target` is.
     pub owner: String,
     pub attended: bool,
+    /// The turn's prompt was relayed to the agent (the overseer's nudges and
+    /// tasks), not said by the person: no write off Desk passes on an
+    /// "Always allow" the person kept for their own turns, and none is
+    /// offered.
+    pub relayed: bool,
 }
 
 /// What the hub link tells a Desk when a message lands in one of its
@@ -625,6 +701,7 @@ mod tests {
             context: Vec::new(),
             message: None,
             spoken: false,
+            voice: None,
         }
     }
 
@@ -811,6 +888,45 @@ mod tests {
         assert_eq!(
             (legacy.channel.as_str(), legacy.device),
             (DESK_CHANNEL, None)
+        );
+    }
+
+    #[test]
+    fn a_turn_says_how_its_answer_comes_back() {
+        let turn = |v: serde_json::Value| serde_json::from_value::<DeskTurn>(v).unwrap();
+        let base = json!({"place": {"kind": "dm"}, "speaker": {"kind": "person"}});
+        let typed = turn(base.clone());
+        assert!(!typed.heard() && !typed.dictated() && typed.speech().is_none());
+
+        // A Desk from before `voice`.
+        let mut old = base.clone();
+        old["spoken"] = json!(true);
+        let old = turn(old);
+        assert!(old.heard() && !old.dictated() && old.speech().is_none());
+
+        let mut aloud = base.clone();
+        aloud["spoken"] = json!(true);
+        aloud["voice"] =
+            json!({"reply": "spoken", "speech": {"provider": " fish_audio ", "model": ""}});
+        let aloud = turn(aloud).validated(DESK_CHANNEL).unwrap();
+        assert!(aloud.heard() && !aloud.dictated());
+        assert_eq!(
+            aloud.speech(),
+            Some(&DeskSpeech {
+                provider: "fish_audio".into(),
+                model: None
+            })
+        );
+
+        let mut dictated = base;
+        dictated["voice"] = json!({"reply": "written", "speech": {"provider": "kokoro"}});
+        let dictated = turn(dictated);
+        assert!(dictated.dictated() && !dictated.heard());
+        assert!(dictated.speech().is_none(), "a written answer has no voice");
+        assert_eq!(
+            serde_json::to_value(&typed).unwrap().get("voice"),
+            None,
+            "a typed turn sends no voice"
         );
     }
 

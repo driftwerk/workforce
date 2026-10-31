@@ -216,6 +216,7 @@ impl HeartbeatRunner {
                     target,
                     owner,
                     attended: false,
+                    relayed: false,
                 },
             );
         workforce_agent::runner::with_desk(
