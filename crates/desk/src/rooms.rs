@@ -657,7 +657,12 @@ impl DeskStore {
     /// that isn't the room's, or an `around` one that is in another place.
     pub async fn messages(&self, room_id: Uuid, page: &Page) -> Result<Option<Vec<RoomMessage>>> {
         let cols = &*MESSAGE_COLUMNS;
-        let place = "room_id = $1 AND thread_id IS NOT DISTINCT FROM $2";
+        // `=` or `IS NULL`, never `IS NOT DISTINCT FROM`, which no index
+        // serves: a page is read along `room_messages_place`.
+        let place = match page.thread {
+            Some(_) => "room_id = $1 AND thread_id = $2",
+            None => "room_id = $1 AND thread_id IS NULL AND $2::uuid IS NULL",
+        };
         let older = |cmp: &str| {
             format!(
                 "SELECT {cols} FROM room_messages WHERE {place} AND (created_at, id) {cmp} ($3, $4) \
