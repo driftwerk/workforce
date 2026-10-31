@@ -148,7 +148,18 @@ impl Desk {
         if puts.iter().any(|p| p.place == ReadPlace::Floor) {
             return Err(DeskError::Invalid("the floor is Desk's own".into()));
         }
-        let changed = self.0.store.put_reads(owner, puts).await?;
+        // A point is never later than now: one from a clock running ahead
+        // would count everything until then as read.
+        let now = Utc::now();
+        let puts: Vec<ReadPut> = puts
+            .iter()
+            .cloned()
+            .map(|mut p| {
+                p.point.at = p.point.at.min(now);
+                p
+            })
+            .collect();
+        let changed = self.0.store.put_reads(owner, &puts).await?;
         self.announce_reads(&changed);
         Ok(changed)
     }
@@ -383,6 +394,25 @@ mod tests {
             );
             assert_eq!(summary.activity.count, 1, "not your own");
             assert_eq!(summary.brief, None);
+
+            let ahead = d
+                .put_reads(
+                    YOU,
+                    &[ReadPut {
+                        place: ReadPlace::Brief,
+                        point: ReadPoint {
+                            at: Utc::now() + chrono::Duration::hours(1),
+                            message: None,
+                        },
+                        mark: crate::reads::Mark::Advance,
+                    }],
+                )
+                .await
+                .unwrap();
+            assert!(
+                ahead[0].point.at <= Utc::now(),
+                "a point from a clock ahead is held to now"
+            );
 
             let (_, mut events) = d.subscribe();
             let changed = d

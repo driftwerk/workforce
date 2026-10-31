@@ -194,6 +194,7 @@ impl DeskStore {
     pub async fn put_reads(&self, owner: &str, puts: &[ReadPut]) -> Result<Vec<Read>> {
         let mut client = self.pool().get().await?;
         let tx = client.transaction().await?;
+        hold_points(&tx, owner).await?;
         let mut changed = Vec::new();
         for put in puts {
             let only_forward = match put.mark {
@@ -370,6 +371,7 @@ impl DeskStore {
         };
         let mut client = self.pool().get().await?;
         let tx = client.transaction().await?;
+        hold_points(&tx, owner).await?;
         let mut changed = Vec::new();
         for (place, place_of, in_place) in [
             ("'room:' || room_id", "room_id", "thread_id IS NULL"),
@@ -452,6 +454,19 @@ impl DeskStore {
             .await?;
         Ok(rows.iter().map(|r| (r.get(0), r.get(1))).collect())
     }
+}
+
+/// Holds `owner`'s points for the rest of `tx`. Writes of several points
+/// lock their rows in the order they come, so two windows writing the same
+/// places in another order, or Mark all read beside them, would deadlock;
+/// one writer at a time per owner can't.
+async fn hold_points(tx: &tokio_postgres::Transaction<'_>, owner: &str) -> Result<()> {
+    tx.execute(
+        "SELECT pg_advisory_xact_lock(hashtextextended('desk.reads:' || $1, 0))",
+        &[&owner],
+    )
+    .await?;
+    Ok(())
 }
 
 /// Threads a summary lists at most, the newest.
@@ -585,6 +600,15 @@ mod tests {
                 store.reads("sarah").await.unwrap().is_empty(),
                 "points are their owner's"
             );
+            let other = ReadPlace::Activity;
+            for s in 30..50 {
+                let one = [put(room, s, Mark::Advance), put(other, s, Mark::Advance)];
+                let another = [put(other, s, Mark::Advance), put(room, s, Mark::Advance)];
+                let (a, b) =
+                    tokio::join!(store.put_reads(YOU, &one), store.put_reads(YOU, &another));
+                a.expect("two windows writing the same places in turn");
+                b.expect("two windows writing the same places in turn");
+            }
         })
         .await;
     }
