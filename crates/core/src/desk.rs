@@ -558,6 +558,11 @@ pub struct DeskScope {
     /// The person (or paired device) whose conversation `target` is.
     pub owner: String,
     pub attended: bool,
+    /// The turn's prompt was relayed to the agent (the overseer's nudges and
+    /// tasks), not said by the person: no write off Desk passes on an
+    /// "Always allow" the person kept for their own turns, and none is
+    /// offered.
+    pub relayed: bool,
 }
 
 /// What the hub link tells a Desk when a message lands in one of its

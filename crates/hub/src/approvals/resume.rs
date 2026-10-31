@@ -61,6 +61,7 @@ pub async fn launch_resume(
                     target,
                     owner: session.owner,
                     attended: false,
+                    relayed: false,
                 })
         });
 

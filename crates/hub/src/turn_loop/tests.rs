@@ -1160,6 +1160,7 @@ async fn a_desk_answer_names_the_message_its_turn_answers_and_a_resumed_one_none
         target: DeskTarget::of_turn(&place, &channel, None, false),
         owner: "person-1".into(),
         attended: false,
+        relayed: false,
     };
     let (_, resumed) = workforce_agent::runner::with_desk(Some(scope), async {
         crate::turn_loop::records::reply_slot(None, &channel)

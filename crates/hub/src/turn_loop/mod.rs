@@ -5080,6 +5080,7 @@ pub(crate) async fn stream_admitted(
             target: d.target.clone(),
             owner: session.owner.clone(),
             attended: true,
+            relayed: false,
         })
         .or_else(workforce_agent::runner::current_desk);
     let origin_for_task = Origin::of_turn(user, channel, session.is_voice_turn());
