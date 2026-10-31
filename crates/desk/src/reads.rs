@@ -443,6 +443,30 @@ impl DeskStore {
             }))
     }
 
+    /// When each session last did something worth the person's attention.
+    pub async fn attention_times(&self) -> Result<std::collections::HashMap<Uuid, DateTime<Utc>>> {
+        let client = self.pool().get().await?;
+        let rows = client
+            .query(
+                "SELECT id, attention_at FROM sessions WHERE attention_at IS NOT NULL",
+                &[],
+            )
+            .await?;
+        Ok(rows.iter().map(|r| (r.get(0), r.get(1))).collect())
+    }
+
+    /// Keeps when session `id` last did something worth attention.
+    pub async fn set_attention(&self, id: Uuid, at: DateTime<Utc>) -> Result<()> {
+        let client = self.pool().get().await?;
+        client
+            .execute(
+                "UPDATE sessions SET attention_at = $2 WHERE id = $1",
+                &[&id, &at],
+            )
+            .await?;
+        Ok(())
+    }
+
     /// When each session came into the state it is in, as kept.
     pub async fn state_times(&self) -> Result<std::collections::HashMap<Uuid, DateTime<Utc>>> {
         let client = self.pool().get().await?;
