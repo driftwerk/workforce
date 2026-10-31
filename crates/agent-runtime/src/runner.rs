@@ -2002,16 +2002,7 @@ pub async fn deliver_generated(
     invocations: &[ToolInvocation],
 ) {
     for img in generated_files(invocations) {
-        if let Err(e) = sink
-            .deliver(
-                ctx,
-                &img.artifact_id,
-                &img.media_type,
-                img.filename.as_deref(),
-                img.caption.as_deref(),
-            )
-            .await
-        {
+        if let Err(e) = sink.deliver_file(ctx, &img).await {
             warn!(
                 error = %e,
                 artifact_id = img.artifact_id.as_str(),

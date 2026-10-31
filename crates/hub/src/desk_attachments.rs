@@ -42,6 +42,8 @@ use workforce_agent::artifacts::{
     global_store, ArtifactDescriptor, ArtifactId, ArtifactStore, ContentType, ATTACHMENT_TTL,
 };
 use workforce_agent::attachments::SESSION_UPLOAD_PRODUCER;
+use workforce_agent::tools::chart::CHART_SPEC_MEDIA_TYPE;
+use workforce_agent::tools::image_gen::GeneratedImageRef;
 use workforce_common::channels::desk::DeskFile;
 use workforce_common::channels::{is_conversational, is_desk_conversation, DESK_CHANNEL};
 use workforce_common::session::{MessageRole, Session, SessionStore};
@@ -680,13 +682,35 @@ impl StagedFile {
     }
 }
 
-/// The files a live Desk turn's `invocations` delivered, as its answer
-/// carries them.
+/// The file a reader of `session` is shown for `file`: what it was drawn
+/// from, in its place, when `session` is a Desk conversation whose reader
+/// said it draws that itself (a chart's spec, for a reader that declared
+/// `chart_specs`); otherwise the file itself.
+pub(crate) fn shown_to(session: Option<&Session>, file: &GeneratedImageRef) -> GeneratedImageRef {
+    let draws = |media_type: &str| {
+        media_type == CHART_SPEC_MEDIA_TYPE
+            && session
+                .is_some_and(|s| is_desk_conversation(&s.channel) && s.rendered_rich().chart_specs)
+    };
+    match file.spec.as_deref() {
+        Some(spec) if draws(&spec.media_type) => GeneratedImageRef {
+            caption: file.caption.clone(),
+            spec: None,
+            ..spec.clone()
+        },
+        _ => file.clone(),
+    }
+}
+
+/// The files a live Desk turn's `invocations` delivered, as its answer in
+/// `session` carries them.
 pub(crate) fn delivered_in(
-    agent: &str,
+    session: &Session,
     invocations: &[workforce_agent::runner::ToolInvocation],
 ) -> Vec<DeskFile> {
+    let agent = session.agent_id.as_str();
     workforce_agent::runner::generated_files(invocations)
+        .map(|file| shown_to(Some(session), &file))
         .map(|file| {
             StagedFile::of(
                 agent,

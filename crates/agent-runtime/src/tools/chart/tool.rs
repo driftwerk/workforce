@@ -13,13 +13,14 @@ use async_trait::async_trait;
 use eyre::Result;
 use serde_json::{json, Value};
 
-use super::{draw, request};
+use super::{draw, request, ChartRequest, CHART_SPEC_MEDIA_TYPE};
 use crate::artifacts::download_marker;
+use crate::artifacts::store::ArtifactStore;
 use crate::artifacts::store::{global_store, ATTACHMENT_TTL};
 use crate::artifacts::stream::download_filename;
 use crate::artifacts::types::{ArtifactBody, ArtifactDescriptor, ContentType};
 use crate::runner::CURRENT_AGENT_ID;
-use crate::tools::image_gen::GENERATED_IMAGES_KEY;
+use crate::tools::image_gen::{GENERATED_IMAGES_KEY, SPEC_KEY};
 use crate::tools::{Tool, ToolResult};
 
 pub const CHART_TOOL_NAME: &str = "chart";
@@ -182,6 +183,9 @@ impl Tool for ChartTool {
             if let Some(caption) = caption {
                 marker["caption"] = json!(caption);
             }
+            if let Some(spec) = stage_spec(store.as_ref(), &agent_id, &chart) {
+                marker[SPEC_KEY] = spec;
+            }
             output[GENERATED_IMAGES_KEY] = json!([marker]);
             output["note"] = json!(
                 "Chart generated and being delivered to this conversation as an image \
@@ -197,6 +201,34 @@ impl Tool for ChartTool {
             );
         }
         Ok(ToolResult::success(output, elapsed(start)))
+    }
+}
+
+/// The chart's validated spec, staged beside its picture for a reader that
+/// draws it itself, as the marker naming it. A spec that cannot be staged
+/// leaves the picture to stand alone.
+fn stage_spec(store: &dyn ArtifactStore, agent_id: &str, chart: &ChartRequest) -> Option<Value> {
+    let bytes = serde_json::to_vec(&chart.spec).ok()?;
+    let filename = download_filename(&chart.title, "json");
+    let size = bytes.len() as u64;
+    let descriptor = ArtifactDescriptor::from_context(
+        CHART_TOOL_NAME,
+        ContentType::OctetStream,
+        agent_id.to_string(),
+    )
+    .with_ttl(ATTACHMENT_TTL)
+    .with_file_meta(filename.clone(), CHART_SPEC_MEDIA_TYPE);
+    match store.write(agent_id, descriptor, ArtifactBody::Bytes(bytes)) {
+        Ok(handle) => Some(download_marker(
+            &handle.id,
+            CHART_SPEC_MEDIA_TYPE,
+            &filename,
+            size,
+        )),
+        Err(e) => {
+            tracing::warn!(error = %e, "staging a chart's spec failed; its picture stands alone");
+            None
+        }
     }
 }
 
@@ -263,6 +295,39 @@ mod tests {
         assert_eq!(marker["filename"], "Signups-by-plan.svg");
         assert_eq!(marker["caption"], "Pro leads.");
         assert_eq!(result.output["artifact_id"], marker["artifact_id"]);
+    }
+
+    /// Beside the picture the marker names the validated spec, staged as a
+    /// file of its own, which reads back as exactly what the validator
+    /// normalised — what a reader that draws charts itself is shown.
+    #[tokio::test]
+    async fn the_marker_names_the_validated_spec_staged_beside_the_picture() {
+        let input = json!({
+            "spec": { "kind": "bar", "labels": ["A", "B"], "series": [{ "name": "Q3", "data": ["4", 5] }] },
+            "format": "svg",
+            "title": "Signups by plan"
+        });
+        let result = run(input.clone()).await;
+        assert!(result.success, "{:?}", result.error);
+        let spec = &result.output[GENERATED_IMAGES_KEY][0][SPEC_KEY];
+        assert_eq!(spec["media_type"], CHART_SPEC_MEDIA_TYPE);
+        assert_eq!(spec["filename"], "Signups-by-plan.json");
+        let id = crate::artifacts::types::ArtifactId::parse(spec["artifact_id"].as_str().unwrap())
+            .unwrap();
+        assert_ne!(spec["artifact_id"], result.output["artifact_id"]);
+        let body = global_store()
+            .unwrap()
+            .read("chart-tool-test", &id)
+            .unwrap()
+            .into_bytes()
+            .unwrap();
+        let staged: Value = serde_json::from_slice(&body).unwrap();
+        let normalised = serde_json::to_value(request(&input).unwrap().spec).unwrap();
+        assert_eq!(staged, normalised);
+        assert_eq!(staged["title"], "Signups by plan");
+        assert_eq!(staged["series"][0]["data"], json!([4.0, 5.0]));
+        let refs = crate::tools::image_gen::parse_generated_images(&result.output);
+        assert_eq!(refs[0].spec.as_ref().unwrap().artifact_id, id);
     }
 
     #[tokio::test]
