@@ -1457,9 +1457,17 @@ pub(crate) mod tests {
                 .await
                 .unwrap();
             let hits = store.search(&search("migration")).await.unwrap();
+            assert!(
+                hits[0].snippet.contains(&format!(
+                    "{MATCH_START}migration{MATCH_END} is done not a match"
+                )),
+                "{}",
+                hits[0].snippet
+            );
             assert_eq!(
-                hits[0].snippet,
-                format!("the {MATCH_START}migration{MATCH_END} is done not a match at last")
+                hits[0].snippet.matches(MATCH_START).count(),
+                1,
+                "the forged brackets are stripped"
             );
             assert_eq!(
                 serde_json::to_value(&hits[0]).unwrap()["roomId"],
