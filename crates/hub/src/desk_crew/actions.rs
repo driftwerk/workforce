@@ -7,7 +7,7 @@ use std::path::Path;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
-use workforce_common::oversight::{Level, Oversight};
+use workforce_common::oversight::{Act, Level, Oversight};
 use workforce_desk::crew::{self, By, Kind, Party};
 use workforce_desk::model::{Engine, NewSession, Origin};
 use workforce_desk::Speaker;
@@ -178,9 +178,68 @@ impl Action {
 }
 
 const OUTWARD: &[&str] = &[
-    "push", "pushes", "deploy", "deploys", "publish", "release", "merge", "delete", "deletes",
-    "remove", "rm", "drop", "destroy", "wipe", "send", "email", "mail", "post", "tweet", "slack",
-    "message", "pay", "purchase", "buy",
+    "push",
+    "pushes",
+    "pushed",
+    "deploy",
+    "deploys",
+    "deployed",
+    "ship",
+    "ships",
+    "publish",
+    "publishes",
+    "published",
+    "release",
+    "releases",
+    "released",
+    "merge",
+    "merges",
+    "merged",
+    "pr",
+    "prs",
+    "delete",
+    "deletes",
+    "deleted",
+    "remove",
+    "removes",
+    "removed",
+    "rm",
+    "drop",
+    "destroy",
+    "wipe",
+    "purge",
+    "send",
+    "sends",
+    "sent",
+    "email",
+    "emails",
+    "mail",
+    "post",
+    "posts",
+    "posted",
+    "tweet",
+    "slack",
+    "message",
+    "messages",
+    "dm",
+    "share",
+    "shares",
+    "shared",
+    "upload",
+    "uploads",
+    "uploaded",
+    "submit",
+    "submits",
+    "submitted",
+    "notify",
+    "notifies",
+    "announce",
+    "invite",
+    "reply",
+    "pay",
+    "purchase",
+    "buy",
+    "order",
 ];
 
 /// Whether `text` names something that pushes, deletes or sends. Words
@@ -210,10 +269,8 @@ impl CrewHub {
             Level::Suggest => return Gate::Suggest("you suggest; the person decides"),
             Level::Act => {}
         }
-        if !self.contained(action) {
-            return Gate::Suggest(
-                "what it leads to wouldn't wait on the person: an agent acts on a message under its own permissions, and a session Desk didn't start may not ask before it acts",
-            );
+        if let Some(why) = self.uncontained(action, &o.act) {
+            return Gate::Suggest(why);
         }
         if action.outward() {
             return Gate::Suggest(
@@ -222,8 +279,10 @@ impl CrewHub {
         }
         let allowed = match action {
             Action::Nudge { .. } => o.act.nudge,
+            // Switched on by `message_agents`, above.
+            Action::Assign { .. } => true,
             Action::Resume { .. } | Action::Restart { .. } => o.act.resume_restart,
-            Action::StartSession { .. } | Action::Assign { .. } => o.act.hand_out_work,
+            Action::StartSession { .. } => o.act.hand_out_work,
             Action::Approve { session, approval } => {
                 if !o.act.read_only_approvals {
                     false
@@ -252,8 +311,8 @@ impl CrewHub {
         }
     }
 
-    /// Whether everything `action` leads to still waits on a gate the
-    /// overseer can't pass, so that it may be done without the person. An
+    /// Why what `action` leads to might not wait on the person, unless
+    /// `act` lets it: `None` when it may be done without them. An
     /// allowlist, matched in full, of what is known to be held:
     ///
     /// - What a session Desk started does next waits on its approvals, which
@@ -265,20 +324,27 @@ impl CrewHub {
     /// An agent's turn runs under its own permissions, which can let it act
     /// outside Desk (open a pull request, file an issue, call an API)
     /// without asking, and a session started in another terminal may have
-    /// been started not to ask: messages to either are the person's call.
-    pub(crate) fn contained(&self, action: &Action) -> bool {
+    /// been started not to ask: messages to either wait on the person unless
+    /// they switched them on (`message_agents`, `message_terminal_sessions`).
+    /// Resuming or restarting a session from another terminal always does.
+    pub(crate) fn uncontained(&self, action: &Action, act: &Act) -> Option<&'static str> {
         let started_here = |session: &Uuid| {
             self.desk
                 .view(*session)
                 .is_ok_and(|v| v.origin == Origin::Desk)
         };
-        match action {
+        let held = match action {
             Action::Nudge {
                 to: Target::Session(s),
                 ..
+            } => match self.desk.view(*s).map(|v| v.origin) {
+                Ok(Origin::Desk) => true,
+                Ok(Origin::External) => act.message_terminal_sessions,
+                Err(_) => false,
+            },
+            Action::Resume { session: s, .. } | Action::Restart { session: s, .. } => {
+                started_here(s)
             }
-            | Action::Resume { session: s, .. }
-            | Action::Restart { session: s, .. } => started_here(s),
             Action::StartSession { .. } => true,
             Action::Approve { .. }
             | Action::Deny { .. }
@@ -288,8 +354,15 @@ impl CrewHub {
                 to: Target::Agent(_),
                 ..
             }
-            | Action::Assign { .. } => false,
-        }
+            | Action::Assign { .. } => {
+                return (!act.message_agents).then_some(
+                    "the person hasn't let you message agents without asking: an agent acts on a message under its own permissions",
+                );
+            }
+        };
+        (!held).then_some(
+            "what it leads to wouldn't wait on the person: a session Desk didn't start may not ask before it acts",
+        )
     }
 
     fn session_name(&self, id: Uuid) -> String {
@@ -634,6 +707,16 @@ mod tests {
         assert!(outward("Push the branch when green"));
         assert!(outward("rm the build folder"));
         assert!(outward("email the team"));
+        for said in [
+            "Share it in #general",
+            "Upload the report",
+            "Open a PR for the date picker",
+            "Notify the client it is fixed",
+            "Submit it",
+            "Reply to the thread when done",
+        ] {
+            assert!(outward(said), "{said}");
+        }
         assert!(!outward("Run the tests without the network ones"));
         assert!(!outward("Still on the provider tests, or stuck?"));
     }

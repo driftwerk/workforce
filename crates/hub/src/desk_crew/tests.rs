@@ -1022,7 +1022,7 @@ async fn the_overseer_only_suggests_what_it_would_have_an_agent_do() {
 
         let s = new_session(&d, dir.path(), "web").await;
         let nudged = tool("crew.nudge")
-            .execute(json!({"session_id": s.id.to_string(), "message": "Open a PR for the date picker", "reason": "Done."}))
+            .execute(json!({"session_id": s.id.to_string(), "message": "Finish the date picker", "reason": "Done."}))
             .await
             .unwrap();
         assert_eq!(nudged.output["done"], "asked web", "{nudged:?}");
@@ -1037,6 +1037,115 @@ async fn the_overseer_only_suggests_what_it_would_have_an_agent_do() {
             .await
             .unwrap();
         assert!(approved.output["suggested"].is_string(), "{approved:?}");
+    })
+    .await;
+}
+
+/// With `message_agents` on, at level act, the overseer's nudges and tasks
+/// to agents go at once (the agent's turn is held to Desk at paired trust),
+/// but words that read as sending or pushing still only suggest. Sessions
+/// started in another terminal are nudged on their own only with
+/// `message_terminal_sessions`, and are never resumed or restarted so.
+#[tokio::test(flavor = "multi_thread")]
+async fn messaging_agents_and_terminal_sessions_is_the_persons_to_switch_on() {
+    use super::actions::{Action, Gate, Target};
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let now = chrono::Utc::now();
+        let terminal = workforce_desk::model::SessionRecord {
+            id: uuid::Uuid::new_v4(),
+            engine: Engine::Claude,
+            name: "elsewhere".into(),
+            goal: String::new(),
+            cwd: dir.path().to_string_lossy().into_owned(),
+            branch: None,
+            origin: workforce_desk::model::Origin::External,
+            state: workforce_desk::model::SessionState::Idle,
+            approvals: workforce_desk::model::Approvals::Desk,
+            cli_session_id: Some("cli-elsewhere".into()),
+            transcript: None,
+            last_prompt: None,
+            last_reply: None,
+            external_pid: None,
+            restore_offer: false,
+            terminal_id: None,
+            display_name: None,
+            asked: None,
+            created_at: now,
+            updated_at: now,
+        };
+        DeskStore::with_pool(pool.clone())
+            .await
+            .unwrap()
+            .put(&terminal)
+            .await
+            .unwrap();
+        let (scout, _s) = agent(dir.path(), "scout", "On it.").await;
+        let dm = scout.sessions.get_or_create(DESK_CHANNEL, PERSON, "scout").unwrap();
+        scout.sessions.save(&dm).unwrap();
+        let (overseer, crew, d, _llm) = overseeing(
+            dir.path(),
+            pool,
+            "ok",
+            "[oversight]\nenabled = true\nlevel = \"act\"\nact = { message_agents = true }\n",
+            &[Arc::clone(&scout)],
+        )
+        .await;
+        eventually("the overseer's tools", async || overseer.tools.has("crew.assign").then_some(())).await;
+        let tool = |name: &str| overseer.tools.get(name).unwrap();
+        let nudged = tool("crew.nudge")
+            .execute(json!({"agent_id": "scout", "message": "How is the staging check going?", "reason": "Quiet."}))
+            .await
+            .unwrap();
+        assert_eq!(nudged.output["done"], "asked scout", "{nudged:?}");
+        let assigned = tool("crew.assign")
+            .execute(json!({"agent_id": "scout", "task": "Check the date picker build", "reason": "Next up."}))
+            .await
+            .unwrap();
+        assert!(assigned.output["done"].is_string(), "{assigned:?}");
+        for message in ["Share it in #general", "Push the branch", "Open a PR for it"] {
+            let held = tool("crew.nudge")
+                .execute(json!({"agent_id": "scout", "message": message, "reason": "Done."}))
+                .await
+                .unwrap();
+            assert!(held.output["suggested"].is_string(), "{message}: {held:?}");
+        }
+
+        let (_, mut o) = crew.overseer_service().unwrap();
+        assert!(o.act.message_agents && !o.act.message_terminal_sessions);
+        let view = d.view(terminal.id).unwrap();
+        assert_eq!(view.origin, workforce_desk::model::Origin::External);
+        let nudge = |to| Action::Nudge {
+            to,
+            message: "How is it going?".into(),
+        };
+        let resume = Action::Resume {
+            session: terminal.id,
+            prompt: Some("Carry on.".into()),
+        };
+        assert!(matches!(
+            crew.gate(&nudge(Target::Session(terminal.id)), &o),
+            Gate::Suggest(_)
+        ));
+        o.act.message_terminal_sessions = true;
+        assert_eq!(crew.gate(&nudge(Target::Session(terminal.id)), &o), Gate::Run);
+        assert!(matches!(crew.gate(&resume, &o), Gate::Suggest(_)), "resuming it is the person's");
+        assert!(
+            matches!(
+                crew.gate(&nudge(Target::Session(uuid::Uuid::new_v4())), &o),
+                Gate::Suggest(_)
+            ),
+            "a session Desk doesn't know"
+        );
+        o.act.nudge = false;
+        assert!(matches!(crew.gate(&nudge(Target::Agent("scout".into())), &o), Gate::Suggest(_)));
+        o.act.nudge = true;
+        o.act.message_agents = false;
+        assert!(matches!(crew.gate(&nudge(Target::Agent("scout".into())), &o), Gate::Suggest(_)));
+        assert!(matches!(
+            crew.gate(&Action::Assign { agent: "scout".into(), task: "Check it".into() }, &o),
+            Gate::Suggest(_)
+        ));
     })
     .await;
 }
