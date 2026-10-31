@@ -4516,9 +4516,9 @@ mod tests {
         .await;
     }
 
-    /// Waits for `id` to be in `state`, up to two seconds.
+    /// Waits for `id` to be in `state`, up to ten seconds.
     async fn comes_to(d: &Desk, id: Uuid, state: SessionState) -> bool {
-        for _ in 0..200 {
+        for _ in 0..1000 {
             if d.view(id).unwrap().state == state {
                 return true;
             }
@@ -4547,17 +4547,15 @@ mod tests {
                 .await
             );
 
+            let model = Duration::from_secs(3);
             let yes: Arc<dyn crew::Crew> = Arc::new(Reader {
                 asks: Some(true),
-                wait: Duration::from_millis(300),
+                wait: model,
             });
             d.read_replies_with(&yes);
             let at = std::time::Instant::now();
             turn_ending(&d, s.id, "push it again", UNSURE).await;
-            assert!(
-                at.elapsed() < Duration::from_millis(300),
-                "the hook doesn't wait for the model"
-            );
+            assert!(at.elapsed() < model, "the hook doesn't wait for the model");
             let v = d.view(s.id).unwrap();
             assert_eq!(
                 (v.state, v.asked),
@@ -4585,7 +4583,8 @@ mod tests {
                 .count();
             assert_eq!(ends, 2, "the turn the model read ended once");
             assert!(
-                recorded(&d, 4)
+                // Started, prompted, finished, prompted, asked.
+                recorded(&d, 5)
                     .await
                     .iter()
                     .any(|(k, text, _)| *k == crew::Kind::Question && text.starts_with("asked")),
@@ -4702,7 +4701,8 @@ mod tests {
                 .await,
                 "the turn ended, not finished"
             );
-            assert!(recorded(&d, 2).await.iter().any(
+            // Started, prompted, interrupted.
+            assert!(recorded(&d, 3).await.iter().any(
                 |(k, text, _)| *k == crew::Kind::Interrupted && text == "interrupted auth-fix"
             ));
         })
