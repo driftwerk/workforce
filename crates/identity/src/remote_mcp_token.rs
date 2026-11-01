@@ -30,8 +30,7 @@ pub struct RemoteMcpToken {
     pub revoked_at: Option<DateTime<Utc>>,
 }
 
-/// Everything but the stored hash and prefix, which are fragments of the
-/// secret: a Debug line is a log line.
+/// Everything but the stored hash: a Debug line is a log line.
 impl std::fmt::Debug for RemoteMcpToken {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RemoteMcpToken")
@@ -186,6 +185,10 @@ mod tests {
             for frag in fragments(body) {
                 assert!(!shown.contains(frag), "debug output leaked a key fragment");
             }
+            assert!(
+                !shown.contains(&minted.hash),
+                "debug output leaked the hash"
+            );
         }
         assert_eq!(record.fingerprint(), fingerprint(&minted.hash));
     }

@@ -85,18 +85,30 @@ impl PostgresIdentityStore {
         MigrationRunner::run(&pool, &[migration_set])
             .await
             .context("running identity migrations")?;
-        // A previous-release node that was still running during the
-        // migration may have minted a key with a stored prefix since.
-        // Clear it (cheap, idempotent). Goes away with the column.
-        let conn = pool.get().await?;
-        conn.execute(
-            "UPDATE remote_mcp_tokens SET token_prefix = '' WHERE token_prefix <> ''",
-            &[],
-        )
-        .await
-        .context("clearing stored remote MCP key prefixes")?;
-        drop(conn);
+        Self::clear_straggling_key_prefixes(&pool).await;
         Ok(Arc::new(Self { pool }))
+    }
+
+    /// A previous-release node still running after the migration may have
+    /// minted a key with a stored prefix since. Clear it (cheap, idempotent).
+    ///
+    /// Best effort: nothing reads the column, so failing here must never stop
+    /// a hub starting. That includes this release restarting after a later one
+    /// has dropped the column. The next start tries again.
+    async fn clear_straggling_key_prefixes(pool: &PostgresPool) {
+        let cleared = match pool.get().await {
+            Ok(conn) => conn
+                .execute(
+                    "UPDATE remote_mcp_tokens SET token_prefix = '' WHERE token_prefix <> ''",
+                    &[],
+                )
+                .await
+                .map_err(|e| e.to_string()),
+            Err(e) => Err(e.to_string()),
+        };
+        if let Err(error) = cleared {
+            tracing::warn!(%error, "could not clear stored remote MCP key prefixes");
+        }
     }
 
     /// Run a future that returns `Result<T>` on the current Tokio
@@ -930,6 +942,27 @@ mod tests {
                 .unwrap()
                 .get(0);
             assert_eq!(left, 0);
+        })
+        .await;
+    }
+
+    /// This release must keep starting after a later one drops the column:
+    /// a crash restart or a rollback to it would otherwise take the hub down.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_store_still_starts_when_the_prefix_column_is_gone() {
+        with_test_pool(PostgresIdentityStore::build_pool, |pool| async move {
+            PostgresIdentityStore::with_pool(pool.clone())
+                .await
+                .expect("first start");
+            pool.get()
+                .await
+                .unwrap()
+                .batch_execute("ALTER TABLE remote_mcp_tokens DROP COLUMN token_prefix")
+                .await
+                .unwrap();
+            PostgresIdentityStore::with_pool(pool)
+                .await
+                .expect("the clear is best effort");
         })
         .await;
     }

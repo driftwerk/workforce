@@ -5,7 +5,7 @@ use std::sync::Mutex;
 use chrono::{DateTime, Utc};
 use eyre::{Result, WrapErr};
 use rusqlite::{params, Connection, OptionalExtension};
-use tracing::info;
+use tracing::{info, warn};
 use uuid::Uuid;
 
 use std::sync::Arc;
@@ -15,6 +15,12 @@ use crate::remote_mcp_token::{RemoteMcpToken, RemoteMcpTokenStore};
 use crate::store::{IdentityAndTeamStore, IdentityFilter, IdentityStore};
 use crate::team::{Team, TeamStore};
 use crate::types::{Identity, IdentityRole, IdentityStatus, ProvisioningSource};
+
+/// The drop is atomic, so a failure leaves the column for the next start.
+/// `secure_delete` zeroes the values as the rows are rewritten, so they are
+/// gone from the file even if the `VACUUM` that follows cannot run.
+const DROP_LEGACY_TOKEN_PREFIX: &str =
+    "PRAGMA secure_delete = ON; ALTER TABLE remote_mcp_tokens DROP COLUMN token_prefix;";
 
 pub struct SqliteIdentityStore {
     conn: Mutex<Connection>,
@@ -109,8 +115,11 @@ impl SqliteIdentityStore {
     /// Earlier versions stored the first characters of each remote MCP key
     /// in `token_prefix`. No part of a key is kept in the clear, so a
     /// database that still has the column loses it (and every value in it).
-    /// This store is single-process, so no older code is reading it
-    /// concurrently; keys are looked up by `token_hash` and are untouched.
+    /// Keys are looked up by `token_hash` and are untouched.
+    ///
+    /// One way: a binary from before this change cannot read the file after.
+    /// Only a hub opens this file in normal running, and it is upgraded by a
+    /// restart, so old and new code do not share it.
     fn drop_legacy_token_prefix(conn: &Connection) -> Result<()> {
         let has_column: bool = conn
             .query_row(
@@ -122,10 +131,14 @@ impl SqliteIdentityStore {
             .wrap_err("Failed to inspect remote_mcp_tokens")?
             > 0;
         if has_column {
-            // VACUUM rewrites the file so the dropped values do not linger in
-            // freed pages.
-            conn.execute_batch("ALTER TABLE remote_mcp_tokens DROP COLUMN token_prefix; VACUUM;")
+            conn.execute_batch(DROP_LEGACY_TOKEN_PREFIX)
                 .wrap_err("Failed to drop remote_mcp_tokens.token_prefix")?;
+            // Also clears pages freed before now, such as deleted rows'. The
+            // column is already gone, so a later start would not come back to
+            // this: it only warns, and must not stop the hub starting.
+            if let Err(error) = conn.execute_batch("VACUUM") {
+                warn!(%error, "could not compact the identity database after dropping key prefixes");
+            }
         }
         Ok(())
     }
@@ -1228,6 +1241,39 @@ mod tests {
         );
         // Re-opening is a no-op.
         SqliteIdentityStore::new(&path).unwrap();
+    }
+
+    /// VACUUM can fail and is never retried, since the column is already gone,
+    /// so the drop alone has to remove the values from the file.
+    #[test]
+    fn dropping_the_legacy_column_erases_its_values_without_a_vacuum() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("identity.db");
+        let prefixes: Vec<String> = (0..50).map(|i| format!("PFX{i:05}")).collect();
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE remote_mcp_tokens (
+                id TEXT PRIMARY KEY, token_hash TEXT NOT NULL UNIQUE,
+                token_prefix TEXT NOT NULL, scopes TEXT NOT NULL DEFAULT '[]');",
+        )
+        .unwrap();
+        for (i, prefix) in prefixes.iter().enumerate() {
+            conn.execute(
+                "INSERT INTO remote_mcp_tokens (id, token_hash, token_prefix) \
+                 VALUES (?1, ?2, ?3)",
+                params![format!("id{i}"), format!("hash{i}"), prefix],
+            )
+            .unwrap();
+        }
+        conn.execute_batch(DROP_LEGACY_TOKEN_PREFIX).unwrap();
+        drop(conn);
+        let raw = std::fs::read(&path).unwrap();
+        for prefix in &prefixes {
+            assert!(
+                !raw.windows(prefix.len()).any(|w| w == prefix.as_bytes()),
+                "{prefix} is still in the database file"
+            );
+        }
     }
 
     #[test]

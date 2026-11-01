@@ -406,4 +406,73 @@ mod tests {
         })
         .await;
     }
+
+    /// A source file an older release last wrote still has `token_prefix`; the
+    /// keys copy across and the prefix does not.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn copies_keys_from_a_source_with_the_legacy_prefix_column() {
+        with_test_pool(PostgresIdentityStore::build_pool, |pool| async move {
+            let tmp = tempfile::NamedTempFile::new().unwrap();
+            let minted = crate::remote_mcp_token::mint();
+            let id = uuid::Uuid::new_v4();
+            let source = Connection::open(tmp.path()).unwrap();
+            source
+                .execute_batch(
+                    "CREATE TABLE identities (
+                        id TEXT PRIMARY KEY, display_name TEXT NOT NULL, email TEXT,
+                        password_hash TEXT, role TEXT NOT NULL DEFAULT 'member',
+                        status TEXT NOT NULL DEFAULT 'active',
+                        provisioning_source TEXT NOT NULL DEFAULT 'manual',
+                        linked_ids TEXT NOT NULL DEFAULT '{}',
+                        created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+                     CREATE TABLE teams (
+                        id TEXT PRIMARY KEY, name TEXT NOT NULL, creator_id TEXT NOT NULL,
+                        members TEXT NOT NULL DEFAULT '[]',
+                        join_requests TEXT NOT NULL DEFAULT '[]',
+                        created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+                     CREATE TABLE remote_mcp_tokens (
+                        id TEXT PRIMARY KEY, identity_id TEXT NOT NULL, label TEXT NOT NULL,
+                        token_hash TEXT NOT NULL UNIQUE, token_prefix TEXT NOT NULL,
+                        scopes TEXT NOT NULL DEFAULT '[]', created_at TEXT NOT NULL,
+                        expires_at TEXT NOT NULL, last_used_at TEXT, revoked_at TEXT);",
+                )
+                .unwrap();
+            let owner = Identity::new("Alice", IdentityRole::Member);
+            source
+                .execute(
+                    "INSERT INTO identities (id, display_name, created_at, updated_at)
+                     VALUES (?1, 'Alice', '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00')",
+                    [owner.id.to_string()],
+                )
+                .unwrap();
+            source
+                .execute(
+                    "INSERT INTO remote_mcp_tokens VALUES (?1, ?2, 'old', ?3, 'legacyfx',
+                     '[\"remote_mcp\"]', '2026-01-01T00:00:00+00:00',
+                     '2099-01-01T00:00:00+00:00', NULL, NULL)",
+                    [id.to_string(), owner.id.to_string(), minted.hash.clone()],
+                )
+                .unwrap();
+            drop(source);
+
+            let report = migrate_sqlite_to_postgres_with_pool(tmp.path(), pool.clone())
+                .await
+                .expect("copy from a source with the old column");
+            assert_eq!(report.remote_mcp_tokens, 1);
+
+            let row = pool
+                .get()
+                .await
+                .unwrap()
+                .query_one(
+                    "SELECT token_hash, token_prefix FROM remote_mcp_tokens WHERE id = $1",
+                    &[&id],
+                )
+                .await
+                .unwrap();
+            assert_eq!(row.get::<_, String>(0), minted.hash);
+            assert_eq!(row.get::<_, String>(1), "");
+        })
+        .await;
+    }
 }
