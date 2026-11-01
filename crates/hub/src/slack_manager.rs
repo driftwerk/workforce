@@ -1100,6 +1100,29 @@ fn inbound_texts(
     }
 }
 
+/// One `sentinel.audit` line per secret captured from an inbound message. The
+/// marker id (a keyed hash) correlates; the preview (first and last four of
+/// the secret) is shown to the person and the agent in the marker itself, but
+/// no part of a secret is ever written to a log.
+fn audit_ingress_captures(
+    session_key: &str,
+    channel: &str,
+    user: &str,
+    captured: &[workforce_common::secret_marker::CapturedSecret],
+) {
+    for cap in captured {
+        info!(
+            target: "sentinel.audit",
+            session_key = %session_key,
+            channel = %channel,
+            user = %user,
+            marker_id = %cap.id,
+            label = %cap.label,
+            "secret captured at slack ingress"
+        );
+    }
+}
+
 /// Messages the scope filter must let through regardless of channel topic.
 /// Approve/reject responses unblock a paused agent — classifying them would
 /// strand the run. Messages that are only files give the classifier no
@@ -1252,6 +1275,57 @@ mod inbound_texts_tests {
     fn share_only_message_has_no_leading_blank_body() {
         let out = texts("", "", &["[shared message]\n> quote"], false);
         assert!(out.content.starts_with("<<<EXTERNAL_UNTRUSTED_CONTENT_"));
+    }
+
+    #[test]
+    fn the_ingress_audit_line_holds_no_part_of_the_secret() {
+        #[derive(Clone, Default)]
+        struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Captured {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let log = Captured::default();
+        let writer = log.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .finish();
+        // Letters the log line's own words never contain, and no hex digit,
+        // so neither the marker id nor a timestamp can match by chance.
+        let key = concat!("sk-ant", "-api03-QzJxKvWqXjZkQvXzJqWxKzVqJxQzKvWy");
+        let _installed = crate::secret_cache::testing::GlobalCache::install(Arc::new(
+            crate::secret_cache::InMemorySecretCache::with_defaults(),
+        ));
+        // Both lines a paste leaves: the cache's capture and the ingress audit.
+        tracing::subscriber::with_default(subscriber, || {
+            let out = texts(
+                &format!("key is {key}"),
+                &format!("key is {key}"),
+                &[],
+                false,
+            );
+            assert!(!out.captured.is_empty(), "the key is captured");
+            audit_ingress_captures("slack:test:C1:1.0", "C1", "U1", &out.captured);
+        });
+        let log = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+        assert!(log.contains("secret captured at slack ingress"), "{log}");
+        assert!(
+            log.matches("secret captured").count() >= 2,
+            "the cache's line too: {log}"
+        );
+        // The vendor marker `sk-ant-api03-` is public; nothing past it may show.
+        let body = &key["sk-ant-api03-".len()..];
+        for at in 0..=body.len() - 4 {
+            let piece = &body[at..at + 4];
+            assert!(!log.contains(piece), "{piece} leaked: {log}");
+        }
     }
 
     #[test]
@@ -2507,18 +2581,7 @@ pub fn spawn_slack_dispatch_loop(
                         },
                     );
                     if !captured_secrets.is_empty() {
-                        for cap in &captured_secrets {
-                            tracing::info!(
-                                target: "sentinel.audit",
-                                session_key = %session_key,
-                                channel = %channel,
-                                user = %user,
-                                marker_id = %cap.id,
-                                label = %cap.label,
-                                preview = %cap.preview,
-                                "secret captured at slack ingress"
-                            );
-                        }
+                        audit_ingress_captures(&session_key, &channel, &user, &captured_secrets);
                         if let Some(surface) = surfaces.first().cloned() {
                             let captures = captured_secrets.clone();
                             let ch = channel.clone();
