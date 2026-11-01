@@ -13,7 +13,7 @@ use workforce_common::usage::{LoginRef, PlanKind, Reading};
 use workforce_desk::floor::{
     self, Gists, Outcome, Scope, Settling, SubjectKey, Target, Turn, TurnOp,
 };
-use workforce_desk::gist::{Gist, Paragraph};
+use workforce_desk::gist::{self, Asked, Gist, Paragraph, Reach};
 use workforce_postgres::{
     MigrationRun, MigrationRunner, MigrationSet, PostgresConfig, PostgresError, PostgresPool,
 };
@@ -162,27 +162,70 @@ impl PgFloorStore {
         row.as_ref().map(turn_of).transpose()
     }
 
-    /// What `owner`'s `subject` was asked: its first asks and its latest,
-    /// oldest first.
-    pub async fn asks(&self, owner: Option<&str>, subject: &SubjectKey) -> Result<Vec<String>> {
+    /// What `owner`'s `subject`'s purpose is read from ([`Reach`]): a
+    /// session's first asks and latest, oldest first; an agent's latest asks
+    /// in its current session within the window, and when that thread began.
+    pub async fn asks(
+        &self,
+        owner: Option<&str>,
+        subject: &SubjectKey,
+        reach: &Reach,
+    ) -> Result<Asked> {
         let conn = self.pool.get().await?;
-        let rows = conn
-            .query(
-                "SELECT task FROM ( \
-                     (SELECT task, started_at FROM turns \
-                      WHERE owner IS NOT DISTINCT FROM $1 AND subject = $2 AND task IS NOT NULL \
-                      ORDER BY started_at LIMIT $3) \
-                     UNION \
-                     (SELECT task, started_at FROM turns \
-                      WHERE owner IS NOT DISTINCT FROM $1 AND subject = $2 AND task IS NOT NULL \
-                      ORDER BY started_at DESC LIMIT $4)) asked \
-                 ORDER BY started_at",
-                &[&owner, &subject.as_str(), &FIRST_ASKS, &LATEST_ASKS],
-            )
-            .await?;
+        let (rows, began) = match reach {
+            Reach::Job => {
+                let rows = conn
+                    .query(
+                        "SELECT task FROM ( \
+                             (SELECT task, started_at FROM turns \
+                              WHERE owner IS NOT DISTINCT FROM $1 AND subject = $2 \
+                                AND task IS NOT NULL \
+                              ORDER BY started_at LIMIT $3) \
+                             UNION \
+                             (SELECT task, started_at FROM turns \
+                              WHERE owner IS NOT DISTINCT FROM $1 AND subject = $2 \
+                                AND task IS NOT NULL \
+                              ORDER BY started_at DESC LIMIT $4)) asked \
+                         ORDER BY started_at",
+                        &[&owner, &subject.as_str(), &FIRST_ASKS, &LATEST_ASKS],
+                    )
+                    .await?;
+                (rows, None)
+            }
+            Reach::Thread { session, since } => {
+                let rows = conn
+                    .query(
+                        "SELECT task FROM ( \
+                             SELECT task, started_at FROM turns \
+                             WHERE owner IS NOT DISTINCT FROM $1 AND subject = $2 \
+                               AND subject_doc->>'sessionId' = $3 AND started_at >= $4 \
+                               AND task IS NOT NULL \
+                             ORDER BY started_at DESC LIMIT $5) asked \
+                         ORDER BY started_at",
+                        &[
+                            &owner,
+                            &subject.as_str(),
+                            session,
+                            since,
+                            &(gist::THREAD_ASKS as i64),
+                        ],
+                    )
+                    .await?;
+                let began: Option<DateTime<Utc>> = conn
+                    .query_one(
+                        "SELECT min(started_at) FROM turns \
+                         WHERE owner IS NOT DISTINCT FROM $1 AND subject = $2 \
+                           AND subject_doc->>'sessionId' = $3 AND started_at >= $4",
+                        &[&owner, &subject.as_str(), session, since],
+                    )
+                    .await?
+                    .get(0);
+                (rows, began)
+            }
+        };
         let mut asks: Vec<String> = rows.iter().map(|row| row.get(0)).collect();
         asks.dedup();
-        Ok(asks)
+        Ok(Asked { asks, began })
     }
 
     /// The gists of `scope`'s subjects.
@@ -1161,9 +1204,44 @@ mod tests {
                 store.apply(&begin(&t, false)).await.unwrap();
             }
             assert_eq!(
-                store.asks(Some("u1"), &scout).await.unwrap(),
+                store
+                    .asks(Some("u1"), &scout, &Reach::Job)
+                    .await
+                    .unwrap()
+                    .asks,
                 ["Plan it", "Build it", "Test it", "Ship it", "Tidy up", "Rest"],
-                "its first asks and its latest, in order, once each"
+                "a session's first asks and its latest, in order, once each"
+            );
+            let thread = |session: &str, since: &str| Reach::Thread {
+                session: session.into(),
+                since: at(since),
+            };
+            let recent = store
+                .asks(Some("u1"), &scout, &thread("s1", "2026-10-29T08:02:00Z"))
+                .await
+                .unwrap();
+            assert_eq!(
+                recent.asks,
+                ["Build it", "Test it", "Ship it", "Tidy up", "Rest"],
+                "an agent's latest five within the window, never its first asks"
+            );
+            assert_eq!(recent.began, Some(at("2026-10-29T08:02:00Z")));
+            assert_eq!(
+                store
+                    .asks(Some("u1"), &scout, &thread("s1", "2026-10-29T08:05:00Z"))
+                    .await
+                    .unwrap()
+                    .asks,
+                ["Tidy up", "Rest"],
+                "and nothing before the window"
+            );
+            let none = store
+                .asks(Some("u1"), &scout, &thread("s2", "2026-10-29T07:00:00Z"))
+                .await
+                .unwrap();
+            assert!(
+                none.asks.is_empty() && none.began.is_none(),
+                "another conversation"
             );
 
             let paragraph = |text: &str, when: &str| Paragraph {

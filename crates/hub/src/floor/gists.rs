@@ -17,7 +17,7 @@ use tracing::{debug, warn};
 use uuid::Uuid;
 use workforce_desk::crew;
 use workforce_desk::floor::{Outcome, Scope, Subject, SubjectKey, Turn, TurnOp};
-use workforce_desk::gist::{self, Doing, Gist, Happening, Moment, Paragraph};
+use workforce_desk::gist::{self, Asked, Doing, Gist, Happening, Moment, Paragraph, Reach};
 use workforce_desk::model::Engine;
 
 use super::postgres::PgFloorStore;
@@ -61,7 +61,13 @@ pub trait Kept: Send + Sync {
         subject: &SubjectKey,
         gist: &Gist,
     ) -> eyre::Result<()>;
-    async fn asks(&self, owner: Option<&str>, subject: &SubjectKey) -> eyre::Result<Vec<String>>;
+    /// What `subject`'s purpose is read from.
+    async fn asks(
+        &self,
+        owner: Option<&str>,
+        subject: &SubjectKey,
+        reach: &Reach,
+    ) -> eyre::Result<Asked>;
     async fn turn(&self, id: Uuid) -> eyre::Result<Option<Turn>>;
     async fn summary(&self, owner: &str, personal: bool) -> eyre::Result<Option<(Paragraph, i64)>>;
     async fn put_summary(
@@ -88,8 +94,13 @@ impl Kept for PgFloorStore {
         PgFloorStore::put_gist(self, owner, subject, gist).await
     }
 
-    async fn asks(&self, owner: Option<&str>, subject: &SubjectKey) -> eyre::Result<Vec<String>> {
-        PgFloorStore::asks(self, owner, subject).await
+    async fn asks(
+        &self,
+        owner: Option<&str>,
+        subject: &SubjectKey,
+        reach: &Reach,
+    ) -> eyre::Result<Asked> {
+        PgFloorStore::asks(self, owner, subject, reach).await
     }
 
     async fn turn(&self, id: Uuid) -> eyre::Result<Option<Turn>> {
@@ -412,7 +423,40 @@ impl Gists {
             warn!(target: "floor", error = %format!("{e:#}"), "reading a gist failed");
             None
         });
-        let asks = self.0.kept.asks(owner, key).await.unwrap_or_default();
+        let read_at = crew::now();
+        // An agent's purpose is its current conversation's, read from its
+        // latest asks; a session's is its one job's.
+        let reach = match &job.subject {
+            Subject::Agent { session_id, .. } => Reach::Thread {
+                session: session_id.clone(),
+                since: read_at - gist::THREAD_WITHIN,
+            },
+            Subject::Session { .. } => Reach::Job,
+        };
+        let Asked { asks, began } = self
+            .0
+            .kept
+            .asks(owner, key, &reach)
+            .await
+            .unwrap_or_else(|e| {
+                warn!(target: "floor", error = %format!("{e:#}"), "reading a subject's asks failed");
+                Asked::default()
+            });
+        // A thread that has no turn in the window yet began with the window.
+        let began = match &reach {
+            Reach::Thread { since, .. } => Some(began.unwrap_or(*since)),
+            Reach::Job => None,
+        };
+        // A purpose from before this thread is not offered to the model to
+        // keep: it would only be written out again.
+        let outdated = kept
+            .as_ref()
+            .and_then(|k| k.purpose_at.zip(began))
+            .is_some_and(|(written, began)| written < began);
+        let offered = kept.as_ref().map(|k| Gist {
+            purpose: if outdated { None } else { k.purpose.clone() },
+            ..k.clone()
+        });
         let goal = model.goal(&job.subject);
         let input = gist::Input {
             name: &job.name,
@@ -426,7 +470,7 @@ impl Gists {
             steps: &job.steps,
             reply: job.reply.as_deref(),
             doing: Some(job.doing),
-            kept: kept.as_ref(),
+            kept: offered.as_ref(),
         };
         let prompt = gist::prompt(&input);
         let asked = model.answer(Some(&job.subject), owner, gist::GIST_SYSTEM, &prompt);
@@ -447,8 +491,8 @@ impl Gists {
             .map_or((None, None), |k| (k.purpose.clone(), k.purpose_at));
         let gist = match written {
             Some(w) => {
-                let renew =
-                    w.purpose.is_some() && gist::purpose_due(purpose_at, job.moment, w.turned, at);
+                let renew = w.purpose.is_some()
+                    && gist::purpose_due(purpose_at, job.moment, w.turned, at, began);
                 Gist {
                     purpose: if renew { w.purpose } else { purpose },
                     purpose_at: if renew { Some(at) } else { purpose_at },
@@ -467,9 +511,13 @@ impl Gists {
             }
             None => {
                 let (plain_purpose, now) = gist::plainly(&input);
-                let fresh = purpose.is_none() && plain_purpose.is_some();
+                // An agent's plain purpose follows its latest ask.
+                let fresh = plain_purpose.is_some()
+                    && (purpose.is_none()
+                        || (began.is_some()
+                            && gist::purpose_due(purpose_at, job.moment, false, at, began)));
                 Gist {
-                    purpose: purpose.or(plain_purpose),
+                    purpose: if fresh { plain_purpose } else { purpose },
                     purpose_at: if fresh { Some(at) } else { purpose_at },
                     now,
                     now_at: at,
@@ -675,6 +723,9 @@ mod tests {
         gists: Mutex<HashMap<Whose, Gist>>,
         written: Mutex<Vec<Gist>>,
         summaries: Mutex<HashMap<(String, bool), (Paragraph, i64)>>,
+        /// What the log has of the subject's asks, and how it was asked.
+        asked: Mutex<Asked>,
+        reached: Mutex<Vec<Reach>>,
     }
 
     #[async_trait]
@@ -704,8 +755,14 @@ mod tests {
             Ok(())
         }
 
-        async fn asks(&self, _: Option<&str>, _: &SubjectKey) -> eyre::Result<Vec<String>> {
-            Ok(vec!["Get Desk ready for the team".into()])
+        async fn asks(
+            &self,
+            _: Option<&str>,
+            _: &SubjectKey,
+            reach: &Reach,
+        ) -> eyre::Result<Asked> {
+            self.reached.lock().push(reach.clone());
+            Ok(self.asked.lock().clone())
         }
 
         async fn turn(&self, _: Uuid) -> eyre::Result<Option<Turn>> {
@@ -815,6 +872,10 @@ mod tests {
 
     fn gists(model: Arc<Scripted>) -> (Gists, Arc<Memory>, Arc<Mutex<usize>>) {
         let memory = Arc::new(Memory::default());
+        *memory.asked.lock() = Asked {
+            asks: vec!["Get Desk ready for the team".into()],
+            began: None,
+        };
         let told = Arc::new(Mutex::new(0));
         let counted = Arc::clone(&told);
         let gists = Gists::start(
@@ -909,11 +970,12 @@ mod tests {
         assert!(!plain.by_model);
         assert_eq!(
             plain.purpose.as_deref(),
-            Some("Get Desk ready for the team.")
+            Some("Look at and land it."),
+            "an agent's plain purpose is its latest ask, its identifier dropped"
         );
         assert_eq!(
-            plain.now, "Now working on: Look at and land it.",
-            "its identifier dropped"
+            plain.now, "Working on it now.",
+            "the ask is the purpose already"
         );
 
         *model.say.lock() = NOTE.into();
@@ -979,6 +1041,200 @@ mod tests {
         let written = memory.written.lock()[0].clone();
         assert!(written.by_model, "ten seconds is within its time");
         assert_eq!(written.now, "Testing the build.");
+    }
+
+    fn kept_purpose(purpose: &str, ago: chrono::Duration) -> Gist {
+        Gist {
+            purpose: Some(purpose.into()),
+            purpose_at: Some(crew::now() - ago),
+            now: "Before.".into(),
+            now_at: crew::now() - ago,
+            turn: Uuid::new_v4(),
+            by_model: true,
+        }
+    }
+
+    fn scout() -> Whose {
+        (Some("u1".into()), SubjectKey::agent("scout"))
+    }
+
+    fn begin_for(turn: Turn, by_person: bool) -> TurnOp {
+        TurnOp::Begin {
+            turn: Box::new(turn),
+            by_person,
+        }
+    }
+
+    const LOGIN: &str = "PURPOSE: Finding why the login page fails.\nCHANGED: no\nNOW: Looking.";
+
+    #[tokio::test(start_paused = true)]
+    async fn an_agents_old_first_topic_gives_way_to_the_recent_conversation() {
+        let model = Scripted::new(LOGIN, Duration::ZERO);
+        let (gists, memory, _) = gists(Arc::clone(&model));
+        // Days old: its purpose was written about the budget.
+        memory.gists.lock().insert(
+            scout(),
+            kept_purpose("Planning next year's budget.", chrono::Duration::days(3)),
+        );
+        *memory.asked.lock() = Asked {
+            asks: vec!["Why does the login page fail?".into()],
+            began: Some(crew::now()),
+        };
+        gists.saw(&begin_for(started(Uuid::new_v4()), true));
+        settle().await;
+
+        let written = memory.written.lock()[0].clone();
+        assert_eq!(
+            written.purpose.as_deref(),
+            Some("Finding why the login page fails.")
+        );
+        let asked = model.asked.lock()[0].clone();
+        assert!(asked.contains("Why does the login page fail?"));
+        assert!(
+            !asked.contains("budget"),
+            "the old topic is not offered to be kept: {asked}"
+        );
+        let reach = memory.reached.lock()[0].clone();
+        match &reach {
+            Reach::Thread { session, since } => {
+                assert_eq!(session, "dm");
+                let within = crew::now() - *since;
+                assert!(
+                    within >= gist::THREAD_WITHIN
+                        && within < gist::THREAD_WITHIN + chrono::Duration::minutes(1)
+                );
+            }
+            other => panic!("an agent reads its thread, not {other:?}"),
+        };
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_new_conversation_replaces_a_purpose_written_minutes_ago_but_the_same_one_keeps_it() {
+        let model = Scripted::new(LOGIN, Duration::ZERO);
+        let (gists, memory, _) = gists(Arc::clone(&model));
+        let ago = chrono::Duration::minutes(20);
+        memory
+            .gists
+            .lock()
+            .insert(scout(), kept_purpose("Planning next year's budget.", ago));
+        // The purpose was written before this conversation began.
+        *memory.asked.lock() = Asked {
+            asks: vec!["Why does the login page fail?".into()],
+            began: Some(crew::now() - chrono::Duration::minutes(5)),
+        };
+        // Not by the person's prompt, and the model says it didn't turn.
+        gists.saw(&begin_for(started(Uuid::new_v4()), false));
+        settle().await;
+        assert_eq!(
+            memory.written.lock()[0].purpose.as_deref(),
+            Some("Finding why the login page fails.")
+        );
+
+        // Written inside the conversation it is still the same.
+        let (gists, memory, _) = self::gists(Scripted::new(LOGIN, Duration::ZERO));
+        memory
+            .gists
+            .lock()
+            .insert(scout(), kept_purpose("Planning next year's budget.", ago));
+        *memory.asked.lock() = Asked {
+            asks: vec!["Plan the budget".into()],
+            began: Some(crew::now() - chrono::Duration::minutes(25)),
+        };
+        gists.saw(&begin_for(started(Uuid::new_v4()), false));
+        settle().await;
+        assert_eq!(
+            memory.written.lock()[0].purpose.as_deref(),
+            Some("Planning next year's budget.")
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_change_of_topic_by_the_person_replaces_an_agents_recent_purpose() {
+        let turned = "PURPOSE: Finding why the login page fails.\nCHANGED: yes\nNOW: Looking.";
+        let (gists, memory, _) = gists(Scripted::new(turned, Duration::ZERO));
+        let minute = chrono::Duration::minutes(1);
+        memory.gists.lock().insert(
+            scout(),
+            kept_purpose("Planning next year's budget.", minute),
+        );
+        *memory.asked.lock() = Asked {
+            asks: vec![
+                "Plan the budget".into(),
+                "Why does the login page fail?".into(),
+            ],
+            began: Some(crew::now() - chrono::Duration::hours(1)),
+        };
+        gists.saw(&begin_for(started(Uuid::new_v4()), false));
+        settle().await;
+        assert_eq!(
+            memory.written.lock()[0].purpose.as_deref(),
+            Some("Planning next year's budget."),
+            "the hub's own turn never turns it"
+        );
+        gists.saw(&begin_for(started(Uuid::new_v4()), true));
+        settle().await;
+        assert_eq!(
+            memory.written.lock()[1].purpose.as_deref(),
+            Some("Finding why the login page fails.")
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_sessions_purpose_stays_whatever_the_model_says_and_reads_its_whole_job() {
+        let turned = "PURPOSE: Something else entirely.\nCHANGED: no\nNOW: Looking.";
+        let (gists, memory, _) = gists(Scripted::new(turned, Duration::ZERO));
+        let id = Uuid::new_v4();
+        let whose = (Some("u1".to_string()), SubjectKey::session(id));
+        memory.gists.lock().insert(
+            whose,
+            kept_purpose(
+                "Getting Desk ready for the team.",
+                chrono::Duration::minutes(10),
+            ),
+        );
+        let session = Turn {
+            subject: Subject::Session {
+                id,
+                engine: Engine::Claude,
+            },
+            name: "release".into(),
+            ..started(Uuid::new_v4())
+        };
+        gists.saw(&begin_for(session, true));
+        settle().await;
+        assert_eq!(
+            memory.written.lock()[0].purpose.as_deref(),
+            Some("Getting Desk ready for the team.")
+        );
+        assert_eq!(memory.reached.lock()[0], Reach::Job);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn without_a_model_an_agents_purpose_is_its_latest_ask_and_follows_a_new_thread() {
+        let (gists, memory, _) = gists(Scripted::new("", Duration::ZERO));
+        memory.gists.lock().insert(
+            scout(),
+            kept_purpose("Planning next year's budget.", chrono::Duration::days(2)),
+        );
+        *memory.asked.lock() = Asked {
+            asks: vec![
+                "Plan the budget".into(),
+                "Why does the login page fail?".into(),
+            ],
+            began: Some(crew::now()),
+        };
+        let mut turn = started(Uuid::new_v4());
+        turn.task = Some("Why does the login page fail?".into());
+        gists.saw(&begin_for(turn, true));
+        settle().await;
+        let written = memory.written.lock()[0].clone();
+        assert!(!written.by_model);
+        assert_eq!(
+            written.purpose.as_deref(),
+            Some("Why does the login page fail?"),
+            "the recent thread, not the first ask or the old purpose"
+        );
+        assert!(written.purpose_at > Some(crew::now() - chrono::Duration::minutes(1)));
     }
 
     #[test]

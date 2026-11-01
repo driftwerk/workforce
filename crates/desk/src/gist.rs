@@ -17,6 +17,14 @@ use crate::floor::Who;
 pub const STEP_EVERY: Duration = Duration::from_secs(2 * 60);
 /// How long a purpose stands before it may be said again.
 pub const PURPOSE_EVERY: chrono::Duration = chrono::Duration::minutes(30);
+/// How far back an agent's purpose is read from: its asks since this long
+/// ago, in the conversation it is in now. An agent is talked to about many
+/// things over days, so what it is for is today's thread (a working day's
+/// worth), never its first asks.
+pub const THREAD_WITHIN: chrono::Duration = chrono::Duration::hours(6);
+/// How many of an agent's latest asks its purpose is read from, if fewer
+/// than [`THREAD_WITHIN`] holds: the tighter of the two applies.
+pub const THREAD_ASKS: usize = 5;
 /// How long the floor's paragraph stands before it may be written again.
 pub const SUMMARY_EVERY: chrono::Duration = chrono::Duration::minutes(10);
 /// How long a subject that finished stays in what's happening.
@@ -24,6 +32,28 @@ pub const DONE_FOR: chrono::Duration = chrono::Duration::hours(2);
 /// How long a model is given to write a gist or the paragraph: off any
 /// turn's path, long enough for a plan's command-line round.
 pub const WRITE_WITHIN: Duration = Duration::from_secs(45);
+
+/// What a subject's purpose is read from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Reach {
+    /// A Desk session has one job: its first asks and its latest.
+    Job,
+    /// An agent's current conversation: its latest [`THREAD_ASKS`] asks in
+    /// session `session` since `since` ([`THREAD_WITHIN`] ago).
+    Thread {
+        session: String,
+        since: DateTime<Utc>,
+    },
+}
+
+/// The asks a purpose is read from, oldest first.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Asked {
+    pub asks: Vec<String>,
+    /// For a thread, when it began: its earliest turn within the window
+    /// (none: it has none kept yet).
+    pub began: Option<DateTime<Utc>>,
+}
 
 /// A subject's gist as kept.
 #[derive(Debug, Clone, PartialEq)]
@@ -141,14 +171,18 @@ pub fn due(moment: Moment, since: Option<Duration>, unsaid: usize) -> Due {
 
 /// Whether a newly written purpose replaces the one kept (written at
 /// `kept`): when none is kept, once it is [`PURPOSE_EVERY`] old, or when
-/// the person's new prompt `turned` the work another way.
+/// the person's new prompt `turned` the work another way. For an agent,
+/// `began` is when its current thread did ([`Asked::began`], or the start
+/// of the window): a purpose written before that was written from another
+/// conversation or from asks now out of the window, and goes.
 pub fn purpose_due(
     kept: Option<DateTime<Utc>>,
     moment: Moment,
     turned: bool,
     now: DateTime<Utc>,
+    began: Option<DateTime<Utc>>,
 ) -> bool {
-    kept.is_none_or(|at| now - at >= PURPOSE_EVERY)
+    kept.is_none_or(|at| now - at >= PURPOSE_EVERY || began.is_some_and(|b| at < b))
         || (turned && moment == Moment::Began { by_person: true })
 }
 
@@ -173,6 +207,12 @@ pub const GIST_SYSTEM: &str = concat!(
     "- PURPOSE: what this work is for and why, as a goal, in one sentence. Say the point of ",
     "it, not the latest step. Keep the previous purpose as it was unless the work has ",
     "clearly changed direction.\n",
+    "  For an AI agent, which the person talks to about many different things over days, ",
+    "PURPOSE is what the person and the agent are working on together right now, in the ",
+    "current conversation: take it from the latest asks, and set aside any earlier topic they ",
+    "have moved on from. If the latest asks are about something else than the previous ",
+    "purpose, write the new purpose and answer CHANGED: yes. A coding session has one job, ",
+    "so its purpose stays.\n",
     "- NOW: what it is doing at this moment, or what it finished, and what that means, in ",
     "one to three sentences. Present tense while it works, past tense once it is done.\n\n",
     "Rules:\n",
@@ -242,7 +282,10 @@ pub fn prompt(input: &Input<'_>) -> String {
         ));
     }
     if !input.asks.is_empty() {
-        out.push_str("What it has been asked over its work, oldest first:\n");
+        out.push_str(match input.session {
+            Some(_) => "What it has been asked over its work, oldest first:\n",
+            None => "What the person has asked it lately in this conversation, oldest first:\n",
+        });
         input
             .asks
             .iter()
@@ -538,11 +581,17 @@ fn first_plain<'a>(lines: impl IntoIterator<Item = Option<&'a str>>) -> Option<S
 }
 
 /// A gist said plainly, without a model, from what `input` holds: its
-/// purpose the goal or first ask, and its now where it stands.
+/// purpose a session's goal or first ask, an agent's latest ask (what the
+/// person is on with it now), and its now where it stands.
 pub fn plainly(input: &Input<'_>) -> (Option<String>, String) {
     let asks = input.asks.iter().map(|a| Some(a.as_str()));
-    let purpose = first_plain(std::iter::once(input.goal).chain(asks).chain([input.ask]))
-        .map(|p| sentence(&p));
+    let purpose = match input.session {
+        Some(_) => first_plain(std::iter::once(input.goal).chain(asks).chain([input.ask])),
+        None => first_plain(
+            std::iter::once(input.ask).chain(input.asks.iter().rev().map(|a| Some(a.as_str()))),
+        ),
+    }
+    .map(|p| sentence(&p));
     let ask = first_plain([input.ask])
         .map(|a| sentence(&a))
         .filter(|a| Some(a) != purpose.as_ref());
@@ -631,35 +680,96 @@ mod tests {
     fn a_purpose_is_said_again_rarely() {
         let now = at("2026-10-30T12:00:00Z");
         let person = Moment::Began { by_person: true };
-        assert!(purpose_due(None, Moment::Stepped, false, now), "none yet");
+        assert!(
+            purpose_due(None, Moment::Stepped, false, now, None),
+            "none yet"
+        );
         assert!(!purpose_due(
             Some(at("2026-10-30T11:45:00Z")),
             Moment::Stepped,
             true,
-            now
+            now,
+            None
         ));
         assert!(purpose_due(
             Some(at("2026-10-30T11:30:00Z")),
             Moment::Stepped,
             false,
-            now
+            now,
+            None
         ));
         assert!(
-            purpose_due(Some(at("2026-10-30T11:59:00Z")), person, true, now),
+            purpose_due(Some(at("2026-10-30T11:59:00Z")), person, true, now, None),
             "the person's prompt took it another way"
         );
         assert!(!purpose_due(
             Some(at("2026-10-30T11:59:00Z")),
             Moment::Began { by_person: false },
             true,
-            now
+            now,
+            None
         ));
         assert!(!purpose_due(
             Some(at("2026-10-30T11:59:00Z")),
             person,
             false,
-            now
+            now,
+            None
         ));
+    }
+
+    #[test]
+    fn an_agents_purpose_goes_when_its_thread_began_after_it_was_written() {
+        let now = at("2026-10-30T12:00:00Z");
+        let person = Moment::Began { by_person: true };
+        let began = Some(at("2026-10-30T11:50:00Z"));
+        assert!(
+            purpose_due(Some(at("2026-10-30T11:40:00Z")), person, false, now, began),
+            "written from a conversation before this one, though minutes old"
+        );
+        assert!(
+            !purpose_due(Some(at("2026-10-30T11:55:00Z")), person, false, now, began),
+            "written in this conversation"
+        );
+        assert!(
+            !purpose_due(Some(at("2026-10-30T11:40:00Z")), person, false, now, None),
+            "a session has no thread"
+        );
+    }
+
+    #[test]
+    fn an_agents_gist_is_about_the_current_conversation() {
+        for rule in [
+            "which the person talks to about many different things over days",
+            "what the person and the agent are working on together right now",
+            "set aside any earlier topic",
+            "A coding session has one job",
+        ] {
+            assert!(GIST_SYSTEM.contains(rule), "{rule:?}");
+        }
+        let asks = [
+            "Plan the budget".to_string(),
+            "Fix the login page".to_string(),
+        ];
+        let agent = Input {
+            name: "Allan",
+            asks: &asks,
+            ask: Some("Why does the login page 500?"),
+            ..Default::default()
+        };
+        assert!(prompt(&agent).contains("asked it lately in this conversation, oldest first"));
+        assert_eq!(
+            plainly(&agent).0.as_deref(),
+            Some("Why does the login page 500?"),
+            "an agent's purpose is its latest ask, not its first"
+        );
+        let agent = Input { ask: None, ..agent };
+        assert_eq!(plainly(&agent).0.as_deref(), Some("Fix the login page."));
+        let session = Input {
+            session: Some("Claude Code"),
+            ..agent
+        };
+        assert_eq!(plainly(&session).0.as_deref(), Some("Plan the budget."));
     }
 
     #[test]
@@ -775,6 +885,7 @@ mod tests {
     fn without_a_model_a_gist_is_said_plainly_dropping_identifier_lines() {
         let asks = ["#123".to_string(), "classify is off - merge it".to_string()];
         let (purpose, now) = plainly(&Input {
+            session: Some("Claude Code"),
             asks: &asks,
             ask: Some("now land #45 on main"),
             doing: Some(Doing::Working),
@@ -787,12 +898,14 @@ mod tests {
         );
         assert_eq!(now, "Now working on: Now land on main.");
         let (purpose, now) = plainly(&Input {
+            session: Some("Claude Code"),
             ask: Some("ship the docs"),
             ..Default::default()
         });
         assert_eq!(purpose.as_deref(), Some("Ship the docs."));
         assert_eq!(now, "Working on it now.", "the ask is the purpose already");
         let (purpose, now) = plainly(&Input {
+            session: Some("Claude Code"),
             goal: Some("fix the login timeout"),
             ask: Some("try again"),
             reply: Some("Done in a1b2c3d4e. The timeout is 30s now."),
