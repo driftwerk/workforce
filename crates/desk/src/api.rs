@@ -19,12 +19,15 @@ use tokio::sync::broadcast::error::RecvError;
 use uuid::Uuid;
 
 use crate::crew::By;
+use crate::model::Engine as CliEngine;
 use crate::model::{Decision, NewSession, SessionPatch};
 use crate::providers::{self, AccountError, Accounts, Catalog, ConnectBody, Entry};
 use crate::pty::Frame;
 use crate::realtime::{Engine, Realtime, RealtimeError};
 use crate::rooms::{Bound, NewMessage, NewRoom, Page, RoomPatch, SearchFilters};
-use crate::service::{Desk, DeskError, Import, Layout, NewTerminal, TerminalPatch};
+use crate::service::{
+    Clearing, Desk, DeskError, Import, Layout, NewTerminal, Removal, TerminalPatch,
+};
 use crate::speech::{Speak, SpeakError, Speech};
 
 /// Decides whether a request may use the desk, and says who it is from: the
@@ -56,7 +59,7 @@ impl IntoResponse for DeskError {
             DeskError::Conflict(_) => StatusCode::CONFLICT,
             DeskError::Invalid(_) => StatusCode::BAD_REQUEST,
             DeskError::Internal(e) => {
-                tracing::error!(error = %e, "desk request failed");
+                tracing::error!(error = format!("{e:#}"), "desk request failed");
                 StatusCode::INTERNAL_SERVER_ERROR
             }
         };
@@ -226,13 +229,79 @@ async fn update(
     s.desk.update(id, p).map(Json).into_response()
 }
 
+/// Removes a session from Desk, its engine's transcript kept.
 async fn forget(State(s): S, h: HeaderMap, Query(q): Q, Path(id): Path<Uuid>) -> Response {
     guarded!(s, h, q);
     s.desk
-        .forget(id)
+        .remove(id, Removal::default())
         .await
-        .map(|()| StatusCode::NO_CONTENT)
+        .map(|_| StatusCode::NO_CONTENT)
         .into_response()
+}
+
+/// Removes a session from Desk, and its engine's transcript when asked.
+async fn remove(
+    State(s): S,
+    h: HeaderMap,
+    Query(q): Q,
+    Path(id): Path<Uuid>,
+    body: Result<Json<Removal>, JsonRejection>,
+) -> Response {
+    guarded!(s, h, q);
+    let how = match body {
+        Ok(Json(how)) => how,
+        Err(e) => return DeskError::Invalid(e.body_text()).into_response(),
+    };
+    s.desk.remove(id, how).await.map(Json).into_response()
+}
+
+async fn end(State(s): S, h: HeaderMap, Query(q): Q, Path(id): Path<Uuid>) -> Response {
+    guarded!(s, h, q);
+    s.desk
+        .end(id, Some(By::you()))
+        .await
+        .map(Json)
+        .into_response()
+}
+
+async fn closed(State(s): S, h: HeaderMap, Query(q): Q) -> Response {
+    guarded!(s, h, q);
+    s.desk.closed_sessions().await.map(Json).into_response()
+}
+
+async fn hidden(State(s): S, h: HeaderMap, Query(q): Q) -> Response {
+    guarded!(s, h, q);
+    s.desk.hidden_sessions().await.map(Json).into_response()
+}
+
+/// Starts tracking a removed CLI session again.
+async fn unhide(
+    State(s): S,
+    h: HeaderMap,
+    Query(q): Q,
+    Path((engine, cli)): Path<(String, String)>,
+) -> Response {
+    guarded!(s, h, q);
+    let engine = match CliEngine::parse(&engine) {
+        Ok(e) => e,
+        Err(e) => return DeskError::Invalid(e.to_string()).into_response(),
+    };
+    s.desk.unhide(engine, &cli);
+    StatusCode::NO_CONTENT.into_response()
+}
+
+async fn clear(
+    State(s): S,
+    h: HeaderMap,
+    Query(q): Q,
+    body: Result<Json<Clearing>, JsonRejection>,
+) -> Response {
+    guarded!(s, h, q);
+    let c = match body {
+        Ok(Json(c)) => c,
+        Err(e) => return DeskError::Invalid(e.body_text()).into_response(),
+    };
+    s.desk.clear_finished(c).await.map(Json).into_response()
 }
 
 async fn stop(State(s): S, h: HeaderMap, Query(q): Q, Path(id): Path<Uuid>) -> Response {
@@ -812,6 +881,15 @@ pub fn sessions_router(desk: Desk, auth: Arc<dyn Authorize>) -> Router {
         .route("/api/desk/spend", get(spend))
         .route("/api/desk/ledger", get(ledger))
         .route("/api/desk/sessions/{id}", patch(update).delete(forget))
+        .route("/api/desk/sessions/closed", get(closed))
+        .route("/api/desk/sessions/hidden", get(hidden))
+        .route(
+            "/api/desk/sessions/hidden/{engine}/{cli}",
+            axum::routing::delete(unhide),
+        )
+        .route("/api/desk/sessions/clear", post(clear))
+        .route("/api/desk/sessions/{id}/remove", post(remove))
+        .route("/api/desk/sessions/{id}/end", post(end))
         .route("/api/desk/sessions/{id}/stop", post(stop))
         .route("/api/desk/sessions/{id}/interrupt", post(interrupt))
         .route("/api/desk/sessions/{id}/asked/allow", post(allow_asked))
@@ -1467,6 +1545,105 @@ mod tests {
             assert_eq!(status, 204);
             let (_, l) = call(&app, "GET", "/api/desk/layout", None).await;
             assert_eq!((&l["groups"][0]["items"], &l["ungrouped"]["items"]), (&json!([]), &json!(["agent:dw/allan", "agent:local/scout"])));
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn sessions_end_clear_and_are_removed_and_tracked_again_through_the_routes() {
+        with_test_pool(build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            DeskStore::migrate(&pool).await.unwrap();
+            let store = DeskStore::from_pool(pool);
+            let old = chrono::Utc::now() - chrono::Duration::days(9);
+            let stopped = crate::model::SessionRecord {
+                state: crate::model::SessionState::Stopped,
+                cli_session_id: Some("cc-old".into()),
+                terminal_id: None,
+                updated_at: old,
+                ..crate::store::tests::record_fixture("old-run")
+            };
+            let closed = crate::model::SessionRecord {
+                state: crate::model::SessionState::Closed,
+                cli_session_id: Some("cc-closed".into()),
+                terminal_id: None,
+                ..crate::store::tests::record_fixture("closed-run")
+            };
+            store.put(&stopped).await.unwrap();
+            store.put(&closed).await.unwrap();
+            let desk = crate::Desk::start(
+                store,
+                options(dir.path()),
+                Default::default(),
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            let app = super::sessions_router(desk, allow_all());
+
+            let (status, c) = call(&app, "GET", "/api/desk/sessions/closed", None).await;
+            assert_eq!(
+                (status, c[0]["id"].as_str()),
+                (200, Some(closed.id.to_string().as_str()))
+            );
+            let (status, n) = call(
+                &app,
+                "POST",
+                "/api/desk/sessions/clear",
+                Some(json!({ "olderThanDays": 7, "dryRun": true })),
+            )
+            .await;
+            assert_eq!((status, &n["removed"]), (200, &json!(1)));
+            let (status, _) = call(
+                &app,
+                "POST",
+                "/api/desk/sessions/clear",
+                Some(json!({ "olderThan": 7 })),
+            )
+            .await;
+            assert_eq!(status, 400);
+            let (status, n) = call(
+                &app,
+                "POST",
+                &format!("/api/desk/sessions/{}/remove", closed.id),
+                Some(json!({ "transcript": false })),
+            )
+            .await;
+            assert_eq!((status, &n["removed"]), (200, &json!(1)));
+            let (status, _) = call(
+                &app,
+                "POST",
+                &format!("/api/desk/sessions/{}/end", stopped.id),
+                None,
+            )
+            .await;
+            assert_eq!(status, 200);
+            let mut hidden = json!([]);
+            for _ in 0..200 {
+                hidden = call(&app, "GET", "/api/desk/sessions/hidden", None).await.1;
+                if hidden.as_array().is_some_and(|h| !h.is_empty()) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert_eq!(hidden[0]["cliSessionId"], "cc-closed");
+            assert_eq!(hidden[0]["name"], "closed-run");
+            let (status, _) = call(
+                &app,
+                "DELETE",
+                "/api/desk/sessions/hidden/claude/cc-closed",
+                None,
+            )
+            .await;
+            assert_eq!(status, 204);
+            let (status, _) = call(
+                &app,
+                "DELETE",
+                "/api/desk/sessions/hidden/nonsense/cc-closed",
+                None,
+            )
+            .await;
+            assert_eq!(status, 400);
         })
         .await;
     }

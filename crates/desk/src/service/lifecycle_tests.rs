@@ -1,0 +1,351 @@
+//! Tests of a session's life after its work: ending, removing, clearing,
+//! and the CLI sessions removed from Desk that adoption leaves alone.
+
+use super::tests::{desk, fake_cli, found, kept_until, logged_desk, new_session, Logged};
+use super::*;
+use crate::store::{build_pool, tests::record_fixture};
+use workforce_postgres::test_support::with_test_pool;
+
+fn listed(found: &[serde_json::Value]) -> Vec<External> {
+    adopt::parse(
+        serde_json::Value::from(found.to_vec())
+            .to_string()
+            .as_bytes(),
+    )
+    .unwrap()
+}
+
+/// What Activity says of session `id`.
+async fn activity_of(store: &DeskStore, id: Uuid) -> i64 {
+    let client = store.pool().get().await.unwrap();
+    client
+        .query_one(
+            "SELECT count(*) FROM activity WHERE subject ->> 'id' = $1 OR actor ->> 'id' = $1",
+            &[&id.to_string()],
+        )
+        .await
+        .unwrap()
+        .get(0)
+}
+
+async fn gone(store: &DeskStore, id: Uuid) {
+    for _ in 0..200 {
+        if store.get(id).await.unwrap().is_none() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("the registry still keeps session {id}");
+}
+
+fn forgot(logged: &Logged, id: Uuid) -> bool {
+    logged.0.lock().iter().any(|op| {
+        matches!(op, TurnOp::Forget { subjects } if subjects.contains(&SubjectKey::session(id)))
+    })
+}
+
+#[tokio::test]
+async fn removing_a_session_forgets_it_everywhere_and_keeps_its_transcript() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DeskStore::from_pool(pool.clone());
+        let (d, logged) = logged_desk(pool, dir.path(), fake_cli(dir.path())).await;
+        let s = new_session(&d, dir.path()).await;
+        kept_until(&store, s.id, |_| true).await;
+        for _ in 0..200 {
+            if activity_of(&store, s.id).await > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            activity_of(&store, s.id).await > 0,
+            "starting it was recorded"
+        );
+        let transcript = dir.path().join("kept.jsonl");
+        std::fs::write(&transcript, "{}").unwrap();
+        d.change(s.id, |r, _| {
+            r.transcript = Some(transcript.to_string_lossy().into_owned())
+        });
+
+        let removed = d.remove(s.id, Removal::default()).await.unwrap();
+        assert_eq!((removed.removed, removed.transcripts), (1, 0));
+        assert!(d.list().is_empty());
+        assert!(!d.0.state.lock().live.contains_key(&s.id), "stopped");
+        gone(&store, s.id).await;
+        assert_eq!(activity_of(&store, s.id).await, 0);
+        assert!(forgot(&logged, s.id), "its floor turns go too");
+        assert!(
+            transcript.is_file(),
+            "the engine's transcript is the engine's"
+        );
+        assert!(matches!(
+            d.remove(s.id, Removal::default()).await,
+            Err(DeskError::NotFound)
+        ));
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_transcript_is_deleted_only_when_asked_and_never_while_it_runs() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let project = home.join(".claude/projects/-Users-k-dev-app");
+        std::fs::create_dir_all(project.join("cc-3/subagents")).unwrap();
+        std::fs::write(project.join("cc-3.jsonl"), "{}").unwrap();
+        std::fs::write(project.join("cc-3/subagents/agent-a.jsonl"), "{}").unwrap();
+        DeskStore::migrate(&pool).await.unwrap();
+        let store = DeskStore::from_pool(pool.clone());
+        let was = SessionRecord {
+            origin: Origin::External,
+            state: SessionState::Closed,
+            cli_session_id: Some("cc-3".into()),
+            transcript: None,
+            external_pid: None,
+            terminal_id: None,
+            ..record_fixture("app-36")
+        };
+        store.put(&was).await.unwrap();
+        let mut opts = super::tests::options(dir.path());
+        opts.env
+            .insert("HOME".into(), home.to_string_lossy().into_owned());
+        let d = Desk::start(store, opts, Default::default(), CancellationToken::new())
+            .await
+            .unwrap();
+        let removed = d
+            .remove(was.id, Removal { transcript: true })
+            .await
+            .unwrap();
+        assert_eq!((removed.removed, removed.transcripts), (1, 2));
+        assert!(!project.join("cc-3.jsonl").exists());
+        assert!(!project.join("cc-3").exists(), "its sub-agents' with it");
+
+        // While it runs here, its transcript stays and so does it.
+        let s = new_session(&d, dir.path()).await;
+        assert!(matches!(
+            d.remove(s.id, Removal { transcript: true }).await,
+            Err(DeskError::Conflict(_))
+        ));
+        assert_eq!(d.list().len(), 1);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_removed_session_is_never_adopted_again_until_tracked_again() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool.clone(), dir.path()).await;
+        let running = listed(&[found("ext-4", "/Users/k/dev/vellev", "vellev-36")]);
+        d.reconcile_external(running.clone()).await;
+        let s = d.list().pop().unwrap();
+        d.remove(s.id, Removal::default()).await.unwrap();
+        // Still running in its own terminal: left alone.
+        d.reconcile_external(running.clone()).await;
+        assert!(d.list().is_empty());
+        let hidden = d.hidden_sessions().await;
+        // The hide is queued; read it once it has landed.
+        let mut hidden = hidden.unwrap();
+        for _ in 0..200 {
+            if !hidden.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            hidden = d.hidden_sessions().await.unwrap();
+        }
+        assert_eq!(
+            hidden
+                .iter()
+                .map(|h| (h.cli_session_id.as_str(), h.name.as_str()))
+                .collect::<Vec<_>>(),
+            [("ext-4", "vellev-36")]
+        );
+
+        // A later hub remembers.
+        let again = desk(pool.clone(), dir.path()).await;
+        again.reconcile_external(running.clone()).await;
+        assert!(again.list().is_empty());
+
+        // Tracked again: adopted when next found, as a new record (the old
+        // one was removed with everything it said).
+        again.unhide(Engine::Claude, "ext-4");
+        again.reconcile_external(running).await;
+        let back = again.list();
+        assert_eq!(back.len(), 1);
+        assert_ne!(back[0].id, s.id);
+        assert_eq!(back[0].cli_session_id.as_deref(), Some("ext-4"));
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_hidden_session_the_registry_still_keeps_is_never_taken_back() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        DeskStore::migrate(&pool).await.unwrap();
+        let store = DeskStore::from_pool(pool.clone());
+        let was = SessionRecord {
+            origin: Origin::External,
+            state: SessionState::Closed,
+            cli_session_id: Some("ext-5".into()),
+            external_pid: None,
+            terminal_id: None,
+            ..record_fixture("vellev-37")
+        };
+        store.put(&was).await.unwrap();
+        store
+            .hide(&Hidden {
+                engine: Engine::Claude,
+                cli_session_id: "ext-5".into(),
+                name: "vellev-37".into(),
+                cwd: "/Users/k/dev/vellev".into(),
+                hidden_at: Utc::now(),
+            })
+            .await
+            .unwrap();
+        let d = desk(pool, dir.path()).await;
+        d.reconcile_external(listed(&[found(
+            "ext-5",
+            "/Users/k/dev/vellev",
+            "vellev-37",
+        )]))
+        .await;
+        assert!(d.list().is_empty());
+        assert!(
+            !d.0.state.lock().records.contains_key(&was.id),
+            "not even recalled"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_forgotten_session_is_never_recalled_while_the_registry_catches_up() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        DeskStore::migrate(&pool).await.unwrap();
+        let store = DeskStore::from_pool(pool.clone());
+        let was = SessionRecord {
+            origin: Origin::External,
+            state: SessionState::Closed,
+            cli_session_id: Some("ext-6".into()),
+            external_pid: None,
+            terminal_id: None,
+            ..record_fixture("vellev-38")
+        };
+        store.put(&was).await.unwrap();
+        let d = desk(pool, dir.path()).await;
+        d.forget(was.id).await.unwrap();
+        gone(&store, was.id).await;
+        // As if the queued delete hadn't landed yet.
+        store.put(&was).await.unwrap();
+        assert_eq!(d.recall(Engine::Claude, "ext-6").await, None);
+        assert!(matches!(d.load(was.id).await, Err(DeskError::NotFound)));
+        d.reconcile_external(listed(&[found(
+            "ext-6",
+            "/Users/k/dev/vellev",
+            "vellev-38",
+        )]))
+        .await;
+        assert!(d.list().iter().all(|s| s.id != was.id));
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn ending_a_session_closes_it_and_it_resumes_from_the_closed_list() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DeskStore::from_pool(pool.clone());
+        let d = desk(pool.clone(), dir.path()).await;
+        let s = new_session(&d, dir.path()).await;
+        let ended = d.end(s.id, Some(By::you())).await.unwrap();
+        assert_eq!((ended.state, ended.live), (SessionState::Closed, false));
+        assert!(d.list().is_empty(), "it leaves the sessions Desk shows");
+        kept_until(&store, s.id, |r| r.state == SessionState::Closed).await;
+
+        // A later hub doesn't load it, but lists it, and resumes it.
+        let again = desk(pool, dir.path()).await;
+        assert!(again.list().is_empty());
+        let closed = again.closed_sessions().await.unwrap();
+        assert_eq!(closed.iter().map(|c| c.id).collect::<Vec<_>>(), [s.id]);
+        let resumed = again.resume(s.id, None, None).await.unwrap();
+        assert_eq!(
+            (resumed.id, resumed.live, resumed.name.as_str()),
+            (s.id, true, "auth-fix")
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_closed_session_from_another_terminal_resumes_in_desk_as_the_same_session() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        DeskStore::migrate(&pool).await.unwrap();
+        let store = DeskStore::from_pool(pool.clone());
+        let was = SessionRecord {
+            origin: Origin::External,
+            state: SessionState::Closed,
+            cli_session_id: Some("ext-7".into()),
+            cwd: dir.path().to_string_lossy().into_owned(),
+            display_name: Some("Ledger migration".into()),
+            external_pid: None,
+            terminal_id: None,
+            ..record_fixture("atlas-13")
+        };
+        store.put(&was).await.unwrap();
+        let d = desk(pool, dir.path()).await;
+        let s = d.resume(was.id, None, Some(By::you())).await.unwrap();
+        assert_eq!((s.id, s.origin, s.live), (was.id, Origin::Desk, true));
+        assert_eq!(s.display_name.as_deref(), Some("Ledger migration"));
+        assert_eq!(s.cli_session_id.as_deref(), Some("ext-7"));
+        let kept = kept_until(&store, was.id, |r| r.origin == Origin::Desk).await;
+        assert_eq!(kept.state, SessionState::Starting);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn finished_sessions_are_cleared_by_how_long_ago_they_finished() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        DeskStore::migrate(&pool).await.unwrap();
+        let store = DeskStore::from_pool(pool.clone());
+        let at = |days: i64| Utc::now() - chrono::Duration::days(days);
+        let finished = |name: &str, state, days| SessionRecord {
+            state,
+            cli_session_id: Some(format!("cc-{name}")),
+            terminal_id: None,
+            updated_at: at(days),
+            created_at: at(days + 1),
+            ..record_fixture(name)
+        };
+        let old_stopped = finished("old-stopped", SessionState::Stopped, 10);
+        let old_closed = finished("old-closed", SessionState::Closed, 30);
+        let recent = finished("recent", SessionState::Stopped, 2);
+        for r in [&old_stopped, &old_closed, &recent] {
+            store.put(r).await.unwrap();
+        }
+        let d = desk(pool, dir.path()).await;
+        let running = new_session(&d, dir.path()).await;
+        let clearing = |dry_run| Clearing {
+            older_than_days: 7,
+            dry_run,
+            transcripts: false,
+        };
+        assert_eq!(d.clear_finished(clearing(true)).await.unwrap().removed, 2);
+        assert_eq!(d.list().len(), 3, "counting removes nothing");
+        assert_eq!(d.clear_finished(clearing(false)).await.unwrap().removed, 2);
+        let mut left: Vec<Uuid> = d.list().into_iter().map(|s| s.id).collect();
+        left.sort();
+        let mut want = vec![recent.id, running.id];
+        want.sort();
+        assert_eq!(left, want);
+        gone(&store, old_closed.id).await;
+        gone(&store, old_stopped.id).await;
+    })
+    .await;
+}

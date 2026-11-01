@@ -227,15 +227,6 @@ impl Desk {
         store.forget_reads(YOU, &format!("thread:{room}/")).await?;
         Ok(())
     }
-
-    /// Forgets a session's point.
-    pub(super) async fn forget_session_read(&self, id: Uuid) -> Result<(), DeskError> {
-        Ok(self
-            .0
-            .store
-            .forget_reads(YOU, &ReadPlace::Session(id).to_string())
-            .await?)
-    }
 }
 
 fn advance(place: ReadPlace, point: ReadPoint) -> ReadPut {
