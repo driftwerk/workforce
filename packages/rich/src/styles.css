@@ -435,3 +435,7 @@ select.wf-form-select { appearance: none; cursor: pointer; }
   padding: 16px 12px; border: 1px dashed var(--rich-border); border-radius: 10px;
   background: var(--rich-surface); color: var(--rich-muted); font-size: 12px; text-align: center;
 }
+
+/* A remote markdown image shown as a link (the host won't let the page fetch it). */
+.wf-md .wf-remote-image { display: inline-flex; align-items: center; gap: 0.35em; vertical-align: baseline; }
+.wf-md .wf-remote-image-icon { flex: none; }

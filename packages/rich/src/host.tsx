@@ -26,6 +26,17 @@ export interface RichHost {
   /** Link schemes kept besides the web's (http, https, mailto), opened through
    *  `openUrl`. Every other scheme is stripped from agent markdown. */
   linkSchemes?: readonly string[];
+  /** What a markdown image at a remote `http(s)` address becomes. `"render"`
+   *  (the default) draws it, so the page fetches it from that address; `"link"`
+   *  shows a link to it instead (an image icon and its alt text, else its
+   *  host), opened through `openUrl`, and the page fetches nothing. A host
+   *  whose content-security policy bars remote images says `"link"`, since
+   *  they would only show as broken. Images that come from the host itself
+   *  (`blob:`, `deskfile:` or `http(s)://deskfile.localhost`, a small raster
+   *  `data:` image, a path on the page's own origin) are drawn either way; in
+   *  `"link"` mode any other source is not drawn at all. A declared link scheme
+   *  is never an image source. */
+  remoteImages?: "link" | "render";
   /** The form was answered already, here or before: it shows locked and says so. */
   answered?: boolean;
   /** Save a file the block generated (CSV, PNG, Excalidraw scene). Absent, the
@@ -45,6 +56,7 @@ interface HostHandle {
   files: boolean;
   forms: boolean;
   answered: boolean;
+  remoteImages: "link" | "render";
   /** `linkSchemes`, joined, so a host rebuilt with the same list keeps its renderers. */
   schemes: string;
 }
@@ -55,6 +67,7 @@ const NO_HOST: HostHandle = {
   files: false,
   forms: false,
   answered: false,
+  remoteImages: "render",
   schemes: "",
 };
 
@@ -67,10 +80,11 @@ export function RichHostProvider({ host, children }: { host: RichHost; children:
   const files = !!host.fetchFile;
   const forms = !!host.submitForm;
   const answered = !!host.answered;
+  const remoteImages: HostHandle["remoteImages"] = host.remoteImages === "link" ? "link" : "render";
   const schemes = (host.linkSchemes ?? []).join(",");
   const handle = useMemo(
-    () => ({ latest, tables, files, forms, answered, schemes }),
-    [tables, files, forms, answered, schemes],
+    () => ({ latest, tables, files, forms, answered, remoteImages, schemes }),
+    [tables, files, forms, answered, remoteImages, schemes],
   );
   return <HostContext.Provider value={handle}>{children}</HostContext.Provider>;
 }
