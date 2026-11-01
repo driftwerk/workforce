@@ -13,7 +13,7 @@ use workforce_common::usage::{LoginRef, PlanKind, Reading};
 use workforce_desk::floor::{
     self, Gists, Outcome, Scope, Settling, SubjectKey, Target, Turn, TurnOp,
 };
-use workforce_desk::gist::{Gist, Paragraph};
+use workforce_desk::gist::{self, Asked, Gist, Paragraph, Reach};
 use workforce_postgres::{
     MigrationRun, MigrationRunner, MigrationSet, PostgresConfig, PostgresError, PostgresPool,
 };
@@ -162,27 +162,84 @@ impl PgFloorStore {
         row.as_ref().map(turn_of).transpose()
     }
 
-    /// What `owner`'s `subject` was asked: its first asks and its latest,
-    /// oldest first.
-    pub async fn asks(&self, owner: Option<&str>, subject: &SubjectKey) -> Result<Vec<String>> {
+    /// What `owner`'s `subject`'s purpose is read from ([`Reach`]): a
+    /// session's first asks and latest, oldest first; an agent's latest asks
+    /// in its current session within the window, and when that thread began.
+    pub async fn asks(
+        &self,
+        owner: Option<&str>,
+        subject: &SubjectKey,
+        reach: &Reach,
+    ) -> Result<Asked> {
         let conn = self.pool.get().await?;
-        let rows = conn
-            .query(
-                "SELECT task FROM ( \
-                     (SELECT task, started_at FROM turns \
-                      WHERE owner IS NOT DISTINCT FROM $1 AND subject = $2 AND task IS NOT NULL \
-                      ORDER BY started_at LIMIT $3) \
-                     UNION \
-                     (SELECT task, started_at FROM turns \
-                      WHERE owner IS NOT DISTINCT FROM $1 AND subject = $2 AND task IS NOT NULL \
-                      ORDER BY started_at DESC LIMIT $4)) asked \
-                 ORDER BY started_at",
-                &[&owner, &subject.as_str(), &FIRST_ASKS, &LATEST_ASKS],
-            )
-            .await?;
+        let (rows, began) = match reach {
+            Reach::Job => {
+                let rows = conn
+                    .query(
+                        "SELECT task FROM ( \
+                             (SELECT task, started_at FROM turns \
+                              WHERE owner IS NOT DISTINCT FROM $1 AND subject = $2 \
+                                AND task IS NOT NULL \
+                              ORDER BY started_at LIMIT $3) \
+                             UNION \
+                             (SELECT task, started_at FROM turns \
+                              WHERE owner IS NOT DISTINCT FROM $1 AND subject = $2 \
+                                AND task IS NOT NULL \
+                              ORDER BY started_at DESC LIMIT $4)) asked \
+                         ORDER BY started_at",
+                        &[&owner, &subject.as_str(), &FIRST_ASKS, &LATEST_ASKS],
+                    )
+                    .await?;
+                (rows, None)
+            }
+            Reach::Thread { since } => {
+                // The conversation is the session of the agent's latest ask in
+                // Desk (a DM or a room), never Slack or another surface, and
+                // not the session of whichever turn the gist is written for.
+                const THREAD: &str = "SELECT subject_doc->>'sessionId' FROM floor.turns \
+                     WHERE owner IS NOT DISTINCT FROM $1 AND subject = $2 \
+                       AND started_at >= $3 AND task IS NOT NULL \
+                       AND place->>'kind' IN ('dm', 'room') \
+                     ORDER BY started_at DESC LIMIT 1";
+                let rows = conn
+                    .query(
+                        &format!(
+                            "SELECT task FROM ( \
+                                 SELECT task, started_at FROM floor.turns \
+                                 WHERE owner IS NOT DISTINCT FROM $1 AND subject = $2 \
+                                   AND started_at >= $3 AND task IS NOT NULL \
+                                   AND place->>'kind' IN ('dm', 'room') \
+                                   AND subject_doc->>'sessionId' = ({THREAD}) \
+                                 ORDER BY started_at DESC LIMIT $4) asked \
+                             ORDER BY started_at"
+                        ),
+                        &[
+                            &owner,
+                            &subject.as_str(),
+                            since,
+                            &(gist::THREAD_ASKS as i64),
+                        ],
+                    )
+                    .await?;
+                let began: Option<DateTime<Utc>> = conn
+                    .query_one(
+                        &format!(
+                            "SELECT min(started_at) FROM floor.turns \
+                             WHERE owner IS NOT DISTINCT FROM $1 AND subject = $2 \
+                               AND started_at >= $3 \
+                               AND place->>'kind' IN ('dm', 'room') \
+                               AND subject_doc->>'sessionId' = ({THREAD})"
+                        ),
+                        &[&owner, &subject.as_str(), since],
+                    )
+                    .await?
+                    .get(0);
+                (rows, began)
+            }
+        };
         let mut asks: Vec<String> = rows.iter().map(|row| row.get(0)).collect();
         asks.dedup();
-        Ok(asks)
+        Ok(Asked { asks, began })
     }
 
     /// The gists of `scope`'s subjects.
@@ -1161,9 +1218,101 @@ mod tests {
                 store.apply(&begin(&t, false)).await.unwrap();
             }
             assert_eq!(
-                store.asks(Some("u1"), &scout).await.unwrap(),
+                store
+                    .asks(Some("u1"), &scout, &Reach::Job)
+                    .await
+                    .unwrap()
+                    .asks,
                 ["Plan it", "Build it", "Test it", "Ship it", "Tidy up", "Rest"],
-                "its first asks and its latest, in order, once each"
+                "a session's first asks and its latest, in order, once each"
+            );
+            let thread = |since: &str| Reach::Thread { since: at(since) };
+            let recent = store
+                .asks(Some("u1"), &scout, &thread("2026-10-29T08:02:00Z"))
+                .await
+                .unwrap();
+            assert_eq!(
+                recent.asks,
+                ["Build it", "Test it", "Ship it", "Tidy up", "Rest"],
+                "an agent's latest five within the window, never its first asks"
+            );
+            assert_eq!(recent.began, Some(at("2026-10-29T08:02:00Z")));
+            assert_eq!(
+                store
+                    .asks(Some("u1"), &scout, &thread("2026-10-29T08:05:00Z"))
+                    .await
+                    .unwrap()
+                    .asks,
+                ["Tidy up", "Rest"],
+                "and nothing before the window"
+            );
+            // Slack speaks, then a Desk room: only Desk's latest conversation counts.
+            let mut slack = turn("scout", Some("u1"), "2026-10-29T08:10:00Z");
+            slack.subject = Subject::Agent {
+                agent_id: "scout".into(),
+                session_id: "slack-thread".into(),
+            };
+            slack.task = Some("Why is the login page down".into());
+            slack.place = Place::Slack {
+                team: None,
+                channel: "C1".into(),
+                thread: None,
+            };
+            store.apply(&begin(&slack, false)).await.unwrap();
+            let unchanged = store
+                .asks(Some("u1"), &scout, &thread("2026-10-29T08:05:00Z"))
+                .await
+                .unwrap();
+            assert_eq!(
+                unchanged.asks,
+                ["Tidy up", "Rest"],
+                "a Slack turn never gives the purpose"
+            );
+            assert_eq!(unchanged.began, Some(at("2026-10-29T08:05:00Z")));
+            // A Desk room thread, the latest Desk conversation, is the one.
+            slack.id = Uuid::new_v4();
+            slack.subject = Subject::Agent {
+                agent_id: "scout".into(),
+                session_id: "room-thread".into(),
+            };
+            slack.place = Place::Room {
+                room: Uuid::new_v4(),
+                thread: None,
+            };
+            slack.task = Some("Why is the login page down".into());
+            slack.started_at = at("2026-10-29T08:11:00Z");
+            store.apply(&begin(&slack, false)).await.unwrap();
+            let now = store
+                .asks(Some("u1"), &scout, &thread("2026-10-29T07:00:00Z"))
+                .await
+                .unwrap();
+            assert_eq!(now.asks, ["Why is the login page down"]);
+            assert_eq!(now.began, Some(at("2026-10-29T08:11:00Z")));
+            // Two sessions' turns never mix, and one more ask in the first
+            // brings it back.
+            let mut back = turn("scout", Some("u1"), "2026-10-29T08:20:00Z");
+            back.task = Some("Back to the build".into());
+            store.apply(&begin(&back, false)).await.unwrap();
+            let again = store
+                .asks(Some("u1"), &scout, &thread("2026-10-29T08:05:00Z"))
+                .await
+                .unwrap();
+            assert_eq!(again.asks, ["Tidy up", "Rest", "Back to the build"]);
+            assert_eq!(again.began, Some(at("2026-10-29T08:05:00Z")));
+            // Another owner's agent of the same name, and a quiet window.
+            assert!(store
+                .asks(Some("u2"), &scout, &thread("2026-10-29T07:00:00Z"))
+                .await
+                .unwrap()
+                .asks
+                .is_empty());
+            let quiet = store
+                .asks(Some("u1"), &scout, &thread("2026-10-29T09:00:00Z"))
+                .await
+                .unwrap();
+            assert!(
+                quiet.asks.is_empty() && quiet.began.is_none(),
+                "no turn in the window: nothing, not an error"
             );
 
             let paragraph = |text: &str, when: &str| Paragraph {
@@ -1195,7 +1344,7 @@ mod tests {
                 "where both had one, the one moved into stays"
             );
             assert_eq!(store.summary("u1", true).await.unwrap(), None);
-            assert_eq!(store.forget("u3").await.unwrap(), 8);
+            assert_eq!(store.forget("u3").await.unwrap(), 11);
             assert_eq!(store.gist(Some("u3"), &scout).await.unwrap(), None);
             assert_eq!(store.prune(at("2026-10-30T00:00:00Z")).await.unwrap(), 2);
             assert!(store.gists(&personal).await.unwrap().is_empty());
