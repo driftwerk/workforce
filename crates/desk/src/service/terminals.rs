@@ -463,7 +463,7 @@ impl Desk {
         let records = match self.0.store.terminals().await {
             Ok(r) => r,
             Err(e) => {
-                tracing::error!(error = %e, "could not load desk terminals");
+                tracing::error!(error = format!("{e:#}"), "could not load desk terminals");
                 return;
             }
         };
@@ -543,6 +543,10 @@ impl Desk {
         }
         let cli = fields["session_id"].as_str().map(str::to_string);
         let cwd = fields["cwd"].as_str().map(str::to_string);
+        if let Some(cli) = cli.as_deref() {
+            // A session resumed here may be one the registry keeps closed.
+            self.recall(Engine::Claude, cli).await;
+        }
         let found = self.terminal_session(terminal, cli.as_deref());
         let id = match (&hook, found) {
             (Hook::SessionStart { .. }, _) | (_, None) => {
@@ -1082,6 +1086,52 @@ mod tests {
             b.extend(e.clone());
         }
         body.to_string().into_bytes()
+    }
+
+    #[tokio::test]
+    async fn a_closed_session_resumed_in_a_terminal_keeps_its_record() {
+        with_test_pool(build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let store = crate::store::DeskStore::from_pool(pool.clone());
+            crate::store::DeskStore::migrate(&pool).await.unwrap();
+            // Ended under an earlier hub: closed, so not loaded at start.
+            let was = SessionRecord {
+                state: SessionState::Closed,
+                cli_session_id: Some("cc-7".into()),
+                display_name: Some("Ledger migration".into()),
+                ..crate::store::tests::record_fixture("api")
+            };
+            store.put(&was).await.unwrap();
+            let d = shell_desk(pool, dir.path()).await;
+            let (tid, token) = open(&d, dir.path()).await;
+            // `claude --resume cc-7` in a Desk terminal.
+            let repo = dir.path().to_string_lossy().into_owned();
+            d.terminal_hook(
+                tid,
+                &token,
+                &hook("SessionStart", "cc-7", serde_json::json!({ "cwd": repo })),
+            )
+            .await
+            .unwrap();
+            let listed = d.list();
+            assert_eq!(listed.len(), 1, "one record per CLI session");
+            let s = &listed[0];
+            assert_eq!((s.id, s.terminal_id, s.live), (was.id, Some(tid), true));
+            assert_eq!(s.display_name.as_deref(), Some("Ledger migration"));
+            for _ in 0..200 {
+                if store
+                    .get(was.id)
+                    .await
+                    .unwrap()
+                    .is_some_and(|r| r.terminal_id == Some(tid))
+                {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            panic!("the registry never took the session back in its terminal");
+        })
+        .await;
     }
 
     #[tokio::test]

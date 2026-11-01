@@ -314,7 +314,10 @@ impl Desk {
     pub(super) async fn ledger_loop(self, mut jobs: mpsc::UnboundedReceiver<Job>) {
         match self.0.store.every_session().await {
             Ok(all) => all.iter().for_each(|r| self.spend_read(r.id)),
-            Err(e) => tracing::warn!(error = %e, "couldn't list the sessions whose spend to read"),
+            Err(e) => tracing::warn!(
+                error = format!("{e:#}"),
+                "couldn't list the sessions whose spend to read"
+            ),
         }
         let mut tell = tokio::time::interval(TELL_EVERY);
         loop {

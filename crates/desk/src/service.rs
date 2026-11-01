@@ -462,7 +462,10 @@ async fn prune_layout(
     match store.put_layout(&pruned).await {
         Ok(()) => pruned,
         Err(e) => {
-            tracing::warn!(error = %e, "couldn't take forgotten sessions out of the sidebar's layout");
+            tracing::warn!(
+                error = format!("{e:#}"),
+                "couldn't take forgotten sessions out of the sidebar's layout"
+            );
             layout
         }
     }
@@ -476,7 +479,10 @@ async fn forget_hub_internal(store: &DeskStore, hub: &HubInternal, turns: Option
     let places = match store.external_places().await {
         Ok(places) => places,
         Err(e) => {
-            tracing::warn!(error = %e, "couldn't look for the hub's own sessions to forget");
+            tracing::warn!(
+                error = format!("{e:#}"),
+                "couldn't look for the hub's own sessions to forget"
+            );
             return;
         }
     };
@@ -496,7 +502,10 @@ async fn forget_hub_internal(store: &DeskStore, hub: &HubInternal, turns: Option
             )
         }
         Err(e) => {
-            tracing::warn!(error = %e, "couldn't forget the hub's own sessions");
+            tracing::warn!(
+                error = format!("{e:#}"),
+                "couldn't forget the hub's own sessions"
+            );
             return;
         }
     }
@@ -3003,6 +3012,43 @@ impl Desk {
         }
     }
 
+    /// Takes back the record the registry keeps for `engine`'s CLI session
+    /// `cli` when the hub doesn't hold it: a closed one isn't loaded at
+    /// start, and the CLI session can run again (resumed in another
+    /// terminal, or in one of Desk's). It is the same session, so it keeps
+    /// its record, name, group and history; a second record for the same
+    /// CLI session can't be saved (one per CLI session id, closed ones too).
+    pub(crate) async fn recall(&self, engine: Engine, cli: &str) -> Option<Uuid> {
+        let held = |st: &State| {
+            st.records
+                .values()
+                .find(|r| r.engine == engine && r.cli_session_id.as_deref() == Some(cli))
+                .map(|r| r.id)
+        };
+        if let Some(id) = held(&self.0.state.lock()) {
+            return Some(id);
+        }
+        let kept = match self.0.store.by_cli_session(engine, cli).await {
+            Ok(kept) => kept?,
+            Err(e) => {
+                tracing::warn!(
+                    error = format!("{e:#}"),
+                    cli,
+                    "couldn't look up a session the registry may keep"
+                );
+                return None;
+            }
+        };
+        let mut st = self.0.state.lock();
+        // Taken while the registry was asked.
+        if let Some(id) = held(&st) {
+            return Some(id);
+        }
+        let id = kept.id;
+        st.records.insert(id, kept);
+        Some(id)
+    }
+
     async fn reconcile_external(&self, found: Vec<External>) {
         let hub = &self.0.opts.hub_internal;
         let held: Vec<Uuid> = self
@@ -3029,15 +3075,22 @@ impl Desk {
         let found = found
             .into_iter()
             .filter(|e| !e.pid.is_some_and(|pid| hub.started(&table, pid)));
+        let found: Vec<External> = found.collect();
+        for ext in &found {
+            self.recall(Engine::Claude, &ext.session_id).await;
+        }
         let home = self.0.env.get("HOME").map(PathBuf::from);
         let (ours, by_cli): (HashSet<String>, HashMap<String, Uuid>) = {
             let st = self.0.state.lock();
             (
-                // Running here, or started in one of Desk's terminals (whose
-                // hooks report it): never another terminal's.
+                // Running here, or in one of Desk's terminals (whose hooks
+                // report it): never another terminal's.
                 st.records
                     .values()
-                    .filter(|r| st.live.contains_key(&r.id) || r.terminal_id.is_some())
+                    .filter(|r| {
+                        st.live.contains_key(&r.id)
+                            || (r.terminal_id.is_some() && r.state.is_running())
+                    })
                     .filter_map(|r| r.cli_session_id.clone())
                     .collect(),
                 st.records
@@ -3048,7 +3101,7 @@ impl Desk {
             )
         };
         let mut present = HashSet::new();
-        for ext in found.filter(|e| !ours.contains(&e.session_id)) {
+        for ext in found.into_iter().filter(|e| !ours.contains(&e.session_id)) {
             let id = by_cli.get(&ext.session_id).copied();
             let transcript = id
                 .and_then(|id| self.record(id).ok()?.transcript)
@@ -3289,7 +3342,9 @@ async fn persist_loop(
             }
         };
         if let Err(e) = result {
-            tracing::error!(error = %e, "desk registry write failed");
+            // The whole chain: the outermost context alone ("saving desk
+            // session") never says why.
+            tracing::error!(error = format!("{e:#}"), "desk registry write failed");
         }
     }
 }
@@ -4667,6 +4722,121 @@ mod tests {
             d.reconcile_external(vec![]).await;
             assert_eq!(d.view(s.id).unwrap().state, SessionState::Closed);
             assert!(d.list().iter().all(|v| v.id != s.id));
+        })
+        .await;
+    }
+
+    /// What the registry keeps for `id`, once the persist queue has
+    /// written what `ready` waits for.
+    async fn kept_until(
+        store: &DeskStore,
+        id: Uuid,
+        ready: impl Fn(&SessionRecord) -> bool,
+    ) -> SessionRecord {
+        for _ in 0..200 {
+            if let Some(r) = store.get(id).await.unwrap().filter(|r| ready(r)) {
+                return r;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("the registry never kept what was asked of session {id}");
+    }
+
+    #[tokio::test]
+    async fn a_session_started_in_desk_is_kept_as_desks_through_the_registry() {
+        with_test_pool(build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let store = DeskStore::from_pool(pool.clone());
+            let d = desk(pool, dir.path()).await;
+            let s = new_session(&d, dir.path()).await;
+            assert_eq!((s.origin, s.live), (Origin::Desk, true));
+            // Every column the upsert writes, through the migrated schema.
+            let kept = kept_until(&store, s.id, |_| true).await;
+            assert_eq!(kept.origin, Origin::Desk);
+            assert_eq!(
+                kept.cli_session_id.as_deref(),
+                Some(s.id.to_string().as_str())
+            );
+            // Found running by `claude agents`, it is still Desk's own.
+            let found = adopt::parse(
+                json!([found(&s.id.to_string(), &s.cwd, "auth-fix")])
+                    .to_string()
+                    .as_bytes(),
+            )
+            .unwrap();
+            d.reconcile_external(found).await;
+            let v = d.view(s.id).unwrap();
+            assert_eq!((v.origin, v.live), (Origin::Desk, true));
+            assert_eq!(d.list().len(), 1);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_forgotten_session_is_not_taken_back() {
+        with_test_pool(build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let store = DeskStore::from_pool(pool.clone());
+            let d = desk(pool, dir.path()).await;
+            let s = new_session(&d, dir.path()).await;
+            let cli = s.id.to_string();
+            kept_until(&store, s.id, |_| true).await;
+            d.forget(s.id).await.unwrap();
+            for _ in 0..200 {
+                if store.get(s.id).await.unwrap().is_none() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert!(store.get(s.id).await.unwrap().is_none());
+            assert_eq!(d.recall(Engine::Claude, &cli).await, None);
+            assert!(d.record(s.id).is_err());
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_closed_session_running_again_elsewhere_keeps_its_record() {
+        with_test_pool(build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            DeskStore::migrate(&pool).await.unwrap();
+            let store = DeskStore::from_pool(pool.clone());
+            // Closed in its terminal under an earlier hub: not loaded at start.
+            let was = SessionRecord {
+                origin: Origin::External,
+                state: SessionState::Closed,
+                cli_session_id: Some("ext-9".into()),
+                display_name: Some("Ledger migration".into()),
+                external_pid: None,
+                terminal_id: None,
+                ..record_fixture("vellev-36")
+            };
+            store.put(&was).await.unwrap();
+            let d = desk(pool, dir.path()).await;
+            assert!(d.list().is_empty());
+
+            let found = adopt::parse(
+                json!([found("ext-9", "/Users/k/dev/vellev", "vellev-36")])
+                    .to_string()
+                    .as_bytes(),
+            )
+            .unwrap();
+            d.reconcile_external(found).await;
+            let listed = d.list();
+            assert_eq!(listed.len(), 1, "one record per CLI session");
+            let s = &listed[0];
+            assert_eq!(s.id, was.id, "the same session, not a second record");
+            assert_eq!(s.display_name.as_deref(), Some("Ledger migration"));
+            assert_eq!(s.state, SessionState::Working);
+            // And the registry takes the change: before, the second record's
+            // insert broke the one-per-CLI-session index on every write.
+            let kept = kept_until(&store, was.id, |r| r.state == SessionState::Working).await;
+            assert_eq!(kept.origin, Origin::External);
+            assert!(store
+                .by_cli_session(Engine::Claude, "ext-9")
+                .await
+                .unwrap()
+                .is_some_and(|r| r.id == was.id));
         })
         .await;
     }

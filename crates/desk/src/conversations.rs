@@ -225,7 +225,7 @@ impl IntoResponse for ConversationError {
             Self::Invalid(_) => StatusCode::BAD_REQUEST,
             Self::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             Self::Internal(e) => {
-                tracing::error!(error = %e, "desk conversation read failed");
+                tracing::error!(error = format!("{e:#}"), "desk conversation read failed");
                 StatusCode::INTERNAL_SERVER_ERROR
             }
         };
