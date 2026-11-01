@@ -4,10 +4,10 @@
 // into React text; wide tables are wrapped to scroll instead of overflowing,
 // and links open through the host when it can, otherwise in a new tab. A link
 // keeps a scheme beyond the web's only when the host declares it. An image is
-// drawn from the host's own sources (blob:, deskfile:, a small raster data: URL,
-// a declared scheme) and from the web unless the host says remote images are
-// links (`remoteImages: "link"`): then one is a link to it, and the page never
-// fetches it.
+// drawn from the host's own sources (blob:, deskfile:, a small raster data: URL)
+// and from the web unless the host says remote images are links
+// (`remoteImages: "link"`): then one is a link to it, anything else is not
+// drawn, and the page never fetches either.
 
 import { createContext, useContext, useMemo, useRef, type ComponentProps } from "react";
 import Markdown, { defaultUrlTransform, type Components, type ExtraProps, type Options } from "react-markdown";
@@ -17,7 +17,7 @@ import remarkGfm from "remark-gfm";
 import { CodeBlock } from "./CodeBlock";
 import { ALL_RICH_FEATURES, balanceFences, codeBlockInfo, richKind, type RichFeatures } from "./fence";
 import { useHost } from "./host";
-import { dataImageOk, LOCAL_IMAGE_SCHEMES, remoteImageLabel, remoteImageUrl } from "./images";
+import { dataImageOk, LOCAL_IMAGE_SCHEMES, localImageSource, remoteImageLabel, remoteImageUrl } from "./images";
 import { RichBlock } from "./RichBlock";
 
 /** Inside a link: an image there is not a second link. */
@@ -60,8 +60,14 @@ function Image({ node, src, alt, ...props }: ComponentProps<"img"> & ExtraProps)
   void node;
   const { remoteImages } = useHost();
   const inLink = useContext(InLink);
-  const remote = remoteImages === "link" && typeof src === "string" ? remoteImageUrl(src) : null;
-  if (!remote) return <img {...props} src={src} alt={alt} loading="lazy" />;
+  const held = remoteImages === "link" && typeof src === "string" && src !== "" ? src : null;
+  const remote = held === null ? null : remoteImageUrl(held);
+  if (!remote) {
+    // Not remote, yet not a source of the host's own either (an address this
+    // cannot read): fail closed, with nothing to fetch.
+    if (held !== null && !localImageSource(held)) return <img {...props} alt={alt} />;
+    return <img {...props} src={src} alt={alt} loading="lazy" />;
+  }
   const label = remoteImageLabel(alt, remote);
   const body = (
     <>
@@ -100,9 +106,10 @@ const schemeOf = (url: string): string | null => {
   return url.slice(0, colon).toLowerCase();
 };
 
-/** The sanitizer and URL transform that keep `schemes` (comma-joined) on links
- *  and images, besides the defaults. An image's `src` also keeps `blob:`,
- *  `deskfile:` and `data:`; a `data:` image is held to a raster type and a size
+/** The sanitizer and URL transform that keep `schemes` (comma-joined) on links,
+ *  besides the defaults. An image's `src` keeps `blob:`, `deskfile:` and
+ *  `data:` besides the web's, never a declared link scheme (those are places to
+ *  go, not files to fetch); a `data:` image is held to a raster type and a size
  *  by the transform, which sees the whole URL. */
 function linkPolicy(schemes: string): {
   rehypePlugins: NonNullable<Options["rehypePlugins"]>;
@@ -119,7 +126,7 @@ function linkPolicy(schemes: string): {
     protocols: {
       ...defaultSchema.protocols,
       href: [...(defaultSchema.protocols?.href ?? []), ...kept],
-      src: [...(defaultSchema.protocols?.src ?? []), ...LOCAL_IMAGE_SCHEMES, "data", ...kept],
+      src: [...(defaultSchema.protocols?.src ?? []), ...LOCAL_IMAGE_SCHEMES, "data"],
     },
   };
   return {
@@ -128,7 +135,7 @@ function linkPolicy(schemes: string): {
       const scheme = schemeOf(url);
       if (key === "src") {
         if (scheme === "data") return dataImageOk(url) ? url : "";
-        if (scheme && (LOCAL_IMAGE_SCHEMES.includes(scheme) || kept.includes(scheme))) return url;
+        if (scheme && LOCAL_IMAGE_SCHEMES.includes(scheme)) return url;
         return defaultUrlTransform(url);
       }
       return scheme && kept.includes(scheme) ? url : defaultUrlTransform(url);

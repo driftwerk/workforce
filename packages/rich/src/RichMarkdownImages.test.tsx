@@ -4,7 +4,7 @@ import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 
 import { RichMarkdown } from "./RichMarkdown";
 import { RichHostProvider, type RichHost } from "./host";
-import { dataImageOk, MAX_DATA_IMAGE, remoteImageLabel, remoteImageUrl } from "./images";
+import { dataImageOk, localImageSource, MAX_DATA_IMAGE, remoteImageLabel, remoteImageUrl } from "./images";
 
 afterEach(cleanup);
 
@@ -73,21 +73,47 @@ describe("remote images as links", () => {
   });
 
   it("still draws the host's own images", () => {
-    const text = `![a](blob:null/1d2c) ![b](${PNG}) ![c](deskfile://localhost/hub/agent/art_1) ![d](http://deskfile.localhost/hub/agent/art_2) ![e](http://127.0.0.1:9/x.png)`;
+    const text = `![a](blob:null/1d2c) ![b](${PNG}) ![c](deskfile://localhost/hub/agent/art_1) ![d](http://deskfile.localhost/hub/agent/art_2) ![e](https://DESKFILE.localhost/hub/agent/art_3) ![f](pics/own.png)`;
     const { container } = show(text, LINK);
     expect(imgs(container)).toEqual([
       "blob:null/1d2c",
       PNG,
       "deskfile://localhost/hub/agent/art_1",
       "http://deskfile.localhost/hub/agent/art_2",
-      "http://127.0.0.1:9/x.png",
+      "https://DESKFILE.localhost/hub/agent/art_3",
+      "pics/own.png",
     ]);
     expect(container.querySelectorAll("a")).toHaveLength(0);
   });
 
-  it("draws an image from a scheme the host declared", () => {
+  it("links, never fetches, any other address on this computer", () => {
+    // Loopback services and other `*.localhost` names are not the host's own:
+    // an image there would be a GET to some other program.
+    const sources = [
+      "http://127.0.0.1:9/x.png",
+      "http://localhost:4100/api/x",
+      "http://evil.localhost/x",
+      "http://deskfile.localhost.evil.example/x",
+      "http://2130706433/x",
+      "http://0x7f000001:8080/x",
+      "http://0.0.0.0:4100/x",
+    ];
+    const { container } = show(sources.map((s, i) => `![p${i}](${s})`).join(" "), LINK);
+    expect(imgs(container)).toEqual([]);
+    expect(container.querySelectorAll("a.wf-remote-image")).toHaveLength(sources.length);
+  });
+
+  it("fails closed on a source it cannot read", () => {
+    // Markdown percent-encodes the brackets, so these hosts no longer parse.
+    const { container } = show("![a](http://[::1]:4100/a) ![b](http://[::ffff:127.0.0.1]/a)", LINK);
+    expect(imgs(container)).toEqual([]);
+  });
+
+  it("never draws an image from a link scheme, declared or not", () => {
     const { container } = show("![a](desk://pic/1) ![b](other://pic/2)", { ...LINK, linkSchemes: ["desk"] });
-    expect(imgs(container)).toEqual(["desk://pic/1"]);
+    expect(imgs(container)).toEqual([]);
+    const rendered = show("![a](desk://pic/1)", { linkSchemes: ["desk"] });
+    expect(imgs(rendered.container)).toEqual([]);
   });
 });
 
@@ -121,6 +147,23 @@ describe("images drawn", () => {
     }
   });
 
+  it("drops a data image dressed up past the raster check", () => {
+    const text = [
+      "![a](DATA:image/png;base64,iVBORw0KGgo=)",
+      "![b](data:image/png;charset=utf-8;base64,iVBORw0KGgo=)",
+      "![c](<data:image/png;base64, iVBORw0KGgo=>)",
+      "![d](data:image/png;base64,iVBORw0KGgo=%0A)",
+      "![e](data:image/svg+xml;charset=utf-8;base64,PHN2Zz4=)",
+      "![f](data:image/png+svg;base64,PHN2Zz4=)",
+      "![g](jav&#x09;ascript:alert(1))",
+    ].join(" ");
+    for (const host of [undefined, { remoteImages: "link" as const }]) {
+      const { container, unmount } = show(text, host);
+      expect(imgs(container)).toEqual([]);
+      unmount();
+    }
+  });
+
   it("drops a data image over the size limit", () => {
     const big = `data:image/png;base64,${"A".repeat(MAX_DATA_IMAGE)}`;
     const { container } = show(`![big](${big})`);
@@ -148,12 +191,27 @@ describe("image sources", () => {
       "relative/x.png",
       "blob:null/1",
       "data:image/png;base64,AAAA",
-      "http://localhost:3000/x.png",
-      "http://app.localhost/x.png",
-      "http://127.0.0.1/x.png",
-      "http://[::1]/x.png",
+      "http://deskfile.localhost/h/a/x",
     ])
       expect(remoteImageUrl(none), String(none)).toBeNull();
+    for (const local of ["http://localhost:3000/x.png", "http://app.localhost/x.png", "http://127.0.0.1/x.png", "http://[::1]/x.png"])
+      expect(remoteImageUrl(local)?.protocol, local).toBe("http:");
+  });
+
+  it("knows the sources a link-mode host may still draw", () => {
+    for (const ok of ["blob:null/1", "deskfile://localhost/h/a/x", "http://deskfile.localhost/h/a/x", PNG, "pics/a.png", "/pics/a.png"])
+      expect(localImageSource(ok), ok).toBe(true);
+    for (const no of [
+      "//evil.example/x",
+      "\\\\evil.example/x",
+      "http://127.0.0.1/x",
+      "https://evil.example/x",
+      "desk://pic/1",
+      "data:image/svg+xml;base64,PHN2Zz4=",
+      "javascript:alert(1)",
+      "http://[bad/x",
+    ])
+      expect(localImageSource(no), no).toBe(false);
   });
 
   it("labels with alt text, else the host", () => {

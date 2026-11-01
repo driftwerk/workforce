@@ -32,8 +32,10 @@ export interface RichHost {
    *  host), opened through `openUrl`, and the page fetches nothing. A host
    *  whose content-security policy bars remote images says `"link"`, since
    *  they would only show as broken. Images that come from the host itself
-   *  (`blob:`, `deskfile:`, a small `data:` image, a declared scheme, an address on
-   *  this computer) are drawn either way. */
+   *  (`blob:`, `deskfile:` or `http(s)://deskfile.localhost`, a small raster
+   *  `data:` image, a path on the page's own origin) are drawn either way; in
+   *  `"link"` mode any other source is not drawn at all. A declared link scheme
+   *  is never an image source. */
   remoteImages?: "link" | "render";
   /** The form was answered already, here or before: it shows locked and says so. */
   answered?: boolean;

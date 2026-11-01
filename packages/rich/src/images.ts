@@ -19,11 +19,23 @@ export function dataImageOk(url: string): boolean {
   return url.length <= MAX_DATA_IMAGE && DATA_IMAGE.test(url);
 }
 
+/** Hosts a page serves its own files from over http(s): a webview that maps a
+ *  custom scheme to `http://<scheme>.localhost` (Windows) serves `deskfile:`
+ *  there. Nothing else on this computer is the host's own: a loopback address
+ *  or another `*.localhost` name is some other program, and an image is a GET
+ *  the page would send it, so those are links like any remote address. */
+const LOCAL_IMAGE_HOSTS: readonly string[] = ["deskfile.localhost"];
+
+/** The scheme of `url`, lowercased; none when it is relative. */
+const schemeOf = (url: string): string | null => {
+  const colon = url.indexOf(":");
+  if (colon < 1 || /[/?#\\]/.test(url.slice(0, colon))) return null;
+  return url.slice(0, colon).toLowerCase();
+};
+
 /** The address a remote image would be fetched from: an absolute `http(s)` URL
  *  or a protocol-relative one (which the browser reads as http(s)). None for
- *  anything else, and for an address on this computer (loopback and
- *  `*.localhost`, the names a host serves its own files from), which is no
- *  remote fetch. */
+ *  anything else, and for the host's own file host (`LOCAL_IMAGE_HOSTS`). */
 export function remoteImageUrl(src: string | undefined): URL | null {
   if (!src) return null;
   const raw = src.trim();
@@ -35,13 +47,26 @@ export function remoteImageUrl(src: string | undefined): URL | null {
     return null;
   }
   if (url.protocol !== "http:" && url.protocol !== "https:") return null;
-  const host = url.hostname.toLowerCase();
-  const local =
-    host === "localhost" ||
-    host.endsWith(".localhost") ||
-    host === "[::1]" ||
-    /^127(?:\.\d{1,3}){3}$/.test(host);
-  return local ? null : url;
+  return LOCAL_IMAGE_HOSTS.includes(url.hostname.toLowerCase()) ? null : url;
+}
+
+/** Whether a host that keeps remote images from the page may still draw `src`:
+ *  one of its own sources (`blob:`, `deskfile:`, its file host), a raster
+ *  `data:` image, or a path on the page's own origin. Anything else is not
+ *  drawn, so an address this cannot read is never fetched: it fails closed. */
+export function localImageSource(src: string): boolean {
+  const raw = src.trim();
+  if (/^[/\\]{2}/.test(raw)) return false;
+  const scheme = schemeOf(raw);
+  if (scheme === null) return true;
+  if (LOCAL_IMAGE_SCHEMES.includes(scheme)) return true;
+  if (scheme === "data") return dataImageOk(raw);
+  if (scheme !== "http" && scheme !== "https") return false;
+  try {
+    return LOCAL_IMAGE_HOSTS.includes(new URL(raw).hostname.toLowerCase());
+  } catch {
+    return false;
+  }
 }
 
 /** What the link for a remote image says: its alt text, else the host. */
