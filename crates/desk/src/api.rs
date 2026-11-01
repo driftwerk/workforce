@@ -1649,6 +1649,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn no_one_unauthorised_ends_removes_clears_or_lists_sessions() {
+        with_test_pool(build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            DeskStore::migrate(&pool).await.unwrap();
+            let store = DeskStore::from_pool(pool);
+            let old = chrono::Utc::now() - chrono::Duration::days(9);
+            let kept = crate::model::SessionRecord {
+                state: crate::model::SessionState::Stopped,
+                cli_session_id: Some("cc-kept".into()),
+                terminal_id: None,
+                updated_at: old,
+                ..crate::store::tests::record_fixture("kept-run")
+            };
+            store.put(&kept).await.unwrap();
+            let desk = crate::Desk::start(
+                store,
+                options(dir.path()),
+                Default::default(),
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            let app = super::sessions_router(desk.clone(), crate::testing::deny_all());
+            let id = kept.id;
+            for (method, uri, body) in [
+                ("GET", "/api/desk/sessions/closed".to_string(), None),
+                ("GET", "/api/desk/sessions/hidden".to_string(), None),
+                (
+                    "DELETE",
+                    "/api/desk/sessions/hidden/claude/cc-kept".to_string(),
+                    None,
+                ),
+                (
+                    "POST",
+                    "/api/desk/sessions/clear".to_string(),
+                    Some(json!({ "olderThanDays": 0 })),
+                ),
+                (
+                    "POST",
+                    format!("/api/desk/sessions/{id}/remove"),
+                    Some(json!({ "transcript": true })),
+                ),
+                ("POST", format!("/api/desk/sessions/{id}/end"), None),
+                ("DELETE", format!("/api/desk/sessions/{id}"), None),
+            ] {
+                let (status, _) = call(&app, method, &uri, body).await;
+                assert_eq!(status, 401, "{method} {uri}");
+            }
+            assert_eq!(
+                desk.list().iter().map(|s| s.id).collect::<Vec<_>>(),
+                [id],
+                "nothing changed"
+            );
+            assert_eq!(desk.list()[0].state, crate::model::SessionState::Stopped);
+        })
+        .await;
+    }
+
+    #[tokio::test]
     async fn a_sourced_room_post_is_created_once_and_repeats_answer_with_it() {
         with_test_pool(build_pool, |pool| async move {
             let dir = tempfile::tempdir().unwrap();

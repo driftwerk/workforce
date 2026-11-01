@@ -286,9 +286,13 @@ enum Persist {
     Put(Box<SessionRecord>),
     Attention(Uuid, DateTime<Utc>),
     /// Sessions forgotten with all Activity says of them and how far they
-    /// were read.
-    Forget(Vec<Uuid>),
-    Hide(Box<lifecycle::Hidden>),
+    /// were read, and the CLI sessions of those removed hidden, in one
+    /// transaction; `done` hears whether it was written.
+    Forget {
+        ids: Vec<Uuid>,
+        hidden: Vec<lifecycle::Hidden>,
+        done: Option<oneshot::Sender<bool>>,
+    },
     Unhide(Engine, String),
     Event(Box<Event>),
     Turn(Box<TurnOp>),
@@ -823,6 +827,11 @@ impl Desk {
     /// the lock it was changed under: what it writes leaves in the order the
     /// session changed.
     fn saved(&self, st: &mut State, before: Option<SessionView>, r: SessionRecord) {
+        if st.forgotten.contains(&r.id) {
+            // Forgotten while it was changed elsewhere (a resume that failed
+            // to launch): it stays forgotten.
+            return;
+        }
         st.records.insert(r.id, r.clone());
         let view = Self::view_of(st, &r);
         if before.as_ref().is_none_or(|b| b.state != view.state) {
@@ -1711,11 +1720,29 @@ impl Desk {
     /// the floor, and takes it out of the sidebar's layout. Its engine's
     /// transcript is the engine's, and stays.
     pub async fn forget(&self, id: Uuid) -> Result<(), DeskError> {
+        self.forget_as(id, None, |_, _| Ok(())).await.map(drop)
+    }
+
+    /// [`Self::forget`], once `may` agrees under the lock it is forgotten
+    /// under, and with `hide` hidden in the same transaction that forgets
+    /// it: removed. What it returns says whether the registry wrote it.
+    async fn forget_as(
+        &self,
+        id: Uuid,
+        hide: Option<lifecycle::Hidden>,
+        may: impl FnOnce(&State, &SessionRecord) -> Result<(), DeskError>,
+    ) -> Result<oneshot::Receiver<bool>, DeskError> {
         self.load(id).await?;
         let live = {
             let mut guard = self.0.state.lock();
             let st = &mut *guard;
-            let view = Self::view_of(st, st.records.get(&id).ok_or(DeskError::NotFound)?);
+            let r = st.records.get(&id).ok_or(DeskError::NotFound)?;
+            may(st, r)?;
+            let view = Self::view_of(st, r);
+            if let Some(h) = &hide {
+                // Hidden before the lock goes: adoption never sees it unhidden.
+                st.hidden.insert((h.engine, h.cli_session_id.clone()));
+            }
             let ops = Self::turn_ops(st, &[Transition::Stopped { closed: false }], &view);
             self.log_turns(ops);
             st.records.remove(&id);
@@ -1731,13 +1758,18 @@ impl Desk {
             live.end();
         }
         drop(live);
-        let _ = self.0.persist.send(Persist::Forget(vec![id]));
+        let (done, written) = oneshot::channel();
+        let _ = self.0.persist.send(Persist::Forget {
+            ids: vec![id],
+            hidden: hide.into_iter().collect(),
+            done: Some(done),
+        });
         self.log_turns(vec![TurnOp::Forget {
             subjects: vec![SubjectKey::session(id)],
         }]);
         let _ = self.0.events.send(DeskEvent::Removed { id });
         self.drop_from_layout(id).await;
-        Ok(())
+        Ok(written)
     }
 
     /// Whether `r` is a session the hub ran itself: one found in another
@@ -2488,7 +2520,8 @@ impl Desk {
         drop(live);
         self.spend_read(id);
         self.change(id, |r, _| {
-            r.state = if closing {
+            // Ended from Desk, whether before its exit was seen or since.
+            r.state = if closing || r.state == SessionState::Closed {
                 SessionState::Closed
             } else if clean {
                 SessionState::Stopped
@@ -3046,6 +3079,10 @@ impl Desk {
     /// its record, name, group and history; a second record for the same
     /// CLI session can't be saved (one per CLI session id, closed ones too).
     pub(crate) async fn recall(&self, engine: Engine, cli: &str) -> Option<Uuid> {
+        if self.is_hidden(engine, cli) {
+            // Removed from Desk: only starting it again tracks it again.
+            return None;
+        }
         let held = |st: &State| {
             st.records
                 .values()
@@ -3362,8 +3399,13 @@ async fn persist_loop(
         let result = match op {
             Persist::Put(r) => store.put(&r).await,
             Persist::Attention(id, at) => store.set_attention(id, at).await,
-            Persist::Forget(ids) => store.forget_sessions(&ids, YOU).await.map(drop),
-            Persist::Hide(h) => store.hide(&h).await,
+            Persist::Forget { ids, hidden, done } => {
+                let result = store.remove_sessions(&ids, &hidden, YOU).await;
+                if let Some(done) = done {
+                    let _ = done.send(result.is_ok());
+                }
+                result.map(drop)
+            }
             Persist::Unhide(engine, cli) => store.unhide(engine, &cli).await,
             Persist::Event(e) => store.add_event(&e).await,
             Persist::Terminal(t) => store.put_terminal(&t).await,

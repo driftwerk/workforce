@@ -87,40 +87,93 @@ async fn removing_a_session_forgets_it_everywhere_and_keeps_its_transcript() {
     .await;
 }
 
+/// A stand-in `claude` whose `agents --json` says `listed` (or fails, when
+/// it is `None`); anything else stays up until killed.
+fn claude_listing(dir: &Path, listed: Option<&[serde_json::Value]>) -> PathBuf {
+    let path = dir.join(format!("claude-{}", Uuid::new_v4()));
+    let agents = match listed {
+        Some(listed) => {
+            let json = dir.join(format!("agents-{}.json", Uuid::new_v4()));
+            std::fs::write(&json, serde_json::Value::from(listed.to_vec()).to_string()).unwrap();
+            format!("cat '{}'", json.display())
+        }
+        None => "echo 'no agents' >&2; exit 1".into(),
+    };
+    std::fs::write(
+        &path,
+        format!("#!/bin/sh\nif [ \"$1\" = agents ]; then {agents}; exit 0; fi\nexec sleep 60\n"),
+    )
+    .unwrap();
+    std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    path
+}
+
+/// A desk whose home is `home` and whose `claude` is `claude`, holding
+/// `records` from before it started.
+async fn desk_at_home(
+    pool: workforce_postgres::PostgresPool,
+    dir: &Path,
+    home: Option<&Path>,
+    claude: PathBuf,
+    records: &[&SessionRecord],
+) -> Desk {
+    DeskStore::migrate(&pool).await.unwrap();
+    let store = DeskStore::from_pool(pool);
+    for r in records {
+        store.put(r).await.unwrap();
+    }
+    let mut opts = super::tests::options(dir).with_program(Engine::Claude, claude);
+    if let Some(home) = home {
+        opts.env
+            .insert("HOME".into(), home.to_string_lossy().into_owned());
+    }
+    Desk::start(store, opts, Default::default(), CancellationToken::new())
+        .await
+        .unwrap()
+}
+
+/// A Claude Code transcript of `cli` in `home`, with a sub-agent's beside it.
+fn claude_transcript(home: &Path, cli: &str) -> PathBuf {
+    let project = home.join(".claude/projects/-Users-k-dev-app");
+    std::fs::create_dir_all(project.join(cli).join("subagents")).unwrap();
+    std::fs::write(project.join(cli).join("subagents/agent-a.jsonl"), "{}").unwrap();
+    std::fs::write(project.join(format!("{cli}.jsonl")), "{}").unwrap();
+    project.join(format!("{cli}.jsonl"))
+}
+
+fn closed_external(name: &str, cli: &str, transcript: Option<&Path>) -> SessionRecord {
+    SessionRecord {
+        origin: Origin::External,
+        state: SessionState::Closed,
+        cli_session_id: Some(cli.into()),
+        transcript: transcript.map(|t| t.to_string_lossy().into_owned()),
+        external_pid: None,
+        terminal_id: None,
+        ..record_fixture(name)
+    }
+}
+
 #[tokio::test]
 async fn a_transcript_is_deleted_only_when_asked_and_never_while_it_runs() {
     with_test_pool(build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().join("home");
-        let project = home.join(".claude/projects/-Users-k-dev-app");
-        std::fs::create_dir_all(project.join("cc-3/subagents")).unwrap();
-        std::fs::write(project.join("cc-3.jsonl"), "{}").unwrap();
-        std::fs::write(project.join("cc-3/subagents/agent-a.jsonl"), "{}").unwrap();
-        DeskStore::migrate(&pool).await.unwrap();
-        let store = DeskStore::from_pool(pool.clone());
-        let was = SessionRecord {
-            origin: Origin::External,
-            state: SessionState::Closed,
-            cli_session_id: Some("cc-3".into()),
-            transcript: None,
-            external_pid: None,
-            terminal_id: None,
-            ..record_fixture("app-36")
-        };
-        store.put(&was).await.unwrap();
-        let mut opts = super::tests::options(dir.path());
-        opts.env
-            .insert("HOME".into(), home.to_string_lossy().into_owned());
-        let d = Desk::start(store, opts, Default::default(), CancellationToken::new())
-            .await
-            .unwrap();
+        let file = claude_transcript(&home, "cc-3");
+        let folder = file.with_file_name("cc-3");
+        let was = closed_external("app-36", "cc-3", None);
+        let claude = claude_listing(dir.path(), Some(&[]));
+        let d = desk_at_home(pool, dir.path(), Some(&home), claude, &[&was]).await;
+        let store = DeskStore::from_pool(d.0.store.pool().clone());
         let removed = d
             .remove(was.id, Removal { transcript: true })
             .await
             .unwrap();
         assert_eq!((removed.removed, removed.transcripts), (1, 2));
-        assert!(!project.join("cc-3.jsonl").exists());
-        assert!(!project.join("cc-3").exists(), "its sub-agents' with it");
+        assert!(!file.exists());
+        assert!(!folder.exists(), "its sub-agents' with it");
+        // Written in the one transaction, before anything was deleted.
+        assert!(store.get(was.id).await.unwrap().is_none());
+        assert_eq!(store.hidden().await.unwrap()[0].cli_session_id, "cc-3");
 
         // While it runs here, its transcript stays and so does it.
         let s = new_session(&d, dir.path()).await;
@@ -129,6 +182,115 @@ async fn a_transcript_is_deleted_only_when_asked_and_never_while_it_runs() {
             Err(DeskError::Conflict(_))
         ));
         assert_eq!(d.list().len(), 1);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_transcript_running_in_another_terminal_or_unknown_stays() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let file = claude_transcript(&home, "cc-9");
+        let was = closed_external("app-40", "cc-9", Some(&file));
+
+        // Resumed in a terminal Desk hasn't looked at since.
+        let running = claude_listing(
+            dir.path(),
+            Some(&[found("cc-9", "/Users/k/dev/app", "app-40")]),
+        );
+        let d = desk_at_home(pool.clone(), dir.path(), Some(&home), running, &[&was]).await;
+        assert!(matches!(
+            d.remove(was.id, Removal { transcript: true }).await,
+            Err(DeskError::Conflict(_))
+        ));
+        assert!(file.is_file());
+        assert!(d.load(was.id).await.is_ok(), "nor is it removed");
+
+        // `claude agents` can't say: nothing is deleted on a guess.
+        let failing = claude_listing(dir.path(), None);
+        let d = desk_at_home(pool.clone(), dir.path(), Some(&home), failing, &[]).await;
+        assert!(matches!(
+            d.remove(was.id, Removal { transcript: true }).await,
+            Err(DeskError::Conflict(_))
+        ));
+        assert!(file.is_file());
+        // Removed without it, it goes and the transcript stays.
+        d.remove(was.id, Removal::default()).await.unwrap();
+        assert!(file.is_file());
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_transcript_path_a_session_said_is_never_trusted() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let victim = claude_transcript(&home, "victim");
+        let outside = dir.path().join("notes.jsonl");
+        std::fs::write(&outside, "{}").unwrap();
+        // A hook said another session's transcript was its own, or a file
+        // outside; another's id climbs to one.
+        let pointing = closed_external("app-41", "cc-10", Some(&victim));
+        let out = closed_external("app-42", "cc-11", Some(&outside));
+        let climbing = closed_external("app-43", "../-Users-k-dev-app/victim", None);
+        let claude = claude_listing(dir.path(), Some(&[]));
+        let d = desk_at_home(
+            pool,
+            dir.path(),
+            Some(&home),
+            claude,
+            &[&pointing, &out, &climbing],
+        )
+        .await;
+        for r in [&pointing, &out, &climbing] {
+            let removed = d.remove(r.id, Removal { transcript: true }).await.unwrap();
+            assert_eq!((removed.removed, removed.transcripts), (1, 0), "{}", r.name);
+        }
+        assert!(victim.is_file());
+        assert!(victim
+            .with_file_name("victim/subagents/agent-a.jsonl")
+            .is_file());
+        assert!(outside.is_file());
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn without_a_home_no_transcript_is_deleted() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let file = claude_transcript(&home, "cc-12");
+        let was = closed_external("app-44", "cc-12", Some(&file));
+        let claude = claude_listing(dir.path(), Some(&[]));
+        let d = desk_at_home(pool, dir.path(), None, claude, &[&was]).await;
+        let removed = d
+            .remove(was.id, Removal { transcript: true })
+            .await
+            .unwrap();
+        assert_eq!((removed.removed, removed.transcripts), (1, 0));
+        assert!(file.is_file());
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_removed_session_changed_elsewhere_is_never_saved_again() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DeskStore::from_pool(pool.clone());
+        let d = desk(pool, dir.path()).await;
+        let s = new_session(&d, dir.path()).await;
+        let r = d.record(s.id).unwrap();
+        d.remove(s.id, Removal::default()).await.unwrap();
+        gone(&store, s.id).await;
+        // As a resume that failed to launch puts back what it read.
+        d.save(r);
+        assert!(d.record(s.id).is_err());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(store.get(s.id).await.unwrap().is_none());
     })
     .await;
 }
@@ -346,6 +508,92 @@ async fn finished_sessions_are_cleared_by_how_long_ago_they_finished() {
         assert_eq!(left, want);
         gone(&store, old_closed.id).await;
         gone(&store, old_stopped.id).await;
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_session_finished_again_lately_is_not_cleared_by_when_it_first_finished() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        DeskStore::migrate(&pool).await.unwrap();
+        let store = DeskStore::from_pool(pool.clone());
+        let old = Utc::now() - chrono::Duration::days(20);
+        let was = SessionRecord {
+            state: SessionState::Stopped,
+            cli_session_id: Some("cc-again".into()),
+            terminal_id: None,
+            updated_at: old,
+            created_at: old,
+            ..record_fixture("again")
+        };
+        store.put(&was).await.unwrap();
+        let d = desk(pool, dir.path()).await;
+        // Resumed and stopped again just now.
+        d.change(was.id, |r, _| r.state = SessionState::Idle);
+        d.change(was.id, |r, _| r.state = SessionState::Stopped);
+        let clearing = |dry_run| Clearing {
+            older_than_days: 7,
+            dry_run,
+            transcripts: false,
+        };
+        assert_eq!(d.clear_finished(clearing(true)).await.unwrap().removed, 0);
+        assert_eq!(d.clear_finished(clearing(false)).await.unwrap().removed, 0);
+        assert!(d.record(was.id).is_ok());
+        // Nor is one that runs, when its state says it finished.
+        let s = new_session(&d, dir.path()).await;
+        assert!(matches!(
+            d.remove_as(s.id, None, |st, r| {
+                if super::lifecycle::finished_before(st, r, Utc::now()) {
+                    Ok(())
+                } else {
+                    Err(DeskError::Conflict("it started again".into()))
+                }
+            })
+            .await,
+            Err(DeskError::Conflict(_))
+        ));
+        assert_eq!(d.list().iter().filter(|v| v.id == s.id).count(), 1);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn clearing_further_back_than_time_goes_is_refused() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        assert!(matches!(
+            d.clear_finished(Clearing {
+                older_than_days: u32::MAX,
+                dry_run: true,
+                transcripts: false,
+            })
+            .await,
+            Err(DeskError::Invalid(_))
+        ));
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_session_ended_as_its_process_exits_stays_closed() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let s = new_session(&d, dir.path()).await;
+        // Ended (closed) after its exit was on its way but before it was seen.
+        d.change(s.id, |r, _| r.state = SessionState::Closed);
+        let pty = std::sync::Arc::clone(&d.0.state.lock().live[&s.id].pty);
+        pty.kill();
+        for _ in 0..250 {
+            if !d.0.state.lock().live.contains_key(&s.id) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(d.record(s.id).unwrap().state, SessionState::Closed);
     })
     .await;
 }

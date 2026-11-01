@@ -173,37 +173,46 @@ impl DeskStore {
     /// the ledger read their transcripts (what they spent is kept). How
     /// many records went.
     pub async fn forget_sessions(&self, ids: &[Uuid], owner: &str) -> Result<u64> {
-        let places: Vec<String> = ids
-            .iter()
-            .map(|id| ReadPlace::Session(*id).to_string())
-            .collect();
-        let parties: Vec<String> = ids.iter().map(Uuid::to_string).collect();
         let mut client = self.pool.get().await?;
         let tx = client.transaction().await?;
-        tx.execute(
-            "DELETE FROM activity \
-             WHERE (subject ->> 'kind' = 'session' AND subject ->> 'id' = ANY($1)) \
-             OR (actor ->> 'kind' = 'session' AND actor ->> 'id' = ANY($1))",
-            &[&parties],
-        )
-        .await?;
-        tx.execute(
-            "DELETE FROM reads WHERE owner = $1 \
-             AND EXISTS (SELECT 1 FROM unnest($2::text[]) p WHERE left(place, length(p)) = p)",
-            &[&owner, &places],
-        )
-        .await?;
-        tx.execute(
-            "DELETE FROM ledger_cursors WHERE session = ANY($1)",
-            &[&ids],
-        )
-        .await?;
-        let gone = tx
-            .execute("DELETE FROM sessions WHERE id = ANY($1)", &[&ids])
-            .await?;
+        let gone = forget_in(&tx, ids, owner).await?;
         tx.commit().await?;
         Ok(gone)
     }
+}
+
+/// [`DeskStore::forget_sessions`] within `tx`.
+pub(crate) async fn forget_in(
+    tx: &tokio_postgres::Transaction<'_>,
+    ids: &[Uuid],
+    owner: &str,
+) -> Result<u64> {
+    let places: Vec<String> = ids
+        .iter()
+        .map(|id| ReadPlace::Session(*id).to_string())
+        .collect();
+    let parties: Vec<String> = ids.iter().map(Uuid::to_string).collect();
+    tx.execute(
+        "DELETE FROM activity \
+         WHERE (subject ->> 'kind' = 'session' AND subject ->> 'id' = ANY($1)) \
+         OR (actor ->> 'kind' = 'session' AND actor ->> 'id' = ANY($1))",
+        &[&parties],
+    )
+    .await?;
+    tx.execute(
+        "DELETE FROM reads WHERE owner = $1 \
+         AND EXISTS (SELECT 1 FROM unnest($2::text[]) p WHERE left(place, length(p)) = p)",
+        &[&owner, &places],
+    )
+    .await?;
+    tx.execute(
+        "DELETE FROM ledger_cursors WHERE session = ANY($1)",
+        &[&ids],
+    )
+    .await?;
+    Ok(tx
+        .execute("DELETE FROM sessions WHERE id = ANY($1)", &[&ids])
+        .await?)
 }
 
 pub(crate) fn record(row: &Row) -> Result<SessionRecord> {
