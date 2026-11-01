@@ -597,3 +597,28 @@ async fn a_session_ended_as_its_process_exits_stays_closed() {
     })
     .await;
 }
+
+#[tokio::test]
+async fn a_codex_transcript_goes_whatever_claude_code_can_say() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let day = home.join(".codex/sessions/2026/10/27");
+        std::fs::create_dir_all(&day).unwrap();
+        let rollout = day.join("rollout-2026-10-27T17-06-33-th-1.jsonl");
+        std::fs::write(&rollout, "{}").unwrap();
+        let was = SessionRecord {
+            engine: Engine::Codex,
+            ..closed_external("codex-1", "th-1", None)
+        };
+        let failing = claude_listing(dir.path(), None);
+        let d = desk_at_home(pool, dir.path(), Some(&home), failing, &[&was]).await;
+        let removed = d
+            .remove(was.id, Removal { transcript: true })
+            .await
+            .unwrap();
+        assert_eq!((removed.removed, removed.transcripts), (1, 1));
+        assert!(!rollout.exists());
+    })
+    .await;
+}

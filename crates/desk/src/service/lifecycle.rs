@@ -382,10 +382,13 @@ impl Desk {
     /// there, untracked. Its engine's transcript stays unless asked, and
     /// can't be deleted while it runs anywhere.
     pub async fn remove(&self, id: Uuid, how: Removal) -> Result<Removed, DeskError> {
-        let elsewhere = if how.transcript {
-            Some(self.running_elsewhere().await?)
-        } else {
-            None
+        let elsewhere = match how.transcript {
+            // Only Claude Code says what runs in other terminals.
+            true if self.load(id).await?.engine == Engine::Claude => {
+                Some(self.running_elsewhere().await?)
+            }
+            true => Some(HashSet::new()),
+            false => None,
         };
         self.remove_as(id, elsewhere.as_ref(), |_, _| Ok(())).await
     }
