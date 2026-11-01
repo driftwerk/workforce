@@ -41,7 +41,11 @@ use crate::worktree;
 
 mod copies;
 mod groups;
+mod lifecycle;
+pub use lifecycle::{Clearing, Hidden, Removal, Removed};
 mod ledger;
+#[cfg(test)]
+mod lifecycle_tests;
 #[cfg(test)]
 mod rooms_tests;
 mod terminals;
@@ -147,6 +151,8 @@ pub(crate) struct Live {
     /// The turn end whose reply the hub's model is reading, while it is:
     /// its turn stays open on the floor until the model says.
     reading: Option<u64>,
+    /// Ended from Desk: closed, not stopped, once its process has gone.
+    closing: bool,
 }
 
 impl Live {
@@ -223,6 +229,12 @@ struct State {
     terminal_ptys: HashMap<Uuid, Arc<Pty>>,
     /// The sidebar's groups.
     layout: Layout,
+    /// CLI sessions the person removed: never adopted again until they
+    /// start tracking them again.
+    hidden: HashSet<(Engine, String)>,
+    /// Sessions forgotten while this hub runs: the registry may still hold
+    /// one until the persist queue reaches it, and it is never taken back.
+    forgotten: HashSet<Uuid>,
 }
 
 /// How often a busy session's tool is recorded as `working`.
@@ -273,10 +285,15 @@ enum Persist {
     DeleteTerminal(Uuid),
     Put(Box<SessionRecord>),
     Attention(Uuid, DateTime<Utc>),
-    Delete(Uuid),
-    /// Sessions that were never the person's, forgotten with all Activity
-    /// says of them.
-    ForgetNotTheirs(Vec<Uuid>),
+    /// Sessions forgotten with all Activity says of them and how far they
+    /// were read, and the CLI sessions of those removed hidden, in one
+    /// transaction; `done` hears whether it was written.
+    Forget {
+        ids: Vec<Uuid>,
+        hidden: Vec<lifecycle::Hidden>,
+        done: Option<oneshot::Sender<bool>>,
+    },
+    Unhide(Engine, String),
     Event(Box<Event>),
     Turn(Box<TurnOp>),
 }
@@ -530,6 +547,12 @@ impl Desk {
         forget_hub_internal(&store, &opts.hub_internal, floor.turns.as_deref()).await;
         let layout = store.layout().await?;
         let session_env = kept_session_env(&store).await;
+        let hidden = store
+            .hidden()
+            .await?
+            .into_iter()
+            .map(|h| (h.engine, h.cli_session_id))
+            .collect();
         let (holder, held) = connect_holder(opts.holder.as_ref()).await;
         let rooms = store
             .rooms()
@@ -589,6 +612,7 @@ impl Desk {
                 session_env,
                 state_since,
                 attention,
+                hidden,
                 ..State::default()
             }),
             events: broadcast::channel(256).0,
@@ -755,6 +779,7 @@ impl Desk {
                     interrupted: false,
                     ends: 0,
                     reading: None,
+                    closing: false,
                 },
             );
             tokio::spawn(self.clone().on_exit(id, exit));
@@ -802,6 +827,11 @@ impl Desk {
     /// the lock it was changed under: what it writes leaves in the order the
     /// session changed.
     fn saved(&self, st: &mut State, before: Option<SessionView>, r: SessionRecord) {
+        if st.forgotten.contains(&r.id) {
+            // Forgotten while it was changed elsewhere (a resume that failed
+            // to launch): it stays forgotten.
+            return;
+        }
         st.records.insert(r.id, r.clone());
         let view = Self::view_of(st, &r);
         if before.as_ref().is_none_or(|b| b.state != view.state) {
@@ -1576,7 +1606,7 @@ impl Desk {
         prompt: Option<String>,
         by: Option<By>,
     ) -> Result<SessionView, DeskError> {
-        let r = self.record(id)?;
+        let r = self.load(id).await?;
         if self.0.state.lock().live.contains_key(&id) {
             return Err(DeskError::Conflict("session is already running".into()));
         }
@@ -1685,16 +1715,38 @@ impl Desk {
         }
     }
 
-    /// Forgets a session: ends it and its turn, deletes its record and
-    /// takes it out of the sidebar's layout.
+    /// Forgets a session: ends it and its turn, deletes its record, what
+    /// Activity says of it, how far it was read and its turns and gists on
+    /// the floor, and takes it out of the sidebar's layout. Its engine's
+    /// transcript is the engine's, and stays.
     pub async fn forget(&self, id: Uuid) -> Result<(), DeskError> {
+        self.forget_as(id, None, |_, _| Ok(())).await.map(drop)
+    }
+
+    /// [`Self::forget`], once `may` agrees under the lock it is forgotten
+    /// under, and with `hide` hidden in the same transaction that forgets
+    /// it: removed. What it returns says whether the registry wrote it.
+    async fn forget_as(
+        &self,
+        id: Uuid,
+        hide: Option<lifecycle::Hidden>,
+        may: impl FnOnce(&State, &SessionRecord) -> Result<(), DeskError>,
+    ) -> Result<oneshot::Receiver<bool>, DeskError> {
+        self.load(id).await?;
         let live = {
             let mut guard = self.0.state.lock();
             let st = &mut *guard;
-            let view = Self::view_of(st, st.records.get(&id).ok_or(DeskError::NotFound)?);
+            let r = st.records.get(&id).ok_or(DeskError::NotFound)?;
+            may(st, r)?;
+            let view = Self::view_of(st, r);
+            if let Some(h) = &hide {
+                // Hidden before the lock goes: adoption never sees it unhidden.
+                st.hidden.insert((h.engine, h.cli_session_id.clone()));
+            }
             let ops = Self::turn_ops(st, &[Transition::Stopped { closed: false }], &view);
             self.log_turns(ops);
             st.records.remove(&id);
+            st.forgotten.insert(id);
             st.seen_transcripts.remove(&id);
             st.state_since.remove(&id);
             st.attention.remove(&id);
@@ -1706,10 +1758,18 @@ impl Desk {
             live.end();
         }
         drop(live);
-        let _ = self.0.persist.send(Persist::Delete(id));
+        let (done, written) = oneshot::channel();
+        let _ = self.0.persist.send(Persist::Forget {
+            ids: vec![id],
+            hidden: hide.into_iter().collect(),
+            done: Some(done),
+        });
+        self.log_turns(vec![TurnOp::Forget {
+            subjects: vec![SubjectKey::session(id)],
+        }]);
         let _ = self.0.events.send(DeskEvent::Removed { id });
         self.drop_from_layout(id).await;
-        self.forget_session_read(id).await
+        Ok(written)
     }
 
     /// Whether `r` is a session the hub ran itself: one found in another
@@ -1726,16 +1786,11 @@ impl Desk {
             .is_some_and(|r| Self::hubs_own(&self.0.opts.hub_internal, r))
     }
 
-    /// Forgets a session the hub ran itself as any is forgotten, and its
-    /// turns and gists on the floor with it: it was never the person's.
+    /// Forgets a session the hub ran itself: it was never the person's.
     async fn forget_hubs_own(&self, id: Uuid) {
         if let Err(e) = self.forget(id).await {
             tracing::warn!(%id, error = %e, "couldn't forget one of the hub's own sessions");
         }
-        let _ = self.0.persist.send(Persist::ForgetNotTheirs(vec![id]));
-        self.log_turns(vec![TurnOp::Forget {
-            subjects: vec![SubjectKey::session(id)],
-        }]);
     }
 
     pub fn decide(
@@ -2391,6 +2446,7 @@ impl Desk {
                 interrupted: false,
                 ends: 0,
                 reading: None,
+                closing: false,
             },
         );
         tokio::spawn(self.clone().on_exit(r.id, exit));
@@ -2459,11 +2515,15 @@ impl Desk {
         let Some(live) = live else { return };
         tracing::info!(%id, ?code, "desk session exited");
         let clean = live.ended || live.stopping;
+        let closing = live.closing;
         live.end();
         drop(live);
         self.spend_read(id);
         self.change(id, |r, _| {
-            r.state = if clean {
+            // Ended from Desk, whether before its exit was seen or since.
+            r.state = if closing || r.state == SessionState::Closed {
+                SessionState::Closed
+            } else if clean {
                 SessionState::Stopped
             } else {
                 r.state.after_loss()
@@ -3019,6 +3079,10 @@ impl Desk {
     /// its record, name, group and history; a second record for the same
     /// CLI session can't be saved (one per CLI session id, closed ones too).
     pub(crate) async fn recall(&self, engine: Engine, cli: &str) -> Option<Uuid> {
+        if self.is_hidden(engine, cli) {
+            // Removed from Desk: only starting it again tracks it again.
+            return None;
+        }
         let held = |st: &State| {
             st.records
                 .values()
@@ -3043,6 +3107,9 @@ impl Desk {
         // Taken while the registry was asked.
         if let Some(id) = held(&st) {
             return Some(id);
+        }
+        if st.forgotten.contains(&kept.id) {
+            return None;
         }
         let id = kept.id;
         st.records.insert(id, kept);
@@ -3075,7 +3142,10 @@ impl Desk {
         let found = found
             .into_iter()
             .filter(|e| !e.pid.is_some_and(|pid| hub.started(&table, pid)));
-        let found: Vec<External> = found.collect();
+        // Ones the person removed stay removed, until they track them again.
+        let found: Vec<External> = found
+            .filter(|e| !self.is_hidden(Engine::Claude, &e.session_id))
+            .collect();
         for ext in &found {
             self.recall(Engine::Claude, &ext.session_id).await;
         }
@@ -3329,8 +3399,14 @@ async fn persist_loop(
         let result = match op {
             Persist::Put(r) => store.put(&r).await,
             Persist::Attention(id, at) => store.set_attention(id, at).await,
-            Persist::Delete(id) => store.delete(id).await,
-            Persist::ForgetNotTheirs(ids) => store.forget_sessions(&ids, YOU).await.map(drop),
+            Persist::Forget { ids, hidden, done } => {
+                let result = store.remove_sessions(&ids, &hidden, YOU).await;
+                if let Some(done) = done {
+                    let _ = done.send(result.is_ok());
+                }
+                result.map(drop)
+            }
+            Persist::Unhide(engine, cli) => store.unhide(engine, &cli).await,
             Persist::Event(e) => store.add_event(&e).await,
             Persist::Terminal(t) => store.put_terminal(&t).await,
             Persist::DeleteTerminal(id) => store.delete_terminal(id).await,
@@ -3359,7 +3435,7 @@ mod tests {
     use workforce_postgres::test_support::with_test_pool;
 
     /// A stand-in CLI that stays up until killed, ignoring its arguments.
-    fn fake_cli(dir: &Path) -> PathBuf {
+    pub(super) fn fake_cli(dir: &Path) -> PathBuf {
         let path = dir.join("fake-cli");
         std::fs::write(&path, "#!/bin/sh\nexec sleep 60\n").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -3399,7 +3475,7 @@ mod tests {
         d.0.state.lock().live[&id].token.clone()
     }
 
-    async fn new_session(d: &Desk, dir: &Path) -> SessionView {
+    pub(super) async fn new_session(d: &Desk, dir: &Path) -> SessionView {
         d.create(
             NewSession {
                 engine: Engine::Claude,
@@ -3893,7 +3969,7 @@ mod tests {
 
     /// Keeps every op the desk logs.
     #[derive(Default)]
-    struct Logged(Mutex<Vec<TurnOp>>);
+    pub(super) struct Logged(pub(super) Mutex<Vec<TurnOp>>);
 
     #[async_trait::async_trait]
     impl TurnLog for Logged {
@@ -4728,7 +4804,7 @@ mod tests {
 
     /// What the registry keeps for `id`, once the persist queue has
     /// written what `ready` waits for.
-    async fn kept_until(
+    pub(super) async fn kept_until(
         store: &DeskStore,
         id: Uuid,
         ready: impl Fn(&SessionRecord) -> bool,
@@ -4842,7 +4918,7 @@ mod tests {
     }
 
     /// An external session at `cwd`, as `claude agents` lists it.
-    fn found(id: &str, cwd: &str, name: &str) -> serde_json::Value {
+    pub(super) fn found(id: &str, cwd: &str, name: &str) -> serde_json::Value {
         json!({ "pid": std::process::id(), "cwd": cwd, "kind": "interactive",
                 "sessionId": id, "name": name, "status": "busy" })
     }
@@ -5085,7 +5161,7 @@ mod tests {
     }
 
     /// A desk whose floor log is `logged`, its sessions run as `cli`.
-    async fn logged_desk(
+    pub(super) async fn logged_desk(
         pool: workforce_postgres::PostgresPool,
         dir: &Path,
         cli: PathBuf,

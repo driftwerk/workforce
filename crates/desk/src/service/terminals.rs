@@ -544,6 +544,18 @@ impl Desk {
         let cli = fields["session_id"].as_str().map(str::to_string);
         let cwd = fields["cwd"].as_str().map(str::to_string);
         if let Some(cli) = cli.as_deref() {
+            if self.is_hidden(Engine::Claude, cli) {
+                // Removed from Desk: started or resumed here again, it is
+                // tracked again; anything else of it (a compaction, a
+                // cleared conversation, its tools) stays untracked, and its
+                // terminal answers for it.
+                let deliberate = matches!(hook, Hook::SessionStart { .. })
+                    && matches!(fields["source"].as_str(), Some("startup" | "resume"));
+                if !deliberate {
+                    return Some(claude::ask_in_terminal());
+                }
+                self.unhide(Engine::Claude, cli);
+            }
             // A session resumed here may be one the registry keeps closed.
             self.recall(Engine::Claude, cli).await;
         }
@@ -638,6 +650,7 @@ impl Desk {
             interrupted: false,
             ends: 0,
             reading: None,
+            closing: false,
         };
         if existing.is_some_and(|id| self.0.state.lock().live.contains_key(&id)) {
             // Already running here: nothing to take back.
@@ -754,6 +767,7 @@ impl Desk {
                             interrupted: false,
                             ends: 0,
                             reading: None,
+                            closing: false,
                         },
                     );
                     self.publish(id);
@@ -1130,6 +1144,56 @@ mod tests {
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
             panic!("the registry never took the session back in its terminal");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_removed_session_in_a_terminal_is_tracked_again_only_when_started_again() {
+        with_test_pool(build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let d = shell_desk(pool, dir.path()).await;
+            let (tid, token) = open(&d, dir.path()).await;
+            let repo = dir.path().to_string_lossy().into_owned();
+            let start = |source: &str| {
+                hook(
+                    "SessionStart",
+                    "cc-8",
+                    serde_json::json!({ "cwd": repo, "source": source }),
+                )
+            };
+            d.terminal_hook(tid, &token, &start("startup"))
+                .await
+                .unwrap();
+            let s = d.list().pop().unwrap();
+            d.remove(s.id, crate::service::Removal::default())
+                .await
+                .unwrap();
+            assert!(
+                d.terminal(tid).unwrap().pid.is_some(),
+                "its shell is the person's: it stays"
+            );
+
+            // Its tools, a compaction, a cleared conversation: still untracked.
+            for body in [
+                hook("PostToolUse", "cc-8", serde_json::json!({})),
+                start("compact"),
+                start("clear"),
+            ] {
+                assert_eq!(
+                    d.terminal_hook(tid, &token, &body).await,
+                    Some(claude::ask_in_terminal())
+                );
+                assert!(d.list().is_empty());
+            }
+            // Resumed there on purpose: tracked again.
+            d.terminal_hook(tid, &token, &start("resume"))
+                .await
+                .unwrap();
+            let back = d.list();
+            assert_eq!(back.len(), 1);
+            assert_eq!(back[0].terminal_id, Some(tid));
+            assert!(!d.is_hidden(Engine::Claude, "cc-8"));
         })
         .await;
     }
