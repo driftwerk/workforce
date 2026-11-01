@@ -37,6 +37,7 @@ postgres = [
 tokio-test = { workspace = true }
 workforce-postgres = { workspace = true, features = ["test-support"] }
 tempfile = "3"
+tracing-subscriber = { workspace = true }
 
 [build-dependencies]
 workforce-build-support = { path = "../build-support" }

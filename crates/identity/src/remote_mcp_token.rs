@@ -16,7 +16,7 @@ pub const TOKEN_PREFIX: &str = "wfr_";
 const SECRET_BYTES: usize = 32;
 const PREFIX_CHARS: usize = 8;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RemoteMcpToken {
     pub id: Uuid,
     pub identity_id: Uuid,
@@ -28,6 +28,23 @@ pub struct RemoteMcpToken {
     pub expires_at: DateTime<Utc>,
     pub last_used_at: Option<DateTime<Utc>>,
     pub revoked_at: Option<DateTime<Utc>>,
+}
+
+/// Everything but the stored hash and prefix, which are fragments of the
+/// secret: a Debug line is a log line.
+impl std::fmt::Debug for RemoteMcpToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RemoteMcpToken")
+            .field("id", &self.id)
+            .field("identity_id", &self.identity_id)
+            .field("label", &self.label)
+            .field("scopes", &self.scopes)
+            .field("created_at", &self.created_at)
+            .field("expires_at", &self.expires_at)
+            .field("last_used_at", &self.last_used_at)
+            .field("revoked_at", &self.revoked_at)
+            .finish_non_exhaustive()
+    }
 }
 
 impl RemoteMcpToken {
@@ -47,9 +64,9 @@ pub struct MintedToken {
 
 impl std::fmt::Debug for MintedToken {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("MintedToken")
-            .field("prefix", &self.prefix)
-            .finish_non_exhaustive()
+        // Neither the plaintext nor its stored prefix: a Debug line is a log
+        // line, and no part of a secret belongs in one.
+        f.debug_struct("MintedToken").finish_non_exhaustive()
     }
 }
 
@@ -104,6 +121,20 @@ mod tests {
             expires_at: now + Duration::days(90),
             last_used_at: None,
             revoked_at: None,
+        }
+    }
+
+    #[test]
+    fn debug_output_shows_no_fragment_of_the_secret() {
+        let minted = mint();
+        let record = RemoteMcpToken {
+            token_hash: minted.hash.clone(),
+            token_prefix: minted.prefix.clone(),
+            ..token(Utc::now())
+        };
+        let shown = format!("{minted:?} {record:?}");
+        for fragment in [&minted.plaintext, &minted.prefix, &minted.hash] {
+            assert!(!shown.contains(fragment.as_str()), "{shown}");
         }
     }
 

@@ -7,12 +7,12 @@ useDefault = true
 description = "Secret-detection and redaction tests: their fixtures are fabricated tokens in every vendor's format"
 paths = [
   '''^crates/common/src/(redact|security_scanner|secret|session|settings)\.rs$''',
-  '''^crates/hub/src/(redact|session_redaction|llm_tool|codex_setup_auth_tool|claude_code|secret_cache)\.rs$''',
+  '''^crates/hub/src/(redact|session_redaction|llm_tool|codex_setup_auth_tool|claude_code|secret_cache|token_hint)\.rs$''',
   '''^crates/agent-runtime/src/security/secret_(sinks|egress)\.rs$''',
   '''^crates/agent-runtime/src/llm/bedrock_credentials\.rs$''',
   '''^crates/hub-core/src/hub_core/logins/(chatgpt_auth|resolve)\.rs$''',
   '''^crates/skills/src/adapters/linear/config\.rs$''',
-  '''^crates/hub/tests/api/login_store_routes\.rs$''',
+  '''^crates/hub/tests/api/(login_store|token_log)_routes\.rs$''',
 ]
 
 [[allowlists]]

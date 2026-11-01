@@ -1353,7 +1353,7 @@ pub(crate) async fn authenticate_ws(
                 // connect. Record the failure and only surface it after JWT
                 // has had its chance.
                 warn!(
-                    token_prefix = %token_prefix_hint(token),
+                    token = %crate::token_hint::hint(token),
                     error = %e,
                     "Pairing store error during WebSocket auth — failing closed"
                 );
@@ -1396,7 +1396,7 @@ pub(crate) async fn authenticate_ws(
     }
 
     warn!(
-        token_prefix = %token_prefix_hint(token),
+        token = %crate::token_hint::hint(token),
         "WebSocket auth failed — invalid or expired token"
     );
 
@@ -5243,7 +5243,7 @@ pub async fn resolve_caller_context(
     }
 
     // Paired-device token (wfp_*): validate and resolve the linked identity.
-    let token_hint = token_prefix_hint(&token);
+    let token_hint = crate::token_hint::hint(&token);
     if let Some(ref pairing) = state.device_pairing {
         match pairing.validate_token_async(token).await {
             Ok(Some(device)) => {
@@ -5262,7 +5262,7 @@ pub async fn resolve_caller_context(
             Ok(None) => {}
             Err(e) => {
                 warn!(
-                    token_prefix = %token_hint,
+                    token = %token_hint,
                     error = %e,
                     "Pairing store error while validating device token — failing closed"
                 );
@@ -5279,20 +5279,13 @@ pub async fn resolve_caller_context(
     // resolves a caller — warn would flood prod logs with non-actionable
     // noise while staying visible enough to diagnose a stranded client.
     info!(
-        token_prefix = %token_hint,
+        token = %token_hint,
         "Presented credential failed authentication (invalid or expired token)"
     );
     CallerContext {
         auth_failure: Some(AuthFailure::InvalidCredentials),
         ..Default::default()
     }
-}
-
-/// First eight characters of a token for log correlation — long enough to
-/// tell tokens apart, far too short to replay. Char-wise so an arbitrary
-/// (attacker-supplied) header can't panic a byte slice mid-codepoint.
-fn token_prefix_hint(token: &str) -> String {
-    token.chars().take(8).collect()
 }
 
 /// Canonical channel name for iOS / paired-device chat conversations, and the

@@ -169,7 +169,6 @@ pub fn substitute_secret_markers(
                         session_key = %session_key,
                         marker_id = %meta.id,
                         label = %meta.label,
-                        preview = %meta.preview,
                         "secret marker substituted at tool boundary"
                     );
                     consumed.push(meta);

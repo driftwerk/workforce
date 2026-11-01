@@ -71,6 +71,9 @@ mod lifecycle_routes;
 #[path = "api/decision_routes.rs"]
 mod decision_routes;
 
+#[path = "api/token_log_routes.rs"]
+mod token_log_routes;
+
 #[path = "api/ws_routes.rs"]
 mod ws_routes;
 
