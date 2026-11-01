@@ -463,7 +463,7 @@ impl Desk {
         let records = match self.0.store.terminals().await {
             Ok(r) => r,
             Err(e) => {
-                tracing::error!(error = %e, "could not load desk terminals");
+                tracing::error!(error = format!("{e:#}"), "could not load desk terminals");
                 return;
             }
         };

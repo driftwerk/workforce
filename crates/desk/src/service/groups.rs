@@ -502,7 +502,7 @@ impl Desk {
             .change_layout(|l| Ok(l.without_sessions(|s| s == id)))
             .await
         {
-            tracing::warn!(%id, error = %e, "a forgotten session stays in the sidebar's layout until the hub restarts");
+            tracing::warn!(%id, error = format!("{e:#}"), "a forgotten session stays in the sidebar's layout until the hub restarts");
         }
     }
 

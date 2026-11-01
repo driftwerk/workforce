@@ -462,7 +462,10 @@ async fn prune_layout(
     match store.put_layout(&pruned).await {
         Ok(()) => pruned,
         Err(e) => {
-            tracing::warn!(error = %e, "couldn't take forgotten sessions out of the sidebar's layout");
+            tracing::warn!(
+                error = format!("{e:#}"),
+                "couldn't take forgotten sessions out of the sidebar's layout"
+            );
             layout
         }
     }
@@ -476,7 +479,10 @@ async fn forget_hub_internal(store: &DeskStore, hub: &HubInternal, turns: Option
     let places = match store.external_places().await {
         Ok(places) => places,
         Err(e) => {
-            tracing::warn!(error = %e, "couldn't look for the hub's own sessions to forget");
+            tracing::warn!(
+                error = format!("{e:#}"),
+                "couldn't look for the hub's own sessions to forget"
+            );
             return;
         }
     };
@@ -496,7 +502,10 @@ async fn forget_hub_internal(store: &DeskStore, hub: &HubInternal, turns: Option
             )
         }
         Err(e) => {
-            tracing::warn!(error = %e, "couldn't forget the hub's own sessions");
+            tracing::warn!(
+                error = format!("{e:#}"),
+                "couldn't forget the hub's own sessions"
+            );
             return;
         }
     }
@@ -4759,6 +4768,29 @@ mod tests {
             let v = d.view(s.id).unwrap();
             assert_eq!((v.origin, v.live), (Origin::Desk, true));
             assert_eq!(d.list().len(), 1);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_forgotten_session_is_not_taken_back() {
+        with_test_pool(build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let store = DeskStore::from_pool(pool.clone());
+            let d = desk(pool, dir.path()).await;
+            let s = new_session(&d, dir.path()).await;
+            let cli = s.id.to_string();
+            kept_until(&store, s.id, |_| true).await;
+            d.forget(s.id).await.unwrap();
+            for _ in 0..200 {
+                if store.get(s.id).await.unwrap().is_none() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert!(store.get(s.id).await.unwrap().is_none());
+            assert_eq!(d.recall(Engine::Claude, &cli).await, None);
+            assert!(d.record(s.id).is_err());
         })
         .await;
     }
