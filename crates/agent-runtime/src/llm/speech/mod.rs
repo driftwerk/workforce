@@ -29,7 +29,7 @@ use eyre::{bail, Result};
 use workforce_common::secret::KeySlot;
 use workforce_common::settings::LlmSpeechConfig;
 
-pub use markup::{Markup, MarkupStream};
+pub use markup::{without_named_directions, Markup, MarkupSplit, Parted};
 
 /// One synthesis request. Model/format are provider construction-time choices
 /// from config; `speed` is per-clip (the model chooses), and `voice` is the

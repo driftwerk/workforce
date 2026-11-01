@@ -90,6 +90,11 @@ client finalizes it locally.
 | `pong` | Response to ping |
 | `error` | Error occurred |
 
+A spoken turn's `stream_delta` and `message` frames may carry `speech` beside `content`: what to say for that
+frame, voice directions included (`"(excited) Found it."`), where it differs from what to show. `content` never
+has directions, so a client that doesn't read `speech` shows the right text and says it plainly. What a turn says
+is every frame's `speech`, else its `content`; a frame may have an empty `content` and some `speech`.
+
 ## Streaming (future)
 
 When streaming is enabled, responses arrive as chunks:

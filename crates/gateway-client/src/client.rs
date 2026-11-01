@@ -1126,6 +1126,7 @@ mod tests {
     #[test]
     fn test_server_message_kind() {
         let msg = ServerMessage {
+            speech: None,
             msg_type: "stream_delta".to_string(),
             content: Some("hello".to_string()),
             session_id: None,
@@ -1162,6 +1163,7 @@ mod tests {
     #[test]
     fn test_server_message_roundtrip() {
         let msg = ServerMessage {
+            speech: None,
             msg_type: "message".to_string(),
             content: Some("response text".to_string()),
             session_id: Some("sess-1".to_string()),
@@ -1200,6 +1202,7 @@ mod tests {
     #[test]
     fn test_server_message_tool_events() {
         let start = ServerMessage {
+            speech: None,
             msg_type: "tool_start".to_string(),
             content: Some("filesystem.read".to_string()),
             session_id: Some("default".to_string()),
@@ -1232,6 +1235,7 @@ mod tests {
         assert_eq!(start.text(), Some("filesystem.read"));
 
         let end = ServerMessage {
+            speech: None,
             msg_type: "tool_end".to_string(),
             content: Some("filesystem.read (12ms, ok)".to_string()),
             session_id: Some("default".to_string()),
@@ -1266,6 +1270,7 @@ mod tests {
     #[test]
     fn test_server_message_error() {
         let msg = ServerMessage {
+            speech: None,
             msg_type: "error".to_string(),
             content: None,
             session_id: None,
@@ -1301,6 +1306,7 @@ mod tests {
     #[test]
     fn test_server_message_reminder() {
         let msg = ServerMessage {
+            speech: None,
             msg_type: "reminder".to_string(),
             content: Some("⏰ Daily standup in 5 minutes".to_string()),
             session_id: Some("scheduler".to_string()),
@@ -1406,6 +1412,7 @@ mod tests {
     #[test]
     fn test_stream_start_message() {
         let msg = ServerMessage {
+            speech: None,
             msg_type: "stream_start".to_string(),
             content: None,
             session_id: Some("sess-1".to_string()),
@@ -1443,6 +1450,7 @@ mod tests {
     #[test]
     fn test_stream_end_message() {
         let msg = ServerMessage {
+            speech: None,
             msg_type: "stream_end".to_string(),
             content: None,
             session_id: Some("sess-1".to_string()),
@@ -1491,6 +1499,7 @@ mod tests {
 
         for (msg_type, content, expected_kind) in sequence {
             let msg = ServerMessage {
+                speech: None,
                 msg_type: msg_type.to_string(),
                 content: if content.is_empty() {
                     None
@@ -1535,6 +1544,7 @@ mod tests {
     #[test]
     fn test_stream_delta_serialization_roundtrip() {
         let msg = ServerMessage {
+            speech: None,
             msg_type: "stream_delta".to_string(),
             content: Some("token chunk".to_string()),
             session_id: Some("sess-42".to_string()),

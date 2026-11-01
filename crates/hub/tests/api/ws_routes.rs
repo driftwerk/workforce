@@ -528,6 +528,144 @@ async fn a_spoken_desk_message_is_a_voice_turn_without_latching_voice_mode() {
     assert!(session.metadata.get("voice_mode").is_none());
 }
 
+const MARKED_REPLY: &[&str] = &[
+    "(exc",
+    "ited) Found it. (sigh",
+    "ing) Well, ",
+    "(laughing)",
+    " yes.",
+];
+
+/// What a stream's frames show, and what they say: `speech`, else `content`.
+fn shown_and_said(frames: &[Value]) -> (String, String) {
+    let deltas = || frames.iter().filter(|f| f["type"] == "stream_delta");
+    let shown = deltas()
+        .map(|f| f["content"].as_str().unwrap_or(""))
+        .collect();
+    let said = deltas()
+        .map(|f| f["speech"].as_str().or(f["content"].as_str()).unwrap_or(""))
+        .collect();
+    (shown, said)
+}
+
+/// A spoken Desk turn's voice directions reach the voice alone: the text on
+/// screen, what's saved of it, and what the model reads of itself next turn
+/// have none.
+#[tokio::test]
+async fn a_spoken_desk_turn_keeps_its_directions_out_of_its_text() {
+    let data = tempfile::tempdir().unwrap();
+    let (service, llm) = crate::support::agent_on_mock_llm_saying(
+        data.path(),
+        MARKED_REPLY,
+        std::time::Duration::ZERO,
+    )
+    .await;
+    let gateway = Gateway::new(vec![("default", service.clone())], None);
+    let token = gateway.admin_token();
+    let addr = serve(gateway.state.clone()).await;
+    let (mut desk, connected) = connect(addr, &format!("token={token}&channel=desk&desk=1")).await;
+    let spoken = json!({"type": "chat", "content": "what's next?", "turn_ref": "ref-1",
+        "desk": {"place": {"kind": "dm"}, "speaker": {"kind": "person"}, "spoken": true,
+                 "voice": {"reply": "spoken", "speech": {"provider": "fish_audio", "model": "s1"}}}});
+    send(&mut desk, spoken).await;
+    let frames = frames_until(&mut desk, "turn_end").await;
+    let (shown, said) = shown_and_said(&frames);
+    assert_eq!(shown, "Found it. Well, yes.", "{frames:?}");
+    assert_eq!(
+        said, "(excited) Found it. (sighing) Well, (laughing) yes.",
+        "{frames:?}"
+    );
+
+    let session = service
+        .sessions
+        .get(connected["session_id"].as_str().unwrap())
+        .unwrap()
+        .unwrap();
+    let saved = session
+        .messages
+        .iter()
+        .rfind(|m| m.role == workforce_common::session::MessageRole::Assistant)
+        .unwrap();
+    assert_eq!(saved.content, "Found it. Well, yes.");
+
+    send(
+        &mut desk,
+        json!({"type": "chat", "content": "and then?", "turn_ref": "ref-2",
+               "desk": {"place": {"kind": "dm"}, "speaker": {"kind": "person"}, "spoken": false}}),
+    )
+    .await;
+    frames_until(&mut desk, "turn_end").await;
+    let asked = llm.received_requests().await.unwrap();
+    let last: Value = serde_json::from_slice(&asked.last().unwrap().body).unwrap();
+    let own: Vec<&Value> = last["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["role"] == "assistant")
+        .collect();
+    assert!(!own.is_empty(), "{last}");
+    assert!(
+        own.iter().all(|m| !m.to_string().contains("(excited)")),
+        "{own:?}"
+    );
+}
+
+/// An older client reads only `content`, so the phone shows clean text, and
+/// is sent what it needs to say the directions once it reads `speech`.
+#[tokio::test]
+async fn a_spoken_phone_turn_shows_clean_text_too() {
+    let data = tempfile::tempdir().unwrap();
+    let (service, _llm) = crate::support::agent_on_mock_llm_saying(
+        data.path(),
+        MARKED_REPLY,
+        std::time::Duration::ZERO,
+    )
+    .await;
+    let gateway = Gateway::new(vec![("default", service)], None);
+    let token = gateway.admin_token();
+    let addr = serve(gateway.state.clone()).await;
+    let (mut phone, _) = connect(addr, &format!("token={token}")).await;
+    send(
+        &mut phone,
+        json!({"type": "chat", "content": "what's next?", "voice_mode": true, "tts_provider": "fishaudio"}),
+    )
+    .await;
+    let frames = frames_until(&mut phone, "stream_end").await;
+    let (shown, said) = shown_and_said(&frames);
+    assert!(!shown.contains('('), "{frames:?}");
+    assert!(shown.contains("Found it."), "{frames:?}");
+    assert!(said.starts_with("(excited) Found it."), "{frames:?}");
+}
+
+/// A voice that takes no directions: clean text, and no `speech` at all.
+#[tokio::test]
+async fn a_voice_without_directions_gets_no_speech_field() {
+    let data = tempfile::tempdir().unwrap();
+    let (service, _llm) = crate::support::agent_on_mock_llm_saying(
+        data.path(),
+        MARKED_REPLY,
+        std::time::Duration::ZERO,
+    )
+    .await;
+    let gateway = Gateway::new(vec![("default", service)], None);
+    let token = gateway.admin_token();
+    let addr = serve(gateway.state.clone()).await;
+    let (mut desk, _) = connect(addr, &format!("token={token}&channel=desk&desk=1")).await;
+    send(
+        &mut desk,
+        json!({"type": "chat", "content": "what's next?", "turn_ref": "ref-1",
+               "desk": {"place": {"kind": "dm"}, "speaker": {"kind": "person"}, "spoken": true,
+                        "voice": {"reply": "spoken", "speech": {"provider": "kokoro"}}}}),
+    )
+    .await;
+    let frames = frames_until(&mut desk, "turn_end").await;
+    assert_eq!(shown_and_said(&frames).0, "Found it. Well, yes.");
+    assert!(
+        frames.iter().all(|f| f.get("speech").is_none()),
+        "{frames:?}"
+    );
+}
+
 /// WELCOME.md is the agent's own directive for greeting a new conversation,
 /// read by its turns; no client is ever sent it.
 #[tokio::test]

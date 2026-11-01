@@ -114,6 +114,10 @@ pub enum ChatProgress {
     StreamStart,
     /// A chunk of streamed text.
     StreamDelta { text: String },
+    /// How the next `StreamDelta` or `Message` is said aloud, where that
+    /// differs from how it reads. A build that can't read it skips it, and
+    /// says the text as it reads.
+    Speech { text: String },
     /// End of a streamed response.
     StreamEnd,
     /// The streamed text of the current model call is void; a replacement

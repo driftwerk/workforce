@@ -418,6 +418,12 @@ pub struct ServerMessage {
     /// to, as it sent it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_ref: Option<String>,
+    /// On a spoken turn's `stream_delta` / `message`: what to say for this
+    /// frame, voice directions included, when that differs from `content`,
+    /// which is what to show (and may then be empty). What a turn says is every
+    /// frame's `speech`, or its `content` where it has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speech: Option<String>,
     /// On a `turn_snapshot`: what the live turn is doing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<workforce_core::desk::TurnPhase>,
@@ -537,6 +543,7 @@ impl ServerMessage {
         options: workforce_core::policy::PermissionPromptOptions,
     ) -> Self {
         Self {
+            speech: None,
             msg_type: "permission_prompt".to_string(),
             content: Some(reason.to_string()),
             session_id: session_id.map(String::from),

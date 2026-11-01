@@ -268,7 +268,13 @@ fn read_with(
         gathered.extend(
             newer
                 .into_iter()
-                .filter_map(|e| said(e, agent, held.as_deref_mut())),
+                .filter_map(|e| said(e, agent, held.as_deref_mut()))
+                .map(|mut said| {
+                    if said.from == Author::Agent {
+                        said.text = crate::spoken_text::kept_text(&head, &said.text).into_owned();
+                    }
+                    said
+                }),
         );
         if after.is_some() && gathered.len() > limit + 1 {
             gathered.drain(..gathered.len() - (limit + 1));

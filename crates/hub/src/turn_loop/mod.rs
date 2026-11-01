@@ -3461,6 +3461,7 @@ pub(crate) async fn process_admitted(
 
     // Build conversation history from session (filters empty content,
     // merges consecutive same-role messages, skips tool/system messages)
+    crate::spoken_text::clean_kept(&mut session);
     let shared_replay = shared_replay(service, &session, user);
     let prior_messages = build_prior_messages(&session.messages, shared_replay.as_ref());
     observe_replay_prefix(&mut session, &prior_messages);
@@ -3577,6 +3578,9 @@ pub(crate) async fn process_admitted(
             return Ok(TurnOutcome::Answered(text));
         }
     };
+    if let Some(kept) = crate::spoken_text::kept_answer(&session, &result.response) {
+        result.response = kept;
+    }
 
     // Routed approvals raised by this (non-progress) run have no progress
     // consumer to DM the approvers — deliver them here, before the reply
@@ -4895,9 +4899,11 @@ pub(crate) async fn stream_admitted(
 
     // Build conversation history from session (filters empty content,
     // merges consecutive same-role messages, skips tool/system messages)
+    crate::spoken_text::clean_kept(&mut session);
     let shared_replay = shared_replay(service, &session, user);
     let prior_messages = build_prior_messages(&session.messages, shared_replay.as_ref());
     observe_replay_prefix(&mut session, &prior_messages);
+    let spoken = crate::spoken_text::spoken_with(&session);
     let session_tools_for_task = Arc::new(crate::tool_loading::session_tools(
         &session.messages,
         service.config.tools.loading.keep_turns,
@@ -5228,6 +5234,9 @@ pub(crate) async fn stream_admitted(
                         return Ok(reply_only(text));
                     }
                 };
+                if let Some(kept) = crate::spoken_text::kept_answer(&session, &result.response) {
+                    result.response = kept;
+                }
 
                 {
                     // The answer is finished — everything below only annotates
@@ -5569,6 +5578,13 @@ pub(crate) async fn stream_admitted(
     ),
     ),
     )));
+
+    // Everything downstream reads the reply without voice directions; they
+    // travel beside it.
+    let progress_rx = match spoken {
+        Some(markup) => crate::spoken_text::parted(progress_rx, markup),
+        None => progress_rx,
+    };
 
     Ok(MessageProgress {
         progress_rx,

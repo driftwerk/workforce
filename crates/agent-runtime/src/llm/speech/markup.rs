@@ -4,8 +4,11 @@
 //! A speech model performs only the directions it was trained on and reads
 //! anything else aloud as words, so one table here is both what the agent is
 //! told it may use ([`Markup::guidance`]) and what is checked before any text
-//! reaches a voice ([`Markup::apply`], and [`MarkupStream`] for text spoken
-//! as it streams). The two cannot drift apart.
+//! reaches a voice ([`Markup::apply`]). The two cannot drift apart.
+//!
+//! Directions are for the voice alone. What a reader sees, and what is kept,
+//! has none: [`Markup::split`] parts a reply as it streams into the text to
+//! show and the text to speak.
 //!
 //! Fish Audio's markers, as its docs give them (Emotion reference, Models
 //! overview):
@@ -272,12 +275,14 @@ impl Markup {
         out
     }
 
-    /// A filter for text spoken as it streams in.
-    pub fn stream(self) -> MarkupStream {
-        MarkupStream {
+    /// Parts a reply as it streams in: the text to show, and the text to
+    /// speak in this voice.
+    pub fn split(self) -> MarkupSplit {
+        MarkupSplit {
             markup: self,
             held: String::new(),
-            cursor: Cursor::default(),
+            shown: Cursor::default(),
+            spoken: Cursor::default(),
         }
     }
 
@@ -334,39 +339,75 @@ TTS provider: Fish Audio (S2)
     }
 }
 
-/// [`Markup::apply`] for text that arrives in pieces: a direction split
-/// across two pieces is held back until it's whole.
-#[derive(Debug, Clone)]
-pub struct MarkupStream {
-    markup: Markup,
-    held: String,
-    cursor: Cursor,
+/// `text` without the directions any voice takes by name: what a kept message
+/// written before directions were parted from the text reads as. Stricter than
+/// [`Markup::apply`] for [`Markup::Plain`], since that text may have been typed:
+/// `(maybe)` stays, `(excited)` goes.
+pub fn without_named_directions(text: &str) -> String {
+    let mut cursor = Cursor::default();
+    let mut out = String::with_capacity(text.len());
+    rewrite_with(
+        |inner, _| match tag(&words(inner)) {
+            Some(_) => Verdict::Drop,
+            None => Verdict::Prose,
+        },
+        text,
+        &mut cursor,
+        &mut out,
+    );
+    out
 }
 
-impl MarkupStream {
+/// One piece of a reply, parted.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Parted {
+    /// What a reader sees: no directions.
+    pub shown: String,
+    /// What the voice is given: the directions it performs.
+    pub spoken: String,
+}
+
+/// [`Markup::split`]: a direction split across two pieces is held back until
+/// it's whole. What is held doesn't depend on the voice, so the two texts
+/// advance together, piece for piece.
+#[derive(Debug, Clone)]
+pub struct MarkupSplit {
+    markup: Markup,
+    held: String,
+    shown: Cursor,
+    spoken: Cursor,
+}
+
+impl MarkupSplit {
     /// What of everything so far can be passed on.
-    pub fn push(&mut self, piece: &str) -> String {
+    pub fn push(&mut self, piece: &str) -> Parted {
         self.held.push_str(piece);
         let keep = open_tail(&self.held);
         let ready: String = self.held.drain(..keep).collect();
-        let mut out = String::with_capacity(ready.len());
-        rewrite(self.markup, &ready, &mut self.cursor, &mut out);
-        out
+        self.part(&ready)
     }
 
     /// The end of the text: whatever was held back, as it stands.
-    pub fn finish(&mut self) -> String {
+    pub fn finish(&mut self) -> Parted {
         let rest = std::mem::take(&mut self.held);
-        let mut out = String::with_capacity(rest.len());
-        rewrite(self.markup, &rest, &mut self.cursor, &mut out);
-        self.cursor = Cursor::default();
-        out
+        let parted = self.part(&rest);
+        self.shown = Cursor::default();
+        self.spoken = Cursor::default();
+        parted
     }
 
     /// Starts again, dropping what was held: the text was retracted.
     pub fn reset(&mut self) {
         self.held.clear();
-        self.cursor = Cursor::default();
+        self.shown = Cursor::default();
+        self.spoken = Cursor::default();
+    }
+
+    fn part(&mut self, text: &str) -> Parted {
+        let mut parted = Parted::default();
+        rewrite(Markup::Plain, text, &mut self.shown, &mut parted.shown);
+        rewrite(self.markup, text, &mut self.spoken, &mut parted.spoken);
+        parted
     }
 }
 
@@ -511,6 +552,20 @@ fn judge(markup: Markup, inner: &str, sentence_start: bool) -> Verdict {
 }
 
 fn rewrite(markup: Markup, text: &str, cursor: &mut Cursor, out: &mut String) {
+    rewrite_with(
+        |inner, sentence_start| judge(markup, inner, sentence_start),
+        text,
+        cursor,
+        out,
+    );
+}
+
+fn rewrite_with(
+    judge: impl Fn(&str, bool) -> Verdict,
+    text: &str,
+    cursor: &mut Cursor,
+    out: &mut String,
+) {
     let mut i = 0;
     while let Some(c) = text[i..].chars().next() {
         if std::mem::take(&mut cursor.skip_space) && c == ' ' {
@@ -520,7 +575,7 @@ fn rewrite(markup: Markup, text: &str, cursor: &mut Cursor, out: &mut String) {
         // Attached to a word it's a call or a plural, `f(x)` or `file(s)`.
         let attached = cursor.last.is_some_and(char::is_alphanumeric);
         if let Some((inner, len)) = group(&text[i..]).filter(|_| !attached) {
-            match judge(markup, inner, cursor.sentence_start) {
+            match judge(inner, cursor.sentence_start) {
                 Verdict::Prose => {}
                 Verdict::Drop => {
                     let next = text[i + len..].chars().next();
@@ -685,51 +740,93 @@ mod tests {
         assert_eq!(Markup::Plain.apply("Hi (sighing), you."), "Hi, you.");
     }
 
-    fn streamed(markup: Markup, pieces: &[&str]) -> String {
-        let mut stream = markup.stream();
-        let mut out: String = pieces.iter().map(|p| stream.push(p)).collect();
-        out.push_str(&stream.finish());
+    fn parted(markup: Markup, pieces: &[&str]) -> Parted {
+        let mut split = markup.split();
+        let mut out = Parted::default();
+        for piece in pieces {
+            let next = split.push(piece);
+            out.shown.push_str(&next.shown);
+            out.spoken.push_str(&next.spoken);
+        }
+        let last = split.finish();
+        out.shown.push_str(&last.shown);
+        out.spoken.push_str(&last.spoken);
         out
     }
 
+    /// However a reply is cut into pieces, a direction split across them
+    /// included, what's shown has none and what's spoken has what the voice
+    /// performs: the same as the whole text would.
     #[test]
-    fn a_stream_says_what_the_whole_text_would() {
+    fn a_split_stream_says_what_the_whole_text_would() {
         let text = "(excited) Found it! (pensive) Hmm. It broke (sad) again (sighing) twice. \
                     Ask Alice (API) or [warmly] me. (Laughs) Ha. Unclosed (end";
         for markup in [Markup::FishS1, Markup::FishS2, Markup::Plain] {
-            let whole = markup.apply(text);
+            let whole = Parted {
+                shown: Markup::Plain.apply(text),
+                spoken: markup.apply(text),
+            };
             let chars: Vec<char> = text.chars().collect();
             for cut in 0..=chars.len() {
                 let (a, b): (String, String) =
                     (chars[..cut].iter().collect(), chars[cut..].iter().collect());
-                assert_eq!(
-                    streamed(markup, &[&a, &b]),
-                    whole,
-                    "{markup:?} cut at {cut}"
-                );
+                assert_eq!(parted(markup, &[&a, &b]), whole, "{markup:?} cut at {cut}");
             }
             let singles: Vec<String> = chars.iter().map(|c| c.to_string()).collect();
             let refs: Vec<&str> = singles.iter().map(String::as_str).collect();
-            assert_eq!(streamed(markup, &refs), whole, "{markup:?} char by char");
+            assert_eq!(parted(markup, &refs), whole, "{markup:?} char by char");
         }
     }
 
     #[test]
-    fn a_stream_holds_back_only_what_might_be_a_direction() {
-        let mut stream = Markup::Plain.stream();
-        assert_eq!(stream.push("Hello (exc"), "Hello");
-        assert_eq!(stream.push("ited) there"), " there");
-        assert_eq!(stream.push(" and f(x, y"), " and f(x, y");
-        assert_eq!(stream.push(" is "), " is");
-        assert_eq!(stream.finish(), " ");
+    fn what_is_shown_never_has_a_direction() {
+        let out = parted(
+            Markup::FishS1,
+            &[
+                "(conf",
+                "ident) Found it. Well (sigh",
+                "ing) yes. (la",
+                "ughing) Ha.",
+            ],
+        );
+        assert_eq!(out.shown, "Found it. Well yes. Ha.");
+        assert_eq!(
+            out.spoken,
+            "(confident) Found it. Well (sighing) yes. (laughing) Ha."
+        );
     }
 
     #[test]
-    fn a_reset_stream_drops_what_it_held() {
-        let mut stream = Markup::FishS1.stream();
-        assert_eq!(stream.push("Okay. (exc"), "Okay.");
-        stream.reset();
-        assert_eq!(stream.push("(excited) New."), "(excited) New.");
+    fn a_split_holds_back_only_what_might_be_a_direction() {
+        let mut split = Markup::Plain.split();
+        assert_eq!(split.push("Hello (exc").shown, "Hello");
+        assert_eq!(split.push("ited) there").shown, " there");
+        assert_eq!(split.push(" and f(x, y").shown, " and f(x, y");
+        assert_eq!(split.push(" is ").shown, " is");
+        assert_eq!(split.finish().shown, " ");
+    }
+
+    #[test]
+    fn a_reset_split_drops_what_it_held() {
+        let mut split = Markup::FishS1.split();
+        assert_eq!(split.push("Okay. (exc").spoken, "Okay.");
+        split.reset();
+        assert_eq!(split.push("(excited) New.").spoken, "(excited) New.");
+    }
+
+    /// What was saved before directions were parted from the text may have
+    /// been typed, so only what names a direction goes.
+    #[test]
+    fn a_kept_message_loses_only_named_directions() {
+        assert_eq!(
+            without_named_directions("(confident) It works (maybe). (Laughs) Ask (see below) me."),
+            "It works (maybe). Ask (see below) me."
+        );
+        assert_eq!(
+            without_named_directions("[excited] Found f(x)."),
+            "Found f(x)."
+        );
+        assert_eq!(without_named_directions("As typed."), "As typed.");
     }
 
     #[test]
