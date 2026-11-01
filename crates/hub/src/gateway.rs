@@ -1245,6 +1245,49 @@ pub(crate) struct WsCaller {
     pub(crate) identity_role: String,
 }
 
+/// The credential a WebSocket handshake presents: its `Authorization: Bearer`
+/// header, which a native client sends to keep the token out of the URL (and
+/// so out of access logs), else its `?token=`, which a browser's WebSocket
+/// can only send that way.
+pub(crate) fn ws_token<'a>(headers: &'a axum::http::HeaderMap, query: Option<&'a str>) -> &'a str {
+    let bearer = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|h| {
+            let (scheme, token) = h.split_once(' ')?;
+            scheme.eq_ignore_ascii_case("bearer").then(|| token.trim())
+        })
+        .filter(|t| !t.is_empty());
+    bearer.or(query).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod ws_token_tests {
+    use super::ws_token;
+    use axum::http::{header::AUTHORIZATION, HeaderMap, HeaderValue};
+
+    fn with(auth: &'static str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(AUTHORIZATION, HeaderValue::from_static(auth));
+        h
+    }
+
+    #[test]
+    fn the_header_is_taken_before_the_query() {
+        assert_eq!(ws_token(&with("Bearer wfp_a"), Some("wfp_b")), "wfp_a");
+        assert_eq!(ws_token(&with("bearer wfp_a"), None), "wfp_a");
+        assert_eq!(ws_token(&HeaderMap::new(), Some("wfp_b")), "wfp_b");
+        assert_eq!(ws_token(&HeaderMap::new(), None), "");
+    }
+
+    #[test]
+    fn a_header_that_is_not_a_bearer_falls_back_to_the_query() {
+        assert_eq!(ws_token(&with("Basic dTpw"), Some("wfp_b")), "wfp_b");
+        assert_eq!(ws_token(&with("Bearer "), Some("wfp_b")), "wfp_b");
+        assert_eq!(ws_token(&with("Bearer"), None), "");
+    }
+}
+
 /// Authenticate a WebSocket handshake's `token`: a device pairing token, then
 /// a JWT. The refusal is the response the upgrade is answered with: 403 for a
 /// suspended person, 503 when the pairing store could not be read, else 401.
@@ -1342,7 +1385,7 @@ pub(crate) async fn authenticate_ws(
         StatusCode::UNAUTHORIZED,
         axum::Json(serde_json::json!({
             "error": "unauthorized",
-            "message": "Authentication required. Provide a valid gateway token (?token=...) or pair your device via /api/pair/device/request."
+            "message": "Authentication required. Provide a valid token (Authorization: Bearer, or ?token=...) or pair your device via /api/pair/device/request."
         })),
     )
         .into_response())
@@ -1351,6 +1394,7 @@ pub(crate) async fn authenticate_ws(
 /// WebSocket upgrade handler.
 async fn ws_handler(
     ws: WebSocketUpgrade,
+    headers: axum::http::HeaderMap,
     Query(query): Query<WsQuery>,
     State(state): State<Arc<GatewayState>>,
 ) -> impl IntoResponse {
@@ -1368,7 +1412,7 @@ async fn ws_handler(
         workforce_gateway_client::protocol::MediaAccept::from_names(query.accept.as_deref());
     let declared =
         query.desk == Some(1) && workforce_common::channels::is_desk_conversation(&anchor_channel);
-    let caller = match authenticate_ws(&state, query.token.as_deref().unwrap_or_default()).await {
+    let caller = match authenticate_ws(&state, ws_token(&headers, query.token.as_deref())).await {
         Ok(caller) => caller,
         Err(refused) => return refused,
     };
