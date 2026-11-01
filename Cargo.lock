@@ -12408,6 +12408,7 @@ dependencies = [
  "tokio-postgres",
  "tokio-test",
  "tracing",
+ "tracing-subscriber",
  "uuid",
  "workforce-build-support",
  "workforce-postgres",

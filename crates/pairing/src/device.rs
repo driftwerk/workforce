@@ -48,7 +48,7 @@ impl DevicePairingService {
         let now = Utc::now();
         let req = DevicePairingRequest {
             id: Uuid::new_v4().to_string(),
-            code: code.clone(),
+            code,
             device_name: device_name.to_string(),
             client_id,
             public_key: public_key.map(|s| s.to_string()),
@@ -64,7 +64,7 @@ impl DevicePairingService {
         };
         self.store.create_device_request(&req)?;
 
-        info!(device_name, code, "Created device pairing request");
+        log_created(&req);
         Ok(req)
     }
 
@@ -210,7 +210,7 @@ impl DevicePairingService {
             let now = Utc::now();
             let req = DevicePairingRequest {
                 id: Uuid::new_v4().to_string(),
-                code: code.clone(),
+                code,
                 device_name: device_name.clone(),
                 client_id,
                 public_key,
@@ -225,7 +225,7 @@ impl DevicePairingService {
                 device_kind,
             };
             store.create_device_request(&req)?;
-            info!(device_name, code, "Created device pairing request");
+            log_created(&req);
             Ok(req)
         })
         .await
@@ -472,6 +472,16 @@ fn approve_in(
     Ok((device, token))
 }
 
+/// The log line for a new device pairing request: never its code, which,
+/// once approved, collects the device's token from the status endpoint.
+fn log_created(req: &DevicePairingRequest) {
+    info!(
+        device_name = %req.device_name,
+        request_id = %req.id,
+        "Created device pairing request"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -650,6 +660,47 @@ mod tests {
         let svc = DevicePairingService::new(store, config);
 
         assert!(svc.initiate("app", vec![], None, None, None, None).is_err());
+    }
+
+    /// What `run` logs on this thread, as one string.
+    fn logged(run: impl FnOnce()) -> String {
+        #[derive(Clone, Default)]
+        struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Captured {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let log = Captured::default();
+        let writer = log.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, run);
+        let bytes = log.0.lock().unwrap().clone();
+        String::from_utf8(bytes).unwrap()
+    }
+
+    #[test]
+    fn a_device_pairing_code_is_never_logged() {
+        let store = Arc::new(SqlitePairingStore::in_memory().unwrap());
+        let svc = DevicePairingService::new(store, device_config());
+        let mut code = String::new();
+        let log = logged(|| {
+            let req = svc
+                .initiate("test-phone", vec!["chat".into()], None, None, None, None)
+                .unwrap();
+            code = req.code.clone();
+            svc.approve(&req.code, "admin").unwrap();
+        });
+        assert!(log.contains("Created device pairing request"), "{log}");
+        assert!(!code.is_empty() && !log.contains(&code), "{code} in {log}");
     }
 
     #[test]
