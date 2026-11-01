@@ -275,6 +275,7 @@ pub mod team_registry;
 pub mod teams_manager;
 pub mod teams_messages;
 pub use hub_core::tool_loading;
+pub mod token_hint;
 pub mod trace_writer;
 pub mod training;
 pub mod training_citations_tool;

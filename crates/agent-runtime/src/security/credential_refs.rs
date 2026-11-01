@@ -256,7 +256,6 @@ impl CredentialResolver<'_> {
                     session_key = %self.session_key,
                     marker_id = %meta.id,
                     label = %meta.label,
-                    preview = %meta.preview,
                     "secret marker resolved into an outbound request"
                 );
                 Ok(Some(cleartext.expose_secret().clone()))

@@ -323,7 +323,7 @@ impl SecretCache for InMemorySecretCache {
         let record = Record {
             secret: cleartext,
             label: label.to_string(),
-            preview: preview.clone(),
+            preview,
             source: source.clone(),
             expires_at: self.clock.now() + self.config.ttl,
         };
@@ -334,7 +334,6 @@ impl SecretCache for InMemorySecretCache {
             session_key = %session_key,
             marker_id = %id,
             label = %label,
-            preview = %preview,
             source = ?source,
             "secret captured"
         );

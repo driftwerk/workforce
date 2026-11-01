@@ -409,7 +409,6 @@ fn warn_on_unredacted_credentials(text: &str, session_key: &str) {
         tracing::warn!(
             target: "sentinel.audit",
             session_key = %session_key,
-            preview = %preview_of(val_str),
             length = val_str.len(),
             "context keyword near high-entropy value but no pattern matched — likely missing vendor pattern in redact.rs"
         );
