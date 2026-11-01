@@ -9,7 +9,7 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
-use workforce_identity::remote_mcp_token::{RemoteMcpToken, TOKEN_PREFIX};
+use workforce_identity::remote_mcp_token::RemoteMcpToken;
 
 use super::tokens::{is_expired, Minted, RemoteMcpTokenService, TokenError};
 use crate::commands::CommandResult;
@@ -101,10 +101,7 @@ fn revoke(
         return Ok(format!("No token matches `{target}`. {USAGE}"));
     };
     Ok(if service.revoke(identity_id, token.id)? {
-        format!(
-            "Revoked `{}` ({}{}…).",
-            token.label, TOKEN_PREFIX, token.token_prefix
-        )
+        format!("Revoked `{}` (key {}).", token.label, token.fingerprint())
     } else {
         format!("`{}` was already revoked.", token.label)
     })
@@ -144,9 +141,9 @@ fn render_list(tokens: &[RemoteMcpToken], now: DateTime<Utc>) -> String {
         let last_used = t.last_used_at.map_or("never".to_string(), day);
         let expired = if is_expired(t, now) { " (expired)" } else { "" };
         format!(
-            "• `{}` — {TOKEN_PREFIX}{}… created {}, expires {}{expired}, last used {last_used}",
+            "• `{}` — key {}, created {}, expires {}{expired}, last used {last_used}",
             t.label,
-            t.token_prefix,
+            t.fingerprint(),
             day(t.created_at),
             day(t.expires_at),
         )
@@ -166,6 +163,7 @@ mod tests {
     use super::*;
     use crate::remote_mcp::tokens::test_support::{enabled_config, identity, service};
     use workforce_common::settings::RemoteMcpConfig;
+    use workforce_identity::remote_mcp_token::TOKEN_PREFIX;
     use workforce_identity::store::IdentityStore as _;
     use workforce_identity::types::IdentityStatus;
 
@@ -239,9 +237,23 @@ mod tests {
         assert!(listed.contains("`laptop`") && listed.contains("`cmd`"));
         assert!(listed.contains("last used never"));
         assert!(!listed.contains(plaintext));
+        let tokens = svc.list(me.id).unwrap();
+        let laptop = tokens.iter().find(|t| t.label == "laptop").unwrap();
+        assert!(listed.contains(&format!("key {}", laptop.fingerprint())));
+        let body = &plaintext[TOKEN_PREFIX.len()..];
+        for start in 0..=body.len() - 6 {
+            assert!(
+                !listed.contains(&body[start..start + 6]),
+                "the listing leaked part of the key"
+            );
+        }
 
         let revoked = run(Some(&svc), Some(me.id), Some("token revoke laptop")).text;
         assert!(revoked.starts_with("Revoked `laptop`"));
+        assert!(revoked.contains(&format!("key {}", laptop.fingerprint())));
+        for start in 0..=body.len() - 6 {
+            assert!(!revoked.contains(&body[start..start + 6]));
+        }
         let again = run(Some(&svc), Some(me.id), Some("token revoke laptop")).text;
         assert!(again.starts_with("No token matches"));
 

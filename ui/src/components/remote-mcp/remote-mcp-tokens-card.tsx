@@ -94,7 +94,7 @@ function CreatedTokenDialog({
   );
 }
 
-function TokenRow({
+export function TokenRow({
   token,
   onRevoke,
   revoking,
@@ -110,7 +110,7 @@ function TokenRow({
           <span className="font-medium">{token.label}</span>
           {token.expired && <Badge variant="outline">Expired</Badge>}
         </div>
-        <code className="text-xs text-muted-foreground">wfr_{token.token_prefix}…</code>
+        <code className="text-xs text-muted-foreground">Key {token.fingerprint}</code>
       </td>
       <td className="px-4 py-3 text-sm text-muted-foreground">
         {new Date(token.created_at).toLocaleDateString()}

@@ -206,7 +206,6 @@ impl RemoteMcpTokenService {
             identity_id,
             label: label.to_string(),
             token_hash: minted.hash,
-            token_prefix: minted.prefix,
             scopes: vec![TOKEN_SCOPE.to_string()],
             created_at: now,
             expires_at: now + Duration::days(i64::from(self.config.token_ttl_days)),

@@ -5,7 +5,7 @@ use std::sync::Mutex;
 use chrono::{DateTime, Utc};
 use eyre::{Result, WrapErr};
 use rusqlite::{params, Connection, OptionalExtension};
-use tracing::info;
+use tracing::{info, warn};
 use uuid::Uuid;
 
 use std::sync::Arc;
@@ -15,6 +15,12 @@ use crate::remote_mcp_token::{RemoteMcpToken, RemoteMcpTokenStore};
 use crate::store::{IdentityAndTeamStore, IdentityFilter, IdentityStore};
 use crate::team::{Team, TeamStore};
 use crate::types::{Identity, IdentityRole, IdentityStatus, ProvisioningSource};
+
+/// The drop is atomic, so a failure leaves the column for the next start.
+/// `secure_delete` zeroes the values as the rows are rewritten, so they are
+/// gone from the file even if the `VACUUM` that follows cannot run.
+const DROP_LEGACY_TOKEN_PREFIX: &str =
+    "PRAGMA secure_delete = ON; ALTER TABLE remote_mcp_tokens DROP COLUMN token_prefix;";
 
 pub struct SqliteIdentityStore {
     conn: Mutex<Connection>,
@@ -73,7 +79,6 @@ impl SqliteIdentityStore {
                 identity_id     TEXT NOT NULL,
                 label           TEXT NOT NULL,
                 token_hash      TEXT NOT NULL UNIQUE,
-                token_prefix    TEXT NOT NULL,
                 scopes          TEXT NOT NULL DEFAULT '[]',
                 created_at      TEXT NOT NULL,
                 expires_at      TEXT NOT NULL,
@@ -103,6 +108,38 @@ impl SqliteIdentityStore {
             ",
         )
         .wrap_err("Failed to initialize identity schema")?;
+        Self::drop_legacy_token_prefix(conn)?;
+        Ok(())
+    }
+
+    /// Earlier versions stored the first characters of each remote MCP key
+    /// in `token_prefix`. No part of a key is kept in the clear, so a
+    /// database that still has the column loses it (and every value in it).
+    /// Keys are looked up by `token_hash` and are untouched.
+    ///
+    /// One way: a binary from before this change cannot read the file after.
+    /// Only a hub opens this file in normal running, and it is upgraded by a
+    /// restart, so old and new code do not share it.
+    fn drop_legacy_token_prefix(conn: &Connection) -> Result<()> {
+        let has_column: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('remote_mcp_tokens') \
+                 WHERE name = 'token_prefix'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .wrap_err("Failed to inspect remote_mcp_tokens")?
+            > 0;
+        if has_column {
+            conn.execute_batch(DROP_LEGACY_TOKEN_PREFIX)
+                .wrap_err("Failed to drop remote_mcp_tokens.token_prefix")?;
+            // Also clears pages freed before now, such as deleted rows'. The
+            // column is already gone, so a later start would not come back to
+            // this: it only warns, and must not stop the hub starting.
+            if let Err(error) = conn.execute_batch("VACUUM") {
+                warn!(%error, "could not compact the identity database after dropping key prefixes");
+            }
+        }
         Ok(())
     }
 
@@ -368,21 +405,20 @@ impl TeamStore for SqliteIdentityStore {
     }
 }
 
-const REMOTE_MCP_TOKEN_COLUMNS: &str = "id, identity_id, label, token_hash, token_prefix, scopes, \
+const REMOTE_MCP_TOKEN_COLUMNS: &str = "id, identity_id, label, token_hash, scopes, \
                                         created_at, expires_at, last_used_at, revoked_at";
 
 impl RemoteMcpTokenStore for SqliteIdentityStore {
     fn create_token(&self, token: &RemoteMcpToken) -> Result<()> {
         let conn = self.lock()?;
         conn.execute(
-            "INSERT INTO remote_mcp_tokens (id, identity_id, label, token_hash, token_prefix, scopes, created_at, expires_at, last_used_at, revoked_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            "INSERT INTO remote_mcp_tokens (id, identity_id, label, token_hash, scopes, created_at, expires_at, last_used_at, revoked_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 token.id.to_string(),
                 token.identity_id.to_string(),
                 token.label,
                 token.token_hash,
-                token.token_prefix,
                 serde_json::to_string(&token.scopes)?,
                 token.created_at.to_rfc3339(),
                 token.expires_at.to_rfc3339(),
@@ -645,7 +681,6 @@ pub(crate) fn parse_remote_mcp_token_row(
         identity_id: Uuid::parse_str(&identity_id).unwrap_or_else(|_| Uuid::new_v4()),
         label: row.get("label")?,
         token_hash: row.get("token_hash")?,
-        token_prefix: row.get("token_prefix")?,
         scopes: serde_json::from_str(&scopes).unwrap_or_default(),
         created_at: parse_rfc3339(&created_at),
         expires_at: parse_rfc3339(&expires_at),
@@ -1149,12 +1184,95 @@ mod tests {
             identity_id,
             label: label.into(),
             token_hash: minted.hash,
-            token_prefix: minted.prefix,
             scopes: vec!["remote_mcp".into()],
             created_at,
             expires_at: created_at + chrono::Duration::days(90),
             last_used_at: None,
             revoked_at: None,
+        }
+    }
+
+    #[test]
+    fn a_database_with_the_legacy_prefix_column_loses_it_and_keeps_its_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("identity.db");
+        let minted = crate::remote_mcp_token::mint();
+        let body = minted.plaintext[crate::remote_mcp_token::TOKEN_PREFIX.len()..].to_string();
+        let legacy_prefix: String = body.chars().take(8).collect();
+        let id = Uuid::new_v4();
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE remote_mcp_tokens (
+                    id TEXT PRIMARY KEY, identity_id TEXT NOT NULL, label TEXT NOT NULL,
+                    token_hash TEXT NOT NULL UNIQUE, token_prefix TEXT NOT NULL,
+                    scopes TEXT NOT NULL DEFAULT '[]', created_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL, last_used_at TEXT, revoked_at TEXT);",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO remote_mcp_tokens VALUES (?1, ?2, 'old', ?3, ?4, '[\"remote_mcp\"]', \
+                 '2026-01-01T00:00:00+00:00', '2099-01-01T00:00:00+00:00', NULL, NULL)",
+                params![
+                    id.to_string(),
+                    Uuid::new_v4().to_string(),
+                    minted.hash,
+                    legacy_prefix
+                ],
+            )
+            .unwrap();
+        }
+        let store = SqliteIdentityStore::new(&path).unwrap();
+        let got = store
+            .get_token_by_hash(&crate::remote_mcp_token::hash_token(&minted.plaintext))
+            .unwrap()
+            .expect("existing key still resolves by hash");
+        assert_eq!(got.id, id);
+        assert_eq!(
+            got.fingerprint(),
+            crate::remote_mcp_token::fingerprint(&minted.hash)
+        );
+        drop(store);
+        let raw = std::fs::read(&path).unwrap();
+        assert!(
+            !raw.windows(legacy_prefix.len())
+                .any(|w| w == legacy_prefix.as_bytes()),
+            "the old prefix is still in the database file"
+        );
+        // Re-opening is a no-op.
+        SqliteIdentityStore::new(&path).unwrap();
+    }
+
+    /// VACUUM can fail and is never retried, since the column is already gone,
+    /// so the drop alone has to remove the values from the file.
+    #[test]
+    fn dropping_the_legacy_column_erases_its_values_without_a_vacuum() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("identity.db");
+        let prefixes: Vec<String> = (0..50).map(|i| format!("PFX{i:05}")).collect();
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE remote_mcp_tokens (
+                id TEXT PRIMARY KEY, token_hash TEXT NOT NULL UNIQUE,
+                token_prefix TEXT NOT NULL, scopes TEXT NOT NULL DEFAULT '[]');",
+        )
+        .unwrap();
+        for (i, prefix) in prefixes.iter().enumerate() {
+            conn.execute(
+                "INSERT INTO remote_mcp_tokens (id, token_hash, token_prefix) \
+                 VALUES (?1, ?2, ?3)",
+                params![format!("id{i}"), format!("hash{i}"), prefix],
+            )
+            .unwrap();
+        }
+        conn.execute_batch(DROP_LEGACY_TOKEN_PREFIX).unwrap();
+        drop(conn);
+        let raw = std::fs::read(&path).unwrap();
+        for prefix in &prefixes {
+            assert!(
+                !raw.windows(prefix.len()).any(|w| w == prefix.as_bytes()),
+                "{prefix} is still in the database file"
+            );
         }
     }
 
@@ -1170,7 +1288,6 @@ mod tests {
         assert_eq!(got.id, token.id);
         assert_eq!(got.identity_id, token.identity_id);
         assert_eq!(got.label, "laptop");
-        assert_eq!(got.token_prefix, token.token_prefix);
         assert_eq!(got.scopes, vec!["remote_mcp".to_string()]);
         assert_eq!(got.created_at.to_rfc3339(), token.created_at.to_rfc3339());
         assert_eq!(got.expires_at.to_rfc3339(), token.expires_at.to_rfc3339());

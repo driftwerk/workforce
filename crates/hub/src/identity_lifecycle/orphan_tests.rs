@@ -328,7 +328,6 @@ async fn every_category_answers_whom_it_holds_things_for() {
             identity_id: alice.id,
             label: "laptop".into(),
             token_hash: "h".into(),
-            token_prefix: "p".into(),
             scopes: vec![],
             created_at: Utc::now(),
             expires_at: Utc::now() + Duration::days(1),
