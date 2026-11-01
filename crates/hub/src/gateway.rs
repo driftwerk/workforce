@@ -1245,20 +1245,30 @@ pub(crate) struct WsCaller {
     pub(crate) identity_role: String,
 }
 
-/// The credential a WebSocket handshake presents: its `Authorization: Bearer`
-/// header, which a native client sends to keep the token out of the URL (and
-/// so out of access logs), else its `?token=`, which a browser's WebSocket
-/// can only send that way.
-pub(crate) fn ws_token<'a>(headers: &'a axum::http::HeaderMap, query: Option<&'a str>) -> &'a str {
-    let bearer = headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|h| {
-            let (scheme, token) = h.split_once(' ')?;
-            scheme.eq_ignore_ascii_case("bearer").then(|| token.trim())
-        })
-        .filter(|t| !t.is_empty());
-    bearer.or(query).unwrap_or_default()
+/// The credential a WebSocket handshake presents: its `?token=`, which a
+/// browser's WebSocket can only send that way, else its `Authorization:
+/// Bearer` header, which a native client sends to keep the token out of the
+/// URL (and so out of access logs).
+///
+/// The query wins when both are present, as in [`resolve_caller_context`]:
+/// every handshake that opened before the header was read opens the same way
+/// now, even through a proxy that adds an `Authorization` of its own.
+pub(crate) fn ws_token(headers: &axum::http::HeaderMap, query: Option<&str>) -> String {
+    let bearer = || {
+        headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|h| {
+                let (scheme, token) = h.split_once(' ')?;
+                scheme.eq_ignore_ascii_case("bearer").then(|| token.trim())
+            })
+            .filter(|t| !t.is_empty())
+    };
+    query
+        .filter(|t| !t.is_empty())
+        .or_else(bearer)
+        .unwrap_or_default()
+        .to_owned()
 }
 
 #[cfg(test)]
@@ -1273,18 +1283,27 @@ mod ws_token_tests {
     }
 
     #[test]
-    fn the_header_is_taken_before_the_query() {
-        assert_eq!(ws_token(&with("Bearer wfp_a"), Some("wfp_b")), "wfp_a");
+    fn the_header_is_read_when_the_url_names_no_token() {
+        assert_eq!(ws_token(&with("Bearer wfp_a"), None), "wfp_a");
         assert_eq!(ws_token(&with("bearer wfp_a"), None), "wfp_a");
-        assert_eq!(ws_token(&HeaderMap::new(), Some("wfp_b")), "wfp_b");
+        assert_eq!(ws_token(&with("BEARER  wfp_a "), None), "wfp_a");
+        assert_eq!(ws_token(&with("Bearer wfp_a"), Some("")), "wfp_a");
         assert_eq!(ws_token(&HeaderMap::new(), None), "");
     }
 
     #[test]
-    fn a_header_that_is_not_a_bearer_falls_back_to_the_query() {
+    fn the_query_wins_as_on_every_rest_route() {
+        assert_eq!(ws_token(&with("Bearer wfp_a"), Some("wfp_b")), "wfp_b");
+        assert_eq!(ws_token(&HeaderMap::new(), Some("wfp_b")), "wfp_b");
+    }
+
+    #[test]
+    fn a_header_that_is_not_a_bearer_is_no_credential() {
         assert_eq!(ws_token(&with("Basic dTpw"), Some("wfp_b")), "wfp_b");
-        assert_eq!(ws_token(&with("Bearer "), Some("wfp_b")), "wfp_b");
+        assert_eq!(ws_token(&with("Basic dTpw"), None), "");
+        assert_eq!(ws_token(&with("Bearer "), None), "");
         assert_eq!(ws_token(&with("Bearer"), None), "");
+        assert_eq!(ws_token(&with("Bearerwfp_a"), None), "");
     }
 }
 
@@ -1412,7 +1431,7 @@ async fn ws_handler(
         workforce_gateway_client::protocol::MediaAccept::from_names(query.accept.as_deref());
     let declared =
         query.desk == Some(1) && workforce_common::channels::is_desk_conversation(&anchor_channel);
-    let caller = match authenticate_ws(&state, ws_token(&headers, query.token.as_deref())).await {
+    let caller = match authenticate_ws(&state, &ws_token(&headers, query.token.as_deref())).await {
         Ok(caller) => caller,
         Err(refused) => return refused,
     };

@@ -263,8 +263,9 @@ async fn connect_with_header(url: String, token: &str) -> Result<Socket, tungste
 }
 
 /// A link and a conversation open with the token in the handshake's
-/// header and none in the URL; without either, they are refused; and the
-/// header is taken over a `?token=` beside it.
+/// header and none in the URL; a link opened so is still theirs at its
+/// ping, which checks that same token again; without either, they are
+/// refused; and a `?token=` beside a header wins, as on every REST route.
 #[tokio::test]
 async fn a_handshake_may_carry_its_token_in_the_authorization_header() {
     let data = tempfile::tempdir().unwrap();
@@ -288,6 +289,14 @@ async fn a_handshake_may_carry_its_token_in_the_authorization_header() {
         .await
         .expect("the link connects with the header alone");
     assert_eq!(next(&mut link).await["type"], "hello");
+    link.send(tungstenite::Message::Text(r#"{"type":"ping"}"#.into()))
+        .await
+        .unwrap();
+    assert_eq!(
+        next(&mut link).await,
+        json!({"type": "pong"}),
+        "the ping checks the token the handshake carried"
+    );
     let mut chat = connect_with_header(format!("ws://{addr}/ws?channel=desk&desk=1"), &token)
         .await
         .expect("a conversation connects with the header alone");
@@ -306,9 +315,14 @@ async fn a_handshake_may_carry_its_token_in_the_authorization_header() {
         assert_eq!(response.status(), 401, "{url}");
     }
 
-    let refused = connect_with_header(format!("ws://{addr}/ws/desk?token={token}"), "not-a-token")
+    let mut queried =
+        connect_with_header(format!("ws://{addr}/ws/desk?token={token}"), "not-a-token")
+            .await
+            .expect("the query is what's checked when both are there");
+    assert_eq!(next(&mut queried).await["type"], "hello");
+    let refused = connect_with_header(format!("ws://{addr}/ws/desk?token=not-a-token"), &token)
         .await
-        .expect_err("the header is what's checked");
+        .expect_err("a bad query is not rescued by the header");
     let tungstenite::Error::Http(response) = refused else {
         panic!("expected an HTTP refusal, got {refused:?}");
     };

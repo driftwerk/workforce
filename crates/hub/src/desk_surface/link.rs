@@ -93,7 +93,10 @@ pub(crate) async fn handler(
     Query(query): Query<LinkQuery>,
     State(state): State<Arc<GatewayState>>,
 ) -> Response {
-    let caller = match authenticate_ws(&state, ws_token(&headers, query.token.as_deref())).await {
+    // The token the handshake was admitted with, header or query: each ping
+    // checks it again, so it must be the same one.
+    let token = ws_token(&headers, query.token.as_deref());
+    let caller = match authenticate_ws(&state, &token).await {
         Ok(caller) => caller,
         Err(refused) => return refused,
     };
@@ -119,7 +122,6 @@ pub(crate) async fn handler(
         holds: holds(&state, &identity),
         identity,
     };
-    let token = query.token.unwrap_or_default();
     ws.on_upgrade(move |socket| run(socket, state, listener, token))
         .into_response()
 }
