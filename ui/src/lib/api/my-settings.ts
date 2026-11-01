@@ -23,7 +23,8 @@ export interface VaultListResponse {
 export interface RemoteMcpToken {
   id: string;
   label: string;
-  token_prefix: string;
+  /** Non-secret label derived from the stored hash; names the key, reveals none of it. */
+  fingerprint: string;
   created_at: string;
   expires_at: string;
   last_used_at: string | null;

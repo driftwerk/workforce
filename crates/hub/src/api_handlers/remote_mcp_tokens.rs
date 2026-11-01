@@ -89,7 +89,8 @@ fn revoked(revoked: bool) -> Result<StatusCode, Rejection> {
 pub struct TokenView {
     id: Uuid,
     label: String,
-    token_prefix: String,
+    /// Non-secret label derived from the stored hash; names the key, reveals none of it.
+    fingerprint: String,
     created_at: DateTime<Utc>,
     expires_at: DateTime<Utc>,
     last_used_at: Option<DateTime<Utc>>,
@@ -100,9 +101,9 @@ impl TokenView {
     fn new(token: RemoteMcpToken, now: DateTime<Utc>) -> Self {
         Self {
             expired: is_expired(&token, now),
+            fingerprint: token.fingerprint(),
             id: token.id,
             label: token.label,
-            token_prefix: token.token_prefix,
             created_at: token.created_at,
             expires_at: token.expires_at,
             last_used_at: token.last_used_at,
@@ -242,6 +243,32 @@ mod tests {
             exp: u64::MAX,
             scopes: vec!["*".into()],
             device_id: device_id.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn a_listed_key_carries_a_fingerprint_and_no_part_of_the_key() {
+        let minted = workforce_identity::remote_mcp_token::mint();
+        let body = minted.plaintext["wfr_".len()..].to_string();
+        let now = Utc::now();
+        let token = RemoteMcpToken {
+            id: Uuid::new_v4(),
+            identity_id: Uuid::new_v4(),
+            label: "laptop".into(),
+            token_hash: minted.hash,
+            scopes: vec!["remote_mcp".into()],
+            created_at: now,
+            expires_at: now + chrono::Duration::days(90),
+            last_used_at: None,
+            revoked_at: None,
+        };
+        let expected = token.fingerprint();
+        let json = serde_json::to_value(TokenView::new(token, now)).unwrap();
+        assert_eq!(json["fingerprint"], expected.as_str());
+        assert!(json.get("token_prefix").is_none());
+        let text = json.to_string();
+        for start in 0..=body.len() - 6 {
+            assert!(!text.contains(&body[start..start + 6]));
         }
     }
 

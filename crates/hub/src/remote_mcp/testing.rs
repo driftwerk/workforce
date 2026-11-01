@@ -136,7 +136,6 @@ pub(crate) fn issue(fixture: &Fixture, identity: &Identity, shape: TokenShape) -
             identity_id: identity.id,
             label: "test".to_string(),
             token_hash: minted.hash,
-            token_prefix: minted.prefix,
             scopes: shape.scopes,
             created_at: Utc::now(),
             expires_at: shape.expires_at,

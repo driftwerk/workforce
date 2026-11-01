@@ -85,6 +85,17 @@ impl PostgresIdentityStore {
         MigrationRunner::run(&pool, &[migration_set])
             .await
             .context("running identity migrations")?;
+        // A previous-release node that was still running during the
+        // migration may have minted a key with a stored prefix since.
+        // Clear it (cheap, idempotent). Goes away with the column.
+        let conn = pool.get().await?;
+        conn.execute(
+            "UPDATE remote_mcp_tokens SET token_prefix = '' WHERE token_prefix <> ''",
+            &[],
+        )
+        .await
+        .context("clearing stored remote MCP key prefixes")?;
+        drop(conn);
         Ok(Arc::new(Self { pool }))
     }
 
@@ -162,7 +173,6 @@ fn row_to_remote_mcp_token(row: &Row) -> Result<RemoteMcpToken> {
         identity_id: row.try_get("identity_id")?,
         label: row.try_get("label")?,
         token_hash: row.try_get("token_hash")?,
-        token_prefix: row.try_get("token_prefix")?,
         scopes: serde_json::from_value(scopes_json).unwrap_or_default(),
         created_at: row.try_get("created_at")?,
         expires_at: row.try_get("expires_at")?,
@@ -171,7 +181,7 @@ fn row_to_remote_mcp_token(row: &Row) -> Result<RemoteMcpToken> {
     })
 }
 
-const REMOTE_MCP_TOKEN_COLUMNS: &str = "id, identity_id, label, token_hash, token_prefix, scopes, \
+const REMOTE_MCP_TOKEN_COLUMNS: &str = "id, identity_id, label, token_hash, scopes, \
                                         created_at, expires_at, last_used_at, revoked_at";
 
 // ─── IdentityStore impl ────────────────────────────────────────────────
@@ -492,15 +502,14 @@ impl RemoteMcpTokenStore for PostgresIdentityStore {
             let scopes = serde_json::to_value(&token.scopes)?;
             conn.execute(
                 "INSERT INTO remote_mcp_tokens
-                 (id, identity_id, label, token_hash, token_prefix, scopes,
+                 (id, identity_id, label, token_hash, scopes,
                   created_at, expires_at, last_used_at, revoked_at)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
                 &[
                     &token.id,
                     &token.identity_id,
                     &token.label,
                     &token.token_hash,
-                    &token.token_prefix,
                     &scopes,
                     &token.created_at,
                     &token.expires_at,
@@ -829,6 +838,102 @@ mod tests {
         .await;
     }
 
+    /// Existing prefixes are wiped by the migration, a previous-release
+    /// reader still decodes the column, and the key still authenticates.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn migration_clears_stored_prefixes_and_keys_keep_resolving() {
+        with_test_pool(PostgresIdentityStore::build_pool, |pool| async move {
+            let store = PostgresIdentityStore::with_pool(pool.clone())
+                .await
+                .expect("construct store");
+            let owner = Identity::new("Alice", IdentityRole::Member);
+            store.create(&owner).unwrap();
+            let minted = crate::remote_mcp_token::mint();
+            let body = minted.plaintext[crate::remote_mcp_token::TOKEN_PREFIX.len()..].to_string();
+            let legacy_prefix: String = body.chars().take(8).collect();
+            let id = Uuid::new_v4();
+            let conn = pool.get().await.unwrap();
+            // A row exactly as the previous release wrote it.
+            conn.execute(
+                "INSERT INTO remote_mcp_tokens
+                 (id, identity_id, label, token_hash, token_prefix, scopes,
+                  created_at, expires_at)
+                 VALUES ($1, $2, 'old', $3, $4, '[\"remote_mcp\"]'::jsonb, now(),
+                         now() + interval '90 days')",
+                &[&id, &owner.id, &minted.hash, &legacy_prefix],
+            )
+            .await
+            .unwrap();
+            conn.batch_execute(include_str!(
+                "../migrations/V004__remote_mcp_tokens_stop_storing_prefix.sql"
+            ))
+            .await
+            .unwrap();
+            // What a previous-release node reads: a plain string column.
+            let stored: String = conn
+                .query_one(
+                    "SELECT token_prefix FROM remote_mcp_tokens WHERE id = $1",
+                    &[&id],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            assert_eq!(stored, "");
+            let got = store
+                .get_token_by_hash(&crate::remote_mcp_token::hash_token(&minted.plaintext))
+                .unwrap()
+                .expect("existing key still resolves by hash");
+            assert_eq!(got.id, id);
+            // New code writes no prefix; the default keeps old readers happy.
+            let fresh = crate::remote_mcp_token::mint();
+            let fresh_id = Uuid::new_v4();
+            store
+                .create_token(&RemoteMcpToken {
+                    id: fresh_id,
+                    identity_id: owner.id,
+                    label: "new".into(),
+                    token_hash: fresh.hash,
+                    scopes: vec!["remote_mcp".into()],
+                    created_at: Utc::now(),
+                    expires_at: Utc::now() + chrono::Duration::days(90),
+                    last_used_at: None,
+                    revoked_at: None,
+                })
+                .unwrap();
+            let stored: String = conn
+                .query_one(
+                    "SELECT token_prefix FROM remote_mcp_tokens WHERE id = $1",
+                    &[&fresh_id],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            assert_eq!(stored, "");
+            // A straggler written by a previous-release node is cleared at start.
+            conn.execute(
+                "UPDATE remote_mcp_tokens SET token_prefix = $2 WHERE id = $1",
+                &[&id, &legacy_prefix],
+            )
+            .await
+            .unwrap();
+            drop(conn);
+            PostgresIdentityStore::with_pool(pool.clone())
+                .await
+                .unwrap();
+            let conn = pool.get().await.unwrap();
+            let left: i64 = conn
+                .query_one(
+                    "SELECT COUNT(*) FROM remote_mcp_tokens WHERE token_prefix <> ''",
+                    &[],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            assert_eq!(left, 0);
+        })
+        .await;
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn lifecycle_claims_are_exclusive_per_subject_until_the_lease_lapses() {
         with_embedded_pg(|store| async move {
@@ -1042,7 +1147,6 @@ mod tests {
                     identity_id: owner.id,
                     label: label.into(),
                     token_hash: minted.hash,
-                    token_prefix: minted.prefix,
                     scopes: vec!["remote_mcp".into()],
                     created_at,
                     expires_at: created_at + chrono::Duration::days(90),

@@ -237,7 +237,7 @@ async fn write_teams(pool: &PostgresPool, rows: Vec<TeamMigRow>) -> Result<usize
 
 fn read_remote_mcp_tokens(sqlite: &Connection) -> Result<Vec<RemoteMcpToken>> {
     let mut stmt = sqlite.prepare(
-        "SELECT id, identity_id, label, token_hash, token_prefix, scopes,
+        "SELECT id, identity_id, label, token_hash, scopes,
                 created_at, expires_at, last_used_at, revoked_at
          FROM remote_mcp_tokens",
     )?;
@@ -256,16 +256,15 @@ async fn write_remote_mcp_tokens(pool: &PostgresPool, rows: Vec<RemoteMcpToken>)
         let scopes = serde_json::to_value(&t.scopes)?;
         conn.execute(
             "INSERT INTO remote_mcp_tokens
-             (id, identity_id, label, token_hash, token_prefix, scopes,
+             (id, identity_id, label, token_hash, scopes,
               created_at, expires_at, last_used_at, revoked_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
              ON CONFLICT (id) DO NOTHING",
             &[
                 &t.id,
                 &t.identity_id,
                 &t.label,
                 &t.token_hash,
-                &t.token_prefix,
                 &scopes,
                 &t.created_at,
                 &t.expires_at,
@@ -356,7 +355,6 @@ mod tests {
                 identity_id: alice_id,
                 label: "laptop".into(),
                 token_hash: minted.hash,
-                token_prefix: minted.prefix,
                 scopes: vec!["remote_mcp".into()],
                 created_at: Utc::now(),
                 expires_at: Utc::now() + chrono::Duration::days(90),

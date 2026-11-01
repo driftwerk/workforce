@@ -14,7 +14,8 @@ use uuid::Uuid;
 
 pub const TOKEN_PREFIX: &str = "wfr_";
 const SECRET_BYTES: usize = 32;
-const PREFIX_CHARS: usize = 8;
+const FINGERPRINT_CONTEXT: &str = "workforce remote-mcp key fingerprint v1";
+const FINGERPRINT_HEX_CHARS: usize = 8;
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RemoteMcpToken {
@@ -22,7 +23,6 @@ pub struct RemoteMcpToken {
     pub identity_id: Uuid,
     pub label: String,
     pub token_hash: String,
-    pub token_prefix: String,
     pub scopes: Vec<String>,
     pub created_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
@@ -48,24 +48,28 @@ impl std::fmt::Debug for RemoteMcpToken {
 }
 
 impl RemoteMcpToken {
+    /// Non-secret label for telling keys apart in a listing. See
+    /// [`fingerprint`].
+    pub fn fingerprint(&self) -> String {
+        fingerprint(&self.token_hash)
+    }
+
     pub fn is_live(&self, now: DateTime<Utc>) -> bool {
         self.revoked_at.is_none() && now < self.expires_at
     }
 }
 
 /// A freshly minted token. `plaintext` leaves this struct exactly once, to the
-/// user; `hash` and `prefix` are what the store keeps.
+/// user; `hash` is what the store keeps.
 #[derive(Clone, PartialEq, Eq)]
 pub struct MintedToken {
     pub plaintext: String,
     pub hash: String,
-    pub prefix: String,
 }
 
 impl std::fmt::Debug for MintedToken {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Neither the plaintext nor its stored prefix: a Debug line is a log
-        // line, and no part of a secret belongs in one.
+        // No part of the secret: a Debug line is a log line.
         f.debug_struct("MintedToken").finish_non_exhaustive()
     }
 }
@@ -77,13 +81,26 @@ pub fn mint() -> MintedToken {
     let plaintext = format!("{TOKEN_PREFIX}{body}");
     MintedToken {
         hash: hash_token(&plaintext),
-        prefix: body.chars().take(PREFIX_CHARS).collect(),
         plaintext,
     }
 }
 
 pub fn hash_token(plaintext: &str) -> String {
     blake3::hash(plaintext.as_bytes()).to_hex().to_string()
+}
+
+/// A short label that names a key without revealing any of it.
+///
+/// Derived from the stored hash (never from the key), through a
+/// domain-separated blake3 `derive_key`, so it is not a slice of the value
+/// authentication compares against. The key is 256 random bits and the hash
+/// is one-way, so 32 bits of a further one-way digest tell an attacker
+/// nothing about the key body. Computed on read, so every key has one with
+/// no backfill.
+pub fn fingerprint(token_hash: &str) -> String {
+    let digest = blake3::derive_key(FINGERPRINT_CONTEXT, token_hash.as_bytes());
+    let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+    hex[..FINGERPRINT_HEX_CHARS].to_string()
 }
 
 pub trait RemoteMcpTokenStore: Send + Sync {
@@ -115,7 +132,6 @@ mod tests {
             identity_id: Uuid::new_v4(),
             label: "laptop".into(),
             token_hash: "h".into(),
-            token_prefix: "p".into(),
             scopes: vec!["remote_mcp".into()],
             created_at: now,
             expires_at: now + Duration::days(90),
@@ -125,21 +141,7 @@ mod tests {
     }
 
     #[test]
-    fn debug_output_shows_no_fragment_of_the_secret() {
-        let minted = mint();
-        let record = RemoteMcpToken {
-            token_hash: minted.hash.clone(),
-            token_prefix: minted.prefix.clone(),
-            ..token(Utc::now())
-        };
-        let shown = format!("{minted:?} {record:?}");
-        for fragment in [&minted.plaintext, &minted.prefix, &minted.hash] {
-            assert!(!shown.contains(fragment.as_str()), "{shown}");
-        }
-    }
-
-    #[test]
-    fn mint_produces_prefixed_unique_tokens_with_matching_hash_and_prefix() {
+    fn mint_produces_prefixed_unique_tokens_with_matching_hash() {
         let a = mint();
         let b = mint();
         assert_ne!(a.plaintext, b.plaintext);
@@ -148,9 +150,44 @@ mod tests {
         assert!(!a.plaintext.contains('='));
         assert_eq!(a.hash, hash_token(&a.plaintext));
         assert_eq!(a.hash.len(), 64);
-        assert_eq!(a.prefix.len(), PREFIX_CHARS);
-        assert!(a.plaintext[TOKEN_PREFIX.len()..].starts_with(&a.prefix));
         assert!(!format!("{a:?}").contains(&a.plaintext));
+    }
+
+    /// Every window of 6 to 12 characters of the key body, to catch any
+    /// fragment (shorter windows could match unrelated output by chance).
+    fn fragments(body: &str) -> Vec<&str> {
+        (0..=body.len() - 6)
+            .flat_map(|i| (6..=(body.len() - i).min(12)).map(move |n| (i, n)))
+            .map(|(i, n)| &body[i..i + n])
+            .collect()
+    }
+
+    #[test]
+    fn fingerprint_is_short_stable_and_not_a_slice_of_key_or_hash() {
+        let minted = mint();
+        let fp = fingerprint(&minted.hash);
+        assert_eq!(fp.len(), FINGERPRINT_HEX_CHARS);
+        assert!(fp.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(fp, fingerprint(&minted.hash));
+        assert_ne!(fp, fingerprint(&mint().hash));
+        assert!(!minted.hash.contains(&fp));
+        assert!(!minted.plaintext.contains(&fp));
+    }
+
+    #[test]
+    fn debug_output_carries_no_fragment_of_the_key() {
+        let minted = mint();
+        let body = &minted.plaintext[TOKEN_PREFIX.len()..];
+        let record = RemoteMcpToken {
+            token_hash: minted.hash.clone(),
+            ..token(Utc::now())
+        };
+        for shown in [format!("{minted:?}"), format!("{record:?}")] {
+            for frag in fragments(body) {
+                assert!(!shown.contains(frag), "debug output leaked a key fragment");
+            }
+        }
+        assert_eq!(record.fingerprint(), fingerprint(&minted.hash));
     }
 
     #[test]
