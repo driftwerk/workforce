@@ -246,3 +246,85 @@ async fn a_read_moved_is_heard_by_every_link_of_its_person_and_no_one_elses() {
     }
     quiet(&mut theirs).await;
 }
+
+/// A handshake that carries its token in `Authorization: Bearer`, the URL
+/// naming none: what Desk's native side sends, so no token reaches an
+/// access log.
+async fn connect_with_header(url: String, token: &str) -> Result<Socket, tungstenite::Error> {
+    use tungstenite::client::IntoClientRequest;
+    let mut request = url.into_client_request().unwrap();
+    request.headers_mut().insert(
+        tungstenite::http::header::AUTHORIZATION,
+        format!("Bearer {token}").parse().unwrap(),
+    );
+    tokio_tungstenite::connect_async(request)
+        .await
+        .map(|(socket, _)| socket)
+}
+
+/// A link and a conversation open with the token in the handshake's
+/// header and none in the URL; a link opened so is still theirs at its
+/// ping, which checks that same token again; without either, they are
+/// refused; and a `?token=` beside a header wins, as on every REST route.
+#[tokio::test]
+async fn a_handshake_may_carry_its_token_in_the_authorization_header() {
+    let data = tempfile::tempdir().unwrap();
+    let service = agent_service(data.path()).await;
+    let identities = Arc::new(SqliteIdentityStore::in_memory().unwrap());
+    let person = Identity::new("Person", IdentityRole::Member);
+    identities.create(&person).unwrap();
+    let state = GatewayParts::new(
+        AgentRegistry::from_parts(
+            [("scout".to_string(), service)].into_iter().collect(),
+            "scout".into(),
+        ),
+        Arc::clone(&identities) as Arc<dyn IdentityStore>,
+        std::path::PathBuf::from("/tmp/desk-link-test-skills"),
+    )
+    .state();
+    let addr = serve(Arc::clone(&state)).await;
+    let token = token_for(&person);
+
+    let mut link = connect_with_header(format!("ws://{addr}/ws/desk"), &token)
+        .await
+        .expect("the link connects with the header alone");
+    assert_eq!(next(&mut link).await["type"], "hello");
+    link.send(tungstenite::Message::Text(r#"{"type":"ping"}"#.into()))
+        .await
+        .unwrap();
+    assert_eq!(
+        next(&mut link).await,
+        json!({"type": "pong"}),
+        "the ping checks the token the handshake carried"
+    );
+    let mut chat = connect_with_header(format!("ws://{addr}/ws?channel=desk&desk=1"), &token)
+        .await
+        .expect("a conversation connects with the header alone");
+    assert_eq!(next(&mut chat).await["type"], "connected");
+
+    for url in [
+        format!("ws://{addr}/ws/desk"),
+        format!("ws://{addr}/ws?channel=desk"),
+    ] {
+        let refused = tokio_tungstenite::connect_async(url.as_str())
+            .await
+            .expect_err("no credential, no socket");
+        let tungstenite::Error::Http(response) = refused else {
+            panic!("expected an HTTP refusal, got {refused:?}");
+        };
+        assert_eq!(response.status(), 401, "{url}");
+    }
+
+    let mut queried =
+        connect_with_header(format!("ws://{addr}/ws/desk?token={token}"), "not-a-token")
+            .await
+            .expect("the query is what's checked when both are there");
+    assert_eq!(next(&mut queried).await["type"], "hello");
+    let refused = connect_with_header(format!("ws://{addr}/ws/desk?token=not-a-token"), &token)
+        .await
+        .expect_err("a bad query is not rescued by the header");
+    let tungstenite::Error::Http(response) = refused else {
+        panic!("expected an HTTP refusal, got {refused:?}");
+    };
+    assert_eq!(response.status(), 401);
+}

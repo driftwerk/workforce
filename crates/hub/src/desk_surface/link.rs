@@ -23,7 +23,7 @@ use tokio::sync::broadcast::error::RecvError;
 use workforce_common::channels::desk::{DeskDelivered, DeskSignal};
 
 use crate::broadcast::{BroadcastMessage, DESK_DELIVERED};
-use crate::gateway::{authenticate_ws, desk_features, GatewayState};
+use crate::gateway::{authenticate_ws, desk_features, ws_token, GatewayState};
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct LinkQuery {
@@ -89,10 +89,14 @@ fn admitted<'a>(msg: &'a BroadcastMessage, listener: &Listener) -> Option<LinkFr
 /// token naming nobody, is refused with 403 `link_requires_identity`.
 pub(crate) async fn handler(
     ws: WebSocketUpgrade,
+    headers: axum::http::HeaderMap,
     Query(query): Query<LinkQuery>,
     State(state): State<Arc<GatewayState>>,
 ) -> Response {
-    let caller = match authenticate_ws(&state, query.token.as_deref().unwrap_or_default()).await {
+    // The token the handshake was admitted with, header or query: each ping
+    // checks it again, so it must be the same one.
+    let token = ws_token(&headers, query.token.as_deref());
+    let caller = match authenticate_ws(&state, &token).await {
         Ok(caller) => caller,
         Err(refused) => return refused,
     };
@@ -118,7 +122,6 @@ pub(crate) async fn handler(
         holds: holds(&state, &identity),
         identity,
     };
-    let token = query.token.unwrap_or_default();
     ws.on_upgrade(move |socket| run(socket, state, listener, token))
         .into_response()
 }
