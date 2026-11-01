@@ -16,7 +16,7 @@ use tokio::time::Instant;
 use tracing::{debug, warn};
 use uuid::Uuid;
 use workforce_desk::crew;
-use workforce_desk::floor::{Outcome, Scope, Subject, SubjectKey, Turn, TurnOp};
+use workforce_desk::floor::{Outcome, Place, Scope, Subject, SubjectKey, Turn, TurnOp};
 use workforce_desk::gist::{self, Asked, Doing, Gist, Happening, Moment, Paragraph, Reach};
 use workforce_desk::model::Engine;
 
@@ -155,6 +155,7 @@ struct Running {
     subject: Subject,
     name: String,
     turn: Uuid,
+    place: Place,
     ask: Option<String>,
     by_person: bool,
     steps: VecDeque<String>,
@@ -172,6 +173,7 @@ struct Job {
     subject: Subject,
     name: String,
     turn: Uuid,
+    place: Place,
     ask: Option<String>,
     steps: Vec<String>,
     reply: Option<String>,
@@ -255,6 +257,7 @@ impl Gists {
                     subject: turn.subject.clone(),
                     name: turn.name.clone(),
                     turn: turn.id,
+                    place: turn.place.clone(),
                     ask: None,
                     by_person,
                     steps: VecDeque::new(),
@@ -267,6 +270,7 @@ impl Gists {
                 r.subject = turn.subject.clone();
                 r.name = turn.name.clone();
                 r.turn = turn.id;
+                r.place = turn.place.clone();
                 r.ask = turn.task.clone();
                 r.by_person = by_person;
                 r.steps.clear();
@@ -374,6 +378,7 @@ impl Gists {
             subject: r.subject.clone(),
             name: r.name.clone(),
             turn: r.turn,
+            place: r.place.clone(),
             ask: r.ask.clone(),
             steps: r.steps.iter().cloned().collect(),
             reply: ended.and_then(|(_, answer)| answer),
@@ -397,6 +402,7 @@ impl Gists {
             subject: t.subject.clone(),
             name: t.name.clone(),
             turn,
+            place: t.place.clone(),
             ask: t.task.clone(),
             steps: vec![],
             reply: answer,
@@ -423,12 +429,36 @@ impl Gists {
             warn!(target: "floor", error = %format!("{e:#}"), "reading a gist failed");
             None
         });
+        if let (Subject::Agent { .. }, Some(surface)) = (&job.subject, gist::elsewhere(&job.place))
+        {
+            // The person's Desk conversation alone gives an agent its
+            // purpose. A turn from another surface changes only what the
+            // agent is doing now, said without its content.
+            let at = crew::now();
+            let (purpose, purpose_at) = kept
+                .as_ref()
+                .and_then(|k| k.purpose.clone().map(|p| (p, k.purpose_at)))
+                .unwrap_or_else(|| (gist::ELSEWHERE_PURPOSE.into(), None));
+            let gist = Gist {
+                purpose: Some(purpose),
+                purpose_at,
+                now: gist::elsewhere_now(surface, job.moment == Moment::Ended),
+                now_at: at,
+                turn: job.turn,
+                by_model: false,
+            };
+            return match self.0.kept.put_gist(owner, key, &gist).await {
+                Ok(()) => (self.0.told)(owner),
+                Err(e) => {
+                    warn!(target: "floor", error = %format!("{e:#}"), "keeping a gist failed")
+                }
+            };
+        }
         let read_at = crew::now();
         // An agent's purpose is its current conversation's, read from its
         // latest asks; a session's is its one job's.
         let reach = match &job.subject {
-            Subject::Agent { session_id, .. } => Reach::Thread {
-                session: session_id.clone(),
+            Subject::Agent { .. } => Reach::Thread {
                 since: read_at - gist::THREAD_WITHIN,
             },
             Subject::Session { .. } => Reach::Job,
@@ -442,19 +472,20 @@ impl Gists {
                 warn!(target: "floor", error = %format!("{e:#}"), "reading a subject's asks failed");
                 Asked::default()
             });
-        // A thread that has no turn in the window yet began with the window.
-        let began = match &reach {
-            Reach::Thread { since, .. } => Some(began.unwrap_or(*since)),
-            Reach::Job => None,
-        };
+        // With no Desk conversation in the window, the last purpose stands.
         // A purpose from before this thread is not offered to the model to
         // keep: it would only be written out again.
         let outdated = kept
             .as_ref()
             .and_then(|k| k.purpose_at.zip(began))
             .is_some_and(|(written, began)| written < began);
+        // The neutral line (no time) is no purpose to keep.
         let offered = kept.as_ref().map(|k| Gist {
-            purpose: if outdated { None } else { k.purpose.clone() },
+            purpose: if outdated || k.purpose_at.is_none() {
+                None
+            } else {
+                k.purpose.clone()
+            },
             ..k.clone()
         });
         let goal = model.goal(&job.subject);
@@ -1096,8 +1127,7 @@ mod tests {
         );
         let reach = memory.reached.lock()[0].clone();
         match &reach {
-            Reach::Thread { session, since } => {
-                assert_eq!(session, "dm");
+            Reach::Thread { since } => {
                 let within = crew::now() - *since;
                 assert!(
                     within >= gist::THREAD_WITHIN
@@ -1177,6 +1207,86 @@ mod tests {
             memory.written.lock()[1].purpose.as_deref(),
             Some("Finding why the login page fails.")
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_agent_with_no_asks_in_the_window_still_shows_a_purpose() {
+        // The model says nothing usable, and the log has no asks in the window.
+        let (gists, memory, _) = gists(Scripted::new("", Duration::ZERO));
+        *memory.asked.lock() = Asked::default();
+        memory.gists.lock().insert(
+            scout(),
+            kept_purpose("Planning next year's budget.", chrono::Duration::days(2)),
+        );
+        let mut turn = started(Uuid::new_v4());
+        turn.task = None;
+        gists.saw(&begin_for(turn, false));
+        settle().await;
+        let written = memory.written.lock()[0].clone();
+        assert!(
+            written.purpose.as_deref().is_some_and(|p| !p.is_empty()),
+            "never blank: {written:?}"
+        );
+    }
+
+    fn in_slack() -> Turn {
+        Turn {
+            place: Place::Slack {
+                team: None,
+                channel: "C1".into(),
+                thread: None,
+            },
+            task: Some("Secret ask from the channel".into()),
+            ..started(Uuid::new_v4())
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_slack_turn_changes_only_what_an_agent_is_doing_never_its_purpose() {
+        let model = Scripted::new(LOGIN, Duration::ZERO);
+        let (gists, memory, _) = gists(Arc::clone(&model));
+        let kept = kept_purpose("Planning next year's budget.", chrono::Duration::hours(2));
+        let was = kept.purpose_at;
+        memory.gists.lock().insert(scout(), kept);
+        gists.saw(&begin_for(in_slack(), true));
+        settle().await;
+        let written = memory.written.lock()[0].clone();
+        assert_eq!(
+            written.purpose.as_deref(),
+            Some("Planning next year's budget.")
+        );
+        assert_eq!(written.purpose_at, was);
+        assert_eq!(written.now, "Answering a request in Slack.");
+        assert!(
+            model.asked.lock().is_empty(),
+            "Slack content never reaches the model"
+        );
+        assert!(memory.reached.lock().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_agent_never_talked_to_in_desk_has_a_neutral_purpose_and_a_desk_turn_replaces_it() {
+        let model = Scripted::new(LOGIN, Duration::ZERO);
+        let (gists, memory, _) = gists(Arc::clone(&model));
+        gists.saw(&begin_for(in_slack(), true));
+        settle().await;
+        let written = memory.written.lock()[0].clone();
+        assert_eq!(written.purpose.as_deref(), Some(gist::ELSEWHERE_PURPOSE));
+        assert_eq!(written.purpose_at, None);
+        memory.gists.lock().insert(scout(), written);
+        *memory.asked.lock() = Asked {
+            asks: vec!["Why does the login page fail?".into()],
+            began: Some(crew::now()),
+        };
+        gists.saw(&begin_for(started(Uuid::new_v4()), true));
+        settle().await;
+        let next = memory.written.lock()[1].clone();
+        assert_eq!(
+            next.purpose.as_deref(),
+            Some("Finding why the login page fails.")
+        );
+        assert!(!model.asked.lock()[0].contains("requests from other places"));
+        assert!(!model.asked.lock()[0].contains("Secret"));
     }
 
     #[tokio::test(start_paused = true)]
