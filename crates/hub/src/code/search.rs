@@ -279,6 +279,12 @@ impl Tool for CodeSearchTool {
         "code.search"
     }
 
+    fn effect(&self, input: &serde_json::Value) -> workforce_core::computer::Effect {
+        workforce_core::computer::Effect::Read {
+            paths: super::utils::effect_paths(input, "path", &self.allowed_paths),
+        }
+    }
+
     fn soft_deadline(&self) -> Option<std::time::Duration> {
         // ripgrep on a sane tree finishes in well under a second. A multi-minute
         // run means it's traversing something huge (e.g. vendored build dirs in a

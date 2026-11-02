@@ -656,6 +656,7 @@ async fn dispatch_tool_step(
     input: serde_json::Value,
     declared_outputs: &[String],
     validation: workforce_agent::tools::arguments::ArgumentValidation,
+    computer: Option<&dyn workforce_agent::tools::computer::ComputerGate>,
 ) -> Result<String, String> {
     if let Some(refusal) = workforce_agent::tools::dispatch::unattended_refusal(tools, tool_name) {
         return Err(refusal);
@@ -669,6 +670,13 @@ async fn dispatch_tool_step(
         )
     {
         return Err(format!("'{tool_name}' did not run: {reason}"));
+    }
+    // A workflow step asks nobody: what the computer gate would ask about is
+    // refused here.
+    if let Some(refusal) =
+        workforce_agent::tools::computer::unattended_refusal(computer, tools, tool_name, &input)
+    {
+        return Err(refusal);
     }
     let result = workforce_agent::runner::CURRENT_AGENT_ID
         .scope(agent_id.to_string(), tool.execute(input))
@@ -3029,6 +3037,7 @@ impl WorkflowRuntime {
             input,
             declared_outputs,
             step_service.config.tools.validation.mode,
+            step_service.computer_gate().as_deref(),
         )
         .await
     }
@@ -10172,6 +10181,7 @@ mod tests {
             serde_json::json!({}),
             &["agent".to_string()],
             workforce_agent::tools::arguments::ArgumentValidation::Shadow,
+            None,
         )
         .await
         .unwrap();
@@ -10183,6 +10193,7 @@ mod tests {
             serde_json::json!({}),
             &[],
             workforce_agent::tools::arguments::ArgumentValidation::Shadow,
+            None,
         )
         .await
         .unwrap_err();
@@ -10257,6 +10268,7 @@ mod tests {
             serde_json::json!({ "n": "x" }),
             &[],
             enforce,
+            None,
         )
         .await
         .unwrap_err();
@@ -10273,6 +10285,7 @@ mod tests {
             serde_json::json!({ "n": 2 }),
             &[],
             enforce,
+            None,
         )
         .await
         .expect("valid arguments run");
@@ -10295,6 +10308,7 @@ mod tests {
             serde_json::json!({}),
             &[],
             workforce_agent::tools::arguments::ArgumentValidation::Shadow,
+            None,
         )
         .await
         .unwrap_err();
@@ -10314,6 +10328,7 @@ mod tests {
             serde_json::json!({}),
             &[],
             workforce_agent::tools::arguments::ArgumentValidation::Shadow,
+            None,
         )
         .await
         .expect("an ungated tool step still runs");
@@ -10432,6 +10447,7 @@ mod tests {
                     input,
                     &[],
                     workforce_agent::tools::arguments::ArgumentValidation::Shadow,
+                    None,
                 ),
             )
         };

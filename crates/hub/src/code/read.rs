@@ -133,6 +133,12 @@ impl Tool for CodeReadTool {
         "code.read"
     }
 
+    fn effect(&self, input: &serde_json::Value) -> workforce_core::computer::Effect {
+        workforce_core::computer::Effect::Read {
+            paths: super::utils::effect_paths(input, "path", &self.allowed_paths),
+        }
+    }
+
     fn description(&self) -> &str {
         "Read file(s) with line numbers and optional ranges"
     }

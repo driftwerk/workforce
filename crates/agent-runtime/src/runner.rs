@@ -29,7 +29,8 @@ use crate::tools::access::{self, ToolAccess, ToolAccessSnapshot};
 use crate::tools::approval::{Decision, GatedCall, OpenPrompt, Refusal, TurnApprovals};
 pub use crate::tools::dispatch::{apply_capability_gate, apply_cascade_gate, ToolGates};
 use crate::tools::dispatch::{
-    execute_approved, execute_gated, gate_tool_call, would_execute, GateOutcome, ToolExecution,
+    execute_approved, execute_gated, gate_tool_call_decided, would_execute, GateOutcome,
+    ToolExecution,
 };
 use crate::tools::loading::{PlanContext, ToolPlan};
 use crate::tools::registry::ToolRegistry;
@@ -1108,6 +1109,9 @@ pub struct RunnerConfig {
     /// agent to write to from their Desk turns. `None` keeps no such
     /// choice, and "Always allow" is not offered for those writes.
     pub surface_allows: Option<Arc<dyn crate::tools::dispatch::SurfaceAllows>>,
+    /// What the agent may do on the person's computer, decided per call; set
+    /// only on a hub with `[desk]`. `None` leaves every call as it was.
+    pub computer_gate: Option<Arc<dyn crate::tools::computer::ComputerGate>>,
     /// Cascade gate consulted *after* the PolicyEngine. Can only further
     /// restrict the PolicyEngine decision — never relax it. When `None`
     /// (the `[permissions] enabled = false` case) the cascade arm is a
@@ -1187,6 +1191,7 @@ impl Default for RunnerConfig {
             trace_tags: Default::default(),
             permission_writer: None,
             surface_allows: None,
+            computer_gate: None,
             permission_gate: None,
             arguments: crate::tools::arguments::ArgumentValidation::default(),
             tool_loading: crate::tools::loading::ToolLoading::default(),
@@ -4517,7 +4522,15 @@ impl AgentRunner {
                     },
                     ..ToolGates::from(&self.config)
                 };
-                let outcome = gate_tool_call(&gates, &self.policy, &self.tools, &tool_name, input);
+                let (outcome, decided) =
+                    gate_tool_call_decided(&gates, &self.policy, &self.tools, &tool_name, input);
+                crate::tools::computer::settle_gated(
+                    self.config.computer_gate.as_deref(),
+                    &tool_name,
+                    decided.as_ref(),
+                    input,
+                    &outcome,
+                );
                 let tool_use_id = tool_use_id.to_string();
                 let input = (*input).clone();
                 let tools = Arc::clone(&self.tools);
@@ -4601,6 +4614,14 @@ impl AgentRunner {
                                 });
                             }
                             RouteResolution::DenyUnreachable => {
+                                crate::tools::computer::settle(
+                                    self.config.computer_gate.as_deref(),
+                                    &tn,
+                                    decided.as_ref(),
+                                    &input,
+                                    crate::tools::computer::Outcome::Unattended,
+                                    Some(UNREACHABLE_APPROVER),
+                                );
                                 join_set.spawn(async move {
                                     let msg = UNREACHABLE_APPROVER.to_string();
                                     (
@@ -4622,6 +4643,14 @@ impl AgentRunner {
                             // no human is watching a non-progress turn, so the
                             // instant error stands.
                             RouteResolution::SelfServe => {
+                                crate::tools::computer::settle(
+                                    self.config.computer_gate.as_deref(),
+                                    &tn,
+                                    decided.as_ref(),
+                                    &input,
+                                    crate::tools::computer::Outcome::Unattended,
+                                    Some(&r),
+                                );
                                 join_set.spawn(async move {
                                     (
                                         tool_use_id,
@@ -5734,7 +5763,15 @@ impl AgentRunner {
                     },
                     ..ToolGates::from(&self.config)
                 };
-                let outcome = gate_tool_call(&gates, &self.policy, &self.tools, &tool_name, input);
+                let (outcome, decided) =
+                    gate_tool_call_decided(&gates, &self.policy, &self.tools, &tool_name, input);
+                crate::tools::computer::settle_gated(
+                    self.config.computer_gate.as_deref(),
+                    &tool_name,
+                    decided.as_ref(),
+                    input,
+                    &outcome,
+                );
                 let tool_use_id = tool_use_id.to_string();
                 let input = (*input).clone();
                 let ptx = progress_tx.clone();
@@ -5859,6 +5896,14 @@ impl AgentRunner {
                                 });
                             }
                             RouteResolution::DenyUnreachable => {
+                                crate::tools::computer::settle(
+                                    self.config.computer_gate.as_deref(),
+                                    &tool_name,
+                                    decided.as_ref(),
+                                    &input,
+                                    crate::tools::computer::Outcome::Unattended,
+                                    Some(UNREACHABLE_APPROVER),
+                                );
                                 join_set.spawn(async move {
                                     let msg = UNREACHABLE_APPROVER.to_string();
                                     let exec = ToolExecution::blocked(msg.clone(), msg);
@@ -5878,6 +5923,14 @@ impl AgentRunner {
                                     });
                                 match opened {
                                     Err(refusal) => {
+                                        crate::tools::computer::settle(
+                                            self.config.computer_gate.as_deref(),
+                                            &tool_name,
+                                            decided.as_ref(),
+                                            &input,
+                                            crate::tools::computer::refused_as(refusal),
+                                            Some(&reason),
+                                        );
                                         join_set.spawn(async move {
                                             refuse(
                                                 &ptx,
@@ -5902,6 +5955,7 @@ impl AgentRunner {
                                             self.call_for(&mut round_calls, &tool_use_id, &input);
                                         let policy = Arc::clone(&self.policy);
                                         let access = Arc::clone(&access_snapshot);
+                                        let computer = self.config.computer_gate.clone();
                                         join_set.spawn(async move {
                                             let decision = await_approval(
                                                 ApprovalAsk {
@@ -5920,6 +5974,21 @@ impl AgentRunner {
                                                 SELF_SERVE_APPROVAL_TIMEOUT,
                                             )
                                             .await;
+                                            crate::tools::computer::settle(
+                                                computer.as_deref(),
+                                                &tool_name,
+                                                decided.as_ref(),
+                                                &input,
+                                                match decision.verdict() {
+                                                    Ok(()) => {
+                                                        crate::tools::computer::Outcome::Allowed
+                                                    }
+                                                    Err(refusal) => {
+                                                        crate::tools::computer::refused_as(refusal)
+                                                    }
+                                                },
+                                                None,
+                                            );
                                             match decision.verdict() {
                                                 Err(refusal) => {
                                                     refuse(
@@ -8658,6 +8727,7 @@ mod tests {
             trace_tags: Default::default(),
             permission_writer: None,
             surface_allows: None,
+            computer_gate: None,
             permission_gate: None,
             arguments: crate::tools::arguments::ArgumentValidation::default(),
             tool_loading: crate::tools::loading::ToolLoading::default(),
@@ -8706,6 +8776,7 @@ mod tests {
             trace_tags: Default::default(),
             permission_writer: None,
             surface_allows: None,
+            computer_gate: None,
             permission_gate: None,
             arguments: crate::tools::arguments::ArgumentValidation::default(),
             tool_loading: crate::tools::loading::ToolLoading::default(),
@@ -14734,6 +14805,7 @@ issue?"#;
             trace_tags: Default::default(),
             permission_writer: None,
             surface_allows: None,
+            computer_gate: None,
             permission_gate: None,
             arguments: crate::tools::arguments::ArgumentValidation::default(),
             tool_loading: crate::tools::loading::ToolLoading::default(),

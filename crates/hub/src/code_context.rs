@@ -1627,6 +1627,11 @@ impl Tool for CodeContextTool {
         "code.context"
     }
 
+    /// Reads the hub's index of the checkouts, not files the call names.
+    fn effect(&self, _input: &serde_json::Value) -> workforce_core::computer::Effect {
+        workforce_core::computer::Effect::Read { paths: Vec::new() }
+    }
+
     fn description(&self) -> &str {
         "Assemble the COMPLETE relevant source for a code question in one call — the full body of \
          the most-relevant symbol PLUS its call-graph closure (what it calls, what calls it) PLUS \

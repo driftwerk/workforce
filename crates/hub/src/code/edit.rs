@@ -399,6 +399,12 @@ impl Tool for CodeEditTool {
         "code.edit"
     }
 
+    fn effect(&self, input: &serde_json::Value) -> workforce_core::computer::Effect {
+        workforce_core::computer::Effect::Write {
+            paths: super::utils::effect_paths(input, "path", &self.allowed_paths),
+        }
+    }
+
     fn description(&self) -> &str {
         "Precise surgical file editing with search-and-replace, create, and delete. Change only \
          the lines the task needs; leave unrelated code and formatting as they are."

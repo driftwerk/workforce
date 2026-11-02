@@ -127,6 +127,11 @@ impl Tool for ClaudeCodeSetupTokenTool {
         "claude_code.setup_token"
     }
 
+    /// Keeps a token in the vault: nothing on this computer.
+    fn effect(&self, _input: &serde_json::Value) -> workforce_core::computer::Effect {
+        workforce_core::computer::Effect::None
+    }
+
     fn description(&self) -> &str {
         DESCRIPTION
     }

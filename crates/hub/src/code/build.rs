@@ -151,6 +151,10 @@ impl Tool for CodeBuildTool {
         "code.build"
     }
 
+    fn effect(&self, input: &serde_json::Value) -> workforce_core::computer::Effect {
+        super::utils::effect_command(input, &self.allowed_paths, &["code.build"])
+    }
+
     fn description(&self) -> &str {
         "Build projects with auto-detected build system. Supports Cargo and NPM."
     }

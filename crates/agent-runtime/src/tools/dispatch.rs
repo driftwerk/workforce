@@ -24,6 +24,7 @@ use crate::tools::access::ToolAccessSnapshot;
 use crate::tools::arguments::{
     check_arguments, render_argument_problems, summarise_argument_problems, ArgumentValidation,
 };
+use crate::tools::computer::{self, ComputerGate, Decision};
 use crate::tools::registry::ToolRegistry;
 use crate::tools::{Destination, RateLimit, SurfaceEffect};
 use workforce_common::channels::CHAT_SURFACE_PLATFORMS;
@@ -47,6 +48,9 @@ pub struct ToolGates {
     pub capability_gate: Option<Arc<dyn CapabilityGate>>,
     pub permission_gate: Option<Arc<dyn PermissionGate>>,
     pub surface_allows: Option<Arc<dyn SurfaceAllows>>,
+    /// What the agent may do on the person's computer; wired only on a hub
+    /// with `[desk]` ([`crate::tools::computer`]).
+    pub computer_gate: Option<Arc<dyn ComputerGate>>,
     pub arguments: ArgumentValidation,
 }
 
@@ -59,6 +63,7 @@ impl From<&RunnerConfig> for ToolGates {
             capability_gate: config.capability_gate.clone(),
             permission_gate: config.permission_gate.clone(),
             surface_allows: config.surface_allows.clone(),
+            computer_gate: config.computer_gate.clone(),
             arguments: config.arguments,
         }
     }
@@ -98,6 +103,31 @@ pub fn gate_tool_call(
     tool_name: &str,
     input: &Value,
 ) -> GateOutcome {
+    gate_tool_call_decided(gates, policy, tools, tool_name, input).0
+}
+
+/// [`gate_tool_call`], with the computer gate's decision when it decided
+/// the call, for the caller to record where the call settles.
+pub fn gate_tool_call_decided(
+    gates: &ToolGates,
+    policy: &PolicyEngine,
+    tools: &ToolRegistry,
+    tool_name: &str,
+    input: &Value,
+) -> (GateOutcome, Option<Decision>) {
+    let decision = computer::decide(gates.computer_gate.as_deref(), tools, tool_name, input);
+    let outcome = gate_with(gates, policy, tools, tool_name, input, decision.as_ref());
+    (outcome, decision)
+}
+
+fn gate_with(
+    gates: &ToolGates,
+    policy: &PolicyEngine,
+    tools: &ToolRegistry,
+    tool_name: &str,
+    input: &Value,
+    decision: Option<&Decision>,
+) -> GateOutcome {
     let request = PolicyRequest {
         agent_id: gates.agent_id.clone(),
         tool_name: tool_name.to_string(),
@@ -132,7 +162,10 @@ pub fn gate_tool_call(
         },
     );
     let response = apply_relayed_gate(response, tool_name, crate::runner::current_desk().as_ref());
-    let holds = to.filter(|_| held == Some(Kept::NotYet));
+    let response = computer::apply(response, decision);
+    // A held computer call offers no "always": the surface's own allow list
+    // is not where its answer is kept.
+    let holds = to.filter(|_| held == Some(Kept::NotYet) && decision.is_none());
     if let PolicyDecision::Deny { reason } = response.decision {
         return GateOutcome::Blocked {
             message: format!("Policy denied: {reason}"),
@@ -882,6 +915,7 @@ mod tests {
                 state: cascade,
             })),
             surface_allows: None,
+            computer_gate: None,
             arguments: ArgumentValidation::default(),
         }
     }
@@ -1985,6 +2019,7 @@ mod tests {
         let allows = Arc::new(Allows::default());
         let g = ToolGates {
             surface_allows: Some(allows.clone()),
+            computer_gate: None,
             ..gates(&calls, None, CascadeState::Allow)
         };
         let gate_with = |g: &ToolGates, user: &'static str, tool: &'static str| {

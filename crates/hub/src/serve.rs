@@ -12,7 +12,6 @@ pub mod testing;
 #[cfg(test)]
 mod tool_tests;
 pub use crate::workflow_runtime::shared_workflow_store;
-pub(crate) use compose::exec_env;
 pub use compose::Compose;
 pub use compose::{
     artifact_index_pace, artifact_search_wait, create_trigger_router, create_webhook_router,
@@ -23,6 +22,7 @@ pub use compose::{
     artifact_mirror_in_step, artifact_mirror_state, artifact_shadow, mirror_index_pace,
     open_artifact_mirror,
 };
+pub(crate) use compose::{exec_env, tool_roots};
 pub use compose::{
     register_advisor_tool, register_chatgpt_login_tool, register_claude_code_setup_token_tool,
     register_claude_code_tool, register_codex_setup_auth_tool, register_coding_session_tool,
