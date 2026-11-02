@@ -248,6 +248,70 @@ pub struct Elsewhere {
     pub removed: bool,
     /// Whether the agent would load the file as it is now.
     pub loads: bool,
+    /// The top-level sections that differ from the saved file.
+    pub sections: Vec<String>,
+    /// For the sections that decide who the agent serves and whether it
+    /// oversees the crew (`[access]`, `[oversight]`), each field that
+    /// differs, as `access.mode: allowlist → open`. Credentials are left out.
+    pub details: Vec<String>,
+}
+
+/// The sections whose changed fields a person is shown one by one.
+const DETAILED: [&str; 2] = ["access", "oversight"];
+
+/// What differs between the `saved` file and the file as it is `now`.
+fn what_changed(saved: Option<&str>, now: Option<&str>) -> (Vec<String>, Vec<String>) {
+    let table = |body: Option<&str>| {
+        body.and_then(|b| toml::from_str::<toml::Table>(b).ok())
+            .unwrap_or_default()
+    };
+    let (saved, now) = (table(saved), table(now));
+    let mut sections: Vec<String> = saved
+        .keys()
+        .chain(now.keys())
+        .filter(|key| saved.get(*key) != now.get(*key))
+        .cloned()
+        .collect();
+    sections.sort();
+    sections.dedup();
+    let mut details = Vec::new();
+    for section in DETAILED.iter().filter(|s| sections.iter().any(|c| c == *s)) {
+        let fields = |t: &toml::Table| -> toml::Table {
+            t.get(*section)
+                .and_then(toml::Value::as_table)
+                .cloned()
+                .unwrap_or_default()
+        };
+        let (was, is) = (fields(&saved), fields(&now));
+        let mut keys: Vec<&String> = was.keys().chain(is.keys()).collect();
+        keys.sort();
+        keys.dedup();
+        for key in keys {
+            if crate::config_tool::is_secret_name(key) || was.get(key) == is.get(key) {
+                continue;
+            }
+            details.push(format!(
+                "{section}.{key}: {} → {}",
+                shown(was.get(key)),
+                shown(is.get(key))
+            ));
+        }
+    }
+    (sections, details)
+}
+
+/// A setting's value as a person reads it, kept short.
+fn shown(value: Option<&toml::Value>) -> String {
+    const MAX: usize = 60;
+    let text = match value {
+        None => return "unset".to_string(),
+        Some(toml::Value::String(s)) => s.clone(),
+        Some(other) => other.to_string(),
+    };
+    match text.char_indices().nth(MAX) {
+        Some((cut, _)) => format!("{}…", &text[..cut]),
+        None => text,
+    }
 }
 
 /// The change made to `service`'s config.toml outside the hub, if one waits.
@@ -260,13 +324,153 @@ pub fn changed_elsewhere(service: &AgentService) -> Option<Elsewhere> {
             return None;
         }
     };
+    let saved = config_files::read(&path).ok().flatten();
+    let (sections, details) = what_changed(saved.as_deref(), now.as_deref());
     Some(Elsewhere {
         hash: content_hash(now.as_deref().unwrap_or_default()),
         removed: now.is_none(),
         loads: now
             .as_deref()
             .is_none_or(|body| crate::workspace_admission::admit_workspace(service, body).is_ok()),
+        sections,
+        details,
     })
+}
+
+/// The agent Desk Helper keeps for itself, whose `config.toml` it edits
+/// before it starts the hub (`DESK_AGENT` in desk-hubd).
+const DESK_HELPER_AGENT: &str = "desk";
+
+/// What Desk Helper adds to its agent's file before it starts the hub, each
+/// only when the file says nothing of it (`ensure_rich`, `ensure_oversight`
+/// in desk-hubd): every rich block on, and overseeing the crew, watching.
+fn desk_helper_additions() -> [(&'static str, toml::Value); 2] {
+    let rich = ["tables", "charts", "forms", "maps", "diagrams", "images"]
+        .into_iter()
+        .map(|kind| (kind.to_string(), toml::Value::Boolean(true)))
+        .collect::<toml::Table>();
+    let oversight = toml::Table::from_iter([
+        ("enabled".to_string(), toml::Value::Boolean(true)),
+        ("level".to_string(), toml::Value::String("watch".into())),
+    ]);
+    [
+        ("rich", toml::Value::Table(rich)),
+        ("oversight", toml::Value::Table(oversight)),
+    ]
+}
+
+/// Whether `now` is the `saved` file of `agent_id` with nothing changed but
+/// what Desk Helper adds to its own agent's file before boot.
+fn desk_helper_made(agent_id: &str, saved: &str, now: Option<&str>) -> bool {
+    if agent_id != DESK_HELPER_AGENT {
+        return false;
+    }
+    let (Ok(saved), Some(Ok(mut now))) = (
+        toml::from_str::<toml::Table>(saved),
+        now.map(toml::from_str::<toml::Table>),
+    ) else {
+        return false;
+    };
+    for (section, added) in desk_helper_additions() {
+        if !saved.contains_key(section) && now.get(section) == Some(&added) {
+            now.remove(section);
+        }
+    }
+    now == saved
+}
+
+/// The body of the last revision history holds of `service`'s config.toml.
+async fn last_saved(service: &AgentService, store: &WorkflowStore) -> eyre::Result<Option<String>> {
+    let id = service.agent_id.as_str();
+    let Some(hash) = store
+        .latest_revision_hash(KIND_AGENT_CONFIG, id, None)
+        .await?
+    else {
+        return Ok(None);
+    };
+    store.revision_content(KIND_AGENT_CONFIG, &hash).await
+}
+
+/// Guard `service`'s config.toml as the hub boots: the file is the hub's own
+/// when it is what history last saved (Desk Helper's additions before boot
+/// aside), or when there is no history yet. Anything else was written while
+/// the hub was not watching, and is held as a change made elsewhere, so a
+/// command that rewrites the file and then stops the hub gains nothing.
+/// Whether a change is held.
+pub async fn guard_at_boot(service: &AgentService, store: Option<&WorkflowStore>) -> bool {
+    let path = service.workspace.join(config_files::WORKSPACE_CONFIG);
+    let saved = match store {
+        Some(store) => last_saved(service, store).await.unwrap_or_else(|e| {
+            tracing::warn!(agent_id = %service.agent_id, error = %e, "Could not read config.toml's history; adopting the file as it stands");
+            None
+        }),
+        None => None,
+    };
+    let guarded = match saved {
+        Some(saved) => match config_files::read(&path) {
+            Ok(now) if now.as_deref() == Some(saved.as_str()) => {
+                config_files::guard(&path).map(|()| false)
+            }
+            Ok(now) if desk_helper_made(service.agent_id.as_str(), &saved, now.as_deref()) => {
+                record_own(service, store).await;
+                config_files::guard(&path).map(|()| false)
+            }
+            Ok(_) => config_files::guard_as(&path, Some(saved)).map(|()| true),
+            Err(e) => Err(e),
+        },
+        None => config_files::guard(&path).map(|()| false),
+    };
+    match guarded {
+        Ok(held) => {
+            if held {
+                tracing::warn!(agent_id = %service.agent_id, "config.toml changed while the hub was stopped; keeping the saved settings until the person decides");
+            }
+            held
+        }
+        Err(e) => {
+            tracing::warn!(agent_id = %service.agent_id, error = %e, "Could not guard config.toml");
+            false
+        }
+    }
+}
+
+/// Record `service`'s config.toml in history when the hub wrote it without
+/// a revision (`system.llm`, compaction, a report theme) and nothing made
+/// elsewhere waits: the next boot then knows the file as the hub's own.
+pub async fn record_own(service: &AgentService, store: Option<&WorkflowStore>) {
+    let Some(store) = store else {
+        return;
+    };
+    let path = service.workspace.join(config_files::WORKSPACE_CONFIG);
+    if !matches!(elsewhere(&path), Ok(None)) {
+        return;
+    }
+    let Ok(Some(body)) = config_files::read(&path) else {
+        return;
+    };
+    let id = service.agent_id.as_str();
+    let recorded = async {
+        let latest = store
+            .latest_revision_hash(KIND_AGENT_CONFIG, id, None)
+            .await?;
+        if latest.as_deref() != Some(content_hash(&body).as_str()) {
+            store
+                .record_revision(
+                    KIND_AGENT_CONFIG,
+                    id,
+                    None,
+                    &body,
+                    false,
+                    EditContext::new("hub", None),
+                    None,
+                )
+                .await?;
+        }
+        eyre::Ok(())
+    };
+    if let Err(e) = recorded.await {
+        tracing::warn!(agent_id = %id, error = %e, "Could not record config.toml in its history");
+    }
 }
 
 /// The change made elsewhere that `hash` names, as the file holds it now:
@@ -392,6 +596,63 @@ pub async fn record_revision(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Desk Helper's own additions before boot are the hub's own, for its own
+    /// agent and as it makes them; nothing else is.
+    #[test]
+    fn only_desk_helpers_own_additions_count_as_the_hubs() {
+        let saved = "[llm]\nmax_rounds = 1\n";
+        let helped =
+            "[llm]\nmax_rounds = 1\n\n[rich]\ntables = true\ncharts = true\nforms = true\n\
+                      maps = true\ndiagrams = true\nimages = true\n\n[oversight]\nenabled = true\n\
+                      level = \"watch\"\n";
+        assert!(desk_helper_made("desk", saved, Some(helped)));
+        assert!(desk_helper_made(
+            "desk",
+            "",
+            Some(&helped.replace("[llm]\nmax_rounds = 1\n\n", ""))
+        ));
+        assert!(
+            !desk_helper_made("scout", saved, Some(helped)),
+            "only Desk's own agent"
+        );
+        assert!(!desk_helper_made(
+            "desk",
+            saved,
+            Some(&helped.replace("\"watch\"", "\"act\""))
+        ));
+        assert!(!desk_helper_made(
+            "desk",
+            saved,
+            Some(&helped.replace("max_rounds = 1", "max_rounds = 9"))
+        ));
+        let had = "[oversight]\nenabled = false\n";
+        assert!(
+            !desk_helper_made(
+                "desk",
+                had,
+                Some("[oversight]\nenabled = true\nlevel = \"watch\"\n")
+            ),
+            "Desk Helper never changes an [oversight] the file has"
+        );
+    }
+
+    #[test]
+    fn a_change_is_shown_by_section_and_by_field_where_it_decides_access() {
+        let (sections, details) = what_changed(
+            Some("[llm]\nmax_rounds = 1\n[access]\nmode = \"allowlist\"\nallow = [\"a\"]\n"),
+            Some("[llm]\nmax_rounds = 2\n[access]\nmode = \"open\"\nallow = [\"a\"]\napi_key = \"x\"\n\
+                  [oversight]\nenabled = true\n"),
+        );
+        assert_eq!(sections, ["access", "llm", "oversight"]);
+        assert_eq!(
+            details,
+            [
+                "access.mode: allowlist → open",
+                "oversight.enabled: unset → true"
+            ]
+        );
+    }
 
     #[test]
     fn oversight_is_switched_off_in_place_in_either_form() {

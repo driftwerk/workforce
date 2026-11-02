@@ -17,6 +17,7 @@ use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{LazyLock, Mutex, MutexGuard, PoisonError};
 
 /// The agent's own settings, layered over the install config.
@@ -89,8 +90,10 @@ pub fn runner_uid() -> Option<u32> {
 /// process last wrote or adopted it, so nothing that reads it takes the
 /// change before the person does.
 pub fn read(path: &Path) -> io::Result<Option<String>> {
-    if let Some(ours) = guarded().get(&guard_key(path)) {
-        return Ok(ours.clone());
+    if let Some(key) = guarded_key(path) {
+        if let Some(ours) = guarded().get(&key) {
+            return Ok(ours.clone());
+        }
     }
     read_on_disk(path)
 }
@@ -155,7 +158,9 @@ pub enum Over<'a> {
 
 /// [`replace`], over the change made elsewhere that `over` names too.
 pub fn replace_over(path: &Path, content: &[u8], over: Over<'_>) -> io::Result<()> {
-    let key = guard_key(path);
+    let Some(key) = guarded_key(path) else {
+        return write_in_place(path, content);
+    };
     let mut guarded = guarded();
     let Some(ours) = guarded.get_mut(&key) else {
         drop(guarded);
@@ -274,8 +279,18 @@ fn made_by(mut owners: impl Iterator<Item = Option<u32>>, runner: u32) -> bool {
 /// where that was no file.
 static GUARDED: LazyLock<Mutex<HashMap<PathBuf, Option<String>>>> = LazyLock::new(Default::default);
 
+/// Whether this process guards any file at all, so a hub that guards none
+/// reads and writes its configuration exactly as it did before guarding was.
+static ANY_GUARDED: AtomicBool = AtomicBool::new(false);
+
 fn guarded() -> MutexGuard<'static, HashMap<PathBuf, Option<String>>> {
     GUARDED.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// The key `path` would be guarded under, worked out before the guard is
+/// taken; `None` while this process guards nothing.
+fn guarded_key(path: &Path) -> Option<PathBuf> {
+    ANY_GUARDED.load(Ordering::Acquire).then(|| guard_key(path))
 }
 
 /// The path a guarded file is known by, however a caller spells its
@@ -317,19 +332,40 @@ pub fn is_changed_elsewhere(e: &io::Error) -> bool {
 /// adopted, so an agent rebuilt while a change made elsewhere waits does not
 /// take that change as its own.
 pub fn guard(path: &Path) -> io::Result<()> {
-    let mut guarded = guarded();
-    if let std::collections::hash_map::Entry::Vacant(entry) = guarded.entry(guard_key(path)) {
-        entry.insert(read_on_disk(path)?);
-    }
+    guard_with(path, read_on_disk(path)?)
+}
+
+/// [`guard`], taking `saved` (`None`: no file) as this process's own rather
+/// than the file as it stands: a hub that finds on disk something other than
+/// what it last saved holds that as a change made elsewhere.
+pub fn guard_as(path: &Path, saved: Option<String>) -> io::Result<()> {
+    guard_with(path, saved)
+}
+
+fn guard_with(path: &Path, ours: Option<String>) -> io::Result<()> {
+    let key = guard_key(path);
+    guarded().entry(key).or_insert(ours);
+    ANY_GUARDED.store(true, Ordering::Release);
     Ok(())
+}
+
+/// Stop guarding the file at `path`: as a new process would, the next
+/// [`guard`] adopts whatever it finds.
+pub fn unguard(path: &Path) {
+    if let Some(key) = guarded_key(path) {
+        guarded().remove(&key);
+    }
 }
 
 /// What the file at `path` holds now, when it is guarded and that is not what
 /// this process last wrote or adopted there: a change made elsewhere
 /// (`Some(None)`: the file was removed). `None` when nothing waits.
 pub fn changed_elsewhere(path: &Path) -> io::Result<Option<Option<String>>> {
+    let Some(key) = guarded_key(path) else {
+        return Ok(None);
+    };
     let guarded = guarded();
-    let Some(ours) = guarded.get(&guard_key(path)) else {
+    let Some(ours) = guarded.get(&key) else {
         return Ok(None);
     };
     let now = read_on_disk(path)?;
@@ -339,8 +375,11 @@ pub fn changed_elsewhere(path: &Path) -> io::Result<Option<Option<String>>> {
 /// Take the change made elsewhere at `path` as this process's own, provided
 /// the file still holds `seen` (`None`: no file). Whether it did.
 pub fn adopt(path: &Path, seen: Option<&str>) -> io::Result<bool> {
+    let Some(key) = guarded_key(path) else {
+        return Ok(false);
+    };
     let mut guarded = guarded();
-    let Some(ours) = guarded.get_mut(&guard_key(path)) else {
+    let Some(ours) = guarded.get_mut(&key) else {
         return Ok(false);
     };
     let now = read_on_disk(path)?;
@@ -355,8 +394,11 @@ pub fn adopt(path: &Path, seen: Option<&str>) -> io::Result<bool> {
 /// file where that was none, over the change made elsewhere, provided the
 /// file still holds `seen` (`None`: no file). Whether it did.
 pub fn restore(path: &Path, seen: Option<&str>) -> io::Result<bool> {
+    let Some(key) = guarded_key(path) else {
+        return Ok(false);
+    };
     let guarded = guarded();
-    let Some(ours) = guarded.get(&guard_key(path)) else {
+    let Some(ours) = guarded.get(&key) else {
         return Ok(false);
     };
     if read_on_disk(path)?.as_deref() != seen {
@@ -767,5 +809,24 @@ mod tests {
         assert_eq!(changed_elsewhere(&path).unwrap(), None);
         assert!(!adopt(&path, Some("ours")).unwrap());
         assert!(!restore(&path, Some("ours")).unwrap());
+    }
+
+    /// A hub that boots onto something other than what it last saved holds
+    /// that as a change made elsewhere; a fresh process adopts again.
+    #[test]
+    fn a_file_guarded_as_saved_holds_what_differs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(WORKSPACE_CONFIG);
+        std::fs::write(&path, "theirs").unwrap();
+        guard_as(&path, Some("saved".into())).unwrap();
+        assert_eq!(read(&path).unwrap().as_deref(), Some("saved"));
+        assert_eq!(
+            changed_elsewhere(&path).unwrap(),
+            Some(Some("theirs".to_string()))
+        );
+        unguard(&path);
+        assert_eq!(changed_elsewhere(&path).unwrap(), None);
+        guard(&path).unwrap();
+        assert_eq!(changed_elsewhere(&path).unwrap(), None, "adopted");
     }
 }

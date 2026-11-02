@@ -213,7 +213,7 @@ fn human_only(path: &[&str]) -> Result<(), String> {
 }
 
 /// Key names whose values are credentials.
-fn is_secret_name(name: &str) -> bool {
+pub(crate) fn is_secret_name(name: &str) -> bool {
     let name = name.to_ascii_lowercase();
     [
         "api_key",

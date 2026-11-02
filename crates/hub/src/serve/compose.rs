@@ -961,7 +961,7 @@ pub(super) async fn build_inner(
     )
     .await;
 
-    super::background::start_sweeps(&service_arc);
+    super::background::start_sweeps(&service_arc).await;
 
     memory_metrics.spawn();
 

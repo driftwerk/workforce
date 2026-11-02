@@ -375,20 +375,32 @@ pub(crate) fn config_need(
     elsewhere: &crate::agent_config_write::Elsewhere,
     since: DateTime<Utc>,
 ) -> Need {
+    let changed = match (elsewhere.sections.as_slice(), elsewhere.details.as_slice()) {
+        ([], _) => String::new(),
+        (sections, details) => {
+            let mut said = format!(" Changed: {}.", sections.join(", "));
+            for detail in details {
+                said.push_str(&format!(" {detail}."));
+            }
+            said
+        }
+    };
+    let wait = format!(" Saves for {name} wait until you choose.");
     let ask = if elsewhere.removed {
         format!(
-            "{name}'s settings file was removed outside Desk. Allow leaves it removed; \
-             Deny puts the saved one back."
+            "{name}'s settings file was removed outside Desk. If you removed it yourself, \
+             tap Allow. Allow leaves it removed; Deny puts the saved one back.{wait}"
         )
     } else if elsewhere.loads {
         format!(
-            "{name}'s settings file was changed outside Desk, and isn't in use. Allow uses \
-             the new file; Deny keeps the saved one."
+            "{name}'s settings file was changed outside Desk, and isn't in use.{changed} If \
+             you edited it yourself, tap Allow. Allow uses the new file; Deny keeps the \
+             saved one.{wait}"
         )
     } else {
         format!(
-            "{name}'s settings file was changed outside Desk to one {name} can't load. \
-             Deny keeps the saved one."
+            "{name}'s settings file was changed outside Desk to one {name} can't load.\
+             {changed} Deny keeps the saved one.{wait}"
         )
     };
     Need {
@@ -602,12 +614,14 @@ struct TokenQuery {
 }
 
 /// Why a decision was not made.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Unanswered {
     /// Someone answered it first, or it went away.
     AlreadyAnswered,
     NotYours,
     Unknown,
+    /// The settings file it would use is one the agent can't load.
+    Unloadable(crate::workspace_admission::ConfigRefusal),
 }
 
 /// Answers the need `at` points to with `choice`, as `caller`, through the
@@ -708,7 +722,12 @@ pub(crate) async fn answer(
             };
             match decided {
                 Ok(()) => Ok(Ok(())),
-                Err(Refused::Stale { .. }) => Ok(Err(Unanswered::AlreadyAnswered)),
+                // Changed again since it was shown: the new change is a need
+                // of its own.
+                Err(Refused::Stale { .. } | Refused::ChangedElsewhere) => {
+                    Ok(Err(Unanswered::AlreadyAnswered))
+                }
+                Err(Refused::Unloadable(refusal)) => Ok(Err(Unanswered::Unloadable(refusal))),
                 Err(refused) => Err(eyre::eyre!("{refused}")),
             }
         }
@@ -730,6 +749,14 @@ async fn decide(
         Ok(Err(Unanswered::AlreadyAnswered)) => refusal(StatusCode::CONFLICT, "already_answered"),
         Ok(Err(Unanswered::NotYours)) => refusal(StatusCode::FORBIDDEN, "not_yours"),
         Ok(Err(Unanswered::Unknown)) => refusal(StatusCode::NOT_FOUND, "unknown"),
+        Ok(Err(Unanswered::Unloadable(why))) => {
+            let agent = match &body.at {
+                DecideRef::Config { agent_id, .. } => agent_id.as_str(),
+                _ => "",
+            };
+            let (_, said) = crate::gateway::config_write_unloadable(agent, why);
+            (StatusCode::UNPROCESSABLE_ENTITY, said).into_response()
+        }
         Err(e) => failed(e),
     }
 }
@@ -1363,6 +1390,8 @@ mod tests {
             hash: "abc".into(),
             removed: false,
             loads: true,
+            sections: vec!["access".into(), "llm".into()],
+            details: vec!["access.mode: allowlist → open".into()],
         };
         let need = config_need("allan", "Allan".into(), &changed, since);
         assert_eq!(need.id, "config:allan:abc");
@@ -1375,6 +1404,13 @@ mod tests {
             "{}",
             need.ask
         );
+        for said in [
+            "If you edited it yourself, tap Allow.",
+            "Saves for Allan wait until you choose.",
+            "Changed: access, llm. access.mode: allowlist → open.",
+        ] {
+            assert!(need.ask.contains(said), "{said}: {}", need.ask);
+        }
         assert_eq!(
             need.answer,
             Answer::Decide {

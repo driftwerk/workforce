@@ -308,3 +308,124 @@ async fn every_reader_sees_the_saved_file_while_a_change_waits() {
         "the file itself waits as it is"
     );
 }
+
+// ── Boot: what history last saved is the hub's own ──
+
+async fn with_history<F, Fut>(test: F)
+where
+    F: FnOnce(Arc<workforce_orchestrator::workflow_store::WorkflowStore>) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    use workforce_orchestrator::workflow_store::WorkflowStore;
+    workforce_postgres::test_support::with_test_pool(
+        WorkflowStore::build_pool,
+        |pool| async move {
+            test(WorkflowStore::new(pool).await.expect("def store")).await;
+        },
+    )
+    .await;
+}
+
+/// What a fresh process does as it boots onto the same workspace: compose
+/// applies the file it finds, then the sweeps guard it against history.
+async fn restart(
+    service: &AgentService,
+    defs: &workforce_orchestrator::workflow_store::WorkflowStore,
+) -> bool {
+    workforce_common::config_files::unguard(&config_path(service));
+    service.reload_config().await.unwrap();
+    let held = workforce_hub::agent_config_write::guard_at_boot(service, Some(defs)).await;
+    if held {
+        service.reload_config().await.unwrap();
+    }
+    held
+}
+
+/// A command rewrites the file and stops the hub: the hub that starts again
+/// holds the change instead of adopting it, and runs the saved settings.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restart_never_adopts_a_change_made_outside_the_hub() {
+    use workforce_hub::agent_config_write::{changed_elsewhere, save};
+    use workforce_orchestrator::workflow_store::EditContext;
+    with_history(|defs| async move {
+        let data = tempfile::tempdir().unwrap();
+        let service = agent(data.path(), true).await;
+        save(
+            &service,
+            service.agent_id.as_str(),
+            Some(&defs),
+            SAVED,
+            EditContext::new("web", None),
+            |_| true,
+        )
+        .await
+        .unwrap();
+        std::fs::write(config_path(&service), WIDENED).unwrap();
+
+        assert!(restart(&service, &defs).await, "the change is held");
+        assert_eq!(
+            running(&service).as_deref(),
+            Some(content_hash(SAVED).as_str())
+        );
+        let waiting = changed_elsewhere(&service).expect("a need for the person");
+        assert_eq!(waiting.sections, ["access", "llm"]);
+        assert_eq!(waiting.details, ["access.mode: unset → open"]);
+        assert_eq!(on_disk(&service), WIDENED, "the file waits as it is");
+    })
+    .await;
+}
+
+/// The hub's own writes that keep no revision of their own (`system.llm`,
+/// compaction, a report theme) go into history as the watcher sees them, so
+/// a restart after one adopts the file.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restart_after_the_hubs_own_write_adopts_it() {
+    use workforce_hub::agent_config_write::{changed_elsewhere, record_own, save};
+    use workforce_orchestrator::workflow_store::EditContext;
+    with_history(|defs| async move {
+        let data = tempfile::tempdir().unwrap();
+        let service = agent(data.path(), true).await;
+        save(
+            &service,
+            service.agent_id.as_str(),
+            Some(&defs),
+            SAVED,
+            EditContext::new("web", None),
+            |_| true,
+        )
+        .await
+        .unwrap();
+        let switched = "[llm]\nmax_rounds = 12\nprovider = \"gemini\"\n";
+        workforce_common::config_files::replace(&config_path(&service), switched.as_bytes())
+            .unwrap();
+        record_own(&service, Some(&defs)).await;
+
+        assert!(!restart(&service, &defs).await);
+        assert_eq!(
+            running(&service).as_deref(),
+            Some(content_hash(switched).as_str())
+        );
+        assert_eq!(changed_elsewhere(&service), None);
+    })
+    .await;
+}
+
+/// An agent history knows nothing of yet adopts its file at boot, as today.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_first_boot_adopts_the_file() {
+    with_history(|defs| async move {
+        let data = tempfile::tempdir().unwrap();
+        let service = agent(data.path(), true).await;
+        std::fs::write(config_path(&service), SAVED).unwrap();
+        assert!(!restart(&service, &defs).await);
+        assert_eq!(
+            running(&service).as_deref(),
+            Some(content_hash(SAVED).as_str())
+        );
+        assert_eq!(
+            workforce_hub::agent_config_write::changed_elsewhere(&service),
+            None
+        );
+    })
+    .await;
+}

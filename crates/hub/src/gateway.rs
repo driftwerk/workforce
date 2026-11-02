@@ -11584,7 +11584,7 @@ pub(crate) fn config_write_refused(
 /// A config.toml write the agent would not load, as a 400 in plain words:
 /// a setting's own plain refusal as it is, anything else generically, with
 /// what was wrong in `findings` (a body that doesn't read as one finding).
-fn config_write_unloadable(
+pub(crate) fn config_write_unloadable(
     id: &str,
     refusal: crate::workspace_admission::ConfigRefusal,
 ) -> (StatusCode, Json<serde_json::Value>) {
