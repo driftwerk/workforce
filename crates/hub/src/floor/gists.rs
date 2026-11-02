@@ -671,6 +671,31 @@ pub(crate) struct HubModel {
     pub state: Arc<crate::gateway::GatewayState>,
 }
 
+/// Run a gist's model call as the person it is for, on their own login. The
+/// hub writes gists off the turn that caused them, where no identity is in
+/// scope, so a call made bare reaches no login of anyone's. `owner` is the
+/// floor's owner; with none (a personal hub's Desk) the call is the agent's
+/// own background work, paid by whoever pays for that. `None`, with no call
+/// made, when nobody's login serves `model`: the gist is then said plainly,
+/// as it is without a model.
+async fn written_for<F: std::future::Future>(
+    service: &crate::serve::AgentService,
+    owner: Option<&str>,
+    model: &str,
+    call: F,
+) -> Option<F::Output> {
+    let person = owner
+        .and_then(|owner| workforce_common::subscription::Payer::classify(Some(owner)).person())
+        .map(|person| person.to_string());
+    service
+        .in_background(
+            &service.background_principal(person.as_deref()),
+            crate::serve::Route::Model(Some(model)),
+            call,
+        )
+        .await
+}
+
 #[async_trait]
 impl Model for HubModel {
     async fn answer(
@@ -695,16 +720,18 @@ impl Model for HubModel {
         .ok_or_else(|| eyre::eyre!("no agent to write with"))?;
         let model = floor_model(&service.tier_registry(), &service.tier_key.read())
             .unwrap_or_else(|| crate::turn_loop::cheap_model(&service));
-        let (response, served) =
-            with_served_log(with_reasoning_suppressed(service.llm.create_message(
-                Some(system),
-                &[LlmMessage::user(user.to_string())],
-                &[],
-                Some(&model),
-                Some(400),
-                true,
-            )))
-            .await;
+        let messages = [LlmMessage::user(user.to_string())];
+        let asked = with_served_log(with_reasoning_suppressed(service.llm.create_message(
+            Some(system),
+            &messages,
+            &[],
+            Some(&model),
+            Some(400),
+            true,
+        )));
+        let (response, served) = written_for(&service, owner, &model, asked)
+            .await
+            .ok_or_else(|| eyre::eyre!("no login to write with"))?;
         let response = response?;
         service.cost_tracker.record(CostEntry {
             task_type: Some("floor_gist"),
@@ -1464,5 +1491,150 @@ mod tests {
         settle().await;
         assert_eq!(model.asked.lock().len(), 2);
         assert!(memory.summaries.lock().contains_key(&("u1".into(), true)));
+    }
+
+    const ALICE: &str = "6f1c1c3e-2a51-4a8e-9a57-0d6b1c9f2b11";
+    const BOB: &str = "0b7f3d52-8f0a-4c2f-9d44-3c1e6a1f4e22";
+
+    /// An agent on the ChatGPT backend, owned by `owner`, on a mock backend.
+    async fn chatgpt_agent(
+        dir: &std::path::Path,
+        server: &wiremock::MockServer,
+        owner: Option<&str>,
+    ) -> Arc<crate::serve::AgentService> {
+        let owner = owner.map(str::to_string);
+        crate::serve::testing::chatgpt_service(dir, server, |config| {
+            config.agents.push(workforce_common::settings::AgentConfig {
+                id: "allan".into(),
+                default: true,
+                owner_id: owner,
+                ..Default::default()
+            });
+        })
+        .await
+    }
+
+    async fn bearers(server: &wiremock::MockServer) -> Vec<String> {
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.url.path() == "/responses")
+            .filter_map(|r| {
+                r.headers
+                    .get("authorization")
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string)
+            })
+            .collect()
+    }
+
+    /// `key` in the global vault holds a ChatGPT login for `who`; its token.
+    fn chatgpt_login_at(service: &crate::serve::AgentService, key: &str, who: &str) -> String {
+        let login = crate::subscription::test_support::login(
+            &format!("acct-{}", Uuid::new_v4()),
+            who,
+            "rt-0",
+        );
+        service
+            .global_vault
+            .as_ref()
+            .expect("global vault")
+            .set(key, &login)
+            .unwrap();
+        crate::subscription::AuthJson::parse(&login)
+            .unwrap()
+            .access_token()
+            .unwrap()
+            .to_string()
+    }
+
+    /// The call a gist makes, made bare as the writer makes it: in a task
+    /// with no identity in scope.
+    async fn write_for(
+        service: &crate::serve::AgentService,
+        owner: Option<&str>,
+    ) -> Option<String> {
+        use workforce_agent::llm::types::LlmMessage;
+        let messages = [LlmMessage::user("user".to_string())];
+        written_for(
+            service,
+            owner,
+            "gpt-6-luna",
+            service.llm.create_message(
+                Some("system"),
+                &messages,
+                &[],
+                Some("gpt-6-luna"),
+                Some(400),
+                true,
+            ),
+        )
+        .await
+        .map(|response| response.expect("served").all_text().unwrap_or_default())
+    }
+
+    #[tokio::test]
+    async fn a_gist_is_written_on_its_owners_own_login() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = wiremock::MockServer::start().await;
+        let service = chatgpt_agent(tmp.path(), &server, None).await;
+        let alice = chatgpt_login_at(&service, &format!("users/{ALICE}/codex/auth_json"), ALICE);
+        crate::serve::testing::answer_bearer(&server, &alice).await;
+
+        assert!(write_for(&service, Some(ALICE)).await.is_some());
+
+        let seen = bearers(&server).await;
+        assert_eq!(seen, vec![format!("Bearer {alice}")]);
+    }
+
+    #[tokio::test]
+    async fn a_gist_with_no_owner_is_the_agents_owners_work() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = wiremock::MockServer::start().await;
+        let service = chatgpt_agent(tmp.path(), &server, Some(BOB)).await;
+        let bob = chatgpt_login_at(&service, &format!("users/{BOB}/codex/auth_json"), BOB);
+        crate::serve::testing::answer_bearer(&server, &bob).await;
+
+        for owner in [None, Some("slack:U123")] {
+            assert!(write_for(&service, owner).await.is_some(), "{owner:?}");
+        }
+
+        let seen = bearers(&server).await;
+        assert_eq!(seen, vec![format!("Bearer {bob}"); 2]);
+    }
+
+    /// The prod condition: no person's login to draw on and none shared. The
+    /// call is not made, to fail over and then on to the hub default, each
+    /// time a turn moves.
+    #[tokio::test]
+    async fn a_gist_nobodys_login_serves_is_not_asked_for() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = wiremock::MockServer::start().await;
+        let service = chatgpt_agent(tmp.path(), &server, None).await;
+        chatgpt_login_at(&service, &format!("users/{BOB}/codex/auth_json"), BOB);
+
+        for owner in [None, Some(ALICE)] {
+            assert!(write_for(&service, owner).await.is_none(), "{owner:?}");
+        }
+
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    /// A login the install shares serves the floor's own gists, as it does
+    /// a personal hub's Desk, which has no person to bill.
+    #[tokio::test]
+    async fn a_gist_with_no_one_to_bill_runs_on_the_shared_login() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = wiremock::MockServer::start().await;
+        let service = chatgpt_agent(tmp.path(), &server, None).await;
+        let shared = chatgpt_login_at(&service, "codex/auth_json", "shared");
+        crate::serve::testing::answer_bearer(&server, &shared).await;
+
+        assert!(write_for(&service, None).await.is_some());
+
+        let seen = bearers(&server).await;
+        assert_eq!(seen, vec![format!("Bearer {shared}")]);
     }
 }
