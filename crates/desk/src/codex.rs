@@ -232,23 +232,29 @@ pub async fn stop_app_server(pid: u32, socket: &Path, grace: Duration) -> Stoppe
                 let same =
                     |b: &crate::procs::Proc| now.iter().any(|p| p.pid == b.pid && p.args == b.args);
                 below.retain(same);
-                for p in crate::procs::under(&now, pid) {
-                    if !below.iter().any(|b| b.pid == p.pid) {
-                        below.push(p.clone());
+                // What runs under the number now is only the server's while
+                // the number is still the server.
+                let still = now.iter().any(is_server);
+                if still {
+                    for p in crate::procs::under(&now, pid) {
+                        if !below.iter().any(|b| b.pid == p.pid) {
+                            below.push(p.clone());
+                        }
                     }
                 }
                 below.iter().for_each(|p| signal(p.pid, libc::SIGKILL));
-                if now.iter().any(is_server) {
+                if still {
                     signal(pid, libc::SIGKILL);
                 }
             }
-            // Unreadable now: only the server, which is checked by its pid
-            // having been the server a moment ago and still running.
+            // Unreadable now: nothing can be confirmed, so nothing is killed
+            // here; the caller that owns another way to end it uses that.
             None => {
-                below.clear();
-                if alive(pid) {
-                    signal(pid, libc::SIGKILL);
-                }
+                tracing::warn!(
+                    pid,
+                    "codex app-server not killed: the process list can't be read"
+                );
+                return Stopped::Unconfirmed;
             }
         }
         wait_gone(vec![pid], WORKER_GRACE).await;
