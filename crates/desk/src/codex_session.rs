@@ -7,14 +7,35 @@
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
+use chrono::{DateTime, Utc};
 use serde_json::Value;
 
-/// A session Codex has: its id and the folder it works in.
+/// A session Codex has: its id, the folder it works in, and when it was
+/// created.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Binding {
     pub id: String,
     pub cwd: String,
     pub rollout: PathBuf,
+    pub created: Option<DateTime<Utc>>,
+}
+
+/// Codex's rollout files, listed once for a round of lookups.
+pub struct Rollouts(Vec<PathBuf>);
+
+impl Rollouts {
+    pub fn of(home: &Path) -> Self {
+        Self(crate::codex::rollouts(home))
+    }
+
+    fn find(&self, id: &str) -> Option<&PathBuf> {
+        let suffix = format!("-{id}.jsonl");
+        self.0.iter().find(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.ends_with(&suffix))
+        })
+    }
 }
 
 /// Where a session's turn stands, as its rollout last said.
@@ -48,9 +69,10 @@ fn indexed(home: &Path) -> Vec<String> {
     rows.into_iter().map(|(_, id)| id).collect()
 }
 
-/// A rollout's session id and folder, from its first line; `None` for a
-/// sub-agent's thread (its parent is the session) or a file that isn't one.
-fn meta(rollout: &Path) -> Option<(String, String)> {
+/// A rollout's session id, folder and creation time, from its first line;
+/// `None` for a sub-agent's thread (its parent is the session) or a file
+/// that isn't a rollout.
+fn meta(rollout: &Path) -> Option<(String, String, Option<DateTime<Utc>>)> {
     let mut first = String::new();
     BufReader::new(std::fs::File::open(rollout).ok()?)
         .read_line(&mut first)
@@ -63,46 +85,52 @@ fn meta(rollout: &Path) -> Option<(String, String)> {
     if p["parent_thread_id"].as_str().is_some() {
         return None;
     }
+    let created = p["timestamp"]
+        .as_str()
+        .and_then(|t| DateTime::parse_from_rfc3339(t).ok())
+        .map(|t| t.with_timezone(&Utc));
     Some((
         p["id"].as_str()?.to_string(),
         p["cwd"].as_str()?.to_string(),
+        created,
     ))
 }
 
-fn bound(home: &Path, id: &str) -> Option<Binding> {
-    let rollout = crate::codex::find_rollout(home, id)?;
-    let (found, cwd) = meta(&rollout)?;
+fn bound(rollouts: &Rollouts, id: &str) -> Option<Binding> {
+    let rollout = rollouts.find(id)?.clone();
+    let (found, cwd, created) = meta(&rollout)?;
     (found == id).then_some(Binding {
         id: found,
         cwd,
         rollout,
+        created,
     })
 }
 
 /// The session `codex resume <id>` opens, when Codex has it.
-pub fn resumed(home: &Path, id: &str) -> Option<Binding> {
-    bound(home, id)
+pub fn resumed(rollouts: &Rollouts, id: &str) -> Option<Binding> {
+    bound(rollouts, id)
 }
 
-/// The session a `codex` started with no id in `cwd` opened: the most
-/// recently indexed one in that folder whose rollout was written since
-/// `since`, and that `taken` doesn't already name.
+/// The session a `codex` started with no id in `cwd` opened: the first one
+/// in that folder *created* since the process began (a session another
+/// tool is working in was created before, however recently it was
+/// written), that `taken` doesn't already name. `None` when there is none
+/// yet, or its creation time can't be read.
 pub fn started(
     home: &Path,
+    rollouts: &Rollouts,
     cwd: &str,
-    since: std::time::SystemTime,
+    since: DateTime<Utc>,
     taken: impl Fn(&str) -> bool,
 ) -> Option<Binding> {
     indexed(home)
         .into_iter()
         .filter(|id| !taken(id))
-        .filter_map(|id| bound(home, &id))
+        .filter_map(|id| bound(rollouts, &id))
         .filter(|b| b.cwd == cwd)
-        .find(|b| {
-            std::fs::metadata(&b.rollout)
-                .and_then(|m| m.modified())
-                .is_ok_and(|t| t >= since)
-        })
+        .filter(|b| b.created.is_some_and(|c| c >= since))
+        .min_by_key(|b| b.created)
 }
 
 /// Where the rollout's turns stand, from its tail.
@@ -131,6 +159,35 @@ pub fn activity(rollout: &Path) -> Activity {
         })
         .last()
         .unwrap_or(Activity::Idle)
+}
+
+/// Whether a `codex` command line is the interactive TUI: not `exec`,
+/// `review`, `mcp-server`, `login`, `app-server` or another subcommand
+/// that runs without a conversation of the person's.
+pub fn is_tui(args: &str) -> bool {
+    const OTHER: [&str; 16] = [
+        "exec",
+        "e",
+        "review",
+        "mcp-server",
+        "mcp",
+        "login",
+        "logout",
+        "app-server",
+        "proto",
+        "completion",
+        "apply",
+        "a",
+        "sandbox",
+        "debug",
+        "features",
+        "plugin",
+    ];
+    let first = args
+        .split_whitespace()
+        .skip(1)
+        .find(|w| !w.starts_with('-'));
+    !first.is_some_and(|w| OTHER.contains(&w))
 }
 
 /// The session id a `codex` command line resumes, if it says one.
@@ -166,11 +223,22 @@ mod tests {
     use std::io::Write;
 
     fn session(home: &Path, id: &str, cwd: &str, parent: Option<&str>, tail: &[&str]) -> PathBuf {
+        session_at(home, id, cwd, parent, "2026-11-02T10:00:00Z", tail)
+    }
+
+    fn session_at(
+        home: &Path,
+        id: &str,
+        cwd: &str,
+        parent: Option<&str>,
+        created: &str,
+        tail: &[&str],
+    ) -> PathBuf {
         let dir = home.join(".codex/sessions/2026/11/02");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(format!("rollout-2026-11-02T10-00-00-{id}.jsonl"));
         let mut f = std::fs::File::create(&path).unwrap();
-        let payload = serde_json::json!({"id": id, "cwd": cwd, "parent_thread_id": parent, "base_instructions": {"text": "x"}});
+        let payload = serde_json::json!({"id": id, "cwd": cwd, "parent_thread_id": parent, "timestamp": created, "base_instructions": {"text": "x"}});
         writeln!(
             f,
             "{}",
@@ -201,38 +269,88 @@ mod tests {
         }
     }
 
+    fn time(t: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(t).unwrap().with_timezone(&Utc)
+    }
+
     #[test]
     fn a_resumed_session_is_its_id_and_folder() {
         let home = tempfile::tempdir().unwrap();
         session(home.path(), "a1", "/work/app", None, &[]);
-        let b = resumed(home.path(), "a1").unwrap();
+        let all = Rollouts::of(home.path());
+        let b = resumed(&all, "a1").unwrap();
         assert_eq!((b.id.as_str(), b.cwd.as_str()), ("a1", "/work/app"));
-        assert_eq!(resumed(home.path(), "nope"), None);
+        assert_eq!(resumed(&all, "nope"), None);
     }
 
     #[test]
-    fn a_new_session_is_the_latest_one_in_its_folder_written_since_it_began() {
+    fn a_new_session_is_the_first_one_created_in_its_folder_since_it_began() {
         let home = tempfile::tempdir().unwrap();
-        session(home.path(), "old", "/work/app", None, &[]);
-        session(home.path(), "other", "/work/else", None, &[]);
-        session(home.path(), "mine", "/work/app", None, &[]);
-        session(home.path(), "child", "/work/app", Some("mine"), &[]);
+        session_at(
+            home.path(),
+            "busy",
+            "/work/app",
+            None,
+            "2026-11-02T09:00:00Z",
+            &["task_started"],
+        );
+        session_at(
+            home.path(),
+            "other",
+            "/work/else",
+            None,
+            "2026-11-02T10:01:00Z",
+            &[],
+        );
+        session_at(
+            home.path(),
+            "mine",
+            "/work/app",
+            None,
+            "2026-11-02T10:01:00Z",
+            &[],
+        );
+        session_at(
+            home.path(),
+            "later",
+            "/work/app",
+            None,
+            "2026-11-02T10:30:00Z",
+            &[],
+        );
+        session_at(
+            home.path(),
+            "child",
+            "/work/app",
+            Some("mine"),
+            "2026-11-02T10:01:30Z",
+            &[],
+        );
         index(
             home.path(),
             &[
-                ("old", "2026-11-02T09:00:00Z"),
+                // Another tool's session, active right now in the same folder.
+                ("busy", "2026-11-02T10:02:00Z"),
                 ("other", "2026-11-02T10:05:00Z"),
                 ("mine", "2026-11-02T10:01:00Z"),
+                ("later", "2026-11-02T10:30:00Z"),
                 ("child", "2026-11-02T10:06:00Z"),
             ],
         );
-        let long_ago = std::time::SystemTime::UNIX_EPOCH;
-        let b = started(home.path(), "/work/app", long_ago, |_| false).unwrap();
-        assert_eq!(b.id, "mine", "not another folder's, not a sub-agent's");
-        let b = started(home.path(), "/work/app", long_ago, |id| id == "mine").unwrap();
-        assert_eq!(b.id, "old", "one another terminal has is skipped");
-        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
-        assert_eq!(started(home.path(), "/work/app", later, |_| false), None);
+        let all = Rollouts::of(home.path());
+        let began = time("2026-11-02T10:00:50Z");
+        let b = started(home.path(), &all, "/work/app", began, |_| false).unwrap();
+        assert_eq!(
+            b.id, "mine",
+            "not the busy one, another folder's, or a sub-agent's"
+        );
+        let b = started(home.path(), &all, "/work/app", began, |id| id == "mine").unwrap();
+        assert_eq!(b.id, "later", "one another terminal has is skipped");
+        let none = time("2026-11-02T11:00:00Z");
+        assert_eq!(
+            started(home.path(), &all, "/work/app", none, |_| false),
+            None
+        );
     }
 
     #[test]
@@ -247,6 +365,23 @@ mod tests {
             Activity::Working
         );
         assert_eq!(at(&["task_started", "turn_aborted"]), Activity::Done);
+    }
+
+    #[test]
+    fn only_the_interactive_codex_is_a_session() {
+        assert!(is_tui("codex"));
+        assert!(is_tui("codex resume abc --approve-for-me"));
+        assert!(is_tui("/x/codex -m gpt"));
+        for other in [
+            "codex exec fix it",
+            "codex review",
+            "codex mcp-server",
+            "codex login",
+            "codex app-server --listen unix:///s",
+            "codex --yolo exec x",
+        ] {
+            assert!(!is_tui(other), "{other}");
+        }
     }
 
     #[test]

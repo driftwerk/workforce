@@ -242,6 +242,8 @@ struct State {
     records: HashMap<Uuid, SessionRecord>,
     rooms: HashMap<Uuid, Room>,
     live: HashMap<Uuid, Live>,
+    /// The `codex` process each terminal-hosted Codex session was bound to.
+    codex_pids: HashMap<Uuid, u32>,
     /// Transcript mtimes already read for adopted sessions.
     seen_transcripts: HashMap<Uuid, SystemTime>,
     /// When each session came into the state it is in.

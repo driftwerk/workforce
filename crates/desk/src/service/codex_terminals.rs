@@ -5,7 +5,9 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
+
+use chrono::Utc;
 
 use uuid::Uuid;
 
@@ -17,13 +19,42 @@ use crate::procs::{self, Proc};
 use crate::pty::Pty;
 use crate::transcript;
 
-/// The `codex` a terminal's shell is running: the TUI, not an app-server
-/// or a worker of one.
+/// Programs a shell or its launcher can be between a terminal's shell and
+/// the `codex` the person typed.
+fn is_launcher(p: &Proc) -> bool {
+    !procs::is_tool_shell(p)
+        && matches!(
+            p.program().as_deref(),
+            Some("node" | "sh" | "bash" | "zsh" | "fish" | "dash" | "ksh")
+        )
+}
+
+/// The `codex` the person typed in a terminal whose shell is `shell`: the
+/// TUI, started from the shell itself, a shell inside it, or through
+/// `node`. Not one a program ran (a Claude Code tool's `codex exec`, an MCP
+/// server), nor an app-server, its worker, or a `--remote` client of one.
 fn codex_in(table: &[Proc], shell: u32) -> Option<&Proc> {
+    let parent = |p: &Proc| table.iter().find(|q| q.pid == p.ppid);
     procs::under(table, shell).into_iter().find(|p| {
-        p.program().as_deref() == Some("codex")
-            && !p.args.contains(" app-server")
-            && !p.args.contains(" --remote")
+        let typed = p.program().as_deref() == Some("codex")
+            && session::is_tui(&p.args)
+            && !p.args.contains(" --remote");
+        if !typed {
+            return false;
+        }
+        let mut at = *p;
+        // Bounded: a listing read mid-reuse could loop.
+        for _ in 0..16 {
+            let Some(up) = parent(at) else { return false };
+            if up.pid == shell {
+                return true;
+            }
+            if !is_launcher(up) {
+                return false;
+            }
+            at = up;
+        }
+        false
     })
 }
 
@@ -53,52 +84,73 @@ impl Desk {
         }
     }
 
-    /// The terminal's running session, when it is a Codex one.
-    fn codex_session_in(&self, terminal: Uuid) -> Option<(Uuid, Option<String>)> {
+    /// The terminal's running session, when it is a Codex one: its id, its
+    /// Codex session's id, and the process it was bound to.
+    fn codex_session_in(&self, terminal: Uuid) -> Option<(Uuid, Option<String>, Option<u32>)> {
         let id = self.terminal_session(terminal, None)?;
         let st = self.0.state.lock();
         let r = st.records.get(&id).filter(|r| r.engine == Engine::Codex)?;
-        Some((id, r.cli_session_id.clone()))
+        Some((
+            id,
+            r.cli_session_id.clone(),
+            st.codex_pids.get(&id).copied(),
+        ))
     }
 
     pub(super) async fn track_codex_terminals(&self) {
         let Some(home) = self.0.env.get("HOME").map(PathBuf::from) else {
             return;
         };
-        let terminals: Vec<(Uuid, Arc<Pty>)> = self
-            .0
-            .state
-            .lock()
-            .terminal_ptys
-            .iter()
-            .map(|(id, p)| (*id, Arc::clone(p)))
-            .collect();
+        let terminals: Vec<(Uuid, Arc<Pty>)> = {
+            let mut st = self.0.state.lock();
+            let live: std::collections::HashSet<Uuid> = st.live.keys().copied().collect();
+            st.codex_pids.retain(|id, _| live.contains(id));
+            st.terminal_ptys
+                .iter()
+                .map(|(id, p)| (*id, Arc::clone(p)))
+                .collect()
+        };
         if terminals.is_empty() {
             return;
         }
         let Some(table) = procs::table().await else {
             return;
         };
+        // Listed once a round, and only when something has to be bound.
+        let mut rollouts: Option<Arc<session::Rollouts>> = None;
         for (terminal, pty) in terminals {
             let codex = pty.pid().and_then(|shell| codex_in(&table, shell));
             let tracked = self.codex_session_in(terminal);
             match (codex, tracked) {
-                (None, Some((id, _))) => self.end_terminal_session(id, true),
+                (None, Some((id, ..))) => self.end_terminal_session(id, true),
                 (Some(p), tracked) => {
                     let wanted = session::resume_arg(&p.args);
-                    if let Some((id, cli)) = &tracked {
-                        // Another session resumed in the same terminal.
-                        if wanted.is_some() && wanted != cli.as_deref() {
-                            self.end_terminal_session(*id, true);
-                        } else {
+                    if let Some((id, cli, bound_to)) = &tracked {
+                        // The same process, still on its session, unless it
+                        // was told to resume another one.
+                        if *bound_to == Some(p.pid)
+                            && (wanted.is_none() || wanted == cli.as_deref())
+                        {
                             self.follow_codex_session(*id).await;
                             continue;
                         }
+                        self.end_terminal_session(*id, true);
                     }
-                    let Some(found) = self.bind_codex(&home, p, wanted).await else {
+                    if rollouts.is_none() {
+                        let h = home.clone();
+                        rollouts = tokio::task::spawn_blocking(move || session::Rollouts::of(&h))
+                            .await
+                            .ok()
+                            .map(Arc::new);
+                    }
+                    let Some(all) = rollouts.clone() else {
+                        continue;
+                    };
+                    let Some(found) = self.bind_codex(&home, all, p, wanted).await else {
                         continue;
                     };
                     let id = self.take_codex_session(terminal, pty, found).await;
+                    self.0.state.lock().codex_pids.insert(id, p.pid);
                     self.follow_codex_session(id).await;
                 }
                 (None, None) => {}
@@ -106,17 +158,18 @@ impl Desk {
         }
     }
 
-    /// The session the `codex` process `p` is.
+    /// The session the `codex` process `p` is: the one it was told to
+    /// resume, else the one it created.
     async fn bind_codex(
         &self,
         home: &std::path::Path,
+        all: Arc<session::Rollouts>,
         p: &Proc,
         wanted: Option<&str>,
     ) -> Option<Binding> {
-        let home = home.to_path_buf();
         if let Some(id) = wanted {
-            let (h, id) = (home.clone(), id.to_string());
-            if let Some(b) = tokio::task::spawn_blocking(move || session::resumed(&h, &id))
+            let (all, id) = (Arc::clone(&all), id.to_string());
+            if let Some(b) = tokio::task::spawn_blocking(move || session::resumed(&all, &id))
                 .await
                 .ok()
                 .flatten()
@@ -124,8 +177,11 @@ impl Desk {
                 return Some(b);
             }
         }
+        let home = home.to_path_buf();
         let cwd = crate::cwd::of_pid(p.pid)?;
-        let since = SystemTime::now() - age(p.pid).await? - Duration::from_secs(5);
+        let since = Utc::now()
+            - chrono::Duration::from_std(age(p.pid).await?).ok()?
+            - chrono::Duration::seconds(5);
         let running: Vec<String> = {
             let st = self.0.state.lock();
             st.live
@@ -136,7 +192,9 @@ impl Desk {
                 .collect()
         };
         tokio::task::spawn_blocking(move || {
-            session::started(&home, &cwd, since, |id| running.iter().any(|r| r == id))
+            session::started(&home, &all, &cwd, since, |id| {
+                running.iter().any(|r| r == id)
+            })
         })
         .await
         .ok()
@@ -190,13 +248,22 @@ impl Desk {
             Activity::Done => SessionState::Done,
         };
         let unchanged = self.record(id).is_ok_and(|r| {
-            r.state == state && r.last_prompt == tail.last_prompt && r.last_reply == tail.last_reply
+            r.state == state
+                && tail
+                    .last_prompt
+                    .as_ref()
+                    .is_none_or(|p| r.last_prompt.as_ref() == Some(p))
+                && tail
+                    .last_reply
+                    .as_ref()
+                    .is_none_or(|p| r.last_reply.as_ref() == Some(p))
         });
         if !unchanged {
             self.change(id, |r, _| {
                 r.state = state;
-                r.last_prompt = tail.last_prompt;
-                r.last_reply = tail.last_reply;
+                // A tail that misses them keeps what was known.
+                r.last_prompt = tail.last_prompt.or(r.last_prompt.take());
+                r.last_reply = tail.last_reply.or(r.last_reply.take());
             });
         }
     }
@@ -229,6 +296,31 @@ mod tests {
         assert_eq!(codex_in(&table, 10).map(|p| p.pid), Some(12));
         assert_eq!(codex_in(&table, 20), None);
         assert_eq!(codex_in(&table, 30), None, "Desk's own pairs are not typed");
+
+        // What a program runs is not what the person typed.
+        let table = [
+            proc(40, 1, "-zsh"),
+            proc(41, 40, "claude"),
+            proc(
+                42,
+                41,
+                "/bin/zsh -c source /h/.claude/shell-snapshots/snapshot-zsh-1.sh && codex",
+            ),
+            proc(43, 42, "/n/vendor/bin/codex"),
+            proc(44, 41, "/n/vendor/bin/codex exec fix it"),
+            proc(50, 1, "-zsh"),
+            proc(51, 50, "/n/vendor/bin/codex mcp-server"),
+            proc(52, 50, "/n/vendor/bin/codex review"),
+        ];
+        assert_eq!(codex_in(&table, 40), None, "under claude, or a tool shell");
+        assert_eq!(codex_in(&table, 50), None, "not the interactive one");
+        // A shell inside the terminal's shell is still the person's.
+        let table = [
+            proc(60, 1, "-zsh"),
+            proc(61, 60, "zsh"),
+            proc(62, 61, "/n/vendor/bin/codex resume abc"),
+        ];
+        assert_eq!(codex_in(&table, 60).map(|p| p.pid), Some(62));
     }
 
     use std::os::unix::fs::PermissionsExt;
@@ -378,6 +470,83 @@ mod tests {
             let all = sessions();
             assert_eq!(all.len(), 1, "no duplicate");
             assert_eq!(all[0].0, first.0);
+            pty.write(b"\x03exit\n").unwrap();
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_codex_run_by_claude_code_in_a_terminal_leaves_its_session_alone() {
+        with_test_pool(crate::store::build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let home = dir.path().join("home");
+            std::fs::create_dir_all(&home).unwrap();
+            let cwd = dir.path().to_string_lossy().into_owned();
+            // A `claude` that runs `codex exec` as a tool would.
+            let bin = dir.path().join("claude");
+            std::fs::write(
+                &bin,
+                "#!/bin/bash\nexec -a claude bash -c '(exec -a \"codex exec x\" sleep 60) & wait'\n",
+            )
+            .unwrap();
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let mut opts = crate::testing::options(dir.path());
+            opts.env = std::collections::BTreeMap::from([
+                ("PATH".into(), "/usr/bin:/bin".into()),
+                ("SHELL".into(), "/bin/sh".into()),
+                ("HOME".into(), home.to_string_lossy().into_owned()),
+            ]);
+            crate::store::DeskStore::migrate(&pool).await.unwrap();
+            let d = Desk::start(
+                crate::store::DeskStore::from_pool(pool),
+                opts,
+                Default::default(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            let t = d
+                .create_terminal(super::super::terminals::NewTerminal {
+                    id: None,
+                    name: None,
+                    cwd: cwd.clone(),
+                    env: Default::default(),
+                })
+                .await
+                .unwrap();
+            let pty = d.attach_terminal(t.id).unwrap();
+            let claude = d.register_terminal_session(
+                Engine::Claude,
+                t.id,
+                Arc::clone(&pty),
+                Some("cc-1".into()),
+                Some(cwd),
+            );
+            pty.write(format!("{}\n", bin.display()).as_bytes()).unwrap();
+            // Until the `codex exec` is really running under it.
+            let mut seen = false;
+            for _ in 0..200 {
+                let table = procs::table().await.unwrap();
+                seen = table.iter().any(|p| p.args.starts_with("codex exec"));
+                if seen {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            assert!(seen, "the tool's codex never ran");
+            for _ in 0..3 {
+                d.track_codex_terminals().await;
+            }
+            assert!(d.view(claude).unwrap().live, "Claude Code's session stays");
+            let codex = d
+                .0
+                .state
+                .lock()
+                .records
+                .values()
+                .filter(|r| r.engine == Engine::Codex)
+                .count();
+            assert_eq!(codex, 0, "a tool's codex is not the person's");
             pty.write(b"\x03exit\n").unwrap();
         })
         .await;
