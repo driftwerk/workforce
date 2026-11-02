@@ -899,7 +899,7 @@ impl Desk {
                     let (server_pty, _) = holder.adopt(&server, history);
                     let server = Server::Held(Arc::new(server_pty));
                     socket.map(|socket| {
-                        self.observe_codex(id, server, socket, record.cli_session_id.clone())
+                        self.observe_codex(id, server, socket, record.cli_session_id.clone(), true)
                     })
                 }
                 other => {
@@ -2653,7 +2653,8 @@ impl Desk {
                     approve_for_me: r.approve_for_me,
                     env: &env,
                 });
-                let link = self.observe_codex(r.id, server, socket, thread.map(str::to_string));
+                let link =
+                    self.observe_codex(r.id, server, socket, thread.map(str::to_string), false);
                 (spec, Some(link))
             }
             Engine::Gemini
@@ -2748,13 +2749,15 @@ impl Desk {
     }
 
     /// Joins a Codex session's app-server as a second client to follow it,
-    /// subscribed to `thread` when it is known (resumed, or taken back).
+    /// subscribed to `thread` when it is known (resumed, or taken back):
+    /// `at_once` when its TUI already runs it (taken back).
     fn observe_codex(
         &self,
         id: Uuid,
         server: Server,
         socket: PathBuf,
         thread: Option<String>,
+        at_once: bool,
     ) -> CodexLink {
         let watch = self.0.cancel.child_token();
         let (tx, rx) = mpsc::channel(64);
@@ -2764,6 +2767,11 @@ impl Desk {
             let watch = watch.clone();
             let plans = self.0.plans.clone();
             let follower = codex::Follower::new(thread, self.0.env.get("HOME").map(PathBuf::from));
+            let follower = if at_once {
+                follower.at_once()
+            } else {
+                follower
+            };
             async move {
                 if let Err(e) = codex::observe(socket, follower, tx, answers, plans, watch).await {
                     tracing::warn!(error = %e, "codex observer stopped");
@@ -3232,6 +3240,15 @@ impl Desk {
                 }
                 continue;
             }
+            if let CodexEvent::Reviewer(reviewer) = &event {
+                // Approve for me is the TUI's to set: if Codex says otherwise,
+                // the session's word for it is wrong.
+                let on = self.record(id).is_ok_and(|r| r.approve_for_me);
+                if on != (reviewer == "auto_review") {
+                    tracing::warn!(%id, %reviewer, approve_for_me = on, "codex runs with other approvals than the session says");
+                }
+                continue;
+            }
             if let CodexEvent::Reviewed { what, verdict } = &event {
                 // What "Approve for me" decided shows as the session's activity.
                 if let Ok(view) = self.view(id) {
@@ -3390,7 +3407,10 @@ impl Desk {
                     }
                     CodexEvent::Answered(_) | CodexEvent::Late(_) => {}
                     CodexEvent::Reply(text) => r.last_reply = Some(transcript::clip(&text)),
-                    CodexEvent::Child(_) | CodexEvent::Usage(_) | CodexEvent::Reviewed { .. } => {}
+                    CodexEvent::Child(_)
+                    | CodexEvent::Usage(_)
+                    | CodexEvent::Reviewed { .. }
+                    | CodexEvent::Reviewer(_) => {}
                 }
             });
             if let (Some(reader), Some(end), Some(reply)) = (reader, read, said_whole) {

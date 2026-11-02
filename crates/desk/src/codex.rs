@@ -351,6 +351,9 @@ pub enum CodexEvent {
     /// Desk's answer came after the request was answered (in the
     /// terminal): not sent.
     Late(Value),
+    /// Who answers its thread's approvals, as Codex said when subscribed:
+    /// `user`, or `auto_review` ("Approve for me").
+    Reviewer(String),
     /// Its automatic reviewer ("Approve for me") decided a request: what
     /// it was, and the verdict in plain words.
     Reviewed {
@@ -609,7 +612,7 @@ pub fn interpret(method: &str, params: &Value) -> Option<Seen> {
             };
             seen(s("/threadId"), event)
         }
-        "item/guardianApprovalReview/completed" => seen(s("/threadId"), reviewed(params)?),
+        "item/autoApprovalReview/completed" => seen(s("/threadId"), reviewed(params)?),
         "thread/tokenUsage/updated" => seen(
             s("/threadId"),
             CodexEvent::Usage(crate::ledger::codex_spend(params, chrono::Utc::now())?),
@@ -680,6 +683,10 @@ pub struct Follower {
     thread: Option<String>,
     /// Subscribed to it, or asking to be.
     subscribed: bool,
+    /// Subscribes as soon as it joins: a session taken back, whose TUI
+    /// already has its thread. Otherwise at the thread's first status, so
+    /// the TUI loads it first, with its own settings.
+    at_once: bool,
     /// The files each file change item it started touches, by item id.
     files: HashMap<String, Vec<String>>,
     /// The requests it forwarded that nobody has answered, by id.
@@ -692,10 +699,17 @@ impl Follower {
         Self {
             thread,
             subscribed: false,
+            at_once: false,
             files: HashMap::new(),
             open: HashMap::new(),
             home,
         }
+    }
+
+    /// Subscribes as soon as it joins (see `at_once`).
+    pub fn at_once(mut self) -> Self {
+        self.at_once = true;
+        self
     }
 
     /// Subscribes to the thread, when it is known and not yet subscribed.
@@ -711,7 +725,8 @@ impl Follower {
 
     /// What to send once joined.
     pub fn joined(&mut self) -> Option<Value> {
-        self.subscribe()
+        // Otherwise at its first status.
+        self.at_once.then(|| self.subscribe()).flatten()
     }
 
     /// What `v` says, and what to send for it. A server request other than
@@ -724,11 +739,24 @@ impl Follower {
                 // The thread can't be resumed before its first turn has
                 // written it down ("no rollout found"): again at its next
                 // status.
-                if id.as_i64() == Some(SUBSCRIBE) && v.get("error").is_some() {
+                if id.as_i64() != Some(SUBSCRIBE) {
+                    return (Vec::new(), None);
+                }
+                if v.get("error").is_some() {
                     tracing::debug!(error = %v["error"], "codex: not subscribed to the thread yet");
                     self.subscribed = false;
+                    return (Vec::new(), None);
                 }
-                (Vec::new(), None)
+                // What the thread runs with, as Codex says it.
+                let said = v
+                    .pointer("/result/approvalsReviewer")
+                    .and_then(Value::as_str)
+                    .zip(self.thread.clone())
+                    .map(|(reviewer, thread)| Seen {
+                        thread,
+                        event: CodexEvent::Reviewer(reviewer.to_string()),
+                    });
+                (said.into_iter().collect(), None)
             }
             (Some(id), Some(method)) => {
                 let params = v.get("params").cloned().unwrap_or(Value::Null);
@@ -1010,7 +1038,7 @@ pub(crate) mod tests {
     fn its_reviewers_verdicts_are_said_plainly() {
         let done = |status: &str, action: Value| {
             interpret(
-                "item/guardianApprovalReview/completed",
+                "item/autoApprovalReview/completed",
                 &json!({"threadId": "t1", "turnId": "u1", "reviewId": "r1", "startedAtMs": 1,
                     "completedAtMs": 2, "decisionSource": "agent",
                     "review": {"status": status}, "action": action}),
@@ -1341,7 +1369,25 @@ pub(crate) mod tests {
             "again, at its next status"
         );
         // Taken back: its thread is known, and it subscribes at once.
-        let mut back = Follower::new(Some("t9".into()), None);
+        let mut launched = Follower::new(Some("t9".into()), None);
+        assert_eq!(
+            launched.joined(),
+            None,
+            "resumed: once its TUI has loaded it"
+        );
+        let status = json!({"method": "thread/status/changed",
+            "params": {"threadId": "t9", "status": {"type": "idle"}}});
+        assert!(launched.heard(&status).1.is_some());
+        let (seen, _) = launched
+            .heard(&json!({"id": SUBSCRIBE, "result": {"approvalsReviewer": "auto_review"}}));
+        assert_eq!(
+            seen,
+            [Seen {
+                thread: "t9".into(),
+                event: CodexEvent::Reviewer("auto_review".into())
+            }]
+        );
+        let mut back = Follower::new(Some("t9".into()), None).at_once();
         assert_eq!(
             back.joined(),
             Some(
@@ -1431,7 +1477,7 @@ pub(crate) mod tests {
         let cancel = CancellationToken::new();
         let observer = tokio::spawn(observe(
             socket,
-            Follower::new(Some("t1".into()), None),
+            Follower::new(Some("t1".into()), None).at_once(),
             events,
             answers,
             None,
