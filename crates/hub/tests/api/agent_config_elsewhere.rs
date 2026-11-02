@@ -1,7 +1,7 @@
-//! An agent never changes what it may do: no tool sets the settings that
-//! decide it, and on a Desk hub, where its commands run as the hub, a change
-//! made to its `config.toml` outside the hub waits on the person instead of
-//! being applied.
+//! On a Desk hub an agent's commands run as the hub, so a command could
+//! rewrite its `config.toml`. A change made outside the hub waits on the
+//! person instead of being applied; the agent's own tool, the person's saves
+//! and Desk Helper's edits before boot all apply as ever.
 
 use std::sync::Arc;
 
@@ -64,27 +64,39 @@ async fn config_tool(
         .unwrap()
 }
 
-/// `system.config` refuses who may talk to the agent and whether it
-/// oversees the crew, whoever's turn it runs on.
+/// Asked by the person, the agent sets up who may talk to it through its
+/// own tool, and that applies at once on a Desk hub, guarded file and all.
+/// (Who may call the tool is the gate's to say, as on any hub.)
 #[tokio::test(flavor = "multi_thread")]
-async fn the_config_tool_never_changes_who_the_agent_serves_or_oversees() {
+async fn the_agent_sets_its_own_access_through_its_tool_and_it_applies() {
     let data = tempfile::tempdir().unwrap();
-    let service = agent(data.path(), false).await;
-    for (key, value) in [
-        ("access.mode", serde_json::json!("allowlist")),
-        ("access.allow", serde_json::json!(["someone"])),
-        ("oversight.enabled", serde_json::json!(true)),
-    ] {
-        let result = config_tool(
-            &service,
-            serde_json::json!({"action": "set", "key": key, "value": value}),
-        )
-        .await;
-        assert!(!result.success, "{key} was set: {:?}", result.output);
-        let message = result.error.clone().unwrap_or_default();
-        assert!(message.contains("human-only"), "{key}: {message}");
-    }
-    assert_eq!(on_disk(&service), "", "nothing was written");
+    let service = agent(data.path(), true).await;
+    let gateway = Gateway::new(vec![("scout", Arc::clone(&service))], None);
+    assert_eq!(put(&gateway, SAVED).await.0, StatusCode::OK);
+
+    let result = config_tool(
+        &service,
+        serde_json::json!({"action": "set", "key": "access.mode", "value": "allowlist"}),
+    )
+    .await;
+    assert!(result.success, "{:?}", result.error);
+    let body = on_disk(&service);
+    assert!(body.contains("mode = \"allowlist\""), "{body}");
+    assert_eq!(
+        running(&service).as_deref(),
+        Some(content_hash(&body).as_str()),
+        "the running agent applied it"
+    );
+    assert_eq!(
+        workforce_hub::agent_config_write::changed_elsewhere(&service),
+        None,
+        "the hub's own write is never a change made elsewhere"
+    );
+    service.reload_config().await.unwrap();
+    assert_eq!(
+        running(&service).as_deref(),
+        Some(content_hash(&body).as_str())
+    );
 }
 
 /// A command rewrites the file while the hub runs: the watcher's reload keeps
