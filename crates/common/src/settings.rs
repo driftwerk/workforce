@@ -7437,9 +7437,21 @@ pub struct AgentWorkspaceConfig {
     /// which says what is wrong with it in plain words.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oversight: Option<toml::Value>,
+    /// Per-agent `[computer]`: how far this agent reaches on this computer,
+    /// read only on a hub with `[desk]`. Kept as written and read by
+    /// [`crate::computer_access`], which says what is wrong with it in
+    /// plain words.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub computer: Option<toml::Value>,
 }
 
 impl AgentWorkspaceConfig {
+    /// This agent's `[computer]`, Full access asking first where it has
+    /// none, or what is wrong with it.
+    pub fn computer(&self) -> Result<workforce_core::computer::ComputerAccess, String> {
+        crate::computer_access::of(self.computer.as_ref())
+    }
+
     /// This agent's `[oversight]`, its defaults (off) where it has none, or
     /// what is wrong with it.
     pub fn oversight(&self) -> Result<crate::oversight::Oversight, String> {

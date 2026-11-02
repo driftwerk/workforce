@@ -129,6 +129,7 @@ impl WorkspaceAdmission {
     /// The findings on `workspace`, or why the agent would not load it.
     fn review(&self, workspace: &AgentWorkspaceConfig) -> Result<Vec<Finding>, ConfigRefusal> {
         workspace.oversight().map_err(ConfigRefusal::Said)?;
+        workspace.computer().map_err(ConfigRefusal::Said)?;
         let prospective = self
             .prospective(Some(workspace))
             .map_err(|e| ConfigRefusal::Parse(e.to_string()))?;
@@ -197,6 +198,35 @@ mod tests {
             admission.review_toml("[oversight\n"),
             Err(ConfigRefusal::Parse(_))
         ));
+    }
+
+    /// `[computer]` is admitted on any hub, `[desk]` or not, and a config
+    /// without it admits as before; what is wrong is said in plain words.
+    #[test]
+    fn computer_is_admitted_and_refused_in_plain_words() {
+        let admission = WorkspaceAdmission::new(
+            Arc::new(WorkforceConfig::default()),
+            "allan",
+            Arc::new(parking_lot::RwLock::new("anthropic".to_string())),
+        );
+        assert!(admission.review_toml("").unwrap().is_empty());
+        for ok in [
+            "[computer]\naccess = \"own_folder\"\n",
+            "[computer]\naccess = \"full\"\nautonomous = true\nask_in_own_folder = true\n",
+        ] {
+            assert!(admission.review_toml(ok).unwrap().is_empty(), "{ok}");
+        }
+        assert_eq!(
+            admission
+                .review_toml("[computer]\naccess = \"own_folder\"\nautonomous = true\n")
+                .unwrap_err(),
+            ConfigRefusal::Said(
+                "An agent can work on its own only with full access to this computer.".into()
+            )
+        );
+        let unchanged: AgentWorkspaceConfig = AgentWorkspaceConfig::parse("").unwrap();
+        assert!(unchanged.computer.is_none());
+        assert!(!toml::to_string(&unchanged).unwrap().contains("computer"));
     }
 
     #[test]
