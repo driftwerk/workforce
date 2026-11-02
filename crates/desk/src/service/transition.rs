@@ -459,6 +459,7 @@ mod tests {
                 engine: Engine::Claude,
                 view: View::Terminal,
                 engine_version: None,
+                approve_for_me: false,
                 name: "auth-fix".into(),
                 goal: String::new(),
                 cwd: "/repo".into(),

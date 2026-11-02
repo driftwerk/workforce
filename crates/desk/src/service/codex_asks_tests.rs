@@ -27,8 +27,9 @@ fn fake_codex(dir: &Path) -> PathBuf {
     std::fs::write(
         &path,
         format!(
-            "#!/bin/sh\n[ \"$1\" = app-server ] && echo \"${{3#unix://}}\" > '{}/listen'\nexec sleep 60\n",
-            dir.display()
+            "#!/bin/sh\n[ \"$1\" = app-server ] && echo \"${{3#unix://}}\" > '{d}/listen'\n\
+             case \"$1\" in --remote|resume) echo \"$@\" > '{d}/tui-args' ;; esac\nexec sleep 60\n",
+            d = dir.display()
         ),
     )
     .unwrap();
@@ -56,7 +57,7 @@ fn serve(dir: &Path) -> tokio::task::JoinHandle<WebSocketStream<UnixStream>> {
 }
 
 async fn until(mut ok: impl FnMut() -> bool) {
-    for _ in 0..300 {
+    for _ in 0..1000 {
         if ok() {
             return;
         }
@@ -73,6 +74,21 @@ fn ask(id: i64, decisions: Option<Value>) -> Value {
         params["availableDecisions"] = d;
     }
     json!({"id": id, "method": "item/commandExecution/requestApproval", "params": params})
+}
+
+fn codex_session(dir: &Path, approve_for_me: bool) -> NewSession {
+    NewSession {
+        engine: Engine::Codex,
+        view: None,
+        name: "cleanup".into(),
+        cwd: dir.to_string_lossy().into_owned(),
+        goal: String::new(),
+        worktree: None,
+        prompt: None,
+        approvals: None,
+        approve_for_me,
+        env: Default::default(),
+    }
 }
 
 fn status(flags: &[&str]) -> Value {
@@ -100,20 +116,7 @@ async fn codex_asks_are_answered_from_desk_and_go_when_answered_anywhere() {
         .unwrap();
         let server = serve(dir.path());
         let s = d
-            .create(
-                NewSession {
-                    engine: Engine::Codex,
-                    view: None,
-                    name: "cleanup".into(),
-                    cwd: dir.path().to_string_lossy().into_owned(),
-                    goal: String::new(),
-                    worktree: None,
-                    prompt: None,
-                    approvals: None,
-                    env: Default::default(),
-                },
-                None,
-            )
+            .create(codex_session(dir.path(), false), None)
             .await
             .unwrap();
         let mut ws = server.await.unwrap();
@@ -204,6 +207,44 @@ async fn codex_asks_are_answered_from_desk_and_go_when_answered_anywhere() {
         until(|| d.view(s.id).unwrap().pending.is_some_and(|p| p.answerable)).await;
         drop(ws);
         until(|| d.view(s.id).unwrap().pending.is_none()).await;
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn approve_for_me_starts_codex_with_its_reviewer_and_stays_on() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        DeskStore::migrate(&pool).await.unwrap();
+        let store = DeskStore::from_pool(pool.clone());
+        let d = Desk::start(
+            DeskStore::from_pool(pool),
+            options(dir.path()).with_program(Engine::Codex, fake_codex(dir.path())),
+            Default::default(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        let claude = NewSession {
+            engine: Engine::Claude,
+            ..codex_session(dir.path(), true)
+        };
+        assert!(
+            matches!(d.create(claude, None).await, Err(DeskError::Invalid(_))),
+            "Codex's alone"
+        );
+        let server = serve(dir.path());
+        let s = d.create(codex_session(dir.path(), true), None).await.unwrap();
+        let _ws = server.await.unwrap();
+        assert!(s.approve_for_me, "the session says it is on");
+        let args = dir.path().join("tui-args");
+        until(|| std::fs::read_to_string(&args).is_ok_and(|a| a.ends_with('\n'))).await;
+        let args = std::fs::read_to_string(&args).unwrap();
+        assert!(
+            args.contains("-c approvals_reviewer=auto_review -c approval_policy=on-request -c sandbox_mode=workspace-write"),
+            "{args}"
+        );
+        assert!(store.get(s.id).await.unwrap().unwrap().approve_for_me, "kept, for its resume");
     })
     .await;
 }

@@ -1622,6 +1622,11 @@ impl Desk {
                 }
             });
         }
+        if new.approve_for_me && new.engine != Engine::Codex {
+            return Err(DeskError::Invalid(
+                "only Codex sessions can approve for you".into(),
+            ));
+        }
         let cwd = PathBuf::from(&new.cwd);
         if !cwd.is_dir() {
             return Err(DeskError::Invalid(format!("{} is not a folder", new.cwd)));
@@ -1648,6 +1653,7 @@ impl Desk {
             engine: new.engine,
             view,
             engine_version: self.version_of(new.engine),
+            approve_for_me: new.approve_for_me && new.engine == Engine::Codex,
             name: name.to_string(),
             goal: new.goal.trim().to_string(),
             cwd: cwd.to_string_lossy().into_owned(),
@@ -2644,6 +2650,7 @@ impl Desk {
                         None => codex::Launch::New,
                     },
                     prompt,
+                    approve_for_me: r.approve_for_me,
                     env: &env,
                 });
                 let link = self.observe_codex(r.id, server, socket, thread.map(str::to_string));
@@ -3225,6 +3232,19 @@ impl Desk {
                 }
                 continue;
             }
+            if let CodexEvent::Reviewed { what, verdict } = &event {
+                // What "Approve for me" decided shows as the session's activity.
+                if let Ok(view) = self.view(id) {
+                    let me = Party::session(&view);
+                    let kind = match *verdict {
+                        "allowed" => Kind::Approved,
+                        _ => Kind::Denied,
+                    };
+                    let text = format!("Codex's reviewer {verdict} {}", crew::clip(what, 160));
+                    self.note(Event::new(kind, me.clone(), Some(me), text));
+                }
+                continue;
+            }
             if matches!(event, CodexEvent::Idle) {
                 // Its rollout has the turn's calls, with their model.
                 self.spend_read(id);
@@ -3370,7 +3390,7 @@ impl Desk {
                     }
                     CodexEvent::Answered(_) | CodexEvent::Late(_) => {}
                     CodexEvent::Reply(text) => r.last_reply = Some(transcript::clip(&text)),
-                    CodexEvent::Child(_) | CodexEvent::Usage(_) => {}
+                    CodexEvent::Child(_) | CodexEvent::Usage(_) | CodexEvent::Reviewed { .. } => {}
                 }
             });
             if let (Some(reader), Some(end), Some(reply)) = (reader, read, said_whole) {
@@ -3553,6 +3573,7 @@ impl Desk {
                         engine: Engine::Claude,
                         view: View::Terminal,
                         engine_version: None,
+                        approve_for_me: false,
                         name: ext
                             .name
                             .clone()
@@ -3820,6 +3841,7 @@ mod tests {
                 worktree: None,
                 prompt: None,
                 approvals: None,
+                approve_for_me: false,
                 env: Default::default(),
             },
             None,
@@ -4184,6 +4206,7 @@ mod tests {
                         worktree: None,
                         prompt: None,
                         approvals: None,
+                        approve_for_me: false,
                         env: BTreeMap::from([(PLUGIN_DIRS.into(), "/plugins/desk".into())]),
                     },
                     None,
@@ -4228,6 +4251,7 @@ mod tests {
                         worktree: None,
                         prompt: None,
                         approvals: None,
+                        approve_for_me: false,
                         env: BTreeMap::from([("NOT A NAME".into(), "x".into())]),
                     },
                     None,
@@ -4272,6 +4296,7 @@ mod tests {
                     worktree: None,
                     prompt: None,
                     approvals: None,
+                    approve_for_me: false,
                     env: added.clone(),
                 },
                 None,
@@ -4695,6 +4720,7 @@ mod tests {
                         worktree: None,
                         prompt: None,
                         approvals: None,
+                        approve_for_me: false,
                         env: Default::default(),
                     },
                     Some(By::you()),

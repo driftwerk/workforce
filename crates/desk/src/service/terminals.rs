@@ -681,6 +681,7 @@ impl Desk {
                     engine,
                     view: View::Terminal,
                     engine_version: self.version_of(engine),
+                    approve_for_me: false,
                     name: term.map_or_else(|| folder_name(&cwd), |t| t.name),
                     goal: String::new(),
                     cwd,
