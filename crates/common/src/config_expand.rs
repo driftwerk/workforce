@@ -9,10 +9,11 @@
 //!
 //! The secrets a supervisor hands the hub on a descriptor
 //! ([`crate::inherited_secrets`]) are never part of that blanket pass. Only
-//! the few base-file fields in [`INHERITED_SECRET_FIELDS`] read them
-//! ([`expand_inherited_secret_fields`]), before the overlay is merged, so
-//! nothing an agent or a tool can write — an agent's prompt, an overlay
-//! value — can ever expand to one.
+//! the few base-file fields in [`INHERITED_SECRET_FIELDS`] read them, each
+//! its own one ([`expand_inherited_secret_fields`]), before the overlay is
+//! merged. The overlay's agent entries, which agents write, are never
+//! expanded at all, so an agent can't read a secret or the hub's
+//! environment back through an agent it made.
 
 use std::sync::LazyLock;
 
@@ -61,31 +62,55 @@ pub fn expand_env_vars_in_table(table: &mut toml::Table) {
     expand_vars_in_table_with(table, &|name| std::env::var(name).ok());
 }
 
-/// The base-config fields (`section.key`) whose `${VAR}` may read the
-/// secrets inherited on a descriptor: the ones a supervisor fills with them.
-pub const INHERITED_SECRET_FIELDS: &[(&str, &str)] = &[
-    ("postgres", "password"),
-    ("vellev", "api_key"),
-    ("desk", "pty_holder_token"),
+/// The base-config fields (`section.key`) that may read a secret inherited
+/// on a descriptor, each with the one variable it may read: the ones a
+/// supervisor (Desk Helper) fills with them. A field reads no other
+/// inherited secret, so a rewritten base file can't send the vault key, or
+/// one secret, anywhere else.
+pub const INHERITED_SECRET_FIELDS: &[(&str, &str, &str)] = &[
+    ("postgres", "password", "DESK_POSTGRES_PASSWORD"),
+    ("vellev", "api_key", "DESK_MEMORY_KEY"),
+    ("desk", "pty_holder_token", "WORKFORCE_GATEWAY_TOKEN"),
 ];
 
-/// Expand `${VAR}` in the base file's [`INHERITED_SECRET_FIELDS`], reading
-/// the inherited secrets first, then the environment
-/// ([`crate::inherited_secrets::var`]). Run it on the base file alone,
-/// before the overlay is merged over it; every other value is left to the
-/// env-only pass.
+/// Expand, in the base file's [`INHERITED_SECRET_FIELDS`], each field's own
+/// `${VAR}`, reading the inherited secrets first, then the environment
+/// ([`crate::inherited_secrets::var`]). Any other placeholder there is left
+/// for the env-only pass. Run it on the base file alone, before the overlay
+/// is merged over it.
 pub fn expand_inherited_secret_fields(base: &mut toml::Table) {
     expand_fields_with(base, &crate::inherited_secrets::var);
 }
 
 fn expand_fields_with(table: &mut toml::Table, lookup: &dyn Fn(&str) -> Option<String>) {
-    for (section, key) in INHERITED_SECRET_FIELDS {
+    for (section, key, var) in INHERITED_SECRET_FIELDS {
         if let Some(toml::Value::String(s)) = table
             .get_mut(*section)
             .and_then(toml::Value::as_table_mut)
             .and_then(|t| t.get_mut(*key))
         {
-            *s = expand_vars_with(s, lookup);
+            *s = ENV_VAR_RE
+                .replace_all(s, |caps: &regex::Captures| {
+                    if &caps[1] != *var {
+                        return caps[0].to_string();
+                    }
+                    lookup(var).unwrap_or_else(|| {
+                        caps.get(2)
+                            .map(|m| m.as_str().to_string())
+                            .unwrap_or_default()
+                    })
+                })
+                .to_string();
+        }
+    }
+}
+
+/// [`expand_env_vars_in_table`] on every top-level key of `table` but
+/// `literal`, whose values are left as written.
+pub fn expand_env_vars_in_table_except(table: &mut toml::Table, literal: &[&str]) {
+    for (key, value) in table.iter_mut() {
+        if !literal.contains(&key.as_str()) {
+            expand_vars_in_value_with(value, &|name| std::env::var(name).ok());
         }
     }
 }
@@ -213,50 +238,55 @@ mod tests {
         std::env::remove_var("CFG_EXPAND_T_REC");
     }
 
-    /// The base file's secret fields take `${VAR}` from the secrets
-    /// inherited on a descriptor first, then from the environment; no other
-    /// field reads the inherited secrets.
+    /// Each secret field takes its own `${VAR}` from the secrets inherited
+    /// on a descriptor first, then the environment; any other placeholder in
+    /// it, and every other field, is left for the env-only pass.
     #[cfg(unix)]
     #[test]
     fn only_the_secret_fields_expand_from_the_inherited_secrets() {
         use std::io::Write;
         let (reader, mut writer) = std::io::pipe().unwrap();
-        let payload = br#"{"CFG_EXPAND_T_FD_PW":"pw-fixture","CFG_EXPAND_T_FD_BOTH":"from-fd"}"#;
+        let payload =
+            br#"{"DESK_POSTGRES_PASSWORD":"pw-fixture","WORKFORCE_VAULT_KEY":"vk-fixture"}"#;
         writer
             .write_all(&(payload.len() as u32).to_be_bytes())
             .unwrap();
         writer.write_all(payload).unwrap();
         drop(writer);
         let secrets = crate::inherited_secrets::InheritedSecrets::read(reader.into()).unwrap();
-        std::env::set_var("CFG_EXPAND_T_FD_BOTH", "from-env");
         let mut table: toml::Table = r#"
             [postgres]
-            password = "${CFG_EXPAND_T_FD_PW}"
-            other = "${CFG_EXPAND_T_FD_PW}"
+            password = "${DESK_POSTGRES_PASSWORD}"
+            other = "${DESK_POSTGRES_PASSWORD}"
             [vellev]
-            api_key = "${CFG_EXPAND_T_FD_BOTH}"
+            api_key = "${WORKFORCE_VAULT_KEY}"
             [desk]
-            pty_holder_token = "${CFG_EXPAND_T_FD_UNSET:-fallback}"
+            pty_holder_token = "${CFG_EXPAND_T_FD_UNSET:-x}${WORKFORCE_GATEWAY_TOKEN:-fallback}"
             [agent]
-            prompt = "${CFG_EXPAND_T_FD_PW}"
+            prompt = "${DESK_POSTGRES_PASSWORD}"
         "#
         .parse()
         .unwrap();
         expand_fields_with(&mut table, &|name| {
             crate::inherited_secrets::var_in(Some(&secrets), name)
         });
-        std::env::remove_var("CFG_EXPAND_T_FD_BOTH");
         assert_eq!(table["postgres"]["password"].as_str(), Some("pw-fixture"));
-        assert_eq!(table["vellev"]["api_key"].as_str(), Some("from-fd"));
-        assert_eq!(table["desk"]["pty_holder_token"].as_str(), Some("fallback"));
-        // Untouched here; the env-only pass reads them later.
+        // Not its own variable: left for the env-only pass.
+        assert_eq!(
+            table["vellev"]["api_key"].as_str(),
+            Some("${WORKFORCE_VAULT_KEY}")
+        );
+        assert_eq!(
+            table["desk"]["pty_holder_token"].as_str(),
+            Some("${CFG_EXPAND_T_FD_UNSET:-x}fallback")
+        );
         assert_eq!(
             table["postgres"]["other"].as_str(),
-            Some("${CFG_EXPAND_T_FD_PW}")
+            Some("${DESK_POSTGRES_PASSWORD}")
         );
         assert_eq!(
             table["agent"]["prompt"].as_str(),
-            Some("${CFG_EXPAND_T_FD_PW}")
+            Some("${DESK_POSTGRES_PASSWORD}")
         );
     }
 

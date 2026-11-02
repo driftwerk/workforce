@@ -289,7 +289,7 @@ pub(crate) fn var_in(secrets: Option<&InheritedSecrets>, name: &str) -> Option<S
 pub(crate) fn install_test_fixture() -> &'static InheritedSecrets {
     INHERITED.get_or_init(|| {
         InheritedSecrets::parse(
-            br#"{"INHERITED_T_PG":"pg-fixture","INHERITED_T_KEY":"key-fixture","INHERITED_T_TOKEN":"token-fixture"}"#,
+            br#"{"DESK_POSTGRES_PASSWORD":"pg-fixture","DESK_MEMORY_KEY":"key-fixture","WORKFORCE_GATEWAY_TOKEN":"token-fixture","WORKFORCE_VAULT_KEY":"vault-fixture"}"#,
         )
         .expect("the fixture parses")
     })
