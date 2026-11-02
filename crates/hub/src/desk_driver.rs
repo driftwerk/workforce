@@ -37,12 +37,19 @@ use crate::agent_llm::vault_provider_name;
 use crate::credentials::{how_to_add, Caller, Legacy};
 use crate::desk_tools::DeskTool;
 use crate::gateway::{resolve_caller_context, GatewayState};
-use crate::hub_core::formatting::normalize_for_tts;
 use crate::hub_core::logins::store as login_store;
 use crate::projects::layout::WorkRoots;
 use crate::serve::AgentService;
 use crate::skill_loader::CredScope;
 use crate::vault::Vault;
+
+/// What a voice with `markup` is given of `text`, a sentence Desk has already
+/// made speakable (its `speakable`): only the directions the voice performs are
+/// checked. It isn't made speakable again, which would say `my_var` "myvar", nor
+/// are bracketed words guessed at: Desk says every word of a reply.
+fn spoken(markup: workforce_agent::llm::speech::Markup, text: &str) -> String {
+    markup.apply_with(workforce_agent::llm::speech::Asides::Said, text)
+}
 
 /// The hub's one desk, once `[desk]` has started it.
 static DESK: OnceLock<Desk> = OnceLock::new();
@@ -119,8 +126,7 @@ impl KeySource for VaultKeys {
 }
 
 /// Spoken replies on the hub's speech providers, with the provider's
-/// defaults for whatever the request leaves out, and its text made speakable
-/// as voice clips' is.
+/// defaults for whatever the request leaves out.
 #[async_trait]
 impl Speech for VaultKeys {
     async fn speak(&self, request: &Speak) -> Result<Audio, SpeakError> {
@@ -136,10 +142,9 @@ impl Speech for VaultKeys {
         };
         let speaker = provider_from_config(&config, Path::new(""), |_| KeySlot::fixed(&*key))
             .map_err(|e| SpeakError::Invalid(e.to_string()))?;
-        // The voice directions it performs are kept; the speaker would drop
-        // the rest anyway, but a text that was nothing else is the caller's
-        // mistake, not the provider's.
-        let text = speaker.markup().apply(&normalize_for_tts(&request.text));
+        // A text that was nothing but directions is the caller's mistake, not
+        // the provider's.
+        let text = spoken(speaker.markup(), &request.text);
         let text = text.trim();
         if text.is_empty() {
             return Err(SpeakError::Invalid(
@@ -701,6 +706,21 @@ mod tests {
         assert!(keys
             .how_to_add(Provider::OpenAi)
             .contains("speech/openai/api_key"));
+    }
+
+    /// Desk's sentence is said as it was sent, less what the voice can't perform.
+    #[test]
+    fn a_desk_sentence_is_said_as_sent() {
+        use workforce_agent::llm::speech::Markup;
+        let text = "(excited) Set my_var, then choose (yes) or (no) (pensive).";
+        assert_eq!(
+            spoken(Markup::FishS1, text),
+            "(excited) Set my_var, then choose (yes) or (no)."
+        );
+        assert_eq!(
+            spoken(Markup::Plain, text),
+            "Set my_var, then choose (yes) or (no)."
+        );
     }
 
     #[test]

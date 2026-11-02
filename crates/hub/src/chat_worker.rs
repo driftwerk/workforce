@@ -325,6 +325,12 @@ fn chat_progress(
         ProgressEvent::StreamDelta { text } => Some(ChatProgress::StreamDelta {
             text: redact_stream_delta(delta_tail, &text),
         }),
+        // Spoken text is the same words as the delta it goes with, a
+        // credential split between deltas included, so the delta's own tail
+        // won't see it yet: it is scanned with what came before it.
+        ProgressEvent::Speech { text } => Some(ChatProgress::Speech {
+            text: redact_stream_delta(&mut delta_tail.clone(), &text),
+        }),
         ProgressEvent::StreamEnd => {
             delta_tail.clear();
             Some(ChatProgress::StreamEnd)

@@ -317,7 +317,14 @@ pub(crate) fn settle_served(
     reserved: workforce_common::session::ReservedContext,
     desk: Option<&workforce_common::channels::desk::DeskTurnContext>,
 ) -> Option<&'static str> {
-    add_redacted_assistant_message(session, &result.response, desk);
+    // A spoken reply can be nothing but a direction: said, but with nothing to
+    // read, and so nothing to keep. Tools it ran still need their message.
+    let nothing_to_read = session.is_voice_turn()
+        && result.response.trim().is_empty()
+        && result.tool_invocations.is_empty();
+    if !nothing_to_read {
+        add_redacted_assistant_message(session, &result.response, desk);
+    }
     if desk.is_some() {
         carry_turn(session, &result.tool_invocations);
     }
