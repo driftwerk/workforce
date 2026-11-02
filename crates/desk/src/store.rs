@@ -295,6 +295,58 @@ pub(crate) mod tests {
         }
     }
 
+    /// The registry's migrations up to `V020__access`, as a hub that ran
+    /// them before Approve for me left it.
+    struct UpToAccess;
+
+    #[async_trait]
+    impl MigrationRun for UpToAccess {
+        async fn run(&self, client: &mut tokio_postgres::Client) -> Result<(), PostgresError> {
+            embedded::migrations::runner()
+                .set_target(refinery::Target::Version(20))
+                .run_async(client)
+                .await
+                .map_err(PostgresError::from)?;
+            Ok(())
+        }
+    }
+
+    /// Whether the registry's sessions have the Approve for me column.
+    async fn has(client: &tokio_postgres::Client) -> i64 {
+        client
+            .query_one(
+                "SELECT count(*) FROM information_schema.columns \
+                 WHERE table_schema = 'desk' AND table_name = 'sessions' \
+                 AND column_name = 'approve_for_me'",
+                &[],
+            )
+            .await
+            .unwrap()
+            .get::<_, i64>(0)
+    }
+
+    #[tokio::test]
+    async fn a_registry_that_ran_access_gains_approve_for_me() {
+        with_test_pool(build_pool, |pool| async move {
+            let set = MigrationSet::new(SCHEMA, Box::new(UpToAccess) as Box<dyn MigrationRun>);
+            MigrationRunner::run(&pool, &[set]).await.unwrap();
+            let client = pool.get().await.unwrap();
+            assert_eq!(has(&client).await, 0, "V020__access ran, not V021");
+            drop(client);
+            DeskStore::migrate(&pool).await.unwrap();
+            assert_eq!(has(&pool.get().await.unwrap()).await, 1);
+            let store = DeskStore::from_pool(pool);
+            let r = SessionRecord {
+                engine: Engine::Codex,
+                approve_for_me: true,
+                ..record_fixture("codex")
+            };
+            store.put(&r).await.unwrap();
+            assert!(store.get(r.id).await.unwrap().unwrap().approve_for_me);
+        })
+        .await;
+    }
+
     #[tokio::test]
     async fn put_get_update_and_delete_round_trip() {
         with_test_pool(build_pool, |pool| async move {
