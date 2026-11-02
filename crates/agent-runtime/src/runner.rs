@@ -1338,6 +1338,10 @@ pub enum ProgressEvent {
     StreamStart,
     /// A chunk of text from the LLM (token-by-token delta).
     StreamDelta { text: String },
+    /// How the text of the next `StreamDelta`, `Response` or `CheckIn` is said
+    /// aloud, voice directions and all, where that differs from how it reads.
+    /// Only a spoken turn's stream carries it.
+    Speech { text: String },
     /// End of the streamed LLM response.
     StreamEnd,
     /// The text just streamed for this round is being discarded: it never
@@ -10420,6 +10424,7 @@ mod tests {
                 ProgressEvent::LlmCall { .. } => "llm_call",
                 ProgressEvent::StreamStart => "stream_start",
                 ProgressEvent::StreamDelta { .. } => "stream_delta",
+                ProgressEvent::Speech { .. } => "speech",
                 ProgressEvent::StreamEnd => "stream_end",
                 ProgressEvent::StreamDiscard { .. } => "stream_discard",
                 ProgressEvent::AnswerSettled => "answer_settled",

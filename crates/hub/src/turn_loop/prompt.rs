@@ -462,6 +462,8 @@ pub(crate) fn without_request_unless(
 /// gets it wrong half the time.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum VoiceSurface {
+    /// Desk, on a computer: the reply is on screen, and read out in full.
+    Desk,
     /// A phone, laptop, or terminal: spoken *and* shown.
     Screen,
     /// A satellite speaker in a room. Nothing is written down.
@@ -477,15 +479,53 @@ impl VoiceSurface {
     /// they cannot recover, while one that wrongly assumes a speaker is merely
     /// a little plainer than it needed to be.
     pub(crate) fn of(channel: &str) -> Self {
-        if workforce_common::channels::is_conversational(channel) {
+        if workforce_common::channels::is_desk_conversation(channel) {
+            Self::Desk
+        } else if workforce_common::channels::is_conversational(channel) {
             Self::Screen
         } else {
             Self::Speaker
         }
     }
 
+    /// What to do with detail that doesn't work aloud, and how long to go on.
+    fn length_rules(self) -> &'static str {
+        match self {
+            Self::Desk => {
+                "\
+         - Your whole reply is said aloud, every word of it, and is on screen as \
+           well. Nothing gets cut short, so give the full answer the question \
+           deserves, written to be heard: don't summarise it or hold part of it \
+           back to offer later.\n\
+         - The one exception is a code block or a long list, which is shown and \
+           skipped when spoken. Include it when it's what they need, and say in a \
+           few words that it's there — \"the code is in the chat\". Say that only \
+           for those, never for anything you could have said.\n\
+         - No emojis, markdown formatting, headers or tables; a few items are said \
+           in a sentence, not as a list\n\
+         - Use proper punctuation for natural pauses\n\
+         - Avoid abbreviations and acronyms that read badly aloud\n"
+            }
+            Self::Screen | Self::Speaker => {
+                "\
+         - When the detail itself matters (a command to run, the code, a list to \
+           keep), give the gist aloud and offer to put the details in the chat.\n\
+         - No emojis, markdown, bullet lists, headers, tables or code blocks\n\
+         - Use proper punctuation for natural pauses\n\
+         - Avoid abbreviations and acronyms that read badly aloud\n\
+         - Keep responses concise and flowing\n"
+            }
+        }
+    }
+
     fn rules(self) -> &'static str {
         match self {
+            Self::Desk => {
+                "\
+- Desk, on their computer: your reply is on screen as it's spoken, from start to
+  finish. A name, number or spelling they miss can be re-read; what is only
+  readable (a link, a path) is still never read out — see above."
+            }
             Self::Screen => {
                 "\
 - Their phone or computer, so your reply is on screen as well as spoken. A name,
@@ -532,6 +572,7 @@ impl VoiceSurface {
 /// that takes directions, exactly the ones it performs, from the table its
 /// text is checked against before it is spoken.
 pub(crate) fn voice_mode_directive(provider: &str, model: Option<&str>, channel: &str) -> String {
+    let surface = VoiceSurface::of(channel);
     let markup = workforce_agent::llm::speech::Markup::of(provider, model);
     let provider_rules = markup.guidance().unwrap_or_else(|| {
         let rules = match workforce_agent::llm::speech::canonical_speech_provider(provider) {
@@ -572,12 +613,7 @@ TTS provider: System TTS
            paths. Say what they are in words instead — \"the settings file in your \
            home folder\", \"the link to the pull request\" — and summarise code by \
            what it does, never line by line.\n\
-         - When the detail itself matters (a command to run, the code, a list to \
-           keep), give the gist aloud and offer to put the details in the chat.\n\
-         - No emojis, markdown, bullet lists, headers, tables or code blocks\n\
-         - Use proper punctuation for natural pauses\n\
-         - Avoid abbreviations and acronyms that read badly aloud\n\
-         - Keep responses concise and flowing\n\
+         {length_rules}\
          - If you need to convey a list, say it naturally: \
            \"There are three things — first X, then Y, and finally Z\"\n\
          - Say exact values exactly: times, dates, numbers, prices, names and \
@@ -594,7 +630,8 @@ TTS provider: System TTS
          Where they are listening:\n\
          {surface_rules}\n\n\
          {provider_rules}",
-        surface_rules = VoiceSurface::of(channel).rules()
+        length_rules = surface.length_rules().trim_start(),
+        surface_rules = surface.rules()
     )
 }
 

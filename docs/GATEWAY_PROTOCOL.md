@@ -90,6 +90,17 @@ client finalizes it locally.
 | `pong` | Response to ping |
 | `error` | Error occurred |
 
+A spoken turn's `stream_delta` and `message` frames may carry `speech` beside `content`: what to say for that
+frame, with voice directions included (`"(excited) Found it."`), where it differs from what to show. `content`
+never has directions. What a turn says is every frame's `speech`, else its `content`.
+
+A declared Desk connection (`desk=1` on a Desk channel) gets `content` as written, the same text that is saved,
+and `speech` as written too: markdown, code and all, for the client to make speakable. On Desk, speech differs from
+the text only by its directions. It may get a frame with an empty `content` and some `speech`. Any other
+connection gets `content` as it always has: made for speech, without directions or a lower-case word in brackets
+that might be one, since it may say it. Its `speech`, where sent, is made for speech too. It's sent no frame with
+an empty `content` that only had speech to carry.
+
 ## Streaming (future)
 
 When streaming is enabled, responses arrive as chunks:

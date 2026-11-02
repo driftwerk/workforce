@@ -395,8 +395,8 @@ fn a_phone_is_told_the_reply_is_also_on_screen() {
 fn an_unknown_surface_is_assumed_to_have_no_screen() {
     assert_eq!(VoiceSurface::of("kitchen-satellite"), VoiceSurface::Speaker);
     assert_eq!(VoiceSurface::of("ios"), VoiceSurface::Screen);
-    assert_eq!(VoiceSurface::of("desk"), VoiceSurface::Screen);
-    assert_eq!(VoiceSurface::of("desk:release"), VoiceSurface::Screen);
+    assert_eq!(VoiceSurface::of("desk"), VoiceSurface::Desk);
+    assert_eq!(VoiceSurface::of("desk:release"), VoiceSurface::Desk);
 }
 
 /// Surface and TTS provider are independent: the same device can change
@@ -456,12 +456,53 @@ fn a_spoken_reply_never_recites_what_only_reads() {
             ),
             "{channel}: {directive}"
         );
-        assert!(
-            directive.contains("offer to put the details in the chat"),
-            "{channel}"
-        );
         assert!(!directive.contains("normal detail is safe"), "{channel}");
     }
+}
+
+/// A phone's reply is kept short and points at the chat for detail; Desk's is
+/// on screen and read out whole, so it's written whole.
+#[test]
+fn desk_is_told_its_whole_reply_is_spoken() {
+    for channel in ["desk", "desk:team-room"] {
+        let directive = voice_mode_directive("fish_audio", Some("s1"), channel);
+        assert!(directive.contains("every word of it"), "{directive}");
+        assert!(directive.contains("the code is in the chat"), "{directive}");
+        for phone in [
+            "offer to put the details in the chat",
+            "Keep responses concise",
+            "give the gist",
+            "or code blocks",
+            "Their phone",
+        ] {
+            assert!(!directive.contains(phone), "{channel} says {phone}");
+        }
+    }
+}
+
+/// The phone and the speaker in a room keep what they were told, word for
+/// word: only Desk's reply is read whole.
+#[test]
+fn the_phone_and_the_satellite_keep_their_rules() {
+    const KEPT: &str = "\
+         - Never read out code, symbols, punctuation marks, markdown, URLs or file \
+           paths. Say what they are in words instead — \"the settings file in your \
+           home folder\", \"the link to the pull request\" — and summarise code by \
+           what it does, never line by line.\n\
+         - When the detail itself matters (a command to run, the code, a list to \
+           keep), give the gist aloud and offer to put the details in the chat.\n\
+         - No emojis, markdown, bullet lists, headers, tables or code blocks\n\
+         - Use proper punctuation for natural pauses\n\
+         - Avoid abbreviations and acronyms that read badly aloud\n\
+         - Keep responses concise and flowing\n\
+         - If you need to convey a list, say it naturally: \
+           \"There are three things — first X, then Y, and finally Z\"\n";
+    for channel in ["ios", "voice-pe"] {
+        let directive = voice_mode_directive("kokoro", None, channel);
+        assert!(directive.contains(KEPT), "{channel}: {directive}");
+    }
+    assert!(voice_mode_directive("kokoro", None, "ios").contains("Their phone or computer"));
+    assert!(voice_mode_directive("kokoro", None, "voice-pe").contains("speaker in a room"));
 }
 
 #[test]

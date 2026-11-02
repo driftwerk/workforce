@@ -260,20 +260,35 @@ pub async fn agent_on_slow_mock_llm(
     data_dir: &std::path::Path,
     delay: std::time::Duration,
 ) -> (Arc<AgentService>, wiremock::MockServer) {
+    agent_on_mock_llm_saying(data_dir, &["done"], delay).await
+}
+
+/// [`agent_on_mock_llm`] whose model answers in these `pieces`, one stream
+/// delta each, after `delay`.
+pub async fn agent_on_mock_llm_saying(
+    data_dir: &std::path::Path,
+    pieces: &[&str],
+    delay: std::time::Duration,
+) -> (Arc<AgentService>, wiremock::MockServer) {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     let server = MockServer::start().await;
     let chunk = |body: serde_json::Value| format!("data: {body}\n\n");
-    let sse = [
-        chunk(serde_json::json!({"id": "c1", "object": "chat.completion.chunk", "model": "mock",
-            "choices": [{"index": 0, "delta": {"role": "assistant", "content": "done"}, "finish_reason": null}]})),
-        chunk(serde_json::json!({"id": "c1", "object": "chat.completion.chunk", "model": "mock",
+    let mut sse: Vec<String> = pieces
+        .iter()
+        .map(|piece| {
+            chunk(serde_json::json!({"id": "c1", "object": "chat.completion.chunk", "model": "mock",
+                "choices": [{"index": 0, "delta": {"role": "assistant", "content": piece}, "finish_reason": null}]}))
+        })
+        .collect();
+    sse.push(chunk(
+        serde_json::json!({"id": "c1", "object": "chat.completion.chunk", "model": "mock",
             "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-            "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}})),
-        "data: [DONE]\n\n".to_string(),
-    ]
-    .concat();
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}}),
+    ));
+    sse.push("data: [DONE]\n\n".to_string());
+    let sse = sse.concat();
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
         .respond_with(
