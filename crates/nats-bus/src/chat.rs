@@ -59,6 +59,11 @@ pub enum TurnControl {
         user: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         place: Option<workforce_core::desk::DeskPlace>,
+        /// Sent to wait for the turn rather than steer it: a live turn
+        /// refuses it as busy instead of taking it in, and the client holds
+        /// it until the turn ends. An instance that predates it steers.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        queue: bool,
     },
     /// An answer to one of the turn's approval prompts.
     Approval {
@@ -78,7 +83,7 @@ pub enum TurnControl {
 pub struct TurnControlReply {
     pub applied: bool,
     /// Why a control the turn is live for was not applied: `busy` for a
-    /// follow-up from another place than the turn's.
+    /// follow-up from another place than the turn's, or one sent to wait.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refused: Option<String>,
 }
@@ -208,11 +213,13 @@ mod tests {
                 text: "also check main".into(),
                 user: "u1".into(),
                 place: None,
+                queue: false,
             },
             TurnControl::FollowUp {
                 text: "and the thread".into(),
                 user: "u1".into(),
                 place: Some(workforce_core::desk::DeskPlace::Dm),
+                queue: true,
             },
             TurnControl::Approval {
                 request_id: "r1".into(),
@@ -233,6 +240,17 @@ mod tests {
         assert_eq!(
             serde_json::to_value(TurnControl::Cancel).unwrap(),
             serde_json::json!({"kind": "cancel"})
+        );
+        // A follow-up that steers reads on the wire exactly as before.
+        assert_eq!(
+            serde_json::to_value(TurnControl::FollowUp {
+                text: "hi".into(),
+                user: "u1".into(),
+                place: None,
+                queue: false,
+            })
+            .unwrap(),
+            serde_json::json!({"kind": "follow_up", "text": "hi", "user": "u1"})
         );
     }
 
@@ -337,7 +355,8 @@ mod tests {
             TurnControl::FollowUp {
                 text: "hi".into(),
                 user: "u1".into(),
-                place: None
+                place: None,
+                queue: false,
             }
         );
         let reply: TurnControlReply =

@@ -78,10 +78,12 @@ pub enum Control {
     /// Put a snapshot of the live Desk turn into its progress stream.
     Snapshot,
     Inject(InjectedMessage),
-    /// A person's follow-up, from the Desk place it names, if any.
+    /// A person's follow-up, from the Desk place it names, if any. One
+    /// sent to `queue` waits for the turn instead of steering it.
     FollowUp {
         message: InjectedMessage,
         place: Option<DeskPlace>,
+        queue: bool,
     },
 }
 
@@ -90,13 +92,19 @@ impl From<TurnControl> for Control {
         match control {
             TurnControl::Cancel => Self::Cancel,
             TurnControl::Snapshot => Self::Snapshot,
-            TurnControl::FollowUp { text, user, place } => Self::FollowUp {
+            TurnControl::FollowUp {
+                text,
+                user,
+                place,
+                queue,
+            } => Self::FollowUp {
                 message: InjectedMessage::UserMessage {
                     text,
                     user,
                     external_id: None,
                 },
                 place,
+                queue,
             },
             TurnControl::Approval {
                 request_id,
@@ -121,8 +129,8 @@ pub enum Applied {
     /// The stop was delivered but the turn had not settled within
     /// [`SETTLE_WAIT`].
     Unsettled,
-    /// A follow-up from another Desk place than the live turn's: it waits
-    /// for the turn to end rather than steering it.
+    /// A follow-up from another Desk place than the live turn's, or one
+    /// sent to queue: it waits for the turn to end rather than steering it.
     Busy,
 }
 
@@ -247,6 +255,21 @@ impl Entry {
             Err(_) => Applied::NotLive,
         }
     }
+
+    /// A message sent to wait for the turn: refused as busy while the turn
+    /// is still working, so nothing reaches it. A turn whose answer is
+    /// already out is wound up, as for a steer, so the message starts the
+    /// next turn once this one has saved.
+    async fn hold(&self) -> Applied {
+        if self.cancel.is_cancelled() {
+            return Applied::NotLive;
+        }
+        if self.answered.load(Ordering::Acquire) {
+            self.stop().await;
+            return Applied::NotLive;
+        }
+        Applied::Busy
+    }
 }
 
 pub struct LiveTurns {
@@ -309,7 +332,7 @@ impl LiveTurns {
     /// Steer the live turn for `session_id`. A stop resolves once the turn has
     /// settled. A follow-up from another Desk place than the turn's is
     /// refused as [`Applied::Busy`], so two threads' asks never merge into
-    /// one turn.
+    /// one turn, and so is one sent to queue, which waits for the turn.
     pub async fn apply(&self, session_id: &str, control: Control) -> Applied {
         let Some(entry) = self.turns.lock().get(session_id).cloned() else {
             return Applied::NotLive;
@@ -323,6 +346,7 @@ impl LiveTurns {
                 }
                 None => Applied::NotLive,
             },
+            Control::FollowUp { queue: true, .. } => entry.hold().await,
             Control::FollowUp {
                 place: Some(place), ..
             } if entry.desk.as_ref().is_some_and(|live| live.place != place) => Applied::Busy,
@@ -798,6 +822,7 @@ mod tests {
                 text: "hi".into(),
                 user: "u1".into(),
                 place: Some(DeskPlace::Dm),
+                queue: true,
             }),
             Control::FollowUp {
                 message: InjectedMessage::UserMessage {
@@ -805,6 +830,7 @@ mod tests {
                     ..
                 },
                 place: Some(DeskPlace::Dm),
+                queue: true,
             }
         ));
     }
@@ -817,6 +843,18 @@ mod tests {
                 external_id: None,
             },
             place,
+            queue: false,
+        }
+    }
+
+    fn queued_from(place: Option<DeskPlace>) -> Control {
+        match follow_up_from(place) {
+            Control::FollowUp { message, place, .. } => Control::FollowUp {
+                message,
+                place,
+                queue: true,
+            },
+            _ => unreachable!(),
         }
     }
 
@@ -988,6 +1026,54 @@ mod tests {
         assert!(inbox.rx.try_recv().is_ok() && inbox.rx.try_recv().is_ok());
     }
 
+    /// A message sent to queue never reaches a working turn, from its own
+    /// place or none, and a turn that isn't live leaves it to start one.
+    #[tokio::test]
+    async fn a_queued_message_waits_for_a_working_turn() {
+        let turns = LiveTurns::new("allan");
+        assert_eq!(
+            turns.apply("s1", queued_from(Some(DeskPlace::Dm))).await,
+            Applied::NotLive
+        );
+        let (_turn, mut inbox) = turns
+            .begin(
+                "s1",
+                SelfServe::Answerable,
+                Some(&asked_in(DeskPlace::Dm)),
+                None,
+            )
+            .await
+            .unwrap();
+        for place in [Some(DeskPlace::Dm), None] {
+            assert_eq!(turns.apply("s1", queued_from(place)).await, Applied::Busy);
+        }
+        assert!(inbox.rx.try_recv().is_err(), "nothing reached the turn");
+        assert_eq!(
+            turns.apply("s1", follow_up_from(Some(DeskPlace::Dm))).await,
+            Applied::Injected,
+            "sent now, it steers as before"
+        );
+    }
+
+    /// A turn whose answer is out is wound up for a queued message, as for
+    /// a steer, so the message starts the next turn.
+    #[tokio::test]
+    async fn a_queued_message_winds_up_a_turn_that_has_answered() {
+        let turns = LiveTurns::new("allan");
+        let (turn, _inbox) = begin(&turns, "s1").await;
+        turn.watch().note(&ProgressEvent::AnswerSettled);
+        let token = turn.cancel_token();
+        let settling = tokio::spawn(async move {
+            token.cancelled().await;
+            drop(turn);
+        });
+        assert_eq!(
+            turns.apply("s1", queued_from(Some(DeskPlace::Dm))).await,
+            Applied::NotLive
+        );
+        settling.await.unwrap();
+    }
+
     #[tokio::test]
     async fn a_turn_from_no_place_takes_any_follow_up() {
         let turns = LiveTurns::new("allan");
@@ -1049,6 +1135,7 @@ mod tests {
             text: "and this".into(),
             user: "u1".into(),
             place: Some(room_thread(3)),
+            queue: false,
         };
         let reply = request(&elsewhere).await.expect("the owner replies");
         let reply: TurnControlReply = serde_json::from_slice(&reply.payload).unwrap();
