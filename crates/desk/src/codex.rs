@@ -92,15 +92,23 @@ pub async fn wait_for_socket(socket: &Path) -> Result<()> {
     eyre::bail!("codex app-server did not open {}", socket.display())
 }
 
-/// The per-session app-server as the hub's own child. Killed when dropped.
+/// How long an app-server gets to wind down once told to stop, before it
+/// is killed.
+pub const STOP_GRACE: Duration = Duration::from_secs(5);
+/// The same for what it left running (a worker outliving its server).
+const WORKER_GRACE: Duration = Duration::from_secs(2);
+
+/// The per-session app-server as the hub's own child.
 pub struct AppServer {
-    _child: Child,
+    /// Until it is stopped: then a task reaps it.
+    child: parking_lot::Mutex<Option<Child>>,
+    pid: Option<u32>,
     pub socket: PathBuf,
 }
 
 impl AppServer {
     pub fn pid(&self) -> Option<u32> {
-        self._child.id()
+        self.pid
     }
 
     pub async fn start(
@@ -117,14 +125,130 @@ impl AppServer {
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
+            // Last resort, when the hub goes without stopping it.
             .kill_on_drop(true)
             .spawn()
             .context("starting codex app-server")?;
         wait_for_socket(&socket).await?;
         Ok(Self {
-            _child: child,
+            pid: child.id(),
+            child: parking_lot::Mutex::new(Some(child)),
             socket,
         })
+    }
+
+    /// Stops it and what it started, in the background (see
+    /// [`stop_app_server`]); its exit is collected, so it leaves no zombie.
+    pub fn stop(&self) {
+        let (Some(pid), Some(mut child)) = (self.pid, self.child.lock().take()) else {
+            return;
+        };
+        let reaper = tokio::spawn(async move {
+            let _ = child.wait().await;
+        });
+        let socket = self.socket.clone();
+        tokio::spawn(async move {
+            stop_app_server(pid, &socket, STOP_GRACE).await;
+            let _ = reaper.await;
+        });
+    }
+}
+
+fn alive(pid: u32) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    // SAFETY: signal 0 only asks whether the process exists.
+    (unsafe { libc::kill(pid, 0) } == 0)
+        || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+fn signal(pid: u32, sig: libc::c_int) {
+    if let Ok(pid) = libc::pid_t::try_from(pid) {
+        // SAFETY: a signal to a process id; one already gone is no error.
+        unsafe { libc::kill(pid, sig) };
+    }
+}
+
+/// Waits until none of `pids` runs, or `within` is up; those still running.
+async fn wait_gone(mut pids: Vec<u32>, within: Duration) -> Vec<u32> {
+    let deadline = tokio::time::Instant::now() + within;
+    loop {
+        pids.retain(|p| alive(*p));
+        if pids.is_empty() || tokio::time::Instant::now() >= deadline {
+            return pids;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Stops the app-server `pid` listening on `socket`, and everything it
+/// started (Codex's workers run in process groups of their own, so a signal
+/// to the server's does not reach them): a polite stop first, which lets a
+/// turn in progress save its session, then a kill of whatever is still
+/// running when `grace` is up. Does nothing when `pid` is no longer that
+/// server (it ended, and the number may be someone else's by now).
+pub async fn stop_app_server(pid: u32, socket: &Path, grace: Duration) {
+    let Some(all) = crate::procs::table().await else {
+        tracing::warn!(
+            pid,
+            "codex app-server not stopped: the process list can't be read"
+        );
+        return;
+    };
+    let named = format!("unix://{}", socket.display());
+    let is_server = |p: &crate::procs::Proc| {
+        p.pid == pid && p.args.contains("app-server") && p.args.contains(&named)
+    };
+    if !all.iter().any(is_server) {
+        return;
+    }
+    let mut below: Vec<crate::procs::Proc> = crate::procs::under(&all, pid)
+        .into_iter()
+        .cloned()
+        .collect();
+    signal(pid, libc::SIGTERM);
+    if !wait_gone(vec![pid], grace).await.is_empty() {
+        tracing::warn!(pid, "codex app-server did not stop in time; killing it");
+        // Whatever it started since the first look goes too.
+        if let Some(now) = crate::procs::table().await {
+            for p in crate::procs::under(&now, pid) {
+                if !below.iter().any(|b| b.pid == p.pid) {
+                    below.push(p.clone());
+                }
+            }
+        }
+        below.iter().for_each(|p| signal(p.pid, libc::SIGKILL));
+        signal(pid, libc::SIGKILL);
+        wait_gone(vec![pid], WORKER_GRACE).await;
+    }
+    // What outlived the server: told to stop, then killed. A process is
+    // only touched while it is still the one that was seen.
+    let seen = |now: &[crate::procs::Proc]| -> Vec<u32> {
+        below
+            .iter()
+            .filter(|b| now.iter().any(|p| p.pid == b.pid && p.args == b.args))
+            .map(|b| b.pid)
+            .collect()
+    };
+    let Some(now) = crate::procs::table().await else {
+        return;
+    };
+    let left = seen(&now);
+    if left.is_empty() {
+        return;
+    }
+    tracing::warn!(
+        pid,
+        left = left.len(),
+        "codex app-server left workers running; stopping them"
+    );
+    left.iter().for_each(|p| signal(*p, libc::SIGTERM));
+    if wait_gone(left.clone(), WORKER_GRACE).await.is_empty() {
+        return;
+    }
+    if let Some(now) = crate::procs::table().await {
+        seen(&now).iter().for_each(|p| signal(*p, libc::SIGKILL));
     }
 }
 
@@ -453,6 +577,63 @@ mod tests {
             }),
             "a sub-agent's thread is its parent's"
         );
+    }
+
+    /// A script standing in for `codex app-server`: `body` runs once it has
+    /// opened the socket path it was told to listen on.
+    fn stand_in(dir: &Path, body: &str) -> (PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let program = dir.join("fake-codex");
+        std::fs::write(
+            &program,
+            format!("#!/bin/sh\n: > \"${{3#unix://}}\"\n{body}\n"),
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (program, dir.join("s.sock"))
+    }
+
+    fn gone(pid: u32) -> bool {
+        !alive(pid)
+    }
+
+    #[tokio::test]
+    async fn a_server_that_winds_down_when_asked_is_not_killed() {
+        let dir = tempfile::tempdir().unwrap();
+        let said = dir.path().join("said");
+        let (program, socket) = stand_in(
+            dir.path(),
+            &format!(
+                "trap 'echo asked > \"{}\"; exit 0' TERM\nwhile :; do sleep 1; done",
+                said.display()
+            ),
+        );
+        let env = BTreeMap::from([("PATH".to_string(), "/usr/bin:/bin".to_string())]);
+        let server = AppServer::start(&program, socket.clone(), &env)
+            .await
+            .unwrap();
+        let pid = server.pid().unwrap();
+        let started = std::time::Instant::now();
+        server.stop();
+        let left = wait_gone(vec![pid], Duration::from_secs(4)).await;
+        assert!(left.is_empty(), "still running");
+        assert!(started.elapsed() < Duration::from_secs(4), "not waited out");
+        assert!(said.exists(), "it was asked, and wound down itself");
+    }
+
+    #[tokio::test]
+    async fn a_process_that_is_not_the_server_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut other = Command::new("sleep")
+            .arg("30")
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let pid = other.id().unwrap();
+        // The number was the server's once; it is someone else's now.
+        stop_app_server(pid, &dir.path().join("s.sock"), Duration::from_millis(200)).await;
+        assert!(!gone(pid));
+        other.kill().await.unwrap();
     }
 
     #[test]
