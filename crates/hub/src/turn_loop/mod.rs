@@ -3461,9 +3461,11 @@ pub(crate) async fn process_admitted(
 
     // Build conversation history from session (filters empty content,
     // merges consecutive same-role messages, skips tool/system messages)
-    crate::spoken_text::clean_kept(&mut session);
     let shared_replay = shared_replay(service, &session, user);
-    let prior_messages = build_prior_messages(&session.messages, shared_replay.as_ref());
+    let prior_messages = build_prior_messages(
+        &crate::spoken_text::for_the_model(&session),
+        shared_replay.as_ref(),
+    );
     observe_replay_prefix(&mut session, &prior_messages);
     let session_tools = Arc::new(crate::tool_loading::session_tools(
         &session.messages,
@@ -4899,9 +4901,11 @@ pub(crate) async fn stream_admitted(
 
     // Build conversation history from session (filters empty content,
     // merges consecutive same-role messages, skips tool/system messages)
-    crate::spoken_text::clean_kept(&mut session);
     let shared_replay = shared_replay(service, &session, user);
-    let prior_messages = build_prior_messages(&session.messages, shared_replay.as_ref());
+    let prior_messages = build_prior_messages(
+        &crate::spoken_text::for_the_model(&session),
+        shared_replay.as_ref(),
+    );
     observe_replay_prefix(&mut session, &prior_messages);
     let spoken = crate::spoken_text::spoken_with(&session);
     let session_tools_for_task = Arc::new(crate::tool_loading::session_tools(

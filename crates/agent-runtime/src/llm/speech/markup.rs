@@ -21,10 +21,15 @@
 //!
 //! What counts as a direction, so prose survives: a group in parentheses or
 //! brackets of up to [`MAX_WORDS`] words of letters, spaces, hyphens and
-//! apostrophes. One that names a known tag (or a near-miss of one, see
-//! [`ALIASES`]) is a direction anywhere. Any other is one only when it is
-//! all lower case and opens a sentence, or is a single word. `(see page 4)`,
+//! apostrophes, outside code and link text. One that names a known tag (or a
+//! near-miss of one, see [`ALIASES`]) is a direction anywhere. `(see page 4)`,
 //! `(API)` and `(a long aside, with commas)` are prose and are left alone.
+//!
+//! The two sides guess differently, because a wrong guess costs differently.
+//! A word read out in brackets costs the listener a moment, so what's spoken
+//! also loses any other group that is all lower case and opens a sentence or
+//! is a single word of two letters or more. What's read and saved loses content
+//! for good, so it loses only what names a direction ([`Markup::shown`]).
 
 /// How directions are written for the voice that will speak.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -242,6 +247,10 @@ pub const ALIASES: &[(&str, &str)] = &[
     ("resolute", "determined"),
 ];
 
+/// Moods agents write that no voice performs and nothing here means: never
+/// offered, but named, so that they don't reach the screen.
+const UNPERFORMED: &[&str] = &["pensive", "thoughtful", "serious"];
+
 /// The most words a direction has.
 pub const MAX_WORDS: usize = 6;
 /// The longest a direction is, brackets included.
@@ -272,6 +281,15 @@ impl Markup {
         let mut cursor = Cursor::default();
         let mut out = String::with_capacity(text.len());
         rewrite(self, text, &mut cursor, &mut out);
+        out
+    }
+
+    /// `text` as a reader is to see it and as it's kept: without the directions
+    /// of a reply spoken in this voice.
+    pub fn shown(self, text: &str) -> String {
+        let mut cursor = Cursor::default();
+        let mut out = String::with_capacity(text.len());
+        rewrite_shown(self, text, &mut cursor, &mut out);
         out
     }
 
@@ -328,7 +346,8 @@ TTS provider: Fish Audio (S2)
 - Sounds, anywhere; write the sound after it, as in \"[laughing] Ha, ha\":
   {sounds}
 - Pauses: {pauses}
-- A short description works too, like [warmly] or [tired], kept to a few words.
+- A short description works too, like [warmly] or [tired], kept to a few words,
+  at the start of a sentence.
 - Use them where a person would really sound that way, not on every sentence.",
                 emotions = list(EMOTIONS, '[', ']'),
                 tones = list(TONES, '[', ']'),
@@ -339,17 +358,26 @@ TTS provider: Fish Audio (S2)
     }
 }
 
-/// `text` without the directions any voice takes by name: what a kept message
-/// written before directions were parted from the text reads as. Stricter than
-/// [`Markup::apply`] for [`Markup::Plain`], since that text may have been typed:
-/// `(maybe)` stays, `(excited)` goes.
+/// `text` without what names a direction: how a message saved before directions
+/// were parted from the text reads now. It may hold what was never meant as one,
+/// so a word that's ordinary out of place stays there: an emotion, a pause or a
+/// near-miss has to open a sentence, as in `(happy) Yes`, not `the (pause) button`.
+/// A sound or a tone, by its own name, goes anywhere.
 pub fn without_named_directions(text: &str) -> String {
     let mut cursor = Cursor::default();
     let mut out = String::with_capacity(text.len());
     rewrite_with(
-        |inner, _| match tag(&words(inner)) {
-            Some(_) => Verdict::Drop,
-            None => Verdict::Prose,
+        |inner, sentence_start, _| {
+            let said = words(inner);
+            let anywhere = [TONES, SOUNDS]
+                .iter()
+                .flat_map(|t| t.iter())
+                .any(|t| t.name == said);
+            if anywhere || (sentence_start && named(&said)) {
+                Verdict::Drop
+            } else {
+                Verdict::Prose
+            }
         },
         text,
         &mut cursor,
@@ -405,7 +433,7 @@ impl MarkupSplit {
 
     fn part(&mut self, text: &str) -> Parted {
         let mut parted = Parted::default();
-        rewrite(Markup::Plain, text, &mut self.shown, &mut parted.shown);
+        rewrite_shown(self.markup, text, &mut self.shown, &mut parted.shown);
         rewrite(self.markup, text, &mut self.spoken, &mut parted.spoken);
         parted
     }
@@ -421,6 +449,22 @@ struct Cursor {
     /// A direction was just dropped where a space already stood: the space
     /// after it goes too.
     skip_space: bool,
+    /// The last thing written was a direction.
+    directed: bool,
+    /// Only spaces so far on this line.
+    line_start: bool,
+    code: Code,
+}
+
+/// Code the rewrite is inside, by the length of the backtick run that opened it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Code {
+    Outside,
+    /// Closed by a run of the same length. Ends with its line at the latest: a
+    /// stray backtick mustn't protect the rest of a reply.
+    Inline(usize),
+    /// Closed by a run at least as long, opening a line.
+    Fence(usize),
 }
 
 impl Default for Cursor {
@@ -429,6 +473,9 @@ impl Default for Cursor {
             sentence_start: true,
             last: None,
             skip_space: false,
+            directed: false,
+            line_start: true,
+            code: Code::Outside,
         }
     }
 }
@@ -436,6 +483,15 @@ impl Default for Cursor {
 impl Cursor {
     fn wrote(&mut self, c: char) {
         self.last = Some(c);
+        self.directed = false;
+        if c == '\n' {
+            self.line_start = true;
+            if matches!(self.code, Code::Inline(_)) {
+                self.code = Code::Outside;
+            }
+        } else if !matches!(c, ' ' | '\t') {
+            self.line_start = false;
+        }
         if matches!(c, '.' | '!' | '?' | '…' | ':' | '\n') {
             self.sentence_start = true;
         } else if !c.is_whitespace() && !matches!(c, '"' | '“' | '\'' | '‘') {
@@ -445,6 +501,23 @@ impl Cursor {
 
     fn after_space(&self) -> bool {
         self.last.is_none_or(char::is_whitespace)
+    }
+
+    /// A run of `ticks` backticks comes next.
+    fn backticks(&mut self, ticks: usize) {
+        self.code = match self.code {
+            Code::Outside if self.line_start && ticks >= 3 => Code::Fence(ticks),
+            Code::Outside => Code::Inline(ticks),
+            Code::Inline(opened) if ticks == opened => Code::Outside,
+            Code::Fence(opened) if self.line_start && ticks >= opened => Code::Outside,
+            code => code,
+        };
+    }
+
+    /// `open` follows a closing bracket, so it's a link's `[text](target)` or
+    /// `[text][label]`. A direction written just before doesn't count: `[sad][calm]`.
+    fn continues_link(&self, open: char) -> bool {
+        matches!(open, '(' | '[') && self.last == Some(']') && !self.directed
     }
 }
 
@@ -462,8 +535,10 @@ fn direction_char(c: char) -> bool {
 
 /// Where the trailing part of `text` that the next piece could still change
 /// begins: an opened group with nothing yet ruling out a direction, or a
-/// direction it ends with (what follows decides the spacing), and the spaces
-/// before either. `text.len()` when there is none.
+/// direction it ends with (what follows decides the spacing), a bracket that
+/// a group opening after it would make a link's text, a run of backticks (what's
+/// next may lengthen it, and code depends on how long it is), and the spaces
+/// before any of them. `text.len()` when there is none.
 fn open_tail(text: &str) -> usize {
     let group = text.rfind(['(', '[']).filter(|&at| {
         let open = text[at..].chars().next().and_then(closer);
@@ -473,7 +548,16 @@ fn open_tail(text: &str) -> usize {
             && rest.chars().all(direction_char);
         unfinished || group(&text[at..]).is_some_and(|(_, len)| at + len == text.len())
     });
-    let end = group.unwrap_or(text.len());
+    let mut end = group.unwrap_or(text.len());
+    if text[end..].starts_with(['(', '[']) && text[..end].ends_with(']') {
+        let bracket = text[..end].rfind('[');
+        if let Some(at) =
+            bracket.filter(|&at| self::group(&text[at..]).is_some_and(|(_, len)| at + len == end))
+        {
+            end = at;
+        }
+    }
+    let end = end.min(text.trim_end_matches('`').len());
     text[..end].trim_end().len()
 }
 
@@ -520,6 +604,11 @@ fn tag(words: &str) -> Option<&'static Tag> {
         .find(|t| t.name == name)
 }
 
+/// Whether `words` names a direction, whether or not any voice performs it.
+fn named(words: &str) -> bool {
+    tag(words).is_some() || UNPERFORMED.contains(&words)
+}
+
 /// What becomes of one direction-shaped group.
 enum Verdict {
     /// Not a direction: prose, left as it is.
@@ -535,7 +624,9 @@ fn judge(markup: Markup, inner: &str, sentence_start: bool) -> Verdict {
     let known = tag(&said);
     let lower = !inner.chars().any(char::is_uppercase);
     let single = said.split(' ').count() == 1;
-    if known.is_none() && !(lower && (sentence_start || single)) {
+    // A letter alone is a list's `(a)` or a task's `[x]`.
+    let letter = said.chars().count() == 1;
+    if known.is_none() && (letter || !(lower && (sentence_start || single))) {
         return Verdict::Prose;
     }
     match (markup, known) {
@@ -553,7 +644,31 @@ fn judge(markup: Markup, inner: &str, sentence_start: bool) -> Verdict {
 
 fn rewrite(markup: Markup, text: &str, cursor: &mut Cursor, out: &mut String) {
     rewrite_with(
-        |inner, sentence_start| judge(markup, inner, sentence_start),
+        |inner, sentence_start, _| judge(markup, inner, sentence_start),
+        text,
+        cursor,
+        out,
+    );
+}
+
+/// What a reader keeps of a direction-shaped group: all but what names a
+/// direction, or, for a voice told it may describe its own at the start of a
+/// sentence, one of those.
+fn rewrite_shown(markup: Markup, text: &str, cursor: &mut Cursor, out: &mut String) {
+    rewrite_with(
+        |inner, sentence_start, open| {
+            let said = words(inner);
+            let described = markup == Markup::FishS2
+                && open == '['
+                && sentence_start
+                && said.chars().count() > 1
+                && !inner.chars().any(char::is_uppercase);
+            if named(&said) || described {
+                Verdict::Drop
+            } else {
+                Verdict::Prose
+            }
+        },
         text,
         cursor,
         out,
@@ -561,7 +676,7 @@ fn rewrite(markup: Markup, text: &str, cursor: &mut Cursor, out: &mut String) {
 }
 
 fn rewrite_with(
-    judge: impl Fn(&str, bool) -> Verdict,
+    judge: impl Fn(&str, bool, char) -> Verdict,
     text: &str,
     cursor: &mut Cursor,
     out: &mut String,
@@ -572,13 +687,29 @@ fn rewrite_with(
             i += 1;
             continue;
         }
+        if c == '`' {
+            let ticks = text[i..].chars().take_while(|c| *c == '`').count();
+            cursor.backticks(ticks);
+            out.push_str(&text[i..i + ticks]);
+            cursor.wrote('`');
+            i += ticks;
+            continue;
+        }
         // Attached to a word it's a call or a plural, `f(x)` or `file(s)`.
-        let attached = cursor.last.is_some_and(char::is_alphanumeric);
-        if let Some((inner, len)) = group(&text[i..]).filter(|_| !attached) {
-            match judge(inner, cursor.sentence_start) {
+        let attached = cursor.last.is_some_and(char::is_alphanumeric) || cursor.continues_link(c);
+        let code = cursor.code != Code::Outside;
+        if let Some((inner, len)) = group(&text[i..]).filter(|_| !attached && !code) {
+            let next = text[i + len..].chars().next();
+            let link =
+                c == '[' && (next == Some('(') || (next == Some('[') && !named(&words(inner))));
+            let verdict = if link {
+                Verdict::Prose
+            } else {
+                judge(inner, cursor.sentence_start, c)
+            };
+            match verdict {
                 Verdict::Prose => {}
                 Verdict::Drop => {
-                    let next = text[i + len..].chars().next();
                     if out.ends_with(' ') && next.is_some_and(|n| ".,!?;:".contains(n)) {
                         out.pop();
                         cursor.last = out.chars().last().or(Some(' '));
@@ -592,6 +723,7 @@ fn rewrite_with(
                     let start = cursor.sentence_start;
                     out.push_str(&direction);
                     cursor.last = direction.chars().last();
+                    cursor.directed = true;
                     // Directions chain: "(sad)(soft tone) Oh."
                     cursor.sentence_start = start;
                     i += len;
@@ -763,10 +895,81 @@ mod tests {
                     Ask Alice (API) or [warmly] me. (Laughs) Ha. Unclosed (end";
         for markup in [Markup::FishS1, Markup::FishS2, Markup::Plain] {
             let whole = Parted {
-                shown: Markup::Plain.apply(text),
+                shown: markup.shown(text),
                 spoken: markup.apply(text),
             };
             let chars: Vec<char> = text.chars().collect();
+            for cut in 0..=chars.len() {
+                let (a, b): (String, String) =
+                    (chars[..cut].iter().collect(), chars[cut..].iter().collect());
+                assert_eq!(parted(markup, &[&a, &b]), whole, "{markup:?} cut at {cut}");
+            }
+            let singles: Vec<String> = chars.iter().map(|c| c.to_string()).collect();
+            let refs: Vec<&str> = singles.iter().map(String::as_str).collect();
+            assert_eq!(parted(markup, &refs), whole, "{markup:?} char by char");
+        }
+    }
+
+    /// What's on screen and saved is the reply as written, less the directions
+    /// that can be named: a reader must never lose content to a guess.
+    #[test]
+    fn what_is_shown_loses_nothing_but_named_directions() {
+        for markup in [Markup::FishS1, Markup::FishS2, Markup::Plain] {
+            for kept in [
+                "Either (a) this or (b) that.",
+                "if (ready) { go(); }",
+                "- [x] done\n- [ ] not yet",
+                "Pass the flag (optional) too.",
+                "See [docs](https://example.com/a) first.",
+                "See [docs](guide) and [the notes][notes].",
+                "Run `(excited)` and `[happy]` here.",
+                "```text\n(excited) as written [happy]\n```\nDone.",
+            ] {
+                assert_eq!(parted(markup, &[kept]).shown, kept, "{markup:?}");
+            }
+        }
+    }
+
+    /// Code and link text are nobody's direction, for the voice either.
+    #[test]
+    fn code_and_link_text_are_left_alone_for_the_voice_too() {
+        for markup in [Markup::FishS1, Markup::FishS2, Markup::Plain] {
+            for kept in [
+                "See [excited](https://example.com/a) first.",
+                "See [docs](guide) now.",
+                "Run `(excited)` here.",
+                "```\n(excited) [happy]\n```",
+                "Either (a) this or (b) that.",
+            ] {
+                assert_eq!(markup.apply(kept), kept, "{markup:?}");
+            }
+        }
+    }
+
+    /// The same across every cut, a link cut at `](`, and a fence or inline code
+    /// cut among its backticks.
+    #[test]
+    fn code_links_and_lists_part_the_same_at_every_cut() {
+        let text = "(excited) Look: [docs](guide) and [x](https://e.com/a).\n\
+                    - [x] done (sighing) mostly\n\
+                    Run `(calm)` or ``a ` (sad) b``.\n\
+                    ```rust\nif (ready) { f(\"(happy)\"); }\n```\n\
+                    (laughing) Either (a) or (b).";
+        let chars: Vec<char> = text.chars().collect();
+        for markup in [Markup::FishS1, Markup::FishS2, Markup::Plain] {
+            let whole = parted(markup, &[text]);
+            assert!(whole.shown.contains("[docs](guide)"), "{}", whole.shown);
+            assert!(whole.shown.contains("if (ready) { f(\"(happy)\"); }"));
+            assert!(whole.shown.contains("`(calm)`"), "{}", whole.shown);
+            assert!(whole.shown.contains("``a ` (sad) b``"), "{}", whole.shown);
+            assert!(
+                whole.shown.contains("Either (a) or (b)."),
+                "{}",
+                whole.shown
+            );
+            assert!(!whole.shown.contains("(excited)"), "{}", whole.shown);
+            assert!(!whole.shown.contains("(sighing)"), "{}", whole.shown);
+            assert!(!whole.shown.contains("(laughing)"), "{}", whole.shown);
             for cut in 0..=chars.len() {
                 let (a, b): (String, String) =
                     (chars[..cut].iter().collect(), chars[cut..].iter().collect());
@@ -826,7 +1029,49 @@ mod tests {
             without_named_directions("[excited] Found f(x)."),
             "Found f(x)."
         );
+        assert_eq!(
+            without_named_directions("Run `(excited)` and\n```\n(happy) x\n```\n(happy) Done."),
+            "Run `(excited)` and\n```\n(happy) x\n```\nDone."
+        );
         assert_eq!(without_named_directions("As typed."), "As typed.");
+    }
+
+    /// Words the tag table shares with ordinary writing stay where they're
+    /// ordinary: this text may never have been a direction.
+    #[test]
+    fn a_kept_message_keeps_ordinary_words_where_they_are_ordinary() {
+        for kept in [
+            "Press the (pause) button.",
+            "Use a (soft) delete.",
+            "The (break) statement ends it.",
+            "They were (happy) with it.",
+            "See [docs](pause) now.",
+        ] {
+            assert_eq!(without_named_directions(kept), kept);
+        }
+        assert_eq!(without_named_directions("(pause) Well."), "Well.");
+        assert_eq!(without_named_directions("Well (sighing) yes."), "Well yes.");
+    }
+
+    /// A voice told it may describe itself at the start of a sentence: that's as
+    /// much a direction as a tag, on S2 alone, and a word elsewhere isn't.
+    #[test]
+    fn what_s2_may_describe_is_kept_from_the_reader() {
+        let text = "[warmly] Welcome back. See [note] below.\n- [x] done";
+        assert_eq!(
+            Markup::FishS2.shown(text),
+            "Welcome back. See [note] below.\n- [x] done"
+        );
+        assert_eq!(Markup::FishS1.shown(text), text);
+    }
+
+    /// Moods no voice performs don't reach the reader either.
+    #[test]
+    fn what_is_named_but_not_performed_is_not_shown() {
+        for markup in [Markup::FishS1, Markup::Plain] {
+            assert_eq!(markup.shown("(pensive) Hmm."), "Hmm.");
+            assert_eq!(markup.apply("(pensive) Hmm."), "Hmm.");
+        }
     }
 
     #[test]

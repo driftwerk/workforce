@@ -22,6 +22,10 @@ pub struct BroadcastMessage {
     /// included: set on a spoken turn's text frames where the two differ.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub speech: Option<String>,
+    /// A spoken turn's text frame. A client that doesn't read `speech` says its
+    /// `content`, so that's what it gets made for speech.
+    #[serde(skip)]
+    pub spoken_turn: bool,
     /// Whether the client should read this message aloud in audio/voice mode.
     /// Tool events and empty markers are `false`; response text is `true`.
     pub speakable: bool,
@@ -110,6 +114,7 @@ impl BroadcastMessage {
             msg_type: msg_type.into(),
             content: content.into(),
             speech: None,
+            spoken_turn: false,
             context_tokens: None,
             context_max: None,
             speakable: true,
@@ -179,6 +184,7 @@ impl BroadcastMessage {
             msg_type: "permission_prompt".to_string(),
             content: reason.into(),
             speech: None,
+            spoken_turn: false,
             context_tokens: None,
             context_max: None,
             speakable: false,

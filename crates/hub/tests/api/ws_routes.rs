@@ -637,6 +637,177 @@ async fn a_spoken_phone_turn_shows_clean_text_too() {
     assert!(said.starts_with("(excited) Found it."), "{frames:?}");
 }
 
+const DESK_SPOKEN: &str = r#"{"place": {"kind": "dm"}, "speaker": {"kind": "person"}, "spoken": true,
+    "voice": {"reply": "spoken", "speech": {"provider": "fish_audio", "model": "s1"}}}"#;
+
+fn spoken_on_desk(content: &str, turn: &str) -> Value {
+    json!({"type": "chat", "content": content, "turn_ref": turn,
+           "desk": serde_json::from_str::<Value>(DESK_SPOKEN).unwrap()})
+}
+
+fn saved_answers(service: &workforce_hub::serve::AgentService, session: &str) -> Vec<String> {
+    service
+        .sessions
+        .get(session)
+        .unwrap()
+        .unwrap()
+        .messages
+        .iter()
+        .filter(|m| m.role == workforce_common::session::MessageRole::Assistant)
+        .map(|m| m.content.clone())
+        .collect()
+}
+
+/// Everything in a reply that isn't a named direction reaches the screen and the
+/// saved message as written.
+#[tokio::test]
+async fn a_spoken_reply_keeps_its_code_links_and_lists() {
+    const REPLY: &[&str] = &[
+        "(excited) See [do",
+        "cs](https://example.com/a).\n- [x] done\nEither (a) or (b). ",
+        "`if (ready)` and my_var and **this**.",
+    ];
+    const WRITTEN: &str = "See [docs](https://example.com/a).\n- [x] done\nEither (a) or (b). \
+                           `if (ready)` and my_var and **this**.";
+    let data = tempfile::tempdir().unwrap();
+    let (service, _llm) =
+        crate::support::agent_on_mock_llm_saying(data.path(), REPLY, std::time::Duration::ZERO)
+            .await;
+    let gateway = Gateway::new(vec![("default", service.clone())], None);
+    let token = gateway.admin_token();
+    let addr = serve(gateway.state.clone()).await;
+    let (mut desk, connected) = connect(addr, &format!("token={token}&channel=desk&desk=1")).await;
+    send(&mut desk, spoken_on_desk("what's next?", "ref-1")).await;
+    let frames = frames_until(&mut desk, "turn_end").await;
+    let (shown, said) = shown_and_said(&frames);
+    assert_eq!(shown, WRITTEN, "{frames:?}");
+    assert_eq!(
+        saved_answers(&service, connected["session_id"].as_str().unwrap()),
+        [WRITTEN]
+    );
+    assert!(said.starts_with("(excited) See"), "{said}");
+    assert!(
+        !said.contains('*'),
+        "what's said is made for speech: {said}"
+    );
+    assert!(said.contains("myvar"), "{said}");
+}
+
+/// A client that doesn't read `speech` is sent what it always was: text made for
+/// speech, since that's what it will say.
+#[tokio::test]
+async fn an_older_phone_still_gets_text_made_for_speech() {
+    let data = tempfile::tempdir().unwrap();
+    let (service, _llm) = crate::support::agent_on_mock_llm_saying(
+        data.path(),
+        &["See my_var and **this**."],
+        std::time::Duration::ZERO,
+    )
+    .await;
+    let gateway = Gateway::new(vec![("default", service)], None);
+    let token = gateway.admin_token();
+    let addr = serve(gateway.state.clone()).await;
+    let (mut phone, _) = connect(addr, &format!("token={token}")).await;
+    send(
+        &mut phone,
+        json!({"type": "chat", "content": "what's next?", "voice_mode": true, "tts_provider": "fishaudio"}),
+    )
+    .await;
+    let frames = frames_until(&mut phone, "stream_end").await;
+    let (shown, _) = shown_and_said(&frames);
+    assert_eq!(shown, "See myvar and this.", "{frames:?}");
+    assert!(
+        frames.iter().all(|f| f.get("speech").is_none()),
+        "{frames:?}"
+    );
+}
+
+/// A reply that was only a direction: said, but there's nothing to show. No empty
+/// bubble is kept, and a client that doesn't read `speech` is sent no empty frame.
+#[tokio::test]
+async fn a_reply_of_only_a_direction_leaves_no_empty_answer() {
+    let data = tempfile::tempdir().unwrap();
+    let (service, _llm) = crate::support::agent_on_mock_llm_saying(
+        data.path(),
+        &["(laughing)"],
+        std::time::Duration::ZERO,
+    )
+    .await;
+    let gateway = Gateway::new(vec![("default", service.clone())], None);
+    let token = gateway.admin_token();
+    let addr = serve(gateway.state.clone()).await;
+    let (mut desk, connected) = connect(addr, &format!("token={token}&channel=desk&desk=1")).await;
+    send(&mut desk, spoken_on_desk("what's next?", "ref-1")).await;
+    let frames = frames_until(&mut desk, "turn_end").await;
+    let (shown, said) = shown_and_said(&frames);
+    assert_eq!(shown, "", "{frames:?}");
+    assert_eq!(said, "(laughing)", "{frames:?}");
+    assert_eq!(
+        saved_answers(&service, connected["session_id"].as_str().unwrap()),
+        Vec::<String>::new()
+    );
+
+    let (mut phone, _) = connect(addr, &format!("token={token}")).await;
+    send(
+        &mut phone,
+        json!({"type": "chat", "content": "what's next?", "voice_mode": true, "tts_provider": "fishaudio"}),
+    )
+    .await;
+    let frames = frames_until(&mut phone, "stream_end").await;
+    let empty = |f: &&Value| {
+        ["stream_delta", "message"].contains(&f["type"].as_str().unwrap_or(""))
+            && f["content"].as_str().unwrap_or("").is_empty()
+    };
+    assert_eq!(frames.iter().filter(empty).count(), 0, "{frames:?}");
+}
+
+/// A row saved with a direction in it is scrubbed for the model, and left as it
+/// is in the store: reading never rewrites history.
+#[tokio::test]
+async fn an_old_row_is_read_clean_but_stays_as_saved() {
+    let data = tempfile::tempdir().unwrap();
+    let (service, llm) = crate::support::agent_on_mock_llm_saying(
+        data.path(),
+        &["Fine."],
+        std::time::Duration::ZERO,
+    )
+    .await;
+    let gateway = Gateway::new(vec![("default", service.clone())], None);
+    let token = gateway.admin_token();
+    let addr = serve(gateway.state.clone()).await;
+    let (mut desk, connected) = connect(addr, &format!("token={token}&channel=desk&desk=1")).await;
+    let session_id = connected["session_id"].as_str().unwrap();
+    send(&mut desk, spoken_on_desk("first", "ref-1")).await;
+    frames_until(&mut desk, "turn_end").await;
+
+    let mut session = service.sessions.get(session_id).unwrap().unwrap();
+    session.add_assistant_message("(confident) Old answer, `(calm)` kept.", 3);
+    service.sessions.save(&session).unwrap();
+
+    send(&mut desk, spoken_on_desk("second", "ref-2")).await;
+    frames_until(&mut desk, "turn_end").await;
+    assert!(
+        saved_answers(&service, session_id)
+            .iter()
+            .any(|a| a == "(confident) Old answer, `(calm)` kept."),
+        "{:?}",
+        saved_answers(&service, session_id)
+    );
+
+    let asked = llm.received_requests().await.unwrap();
+    let last: Value = serde_json::from_slice(&asked.last().unwrap().body).unwrap();
+    let own: Vec<&Value> = last["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["role"] == "assistant")
+        .collect();
+    let text = format!("{own:?}");
+    assert!(text.contains("Old answer"), "{text}");
+    assert!(!text.contains("(confident)"), "{text}");
+    assert!(text.contains("`(calm)`"), "code is left alone: {text}");
+}
+
 /// A voice that takes no directions: clean text, and no `speech` at all.
 #[tokio::test]
 async fn a_voice_without_directions_gets_no_speech_field() {

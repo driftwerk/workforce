@@ -1578,9 +1578,20 @@ fn unread_turn_ref(text: &str) -> Option<String> {
 /// declare itself Desk's (iOS, the web UI, an old Desk) gets exactly the
 /// frame it always did: no turn ref, no reply id, and none of Desk's own
 /// frames.
-fn server_frame(msg: BroadcastMessage, declared: bool) -> Option<ServerMessage> {
+fn server_frame(mut msg: BroadcastMessage, declared: bool) -> Option<ServerMessage> {
     if !declared && DESK_ONLY_FRAMES.contains(&msg.msg_type.as_str()) {
         return None;
+    }
+    if !declared {
+        for_a_client_saying_content(&mut msg);
+        // All it reads of the frame is `content`: with none, there's nothing to
+        // send it but an empty bubble.
+        if msg.spoken_turn
+            && msg.content.is_empty()
+            && matches!(msg.msg_type.as_str(), "stream_delta" | "message")
+        {
+            return None;
+        }
     }
     let id = msg
         .id
@@ -3158,22 +3169,21 @@ pub(crate) async fn forward_local_progress(
                 String::new(),
             )),
             ProgressEvent::Speech { text } => {
-                speech.set(spoken_form(text, tts_normalize, false));
+                speech.set(text);
                 None
             }
             ProgressEvent::StreamDelta { text } => {
                 if mentions.is_some() {
                     said.push_str(&text);
                 }
-                let content = if tts_normalize {
-                    crate::formatting::normalize_delta_for_tts(&text)
-                } else {
-                    text
-                };
                 let speech = speech.take();
-                (!content.is_empty() || speech.is_some()).then(|| {
-                    let mut delta = BroadcastMessage::new(sid.clone(), "stream_delta", content);
-                    delta.speech = speech;
+                (!text.is_empty() || speech.is_some()).then(|| {
+                    let mut delta = BroadcastMessage::new(sid.clone(), "stream_delta", text);
+                    if tts_normalize {
+                        say_frame(&mut delta, speech);
+                    } else {
+                        delta.speech = speech;
+                    }
                     delta
                 })
             }
@@ -3206,24 +3216,16 @@ pub(crate) async fn forward_local_progress(
                     // duplicate display on clients.
                     None
                 } else {
-                    let rendered = workforce_common::secret_marker::render_markers_as_preview(text);
-                    let text = if workforce_common::security_scanner::contains_credentials(
-                        &rendered,
-                    ) {
-                        tracing::warn!(target: "sentinel", "Credential detected in response — redacting");
-                        workforce_common::security_scanner::redact_credentials(&rendered)
-                    } else {
-                        rendered
-                    };
-                    let content = if tts_normalize {
-                        crate::formatting::normalize_for_tts(&text)
-                    } else {
-                        text
-                    };
+                    let content = safe_message(text, "response");
+                    let spoken = spoken.map(|s| safe_message(&s, "response"));
                     // Non-streamed response (e.g. slash
                     // commands) — send as a regular message.
                     let mut message = BroadcastMessage::new(sid.clone(), "message", content);
-                    message.speech = spoken;
+                    if tts_normalize {
+                        say_frame(&mut message, spoken);
+                    } else {
+                        message.speech = spoken;
+                    }
                     if let Some(mentions) = &mentions {
                         message.desk = mentions(message.content.clone()).await;
                     }
@@ -3297,7 +3299,13 @@ pub(crate) async fn forward_local_progress(
             // here a reply interrupts the run.)
             ProgressEvent::CheckIn { note } => {
                 let mut message = BroadcastMessage::new(sid.clone(), "message", note);
-                message.speech = speech.take();
+                message.speech = speech.take().map(|s| {
+                    if tts_normalize {
+                        spoken_form(&s, "message")
+                    } else {
+                        s
+                    }
+                });
                 Some(message)
             }
             ProgressEvent::Snapshot(snapshot) => {
@@ -3738,13 +3746,43 @@ async fn forward_nats_progress(
     }
 }
 
-/// How a spoken turn's frame is said: with what the frame's text had done to
-/// it for speech (`whole`: a whole message, else a delta).
-fn spoken_form(text: String, tts_normalize: bool, whole: bool) -> String {
-    match (tts_normalize, whole) {
-        (false, _) => text,
-        (true, false) => crate::formatting::normalize_delta_for_tts(&text),
-        (true, true) => crate::formatting::normalize_for_tts(&text),
+/// `text`, a spoken turn's, made for speech, as `msg_type` frames it.
+fn spoken_form(text: &str, msg_type: &str) -> String {
+    if msg_type == "message" {
+        crate::formatting::normalize_for_tts(text)
+    } else {
+        crate::formatting::normalize_delta_for_tts(text)
+    }
+}
+
+/// Marks a spoken turn's text frame, with `speech` (its directions, if the
+/// frame's text has any) made for speech. `content` stays as written, since
+/// that's what is shown and saved; [`for_a_client_saying_content`] undoes that
+/// for a client that takes no `speech`.
+fn say_frame(frame: &mut BroadcastMessage, speech: Option<String>) {
+    let said = spoken_form(speech.as_deref().unwrap_or(&frame.content), &frame.msg_type);
+    frame.speech = (said != frame.content).then_some(said);
+    frame.spoken_turn = true;
+}
+
+/// A spoken turn's frame for a client that hasn't said it takes `speech` apart:
+/// it says `content`, so `content` is what it always was, made for speech.
+fn for_a_client_saying_content(frame: &mut BroadcastMessage) {
+    if frame.spoken_turn {
+        frame.content = spoken_form(&frame.content, &frame.msg_type);
+        frame.speech = frame.speech.take().filter(|s| *s != frame.content);
+    }
+}
+
+/// What may be sent of a whole message: its secret markers rendered, and any
+/// credential in it redacted.
+fn safe_message(text: &str, what: &str) -> String {
+    let rendered = workforce_common::secret_marker::render_markers_as_preview(text);
+    if workforce_common::security_scanner::contains_credentials(&rendered) {
+        tracing::warn!(target: "sentinel", "Credential detected in {what} — redacting");
+        workforce_common::security_scanner::redact_credentials(&rendered)
+    } else {
+        rendered
     }
 }
 
@@ -3758,7 +3796,7 @@ fn nats_broadcast(
 ) -> Option<BroadcastMessage> {
     match &progress {
         ChatProgress::Speech { text } => {
-            speech.set(spoken_form(text.clone(), tts_normalize, false));
+            speech.set(text.clone());
             return None;
         }
         ChatProgress::StreamDiscard { .. } | ChatProgress::StreamEnd => speech.clear(),
@@ -3769,8 +3807,17 @@ fn nats_broadcast(
         ChatProgress::StreamDelta { .. } | ChatProgress::Message { .. }
     );
     let mut broadcast = chat_progress_to_broadcast(progress, session_id, tts_normalize)?;
-    if takes_speech {
-        broadcast.speech = speech.take();
+    if let Some(said) = speech.take().filter(|_| takes_speech) {
+        let said = if broadcast.msg_type == "message" {
+            safe_message(&said, "message")
+        } else {
+            said
+        };
+        if tts_normalize {
+            say_frame(&mut broadcast, Some(said));
+        } else {
+            broadcast.speech = Some(said);
+        }
     }
     Some(broadcast)
 }
@@ -3789,12 +3836,11 @@ pub(crate) fn chat_progress_to_broadcast(
             String::new(),
         )),
         ChatProgress::StreamDelta { text } => {
-            let content = if tts_normalize {
-                crate::formatting::normalize_delta_for_tts(&text)
-            } else {
-                text
-            };
-            Some(BroadcastMessage::new(session_id, "stream_delta", content))
+            let mut delta = BroadcastMessage::new(session_id, "stream_delta", text);
+            if tts_normalize {
+                say_frame(&mut delta, None);
+            }
+            Some(delta)
         }
         ChatProgress::Speech { .. } => None,
         ChatProgress::StreamEnd => Some(BroadcastMessage::new(
@@ -3808,19 +3854,12 @@ pub(crate) fn chat_progress_to_broadcast(
             reason.as_str(),
         )),
         ChatProgress::Message { text } => {
-            let rendered = workforce_common::secret_marker::render_markers_as_preview(&text);
-            let text = if workforce_common::security_scanner::contains_credentials(&rendered) {
-                tracing::warn!(target: "sentinel", "Credential detected in message — redacting");
-                workforce_common::security_scanner::redact_credentials(&rendered)
-            } else {
-                rendered
-            };
-            let content = if tts_normalize {
-                crate::formatting::normalize_for_tts(&text)
-            } else {
-                text
-            };
-            Some(BroadcastMessage::new(session_id, "message", content))
+            let mut message =
+                BroadcastMessage::new(session_id, "message", safe_message(&text, "message"));
+            if tts_normalize {
+                say_frame(&mut message, None);
+            }
+            Some(message)
         }
         ChatProgress::ToolStart { name, detail } => {
             let content = if detail.is_empty() {

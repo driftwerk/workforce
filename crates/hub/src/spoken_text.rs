@@ -14,7 +14,7 @@ use crate::chat_worker::AnswerDelivery;
 use tokio::sync::mpsc;
 use workforce_agent::llm::speech::{without_named_directions, Markup, MarkupSplit, Parted};
 use workforce_agent::runner::ProgressEvent;
-use workforce_common::session::{MessageRole, Session};
+use workforce_common::session::{MessageRole, Session, SessionMessage};
 
 /// How `session`'s turn now running is heard; `None` for one that isn't.
 pub fn spoken_with(session: &Session) -> Option<Markup> {
@@ -31,7 +31,7 @@ pub fn spoken_with(session: &Session) -> Option<Markup> {
 /// The text a spoken turn's answer is kept and shown as; `None` for a turn
 /// that wasn't spoken, whose text is as written.
 pub fn kept_answer(session: &Session, answer: &str) -> Option<String> {
-    spoken_with(session).map(|_| Markup::Plain.apply(answer))
+    spoken_with(session).map(|markup| markup.shown(answer))
 }
 
 /// Whether a voice that takes directions has spoken in `session`, so what was
@@ -53,17 +53,19 @@ pub fn kept_text<'a>(session: &Session, text: &'a str) -> Cow<'a, str> {
     }
 }
 
-/// What `session` keeps of its agent, as it reads now, for the model to read
-/// next: what it sees of itself is what the person saw.
-pub fn clean_kept(session: &mut Session) {
+/// The messages of `session` as the model is to read them: what it sees of
+/// itself is what the person saw. A copy: reading never rewrites what's saved.
+pub fn for_the_model(session: &Session) -> Cow<'_, [SessionMessage]> {
     if !may_keep_directions(session) {
-        return;
+        return Cow::Borrowed(&session.messages);
     }
-    for message in &mut session.messages {
+    let mut messages = session.messages.clone();
+    for message in &mut messages {
         if message.role == MessageRole::Assistant {
             message.content = without_named_directions(&message.content);
         }
     }
+    Cow::Owned(messages)
 }
 
 /// Parts a stream of a spoken turn's progress.
@@ -106,7 +108,7 @@ impl Parting {
                 vec![ProgressEvent::StreamDiscard { reason }]
             }
             ProgressEvent::Response { text } => {
-                let shown = Markup::Plain.apply(&text);
+                let shown = self.markup.shown(&text);
                 let spoken = self.markup.apply(&text);
                 // Already streamed, it reaches no client: no frame to go with.
                 let mut out = if self.delivery.delivers_response() {
@@ -118,7 +120,7 @@ impl Parting {
                 out
             }
             ProgressEvent::CheckIn { note } => {
-                let shown = Markup::Plain.apply(&note);
+                let shown = self.markup.shown(&note);
                 let spoken = self.markup.apply(&note);
                 let mut out = speech_of(&shown, spoken);
                 out.push(ProgressEvent::CheckIn { note: shown });
@@ -283,6 +285,12 @@ mod tests {
             ],
         );
         assert_eq!(shown(&plain), "Found it.");
+        let unknown = frames(
+            Markup::Plain,
+            vec![delta("Pass (maybe) it."), ProgressEvent::StreamEnd],
+        );
+        assert_eq!(shown(&unknown), "Pass (maybe) it.");
+        assert_eq!(heard(&unknown), "Pass it.");
         assert!(plain.iter().all(|(_, speech)| speech.is_none()));
         let fish = frames(
             Markup::FishS1,
@@ -329,7 +337,18 @@ mod tests {
     /// back from history is the one that was on screen.
     #[test]
     fn what_streams_is_what_is_kept() {
-        let answer = "(excited) Found it! (pensive) Hmm. It (sighing) broke. Ask Alice (API).";
+        let answer = "(excited) Found it! (pensive) Hmm. It (sighing) broke. Ask Alice (API).\n\
+                      See [docs](https://example.com/a) or [notes](guide).\n\
+                      - [x] done (laughing) mostly\n- [ ] not yet (a) or (b)\n\
+                      Run `(calm)` then:\n```rust\nif (ready) { f(\"(happy)\"); }\n```\nDone.";
+        let kept = "Found it! Hmm. It broke. Ask Alice (API).\n\
+                    See [docs](https://example.com/a) or [notes](guide).\n\
+                    - [x] done mostly\n- [ ] not yet (a) or (b)\n\
+                    Run `(calm)` then:\n```rust\nif (ready) { f(\"(happy)\"); }\n```\nDone.";
+        assert_eq!(Markup::FishS1.shown(answer), kept);
+        let session =
+            session(serde_json::json!({ "voice_turn": true, "tts_provider": "fish_audio" }));
+        assert_eq!(kept_answer(&session, answer).as_deref(), Some(kept));
         let chars: Vec<char> = answer.chars().collect();
         for cut in 0..=chars.len() {
             let (a, b): (String, String) =
@@ -338,7 +357,7 @@ mod tests {
                 Markup::FishS1,
                 vec![delta(&a), delta(&b), ProgressEvent::StreamEnd],
             );
-            assert_eq!(shown(&frames), Markup::Plain.apply(answer), "cut at {cut}");
+            assert_eq!(shown(&frames), kept, "cut at {cut}");
         }
     }
 
@@ -399,8 +418,12 @@ mod tests {
         let mut spoken = session(serde_json::json!({ "tts_provider": "fish_audio" }));
         spoken.add_user_message("(excited) as I typed it", None);
         spoken.add_assistant_message("(confident) It works.", 3);
-        clean_kept(&mut spoken);
-        assert_eq!(spoken.messages[0].content, "(excited) as I typed it");
-        assert_eq!(spoken.messages[1].content, "It works.");
+        let read = for_the_model(&spoken);
+        assert_eq!(read[0].content, "(excited) as I typed it");
+        assert_eq!(read[1].content, "It works.");
+        assert_eq!(
+            spoken.messages[1].content, "(confident) It works.",
+            "what's saved is left as it is"
+        );
     }
 }
