@@ -14,3 +14,8 @@ slow-timeout = { period = "60s" }
 # Print the slow and failed tests again at the end, where they can be read.
 final-status-level = "slow"
 failure-output = "immediate-final"
+
+# One JUnit file per run, at target/nextest/ci/junit.xml; CI sums its test
+# count across the partitions to hold them to the archive's total.
+[profile.ci.junit]
+path = "junit.xml"
