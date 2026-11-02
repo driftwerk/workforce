@@ -228,7 +228,13 @@ impl Tool for DeskTool {
                     .filter(|c| !c.trim().is_empty())
                     .map(|c| workforce_agent::tools::paths::resolve_real(std::path::Path::new(c))),
             },
-            _ => workforce_core::computer::Effect::None,
+            Verb::List
+            | Verb::Prompt
+            | Verb::Read
+            | Verb::Wait
+            | Verb::Approve
+            | Verb::Stop
+            | Verb::Interrupt => workforce_core::computer::Effect::None,
         }
     }
 

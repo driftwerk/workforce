@@ -336,22 +336,22 @@ mod tests {
     }
 
     /// Driftwerk and Patchwork run no `[desk]`: nothing installs the gate,
-    /// and every call is decided as on main.
-    #[test]
-    fn a_hub_without_desk_has_no_gate_and_decides_as_before() {
+    /// a composed agent has none, and its calls are decided as on main.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_hub_without_desk_has_no_gate_and_decides_as_before() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = crate::serve::testing::plain_service(dir.path()).await;
+        assert!(service.computer_gate().is_none());
+        let gates = service.tool_gates(None);
+        assert!(gates.computer_gate.is_none());
         let hub = hub();
-        assert!(workforce_hub_core::serve::computer_gate_for(&hub.subject).is_none());
         let tools = tools(&hub.subject.workspace);
         for (tool, input) in [
             ("exec.run", json!({"command": "git push --force"})),
-            (
-                "filesystem.write",
-                json!({"path": "/etc/hosts", "content": "x"}),
-            ),
+            ("filesystem.write", json!({"path": "a.md", "content": "x"})),
             ("memory.recall", json!({})),
         ] {
-            let outcome =
-                as_sarah(|| gate_tool_call(&gates(None), &policy(), &tools, tool, &input));
+            let outcome = as_sarah(|| gate_tool_call(&gates, &policy(), &tools, tool, &input));
             assert_eq!(kind(&outcome), "run", "{tool}");
         }
     }
