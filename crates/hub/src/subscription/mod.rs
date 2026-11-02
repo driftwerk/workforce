@@ -48,7 +48,7 @@ use workforce_common::settings::WorkforceConfig;
 
 use crate::coding_sandbox::{remote_launcher_for, McpSurface, SandboxLauncher};
 pub use crate::hub_core::subscriptions::{
-    chain_specs, review_agent_llm, route_models, routed_kind, routed_subscriptions, tier_models,
+    provider_specs, review_agent_llm, route_models, routed_kind, routed_subscriptions, tier_models,
     unknown_operator, validate_agent_llm, LOGINS_ARE_NOT_ACCOUNTS,
 };
 pub use crate::hub_core::subscriptions::{Finding, Install, Severity, SharedSubscriptions};
@@ -515,6 +515,95 @@ mod tests {
             &REMOTE,
         )
         .expect("the routes that replace it load");
+    }
+
+    #[test]
+    fn a_chatgpt_advisor_on_another_route_or_at_a_level_chatgpt_lacks_is_refused() {
+        use workforce_common::settings::{AdvisorConfig, AdvisorSource};
+        let llm = LlmConfig::default();
+        let with = |advisor: AdvisorConfig| {
+            let mut resolved = resolved();
+            resolved.advisor = advisor;
+            review_agent_llm(&llm, &resolved, &LOCAL)
+                .into_iter()
+                .filter(|finding| finding.spec.starts_with("[advisor"))
+                .collect::<Vec<_>>()
+        };
+        let chatgpt = |model: &str, effort: &str| AdvisorConfig {
+            enabled: true,
+            source: AdvisorSource::ChatGpt,
+            model: Some(model.into()),
+            effort: Some(effort.into()),
+            ..Default::default()
+        };
+        assert!(with(chatgpt("chatgpt:gpt-6-astra", "high")).is_empty());
+        assert!(with(chatgpt("chatgpt:powerful", "XHIGH")).is_empty());
+
+        let elsewhere = with(chatgpt("anthropic:powerful", "high"));
+        assert_eq!(elsewhere.len(), 1, "{elsewhere:?}");
+        assert_eq!(elsewhere[0].severity, Severity::Refused);
+        assert_eq!(elsewhere[0].spec, "[advisor] model");
+
+        let level = with(chatgpt("chatgpt:gpt-6-astra", "max"));
+        assert_eq!(level.len(), 1, "{level:?}");
+        assert_eq!(level[0].severity, Severity::Refused);
+        assert!(level[0].message.contains("xhigh"), "{level:?}");
+
+        // Off, or on another source, none of this is the route's to refuse.
+        let off = AdvisorConfig {
+            enabled: false,
+            ..chatgpt("anthropic:powerful", "max")
+        };
+        assert!(with(off).is_empty());
+        let on_claude = AdvisorConfig {
+            source: AdvisorSource::ClaudeCode,
+            ..chatgpt("opus", "max")
+        };
+        assert!(with(on_claude).is_empty());
+
+        let synth_elsewhere = with(AdvisorConfig {
+            fanout: workforce_common::settings::AdvisorFanoutConfig {
+                synth_model: Some("anthropic:powerful".into()),
+                ..Default::default()
+            },
+            ..chatgpt("chatgpt:gpt-6-astra", "high")
+        });
+        assert_eq!(synth_elsewhere.len(), 1, "{synth_elsewhere:?}");
+        assert_eq!(synth_elsewhere[0].severity, Severity::Refused);
+        assert_eq!(synth_elsewhere[0].spec, "[advisor.fanout] synth_model");
+
+        let unserved = with(chatgpt("chatgpt:opus", "high"));
+        assert_eq!(unserved.len(), 1, "{unserved:?}");
+        assert_eq!(unserved[0].severity, Severity::Warning);
+        assert!(unserved[0].message.contains("will fail"), "{unserved:?}");
+    }
+
+    #[test]
+    fn an_advisor_route_that_cannot_serve_warns_and_the_agent_still_loads() {
+        use workforce_common::settings::{AdvisorConfig, AdvisorSource};
+        let llm = LlmConfig::default();
+        for model in [
+            "codex:powerful",
+            "codex:gpt-5.5",
+            "claude-max:opus",
+            "chatgpt:gpt-5.5",
+        ] {
+            let mut resolved = resolved();
+            resolved.advisor = AdvisorConfig {
+                enabled: true,
+                source: AdvisorSource::Model,
+                model: Some(model.into()),
+                ..Default::default()
+            };
+            validate_agent_llm(&llm, &resolved, &LOCAL).unwrap_or_else(|e| panic!("{model}: {e}"));
+            let findings = review_agent_llm(&llm, &resolved, &LOCAL);
+            assert!(
+                findings
+                    .iter()
+                    .any(|f| f.spec == "[advisor]" && f.severity == Severity::Warning),
+                "{model}: {findings:?}"
+            );
+        }
     }
 
     #[test]

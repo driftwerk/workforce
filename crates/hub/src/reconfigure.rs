@@ -17,6 +17,45 @@ impl crate::hosts::ReconfigureHost for Reconfigurer {
     }
 }
 
+/// Set up the providers the config just applied routes to and the chain has
+/// none of yet, so a route added by a reload runs without a restart. An agent
+/// built with no chain has nowhere to add one, and a `chatgpt` route runs on
+/// nothing else (a CLI route needs no chain): what that defers is returned.
+async fn add_routed_providers(
+    service: &AgentService,
+    llm: &workforce_common::settings::LlmConfig,
+) -> Option<String> {
+    let resolved = service.resolved.snapshot();
+    let primary = *service.provider_kind.read();
+    let routes = crate::agent_llm::external_routes(
+        primary,
+        crate::subscription::provider_specs(llm, &resolved),
+    );
+    let Some(chain) = service.failover_provider.as_ref() else {
+        return routes
+            .values()
+            .any(|kind| *kind == workforce_agent::llm::provider::ProviderKind::ChatGpt)
+            .then(|| "chatgpt route".to_string());
+    };
+    let known = chain.list_external_providers().await;
+    for (name, kind) in routes.into_iter().filter(|(name, _)| !known.contains(name)) {
+        match service
+            .providers
+            .provider(kind, None, None, false, None)
+            .await
+        {
+            Ok(provider) => chain.add_external_provider(&name, provider).await,
+            Err(error) => warn!(
+                agent = %service.agent_id,
+                provider = %name,
+                %error,
+                "Config reload: routed provider unavailable"
+            ),
+        }
+    }
+    None
+}
+
 pub(crate) async fn apply_config(service: &AgentService) -> eyre::Result<Vec<String>> {
     let (workspace_config, config_text) =
         workforce_common::settings::AgentWorkspaceConfig::load_with_text(&service.workspace)?
@@ -44,7 +83,7 @@ pub(crate) async fn apply_config(service: &AgentService) -> eyre::Result<Vec<Str
         &next,
         &crate::subscription::Install::of(&service.config),
     )?;
-    let deferred: Vec<String> = service
+    let mut deferred: Vec<String> = service
         .resolved
         .snapshot()
         .structural_diff(&next)
@@ -105,6 +144,8 @@ pub(crate) async fn apply_config(service: &AgentService) -> eyre::Result<Vec<Str
             *cur = resolved;
         }
     }
+
+    deferred.extend(add_routed_providers(service, &effective).await);
 
     if let Some(ref fp) = service.failover_provider {
         let next_retry = effective

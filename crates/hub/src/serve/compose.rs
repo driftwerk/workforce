@@ -2238,7 +2238,7 @@ impl LlmStack {
         // route must reach its own provider, never the metered primary.
         let external_routes = crate::agent_llm::external_routes(
             provider_kind_val,
-            crate::subscription::chain_specs(effective_llm, resolved_at_build),
+            crate::subscription::provider_specs(effective_llm, resolved_at_build),
         );
         #[allow(clippy::type_complexity)]
         let (llm, health_tracker, failover_ref): (

@@ -11,7 +11,7 @@ use workforce_agent::llm::failover::{FailoverConfig, FailoverProvider, HealthCon
 use workforce_agent::llm::provider::ProviderKind;
 use workforce_agent::llm::types::{ContentBlock, ImageSource};
 use workforce_agent::runner::{InjectedMessage, ProgressEvent, RunResult, StreamDiscardReason};
-use workforce_common::settings::{ExecutorKind, WorkforceConfig};
+use workforce_common::settings::{AdvisorConfig, AdvisorSource, ExecutorKind, WorkforceConfig};
 use workforce_common::subscription::SubscriptionKind;
 
 use super::*;
@@ -1528,6 +1528,396 @@ async fn the_configured_effort_reaches_the_chatgpt_request_on_every_turn_path() 
         [json!("high"), json!("xhigh"), serde_json::Value::Null],
         "the live effort reaches the backend, streamed or not, and none leaves its default"
     );
+}
+
+/// Claude Code alone: nothing but the advisor can route to ChatGPT.
+fn claude_alone(config: &mut WorkforceConfig) {
+    config.llm.provider = "claude-code".into();
+    config.llm.default_model = "sonnet".into();
+    config.llm.failover = Vec::new();
+}
+
+fn advisor_on(source: AdvisorSource, model: &str) -> AdvisorConfig {
+    AdvisorConfig {
+        enabled: true,
+        source,
+        model: Some(model.into()),
+        ..Default::default()
+    }
+}
+
+fn review_request(lenses: &[&str]) -> crate::advisor::AdvisorRequest {
+    crate::advisor::AdvisorRequest {
+        payload: workforce_common::settings::AdvisorPayload::Transcript,
+        payload_text: "user: ship it?".into(),
+        payload_truncated: false,
+        question: Some("Is the plan sound?".into()),
+        lenses: lenses.iter().map(|lens| lens.to_string()).collect(),
+    }
+}
+
+async fn review(hub: &Hub, lenses: &[&str]) -> crate::advisor::AdvisorOutcome {
+    workforce_agent::runner::CURRENT_USER_ID
+        .scope(
+            ALICE.to_string(),
+            crate::advisor::dispatch(
+                &hub.service,
+                &hub.service.effective_advisor(),
+                &review_request(lenses),
+                Some(ALICE),
+                &std::sync::Arc::default(),
+                None,
+            ),
+        )
+        .await
+}
+
+#[tokio::test]
+async fn advisor_model_backend_sets_up_the_chatgpt_route_it_names() {
+    let hub = hub(|config| {
+        claude_alone(config);
+        config.advisor = advisor_on(AdvisorSource::Model, "chatgpt:gpt-6-astra");
+    })
+    .await;
+    hub.chatgpt_login(ALICE).await;
+
+    let outcome = review(&hub, &[]).await;
+
+    assert!(
+        matches!(outcome, crate::advisor::AdvisorOutcome::Advice(_)),
+        "{outcome:?}"
+    );
+    assert_eq!(chatgpt_bodies(&hub).await[0]["model"], json!("gpt-6-astra"));
+}
+
+/// A metered primary, on the same mock server, and no failover list: any call
+/// the advisor leaks to them shows up there.
+fn metered_alone(config: &mut WorkforceConfig, server_uri: String) {
+    config.llm.provider = "ollama".into();
+    config.llm.api_key = Some(server_uri);
+    config.llm.default_model = "mock".into();
+    config.llm.failover = Vec::new();
+}
+
+fn chatgpt_advisor(configure: impl FnOnce(&mut AdvisorConfig)) -> AdvisorConfig {
+    let mut advisor = AdvisorConfig {
+        enabled: true,
+        source: AdvisorSource::ChatGpt,
+        ..Default::default()
+    };
+    configure(&mut advisor);
+    advisor
+}
+
+/// `/responses` fails for good: a 400 nothing retries.
+async fn chatgpt_fails(hub: &Hub) {
+    use wiremock::matchers::{method, path};
+    wiremock::Mock::given(method("POST"))
+        .and(path("/responses"))
+        .respond_with(wiremock::ResponseTemplate::new(400).set_body_json(json!({
+            "error": { "message": "Invalid 'input': malformed item." }
+        })))
+        .with_priority(1)
+        .mount(&hub.server)
+        .await;
+}
+
+/// What reached the metered primary, past its credential probe at boot.
+async fn metered_calls(server: &wiremock::MockServer) -> Vec<String> {
+    server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+        .filter(|body| !body.contains(r#""max_tokens":1,"#))
+        .collect()
+}
+
+#[tokio::test]
+async fn chatgpt_advisor_runs_on_astra_on_an_agent_with_no_other_chatgpt_route() {
+    let hub = hub(|config| {
+        claude_alone(config);
+        config.advisor = chatgpt_advisor(|a| a.model = Some("astra".into()));
+    })
+    .await;
+    hub.chatgpt_login(ALICE).await;
+
+    let outcome = review(&hub, &[]).await;
+
+    match outcome {
+        crate::advisor::AdvisorOutcome::Advice(advice) => {
+            assert_eq!(advice.source_label, "chatgpt")
+        }
+        other => panic!("the review ran on ChatGPT: {other:?}"),
+    }
+    let bodies = chatgpt_bodies(&hub).await;
+    assert_eq!(bodies.len(), 1);
+    assert_eq!(bodies[0]["model"], json!("gpt-6-astra"));
+    assert_eq!(bodies[0]["reasoning"]["effort"], json!("high"));
+    assert!(hub.claude.calls().is_empty());
+}
+
+#[tokio::test]
+async fn chatgpt_advisor_sends_its_own_effort() {
+    let hub = hub(|config| {
+        claude_alone(config);
+        config.advisor = chatgpt_advisor(|a| {
+            a.model = Some("astra".into());
+            a.effort = Some("xhigh".into());
+        });
+    })
+    .await;
+    hub.chatgpt_login(ALICE).await;
+
+    review(&hub, &[]).await;
+
+    assert_eq!(
+        chatgpt_bodies(&hub).await[0]["reasoning"]["effort"],
+        json!("xhigh")
+    );
+}
+
+#[tokio::test]
+async fn chatgpt_advisor_with_no_model_runs_on_the_powerful_tier() {
+    let hub = hub(|config| {
+        claude_alone(config);
+        config.advisor = chatgpt_advisor(|_| {});
+    })
+    .await;
+    hub.chatgpt_login(ALICE).await;
+
+    let outcome = review(&hub, &[]).await;
+
+    assert!(
+        matches!(outcome, crate::advisor::AdvisorOutcome::Advice(_)),
+        "{outcome:?}"
+    );
+    assert_eq!(chatgpt_bodies(&hub).await[0]["model"], json!("gpt-6.1-sol"));
+}
+
+#[tokio::test]
+async fn chatgpt_advisor_panel_runs_every_leg_and_the_synth_on_chatgpt() {
+    let hub = hub(|config| {
+        claude_alone(config);
+        config.advisor = chatgpt_advisor(|a| {
+            a.model = Some("astra".into());
+            a.effort = Some("xhigh".into());
+        });
+    })
+    .await;
+    hub.chatgpt_login(ALICE).await;
+
+    let outcome = review(&hub, &["security", "correctness"]).await;
+
+    assert!(
+        matches!(outcome, crate::advisor::AdvisorOutcome::Advice(_)),
+        "{outcome:?}"
+    );
+    let bodies = chatgpt_bodies(&hub).await;
+    assert_eq!(bodies.len(), 3, "two lenses and the synthesiser");
+    for body in &bodies {
+        assert_eq!(body["model"], json!("gpt-6-astra"));
+        assert_eq!(body["reasoning"]["effort"], json!("xhigh"));
+    }
+    assert!(hub.claude.calls().is_empty());
+}
+
+#[tokio::test]
+async fn chatgpt_advisor_failure_never_reaches_a_paid_model_with_the_guard_on() {
+    let metered = wiremock::MockServer::start().await;
+    let uri = metered.uri();
+    let hub = hub(|config| {
+        metered_alone(config, uri);
+        config.llm.failover = vec!["claude-code:sonnet".into()];
+        config.advisor = chatgpt_advisor(|a| a.model = Some("astra".into()));
+    })
+    .await;
+    hub.claude_login(ALICE);
+    hub.chatgpt_login(ALICE).await;
+    chatgpt_fails(&hub).await;
+
+    let outcome = review(&hub, &[]).await;
+
+    match outcome {
+        crate::advisor::AdvisorOutcome::Unavailable(
+            crate::advisor::AdvisorFailure::FailoverDisabled { detail },
+        ) => {
+            assert!(detail.contains("ChatGPT"), "{detail}");
+            assert!(detail.contains("malformed item"), "{detail}");
+        }
+        other => panic!("the cost guard held: {other:?}"),
+    }
+    assert!(hub.chatgpt_requests().await >= 1);
+    assert_eq!(metered_calls(&metered).await, Vec::<String>::new());
+    assert!(hub.claude.calls().is_empty(), "the failover list stays out");
+}
+
+#[tokio::test]
+async fn chatgpt_advisor_panel_failure_never_reaches_a_paid_model_with_the_guard_on() {
+    let metered = wiremock::MockServer::start().await;
+    let uri = metered.uri();
+    let hub = hub(|config| {
+        metered_alone(config, uri);
+        config.llm.failover = vec!["claude-code:sonnet".into()];
+        config.advisor = chatgpt_advisor(|a| a.model = Some("astra".into()));
+    })
+    .await;
+    hub.claude_login(ALICE);
+    hub.chatgpt_login(ALICE).await;
+    chatgpt_fails(&hub).await;
+
+    let outcome = review(&hub, &["security", "correctness"]).await;
+
+    assert!(
+        matches!(
+            outcome,
+            crate::advisor::AdvisorOutcome::Unavailable(
+                crate::advisor::AdvisorFailure::FailoverDisabled { .. }
+            )
+        ),
+        "{outcome:?}"
+    );
+    assert_eq!(metered_calls(&metered).await, Vec::<String>::new());
+    assert!(hub.claude.calls().is_empty());
+}
+
+#[tokio::test]
+async fn chatgpt_advisor_failure_reaches_the_fallback_only_when_opted_in() {
+    let hub = hub(|config| {
+        claude_alone(config);
+        config.advisor = chatgpt_advisor(|a| {
+            a.model = Some("astra".into());
+            a.allow_failover_to_models = true;
+            a.fallback_model = Some("claude-code:sonnet".into());
+        });
+    })
+    .await;
+    hub.claude_login(ALICE);
+    hub.claude.reply(None, &answer("The fallback's view."));
+    hub.chatgpt_login(ALICE).await;
+    chatgpt_fails(&hub).await;
+
+    let outcome = review(&hub, &[]).await;
+
+    match outcome {
+        crate::advisor::AdvisorOutcome::Advice(advice) => {
+            assert_eq!(advice.text, "The fallback's view.")
+        }
+        other => panic!("the review failed over: {other:?}"),
+    }
+    assert_eq!(hub.claude.calls().len(), 1);
+}
+
+#[tokio::test]
+async fn chatgpt_advisor_opted_in_with_no_fallback_named_moves_to_the_agents_default() {
+    let metered = wiremock::MockServer::start().await;
+    let uri = metered.uri();
+    let hub = hub(|config| {
+        metered_alone(config, uri);
+        config.advisor = chatgpt_advisor(|a| {
+            a.model = Some("astra".into());
+            a.allow_failover_to_models = true;
+        });
+    })
+    .await;
+    hub.chatgpt_login(ALICE).await;
+    chatgpt_fails(&hub).await;
+
+    review(&hub, &[]).await;
+
+    let calls = metered_calls(&metered).await;
+    assert!(!calls.is_empty(), "the review moved to the default model");
+    assert!(calls[0].contains("Is the plan sound?"), "{calls:?}");
+}
+
+#[tokio::test]
+async fn chatgpt_advisor_without_a_login_says_so_before_any_request() {
+    let hub = hub(|config| {
+        claude_alone(config);
+        config.advisor = chatgpt_advisor(|a| a.model = Some("astra".into()));
+    })
+    .await;
+
+    let outcome = review(&hub, &[]).await;
+
+    assert!(
+        matches!(
+            outcome,
+            crate::advisor::AdvisorOutcome::Unavailable(
+                crate::advisor::AdvisorFailure::NoLogin { .. }
+            )
+        ),
+        "{outcome:?}"
+    );
+    assert_eq!(hub.chatgpt_requests().await, 0);
+}
+
+#[tokio::test]
+async fn chatgpt_advisor_on_an_install_with_chatgpt_direct_off_names_the_switch() {
+    let hub = hub(|config| {
+        claude_alone(config);
+        config.subscription.chatgpt_direct = false;
+        config.advisor = chatgpt_advisor(|a| a.model = Some("astra".into()));
+    })
+    .await;
+    hub.chatgpt_login(ALICE).await;
+
+    let outcome = review(&hub, &[]).await;
+
+    match outcome {
+        crate::advisor::AdvisorOutcome::Unavailable(
+            crate::advisor::AdvisorFailure::Misconfigured { detail },
+        ) => assert!(detail.contains("chatgpt_direct"), "{detail}"),
+        other => panic!("the install's switch was named: {other:?}"),
+    }
+    assert_eq!(hub.chatgpt_requests().await, 0);
+}
+
+#[tokio::test]
+async fn reloading_onto_a_chatgpt_advisor_sets_up_its_route() {
+    let hub = hub(claude_alone).await;
+    hub.chatgpt_login(ALICE).await;
+    workforce_common::settings::AgentWorkspaceConfig::write(
+        &hub.service.workspace,
+        "[advisor]\nenabled = true\nsource = \"chatgpt\"\nmodel = \"astra\"\n",
+    )
+    .unwrap();
+
+    let deferred = hub.service.reload_config().await.unwrap();
+
+    assert!(deferred.is_empty(), "{deferred:?}");
+    let outcome = review(&hub, &[]).await;
+    assert!(
+        matches!(outcome, crate::advisor::AdvisorOutcome::Advice(_)),
+        "{outcome:?}"
+    );
+    assert_eq!(chatgpt_bodies(&hub).await[0]["model"], json!("gpt-6-astra"));
+}
+
+#[tokio::test]
+async fn reloading_an_agent_with_no_chain_onto_a_chatgpt_advisor_asks_for_a_restart() {
+    let metered = wiremock::MockServer::start().await;
+    let uri = metered.uri();
+    let hub = hub(|config| metered_alone(config, uri)).await;
+    hub.chatgpt_login(ALICE).await;
+    workforce_common::settings::AgentWorkspaceConfig::write(
+        &hub.service.workspace,
+        "[advisor]\nenabled = true\nsource = \"chatgpt\"\nmodel = \"astra\"\n",
+    )
+    .unwrap();
+
+    let deferred = hub.service.reload_config().await.unwrap();
+
+    assert_eq!(deferred, vec!["chatgpt route".to_string()]);
+    match review(&hub, &[]).await {
+        crate::advisor::AdvisorOutcome::Unavailable(
+            crate::advisor::AdvisorFailure::Misconfigured { detail },
+        ) => assert!(detail.contains("restart"), "{detail}"),
+        other => panic!("the metered primary stayed out: {other:?}"),
+    }
+    assert_eq!(metered_calls(&metered).await, Vec::<String>::new());
+    assert_eq!(hub.chatgpt_requests().await, 0);
 }
 
 #[tokio::test]

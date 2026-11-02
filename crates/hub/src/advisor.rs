@@ -65,6 +65,8 @@ use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
+use workforce_agent::llm::anthropic::Effort;
+use workforce_agent::llm::provider::{with_effort_override, ProviderKind};
 use workforce_agent::tools::filesystem::{Glob, Grep, ReadFile};
 use workforce_agent::tools::web::{WebFetchTool, WebSearchTool};
 use workforce_agent::tools::{Tool, ToolResult};
@@ -259,6 +261,10 @@ pub fn advisor_tool_directive(config: &AdvisorConfig) -> String {
             config.model.as_deref().unwrap_or("default")
         ),
         AdvisorSource::ClaudeCode => "Claude Code (read-only)".to_string(),
+        AdvisorSource::ChatGpt => format!(
+            "a ChatGPT reviewer ({})",
+            config.model.as_deref().unwrap_or("default")
+        ),
         AdvisorSource::Agent => format!(
             "a designated advisor agent ({})",
             config.agent_id.as_deref().unwrap_or("unset")
@@ -371,7 +377,7 @@ impl AdvisorFailure {
             Self::AgentNotFound { agent_id } => format!("Configured advisor agent `{agent_id}` not found or `advisor_mode = false`."),
             Self::Transient { detail } => format!("Transient failure contacting advisor backend: {detail}"),
             Self::Unknown { detail } => format!("Advisor backend failed: {detail}"),
-            Self::FailoverDisabled { detail } => format!("Claude Code advisor failed and `cc_allow_failover_to_models` is false (cost guard). Exact failure: {detail}"),
+            Self::FailoverDisabled { detail } => format!("Advisor failed and `allow_failover_to_models` is false (cost guard). Exact failure: {detail}"),
             Self::TurnLimitExceeded { limit } => format!("Advisor invocation limit ({limit}) reached for this turn."),
             Self::Misconfigured { detail } => format!("Advisor is enabled but misconfigured: {detail}"),
             Self::Cancelled => "Advisor invocation was cancelled.".to_string(),
@@ -715,7 +721,7 @@ fn fanout_synth_model(service: &Arc<AgentService>, config: &AdvisorConfig) -> Op
 
 /// The synth-model decision that doesn't need a live provider: an explicit
 /// override wins; `agent` uses the target's default (`None`); `claude_code`
-/// stays on the configured CC model (no downgrade). Returns `None` only for the
+/// and `chatgpt` stay on the configured model (no downgrade). Returns `None` only for the
 /// `model` backend, signalling the caller to resolve the `standard` tier.
 fn fanout_synth_model_no_tier(config: &AdvisorConfig) -> Option<Option<String>> {
     if let Some(m) = &config.fanout.synth_model {
@@ -723,7 +729,7 @@ fn fanout_synth_model_no_tier(config: &AdvisorConfig) -> Option<Option<String>> 
     }
     match config.source {
         AdvisorSource::Agent => Some(None),
-        AdvisorSource::ClaudeCode => Some(config.model.clone()),
+        AdvisorSource::ClaudeCode | AdvisorSource::ChatGpt => Some(config.model.clone()),
         AdvisorSource::Model => None,
     }
 }
@@ -742,8 +748,9 @@ fn fanout_leg_model(config: &AdvisorConfig) -> Option<String> {
 
 /// Resolve the agent whose routes run the panel (every lens + the synth)
 /// and a label base for `source_label`. `model` runs on the calling agent's
-/// own routes (`None`); `agent` uses the validated target agent's (mirrors
-/// [`dispatch_agent`], including the `advisor_mode` gate).
+/// own routes (`None`), as `chatgpt` does on its pinned one; `agent` uses the
+/// validated target agent's (mirrors [`dispatch_agent`], including the
+/// `advisor_mode` gate).
 fn resolve_fanout_provider(
     service: &Arc<AgentService>,
     config: &AdvisorConfig,
@@ -751,6 +758,7 @@ fn resolve_fanout_provider(
 ) -> Result<(Option<Arc<AgentService>>, String), AdvisorFailure> {
     match config.source {
         AdvisorSource::Model => Ok((None, "model".to_string())),
+        AdvisorSource::ChatGpt => Ok((None, "chatgpt".to_string())),
         AdvisorSource::Agent => {
             let target_id = validate_agent_target(config, service.agent_id.as_str())?;
             let registry = registry.get().and_then(Weak::upgrade).ok_or_else(|| {
@@ -777,14 +785,21 @@ fn resolve_fanout_provider(
     }
 }
 
-/// The loop a review on `model` runs on: the `target` agent's routes when
-/// the panel runs on one, else the calling agent's own.
+/// The loop a review on `model` runs on: `chatgpt`'s route alone, else the
+/// `target` agent's routes when the panel runs on one, else the calling
+/// agent's own.
 async fn review_loop(
     service: &Arc<AgentService>,
+    source: AdvisorSource,
     target: Option<&Arc<AgentService>>,
     model: Option<&str>,
 ) -> Arc<dyn ToolLoop> {
-    crate::agent_turn::tool_loop::tool_loop(target.unwrap_or(service), model).await
+    match (source, model) {
+        (AdvisorSource::ChatGpt, Some(spec)) => {
+            crate::agent_turn::tool_loop::pinned_loop(service, spec)
+        }
+        _ => crate::agent_turn::tool_loop::tool_loop(target.unwrap_or(service), model).await,
+    }
 }
 
 /// Build one lens's request: the same session payload, but the focused
@@ -821,7 +836,7 @@ fn degraded_panel_text(panel: &[(String, String)]) -> String {
     buf
 }
 
-/// Fan out into a diverse-lens panel on the in-process `model`/`agent`
+/// Fan out into a diverse-lens panel on the in-process `model`/`agent`/`chatgpt`
 /// backends: one read-only advisor review per lens in parallel, then a
 /// reconciling synthesiser that unions their premises. Returns the
 /// synthesiser's opinion as a normal [`AdvisorOutcome::Advice`], so the calling
@@ -843,7 +858,13 @@ async fn dispatch_fanout_loop(
     let system_prompt = build_advisor_system_prompt(config, None);
 
     let leg_model = fanout_leg_model(config);
-    let leg_loop = review_loop(service, target.as_ref(), leg_model.as_deref()).await;
+    let leg_loop = review_loop(
+        service,
+        config.source,
+        target.as_ref(),
+        leg_model.as_deref(),
+    )
+    .await;
 
     // One read-only review per lens, all concurrent. Each leg is time-bounded so
     // a hung provider call can't stall the turn; a timed-out leg is just a
@@ -898,7 +919,13 @@ async fn dispatch_fanout_loop(
     let panel_count = panel.len();
     let synth_input = render_panel_for_synth(request.question.as_deref(), &panel);
     let synth_model = fanout_synth_model(service, config);
-    let synth_loop = review_loop(service, target.as_ref(), synth_model.as_deref()).await;
+    let synth_loop = review_loop(
+        service,
+        config.source,
+        target.as_ref(),
+        synth_model.as_deref(),
+    )
+    .await;
     let synth_outcome = tokio::time::timeout(
         FANOUT_LEG_TIMEOUT,
         dispatch_via_loop(
@@ -1170,7 +1197,7 @@ async fn run_cc_advisor(
         max_turns: Some(config.max_rounds),
         allowed_tools: mcp.iter().flat_map(RoundTools::allowed_tools).collect(),
         model: model.clone(),
-        effort: config.cc_effort.clone(),
+        effort: config.effort.clone(),
         mcp: mcp.clone(),
         ..ClaudeCodeConfig::contained(
             workdir.path().to_path_buf(),
@@ -1254,7 +1281,7 @@ async fn run_cc_advisor(
             };
             match failover_request {
                 Some(req) => {
-                    cc_failure_or_failover(service, config, req, identity_id, cancel, detail).await
+                    failure_or_failover(service, config, req, identity_id, cancel, detail).await
                 }
                 None => AdvisorOutcome::Unavailable(AdvisorFailure::from_error_text(&detail)),
             }
@@ -1294,7 +1321,7 @@ async fn dispatch_claude_code(
 /// CC subprocess per lens in parallel, then a CC synthesiser. Every leg and the
 /// synth run on Claude Code (the configured strong reviewer) — the panel only
 /// touches a weaker/non-Claude model when one is explicitly configured
-/// (`fanout.synth_model`) or via the `cc_allow_failover_to_models` guard.
+/// (`fanout.synth_model`) or via the `allow_failover_to_models` guard.
 async fn dispatch_fanout_cc(
     service: &Arc<AgentService>,
     config: &AdvisorConfig,
@@ -1394,30 +1421,42 @@ async fn dispatch_fanout_cc(
     )
 }
 
-/// Decide whether a failed CC dispatch should fall back to a paid model.
-/// Pure function — returns `Ok(fallback_config)` when failover is
-/// allowed, or `Err(FailoverDisabled)` to honour the cost guard.
-fn cc_failover_decision(
+/// Decide whether a failed plan-source dispatch should fall back to a paid
+/// model. Pure function — returns `Ok(fallback_config)` when failover is
+/// allowed, or `Err(FailoverDisabled)` to honour the cost guard. Claude Code
+/// falls back to the configured model through the API when no fallback is
+/// named; ChatGPT's own model just failed, so it falls back to the agent's
+/// default.
+fn failover_decision(
     config: &AdvisorConfig,
     detail: String,
 ) -> Result<AdvisorConfig, AdvisorFailure> {
-    if !config.cc_allow_failover_to_models {
-        return Err(AdvisorFailure::FailoverDisabled { detail });
+    let (backend, model) = match config.source {
+        AdvisorSource::ChatGpt => ("ChatGPT", config.fallback_model.clone()),
+        _ => (
+            "Claude Code",
+            config
+                .fallback_model
+                .clone()
+                .or_else(|| config.model.clone()),
+        ),
+    };
+    if !config.allow_failover_to_models {
+        return Err(AdvisorFailure::FailoverDisabled {
+            detail: format!("{backend}: {detail}"),
+        });
     }
     Ok(AdvisorConfig {
         source: AdvisorSource::Model,
-        model: config
-            .cc_fallback_model
-            .clone()
-            .or_else(|| config.model.clone()),
+        model,
         ..config.clone()
     })
 }
 
-/// When CC fails, respect the `cc_allow_failover_to_models` cost guard.
-/// Default behaviour returns `FailoverDisabled` so subscription users
+/// When a plan source fails, respect the `allow_failover_to_models` cost
+/// guard. Default behaviour returns `FailoverDisabled` so subscription users
 /// don't get billed against a paid API silently.
-async fn cc_failure_or_failover(
+async fn failure_or_failover(
     service: &Arc<AgentService>,
     config: &AdvisorConfig,
     request: &AdvisorRequest,
@@ -1425,13 +1464,13 @@ async fn cc_failure_or_failover(
     cancel: Option<CancellationToken>,
     detail: String,
 ) -> AdvisorOutcome {
-    match cc_failover_decision(config, detail) {
+    match failover_decision(config, detail) {
         Err(failure) => {
             if let AdvisorFailure::FailoverDisabled { detail } = &failure {
                 warn!(
                     target: "advisor",
                     detail = %detail,
-                    "Claude Code advisor failed; failover disabled"
+                    "Plan advisor failed; failover disabled"
                 );
             }
             AdvisorOutcome::Unavailable(failure)
@@ -1440,10 +1479,113 @@ async fn cc_failure_or_failover(
             info!(
                 target: "advisor",
                 model = ?fallback_config.model,
-                "Claude Code advisor failed; failing over to model"
+                "Plan advisor failed; failing over to model"
             );
             dispatch_model(service, &fallback_config, request, identity_id, cancel).await
         }
+    }
+}
+
+/// The `chatgpt` route a `source = "chatgpt"` advisor runs on, once it can run:
+/// checked before any call so each reason is named rather than found in a
+/// provider error. Without a provider chain a route would land on the agent's
+/// primary, which may be metered, so that's refused too.
+fn chatgpt_preflight<'a>(
+    service: &Arc<AgentService>,
+    config: &'a AdvisorConfig,
+) -> Result<&'a str, AdvisorFailure> {
+    let misconfigured = |detail: String| AdvisorFailure::Misconfigured { detail };
+    let spec = config
+        .model
+        .as_deref()
+        .filter(|model| crate::subscription::routed_kind(model) == Some(ProviderKind::ChatGpt))
+        .ok_or_else(|| {
+            misconfigured(format!(
+                "advisor.source = \"chatgpt\" but advisor.model = {:?} does not route to chatgpt",
+                config.model
+            ))
+        })?;
+    if !service.config.subscription.chatgpt_direct {
+        return Err(misconfigured(
+            "advisor.source = \"chatgpt\" needs [subscription] chatgpt_direct = true on this \
+             install"
+                .to_string(),
+        ));
+    }
+    if service.failover_provider.is_none() {
+        return Err(misconfigured(
+            "this agent was started with no ChatGPT route; restart it to set one up".to_string(),
+        ));
+    }
+    service
+        .logins
+        .resolve(SubscriptionKind::ChatGpt)
+        .map_err(|no_login| AdvisorFailure::NoLogin {
+            notice: no_login_notice(service.agent_id.as_str(), &no_login),
+        })?;
+    Ok(spec)
+}
+
+/// Review on a ChatGPT plan: one review, or a panel when asked for, each call
+/// on the pinned route at the configured effort. A failure goes through the
+/// cost guard; the fallback runs outside the effort, at its own model's.
+async fn dispatch_chatgpt(
+    service: &Arc<AgentService>,
+    config: &AdvisorConfig,
+    request: &AdvisorRequest,
+    identity_id: Option<&str>,
+    registry: &crate::hosts::RegistryCell,
+    cancel: Option<CancellationToken>,
+) -> AdvisorOutcome {
+    let spec = match chatgpt_preflight(service, config) {
+        Ok(spec) => spec,
+        Err(failure) => return AdvisorOutcome::Unavailable(failure),
+    };
+    let effort = config.effort.as_deref().and_then(Effort::parse);
+    let review = async {
+        match should_fanout(config, request) {
+            true => {
+                dispatch_fanout_loop(
+                    service,
+                    config,
+                    request,
+                    identity_id,
+                    registry,
+                    cancel.clone(),
+                )
+                .await
+            }
+            false => {
+                dispatch_via_loop(
+                    crate::agent_turn::tool_loop::pinned_loop(service, spec).as_ref(),
+                    service,
+                    build_advisor_system_prompt(config, None),
+                    render_request(request),
+                    build_advisor_tools(service),
+                    Some(spec.to_string()),
+                    config.max_rounds,
+                    cancel.clone(),
+                    identity_id,
+                    "chatgpt".to_string(),
+                    "advisor:chatgpt",
+                )
+                .await
+            }
+        }
+    };
+    match with_effort_override(effort, review).await {
+        AdvisorOutcome::Unavailable(failure) if !matches!(failure, AdvisorFailure::Cancelled) => {
+            failure_or_failover(
+                service,
+                config,
+                request,
+                identity_id,
+                cancel,
+                failure.human_reason(),
+            )
+            .await
+        }
+        outcome => outcome,
     }
 }
 
@@ -1555,6 +1697,9 @@ pub async fn dispatch(
             AdvisorSource::ClaudeCode => {
                 dispatch_fanout_cc(service, config, request, identity_id, cancel).await
             }
+            AdvisorSource::ChatGpt => {
+                dispatch_chatgpt(service, config, request, identity_id, registry, cancel).await
+            }
             _ => {
                 dispatch_fanout_loop(service, config, request, identity_id, registry, cancel).await
             }
@@ -1564,6 +1709,9 @@ pub async fn dispatch(
         AdvisorSource::Model => dispatch_model(service, config, request, identity_id, cancel).await,
         AdvisorSource::ClaudeCode => {
             dispatch_claude_code(service, config, request, identity_id, cancel).await
+        }
+        AdvisorSource::ChatGpt => {
+            dispatch_chatgpt(service, config, request, identity_id, registry, cancel).await
         }
         AdvisorSource::Agent => {
             dispatch_agent(service, config, request, identity_id, registry, cancel).await
@@ -2067,7 +2215,7 @@ mod tests {
             detail: "exit 1: spawn failed".into(),
         };
         let msg = f.human_reason();
-        assert!(msg.contains("cc_allow_failover_to_models"));
+        assert!(msg.contains("allow_failover_to_models"));
         assert!(msg.contains("spawn failed"));
     }
 
@@ -2152,13 +2300,13 @@ mod tests {
     }
 
     #[test]
-    fn cc_failover_decision_refuses_when_guard_is_off() {
+    fn failover_decision_refuses_when_guard_is_off() {
         let cfg = AdvisorConfig {
             source: AdvisorSource::ClaudeCode,
-            cc_allow_failover_to_models: false,
+            allow_failover_to_models: false,
             ..Default::default()
         };
-        match cc_failover_decision(&cfg, "exit 1: spawn failed".into()) {
+        match failover_decision(&cfg, "exit 1: spawn failed".into()) {
             Err(AdvisorFailure::FailoverDisabled { detail }) => {
                 assert!(detail.contains("spawn failed"));
             }
@@ -2167,41 +2315,41 @@ mod tests {
     }
 
     #[test]
-    fn cc_failover_decision_returns_model_config_when_guard_is_on() {
+    fn failover_decision_returns_model_config_when_guard_is_on() {
         let cfg = AdvisorConfig {
             source: AdvisorSource::ClaudeCode,
-            cc_allow_failover_to_models: true,
-            cc_fallback_model: Some("expensive".into()),
+            allow_failover_to_models: true,
+            fallback_model: Some("expensive".into()),
             ..Default::default()
         };
-        let fallback = cc_failover_decision(&cfg, "exit 137".into()).expect("failover allowed");
+        let fallback = failover_decision(&cfg, "exit 137".into()).expect("failover allowed");
         assert_eq!(fallback.source, AdvisorSource::Model);
         assert_eq!(fallback.model.as_deref(), Some("expensive"));
     }
 
     #[test]
-    fn cc_failover_decision_falls_back_to_model_field_when_no_fallback_model() {
+    fn failover_decision_falls_back_to_model_field_when_no_fallback_model() {
         let cfg = AdvisorConfig {
             source: AdvisorSource::ClaudeCode,
-            cc_allow_failover_to_models: true,
-            cc_fallback_model: None,
+            allow_failover_to_models: true,
+            fallback_model: None,
             model: Some("default-model".into()),
             ..Default::default()
         };
-        let fallback = cc_failover_decision(&cfg, "x".into()).expect("failover allowed");
+        let fallback = failover_decision(&cfg, "x".into()).expect("failover allowed");
         assert_eq!(fallback.model.as_deref(), Some("default-model"));
     }
 
     #[test]
-    fn cc_failover_decision_passes_alias_through_verbatim() {
+    fn failover_decision_passes_alias_through_verbatim() {
         let cfg = AdvisorConfig {
             source: AdvisorSource::ClaudeCode,
-            cc_allow_failover_to_models: true,
-            cc_fallback_model: None,
+            allow_failover_to_models: true,
+            fallback_model: None,
             model: Some("opus".into()),
             ..Default::default()
         };
-        let fallback = cc_failover_decision(&cfg, "x".into()).expect("failover allowed");
+        let fallback = failover_decision(&cfg, "x".into()).expect("failover allowed");
         assert_eq!(fallback.model.as_deref(), Some("opus"));
     }
 

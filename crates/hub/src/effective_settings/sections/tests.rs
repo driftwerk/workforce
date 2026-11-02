@@ -1627,3 +1627,17 @@ max_chars = 3000
         assert_eq!(row.value, row.chain.last().unwrap().value, "{}", row.path());
     }
 }
+
+#[tokio::test]
+async fn an_advisor_key_written_under_its_old_name_is_the_agents_under_the_new_one() {
+    let hub = hub(|_| {}).await;
+    configured(&hub, "[advisor]\ncc_effort = \"low\"\n").await;
+
+    let rows = all(&hub, &member(ALICE)).await;
+
+    let effort = row(&rows, "advisor.effort");
+    assert_eq!(
+        (effort.source, &effort.value),
+        (Some(Source::Agent), &json!("low"))
+    );
+}

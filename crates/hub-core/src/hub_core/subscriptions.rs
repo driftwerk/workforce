@@ -18,8 +18,8 @@ use workforce_agent::tools::speech_gen::SPEECH_TOOL_NAME;
 use workforce_agent::tools::video_gen::VIDEO_TOOL_NAME;
 use workforce_common::secret::KeySlot;
 use workforce_common::settings::{
-    is_removed_provider, AgentWorkspaceConfig, CodingCodexConfig, CodingEngineKind, ExecutorKind,
-    LlmConfig, WorkforceConfig, REMOVED_PROVIDER_POINTER,
+    is_removed_provider, AdvisorConfig, AdvisorSource, AgentWorkspaceConfig, CodingCodexConfig,
+    CodingEngineKind, ExecutorKind, LlmConfig, WorkforceConfig, REMOVED_PROVIDER_POINTER,
 };
 use workforce_common::subscription::{SubscriptionKind, SubscriptionRoute};
 
@@ -280,10 +280,20 @@ pub fn chain_specs<'a>(
         .chain(&memory.lesson_extract_model)
 }
 
+/// Every model the agent's chain needs a provider for: its [`chain_specs`] and
+/// what its advisor routes. The advisor's stay out of [`chain_specs`], since a
+/// bad one costs reviews, not the agent: see [`advisor_route_findings`].
+pub fn provider_specs<'a>(
+    llm: &'a LlmConfig,
+    resolved: &'a ResolvedConfig,
+) -> impl Iterator<Item = &'a String> + 'a {
+    chain_specs(llm, resolved).chain(resolved.advisor.routed_models())
+}
+
 /// The subscriptions whose logins an agent's calls draw on, as its
-/// [`chain_specs`] route them, each once in [`SubscriptionKind::ALL`] order.
+/// [`provider_specs`] route them, each once in [`SubscriptionKind::ALL`] order.
 pub fn routed_subscriptions(llm: &LlmConfig, resolved: &ResolvedConfig) -> Vec<SubscriptionKind> {
-    let routed: Vec<SubscriptionKind> = chain_specs(llm, resolved)
+    let routed: Vec<SubscriptionKind> = provider_specs(llm, resolved)
         .filter_map(|spec| {
             routed_kind(spec)?
                 .subscription_route()
@@ -490,6 +500,8 @@ pub fn review_agent_llm(
         .chain(direct_off)
         .chain(media_findings(llm))
         .chain(effort_finding(llm, resolved))
+        .chain(chatgpt_advisor_findings(&resolved.advisor))
+        .chain(advisor_route_findings(&resolved.advisor, install))
         .chain(
             resolved
                 .workspace
@@ -498,6 +510,97 @@ pub fn review_agent_llm(
         )
         .partition(Finding::is_refused);
     refused.into_iter().chain(warnings).collect()
+}
+
+/// What a `source = "chatgpt"` advisor asks that its route can't do: run on a
+/// model routed elsewhere, or at a level ChatGPT doesn't take. Such a config is
+/// new and asks for what the source exists to rule out, so it doesn't load.
+fn chatgpt_advisor_findings(advisor: &AdvisorConfig) -> impl Iterator<Item = Finding> {
+    let on_chatgpt = advisor.enabled && advisor.source == AdvisorSource::ChatGpt;
+    let elsewhere = |spec: &'static str, model: Option<&str>| {
+        model
+            .filter(|_| on_chatgpt)
+            .filter(|model| routed_kind(model) != Some(ProviderKind::ChatGpt))
+            .map(|model| {
+                Finding::refused(
+                    spec,
+                    format!(
+                        "{model:?} does not route to chatgpt: source = \"chatgpt\" runs on a \
+                         ChatGPT plan login only; use a model id, a tier or chatgpt:<id>"
+                    ),
+                )
+            })
+    };
+    let model = elsewhere("[advisor] model", advisor.model.as_deref());
+    let synth = elsewhere(
+        "[advisor.fanout] synth_model",
+        advisor
+            .fanout
+            .synth_model
+            .as_deref()
+            .filter(|_| advisor.fanout.enabled),
+    );
+    let offered = ProviderKind::ChatGpt.efforts();
+    let effort = advisor
+        .effort
+        .as_deref()
+        .filter(|_| on_chatgpt)
+        .filter(|effort| {
+            !offered
+                .iter()
+                .any(|e| e.eq_ignore_ascii_case(effort.trim()))
+        })
+        .map(|effort| {
+            Finding::refused(
+                "[advisor] effort",
+                format!(
+                    "effort = {effort:?} is not a level chatgpt takes: use one of {}",
+                    offered.join(", ")
+                ),
+            )
+        });
+    model.into_iter().chain(synth).chain(effort)
+}
+
+/// What stops an advisor's own routes serving a review. Warnings, never
+/// refusals: only the advisor is affected, it says why on each call, and the
+/// agent's other work must still load.
+fn advisor_route_findings(advisor: &AdvisorConfig, install: &Install<'_>) -> Vec<Finding> {
+    let mut findings = Vec::new();
+    for spec in advisor.routed_models() {
+        let kind = routed_kind(spec);
+        let model = split_routing_prefix(spec.trim()).1;
+        let named = spec.contains(':') && ModelTier::from_name(model).is_none();
+        findings.extend(removed_provider_finding(spec).map(|f| f.message));
+        if kind == Some(ProviderKind::ChatGpt) {
+            findings.extend(chatgpt_model_finding(spec, model).map(|f| f.message));
+            if !install.chatgpt_direct {
+                findings.push(format!(
+                    "{spec:?}: the install has chatgpt_direct off; calls on this route are refused"
+                ));
+            }
+        }
+        if kind == Some(ProviderKind::Codex) {
+            if *install.executor != ExecutorKind::Remote {
+                findings.push(format!(
+                    "{spec:?} routes to codex, which runs only on the remote worker"
+                ));
+            }
+            if named {
+                let id = install.codex.resolve_model(model);
+                findings.extend(codex_turn_model_finding(spec, &id).map(|f| f.message));
+            }
+        }
+    }
+    findings
+        .into_iter()
+        .map(|message| {
+            Finding::warning(
+                "[advisor]",
+                format!("{message}; advisor reviews on it will fail"),
+            )
+        })
+        .collect()
 }
 
 /// What `[llm] effort` says that the agent's provider and model cannot

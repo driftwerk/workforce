@@ -75,6 +75,15 @@ pub(crate) async fn tool_loop(
     }
 }
 
+/// The loop on the one route `spec` names, with nothing behind it: neither the
+/// agent's failover list nor its hub default model.
+pub(crate) fn pinned_loop(service: &Arc<AgentService>, spec: &str) -> Arc<dyn ToolLoop> {
+    Arc::new(ChainLoop {
+        chain: crate::turn_loop::pinned_chain(service, spec),
+        service: Arc::clone(service),
+    })
+}
+
 /// The routes of `spec`, else of the agent's default model, when any of
 /// them is a CLI's; `None` when the agent's provider serves them all.
 pub(crate) async fn loop_routes(service: &AgentService, spec: Option<&str>) -> Option<TurnChain> {
