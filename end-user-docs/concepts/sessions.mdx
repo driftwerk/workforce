@@ -89,6 +89,10 @@ The defaults are tuned for a 200,000-token context window and aim to keep usage 
 | `max_compaction_passes` | 3 | Maximum compaction iterations per cycle — safety valve. |
 | `min_messages_to_compact` | 5 | Minimum messages to compact — skip if fewer non-system messages would be replaced. |
 | `rollover_keep_recent` | 4 | Recent turns carried verbatim into a rolled-over session, on top of the carry-over summary. |
+| `soft_eviction_threshold` | 0.60 | Fraction of the context window at which stale tool outputs from the current turn are evicted, before full summarisation is needed (60%). |
+| `stale_rollover_hours` | 24 | Hours of inactivity after which resuming a conversational-channel session rolls it over to a fresh one with a dated carry-over. `0` disables. |
+| `voice_rollover_max_messages` | 80 | Number of user and assistant messages at which a voice session rolls over, regardless of token usage. `0` disables. |
+| `chat_rollover_max_messages` | 200 | Number of user and assistant messages at which a text session on a conversational channel (iOS, web, terminal) rolls over. `0` disables. |
 | `flush_prompt` | `None` | Custom system prompt for memory flush (what to persist before compaction). |
 | `summary_prompt` | `None` | Custom system prompt for conversation summarisation. |
 
