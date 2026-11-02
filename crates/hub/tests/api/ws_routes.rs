@@ -685,22 +685,22 @@ async fn a_spoken_reply_keeps_its_code_links_and_lists() {
         saved_answers(&service, connected["session_id"].as_str().unwrap()),
         [WRITTEN]
     );
-    assert!(said.starts_with("(excited) See"), "{said}");
-    assert!(
-        !said.contains('*'),
-        "what's said is made for speech: {said}"
+    assert_eq!(
+        said,
+        format!("(excited) {WRITTEN}"),
+        "Desk makes what's said speakable itself: {frames:?}"
     );
-    assert!(said.contains("myvar"), "{said}");
 }
 
 /// A client that doesn't read `speech` is sent what it always was: text made for
-/// speech, since that's what it will say.
+/// speech, since that's what it will say, without a bracketed word that might
+/// be a direction.
 #[tokio::test]
 async fn an_older_phone_still_gets_text_made_for_speech() {
     let data = tempfile::tempdir().unwrap();
     let (service, _llm) = crate::support::agent_on_mock_llm_saying(
         data.path(),
-        &["See my_var and **this**."],
+        &["See my_var and **this** (optional)."],
         std::time::Duration::ZERO,
     )
     .await;

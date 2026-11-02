@@ -66,9 +66,9 @@ use workforce_agent::runner::AgentRunner;
 
 use crate::hosts::TurnHost;
 use crate::serve::{
-    answer_is_code_shaped, build_prior_messages, data_claim_grounding_skip, end_turn_record,
-    infer_task_type, is_person, is_workflow_step_session, persist_turn_owned_metadata,
-    prompt_privacy, prompt_visibility, record_round_cap_continuation,
+    answer_is_code_shaped, build_prior_messages_reading, data_claim_grounding_skip,
+    end_turn_record, infer_task_type, is_person, is_workflow_step_session,
+    persist_turn_owned_metadata, prompt_privacy, prompt_visibility, record_round_cap_continuation,
     render_shared_visibility_block, render_slack_identity_block, reply_only,
     select_visible_other_sessions, session_owner_for_turn, stop_turn_record, worker_tool_patterns,
     AgentService, IsolatedRoute, IsolatedRun, MessageProgress, PromptPrivacy, RunAuthor,
@@ -3462,9 +3462,10 @@ pub(crate) async fn process_admitted(
     // Build conversation history from session (filters empty content,
     // merges consecutive same-role messages, skips tool/system messages)
     let shared_replay = shared_replay(service, &session, user);
-    let prior_messages = build_prior_messages(
-        &crate::spoken_text::for_the_model(&session),
+    let prior_messages = build_prior_messages_reading(
+        &session.messages,
         shared_replay.as_ref(),
+        crate::spoken_text::for_the_model(&session),
     );
     observe_replay_prefix(&mut session, &prior_messages);
     let session_tools = Arc::new(crate::tool_loading::session_tools(
@@ -4902,12 +4903,14 @@ pub(crate) async fn stream_admitted(
     // Build conversation history from session (filters empty content,
     // merges consecutive same-role messages, skips tool/system messages)
     let shared_replay = shared_replay(service, &session, user);
-    let prior_messages = build_prior_messages(
-        &crate::spoken_text::for_the_model(&session),
+    let prior_messages = build_prior_messages_reading(
+        &session.messages,
         shared_replay.as_ref(),
+        crate::spoken_text::for_the_model(&session),
     );
     observe_replay_prefix(&mut session, &prior_messages);
-    let spoken = crate::spoken_text::spoken_with(&session);
+    let spoken = crate::spoken_text::spoken_with(&session)
+        .map(|markup| (markup, crate::spoken_text::asides_of(&session)));
     let session_tools_for_task = Arc::new(crate::tool_loading::session_tools(
         &session.messages,
         service.config.tools.loading.keep_turns,
@@ -5586,7 +5589,7 @@ pub(crate) async fn stream_admitted(
     // Everything downstream reads the reply without voice directions; they
     // travel beside it.
     let progress_rx = match spoken {
-        Some(markup) => crate::spoken_text::parted(progress_rx, markup),
+        Some((markup, asides)) => crate::spoken_text::parted(progress_rx, markup, asides),
         None => progress_rx,
     };
 

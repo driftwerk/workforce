@@ -290,6 +290,16 @@ pub fn build_prior_messages(
     messages: &[SessionMessage],
     shared: Option<&SharedReplay>,
 ) -> Vec<LlmMessage> {
+    build_prior_messages_reading(messages, shared, std::borrow::Cow::Borrowed)
+}
+
+/// [`build_prior_messages`], with each assistant message's text as `assistant`
+/// reads it; what's stored is left as it is, and nothing else is copied.
+pub fn build_prior_messages_reading<'m>(
+    messages: &'m [SessionMessage],
+    shared: Option<&SharedReplay>,
+    assistant: impl Fn(&'m str) -> std::borrow::Cow<'m, str>,
+) -> Vec<LlmMessage> {
     let filtered: Vec<&SessionMessage> = messages
         .iter()
         .filter(|m| m.role != MessageRole::System)
@@ -339,10 +349,11 @@ pub fn build_prior_messages(
                 build_user_llm_message(msg, shared)
             }
             MessageRole::Assistant => {
-                if msg.content.trim().is_empty() {
+                let text = assistant(&msg.content);
+                if text.trim().is_empty() {
                     continue;
                 }
-                LlmMessage::assistant(&msg.content)
+                LlmMessage::assistant(&*text)
             }
             MessageRole::Tool => {
                 if shared.is_some_and(|s| msg.actor.as_deref() != Some(s.viewer.as_str())) {

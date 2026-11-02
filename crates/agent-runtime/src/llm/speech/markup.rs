@@ -25,11 +25,13 @@
 //! near-miss of one, see [`ALIASES`]) is a direction anywhere. `(see page 4)`,
 //! `(API)` and `(a long aside, with commas)` are prose and are left alone.
 //!
-//! The two sides guess differently, because a wrong guess costs differently.
-//! A word read out in brackets costs the listener a moment, so what's spoken
-//! also loses any other group that is all lower case and opens a sentence or
-//! is a single word of two letters or more. What's read and saved loses content
-//! for good, so it loses only what names a direction ([`Markup::shown`]).
+//! What's read and saved loses only what names a direction ([`Markup::shown`]):
+//! anything more would lose content for good. What's spoken depends on where
+//! it's heard ([`Asides`]). Where every word is said (Desk), speech loses
+//! exactly what the text shown does. Where a reply is only heard, a word read
+//! out in brackets costs the listener a moment, so speech also loses any other
+//! group that is all lower case and opens a sentence or is a single word of two
+//! letters or more.
 
 /// How directions are written for the voice that will speak.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,6 +42,18 @@ pub enum Markup {
     FishS2,
     /// Every other voice: no directions at all.
     Plain,
+}
+
+/// What speech makes of a group in brackets that names no direction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Asides {
+    /// Said, as it's shown: the reply is on screen and heard in full, so speech
+    /// and text differ only by the directions.
+    Said,
+    /// Taken for a direction the agent made up when it's lower case and a word
+    /// alone or opening a sentence, as in `(pensive)`: where a reply is only
+    /// heard, a word read out in brackets costs more than one lost.
+    Guessed,
 }
 
 /// Where a tag may go.
@@ -276,11 +290,17 @@ impl Markup {
     }
 
     /// `text` with only the directions this voice performs, each written as
-    /// it takes them.
+    /// it takes them, and other bracketed words guessed at ([`Asides::Guessed`]).
     pub fn apply(self, text: &str) -> String {
+        self.apply_with(Asides::Guessed, text)
+    }
+
+    /// [`Markup::apply`], with `asides` deciding what becomes of other
+    /// bracketed words.
+    pub fn apply_with(self, asides: Asides, text: &str) -> String {
         let mut cursor = Cursor::default();
         let mut out = String::with_capacity(text.len());
-        rewrite(self, text, &mut cursor, &mut out);
+        rewrite(self, asides, text, &mut cursor, &mut out);
         out
     }
 
@@ -289,15 +309,22 @@ impl Markup {
     pub fn shown(self, text: &str) -> String {
         let mut cursor = Cursor::default();
         let mut out = String::with_capacity(text.len());
-        rewrite_shown(self, text, &mut cursor, &mut out);
+        rewrite_shown(text, &mut cursor, &mut out);
         out
     }
 
     /// Parts a reply as it streams in: the text to show, and the text to
-    /// speak in this voice.
+    /// speak in this voice, with other bracketed words guessed at.
     pub fn split(self) -> MarkupSplit {
+        self.split_with(Asides::Guessed)
+    }
+
+    /// [`Markup::split`], with `asides` deciding what speech makes of other
+    /// bracketed words.
+    pub fn split_with(self, asides: Asides) -> MarkupSplit {
         MarkupSplit {
             markup: self,
+            asides,
             held: String::new(),
             shown: Cursor::default(),
             spoken: Cursor::default(),
@@ -339,15 +366,14 @@ TTS provider: Fish Audio (S1)
                 "\
 TTS provider: Fish Audio (S2)
 - You can direct the voice with cues in square brackets, never parentheses
-  (those are read out loud).
+  (those are read out loud). Only the cues below are taken for directions:
+  any other word in square brackets is shown to the reader as you wrote it.
 - An emotion goes at the start of the sentence it colours:
   {emotions}
 - Tone, anywhere: {tones}
 - Sounds, anywhere; write the sound after it, as in \"[laughing] Ha, ha\":
   {sounds}
 - Pauses: {pauses}
-- A short description works too, like [warmly] or [tired], kept to a few words,
-  at the start of a sentence.
 - Use them where a person would really sound that way, not on every sentence.",
                 emotions = list(EMOTIONS, '[', ']'),
                 tones = list(TONES, '[', ']'),
@@ -386,6 +412,31 @@ pub fn without_named_directions(text: &str) -> String {
     out
 }
 
+/// Speech for a client that reads a reply's text aloud as it shows it: the
+/// directions and the bracketed words guessed to be some taken out, as a voice
+/// that takes none would be given them ([`Asides::Guessed`]), piece by piece
+/// of a stream's speech. Each piece is to end where [`MarkupSplit`] ends one,
+/// never inside a group.
+#[derive(Debug, Clone, Default)]
+pub struct Plainly {
+    cursor: Cursor,
+}
+
+impl Plainly {
+    /// The next piece of the stream's speech, as the client is to say it.
+    pub fn piece(&mut self, spoken: &str) -> String {
+        let mut out = String::with_capacity(spoken.len());
+        rewrite(
+            Markup::Plain,
+            Asides::Guessed,
+            spoken,
+            &mut self.cursor,
+            &mut out,
+        );
+        out
+    }
+}
+
 /// One piece of a reply, parted.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Parted {
@@ -401,6 +452,7 @@ pub struct Parted {
 #[derive(Debug, Clone)]
 pub struct MarkupSplit {
     markup: Markup,
+    asides: Asides,
     held: String,
     shown: Cursor,
     spoken: Cursor,
@@ -433,8 +485,14 @@ impl MarkupSplit {
 
     fn part(&mut self, text: &str) -> Parted {
         let mut parted = Parted::default();
-        rewrite_shown(self.markup, text, &mut self.shown, &mut parted.shown);
-        rewrite(self.markup, text, &mut self.spoken, &mut parted.spoken);
+        rewrite_shown(text, &mut self.shown, &mut parted.shown);
+        rewrite(
+            self.markup,
+            self.asides,
+            text,
+            &mut self.spoken,
+            &mut parted.spoken,
+        );
         parted
     }
 }
@@ -615,9 +673,11 @@ enum Verdict {
     Prose,
     Drop,
     Write(String),
+    /// Prose, written another way for the voice to read it.
+    Said(String),
 }
 
-fn judge(markup: Markup, inner: &str, sentence_start: bool) -> Verdict {
+fn judge(markup: Markup, asides: Asides, inner: &str, open: char, sentence_start: bool) -> Verdict {
     let said = words(inner);
     // Any family's tag is a direction, so a voice that can't perform it
     // still has it removed.
@@ -626,8 +686,14 @@ fn judge(markup: Markup, inner: &str, sentence_start: bool) -> Verdict {
     let single = said.split(' ').count() == 1;
     // A letter alone is a list's `(a)` or a task's `[x]`.
     let letter = said.chars().count() == 1;
-    if known.is_none() && (letter || !(lower && (sentence_start || single))) {
-        return Verdict::Prose;
+    let guessed = asides == Asides::Guessed && !letter && lower && (sentence_start || single);
+    if !(named(&said) || guessed) {
+        // S2 performs anything in square brackets as a cue, and reads what's in
+        // parentheses: a word meant to be heard goes in those.
+        return match (markup, asides, open) {
+            (Markup::FishS2, Asides::Said, '[') if !letter => Verdict::Said(format!("({inner})")),
+            _ => Verdict::Prose,
+        };
     }
     match (markup, known) {
         (Markup::Plain, _) => Verdict::Drop,
@@ -642,9 +708,9 @@ fn judge(markup: Markup, inner: &str, sentence_start: bool) -> Verdict {
     }
 }
 
-fn rewrite(markup: Markup, text: &str, cursor: &mut Cursor, out: &mut String) {
+fn rewrite(markup: Markup, asides: Asides, text: &str, cursor: &mut Cursor, out: &mut String) {
     rewrite_with(
-        |inner, sentence_start, _| judge(markup, inner, sentence_start),
+        |inner, sentence_start, open| judge(markup, asides, inner, open, sentence_start),
         text,
         cursor,
         out,
@@ -652,18 +718,12 @@ fn rewrite(markup: Markup, text: &str, cursor: &mut Cursor, out: &mut String) {
 }
 
 /// What a reader keeps of a direction-shaped group: all but what names a
-/// direction, or, for a voice told it may describe its own at the start of a
-/// sentence, one of those.
-fn rewrite_shown(markup: Markup, text: &str, cursor: &mut Cursor, out: &mut String) {
+/// direction. No voice is told it may write any other, so nothing else is
+/// taken for one: `[error] failed to connect` is a log line.
+fn rewrite_shown(text: &str, cursor: &mut Cursor, out: &mut String) {
     rewrite_with(
-        |inner, sentence_start, open| {
-            let said = words(inner);
-            let described = markup == Markup::FishS2
-                && open == '['
-                && sentence_start
-                && said.chars().count() > 1
-                && !inner.chars().any(char::is_uppercase);
-            if named(&said) || described {
+        |inner, _, _| {
+            if named(&words(inner)) {
                 Verdict::Drop
             } else {
                 Verdict::Prose
@@ -716,6 +776,12 @@ fn rewrite_with(
                     } else {
                         cursor.skip_space = cursor.after_space();
                     }
+                    i += len;
+                    continue;
+                }
+                Verdict::Said(prose) => {
+                    out.push_str(&prose);
+                    prose.chars().for_each(|c| cursor.wrote(c));
                     i += len;
                     continue;
                 }
@@ -1053,16 +1119,118 @@ mod tests {
         assert_eq!(without_named_directions("Well (sighing) yes."), "Well yes.");
     }
 
-    /// A voice told it may describe itself at the start of a sentence: that's as
-    /// much a direction as a tag, on S2 alone, and a word elsewhere isn't.
+    /// Nothing but a named direction is taken from the reader, at the start of
+    /// a sentence or a line either: no voice is told it may write another.
     #[test]
-    fn what_s2_may_describe_is_kept_from_the_reader() {
-        let text = "[warmly] Welcome back. See [note] below.\n- [x] done";
-        assert_eq!(
-            Markup::FishS2.shown(text),
-            "Welcome back. See [note] below.\n- [x] done"
-        );
-        assert_eq!(Markup::FishS1.shown(text), text);
+    fn what_is_shown_keeps_log_lines_and_words_after_a_colon() {
+        let text = "Tip: [draft] version. Status: [ok] and done.\n\
+                    [error] failed to connect\n[info] retrying\n[warmly] Welcome back.";
+        let chars: Vec<char> = text.chars().collect();
+        for markup in [Markup::FishS1, Markup::FishS2, Markup::Plain] {
+            assert_eq!(markup.shown(text), text, "{markup:?}");
+            for cut in 0..=chars.len() {
+                let (a, b): (String, String) =
+                    (chars[..cut].iter().collect(), chars[cut..].iter().collect());
+                assert_eq!(
+                    parted(markup, &[&a, &b]).shown,
+                    text,
+                    "{markup:?} cut at {cut}"
+                );
+            }
+        }
+        let s2 = Markup::FishS2.guidance().unwrap();
+        assert!(!s2.contains("[warmly]"), "S2 guidance offers its own cues");
+    }
+
+    /// Where every word is said, speech loses what the text shown loses and no
+    /// more; S2 is given in parentheses what it would otherwise take for a cue.
+    #[test]
+    fn where_every_word_is_said_speech_drops_only_named_directions() {
+        for (markup, text, said) in [
+            (
+                Markup::FishS1,
+                "Choose (yes) or (no).",
+                "Choose (yes) or (no).",
+            ),
+            (
+                Markup::FishS1,
+                "The mode is (strict) by default",
+                "The mode is (strict) by default",
+            ),
+            (
+                Markup::FishS1,
+                "Menu (file) > [edit]",
+                "Menu (file) > [edit]",
+            ),
+            (Markup::FishS1, "(re)start it", "(re)start it"),
+            (
+                Markup::FishS1,
+                "(excited) Pick (one). (pensive) Hm.",
+                "(excited) Pick (one). Hm.",
+            ),
+            (Markup::Plain, "(excited) Pick (one).", "Pick (one)."),
+            (
+                Markup::FishS2,
+                "Menu (file) > [edit]",
+                "Menu (file) > (edit)",
+            ),
+            (
+                Markup::FishS2,
+                "[excited] Done: [x] one.",
+                "[excited] Done: [x] one.",
+            ),
+            (Markup::FishS2, "(pensive) Hm.", "[pensive] Hm."),
+        ] {
+            assert_eq!(markup.apply_with(Asides::Said, text), said, "{markup:?}");
+        }
+        // Elsewhere, as the phones have it.
+        assert_eq!(Markup::FishS1.apply("Choose (yes) or (no)."), "Choose or.");
+    }
+
+    /// Streamed where every word is said, speech is what the whole text gives,
+    /// at every cut.
+    #[test]
+    fn where_every_word_is_said_a_split_says_what_the_whole_text_would() {
+        let text = "(excited) Choose (yes) or [edit]. Menu (file) > (re)start (sighing) now.";
+        let chars: Vec<char> = text.chars().collect();
+        for markup in [Markup::FishS1, Markup::FishS2, Markup::Plain] {
+            let whole = Parted {
+                shown: markup.shown(text),
+                spoken: markup.apply_with(Asides::Said, text),
+            };
+            for cut in 0..=chars.len() {
+                let (a, b): (String, String) =
+                    (chars[..cut].iter().collect(), chars[cut..].iter().collect());
+                let mut split = markup.split_with(Asides::Said);
+                let mut out = split.push(&a);
+                let next = split.push(&b);
+                let last = split.finish();
+                out.shown.push_str(&next.shown);
+                out.shown.push_str(&last.shown);
+                out.spoken.push_str(&next.spoken);
+                out.spoken.push_str(&last.spoken);
+                assert_eq!(out, whole, "{markup:?} cut at {cut}");
+            }
+        }
+    }
+
+    /// What a client saying a frame's text hears, piece by piece of a stream's
+    /// speech, is what the whole speech gives a voice that takes no directions.
+    #[test]
+    fn plainly_says_a_stream_as_the_whole_would_be_said() {
+        let text = "(excited) Pass the flag (optional) too. Ask (see below) me [edit] (Two) now.";
+        for markup in [Markup::FishS1, Markup::FishS2, Markup::Plain] {
+            for asides in [Asides::Said, Asides::Guessed] {
+                let mut split = markup.split_with(asides);
+                let mut plainly = Plainly::default();
+                let mut heard = String::new();
+                for piece in text.split_inclusive(' ') {
+                    heard.push_str(&plainly.piece(&split.push(piece).spoken));
+                }
+                heard.push_str(&plainly.piece(&split.finish().spoken));
+                assert_eq!(heard, Markup::Plain.apply(text), "{markup:?} {asides:?}");
+            }
+        }
     }
 
     /// Moods no voice performs don't reach the reader either.

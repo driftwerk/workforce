@@ -135,7 +135,7 @@ impl CrewHub {
             .closing(service)
             .into_iter()
             .filter_map(|progress| {
-                crate::gateway::chat_progress_to_broadcast(progress, &session_id, false)
+                crate::gateway::chat_progress_to_broadcast(progress, &session_id)
             })
         {
             let _ = tx.send(message);

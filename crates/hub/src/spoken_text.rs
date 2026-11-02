@@ -12,9 +12,11 @@ use std::borrow::Cow;
 
 use crate::chat_worker::AnswerDelivery;
 use tokio::sync::mpsc;
-use workforce_agent::llm::speech::{without_named_directions, Markup, MarkupSplit, Parted};
+use workforce_agent::llm::speech::{
+    without_named_directions, Asides, Markup, MarkupSplit, Parted, Plainly,
+};
 use workforce_agent::runner::ProgressEvent;
-use workforce_common::session::{MessageRole, Session, SessionMessage};
+use workforce_common::session::Session;
 
 /// How `session`'s turn now running is heard; `None` for one that isn't.
 pub fn spoken_with(session: &Session) -> Option<Markup> {
@@ -26,6 +28,16 @@ pub fn spoken_with(session: &Session) -> Option<Markup> {
             .unwrap_or_default();
         Markup::of(provider, session.tts_model())
     })
+}
+
+/// What `session`'s speech makes of a bracketed word that names no direction:
+/// on Desk, where the reply is on screen and said in full, it's said.
+pub fn asides_of(session: &Session) -> Asides {
+    if workforce_common::channels::is_desk_conversation(&session.channel) {
+        Asides::Said
+    } else {
+        Asides::Guessed
+    }
 }
 
 /// The text a spoken turn's answer is kept and shown as; `None` for a turn
@@ -53,19 +65,22 @@ pub fn kept_text<'a>(session: &Session, text: &'a str) -> Cow<'a, str> {
     }
 }
 
-/// The messages of `session` as the model is to read them: what it sees of
-/// itself is what the person saw. A copy: reading never rewrites what's saved.
-pub fn for_the_model(session: &Session) -> Cow<'_, [SessionMessage]> {
-    if !may_keep_directions(session) {
-        return Cow::Borrowed(&session.messages);
-    }
-    let mut messages = session.messages.clone();
-    for message in &mut messages {
-        if message.role == MessageRole::Assistant {
-            message.content = without_named_directions(&message.content);
+/// How the model is to read the text of `session`'s assistant messages: what
+/// it sees of itself is what the person saw. Reading never rewrites what's
+/// saved, and a message with nothing to take out isn't copied.
+pub fn for_the_model(session: &Session) -> for<'a> fn(&'a str) -> Cow<'a, str> {
+    if may_keep_directions(session) {
+        |text| {
+            let read = without_named_directions(text);
+            if read == text {
+                Cow::Borrowed(text)
+            } else {
+                Cow::Owned(read)
+            }
         }
+    } else {
+        |text| Cow::Borrowed(text)
     }
-    Cow::Owned(messages)
 }
 
 /// Parts a stream of a spoken turn's progress.
@@ -73,16 +88,18 @@ pub fn for_the_model(session: &Session) -> Cow<'_, [SessionMessage]> {
 struct Parting {
     split: MarkupSplit,
     markup: Markup,
+    asides: Asides,
     delivery: AnswerDelivery,
     /// Speech of pieces that show nothing yet, for the next frame.
     carried: String,
 }
 
 impl Parting {
-    fn new(markup: Markup) -> Self {
+    fn new(markup: Markup, asides: Asides) -> Self {
         Self {
-            split: markup.split(),
+            split: markup.split_with(asides),
             markup,
+            asides,
             delivery: AnswerDelivery::default(),
             carried: String::new(),
         }
@@ -92,6 +109,12 @@ impl Parting {
     fn event(&mut self, event: ProgressEvent) -> Vec<ProgressEvent> {
         self.delivery.note(&event);
         match event {
+            // A stream cut off with no end leaves nothing held for the next.
+            ProgressEvent::StreamStart => {
+                self.split.reset();
+                self.carried.clear();
+                vec![ProgressEvent::StreamStart]
+            }
             ProgressEvent::StreamDelta { text } => {
                 let parted = self.split.push(&text);
                 self.delta(parted, false)
@@ -109,7 +132,7 @@ impl Parting {
             }
             ProgressEvent::Response { text } => {
                 let shown = self.markup.shown(&text);
-                let spoken = self.markup.apply(&text);
+                let spoken = self.markup.apply_with(self.asides, &text);
                 // Already streamed, it reaches no client: no frame to go with.
                 let mut out = if self.delivery.delivers_response() {
                     speech_of(&shown, spoken)
@@ -121,7 +144,7 @@ impl Parting {
             }
             ProgressEvent::CheckIn { note } => {
                 let shown = self.markup.shown(&note);
-                let spoken = self.markup.apply(&note);
+                let spoken = self.markup.apply_with(self.asides, &note);
                 let mut out = speech_of(&shown, spoken);
                 out.push(ProgressEvent::CheckIn { note: shown });
                 out
@@ -155,14 +178,16 @@ fn speech_of(shown: &str, spoken: String) -> Vec<ProgressEvent> {
     }
 }
 
-/// `progress` with a turn's reply parted for a voice with `markup`.
+/// `progress` with a turn's reply parted for a voice with `markup`, its speech
+/// making of other bracketed words what `asides` says.
 pub fn parted(
     mut progress: mpsc::Receiver<ProgressEvent>,
     markup: Markup,
+    asides: Asides,
 ) -> mpsc::Receiver<ProgressEvent> {
     let (tx, rx) = mpsc::channel(64);
     tokio::spawn(async move {
-        let mut parting = Parting::new(markup);
+        let mut parting = Parting::new(markup, asides);
         while let Some(event) = progress.recv().await {
             for event in parting.event(event) {
                 if tx.send(event).await.is_err() {
@@ -175,21 +200,38 @@ pub fn parted(
 }
 
 /// The speech a frame says aloud instead of its text, from the
-/// [`ProgressEvent::Speech`] just before it.
+/// [`ProgressEvent::Speech`] just before it, and what a client that reads a
+/// frame's text aloud hears of the stream ([`Plainly`]).
 #[derive(Debug, Default)]
-pub struct NextSpeech(Option<String>);
+pub struct NextSpeech {
+    next: Option<String>,
+    plainly: Plainly,
+}
 
 impl NextSpeech {
     pub fn set(&mut self, text: String) {
-        self.0 = Some(text);
+        self.next = Some(text);
     }
 
     pub fn take(&mut self) -> Option<String> {
-        self.0.take()
+        self.next.take()
     }
 
+    /// A stream starts, ends or is retracted: nothing of it carries on.
     pub fn clear(&mut self) {
-        self.0 = None;
+        self.next = None;
+        self.plainly = Plainly::default();
+    }
+
+    /// `said`, a frame's speech, as a client that says a frame's text is to
+    /// hear it: as it heard a spoken turn before speech was parted from the
+    /// text, less the directions. A whole `message` stands alone.
+    pub fn plainly(&mut self, said: &str, whole: bool) -> String {
+        if whole {
+            Plainly::default().piece(said)
+        } else {
+            self.plainly.piece(said)
+        }
     }
 }
 
@@ -205,7 +247,15 @@ mod tests {
     /// The text shown and the text spoken, frame by frame as a forwarder
     /// makes them.
     fn frames(markup: Markup, events: Vec<ProgressEvent>) -> Vec<(String, Option<String>)> {
-        let mut parting = Parting::new(markup);
+        frames_with(markup, Asides::Guessed, events)
+    }
+
+    fn frames_with(
+        markup: Markup,
+        asides: Asides,
+        events: Vec<ProgressEvent>,
+    ) -> Vec<(String, Option<String>)> {
+        let mut parting = Parting::new(markup, asides);
         let mut next = NextSpeech::default();
         let mut out = Vec::new();
         for event in events.into_iter().flat_map(|e| parting.event(e)) {
@@ -304,6 +354,59 @@ mod tests {
         assert_eq!(fish[1], (" it.".to_string(), None));
     }
 
+    /// A stream cut off with no end, then another: what the first held back
+    /// doesn't reach the second.
+    #[test]
+    fn a_new_stream_starts_clean() {
+        let frames = frames(
+            Markup::FishS1,
+            vec![
+                ProgressEvent::StreamStart,
+                delta("Draft (exc"),
+                ProgressEvent::StreamStart,
+                delta("(calm) Real."),
+                ProgressEvent::StreamEnd,
+            ],
+        );
+        assert_eq!(shown(&frames), "DraftReal.");
+        assert_eq!(heard(&frames), "Draft(calm) Real.");
+    }
+
+    /// On Desk every word is said: speech loses only what names a direction.
+    #[test]
+    fn on_desk_speech_says_every_word_but_directions() {
+        let frames = frames_with(
+            Markup::FishS1,
+            Asides::Said,
+            vec![
+                delta("(excited) Choose (yes) or (no)"),
+                ProgressEvent::StreamEnd,
+            ],
+        );
+        assert_eq!(shown(&frames), "Choose (yes) or (no)");
+        assert_eq!(heard(&frames), "(excited) Choose (yes) or (no)");
+        assert_eq!(asides_of(&session(serde_json::json!({}))), Asides::Said);
+        assert_eq!(asides_of(&Session::new("ios", "u", "a")), Asides::Guessed);
+    }
+
+    /// A client that says a frame's text hears a stream as it did before speech
+    /// was parted from it, less the directions: across frames, a group opening
+    /// one is judged where it stands in the sentence.
+    #[test]
+    fn a_client_saying_text_hears_what_it_always_did() {
+        let mut next = NextSpeech::default();
+        let heard: String = [
+            "Pass the flag (optional) too. Ask",
+            " (see below) me. ",
+            "(confident) Yes.",
+        ]
+        .into_iter()
+        .map(|piece| next.plainly(piece, false))
+        .collect();
+        assert_eq!(heard, "Pass the flag too. Ask (see below) me. Yes.");
+        assert_eq!(next.plainly("(see below) Done.", true), "Done.");
+    }
+
     #[test]
     fn a_retracted_stream_takes_its_speech_with_it() {
         let frames = frames(
@@ -364,7 +467,7 @@ mod tests {
     #[tokio::test]
     async fn the_relay_keeps_order_and_ends_with_its_source() {
         let (tx, rx) = mpsc::channel(8);
-        let mut out = parted(rx, Markup::FishS1);
+        let mut out = parted(rx, Markup::FishS1, Asides::Guessed);
         tx.send(ProgressEvent::StreamStart).await.unwrap();
         tx.send(delta("(excited) Yes.")).await.unwrap();
         tx.send(ProgressEvent::StreamEnd).await.unwrap();
@@ -419,8 +522,22 @@ mod tests {
         spoken.add_user_message("(excited) as I typed it", None);
         spoken.add_assistant_message("(confident) It works.", 3);
         let read = for_the_model(&spoken);
-        assert_eq!(read[0].content, "(excited) as I typed it");
-        assert_eq!(read[1].content, "It works.");
+        assert_eq!(read(&spoken.messages[1].content), "It works.");
+        assert!(
+            matches!(read("As written."), Cow::Borrowed(_)),
+            "not copied"
+        );
+        spoken.add_user_message("next", None);
+        let texts: Vec<String> =
+            workforce_hub_core::serve::build_prior_messages_reading(&spoken.messages, None, read)
+                .iter()
+                .flat_map(|m| &m.content)
+                .filter_map(|block| match block {
+                    workforce_agent::llm::types::ContentBlock::Text { text } => Some(text.clone()),
+                    _ => None,
+                })
+                .collect();
+        assert_eq!(texts, ["(excited) as I typed it", "It works."]);
         assert_eq!(
             spoken.messages[1].content, "(confident) It works.",
             "what's saved is left as it is"

@@ -26,6 +26,11 @@ pub struct BroadcastMessage {
     /// `content`, so that's what it gets made for speech.
     #[serde(skip)]
     pub spoken_turn: bool,
+    /// What a client that says `content` hears of a spoken turn's text frame:
+    /// its speech as such a client always heard it, made for speech. Never sent
+    /// as it is: it becomes that client's `content`.
+    #[serde(skip)]
+    pub heard: Option<String>,
     /// Whether the client should read this message aloud in audio/voice mode.
     /// Tool events and empty markers are `false`; response text is `true`.
     pub speakable: bool,
@@ -115,6 +120,7 @@ impl BroadcastMessage {
             content: content.into(),
             speech: None,
             spoken_turn: false,
+            heard: None,
             context_tokens: None,
             context_max: None,
             speakable: true,
@@ -185,6 +191,7 @@ impl BroadcastMessage {
             content: reason.into(),
             speech: None,
             spoken_turn: false,
+            heard: None,
             context_tokens: None,
             context_max: None,
             speakable: false,
