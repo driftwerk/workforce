@@ -2,10 +2,13 @@
 //!
 //! Supports `${VAR}` / `${VAR:-default}` (process env) and `${vault:path}`
 //! (via a [`VaultResolver`]). The main `workforce.toml` loader applies env
-//! expansion as a blanket pass; vault references are resolved per-field at
-//! access time because the vault is itself configured by the same file.
-//! The per-skill `config.toml` loader in `workforce-skills::config_loader`
-//! shares these routines.
+//! expansion as a blanket pass ([`expand_hub_vars_in_table`]), where `${VAR}`
+//! also resolves against the secrets a supervisor handed the hub on a
+//! descriptor ([`crate::inherited_secrets`]); vault references are resolved
+//! per-field at access time because the vault is itself configured by the
+//! same file. The per-skill `config.toml` loader in
+//! `workforce-skills::config_loader` shares the env-only routines, so a
+//! skill's config can never expand to one of the hub's own secrets.
 
 use std::sync::LazyLock;
 
@@ -22,15 +25,19 @@ static VAULT_REF_RE: LazyLock<Regex> =
 /// Expand `${VAR}` / `${VAR:-default}` from the process env. Missing
 /// variables with no default produce an empty string.
 pub fn expand_env_vars(input: &str) -> String {
+    expand_vars_with(input, &|name| std::env::var(name).ok())
+}
+
+/// Expand `${VAR}` / `${VAR:-default}`, reading each variable through
+/// `lookup`.
+fn expand_vars_with(input: &str, lookup: &dyn Fn(&str) -> Option<String>) -> String {
     ENV_VAR_RE
-        .replace_all(input, |caps: &regex::Captures| {
-            match std::env::var(&caps[1]) {
-                Ok(val) => val,
-                Err(_) => caps
-                    .get(2)
-                    .map(|m| m.as_str().to_string())
-                    .unwrap_or_default(),
-            }
+        .replace_all(input, |caps: &regex::Captures| match lookup(&caps[1]) {
+            Some(val) => val,
+            None => caps
+                .get(2)
+                .map(|m| m.as_str().to_string())
+                .unwrap_or_default(),
         })
         .to_string()
 }
@@ -47,18 +54,29 @@ pub fn expand_vault_refs(input: &str, vault: &dyn VaultResolver) -> String {
 /// Recursively expand `${VAR}` in every string value of a TOML table.
 /// Non-string scalars are untouched.
 pub fn expand_env_vars_in_table(table: &mut toml::Table) {
+    expand_vars_in_table_with(table, &|name| std::env::var(name).ok());
+}
+
+/// [`expand_env_vars_in_table`] for the hub's own `workforce.toml`: `${VAR}`
+/// reads the secrets inherited on a descriptor first, then the environment
+/// ([`crate::inherited_secrets::var`]).
+pub fn expand_hub_vars_in_table(table: &mut toml::Table) {
+    expand_vars_in_table_with(table, &crate::inherited_secrets::var);
+}
+
+fn expand_vars_in_table_with(table: &mut toml::Table, lookup: &dyn Fn(&str) -> Option<String>) {
     for (_key, value) in table.iter_mut() {
-        expand_env_vars_in_value(value);
+        expand_vars_in_value_with(value, lookup);
     }
 }
 
-fn expand_env_vars_in_value(value: &mut toml::Value) {
+fn expand_vars_in_value_with(value: &mut toml::Value, lookup: &dyn Fn(&str) -> Option<String>) {
     match value {
-        toml::Value::String(s) => *s = expand_env_vars(s),
-        toml::Value::Table(t) => expand_env_vars_in_table(t),
+        toml::Value::String(s) => *s = expand_vars_with(s, lookup),
+        toml::Value::Table(t) => expand_vars_in_table_with(t, lookup),
         toml::Value::Array(arr) => {
             for item in arr.iter_mut() {
-                expand_env_vars_in_value(item);
+                expand_vars_in_value_with(item, lookup);
             }
         }
         _ => {}
@@ -167,6 +185,44 @@ mod tests {
         assert_eq!(list[0].as_str().unwrap(), "filled");
         assert_eq!(list[1].as_str().unwrap(), "literal");
         std::env::remove_var("CFG_EXPAND_T_REC");
+    }
+
+    /// The hub's config takes `${VAR}` from the secrets inherited on a
+    /// descriptor first, then from the environment.
+    #[cfg(unix)]
+    #[test]
+    fn hub_config_expands_from_the_inherited_secrets() {
+        use std::io::Write;
+        let (reader, mut writer) = std::io::pipe().unwrap();
+        writer
+            .write_all(br#"{"CFG_EXPAND_T_FD_PW":"pw-fixture","CFG_EXPAND_T_FD_BOTH":"from-fd"}"#)
+            .unwrap();
+        drop(writer);
+        let secrets = crate::inherited_secrets::InheritedSecrets::read(reader.into()).unwrap();
+        std::env::set_var("CFG_EXPAND_T_FD_ENV", "from-env");
+        std::env::set_var("CFG_EXPAND_T_FD_BOTH", "from-env");
+        let mut table: toml::Table = r#"
+            [postgres]
+            url = "postgres://desk:${CFG_EXPAND_T_FD_PW}@127.0.0.1:1/hub"
+            [other]
+            env = "${CFG_EXPAND_T_FD_ENV}"
+            both = "${CFG_EXPAND_T_FD_BOTH}"
+            unset = "${CFG_EXPAND_T_FD_UNSET:-fallback}"
+        "#
+        .parse()
+        .unwrap();
+        expand_vars_in_table_with(&mut table, &|name| {
+            crate::inherited_secrets::var_in(Some(&secrets), name)
+        });
+        std::env::remove_var("CFG_EXPAND_T_FD_ENV");
+        std::env::remove_var("CFG_EXPAND_T_FD_BOTH");
+        assert_eq!(
+            table["postgres"]["url"].as_str(),
+            Some("postgres://desk:pw-fixture@127.0.0.1:1/hub")
+        );
+        assert_eq!(table["other"]["env"].as_str(), Some("from-env"));
+        assert_eq!(table["other"]["both"].as_str(), Some("from-fd"));
+        assert_eq!(table["other"]["unset"].as_str(), Some("fallback"));
     }
 
     #[test]

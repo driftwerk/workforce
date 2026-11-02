@@ -34,6 +34,12 @@ const ALLOWED_VARS: &[&str] = &[
     "SSL_CERT_DIR",
 ];
 
+/// Added to [`ALLOWED_VARS`] for a command run in-process on someone's own
+/// computer ([`EnvPolicy::build_local`]): who they are, which login shell is
+/// theirs, and the SSH agent launchd or systemd gives the session (not the
+/// dotfiles), so `git` over SSH keeps working.
+const LOCAL_EXTRA_VARS: &[&str] = &["USER", "LOGNAME", "SHELL", "SSH_AUTH_SOCK"];
+
 /// Caps on the hub-supplied environment. Generous for a credential set and a
 /// handful of settings, small enough that a malformed request cannot make the
 /// daemon allocate without bound.
@@ -140,6 +146,28 @@ impl EnvPolicy {
         env.into_iter().collect()
     }
 
+    /// The allowlisted environment for a command run in-process, as the
+    /// hub's own user, on someone's own computer: [`ALLOWED_VARS`] and
+    /// [`LOCAL_EXTRA_VARS`] from `source`, and a `PATH` when it has none.
+    /// Everything else (the hub's secrets, the person's other variables) is
+    /// dropped.
+    ///
+    /// Unlike [`build`], it adds none of the runner container's toolchain
+    /// defaults: on a person's computer `rustup` and `cargo` live under their
+    /// home, and a `RUSTUP_HOME` pointing into `/usr/local` would break them.
+    ///
+    /// [`build`]: EnvPolicy::build
+    pub fn build_local(source: &BTreeMap<String, String>) -> Vec<(String, String)> {
+        let mut env: BTreeMap<String, String> = ALLOWED_VARS
+            .iter()
+            .chain(LOCAL_EXTRA_VARS)
+            .filter_map(|&var| source.get(var).map(|val| (var.to_string(), val.clone())))
+            .collect();
+        env.entry("PATH".to_string())
+            .or_insert_with(|| FALLBACK_PATH.to_string());
+        env.into_iter().collect()
+    }
+
     /// Snapshot the current process environment as a source map for [`build`].
     ///
     /// [`build`]: EnvPolicy::build
@@ -178,6 +206,40 @@ mod tests {
         assert!(!built.contains_key("WORKFORCE_VAULT_KEY"));
         assert!(!built.contains_key("WORKFORCE_GATEWAY_TOKEN"));
         assert!(!built.contains_key("ANTHROPIC_API_KEY"));
+    }
+
+    #[test]
+    fn local_build_keeps_the_allowlist_and_drops_everything_else() {
+        let src = source(&[
+            ("PATH", "/opt/homebrew/bin:/usr/bin"),
+            ("HOME", "/Users/sarah"),
+            ("USER", "sarah"),
+            ("SHELL", "/bin/zsh"),
+            ("SSH_AUTH_SOCK", "/private/tmp/agent.sock"),
+            ("DESK_POSTGRES_PASSWORD", "pw-fixture"),
+            ("DESK_MEMORY_KEY", "mk-fixture"),
+            ("WORKFORCE_VAULT_KEY", "vk-fixture"),
+            ("WORKFORCE_SECRETS_FD", "3"),
+            ("HTTPS_PROXY", "http://proxy.internal:8080"),
+        ]);
+        let built: BTreeMap<String, String> = EnvPolicy::build_local(&src).into_iter().collect();
+        assert_eq!(
+            built.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["HOME", "PATH", "SHELL", "SSH_AUTH_SOCK", "USER"]
+        );
+        // The person's PATH as it is, and no container toolchain defaults.
+        assert_eq!(built["PATH"], "/opt/homebrew/bin:/usr/bin");
+        assert!(!built.contains_key("RUSTUP_HOME"));
+        assert!(!built.contains_key("CARGO_HOME"));
+    }
+
+    #[test]
+    fn local_build_gives_a_path_when_the_source_has_none() {
+        let built: BTreeMap<String, String> = EnvPolicy::build_local(&BTreeMap::new())
+            .into_iter()
+            .collect();
+        assert_eq!(built.get("PATH").map(String::as_str), Some(FALLBACK_PATH));
+        assert_eq!(built.len(), 1);
     }
 
     #[test]

@@ -19,6 +19,7 @@ pub mod engagement;
 pub mod errors;
 pub mod heartbeat_check;
 pub mod identity;
+pub mod inherited_secrets;
 pub mod instance;
 pub mod learning_plan;
 pub mod locking;

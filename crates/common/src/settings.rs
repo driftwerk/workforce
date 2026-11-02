@@ -10681,8 +10681,9 @@ impl WorkforceConfig {
 
     /// Parse a TOML string into a config (no overlay — used for embedded /
     /// test configs and by callers that already merged). Applies, in order:
-    /// `${VAR}` env var expansion across every string value (see
-    /// [`crate::config_expand`]), per-store backend defaulting when
+    /// `${VAR}` expansion across every string value, from the secrets
+    /// inherited on a descriptor and then the env (see
+    /// [`crate::config_expand::expand_hub_vars_in_table`]), per-store backend defaulting when
     /// `[postgres] enabled = true`, and the legacy per-field env overrides in
     /// [`Self::apply_env_overrides`]. Vault (`${vault:...}`) references are
     /// resolved per-field at access time, not here.
@@ -10698,7 +10699,7 @@ impl WorkforceConfig {
     /// overlay writer validates a candidate merged table through the exact
     /// same path the next boot will take (write-accepts ⇔ boot-accepts).
     pub fn from_raw_table(mut table: toml::Table) -> eyre::Result<Self> {
-        crate::config_expand::expand_env_vars_in_table(&mut table);
+        crate::config_expand::expand_hub_vars_in_table(&mut table);
         apply_postgres_backend_defaults(&mut table);
 
         let mut config: Self = toml::Value::Table(table)

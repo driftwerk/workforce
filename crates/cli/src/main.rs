@@ -3516,8 +3516,19 @@ fn build_oauth_state_store(
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    // First, while this is the only thread: the secrets a supervisor hands
+    // over on a descriptor are read, the descriptor closed and its variable
+    // removed, so nothing the hub starts inherits them (see
+    // `workforce_common::inherited_secrets`).
+    workforce_common::inherited_secrets::take_from_env()?;
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(run())
+}
+
+async fn run() -> Result<()> {
     // Before any TLS client exists, including the telemetry exporters
     // `setup_logging` builds.
     workforce_common::tls::install_default_crypto_provider();
@@ -4067,11 +4078,9 @@ rules:
                 // Set config path for CRUD persistence to workforce.toml
                 state.config_path = Some(config_path.clone());
                 // Share the gateway auth token for admin API write protection
-                state.auth_token = wf_config
-                    .gateway
-                    .auth_token
-                    .clone()
-                    .or_else(|| std::env::var("WORKFORCE_GATEWAY_TOKEN").ok());
+                state.auth_token = wf_config.gateway.auth_token.clone().or_else(|| {
+                    workforce_common::inherited_secrets::var("WORKFORCE_GATEWAY_TOKEN")
+                });
                 // Share the default agent's job runner for the /api/subagents admin API
                 state.agent_jobs = default_service.job_runner.clone();
                 // Share knowledge service for admin API (DW-428)
@@ -4114,7 +4123,7 @@ rules:
                 .gateway
                 .auth_token
                 .clone()
-                .or_else(|| std::env::var("WORKFORCE_GATEWAY_TOKEN").ok())
+                .or_else(|| workforce_common::inherited_secrets::var("WORKFORCE_GATEWAY_TOKEN"))
                 .unwrap_or_else(|| {
                     let token = uuid::Uuid::new_v4().to_string();
                     eprintln!(
@@ -4898,7 +4907,7 @@ rules:
                 .gateway
                 .jwt_secret
                 .clone()
-                .or_else(|| std::env::var("WORKFORCE_JWT_SECRET").ok())
+                .or_else(|| workforce_common::inherited_secrets::var("WORKFORCE_JWT_SECRET"))
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| {
                     tracing::warn!(

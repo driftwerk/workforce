@@ -24,6 +24,60 @@ pub const EXEC_SECRET_VARS: &[&str] = &[
     "WORKFORCE_JWT_SECRET",
 ];
 
+/// How an in-process `exec.run` child's environment is built. A configured
+/// runner ignores it: the daemon always applies its own scrubbed allowlist.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum LocalEnv {
+    /// The hub's environment minus [`EXEC_SECRET_VARS`]: servers and
+    /// development, unchanged.
+    #[default]
+    Inherit,
+    /// A clean, allowlisted environment, never the hub's, with the command
+    /// run through the person's login shell so their dotfiles set up `PATH`
+    /// and toolchains as in a terminal. For a hub on someone's own computer
+    /// (`[desk]`), where commands run as the hub's own user.
+    Allowlisted,
+}
+
+/// Login shells that take `-l -c <script> <arg0> <arg1>` the POSIX way, so
+/// the command reaches `/bin/sh` as `$1`, unquoted and unchanged.
+const LOGIN_SHELLS: &[&str] = &["sh", "bash", "zsh", "dash", "ksh"];
+
+/// The program and arguments that run `command`: `sh -c <command>`, or, for
+/// [`LocalEnv::Allowlisted`] with a known login shell in `shell`, that shell
+/// as a login shell which then `exec`s `/bin/sh -c <command>`. The login
+/// shell only sets up the environment from the person's dotfiles; the
+/// command itself still runs under `sh`, as it does everywhere else.
+fn shell_invocation(
+    command: String,
+    local_env: LocalEnv,
+    shell: Option<&str>,
+) -> (String, Vec<String>) {
+    let login = shell
+        .filter(|_| local_env == LocalEnv::Allowlisted)
+        .map(std::path::Path::new)
+        .filter(|p| p.is_absolute())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| LOGIN_SHELLS.contains(&n))
+        })
+        .filter(|p| p.is_file());
+    match login {
+        Some(shell) => (
+            shell.display().to_string(),
+            vec![
+                "-l".to_string(),
+                "-c".to_string(),
+                r#"exec /bin/sh -c "$1""#.to_string(),
+                "sh".to_string(),
+                command,
+            ],
+        ),
+        None => ("sh".to_string(), vec!["-c".to_string(), command]),
+    }
+}
+
 // Re-exported so existing callers (`code.*` tools) keep importing the workdir
 // validator from `tools::exec`; the implementation now lives in `exec_runner`.
 pub use super::exec_runner::validate_workdir;
@@ -83,6 +137,8 @@ pub struct ExecCommand {
     /// socket is fail-closed: an unreachable daemon errors, never falling back
     /// to in-process execution (that would re-expose the vault — audit F7).
     runner: Option<RunnerEndpoint>,
+    /// The child's environment when running in-process.
+    local_env: LocalEnv,
 }
 
 impl ExecCommand {
@@ -92,6 +148,7 @@ impl ExecCommand {
             workspace: None,
             allowed_workdirs: Vec::new(),
             runner: None,
+            local_env: LocalEnv::Inherit,
         }
     }
 
@@ -108,6 +165,11 @@ impl ExecCommand {
 
     pub fn with_runner(mut self, runner: Option<RunnerEndpoint>) -> Self {
         self.runner = runner;
+        self
+    }
+
+    pub fn with_local_env(mut self, local_env: LocalEnv) -> Self {
+        self.local_env = local_env;
         self
     }
 }
@@ -256,9 +318,18 @@ impl Tool for ExecCommand {
             .clone()
             .or_else(|| self.workspace.as_ref().map(|p| p.display().to_string()));
 
+        // The login shell is the hub's, and only matters in-process: the
+        // daemon runs `sh` under its own user.
+        let local_env = if self.runner.is_some() {
+            LocalEnv::Inherit
+        } else {
+            self.local_env
+        };
+        let shell = std::env::var("SHELL").ok();
+        let (program, args) = shell_invocation(input.command, local_env, shell.as_deref());
         let req = ExecRequest {
-            program: "sh".to_string(),
-            args: vec!["-c".to_string(), input.command],
+            program,
+            args,
             workdir: effective_workdir,
             timeout_secs: requested_timeout,
             // The wire protocol carries a bool, not a count; any positive retry
@@ -270,11 +341,15 @@ impl Tool for ExecCommand {
             mcp: None,
         };
 
-        // In-process (dev/local) path inherits the parent env minus the three
-        // secret vars — today's behaviour, unchanged. When dispatching, the
-        // daemon scrubs to the allowlist instead and this mode is ignored.
-        let local_env = EnvMode::Inherit {
-            remove: EXEC_SECRET_VARS,
+        // In-process: the parent env minus the three secret vars (servers and
+        // development, unchanged), or the allowlist alone on a hub on
+        // someone's own computer. When dispatching, the daemon scrubs to its
+        // allowlist instead and this mode is ignored.
+        let local_env = match local_env {
+            LocalEnv::Inherit => EnvMode::Inherit {
+                remove: EXEC_SECRET_VARS,
+            },
+            LocalEnv::Allowlisted => EnvMode::Allowlisted,
         };
         match run_or_dispatch(self.runner.as_ref(), req, &self.allowed_workdirs, local_env).await {
             Ok(outcome) => Ok(assemble_result(outcome, requested_timeout, start)),
@@ -531,6 +606,104 @@ mod tests {
             .unwrap()
             .contains("secure command runner unavailable"));
         assert!(!sentinel.exists(), "fail-closed violated: command executed");
+    }
+
+    #[test]
+    fn commands_run_under_sh_unless_allowlisted_with_a_login_shell() {
+        let cmd = || "echo hi".to_string();
+        assert_eq!(
+            shell_invocation(cmd(), LocalEnv::Inherit, Some("/bin/sh")),
+            (
+                "sh".to_string(),
+                vec!["-c".to_string(), "echo hi".to_string()]
+            )
+        );
+        let (program, args) = shell_invocation(cmd(), LocalEnv::Allowlisted, Some("/bin/sh"));
+        assert_eq!(program, "/bin/sh");
+        assert_eq!(
+            args,
+            ["-l", "-c", r#"exec /bin/sh -c "$1""#, "sh", "echo hi"]
+        );
+        // A shell that doesn't take positional arguments the POSIX way, a
+        // relative path or a missing file falls back to plain `sh`.
+        for shell in [
+            Some("/usr/local/bin/fish"),
+            Some("zsh"),
+            Some("/nope/zsh"),
+            None,
+        ] {
+            assert_eq!(
+                shell_invocation(cmd(), LocalEnv::Allowlisted, shell).0,
+                "sh",
+                "{shell:?}"
+            );
+        }
+    }
+
+    /// On a hub on someone's own computer, a command `exec.run` starts sees
+    /// neither of the hub's database secrets, nor any other variable off the
+    /// allowlist, and still runs exactly as written.
+    #[tokio::test]
+    async fn allowlisted_exec_run_cannot_see_the_hubs_secrets() {
+        // Names no other test in this binary touches.
+        unsafe {
+            std::env::set_var("DESK_POSTGRES_PASSWORD", "pw-fixture");
+            std::env::set_var("DESK_MEMORY_KEY", "mk-fixture");
+            std::env::set_var("EXEC_T_OFF_THE_ALLOWLIST", "other-fixture");
+        }
+        let tool = ExecCommand::default().with_local_env(LocalEnv::Allowlisted);
+        // Names only, and probes for the two values: the person's dotfiles
+        // run in the login shell, and what they export never reaches a test
+        // log.
+        let result = tool
+            .execute(serde_json::json!({
+                "command": "env | cut -d= -f1; \
+                    echo \"pw=[${DESK_POSTGRES_PASSWORD:-absent}] mk=[${DESK_MEMORY_KEY:-absent}]\"; \
+                    echo \"quoted 'arg' $((1 + 1))\"",
+            }))
+            .await
+            .unwrap();
+        unsafe {
+            std::env::remove_var("DESK_POSTGRES_PASSWORD");
+            std::env::remove_var("DESK_MEMORY_KEY");
+            std::env::remove_var("EXEC_T_OFF_THE_ALLOWLIST");
+        }
+        assert!(result.success, "exit code {}", result.output["exit_code"]);
+        let stdout = result.output["stdout"].as_str().unwrap();
+        let names: Vec<&str> = stdout.lines().collect();
+        for leaked in [
+            "DESK_POSTGRES_PASSWORD",
+            "DESK_MEMORY_KEY",
+            "EXEC_T_OFF_THE_ALLOWLIST",
+        ] {
+            assert!(!names.contains(&leaked), "{leaked} reached the command");
+        }
+        assert!(
+            names.contains(&"pw=[absent] mk=[absent]"),
+            "a secret's value reached the command"
+        );
+        assert_eq!(
+            names.last(),
+            Some(&"quoted 'arg' 2"),
+            "the command was changed on its way through the login shell"
+        );
+    }
+
+    /// Elsewhere (no `[desk]`), the in-process path is unchanged: ordinary
+    /// variables pass through, the three secrets don't.
+    #[tokio::test]
+    async fn inherited_exec_run_is_unchanged() {
+        unsafe {
+            std::env::set_var("EXEC_T_INHERITED", "passes");
+        }
+        let result = ExecCommand::default()
+            .execute(serde_json::json!({"command": "echo [${EXEC_T_INHERITED:-absent}]"}))
+            .await
+            .unwrap();
+        unsafe {
+            std::env::remove_var("EXEC_T_INHERITED");
+        }
+        assert_eq!(result.output["stdout"].as_str().unwrap().trim(), "[passes]");
     }
 
     /// End-to-end through the tool's dispatch arm against a live daemon: the

@@ -114,6 +114,7 @@ impl McpServingAgent {
                 vault.clone(),
                 global_vault.clone(),
             )),
+            exec_env: crate::serve::exec_env(&config),
             ..Default::default()
         };
 

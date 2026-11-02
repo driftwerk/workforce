@@ -42,6 +42,11 @@ pub enum EnvMode {
     /// Discard the parent env and rebuild it from the allowlist + toolchain
     /// injection (the daemon's security boundary).
     Scrubbed,
+    /// Discard the parent env and rebuild it from the allowlist alone
+    /// ([`EnvPolicy::build_local`]): the in-process path on a hub that runs on
+    /// someone's own computer (`[desk]`), where commands run as the hub's own
+    /// user and must never inherit its environment.
+    Allowlisted,
 }
 
 /// Apply `mode` to `cmd`'s environment. `Inherit` leaves the inherited parent
@@ -61,6 +66,12 @@ fn apply_env(cmd: &mut Command, mode: &EnvMode, overrides: &[(String, String)]) 
             // which would re-expose the vault key, gateway token, and JWT secret.
             cmd.env_clear();
             for (key, value) in EnvPolicy::build(&EnvPolicy::current_env()) {
+                cmd.env(key, value);
+            }
+        }
+        EnvMode::Allowlisted => {
+            cmd.env_clear();
+            for (key, value) in EnvPolicy::build_local(&EnvPolicy::current_env()) {
                 cmd.env(key, value);
             }
         }
@@ -727,6 +738,38 @@ mod tests {
             "key=[absent] proxy=[http://proxy.internal:8080]"
         );
         assert_eq!(summary.exit_code, Some(0));
+    }
+
+    /// The in-process mode of a hub on someone's own computer: the child
+    /// sees the allowlist and nothing else — not the hub's secrets, not the
+    /// person's other variables.
+    #[tokio::test]
+    async fn allowlisted_mode_shows_the_child_only_the_allowlist() {
+        let _env = ENV_MUTATION_LOCK.lock().await;
+        unsafe {
+            std::env::set_var("WORKFORCE_VAULT_KEY", "vk-fixture");
+            std::env::set_var("HTTPS_PROXY", "http://proxy.internal:8080");
+        }
+        let (out, _err, summary) =
+            run_collect_mode(&req("env", &[]), &[], EnvMode::Allowlisted).await;
+        unsafe {
+            std::env::remove_var("WORKFORCE_VAULT_KEY");
+            std::env::remove_var("HTTPS_PROXY");
+        }
+        assert_eq!(summary.exit_code, Some(0));
+        let expected: std::collections::BTreeMap<String, String> =
+            EnvPolicy::build_local(&EnvPolicy::current_env())
+                .into_iter()
+                .collect();
+        let seen: std::collections::BTreeMap<String, String> = out
+            .lines()
+            .filter_map(|l| l.split_once('='))
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        assert_eq!(seen, expected);
+        for fixture in ["vk-fixture", "proxy.internal"] {
+            assert!(!out.contains(fixture), "{fixture} reached the child");
+        }
     }
 
     #[tokio::test]

@@ -12,6 +12,7 @@ pub mod testing;
 #[cfg(test)]
 mod tool_tests;
 pub use crate::workflow_runtime::shared_workflow_store;
+pub(crate) use compose::exec_env;
 pub use compose::Compose;
 pub use compose::{
     artifact_index_pace, artifact_search_wait, create_trigger_router, create_webhook_router,

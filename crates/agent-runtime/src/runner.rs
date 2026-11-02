@@ -7113,6 +7113,8 @@ pub struct ToolSecrets {
     /// `exec.run` dispatches to the daemon (fail-closed if unreachable)
     /// instead of executing commands in-process. `None` = in-process (dev).
     pub runner: Option<crate::tools::exec_runner::RunnerEndpoint>,
+    /// The environment `exec.run` gives a command it runs in-process.
+    pub exec_env: crate::tools::exec::LocalEnv,
 }
 
 impl ToolSecrets {
@@ -7121,6 +7123,7 @@ impl ToolSecrets {
         Self {
             brave_api_key: std::env::var("BRAVE_API_KEY").ok().map(fixed_key),
             runner: None,
+            exec_env: Default::default(),
         }
     }
 }
@@ -7148,7 +7151,9 @@ pub fn default_tools(allowed_paths: Vec<std::path::PathBuf>, secrets: ToolSecret
     for path in allowed_paths.iter().skip(1) {
         exec = exec.with_allowed_workdir(path.clone());
     }
-    let exec = exec.with_runner(secrets.runner.clone());
+    let exec = exec
+        .with_runner(secrets.runner.clone())
+        .with_local_env(secrets.exec_env);
     registry.register(Arc::new(exec));
 
     // Security audit tool
