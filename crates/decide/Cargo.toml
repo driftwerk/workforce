@@ -18,5 +18,5 @@ url = { workspace = true }
 
 [dev-dependencies]
 axum = { workspace = true }
-metrics-util = { version = "0.19", default-features = false, features = ["debugging"] }
+metrics-util = { version = "0.20", default-features = false, features = ["debugging"] }
 parking_lot = { workspace = true }

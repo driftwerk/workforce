@@ -10,7 +10,7 @@ description = "Client library for connecting to the Workforce gateway"
 [dependencies]
 workforce-core = { workspace = true }
 tokio = { workspace = true }
-tokio-tungstenite = { version = "0.28", features = ["native-tls"] }
+tokio-tungstenite = { version = "0.30", features = ["native-tls"] }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
