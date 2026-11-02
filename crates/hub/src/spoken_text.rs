@@ -71,6 +71,9 @@ pub fn kept_text<'a>(session: &Session, text: &'a str) -> Cow<'a, str> {
 pub fn for_the_model(session: &Session) -> for<'a> fn(&'a str) -> Cow<'a, str> {
     if may_keep_directions(session) {
         |text| {
+            if !text.contains(['(', '[']) {
+                return Cow::Borrowed(text);
+            }
             let read = without_named_directions(text);
             if read == text {
                 Cow::Borrowed(text)
