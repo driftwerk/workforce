@@ -340,6 +340,24 @@ impl S3ArtifactStore {
             .map(|s| s.descriptor))
     }
 
+    /// The body's length as S3 says it, by a `HEAD` that downloads nothing.
+    /// A missing object has no error code to go by, as a `HEAD` has no body.
+    async fn body_size_async(&self, agent_id: &str, id: &ArtifactId) -> Result<Option<u64>> {
+        let key = object_key(&self.prefix, agent_id, id)?;
+        match self
+            .client
+            .head_object()
+            .bucket(&self.bucket)
+            .key(&key)
+            .send()
+            .await
+        {
+            Ok(out) => Ok(out.content_length().and_then(|n| u64::try_from(n).ok())),
+            Err(e) if e.as_service_error().is_some_and(|e| e.is_not_found()) => Ok(None),
+            Err(e) => Err(eyre!("head_object {key} failed: {e}")),
+        }
+    }
+
     /// Presigned `GET` URL for the artifact, overriding `Content-Type` /
     /// `Content-Disposition` from the persisted descriptor so a redirected
     /// download arrives with the right filename and MIME. The async core
@@ -400,6 +418,10 @@ impl super::store::ArtifactStore for S3ArtifactStore {
 
     fn metadata(&self, agent_id: &str, id: &ArtifactId) -> Result<Option<ArtifactDescriptor>> {
         Self::now_block_on(self.metadata_async(agent_id, id))
+    }
+
+    fn body_size(&self, agent_id: &str, id: &ArtifactId) -> Result<Option<u64>> {
+        Self::now_block_on(self.body_size_async(agent_id, id))
     }
 
     fn write_from_path(
@@ -586,6 +608,59 @@ mod tests {
         let store = S3ArtifactStore::new(Client::from_conf(conf), "b".into(), "p/".into());
         assert!(store.staging_dir("agent-a").is_none());
         assert_eq!(store.purge_expired().unwrap(), 0);
+    }
+
+    /// The store against `server`, as S3 is reached through an endpoint.
+    fn store_at(server: &wiremock::MockServer) -> S3ArtifactStore {
+        let conf = aws_sdk_s3::Config::builder()
+            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+            .region(aws_sdk_s3::config::Region::new("us-east-1"))
+            .endpoint_url(server.uri())
+            .force_path_style(true)
+            .credentials_provider(aws_credential_types::Credentials::new(
+                "test", "test", None, None, "test",
+            ))
+            .build();
+        S3ArtifactStore::new(Client::from_conf(conf), "b".into(), "p/".into())
+    }
+
+    /// Only a `HEAD` is mounted, so asking for the body would fail: its size
+    /// takes no download.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_body_s_size_is_asked_of_s3_with_nothing_downloaded() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("HEAD"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![0; 4242]))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let store = store_at(&server);
+        let id = ArtifactId::fresh();
+        assert_eq!(store.body_size("agent-a", &id).unwrap(), Some(4242));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_missing_body_has_no_size_and_a_failing_s3_says_so() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("HEAD"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        let store = store_at(&server);
+        let id = ArtifactId::fresh();
+        assert_eq!(store.body_size("agent-a", &id).unwrap(), None);
+
+        server.reset().await;
+        Mock::given(method("HEAD"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&server)
+            .await;
+        let err = store.body_size("agent-a", &id).unwrap_err().to_string();
+        assert!(err.contains("head_object"), "{err}");
     }
 
     // --- gated round-trip against localstack / real S3 ---

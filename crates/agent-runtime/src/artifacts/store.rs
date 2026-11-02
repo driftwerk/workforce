@@ -85,6 +85,16 @@ pub trait ArtifactStore: Send + Sync {
         Ok(None)
     }
 
+    /// How many bytes the artifact's body is, asked of the store without
+    /// reading it; `None` when it has none or can't say. Says nothing of
+    /// expiry: a caller that cares has asked [`metadata`](Self::metadata).
+    fn body_size(&self, agent_id: &str, id: &ArtifactId) -> Result<Option<u64>> {
+        Ok(self
+            .body_file_path(agent_id, id)?
+            .and_then(|path| fs::metadata(path).ok())
+            .map(|metadata| metadata.len()))
+    }
+
     /// Best-effort immediate removal of an artifact (body + metadata) —
     /// e.g. a multi-file upload rolled back after one file trips the size
     /// cap. Default no-op: TTL-based purging covers stores without cheap

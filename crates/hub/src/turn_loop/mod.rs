@@ -4730,8 +4730,20 @@ pub(crate) async fn stream_admitted(
         attachments.clone(),
         trust_level,
     );
-    if let (Some(desk), Some(asked)) = (desk, session.messages.last_mut()) {
-        asked.desk = Some(desk.turn.mark());
+    if let Some(desk) = desk {
+        let files = crate::desk_attachments::carried(
+            Arc::clone(&service.sessions),
+            service.agent_id.as_str(),
+            &session.owner,
+            attachments.as_deref(),
+        )
+        .await;
+        if let Some(asked) = session.messages.last_mut() {
+            asked.desk = Some(workforce_common::channels::desk::DeskMark {
+                files,
+                ..desk.turn.mark()
+            });
+        }
     }
     // The message this turn answers, for the resume sweep.
     let turn_message_id = session.messages.get(archive_base).map(|m| m.id.clone());

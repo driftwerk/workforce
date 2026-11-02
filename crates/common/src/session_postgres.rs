@@ -58,9 +58,9 @@ use crate::session::{
     message_to_transcript_entry, paginate_entries, rank_search_results, reassigned_channel,
     redact_message_secrets, redact_messages_in_place, search_terms, tool_calls_for, ArchivePage,
     InterruptedTurn, JournalEntry, MessageRole, Reassigned, RedactionStats, Session,
-    SessionContextType, SessionContextUsage, SessionExport, SessionKind, SessionMessage,
-    SessionSearchResult, SessionStats, SessionStore, ToolCallRecord, TranscriptEntry,
-    TurnPrincipal,
+    SessionAttachment, SessionContextType, SessionContextUsage, SessionExport, SessionKind,
+    SessionMessage, SessionSearchResult, SessionStats, SessionStore, ToolCallRecord,
+    TranscriptEntry, TurnPrincipal,
 };
 
 mod embedded {
@@ -1942,6 +1942,56 @@ impl SessionStore for PostgresSessionStore {
         })
     }
 
+    /// From the live blob, as the archive holds no attachments. Selected
+    /// field by field in the database: what a message holds inline stays
+    /// there.
+    fn message_files(
+        &self,
+        session_id: &str,
+    ) -> Result<std::collections::HashMap<String, Vec<SessionAttachment>>> {
+        let id = parse_uuid(session_id)?;
+        self.block_on(async move {
+            let mut conn = self.pool.get().await?;
+            let scoped = self.scope(&mut conn).await?;
+            let rows = scoped
+                .query(
+                    "SELECT m->>'id', f->>'filename', f->>'mime_type', f->>'artifact_id'
+                     FROM sessions s,
+                          jsonb_array_elements(s.messages) WITH ORDINALITY AS ms(m, at_message),
+                          jsonb_array_elements(
+                              CASE WHEN jsonb_typeof(m->'attachments') = 'array'
+                                   THEN m->'attachments' ELSE '[]'::jsonb END
+                          ) WITH ORDINALITY AS fs(f, at_file)
+                     WHERE s.id = $1 AND s.agent_id = $2 AND s.tenant_id = $3
+                       AND f->>'artifact_id' IS NOT NULL
+                     ORDER BY at_message, at_file",
+                    &[&id, &self.agent_id, &self.tenant_id()],
+                )
+                .await?;
+            scoped.finish().await?;
+            let mut files = std::collections::HashMap::<String, Vec<SessionAttachment>>::new();
+            for row in &rows {
+                let (message, filename, mime_type, artifact_id): (
+                    Option<String>,
+                    Option<String>,
+                    Option<String>,
+                    String,
+                ) = (row.get(0), row.get(1), row.get(2), row.get(3));
+                if let Some(message) = message {
+                    files
+                        .entry(message)
+                        .or_default()
+                        .push(SessionAttachment::from_artifact(
+                            filename.unwrap_or_default(),
+                            mime_type.unwrap_or_default(),
+                            artifact_id,
+                        ));
+                }
+            }
+            Ok(files)
+        })
+    }
+
     fn read_archive_message(
         &self,
         session_id: &str,
@@ -2516,6 +2566,69 @@ pub(crate) mod tests {
             assert_eq!(older.messages.len(), 2);
             assert_eq!(older.messages[0].content, "turn 1");
             assert_eq!(older.messages[1].content, "turn 2");
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_message_s_files_are_read_by_reference_and_never_their_inline_bytes() {
+        with_store(|store| async move {
+            let s: Arc<dyn SessionStore> = store;
+            let mut sess = s.get_or_create("desk", "u", "agent-a").unwrap();
+            let both = SessionMessage {
+                attachments: Some(vec![
+                    SessionAttachment::from_artifact("a.png", "image/png", "art_a"),
+                    SessionAttachment {
+                        data: "aW5saW5l".into(),
+                        ..SessionAttachment::from_artifact("b.png", "image/png", "art_b")
+                    },
+                    SessionAttachment {
+                        filename: "inline.png".into(),
+                        mime_type: "image/png".into(),
+                        data: "aW5saW5l".into(),
+                        artifact_id: None,
+                    },
+                ]),
+                ..user_msg("look")
+            };
+            let inline_only = SessionMessage {
+                attachments: Some(vec![SessionAttachment {
+                    filename: "inline.png".into(),
+                    mime_type: "image/png".into(),
+                    data: "aW5saW5l".into(),
+                    artifact_id: None,
+                }]),
+                ..user_msg("inline")
+            };
+            sess.messages
+                .extend([user_msg("plain"), both.clone(), inline_only]);
+            s.save(&sess).unwrap();
+
+            let files = s.message_files(&sess.id).unwrap();
+            assert_eq!(files.len(), 1, "only a message with a referenced file");
+            let on_both: Vec<_> = files[&both.id]
+                .iter()
+                .map(|f| {
+                    (
+                        f.filename.as_str(),
+                        f.mime_type.as_str(),
+                        f.data.as_str(),
+                        f.artifact_id.as_deref(),
+                    )
+                })
+                .collect();
+            assert_eq!(
+                on_both,
+                [
+                    ("a.png", "image/png", "", Some("art_a")),
+                    ("b.png", "image/png", "", Some("art_b")),
+                ],
+                "in order, with no bytes"
+            );
+            assert!(s
+                .message_files(&Uuid::new_v4().to_string())
+                .unwrap()
+                .is_empty());
         })
         .await;
     }

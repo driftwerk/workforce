@@ -20,8 +20,13 @@
 //! - **On the message**: whether or not the desk is on, the files a live
 //!   Desk turn delivered ride in its answer's Desk mark, and a file
 //!   delivered outside a turn is a message of its own carrying it, so a
-//!   Desk that missed them live drains them with the conversation.
+//!   Desk that missed them live drains them with the conversation. So do
+//!   the person's, in the mark of the message that carried them (see
+//!   [`carried`]); a message saved before that, or a file its mark couldn't
+//!   carry, is held only in its own `attachments` while it is in the
+//!   session's live messages (see [`described`]).
 
+use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::path::Path;
 use std::sync::Arc;
@@ -46,7 +51,7 @@ use workforce_agent::tools::chart::CHART_SPEC_MEDIA_TYPE;
 use workforce_agent::tools::image_gen::GeneratedImageRef;
 use workforce_common::channels::desk::DeskFile;
 use workforce_common::channels::{is_conversational, is_desk_conversation, DESK_CHANNEL};
-use workforce_common::session::{MessageRole, Session, SessionStore};
+use workforce_common::session::{MessageRole, Session, SessionAttachment, SessionStore};
 use workforce_gateway_client::protocol::Attachment;
 
 use crate::gateway::{resolve_caller_context, GatewayState};
@@ -248,7 +253,9 @@ impl Described {
     }
 }
 
-/// The size of the file `id` in `agent`'s store, and an image's pixels.
+/// The size of the file `id` in `agent`'s store, and an image's pixels. A
+/// store that keeps no files says its size, and pixels aren't worth the
+/// download: a reader lays an image out without them until it has it.
 pub(crate) fn describe(
     store: &dyn ArtifactStore,
     agent: &str,
@@ -256,7 +263,14 @@ pub(crate) fn describe(
     media_type: &str,
 ) -> Described {
     let Some(path) = store.body_file_path(agent, id).ok().flatten() else {
-        return Described::default();
+        let size = store.body_size(agent, id).unwrap_or_else(|e| {
+            warn!(error = %e, artifact_id = %id.as_str(), "asking a file's size of its store failed");
+            None
+        });
+        return Described {
+            size: size.unwrap_or(0),
+            ..Described::default()
+        };
     };
     let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
     Described::sized(size, media_type, || read_head(&path, IMAGE_HEAD))
@@ -513,12 +527,21 @@ mod kept {
         owner: &str,
         page: &mut Page,
         span: crate::desk_conversations::Span,
+        held: &mut HashSet<String>,
     ) {
         let ids: Vec<String> = page.messages.iter().map(|m| m.id.clone()).collect();
         match desk.store().attachments_on(&ids).await {
             Ok(mut on) => page.messages.iter_mut().for_each(|m| {
                 if let Some(files) = on.remove(&m.id) {
-                    m.attachments = files.iter().map(Kept::shown).collect();
+                    // What is kept says more than what the message holds,
+                    // and a file only the message holds stays on it.
+                    let kept: Vec<_> = files.iter().map(Kept::shown).collect();
+                    kept.iter().for_each(|k| {
+                        held.remove(&k.artifact_id);
+                    });
+                    m.attachments
+                        .retain(|a| !kept.iter().any(|k| k.artifact_id == a.artifact_id));
+                    m.attachments.splice(0..0, kept);
                 }
             }),
             Err(e) => warn!(error = %e, "reading the files of a DM failed"),
@@ -592,6 +615,265 @@ pub(crate) async fn session_ended(session_id: &str) {
     }
 }
 
+/// The owners of the sessions one call asks about. On Postgres a session is
+/// read whole, its messages too, so each is read once however many files are
+/// filed under it.
+struct Owners<F> {
+    look_up: F,
+    known: HashMap<String, Option<String>>,
+}
+
+impl<F: FnMut(&str) -> Option<String>> Owners<F> {
+    fn new(look_up: F) -> Self {
+        Self {
+            look_up,
+            known: HashMap::new(),
+        }
+    }
+
+    fn of(&mut self, session: &str) -> Option<&str> {
+        let look_up = &mut self.look_up;
+        self.known
+            .entry(session.to_string())
+            .or_insert_with(|| look_up(session))
+            .as_deref()
+    }
+}
+
+/// The owners of `sessions`'s sessions. One that can't be read has none, so
+/// nothing filed under it reads as `owner`'s.
+fn owners_in(sessions: &dyn SessionStore) -> Owners<impl FnMut(&str) -> Option<String> + '_> {
+    Owners::new(move |session: &str| match sessions.get(session) {
+        Ok(found) => found.map(|session| session.owner),
+        Err(e) => {
+            warn!(error = %e, session, "reading the owner of a file's session failed");
+            None
+        }
+    })
+}
+
+/// Whether `owner` may read the file `descriptor` describes, as the download
+/// route has it: it was made for them, or it is filed under a session of
+/// theirs. A message names whatever id its client gave, so this comes before
+/// anything is said of what that id is.
+fn readable_by<F: FnMut(&str) -> Option<String>>(
+    owners: &mut Owners<F>,
+    descriptor: &ArtifactDescriptor,
+    owner: &str,
+) -> bool {
+    descriptor.user_id.as_deref() == Some(owner)
+        || descriptor
+            .session_id
+            .as_deref()
+            .and_then(|session| owners.of(session))
+            == Some(owner)
+}
+
+/// The file `a` as its message's client named it, and all that is said of a
+/// file `owner` may not read or that has expired, so the two read alike: no
+/// size, no pixels. `None` when it can't be shown at all.
+pub(crate) fn named(a: &SessionAttachment) -> Option<workforce_desk::attachments::Attachment> {
+    let file = workforce_desk::attachments::Attachment {
+        artifact_id: a.artifact_id.clone()?,
+        media_type: a.mime_type.clone(),
+        filename: safe_filename(&a.filename),
+        size: 0,
+        width: None,
+        height: None,
+        duration: None,
+        thumbnail_url: None,
+        hub: None,
+        agent: None,
+    };
+    file.invalid().is_none().then_some(file)
+}
+
+/// The person's files on `page` of their conversation with `agent` that only
+/// their message's client has named (`held`, from
+/// [`read_shown`](crate::desk_conversations::read_shown)), told from `agent`'s
+/// store. A mark's files and kept ones already say what was known of them
+/// when they were made, whatever that was, so they are not asked about again.
+/// Off the runtime: this reads the store once per file and an image's head.
+pub(crate) async fn described(
+    sessions: Arc<dyn SessionStore>,
+    agent: &str,
+    owner: &str,
+    page: &mut workforce_desk::Page,
+    held: &HashSet<String>,
+) {
+    let Some(store) = global_store() else {
+        return;
+    };
+    let at: Vec<(usize, usize)> = page
+        .messages
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m.from == workforce_desk::Author::User)
+        .flat_map(|(i, m)| {
+            m.attachments
+                .iter()
+                .enumerate()
+                .filter(|(_, file)| held.contains(&file.artifact_id))
+                .map(move |(j, _)| (i, j))
+        })
+        .collect();
+    if at.is_empty() {
+        return;
+    }
+    let mut files: Vec<_> = at
+        .iter()
+        .map(|&(i, j)| page.messages[i].attachments[j].clone())
+        .collect();
+    let (agent, owner) = (agent.to_string(), owner.to_string());
+    let told = tokio::task::spawn_blocking(move || {
+        describe_files(
+            store.as_ref(),
+            sessions.as_ref(),
+            &agent,
+            &owner,
+            &mut files,
+        );
+        files
+    })
+    .await;
+    match told {
+        Ok(files) => {
+            for ((i, j), file) in at.into_iter().zip(files) {
+                page.messages[i].attachments[j] = file;
+            }
+        }
+        Err(e) => warn!(error = %e, "telling a DM's files failed"),
+    }
+}
+
+/// `files` as `agent`'s store tells them: its type and name, which it read
+/// from their bytes, its size and an image's pixels. Those `owner` may not
+/// read, or that are gone, stay as they are.
+fn describe_files(
+    store: &dyn ArtifactStore,
+    sessions: &dyn SessionStore,
+    agent: &str,
+    owner: &str,
+    files: &mut [workforce_desk::attachments::Attachment],
+) {
+    let mut owners = owners_in(sessions);
+    for file in files {
+        let Ok(id) = ArtifactId::parse(&file.artifact_id) else {
+            continue;
+        };
+        let descriptor = match store.metadata(agent, &id) {
+            Ok(Some(descriptor)) => descriptor,
+            Ok(None) => continue,
+            Err(e) => {
+                warn!(error = %e, artifact_id = %id.as_str(), "reading what a DM's file is failed");
+                continue;
+            }
+        };
+        if !readable_by(&mut owners, &descriptor, owner) {
+            continue;
+        }
+        if let Some(media_type) = descriptor.media_type {
+            file.media_type = media_type;
+        }
+        if let Some(filename) = descriptor.filename {
+            file.filename = safe_filename(&filename);
+        }
+        let known = describe(store, agent, &id, &file.media_type);
+        file.size = known.size;
+        file.width = known.width;
+        file.height = known.height;
+    }
+}
+
+/// The files `attachments`, on a message `owner` is sending to `agent`, as
+/// its mark carries them, so they stay with the message when the session's
+/// live messages are compacted and rolled over. Only those of `agent`'s store
+/// that `owner` may read: it is what the message's client said, and the mark
+/// is what its conversation shows. Off the runtime: this reads the store once
+/// per file and an image's head, on the way into a turn.
+pub(crate) async fn carried(
+    sessions: Arc<dyn SessionStore>,
+    agent: &str,
+    owner: &str,
+    attachments: Option<&[SessionAttachment]>,
+) -> Vec<DeskFile> {
+    let Some(store) = global_store() else {
+        return Vec::new();
+    };
+    // By reference only: what a file holds inline has no address to carry.
+    let named: Vec<SessionAttachment> = attachments
+        .unwrap_or_default()
+        .iter()
+        .take(workforce_desk::attachments::MAX_PER_MESSAGE)
+        .filter_map(|a| {
+            let id = a.artifact_id.as_deref()?;
+            Some(SessionAttachment::from_artifact(
+                &a.filename,
+                &a.mime_type,
+                id,
+            ))
+        })
+        .collect();
+    if named.is_empty() {
+        return Vec::new();
+    }
+    let (agent, owner) = (agent.to_string(), owner.to_string());
+    tokio::task::spawn_blocking(move || {
+        carried_files(store.as_ref(), sessions.as_ref(), &agent, &owner, &named)
+    })
+    .await
+    .unwrap_or_else(|e| {
+        warn!(error = %e, "stamping a message's files on its mark failed");
+        Vec::new()
+    })
+}
+
+fn carried_files(
+    store: &dyn ArtifactStore,
+    sessions: &dyn SessionStore,
+    agent: &str,
+    owner: &str,
+    attachments: &[SessionAttachment],
+) -> Vec<DeskFile> {
+    let mut owners = owners_in(sessions);
+    attachments
+        .iter()
+        .filter_map(|a| {
+            let named = a.artifact_id.as_deref()?;
+            let Ok(id) = ArtifactId::parse(named) else {
+                debug!(artifact_id = named, "a message names no artifact: its mark leaves it out");
+                return None;
+            };
+            let descriptor = match store.metadata(agent, &id) {
+                Ok(Some(descriptor)) => descriptor,
+                Ok(None) => {
+                    debug!(artifact_id = named, "a message's file has gone: its mark leaves it out");
+                    return None;
+                }
+                Err(e) => {
+                    warn!(error = %e, artifact_id = named, "looking up a message's file failed: its mark leaves it out");
+                    return None;
+                }
+            };
+            if !readable_by(&mut owners, &descriptor, owner) {
+                debug!(artifact_id = named, "a message's file isn't its person's: its mark leaves it out");
+                return None;
+            }
+            Some(
+                StagedFile::in_store(
+                    store,
+                    agent,
+                    &id,
+                    descriptor.media_type.as_deref().unwrap_or(&a.mime_type),
+                    descriptor.filename.as_deref().unwrap_or(&a.filename),
+                    None,
+                )
+                .delivered(agent),
+            )
+        })
+        .collect()
+}
+
 /// A Desk conversation files go into: a DM, room or thread session of the
 /// agent whose turn delivered them.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -625,14 +907,49 @@ impl StagedFile {
         filename: &str,
         caption: Option<&str>,
     ) -> Self {
+        Self::described_as(
+            global_store()
+                .map(|store| describe(store.as_ref(), agent, artifact_id, media_type))
+                .unwrap_or_default(),
+            artifact_id,
+            media_type,
+            filename,
+            caption,
+        )
+    }
+
+    /// [`of`](Self::of), from a store in hand: off the runtime, a turn's own
+    /// store isn't there to be found.
+    fn in_store(
+        store: &dyn ArtifactStore,
+        agent: &str,
+        artifact_id: &ArtifactId,
+        media_type: &str,
+        filename: &str,
+        caption: Option<&str>,
+    ) -> Self {
+        Self::described_as(
+            describe(store, agent, artifact_id, media_type),
+            artifact_id,
+            media_type,
+            filename,
+            caption,
+        )
+    }
+
+    fn described_as(
+        described: Described,
+        artifact_id: &ArtifactId,
+        media_type: &str,
+        filename: &str,
+        caption: Option<&str>,
+    ) -> Self {
         Self {
             artifact_id: artifact_id.clone(),
             media_type: media_type.to_string(),
             filename: safe_filename(filename),
             caption: caption.map(str::to_string),
-            described: global_store()
-                .map(|store| describe(store.as_ref(), agent, artifact_id, media_type))
-                .unwrap_or_default(),
+            described,
         }
     }
 
