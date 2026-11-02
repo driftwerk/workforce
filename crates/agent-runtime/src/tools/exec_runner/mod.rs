@@ -15,7 +15,7 @@ mod link;
 mod memory;
 mod process_group;
 pub mod protocol;
-mod run_exec;
+pub(crate) mod run_exec;
 mod run_or_dispatch;
 mod server;
 mod setup;

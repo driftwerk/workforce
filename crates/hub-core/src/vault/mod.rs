@@ -269,11 +269,11 @@ impl Vault {
             .collect()
     }
 
-    /// The master key from the `WORKFORCE_VAULT_KEY` env var or an existing
-    /// key file; `None` when neither exists. Never creates a key.
+    /// The master key from `WORKFORCE_VAULT_KEY` (inherited on a
+    /// descriptor, else the env var) or an existing key file; `None` when
+    /// neither exists. Never creates a key.
     pub fn read_master_key(key_file: Option<&Path>, data_dir: &Path) -> Result<Option<String>> {
-        if let Some(key) = std::env::var("WORKFORCE_VAULT_KEY")
-            .ok()
+        if let Some(key) = workforce_common::inherited_secrets::var("WORKFORCE_VAULT_KEY")
             .filter(|key| !key.is_empty())
         {
             return Ok(Some(key));

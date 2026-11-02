@@ -297,11 +297,13 @@ pub fn pid_file(socket: &Path) -> PathBuf {
 
 /// `workforce pty-holder`: detaches from whoever started it (its own
 /// session, so it outlives the supervisor restarting the hub, and SIGHUP is
-/// ignored), reads its token from [`TOKEN_ENV`], and serves until SIGTERM
-/// or SIGINT, which end its terminals.
-pub async fn run(socket: &Path) -> Result<()> {
+/// ignored), and serves until SIGTERM or SIGINT, which end its terminals.
+/// `token` is what it requires of every client; the caller reads it from
+/// [`TOKEN_ENV`], which Desk Helper hands over on a pipe, never in the
+/// environment.
+pub async fn run(socket: &Path, token: &str) -> Result<()> {
     use tokio::signal::unix::{signal, SignalKind};
-    let token = std::env::var(TOKEN_ENV).map_err(|_| eyre::eyre!("{TOKEN_ENV} is not set"))?;
+
     // SAFETY: setsid has no preconditions; it fails harmlessly when this
     // process already leads a group.
     if unsafe { libc::setsid() } == -1 {
@@ -325,7 +327,7 @@ pub async fn run(socket: &Path) -> Result<()> {
         }
         stop.cancel();
     });
-    serve(socket, &token, cancel).await
+    serve(socket, token, cancel).await
 }
 
 async fn connection(state: Arc<HolderState>, stream: UnixStream, cancel: CancellationToken) {

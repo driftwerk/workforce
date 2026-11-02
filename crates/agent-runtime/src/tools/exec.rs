@@ -24,6 +24,21 @@ pub const EXEC_SECRET_VARS: &[&str] = &[
     "WORKFORCE_JWT_SECRET",
 ];
 
+/// How an in-process `exec.run` child's environment is built. A configured
+/// runner ignores it: the daemon always applies its own scrubbed allowlist.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum LocalEnv {
+    /// The hub's environment minus [`EXEC_SECRET_VARS`]: servers and
+    /// development, unchanged.
+    #[default]
+    Inherit,
+    /// A clean, allowlisted environment, never the hub's. For a hub on
+    /// someone's own computer (`[desk]`), where commands run as the hub's own
+    /// user. The hub's `PATH` there is already the person's login `PATH`, so
+    /// it is kept as it is, with their toolchain and proxy variables.
+    Allowlisted,
+}
+
 // Re-exported so existing callers (`code.*` tools) keep importing the workdir
 // validator from `tools::exec`; the implementation now lives in `exec_runner`.
 pub use super::exec_runner::validate_workdir;
@@ -83,6 +98,8 @@ pub struct ExecCommand {
     /// socket is fail-closed: an unreachable daemon errors, never falling back
     /// to in-process execution (that would re-expose the vault — audit F7).
     runner: Option<RunnerEndpoint>,
+    /// The child's environment when running in-process.
+    local_env: LocalEnv,
 }
 
 impl ExecCommand {
@@ -92,6 +109,7 @@ impl ExecCommand {
             workspace: None,
             allowed_workdirs: Vec::new(),
             runner: None,
+            local_env: LocalEnv::Inherit,
         }
     }
 
@@ -108,6 +126,11 @@ impl ExecCommand {
 
     pub fn with_runner(mut self, runner: Option<RunnerEndpoint>) -> Self {
         self.runner = runner;
+        self
+    }
+
+    pub fn with_local_env(mut self, local_env: LocalEnv) -> Self {
+        self.local_env = local_env;
         self
     }
 }
@@ -270,11 +293,15 @@ impl Tool for ExecCommand {
             mcp: None,
         };
 
-        // In-process (dev/local) path inherits the parent env minus the three
-        // secret vars — today's behaviour, unchanged. When dispatching, the
-        // daemon scrubs to the allowlist instead and this mode is ignored.
-        let local_env = EnvMode::Inherit {
-            remove: EXEC_SECRET_VARS,
+        // In-process: the parent env minus the three secret vars (servers and
+        // development, unchanged), or the allowlist alone on a hub on
+        // someone's own computer. When dispatching, the daemon scrubs to its
+        // allowlist instead and this mode is ignored.
+        let local_env = match self.local_env {
+            LocalEnv::Inherit => EnvMode::Inherit {
+                remove: EXEC_SECRET_VARS,
+            },
+            LocalEnv::Allowlisted => EnvMode::Allowlisted,
         };
         match run_or_dispatch(self.runner.as_ref(), req, &self.allowed_workdirs, local_env).await {
             Ok(outcome) => Ok(assemble_result(outcome, requested_timeout, start)),
@@ -531,6 +558,108 @@ mod tests {
             .unwrap()
             .contains("secure command runner unavailable"));
         assert!(!sentinel.exists(), "fail-closed violated: command executed");
+    }
+
+    /// On a hub on someone's own computer, a command `exec.run` starts sees
+    /// neither of the hub's database secrets, nor any other variable off the
+    /// allowlist, and still runs exactly as written.
+    #[tokio::test]
+    async fn allowlisted_exec_run_cannot_see_the_hubs_secrets() {
+        // Names no other test in this binary touches.
+        unsafe {
+            std::env::set_var("DESK_POSTGRES_PASSWORD", "pw-fixture");
+            std::env::set_var("DESK_MEMORY_KEY", "mk-fixture");
+            std::env::set_var("EXEC_T_OFF_THE_ALLOWLIST", "other-fixture");
+        }
+        let tool = ExecCommand::default().with_local_env(LocalEnv::Allowlisted);
+        // Names only, and probes for the two values: what the environment
+        // holds never reaches a test log.
+        let result = tool
+            .execute(serde_json::json!({
+                "command": "env | cut -d= -f1; \
+                    echo \"pw=[${DESK_POSTGRES_PASSWORD:-absent}] mk=[${DESK_MEMORY_KEY:-absent}]\"; \
+                    echo \"quoted 'arg' $((1 + 1))\"",
+            }))
+            .await
+            .unwrap();
+        unsafe {
+            std::env::remove_var("DESK_POSTGRES_PASSWORD");
+            std::env::remove_var("DESK_MEMORY_KEY");
+            std::env::remove_var("EXEC_T_OFF_THE_ALLOWLIST");
+        }
+        assert!(result.success, "exit code {}", result.output["exit_code"]);
+        let stdout = result.output["stdout"].as_str().unwrap();
+        let names: Vec<&str> = stdout.lines().collect();
+        for leaked in [
+            "DESK_POSTGRES_PASSWORD",
+            "DESK_MEMORY_KEY",
+            "EXEC_T_OFF_THE_ALLOWLIST",
+        ] {
+            assert!(!names.contains(&leaked), "{leaked} reached the command");
+        }
+        assert!(
+            names.contains(&"pw=[absent] mk=[absent]"),
+            "a secret's value reached the command"
+        );
+        assert_eq!(
+            names.last(),
+            Some(&"quoted 'arg' 2"),
+            "the command was changed on its way to sh"
+        );
+    }
+
+    /// The hub's PATH is the person's login PATH already: a command sees it
+    /// exactly, in its order (no login shell re-running `path_helper` in
+    /// front of their shims and Homebrew), and their toolchain and proxy
+    /// variables come with it.
+    #[tokio::test]
+    async fn allowlisted_exec_run_keeps_path_order_and_toolchain_vars() {
+        let _env = super::super::exec_runner::run_exec::tests::ENV_MUTATION_LOCK
+            .lock()
+            .await;
+        let path = std::env::var("PATH").unwrap_or_default();
+        let shims = format!("/exec-t/shims:{path}");
+        unsafe {
+            std::env::set_var("PATH", &shims);
+            std::env::set_var("JAVA_HOME", "/exec-t/jdk");
+            std::env::set_var("no_proxy", "localhost,.internal");
+        }
+        let result = ExecCommand::default()
+            .with_local_env(LocalEnv::Allowlisted)
+            .execute(serde_json::json!({
+                "command": "echo \"$PATH\"; echo \"$JAVA_HOME\"; echo \"$no_proxy\"",
+            }))
+            .await
+            .unwrap();
+        unsafe {
+            std::env::set_var("PATH", &path);
+            std::env::remove_var("JAVA_HOME");
+            std::env::remove_var("no_proxy");
+        }
+        let stdout = result.output["stdout"].as_str().unwrap();
+        let lines: Vec<&str> = stdout.lines().collect();
+        assert!(
+            lines.first() == Some(&shims.as_str()),
+            "PATH lost its order"
+        );
+        assert_eq!(&lines[1..], ["/exec-t/jdk", "localhost,.internal"]);
+    }
+
+    /// Elsewhere (no `[desk]`), the in-process path is unchanged: ordinary
+    /// variables pass through, the three secrets don't.
+    #[tokio::test]
+    async fn inherited_exec_run_is_unchanged() {
+        unsafe {
+            std::env::set_var("EXEC_T_INHERITED", "passes");
+        }
+        let result = ExecCommand::default()
+            .execute(serde_json::json!({"command": "echo [${EXEC_T_INHERITED:-absent}]"}))
+            .await
+            .unwrap();
+        unsafe {
+            std::env::remove_var("EXEC_T_INHERITED");
+        }
+        assert_eq!(result.output["stdout"].as_str().unwrap().trim(), "[passes]");
     }
 
     /// End-to-end through the tool's dispatch arm against a live daemon: the

@@ -10642,7 +10642,7 @@ impl WorkforceConfig {
                 "Config overlay key is not overlayable (infra-owned) — ignored"
             );
         }
-        let mut config = Self::from_raw_table(raw.merged())?;
+        let mut config = Self::from_base_and_overlay(raw.base.clone(), raw.overlay.as_ref())?;
         if let Some(config_dir) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
             config.anchor_relative_paths(config_dir);
         }
@@ -10679,24 +10679,39 @@ impl WorkforceConfig {
         }
     }
 
-    /// Parse a TOML string into a config (no overlay — used for embedded /
-    /// test configs and by callers that already merged). Applies, in order:
-    /// `${VAR}` env var expansion across every string value (see
-    /// [`crate::config_expand`]), per-store backend defaulting when
-    /// `[postgres] enabled = true`, and the legacy per-field env overrides in
-    /// [`Self::apply_env_overrides`]. Vault (`${vault:...}`) references are
-    /// resolved per-field at access time, not here.
+    /// Parse a TOML string into a config, as a base file with no overlay
+    /// (embedded / test configs): [`Self::from_base_and_overlay`].
     pub fn from_toml(toml_str: &str) -> eyre::Result<Self> {
         let table: toml::Table = toml_str
             .parse()
             .map_err(|e| eyre::eyre!("Failed to parse config: {}", e))?;
-        Self::from_raw_table(table)
+        Self::from_base_and_overlay(table, None)
     }
 
-    /// The shared post-parse pipeline: env expansion → postgres backend
-    /// defaulting → deserialization → legacy env overrides. Public so the
-    /// overlay writer validates a candidate merged table through the exact
-    /// same path the next boot will take (write-accepts ⇔ boot-accepts).
+    /// A config from the infra-owned base file and the runtime overlay. The
+    /// base's few secret fields expand from the secrets inherited on a
+    /// descriptor first
+    /// ([`crate::config_expand::expand_inherited_secret_fields`]), then the
+    /// overlay is merged over it, then everything goes through
+    /// [`Self::from_raw_table`]. Nothing the overlay holds, and no other base
+    /// field, ever reads an inherited secret. The hub's boot and the
+    /// overlay writer's validation both come through here, so
+    /// write-accepts ⇔ boot-accepts holds.
+    pub fn from_base_and_overlay(
+        mut base: toml::Table,
+        overlay: Option<&toml::Table>,
+    ) -> eyre::Result<Self> {
+        crate::config_expand::expand_inherited_secret_fields(&mut base);
+        if let Some(overlay) = overlay {
+            crate::config_overlay::merge_overlay(&mut base, overlay);
+        }
+        Self::from_raw_table(base)
+    }
+
+    /// The shared post-parse pipeline: env expansion (never the inherited
+    /// secrets) → postgres backend defaulting → deserialization → legacy env
+    /// overrides. Callers holding a base and an overlay use
+    /// [`Self::from_base_and_overlay`], the path the boot takes.
     pub fn from_raw_table(mut table: toml::Table) -> eyre::Result<Self> {
         crate::config_expand::expand_env_vars_in_table(&mut table);
         apply_postgres_backend_defaults(&mut table);
@@ -11449,6 +11464,68 @@ fn default_true() -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    /// Only the base file's few secret fields expand from the inherited
+    /// secrets. Anything an agent or a tool can write (the overlay: agents,
+    /// their prompts) never does, nor do the base's other fields.
+    #[test]
+    fn agent_written_config_never_expands_to_an_inherited_secret() {
+        crate::inherited_secrets::install_test_fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let base_path = dir.path().join("workforce.toml");
+        std::fs::write(
+            &base_path,
+            format!(
+                r#"
+[hub]
+data_dir = "{}"
+
+[postgres]
+password = "${{INHERITED_T_PG}}"
+
+[vellev]
+api_key = "${{INHERITED_T_KEY}}"
+
+[desk]
+pty_holder_token = "${{INHERITED_T_TOKEN}}"
+
+[[agents]]
+id = "base-agent"
+default = true
+system_prompt = "base [${{INHERITED_T_KEY}}]"
+"#,
+                dir.path().display()
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join(crate::config_overlay::OVERLAY_FILE),
+            r#"
+[[agents]]
+id = "injected"
+system_prompt = "overlay [${INHERITED_T_KEY}] [${INHERITED_T_PG}]"
+"#,
+        )
+        .unwrap();
+        let config = WorkforceConfig::load(&base_path).unwrap();
+        let pg = config.postgres.as_ref().and_then(|p| p.password.as_deref());
+        assert_eq!(pg, Some("pg-fixture"));
+        let prompt = |id: &str| {
+            config
+                .agents
+                .iter()
+                .find(|a| a.id == id)
+                .and_then(|a| a.system_prompt.clone())
+                .unwrap_or_else(|| panic!("agent {id} is missing"))
+        };
+        assert_eq!(prompt("injected"), "overlay [] []");
+        assert_eq!(prompt("base-agent"), "base []");
+        assert_eq!(config.vellev.api_key.as_deref(), Some("key-fixture"));
+        assert_eq!(
+            config.desk.pty_holder_token.as_deref(),
+            Some("token-fixture")
+        );
+    }
     use super::*;
 
     #[test]

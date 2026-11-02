@@ -2302,6 +2302,19 @@ impl LlmStack {
     }
 }
 
+/// The environment `exec.run` gives a command it runs in-process. A hub on
+/// someone's own computer (`[desk]`) runs commands as that person, beside its
+/// own secrets, so they start from the allowlist rather than the hub's
+/// environment; elsewhere it is unchanged. With a runner configured the
+/// daemon scrubs instead, whatever this says.
+pub(crate) fn exec_env(config: &WorkforceConfig) -> workforce_agent::tools::exec::LocalEnv {
+    if config.desk.enabled {
+        workforce_agent::tools::exec::LocalEnv::Allowlisted
+    } else {
+        workforce_agent::tools::exec::LocalEnv::Inherit
+    }
+}
+
 impl Toolbox {
     fn new(config: &WorkforceConfig, setup: &Setup, credentials: &Credentials) -> Self {
         let Setup {
@@ -2324,6 +2337,7 @@ impl Toolbox {
             // Dispatch exec-class commands to the privilege-separated runner
             // daemon when a socket is configured (audit F7).
             runner: runner.clone(),
+            exec_env: exec_env(config),
         };
 
         // Build tools (wrapped in Arc early so system tools can share the reference)
@@ -5381,5 +5395,19 @@ fn turn_host() -> Arc<dyn crate::hosts::TurnHost> {
     #[cfg(not(feature = "postgres"))]
     {
         Arc::new(crate::turn_loop::TurnLoop)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use workforce_agent::tools::exec::LocalEnv;
+
+    #[test]
+    fn exec_starts_clean_only_on_a_desk_hub() {
+        let mut config = WorkforceConfig::default();
+        assert_eq!(exec_env(&config), LocalEnv::Inherit);
+        config.desk.enabled = true;
+        assert_eq!(exec_env(&config), LocalEnv::Allowlisted);
     }
 }
