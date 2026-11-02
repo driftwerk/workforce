@@ -681,6 +681,31 @@ impl From<&crate::channels::desk::DeskFile> for SessionAttachment {
     }
 }
 
+/// The files `messages` hold by reference, by message id: their names, types
+/// and artifact ids, and never the bytes of anything held inline, which no
+/// id can fetch.
+pub fn files_by_message(messages: &[SessionMessage]) -> HashMap<String, Vec<SessionAttachment>> {
+    messages
+        .iter()
+        .filter_map(|m| {
+            let files: Vec<SessionAttachment> = m
+                .attachments
+                .iter()
+                .flatten()
+                .filter_map(|a| {
+                    let id = a.artifact_id.as_deref()?;
+                    Some(SessionAttachment::from_artifact(
+                        &a.filename,
+                        &a.mime_type,
+                        id,
+                    ))
+                })
+                .collect();
+            (!files.is_empty()).then(|| (m.id.clone(), files))
+        })
+        .collect()
+}
+
 impl SessionAttachment {
     /// Build a by-reference attachment: the payload was already written to
     /// the artifact store and consumers resolve it from there.
@@ -3147,6 +3172,20 @@ pub trait SessionStore: Send + Sync {
         Ok(ArchivePage { messages, has_more })
     }
 
+    /// The files the messages of `session_id` hold by reference, by message
+    /// id ([`files_by_message`]). What a store's archive doesn't keep is read
+    /// from its live messages, so a message compacted out of them may be
+    /// missing. Nothing for an unknown session.
+    fn message_files(
+        &self,
+        session_id: &str,
+    ) -> eyre::Result<HashMap<String, Vec<SessionAttachment>>> {
+        Ok(self
+            .get(session_id)?
+            .map(|session| files_by_message(&session.messages))
+            .unwrap_or_default())
+    }
+
     /// How far `owner` has read their Desk conversation with this store's
     /// agent on `channel`, when this store keeps read points.
     fn desk_read(
@@ -4877,6 +4916,23 @@ impl SessionStore for JsonlSessionStore {
             }
         }
         paginate_entries(entries, before_id, limit)
+    }
+
+    /// The archive keeps whole messages, so a file outlives its message's
+    /// compaction out of the live ones.
+    fn message_files(
+        &self,
+        session_id: &str,
+    ) -> eyre::Result<HashMap<String, Vec<SessionAttachment>>> {
+        let known = self
+            .cache
+            .lock()
+            .map_err(|e| eyre::eyre!("Lock poisoned: {e}"))?
+            .contains_key(session_id);
+        if !known {
+            return Ok(HashMap::new());
+        }
+        Ok(files_by_message(&self.read_archive_messages(session_id)?))
     }
 
     fn read_archive_message(

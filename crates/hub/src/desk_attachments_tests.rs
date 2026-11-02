@@ -556,6 +556,424 @@ async fn a_file_a_workflow_run_delivers_into_desk_is_served_to_its_person() {
     assert_eq!(status, StatusCode::NOT_FOUND, "nor anyone else's");
 }
 
+/// Uploads `bytes` as `token`'s for their DM with scout, and answers its id.
+async fn uploaded(state: &Arc<GatewayState>, token: &str, name: &str, bytes: Vec<u8>) -> String {
+    let (status, _, body) = call(
+        state,
+        axum::http::Request::post(format!(
+            "/api/agents/scout/attachments?channel=desk&filename={name}"
+        ))
+        .header("authorization", format!("Bearer {token}"))
+        .body(axum::body::Body::from(bytes))
+        .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    serde_json::from_slice::<serde_json::Value>(&body).unwrap()["artifact_id"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+/// The reported conversation, from Alice's Desk over its socket: two images
+/// with words, an answer, one image alone, an answer, more chat. Answers her
+/// conversation read as she reads it.
+async fn the_reported_conversation(
+    state: &Arc<GatewayState>,
+    alice: &str,
+    bob: &str,
+) -> (workforce_desk::Page, [String; 3], String) {
+    use futures::SinkExt;
+    let (a, b, c) = (
+        uploaded(state, alice, "a.png", png(30, 20)).await,
+        uploaded(state, alice, "b.png", png(4, 5)).await,
+        uploaded(state, alice, "c.png", png(6, 7)).await,
+    );
+    let bobs = uploaded(state, bob, "bobs.png", png(40, 50)).await;
+    let addr = serve_on_a_port(state).await;
+    let (mut socket, _) = tokio_tungstenite::connect_async(format!(
+        "ws://{addr}/ws?token={alice}&agent_id=scout&channel=desk&desk=1&accept=*/*"
+    ))
+    .await
+    .unwrap();
+    until(&mut socket, "connected").await;
+    let by_ref = |id: &str, name: &str| json!({"filename": name, "mime_type": "image/png", "data": "", "artifact_id": id});
+    for (turn, (content, files)) in [
+        (
+            "two of these",
+            json!([by_ref(&a, "a.png"), by_ref(&b, "b.png")]),
+        ),
+        ("", json!([by_ref(&c, "c.png")])),
+        ("more chat", json!([])),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        socket
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                json!({"type": "chat", "content": content, "attachments": files,
+                       "turn_ref": format!("ref-{turn}"),
+                       "desk": {"place": {"kind": "dm"}, "speaker": {"kind": "person"}}})
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        until(&mut socket, "turn_end").await;
+    }
+    (reads(state, alice).await, [a, b, c], bobs)
+}
+
+/// The DM with scout, as the person `token` signs in reads it.
+async fn reads(state: &Arc<GatewayState>, token: &str) -> workforce_desk::Page {
+    use workforce_desk::Conversations as _;
+    let mut headers = HeaderMap::new();
+    headers.insert("authorization", format!("Bearer {token}").parse().unwrap());
+    crate::desk_conversations::HubConversations(Arc::clone(state))
+        .page(
+            &headers,
+            None,
+            "scout",
+            DESK_CHANNEL,
+            workforce_desk::Cursor::Newest,
+            50,
+        )
+        .await
+        .unwrap()
+}
+
+/// With the desk store off, what a person uploads into their DM reads back on
+/// their messages, described from the store and without bytes; the files are
+/// served to them and nobody else; and another person's file named on a
+/// message says nothing of itself.
+#[tokio::test(flavor = "multi_thread")]
+async fn with_the_desk_store_off_a_dm_shows_the_files_its_person_sent() {
+    let dir = tempfile::tempdir().unwrap();
+    let (scout, _llm) = agent(dir.path(), "scout", "Seen.", Duration::ZERO).await;
+    let (state, [(alice_id, alice), (_, bob)]) = gateway(&scout);
+    store();
+    assert!(crate::desk_driver::desk().is_none());
+    let (_, [a, b, c], bobs) = the_reported_conversation(&state, &alice, &bob).await;
+    // A message naming Bob's file, which a turn would refuse but a client can
+    // still send.
+    let mut session = scout
+        .sessions
+        .find(DESK_CHANNEL, &alice_id)
+        .unwrap()
+        .unwrap();
+    session.add_user_message_with_attachments(
+        "and this one",
+        None,
+        Some(vec![SessionAttachment::from_artifact(
+            "mine.png",
+            "text/plain",
+            &bobs,
+        )]),
+    );
+    scout.sessions.save(&session).unwrap();
+    scout
+        .sessions
+        .append_to_archive(&session.id, session.messages.last().unwrap())
+        .unwrap();
+    let page = reads(&state, &alice).await;
+
+    let said: Vec<(&str, Vec<&str>)> = page
+        .messages
+        .iter()
+        .map(|m| {
+            (
+                m.text.as_str(),
+                m.attachments
+                    .iter()
+                    .map(|f| f.artifact_id.as_str())
+                    .collect(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        said,
+        [
+            ("two of these", vec![a.as_str(), b.as_str()]),
+            ("Seen.", vec![]),
+            ("", vec![c.as_str()]),
+            ("Seen.", vec![]),
+            ("more chat", vec![]),
+            ("Seen.", vec![]),
+            ("and this one", vec![bobs.as_str()]),
+        ]
+    );
+    let first = &page.messages[0].attachments[0];
+    assert_eq!(
+        (
+            first.filename.as_str(),
+            first.media_type.as_str(),
+            first.size,
+            first.width,
+            first.height
+        ),
+        (
+            "a.png",
+            "image/png",
+            png(30, 20).len() as u64,
+            Some(30),
+            Some(20)
+        )
+    );
+    let foreign = &page.messages[6].attachments[0];
+    assert_eq!(
+        (
+            foreign.filename.as_str(),
+            foreign.size,
+            foreign.width,
+            foreign.height
+        ),
+        ("mine.png", 0, None, None),
+        "as her client named it: nothing of what it is"
+    );
+    assert!(!serde_json::to_string(&page).unwrap().contains("\"data\""));
+
+    // Hers to fetch, on this hub, and no one else's.
+    let uri = |id: &str| format!("/api/agents/scout/attachments/{id}");
+    let (status, _, body) = call(&state, get(&uri(&c), Some(&alice), None)).await;
+    assert_eq!((status, body), (StatusCode::OK, png(6, 7)));
+    let (status, ..) = call(&state, get(&uri(&c), Some(&bob), None)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, ..) = call(&state, get(&uri(&bobs), Some(&alice), None)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "naming it is no read of it");
+
+    // Compaction takes them off the live messages; the mark keeps them.
+    let mut session = scout
+        .sessions
+        .find(DESK_CHANNEL, &alice_id)
+        .unwrap()
+        .unwrap();
+    let asked = &session
+        .messages
+        .iter()
+        .find(|m| m.content == "two of these");
+    let mark = asked.unwrap().desk.as_ref().unwrap();
+    assert_eq!(
+        mark.files.iter().map(|f| f.size).collect::<Vec<_>>(),
+        [png(30, 20).len() as u64, png(4, 5).len() as u64],
+    );
+    assert!(
+        carried(
+            scout.sessions.as_ref(),
+            "scout",
+            &alice_id,
+            Some(&[SessionAttachment::from_artifact(
+                "mine.png",
+                "image/png",
+                &bobs
+            )]),
+        )
+        .is_empty(),
+        "a mark carries only what its person may read"
+    );
+    session
+        .messages
+        .iter_mut()
+        .for_each(|m| m.attachments = None);
+    scout.sessions.save(&session).unwrap();
+    let read = crate::desk_conversations::page(
+        scout.sessions.as_ref(),
+        &workforce_desk::Speaker::agent("scout", "Scout"),
+        &alice_id,
+        DESK_CHANNEL,
+        workforce_desk::Cursor::Newest,
+        50,
+    )
+    .unwrap();
+    assert_eq!(read.messages[0].attachments.len(), 2);
+    assert_eq!(read.messages[2].attachments[0].artifact_id, c);
+}
+
+/// A file that has expired is still on its message, as it was named, and the
+/// conversation still reads.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_file_that_has_gone_stays_on_its_message_as_it_was_named() {
+    let dir = tempfile::tempdir().unwrap();
+    let (scout, _llm) = agent(dir.path(), "scout", "Seen.", Duration::ZERO).await;
+    store();
+    let mut session = scout
+        .sessions
+        .get_or_create(DESK_CHANNEL, "alice", "scout")
+        .unwrap();
+    let gone = ArtifactId::fresh();
+    session.add_user_message_with_attachments(
+        "",
+        None,
+        Some(vec![SessionAttachment::from_artifact(
+            "gone.png",
+            "image/png",
+            gone.as_str(),
+        )]),
+    );
+    scout.sessions.save(&session).unwrap();
+    let mut read = crate::desk_conversations::page(
+        scout.sessions.as_ref(),
+        &workforce_desk::Speaker::agent("scout", "Scout"),
+        "alice",
+        DESK_CHANNEL,
+        workforce_desk::Cursor::Newest,
+        50,
+    )
+    .unwrap();
+    described(scout.sessions.as_ref(), "scout", "alice", &mut read);
+    let file = &read.messages[0].attachments[0];
+    assert_eq!(
+        (file.filename.as_str(), file.size, file.width),
+        ("gone.png", 0, None)
+    );
+}
+
+/// A device with no identity behind it uploads under a session, not a
+/// person: its files are described and carried through that session's owner,
+/// and a rolled-over conversation's first session still counts as theirs.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_device_s_upload_is_theirs_through_its_session_across_a_rollover() {
+    let dir = tempfile::tempdir().unwrap();
+    let (scout, _llm) = agent(dir.path(), "scout", "Seen.", Duration::ZERO).await;
+    let mut first = scout
+        .sessions
+        .get_or_create(DESK_CHANNEL, "device-1", "scout")
+        .unwrap();
+    let image = png(8, 9);
+    let upload = |session: &str| ArtifactDescriptor {
+        session_id: Some(session.to_string()),
+        ..ArtifactDescriptor::from_context(
+            workforce_agent::attachments::SESSION_UPLOAD_PRODUCER,
+            ContentType::OctetStream,
+            "scout",
+        )
+        .with_file_meta("device.png", "image/png")
+    };
+    let id = store()
+        .write(
+            "scout",
+            upload(&first.id),
+            workforce_agent::artifacts::ArtifactBody::Bytes(image.clone()),
+        )
+        .unwrap()
+        .id;
+    let sessions = scout.sessions.as_ref();
+    workforce_agent::rollover::seal_and_mint(sessions, &mut first, 0).unwrap();
+    let named = [SessionAttachment::from_artifact(
+        "x.png",
+        "image/png",
+        id.as_str(),
+    )];
+    let carried_files = carried(sessions, "scout", "device-1", Some(&named));
+    assert_eq!(
+        carried_files
+            .iter()
+            .map(|f| (f.filename.as_str(), f.size, f.width))
+            .collect::<Vec<_>>(),
+        [("device.png", image.len() as u64, Some(8))],
+    );
+    assert!(carried(sessions, "scout", "device-2", Some(&named)).is_empty());
+}
+
+/// With the desk store on, the kept records of a person's files win, a file
+/// only their message holds stays, and nothing is said twice.
+#[cfg(feature = "postgres")]
+#[tokio::test(flavor = "multi_thread")]
+async fn with_the_desk_store_on_kept_files_win_with_no_duplicates() {
+    use workforce_desk::attachments::{Kept, Origin};
+    use workforce_postgres::test_support::with_test_pool;
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (scout, _llm) = agent(dir.path(), "scout", "Seen.", Duration::ZERO).await;
+        let (state, [(alice_id, alice), (_, bob)]) = gateway(&scout);
+        let d = crate::desk_crew::tests::desk(pool, dir.path()).await;
+        assert!(crate::desk_driver::install_desk_for_test(d.clone()));
+        let _crew = crate::desk_crew::CrewHub::start(
+            Arc::clone(&state),
+            d.clone(),
+            crate::desk_crew::Timing::default(),
+            tokio_util::sync::CancellationToken::new(),
+        );
+        store();
+        let (page, [a, b, c], _) = the_reported_conversation(&state, &alice, &bob).await;
+        let on = |i: usize| -> Vec<&str> {
+            page.messages[i]
+                .attachments
+                .iter()
+                .map(|f| f.artifact_id.as_str())
+                .collect()
+        };
+        assert_eq!(on(0), [a.as_str(), b.as_str()]);
+        assert_eq!(page.messages[2].text, "");
+        assert_eq!(on(2), [c.as_str()]);
+        assert!(
+            page.messages.iter().all(|m| !m.id.starts_with("file:")),
+            "a person's file is never a message of its own"
+        );
+
+        // A kept record with more to say wins; the file it doesn't cover stays.
+        let message = page.messages[0].id.clone();
+        d.store()
+            .put_attachment(&Kept {
+                artifact_id: "kept-only".into(),
+                agent_id: "scout".into(),
+                channel: DESK_CHANNEL.into(),
+                owner: alice_id.clone(),
+                session_id: scout
+                    .sessions
+                    .find(DESK_CHANNEL, &alice_id)
+                    .unwrap()
+                    .unwrap()
+                    .id,
+                origin: Origin::You,
+                message_id: Some(message.clone()),
+                media_type: "image/png".into(),
+                filename: "kept.png".into(),
+                size: 1,
+                width: None,
+                height: None,
+                duration: None,
+                thumbnail_id: None,
+                caption: None,
+                at: chrono::Utc::now(),
+            })
+            .await
+            .unwrap();
+        let mut again = crate::desk_conversations::page(
+            scout.sessions.as_ref(),
+            &workforce_desk::Speaker::agent("scout", "Scout"),
+            &alice_id,
+            DESK_CHANNEL,
+            workforce_desk::Cursor::Newest,
+            50,
+        )
+        .unwrap();
+        with_attachments(
+            &d,
+            &workforce_desk::Speaker::agent("scout", "Scout"),
+            DESK_CHANNEL,
+            &alice_id,
+            &mut again,
+            Default::default(),
+        )
+        .await;
+        let first = &again.messages[0];
+        assert_eq!(first.id, message);
+        let ids: Vec<&str> = first
+            .attachments
+            .iter()
+            .map(|f| f.artifact_id.as_str())
+            .collect();
+        assert!(
+            ids.contains(&"kept-only") && ids.contains(&a.as_str()) && ids.contains(&b.as_str())
+        );
+        let mut unique = ids.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), ids.len(), "{ids:?}");
+    })
+    .await;
+}
+
 /// A conversation's files for `view_attachment` are those its people
 /// attached: a message that names another person's upload, or some other
 /// tool's artifact, lists neither.

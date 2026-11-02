@@ -20,7 +20,11 @@
 //! - **On the message**: whether or not the desk is on, the files a live
 //!   Desk turn delivered ride in its answer's Desk mark, and a file
 //!   delivered outside a turn is a message of its own carrying it, so a
-//!   Desk that missed them live drains them with the conversation.
+//!   Desk that missed them live drains them with the conversation. So do
+//!   the person's, in the mark of the message that carried them (see
+//!   [`carried`]); a message saved before that holds them only in its own
+//!   `attachments` while it is in the session's live messages (see
+//!   [`described`]).
 
 use std::io::Read;
 use std::path::Path;
@@ -46,7 +50,7 @@ use workforce_agent::tools::chart::CHART_SPEC_MEDIA_TYPE;
 use workforce_agent::tools::image_gen::GeneratedImageRef;
 use workforce_common::channels::desk::DeskFile;
 use workforce_common::channels::{is_conversational, is_desk_conversation, DESK_CHANNEL};
-use workforce_common::session::{MessageRole, Session, SessionStore};
+use workforce_common::session::{MessageRole, Session, SessionAttachment, SessionStore};
 use workforce_gateway_client::protocol::Attachment;
 
 use crate::gateway::{resolve_caller_context, GatewayState};
@@ -518,7 +522,12 @@ mod kept {
         match desk.store().attachments_on(&ids).await {
             Ok(mut on) => page.messages.iter_mut().for_each(|m| {
                 if let Some(files) = on.remove(&m.id) {
-                    m.attachments = files.iter().map(Kept::shown).collect();
+                    // What is kept says more than what the message holds,
+                    // and a file only the message holds stays on it.
+                    let kept: Vec<_> = files.iter().map(Kept::shown).collect();
+                    m.attachments
+                        .retain(|a| !kept.iter().any(|k| k.artifact_id == a.artifact_id));
+                    m.attachments.splice(0..0, kept);
                 }
             }),
             Err(e) => warn!(error = %e, "reading the files of a DM failed"),
@@ -590,6 +599,115 @@ pub(crate) async fn session_ended(session_id: &str) {
     if let Err(e) = forget_session_files(session_id).await {
         warn!(error = %e, session_id, "forgetting a gone session's files failed");
     }
+}
+
+/// Whether `owner` may read the file `descriptor` describes, as the download
+/// route has it: it was made for them, or it is filed under a session of
+/// theirs. A message names whatever id its client gave, so this comes before
+/// anything is said of what that id is.
+fn readable_by(sessions: &dyn SessionStore, descriptor: &ArtifactDescriptor, owner: &str) -> bool {
+    descriptor.user_id.as_deref() == Some(owner)
+        || descriptor
+            .session_id
+            .as_deref()
+            .and_then(|session| sessions.get(session).ok().flatten())
+            .is_some_and(|session| session.owner == owner)
+}
+
+/// The file `a` as its message's client named it, and all that is said of a
+/// file `owner` may not read or that has expired, so the two read alike: no
+/// size, no pixels. `None` when it can't be shown at all.
+pub(crate) fn named(a: &SessionAttachment) -> Option<workforce_desk::attachments::Attachment> {
+    let file = workforce_desk::attachments::Attachment {
+        artifact_id: a.artifact_id.clone()?,
+        media_type: a.mime_type.clone(),
+        filename: safe_filename(&a.filename),
+        size: 0,
+        width: None,
+        height: None,
+        duration: None,
+        thumbnail_url: None,
+        hub: None,
+        agent: None,
+    };
+    file.invalid().is_none().then_some(file)
+}
+
+/// The person's files on `page` of their conversation with `agent` that say
+/// nothing of themselves yet, told from `agent`'s store: its type and name,
+/// which it read from their bytes, its size and an image's pixels. Those
+/// `owner` may not read, or that are gone, stay as their message named them.
+pub(crate) fn described(
+    sessions: &dyn SessionStore,
+    agent: &str,
+    owner: &str,
+    page: &mut workforce_desk::Page,
+) {
+    let Some(store) = global_store() else {
+        return;
+    };
+    let files = page
+        .messages
+        .iter_mut()
+        .filter(|m| m.from == workforce_desk::Author::User)
+        .flat_map(|m| m.attachments.iter_mut())
+        .filter(|file| file.size == 0);
+    for file in files {
+        let Ok(id) = ArtifactId::parse(&file.artifact_id) else {
+            continue;
+        };
+        let Some(descriptor) = store.metadata(agent, &id).ok().flatten() else {
+            continue;
+        };
+        if !readable_by(sessions, &descriptor, owner) {
+            continue;
+        }
+        if let Some(media_type) = descriptor.media_type {
+            file.media_type = media_type;
+        }
+        if let Some(filename) = descriptor.filename {
+            file.filename = filename;
+        }
+        let known = describe(store.as_ref(), agent, &id, &file.media_type);
+        file.size = known.size;
+        file.width = known.width;
+        file.height = known.height;
+    }
+}
+
+/// The files `attachments`, on a message `owner` is sending to `agent`, as
+/// its mark carries them, so they stay with the message when the session's
+/// live messages are compacted and rolled over. Only those of `agent`'s store
+/// that `owner` may read: it is what the message's client said, and the mark
+/// is what its conversation shows.
+pub(crate) fn carried(
+    sessions: &dyn SessionStore,
+    agent: &str,
+    owner: &str,
+    attachments: Option<&[SessionAttachment]>,
+) -> Vec<DeskFile> {
+    let Some(store) = global_store() else {
+        return Vec::new();
+    };
+    attachments
+        .unwrap_or_default()
+        .iter()
+        .take(workforce_desk::attachments::MAX_PER_MESSAGE)
+        .filter_map(|a| {
+            let id = ArtifactId::parse(a.artifact_id.as_deref()?).ok()?;
+            let descriptor = store.metadata(agent, &id).ok().flatten()?;
+            readable_by(sessions, &descriptor, owner).then(|| {
+                StagedFile::of(
+                    agent,
+                    &id,
+                    descriptor.media_type.as_deref().unwrap_or(&a.mime_type),
+                    descriptor.filename.as_deref().unwrap_or(&a.filename),
+                    None,
+                )
+                .delivered(agent)
+            })
+        })
+        .collect()
 }
 
 /// A Desk conversation files go into: a DM, room or thread session of the
