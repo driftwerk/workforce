@@ -74,6 +74,13 @@ struct Cli {
     /// Policy file path.
     #[arg(long, global = true)]
     policy: Option<PathBuf>,
+
+    /// The descriptor a supervisor handed this process its secrets on, as
+    /// `WORKFORCE_SECRETS_FD` names it. Given as well so that a hub too old
+    /// to read the descriptor refuses to start rather than starting without
+    /// its secrets.
+    #[arg(long, global = true, hide = true)]
+    secrets_fd: Option<i32>,
 }
 
 #[derive(Subcommand)]
@@ -3572,6 +3579,7 @@ async fn run() -> Result<()> {
     }
 
     let cli = Cli::parse();
+    workforce_common::inherited_secrets::check_flag(cli.secrets_fd)?;
 
     match cli.command {
         Commands::Run {
@@ -6281,7 +6289,10 @@ rules:
                         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
                 )
                 .try_init();
-            workforce_desk::holder::run(&socket).await?;
+            // On a pipe from Desk Helper (`--secrets-fd`), else the env.
+            let token = workforce_common::inherited_secrets::var(workforce_desk::holder::TOKEN_ENV)
+                .ok_or_else(|| eyre::eyre!("{} is not set", workforce_desk::holder::TOKEN_ENV))?;
+            workforce_desk::holder::run(&socket, &token).await?;
         }
         Commands::McpServe {
             agent_id,
@@ -13123,6 +13134,20 @@ mod serve_guard_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
+
+    /// A supervisor names the secrets' descriptor on the command line as
+    /// well as in `WORKFORCE_SECRETS_FD`, on any subcommand it runs, so a
+    /// hub too old to read it refuses the flag at once.
+    #[test]
+    fn the_secrets_descriptor_is_taken_on_any_subcommand() {
+        let cli =
+            Cli::try_parse_from(["workforce", "serve", "--secrets-fd", "3", "-c", "hub.toml"])
+                .unwrap();
+        assert_eq!(cli.secrets_fd, Some(3));
+        let cli = Cli::try_parse_from(["workforce", "serve", "-c", "hub.toml"]).unwrap();
+        assert_eq!(cli.secrets_fd, None);
+    }
 
     #[test]
     fn artifacts_are_reindexed_by_their_own_command() {

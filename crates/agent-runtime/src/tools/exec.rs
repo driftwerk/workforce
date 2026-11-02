@@ -32,50 +32,11 @@ pub enum LocalEnv {
     /// development, unchanged.
     #[default]
     Inherit,
-    /// A clean, allowlisted environment, never the hub's, with the command
-    /// run through the person's login shell so their dotfiles set up `PATH`
-    /// and toolchains as in a terminal. For a hub on someone's own computer
-    /// (`[desk]`), where commands run as the hub's own user.
+    /// A clean, allowlisted environment, never the hub's. For a hub on
+    /// someone's own computer (`[desk]`), where commands run as the hub's own
+    /// user. The hub's `PATH` there is already the person's login `PATH`, so
+    /// it is kept as it is, with their toolchain and proxy variables.
     Allowlisted,
-}
-
-/// Login shells that take `-l -c <script> <arg0> <arg1>` the POSIX way, so
-/// the command reaches `/bin/sh` as `$1`, unquoted and unchanged.
-const LOGIN_SHELLS: &[&str] = &["sh", "bash", "zsh", "dash", "ksh"];
-
-/// The program and arguments that run `command`: `sh -c <command>`, or, for
-/// [`LocalEnv::Allowlisted`] with a known login shell in `shell`, that shell
-/// as a login shell which then `exec`s `/bin/sh -c <command>`. The login
-/// shell only sets up the environment from the person's dotfiles; the
-/// command itself still runs under `sh`, as it does everywhere else.
-fn shell_invocation(
-    command: String,
-    local_env: LocalEnv,
-    shell: Option<&str>,
-) -> (String, Vec<String>) {
-    let login = shell
-        .filter(|_| local_env == LocalEnv::Allowlisted)
-        .map(std::path::Path::new)
-        .filter(|p| p.is_absolute())
-        .filter(|p| {
-            p.file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| LOGIN_SHELLS.contains(&n))
-        })
-        .filter(|p| p.is_file());
-    match login {
-        Some(shell) => (
-            shell.display().to_string(),
-            vec![
-                "-l".to_string(),
-                "-c".to_string(),
-                r#"exec /bin/sh -c "$1""#.to_string(),
-                "sh".to_string(),
-                command,
-            ],
-        ),
-        None => ("sh".to_string(), vec!["-c".to_string(), command]),
-    }
 }
 
 // Re-exported so existing callers (`code.*` tools) keep importing the workdir
@@ -318,18 +279,9 @@ impl Tool for ExecCommand {
             .clone()
             .or_else(|| self.workspace.as_ref().map(|p| p.display().to_string()));
 
-        // The login shell is the hub's, and only matters in-process: the
-        // daemon runs `sh` under its own user.
-        let local_env = if self.runner.is_some() {
-            LocalEnv::Inherit
-        } else {
-            self.local_env
-        };
-        let shell = std::env::var("SHELL").ok();
-        let (program, args) = shell_invocation(input.command, local_env, shell.as_deref());
         let req = ExecRequest {
-            program,
-            args,
+            program: "sh".to_string(),
+            args: vec!["-c".to_string(), input.command],
             workdir: effective_workdir,
             timeout_secs: requested_timeout,
             // The wire protocol carries a bool, not a count; any positive retry
@@ -345,7 +297,7 @@ impl Tool for ExecCommand {
         // development, unchanged), or the allowlist alone on a hub on
         // someone's own computer. When dispatching, the daemon scrubs to its
         // allowlist instead and this mode is ignored.
-        let local_env = match local_env {
+        let local_env = match self.local_env {
             LocalEnv::Inherit => EnvMode::Inherit {
                 remove: EXEC_SECRET_VARS,
             },
@@ -608,38 +560,6 @@ mod tests {
         assert!(!sentinel.exists(), "fail-closed violated: command executed");
     }
 
-    #[test]
-    fn commands_run_under_sh_unless_allowlisted_with_a_login_shell() {
-        let cmd = || "echo hi".to_string();
-        assert_eq!(
-            shell_invocation(cmd(), LocalEnv::Inherit, Some("/bin/sh")),
-            (
-                "sh".to_string(),
-                vec!["-c".to_string(), "echo hi".to_string()]
-            )
-        );
-        let (program, args) = shell_invocation(cmd(), LocalEnv::Allowlisted, Some("/bin/sh"));
-        assert_eq!(program, "/bin/sh");
-        assert_eq!(
-            args,
-            ["-l", "-c", r#"exec /bin/sh -c "$1""#, "sh", "echo hi"]
-        );
-        // A shell that doesn't take positional arguments the POSIX way, a
-        // relative path or a missing file falls back to plain `sh`.
-        for shell in [
-            Some("/usr/local/bin/fish"),
-            Some("zsh"),
-            Some("/nope/zsh"),
-            None,
-        ] {
-            assert_eq!(
-                shell_invocation(cmd(), LocalEnv::Allowlisted, shell).0,
-                "sh",
-                "{shell:?}"
-            );
-        }
-    }
-
     /// On a hub on someone's own computer, a command `exec.run` starts sees
     /// neither of the hub's database secrets, nor any other variable off the
     /// allowlist, and still runs exactly as written.
@@ -652,9 +572,8 @@ mod tests {
             std::env::set_var("EXEC_T_OFF_THE_ALLOWLIST", "other-fixture");
         }
         let tool = ExecCommand::default().with_local_env(LocalEnv::Allowlisted);
-        // Names only, and probes for the two values: the person's dotfiles
-        // run in the login shell, and what they export never reaches a test
-        // log.
+        // Names only, and probes for the two values: what the environment
+        // holds never reaches a test log.
         let result = tool
             .execute(serde_json::json!({
                 "command": "env | cut -d= -f1; \
@@ -685,8 +604,45 @@ mod tests {
         assert_eq!(
             names.last(),
             Some(&"quoted 'arg' 2"),
-            "the command was changed on its way through the login shell"
+            "the command was changed on its way to sh"
         );
+    }
+
+    /// The hub's PATH is the person's login PATH already: a command sees it
+    /// exactly, in its order (no login shell re-running `path_helper` in
+    /// front of their shims and Homebrew), and their toolchain and proxy
+    /// variables come with it.
+    #[tokio::test]
+    async fn allowlisted_exec_run_keeps_path_order_and_toolchain_vars() {
+        let _env = super::super::exec_runner::run_exec::tests::ENV_MUTATION_LOCK
+            .lock()
+            .await;
+        let path = std::env::var("PATH").unwrap_or_default();
+        let shims = format!("/exec-t/shims:{path}");
+        unsafe {
+            std::env::set_var("PATH", &shims);
+            std::env::set_var("JAVA_HOME", "/exec-t/jdk");
+            std::env::set_var("no_proxy", "localhost,.internal");
+        }
+        let result = ExecCommand::default()
+            .with_local_env(LocalEnv::Allowlisted)
+            .execute(serde_json::json!({
+                "command": "echo \"$PATH\"; echo \"$JAVA_HOME\"; echo \"$no_proxy\"",
+            }))
+            .await
+            .unwrap();
+        unsafe {
+            std::env::set_var("PATH", &path);
+            std::env::remove_var("JAVA_HOME");
+            std::env::remove_var("no_proxy");
+        }
+        let stdout = result.output["stdout"].as_str().unwrap();
+        let lines: Vec<&str> = stdout.lines().collect();
+        assert!(
+            lines.first() == Some(&shims.as_str()),
+            "PATH lost its order"
+        );
+        assert_eq!(&lines[1..], ["/exec-t/jdk", "localhost,.internal"]);
     }
 
     /// Elsewhere (no `[desk]`), the in-process path is unchanged: ordinary

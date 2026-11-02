@@ -10,11 +10,13 @@
 //! ([`take_from_env`]), closes it, removes [`FD_ENV`], and keeps the secrets
 //! in this process only.
 //!
-//! The payload is one JSON object of variable names to string values, e.g.
-//! `{"WORKFORCE_VAULT_KEY": "…"}`. Names have the shape of environment
-//! variable names, so `${NAME}` in `workforce.toml` resolves against them
-//! first ([`var`]); everything else still reads the environment, and with no
-//! [`FD_ENV`] nothing changes.
+//! The descriptor must be a pipe. The payload is its length (4 bytes,
+//! big-endian), then one JSON object of variable names to string values,
+//! e.g. `{"WORKFORCE_VAULT_KEY": "…"}`. Names have the shape of environment
+//! variable names. The few base-config fields a supervisor fills with them
+//! (`crate::config_expand::INHERITED_SECRET_FIELDS`) and the hub's own key
+//! reads resolve against them first ([`var`]); nothing else does, and with
+//! no [`FD_ENV`] nothing changes.
 //!
 //! Values never reach a log or an error: errors name a variable or a byte
 //! position, never what was read.
@@ -34,6 +36,8 @@ pub const FD_ENV: &str = "WORKFORCE_SECRETS_FD";
 pub const MAX_BYTES: usize = 64 * 1024;
 /// The most secrets one payload may carry.
 pub const MAX_SECRETS: usize = 64;
+/// How long the hub waits for its supervisor's payload before it gives up.
+pub const READ_WITHIN: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Secrets read from a descriptor, by variable name. `Debug` shows the
 /// names only.
@@ -80,18 +84,42 @@ impl InheritedSecrets {
         Ok(Self(secrets))
     }
 
-    /// Reads a payload from `fd` to its end and closes it.
+    /// Reads a framed payload from the pipe `fd` and closes it, giving up
+    /// after [`READ_WITHIN`].
     #[cfg(unix)]
     pub fn read(fd: std::os::fd::OwnedFd) -> Result<Self> {
-        use std::io::Read;
-        let mut bytes = Vec::new();
-        // One byte over the cap, so an oversized payload is told apart from
-        // one exactly at it.
-        std::fs::File::from(fd)
-            .take(MAX_BYTES as u64 + 1)
-            .read_to_end(&mut bytes)
-            .map_err(|e| eyre::eyre!("reading the inherited secrets: {e}"))?;
-        Self::parse(&bytes)
+        Self::read_within(fd, READ_WITHIN)
+    }
+
+    /// [`Self::read`] with its own deadline. `fd` must be a pipe. The
+    /// payload's length comes first (4 bytes, big-endian), so the read ends
+    /// once it is in, whoever else still holds the write end; a supervisor
+    /// that never writes is an error at the deadline, never a hang.
+    #[cfg(unix)]
+    pub fn read_within(fd: std::os::fd::OwnedFd, within: std::time::Duration) -> Result<Self> {
+        use std::os::fd::AsRawFd;
+        // SAFETY: `fstat` fills a `stat` this function owns, for an open
+        // descriptor it owns.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstat(fd.as_raw_fd(), &mut st) } == -1 {
+            bail!(
+                "the inherited secrets' descriptor can't be read: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        if st.st_mode & libc::S_IFMT != libc::S_IFIFO {
+            bail!("the inherited secrets' descriptor isn't a pipe");
+        }
+        let deadline = std::time::Instant::now() + within;
+        let mut header = [0u8; 4];
+        read_exact_by(&fd, &mut header, deadline, within)?;
+        let len = u32::from_be_bytes(header) as usize;
+        if len > MAX_BYTES {
+            bail!("the inherited secrets are over {MAX_BYTES} bytes");
+        }
+        let mut body = vec![0u8; len];
+        read_exact_by(&fd, &mut body, deadline, within)?;
+        Self::parse(&body)
     }
 
     /// The secret named `name`.
@@ -109,6 +137,57 @@ impl InheritedSecrets {
     }
 }
 
+/// Fills `buf` from `fd`, waiting at most until `deadline`.
+#[cfg(unix)]
+fn read_exact_by(
+    fd: &std::os::fd::OwnedFd,
+    buf: &mut [u8],
+    deadline: std::time::Instant,
+    within: std::time::Duration,
+) -> Result<()> {
+    use std::os::fd::AsRawFd;
+    let mut filled = 0;
+    while filled < buf.len() {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            bail!("the inherited secrets didn't arrive within {within:?}");
+        }
+        let mut pfd = libc::pollfd {
+            fd: fd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ms = libc::c_int::try_from(left.as_millis().max(1)).unwrap_or(libc::c_int::MAX);
+        // SAFETY: one `pollfd` this function owns.
+        let ready = unsafe { libc::poll(&mut pfd, 1, ms) };
+        if ready == -1 {
+            let e = std::io::Error::last_os_error();
+            if e.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            bail!("waiting for the inherited secrets: {e}");
+        }
+        if ready == 0 {
+            continue;
+        }
+        let rest = &mut buf[filled..];
+        // SAFETY: reads at most `rest.len()` bytes into `rest`.
+        let n = unsafe { libc::read(fd.as_raw_fd(), rest.as_mut_ptr().cast(), rest.len()) };
+        if n == -1 {
+            let e = std::io::Error::last_os_error();
+            if e.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            bail!("reading the inherited secrets: {e}");
+        }
+        if n == 0 {
+            bail!("the inherited secrets ended before their length");
+        }
+        filled += n as usize;
+    }
+    Ok(())
+}
+
 /// `[A-Z_][A-Z0-9_]*`, the shape `${NAME}` expansion accepts.
 fn is_var_name(name: &str) -> bool {
     let mut chars = name.chars();
@@ -119,6 +198,28 @@ fn is_var_name(name: &str) -> bool {
 }
 
 static INHERITED: OnceLock<InheritedSecrets> = OnceLock::new();
+/// The descriptor the inherited secrets were read from.
+static TAKEN_FROM: OnceLock<i32> = OnceLock::new();
+
+/// The descriptor [`take_from_env`] read the secrets from, if it read any.
+/// A supervisor also names it on the command line (`--secrets-fd`), which a
+/// hub too old to read it refuses at once.
+pub fn taken_from() -> Option<i32> {
+    TAKEN_FROM.get().copied()
+}
+
+/// Checks `--secrets-fd` against what [`take_from_env`] read: the flag names
+/// the descriptor [`FD_ENV`] named.
+pub fn check_flag(flag: Option<i32>) -> Result<()> {
+    match (flag, taken_from()) {
+        (None, _) => Ok(()),
+        (Some(fd), Some(read)) if fd == read => Ok(()),
+        (Some(fd), Some(read)) => {
+            bail!("--secrets-fd {fd} doesn't match {FD_ENV}, which named descriptor {read}")
+        }
+        (Some(fd), None) => bail!("--secrets-fd {fd} was given without {FD_ENV}"),
+    }
+}
 
 /// Reads the secrets from the descriptor [`FD_ENV`] names, if it names one,
 /// closes the descriptor and removes [`FD_ENV`], so nothing the hub starts
@@ -133,8 +234,9 @@ pub fn take_from_env() -> Result<usize> {
         return Ok(0);
     };
     std::env::remove_var(FD_ENV);
-    let secrets = read_named(&raw.to_string_lossy())?;
+    let (fd, secrets) = read_named(&raw.to_string_lossy())?;
     let count = secrets.0.len();
+    let _ = TAKEN_FROM.set(fd);
     if INHERITED.set(secrets).is_err() {
         bail!("the inherited secrets were already read");
     }
@@ -142,7 +244,7 @@ pub fn take_from_env() -> Result<usize> {
 }
 
 #[cfg(unix)]
-fn read_named(raw: &str) -> Result<InheritedSecrets> {
+fn read_named(raw: &str) -> Result<(i32, InheritedSecrets)> {
     use std::os::fd::{FromRawFd, OwnedFd, RawFd};
     let fd: RawFd = raw
         .trim()
@@ -159,11 +261,11 @@ fn read_named(raw: &str) -> Result<InheritedSecrets> {
     // SAFETY: the descriptor is open, was handed to this process for this
     // alone, and nothing else in the process owns it this early in `main`.
     let owned = unsafe { OwnedFd::from_raw_fd(fd) };
-    InheritedSecrets::read(owned)
+    Ok((fd, InheritedSecrets::read(owned)?))
 }
 
 #[cfg(not(unix))]
-fn read_named(_raw: &str) -> Result<InheritedSecrets> {
+fn read_named(_raw: &str) -> Result<(i32, InheritedSecrets)> {
     bail!("{FD_ENV} is only supported on Unix")
 }
 
@@ -181,16 +283,94 @@ pub(crate) fn var_in(secrets: Option<&InheritedSecrets>, name: &str) -> Option<S
         .or_else(|| std::env::var(name).ok())
 }
 
+/// Installs a fixed set of inherited secrets for this test process, as
+/// `take_from_env` would. Every caller gets the same fixture.
+#[cfg(test)]
+pub(crate) fn install_test_fixture() -> &'static InheritedSecrets {
+    INHERITED.get_or_init(|| {
+        InheritedSecrets::parse(
+            br#"{"INHERITED_T_PG":"pg-fixture","INHERITED_T_KEY":"key-fixture","INHERITED_T_TOKEN":"token-fixture"}"#,
+        )
+        .expect("the fixture parses")
+    })
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::io::Write;
 
+    /// `payload` as a supervisor frames it: its length, then itself.
+    fn framed(payload: &[u8]) -> Vec<u8> {
+        let mut out = (payload.len() as u32).to_be_bytes().to_vec();
+        out.extend_from_slice(payload);
+        out
+    }
+
     fn through_pipe(payload: &[u8]) -> Result<InheritedSecrets> {
         let (reader, mut writer) = std::io::pipe().unwrap();
-        writer.write_all(payload).unwrap();
+        writer.write_all(&framed(payload)).unwrap();
         drop(writer);
         InheritedSecrets::read(reader.into())
+    }
+
+    /// A copy of the write end held open elsewhere (another child that
+    /// inherited it) can't make the hub wait: it reads the framed length,
+    /// not to EOF.
+    #[test]
+    fn a_write_end_left_open_does_not_hang_the_read() {
+        let (reader, mut writer) = std::io::pipe().unwrap();
+        writer
+            .write_all(&framed(br#"{"DESK_MEMORY_KEY":"mk-fixture"}"#))
+            .unwrap();
+        let started = std::time::Instant::now();
+        let secrets =
+            InheritedSecrets::read_within(reader.into(), std::time::Duration::from_secs(5))
+                .unwrap();
+        assert_eq!(secrets.get("DESK_MEMORY_KEY"), Some("mk-fixture"));
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        drop(writer);
+    }
+
+    /// A supervisor that never writes gives a clear error at the deadline,
+    /// never a hub that hangs at start.
+    #[test]
+    fn a_silent_pipe_times_out() {
+        let (reader, writer) = std::io::pipe().unwrap();
+        let started = std::time::Instant::now();
+        let err =
+            InheritedSecrets::read_within(reader.into(), std::time::Duration::from_millis(200))
+                .unwrap_err()
+                .to_string();
+        assert!(err.contains("within"), "{err}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        drop(writer);
+    }
+
+    /// A pipe that ends before its framed length is an error.
+    #[test]
+    fn a_short_payload_is_refused() {
+        let (reader, mut writer) = std::io::pipe().unwrap();
+        let mut bytes = framed(br#"{"DESK_MEMORY_KEY":"mk-fixture"}"#);
+        bytes.truncate(bytes.len() - 3);
+        writer.write_all(&bytes).unwrap();
+        drop(writer);
+        let err = InheritedSecrets::read(reader.into())
+            .unwrap_err()
+            .to_string();
+        assert!(!err.contains("mk-fixture"), "{err}");
+    }
+
+    /// Only a pipe is accepted: a regular file (or anything else a wrong
+    /// number might name) is refused.
+    #[test]
+    fn a_descriptor_that_is_not_a_pipe_is_refused() {
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(&framed(br#"{"A":"b"}"#)).unwrap();
+        use std::io::Seek;
+        file.rewind().unwrap();
+        let err = InheritedSecrets::read(file.into()).unwrap_err().to_string();
+        assert!(err.contains("pipe"), "{err}");
     }
 
     #[test]
@@ -215,12 +395,24 @@ mod tests {
         use std::os::fd::IntoRawFd;
         let (reader, mut writer) = std::io::pipe().unwrap();
         writer
-            .write_all(br#"{"WORKFORCE_GATEWAY_TOKEN":"gt-fixture"}"#)
+            .write_all(&framed(br#"{"WORKFORCE_GATEWAY_TOKEN":"gt-fixture"}"#))
             .unwrap();
         drop(writer);
         let fd = std::os::fd::OwnedFd::from(reader).into_raw_fd();
-        let secrets = read_named(&fd.to_string()).unwrap();
+        let (read_from, secrets) = read_named(&fd.to_string()).unwrap();
+        assert_eq!(read_from, fd);
         assert_eq!(secrets.get("WORKFORCE_GATEWAY_TOKEN"), Some("gt-fixture"));
+    }
+
+    /// `--secrets-fd` without the descriptor having been read is refused:
+    /// the flag never stands in for the secrets.
+    #[test]
+    fn the_flag_needs_the_secrets_it_names() {
+        assert!(check_flag(None).is_ok());
+        if taken_from().is_none() {
+            let err = check_flag(Some(3)).unwrap_err().to_string();
+            assert!(err.contains(FD_ENV), "{err}");
+        }
     }
 
     #[test]
@@ -255,15 +447,14 @@ mod tests {
 
     #[test]
     fn an_oversized_payload_is_refused() {
-        let big = format!(r#"{{"BIG":"{}"}}"#, "x".repeat(MAX_BYTES));
-        // Written from a thread: the pipe's buffer is smaller than the payload.
+        // The length alone is refused, before anything else is read.
         let (reader, mut writer) = std::io::pipe().unwrap();
-        let w = std::thread::spawn(move || {
-            let _ = writer.write_all(big.as_bytes());
-        });
+        writer
+            .write_all(&((MAX_BYTES as u32) + 1).to_be_bytes())
+            .unwrap();
         let err = InheritedSecrets::read(reader.into()).unwrap_err();
         assert!(err.to_string().contains("bytes"), "{err}");
-        w.join().unwrap();
+        drop(writer);
     }
 
     #[test]

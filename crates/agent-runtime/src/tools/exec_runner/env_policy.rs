@@ -35,10 +35,49 @@ const ALLOWED_VARS: &[&str] = &[
 ];
 
 /// Added to [`ALLOWED_VARS`] for a command run in-process on someone's own
-/// computer ([`EnvPolicy::build_local`]): who they are, which login shell is
-/// theirs, and the SSH agent launchd or systemd gives the session (not the
-/// dotfiles), so `git` over SSH keeps working.
-const LOCAL_EXTRA_VARS: &[&str] = &["USER", "LOGNAME", "SHELL", "SSH_AUTH_SOCK"];
+/// computer ([`EnvPolicy::build_local`]): who they are, the SSH agent launchd
+/// or systemd gives the session, where their toolchains live, and their
+/// proxies, so `git`, version managers' shims and package managers behave as
+/// in their terminal.
+///
+/// Every name is listed: a prefix (`HOMEBREW_*`) would also carry
+/// `HOMEBREW_GITHUB_API_TOKEN`. Nothing secret-shaped (`*_TOKEN`, `*_KEY`,
+/// `*_SECRET`, `*_PASSWORD`) belongs here. The proxy variables are the
+/// person's own; one may hold their proxy login, never the hub's.
+const LOCAL_EXTRA_VARS: &[&str] = &[
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "SSH_AUTH_SOCK",
+    "HOMEBREW_PREFIX",
+    "HOMEBREW_CELLAR",
+    "HOMEBREW_REPOSITORY",
+    "NVM_DIR",
+    "PYENV_ROOT",
+    "RBENV_ROOT",
+    "ASDF_DIR",
+    "ASDF_DATA_DIR",
+    "MISE_DATA_DIR",
+    "GOPATH",
+    "GOROOT",
+    "JAVA_HOME",
+    "VOLTA_HOME",
+    "PNPM_HOME",
+    "BUN_INSTALL",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_CACHE_HOME",
+    "XDG_STATE_HOME",
+    "XDG_RUNTIME_DIR",
+    "http_proxy",
+    "https_proxy",
+    "no_proxy",
+    "all_proxy",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "NO_PROXY",
+    "ALL_PROXY",
+];
 
 /// Caps on the hub-supplied environment. Generous for a credential set and a
 /// handful of settings, small enough that a malformed request cannot make the
@@ -221,16 +260,43 @@ mod tests {
             ("WORKFORCE_VAULT_KEY", "vk-fixture"),
             ("WORKFORCE_SECRETS_FD", "3"),
             ("HTTPS_PROXY", "http://proxy.internal:8080"),
+            ("JAVA_HOME", "/Library/Java/Home"),
+            ("HOMEBREW_PREFIX", "/opt/homebrew"),
+            ("HOMEBREW_GITHUB_API_TOKEN", "gh-fixture"),
+            ("ANTHROPIC_API_KEY", "ak-fixture"),
         ]);
         let built: BTreeMap<String, String> = EnvPolicy::build_local(&src).into_iter().collect();
         assert_eq!(
             built.keys().map(String::as_str).collect::<Vec<_>>(),
-            ["HOME", "PATH", "SHELL", "SSH_AUTH_SOCK", "USER"]
+            [
+                "HOME",
+                "HOMEBREW_PREFIX",
+                "HTTPS_PROXY",
+                "JAVA_HOME",
+                "PATH",
+                "SHELL",
+                "SSH_AUTH_SOCK",
+                "USER"
+            ]
         );
         // The person's PATH as it is, and no container toolchain defaults.
         assert_eq!(built["PATH"], "/opt/homebrew/bin:/usr/bin");
         assert!(!built.contains_key("RUSTUP_HOME"));
         assert!(!built.contains_key("CARGO_HOME"));
+    }
+
+    /// No name the person's computer gets is shaped like a secret.
+    #[test]
+    fn the_local_allowlist_holds_nothing_secret_shaped() {
+        for name in ALLOWED_VARS.iter().chain(LOCAL_EXTRA_VARS) {
+            let upper = name.to_ascii_uppercase();
+            for part in ["TOKEN", "KEY", "SECRET", "PASSWORD", "CREDENTIAL", "AUTH_"] {
+                assert!(
+                    !upper.contains(part) || upper == "SSH_AUTH_SOCK",
+                    "{name} looks like a secret"
+                );
+            }
+        }
     }
 
     #[test]

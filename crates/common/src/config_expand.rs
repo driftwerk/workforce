@@ -2,13 +2,17 @@
 //!
 //! Supports `${VAR}` / `${VAR:-default}` (process env) and `${vault:path}`
 //! (via a [`VaultResolver`]). The main `workforce.toml` loader applies env
-//! expansion as a blanket pass ([`expand_hub_vars_in_table`]), where `${VAR}`
-//! also resolves against the secrets a supervisor handed the hub on a
-//! descriptor ([`crate::inherited_secrets`]); vault references are resolved
-//! per-field at access time because the vault is itself configured by the
-//! same file. The per-skill `config.toml` loader in
-//! `workforce-skills::config_loader` shares the env-only routines, so a
-//! skill's config can never expand to one of the hub's own secrets.
+//! expansion as a blanket pass; vault references are resolved per-field at
+//! access time because the vault is itself configured by the same file.
+//! The per-skill `config.toml` loader in `workforce-skills::config_loader`
+//! shares these routines.
+//!
+//! The secrets a supervisor hands the hub on a descriptor
+//! ([`crate::inherited_secrets`]) are never part of that blanket pass. Only
+//! the few base-file fields in [`INHERITED_SECRET_FIELDS`] read them
+//! ([`expand_inherited_secret_fields`]), before the overlay is merged, so
+//! nothing an agent or a tool can write — an agent's prompt, an overlay
+//! value — can ever expand to one.
 
 use std::sync::LazyLock;
 
@@ -57,11 +61,33 @@ pub fn expand_env_vars_in_table(table: &mut toml::Table) {
     expand_vars_in_table_with(table, &|name| std::env::var(name).ok());
 }
 
-/// [`expand_env_vars_in_table`] for the hub's own `workforce.toml`: `${VAR}`
-/// reads the secrets inherited on a descriptor first, then the environment
-/// ([`crate::inherited_secrets::var`]).
-pub fn expand_hub_vars_in_table(table: &mut toml::Table) {
-    expand_vars_in_table_with(table, &crate::inherited_secrets::var);
+/// The base-config fields (`section.key`) whose `${VAR}` may read the
+/// secrets inherited on a descriptor: the ones a supervisor fills with them.
+pub const INHERITED_SECRET_FIELDS: &[(&str, &str)] = &[
+    ("postgres", "password"),
+    ("vellev", "api_key"),
+    ("desk", "pty_holder_token"),
+];
+
+/// Expand `${VAR}` in the base file's [`INHERITED_SECRET_FIELDS`], reading
+/// the inherited secrets first, then the environment
+/// ([`crate::inherited_secrets::var`]). Run it on the base file alone,
+/// before the overlay is merged over it; every other value is left to the
+/// env-only pass.
+pub fn expand_inherited_secret_fields(base: &mut toml::Table) {
+    expand_fields_with(base, &crate::inherited_secrets::var);
+}
+
+fn expand_fields_with(table: &mut toml::Table, lookup: &dyn Fn(&str) -> Option<String>) {
+    for (section, key) in INHERITED_SECRET_FIELDS {
+        if let Some(toml::Value::String(s)) = table
+            .get_mut(*section)
+            .and_then(toml::Value::as_table_mut)
+            .and_then(|t| t.get_mut(*key))
+        {
+            *s = expand_vars_with(s, lookup);
+        }
+    }
 }
 
 fn expand_vars_in_table_with(table: &mut toml::Table, lookup: &dyn Fn(&str) -> Option<String>) {
@@ -187,42 +213,51 @@ mod tests {
         std::env::remove_var("CFG_EXPAND_T_REC");
     }
 
-    /// The hub's config takes `${VAR}` from the secrets inherited on a
-    /// descriptor first, then from the environment.
+    /// The base file's secret fields take `${VAR}` from the secrets
+    /// inherited on a descriptor first, then from the environment; no other
+    /// field reads the inherited secrets.
     #[cfg(unix)]
     #[test]
-    fn hub_config_expands_from_the_inherited_secrets() {
+    fn only_the_secret_fields_expand_from_the_inherited_secrets() {
         use std::io::Write;
         let (reader, mut writer) = std::io::pipe().unwrap();
+        let payload = br#"{"CFG_EXPAND_T_FD_PW":"pw-fixture","CFG_EXPAND_T_FD_BOTH":"from-fd"}"#;
         writer
-            .write_all(br#"{"CFG_EXPAND_T_FD_PW":"pw-fixture","CFG_EXPAND_T_FD_BOTH":"from-fd"}"#)
+            .write_all(&(payload.len() as u32).to_be_bytes())
             .unwrap();
+        writer.write_all(payload).unwrap();
         drop(writer);
         let secrets = crate::inherited_secrets::InheritedSecrets::read(reader.into()).unwrap();
-        std::env::set_var("CFG_EXPAND_T_FD_ENV", "from-env");
         std::env::set_var("CFG_EXPAND_T_FD_BOTH", "from-env");
         let mut table: toml::Table = r#"
             [postgres]
-            url = "postgres://desk:${CFG_EXPAND_T_FD_PW}@127.0.0.1:1/hub"
-            [other]
-            env = "${CFG_EXPAND_T_FD_ENV}"
-            both = "${CFG_EXPAND_T_FD_BOTH}"
-            unset = "${CFG_EXPAND_T_FD_UNSET:-fallback}"
+            password = "${CFG_EXPAND_T_FD_PW}"
+            other = "${CFG_EXPAND_T_FD_PW}"
+            [vellev]
+            api_key = "${CFG_EXPAND_T_FD_BOTH}"
+            [desk]
+            pty_holder_token = "${CFG_EXPAND_T_FD_UNSET:-fallback}"
+            [agent]
+            prompt = "${CFG_EXPAND_T_FD_PW}"
         "#
         .parse()
         .unwrap();
-        expand_vars_in_table_with(&mut table, &|name| {
+        expand_fields_with(&mut table, &|name| {
             crate::inherited_secrets::var_in(Some(&secrets), name)
         });
-        std::env::remove_var("CFG_EXPAND_T_FD_ENV");
         std::env::remove_var("CFG_EXPAND_T_FD_BOTH");
+        assert_eq!(table["postgres"]["password"].as_str(), Some("pw-fixture"));
+        assert_eq!(table["vellev"]["api_key"].as_str(), Some("from-fd"));
+        assert_eq!(table["desk"]["pty_holder_token"].as_str(), Some("fallback"));
+        // Untouched here; the env-only pass reads them later.
         assert_eq!(
-            table["postgres"]["url"].as_str(),
-            Some("postgres://desk:pw-fixture@127.0.0.1:1/hub")
+            table["postgres"]["other"].as_str(),
+            Some("${CFG_EXPAND_T_FD_PW}")
         );
-        assert_eq!(table["other"]["env"].as_str(), Some("from-env"));
-        assert_eq!(table["other"]["both"].as_str(), Some("from-fd"));
-        assert_eq!(table["other"]["unset"].as_str(), Some("fallback"));
+        assert_eq!(
+            table["agent"]["prompt"].as_str(),
+            Some("${CFG_EXPAND_T_FD_PW}")
+        );
     }
 
     #[test]

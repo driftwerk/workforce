@@ -68,7 +68,7 @@ pub fn load_overlay_table(data_dir: &Path) -> Result<toml::Table> {
 /// 2. **Allowlist** — non-overlayable keys are refused with a typed error
 ///    naming them (infra-owned sections change in the infra repo).
 /// 3. **Merged validation** — base ⊕ new overlay must parse and validate
-///    through [`WorkforceConfig::from_raw_table`], the same pipeline the
+///    through [`WorkforceConfig::from_base_and_overlay`], the same pipeline the
 ///    next boot takes; a bad overlay must never take the hub down.
 /// 4. **Revision capture** — the full post-change overlay snapshot lands in
 ///    `def_revisions`. When Postgres is up, a capture failure REFUSES the
@@ -125,9 +125,7 @@ async fn mutate_overlay_locked(
     }
 
     let raw = overlay::load_raw(base_config_path)?;
-    let mut merged = raw.base.clone();
-    overlay::merge_overlay(&mut merged, &new_overlay);
-    let cfg = WorkforceConfig::from_raw_table(merged)
+    let cfg = WorkforceConfig::from_base_and_overlay(raw.base, Some(&new_overlay))
         .map_err(|e| eyre!("overlay rejected — merged config does not parse: {e}"))?;
     cfg.validate()
         .map_err(|e| eyre!("overlay rejected — merged config invalid: {e}"))?;
@@ -287,9 +285,7 @@ pub async fn overlay_remove_agent(
         |ov| {
             let before = ov.clone();
             let raw = overlay::load_raw(&base_path)?;
-            let mut merged = raw.base.clone();
-            overlay::merge_overlay(&mut merged, ov);
-            let cfg = WorkforceConfig::from_raw_table(merged)?;
+            let cfg = WorkforceConfig::from_base_and_overlay(raw.base, Some(ov))?;
             if cfg.default_agent().is_some_and(|a| a.id == id) {
                 bail!(
                     "cannot remove the default agent '{id}' — change the infra \

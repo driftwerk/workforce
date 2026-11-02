@@ -492,7 +492,7 @@ where
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// The env-mode tests mutate process-global vars (`HTTPS_PROXY`,
@@ -501,7 +501,7 @@ mod tests {
     /// between one test's `set_var` and its child spawn (`proxy=[absent]`
     /// instead of the set value). Every test that touches these vars takes
     /// this lock first.
-    static ENV_MUTATION_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    pub(crate) static ENV_MUTATION_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     fn req(program: &str, args: &[&str]) -> ExecRequest {
         ExecRequest {
@@ -748,13 +748,13 @@ mod tests {
         let _env = ENV_MUTATION_LOCK.lock().await;
         unsafe {
             std::env::set_var("WORKFORCE_VAULT_KEY", "vk-fixture");
-            std::env::set_var("HTTPS_PROXY", "http://proxy.internal:8080");
+            std::env::set_var("RUN_EXEC_T_OFF_THE_LIST", "off-list-fixture");
         }
         let (out, _err, summary) =
             run_collect_mode(&req("env", &[]), &[], EnvMode::Allowlisted).await;
         unsafe {
             std::env::remove_var("WORKFORCE_VAULT_KEY");
-            std::env::remove_var("HTTPS_PROXY");
+            std::env::remove_var("RUN_EXEC_T_OFF_THE_LIST");
         }
         assert_eq!(summary.exit_code, Some(0));
         let expected: std::collections::BTreeMap<String, String> =
@@ -767,7 +767,7 @@ mod tests {
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
         assert_eq!(seen, expected);
-        for fixture in ["vk-fixture", "proxy.internal"] {
+        for fixture in ["vk-fixture", "off-list-fixture"] {
             assert!(!out.contains(fixture), "{fixture} reached the child");
         }
     }
