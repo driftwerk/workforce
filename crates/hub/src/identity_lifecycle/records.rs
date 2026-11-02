@@ -927,7 +927,7 @@ impl Holding for AuditRecords {
 /// Stores that keep nothing past a fixed window and cannot be read by
 /// person: traces (keyed by session, rotated), the chat request stream
 /// (7 days), OAuth redirect state (10 minutes), browser profiles (reaped
-/// when idle) and task telemetry (90 days).
+/// when idle), task telemetry and Desk's access activity (90 days each).
 pub struct RetentionBound;
 
 #[async_trait]
