@@ -727,7 +727,7 @@ async fn an_older_phone_still_gets_text_made_for_speech() {
 #[tokio::test]
 async fn a_reply_of_only_a_direction_leaves_no_empty_answer() {
     let data = tempfile::tempdir().unwrap();
-    let (service, _llm) = crate::support::agent_on_mock_llm_saying(
+    let (service, llm) = crate::support::agent_on_mock_llm_saying(
         data.path(),
         &["(laughing)"],
         std::time::Duration::ZERO,
@@ -742,6 +742,18 @@ async fn a_reply_of_only_a_direction_leaves_no_empty_answer() {
     let (shown, said) = shown_and_said(&frames);
     assert_eq!(shown, "", "{frames:?}");
     assert_eq!(said, "(laughing)", "{frames:?}");
+    assert!(frames.iter().all(|f| f["type"] != "error"), "{frames:?}");
+    let asked_the_turn = llm
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| String::from_utf8_lossy(&r.body).contains("what's next?"))
+        .count();
+    assert_eq!(
+        asked_the_turn, 1,
+        "it isn't taken for no answer, and asked again"
+    );
     assert_eq!(
         saved_answers(&service, connected["session_id"].as_str().unwrap()),
         Vec::<String>::new()
