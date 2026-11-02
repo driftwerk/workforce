@@ -96,7 +96,11 @@ impl<'a> HeldFiles<'a> {
 /// sends: secret markers as previews, credentials redacted; its attachments
 /// are the files its mark names, or a person's the files their message holds.
 /// A person's message is theirs until [`with_authors`] says otherwise.
-fn said(entry: &TranscriptEntry, agent: &Speaker, held: &mut HeldFiles<'_>) -> Option<Said> {
+fn said(
+    entry: &TranscriptEntry,
+    agent: &Speaker,
+    held: Option<&mut HeldFiles<'_>>,
+) -> Option<Said> {
     let (from, author) = match entry.role {
         MessageRole::User => (Author::User, Speaker::you()),
         MessageRole::Assistant => (Author::Agent, agent.clone()),
@@ -114,7 +118,7 @@ fn said(entry: &TranscriptEntry, agent: &Speaker, held: &mut HeldFiles<'_>) -> O
         .iter()
         .map(Into::into)
         .collect();
-    if attachments.is_empty() && from == Author::User {
+    if let (true, Author::User, Some(held)) = (attachments.is_empty(), from, held) {
         attachments = held.on(entry);
     }
     if trimmed.is_empty() && attachments.is_empty() {
@@ -142,9 +146,33 @@ pub(crate) struct Span {
     pub before: Option<DateTime<Utc>>,
 }
 
+/// `owner`'s conversation on the Desk `channel` with `agent` in `store`, as
+/// [`read`] has it, and the person's files their messages hold: what a person
+/// is shown. Looks those up once per session of the chain, which [`read`]
+/// spares the reads that run on every listing.
+pub(crate) fn read_shown(
+    store: &dyn SessionStore,
+    agent: &Speaker,
+    owner: &str,
+    channel: &str,
+    cursor: Cursor<'_>,
+    limit: usize,
+) -> Result<(Page, Span), ConversationError> {
+    read_with(
+        store,
+        agent,
+        owner,
+        channel,
+        cursor,
+        limit,
+        Some(HeldFiles::of(store)),
+    )
+}
+
 /// `owner`'s conversation on the Desk `channel` with `agent` in `store`: at
 /// most `limit` messages at `cursor`, oldest first, and the time they
-/// cover. Reads only: it never creates the session or rolls it over.
+/// cover. Reads only: it never creates the session or rolls it over. A
+/// person's files are those their marks carry.
 pub(crate) fn read(
     store: &dyn SessionStore,
     agent: &Speaker,
@@ -152,6 +180,18 @@ pub(crate) fn read(
     channel: &str,
     cursor: Cursor<'_>,
     limit: usize,
+) -> Result<(Page, Span), ConversationError> {
+    read_with(store, agent, owner, channel, cursor, limit, None)
+}
+
+fn read_with(
+    store: &dyn SessionStore,
+    agent: &Speaker,
+    owner: &str,
+    channel: &str,
+    cursor: Cursor<'_>,
+    limit: usize,
+    mut held: Option<HeldFiles<'_>>,
 ) -> Result<(Page, Span), ConversationError> {
     let internal = |e: eyre::Report| ConversationError::Internal(format!("{e:#}"));
     if !is_desk_conversation(channel) {
@@ -181,7 +221,6 @@ pub(crate) fn read(
     // a forward page starts after, ends it. A forward page keeps only the
     // oldest of what it passes on the way back, which is all it returns.
     let mut gathered: Vec<Said> = Vec::new();
-    let mut held = HeldFiles::of(store);
     let mut exhausted = false;
     let mut reached = false;
     let reads = match after {
@@ -211,7 +250,11 @@ pub(crate) fn read(
                 .rfind(|e| Some(e.id.as_str()) == after)
                 .map(|e| e.timestamp);
         }
-        gathered.extend(newer.into_iter().filter_map(|e| said(e, agent, &mut held)));
+        gathered.extend(
+            newer
+                .into_iter()
+                .filter_map(|e| said(e, agent, held.as_mut())),
+        );
         if after.is_some() && gathered.len() > limit + 1 {
             gathered.drain(..gathered.len() - (limit + 1));
         }
@@ -382,7 +425,7 @@ impl Conversations for HubConversations {
             agent,
             &service.display_name().unwrap_or_else(|| agent.to_string()),
         );
-        let (mut page, span) = read(
+        let (mut page, span) = read_shown(
             service.sessions.as_ref(),
             &speaker,
             &owner,
@@ -908,6 +951,27 @@ mod tests {
             .collect()
     }
 
+    /// The page a person is shown, newest first.
+    fn shown_page(store: &dyn SessionStore, limit: usize) -> Page {
+        read_shown(store, &scout(), ME, DESK_CHANNEL, Cursor::Newest, limit)
+            .unwrap()
+            .0
+    }
+
+    /// The read a listing runs on every poll for every agent asks nothing of
+    /// a message's own files; only what a person is shown does.
+    #[test]
+    fn a_listing_s_read_leaves_a_message_s_own_files_alone() {
+        let store = InMemorySessionStore::new();
+        held(&store, "words", &[("a.png", "art_a")]);
+        held(&store, "", &[("b.png", "art_b")]);
+        let read = page(&store, &scout(), ME, DESK_CHANNEL, Cursor::Newest, 50).unwrap();
+        assert_eq!(
+            shape(&read),
+            [("words", vec![]), ("seen 1", vec![]), ("seen 1", vec![])]
+        );
+    }
+
     /// The reported conversation, read from a session that has only what it
     /// always had: no mark on the person's messages, no desk store.
     fn a_person_s_files_read_back_from_what_their_messages_hold_on(store: &dyn SessionStore) {
@@ -918,7 +982,7 @@ mod tests {
         );
         held(store, "", &[("c.png", "art_c")]);
         exchange(store, 0);
-        let read = page(store, &scout(), ME, DESK_CHANNEL, Cursor::Newest, 50).unwrap();
+        let read = shown_page(store, 50);
         assert_eq!(
             shape(&read),
             [
@@ -971,15 +1035,7 @@ mod tests {
                 for message in &session.messages {
                     store.append_to_archive(&session.id, message).unwrap();
                 }
-                let read = page(
-                    store.as_ref(),
-                    &scout(),
-                    ME,
-                    DESK_CHANNEL,
-                    Cursor::Newest,
-                    50,
-                )
-                .unwrap();
+                let read = shown_page(store.as_ref(), 50);
                 assert_eq!(read.messages.len(), 6);
                 assert_eq!(shape(&read)[0].1, ["art_a", "art_b"]);
                 assert_eq!(shape(&read)[2], ("", vec!["art_c"]));
@@ -1027,7 +1083,7 @@ mod tests {
             ..DeskMark::default()
         });
         store.save(&session).unwrap();
-        let read = page(&store, &scout(), ME, DESK_CHANNEL, Cursor::Newest, 50).unwrap();
+        let read = shown_page(&store, 50);
         assert_eq!(shape(&read), [("with text", vec![]), ("", vec!["art_d"])],);
         assert_eq!(read.messages[1].attachments[0].size, 9);
     }
@@ -1046,7 +1102,7 @@ mod tests {
         }
         workforce_agent::rollover::seal_and_mint(&store, &mut first, 0).unwrap();
         held(&store, "after", &[("c.png", "art_c")]);
-        let read = page(&store, &scout(), ME, DESK_CHANNEL, Cursor::Newest, 50).unwrap();
+        let read = shown_page(&store, 50);
         assert_eq!(
             shape(&read),
             [
@@ -1067,7 +1123,7 @@ mod tests {
         let store = InMemorySessionStore::new();
         held(&store, "", &[("a.png", "art_a")]);
         held(&store, "", &[("b.png", "art_b")]);
-        let read = page(&store, &scout(), ME, DESK_CHANNEL, Cursor::Newest, 3).unwrap();
+        let read = shown_page(&store, 3);
         assert_eq!(
             shape(&read),
             [("seen 1", vec![]), ("", vec!["art_b"]), ("seen 1", vec![])],

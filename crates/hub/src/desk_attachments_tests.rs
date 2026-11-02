@@ -775,7 +775,7 @@ async fn with_the_desk_store_off_a_dm_shows_the_files_its_person_sent() {
         .iter_mut()
         .for_each(|m| m.attachments = None);
     scout.sessions.save(&session).unwrap();
-    let read = crate::desk_conversations::page(
+    let read = crate::desk_conversations::read_shown(
         scout.sessions.as_ref(),
         &workforce_desk::Speaker::agent("scout", "Scout"),
         &alice_id,
@@ -783,9 +783,26 @@ async fn with_the_desk_store_off_a_dm_shows_the_files_its_person_sent() {
         workforce_desk::Cursor::Newest,
         50,
     )
-    .unwrap();
+    .unwrap()
+    .0;
     assert_eq!(read.messages[0].attachments.len(), 2);
     assert_eq!(read.messages[2].attachments[0].artifact_id, c);
+
+    // Rolled over, the upload is filed under a sealed session: still hers to
+    // fetch, still no one else's, still on its message.
+    let mut sealed = scout
+        .sessions
+        .find(DESK_CHANNEL, &alice_id)
+        .unwrap()
+        .unwrap();
+    workforce_agent::rollover::seal_and_mint(scout.sessions.as_ref(), &mut sealed, 0).unwrap();
+    let (status, _, body) = call(&state, get(&uri(&c), Some(&alice), None)).await;
+    assert_eq!((status, body), (StatusCode::OK, png(6, 7)));
+    let (status, ..) = call(&state, get(&uri(&c), Some(&bob), None)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let after = reads(&state, &alice).await;
+    assert_eq!(after.messages[2].attachments[0].artifact_id, c);
+    assert_eq!(after.messages[2].attachments[0].width, Some(6));
 }
 
 /// A file that has expired is still on its message, as it was named, and the
@@ -810,7 +827,7 @@ async fn a_file_that_has_gone_stays_on_its_message_as_it_was_named() {
         )]),
     );
     scout.sessions.save(&session).unwrap();
-    let mut read = crate::desk_conversations::page(
+    let mut read = crate::desk_conversations::read_shown(
         scout.sessions.as_ref(),
         &workforce_desk::Speaker::agent("scout", "Scout"),
         "alice",
@@ -818,7 +835,8 @@ async fn a_file_that_has_gone_stays_on_its_message_as_it_was_named() {
         workforce_desk::Cursor::Newest,
         50,
     )
-    .unwrap();
+    .unwrap()
+    .0;
     described(scout.sessions.as_ref(), "scout", "alice", &mut read);
     let file = &read.messages[0].attachments[0];
     assert_eq!(
@@ -938,7 +956,7 @@ async fn with_the_desk_store_on_kept_files_win_with_no_duplicates() {
             })
             .await
             .unwrap();
-        let mut again = crate::desk_conversations::page(
+        let mut again = crate::desk_conversations::read_shown(
             scout.sessions.as_ref(),
             &workforce_desk::Speaker::agent("scout", "Scout"),
             &alice_id,
@@ -946,7 +964,8 @@ async fn with_the_desk_store_on_kept_files_win_with_no_duplicates() {
             workforce_desk::Cursor::Newest,
             50,
         )
-        .unwrap();
+        .unwrap()
+        .0;
         with_attachments(
             &d,
             &workforce_desk::Speaker::agent("scout", "Scout"),
