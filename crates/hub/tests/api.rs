@@ -13,6 +13,9 @@ mod agent_rename_routes;
 #[path = "api/agent_config_routes.rs"]
 mod agent_config_routes;
 
+#[path = "api/agent_config_elsewhere.rs"]
+mod agent_config_elsewhere;
+
 #[path = "api/authz_routes.rs"]
 mod authz_routes;
 

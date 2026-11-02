@@ -58,7 +58,8 @@ impl Tool for ConfigTool {
          workforce.toml, by dotted key such as `llm.voice_model` or `compaction.keep_recent_messages`. \
          `get` without a key returns the whole file. `set` and `unset` save it as the settings UI \
          does: refused if the agent would not load it, recorded in its history, applied at once. \
-         Credentials belong in the vault, never here."
+         What the agent may do (`computer`, `skills`, `environments`, `access`, `oversight`) is \
+         the person's to change, in its settings. Credentials belong in the vault, never here."
     }
 
     fn input_schema(&self) -> serde_json::Value {
@@ -199,8 +200,14 @@ fn key_path(key: &str) -> Result<Vec<&str>, String> {
     Ok(path)
 }
 
-/// Refuse the settings only a human changes: the agent's environments decide
-/// which instances it may reach, so it never edits them itself.
+/// The sections that decide what the agent may do, reach and oversee: what it
+/// may touch on this computer (`computer`), which connectors it loads
+/// (`skills`), which instances it may reach (`environments`), who may talk
+/// to it (`access`) and whether it oversees the crew (`oversight`). The agent
+/// never edits them itself, whoever's turn it runs on.
+const HUMAN_ONLY: [&str; 5] = ["computer", "skills", "environments", "access", "oversight"];
+
+/// Refuse the settings only a human changes ([`HUMAN_ONLY`]).
 fn human_only(path: &[&str]) -> Result<(), String> {
     match path.first() {
         Some(&"environments") => Err(
@@ -208,6 +215,10 @@ fn human_only(path: &[&str]) -> Result<(), String> {
              agent's settings"
                 .to_string(),
         ),
+        Some(section) if HUMAN_ONLY.contains(section) => Err(format!(
+            "`{section}` is human-only: it decides what this agent may do, so a person changes \
+             it in the agent's settings"
+        )),
         _ => Ok(()),
     }
 }
@@ -415,6 +426,35 @@ voice_model = \"gemini-3.8-flash\" # spoken turns\n";
             assert!(err.contains("human-only"), "{key}: {err}");
         }
         assert!(human_only(&key_path("llm.voice_model").unwrap()).is_ok());
+    }
+
+    /// What the agent may do, reach and oversee is the person's to change:
+    /// no caller's tool call edits it, an admin's turn included.
+    #[test]
+    fn what_the_agent_may_do_is_human_only() {
+        for key in [
+            "computer",
+            "computer.access",
+            "computer.autonomous",
+            "skills",
+            "skills.enabled",
+            "access",
+            "access.mode",
+            "access.allow",
+            "oversight",
+            "oversight.enabled",
+            "oversight.level",
+        ] {
+            let err = human_only(&key_path(key).unwrap()).unwrap_err();
+            assert!(err.contains("human-only"), "{key}: {err}");
+        }
+        for key in [
+            "llm.voice_model",
+            "compaction.keep_recent_messages",
+            "rich.charts",
+        ] {
+            assert!(human_only(&key_path(key).unwrap()).is_ok(), "{key}");
+        }
     }
 
     #[test]

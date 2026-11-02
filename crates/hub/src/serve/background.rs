@@ -5,6 +5,8 @@ use std::sync::Arc;
 
 /// The watchers and sweeps that run for as long as the service does.
 pub(super) fn start_sweeps(service: &Arc<AgentService>) {
+    guard_config(service);
+
     // FsWatcher: hot-reload config.toml, written in place or replaced by a
     // rename, when provider/model settings change.
     {
@@ -162,5 +164,26 @@ pub(super) fn start_sweeps(service: &Arc<AgentService>) {
                 }
             }
         });
+    }
+}
+
+/// On a hub running Desk with no runner, the agent's commands run as the hub
+/// and can rewrite its `config.toml`: guard the file from here on, so a
+/// change made outside the hub waits on the person instead of being applied
+/// ([`crate::agent_config_write::changed_elsewhere`]). What is on disk now is
+/// the hub's own, Desk Helper's edits before it started the hub included.
+///
+/// Elsewhere commands run as the runner's own user, which the file is closed
+/// to ([`workforce_common::config_files::close_agent_workspace`]), and
+/// replicas may share the workspace, so the file is not guarded there.
+fn guard_config(service: &AgentService) {
+    if !service.config.desk.enabled || workforce_common::config_files::runner_uid().is_some() {
+        return;
+    }
+    let path = service
+        .workspace
+        .join(workforce_common::config_files::WORKSPACE_CONFIG);
+    if let Err(e) = workforce_common::config_files::guard(&path) {
+        tracing::warn!(agent_id = %service.agent_id, error = %e, "Could not guard config.toml");
     }
 }

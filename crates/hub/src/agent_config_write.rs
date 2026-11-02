@@ -3,8 +3,15 @@
 //! tool. Each write is checked against the body its writer read, admitted
 //! only if the agent would load it, recorded as a revision before it lands,
 //! and hot-applied to the running agent.
+//!
+//! Where the file is guarded (a hub running Desk, whose agents' commands run
+//! as the hub), a change made to it outside the hub is held: it is not
+//! applied, no write here is laid over it, and the person uses it or keeps
+//! the saved file ([`changed_elsewhere`], [`use_changed`], [`keep_saved`]).
 
 use std::path::Path;
+
+use workforce_common::config_files::{self, Over};
 
 use workforce_orchestrator::workflow_store::{
     content_hash, EditContext, WorkflowStore, KIND_AGENT_CONFIG,
@@ -24,6 +31,9 @@ pub enum Refused {
     Unloadable(ConfigRefusal),
     /// History could not record the write, so it was not made.
     Revision(String),
+    /// The file holds a change made outside the hub, which waits on the
+    /// person: nothing is saved over it until they decide.
+    ChangedElsewhere,
     /// The file could not be read or replaced.
     Io(String),
 }
@@ -36,6 +46,7 @@ impl std::fmt::Display for Refused {
             }
             Self::Unloadable(refusal) => write!(f, "the agent would not load that: {refusal}"),
             Self::Revision(e) => write!(f, "not saved: its history could not record it ({e})"),
+            Self::ChangedElsewhere => f.write_str(config_files::CHANGED_ELSEWHERE),
             Self::Io(e) => write!(f, "not saved: {e}"),
         }
     }
@@ -67,7 +78,20 @@ pub async fn save(
     edit: EditContext<'_>,
     expects: impl Fn(Option<&str>) -> bool,
 ) -> Result<Saved, Refused> {
-    let saved = save_one(service, ref_id, store, body, edit, expects).await?;
+    save_over(service, ref_id, store, body, edit, expects, Over::Ours).await
+}
+
+/// [`save`], over the change made elsewhere `over` names too.
+async fn save_over(
+    service: &AgentService,
+    ref_id: &str,
+    store: Option<&WorkflowStore>,
+    body: &str,
+    edit: EditContext<'_>,
+    expects: impl Fn(Option<&str>) -> bool,
+    over: Over<'_>,
+) -> Result<Saved, Refused> {
+    let saved = save_one(service, ref_id, store, body, edit, expects, over).await?;
     if oversees(body) {
         one_overseer(service, store).await;
     }
@@ -131,6 +155,7 @@ pub(crate) async fn one_overseer(keep: &AgentService, store: Option<&WorkflowSto
             &off,
             EditContext::new("oversight", None),
             |now| now == Some(current.as_str()),
+            Over::Ours,
         )
         .await
         {
@@ -151,12 +176,18 @@ async fn save_one(
     body: &str,
     edit: EditContext<'_>,
     expects: impl Fn(Option<&str>) -> bool,
+    over: Over<'_>,
 ) -> Result<Saved, Refused> {
     use workforce_common::settings::AgentWorkspaceConfig;
-    let path = service
-        .workspace
-        .join(workforce_common::config_files::WORKSPACE_CONFIG);
+    let path = service.workspace.join(config_files::WORKSPACE_CONFIG);
+    // `current` is the file as the hub reads it: the saved one, while a
+    // change made elsewhere waits on disk.
     let admit = |current: Option<&str>| {
+        match (elsewhere(&path)?, over) {
+            (None, _) => {}
+            (Some(Some(now)), Over::Chosen(seen)) if now == seen => {}
+            (Some(_), _) => return Err(Refused::ChangedElsewhere),
+        }
         if !expects(current) {
             return Err(Refused::Stale {
                 current_hash: content_hash(current.unwrap_or_default()),
@@ -175,8 +206,16 @@ async fn save_one(
 
     let findings = AgentWorkspaceConfig::locked(&service.workspace, || {
         let findings = admit(read(&path)?.as_deref())?;
-        AgentWorkspaceConfig::write(&service.workspace, body)
-            .map_err(|e| Refused::Io(e.to_string()))?;
+        config_files::replace_over(&path, body.as_bytes(), over).map_err(|e| {
+            if config_files::is_changed_elsewhere(&e) {
+                Refused::ChangedElsewhere
+            } else {
+                Refused::Io(format!(
+                    "Failed to write workspace config '{}': {e}",
+                    path.display()
+                ))
+            }
+        })?;
         Ok(findings)
     })?;
     tracing::info!(agent_id = %service.agent_id, via = edit.edited_via, "Agent config.toml saved");
@@ -190,6 +229,116 @@ async fn save_one(
         restart_required,
         hash: content_hash(body),
     })
+}
+
+/// The change made elsewhere the file at `path` holds, if one waits.
+fn elsewhere(path: &Path) -> Result<Option<Option<String>>, Refused> {
+    config_files::changed_elsewhere(path)
+        .map_err(|e| Refused::Io(format!("failed to read {}: {e}", path.display())))
+}
+
+/// A change made to an agent's config.toml outside the hub, waiting on the
+/// person.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Elsewhere {
+    /// The content hash of what the file holds now (of nothing, when it was
+    /// removed): an answer names it, so it decides the change it was shown.
+    pub hash: String,
+    /// The file was removed rather than changed.
+    pub removed: bool,
+    /// Whether the agent would load the file as it is now.
+    pub loads: bool,
+}
+
+/// The change made to `service`'s config.toml outside the hub, if one waits.
+pub fn changed_elsewhere(service: &AgentService) -> Option<Elsewhere> {
+    let path = service.workspace.join(config_files::WORKSPACE_CONFIG);
+    let now = match elsewhere(&path) {
+        Ok(now) => now?,
+        Err(e) => {
+            tracing::warn!(agent_id = %service.agent_id, error = %e, "Could not read config.toml");
+            return None;
+        }
+    };
+    Some(Elsewhere {
+        hash: content_hash(now.as_deref().unwrap_or_default()),
+        removed: now.is_none(),
+        loads: now
+            .as_deref()
+            .is_none_or(|body| crate::workspace_admission::admit_workspace(service, body).is_ok()),
+    })
+}
+
+/// The change made elsewhere that `hash` names, as the file holds it now:
+/// [`Refused::Stale`] when none waits or the file has changed again.
+fn seen(path: &Path, hash: &str) -> Result<Option<String>, Refused> {
+    match elsewhere(path)? {
+        Some(now) if content_hash(now.as_deref().unwrap_or_default()) == hash => Ok(now),
+        _ => Err(stale(path)?),
+    }
+}
+
+/// The refusal of an answer to a change no longer waiting as it was shown.
+fn stale(path: &Path) -> Result<Refused, Refused> {
+    Ok(Refused::Stale {
+        current_hash: content_hash(read(path)?.as_deref().unwrap_or_default()),
+    })
+}
+
+/// The person uses the change made to `service`'s config.toml outside the
+/// hub that `hash` names: admitted, recorded and applied as any save (a
+/// removed file is taken as removed, and the running config kept, as a
+/// reload that finds none does).
+pub async fn use_changed(
+    service: &AgentService,
+    store: Option<&WorkflowStore>,
+    hash: &str,
+    actor: Option<&str>,
+) -> Result<(), Refused> {
+    let path = service.workspace.join(config_files::WORKSPACE_CONFIG);
+    let edit = EditContext::new("desk", actor);
+    match seen(&path, hash)? {
+        Some(body) => {
+            let id = service.agent_id.as_str().to_string();
+            save_over(
+                service,
+                &id,
+                store,
+                &body,
+                edit,
+                // The hub reads the saved file until the change is used:
+                // `Over::Chosen` holds the write to the change as it was seen.
+                |_| true,
+                Over::Chosen(&body),
+            )
+            .await?;
+        }
+        None => {
+            if !config_files::adopt(&path, None).map_err(|e| Refused::Io(e.to_string()))? {
+                return Err(stale(&path)?);
+            }
+        }
+    }
+    tracing::info!(agent_id = %service.agent_id, "The person used a change made to config.toml outside the hub");
+    Ok(())
+}
+
+/// The person keeps the saved config.toml over the change made outside the
+/// hub that `hash` names: the file is put back as the hub last wrote it, and
+/// the running config, which never took the change, stays.
+pub fn keep_saved(service: &AgentService, hash: &str) -> Result<(), Refused> {
+    let path = service.workspace.join(config_files::WORKSPACE_CONFIG);
+    let now = seen(&path, hash)?;
+    let restored =
+        workforce_common::settings::AgentWorkspaceConfig::locked(&service.workspace, || {
+            config_files::restore(&path, now.as_deref())
+        })
+        .map_err(|e| Refused::Io(e.to_string()))?;
+    if !restored {
+        return Err(stale(&path)?);
+    }
+    tracing::info!(agent_id = %service.agent_id, "The person kept the saved config.toml over a change made outside the hub");
+    Ok(())
 }
 
 /// The file at `path` as it stands, `None` when there is none.

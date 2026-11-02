@@ -11556,6 +11556,14 @@ pub(crate) fn config_write_refused(
             })),
         ),
         Refused::Unloadable(refusal) => config_write_unloadable(id, refusal),
+        Refused::ChangedElsewhere => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "This agent's settings file was changed outside Desk. Use that change \
+                          or keep the saved settings first; nothing is saved over it until then.",
+                "changed_elsewhere": true,
+            })),
+        ),
         Refused::Revision(e) => {
             warn!(agent_id = %id, error = %e, "Config revision capture failed — refusing write");
             (
