@@ -162,8 +162,8 @@ impl Live {
         if self.terminal.is_none() {
             self.pty.kill();
         }
-        if let Some(Server::Held(server)) = self._codex.as_ref().map(|c| &c.server) {
-            server.kill();
+        if let Some(codex) = &self._codex {
+            codex.stop();
         }
     }
 }
@@ -194,7 +194,40 @@ impl Server {
 /// observer, and the app-server when it is the hub's own.
 struct CodexLink {
     server: Server,
+    /// Where the app-server listens.
+    socket: PathBuf,
     watch: CancellationToken,
+}
+
+impl CodexLink {
+    /// Stops the app-server and what it started, wherever it runs, without
+    /// waiting for them (see [`codex::stop_app_server`]).
+    fn stop(&self) {
+        match &self.server {
+            Server::Local(server) => server.stop(),
+            Server::Held(pty) => stop_held_server(Arc::clone(pty), self.socket.clone()),
+        }
+    }
+}
+
+/// Stops a holder's app-server and its workers; when its process can't be
+/// confirmed to be the server's, the holder is asked to end it instead.
+fn stop_held_server(pty: Arc<Pty>, socket: PathBuf) {
+    let Some(pid) = pty.pid() else {
+        pty.kill();
+        return;
+    };
+    tokio::spawn(async move {
+        if codex::stop_app_server(pid, &socket, codex::STOP_GRACE).await
+            == codex::Stopped::Unconfirmed
+        {
+            tracing::warn!(
+                pid,
+                "codex app-server's process not confirmed; asking the holder to end it"
+            );
+            pty.kill();
+        }
+    });
 }
 
 impl Drop for CodexLink {
@@ -796,7 +829,13 @@ impl Desk {
                 holder.reap(stray.id);
             } else {
                 tracing::info!(id = %stray.id, "ending a held terminal no session owns");
-                holder.adopt(&stray, 0).0.kill();
+                let socket = stray.meta["socket"].as_str().map(PathBuf::from);
+                let pty = Arc::new(holder.adopt(&stray, 0).0);
+                match socket {
+                    // An app-server and its workers are stopped as a session's are.
+                    Some(socket) => stop_held_server(pty, socket),
+                    None => pty.kill(),
+                }
             }
         }
     }
@@ -2420,8 +2459,8 @@ impl Desk {
         let (pty, exit) = match started {
             Ok(started) => started,
             Err(e) => {
-                if let Some(Server::Held(server)) = codex.as_ref().map(|c| &c.server) {
-                    server.kill();
+                if let Some(codex) = &codex {
+                    codex.stop();
                 }
                 return Err(e);
             }
@@ -2502,7 +2541,11 @@ impl Desk {
             }
         });
         tokio::spawn(self.clone().codex_loop(id, rx));
-        CodexLink { server, watch }
+        CodexLink {
+            server,
+            socket,
+            watch,
+        }
     }
 
     async fn on_exit(self, id: Uuid, exit: oneshot::Receiver<Exit>) {
@@ -5585,5 +5628,103 @@ mod tests {
             ));
         })
         .await;
+    }
+}
+
+#[cfg(test)]
+mod codex_stop_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn alive(pid: i32) -> bool {
+        // SAFETY: signal 0 only checks that the process exists.
+        unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    fn pid_in(file: &Path) -> i32 {
+        std::fs::read_to_string(file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap()
+    }
+
+    /// A stand-in `codex app-server` that is busy with a turn: it ignores
+    /// the polite signals, as does the worker it keeps in a process group
+    /// of its own (Codex's `codex-code-mode-host`). It writes its session
+    /// file and both pids where the test reads them.
+    fn busy_server(dir: &Path) -> PathBuf {
+        let path = dir.join("busy-codex");
+        std::fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\ntrap '' HUP TERM\n\
+                 echo turn > '{d}/rollout.jsonl'\n\
+                 set -m\nsleep 300 &\necho $! > '{d}/worker.pid'\n\
+                 echo $$ > '{d}/server.pid'\n\
+                 : > \"${{3#unix://}}\"\n\
+                 while :; do sleep 1; done\n",
+                d = dir.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    async fn held_server(dir: &Path, program: &Path) -> (CodexLink, i32, tempfile::TempDir) {
+        let (hdir, socket, _cancel) = crate::holder::tests::holder().await;
+        let holder = Holder::connect(&socket, crate::holder::tests::TOKEN)
+            .await
+            .unwrap();
+        let sock = dir.join("run/s.sock");
+        codex::prepare_socket(&sock).await.unwrap();
+        let env = BTreeMap::from([("PATH".to_string(), "/usr/bin:/bin".to_string())]);
+        let spec = codex::app_server(program, &sock, &env);
+        let (pty, _) = holder
+            .spawn(
+                &spec,
+                80,
+                24,
+                0,
+                serde_json::json!({"kind": "codex-app-server"}),
+            )
+            .await
+            .unwrap();
+        codex::wait_for_socket(&sock).await.unwrap();
+        let pid = pty.pid().unwrap() as i32;
+        let link = CodexLink {
+            server: Server::Held(Arc::new(pty)),
+            socket: sock,
+            watch: CancellationToken::new(),
+        };
+        (link, pid, hdir)
+    }
+
+    #[tokio::test]
+    async fn closing_a_session_leaves_no_app_server_or_worker_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let program = busy_server(dir.path());
+        let (link, server, _hdir) = held_server(dir.path(), &program).await;
+        let worker = pid_in(&dir.path().join("worker.pid"));
+        assert!(alive(server) && alive(worker));
+
+        link.stop();
+
+        let deadline = std::time::Instant::now() + codex::STOP_GRACE + Duration::from_secs(8);
+        while (alive(server) || alive(worker)) && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let left = (alive(server), alive(worker));
+        // Whatever is left must not outlive the test.
+        for pid in [server, worker] {
+            // SAFETY: the pids are the stand-in's own.
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+        assert_eq!(left, (false, false), "(server, worker) still running");
+        assert!(
+            dir.path().join("rollout.jsonl").exists(),
+            "the session file is Codex's, and stays"
+        );
     }
 }
