@@ -4,7 +4,7 @@ The advisor is a voluntary second-opinion surface. Agents can invoke an `advisor
 
 ## Overview
 
-Three backends:
+Four backends:
 
 ```
 Agent calls advisor(question?)
@@ -23,15 +23,19 @@ Agent calls advisor(question?)
   |                     CC's own retry handles 429 / transients.
   |                     Subscription-friendly. Never billed silently.
   |
+  +-- "chatgpt"      -> In-process loop on a ChatGPT plan login, pinned to one
+  |                     `chatgpt` route: no failover list, no hub default.
+  |                     Never billed silently.
+  |
   +-- "agent"        -> Another configured agent's LLM (no tools)
                         Target must opt in via `advisor_mode = true`.
 ```
 
 Defence-in-depth keeps the advisory-only contract honest:
 
-- **Model** / **Agent** — no tool definitions forwarded, so there's nothing to call.
+- **Model** / **Agent** / **ChatGPT** — the in-process loop gets only the read-only tool set.
 - **Claude Code** — read-only tool allowlist, plus a `max_turns` budget.
-- All three paths get an appended system directive stating the rules in plain English.
+- All four paths get an appended system directive stating the rules in plain English.
 
 ## Quick start — Claude Code as advisor
 
@@ -46,7 +50,7 @@ This is the primary case (subscription-cheap, the same OAuth token your `/cc` ch
 
 [advisor]
 enabled = true
-source = "claude_code"            # "model" | "claude_code" | "agent"
+source = "claude_code"            # "model" | "claude_code" | "chatgpt" | "agent"
 
 # Payload forwarded to the advisor. Default "transcript" everywhere.
 # payload = "transcript"          # "transcript" | "summary"
@@ -65,18 +69,42 @@ source = "claude_code"            # "model" | "claude_code" | "agent"
 #
 # Cost guard: CC failures DO NOT silently fall back to a paid model.
 # Flip the next line on if you want failover to the model below.
-cc_allow_failover_to_models = false
-# cc_fallback_model = "expensive"
+allow_failover_to_models = false
+# fallback_model = "expensive"
 
 # How many turns CC may take (each tool call consumes one turn).
 # Five gives the read-only tools (file read, grep, glob, web fetch and
 # search) headroom to read before synthesising.
-# cc_max_turns = 5
-# cc_effort = "high"
+# max_rounds = 5
+# effort = "high"
 
 # Optional extra guidance prepended to the advisor's prompt.
 # system_prompt_suffix = "Focus on security and concurrency."
 ```
+
+The old key names (`cc_allow_failover_to_models`, `cc_fallback_model`, `cc_effort`, `cc_max_turns`) still work. Don't set a key under both names in one table: the config won't parse.
+
+## Source = `"chatgpt"`
+
+The same shape as `claude_code`, on a ChatGPT plan login instead. It runs in the hub, on one `chatgpt` route, with no Codex CLI involved.
+
+```toml
+[advisor]
+enabled = true
+source = "chatgpt"
+model = "astra"                   # short name, tier, model id or chatgpt:<id>
+effort = "high"                   # low | medium | high | xhigh
+allow_failover_to_models = false
+# fallback_model = "expensive"    # used only when the guard above is on
+max_rounds = 10
+```
+
+- **Model.** Unset means `chatgpt:powerful`. A tier resolves through the agent's tiers at each call. Short names come from `[coding_session.codex]`, which is the Codex coding table, so a short name can name an older model than the agent tiers do (`sol` is `gpt-5.6-sol` by default): write the id when it matters. A model routed to another provider is refused when the config loads, as is a `fanout.synth_model` routed elsewhere. `model` inherits like every field: an agent switching to this source under a global `model = "opus"` inherits `opus` and every review fails, with a warning at load, so name a model when you switch per agent.
+- **Login.** The payer's ChatGPT login, resolved like every subscription call in the agent's `[llm.logins]` order. No login returns `no_login` before any request.
+- **Install switch.** Needs `[subscription] chatgpt_direct = true`. With it off the config still loads with a warning, and each call returns `misconfigured` naming the switch.
+- **Cost guard.** A failure returns `failover_disabled` and goes nowhere else. With `allow_failover_to_models = true` the review moves to `fallback_model`, or the agent's default model when none is named, through the agent's normal chain and at that model's own effort.
+- **Panels.** Every lens and the reconciler run on the same route and effort. `fanout.synth_model` overrides the reconciler, and stays on `chatgpt`.
+- **Reloading.** Switching a running agent to this source sets up its route without a restart. The exception is an agent built with no provider chain (a metered primary, no failover list, no other subscription route): the reload reports `chatgpt route` as needing a restart, and until then calls return `misconfigured` rather than reaching the primary.
 
 ## Source = `"model"`
 
@@ -95,7 +123,7 @@ model = "expensive"               # tier key or specific model id
 # system_prompt_suffix = "..."
 ```
 
-The `model` field accepts either a tier key (resolved via this agent's `TierRegistry`) or a concrete model id. When unset, the agent's default model is used.
+The `model` field accepts either a tier key (resolved via this agent's `TierRegistry`) or a concrete model id. When unset, the agent's default model is used. A routed spec works too, and the agent sets up that provider: `model = "chatgpt:gpt-6-astra"` runs on ChatGPT on any agent (an agent built with no provider chain needs a restart first, which the reload reports), with the agent's failover chain behind it. Use `source = "chatgpt"` to keep the cost guard. A route that can't serve (the provider switched off, an unserved model) warns at load and only the advisor fails.
 
 ## Source = `"agent"`
 
@@ -128,15 +156,15 @@ All fields live under `[advisor]`. The per-agent `{workspace}/config.toml` overr
 | Field | Default | Notes |
 | --- | --- | --- |
 | `enabled` | `false` | Opt-in. When false, the tool is not registered. |
-| `source` | `"model"` | `"model"`, `"claude_code"`, or `"agent"`. |
+| `source` | `"model"` | `"model"`, `"claude_code"`, `"chatgpt"`, or `"agent"`. |
 | `payload` | `"transcript"` | `"transcript"` or `"summary"`. |
 | `payload_max_tokens` | `200000` | Tail-preferred truncation when exceeded. |
 | `per_turn_invocation_limit` | `3` | Calls above this return `TurnLimitExceeded`. |
-| `model` | `None` | Tier key or model id (model source). |
-| `cc_allow_failover_to_models` | `false` | CC cost guard. Off = surface failure, don't bill API. |
-| `cc_fallback_model` | `None` | Used when `cc_allow_failover_to_models = true`. |
-| `cc_max_turns` | `5` | CC turn budget. Each tool call consumes one. |
-| `cc_effort` | `"high"` | `--effort` passed to the CC CLI. |
+| `model` | `None` | Tier key or model id. `chatgpt` also takes a short name, and defaults to `chatgpt:powerful`. |
+| `allow_failover_to_models` | `false` | Cost guard on `claude_code` and `chatgpt`. Off = surface failure, don't bill API. Old name: `cc_allow_failover_to_models`. |
+| `fallback_model` | `None` | Used when the guard is on. Old name: `cc_fallback_model`. |
+| `max_rounds` | `7` | Tool-loop budget. Each tool call consumes one. Old name: `cc_max_turns`. |
+| `effort` | `"high"` | On `claude_code` and `chatgpt` only; `model` and `agent` run at their agent's `[llm] effort`. Old name: `cc_effort`. |
 | `agent_id` | `None` | Target agent id for `source = "agent"`. |
 | `system_prompt_suffix` | `None` | Extra guidance appended to the advisor's prompt. |
 
@@ -156,7 +184,7 @@ Successful result:
 ```json
 {
   "advice": "...the advisor's written response...",
-  "source": "claude_code" | "model" | "agent:<id>",
+  "source": "claude_code" | "chatgpt" | "model" | "agent:<id>",
   "model": "claude-code" | "<model name>" | null,
   "duration_ms": 1234
 }
@@ -166,7 +194,7 @@ Unavailable result (the agent is instructed to relay this to the user and contin
 
 ```json
 {
-  "advisor_unavailable": "Claude Code advisor failed and `cc_allow_failover_to_models` is false (cost guard). Exact failure: exit 1 — ...",
+  "advisor_unavailable": "Advisor failed and `allow_failover_to_models` is false (cost guard). Exact failure: Claude Code: exit 1 — ...",
   "failure_kind": {"kind": "failover_disabled", "detail": "..."}
 }
 ```
@@ -175,14 +203,14 @@ Unavailable result (the agent is instructed to relay this to the user and contin
 
 The advisor is a checkpoint, never a hard dependency. Every failure is non-blocking: the tool returns `advisor_unavailable` with a typed `failure_kind` and the agent continues. Failure kinds:
 
-- `no_login` — CC: no Claude login of the payer's resolves on this agent; the notice says how to connect one.
+- `no_login` — `claude_code` / `chatgpt`: no login of the payer's resolves on this agent; the notice says how to connect one.
 - `cli_missing` — CC: `claude` binary not on `PATH`.
 - `rate_limit` — backend reported 429.
 - `auth_failed` — invalid or expired credential.
 - `agent_not_found` — target agent missing or `advisor_mode = false`.
-- `failover_disabled` — CC failed and `cc_allow_failover_to_models = false`.
+- `failover_disabled` — `claude_code` or `chatgpt` failed and `allow_failover_to_models = false`.
 - `turn_limit_exceeded` — `per_turn_invocation_limit` reached for this user turn.
-- `misconfigured` — e.g. `source = "agent"` with no `agent_id`, self-reference, advisor not enabled.
+- `misconfigured` — e.g. `source = "agent"` with no `agent_id`, self-reference, advisor not enabled, `source = "chatgpt"` with `chatgpt_direct` off.
 - `transient` / `unknown` — anything else, with the underlying detail attached.
 
 The system prompt explicitly instructs the agent to relay the failure reason to the user verbatim and skip the advisor for the rest of the turn — no retry loops.
@@ -193,6 +221,7 @@ The system prompt explicitly instructs the agent to relay the failure reason to 
 | --- | --- | --- |
 | `model` | `cost_tracker.record` with `task_type = "advisor"`, `description = "advisor:model"` | `identity_id = current_identity_id()` if a human is in scope; agent-only fallback. |
 | `agent` | Same as `model`, `description = "advisor:agent"` | Same human-first rule. Recorded against the **calling** agent (it's spending the budget), even though the target agent's `LlmProvider` made the call. |
+| `chatgpt` | `cost_tracker.record` with `description = "advisor:chatgpt"` (`advisor:fanout_lens` / `advisor:fanout_synth` on a panel), marked as served by the plan login that paid. | Same human-first rule. |
 | `claude_code` | Tracing log only (`target = "advisor"`) — matches `claude_code_chat` / `claude_pilot` | `cc.cost_usd` is `$0` for Max subscriptions and a real cost otherwise; the standard cost tracker can't capture that cleanly, so the CC value is logged natively. |
 
 The human-user-first rule means a user-provided CC key has its cost attributed to that user, while a shared key has cost attributed to whichever human instantiated the call.

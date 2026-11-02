@@ -289,8 +289,8 @@ payload = "transcript"  # Ship the full conversation
 payload_max_tokens = 200000
 # Max conversational rounds the advisor's tool loop may take, across all sources.
 max_rounds = 7
-# `--effort` passed to CC. Default `"high"` — advisor benefits from reasoning headroom.
-cc_effort = "high"
+# Effort on `claude_code` and `chatgpt`. Default `"high"` — advisor benefits from reasoning headroom.
+effort = "high"
 # `source = "agent"` target agent ID. The target must have `advisor_mode = true`.
 agent_id = "reviewer"
 ```

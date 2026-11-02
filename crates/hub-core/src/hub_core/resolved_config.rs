@@ -168,10 +168,11 @@ impl ResolvedConfig {
         let base_advisor = agent_config
             .map(|a| a.effective_advisor(&global.advisor))
             .unwrap_or_else(|| global.advisor.clone());
-        let advisor = match workspace_config {
+        let mut advisor = match workspace_config {
             Some(ws) => ws.merge_advisor(&base_advisor),
             None => base_advisor,
         };
+        route_chatgpt_advisor(&mut advisor, &global.coding_session.codex);
 
         let tiers = TierRegistry::new(equivalences);
         resolve_routed_field(&mut compaction.compaction_model, &tiers, tier_key);
@@ -317,6 +318,43 @@ impl ResolvedConfig {
         }
         changed
     }
+}
+
+/// Point a `source = "chatgpt"` advisor's models at the `chatgpt` route, so
+/// every later reader sees the spec its calls run on. A tier stays a tier,
+/// which a call resolves against the live tables.
+fn route_chatgpt_advisor(
+    advisor: &mut workforce_common::settings::AdvisorConfig,
+    codex: &workforce_common::settings::CodingCodexConfig,
+) {
+    if advisor.source != workforce_common::settings::AdvisorSource::ChatGpt {
+        return;
+    }
+    advisor.model = Some(chatgpt_spec(advisor.model.as_deref().unwrap_or(""), codex));
+    if let Some(synth) = advisor.fanout.synth_model.as_mut() {
+        *synth = chatgpt_spec(synth, codex);
+    }
+}
+
+/// `spec` on the `chatgpt` route: nothing or the bare provider is its strongest
+/// tier, and a short name is Codex's. A spec routed anywhere already, or naming
+/// another provider, is left for review to judge.
+fn chatgpt_spec(spec: &str, codex: &workforce_common::settings::CodingCodexConfig) -> String {
+    use workforce_agent::llm::provider::ProviderKind;
+    use workforce_agent::llm::tiers::ModelTier;
+    let spec = spec.trim();
+    let name = ProviderKind::ChatGpt.canonical_name();
+    let routed = crate::hub_core::subscriptions::routed_kind(spec);
+    if spec.is_empty() || (!spec.contains(':') && routed == Some(ProviderKind::ChatGpt)) {
+        return format!("{name}:{}", ModelTier::Powerful.as_str());
+    }
+    if spec.contains(':') || routed.is_some() {
+        return spec.to_string();
+    }
+    if ModelTier::from_name(spec).is_some() {
+        return format!("{name}:{spec}");
+    }
+    format!("{name}:{}", codex.resolve_model(spec))
 }
 
 pub fn resolve_routed_field(field: &mut Option<String>, tiers: &TierRegistry, tier_key: &str) {
@@ -954,6 +992,66 @@ mod tests {
             model: Some("cheap".into()),
         });
         assert!(base.structural_diff(&next).is_empty());
+    }
+
+    #[test]
+    fn a_chatgpt_advisors_models_resolve_onto_the_chatgpt_route() {
+        use workforce_common::settings::AdvisorSource;
+        let resolved_model = |source, model: Option<&str>| {
+            let mut global = WorkforceConfig::default();
+            global.advisor.source = source;
+            global.advisor.model = model.map(str::to_string);
+            ResolvedConfig::resolve(None, None, &global, "anthropic", None)
+                .advisor
+                .model
+        };
+        let chatgpt = AdvisorSource::ChatGpt;
+        for (written, resolved) in [
+            (None, "chatgpt:powerful"),
+            (Some("chatgpt"), "chatgpt:powerful"),
+            (Some("standard"), "chatgpt:standard"),
+            (Some("astra"), "chatgpt:gpt-6-astra"),
+            (Some("gpt-6.1-sol"), "chatgpt:gpt-6.1-sol"),
+            (Some("chatgpt:gpt-6-astra"), "chatgpt:gpt-6-astra"),
+            (Some("anthropic:powerful"), "anthropic:powerful"),
+            (Some("codex"), "codex"),
+        ] {
+            assert_eq!(
+                resolved_model(chatgpt, written).as_deref(),
+                Some(resolved),
+                "{written:?}"
+            );
+        }
+        // Every other source's model is left exactly as written.
+        for source in [
+            AdvisorSource::Model,
+            AdvisorSource::ClaudeCode,
+            AdvisorSource::Agent,
+        ] {
+            assert_eq!(resolved_model(source, None), None);
+            assert_eq!(
+                resolved_model(source, Some("astra")).as_deref(),
+                Some("astra")
+            );
+        }
+    }
+
+    #[test]
+    fn a_chatgpt_advisors_synth_model_resolves_unless_already_routed() {
+        let synth = |written: &str| {
+            let mut global = WorkforceConfig::default();
+            global.advisor.source = workforce_common::settings::AdvisorSource::ChatGpt;
+            global.advisor.fanout.synth_model = Some(written.to_string());
+            ResolvedConfig::resolve(None, None, &global, "anthropic", None)
+                .advisor
+                .fanout
+                .synth_model
+        };
+        assert_eq!(synth("luna").as_deref(), Some("chatgpt:gpt-5.6-luna"));
+        assert_eq!(
+            synth("claude-code:opus").as_deref(),
+            Some("claude-code:opus")
+        );
     }
 
     #[test]

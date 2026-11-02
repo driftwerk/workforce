@@ -1332,6 +1332,10 @@ pub enum AdvisorSource {
     /// Subscription-friendly path. Per Anthropic TOS Max OAuth tokens may
     /// only flow through the CLI subprocess, never the Messages API.
     ClaudeCode,
+    /// In-process tool loop on a ChatGPT plan login, pinned to one `chatgpt`
+    /// route: no failover list and no hub default model behind it.
+    #[serde(rename = "chatgpt")]
+    ChatGpt,
     /// Dispatch to another configured agent (must have `advisor_mode = true`).
     Agent,
 }
@@ -1389,17 +1393,24 @@ pub struct AdvisorConfig {
     /// `"opus"`) which resolve to the latest available version, or any
     /// concrete model id CC understands. When unset, CC uses its own
     /// default.
+    ///
+    /// For `source = "chatgpt"`: a short name (`"astra"`, from
+    /// `[coding_session.codex]`), a tier, a model id or `chatgpt:<id>`. When
+    /// unset, `chatgpt:powerful`.
     #[serde(default)]
     pub model: Option<String>,
-    /// Cost-guard for `source = "claude_code"`. When false (default), CC
-    /// failures are surfaced to the user with `FailoverDisabled`; the advisor
-    /// does NOT silently fall back to paid models. When true, falls back to
-    /// `cc_fallback_model` via the standard failover chain.
-    #[serde(default)]
-    pub cc_allow_failover_to_models: bool,
-    /// Model used when `cc_allow_failover_to_models = true` and CC fails.
-    #[serde(default)]
-    pub cc_fallback_model: Option<String>,
+    /// Cost-guard for the plan sources (`claude_code`, `chatgpt`). When false
+    /// (default), a failure is surfaced to the user with `FailoverDisabled`;
+    /// the advisor does NOT silently fall back to paid models. When true,
+    /// falls back to `fallback_model` via the standard failover chain.
+    /// Accepts the legacy `cc_allow_failover_to_models` key.
+    #[serde(default, alias = "cc_allow_failover_to_models")]
+    pub allow_failover_to_models: bool,
+    /// Model used when `allow_failover_to_models = true` and a plan source
+    /// fails. Unset: `claude_code` falls back to `model`, `chatgpt` to the
+    /// agent's default model. Accepts the legacy `cc_fallback_model` key.
+    #[serde(default, alias = "cc_fallback_model")]
+    pub fallback_model: Option<String>,
     /// Max conversational rounds the advisor's tool loop may take, across
     /// all sources (Model, Agent, Claude Code). Each tool call consumes a
     /// round, so the read-only allowlist requires headroom to verify
@@ -1408,10 +1419,12 @@ pub struct AdvisorConfig {
     /// Accepts the legacy `cc_max_turns` key for back-compat.
     #[serde(default = "default_advisor_max_rounds", alias = "cc_max_turns")]
     pub max_rounds: u32,
-    /// `--effort` passed to CC. Default `"high"` — advisor benefits from
-    /// reasoning headroom.
-    #[serde(default = "default_advisor_cc_effort")]
-    pub cc_effort: Option<String>,
+    /// Reasoning effort on the plan sources (`claude_code`, `chatgpt`).
+    /// Default `"high"` — advisor benefits from reasoning headroom. `model`
+    /// and `agent` run at their agent's `[llm] effort` instead. Accepts the
+    /// legacy `cc_effort` key.
+    #[serde(default = "default_advisor_effort", alias = "cc_effort")]
+    pub effort: Option<String>,
     /// Target agent id for `source = "agent"`. The target must have
     /// `advisor_mode = true` set on its `AgentConfig`.
     #[serde(default)]
@@ -1427,6 +1440,35 @@ pub struct AdvisorConfig {
     pub fanout: AdvisorFanoutConfig,
 }
 
+impl AdvisorConfig {
+    /// The models this advisor's calls route through the agent's own provider
+    /// chain, whose providers the agent must set up for them. `agent` runs on
+    /// its target's routes, and `claude_code`'s own model goes to the CLI's
+    /// `--model`, so neither routes one here. A switched-off advisor routes
+    /// nothing.
+    pub fn routed_models(&self) -> Vec<&String> {
+        if !self.enabled {
+            return Vec::new();
+        }
+        let synth = self
+            .fanout
+            .synth_model
+            .as_ref()
+            .filter(|_| self.fanout.enabled);
+        let fallback = self
+            .fallback_model
+            .as_ref()
+            .filter(|_| self.allow_failover_to_models);
+        let models = match self.source {
+            AdvisorSource::Model => [self.model.as_ref(), synth, None],
+            AdvisorSource::ChatGpt => [self.model.as_ref(), synth, fallback],
+            AdvisorSource::ClaudeCode => [fallback, None, None],
+            AdvisorSource::Agent => [None, None, None],
+        };
+        models.into_iter().flatten().collect()
+    }
+}
+
 /// Fan-out ("panel") settings for the advisor.
 ///
 /// When the calling agent passes 2+ distinct `lenses`, the advisor reviews
@@ -1438,7 +1480,7 @@ pub struct AdvisorConfig {
 /// reviewer fans out on the strong reviewer: `claude_code` spawns parallel CLI
 /// subprocesses (legs and synth on the configured Claude Code model), `model`/
 /// `agent` run in-process loops. A weaker/non-Claude model is used only when
-/// explicitly configured (`synth_model`) or via the `cc_allow_failover_to_models`
+/// explicitly configured (`synth_model`) or via the `allow_failover_to_models`
 /// guard — fan-out never silently downgrades.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdvisorFanoutConfig {
@@ -1526,7 +1568,7 @@ fn default_advisor_max_rounds() -> u32 {
     7
 }
 
-fn default_advisor_cc_effort() -> Option<String> {
+fn default_advisor_effort() -> Option<String> {
     Some("high".to_string())
 }
 
@@ -1539,10 +1581,10 @@ impl Default for AdvisorConfig {
             payload_max_tokens: default_advisor_payload_max_tokens(),
             per_turn_invocation_limit: default_advisor_per_turn_limit(),
             model: None,
-            cc_allow_failover_to_models: false,
-            cc_fallback_model: None,
+            allow_failover_to_models: false,
+            fallback_model: None,
             max_rounds: default_advisor_max_rounds(),
-            cc_effort: default_advisor_cc_effort(),
+            effort: default_advisor_effort(),
             agent_id: None,
             system_prompt_suffix: None,
             fanout: AdvisorFanoutConfig::default(),
@@ -1566,14 +1608,14 @@ pub struct AgentAdvisorConfig {
     pub per_turn_invocation_limit: Option<u32>,
     #[serde(default)]
     pub model: Option<String>,
-    #[serde(default)]
-    pub cc_allow_failover_to_models: Option<bool>,
-    #[serde(default)]
-    pub cc_fallback_model: Option<String>,
+    #[serde(default, alias = "cc_allow_failover_to_models")]
+    pub allow_failover_to_models: Option<bool>,
+    #[serde(default, alias = "cc_fallback_model")]
+    pub fallback_model: Option<String>,
     #[serde(default, alias = "cc_max_turns")]
     pub max_rounds: Option<u32>,
-    #[serde(default)]
-    pub cc_effort: Option<String>,
+    #[serde(default, alias = "cc_effort")]
+    pub effort: Option<String>,
     #[serde(default)]
     pub agent_id: Option<String>,
     #[serde(default)]
@@ -6982,15 +7024,15 @@ impl AgentConfig {
                     .per_turn_invocation_limit
                     .unwrap_or(global.per_turn_invocation_limit),
                 model: agent.model.clone().or_else(|| global.model.clone()),
-                cc_allow_failover_to_models: agent
-                    .cc_allow_failover_to_models
-                    .unwrap_or(global.cc_allow_failover_to_models),
-                cc_fallback_model: agent
-                    .cc_fallback_model
+                allow_failover_to_models: agent
+                    .allow_failover_to_models
+                    .unwrap_or(global.allow_failover_to_models),
+                fallback_model: agent
+                    .fallback_model
                     .clone()
-                    .or_else(|| global.cc_fallback_model.clone()),
+                    .or_else(|| global.fallback_model.clone()),
                 max_rounds: agent.max_rounds.unwrap_or(global.max_rounds),
-                cc_effort: agent.cc_effort.clone().or_else(|| global.cc_effort.clone()),
+                effort: agent.effort.clone().or_else(|| global.effort.clone()),
                 agent_id: agent.agent_id.clone().or_else(|| global.agent_id.clone()),
                 system_prompt_suffix: agent
                     .system_prompt_suffix
@@ -7847,15 +7889,15 @@ impl AgentWorkspaceConfig {
                     .per_turn_invocation_limit
                     .unwrap_or(base.per_turn_invocation_limit),
                 model: ws.model.clone().or_else(|| base.model.clone()),
-                cc_allow_failover_to_models: ws
-                    .cc_allow_failover_to_models
-                    .unwrap_or(base.cc_allow_failover_to_models),
-                cc_fallback_model: ws
-                    .cc_fallback_model
+                allow_failover_to_models: ws
+                    .allow_failover_to_models
+                    .unwrap_or(base.allow_failover_to_models),
+                fallback_model: ws
+                    .fallback_model
                     .clone()
-                    .or_else(|| base.cc_fallback_model.clone()),
+                    .or_else(|| base.fallback_model.clone()),
                 max_rounds: ws.max_rounds.unwrap_or(base.max_rounds),
-                cc_effort: ws.cc_effort.clone().or_else(|| base.cc_effort.clone()),
+                effort: ws.effort.clone().or_else(|| base.effort.clone()),
                 agent_id: ws.agent_id.clone().or_else(|| base.agent_id.clone()),
                 system_prompt_suffix: ws
                     .system_prompt_suffix
@@ -13522,22 +13564,22 @@ prompt = "Check the weather"
         let global = AdvisorConfig {
             enabled: false,
             source: AdvisorSource::Model,
-            cc_allow_failover_to_models: false,
+            allow_failover_to_models: false,
             model: Some("expensive".into()),
             ..Default::default()
         };
         let agent = test_agent_with_advisor(Some(AgentAdvisorConfig {
             enabled: Some(true),
             source: Some(AdvisorSource::ClaudeCode),
-            cc_allow_failover_to_models: Some(true),
-            cc_fallback_model: Some("expensive".into()),
+            allow_failover_to_models: Some(true),
+            fallback_model: Some("expensive".into()),
             ..Default::default()
         }));
         let effective = agent.effective_advisor(&global);
         assert!(effective.enabled);
         assert_eq!(effective.source, AdvisorSource::ClaudeCode);
-        assert!(effective.cc_allow_failover_to_models);
-        assert_eq!(effective.cc_fallback_model.as_deref(), Some("expensive"));
+        assert!(effective.allow_failover_to_models);
+        assert_eq!(effective.fallback_model.as_deref(), Some("expensive"));
         // unset agent fields inherit global
         assert_eq!(effective.model.as_deref(), Some("expensive"));
     }
@@ -13547,7 +13589,7 @@ prompt = "Check the weather"
         let cfg = AdvisorConfig::default();
         assert!(!cfg.enabled, "advisor must be opt-in");
         assert!(
-            !cfg.cc_allow_failover_to_models,
+            !cfg.allow_failover_to_models,
             "CC cost-guard must default to OFF"
         );
         assert_eq!(cfg.payload, AdvisorPayload::Transcript);
@@ -13562,6 +13604,63 @@ prompt = "Check the weather"
         assert!(cfg.fanout.enabled);
         assert!(cfg.fanout.max_lenses >= 2);
         assert!(cfg.fanout.synth_model.is_none());
+    }
+
+    #[test]
+    fn advisor_source_chatgpt_parses_by_its_config_name() {
+        let cfg: AdvisorConfig = toml::from_str(r#"source = "chatgpt""#).unwrap();
+        assert_eq!(cfg.source, AdvisorSource::ChatGpt);
+    }
+
+    #[test]
+    fn advisor_legacy_cc_keys_still_set_the_neutral_fields() {
+        let legacy = r#"
+            cc_allow_failover_to_models = true
+            cc_fallback_model = "expensive"
+            cc_effort = "low"
+        "#;
+        let global: AdvisorConfig = toml::from_str(legacy).unwrap();
+        assert!(global.allow_failover_to_models);
+        assert_eq!(global.fallback_model.as_deref(), Some("expensive"));
+        assert_eq!(global.effort.as_deref(), Some("low"));
+        let agent: AgentAdvisorConfig = toml::from_str(legacy).unwrap();
+        assert_eq!(agent.allow_failover_to_models, Some(true));
+        assert_eq!(agent.fallback_model.as_deref(), Some("expensive"));
+        assert_eq!(agent.effort.as_deref(), Some("low"));
+    }
+
+    #[test]
+    fn advisor_routes_only_the_models_its_chain_runs() {
+        let advisor = |source| AdvisorConfig {
+            enabled: true,
+            source,
+            model: Some("m".into()),
+            fallback_model: Some("f".into()),
+            allow_failover_to_models: true,
+            fanout: AdvisorFanoutConfig {
+                synth_model: Some("s".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let routed = |cfg: &AdvisorConfig| -> Vec<String> {
+            cfg.routed_models().into_iter().cloned().collect()
+        };
+        assert_eq!(routed(&advisor(AdvisorSource::Model)), ["m", "s"]);
+        assert_eq!(routed(&advisor(AdvisorSource::ChatGpt)), ["m", "s", "f"]);
+        assert_eq!(routed(&advisor(AdvisorSource::ClaudeCode)), ["f"]);
+        assert!(routed(&advisor(AdvisorSource::Agent)).is_empty());
+
+        let guarded = AdvisorConfig {
+            allow_failover_to_models: false,
+            ..advisor(AdvisorSource::ChatGpt)
+        };
+        assert_eq!(routed(&guarded), ["m", "s"]);
+        let off = AdvisorConfig {
+            enabled: false,
+            ..advisor(AdvisorSource::ChatGpt)
+        };
+        assert!(routed(&off).is_empty());
     }
 
     #[test]
@@ -13672,7 +13771,7 @@ max_rounds = 9
         assert_eq!(advisor.source, AdvisorSource::ClaudeCode);
         assert_eq!(advisor.payload, AdvisorPayload::Transcript);
         assert_eq!(advisor.model.as_deref(), Some("opus"));
-        assert!(!advisor.cc_allow_failover_to_models);
+        assert!(!advisor.allow_failover_to_models);
         assert_eq!(advisor.max_rounds, 9);
     }
 

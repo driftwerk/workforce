@@ -17,7 +17,7 @@ use workforce_agent::llm::tiers::{extract_routing_provider, Provider};
 use workforce_common::settings::{is_claude_oat, oat_refusal, LlmConfig};
 
 use crate::resolved_config::ResolvedConfig;
-use crate::subscription::{chain_specs, PlanLogins};
+use crate::subscription::{provider_specs, PlanLogins};
 use crate::vault::Vault;
 
 /// Vault `llm/accounts/*` provider label for a [`ProviderKind`] — the value
@@ -299,8 +299,11 @@ impl AgentProviders {
             pool.add("default", provider).await;
         }
         if let Some(failover) = failover {
-            self.register_externals(failover, external_routes(kind, chain_specs(llm, resolved)))
-                .await;
+            self.register_externals(
+                failover,
+                external_routes(kind, provider_specs(llm, resolved)),
+            )
+            .await;
         }
     }
 
