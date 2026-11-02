@@ -463,6 +463,8 @@ mod tests {
             detail: detail.into(),
             since: chrono::Utc::now(),
             answerable: true,
+            choices: Vec::new(),
+            why: None,
         }
     }
 

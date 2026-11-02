@@ -652,6 +652,7 @@ impl Desk {
             ends: 0,
             reading: None,
             closing: false,
+            codex_ask: None,
         };
         if existing.is_some_and(|id| self.0.state.lock().live.contains_key(&id)) {
             // Already running here: nothing to take back.
@@ -769,6 +770,7 @@ impl Desk {
                             ends: 0,
                             reading: None,
                             closing: false,
+                            codex_ask: None,
                         },
                     );
                     self.publish(id);

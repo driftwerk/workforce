@@ -203,7 +203,8 @@ pub fn caps(engine: Engine, view: View) -> Caps {
             plan: Some(LocalPlan::Claude),
             notes: Vec::new(),
         },
-        // Codex's app-server sends its approvals to the TUI, which asks.
+        // Codex's TUI asks its approvals; Desk, subscribed to its thread,
+        // can answer its command and file requests too.
         Engine::Codex => Caps {
             state: StateSource::Server,
             approvals: Answerer::Terminal,
@@ -211,7 +212,9 @@ pub fn caps(engine: Engine, view: View) -> Caps {
             interrupt: Interrupt::Keys,
             usage: UsageSource::Tokens,
             plan: Some(LocalPlan::Codex),
-            notes: vec!["Codex asks its approvals in its own terminal."],
+            notes: vec![
+                "Codex asks its approvals in its terminal; you can answer them from the Floor too.",
+            ],
         },
         Engine::Gemini
         | Engine::Copilot

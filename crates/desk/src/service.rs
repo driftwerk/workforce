@@ -44,6 +44,8 @@ mod copies;
 mod groups;
 mod lifecycle;
 pub use lifecycle::{Clearing, Hidden, Removal, Removed};
+#[cfg(test)]
+mod codex_asks_tests;
 mod ledger;
 #[cfg(test)]
 mod lifecycle_tests;
@@ -154,6 +156,16 @@ pub(crate) struct Live {
     reading: Option<u64>,
     /// Ended from Desk: closed, not stopped, once its process has gone.
     closing: bool,
+    /// The Codex request its pending approval is, while Desk can answer it.
+    codex_ask: Option<CodexAsk>,
+}
+
+/// A Codex request Desk can answer: the pending approval it is, and its
+/// JSON-RPC id.
+#[derive(Debug, Clone)]
+struct CodexAsk {
+    approval: Uuid,
+    request: Value,
 }
 
 impl Live {
@@ -198,6 +210,8 @@ struct CodexLink {
     /// Where the app-server listens.
     socket: PathBuf,
     watch: CancellationToken,
+    /// Answers to what it asks, to its observer.
+    replies: mpsc::UnboundedSender<codex::Reply>,
 }
 
 impl CodexLink {
@@ -464,6 +478,44 @@ fn background_tasks(count: u32) -> String {
     match count {
         1 => "1 background task".into(),
         n => format!("{n} background tasks"),
+    }
+}
+
+/// Codex asks what Desk can answer: the request it says it waits on, now
+/// with what it is and what answers it (the same request, if it is one it
+/// asked again, as a late subscription hears).
+fn codex_asks(r: &mut SessionRecord, l: &mut Live, ask: codex::Ask) {
+    let again = l
+        .codex_ask
+        .as_ref()
+        .is_some_and(|a| a.request == ask.request);
+    let was = l.pending.take().filter(|p| !p.answerable || again);
+    let pending = PendingApproval {
+        id: was.as_ref().map_or_else(Uuid::new_v4, |p| p.id),
+        since: was.as_ref().map_or_else(Utc::now, |p| p.since),
+        tool: ask.tool,
+        detail: ask.detail,
+        answerable: true,
+        choices: ask.choices,
+        why: ask.why,
+    };
+    r.state = SessionState::Blocked;
+    r.asked = None;
+    l.codex_ask = Some(CodexAsk {
+        approval: pending.id,
+        request: ask.request,
+    });
+    l.pending = Some(pending);
+}
+
+/// Codex's request `request` was answered, in Desk or its terminal.
+fn codex_resolved(r: &mut SessionRecord, l: &mut Live, request: &Value) {
+    if l.codex_ask.as_ref().is_some_and(|a| a.request == *request) {
+        l.codex_ask = None;
+        l.pending = None;
+        if r.state == SessionState::Blocked {
+            r.state = SessionState::Working;
+        }
     }
 }
 
@@ -781,7 +833,9 @@ impl Desk {
                     let socket = server.meta["socket"].as_str().map(PathBuf::from);
                     let (server_pty, _) = holder.adopt(&server, history);
                     let server = Server::Held(Arc::new(server_pty));
-                    socket.map(|socket| self.observe_codex(id, server, socket))
+                    socket.map(|socket| {
+                        self.observe_codex(id, server, socket, record.cli_session_id.clone())
+                    })
                 }
                 other => {
                     held.strays.extend(other);
@@ -802,6 +856,8 @@ impl Desk {
                         detail: "Answer in the terminal".into(),
                         since: Utc::now(),
                         answerable: false,
+                        choices: Vec::new(),
+                        why: None,
                     }),
                     answer: None,
                     ended: false,
@@ -817,6 +873,7 @@ impl Desk {
                     ends: 0,
                     reading: None,
                     closing: false,
+                    codex_ask: None,
                 },
             );
             tokio::spawn(self.clone().on_exit(id, exit));
@@ -1269,7 +1326,8 @@ impl Desk {
                 ),
                 Transition::Unblocked { by_desk: true, .. }
                 | Transition::Spoke { .. }
-                | Transition::ToTerminal { .. } => None,
+                | Transition::ToTerminal { .. }
+                | Transition::Answerable { .. } => None,
                 Transition::Asked { asked, .. } => {
                     let text = match &asked.denied {
                         Some(d) => format!("stopped: {} was not allowed", d.name()),
@@ -1863,28 +1921,71 @@ impl Desk {
                     "that approval is no longer pending".into(),
                 ));
             }
-            let answer = live
-                .answer
-                .take()
-                .ok_or_else(|| DeskError::Conflict("the terminal is asking for this one".into()))?;
+            let codex = live
+                .codex_ask
+                .as_ref()
+                .filter(|a| a.approval == approval)
+                .map(|a| a.request.clone());
+            let answer = match codex {
+                // Codex asks the terminal too: answered here, it stops asking there.
+                Some(request) => {
+                    let offered = live
+                        .pending
+                        .as_ref()
+                        .is_some_and(|p| p.choices.contains(&decision));
+                    if decision != Decision::Terminal {
+                        if !offered {
+                            return Err(DeskError::Invalid(
+                                "Codex doesn't offer that answer to this request".into(),
+                            ));
+                        }
+                        let sent = live._codex.as_ref().is_some_and(|link| {
+                            link.replies
+                                .send(codex::Reply { request, decision })
+                                .is_ok()
+                        });
+                        if !sent {
+                            return Err(DeskError::Conflict(
+                                "the terminal is asking for this one".into(),
+                            ));
+                        }
+                    }
+                    live.codex_ask = None;
+                    None
+                }
+                None => {
+                    if matches!(decision, Decision::AllowForSession | Decision::Cancel) {
+                        return Err(DeskError::Invalid(
+                            "only Codex's requests take that answer".into(),
+                        ));
+                    }
+                    Some(live.answer.take().ok_or_else(|| {
+                        DeskError::Conflict("the terminal is asking for this one".into())
+                    })?)
+                }
+            };
             match decision {
                 Decision::Terminal => {
                     if let Some(p) = live.pending.as_mut() {
                         p.answerable = false;
                     }
                 }
-                Decision::Allow | Decision::Deny => {
+                Decision::Allow | Decision::Deny | Decision::AllowForSession | Decision::Cancel => {
                     live.pending = None;
                     st.decided.insert(approval);
                 }
             }
             (answer, seen)
         };
-        let _ = answer.send(match decision {
-            Decision::Allow => claude::allow(),
-            Decision::Deny => claude::deny(),
-            Decision::Terminal => claude::ask_in_terminal(),
-        });
+        if let Some(answer) = answer {
+            let _ = answer.send(match decision {
+                Decision::Allow => claude::allow(),
+                Decision::Deny => claude::deny(),
+                Decision::Terminal | Decision::AllowForSession | Decision::Cancel => {
+                    claude::ask_in_terminal()
+                }
+            });
+        }
         self.change_since(seen, id, |r, l| {
             if l.is_some_and(|l| l.pending.is_none()) {
                 r.state = SessionState::Working;
@@ -1910,6 +2011,16 @@ impl Desk {
                     Kind::Denied,
                     me,
                     format!("denied {} to {what}", view.label()),
+                )),
+                Decision::AllowForSession => Some(by.event(
+                    Kind::Approved,
+                    me,
+                    format!("allowed {} to {what}, for the session", view.label()),
+                )),
+                Decision::Cancel => Some(by.event(
+                    Kind::Denied,
+                    me,
+                    format!("denied {} to {what}, and stopped its turn", view.label()),
                 )),
                 Decision::Terminal => None,
             };
@@ -2427,18 +2538,19 @@ impl Desk {
             Engine::Codex => {
                 let socket = self.0.opts.run_dir.join(format!("{}.sock", r.id.simple()));
                 let server = self.start_app_server(r.id, &socket).await?;
+                let thread = r.cli_session_id.as_deref().filter(|_| resume);
                 let spec = codex::spawn(&codex::CodexSpawn {
                     program: self.program_of(Engine::Codex)?,
                     cwd,
                     socket: &socket,
-                    launch: match (resume, r.cli_session_id.as_deref()) {
-                        (true, Some(thread_id)) => codex::Launch::Resume { thread_id },
-                        _ => codex::Launch::New,
+                    launch: match thread {
+                        Some(thread_id) => codex::Launch::Resume { thread_id },
+                        None => codex::Launch::New,
                     },
                     prompt,
                     env: &env,
                 });
-                let link = self.observe_codex(r.id, server, socket);
+                let link = self.observe_codex(r.id, server, socket, thread.map(str::to_string));
                 (spec, Some(link))
             }
             Engine::Gemini
@@ -2490,6 +2602,7 @@ impl Desk {
                 ends: 0,
                 reading: None,
                 closing: false,
+                codex_ask: None,
             },
         );
         tokio::spawn(self.clone().on_exit(r.id, exit));
@@ -2530,16 +2643,25 @@ impl Desk {
         Ok(Server::Held(pty))
     }
 
-    /// Joins a Codex session's app-server as a second client to follow it.
-    fn observe_codex(&self, id: Uuid, server: Server, socket: PathBuf) -> CodexLink {
+    /// Joins a Codex session's app-server as a second client to follow it,
+    /// subscribed to `thread` when it is known (resumed, or taken back).
+    fn observe_codex(
+        &self,
+        id: Uuid,
+        server: Server,
+        socket: PathBuf,
+        thread: Option<String>,
+    ) -> CodexLink {
         let watch = self.0.cancel.child_token();
         let (tx, rx) = mpsc::channel(64);
+        let (replies, answers) = mpsc::unbounded_channel();
         tokio::spawn({
             let socket = server.socket(&socket);
             let watch = watch.clone();
             let plans = self.0.plans.clone();
+            let follower = codex::Follower::new(thread, self.0.env.get("HOME").map(PathBuf::from));
             async move {
-                if let Err(e) = codex::observe(socket, tx, plans, watch).await {
+                if let Err(e) = codex::observe(socket, follower, tx, answers, plans, watch).await {
                     tracing::warn!(error = %e, "codex observer stopped");
                 }
             }
@@ -2549,6 +2671,7 @@ impl Desk {
             server,
             socket,
             watch,
+            replies,
         }
     }
 
@@ -2709,6 +2832,8 @@ impl Desk {
                         detail: message,
                         since: Utc::now(),
                         answerable: false,
+                        choices: Vec::new(),
+                        why: None,
                     });
                 }
             }),
@@ -2888,6 +3013,8 @@ impl Desk {
             detail,
             since: Utc::now(),
             answerable: desk_answers,
+            choices: Vec::new(),
+            why: None,
         };
         let (tx, rx) = oneshot::channel();
         self.change(id, |r, l| {
@@ -3042,6 +3169,9 @@ impl Desk {
                             r.asked = None;
                             // A repeated notice is the same request, still asked.
                             let asked = l.pending.take();
+                            if !waiting {
+                                l.codex_ask = None;
+                            }
                             l.pending = waiting.then(|| {
                                 asked.unwrap_or_else(|| PendingApproval {
                                     id: Uuid::new_v4(),
@@ -3049,6 +3179,8 @@ impl Desk {
                                     detail: "Answer in the terminal".into(),
                                     since: Utc::now(),
                                     answerable: false,
+                                    choices: Vec::new(),
+                                    why: None,
                                 })
                             });
                         }
@@ -3075,6 +3207,7 @@ impl Desk {
                         if let Some(l) = l {
                             l.current_tool = None;
                             l.pending = None;
+                            l.codex_ask = None;
                             l.background =
                                 std::mem::take(&mut l.background).looked_if(running, Utc::now());
                         }
@@ -3086,9 +3219,23 @@ impl Desk {
                         }
                     }
                     CodexEvent::Tool(t) => {
-                        r.state = SessionState::Working;
+                        // A command it asks to run starts before it asks:
+                        // what it waits on still holds it.
+                        if l.as_ref().is_none_or(|l| l.pending.is_none()) {
+                            r.state = SessionState::Working;
+                        }
                         if let Some(l) = l {
                             l.current_tool = Some(t);
+                        }
+                    }
+                    CodexEvent::Asks(ask) => {
+                        if let Some(l) = l.filter(|_| !ask.choices.is_empty()) {
+                            codex_asks(r, l, ask);
+                        }
+                    }
+                    CodexEvent::Resolved(request) => {
+                        if let Some(l) = l {
+                            codex_resolved(r, l, &request);
                         }
                     }
                     CodexEvent::Reply(text) => r.last_reply = Some(transcript::clip(&text)),
@@ -3099,6 +3246,17 @@ impl Desk {
                 self.read_later(id, end, reader, reply);
             }
         }
+        // Its server went away: what it asked can't be answered from Desk.
+        self.change(id, |r, l| {
+            if let Some(l) = l {
+                if l.codex_ask.take().is_some() {
+                    l.pending = None;
+                    if r.state == SessionState::Blocked {
+                        r.state = SessionState::Working;
+                    }
+                }
+            }
+        });
     }
 
     async fn adopt_loop(self, every: Duration) {
@@ -4034,7 +4192,7 @@ mod tests {
     }
 
     /// Whether what `logged` holds comes to satisfy `f`.
-    async fn logs(logged: &Logged, f: impl Fn(&[TurnOp]) -> bool) -> bool {
+    pub(super) async fn logs(logged: &Logged, f: impl Fn(&[TurnOp]) -> bool) -> bool {
         for _ in 0..200 {
             if f(&logged.0.lock()) {
                 return true;
@@ -5701,6 +5859,7 @@ mod codex_stop_tests {
             server: Server::Held(Arc::new(pty)),
             socket: sock,
             watch: CancellationToken::new(),
+            replies: mpsc::unbounded_channel().0,
         };
         (link, pid, hdir)
     }
