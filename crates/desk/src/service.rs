@@ -39,6 +39,7 @@ use crate::transcript;
 use crate::usage::{LocalPlan, PlanSink};
 use crate::worktree;
 
+mod codex_terminals;
 mod copies;
 mod groups;
 mod lifecycle;
@@ -749,6 +750,7 @@ impl Desk {
         let terminals = std::mem::take(&mut held.terminals).into_iter().collect();
         self.adopt_terminals(holder.as_ref(), terminals).await;
         tokio::spawn(self.clone().follow_cwds());
+        tokio::spawn(self.clone().follow_codex_terminals());
         let Some(holder) = holder else {
             return;
         };
