@@ -366,9 +366,97 @@ fn routed_needs(
         .collect())
 }
 
-/// What still needs the person: what their turns wait on and ask, and the
-/// routed approvals waiting on them. The one source every count is a count
-/// of.
+/// A change made to `service`'s settings file outside the hub, as a need:
+/// the person uses it (Allow) or keeps the saved file (Deny). No turn asks
+/// it, so it waits from when the file last changed.
+pub(crate) fn config_need(
+    agent_id: &str,
+    name: String,
+    elsewhere: &crate::agent_config_write::Elsewhere,
+    since: DateTime<Utc>,
+) -> Need {
+    let changed = match (elsewhere.sections.as_slice(), elsewhere.details.as_slice()) {
+        ([], _) => String::new(),
+        (sections, details) => {
+            let mut said = format!(" Changed: {}.", sections.join(", "));
+            for detail in details {
+                said.push_str(&format!(" {detail}."));
+            }
+            said
+        }
+    };
+    let wait = format!(" Saves for {name} wait until you choose.");
+    let ask = if elsewhere.removed {
+        format!(
+            "{name}'s settings file was removed outside Desk. If you removed it yourself, \
+             tap Allow. Allow leaves it removed; Deny puts the saved one back.{wait}"
+        )
+    } else if elsewhere.loads {
+        format!(
+            "{name}'s settings file was changed outside Desk, and isn't in use.{changed} If \
+             you edited it yourself, tap Allow. Allow uses the new file; Deny keeps the \
+             saved one.{wait}"
+        )
+    } else {
+        format!(
+            "{name}'s settings file was changed outside Desk to one {name} can't load.\
+             {changed} Deny keeps the saved one.{wait}"
+        )
+    };
+    Need {
+        id: format!("config:{agent_id}:{}", elsewhere.hash),
+        kind: NeedKind::Approval,
+        who: Who {
+            kind: PartyKind::Agent,
+            id: agent_id.to_string(),
+            name,
+            engine: None,
+        },
+        ask,
+        options: None,
+        since,
+        place: Place::Dm,
+        answer: Answer::Decide {
+            at: DecideRef::Config {
+                agent_id: agent_id.to_string(),
+                hash: elsewhere.hash.clone(),
+            },
+        },
+    }
+}
+
+/// The changes made to agents' settings files outside the hub, for the
+/// person who holds it: only they use or discard one.
+fn config_needs(state: &GatewayState, caller: &FloorCaller) -> Vec<Need> {
+    if !caller.personal {
+        return Vec::new();
+    }
+    state
+        .registry
+        .all_services()
+        .iter()
+        .filter_map(|service| {
+            let elsewhere = crate::agent_config_write::changed_elsewhere(service)?;
+            let since = std::fs::symlink_metadata(
+                service
+                    .workspace
+                    .join(workforce_common::config_files::WORKSPACE_CONFIG),
+            )
+            .and_then(|meta| meta.modified())
+            .map_or_else(|_| Utc::now(), DateTime::<Utc>::from);
+            Some(config_need(
+                service.agent_id.as_str(),
+                crate::desk_crew::name_of(service),
+                &elsewhere,
+                since,
+            ))
+        })
+        .collect()
+}
+
+/// What still needs the person: what their turns wait on and ask, the
+/// routed approvals waiting on them, and their agents' settings changed
+/// outside the hub. The one source every count is a count of.
 fn needs_of(
     state: &GatewayState,
     caller: &FloorCaller,
@@ -379,6 +467,7 @@ fn needs_of(
         floor::open_needs(turns)
             .into_iter()
             .chain(routed_needs(state, caller, now)?)
+            .chain(config_needs(state, caller))
             .collect(),
     ))
 }
@@ -525,12 +614,14 @@ struct TokenQuery {
 }
 
 /// Why a decision was not made.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Unanswered {
     /// Someone answered it first, or it went away.
     AlreadyAnswered,
     NotYours,
     Unknown,
+    /// The settings file it would use is one the agent can't load.
+    Unloadable(crate::workspace_admission::ConfigRefusal),
 }
 
 /// Answers the need `at` points to with `choice`, as `caller`, through the
@@ -615,6 +706,31 @@ pub(crate) async fn answer(
                 Err(e) => Err(e.into()),
             }
         }
+        DecideRef::Config { agent_id, hash } => {
+            use crate::agent_config_write::{keep_saved, use_changed, Refused};
+            if !caller.personal {
+                return Ok(Err(Unanswered::NotYours));
+            }
+            let Some(service) = state.registry.get(agent_id) else {
+                return Ok(Err(Unanswered::Unknown));
+            };
+            let decided = match choice {
+                Choice::Allow => {
+                    use_changed(&service, state.def_store.as_deref(), hash, Some(&caller.id)).await
+                }
+                Choice::Deny => keep_saved(&service, hash),
+            };
+            match decided {
+                Ok(()) => Ok(Ok(())),
+                // Changed again since it was shown: the new change is a need
+                // of its own.
+                Err(Refused::Stale { .. } | Refused::ChangedElsewhere) => {
+                    Ok(Err(Unanswered::AlreadyAnswered))
+                }
+                Err(Refused::Unloadable(refusal)) => Ok(Err(Unanswered::Unloadable(refusal))),
+                Err(refused) => Err(eyre::eyre!("{refused}")),
+            }
+        }
     }
 }
 
@@ -633,6 +749,14 @@ async fn decide(
         Ok(Err(Unanswered::AlreadyAnswered)) => refusal(StatusCode::CONFLICT, "already_answered"),
         Ok(Err(Unanswered::NotYours)) => refusal(StatusCode::FORBIDDEN, "not_yours"),
         Ok(Err(Unanswered::Unknown)) => refusal(StatusCode::NOT_FOUND, "unknown"),
+        Ok(Err(Unanswered::Unloadable(why))) => {
+            let agent = match &body.at {
+                DecideRef::Config { agent_id, .. } => agent_id.as_str(),
+                _ => "",
+            };
+            let (_, said) = crate::gateway::config_write_unloadable(agent, why);
+            (StatusCode::UNPROCESSABLE_ENTITY, said).into_response()
+        }
         Err(e) => failed(e),
     }
 }
@@ -1254,5 +1378,72 @@ mod tests {
                 }]
             })
         );
+    }
+
+    /// A settings file changed outside the hub is the person's to decide on
+    /// the floor, by what it held when shown, and says what each answer does.
+    #[test]
+    fn a_settings_change_made_elsewhere_is_a_need_bound_to_what_was_shown() {
+        use crate::agent_config_write::Elsewhere;
+        let since = Utc::now();
+        let changed = Elsewhere {
+            hash: "abc".into(),
+            removed: false,
+            loads: true,
+            sections: vec!["access".into(), "llm".into()],
+            details: vec!["access.mode: allowlist → open".into()],
+        };
+        let need = config_need("allan", "Allan".into(), &changed, since);
+        assert_eq!(need.id, "config:allan:abc");
+        assert_eq!(need.kind, NeedKind::Approval);
+        assert_eq!(need.who.id, "allan");
+        assert_eq!(need.since, since);
+        assert!(need.ask.contains("Allow uses the new file"), "{}", need.ask);
+        assert!(
+            need.ask.contains("Deny keeps the saved one"),
+            "{}",
+            need.ask
+        );
+        for said in [
+            "If you edited it yourself, tap Allow.",
+            "Saves for Allan wait until you choose.",
+            "Changed: access, llm. access.mode: allowlist → open.",
+        ] {
+            assert!(need.ask.contains(said), "{said}: {}", need.ask);
+        }
+        assert_eq!(
+            need.answer,
+            Answer::Decide {
+                at: DecideRef::Config {
+                    agent_id: "allan".into(),
+                    hash: "abc".into(),
+                },
+            }
+        );
+        let at = serde_json::to_value(DecideRef::Config {
+            agent_id: "allan".into(),
+            hash: "abc".into(),
+        })
+        .unwrap();
+        assert_eq!(
+            at,
+            json!({"kind": "config", "agentId": "allan", "hash": "abc"})
+        );
+
+        let broken = Elsewhere {
+            loads: false,
+            ..changed.clone()
+        };
+        let ask = config_need("allan", "Allan".into(), &broken, since).ask;
+        assert!(
+            ask.contains("can't load") && !ask.contains("Allow"),
+            "{ask}"
+        );
+        let removed = Elsewhere {
+            removed: true,
+            ..changed
+        };
+        let ask = config_need("allan", "Allan".into(), &removed, since).ask;
+        assert!(ask.contains("removed"), "{ask}");
     }
 }

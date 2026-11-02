@@ -11556,6 +11556,14 @@ pub(crate) fn config_write_refused(
             })),
         ),
         Refused::Unloadable(refusal) => config_write_unloadable(id, refusal),
+        Refused::ChangedElsewhere => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "This agent's settings file was changed outside Desk. Use that change \
+                          or keep the saved settings first; nothing is saved over it until then.",
+                "changed_elsewhere": true,
+            })),
+        ),
         Refused::Revision(e) => {
             warn!(agent_id = %id, error = %e, "Config revision capture failed — refusing write");
             (
@@ -11576,7 +11584,7 @@ pub(crate) fn config_write_refused(
 /// A config.toml write the agent would not load, as a 400 in plain words:
 /// a setting's own plain refusal as it is, anything else generically, with
 /// what was wrong in `findings` (a body that doesn't read as one finding).
-fn config_write_unloadable(
+pub(crate) fn config_write_unloadable(
     id: &str,
     refusal: crate::workspace_admission::ConfigRefusal,
 ) -> (StatusCode, Json<serde_json::Value>) {

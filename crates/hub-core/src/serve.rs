@@ -2311,7 +2311,26 @@ impl AgentService {
     /// error, so the agent never runs a half-applied edit. The resolved config
     /// is swapped before the provider, so a reader that observes the new
     /// provider cannot see stale tier-resolved background-task models.
+    ///
+    /// A file changed outside the hub while it is guarded
+    /// ([`workforce_common::config_files::guard`]) is not applied either: the
+    /// saved config is what runs until the person uses or discards it.
     pub async fn reload_config(&self) -> eyre::Result<Vec<String>> {
+        let path = self
+            .workspace
+            .join(workforce_common::config_files::WORKSPACE_CONFIG);
+        if workforce_common::config_files::changed_elsewhere(&path)?.is_some() {
+            tracing::warn!(
+                agent_id = %self.agent_id,
+                "config.toml was changed outside the hub; keeping the saved settings until the person decides"
+            );
+            // Every reader sees the saved file while the change waits, so
+            // applying it puts back the saved settings: a no-op while they
+            // run, and what a hub that booted onto the change needs.
+            if workforce_common::config_files::read(&path)?.is_none() {
+                return Ok(Vec::new());
+            }
+        }
         let applied = self.hosts.reconfigure.apply(self).await;
         *self.config_rejected.write() = applied.as_ref().err().map(|e| e.to_string());
         applied

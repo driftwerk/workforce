@@ -13,9 +13,12 @@
 //! operator copying files in as root or as their own user, or a volume whose
 //! files a host account owns, is the install's own doing.
 
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::io::{self, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{LazyLock, Mutex, MutexGuard, PoisonError};
 
 /// The agent's own settings, layered over the install config.
 pub const WORKSPACE_CONFIG: &str = "config.toml";
@@ -82,7 +85,22 @@ pub fn runner_uid() -> Option<u32> {
 /// made it. A file the agent uid planted where none existed is left out, with
 /// a warning, exactly as though it were absent; one an older replica left
 /// group-writable is closed before it is read.
+///
+/// A [guarded](guard) file holding a change made elsewhere reads as this
+/// process last wrote or adopted it, so nothing that reads it takes the
+/// change before the person does.
 pub fn read(path: &Path) -> io::Result<Option<String>> {
+    if let Some(key) = guarded_key(path) {
+        if let Some(ours) = guarded().get(&key) {
+            return Ok(ours.clone());
+        }
+    }
+    read_on_disk(path)
+}
+
+/// The text of the file at `path` as it is on disk, a change made elsewhere
+/// included.
+fn read_on_disk(path: &Path) -> io::Result<Option<String>> {
     read_unless_planted_by(path, runner_uid())
 }
 
@@ -121,7 +139,44 @@ pub fn is_plain_name(name: &str) -> bool {
 /// hub alone whatever the umask. The text goes to a temporary file created
 /// exclusively under a fresh name beside it, so nothing planted in the
 /// directory can redirect the write, and is then renamed into place.
+///
+/// A [guarded](guard) file is replaced only over what this process last
+/// wrote or adopted there: one holding a change made elsewhere is left as it
+/// is, refused with [`ChangedElsewhere`].
 pub fn replace(path: &Path, content: &[u8]) -> io::Result<()> {
+    replace_over(path, content, Over::Ours)
+}
+
+/// What a [`replace_over`] may replace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Over<'a> {
+    /// Only what this process last wrote or adopted there.
+    Ours,
+    /// That, or this change made elsewhere, which the person chose to use.
+    Chosen(&'a str),
+}
+
+/// [`replace`], over the change made elsewhere that `over` names too.
+pub fn replace_over(path: &Path, content: &[u8], over: Over<'_>) -> io::Result<()> {
+    let Some(key) = guarded_key(path) else {
+        return write_in_place(path, content);
+    };
+    let mut guarded = guarded();
+    let Some(ours) = guarded.get_mut(&key) else {
+        drop(guarded);
+        return write_in_place(path, content);
+    };
+    let now = read_on_disk(path)?;
+    let chosen = matches!(over, Over::Chosen(seen) if now.as_deref() == Some(seen));
+    if now != *ours && !chosen {
+        return Err(io::Error::other(ChangedElsewhere));
+    }
+    write_in_place(path, content)?;
+    *ours = Some(String::from_utf8_lossy(content).into_owned());
+    Ok(())
+}
+
+fn write_in_place(path: &Path, content: &[u8]) -> io::Result<()> {
     let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -209,6 +264,154 @@ fn planted(path: &Path, runner: Option<u32>) -> bool {
 /// Whether any of `owners` is `runner`, or cannot be known.
 fn made_by(mut owners: impl Iterator<Item = Option<u32>>, runner: u32) -> bool {
     owners.any(|owner| owner.is_none_or(|owner| owner == runner))
+}
+
+// ── Changes made elsewhere ───────────────────────────────────────────────
+//
+// Where no runner keeps an agent's commands apart from the hub, a command can
+// rewrite a configuration file as easily as the hub can. A guarded file is
+// one whose writes this process tells apart: it keeps the body it last wrote
+// or adopted there, so a body it finds that is anything else was made
+// elsewhere. That change waits on the person: it is not applied, and no
+// write of the hub's own is laid over it, until they keep or discard it.
+
+/// The body this process last wrote or adopted at each guarded path, `None`
+/// where that was no file.
+static GUARDED: LazyLock<Mutex<HashMap<PathBuf, Option<String>>>> = LazyLock::new(Default::default);
+
+/// Whether this process guards any file at all, so a hub that guards none
+/// reads and writes its configuration exactly as it did before guarding was.
+static ANY_GUARDED: AtomicBool = AtomicBool::new(false);
+
+fn guarded() -> MutexGuard<'static, HashMap<PathBuf, Option<String>>> {
+    GUARDED.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// The key `path` would be guarded under, worked out before the guard is
+/// taken; `None` while this process guards nothing.
+fn guarded_key(path: &Path) -> Option<PathBuf> {
+    ANY_GUARDED.load(Ordering::Acquire).then(|| guard_key(path))
+}
+
+/// The path a guarded file is known by, however a caller spells its
+/// directory.
+fn guard_key(path: &Path) -> PathBuf {
+    match (
+        path.parent().and_then(|dir| dir.canonicalize().ok()),
+        path.file_name(),
+    ) {
+        (Some(dir), Some(name)) => dir.join(name),
+        _ => path.to_path_buf(),
+    }
+}
+
+/// What a writer is told while a change made elsewhere waits.
+pub const CHANGED_ELSEWHERE: &str = "The settings file was changed outside the hub. That change \
+     waits for the person to use it or keep the saved one, and nothing is saved over it until then.";
+
+/// A write refused because the file holds a change made elsewhere.
+#[derive(Debug)]
+pub struct ChangedElsewhere;
+
+impl std::fmt::Display for ChangedElsewhere {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(CHANGED_ELSEWHERE)
+    }
+}
+
+impl std::error::Error for ChangedElsewhere {}
+
+/// Whether `e` refused a write over a change made elsewhere.
+pub fn is_changed_elsewhere(e: &io::Error) -> bool {
+    e.get_ref()
+        .is_some_and(|inner| inner.is::<ChangedElsewhere>())
+}
+
+/// Guard the file at `path` from now on, adopting it as it stands the first
+/// time. A file this process already guards keeps what it last wrote or
+/// adopted, so an agent rebuilt while a change made elsewhere waits does not
+/// take that change as its own.
+pub fn guard(path: &Path) -> io::Result<()> {
+    guard_with(path, read_on_disk(path)?)
+}
+
+/// [`guard`], taking `saved` (`None`: no file) as this process's own rather
+/// than the file as it stands: a hub that finds on disk something other than
+/// what it last saved holds that as a change made elsewhere.
+pub fn guard_as(path: &Path, saved: Option<String>) -> io::Result<()> {
+    guard_with(path, saved)
+}
+
+fn guard_with(path: &Path, ours: Option<String>) -> io::Result<()> {
+    let key = guard_key(path);
+    guarded().entry(key).or_insert(ours);
+    ANY_GUARDED.store(true, Ordering::Release);
+    Ok(())
+}
+
+/// Stop guarding the file at `path`: as a new process would, the next
+/// [`guard`] adopts whatever it finds.
+pub fn unguard(path: &Path) {
+    if let Some(key) = guarded_key(path) {
+        guarded().remove(&key);
+    }
+}
+
+/// What the file at `path` holds now, when it is guarded and that is not what
+/// this process last wrote or adopted there: a change made elsewhere
+/// (`Some(None)`: the file was removed). `None` when nothing waits.
+pub fn changed_elsewhere(path: &Path) -> io::Result<Option<Option<String>>> {
+    let Some(key) = guarded_key(path) else {
+        return Ok(None);
+    };
+    let guarded = guarded();
+    let Some(ours) = guarded.get(&key) else {
+        return Ok(None);
+    };
+    let now = read_on_disk(path)?;
+    Ok((now != *ours).then_some(now))
+}
+
+/// Take the change made elsewhere at `path` as this process's own, provided
+/// the file still holds `seen` (`None`: no file). Whether it did.
+pub fn adopt(path: &Path, seen: Option<&str>) -> io::Result<bool> {
+    let Some(key) = guarded_key(path) else {
+        return Ok(false);
+    };
+    let mut guarded = guarded();
+    let Some(ours) = guarded.get_mut(&key) else {
+        return Ok(false);
+    };
+    let now = read_on_disk(path)?;
+    if now.as_deref() != seen {
+        return Ok(false);
+    }
+    *ours = now;
+    Ok(true)
+}
+
+/// Put back what this process last wrote or adopted at `path`, removing the
+/// file where that was none, over the change made elsewhere, provided the
+/// file still holds `seen` (`None`: no file). Whether it did.
+pub fn restore(path: &Path, seen: Option<&str>) -> io::Result<bool> {
+    let Some(key) = guarded_key(path) else {
+        return Ok(false);
+    };
+    let guarded = guarded();
+    let Some(ours) = guarded.get(&key) else {
+        return Ok(false);
+    };
+    if read_on_disk(path)?.as_deref() != seen {
+        return Ok(false);
+    }
+    match ours {
+        Some(body) => write_in_place(path, body.as_bytes())?,
+        None => match std::fs::remove_file(path) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+            _ => {}
+        },
+    }
+    Ok(true)
 }
 
 #[cfg(unix)]
@@ -529,5 +732,101 @@ mod tests {
         for name in ["", ".", "..", "../config", "a/b", "a\\b", "x\0y"] {
             assert!(!is_plain_name(name), "{name:?}");
         }
+    }
+
+    /// A guarded file's own writes go on as before; a body written by anything
+    /// else waits, and no ordinary write is laid over it.
+    #[test]
+    fn a_guarded_file_tells_its_own_writes_from_others() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(WORKSPACE_CONFIG);
+        std::fs::write(&path, "[llm]\nmax_rounds = 1\n").unwrap();
+        guard(&path).unwrap();
+        assert_eq!(changed_elsewhere(&path).unwrap(), None, "adopted at once");
+
+        replace(&path, b"[llm]\nmax_rounds = 2\n").unwrap();
+        assert_eq!(changed_elsewhere(&path).unwrap(), None, "its own write");
+
+        let widened = "[access]\nmode = \"open\"\n";
+        std::fs::write(&path, widened).unwrap();
+        assert_eq!(
+            changed_elsewhere(&path).unwrap(),
+            Some(Some(widened.to_string()))
+        );
+        assert_eq!(
+            read(&path).unwrap().as_deref(),
+            Some("[llm]\nmax_rounds = 2\n"),
+            "the hub reads its own until the person decides"
+        );
+        let refused = replace(&path, b"[llm]\nmax_rounds = 3\n").unwrap_err();
+        assert!(is_changed_elsewhere(&refused), "{refused}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), widened);
+
+        // Spelt another way, it is the same file.
+        let spelt = dir.path().join(".").join(WORKSPACE_CONFIG);
+        assert!(changed_elsewhere(&spelt).unwrap().is_some());
+
+        // Guarding it again, as a rebuilt agent does, adopts nothing.
+        guard(&path).unwrap();
+        assert!(changed_elsewhere(&path).unwrap().is_some());
+    }
+
+    #[test]
+    fn a_change_made_elsewhere_is_kept_or_used_only_as_it_was_seen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(WORKSPACE_CONFIG);
+        let saved = "[llm]\nmax_rounds = 1\n";
+        std::fs::write(&path, saved).unwrap();
+        guard(&path).unwrap();
+
+        std::fs::write(&path, "first").unwrap();
+        assert!(!restore(&path, Some("something else")).unwrap());
+        assert!(restore(&path, Some("first")).unwrap());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), saved);
+        assert_eq!(changed_elsewhere(&path).unwrap(), None);
+
+        std::fs::write(&path, "second").unwrap();
+        let refused = replace_over(&path, b"third", Over::Chosen("first")).unwrap_err();
+        assert!(is_changed_elsewhere(&refused));
+        replace_over(&path, b"second", Over::Chosen("second")).unwrap();
+        assert_eq!(changed_elsewhere(&path).unwrap(), None, "used");
+
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(changed_elsewhere(&path).unwrap(), Some(None), "removed");
+        assert!(adopt(&path, None).unwrap());
+        assert_eq!(changed_elsewhere(&path).unwrap(), None);
+        std::fs::write(&path, "planted").unwrap();
+        assert!(restore(&path, Some("planted")).unwrap());
+        assert!(!path.exists(), "there was no file to put back");
+    }
+
+    #[test]
+    fn an_unguarded_file_is_replaced_as_ever() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(WORKSPACE_CONFIG);
+        std::fs::write(&path, "theirs").unwrap();
+        replace(&path, b"ours").unwrap();
+        assert_eq!(changed_elsewhere(&path).unwrap(), None);
+        assert!(!adopt(&path, Some("ours")).unwrap());
+        assert!(!restore(&path, Some("ours")).unwrap());
+    }
+
+    /// A hub that boots onto something other than what it last saved holds
+    /// that as a change made elsewhere; a fresh process adopts again.
+    #[test]
+    fn a_file_guarded_as_saved_holds_what_differs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(WORKSPACE_CONFIG);
+        std::fs::write(&path, "theirs").unwrap();
+        guard_as(&path, Some("saved".into())).unwrap();
+        assert_eq!(read(&path).unwrap().as_deref(), Some("saved"));
+        assert_eq!(
+            changed_elsewhere(&path).unwrap(),
+            Some(Some("theirs".to_string()))
+        );
+        unguard(&path);
+        assert_eq!(changed_elsewhere(&path).unwrap(), None);
+        guard(&path).unwrap();
+        assert_eq!(changed_elsewhere(&path).unwrap(), None, "adopted");
     }
 }
