@@ -758,7 +758,7 @@ async fn with_the_desk_store_off_a_dm_shows_the_files_its_person_sent() {
     );
     assert!(
         carried(
-            scout.sessions.as_ref(),
+            Arc::clone(&scout.sessions),
             "scout",
             &alice_id,
             Some(&[SessionAttachment::from_artifact(
@@ -767,6 +767,7 @@ async fn with_the_desk_store_off_a_dm_shows_the_files_its_person_sent() {
                 &bobs
             )]),
         )
+        .await
         .is_empty(),
         "a mark carries only what its person may read"
     );
@@ -827,7 +828,7 @@ async fn a_file_that_has_gone_stays_on_its_message_as_it_was_named() {
         )]),
     );
     scout.sessions.save(&session).unwrap();
-    let mut read = crate::desk_conversations::read_shown(
+    let (mut read, _, held) = crate::desk_conversations::read_shown(
         scout.sessions.as_ref(),
         &workforce_desk::Speaker::agent("scout", "Scout"),
         "alice",
@@ -835,14 +836,367 @@ async fn a_file_that_has_gone_stays_on_its_message_as_it_was_named() {
         workforce_desk::Cursor::Newest,
         50,
     )
-    .unwrap()
-    .0;
-    described(scout.sessions.as_ref(), "scout", "alice", &mut read);
+    .unwrap();
+    described(
+        Arc::clone(&scout.sessions),
+        "scout",
+        "alice",
+        &mut read,
+        &held,
+    )
+    .await;
     let file = &read.messages[0].attachments[0];
     assert_eq!(
         (file.filename.as_str(), file.size, file.width),
         ("gone.png", 0, None)
     );
+}
+
+/// A store that keeps no files, as S3 doesn't: it can say what a file is and
+/// how long, and whatever the bytes are is a download nothing should ask for.
+struct NoFilesStore {
+    descriptors: HashMap<String, ArtifactDescriptor>,
+    size: u64,
+    fail: bool,
+    metadata_asks: std::sync::atomic::AtomicUsize,
+    size_asks: std::sync::atomic::AtomicUsize,
+    asked_on: std::sync::Mutex<Vec<std::thread::ThreadId>>,
+}
+
+impl NoFilesStore {
+    fn of(
+        size: u64,
+        descriptors: impl IntoIterator<Item = (ArtifactId, ArtifactDescriptor)>,
+    ) -> Self {
+        Self {
+            descriptors: descriptors
+                .into_iter()
+                .map(|(id, d)| (id.as_str().to_string(), d))
+                .collect(),
+            size,
+            fail: false,
+            metadata_asks: Default::default(),
+            size_asks: Default::default(),
+            asked_on: Default::default(),
+        }
+    }
+
+    fn asks(&self) -> (usize, usize) {
+        use std::sync::atomic::Ordering::SeqCst;
+        (self.metadata_asks.load(SeqCst), self.size_asks.load(SeqCst))
+    }
+}
+
+impl ArtifactStore for NoFilesStore {
+    fn write(
+        &self,
+        _agent_id: &str,
+        _descriptor: ArtifactDescriptor,
+        _body: workforce_agent::artifacts::ArtifactBody,
+    ) -> eyre::Result<workforce_agent::artifacts::ArtifactHandle> {
+        unreachable!("nothing is written")
+    }
+
+    fn read(
+        &self,
+        _agent_id: &str,
+        _id: &ArtifactId,
+    ) -> eyre::Result<workforce_agent::artifacts::ArtifactBody> {
+        panic!("a whole file is downloaded for what its store can say")
+    }
+
+    fn metadata(
+        &self,
+        _agent_id: &str,
+        id: &ArtifactId,
+    ) -> eyre::Result<Option<ArtifactDescriptor>> {
+        self.metadata_asks
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.asked_on
+            .lock()
+            .unwrap()
+            .push(std::thread::current().id());
+        if self.fail {
+            eyre::bail!("the bucket is having a moment");
+        }
+        Ok(self.descriptors.get(id.as_str()).cloned())
+    }
+
+    fn body_size(&self, _agent_id: &str, _id: &ArtifactId) -> eyre::Result<Option<u64>> {
+        self.size_asks
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(Some(self.size))
+    }
+
+    fn purge_expired(&self) -> eyre::Result<usize> {
+        Ok(0)
+    }
+}
+
+/// A file of `user`'s or filed under `session`, named `name`.
+fn descriptor_of(user: Option<&str>, session: Option<&str>, name: &str) -> ArtifactDescriptor {
+    ArtifactDescriptor {
+        user_id: user.map(str::to_string),
+        session_id: session.map(str::to_string),
+        ..ArtifactDescriptor::from_context("test", ContentType::OctetStream, "scout")
+            .with_file_meta(name, "image/png")
+    }
+}
+
+/// A person's message whose client named `held` and whose mark carries
+/// `marked`, in a session of `owner`'s with `scout`.
+fn a_message_naming(
+    sessions: &dyn SessionStore,
+    owner: &str,
+    held: &[&ArtifactId],
+    marked: &[workforce_common::channels::desk::DeskFile],
+) {
+    let mut session = sessions
+        .get_or_create(DESK_CHANNEL, owner, "scout")
+        .unwrap();
+    session.add_user_message_with_attachments(
+        "look",
+        None,
+        Some(
+            held.iter()
+                .map(|id| SessionAttachment::from_artifact("x.png", "image/png", id.as_str()))
+                .collect(),
+        ),
+    );
+    session.messages.last_mut().unwrap().desk = Some(workforce_common::channels::desk::DeskMark {
+        files: marked.to_vec(),
+        ..Default::default()
+    });
+    sessions.save(&session).unwrap();
+}
+
+fn in_memory() -> Arc<dyn SessionStore> {
+    Arc::new(workforce_common::session::InMemorySessionStore::new())
+}
+
+/// What `owner` is shown of their conversation with `scout`, told from `store`.
+async fn shown_from(
+    store: Arc<NoFilesStore>,
+    sessions: &Arc<dyn SessionStore>,
+    owner: &str,
+) -> workforce_desk::Page {
+    let (mut page, _, held) = crate::desk_conversations::read_shown(
+        sessions.as_ref(),
+        &workforce_desk::Speaker::agent("scout", "Scout"),
+        owner,
+        DESK_CHANNEL,
+        workforce_desk::Cursor::Newest,
+        50,
+    )
+    .unwrap();
+    workforce_agent::runner::CURRENT_ARTIFACT_STORE
+        .scope(
+            store,
+            described(Arc::clone(sessions), "scout", owner, &mut page, &held),
+        )
+        .await;
+    page
+}
+
+/// On a store that keeps no files, a file's size is the store's to say, and
+/// its pixels would take a download nothing makes.
+#[test]
+fn a_file_with_no_path_is_sized_by_its_store_and_never_downloaded() {
+    let id = ArtifactId::fresh();
+    let store = NoFilesStore::of(4242, []);
+    assert_eq!(
+        describe(&store, "scout", &id, "image/png"),
+        Described {
+            size: 4242,
+            width: None,
+            height: None
+        }
+    );
+}
+
+/// A mark's file was told when it was stamped, whatever that came to: a read
+/// doesn't ask again, however many times, and however small it was.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_mark_s_file_is_not_asked_about_again_on_every_read() {
+    let sessions = in_memory();
+    let (held, stamped) = (ArtifactId::fresh(), ArtifactId::fresh());
+    let store = Arc::new(NoFilesStore::of(
+        7,
+        [
+            (held.clone(), descriptor_of(Some("alice"), None, "held.png")),
+            (
+                stamped.clone(),
+                descriptor_of(Some("alice"), None, "stamped.png"),
+            ),
+        ],
+    ));
+    a_message_naming(
+        sessions.as_ref(),
+        "alice",
+        &[&held],
+        &[workforce_common::channels::desk::DeskFile {
+            artifact_id: stamped.as_str().to_string(),
+            agent_id: "scout".into(),
+            filename: "stamped.png".into(),
+            media_type: "image/png".into(),
+            size: 0,
+            width: None,
+            height: None,
+            caption: None,
+        }],
+    );
+    let page = shown_from(Arc::clone(&store), &sessions, "alice").await;
+    let files: Vec<_> = page.messages[0]
+        .attachments
+        .iter()
+        .map(|f| (f.artifact_id.as_str(), f.filename.as_str(), f.size))
+        .collect();
+    assert_eq!(
+        files,
+        [
+            (stamped.as_str(), "stamped.png", 0),
+            (held.as_str(), "held.png", 7),
+        ],
+    );
+    assert_eq!(store.asks(), (1, 1), "only the file its mark doesn't carry");
+}
+
+/// However a file can't be read, nothing is said of it and no size is asked
+/// for: another person's and a gone one read alike.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_store_that_keeps_no_files_says_nothing_of_a_file_that_isn_t_theirs() {
+    let sessions = in_memory();
+    let (bobs, gone) = (ArtifactId::fresh(), ArtifactId::fresh());
+    let store = Arc::new(NoFilesStore::of(
+        7,
+        [(bobs.clone(), descriptor_of(Some("bob"), None, "bob.png"))],
+    ));
+    a_message_naming(sessions.as_ref(), "alice", &[&bobs, &gone], &[]);
+    let page = shown_from(Arc::clone(&store), &sessions, "alice").await;
+    let files: Vec<_> = page.messages[0]
+        .attachments
+        .iter()
+        .map(|f| (f.filename.as_str(), f.size, f.width))
+        .collect();
+    assert_eq!(files, [("x.png", 0, None), ("x.png", 0, None)]);
+    assert_eq!(store.asks(), (2, 0));
+}
+
+/// What a store says a file is called is a name like any other a client gave.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_held_file_s_name_from_its_store_keeps_no_directories() {
+    let sessions = in_memory();
+    let id = ArtifactId::fresh();
+    let store = Arc::new(NoFilesStore::of(
+        7,
+        [(
+            id.clone(),
+            descriptor_of(Some("alice"), None, "../../evil.png"),
+        )],
+    ));
+    a_message_naming(sessions.as_ref(), "alice", &[&id], &[]);
+    let page = shown_from(store, &sessions, "alice").await;
+    assert_eq!(page.messages[0].attachments[0].filename, "evil.png");
+}
+
+/// A page's and a turn's files are told off the runtime: a store's asks may
+/// each be a round trip, or a read of a file's head.
+#[tokio::test(flavor = "current_thread")]
+async fn a_conversation_s_files_are_told_off_the_runtime() {
+    let sessions = in_memory();
+    let id = ArtifactId::fresh();
+    let store = Arc::new(NoFilesStore::of(
+        7,
+        [(id.clone(), descriptor_of(Some("alice"), None, "a.png"))],
+    ));
+    a_message_naming(sessions.as_ref(), "alice", &[&id], &[]);
+    let here = std::thread::current().id();
+
+    shown_from(Arc::clone(&store), &sessions, "alice").await;
+    let named = [SessionAttachment::from_artifact(
+        "a.png",
+        "image/png",
+        id.as_str(),
+    )];
+    let files = workforce_agent::runner::CURRENT_ARTIFACT_STORE
+        .scope(
+            Arc::clone(&store) as Arc<dyn ArtifactStore>,
+            carried(Arc::clone(&sessions), "scout", "alice", Some(&named)),
+        )
+        .await;
+    assert_eq!(files.len(), 1, "the turn's own store is the one asked");
+    let asked_on = store.asked_on.lock().unwrap();
+    assert_eq!(asked_on.len(), 2);
+    assert!(asked_on.iter().all(|thread| *thread != here));
+}
+
+/// One call reads a session's owner once, whichever way that came out.
+#[test]
+fn a_session_s_owner_is_read_once_in_a_call() {
+    let mut reads = Vec::new();
+    let mut owners = Owners::new(|session: &str| {
+        reads.push(session.to_string());
+        (session == "mine").then(|| "alice".to_string())
+    });
+    for (session, readable) in [
+        ("mine", true),
+        ("mine", true),
+        ("other", false),
+        ("other", false),
+        ("mine", true),
+    ] {
+        let file = descriptor_of(None, Some(session), "a.png");
+        assert_eq!(readable_by(&mut owners, &file, "alice"), readable);
+    }
+    drop(owners);
+    assert_eq!(reads, ["mine", "other"]);
+    let mut none = Owners::new(|_: &str| -> Option<String> { panic!("no session asked for") });
+    assert!(readable_by(
+        &mut none,
+        &descriptor_of(Some("alice"), Some("any"), "a.png"),
+        "alice"
+    ));
+}
+
+/// A file a mark leaves out because its lookup failed says so, with its id
+/// and why.
+#[test]
+fn a_file_whose_lookup_failed_is_logged_when_its_mark_leaves_it_out() {
+    #[derive(Clone, Default)]
+    struct Logged(Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for Logged {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let logged = Logged::default();
+    let writer = logged.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::WARN)
+        .with_writer(move || writer.clone())
+        .finish();
+    let sessions = in_memory();
+    let id = ArtifactId::fresh();
+    let store = NoFilesStore {
+        fail: true,
+        ..NoFilesStore::of(7, [])
+    };
+    let named = [SessionAttachment::from_artifact(
+        "a.png",
+        "image/png",
+        id.as_str(),
+    )];
+    let files = tracing::subscriber::with_default(subscriber, || {
+        carried_files(&store, sessions.as_ref(), "scout", "alice", &named)
+    });
+    assert!(files.is_empty());
+    let logged = String::from_utf8(logged.0.lock().unwrap().clone()).unwrap();
+    assert!(logged.contains(id.as_str()), "{logged}");
+    assert!(logged.contains("the bucket is having a moment"), "{logged}");
 }
 
 /// A device with no identity behind it uploads under a session, not a
@@ -874,14 +1228,14 @@ async fn a_device_s_upload_is_theirs_through_its_session_across_a_rollover() {
         )
         .unwrap()
         .id;
-    let sessions = scout.sessions.as_ref();
-    workforce_agent::rollover::seal_and_mint(sessions, &mut first, 0).unwrap();
+    let sessions = &scout.sessions;
+    workforce_agent::rollover::seal_and_mint(sessions.as_ref(), &mut first, 0).unwrap();
     let named = [SessionAttachment::from_artifact(
         "x.png",
         "image/png",
         id.as_str(),
     )];
-    let carried_files = carried(sessions, "scout", "device-1", Some(&named));
+    let carried_files = carried(Arc::clone(sessions), "scout", "device-1", Some(&named)).await;
     assert_eq!(
         carried_files
             .iter()
@@ -889,7 +1243,11 @@ async fn a_device_s_upload_is_theirs_through_its_session_across_a_rollover() {
             .collect::<Vec<_>>(),
         [("device.png", image.len() as u64, Some(8))],
     );
-    assert!(carried(sessions, "scout", "device-2", Some(&named)).is_empty());
+    assert!(
+        carried(Arc::clone(sessions), "scout", "device-2", Some(&named))
+            .await
+            .is_empty()
+    );
 }
 
 /// With the desk store on, the kept records of a person's files win, a file
@@ -956,7 +1314,7 @@ async fn with_the_desk_store_on_kept_files_win_with_no_duplicates() {
             })
             .await
             .unwrap();
-        let mut again = crate::desk_conversations::read_shown(
+        let (mut again, _, mut held) = crate::desk_conversations::read_shown(
             scout.sessions.as_ref(),
             &workforce_desk::Speaker::agent("scout", "Scout"),
             &alice_id,
@@ -964,8 +1322,7 @@ async fn with_the_desk_store_on_kept_files_win_with_no_duplicates() {
             workforce_desk::Cursor::Newest,
             50,
         )
-        .unwrap()
-        .0;
+        .unwrap();
         with_attachments(
             &d,
             &workforce_desk::Speaker::agent("scout", "Scout"),
@@ -973,6 +1330,7 @@ async fn with_the_desk_store_on_kept_files_win_with_no_duplicates() {
             &alice_id,
             &mut again,
             Default::default(),
+            &mut held,
         )
         .await;
         let first = &again.messages[0];

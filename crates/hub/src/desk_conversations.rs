@@ -8,7 +8,7 @@
 //! same one. A conversation left a day goes on in a successor holding a
 //! carry-over; the read walks the whole chain, so it reads as one.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -52,6 +52,8 @@ const HUB_NOTES: &[&str] = &[
 struct HeldFiles<'a> {
     store: &'a dyn SessionStore,
     sessions: HashMap<String, HashMap<String, Vec<SessionAttachment>>>,
+    /// The ids of those taken from here: only their clients have named them.
+    named: HashSet<String>,
 }
 
 impl<'a> HeldFiles<'a> {
@@ -59,6 +61,7 @@ impl<'a> HeldFiles<'a> {
         Self {
             store,
             sessions: HashMap::new(),
+            named: HashSet::new(),
         }
     }
 
@@ -94,7 +97,8 @@ impl<'a> HeldFiles<'a> {
 /// prompt or a note the hub left for the model; a file sent or delivered
 /// without a caption is one, with no text. The text is what the live channel
 /// sends: secret markers as previews, credentials redacted; its attachments
-/// are the files its mark names, or a person's the files their message holds.
+/// are the files its mark names and, for a person's, those their message
+/// holds that it doesn't.
 /// A person's message is theirs until [`with_authors`] says otherwise.
 fn said(
     entry: &TranscriptEntry,
@@ -118,8 +122,23 @@ fn said(
         .iter()
         .map(Into::into)
         .collect();
-    if let (true, Author::User, Some(held)) = (attachments.is_empty(), from, held) {
-        attachments = held.on(entry);
+    // A mark may carry only some of them: one whose lookup failed when it was
+    // stamped is still on the message.
+    if let (Author::User, Some(held)) = (from, held) {
+        let room = MAX_PER_MESSAGE.saturating_sub(attachments.len());
+        let others: Vec<Attachment> = held
+            .on(entry)
+            .into_iter()
+            .filter(|file| {
+                !attachments
+                    .iter()
+                    .any(|a| a.artifact_id == file.artifact_id)
+            })
+            .take(room)
+            .collect();
+        held.named
+            .extend(others.iter().map(|file| file.artifact_id.clone()));
+        attachments.extend(others);
     }
     if trimmed.is_empty() && attachments.is_empty() {
         return None;
@@ -149,7 +168,9 @@ pub(crate) struct Span {
 /// `owner`'s conversation on the Desk `channel` with `agent` in `store`, as
 /// [`read`] has it, and the person's files their messages hold: what a person
 /// is shown. Looks those up once per session of the chain, which [`read`]
-/// spares the reads that run on every listing.
+/// spares the reads that run on every listing. Also the ids of those files,
+/// which only their clients have named so far (see
+/// [`described`](crate::desk_attachments::described)).
 pub(crate) fn read_shown(
     store: &dyn SessionStore,
     agent: &Speaker,
@@ -157,16 +178,10 @@ pub(crate) fn read_shown(
     channel: &str,
     cursor: Cursor<'_>,
     limit: usize,
-) -> Result<(Page, Span), ConversationError> {
-    read_with(
-        store,
-        agent,
-        owner,
-        channel,
-        cursor,
-        limit,
-        Some(HeldFiles::of(store)),
-    )
+) -> Result<(Page, Span, HashSet<String>), ConversationError> {
+    let mut held = HeldFiles::of(store);
+    let (page, span) = read_with(store, agent, owner, channel, cursor, limit, Some(&mut held))?;
+    Ok((page, span, held.named))
 }
 
 /// `owner`'s conversation on the Desk `channel` with `agent` in `store`: at
@@ -191,7 +206,7 @@ fn read_with(
     channel: &str,
     cursor: Cursor<'_>,
     limit: usize,
-    mut held: Option<HeldFiles<'_>>,
+    mut held: Option<&mut HeldFiles<'_>>,
 ) -> Result<(Page, Span), ConversationError> {
     let internal = |e: eyre::Report| ConversationError::Internal(format!("{e:#}"));
     if !is_desk_conversation(channel) {
@@ -253,7 +268,7 @@ fn read_with(
         gathered.extend(
             newer
                 .into_iter()
-                .filter_map(|e| said(e, agent, held.as_mut())),
+                .filter_map(|e| said(e, agent, held.as_deref_mut())),
         );
         if after.is_some() && gathered.len() > limit + 1 {
             gathered.drain(..gathered.len() - (limit + 1));
@@ -425,7 +440,7 @@ impl Conversations for HubConversations {
             agent,
             &service.display_name().unwrap_or_else(|| agent.to_string()),
         );
-        let (mut page, span) = read_shown(
+        let (mut page, span, mut held) = read_shown(
             service.sessions.as_ref(),
             &speaker,
             &owner,
@@ -443,15 +458,18 @@ impl Conversations for HubConversations {
                 &owner,
                 &mut page,
                 span,
+                &mut held,
             )
             .await;
         }
         crate::desk_attachments::described(
-            service.sessions.as_ref(),
+            Arc::clone(&service.sessions),
             service.agent_id.as_str(),
             &owner,
             &mut page,
-        );
+            &held,
+        )
+        .await;
         Ok(page)
     }
 
@@ -1086,6 +1104,40 @@ mod tests {
         let read = shown_page(&store, 50);
         assert_eq!(shape(&read), [("with text", vec![]), ("", vec!["art_d"])],);
         assert_eq!(read.messages[1].attachments[0].size, 9);
+    }
+
+    /// A mark that carries some of a message's files doesn't hide the others:
+    /// one a lookup failed on when it was stamped is still on the message.
+    /// Each shows once, the mark's first, and a listing's read asks for no more
+    /// than the mark.
+    #[test]
+    fn a_partly_stamped_mark_leaves_the_message_s_other_files_showing() {
+        use workforce_common::channels::desk::{DeskFile, DeskMark};
+        let store = InMemorySessionStore::new();
+        held(&store, "words", &[("a.png", "art_a"), ("b.png", "art_b")]);
+        let mut session = store.get_or_create(DESK_CHANNEL, ME, "scout").unwrap();
+        session.messages[0].desk = Some(DeskMark {
+            files: vec![DeskFile {
+                artifact_id: "art_a".into(),
+                agent_id: "scout".into(),
+                filename: "a.png".into(),
+                media_type: "image/png".into(),
+                size: 9,
+                width: None,
+                height: None,
+                caption: None,
+            }],
+            ..DeskMark::default()
+        });
+        store.save(&session).unwrap();
+
+        let (read, _, named) =
+            read_shown(&store, &scout(), ME, DESK_CHANNEL, Cursor::Newest, 50).unwrap();
+        assert_eq!(shape(&read)[0], ("words", vec!["art_a", "art_b"]));
+        assert_eq!(read.messages[0].attachments[0].size, 9);
+        assert_eq!(named, HashSet::from(["art_b".to_string()]));
+        let listed = page(&store, &scout(), ME, DESK_CHANNEL, Cursor::Newest, 50).unwrap();
+        assert_eq!(shape(&listed)[0], ("words", vec!["art_a"]));
     }
 
     /// The files stay with their messages across a rollover: on the sealed
