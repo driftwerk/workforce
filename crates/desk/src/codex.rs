@@ -530,7 +530,11 @@ pub fn find_rollout(home: &Path, thread_id: &str) -> Option<PathBuf> {
     let suffix = format!("-{thread_id}.jsonl");
     let mut stack = vec![home.join(".codex/sessions")];
     while let Some(dir) = stack.pop() {
-        for entry in std::fs::read_dir(&dir).ok()?.flatten() {
+        // A folder that can't be read is skipped, not the whole search.
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
                 stack.push(path);
@@ -544,6 +548,31 @@ pub fn find_rollout(home: &Path, thread_id: &str) -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// Every rollout Codex has, in one walk (a folder that can't be read is
+/// skipped).
+pub fn rollouts(home: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let mut stack = vec![home.join(".codex/sessions")];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("rollout-") && n.ends_with(".jsonl"))
+            {
+                found.push(path);
+            }
+        }
+    }
+    found
 }
 
 #[cfg(test)]
@@ -694,6 +723,24 @@ mod tests {
         std::fs::write(day.join("rollout-2026-10-27T17-06-33-t1.jsonl"), "").unwrap();
         assert!(find_rollout(home.path(), "t1").is_some());
         assert!(find_rollout(home.path(), "t2").is_none());
+    }
+
+    #[test]
+    fn a_folder_that_cant_be_read_does_not_end_the_search() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let sessions = home.path().join(".codex/sessions");
+        let locked = sessions.join("2026/10/26");
+        let open = sessions.join("2026/10/27");
+        std::fs::create_dir_all(&locked).unwrap();
+        std::fs::create_dir_all(&open).unwrap();
+        std::fs::write(open.join("rollout-2026-10-27T17-06-33-t1.jsonl"), "").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let found = find_rollout(home.path(), "t1").is_some();
+        let all = rollouts(home.path()).len();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(found);
+        assert_eq!(all, 1);
     }
 
     #[test]

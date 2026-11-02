@@ -14,7 +14,7 @@ pub struct Proc {
 impl Proc {
     /// The program it runs: its command's file name, without a login
     /// shell's leading `-`.
-    fn program(&self) -> Option<String> {
+    pub(crate) fn program(&self) -> Option<String> {
         let command = self.args.split_whitespace().next()?;
         let name = command.rsplit('/').next().unwrap_or(command);
         let name = name.strip_prefix('-').unwrap_or(name);

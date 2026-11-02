@@ -565,7 +565,7 @@ impl Desk {
                 if matches!(hook, Hook::SessionEnd) {
                     return Some(Value::Object(Default::default()));
                 }
-                self.register_terminal_session(terminal, pty, cli, cwd)
+                self.register_terminal_session(Engine::Claude, terminal, pty, cli, cwd)
             }
             (_, Some(id)) => id,
         };
@@ -579,7 +579,7 @@ impl Desk {
 
     /// The running session in `terminal` with this Claude Code session id
     /// (any, when the hook didn't say).
-    fn terminal_session(&self, terminal: Uuid, cli: Option<&str>) -> Option<Uuid> {
+    pub(super) fn terminal_session(&self, terminal: Uuid, cli: Option<&str>) -> Option<Uuid> {
         let st = self.0.state.lock();
         st.live
             .iter()
@@ -594,14 +594,15 @@ impl Desk {
             })
     }
 
-    fn register_terminal_session(
+    pub(super) fn register_terminal_session(
         &self,
+        engine: Engine,
         terminal: Uuid,
         pty: Arc<Pty>,
         cli: Option<String>,
         cwd: Option<String>,
     ) -> Uuid {
-        // One Claude Code at a time in a terminal: one still marked running
+        // One session at a time in a terminal: one still marked running
         // there under another id has gone.
         let others: Vec<Uuid> = {
             let st = self.0.state.lock();
@@ -622,7 +623,7 @@ impl Desk {
             let existing = cli.as_deref().and_then(|c| {
                 st.records
                     .values()
-                    .find(|r| r.engine == Engine::Claude && r.cli_session_id.as_deref() == Some(c))
+                    .find(|r| r.engine == engine && r.cli_session_id.as_deref() == Some(c))
                     .map(|r| r.id)
             });
             (existing, st.terminals.get(&terminal).cloned())
@@ -675,9 +676,9 @@ impl Desk {
                     .unwrap_or_default();
                 self.save(SessionRecord {
                     id,
-                    engine: Engine::Claude,
+                    engine,
                     view: View::Terminal,
-                    engine_version: self.version_of(Engine::Claude),
+                    engine_version: self.version_of(engine),
                     name: term.map_or_else(|| folder_name(&cwd), |t| t.name),
                     goal: String::new(),
                     cwd,
@@ -706,7 +707,7 @@ impl Desk {
 
     /// A session in a terminal is no longer running: it ended there
     /// (`clean`), or the terminal itself went.
-    fn end_terminal_session(&self, id: Uuid, clean: bool) {
+    pub(super) fn end_terminal_session(&self, id: Uuid, clean: bool) {
         let live = self.0.state.lock().live.remove(&id);
         if live.is_none() {
             return;
