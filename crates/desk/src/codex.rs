@@ -13,7 +13,7 @@ use futures::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use tokio::net::UnixStream;
 use tokio::process::{Child, Command};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
 
@@ -143,12 +143,23 @@ impl AppServer {
         let (Some(pid), Some(mut child)) = (self.pid, self.child.lock().take()) else {
             return;
         };
+        // Collects its exit as soon as it comes; killed through the handle
+        // (which knows whether the number is still its own) when the
+        // process list could not confirm it.
+        let (unconfirmed, give_up) = oneshot::channel::<()>();
         let reaper = tokio::spawn(async move {
-            let _ = child.wait().await;
+            tokio::select! {
+                _ = child.wait() => {}
+                Ok(()) = give_up => {
+                    let _ = child.kill().await;
+                }
+            }
         });
         let socket = self.socket.clone();
         tokio::spawn(async move {
-            stop_app_server(pid, &socket, STOP_GRACE).await;
+            if stop_app_server(pid, &socket, STOP_GRACE).await == Stopped::Unconfirmed {
+                let _ = unconfirmed.send(());
+            }
             let _ = reaper.await;
         });
     }
@@ -186,22 +197,25 @@ async fn wait_gone(mut pids: Vec<u32>, within: Duration) -> Vec<u32> {
 /// started (Codex's workers run in process groups of their own, so a signal
 /// to the server's does not reach them): a polite stop first, which lets a
 /// turn in progress save its session, then a kill of whatever is still
-/// running when `grace` is up. Does nothing when `pid` is no longer that
-/// server (it ended, and the number may be someone else's by now).
-pub async fn stop_app_server(pid: u32, socket: &Path, grace: Duration) {
+/// running when `grace` is up. Each process is signalled by its own pid,
+/// and only while it is still the one that was seen. Does nothing when
+/// `pid` is no longer that server (it ended, and the number may be
+/// someone else's by now): [`Stopped::Unconfirmed`], so a caller that owns
+/// another way to end it can use that.
+pub async fn stop_app_server(pid: u32, socket: &Path, grace: Duration) -> Stopped {
     let Some(all) = crate::procs::table().await else {
         tracing::warn!(
             pid,
             "codex app-server not stopped: the process list can't be read"
         );
-        return;
+        return Stopped::Unconfirmed;
     };
     let named = format!("unix://{}", socket.display());
     let is_server = |p: &crate::procs::Proc| {
         p.pid == pid && p.args.contains("app-server") && p.args.contains(&named)
     };
     if !all.iter().any(is_server) {
-        return;
+        return Stopped::Unconfirmed;
     }
     let mut below: Vec<crate::procs::Proc> = crate::procs::under(&all, pid)
         .into_iter()
@@ -210,16 +224,33 @@ pub async fn stop_app_server(pid: u32, socket: &Path, grace: Duration) {
     signal(pid, libc::SIGTERM);
     if !wait_gone(vec![pid], grace).await.is_empty() {
         tracing::warn!(pid, "codex app-server did not stop in time; killing it");
-        // Whatever it started since the first look goes too.
-        if let Some(now) = crate::procs::table().await {
-            for p in crate::procs::under(&now, pid) {
-                if !below.iter().any(|b| b.pid == p.pid) {
-                    below.push(p.clone());
+        // The first look is up to `grace` old, and numbers are reused: of
+        // what it showed, only what is still the same process is killed,
+        // and whatever the server started since goes too.
+        match crate::procs::table().await {
+            Some(now) => {
+                let same =
+                    |b: &crate::procs::Proc| now.iter().any(|p| p.pid == b.pid && p.args == b.args);
+                below.retain(same);
+                for p in crate::procs::under(&now, pid) {
+                    if !below.iter().any(|b| b.pid == p.pid) {
+                        below.push(p.clone());
+                    }
+                }
+                below.iter().for_each(|p| signal(p.pid, libc::SIGKILL));
+                if now.iter().any(is_server) {
+                    signal(pid, libc::SIGKILL);
+                }
+            }
+            // Unreadable now: only the server, which is checked by its pid
+            // having been the server a moment ago and still running.
+            None => {
+                below.clear();
+                if alive(pid) {
+                    signal(pid, libc::SIGKILL);
                 }
             }
         }
-        below.iter().for_each(|p| signal(p.pid, libc::SIGKILL));
-        signal(pid, libc::SIGKILL);
         wait_gone(vec![pid], WORKER_GRACE).await;
     }
     // What outlived the server: told to stop, then killed. A process is
@@ -232,11 +263,11 @@ pub async fn stop_app_server(pid: u32, socket: &Path, grace: Duration) {
             .collect()
     };
     let Some(now) = crate::procs::table().await else {
-        return;
+        return Stopped::Done;
     };
     let left = seen(&now);
     if left.is_empty() {
-        return;
+        return Stopped::Done;
     }
     tracing::warn!(
         pid,
@@ -245,11 +276,22 @@ pub async fn stop_app_server(pid: u32, socket: &Path, grace: Duration) {
     );
     left.iter().for_each(|p| signal(*p, libc::SIGTERM));
     if wait_gone(left.clone(), WORKER_GRACE).await.is_empty() {
-        return;
+        return Stopped::Done;
     }
     if let Some(now) = crate::procs::table().await {
         seen(&now).iter().for_each(|p| signal(*p, libc::SIGKILL));
     }
+    Stopped::Done
+}
+
+/// What [`stop_app_server`] could tell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stopped {
+    /// It was the server, and it and its workers were stopped.
+    Done,
+    /// The process list couldn't be read, or `pid` isn't the server: nothing
+    /// was signalled.
+    Unconfirmed,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -631,7 +673,9 @@ mod tests {
             .unwrap();
         let pid = other.id().unwrap();
         // The number was the server's once; it is someone else's now.
-        stop_app_server(pid, &dir.path().join("s.sock"), Duration::from_millis(200)).await;
+        let outcome =
+            stop_app_server(pid, &dir.path().join("s.sock"), Duration::from_millis(200)).await;
+        assert_eq!(outcome, Stopped::Unconfirmed);
         assert!(!gone(pid));
         other.kill().await.unwrap();
     }

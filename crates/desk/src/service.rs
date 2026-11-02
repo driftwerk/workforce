@@ -205,17 +205,29 @@ impl CodexLink {
     fn stop(&self) {
         match &self.server {
             Server::Local(server) => server.stop(),
-            Server::Held(pty) => match pty.pid() {
-                Some(pid) => {
-                    let socket = self.socket.clone();
-                    tokio::spawn(async move {
-                        codex::stop_app_server(pid, &socket, codex::STOP_GRACE).await;
-                    });
-                }
-                None => pty.kill(),
-            },
+            Server::Held(pty) => stop_held_server(Arc::clone(pty), self.socket.clone()),
         }
     }
+}
+
+/// Stops a holder's app-server and its workers; when its process can't be
+/// confirmed to be the server's, the holder is asked to end it instead.
+fn stop_held_server(pty: Arc<Pty>, socket: PathBuf) {
+    let Some(pid) = pty.pid() else {
+        pty.kill();
+        return;
+    };
+    tokio::spawn(async move {
+        if codex::stop_app_server(pid, &socket, codex::STOP_GRACE).await
+            == codex::Stopped::Unconfirmed
+        {
+            tracing::warn!(
+                pid,
+                "codex app-server's process not confirmed; asking the holder to end it"
+            );
+            pty.kill();
+        }
+    });
 }
 
 impl Drop for CodexLink {
@@ -818,14 +830,11 @@ impl Desk {
             } else {
                 tracing::info!(id = %stray.id, "ending a held terminal no session owns");
                 let socket = stray.meta["socket"].as_str().map(PathBuf::from);
-                match (stray.pid, socket) {
+                let pty = Arc::new(holder.adopt(&stray, 0).0);
+                match socket {
                     // An app-server and its workers are stopped as a session's are.
-                    (Some(pid), Some(socket)) => {
-                        tokio::spawn(async move {
-                            codex::stop_app_server(pid, &socket, codex::STOP_GRACE).await;
-                        });
-                    }
-                    _ => holder.adopt(&stray, 0).0.kill(),
+                    Some(socket) => stop_held_server(pty, socket),
+                    None => pty.kill(),
                 }
             }
         }
