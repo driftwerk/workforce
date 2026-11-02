@@ -327,6 +327,11 @@ pub enum CodexEvent {
     /// A request it asked was answered, by Desk or the terminal (the
     /// request's JSON-RPC id).
     Resolved(Value),
+    /// Desk's answer to a request went to Codex, still open.
+    Answered(Value),
+    /// Desk's answer came after the request was answered (in the
+    /// terminal): not sent.
+    Late(Value),
 }
 
 /// A command or file change Codex asks to be allowed.
@@ -619,6 +624,8 @@ pub struct Follower {
     subscribed: bool,
     /// The files each file change item it started touches, by item id.
     files: HashMap<String, Vec<String>>,
+    /// The requests it forwarded that nobody has answered, by id.
+    open: HashMap<String, String>,
     home: Option<PathBuf>,
 }
 
@@ -628,6 +635,7 @@ impl Follower {
             thread,
             subscribed: false,
             files: HashMap::new(),
+            open: HashMap::new(),
             home,
         }
     }
@@ -637,8 +645,10 @@ impl Follower {
     fn subscribe(&mut self) -> Option<Value> {
         let thread = self.thread.as_ref().filter(|_| !self.subscribed)?;
         self.subscribed = true;
+        // Not its history, which can outgrow a frame: what it asks still
+        // comes.
         Some(json!({ "id": SUBSCRIBE, "method": "thread/resume",
-            "params": { "threadId": thread } }))
+            "params": { "threadId": thread, "excludeTurns": true } }))
     }
 
     /// What to send once joined.
@@ -666,6 +676,9 @@ impl Follower {
                 let params = v.get("params").cloned().unwrap_or(Value::Null);
                 let asks = ask_of(method, id, &params, &self.files, self.home.as_deref())
                     .filter(|s| self.thread.as_deref() == Some(s.thread.as_str()));
+                if let Some(s) = &asks {
+                    self.open.insert(id.to_string(), s.thread.clone());
+                }
                 (asks.into_iter().collect(), None)
             }
             (None, Some(method)) => {
@@ -686,6 +699,9 @@ impl Follower {
                     }
                 }
                 if method == "serverRequest/resolved" {
+                    if let Some(request) = params.get("requestId") {
+                        self.open.remove(&request.to_string());
+                    }
                     let seen = params
                         .get("threadId")
                         .and_then(Value::as_str)
@@ -714,6 +730,21 @@ impl Follower {
             }
             (None, None) => (Vec::new(), None),
         }
+    }
+}
+
+impl Follower {
+    /// What to send for `reply`, and what to say of it: nothing is sent to
+    /// a request already answered.
+    pub fn reply(&mut self, reply: &Reply) -> (Option<Seen>, Option<Value>) {
+        let thread = self.open.remove(&reply.request.to_string());
+        let answer = answer_of(reply).filter(|_| thread.is_some());
+        let event = match answer {
+            Some(_) => CodexEvent::Answered(reply.request.clone()),
+            None => CodexEvent::Late(reply.request.clone()),
+        };
+        let thread = thread.or_else(|| self.thread.clone());
+        (thread.map(|thread| Seen { thread, event }), answer)
     }
 }
 
@@ -764,8 +795,12 @@ pub async fn observe(
             _ = cancel.cancelled() => return Ok(()),
             reply = replies.recv(), if replying => match reply {
                 Some(reply) => {
-                    if let Some(answer) = answer_of(&reply) {
+                    let (seen, answer) = follower.reply(&reply);
+                    if let Some(answer) = answer {
                         tx.send(Message::text(answer.to_string())).await?;
+                    }
+                    if let Some(seen) = seen {
+                        events.send(seen).await?;
                     }
                 }
                 None => replying = false,
@@ -1165,8 +1200,7 @@ pub(crate) mod tests {
         let other = json!({"method": "thread/status/changed",
             "params": {"threadId": "side", "status": {"type": "active", "activeFlags": []}}});
         assert_eq!(f.heard(&other).1, None, "only its own thread");
-        let resume =
-            json!({"id": SUBSCRIBE, "method": "thread/resume", "params": {"threadId": "t1"}});
+        let resume = json!({"id": SUBSCRIBE, "method": "thread/resume", "params": {"threadId": "t1", "excludeTurns": true}});
         assert_eq!(f.heard(&active).1, Some(resume.clone()));
         assert_eq!(f.heard(&active).1, None, "asked once");
         f.heard(
@@ -1181,7 +1215,9 @@ pub(crate) mod tests {
         let mut back = Follower::new(Some("t9".into()), None);
         assert_eq!(
             back.joined(),
-            Some(json!({"id": SUBSCRIBE, "method": "thread/resume", "params": {"threadId": "t9"}}))
+            Some(
+                json!({"id": SUBSCRIBE, "method": "thread/resume", "params": {"threadId": "t9", "excludeTurns": true}})
+            )
         );
     }
 
@@ -1304,12 +1340,25 @@ pub(crate) mod tests {
             .unwrap();
         let answer = next_sent(&mut ws, |v| v.get("result").is_some()).await;
         assert_eq!(answer, json!({"id": 0, "result": {"decision": "accept"}}));
+        macro_rules! next {
+            () => {
+                tokio::time::timeout(Duration::from_secs(5), seen.recv())
+                    .await
+                    .unwrap()
+                    .unwrap()
+            };
+        }
+        assert_eq!(next!().event, CodexEvent::Answered(json!(0)));
         say(&mut ws, json!({"method": "serverRequest/resolved", "params": {"threadId": "t1", "requestId": 0}})).await;
-        let got = tokio::time::timeout(Duration::from_secs(5), seen.recv())
-            .await
-            .unwrap()
+        assert_eq!(next!().event, CodexEvent::Resolved(json!(0)));
+        // Answered again, after: not sent, and said so.
+        replies
+            .send(Reply {
+                request: json!(0),
+                decision: Decision::Allow,
+            })
             .unwrap();
-        assert_eq!(got.event, CodexEvent::Resolved(json!(0)));
+        assert_eq!(next!().event, CodexEvent::Late(json!(0)));
         // The server goes (without a goodbye): so does the observer, and
         // what it forwards.
         drop(ws);

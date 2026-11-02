@@ -156,16 +156,28 @@ pub(crate) struct Live {
     reading: Option<u64>,
     /// Ended from Desk: closed, not stopped, once its process has gone.
     closing: bool,
-    /// The Codex request its pending approval is, while Desk can answer it.
-    codex_ask: Option<CodexAsk>,
+    /// The Codex requests Desk can answer, oldest first: its pending
+    /// approval is the first's.
+    codex_asks: Vec<CodexAsk>,
+    /// Answers Desk sent Codex, by request, until Codex is told them (or
+    /// was answered in the terminal first): what Activity then says.
+    codex_sent: HashMap<String, CodexSent>,
 }
 
-/// A Codex request Desk can answer: the pending approval it is, and its
-/// JSON-RPC id.
+/// A Codex request Desk can answer: its JSON-RPC id, and the pending
+/// approval it is.
 #[derive(Debug, Clone)]
 struct CodexAsk {
-    approval: Uuid,
     request: Value,
+    pending: PendingApproval,
+}
+
+/// An answer Desk sent one of Codex's requests.
+#[derive(Debug, Clone)]
+struct CodexSent {
+    pending: PendingApproval,
+    decision: Decision,
+    by: By,
 }
 
 impl Live {
@@ -481,15 +493,17 @@ fn background_tasks(count: u32) -> String {
     }
 }
 
-/// Codex asks what Desk can answer: the request it says it waits on, now
-/// with what it is and what answers it (the same request, if it is one it
-/// asked again, as a late subscription hears).
+/// Codex asks what Desk can answer: kept with the others it waits on (it
+/// can ask several at once), the same request again if it asks it again,
+/// as a late subscription hears. The first it asks becomes the "Answer in
+/// the terminal" request it already said it waits on.
 fn codex_asks(r: &mut SessionRecord, l: &mut Live, ask: codex::Ask) {
-    let again = l
-        .codex_ask
-        .as_ref()
-        .is_some_and(|a| a.request == ask.request);
-    let was = l.pending.take().filter(|p| !p.answerable || again);
+    let known = l.codex_asks.iter().position(|a| a.request == ask.request);
+    let was = match known {
+        Some(i) => Some(l.codex_asks[i].pending.clone()),
+        None if l.codex_asks.is_empty() => l.pending.clone().filter(|p| !p.answerable),
+        None => None,
+    };
     let pending = PendingApproval {
         id: was.as_ref().map_or_else(Uuid::new_v4, |p| p.id),
         since: was.as_ref().map_or_else(Utc::now, |p| p.since),
@@ -499,24 +513,75 @@ fn codex_asks(r: &mut SessionRecord, l: &mut Live, ask: codex::Ask) {
         choices: ask.choices,
         why: ask.why,
     };
-    r.state = SessionState::Blocked;
-    r.asked = None;
-    l.codex_ask = Some(CodexAsk {
-        approval: pending.id,
+    let asked = CodexAsk {
         request: ask.request,
-    });
-    l.pending = Some(pending);
+        pending,
+    };
+    match known {
+        Some(i) => l.codex_asks[i] = asked,
+        None => l.codex_asks.push(asked),
+    }
+    codex_front(r, l);
 }
 
-/// Codex's request `request` was answered, in Desk or its terminal.
-fn codex_resolved(r: &mut SessionRecord, l: &mut Live, request: &Value) {
-    if l.codex_ask.as_ref().is_some_and(|a| a.request == *request) {
-        l.codex_ask = None;
-        l.pending = None;
-        if r.state == SessionState::Blocked {
-            r.state = SessionState::Working;
+/// Its pending approval is the oldest of Codex's open requests; none left,
+/// it works on.
+fn codex_front(r: &mut SessionRecord, l: &mut Live) {
+    match l.codex_asks.first() {
+        Some(first) => {
+            l.pending = Some(first.pending.clone());
+            r.state = SessionState::Blocked;
+            r.asked = None;
+        }
+        None => {
+            l.pending = None;
+            if r.state == SessionState::Blocked {
+                r.state = SessionState::Working;
+            }
         }
     }
+}
+
+/// Codex's request `request` was answered, in Desk or its terminal: only
+/// that one goes.
+fn codex_resolved(r: &mut SessionRecord, l: &mut Live, request: &Value) {
+    let before = l.codex_asks.len();
+    l.codex_asks.retain(|a| a.request != *request);
+    if l.codex_asks.len() != before {
+        codex_front(r, l);
+    }
+}
+
+/// What Activity says of an answer `by` gave `p`.
+fn decided_note(
+    view: &SessionView,
+    p: &PendingApproval,
+    decision: Decision,
+    by: By,
+) -> Option<Event> {
+    let what = match p.tool.split('(').next().unwrap_or(&p.tool) {
+        "Bash" if !p.detail.is_empty() => format!("run {}", crew::clip(&p.detail, 120)),
+        "Edit" | "Write" | "MultiEdit" if !p.detail.is_empty() => {
+            format!("edit {}", crew::clip(&p.detail, 120))
+        }
+        _ => format!("use {}", crew::clip(&p.tool, 120)),
+    };
+    let me = Some(Party::session(view));
+    let label = view.label();
+    let (kind, text) = match decision {
+        Decision::Allow => (Kind::Approved, format!("allowed {label} to {what}")),
+        Decision::Deny => (Kind::Denied, format!("denied {label} to {what}")),
+        Decision::AllowForSession => (
+            Kind::Approved,
+            format!("allowed {label} to {what}, for the session"),
+        ),
+        Decision::Cancel => (
+            Kind::Denied,
+            format!("denied {label} to {what}, and stopped its turn"),
+        ),
+        Decision::Terminal => return None,
+    };
+    Some(by.event(kind, me, text).approval(p.id))
 }
 
 /// How a session's pending request reads in Activity.
@@ -873,7 +938,8 @@ impl Desk {
                     ends: 0,
                     reading: None,
                     closing: false,
-                    codex_ask: None,
+                    codex_asks: Vec::new(),
+                    codex_sent: HashMap::new(),
                 },
             );
             tokio::spawn(self.clone().on_exit(id, exit));
@@ -1901,6 +1967,16 @@ impl Desk {
         decision: Decision,
         by: Option<By>,
     ) -> Result<SessionView, DeskError> {
+        let codex = self
+            .0
+            .state
+            .lock()
+            .live
+            .get(&id)
+            .is_some_and(|l| l.codex_asks.iter().any(|a| a.pending.id == approval));
+        if codex {
+            return self.decide_codex(id, approval, decision, by);
+        }
         let asked = self
             .0
             .state
@@ -1921,49 +1997,15 @@ impl Desk {
                     "that approval is no longer pending".into(),
                 ));
             }
-            let codex = live
-                .codex_ask
-                .as_ref()
-                .filter(|a| a.approval == approval)
-                .map(|a| a.request.clone());
-            let answer = match codex {
-                // Codex asks the terminal too: answered here, it stops asking there.
-                Some(request) => {
-                    let offered = live
-                        .pending
-                        .as_ref()
-                        .is_some_and(|p| p.choices.contains(&decision));
-                    if decision != Decision::Terminal {
-                        if !offered {
-                            return Err(DeskError::Invalid(
-                                "Codex doesn't offer that answer to this request".into(),
-                            ));
-                        }
-                        let sent = live._codex.as_ref().is_some_and(|link| {
-                            link.replies
-                                .send(codex::Reply { request, decision })
-                                .is_ok()
-                        });
-                        if !sent {
-                            return Err(DeskError::Conflict(
-                                "the terminal is asking for this one".into(),
-                            ));
-                        }
-                    }
-                    live.codex_ask = None;
-                    None
-                }
-                None => {
-                    if matches!(decision, Decision::AllowForSession | Decision::Cancel) {
-                        return Err(DeskError::Invalid(
-                            "only Codex's requests take that answer".into(),
-                        ));
-                    }
-                    Some(live.answer.take().ok_or_else(|| {
-                        DeskError::Conflict("the terminal is asking for this one".into())
-                    })?)
-                }
-            };
+            if matches!(decision, Decision::AllowForSession | Decision::Cancel) {
+                return Err(DeskError::Invalid(
+                    "only Codex's requests take that answer".into(),
+                ));
+            }
+            let answer = live
+                .answer
+                .take()
+                .ok_or_else(|| DeskError::Conflict("the terminal is asking for this one".into()))?;
             match decision {
                 Decision::Terminal => {
                     if let Some(p) = live.pending.as_mut() {
@@ -1977,58 +2019,112 @@ impl Desk {
             }
             (answer, seen)
         };
-        if let Some(answer) = answer {
-            let _ = answer.send(match decision {
-                Decision::Allow => claude::allow(),
-                Decision::Deny => claude::deny(),
-                Decision::Terminal | Decision::AllowForSession | Decision::Cancel => {
-                    claude::ask_in_terminal()
-                }
-            });
-        }
+        let _ = answer.send(match decision {
+            Decision::Allow => claude::allow(),
+            Decision::Deny => claude::deny(),
+            Decision::Terminal | Decision::AllowForSession | Decision::Cancel => {
+                claude::ask_in_terminal()
+            }
+        });
         self.change_since(seen, id, |r, l| {
             if l.is_some_and(|l| l.pending.is_none()) {
                 r.state = SessionState::Working;
             }
         });
         let view = self.view(id)?;
-        if let (Some(by), Some(p)) = (by, asked) {
-            let what = match p.tool.split('(').next().unwrap_or(&p.tool) {
-                "Bash" if !p.detail.is_empty() => format!("run {}", crew::clip(&p.detail, 120)),
-                "Edit" | "Write" | "MultiEdit" if !p.detail.is_empty() => {
-                    format!("edit {}", crew::clip(&p.detail, 120))
-                }
-                _ => format!("use {}", crew::clip(&p.tool, 120)),
-            };
-            let me = Some(Party::session(&view));
-            let event = match decision {
-                Decision::Allow => Some(by.event(
-                    Kind::Approved,
-                    me,
-                    format!("allowed {} to {what}", view.label()),
-                )),
-                Decision::Deny => Some(by.event(
-                    Kind::Denied,
-                    me,
-                    format!("denied {} to {what}", view.label()),
-                )),
-                Decision::AllowForSession => Some(by.event(
-                    Kind::Approved,
-                    me,
-                    format!("allowed {} to {what}, for the session", view.label()),
-                )),
-                Decision::Cancel => Some(by.event(
-                    Kind::Denied,
-                    me,
-                    format!("denied {} to {what}, and stopped its turn", view.label()),
-                )),
-                Decision::Terminal => None,
-            };
-            if let Some(e) = event {
-                self.note(e.approval(p.id));
-            }
+        if let Some(e) = by
+            .zip(asked)
+            .and_then(|(by, p)| decided_note(&view, &p, decision, by))
+        {
+            self.note(e);
         }
         Ok(view)
+    }
+
+    /// Answers one of Codex's requests. Only the person does: what Codex
+    /// asks is to leave its sandbox, which no agent's tool may grant (the
+    /// overseer's read-only rule reads Codex's words, not what runs).
+    /// Activity says it once Codex is told, or that the terminal answered
+    /// first.
+    fn decide_codex(
+        &self,
+        id: Uuid,
+        approval: Uuid,
+        decision: Decision,
+        by: Option<By>,
+    ) -> Result<SessionView, DeskError> {
+        let by = by
+            .filter(|b| b.party.kind == crew::PartyKind::You)
+            .ok_or_else(|| DeskError::Invalid("only the person answers Codex's requests".into()))?;
+        let seen = {
+            let mut guard = self.0.state.lock();
+            let st = &mut *guard;
+            let seen = st.records.get(&id).map(|r| Self::view_of(st, r));
+            let live = st
+                .live
+                .get_mut(&id)
+                .ok_or_else(|| DeskError::Conflict("session is not running".into()))?;
+            let at = live
+                .codex_asks
+                .iter()
+                .position(|a| a.pending.id == approval)
+                .ok_or_else(|| DeskError::Conflict("that approval is no longer pending".into()))?;
+            if decision == Decision::Terminal {
+                // Its terminal asks it too: Desk just stops offering it.
+                let asked = live.codex_asks.remove(at);
+                if live.pending.as_ref().is_some_and(|p| p.id == approval) {
+                    live.pending = Some(PendingApproval {
+                        answerable: false,
+                        ..asked.pending
+                    });
+                }
+                return self.view_after(seen, id);
+            }
+            let asked = &live.codex_asks[at];
+            if !asked.pending.choices.contains(&decision) {
+                return Err(DeskError::Invalid(
+                    "Codex doesn't offer that answer to this request".into(),
+                ));
+            }
+            let request = asked.request.clone();
+            let sent = live._codex.as_ref().is_some_and(|link| {
+                link.replies
+                    .send(codex::Reply {
+                        request: request.clone(),
+                        decision,
+                    })
+                    .is_ok()
+            });
+            if !sent {
+                return Err(DeskError::Conflict(
+                    "the terminal is asking for this one".into(),
+                ));
+            }
+            let asked = live.codex_asks.remove(at);
+            live.codex_sent.insert(
+                request.to_string(),
+                CodexSent {
+                    pending: asked.pending,
+                    decision,
+                    by,
+                },
+            );
+            st.decided.insert(approval);
+            seen
+        };
+        self.view_after(seen, id)
+    }
+
+    /// The session's view once a decision changed what it waits on.
+    fn view_after(&self, seen: Option<SessionView>, id: Uuid) -> Result<SessionView, DeskError> {
+        self.change_since(seen, id, |r, l| {
+            // Handed back to the terminal, it still waits; else on to the
+            // next it asks, or work.
+            if let Some(l) = l.filter(|l| l.pending.as_ref().is_none_or(|p| p.answerable)) {
+                codex_front(r, l);
+            }
+        });
+        self.view(id)
     }
 
     /// Types a prompt into a running session's terminal and submits it, as a
@@ -2602,7 +2698,8 @@ impl Desk {
                 ends: 0,
                 reading: None,
                 closing: false,
-                codex_ask: None,
+                codex_asks: Vec::new(),
+                codex_sent: HashMap::new(),
             },
         );
         tokio::spawn(self.clone().on_exit(r.id, exit));
@@ -3095,6 +3192,39 @@ impl Desk {
             if ours.as_deref().is_some_and(|t| t != thread) {
                 continue;
             }
+            if let CodexEvent::Answered(request) | CodexEvent::Late(request) = &event {
+                // Said once Codex is told, or that its terminal had answered.
+                let sent = self
+                    .0
+                    .state
+                    .lock()
+                    .live
+                    .get_mut(&id)
+                    .and_then(|l| l.codex_sent.remove(&request.to_string()));
+                if let (Some(sent), Ok(view)) = (sent, self.view(id)) {
+                    let note = match event {
+                        CodexEvent::Answered(_) => {
+                            decided_note(&view, &sent.pending, sent.decision, sent.by)
+                        }
+                        _ => {
+                            let me = Party::session(&view);
+                            Some(
+                                Event::new(
+                                    Kind::Answered,
+                                    me.clone(),
+                                    Some(me),
+                                    "was answered in its terminal before Desk's answer reached it",
+                                )
+                                .approval(sent.pending.id),
+                            )
+                        }
+                    };
+                    if let Some(note) = note {
+                        self.note(note);
+                    }
+                }
+                continue;
+            }
             if matches!(event, CodexEvent::Idle) {
                 // Its rollout has the turn's calls, with their model.
                 self.spend_read(id);
@@ -3170,7 +3300,7 @@ impl Desk {
                             // A repeated notice is the same request, still asked.
                             let asked = l.pending.take();
                             if !waiting {
-                                l.codex_ask = None;
+                                l.codex_asks.clear();
                             }
                             l.pending = waiting.then(|| {
                                 asked.unwrap_or_else(|| PendingApproval {
@@ -3207,7 +3337,7 @@ impl Desk {
                         if let Some(l) = l {
                             l.current_tool = None;
                             l.pending = None;
-                            l.codex_ask = None;
+                            l.codex_asks.clear();
                             l.background =
                                 std::mem::take(&mut l.background).looked_if(running, Utc::now());
                         }
@@ -3238,6 +3368,7 @@ impl Desk {
                             codex_resolved(r, l, &request);
                         }
                     }
+                    CodexEvent::Answered(_) | CodexEvent::Late(_) => {}
                     CodexEvent::Reply(text) => r.last_reply = Some(transcript::clip(&text)),
                     CodexEvent::Child(_) | CodexEvent::Usage(_) => {}
                 }
@@ -3249,11 +3380,9 @@ impl Desk {
         // Its server went away: what it asked can't be answered from Desk.
         self.change(id, |r, l| {
             if let Some(l) = l {
-                if l.codex_ask.take().is_some() {
-                    l.pending = None;
-                    if r.state == SessionState::Blocked {
-                        r.state = SessionState::Working;
-                    }
+                if !l.codex_asks.is_empty() {
+                    l.codex_asks.clear();
+                    codex_front(r, l);
                 }
             }
         });
