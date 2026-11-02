@@ -89,12 +89,10 @@ pub fn runner_uid() -> Option<u32> {
 /// process last wrote or adopted it, so nothing that reads it takes the
 /// change before the person does.
 pub fn read(path: &Path) -> io::Result<Option<String>> {
-    let guarded = guarded();
-    let now = read_on_disk(path)?;
-    Ok(match guarded.get(&guard_key(path)) {
-        Some(ours) => ours.clone(),
-        None => now,
-    })
+    if let Some(ours) = guarded().get(&guard_key(path)) {
+        return Ok(ours.clone());
+    }
+    read_on_disk(path)
 }
 
 /// The text of the file at `path` as it is on disk, a change made elsewhere
