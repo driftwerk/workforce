@@ -10688,32 +10688,41 @@ impl WorkforceConfig {
         Self::from_base_and_overlay(table, None)
     }
 
-    /// A config from the infra-owned base file and the runtime overlay. The
-    /// base's few secret fields expand from the secrets inherited on a
-    /// descriptor first
-    /// ([`crate::config_expand::expand_inherited_secret_fields`]), then the
-    /// overlay is merged over it, then everything goes through
-    /// [`Self::from_raw_table`]. Nothing the overlay holds, and no other base
-    /// field, ever reads an inherited secret. The hub's boot and the
-    /// overlay writer's validation both come through here, so
-    /// write-accepts ⇔ boot-accepts holds.
+    /// A config from the infra-owned base file and the runtime overlay:
+    /// - the base's few secret fields expand from the secrets inherited on
+    ///   a descriptor, each its own one
+    ///   ([`crate::config_expand::expand_inherited_secret_fields`]);
+    /// - then the base expands `${VAR}` from the environment;
+    /// - the overlay's agent entries
+    ///   ([`crate::config_overlay::AGENT_OVERLAYABLE_KEYS`]), which agents
+    ///   write, stay as written; its other keys, which only an admin
+    ///   writes, expand from the environment as before;
+    /// - then the overlay is merged over the base, and the result goes
+    ///   through postgres backend defaulting, deserialization and the
+    ///   legacy env overrides.
+    ///
+    /// The hub's boot and the overlay writer's validation both come through
+    /// here, so write-accepts ⇔ boot-accepts holds.
     pub fn from_base_and_overlay(
         mut base: toml::Table,
         overlay: Option<&toml::Table>,
     ) -> eyre::Result<Self> {
         crate::config_expand::expand_inherited_secret_fields(&mut base);
+        crate::config_expand::expand_env_vars_in_table(&mut base);
         if let Some(overlay) = overlay {
-            crate::config_overlay::merge_overlay(&mut base, overlay);
+            let mut overlay = overlay.clone();
+            crate::config_expand::expand_env_vars_in_table_except(
+                &mut overlay,
+                crate::config_overlay::AGENT_OVERLAYABLE_KEYS,
+            );
+            crate::config_overlay::merge_overlay(&mut base, &overlay);
         }
-        Self::from_raw_table(base)
+        Self::from_expanded_table(base)
     }
 
-    /// The shared post-parse pipeline: env expansion (never the inherited
-    /// secrets) → postgres backend defaulting → deserialization → legacy env
-    /// overrides. Callers holding a base and an overlay use
-    /// [`Self::from_base_and_overlay`], the path the boot takes.
-    pub fn from_raw_table(mut table: toml::Table) -> eyre::Result<Self> {
-        crate::config_expand::expand_env_vars_in_table(&mut table);
+    /// Postgres backend defaulting → deserialization → legacy env
+    /// overrides, on a table already expanded.
+    fn from_expanded_table(mut table: toml::Table) -> eyre::Result<Self> {
         apply_postgres_backend_defaults(&mut table);
 
         let mut config: Self = toml::Value::Table(table)
@@ -11465,67 +11474,128 @@ fn default_true() -> bool {
 #[cfg(test)]
 mod tests {
 
+    fn load_base_and_overlay(base: &str, overlay: &str) -> WorkforceConfig {
+        let dir = tempfile::tempdir().unwrap();
+        let base_path = dir.path().join("workforce.toml");
+        std::fs::write(
+            &base_path,
+            format!("[hub]\ndata_dir = \"{}\"\n{base}", dir.path().display()),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join(crate::config_overlay::OVERLAY_FILE),
+            overlay,
+        )
+        .unwrap();
+        WorkforceConfig::load(&base_path).unwrap()
+    }
+
+    fn prompt_of(config: &WorkforceConfig, id: &str) -> String {
+        config
+            .agents
+            .iter()
+            .find(|a| a.id == id)
+            .and_then(|a| a.system_prompt.clone())
+            .unwrap_or_else(|| panic!("agent {id} is missing"))
+    }
+
     /// Only the base file's few secret fields expand from the inherited
     /// secrets. Anything an agent or a tool can write (the overlay: agents,
     /// their prompts) never does, nor do the base's other fields.
     #[test]
     fn agent_written_config_never_expands_to_an_inherited_secret() {
         crate::inherited_secrets::install_test_fixture();
-        let dir = tempfile::tempdir().unwrap();
-        let base_path = dir.path().join("workforce.toml");
-        std::fs::write(
-            &base_path,
-            format!(
-                r#"
-[hub]
-data_dir = "{}"
-
+        let config = load_base_and_overlay(
+            r#"
 [postgres]
-password = "${{INHERITED_T_PG}}"
+password = "${DESK_POSTGRES_PASSWORD}"
 
 [vellev]
-api_key = "${{INHERITED_T_KEY}}"
+api_key = "${DESK_MEMORY_KEY}"
 
 [desk]
-pty_holder_token = "${{INHERITED_T_TOKEN}}"
+pty_holder_token = "${WORKFORCE_GATEWAY_TOKEN}"
 
 [[agents]]
 id = "base-agent"
 default = true
-system_prompt = "base [${{INHERITED_T_KEY}}]"
+system_prompt = "base [${DESK_MEMORY_KEY}]"
 "#,
-                dir.path().display()
-            ),
-        )
-        .unwrap();
-        std::fs::write(
-            dir.path().join(crate::config_overlay::OVERLAY_FILE),
             r#"
 [[agents]]
 id = "injected"
-system_prompt = "overlay [${INHERITED_T_KEY}] [${INHERITED_T_PG}]"
+system_prompt = "overlay [${DESK_MEMORY_KEY}] [${DESK_POSTGRES_PASSWORD}]"
 "#,
-        )
-        .unwrap();
-        let config = WorkforceConfig::load(&base_path).unwrap();
+        );
         let pg = config.postgres.as_ref().and_then(|p| p.password.as_deref());
         assert_eq!(pg, Some("pg-fixture"));
-        let prompt = |id: &str| {
-            config
-                .agents
-                .iter()
-                .find(|a| a.id == id)
-                .and_then(|a| a.system_prompt.clone())
-                .unwrap_or_else(|| panic!("agent {id} is missing"))
-        };
-        assert_eq!(prompt("injected"), "overlay [] []");
-        assert_eq!(prompt("base-agent"), "base []");
         assert_eq!(config.vellev.api_key.as_deref(), Some("key-fixture"));
         assert_eq!(
             config.desk.pty_holder_token.as_deref(),
             Some("token-fixture")
         );
+        assert_eq!(prompt_of(&config, "base-agent"), "base []");
+        // Left as written: never expanded.
+        assert_eq!(
+            prompt_of(&config, "injected"),
+            "overlay [${DESK_MEMORY_KEY}] [${DESK_POSTGRES_PASSWORD}]"
+        );
     }
+
+    /// An agent entry in the overlay (which agents can write) never expands
+    /// `${VAR}`, from the inherited secrets or from the hub's environment;
+    /// the base file still does.
+    #[test]
+    fn overlay_agents_never_expand_the_hubs_environment() {
+        std::env::set_var("CFG_T_LOGIN_ENV", "login-fixture");
+        let config = load_base_and_overlay(
+            r#"
+[[agents]]
+id = "base-agent"
+default = true
+system_prompt = "base [${CFG_T_LOGIN_ENV}]"
+"#,
+            r#"
+[[agents]]
+id = "made-by-an-agent"
+system_prompt = "[${CFG_T_LOGIN_ENV}]"
+"#,
+        );
+        std::env::remove_var("CFG_T_LOGIN_ENV");
+        assert_eq!(prompt_of(&config, "base-agent"), "base [login-fixture]");
+        assert_eq!(
+            prompt_of(&config, "made-by-an-agent"),
+            "[${CFG_T_LOGIN_ENV}]"
+        );
+    }
+
+    /// Each secret field reads only its own inherited secret: a rewritten
+    /// base file can't send the vault key to another field, or one secret
+    /// to another's field.
+    #[test]
+    fn each_secret_field_reads_only_its_own_secret() {
+        crate::inherited_secrets::install_test_fixture();
+        let config = load_base_and_overlay(
+            r#"
+[postgres]
+password = "${WORKFORCE_VAULT_KEY}"
+
+[vellev]
+url = "http://127.0.0.1:1/${WORKFORCE_VAULT_KEY}"
+api_key = "${DESK_POSTGRES_PASSWORD}"
+
+[desk]
+pty_holder_token = "${DESK_MEMORY_KEY}"
+"#,
+            "",
+        );
+        let pg = config.postgres.as_ref().and_then(|p| p.password.as_deref());
+        assert_eq!(pg, Some(""));
+        assert_eq!(config.vellev.url, "http://127.0.0.1:1/");
+        assert_eq!(config.vellev.api_key.as_deref(), Some(""));
+        assert_eq!(config.desk.pty_holder_token.as_deref(), Some(""));
+    }
+
     use super::*;
 
     #[test]
