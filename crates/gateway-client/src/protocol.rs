@@ -175,12 +175,16 @@ pub struct ClientMessage {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SendMode {
-    /// Joins the running turn, which takes it in as a follow-up.
-    #[default]
-    Steer,
     /// Waits for the running turn: refused as `busy` while it works, so the
     /// client holds it and sends it again once the turn has ended.
     Queue,
+    /// Joins the running turn, which takes it in as a follow-up. A mode
+    /// this build doesn't know reads as this one, so a newer client's
+    /// message still goes, as it would have before modes (serde's catch-all
+    /// is the last variant).
+    #[default]
+    #[serde(other)]
+    Steer,
 }
 
 /// The longest `turn_ref` a client may send.
@@ -1188,6 +1192,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(queued.mode, Some(SendMode::Queue));
+        let unknown: ClientMessage = serde_json::from_value(
+            serde_json::json!({"type": "chat", "content": "hi", "mode": "interrupt"}),
+        )
+        .expect("an unknown mode doesn't lose the message");
+        assert_eq!(unknown.mode, Some(SendMode::Steer));
+        assert_eq!(unknown.content.as_deref(), Some("hi"));
     }
 
     #[test]
