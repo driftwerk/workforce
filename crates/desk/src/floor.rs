@@ -145,6 +145,10 @@ pub enum DecideRef {
     },
     /// A routed approval the person is an approver of.
     Routed { request_id: String },
+    /// A change made to an agent's settings file outside the hub, by the
+    /// hash of what the file held when it was shown: Allow uses it, Deny
+    /// keeps the saved one.
+    Config { agent_id: String, hash: String },
 }
 
 /// A stretch of a turn that waited on the person: one per ask.

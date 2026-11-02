@@ -165,6 +165,26 @@ pub struct ClientMessage {
     /// Desk connection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_ref: Option<String>,
+    /// What a chat message does to a turn already running in its session.
+    /// Absent is [`SendMode::Steer`], as every surface has always had it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<SendMode>,
+}
+
+/// What a chat message sent during a running turn does.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SendMode {
+    /// Waits for the running turn: refused as `busy` while it works, so the
+    /// client holds it and sends it again once the turn has ended.
+    Queue,
+    /// Joins the running turn, which takes it in as a follow-up. A mode
+    /// this build doesn't know reads as this one, so a newer client's
+    /// message still goes, as it would have before modes (serde's catch-all
+    /// is the last variant).
+    #[default]
+    #[serde(other)]
+    Steer,
 }
 
 /// The longest `turn_ref` a client may send.
@@ -188,6 +208,7 @@ impl ClientMessage {
             answers_approvals: None,
             desk: None,
             turn_ref: None,
+            mode: None,
         }
     }
 
@@ -213,6 +234,7 @@ impl ClientMessage {
             answers_approvals: None,
             desk: None,
             turn_ref: None,
+            mode: None,
         }
     }
 
@@ -233,6 +255,7 @@ impl ClientMessage {
             answers_approvals: None,
             desk: None,
             turn_ref: None,
+            mode: None,
         }
     }
 
@@ -261,6 +284,7 @@ impl ClientMessage {
             answers_approvals: None,
             desk: None,
             turn_ref: None,
+            mode: None,
         }
     }
 
@@ -281,6 +305,7 @@ impl ClientMessage {
             answers_approvals: None,
             desk: None,
             turn_ref: None,
+            mode: None,
         }
     }
 
@@ -301,6 +326,7 @@ impl ClientMessage {
             answers_approvals: None,
             desk: None,
             turn_ref: None,
+            mode: None,
         }
     }
 
@@ -1146,6 +1172,32 @@ mod tests {
             height: mime.starts_with("image/").then_some(1),
             duration: None,
         }
+    }
+
+    /// A chat frame that names no mode steers, as every surface's always
+    /// has, and a client that sends none is sent and read byte for byte as
+    /// before; Desk's `queue` reads as such.
+    #[test]
+    fn a_chat_frame_without_a_mode_steers_as_before() {
+        let frame: ClientMessage =
+            serde_json::from_value(serde_json::json!({"type": "chat", "content": "hi"})).unwrap();
+        assert_eq!(frame.mode, None);
+        assert_eq!(frame.mode.unwrap_or_default(), SendMode::Steer);
+        assert!(serde_json::to_value(ClientMessage::chat("hi"))
+            .unwrap()
+            .get("mode")
+            .is_none());
+        let queued: ClientMessage = serde_json::from_value(
+            serde_json::json!({"type": "chat", "content": "next", "mode": "queue"}),
+        )
+        .unwrap();
+        assert_eq!(queued.mode, Some(SendMode::Queue));
+        let unknown: ClientMessage = serde_json::from_value(
+            serde_json::json!({"type": "chat", "content": "hi", "mode": "interrupt"}),
+        )
+        .expect("an unknown mode doesn't lose the message");
+        assert_eq!(unknown.mode, Some(SendMode::Steer));
+        assert_eq!(unknown.content.as_deref(), Some("hi"));
     }
 
     #[test]

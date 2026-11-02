@@ -337,7 +337,7 @@ async fn a_desk_connection_sends_turns_the_agent_reads_in_their_place() {
     } else {
         &[]
     };
-    let mut offered = vec!["desk.place", "desk.stream"];
+    let mut offered = vec!["desk.place", "desk.stream", "desk.queue"];
     offered.extend(link);
     assert_eq!(
         connected["features"],

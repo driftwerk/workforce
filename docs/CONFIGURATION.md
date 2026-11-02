@@ -14,7 +14,7 @@ Workforce uses a three-layer configuration system that separates global defaults
 
 **Layer 1: `workforce.toml`** — CI-managed global defaults. Contains hub settings, NATS, Weaviate, memory, gateway, budget, knowledge, session lifecycle, session policies, heartbeat, groups, teams, and agent definitions. Overwritten on every infra deploy.
 
-**Layer 2: `{workspace}/config.toml`** — Per-agent runtime configuration. Contains LLM settings (model, max_tokens, failover), compaction config, memory config, and routing config. Written by agent tools (`system.set_model`, etc.) or human edit. Plain TOML — easy to inspect and diff. Survives CI deploys because agent workspaces live on persistent volumes.
+**Layer 2: `{workspace}/config.toml`** — Per-agent runtime configuration. Contains LLM settings (model, max_tokens, failover), compaction config, memory config, and routing config. Written by agent tools (`system.set_model`, etc.) or human edit. Plain TOML — easy to inspect and diff. Survives CI deploys because agent workspaces live on persistent volumes. On a hub running Desk, a hand edit is held until you approve it on the Floor (see [Hot-reload](#hot-reload)).
 
 **Layer 3: Vault** — Secrets only. API keys, OAuth tokens, credentials. Encrypted at rest with AES-256-GCM. See [VAULT.md](VAULT.md) for details.
 
@@ -48,7 +48,9 @@ For any LLM setting (model, max_tokens, failover, etc.), the effective value is 
 
 ### Hot-reload
 
-Editing `{workspace}/config.toml` (via the UI or API) applies on the **next turn** without a hub restart. The agent re-reads the file and swaps its runtime config: the `[memory]`, `[compaction]`, `[spill]`, and `[advisor]` sections, plus the LLM provider/model. Background-task model tiers re-resolve against the live provider.
+Editing `{workspace}/config.toml` (via the UI or API) applies on the **next turn** without a hub restart.
+
+> **On a hub running Desk** (`[desk] enabled`, no exec runner, not `[cluster] expected`), an agent's commands run as the hub and could rewrite this file, so an edit made to it outside the hub (by hand, by a command, or while the hub was stopped) is **not** applied. It shows on Desk's Floor: Allow uses the new file, Deny keeps the saved one, and saves for that agent wait until you choose. Changes made through Desk's settings, the API or the agent's own tools apply as usual. The agent re-reads the file and swaps its runtime config: the `[memory]`, `[compaction]`, `[spill]`, and `[advisor]` sections, plus the LLM provider/model. Background-task model tiers re-resolve against the live provider.
 
 A few fields are baked into a resource built at startup (a store connection or a background task) and **still require a restart**; an edit to them is applied where possible and the deferred field names are returned in the save API response as `restart_required`:
 
@@ -1118,7 +1120,7 @@ on the persistent data volume survives:
 ### Making Config Changes Permanent
 
 - **Global settings:** edit `workforce.toml` wherever your deployment keeps it, then redeploy
-- **Per-agent settings:** use agent tools (`system.set_model`, etc.) or edit `{workspace}/config.toml` — changes survive redeploys
+- **Per-agent settings:** use agent tools (`system.set_model`, etc.) or edit `{workspace}/config.toml` — changes survive redeploys (on a hub running Desk, approve a hand edit on the Floor first; see [Hot-reload](#hot-reload))
 - **Secrets:** use agent tools (`system.add_llm_token`) or the CLI (`workforce vault set`) — the vault is on the persistent volume
 
 ## Vault-to-Workspace Migration
