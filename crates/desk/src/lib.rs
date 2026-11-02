@@ -10,6 +10,7 @@ mod background;
 mod claude;
 mod codex;
 mod codex_session;
+pub mod computer;
 pub mod conversations;
 pub mod crew;
 mod crew_api;

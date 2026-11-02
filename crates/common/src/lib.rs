@@ -39,6 +39,7 @@ pub mod private_fs;
 /// `PairingConfig`). New callers should depend on `workforce-postgres`
 /// directly.
 pub use workforce_postgres as postgres;
+pub mod computer_access;
 pub mod oversight;
 pub mod persona;
 pub mod pg_text;

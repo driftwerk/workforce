@@ -149,6 +149,19 @@ const CLAIMS: &[(&str, &str, &str, Claim)] = &[
         "owner_instance",
         NotPersonal(INSTANCE),
     ),
+    (
+        "desk",
+        "access_activity",
+        "decided_by",
+        NotPersonal("how a call was decided: rule, grant, session, person or classifier"),
+    ),
+    ("desk", "access_activity", "person", By(C::RetentionBound)),
+    (
+        "desk",
+        "access_grants",
+        "person",
+        NotPersonal("`you`, the one person of the Desk whose own hub this is"),
+    ),
     ("desk", "attachments", "owner", By(C::Sessions)),
     (
         "desk",
