@@ -665,8 +665,14 @@ pub(super) async fn build_inner(
     )
     .await?;
 
-    let (policy, adapter_loader) =
-        install_policy(&config, &credentials, &toolbox, &admin, &skills)?;
+    let (policy, adapter_loader) = install_policy(
+        &config,
+        &credentials,
+        &toolbox,
+        &admin,
+        &skills,
+        &setup.workspace,
+    )?;
 
     register_telemetry_tools(
         &config,
@@ -4248,6 +4254,7 @@ fn install_policy(
     toolbox: &Toolbox,
     admin: &Admin,
     skills: &Skills,
+    workspace: &std::path::Path,
 ) -> Result<(Arc<PolicyEngine>, crate::wasm_tool_invoker::AdapterLoader)> {
     let Credentials {
         vault,
@@ -4310,7 +4317,15 @@ fn install_policy(
             crate::authz::capability_matrix_handle(),
             tokio::runtime::Handle::current(),
         )
-        .with_adapter_loader(Arc::clone(&adapter_loader)),
+        .with_adapter_loader(Arc::clone(&adapter_loader))
+        // A skill's inner calls reach a connector only as the agent's own
+        // `[skills]` lets the agent itself, on a `[desk]` hub.
+        .with_connector_access(config.desk.enabled.then(|| {
+            crate::connector_access::ConnectorToolAccess::policy(
+                workspace.to_path_buf(),
+                Arc::clone(tools),
+            )
+        })),
     ));
     Ok((policy, adapter_loader))
 }
