@@ -35,6 +35,11 @@ vt100 = "0.18.1"
 workforce-core = { workspace = true }
 workforce-postgres = { path = "../postgres", features = ["postgres"] }
 
+# An engine account's sign-in is kept in the keychain on macOS; elsewhere
+# Desk keeps it in a private file.
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3", features = ["apple-native"] }
+
 [build-dependencies]
 workforce-build-support = { path = "../build-support" }
 

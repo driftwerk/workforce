@@ -80,6 +80,9 @@ pub struct SessionRecord {
     pub engine_version: Option<String>,
     /// Codex's own reviewer answers its approvals ("Approve for me").
     pub approve_for_me: bool,
+    /// The person's account it runs on ([`crate::engine_accounts`]); none:
+    /// the CLI's own sign-in on this computer.
+    pub account: Option<Uuid>,
     pub name: String,
     pub goal: String,
     pub cwd: String,
@@ -147,6 +150,10 @@ pub struct SessionView {
     pub approvals: Approvals,
     /// Codex's own reviewer answers its approvals ("Approve for me").
     pub approve_for_me: bool,
+    /// The person's account it runs on; none: the CLI's own sign-in.
+    pub account: Option<crate::engine_accounts::AccountRef>,
+    /// The account it moves to once its turn ends, when a switch waits.
+    pub switching_to: Option<crate::engine_accounts::AccountRef>,
     /// The Desk terminal it runs in, when it was started in one.
     pub terminal_id: Option<Uuid>,
     /// What the person calls it in Desk (`name` is the hub's own).
@@ -240,6 +247,8 @@ impl SessionView {
             pending,
             approvals: r.approvals,
             approve_for_me: r.approve_for_me,
+            account: None,
+            switching_to: None,
             terminal_id: r.terminal_id,
             display_name: r.display_name.clone(),
             group: None,
@@ -302,6 +311,14 @@ pub enum DeskEvent {
     Spend {
         session: Uuid,
     },
+    /// The person's engine accounts changed: all of them as they now are.
+    Accounts {
+        accounts: Vec<crate::engine_accounts::AccountView>,
+    },
+    /// Signing in to an account through its engine's own command moved on.
+    AccountSignIn {
+        sign_in: crate::engine_accounts::SignInView,
+    },
     /// A key of Desk's own state changed; `value` is `null` once removed.
     State {
         key: String,
@@ -330,6 +347,10 @@ pub struct NewSession {
     /// Codex only: its own reviewer answers its approvals.
     #[serde(default)]
     pub approve_for_me: bool,
+    /// The person's account it runs on: absent, the engine's default
+    /// account; `null`, the CLI's own sign-in on this computer.
+    #[serde(default, deserialize_with = "present")]
+    pub account: Option<Option<Uuid>>,
     /// Added to the CLI's environment, as a terminal's is: Desk's plugin
     /// folder in `CLAUDE_CODE_PLUGIN_DIRS`.
     #[serde(default)]
