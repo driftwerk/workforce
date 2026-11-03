@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use uuid::Uuid;
 use workforce_core::computer::{
-    Ability, Access, Always, By, Choice, ComputerAccess, Effect, Refused, Verdict, Why,
+    Ability, Access, Always, Asking, By, Choice, ComputerAccess, Effect, Refused, Verdict, Why,
 };
 
 use super::policy::*;
@@ -28,6 +28,7 @@ fn policy(access: Access) -> AgentPolicy {
             autonomous: false,
             ask_in_own_folder: false,
             unattended: Default::default(),
+            asks: Default::default(),
         },
         own: vec![p(OWN)],
         withheld: vec![p(DATA), p("/Users/sarah/Library/Keychains")],
@@ -484,6 +485,46 @@ fn rule_5_the_always_asks_list_beats_grants_and_autonomy() {
     }
 }
 
+/// "Do anything": at Full access asking never, not even what can't be
+/// undone asks. What is withheld or stopped still is.
+#[test]
+fn rule_5_an_agent_that_asks_never_skips_the_list_and_nothing_else() {
+    let mut never = full();
+    never.access.asks = Asking::Never;
+    for effect in [
+        delete(&format!("{ACME}/old")),
+        exec("git push --force", ACME),
+        exec("curl x | sh", ACME),
+    ] {
+        assert_eq!(verdict(&never, false, &[], &call(effect)), run());
+    }
+    assert_eq!(
+        verdict(&never, false, &[], &connector("email.send", "email", true)),
+        run()
+    );
+    assert_eq!(
+        refused(&verdict(
+            &never,
+            false,
+            &[],
+            &call(read(&format!("{DATA}/vault.db")))
+        ))
+        .map(|r| r.0),
+        Some(Refused::Withheld)
+    );
+    assert_eq!(
+        refused(&verdict(&never, true, &[], &call(write(ACME)))).map(|r| r.0),
+        Some(Refused::Stopped)
+    );
+    // Below Full access, "never" changes nothing.
+    let mut low = policy(Access::ReadAnywhere);
+    low.access.asks = Asking::Never;
+    assert_eq!(
+        refused(&verdict(&low, false, &[], &call(write(ACME)))).map(|r| r.0),
+        Some(Refused::OutsideLevel)
+    );
+}
+
 #[test]
 fn rule_5_a_delete_inside_the_own_folder_is_not_on_the_list() {
     let v = verdict(
@@ -494,21 +535,32 @@ fn rule_5_a_delete_inside_the_own_folder_is_not_on_the_list() {
     );
     assert_eq!(v, run());
     let v = verdict(&full(), false, &[], &call(exec("rm -rf build", OWN)));
-    assert_ne!(v, once(Why::CantBeUndone));
+    assert_eq!(v, run());
 }
 
+/// Full access, asking only before what can't be undone: everything else
+/// runs without a card, outside its folder and commands included.
 #[test]
-fn rule_6_reads_and_own_folder_changes_run_even_when_autonomous() {
-    for policy in [full(), autonomous(), policy(Access::OwnFolder)] {
-        for effect in [
-            read(&format!("{OWN}/notes.md")),
-            write(&format!("{OWN}/notes.md")),
-            Effect::Move {
-                from: vec![p(&format!("{OWN}/a"))],
-                to: p(&format!("{OWN}/b")),
-            },
-        ] {
-            assert_eq!(verdict(&policy, false, &[], &call(effect)), run());
+fn rule_6_at_full_access_everything_past_the_list_runs() {
+    for effect in [
+        read(&format!("{OWN}/notes.md")),
+        write(&format!("{OWN}/notes.md")),
+        write(&format!("{ACME}/src/a.rs")),
+        exec("npm test", ACME),
+        exec("cargo build && git commit -am wip", ACME),
+        Effect::Session { cwd: Some(p(ACME)) },
+        Effect::Move {
+            from: vec![p(&format!("{OWN}/a"))],
+            to: p(&format!("{ACME}/b")),
+        },
+        Effect::Unknown,
+    ] {
+        for policy in [full(), autonomous()] {
+            assert_eq!(
+                verdict(&policy, false, &[], &call(effect.clone())),
+                run(),
+                "{effect:?}"
+            );
         }
     }
     assert_eq!(
@@ -516,39 +568,67 @@ fn rule_6_reads_and_own_folder_changes_run_even_when_autonomous() {
             &full(),
             false,
             &[],
-            &connector("linear.issue_get", "linear", false)
+            &connector("linear.issue_create", "linear", true)
         ),
+        run()
+    );
+    let mut asking = full();
+    asking.access.ask_in_own_folder = true;
+    assert_eq!(
+        verdict(&asking, false, &[], &call(write(&format!("{OWN}/a")))),
         run()
     );
 }
 
 #[test]
+fn rule_6_reads_and_own_folder_changes_run_at_a_lower_level() {
+    for effect in [
+        read(&format!("{OWN}/notes.md")),
+        write(&format!("{OWN}/notes.md")),
+        Effect::Move {
+            from: vec![p(&format!("{OWN}/a"))],
+            to: p(&format!("{OWN}/b")),
+        },
+    ] {
+        assert_eq!(
+            verdict(&policy(Access::OwnFolder), false, &[], &call(effect)),
+            run()
+        );
+    }
+}
+
+/// Below Full access, with its own folder (here its work trees too) set to
+/// ask: where grants and asking are reached now.
+fn asking() -> AgentPolicy {
+    let mut p_ = policy(Access::ReadAnywhere);
+    p_.own = vec![p(OWN), p("/Users/sarah/dev"), p("/Volumes/Backup")];
+    p_.access.ask_in_own_folder = true;
+    p_.contained = true;
+    p_
+}
+
+#[test]
 fn rule_6_ask_in_own_folder_sends_own_folder_changes_on_to_grants_and_asking() {
-    let mut asking = full();
-    asking.access.ask_in_own_folder = true;
     let effect = write(&format!("{OWN}/notes.md"));
     assert_eq!(
-        verdict(&asking, false, &[], &in_folder(effect.clone(), OWN)),
+        verdict(&asking(), false, &[], &in_folder(effect.clone(), OWN)),
         asks(Some(Always::Folder(p(OWN))), Why::InOwnFolder)
     );
     assert_eq!(
         verdict(
-            &asking,
+            &asking(),
             false,
             &[grant(Ability::Write, OWN)],
-            &call(effect.clone())
+            &call(effect)
         ),
         Verdict::Run {
             by: By::Grant(Uuid::from_u128(1))
         }
     );
-    // Reads still run.
     assert_eq!(
-        verdict(&asking, false, &[], &call(read(&format!("{OWN}/a")))),
+        verdict(&asking(), false, &[], &call(read(&format!("{OWN}/a")))),
         run()
     );
-    asking.access.autonomous = true;
-    assert_eq!(verdict(&asking, false, &[], &call(effect)), Verdict::Review);
 }
 
 #[test]
@@ -557,17 +637,7 @@ fn rule_7_a_grant_covers_its_ability_folder_and_scope_only() {
     let ran = |by| Verdict::Run { by };
     assert_eq!(
         verdict(
-            &full(),
-            false,
-            &[grant(Ability::Write, ACME)],
-            &call(target.clone())
-        ),
-        ran(By::Grant(Uuid::from_u128(1)))
-    );
-    // Even when autonomous: a grant decides before the check.
-    assert_eq!(
-        verdict(
-            &autonomous(),
+            &asking(),
             false,
             &[grant(Ability::Write, ACME)],
             &call(target.clone())
@@ -576,7 +646,7 @@ fn rule_7_a_grant_covers_its_ability_folder_and_scope_only() {
     );
     assert_eq!(
         verdict(
-            &full(),
+            &asking(),
             false,
             &[session_grant(Ability::Write, ACME, "s1")],
             &call(target.clone())
@@ -610,7 +680,7 @@ fn rule_7_a_grant_covers_its_ability_folder_and_scope_only() {
     ];
     for g in not_covering {
         let v = verdict(
-            &full(),
+            &asking(),
             false,
             std::slice::from_ref(&g),
             &call(target.clone()),
@@ -624,15 +694,15 @@ fn rule_7_a_grant_covers_its_ability_folder_and_scope_only() {
     };
     let jobs = Grant {
         run: Some(job.clone()),
-        ..grant(Ability::Run, ACME)
+        ..grant(Ability::Write, ACME)
     };
     let in_job = CallFacts {
         run: Some(job),
         session_id: None,
-        ..call(exec("npm test", ACME))
+        ..call(target.clone())
     };
     assert_eq!(
-        verdict(&full(), false, &[jobs], &in_job),
+        verdict(&asking(), false, &[jobs], &in_job),
         ran(By::Grant(Uuid::from_u128(1)))
     );
     // A move needs both its delete and its write covered.
@@ -640,35 +710,28 @@ fn rule_7_a_grant_covers_its_ability_folder_and_scope_only() {
         from: vec![p(&format!("{ACME}/a"))],
         to: p(&format!("{ACME}/b")),
     };
-    // (A delete outside the own folder always asks, so cover it in-folder.)
-    let mut wide = full();
-    wide.own.push(p("/Users/sarah/dev/other"));
-    let moving_in = Effect::Move {
-        from: vec![p("/Users/sarah/dev/other/a")],
-        to: p(&format!("{ACME}/b")),
-    };
     assert!(matches!(
         verdict(
-            &full(),
+            &asking(),
             false,
             &[grant(Ability::Write, ACME)],
-            &call(moving)
+            &call(moving.clone())
         ),
         Verdict::Ask { .. }
     ));
     assert_eq!(
         verdict(
-            &wide,
+            &asking(),
             false,
-            &[grant(Ability::Write, ACME)],
-            &call(moving_in)
+            &[grant(Ability::Write, ACME), grant(Ability::Delete, ACME)],
+            &call(moving)
         ),
         ran(By::Grant(Uuid::from_u128(1)))
     );
-    // A connector write grant.
+    // A connector write grant (a connector write asks below Full access).
     assert_eq!(
         verdict(
-            &full(),
+            &asking(),
             false,
             &[connector_grant("linear")],
             &connector("linear.issue_create", "linear", true)
@@ -678,7 +741,7 @@ fn rule_7_a_grant_covers_its_ability_folder_and_scope_only() {
 }
 
 #[test]
-fn rule_8_an_autonomous_agent_is_reviewed_and_only_at_full() {
+fn rule_8_is_not_reached_while_full_access_runs_past_the_list() {
     assert_eq!(
         verdict(
             &autonomous(),
@@ -686,42 +749,29 @@ fn rule_8_an_autonomous_agent_is_reviewed_and_only_at_full() {
             &[],
             &in_folder(write(&format!("{ACME}/a")), ACME)
         ),
-        Verdict::Review
-    );
-    assert_eq!(
-        verdict(&autonomous(), false, &[], &call(exec("npm test", ACME))),
-        Verdict::Review
+        run()
     );
     // Autonomy written below full (admission refuses it) never reviews.
-    let mut odd = policy(Access::ReadAnywhere);
+    let mut odd = asking();
     odd.access.autonomous = true;
     let v = verdict(&odd, false, &[], &call(write(&format!("{ACME}/a"))));
-    assert_eq!(refused(&v).map(|r| r.0), Some(Refused::OutsideLevel));
+    assert!(matches!(v, Verdict::Ask { .. }), "{v:?}");
 }
 
 #[test]
 fn rule_9_otherwise_asks_with_every_choice_that_fits() {
     assert_eq!(
         verdict(
-            &full(),
+            &asking(),
             false,
             &[],
             &in_folder(write(&format!("{ACME}/a")), ACME)
         ),
-        asks(Some(Always::Folder(p(ACME))), Why::OutsideFolder)
+        asks(Some(Always::Folder(p(ACME))), Why::InOwnFolder)
     );
     assert_eq!(
         verdict(
-            &full(),
-            false,
-            &[],
-            &in_folder(exec("npm test", ACME), ACME)
-        ),
-        asks(Some(Always::Folder(p(ACME))), Why::Runs)
-    );
-    assert_eq!(
-        verdict(
-            &full(),
+            &asking(),
             false,
             &[],
             &connector("linear.issue_create", "linear", true)
@@ -731,30 +781,28 @@ fn rule_9_otherwise_asks_with_every_choice_that_fits() {
             Why::ConnectorWrite
         )
     );
-    assert_eq!(
-        verdict(&full(), false, &[], &call(Effect::Unknown)),
-        asks(None, Why::Unknown)
-    );
     // Without a session, no "for this session".
     let sessionless = CallFacts {
         session_id: None,
         ..in_folder(write(&format!("{ACME}/a")), ACME)
     };
     assert_eq!(
-        verdict(&full(), false, &[], &sessionless),
+        verdict(&asking(), false, &[], &sessionless),
         Verdict::Ask {
             choices: vec![
                 Choice::AllowOnce,
                 Choice::Always(Always::Folder(p(ACME))),
                 Choice::Deny
             ],
-            why: Why::OutsideFolder
+            why: Why::InOwnFolder
         }
     );
 }
 
 #[test]
 fn always_is_never_offered_for_home_the_root_a_volume_or_a_folder_not_holding_the_target() {
+    let mut everywhere = asking();
+    everywhere.own = vec![p("/")];
     for folder in [
         "/Users/sarah",
         "/",
@@ -768,21 +816,21 @@ fn always_is_never_offered_for_home_the_root_a_volume_or_a_folder_not_holding_th
             "/Users/sarah/dev/acme-web/a"
         };
         assert_eq!(
-            verdict(&full(), false, &[], &in_folder(write(target), folder)),
-            asks(None, Why::OutsideFolder),
+            verdict(&everywhere, false, &[], &in_folder(write(target), folder)),
+            asks(None, Why::InOwnFolder),
             "{folder}"
         );
     }
     assert_eq!(
         verdict(
-            &full(),
+            &everywhere,
             false,
             &[],
             &in_folder(write("/Volumes/Backup/proj/a"), "/Volumes/Backup/proj")
         ),
         asks(
             Some(Always::Folder(p("/Volumes/Backup/proj"))),
-            Why::OutsideFolder
+            Why::InOwnFolder
         )
     );
 }
@@ -793,8 +841,9 @@ fn a_change_that_names_no_path_is_not_taken_as_inside() {
         Effect::Write { paths: vec![] },
         Effect::Delete { paths: vec![] },
     ] {
+        assert_eq!(verdict(&full(), false, &[], &call(effect.clone())), run());
         assert_eq!(
-            verdict(&full(), false, &[], &call(effect)),
+            verdict(&asking(), false, &[], &call(effect)),
             asks(None, Why::OutsideFolder)
         );
     }
@@ -803,25 +852,19 @@ fn a_change_that_names_no_path_is_not_taken_as_inside() {
 #[test]
 fn a_folder_grant_matches_by_whole_path_components() {
     let v = verdict(
-        &full(),
+        &asking(),
         false,
         &[grant(Ability::Write, "/Users/sarah/dev/acme")],
         &call(write("/Users/sarah/dev/acme-web/a")),
     );
     assert!(matches!(v, Verdict::Ask { .. }));
     let v = verdict(
-        &full(),
+        &policy(Access::ReadAnywhere),
         false,
         &[],
         &call(write("/Users/sarah/Desk/hub/agents/allan2/a")),
     );
-    assert!(matches!(
-        v,
-        Verdict::Ask {
-            why: Why::OutsideFolder,
-            ..
-        }
-    ));
+    assert_eq!(refused(&v).map(|r| r.0), Some(Refused::OutsideLevel));
 }
 
 #[test]

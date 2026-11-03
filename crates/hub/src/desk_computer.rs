@@ -627,7 +627,8 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn on_a_desk_hub_an_agent_with_no_computer_section_asks_before_commands() {
+    async fn on_a_desk_hub_an_agent_with_no_computer_section_asks_only_before_what_cant_be_undone()
+    {
         with_test_pool(workforce_desk::store::build_pool, |pool| async move {
             let store = Arc::new(DeskStore::with_pool(pool).await.unwrap());
             let hub = hub();
@@ -643,17 +644,19 @@ mod tests {
             };
             // An own-folder write runs, a relative path included.
             assert_eq!(decide("filesystem.write", json!({"path": "notes/a.md", "content": "x"})), "run");
-            // A command asks, offering only Allow once and Deny.
-            assert_eq!(decide("exec.run", json!({"command": "npm test"})), "asks once");
+            // An ordinary command runs; one that can't be undone asks,
+            // offering only Allow once and Deny.
+            assert_eq!(decide("exec.run", json!({"command": "npm test"})), "run");
             assert_eq!(decide("exec.run", json!({"command": "rm -rf /tmp/x"})), "asks once");
+            assert_eq!(decide("exec.run", json!({"command": "git push --force"})), "asks once");
             // Other namespaces never ask.
             assert_eq!(decide("memory.recall", json!({})), "run");
             assert_eq!(decide("web.fetch", json!({})), "run");
 
-            // Nobody to ask (a job, a workflow step): at Full access it runs,
-            // as before.
+            // Nobody to ask (a job, a workflow step): even what would ask runs
+            // at Full access, as before.
             let ran = as_sarah(|| {
-                unattended_refusal(Some(gate.as_ref()), &tools, "exec.run", &json!({"command": "npm test"}))
+                unattended_refusal(Some(gate.as_ref()), &tools, "exec.run", &json!({"command": "rm -rf /tmp/x"}))
             });
             assert_eq!(ran, None);
 
@@ -809,18 +812,20 @@ mod tests {
                 .0,
                 "refused"
             );
-            // A change outside asks first.
+            // A change outside runs: Full access asks only before what
+            // can't be undone.
             assert_eq!(
                 run(
                     &full,
                     &tools,
                     "filesystem.write",
-                    json!({"path": elsewhere.to_string_lossy(), "content": "x"})
+                    json!({"path": elsewhere.to_string_lossy(), "content": "changed"})
                 )
                 .await
                 .0,
-                "asks once"
+                "run"
             );
+            assert_eq!(std::fs::read_to_string(&elsewhere).unwrap(), "changed");
 
             let own = gate_at("[computer]\naccess = \"own_folder\"\n");
             assert_eq!(
@@ -850,32 +855,34 @@ mod tests {
         with_test_pool(workforce_desk::store::build_pool, |pool| async move {
             let store = Arc::new(DeskStore::with_pool(pool).await.unwrap());
             let hub = hub();
-            let repo = Path::new(&hub.config.hub.data_dir)
-                .ancestors()
-                .nth(3)
-                .unwrap()
-                .join("dev/acme-web");
+            // Asking in its own folder, where the repo it works in is: the
+            // level where cards with choices are reached now.
+            let repo = hub.subject.workspace.join("acme-web");
             std::fs::create_dir_all(repo.join(".git")).unwrap();
             std::fs::create_dir_all(repo.join("src")).unwrap();
+            std::fs::write(
+                hub.subject.workspace.join("config.toml"),
+                "[computer]\naccess = \"read_anywhere\"\nask_in_own_folder = true\n",
+            )
+            .unwrap();
             let gate = HubComputerGate::for_agent(
                 Computer::new(Arc::clone(&store)),
                 &hub.config,
                 &hub.subject,
             );
-            let exec = |cwd: &Path, command: &str| Effect::Exec {
-                command: command.into(),
-                cwd: Some(cwd.to_path_buf()),
+            let write = |path: &Path| Effect::Write {
+                paths: vec![path.to_path_buf()],
             };
-            let decide = |effect: Effect| {
-                let verdict = as_sarah(|| gate.verdict("exec.run", &effect));
+            let decide = |gate: &HubComputerGate, effect: Effect| {
+                let verdict = as_sarah(|| gate.verdict("filesystem.write", &effect));
                 Decision {
                     effect,
                     verdict,
                     reach: None,
                 }
             };
-            let tests = decide(exec(&repo.join("src"), "npm test"));
-            let card = as_sarah(|| gate.prompt(&tests));
+            let first = decide(&gate, write(&repo.join("src/a.rs")));
+            let card = as_sarah(|| gate.prompt(&first));
             assert!(card.allow_once && card.deny_once && card.allow_session);
             assert!(!card.allow_always && !card.deny_always);
             assert_eq!(
@@ -884,28 +891,33 @@ mod tests {
                 "the repo, not its src"
             );
             let facts = card.facts.unwrap();
-            assert_eq!(facts.effect, "exec");
-            assert_eq!(facts.command.as_deref(), Some("npm test"));
-            assert_eq!(facts.why, "Runs on this computer");
+            assert_eq!(facts.effect, "write");
+            assert_eq!(
+                facts.paths,
+                [shown(&repo.join("src/a.rs"), &gate.policy.home)]
+            );
+            assert_eq!(facts.why, "You asked to be asked in its folder too");
 
             // "For this session": runs in this session only.
-            as_sarah(|| gate.keep(&tests, PermissionChoice::AllowSession)).unwrap();
-            let again = decide(exec(&repo, "npm run lint"));
+            as_sarah(|| gate.keep(&first, PermissionChoice::AllowSession)).unwrap();
+            let again = decide(&gate, write(&repo.join("b.rs")));
             assert!(
                 matches!(again.verdict, Verdict::Run { by: By::Session(_) }),
                 "{:?}",
                 again.verdict
             );
             let elsewhere = CURRENT_USER_ID.sync_scope("sarah".into(), || {
-                CURRENT_SESSION_KEY
-                    .sync_scope("s2".into(), || gate.verdict("exec.run", &again.effect))
+                CURRENT_SESSION_KEY.sync_scope("s2".into(), || {
+                    gate.verdict("filesystem.write", &again.effect)
+                })
             });
             assert!(matches!(elsewhere, Verdict::Ask { .. }), "{elsewhere:?}");
             // "Always in this folder": any session.
-            as_sarah(|| gate.keep(&tests, PermissionChoice::AllowInFolder)).unwrap();
+            as_sarah(|| gate.keep(&first, PermissionChoice::AllowInFolder)).unwrap();
             let elsewhere = CURRENT_USER_ID.sync_scope("sarah".into(), || {
-                CURRENT_SESSION_KEY
-                    .sync_scope("s2".into(), || gate.verdict("exec.run", &again.effect))
+                CURRENT_SESSION_KEY.sync_scope("s2".into(), || {
+                    gate.verdict("filesystem.write", &again.effect)
+                })
             });
             assert!(
                 matches!(elsewhere, Verdict::Run { by: By::Grant(_) }),
@@ -920,12 +932,28 @@ mod tests {
                 .iter()
                 .any(|g| g.grant.session_id.as_deref() == Some("s1") && g.expires_at.is_some()));
 
-            // The always-asks set offers neither, and keeps neither.
-            let force = decide(exec(&repo, "git push --force"));
-            let card = as_sarah(|| gate.prompt(&force));
+            // At Full access, what can't be undone offers neither, and keeps
+            // neither.
+            std::fs::write(hub.subject.workspace.join("config.toml"), "").unwrap();
+            let full = HubComputerGate::for_agent(
+                Computer::new(Arc::clone(&store)),
+                &hub.config,
+                &hub.subject,
+            );
+            let force = Effect::Exec {
+                command: "git push --force".into(),
+                cwd: Some(repo.clone()),
+            };
+            let force = Decision {
+                verdict: as_sarah(|| full.verdict("exec.run", &force)),
+                effect: force,
+                reach: None,
+            };
+            let card = as_sarah(|| full.prompt(&force));
             assert!(!card.allow_session && card.allow_in_folder.is_none());
-            assert!(as_sarah(|| gate.keep(&force, PermissionChoice::AllowInFolder)).is_err());
-            assert!(as_sarah(|| gate.keep(&force, PermissionChoice::AllowSession)).is_err());
+            assert_eq!(card.facts.unwrap().why, "Can't be undone");
+            assert!(as_sarah(|| full.keep(&force, PermissionChoice::AllowInFolder)).is_err());
+            assert!(as_sarah(|| full.keep(&force, PermissionChoice::AllowSession)).is_err());
             assert_eq!(store.grants(Some("allan")).await.unwrap().len(), 2);
         })
         .await;
@@ -988,7 +1016,8 @@ mod tests {
             let store = Arc::new(DeskStore::with_pool(pool).await.unwrap());
             let hub = hub();
             let tools = tools(&hub.subject.workspace);
-            let input = json!({"command": "npm test"});
+            // What can't be undone: the only thing Full access asks about.
+            let input = json!({"command": "rm -rf /tmp/x"});
             let gate_with = |config: &str| -> Arc<dyn ComputerGate> {
                 std::fs::write(hub.subject.workspace.join("config.toml"), config).unwrap();
                 Arc::new(HubComputerGate::for_agent(
@@ -1058,7 +1087,7 @@ mod tests {
             ));
             let tools = tools(&hub.subject.workspace);
             let token = format!("ghp_{}", "a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8");
-            let input = json!({"command": format!("echo {token}")});
+            let input = json!({"command": format!("rm -rf /tmp/{token}")});
             let effect = tools.get("exec.run").unwrap().effect(&input);
             let verdict = as_sarah(|| gate.verdict("exec.run", &effect));
             assert!(matches!(verdict, Verdict::Ask { .. }));

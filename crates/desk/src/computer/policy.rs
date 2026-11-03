@@ -8,11 +8,14 @@
 //! 3. The call is outside the agent's level: refuse, in a plain sentence
 //!    naming the level and Settings.
 //! 4. A connector that is off, or read only and given a write: refuse.
-//! 5. The call is on the always-asks list: ask, offering Allow once and Deny.
-//! 6. A read, a change inside the own folder, or a contained command at a
-//!    lower level: run.
+//! 5. The call is on the always-asks list (it can't be undone, or can't be
+//!    read as simple commands): ask, offering Allow once and Deny. An agent
+//!    at Full access that asks never skips this.
+//! 6. Anything at Full access; a read, a change inside the own folder, or a
+//!    contained command at a lower level: run.
 //! 7. A grant or a session allowance covers it: run.
-//! 8. The agent works on its own: the check reviews it.
+//! 8. The agent works on its own: the check reviews it (not reached while
+//!    Full access runs everything past rule 5; kept for AC11).
 //! 9. Otherwise: ask, offering Allow once, for this session, always in the
 //!    folder, and Deny.
 //!
@@ -28,7 +31,8 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use workforce_core::computer::{
-    Ability, Access, Always, By, Choice, ComputerAccess, Effect, Refusal, Refused, Verdict, Why,
+    Ability, Access, Always, Asking, By, Choice, ComputerAccess, Effect, Refusal, Refused, Verdict,
+    Why,
 };
 
 use super::asks::{always_asks, Asks, Place};
@@ -458,9 +462,11 @@ pub fn verdict(p: &AgentPolicy, stopped: bool, grants: &[Grant], call: &CallFact
         }
     }
 
-    // 5. The always-asks list.
+    // 5. The always-asks list, unless the agent at Full access asks never.
     let once = || vec![Choice::AllowOnce, Choice::Deny];
+    let never = access == Access::Full && p.access.asks == Asking::Never;
     match &call.effect {
+        _ if never => {}
         Effect::Delete { paths } | Effect::Move { from: paths, .. }
             if paths.iter().any(|path| !p.inside(path)) =>
         {
@@ -492,6 +498,8 @@ pub fn verdict(p: &AgentPolicy, stopped: bool, grants: &[Grant], call: &CallFact
     };
     let changes_inside = || inside() && !p.access.ask_in_own_folder;
     let runs = match &call.effect {
+        // Full access: whatever passed the always-asks list runs.
+        _ if access == Access::Full => true,
         Effect::Read { .. } | Effect::Connector { write: false, .. } => true,
         Effect::Write { .. } | Effect::Delete { .. } | Effect::Move { .. } => changes_inside(),
         // Contained to the level (checked in 3).
