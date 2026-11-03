@@ -63,6 +63,8 @@ pub struct HubSkillToolInvoker {
     adapter_loader: Option<AdapterLoader>,
     /// Which connectors' tools the agent's `[skills]` hides (a `[desk]` hub).
     connectors: Option<Arc<dyn workforce_agent::tools::access::ToolAccess>>,
+    /// The agent's workspace, for its computer gate (a `[desk]` hub).
+    workspace: Option<std::path::PathBuf>,
 }
 
 impl HubSkillToolInvoker {
@@ -82,17 +84,54 @@ impl HubSkillToolInvoker {
             rate_limit_backoff: RATE_LIMIT_BACKOFF,
             adapter_loader: None,
             connectors: None,
+            workspace: None,
         }
     }
 
     /// Refuses a skill's inner call to a connector the agent's `[skills]`
     /// turns off, or a write to one it makes read only.
+    /// Decides a skill's inner calls by the agent's computer gate too, as
+    /// a call nobody can answer: what would ask runs only where the agent
+    /// runs unattended asks, and a refusal stays one.
+    pub fn with_computer_gate(mut self, workspace: Option<std::path::PathBuf>) -> Self {
+        self.workspace = workspace;
+        self
+    }
+
     pub fn with_connector_access(
         mut self,
         access: Option<Arc<dyn workforce_agent::tools::access::ToolAccess>>,
     ) -> Self {
         self.connectors = access;
         self
+    }
+}
+
+impl HubSkillToolInvoker {
+    /// Why the agent's computer gate won't let a skill make this call, if it
+    /// won't. A skill can't ask, so a call that would ask is refused unless
+    /// the agent runs such calls unattended.
+    fn computer_refusal(&self, ctx: &SkillCallContext, tool: &str, args: &Value) -> Option<String> {
+        use workforce_core::computer::Verdict;
+        let workspace = self.workspace.clone()?;
+        let gate = crate::serve::computer_gate_for(&crate::serve::ComputerSubject {
+            agent: ctx.agent_id.clone(),
+            name: None,
+            workspace,
+        })?;
+        let decision = workforce_agent::tools::computer::decide_unattended(
+            Some(gate.as_ref()),
+            &self.registry,
+            tool,
+            args,
+        )?;
+        match decision.verdict {
+            Verdict::Run { .. } => None,
+            Verdict::Refuse { refusal } => Some(refusal.sentence),
+            Verdict::Ask { .. } | Verdict::Review => Some(format!(
+                "{tool} needs the person's say, and a skill can't ask: run it yourself."
+            )),
+        }
     }
 }
 
@@ -260,6 +299,7 @@ impl HubSkillToolInvoker {
             effect.as_ref(),
             workforce_agent::runner::current_desk().as_ref(),
             args,
+            false,
             || {
                 workforce_agent::tools::dispatch::kept(
                     crate::desk_surface::allows().as_deref(),
@@ -337,6 +377,9 @@ impl HubSkillToolInvoker {
             .and_then(|c| c.snapshot().block_reason(tool).map(str::to_string))
         {
             return envelope(false, Value::Null, Some(reason));
+        }
+        if let Some(refused) = self.computer_refusal(ctx, tool, &args) {
+            return envelope(false, Value::Null, Some(refused));
         }
         let Some(registered) = self.resolve(tool) else {
             return envelope(

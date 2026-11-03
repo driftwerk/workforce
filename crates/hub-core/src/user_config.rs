@@ -375,6 +375,40 @@ impl LayeredUserVault {
         }
     }
 
+    /// Where an unaddressed write of `path` lands. Unpinned, the default
+    /// tier. Pinned to a connection, the tier the value is read from now, else
+    /// the first the pin reads, so a refreshed token stays in the connection
+    /// it came from: one agent's own never lands in the person's shared slot.
+    /// A connector that is off takes no writes.
+    fn write_tier(&self, path: &str) -> eyre::Result<workforce_common::settings::VaultSource> {
+        use workforce_common::credential_pin::TierPin;
+        use workforce_common::settings::VaultSource;
+        let pin = self.pin(path);
+        match pin {
+            TierPin::All => return Ok(self.default_write_tier(path)),
+            TierPin::Nothing => {
+                return Err(eyre::eyre!(
+                    "`{path}` belongs to a connector that is off for this agent, so nothing was written"
+                ))
+            }
+            TierPin::Own | TierPin::Mine => {}
+        }
+        if let Some((tier, _, _)) = self
+            .tiers_in_order_for(path)
+            .into_iter()
+            .find(|(_, vault, key)| vault.get(key).is_some())
+        {
+            return Ok(tier);
+        }
+        let person = Self::user_key(path).is_some();
+        Ok(match (pin, person) {
+            (TierPin::Own, true) => VaultSource::AgentPerUser,
+            (TierPin::Own, false) => VaultSource::AgentSpecific,
+            (_, true) => VaultSource::GlobalPerUser,
+            (_, false) => VaultSource::Global,
+        })
+    }
+
     /// List entries at a user-scoped tier (T1/T2). `prefix` is the bare
     /// logical prefix; the per-user `users/{uid}/` segment is added before
     /// the list and stripped from the results.
@@ -433,7 +467,7 @@ impl workforce_common::settings::SecretStore for LayeredUserVault {
         value: &str,
         actor: workforce_common::settings::VaultActor<'_>,
     ) -> eyre::Result<()> {
-        let tier = self.default_write_tier(path);
+        let tier = self.write_tier(path)?;
         self.set_at_tier(path, value, tier, actor)
     }
 
@@ -547,7 +581,7 @@ impl workforce_common::settings::SecretStore for LayeredUserVault {
         let targets = entries
             .iter()
             .map(|&(path, value)| {
-                self.resolve_write(path, self.default_write_tier(path))
+                self.resolve_write(path, self.write_tier(path)?)
                     .map(|(vault, key)| (vault, key, value))
             })
             .collect::<eyre::Result<Vec<_>>>()?;
@@ -569,7 +603,8 @@ impl workforce_common::settings::SecretStore for LayeredUserVault {
     }
 
     fn write_location(&self, path: &str) -> String {
-        self.resolve_write(path, self.default_write_tier(path))
+        self.write_tier(path)
+            .and_then(|tier| self.resolve_write(path, tier))
             .map_or_else(
                 |_| path.to_string(),
                 |(vault, key)| vault.write_location(&key),

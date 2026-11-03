@@ -48,6 +48,15 @@ impl ToolRegistry {
         }
     }
 
+    /// An empty registry for the same agent as `source`: a skill it loads
+    /// later reads its keys as `source`'s agent's are pinned.
+    pub fn empty_like(source: &ToolRegistry) -> Self {
+        Self {
+            credential_pins: source.credential_pins(),
+            ..Self::new()
+        }
+    }
+
     /// The slot this agent's credential pins go in.
     pub fn credential_pins(&self) -> Arc<workforce_common::credential_pin::PinSlot> {
         Arc::clone(&self.credential_pins)

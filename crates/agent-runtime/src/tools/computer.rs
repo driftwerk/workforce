@@ -78,6 +78,11 @@ pub trait ComputerGate: Send + Sync {
     /// Whether `tool` is in a namespace the gate decides. Nothing else is
     /// asked of a tool outside them: its effect is never read.
     fn decides(&self, tool: &str) -> bool;
+    /// Whether the agent is at Full access and asks before nothing ("do
+    /// anything"): the surface gate then stands down too.
+    fn asks_nothing(&self) -> bool {
+        false
+    }
     /// What `tool` does when it can't say itself (`effect` is the tool's
     /// own): the hub names a connector's read or write from its tool name.
     /// The tool's own effect stays first.

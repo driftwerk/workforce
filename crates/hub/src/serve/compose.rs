@@ -4325,7 +4325,8 @@ fn install_policy(
                 workspace.to_path_buf(),
                 Arc::clone(tools),
             )
-        })),
+        }))
+        .with_computer_gate(config.desk.enabled.then(|| workspace.to_path_buf())),
     ));
     Ok((policy, adapter_loader))
 }

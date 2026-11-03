@@ -10,7 +10,8 @@
 //! - Any other ("my connection") reads `GlobalPerUser`, then `Global`, so a
 //!   key the person saved earlier at the bare tier keeps working.
 //! - An agent with no `enabled` keeps every tier for every connector, as
-//!   before.
+//!   before, except one it names in `own_credential`, which reads only its
+//!   own connection.
 //!
 //! A connector's OAuth app (`skills/<id>/oauth_client/…`) is the hub's, not
 //! a connection's, and is never pinned. Every hub without `[desk]` fills no
@@ -46,7 +47,9 @@ pub fn pin_of(binding: &ConnectorBinding, path: &str) -> TierPin {
     let Some(connector) = connector_of_path(path) else {
         return TierPin::All;
     };
-    if binding.enabled.is_none() {
+    // No `enabled`: every connector is on, and one named in
+    // `own_credential` still reads only its own connection.
+    if binding.enabled.is_none() && !binding.own(connector) {
         return TierPin::All;
     }
     match (binding.is_on(connector), binding.own(connector)) {
@@ -106,6 +109,58 @@ impl AgentPins {
 impl PinSource for AgentPins {
     fn pin(&self, path: &str) -> TierPin {
         pin_of(&self.binding(), path)
+    }
+}
+
+/// The binding the `config.toml` in `workspace` has now.
+pub fn binding_in(workspace: &std::path::Path) -> ConnectorBinding {
+    AgentPins::new(workspace.to_path_buf()).binding()
+}
+
+/// The connectors whose reach `before` → `after` changes: on or off, or
+/// through whose connection.
+pub fn changed(before: &ConnectorBinding, after: &ConnectorBinding) -> Vec<&'static str> {
+    CONNECTORS
+        .iter()
+        .copied()
+        .filter(|c| {
+            let path = primary(c).unwrap_or_default();
+            pin_of(before, path) != pin_of(after, path) || before.is_on(c) != after.is_on(c)
+        })
+        .collect()
+}
+
+/// After `service`'s `[skills]` changed, loads each connector whose reach
+/// changed again, so one that copied its keys when it loaded (Email) or
+/// holds them in memory (Slack) uses the connection it has now.
+pub async fn rebind(service: &AgentService, before: &ConnectorBinding, after: &ConnectorBinding) {
+    for connector in changed(before, after) {
+        if connector == "slack" {
+            if let Some(reload) = service.tools.get("system.reload_slack") {
+                if let Err(e) = reload.execute(serde_json::json!({})).await {
+                    tracing::warn!(error = %format!("{e:#}"), "Slack didn't reconnect after its binding changed");
+                }
+            }
+            continue;
+        }
+        let loaded = service.skill_state.is_loaded(connector)
+            || crate::skill_loader::skill_tools_registered(connector, &service.tools);
+        let Some(vault) = service.vault.clone().filter(|_| loaded) else {
+            continue;
+        };
+        crate::skill_loader::unload_skill(connector, &service.tools);
+        service.skill_state.mark_unloaded(connector);
+        if let Err(e) = crate::skill_loader::load_and_track(
+            connector,
+            vault,
+            service.global_vault.clone(),
+            &service.config,
+            &service.tools,
+            &service.skill_state,
+            "vault",
+        ) {
+            tracing::info!(connector, error = %format!("{e:#}"), "a connector stays unloaded after its binding changed");
+        }
     }
 }
 
@@ -211,7 +266,9 @@ mod tests {
     #[test]
     fn the_binding_pins_each_connector() {
         let path = "skills/linear/api_key";
-        assert_eq!(pin_of(&binding(None, &["linear"]), path), TierPin::All);
+        assert_eq!(pin_of(&binding(None, &[]), path), TierPin::All);
+        // Its own connection holds without `enabled` too.
+        assert_eq!(pin_of(&binding(None, &["linear"]), path), TierPin::Own);
         assert_eq!(pin_of(&binding(Some(&[]), &[]), path), TierPin::Nothing);
         assert_eq!(
             pin_of(&binding(Some(&["linear"]), &[]), path),
@@ -350,5 +407,98 @@ mod tests {
         let over =
             CURRENT_USER_ID.sync_scope("sarah".to_string(), || store.get_user_override(path));
         assert_eq!(over.as_deref(), Some("mine"));
+    }
+
+    /// Sarah's Google for all her agents is sarah@; Allan has his own,
+    /// bot@. Allan's token refresh writes back into Allan's own connection,
+    /// so Ben still reads Sarah's.
+    #[test]
+    fn a_refreshed_token_stays_in_the_connection_it_came_from() {
+        use workforce_agent::runner::CURRENT_USER_ID;
+        use workforce_common::credential_pin::PinSlot;
+        use workforce_common::settings::{SecretStore, VaultActor};
+
+        let dir = tempfile::tempdir().unwrap();
+        let open = |name: &str| Arc::new(Vault::open(&dir.path().join(name), "test-key").unwrap());
+        let (global, allan, ben) = (open("global"), open("allan"), open("ben"));
+        let token = "skills/google/workspaces/default/access_token";
+        let user = |p: &str| format!("users/sarah/{p}");
+        global.set(&user(token), "sarah-token").unwrap();
+        allan.set(&user(token), "bot-token").unwrap();
+        let store = |vault: &Arc<Vault>, body: &str| {
+            let workspace = dir.path().join(format!("ws-{}", body.len()));
+            std::fs::create_dir_all(&workspace).unwrap();
+            std::fs::write(
+                workspace.join(workforce_common::config_files::WORKSPACE_CONFIG),
+                body,
+            )
+            .unwrap();
+            let slot = Arc::new(PinSlot::default());
+            slot.fill(Arc::new(AgentPins::new(workspace)) as Arc<dyn PinSource>);
+            crate::user_config::LayeredUserVault::new(Arc::clone(vault), Some(Arc::clone(&global)))
+                .with_pins(slot)
+        };
+        let allans = store(
+            &allan,
+            "[skills]\nenabled = [\"google\"]\nown_credential = [\"google\"]\n",
+        );
+        let bens = store(&ben, "[skills]\nenabled = [\"google\"]\n");
+        CURRENT_USER_ID.sync_scope("sarah".to_string(), || {
+            assert_eq!(allans.get(token).as_deref(), Some("bot-token"));
+            assert_eq!(bens.get(token).as_deref(), Some("sarah-token"));
+            // A refresh writes through set_many, and a plain set too.
+            allans
+                .set_many(&[(token, "bot-token-2")], VaultActor::System("refresh"))
+                .unwrap();
+            allans.set(token, "bot-token-3").unwrap();
+            assert_eq!(allan.get(&user(token)).as_deref(), Some("bot-token-3"));
+            assert_eq!(global.get(&user(token)).as_deref(), Some("sarah-token"));
+            assert_eq!(bens.get(token).as_deref(), Some("sarah-token"));
+            // Ben's refresh stays in Sarah's.
+            bens.set(token, "sarah-token-2").unwrap();
+            assert_eq!(global.get(&user(token)).as_deref(), Some("sarah-token-2"));
+            assert_eq!(allan.get(&user(token)).as_deref(), Some("bot-token-3"));
+            // Allan's own connection with nothing kept yet lands in his own.
+            allan.delete(&user(token)).unwrap();
+            allans.set(token, "bot-fresh").unwrap();
+            assert_eq!(allan.get(&user(token)).as_deref(), Some("bot-fresh"));
+            // Off: nothing is written anywhere.
+            let off = store(&ben, "[skills]\nenabled = []\n");
+            assert!(off.set(token, "x").is_err());
+            assert!(off
+                .set_many(&[(token, "x")], VaultActor::System("refresh"))
+                .is_err());
+            assert_eq!(global.get(&user(token)).as_deref(), Some("sarah-token-2"));
+        });
+    }
+
+    /// A worker's curated registry, and a read source it loads into it,
+    /// read keys as the agent's are pinned.
+    #[test]
+    fn a_workers_registry_keeps_the_agents_pins() {
+        let source = workforce_agent::tools::registry::ToolRegistry::new();
+        let curated = crate::mcp::build_mcp_registry(&source, &["linear.*".to_string()]);
+        assert!(Arc::ptr_eq(
+            &source.credential_pins(),
+            &curated.credential_pins()
+        ));
+        let all = crate::mcp::build_mcp_registry(&source, &[]);
+        assert!(Arc::ptr_eq(
+            &source.credential_pins(),
+            &all.credential_pins()
+        ));
+    }
+
+    #[test]
+    fn a_change_of_reach_is_found_per_connector() {
+        let none = binding(None, &[]);
+        let linear_mine = binding(Some(&["linear"]), &[]);
+        let linear_own = binding(Some(&["linear"]), &["linear"]);
+        let mut changed_now = changed(&none, &linear_mine);
+        changed_now.sort();
+        // Everything but Linear went off; Linear moved to my connection.
+        assert_eq!(changed_now.len(), CONNECTORS.len());
+        assert_eq!(changed(&linear_mine, &linear_own), ["linear"]);
+        assert!(changed(&linear_own, &linear_own).is_empty());
     }
 }

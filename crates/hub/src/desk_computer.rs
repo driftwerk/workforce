@@ -577,6 +577,11 @@ impl ComputerGate for HubComputerGate {
         Ok(())
     }
 
+    fn asks_nothing(&self) -> bool {
+        self.policy.access.access == workforce_core::computer::Access::Full
+            && self.policy.access.asks == workforce_core::computer::Asking::Never
+    }
+
     fn unattended_runs(&self) -> bool {
         self.policy.access.access == workforce_core::computer::Access::Full
             && self.policy.access.unattended == workforce_core::computer::Unattended::Run
