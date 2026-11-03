@@ -67,6 +67,20 @@ pub async fn google_oauth_callback(
     let store = google_web_flow_store();
 
     if let Some(err) = params.error {
+        // A sign-in Desk started ends here, nothing saved; an agent's waits
+        // on as it always has.
+        #[cfg(feature = "postgres")]
+        if let Some(desk) = params
+            .state
+            .as_deref()
+            .and_then(|s| store.take_desk(s))
+            .and_then(|e| e.desk)
+        {
+            if let Some(connections) = crate::desk_connections::installed() {
+                connections.google_cancelled(&desk.flow);
+            }
+            return desk_page(false, "Sign-in was cancelled. Nothing was saved.");
+        }
         let detail = params.error_description.unwrap_or_default();
         return failure(&format!("Google reported: {err} {detail}"));
     }
@@ -81,6 +95,11 @@ pub async fn google_oauth_callback(
              Ask the agent to start a fresh `google.setup(action='login')` flow.",
         );
     };
+
+    #[cfg(feature = "postgres")]
+    if let Some(desk) = entry.desk.clone() {
+        return complete_for_desk(vault, &code, &entry, &desk).await;
+    }
 
     match complete_exchange(vault, &code, &entry.verifier, &entry.uid, &entry.workspace).await {
         Ok(email) => {
@@ -133,6 +152,59 @@ async fn complete_exchange(
     // keeping the `VaultActor::User(uid)` audit tag from inside `persist_at`.
     persist_tokens_at_user_scope(&store, uid, workspace, &tokens)?;
     Ok(email)
+}
+
+/// Completes a sign-in Desk's Connections started: the exchange on the
+/// redirect it named, then its tokens kept at the tier it was for.
+#[cfg(feature = "postgres")]
+async fn complete_for_desk(
+    vault: &Arc<Vault>,
+    code: &str,
+    entry: &workforce_skills::adapters::google::web_flow::WebFlowEntry,
+    desk: &workforce_skills::adapters::google::web_flow::DeskFlow,
+) -> Response {
+    let Some(connections) = crate::desk_connections::installed() else {
+        return desk_page(false, "Desk isn't running on this hub. Nothing was saved.");
+    };
+    let exchanged = async {
+        let store = crate::user_config::UserAwareVault::global(Arc::clone(vault));
+        let creds = OAuthClientCreds::from_store_or_bundled(&store)?;
+        let http = build_http_client()?;
+        exchange_web_code(&http, &creds, code, &entry.verifier, &desk.redirect_uri).await
+    };
+    match exchanged.await {
+        Ok(tokens) => match connections
+            .google_signed_in(&desk.flow, &entry.uid, &tokens)
+            .await
+        {
+            Ok(account) => desk_page(true, &format!("Google is connected as {account}.")),
+            Err(said) => desk_page(false, &said),
+        },
+        Err(e) => {
+            error!(error = %e, "a Desk Google sign-in failed at the exchange");
+            connections.google_failed(&desk.flow, "Google didn't finish the sign-in");
+            desk_page(
+                false,
+                "Google didn't finish the sign-in. Nothing was saved.",
+            )
+        }
+    }
+}
+
+/// The page a Desk sign-in ends on.
+#[cfg(feature = "postgres")]
+fn desk_page(done: bool, said: &str) -> Response {
+    let (title, status) = match done {
+        true => ("Connected", StatusCode::OK),
+        false => ("Not connected", StatusCode::BAD_REQUEST),
+    };
+    let body = format!(
+        "<!doctype html><html><head><meta charset=utf-8><title>{title}</title>\
+<style>body{{font-family:system-ui,sans-serif;max-width:480px;margin:4rem auto;text-align:center}}</style>\
+</head><body><h1>{title}</h1><p>{}</p><p>You can close this tab and go back to Desk.</p></body></html>",
+        crate::formatting::html_escape(said)
+    );
+    (status, Html(body)).into_response()
 }
 
 fn success() -> Response {

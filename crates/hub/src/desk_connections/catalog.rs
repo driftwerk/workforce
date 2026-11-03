@@ -1,0 +1,346 @@
+//! The services a person connects on Desk, and where each one's keys are
+//! kept. Every path here is one the adapter already reads and
+//! `credential_catalog()` already lists: Connections is a view over the
+//! vault and invents no paths.
+
+use serde::Serialize;
+use workforce_common::settings::VaultSource;
+
+/// How a connector is signed in to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SignIn {
+    /// The fields below.
+    Fields,
+    /// GitHub's device flow, or a token in the fields.
+    Github,
+    /// Google's sign-in on the person's own OAuth client.
+    Google,
+}
+
+/// One thing the person types to connect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct Field {
+    pub name: &'static str,
+    pub label: &'static str,
+    pub secret: bool,
+    pub required: bool,
+    pub placeholder: &'static str,
+    /// Where it is kept, as the adapter reads it (before any `users/<id>/`).
+    #[serde(skip)]
+    pub path: &'static str,
+}
+
+const fn secret(name: &'static str, label: &'static str, path: &'static str) -> Field {
+    Field {
+        name,
+        label,
+        secret: true,
+        required: true,
+        placeholder: "",
+        path,
+    }
+}
+
+const fn plain(
+    name: &'static str,
+    label: &'static str,
+    placeholder: &'static str,
+    path: &'static str,
+) -> Field {
+    Field {
+        name,
+        label,
+        secret: false,
+        required: true,
+        placeholder,
+        path,
+    }
+}
+
+const fn optional(field: Field) -> Field {
+    Field {
+        required: false,
+        ..field
+    }
+}
+
+/// A service agents can be given.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Connector {
+    /// The adapter's `tool_prefix` and catalog name.
+    pub id: &'static str,
+    pub name: &'static str,
+    /// One line on what it gives agents.
+    pub about: &'static str,
+    pub sign_in: SignIn,
+    pub fields: &'static [Field],
+    /// Kept only in the shared tiers (Slack's bot token): "all my agents" is
+    /// the hub-wide tier, "just this agent" the agent's own.
+    pub shared: bool,
+    /// Every path a connection holds, so a disconnect removes it all.
+    pub held: &'static [&'static str],
+    /// The path whose value means it is connected.
+    pub primary: &'static str,
+}
+
+const GOOGLE_HELD: &[&str] = &[
+    "skills/google/workspaces/default/refresh_token",
+    "skills/google/workspaces/default/access_token",
+    "skills/google/workspaces/default/expires_at",
+    "skills/google/workspaces/default/scopes",
+    "skills/google/workspaces/default/email",
+];
+
+/// The Google OAuth client the person brings: hub-wide, as the callback
+/// reads it.
+pub const GOOGLE_CLIENT_ID: &str = "skills/google/oauth_client/client_id";
+pub const GOOGLE_CLIENT_SECRET: &str = "skills/google/oauth_client/client_secret";
+pub const GOOGLE_REDIRECT_URI: &str = "skills/google/oauth_client/redirect_uri";
+/// Where Google's account email is kept beside its tokens.
+pub const GOOGLE_EMAIL: &str = "skills/google/workspaces/default/email";
+pub const GOOGLE_WORKSPACE: &str = "default";
+/// The email account a connection is kept as.
+pub const EMAIL_ACCOUNT: &str = "default";
+
+const GITHUB_FIELDS: &[Field] = &[secret(
+    "token",
+    "Personal access token",
+    "skills/github/token",
+)];
+const EMAIL_FIELDS: &[Field] = &[
+    plain(
+        "username",
+        "Email address",
+        "sarah@acme.example",
+        "skills/email/accounts/default/username",
+    ),
+    secret(
+        "password",
+        "App password",
+        "skills/email/accounts/default/password",
+    ),
+    plain(
+        "imap_host",
+        "IMAP server",
+        "imap.gmail.com",
+        "skills/email/accounts/default/imap_host",
+    ),
+    // The loader skips an account without one.
+    plain(
+        "smtp_host",
+        "SMTP server",
+        "smtp.gmail.com",
+        "skills/email/accounts/default/smtp_host",
+    ),
+];
+const JIRA_FIELDS: &[Field] = &[
+    plain("site", "Site", "acme.atlassian.net", "skills/jira/site"),
+    plain("email", "Email", "sarah@acme.example", "skills/jira/email"),
+    secret("api_token", "API token", "skills/jira/api_token"),
+];
+const LINEAR_FIELDS: &[Field] = &[secret("api_key", "API key", "skills/linear/api_key")];
+const SLACK_FIELDS: &[Field] = &[secret("bot_token", "Bot token", "slack.bot_token")];
+const DATADOG_FIELDS: &[Field] = &[
+    secret("api_key", "API key", "skills/datadog/api_key"),
+    secret("app_key", "Application key", "skills/datadog/app_key"),
+    optional(plain("site", "Site", "us1", "skills/datadog/site")),
+];
+const METABASE_FIELDS: &[Field] = &[
+    plain(
+        "site_url",
+        "Address",
+        "https://metabase.acme.example",
+        "skills/metabase/site_url",
+    ),
+    secret("api_key", "API key", "skills/metabase/api_key"),
+];
+
+const GITHUB_HELD: &[&str] = &["skills/github/token"];
+const EMAIL_HELD: &[&str] = &[
+    "skills/email/accounts/default/username",
+    "skills/email/accounts/default/password",
+    "skills/email/accounts/default/imap_host",
+    "skills/email/accounts/default/smtp_host",
+];
+const JIRA_HELD: &[&str] = &[
+    "skills/jira/site",
+    "skills/jira/email",
+    "skills/jira/api_token",
+];
+const LINEAR_HELD: &[&str] = &["skills/linear/api_key"];
+const SLACK_HELD: &[&str] = &["slack.bot_token"];
+const DATADOG_HELD: &[&str] = &[
+    "skills/datadog/api_key",
+    "skills/datadog/app_key",
+    "skills/datadog/site",
+];
+const METABASE_HELD: &[&str] = &["skills/metabase/site_url", "skills/metabase/api_key"];
+
+/// The connectors of v1, in the order Settings lists them.
+pub const CATALOG: &[Connector] = &[
+    Connector {
+        id: "github",
+        name: "GitHub",
+        about: "Repositories, issues and pull requests.",
+        sign_in: SignIn::Github,
+        fields: GITHUB_FIELDS,
+        shared: false,
+        held: GITHUB_HELD,
+        primary: "skills/github/token",
+    },
+    Connector {
+        id: "google",
+        name: "Google",
+        about: "Gmail, Calendar, Drive, Docs and Sheets.",
+        sign_in: SignIn::Google,
+        fields: &[],
+        shared: false,
+        held: GOOGLE_HELD,
+        primary: "skills/google/workspaces/default/refresh_token",
+    },
+    Connector {
+        id: "email",
+        name: "Email",
+        about: "Reads and sends mail from one mailbox, over IMAP and SMTP.",
+        sign_in: SignIn::Fields,
+        fields: EMAIL_FIELDS,
+        shared: false,
+        held: EMAIL_HELD,
+        primary: "skills/email/accounts/default/password",
+    },
+    Connector {
+        id: "jira",
+        name: "Jira",
+        about: "Issues, boards and sprints.",
+        sign_in: SignIn::Fields,
+        fields: JIRA_FIELDS,
+        shared: false,
+        held: JIRA_HELD,
+        primary: "skills/jira/api_token",
+    },
+    Connector {
+        id: "linear",
+        name: "Linear",
+        about: "Issues, projects and cycles.",
+        sign_in: SignIn::Fields,
+        fields: LINEAR_FIELDS,
+        shared: false,
+        held: LINEAR_HELD,
+        primary: "skills/linear/api_key",
+    },
+    Connector {
+        id: "slack",
+        name: "Slack",
+        about: "Reads channels and posts as your Slack app.",
+        sign_in: SignIn::Fields,
+        fields: SLACK_FIELDS,
+        shared: true,
+        held: SLACK_HELD,
+        primary: "slack.bot_token",
+    },
+    Connector {
+        id: "datadog",
+        name: "Datadog",
+        about: "Logs, metrics and monitors.",
+        sign_in: SignIn::Fields,
+        fields: DATADOG_FIELDS,
+        shared: false,
+        held: DATADOG_HELD,
+        primary: "skills/datadog/api_key",
+    },
+    Connector {
+        id: "metabase",
+        name: "Metabase",
+        about: "Questions, dashboards and SQL on your Metabase.",
+        sign_in: SignIn::Fields,
+        fields: METABASE_FIELDS,
+        shared: false,
+        held: METABASE_HELD,
+        primary: "skills/metabase/api_key",
+    },
+];
+
+pub fn find(id: &str) -> Option<&'static Connector> {
+    CATALOG.iter().find(|c| c.id == id)
+}
+
+impl Connector {
+    /// The tiers a connection at `agent_level` is kept in, the one written
+    /// first. The second is what was there before Connections: a key saved
+    /// at the bare tier, which still counts and is what a disconnect at
+    /// that level removes.
+    pub fn tiers(&self, agent_level: bool) -> [VaultSource; 2] {
+        match (self.shared, agent_level) {
+            (true, false) => [VaultSource::Global, VaultSource::Global],
+            (true, true) => [VaultSource::AgentSpecific, VaultSource::AgentSpecific],
+            (false, false) => [VaultSource::GlobalPerUser, VaultSource::Global],
+            (false, true) => [VaultSource::AgentPerUser, VaultSource::AgentSpecific],
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_path_is_one_the_vault_editor_already_offers() {
+        let offered: Vec<String> = crate::skill_loader::credential_catalog()
+            .into_iter()
+            .map(|e| e.template)
+            .collect();
+        let known = |path: &str| {
+            offered.iter().any(|t| {
+                t == path
+                    || match t.split_once('{') {
+                        // A template: `skills/email/accounts/{account}/username`.
+                        Some((head, rest)) => rest.split_once('}').is_some_and(|(_, tail)| {
+                            path.starts_with(head) && path.ends_with(tail)
+                        }),
+                        None => false,
+                    }
+            })
+        };
+        for c in CATALOG {
+            assert!(
+                crate::skill_loader::builtin_skill_catalog()
+                    .iter()
+                    .any(|m| m.tool_prefix == c.id),
+                "{} is a built-in adapter",
+                c.id
+            );
+            for path in c.held.iter().chain([&c.primary]) {
+                assert!(known(path), "{path} is in credential_catalog()");
+            }
+            for f in c.fields {
+                assert!(c.held.contains(&f.path), "{} holds {}", c.id, f.path);
+            }
+        }
+    }
+
+    #[test]
+    fn only_slack_is_kept_in_the_shared_tiers_and_every_other_path_may_be_a_persons() {
+        for c in CATALOG {
+            for path in c.held {
+                assert!(
+                    !crate::vault_policy::is_shared_only(path),
+                    "{path} may be written per person"
+                );
+            }
+            assert_eq!(c.shared, c.id == "slack", "{}", c.id);
+        }
+        let slack = find("slack").unwrap();
+        assert_eq!(
+            slack.tiers(false),
+            [VaultSource::Global, VaultSource::Global]
+        );
+        assert_eq!(
+            slack.tiers(true),
+            [VaultSource::AgentSpecific, VaultSource::AgentSpecific]
+        );
+        let linear = find("linear").unwrap();
+        assert_eq!(linear.tiers(false)[0], VaultSource::GlobalPerUser);
+        assert_eq!(linear.tiers(true)[0], VaultSource::AgentPerUser);
+    }
+}
