@@ -2547,7 +2547,7 @@ mod tests {
             DecisionForm {
                 title: "Send today's digest?".into(),
                 label: "Revise with a much longer label".into(),
-                input: workforce_orchestrator::workflow::decision::ButtonInput {
+                input: workforce_orchestrator::workflow::decision::ChoiceInput {
                     variable: "review_notes".into(),
                     label: "What should change?".into(),
                     placeholder: placeholder.map(str::to_string),

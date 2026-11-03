@@ -94,6 +94,39 @@ pub struct ButtonInput {
     pub required: bool,
 }
 
+/// A button's input as a run holds it: [`ButtonInput`] without
+/// `deny_unknown_fields`, so a run paused by a newer build still reads.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChoiceInput {
+    pub variable: String,
+    pub label: String,
+    #[serde(default)]
+    pub placeholder: Option<String>,
+    #[serde(default = "default_max_chars")]
+    pub max_chars: usize,
+    #[serde(default = "default_true")]
+    pub required: bool,
+}
+
+impl From<ButtonInput> for ChoiceInput {
+    fn from(input: ButtonInput) -> Self {
+        let ButtonInput {
+            variable,
+            label,
+            placeholder,
+            max_chars,
+            required,
+        } = input;
+        Self {
+            variable,
+            label,
+            placeholder,
+            max_chars,
+            required,
+        }
+    }
+}
+
 fn default_max_chars() -> usize {
     DEFAULT_INPUT_CHARS
 }
@@ -233,7 +266,7 @@ pub struct Choice {
     #[serde(default)]
     pub set: BTreeMap<String, String>,
     #[serde(default)]
-    pub input: Option<ButtonInput>,
+    pub input: Option<ChoiceInput>,
 }
 
 /// What a press writes besides the button's `set`.
@@ -1004,7 +1037,7 @@ impl RunDecision {
                     next: button.route(step)?,
                     start,
                     set: button.set.clone(),
-                    input: button.input.clone(),
+                    input: button.input.clone().map(ChoiceInput::from),
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
@@ -2244,7 +2277,7 @@ exit = true
         })
     }
 
-    fn revise_choice(edit: impl Fn(&mut ButtonInput)) -> Choice {
+    fn revise_choice(edit: impl Fn(&mut ChoiceInput)) -> Choice {
         let def = revisable(|t| t.to_string()).unwrap();
         let mut choice = opened(&def, &mut paused_at_review(&def))
             .choice("revise")
@@ -2536,5 +2569,30 @@ exit = true
             read.closed,
             Some(Closed::Decided { input: None, .. })
         ));
+    }
+
+    #[test]
+    fn a_choice_input_a_newer_build_wrote_still_reads() {
+        let def = revisable(|t| t.to_string()).unwrap();
+        let mut instance = paused_at_review(&def);
+        opened(&def, &mut instance);
+        let mut stored = instance.variables[DECISION_KEY].clone();
+        stored["choices"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .filter_map(|choice| choice["input"].as_object_mut())
+            .for_each(|input| {
+                input.insert("rows".into(), serde_json::json!(4));
+            });
+
+        let read = RunDecision::read(&serde_json::json!({ DECISION_KEY: stored })).unwrap();
+
+        assert_eq!(
+            read.choice("revise")
+                .and_then(|c| c.input.as_ref())
+                .map(|input| input.variable.as_str()),
+            Some("review_notes")
+        );
     }
 }

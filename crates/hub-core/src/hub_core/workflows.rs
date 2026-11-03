@@ -3,7 +3,7 @@
 use crate::run_steering::SteerRefused;
 use uuid::Uuid;
 use workforce_core::access::Visibility;
-use workforce_orchestrator::workflow::decision::{ButtonInput, InputRefused};
+use workforce_orchestrator::workflow::decision::{ChoiceInput, InputRefused};
 
 /// A workflow lifecycle event delivered to a streaming HTTP trigger caller.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -103,7 +103,7 @@ pub struct TypedPress {
 pub struct DecisionForm {
     pub title: String,
     pub label: String,
-    pub input: ButtonInput,
+    pub input: ChoiceInput,
     /// Whether the card sits in the run's own thread, where a typed reply
     /// presses it too.
     pub in_thread: bool,

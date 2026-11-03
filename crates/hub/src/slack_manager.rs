@@ -10689,7 +10689,7 @@ async fn control_workflow_from_thread(
             return;
         }
         WorkflowCommand::Resume { outcome, feedback } => {
-            info!(instance = %inst.id, outcome = ?outcome, feedback = ?feedback, "Resuming workflow from Slack");
+            info!(instance = %inst.id, outcome = ?outcome, feedback_chars = ?feedback.as_ref().map(|f| f.chars().count()), "Resuming workflow from Slack");
             let ask = crate::hub_core::workflows::ResumeAsk {
                 outcome: outcome.clone(),
                 gate: None,
@@ -13308,8 +13308,7 @@ mod workflow_steering_tests {
             assert_eq!(
                 paused_thread_reminder(press.hub.runtime.as_ref(), &row),
                 "This run is waiting on a decision: *Send* · *Redraft* · *Cancel* · *Done* · \
-                 *Flag* · `Revise: <What should change?>`, from Bob. Reply with a choice or use \
-                 the buttons."
+                 *Flag* · `Revise: …`, from Bob. Reply with a choice or use the buttons."
             );
             assert!(build_workflow_status_message(&row, &press.hub.host())
                 .await

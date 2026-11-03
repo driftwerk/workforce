@@ -1,4 +1,4 @@
-import { useState, type ReactNode } from "react";
+import { useId, useState, type ReactNode } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -153,10 +153,13 @@ function DecisionPanel({ instanceId, decision, children }: DecisionPanelProps) {
   const resumeMutation = useResumeWorkflow();
   const [asking, setAsking] = useState<string | null>(null);
   const [text, setText] = useState("");
+  const inputId = useId();
+  const problemId = useId();
   const deciders = waitingOnSentence(decision.waiting_on);
   const expiry = expiryText(decision.expires_at, decision.on_expiry);
   const asked = decision.choices.find((choice) => choice.input && choice.outcome === asking);
   const problem = asked ? inputProblem(text, asked) : null;
+  const shownProblem = text ? problem : null;
 
   const decide = (choice: DecisionChoice, feedback?: string) => {
     if (choice.confirm && !confirm(choice.confirm)) return;
@@ -192,6 +195,7 @@ function DecisionPanel({ instanceId, decision, children }: DecisionPanelProps) {
               size="sm"
               className="h-7 text-xs"
               disabled={resumeMutation.isPending}
+              aria-expanded={choice.input ? choice.outcome === asking : undefined}
               onClick={() => press(choice)}
             >
               {choice.label}
@@ -203,17 +207,18 @@ function DecisionPanel({ instanceId, decision, children }: DecisionPanelProps) {
       )}
       {decision.may_decide && asked?.input && (
         <div className="space-y-1.5">
-          <label htmlFor="decision-input" className="text-xs font-medium text-muted-foreground">
+          <label htmlFor={inputId} className="text-xs font-medium text-muted-foreground">
             {asked.input.label}
           </label>
           <textarea
-            id="decision-input"
+            id={inputId}
             className="w-full min-h-[72px] rounded-md border bg-background px-3 py-2 text-xs resize-y"
             value={text}
             onChange={(e) => setText(e.target.value)}
-            maxLength={asked.input.max_chars}
             placeholder={asked.input.placeholder ?? undefined}
             disabled={resumeMutation.isPending}
+            aria-invalid={shownProblem !== null}
+            aria-describedby={shownProblem ? problemId : undefined}
           />
           <div className="flex items-center gap-2">
             <Button
@@ -225,7 +230,11 @@ function DecisionPanel({ instanceId, decision, children }: DecisionPanelProps) {
             >
               {asked.label}
             </Button>
-            {problem && text && <span className="text-xs text-muted-foreground">{problem}</span>}
+            {shownProblem && (
+              <span id={problemId} className="text-xs text-muted-foreground">
+                {shownProblem}
+              </span>
+            )}
           </div>
         </div>
       )}

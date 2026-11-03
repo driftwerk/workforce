@@ -1223,8 +1223,8 @@ impl WorkflowRuntime {
         let choices = decision
             .choices
             .iter()
-            .map(|c| match &c.input {
-                Some(input) => format!("`{}: <{}>`", c.label, input.label),
+            .map(|c| match c.input {
+                Some(_) => format!("`{}: …`", c.label),
                 None => format!("*{}*", c.label),
             })
             .collect::<Vec<_>>()
