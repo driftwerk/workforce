@@ -162,6 +162,18 @@ const CLAIMS: &[(&str, &str, &str, Claim)] = &[
         "person",
         NotPersonal("`you`, the one person of the Desk whose own hub this is"),
     ),
+    (
+        "desk",
+        "breakers",
+        "subject",
+        NotPersonal("the session, agent or spend total a breaker holds, never a person's id"),
+    ),
+    (
+        "desk",
+        "budgets",
+        "scope",
+        NotPersonal("what a budget counts: Desk, a default, or one session or agent"),
+    ),
     ("desk", "attachments", "owner", By(C::Sessions)),
     ("desk", "connections", "person", By(C::Vault)),
     (
