@@ -4,10 +4,13 @@
 //! its activity. Installed by [`install`] when Desk starts; a hub without
 //! `[desk]` installs nothing and every call is decided as before.
 //!
-//! Only the computer namespaces (`filesystem`, `code`, `exec`, `desk`,
-//! `coding`, `claude_code`, `wasm_skill`, `attachments`) are decided.
-//! Connectors pass until their read lists and per-agent bindings land
-//! (AC9), and every other namespace never asks.
+//! The computer namespaces (`filesystem`, `code`, `exec`, `desk`, `coding`,
+//! `claude_code`, `wasm_skill`, `attachments`) are decided, and so are the
+//! connectors Desk lists (`CONNECTORS`): a call there is a read or a write
+//! by its tool name, refused when the agent's `[skills]` turns the
+//! connector off or makes it read only, and asked about when it sends to
+//! people. Every other namespace, the other built-in adapters included,
+//! never asks.
 //!
 //! An agent with no `[computer]` is Full access, asking first; its own
 //! folder is the roots its tools already have (`tool_roots`).
@@ -56,6 +59,34 @@ fn access_of(subject: &ComputerSubject) -> ComputerAccess {
         }),
         _ => ComputerAccess::default(),
     }
+}
+
+/// This agent's `[skills]` binding, as the verdict reads it: `None` (every
+/// connector) where it names no `enabled` nor `read_only`. One that can't be
+/// read turns every connector off: admission refuses it before it is written.
+fn connectors_of(subject: &ComputerSubject) -> Option<workforce_desk::computer::Connectors> {
+    let binding = match AgentWorkspaceConfig::load(&subject.workspace) {
+        Ok(Some(config)) => config.connectors().unwrap_or_else(|e| {
+            warn!(agent = %subject.agent, error = %e, "[skills] unreadable; its connectors are off");
+            workforce_common::connector_binding::ConnectorBinding {
+                enabled: Some(Vec::new()),
+                ..Default::default()
+            }
+        }),
+        _ => return None,
+    };
+    if binding.enabled.is_none() && binding.read_only.is_empty() {
+        return None;
+    }
+    Some(workforce_desk::computer::Connectors {
+        enabled: binding.enabled.unwrap_or_else(|| {
+            workforce_common::connector_binding::CONNECTORS
+                .iter()
+                .map(|c| c.to_string())
+                .collect()
+        }),
+        read_only: binding.read_only,
+    })
 }
 
 /// What no agent reaches on this computer: Desk's data (the hub's data, its
@@ -112,7 +143,7 @@ impl HubComputerGate {
                 home,
                 // Commands can't be contained yet (AC5).
                 contained: false,
-                connectors: None,
+                connectors: connectors_of(subject),
             },
         }
     }
@@ -246,6 +277,13 @@ impl HubComputerGate {
 
     fn activity(&self, record: &Record) -> Activity {
         let home = &self.policy.home;
+        let connector = match &record.decision.effect {
+            Effect::Connector { connector, .. } => workforce_common::connector_binding::CONNECTORS
+                .iter()
+                .copied()
+                .find(|c| c == connector),
+            _ => None,
+        };
         let (kind, folder) = match &record.decision.effect {
             Effect::Read { paths } => ("read", paths.first().cloned()),
             Effect::Write { paths } => ("write", paths.first().cloned()),
@@ -281,9 +319,11 @@ impl HubComputerGate {
             kind: kind.into(),
             doing: describe(&record.decision.effect).replace(&home.display().to_string(), "~"),
             folder: folder.map(|f| shown(&f, home)),
-            connector: None,
+            connector: connector.map(str::to_string),
             tool: record.tool.clone(),
-            vault_source: None,
+            vault_source: connector
+                .and_then(|c| crate::connector_pins::source_of(&self.policy.agent, c))
+                .map(|s| s.label().to_string()),
             decided_by: decided_by.into(),
             outcome: json!({
                 "outcome": record.outcome.as_str(),
@@ -299,7 +339,26 @@ impl HubComputerGate {
 
 impl ComputerGate for HubComputerGate {
     fn decides(&self, tool: &str) -> bool {
-        namespace(tool) == Some(Namespace::Computer)
+        match namespace(tool) {
+            Some(Namespace::Computer) => true,
+            Some(Namespace::Connector) => {
+                workforce_common::connector_binding::connector_of(tool).is_some()
+            }
+            None => false,
+        }
+    }
+
+    fn effect_of(&self, tool: &str, effect: Effect) -> Effect {
+        match (
+            effect,
+            workforce_common::connector_binding::connector_of(tool),
+        ) {
+            (Effect::Unknown, Some(connector)) => Effect::Connector {
+                connector: connector.to_string(),
+                write: !workforce_common::connector_binding::is_read(tool),
+            },
+            (effect, _) => effect,
+        }
     }
 
     fn reach(&self, effect: &Effect) -> Option<workforce_agent::tools::paths::Reach> {
@@ -673,6 +732,59 @@ mod tests {
                 other => panic!("{other:?}"),
             }
             store.set_access_stopped(false).await.unwrap();
+        })
+        .await;
+    }
+
+    /// Connector calls by their tool names, as the agent's `[skills]` and
+    /// its asking say: off and read-only refuse, a send to people asks by
+    /// default and never once the agent asks before nothing, any other
+    /// write runs; a job still runs what would ask. Adapters Desk doesn't
+    /// list are never decided.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn connector_calls_follow_the_binding_and_only_sends_to_people_ask() {
+        with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+            let store = Arc::new(DeskStore::with_pool(pool).await.unwrap());
+            let hub = hub();
+            let config = hub.subject.workspace.join("config.toml");
+            let tools = tools(&hub.subject.workspace);
+            for name in [
+                "linear.issue_get",
+                "linear.issue_create",
+                "slack.send",
+                "github.pr_merge",
+                "github.pr_get",
+                "jira.search",
+                "browser.navigate",
+            ] {
+                tools.register(Arc::new(Elsewhere(name)));
+            }
+            let decide_with = |body: &str, tool: &str| {
+                std::fs::write(&config, body).unwrap();
+                let gate: Arc<dyn ComputerGate> = Arc::new(HubComputerGate::for_agent(
+                    Computer::new(Arc::clone(&store)),
+                    &hub.config,
+                    &hub.subject,
+                ));
+                let g = gates(Some(Arc::clone(&gate)));
+                let asked = as_sarah(|| kind(&gate_tool_call(&g, &policy(), &tools, tool, &json!({}))));
+                let unattended = as_sarah(|| unattended_refusal(Some(gate.as_ref()), &tools, tool, &json!({})));
+                (asked, unattended.is_none())
+            };
+            let bound = "[skills]\nenabled = [\"linear\", \"slack\", \"github\"]\nread_only = [\"github\"]\n";
+            assert_eq!(decide_with(bound, "linear.issue_get").0, "run");
+            assert_eq!(decide_with(bound, "linear.issue_create").0, "run");
+            assert_eq!(decide_with(bound, "slack.send"), ("asks once", true));
+            assert_eq!(decide_with(bound, "github.pr_get").0, "run");
+            assert_eq!(decide_with(bound, "github.pr_merge").0, "refused");
+            assert_eq!(decide_with(bound, "jira.search").0, "refused");
+            assert_eq!(decide_with(bound, "browser.navigate").0, "run");
+            // Asking before nothing: a send runs too.
+            let never = format!("[computer]\nasks = \"never\"\n\n{bound}");
+            assert_eq!(decide_with(&never, "slack.send").0, "run");
+            // No binding: every connector, as before; a send still asks.
+            assert_eq!(decide_with("", "jira.search").0, "run");
+            assert_eq!(decide_with("", "slack.send").0, "asks once");
         })
         .await;
     }

@@ -2000,10 +2000,19 @@ fn layered_user_store(
     agent_vault: Arc<Vault>,
     global_vault: Option<Arc<Vault>>,
 ) -> Arc<dyn workforce_common::settings::SecretStore> {
-    Arc::new(crate::user_config::LayeredUserVault::new(
-        agent_vault,
-        global_vault,
-    ))
+    let store = crate::user_config::LayeredUserVault::new(agent_vault, global_vault);
+    Arc::new(match LOADING_PINS.with(|p| p.borrow().clone()) {
+        Some(pins) => store.with_pins(pins),
+        None => store,
+    })
+}
+
+thread_local! {
+    /// The pins of the agent whose skill [`load_skill_from_vault`] is
+    /// loading, so every store its adapter keeps reads as that agent's
+    /// `[skills]` says (loading is synchronous, on one thread).
+    static LOADING_PINS: std::cell::RefCell<Option<Arc<workforce_common::credential_pin::PinSlot>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 fn discover_workspaces(
@@ -2202,6 +2211,14 @@ pub fn load_skill_from_vault(
     config: &WorkforceConfig,
     registry: &ToolRegistry,
 ) -> eyre::Result<SkillLoadResult> {
+    struct Loading;
+    impl Drop for Loading {
+        fn drop(&mut self) {
+            LOADING_PINS.with(|p| p.borrow_mut().take());
+        }
+    }
+    LOADING_PINS.with(|p| *p.borrow_mut() = Some(registry.credential_pins()));
+    let _loading = Loading;
     match skill_name {
         "github" => load_github_from_vault(vault, global_vault, config, registry),
         "google" => load_google_from_vault(vault, global_vault, registry),
