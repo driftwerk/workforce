@@ -27,7 +27,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 # Slack transport (behind feature flag)
 reqwest = { workspace = true, optional = true }
 tokio = { version = "1", features = ["sync", "time", "macros", "rt"], optional = true }
-tokio-tungstenite = { version = "0.28", features = ["native-tls"], optional = true }
+tokio-tungstenite = { version = "0.30", features = ["native-tls"], optional = true }
 futures = { version = "0.3", optional = true }
 lru = { workspace = true, optional = true }
 
@@ -45,7 +45,7 @@ pulldown-cmark = { workspace = true, optional = true }
 # Google skill (pure-Rust OAuth2 + REST clients)
 axum = { workspace = true, optional = true }
 url = { workspace = true, optional = true }
-sha2 = { version = "0.10", optional = true }
+sha2 = { version = "0.11", optional = true }
 rand = { workspace = true, optional = true }
 open = { version = "5", optional = true }
 workforce-oauth-client = { workspace = true, optional = true }

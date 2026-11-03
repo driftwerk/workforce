@@ -65,7 +65,7 @@ ratatui = { workspace = true }
 crossterm = { workspace = true }
 ratatui-textarea = { workspace = true }
 futures = { workspace = true }
-tokio-tungstenite = { version = "0.28", features = ["native-tls"] }
+tokio-tungstenite = { version = "0.30", features = ["native-tls"] }
 pulldown-cmark = { workspace = true }
 unicode-width = { workspace = true }
 base64 = { workspace = true }
@@ -77,7 +77,7 @@ glob = "0.3"
 # `#[global_allocator]` block in `src/main.rs`. Not available on MSVC; the cfg
 # guard there falls back to the system allocator on that target.
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
-tikv-jemallocator = { version = "0.6", features = ["unprefixed_malloc_on_supported_platforms", "background_threads", "profiling"] }
+tikv-jemallocator = { version = "0.7", features = ["unprefixed_malloc_on_supported_platforms", "background_threads", "profiling"] }
 
 [dev-dependencies]
 async-trait = { workspace = true }
