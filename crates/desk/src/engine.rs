@@ -142,6 +142,9 @@ pub struct Caps {
     /// Whether it can be started with its own reviewer answering its
     /// approvals ("Approve for me").
     pub approve_for_me: bool,
+    /// Whether its sessions can each run on one of several of the person's
+    /// accounts, and how those sign in.
+    pub accounts: crate::engine_accounts::AccountsVia,
     /// What the person reads beside it, in the new session dialog and on
     /// its card.
     pub notes: Vec<&'static str>,
@@ -158,6 +161,7 @@ impl Caps {
             usage: UsageSource::None,
             plan: None,
             approve_for_me: false,
+            accounts: crate::engine_accounts::AccountsVia::None,
             notes: Vec::new(),
         }
     }
@@ -206,6 +210,10 @@ pub fn caps(engine: Engine, view: View) -> Caps {
             usage: UsageSource::Tokens,
             plan: Some(LocalPlan::Claude),
             approve_for_me: false,
+            // `claude setup-token`, given to each session as
+            // `CLAUDE_CODE_OAUTH_TOKEN`, which Claude Code ranks above its
+            // keychain login (code.claude.com/docs/en/authentication).
+            accounts: crate::engine_accounts::AccountsVia::Token,
             notes: Vec::new(),
         },
         // Codex's TUI asks its approvals; Desk, subscribed to its thread,
@@ -218,6 +226,7 @@ pub fn caps(engine: Engine, view: View) -> Caps {
             usage: UsageSource::Tokens,
             plan: Some(LocalPlan::Codex),
             approve_for_me: true,
+            accounts: crate::engine_accounts::AccountsVia::None,
             notes: vec![
                 "Codex asks its approvals in its terminal; you can answer them from the Floor too.",
             ],

@@ -130,6 +130,31 @@ impl PlanUsage for Plans {
 }
 
 impl PlanSink for Plans {
+    fn windows(&self, plan: LocalPlan, payload: &Value) -> Vec<workforce_desk::usage::LimitWindow> {
+        let windows = match plan {
+            LocalPlan::Claude => claude_mod_usage(payload),
+            LocalPlan::Codex => codex_usage(payload),
+        };
+        windows
+            .into_iter()
+            .map(|w| workforce_desk::usage::LimitWindow {
+                used_percent: w.used_percent,
+                resets_at: w.resets_at,
+                minutes: w.minutes,
+            })
+            .collect()
+    }
+
+    fn account_key(&self, plan: LocalPlan, ids: &[String]) -> Option<String> {
+        account_key(
+            match plan {
+                LocalPlan::Claude => PlanKind::Claude,
+                LocalPlan::Codex => PlanKind::Chatgpt,
+            },
+            ids,
+        )
+    }
+
     fn local(&self, plan: LocalPlan, payload: Value, account: LocalAccount) {
         let (kind, windows) = match plan {
             LocalPlan::Claude => (PlanKind::Claude, claude_mod_usage(&payload)),

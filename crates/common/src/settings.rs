@@ -709,6 +709,35 @@ pub struct DeskConfig {
     /// in days, so its history can still open it.
     #[serde(default = "default_desk_attachment_retention_days")]
     pub attachment_retention_days: u64,
+    /// Where the person's engine accounts' sign-ins are kept (`[desk.accounts]`).
+    /// Unset: Desk keeps no accounts, and every session runs on the CLI's
+    /// own sign-in on this computer.
+    #[serde(default)]
+    pub accounts: DeskAccounts,
+}
+
+/// Where the sign-ins of the person's engine accounts (a second Claude
+/// subscription, say) are kept. Never in Postgres, the hub's vault or its
+/// config: Desk Helper says which store Desk chose for its own secrets.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeskAccounts {
+    /// `system` (the keychain), `file` (a private file), or none.
+    #[serde(default)]
+    pub store: Option<DeskAccountsStore>,
+    /// The private file, with `store = "file"`.
+    #[serde(default)]
+    pub file: Option<String>,
+    /// The service the keychain's items are kept under, with
+    /// `store = "system"`. Default: Desk's own (`xyz.driftwerk.desk`).
+    #[serde(default)]
+    pub service: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DeskAccountsStore {
+    System,
+    File,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -739,6 +768,7 @@ impl Default for DeskConfig {
             pty_holder_token: None,
             attachment_max_mb: default_desk_attachment_max_mb(),
             attachment_retention_days: default_desk_attachment_retention_days(),
+            accounts: DeskAccounts::default(),
         }
     }
 }

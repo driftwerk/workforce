@@ -81,6 +81,7 @@ pub(crate) fn options(dir: &std::path::Path) -> crate::service::Options {
         adopt_every: None,
         holder: None,
         hub_internal: Default::default(),
+        account_keys: None,
     }
 }
 
