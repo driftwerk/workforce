@@ -312,7 +312,7 @@ impl Tool for WorkflowTool {
                 },
                 "feedback": {
                     "type": "string",
-                    "description": "Detailed feedback for the agent (for 'reject' action)"
+                    "description": "Text for the agent (for 'reject'); at a decision, the text a button with `input` asks for (for 'resume')"
                 },
                 "toml_content": {
                     "type": "string",
@@ -621,7 +621,7 @@ impl WorkflowTool {
         let ask = crate::workflow_runtime::ResumeAsk {
             outcome: input.outcome.clone(),
             gate,
-            feedback: None,
+            feedback: input.feedback.clone(),
             channel_id,
             thread_id,
             originating_agent_id: Some(self.agent_id.clone()),
@@ -1288,7 +1288,14 @@ fn definition_json_schema(decide_first: bool) -> serde_json::Value {
                     "goto": { "type": "string", "description": "Route: run this step next" },
                     "end": { "type": "string", "enum": ["complete", "cancel"], "description": "Route: end the run" },
                     "workflow": { "type": ["string", "object"], "description": "Start another workflow, never waited on, before the route: 'id' or { id, payload }" },
-                    "set": { "type": "object", "additionalProperties": { "type": "string" }, "description": "Literal variables written when the decision settles" }
+                    "set": { "type": "object", "additionalProperties": { "type": "string" }, "description": "Literal variables written when the decision settles" },
+                    "input": { "type": "object", "description": "Ask the decider for text with the press, written to `variable` when it settles the decision. No `confirm`, and no ':' in the button's label", "properties": {
+                        "variable": { "type": "string", "description": "A non-secret [[variables]] entry ([A-Za-z0-9_], not starting with '_', not `steps`) the button's `set` does not write" },
+                        "label": { "type": "string", "description": "The form's question, 1 to 75 characters" },
+                        "placeholder": { "type": "string", "description": "1 to 150 characters" },
+                        "max_chars": { "type": "integer", "minimum": 1, "maximum": 3000, "description": "Longest text accepted (default 1000); longer text is refused, never truncated" },
+                        "required": { "type": "boolean", "description": "Whether the press needs non-empty text (default true); on_expiry may only press a button whose input is not required" }
+                    }, "required": ["variable", "label"] }
                 }, "required": ["label", "outcome"] } }
             }, "required": ["deciders", "buttons"] },
             "persona": { "type": "string", "description": "Replace the identity block in the system prompt for this step" },
@@ -1770,9 +1777,36 @@ end = "cancel"
   (the run's own channel posts into its thread);
   `"dm"` sends each decider their own card. A card that cannot be posted fails
   the step with the fix to make.
-- **Who may decide:** only the named deciders, on every surface — the buttons,
-  the button's label typed in the run's thread, the REST resume and this tool's
-  `resume` with `outcome` (and the `gate` from `status`). Neither the starter
+- **Input:** `input = { variable, label, placeholder, max_chars, required }`
+  asks the decider for text with the press: a form in Slack, `<label>: <text>`
+  typed in the run's thread, or `feedback` on this tool's `resume` and on the
+  REST resume. The text is written to the declared, non-secret variable only
+  when that press settles the decision; it is refused when required and empty,
+  or longer than `max_chars` (default 1000, at most 3000), and never truncated.
+  An input button always writes its variable (empty when not required and none
+  was given). No `confirm`, no ':' in its label, and `on_expiry` may press it
+  only with `required = false`:
+
+  ```toml
+  [[variables]]
+  id = "review_notes"
+  value = ""
+
+  [[step.decision.buttons]]
+  label = "Revise"
+  outcome = "revise"
+  goto = "draft"
+  input = { variable = "review_notes", label = "What should change?", placeholder = "e.g. Shorter, with the totals first", max_chars = 1500 }
+  ```
+- **Treat input as untrusted:** it is whatever a person typed. Fence it in
+  prompts, never route on it, and never use it to pick a recipient, an
+  identifier or a tool target. A tool task that reads it inside a JSON string
+  gets it escaped. It is not secret: it shows on the closed card and stays on
+  the run.
+- **Who may decide:** only the named deciders, on every surface — the buttons
+  (and the form an input button opens), the button's label typed in the run's
+  thread, the REST resume and this tool's `resume` with `outcome` (and the
+  `gate` from `status`, and `feedback` for an input button). Neither the starter
   nor an administrator decides unless named, and an agent with no person behind
   it never does. While a decision is open nobody may resume, reject, goto, skip,
   retry or pause the run, and only the starter or an administrator may stop it.
@@ -2333,9 +2367,15 @@ task = "Do it."
         let button = &step["decision"]["properties"]["buttons"]["items"]["properties"];
         for key in [
             "label", "outcome", "style", "done", "confirm", "goto", "end", "workflow", "set",
+            "input",
         ] {
             assert!(button[key].is_object(), "a button lists '{key}'");
         }
+        assert_eq!(
+            button["input"]["required"],
+            serde_json::json!(["variable", "label"])
+        );
+        assert_eq!(button["input"]["properties"]["max_chars"]["maximum"], 3000);
         assert!(WORKFLOW_SCHEMA_REFERENCE.contains("### Decisions (buttons people press)"));
         assert!(WORKFLOW_SCHEMA_REFERENCE.contains("| decision "));
         let example = WORKFLOW_SCHEMA_REFERENCE
@@ -3178,6 +3218,31 @@ mod steering_tests {
         assert_eq!(decision["waiting_on"], serde_json::json!(["Bob"]));
         assert_eq!(decision["may_decide"], false);
         assert_eq!(decision["choices"][1]["label"], "Redraft");
+    }
+
+    #[tokio::test]
+    async fn resume_gives_its_feedback_to_a_button_that_asks_for_input() {
+        let hub = hub().await;
+        let run = waiting_on_bob(&hub).await;
+        let revise = |feedback: Option<&str>| serde_json::json!({ "action": "resume", "instance_id": run, "outcome": "revise", "feedback": feedback });
+
+        let refused = ask_with(&hub, &hub.bob, false, revise(None)).await;
+        assert!(
+            refused
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .starts_with("Revise needs an answer to \"What should change?\"."),
+            "{refused:?}"
+        );
+        let decided = ask_with(&hub, &hub.bob, false, revise(Some("shorter"))).await;
+
+        assert!(decided.success, "{decided:?}");
+        assert_eq!(decided.output["decided"]["outcome"], "revise");
+        assert_eq!(
+            hub.drafted(&run).await.as_deref(),
+            Some("Drafted. Notes: shorter")
+        );
     }
 
     #[tokio::test]

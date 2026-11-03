@@ -8816,8 +8816,18 @@ impl crate::hosts::WorkflowHost for WorkflowRuntime {
         channel: &str,
         thread_ts: &str,
         text: &str,
-    ) -> Option<(String, uuid::Uuid, String)> {
+    ) -> Option<decision::TypedPress> {
         WorkflowRuntime::decision_reply(self, channel, thread_ts, text)
+    }
+
+    fn decision_form(
+        &self,
+        instance_id: &str,
+        gate: uuid::Uuid,
+        outcome: &str,
+        slack_user: &str,
+    ) -> std::result::Result<Option<decision::DecisionForm>, decision::DecisionRefused> {
+        WorkflowRuntime::decision_form(self, instance_id, gate, outcome, slack_user)
     }
 
     fn decision_reminder(&self, row: &WorkflowInstanceRow) -> Option<String> {
@@ -14265,6 +14275,17 @@ pub(crate) mod testing {
             panic!("the run never stopped moving");
         }
 
+        /// What the run `id`'s latest `draft` reported.
+        pub(crate) async fn drafted(&self, id: &str) -> Option<String> {
+            self.settled(id)
+                .await
+                .step_history
+                .iter()
+                .rev()
+                .find(|record| record.step_id == "draft" && !record.failed)
+                .and_then(|record| record.report.clone())
+        }
+
         /// The steps the run `id` has run, in order.
         pub(crate) async fn ran(&self, id: &str) -> Vec<String> {
             self.settled(id)
@@ -14351,15 +14372,18 @@ pub(crate) mod testing {
         )
     }
 
-    /// The steps of a digest workflow: `draft` renders its draft, `review`
-    /// waits on a decision `extra` adds to, and `send` sends. `deciders` is the
-    /// value of the `approvers` variable the decision reads.
+    /// The steps of a digest workflow: `draft` renders its draft (with any
+    /// review notes), `review` waits on a decision `extra` adds to, and `send`
+    /// sends. `deciders` is the value of the `approvers` variable the decision
+    /// reads; Revise asks for notes of at most 20 characters.
     pub(crate) fn decision_steps(deciders: &str, extra: &str) -> String {
         format!(
             "[[variables]]\nid = \"approvers\"\nvalue = \"{deciders}\"\n\n\
              [[variables]]\nid = \"escalated\"\nvalue = \"no\"\n\n\
+             [[variables]]\nid = \"review_notes\"\nvalue = \"\"\n\n\
              [[step]]\nid = \"draft\"\nname = \"Draft\"\ntask = \"\"\n\
-             report = \"Drafted.\"\nreport_render = \"template\"\n\n\
+             report = \"Drafted.{{% if review_notes %}} Notes: {{{{ review_notes }}}}{{% endif %}}\"\n\
+             report_render = \"template\"\n\n\
              [[step]]\nid = \"review\"\nname = \"Review the digest\"\ntask = \"\"\n\
              report = \"Today's digest.\"\nreport_render = \"template\"\n\
              pause = \"awaiting-approval\"\n\
@@ -14370,6 +14394,8 @@ pub(crate) mod testing {
              [[step.decision.buttons]]\nlabel = \"Cancel\"\noutcome = \"cancel\"\nstyle = \"danger\"\nend = \"cancel\"\n\n\
              [[step.decision.buttons]]\nlabel = \"Done\"\noutcome = \"done\"\nend = \"complete\"\n\n\
              [[step.decision.buttons]]\nlabel = \"Flag\"\noutcome = \"flag\"\ngoto = \"send\"\nset = {{ escalated = \"yes\" }}\n\n\
+             [[step.decision.buttons]]\nlabel = \"Revise\"\noutcome = \"revise\"\ngoto = \"draft\"\n\
+             input = {{ variable = \"review_notes\", label = \"What should change?\", max_chars = 20 }}\n\n\
              [[step]]\nid = \"send\"\nname = \"Send\"\ntask = \"\"\n\
              report = \"Sent, escalated {{{{ escalated }}}}.\"\nreport_render = \"template\"\nexit = true\n"
         )

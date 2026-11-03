@@ -66,6 +66,14 @@ export interface DecisionButton {
   end?: "complete" | "cancel";
   workflow?: string | { id: string; wait?: boolean; payload?: Record<string, string> };
   set?: Record<string, string>;
+  /** Text the press asks the decider for, written to `variable`. */
+  input?: {
+    variable: string;
+    label: string;
+    placeholder?: string;
+    max_chars?: number;
+    required?: boolean;
+  };
 }
 
 /** A step's `[step.decision]`: named people choose what happens next. */
@@ -188,12 +196,22 @@ export interface WorkflowInstance {
   awaiting_decision?: boolean;
 }
 
+/** The text a choice of an open decision asks for. */
+export interface DecisionInput {
+  /** The question. */
+  label: string;
+  placeholder: string | null;
+  max_chars: number;
+  required: boolean;
+}
+
 /** A choice of an open decision. */
 export interface DecisionChoice {
   label: string;
   outcome: string;
   style: DecisionStyle | null;
   confirm: string | null;
+  input: DecisionInput | null;
 }
 
 /** The decision a paused run waits on, as the caller sees it. */
@@ -320,8 +338,8 @@ export const workflowsApi = {
     return admin.get<{ instances: WorkflowInstance[]; count: number }>(`/api/workflow-instances${qs ? `?${qs}` : ""}`);
   },
   getInstance: (id: string) => admin.get<WorkflowInstance>(`/api/workflow-instances/${id}`),
-  resume: (id: string, outcome?: string, gate?: string) =>
-    admin.post(`/api/workflow-instances/${id}/resume`, { outcome, gate }),
+  resume: (id: string, outcome?: string, gate?: string, feedback?: string) =>
+    admin.post(`/api/workflow-instances/${id}/resume`, { outcome, gate, feedback }),
   abort: (id: string) => admin.post(`/api/workflow-instances/${id}/abort`),
   reject: (id: string, reason?: string, feedback?: string) =>
     admin.post(`/api/workflow-instances/${id}/reject`, { reason, feedback }),

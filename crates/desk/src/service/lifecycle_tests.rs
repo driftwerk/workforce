@@ -1,7 +1,7 @@
 //! Tests of a session's life after its work: ending, removing, clearing,
 //! and the CLI sessions removed from Desk that adoption leaves alone.
 
-use super::tests::{desk, fake_cli, found, kept_until, logged_desk, new_session, Logged};
+use super::tests::{desk, fake_cli, found, kept_until, logged_desk, logs, new_session, Logged};
 use super::*;
 use crate::store::{build_pool, tests::record_fixture};
 use workforce_postgres::test_support::with_test_pool;
@@ -619,6 +619,152 @@ async fn a_codex_transcript_goes_whatever_claude_code_can_say() {
             .unwrap();
         assert_eq!((removed.removed, removed.transcripts), (1, 1));
         assert!(!rollout.exists());
+    })
+    .await;
+}
+
+/// A turn of `r`'s that began at `at`, as the floor's log keeps it open.
+fn begun(r: &SessionRecord, at: DateTime<Utc>) -> crate::floor::Turn {
+    crate::floor::Turn {
+        id: Uuid::new_v4(),
+        owner: None,
+        subject: crate::floor::Subject::Session {
+            id: r.id,
+            engine: r.engine,
+        },
+        name: r.name.clone(),
+        place: crate::floor::Place::Session,
+        task: r.last_prompt.clone(),
+        doing: None,
+        started_at: at,
+        heard_at: at,
+        ended_at: None,
+        outcome: None,
+        answer: None,
+        question: None,
+        settled_at: None,
+        waits: vec![],
+        idle: vec![],
+        token: None,
+        instance: None,
+    }
+}
+
+fn begin(t: &crate::floor::Turn) -> TurnOp {
+    TurnOp::Begin {
+        turn: Box::new(t.clone()),
+        by_person: true,
+    }
+}
+
+#[test]
+fn a_restarted_desk_carries_on_the_latest_open_turn_of_each_session_at_work() {
+    let at = Utc::now() - chrono::Duration::minutes(30);
+    let mins = chrono::Duration::minutes;
+    let working = record_fixture("api");
+    let blocked = SessionRecord {
+        state: SessionState::Blocked,
+        ..record_fixture("web")
+    };
+    let lost = SessionRecord {
+        state: SessionState::Interrupted,
+        ..record_fixture("docs")
+    };
+    let done = SessionRecord {
+        state: SessionState::Done,
+        ..record_fixture("infra")
+    };
+    let records: HashMap<Uuid, SessionRecord> = [&working, &blocked, &lost, &done]
+        .into_iter()
+        .map(|r| (r.id, r.clone()))
+        .collect();
+    let older = begun(&working, at);
+    let latest = begun(&working, at + mins(5));
+    let mut ended = begun(&blocked, at + mins(9));
+    ended.ended_at = Some(at + mins(10));
+    let waiting = begun(&blocked, at + mins(1));
+    let logged = [
+        latest.clone(),
+        older,
+        ended,
+        waiting.clone(),
+        begun(&lost, at),
+        begun(&done, at),
+        begun(&record_fixture("forgotten"), at),
+    ];
+    assert_eq!(
+        still_open(&records, &logged),
+        HashMap::from([(working.id, latest.id), (blocked.id, waiting.id)]),
+        "a lost or finished session's turn, and an ended one, are left to settle"
+    );
+}
+
+#[tokio::test]
+async fn a_session_at_work_across_a_restart_keeps_its_turn_and_one_lost_with_the_hub_does_not() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ended = std::process::Command::new("true").spawn().unwrap();
+        let dead = ended.id();
+        ended.wait().unwrap();
+        let alive = SessionRecord {
+            origin: Origin::External,
+            external_pid: Some(std::process::id() as i32),
+            ..record_fixture("api")
+        };
+        let gone = SessionRecord {
+            origin: Origin::External,
+            external_pid: Some(dead as i32),
+            ..record_fixture("web")
+        };
+        let at = Utc::now() - chrono::Duration::minutes(10);
+        let (kept, lost) = (begun(&alive, at), begun(&gone, at));
+        let logged = Arc::new(Logged::default());
+        logged.0.lock().extend([begin(&kept), begin(&lost)]);
+        DeskStore::migrate(&pool).await.unwrap();
+        let store = DeskStore::from_pool(pool);
+        store.put(&alive).await.unwrap();
+        store.put(&gone).await.unwrap();
+
+        // The hub comes back over the same registry and log.
+        let d = Desk::start(
+            store,
+            super::tests::options(dir.path()),
+            Floor {
+                turns: Some(logged.clone()),
+                ..Default::default()
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(d.view(alive.id).unwrap().state, SessionState::Working);
+        assert_eq!(d.view(gone.id).unwrap().state, SessionState::Interrupted);
+        assert_eq!(
+            d.open_turns(),
+            HashSet::from([kept.id]),
+            "the floor sees the one at work run, as the sidebar does; the lost one settles"
+        );
+
+        d.change(alive.id, |r, _| {
+            r.state = SessionState::Done;
+            r.last_reply = Some("All green.".into());
+        });
+        assert!(
+            logs(&logged, |ops| ops.iter().any(|op| matches!(
+                op,
+                TurnOp::End { turn, outcome: Outcome::Finished, .. } if *turn == kept.id
+            )))
+            .await,
+            "the turn it was in ends"
+        );
+        let begins = logged
+            .0
+            .lock()
+            .iter()
+            .filter(|op| matches!(op, TurnOp::Begin { .. }))
+            .count();
+        assert_eq!(begins, 2, "no second turn begun for the same work");
+        assert!(d.open_turns().is_empty());
     })
     .await;
 }

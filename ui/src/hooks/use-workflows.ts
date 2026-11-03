@@ -100,8 +100,8 @@ export function useRunWorkflow() {
 export function useResumeWorkflow() {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: ({ id, outcome, gate }: { id: string; outcome?: string; gate?: string }) =>
-      workflowsApi.resume(id, outcome, gate),
+    mutationFn: ({ id, outcome, gate, feedback }: { id: string; outcome?: string; gate?: string; feedback?: string }) =>
+      workflowsApi.resume(id, outcome, gate, feedback),
     onSettled: () => {
       qc.invalidateQueries({ queryKey: ["workflow-instances"] });
       qc.invalidateQueries({ queryKey: ["workflow-instance"] });

@@ -31,6 +31,11 @@ pub(super) enum Transition<'a> {
     ToTerminal {
         pending: &'a PendingApproval,
     },
+    /// A request only its terminal could answer became Desk's to answer
+    /// too (Codex says what it asks just after it says it waits).
+    Answerable {
+        pending: &'a PendingApproval,
+    },
     /// A request it was waiting on was answered: through Desk, or in its
     /// terminal.
     Unblocked {
@@ -172,6 +177,17 @@ impl<'a> Transition<'a> {
                         .is_some_and(|b| b.id == p.id && b.answerable)
             })
             .map(|pending| Self::ToTerminal { pending });
+        let answerable = now
+            .pending
+            .as_ref()
+            .filter(|p| {
+                p.answerable
+                    && before
+                        .pending
+                        .as_ref()
+                        .is_some_and(|b| b.id == p.id && !b.answerable)
+            })
+            .map(|pending| Self::Answerable { pending });
         let background = (now.waiting_on() != before.waiting_on()).then(|| Self::Background {
             from: before.waiting_on(),
             count: now.waiting_on(),
@@ -187,6 +203,7 @@ impl<'a> Transition<'a> {
             .chain(state)
             .chain(spoke)
             .chain(to_terminal)
+            .chain(answerable)
             .chain(tool)
             .collect()
     }
@@ -300,7 +317,9 @@ pub(super) fn turn_ops(
                 }
                 _ => ops.push(settle()),
             },
-            Transition::Blocked { pending } | Transition::ToTerminal { pending } => {
+            Transition::Blocked { pending }
+            | Transition::ToTerminal { pending }
+            | Transition::Answerable { pending } => {
                 let turn = working(&mut ops, &mut open);
                 ops.push(TurnOp::Wait {
                     turn,
@@ -401,9 +420,19 @@ fn wait_of(session: Uuid, p: &PendingApproval) -> Wait {
         key: p.id.to_string(),
         from: p.since,
         to: None,
-        ask: crew::approval_summary(&p.tool, &p.detail),
+        ask: match &p.why {
+            Some(why) => format!("{} {why}", crew::approval_summary(&p.tool, &p.detail)),
+            None => crew::approval_summary(&p.tool, &p.detail),
+        },
         answer: match (p.tool.as_str(), p.answerable) {
             ("Input", _) => Answer::Reply,
+            (_, true) if !p.choices.is_empty() => Answer::Decide {
+                at: DecideRef::Codex {
+                    session_id: session,
+                    approval_id: p.id,
+                    choices: p.choices.clone(),
+                },
+            },
             (_, true) => Answer::Decide {
                 at: DecideRef::Session {
                     session_id: session,
@@ -430,6 +459,7 @@ mod tests {
                 engine: Engine::Claude,
                 view: View::Terminal,
                 engine_version: None,
+                approve_for_me: false,
                 name: "auth-fix".into(),
                 goal: String::new(),
                 cwd: "/repo".into(),
@@ -462,6 +492,8 @@ mod tests {
             detail: "cargo test".into(),
             since: Utc::now(),
             answerable: true,
+            choices: Vec::new(),
+            why: None,
         }
     }
 
@@ -1088,6 +1120,8 @@ mod tests {
             detail: String::new(),
             since: Utc::now(),
             answerable: true,
+            choices: Vec::new(),
+            why: None,
         };
         for t in [
             Transition::Finished { reply: "" },

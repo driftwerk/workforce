@@ -2827,8 +2827,12 @@ pub fn spawn_slack_dispatch_loop(
                                 // A button's label typed in the run's own thread
                                 // presses it — before command parsing, so
                                 // `cancel` at a decision is its Cancel button.
-                                if let Some((run, gate, outcome)) =
-                                    wf_runtime.decision_reply(&channel, ts, &text)
+                                let typed = workforce_skills::adapters::slack::formatting::finalize_inbound_text(
+                                    &text,
+                                    &HashMap::new(),
+                                    &HashMap::new(),
+                                );
+                                if let Some(press) = wf_runtime.decision_reply(&channel, ts, &typed)
                                 {
                                     if from_home_workspace(
                                         workspace_concrete_surfaces.get(&workspace_id),
@@ -2844,8 +2848,7 @@ pub fn spawn_slack_dispatch_loop(
                                         let (channel, ts) = (channel.clone(), ts.clone());
                                         tokio::spawn(async move {
                                             decide_from_thread(
-                                                &runtime, &surfaces, &channel, &ts, &steerer, &run,
-                                                gate, outcome,
+                                                &runtime, &surfaces, &channel, &ts, &steerer, press,
                                             )
                                             .await;
                                         });
@@ -5046,6 +5049,17 @@ pub fn spawn_slack_dispatch_loop(
                     tokio::spawn(async move { tell_to_retry(&response_url).await });
                     continue;
                 }
+                SlackAction::ViewSubmission {
+                    private_metadata,
+                    values,
+                    ..
+                } if drain_token.is_cancelled() => {
+                    tracing::info!("Draining — skipping a form submission during shutdown");
+                    tokio::spawn(async move {
+                        tell_submitter(&private_metadata, &values, RESTARTING).await
+                    });
+                    continue;
+                }
                 SlackAction::SlashCommand {
                     workspace_id,
                     session_key,
@@ -5230,6 +5244,7 @@ pub fn spawn_slack_dispatch_loop(
                     message_ts,
                     message_blocks,
                     response_url,
+                    trigger_id,
                 } => {
                     // Stops, approval answers and run controls alike: a
                     // suspended person steers nothing.
@@ -5280,6 +5295,7 @@ pub fn spawn_slack_dispatch_loop(
                                         message_blocks,
                                         value,
                                         response_url,
+                                        trigger_id,
                                     },
                                 )
                                 .await;
@@ -5574,6 +5590,50 @@ pub fn spawn_slack_dispatch_loop(
                         }
                     });
                 }
+                SlackAction::ViewSubmission {
+                    workspace_id,
+                    user,
+                    user_team,
+                    callback_id,
+                    private_metadata,
+                    values,
+                } => {
+                    if callback_id != crate::slack_blocks::DECISION_INPUT_CALLBACK {
+                        continue;
+                    }
+                    if let Some(person) =
+                        crate::standing::suspended_on(identity_store.as_ref(), "slack", &user)
+                    {
+                        info!(person = %person.id, "Decision form refused: the person is suspended");
+                        continue;
+                    }
+                    let Some((svc, runtime)) = registry.resolve(None).and_then(|svc| {
+                        let runtime = Arc::clone(svc.workflow_runtime()?);
+                        Some((svc, runtime))
+                    }) else {
+                        tokio::spawn(async move {
+                            tell_submitter(&private_metadata, &values, DECISION_UNAVAILABLE).await
+                        });
+                        continue;
+                    };
+                    let surface = workspace_concrete_surfaces.get(&workspace_id).cloned();
+                    let identities = identity_store.clone();
+                    tokio::spawn(async move {
+                        handle_decision_input(
+                            &runtime,
+                            &svc,
+                            surface.as_ref(),
+                            identities.as_ref(),
+                            DecisionSubmission {
+                                user,
+                                user_team,
+                                private_metadata,
+                                values,
+                            },
+                        )
+                        .await;
+                    });
+                }
                 SlackAction::Ignore => {}
             }
         }
@@ -5711,11 +5771,118 @@ struct DecisionClick {
     message_blocks: Option<serde_json::Value>,
     value: Option<String>,
     response_url: String,
+    trigger_id: Option<String>,
 }
 
-/// Settle the decision a card's button names, as the person who clicked.
-/// A settled press says nothing: every card is rewritten. A refusal is told
-/// to the clicker alone, and a press on a closed card repairs that card.
+/// A decision form, as Slack delivered its submission.
+struct DecisionSubmission {
+    user: String,
+    user_team: Option<String>,
+    private_metadata: String,
+    values: serde_json::Value,
+}
+
+/// Where a refused press from a card is answered: privately to the person,
+/// with the card repaired when the decision has moved on.
+struct Answer<'a> {
+    instance: &'a str,
+    gate: uuid::Uuid,
+    channel: &'a str,
+    ts: Option<&'a str>,
+    echoed: Option<serde_json::Value>,
+    response_url: &'a str,
+    /// The text the press gave, echoed back so it is not lost.
+    said: Option<&'a str>,
+}
+
+/// Who a Slack user presses as, or `None` when they are suspended.
+async fn slack_steerer(
+    service: &Arc<crate::serve::AgentService>,
+    surface: Option<&Arc<SlackSurface>>,
+    identity_store: Option<&Arc<dyn workforce_identity::store::IdentityStore>>,
+    user: &str,
+) -> Option<crate::run_steering::Steerer> {
+    let identity_id =
+        match resolve_slack_identity_for_request(identity_store, surface.map(Arc::as_ref), user)
+            .await
+        {
+            SlackIdentityForRequest::Resolved { identity_id, .. } => Some(identity_id),
+            SlackIdentityForRequest::Anonymous => None,
+            SlackIdentityForRequest::Suspended => return None,
+        };
+    Some(thread_steerer(service, identity_id, user))
+}
+
+/// `message`, then the text a press gave, so a press that settled nothing
+/// does not lose it.
+fn with_said(message: &str, said: Option<&str>) -> String {
+    match said.filter(|said| !said.trim().is_empty()) {
+        Some(said) => format!(
+            "{message}\nYour text, so it is not lost:\n```\n{}\n```",
+            crate::slack_blocks::card_text(said)
+        ),
+        None => message.to_string(),
+    }
+}
+
+/// Tell whoever submitted a decision form that it settled nothing, echoing
+/// their text.
+async fn tell_submitter(private_metadata: &str, values: &serde_json::Value, message: &str) {
+    if let Some(meta) = crate::slack_blocks::parse_decision_input_meta(private_metadata) {
+        post_ephemeral(
+            &meta.response_url,
+            &with_said(message, submitted_text(values).as_deref()),
+        )
+        .await;
+    }
+}
+
+/// The text a decision form was submitted with, `None` when left empty.
+fn submitted_text(values: &serde_json::Value) -> Option<String> {
+    values[crate::slack_blocks::DECISION_INPUT_BLOCK][crate::slack_blocks::DECISION_INPUT_ACTION]
+        ["value"]
+        .as_str()
+        .map(str::to_string)
+}
+
+/// Tell the person why their press settled nothing, and repair the card
+/// they pressed when its decision has moved on.
+async fn answer_refused(
+    runtime: &Arc<dyn crate::hosts::WorkflowHost>,
+    refused: &crate::hub_core::workflows::DecisionRefused,
+    answer: Answer<'_>,
+) {
+    use crate::hub_core::workflows::DecisionRefused;
+    let told = match refused {
+        DecisionRefused::Unavailable(why) => {
+            warn!(instance = %answer.instance, error = %why, "A decision press could not be recorded");
+            DECISION_UNAVAILABLE.to_string()
+        }
+        refused => refused.to_string(),
+    };
+    post_ephemeral(answer.response_url, &with_said(&told, answer.said)).await;
+    let moved_on = matches!(
+        refused,
+        DecisionRefused::Decided { .. } | DecisionRefused::Ended { .. } | DecisionRefused::Outdated
+    );
+    if let Some(ts) = answer.ts.filter(|_| moved_on) {
+        runtime
+            .repair_card(
+                answer.instance,
+                answer.gate,
+                answer.channel,
+                ts,
+                answer.echoed,
+                answer.response_url,
+            )
+            .await;
+    }
+}
+
+/// Settle the decision a card's button names, as the person who clicked,
+/// or open the form a button that asks for input opens. A settled press
+/// says nothing: every card is rewritten. A refusal is told to the clicker
+/// alone, and a press on a closed card repairs that card.
 async fn handle_decision_button(
     runtime: &Arc<dyn crate::hosts::WorkflowHost>,
     service: &Arc<crate::serve::AgentService>,
@@ -5731,6 +5898,7 @@ async fn handle_decision_button(
         message_blocks,
         value,
         response_url,
+        trigger_id,
     } = click;
     let Some((instance, gate, outcome)) = value
         .as_deref()
@@ -5743,77 +5911,144 @@ async fn handle_decision_button(
         post_ephemeral(&response_url, OUTSIDE_HOME_WORKSPACE).await;
         return;
     }
-    let identity_id =
-        match resolve_slack_identity_for_request(identity_store, surface.map(Arc::as_ref), &user)
-            .await
-        {
-            SlackIdentityForRequest::Resolved { identity_id, .. } => Some(identity_id),
-            SlackIdentityForRequest::Anonymous => None,
-            SlackIdentityForRequest::Suspended => return,
-        };
-    let steerer = thread_steerer(service, identity_id, &user);
-    let decided = Arc::clone(runtime)
-        .decide(
-            &instance,
-            crate::hub_core::workflows::DecisionAsk {
+    let refused = match runtime.decision_form(&instance, gate, &outcome, &user) {
+        Ok(Some(form)) => {
+            let meta =
+                crate::slack_blocks::decision_input_meta(&crate::slack_blocks::DecisionInputMeta {
+                    run: instance.clone(),
+                    gate,
+                    outcome,
+                    channel,
+                    ts: message_ts,
+                    response_url: response_url.clone(),
+                });
+            let view = crate::slack_blocks::decision_input_view(&form, &meta);
+            let opened = match (surface, trigger_id.as_deref()) {
+                (Some(surface), Some(trigger)) => surface
+                    .open_view(trigger, &view)
+                    .await
+                    .map_err(|e| e.to_string()),
+                _ => Err("the click carried no trigger".to_string()),
+            };
+            if let Err(why) = opened {
+                warn!(instance = %instance, error = %why, "A decision form could not open");
+                let typed = match form.in_thread {
+                    true => format!(", or reply `{}: …` in this thread", form.label),
+                    false => String::new(),
+                };
+                post_ephemeral(
+                    &response_url,
+                    &format!("The form could not open; press the button again{typed}."),
+                )
+                .await;
+            }
+            return;
+        }
+        Ok(None) => {
+            let Some(steerer) = slack_steerer(service, surface, identity_store, &user).await else {
+                return;
+            };
+            let ask = crate::hub_core::workflows::DecisionAsk {
                 gate: Some(gate),
                 choice: outcome,
                 feedback: None,
-            },
-            &steerer,
-        )
-        .await;
-    use crate::hub_core::workflows::DecisionRefused;
-    match decided {
-        Ok(_) => {}
-        Err(
-            refused @ (DecisionRefused::Decided { .. }
-            | DecisionRefused::Ended { .. }
-            | DecisionRefused::Outdated),
-        ) => {
-            post_ephemeral(&response_url, &refused.to_string()).await;
-            if let Some(ts) = message_ts {
-                runtime
-                    .repair_card(
-                        &instance,
-                        gate,
-                        &channel,
-                        &ts,
-                        message_blocks,
-                        &response_url,
-                    )
-                    .await;
+            };
+            match Arc::clone(runtime).decide(&instance, ask, &steerer).await {
+                Ok(_) => return,
+                Err(refused) => refused,
             }
         }
-        Err(DecisionRefused::Unavailable(why)) => {
-            warn!(instance = %instance, error = %why, "A decision press could not be recorded");
-            post_ephemeral(&response_url, DECISION_UNAVAILABLE).await;
-        }
-        Err(refused) => post_ephemeral(&response_url, &refused.to_string()).await,
+        Err(refused) => refused,
+    };
+    answer_refused(
+        runtime,
+        &refused,
+        Answer {
+            instance: &instance,
+            gate,
+            channel: &channel,
+            ts: message_ts.as_deref(),
+            echoed: message_blocks,
+            response_url: &response_url,
+            said: None,
+        },
+    )
+    .await;
+}
+
+/// Settle the decision a submitted form names, as the person who submitted
+/// it, with the text they gave. A refusal is told to them alone, echoing
+/// their text, and repairs the card when the decision has moved on.
+async fn handle_decision_input(
+    runtime: &Arc<dyn crate::hosts::WorkflowHost>,
+    service: &Arc<crate::serve::AgentService>,
+    surface: Option<&Arc<SlackSurface>>,
+    identity_store: Option<&Arc<dyn workforce_identity::store::IdentityStore>>,
+    submission: DecisionSubmission,
+) {
+    let DecisionSubmission {
+        user,
+        user_team,
+        private_metadata,
+        values,
+    } = submission;
+    let Some(meta) = crate::slack_blocks::parse_decision_input_meta(&private_metadata) else {
+        warn!(user = %user, "A decision form came back without metadata this build wrote");
+        return;
+    };
+    let text = submitted_text(&values);
+    if !from_home_workspace(surface, &user, user_team.as_deref()).await {
+        post_ephemeral(
+            &meta.response_url,
+            &with_said(OUTSIDE_HOME_WORKSPACE, text.as_deref()),
+        )
+        .await;
+        return;
+    }
+    let Some(steerer) = slack_steerer(service, surface, identity_store, &user).await else {
+        return;
+    };
+    let ask = crate::hub_core::workflows::DecisionAsk {
+        gate: Some(meta.gate),
+        choice: meta.outcome.clone(),
+        feedback: text.clone(),
+    };
+    if let Err(refused) = Arc::clone(runtime).decide(&meta.run, ask, &steerer).await {
+        answer_refused(
+            runtime,
+            &refused,
+            Answer {
+                instance: &meta.run,
+                gate: meta.gate,
+                channel: &meta.channel,
+                ts: meta.ts.as_deref(),
+                echoed: None,
+                response_url: &meta.response_url,
+                said: text.as_deref(),
+            },
+        )
+        .await;
     }
 }
 
-/// Press the decision `run` waits on with the `outcome` a reply in its
-/// thread named. Only a refusal is answered, in the thread; a settled
+/// Press the decision a reply typed in its run's thread names, with any
+/// text it gave. Only a refusal is answered, in the thread; a settled
 /// decision is answered by its cards.
-#[allow(clippy::too_many_arguments)]
 async fn decide_from_thread(
     runtime: &Arc<dyn crate::hosts::WorkflowHost>,
     surfaces: &[Arc<dyn ChannelSurface>],
     channel: &str,
     ts: &str,
     steerer: &crate::run_steering::Steerer,
-    run: &str,
-    gate: uuid::Uuid,
-    outcome: String,
+    press: crate::hub_core::workflows::TypedPress,
 ) {
     let ask = crate::hub_core::workflows::DecisionAsk {
-        gate: Some(gate),
-        choice: outcome,
-        feedback: None,
+        gate: Some(press.gate),
+        choice: press.outcome,
+        feedback: press.text,
     };
-    if let Err(refused) = Arc::clone(runtime).decide(run, ask, steerer).await {
-        info!(instance = %run, error = %refused, "A typed decision was refused");
+    if let Err(refused) = Arc::clone(runtime).decide(&press.run, ask, steerer).await {
+        info!(instance = %press.run, error = %refused, "A typed decision was refused");
         send_to_surfaces(
             surfaces,
             channel,
@@ -10456,7 +10691,7 @@ async fn control_workflow_from_thread(
             return;
         }
         WorkflowCommand::Resume { outcome, feedback } => {
-            info!(instance = %inst.id, outcome = ?outcome, feedback = ?feedback, "Resuming workflow from Slack");
+            info!(instance = %inst.id, outcome = ?outcome, feedback_chars = ?feedback.as_ref().map(|f| f.chars().count()), "Resuming workflow from Slack");
             let ask = crate::hub_core::workflows::ResumeAsk {
                 outcome: outcome.clone(),
                 gate: None,
@@ -12783,12 +13018,17 @@ mod workflow_steering_tests {
         }
 
         async fn press() -> Press {
+            press_with("").await
+        }
+
+        /// [`press`] with `extra` on the decision.
+        async fn press_with(extra: &str) -> Press {
             let hub = hub().await;
             let surface = hub.with_slack();
             link(&hub, &hub.bob, "UBOB");
             link(&hub, &hub.alice, "UALICE");
             let key = hub
-                .define_steps(Visibility::Private, false, &decision_steps(&hub.bob, ""))
+                .define_steps(Visibility::Private, false, &decision_steps(&hub.bob, extra))
                 .await;
             let run = hub
                 .run_to_decision(&key, Some(&hub.alice), Some(RUN_CHANNEL))
@@ -12836,9 +13076,80 @@ mod workflow_steering_tests {
                         message_blocks: echoed,
                         value: Some(value),
                         response_url: format!("{}/respond", self.responses.uri()),
+                        trigger_id: Some("trigger-1".into()),
                     },
                 )
                 .await;
+            }
+
+            /// Slack answering `views.open` with `answer`.
+            async fn opening_views(&self, answer: serde_json::Value) {
+                wiremock::Mock::given(wiremock::matchers::method("POST"))
+                    .and(wiremock::matchers::path("/views.open"))
+                    .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(answer))
+                    .with_priority(1)
+                    .mount(&self.responses)
+                    .await;
+            }
+
+            /// Every view Slack was asked to open.
+            async fn opened(&self) -> Vec<serde_json::Value> {
+                self.responses
+                    .received_requests()
+                    .await
+                    .unwrap_or_default()
+                    .iter()
+                    .filter(|r| r.url.path() == "/views.open")
+                    .filter_map(|r| serde_json::from_slice(&r.body).ok())
+                    .collect()
+            }
+
+            /// `user` of `team` submitting the form of `outcome` at `gate`
+            /// with `text`.
+            async fn submit(
+                &self,
+                user: &str,
+                team: &str,
+                gate: uuid::Uuid,
+                outcome: &str,
+                text: Option<&str>,
+            ) {
+                let identities = self.hub.service.identity_store.read().clone();
+                let meta = crate::slack_blocks::decision_input_meta(
+                    &crate::slack_blocks::DecisionInputMeta {
+                        run: self.run.clone(),
+                        gate,
+                        outcome: outcome.into(),
+                        channel: RUN_CHANNEL.into(),
+                        ts: Some(self.decision().cards[0].ts.clone()),
+                        response_url: format!("{}/respond", self.responses.uri()),
+                    },
+                );
+                handle_decision_input(
+                    &self.hub.host(),
+                    &self.hub.service,
+                    Some(&self.slack),
+                    identities.as_ref(),
+                    DecisionSubmission {
+                        user: user.into(),
+                        user_team: Some(team.into()),
+                        private_metadata: meta,
+                        values: serde_json::json!({
+                            crate::slack_blocks::DECISION_INPUT_BLOCK: {
+                                crate::slack_blocks::DECISION_INPUT_ACTION: {
+                                    "type": "plain_text_input",
+                                    "value": text,
+                                }
+                            }
+                        }),
+                    },
+                )
+                .await;
+            }
+
+            /// What the run's draft said last.
+            async fn drafted(&self) -> String {
+                self.hub.drafted(&self.run).await.unwrap_or_default()
             }
 
             async fn press_as(&self, user: &str, team: &str, outcome: &str) {
@@ -12935,7 +13246,7 @@ mod workflow_steering_tests {
                 .as_str()
                 .unwrap()
                 .to_string();
-            let (run, gate, outcome) = press
+            let typed = press
                 .hub
                 .runtime
                 .decision_reply(RUN_CHANNEL, &thread, "cancel")
@@ -12950,9 +13261,7 @@ mod workflow_steering_tests {
                 RUN_CHANNEL,
                 &thread,
                 &bob,
-                &run,
-                gate,
-                outcome,
+                typed,
             )
             .await;
 
@@ -12983,7 +13292,7 @@ mod workflow_steering_tests {
 
             assert_eq!(
                 said,
-                "Choose one of: Send · Redraft · Cancel · Done · Flag."
+                "Choose one of: Send · Redraft · Cancel · Done · Flag · Revise."
             );
             assert!(open_in(&press.hub.instance(&press.run)).is_some());
         }
@@ -13001,11 +13310,179 @@ mod workflow_steering_tests {
             assert_eq!(
                 paused_thread_reminder(press.hub.runtime.as_ref(), &row),
                 "This run is waiting on a decision: *Send* · *Redraft* · *Cancel* · *Done* · \
-                 *Flag*, from Bob. Reply with a choice or use the buttons."
+                 *Flag* · `Revise: …`, from Bob. Reply with a choice or use the buttons."
             );
             assert!(build_workflow_status_message(&row, &press.hub.host())
                 .await
                 .ends_with("Reply with a choice or use the buttons."));
+        }
+
+        #[tokio::test]
+        async fn a_click_on_an_input_button_opens_its_form_and_settles_nothing() {
+            let press = press().await;
+            press.opening_views(serde_json::json!({ "ok": true })).await;
+
+            press.press_as("UBOB", "T_HOME", "revise").await;
+
+            let opened = press.opened().await;
+            assert_eq!(opened.len(), 1, "{opened:?}");
+            assert_eq!(opened[0]["trigger_id"], "trigger-1");
+            let view = &opened[0]["view"];
+            assert_eq!(
+                view["callback_id"],
+                crate::slack_blocks::DECISION_INPUT_CALLBACK
+            );
+            assert_eq!(view["blocks"][1]["element"]["max_length"], 20);
+            let meta = crate::slack_blocks::parse_decision_input_meta(
+                view["private_metadata"].as_str().unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                (meta.run.as_str(), meta.gate, meta.outcome.as_str()),
+                (press.run.as_str(), press.decision().gate, "revise")
+            );
+            assert!(press.told().await.is_empty());
+            assert!(open_in(&press.hub.instance(&press.run)).is_some());
+        }
+
+        #[tokio::test]
+        async fn a_click_from_someone_slack_rules_out_is_refused_without_a_form() {
+            let press = press().await;
+            press.opening_views(serde_json::json!({ "ok": true })).await;
+
+            press.press_as("UALICE", "T_HOME", "revise").await;
+
+            assert_eq!(press.told().await, ["Only Bob can decide this."]);
+            assert!(press.opened().await.is_empty());
+        }
+
+        #[tokio::test]
+        async fn a_form_that_cannot_open_is_told_with_the_typed_form_only_in_the_runs_thread() {
+            let refused = serde_json::json!({ "ok": false, "error": "expired_trigger_id" });
+            let in_thread = press().await;
+            in_thread.opening_views(refused.clone()).await;
+            let elsewhere = press_with("channel = \"COTHER0001\"").await;
+            elsewhere.opening_views(refused).await;
+
+            in_thread.press_as("UBOB", "T_HOME", "revise").await;
+            elsewhere.press_as("UBOB", "T_HOME", "revise").await;
+
+            assert_eq!(
+                in_thread.told().await,
+                ["The form could not open; press the button again, or reply `Revise: …` in this thread."]
+            );
+            assert_eq!(
+                elsewhere.told().await,
+                ["The form could not open; press the button again."]
+            );
+            assert!(open_in(&in_thread.hub.instance(&in_thread.run)).is_some());
+        }
+
+        #[tokio::test]
+        async fn a_form_submitted_by_a_decider_settles_with_its_text() {
+            let press = press().await;
+            let gate = press.decision().gate;
+
+            press
+                .submit("UBOB", "T_HOME", gate, "revise", Some("lead with totals"))
+                .await;
+
+            assert_eq!(press.drafted().await, "Drafted. Notes: lead with totals");
+            assert!(press.told().await.is_empty());
+        }
+
+        #[tokio::test]
+        async fn a_form_from_a_non_decider_or_another_workspace_is_refused_and_writes_nothing() {
+            let press = press().await;
+            let gate = press.decision().gate;
+
+            press
+                .submit("UALICE", "T_HOME", gate, "revise", Some("mine"))
+                .await;
+            press
+                .submit("UBOB", "T_GUEST", gate, "revise", Some("guest"))
+                .await;
+
+            assert_eq!(
+                press.told().await,
+                [
+                    "Only Bob can decide this.\nYour text, so it is not lost:\n```\nmine\n```",
+                    "Only people in this Slack workspace can decide this.\nYour text, so it is \
+                     not lost:\n```\nguest\n```",
+                ]
+            );
+            let instance = press.hub.instance(&press.run);
+            assert_eq!(instance.variables["review_notes"], "");
+            assert!(open_in(&instance).is_some());
+        }
+
+        #[tokio::test]
+        async fn a_form_submitted_after_the_decision_closed_is_told_echoed_and_repaired() {
+            let press = press().await;
+            let gate = press.decision().gate;
+            let ts = press.decision().cards[0].ts.clone();
+            press.press_as("UBOB", "T_HOME", "send").await;
+            press.hub.settled(&press.run).await;
+
+            press
+                .submit("UBOB", "T_HOME", gate, "revise", Some("too late"))
+                .await;
+
+            assert_eq!(
+                press.told().await,
+                ["This run has ended (completed); nothing was decided.\nYour text, so it is not \
+                  lost:\n```\ntoo late\n```"]
+            );
+            let updated = press.surface.updated.lock().await;
+            assert!(updated
+                .iter()
+                .any(|(channel, at, _)| channel == RUN_CHANNEL && *at == ts));
+        }
+
+        #[tokio::test]
+        async fn a_typed_reply_gives_its_text_and_a_bare_input_label_is_told_the_typed_form() {
+            let press = press().await;
+            let thread = press.hub.instance(&press.run).variables["_thread_id"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            let replies = Arc::new(Thread::default());
+            let surfaces: Vec<Arc<dyn ChannelSurface>> = vec![replies.clone()];
+            let bob = thread_steerer(&press.hub.service, Some(press.hub.bob.clone()), "UBOB");
+            let typed = |text: &str| {
+                press
+                    .hub
+                    .runtime
+                    .decision_reply(RUN_CHANNEL, &thread, text)
+                    .expect("a typed press")
+            };
+
+            decide_from_thread(
+                &press.hub.host(),
+                &surfaces,
+                RUN_CHANNEL,
+                &thread,
+                &bob,
+                typed("Revise"),
+            )
+            .await;
+            let told = replies.0.lock().await.clone();
+            assert_eq!(told.len(), 1);
+            assert!(
+                told[0].contains("`Revise: …` typed in the run's thread"),
+                "{told:?}"
+            );
+            decide_from_thread(
+                &press.hub.host(),
+                &surfaces,
+                RUN_CHANNEL,
+                &thread,
+                &bob,
+                typed("Revise: notes"),
+            )
+            .await;
+
+            assert_eq!(press.drafted().await, "Drafted. Notes: notes");
         }
 
         #[tokio::test]

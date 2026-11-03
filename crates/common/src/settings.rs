@@ -1713,10 +1713,20 @@ pub struct LocalAgentsConfig {
 /// NATS connection configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NatsConfig {
+    /// Whether this hub uses NATS at all. `false` runs it as a single
+    /// instance with no bus: turn control and follow-ups are applied in
+    /// process, there is no leader election (this instance runs every
+    /// singleton) and no JetStream streams. It wins over `url` and
+    /// `WORKFORCE_NATS_URL`. Unset: on, except on a Desk hub (`[desk]
+    /// enabled`) that names no url, see [`WorkforceConfig::nats_url`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
     /// NATS server URL. Schemes: `nats://` (cleartext), `tls://` (TLS),
     /// `ws://` / `wss://` (WebSocket). Comma-separated for clusters.
-    #[serde(default = "default_nats_url")]
-    pub url: String,
+    /// Unset: `nats://localhost:4222`, but never on a Desk hub, whose
+    /// local port 4222 may be another project's server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
     /// Path to a NATS `.creds` file (NKey + JWT auth). The standard
     /// secure-credentials format produced by `nsc add user ... --creds-out`.
     /// Mutually exclusive with `token` — if both are set, `credentials`
@@ -1749,7 +1759,8 @@ fn default_nats_stream_replicas() -> usize {
 impl Default for NatsConfig {
     fn default() -> Self {
         Self {
-            url: default_nats_url(),
+            enabled: None,
+            url: None,
             credentials: None,
             token: None,
             tls: false,
@@ -7443,6 +7454,11 @@ pub struct AgentWorkspaceConfig {
     /// plain words.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub computer: Option<toml::Value>,
+    /// Per-agent `[skills]`: which connectors reach this agent, read only on
+    /// a hub with `[desk]`. Kept as written and read by
+    /// [`crate::connector_binding`]; absent, every connector does, as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skills: Option<toml::Value>,
 }
 
 impl AgentWorkspaceConfig {
@@ -7450,6 +7466,12 @@ impl AgentWorkspaceConfig {
     /// none, or what is wrong with it.
     pub fn computer(&self) -> Result<workforce_core::computer::ComputerAccess, String> {
         crate::computer_access::of(self.computer.as_ref())
+    }
+
+    /// This agent's connectors, every one where it has no `[skills]`, or
+    /// what is wrong with it.
+    pub fn connectors(&self) -> Result<crate::connector_binding::ConnectorBinding, String> {
+        crate::connector_binding::of(self.skills.as_ref())
     }
 
     /// This agent's `[oversight]`, its defaults (off) where it has none, or
@@ -10758,7 +10780,7 @@ impl WorkforceConfig {
         var: &dyn Fn(&str) -> Result<String, std::env::VarError>,
     ) {
         if let Ok(v) = var("WORKFORCE_NATS_URL") {
-            self.nats.url = v;
+            self.nats.url = Some(v);
         }
         if let Ok(v) = var("WORKFORCE_WEAVIATE_URL").or_else(|_| var("WEAVIATE_URL")) {
             self.weaviate.url = v;
@@ -11076,10 +11098,33 @@ impl WorkforceConfig {
         Ok(())
     }
 
+    /// The NATS server this hub connects to, or `None` when it runs with no
+    /// bus. Off when `[nats] enabled = false`, whatever names a url. A Desk
+    /// hub (`[desk] enabled`) connects only to a url its config or
+    /// `WORKFORCE_NATS_URL` names, or with `enabled = true`: the default
+    /// `localhost:4222` on a person's computer may be another project's
+    /// server, which would share this hub's streams and leader lease and
+    /// stall its turns whenever it restarts. Any other hub keeps that
+    /// default.
+    pub fn nats_url(&self) -> Option<String> {
+        match (self.nats.enabled, self.nats.url.as_deref()) {
+            (Some(false), _) => None,
+            (_, Some(url)) => Some(url.to_string()),
+            (None, None) if self.desk.enabled => None,
+            (_, None) => Some(default_nats_url()),
+        }
+    }
+
     /// Validate the configuration.
     pub fn validate(&self) -> eyre::Result<()> {
-        if self.nats.url.is_empty() {
+        if self.nats.url.as_deref().is_some_and(str::is_empty) {
             return Err(eyre::eyre!("NATS URL cannot be empty"));
+        }
+        if self.cluster.expected && self.nats_url().is_none() {
+            return Err(eyre::eyre!(
+                "[cluster] expected = true needs NATS, but it is off for this hub: \
+                 name its [nats] url"
+            ));
         }
         for (setting, waits) in [
             (
@@ -12738,7 +12783,7 @@ id = "carol"
         std::env::remove_var("WORKFORCE_LISTEN");
 
         let config = WorkforceConfig::from_toml("").unwrap();
-        assert_eq!(config.nats.url, "nats://localhost:4222");
+        assert_eq!(config.nats_url().as_deref(), Some("nats://localhost:4222"));
         assert_eq!(config.llm.provider, "openrouter");
         assert_eq!(config.hub.listen, "0.0.0.0:8090");
         assert!(config.timezone.is_none());
@@ -12853,8 +12898,75 @@ model = "claude-sonnet-4"
     #[test]
     fn validate_empty_nats_url() {
         let mut config = WorkforceConfig::default();
-        config.nats.url = String::new();
+        config.nats.url = Some(String::new());
         assert!(config.validate().is_err());
+    }
+
+    /// `toml` read as the hub reads it, with `env` as its whole environment.
+    fn configured(toml: &str, env: &'static [(&'static str, &'static str)]) -> WorkforceConfig {
+        let mut config: WorkforceConfig = toml::from_str(toml).unwrap();
+        config.apply_env_overrides_from(&|name: &str| {
+            env.iter()
+                .find(|(set, _)| *set == name)
+                .map(|(_, value)| value.to_string())
+                .ok_or(std::env::VarError::NotPresent)
+        });
+        config
+    }
+
+    /// A Desk hub never dials a NATS server its config doesn't name: the
+    /// person's port 4222 may be another project's.
+    #[test]
+    fn a_desk_hub_has_no_nats_unless_its_config_names_one() {
+        let desk = "[desk]\nenabled = true\n";
+        assert_eq!(configured(desk, &[]).nats_url(), None);
+        let named = configured(&format!("{desk}[nats]\nurl = \"nats://bus:4222\"\n"), &[]);
+        assert_eq!(named.nats_url().as_deref(), Some("nats://bus:4222"));
+        let from_env = configured(desk, &[("WORKFORCE_NATS_URL", "nats://env:4222")]);
+        assert_eq!(from_env.nats_url().as_deref(), Some("nats://env:4222"));
+        let opted_in = configured(&format!("{desk}[nats]\nenabled = true\n"), &[]);
+        assert_eq!(
+            opted_in.nats_url().as_deref(),
+            Some("nats://localhost:4222")
+        );
+    }
+
+    /// `[nats] enabled = false` turns NATS off whatever names a url, the
+    /// login environment desk-hubd passes the hub included.
+    #[test]
+    fn nats_switched_off_wins_over_any_url() {
+        let off = "[desk]\nenabled = true\n[nats]\nenabled = false\nurl = \"nats://bus:4222\"\n";
+        let config = configured(off, &[("WORKFORCE_NATS_URL", "nats://localhost:4222")]);
+        assert_eq!(config.nats_url(), None);
+        assert!(config.validate().is_ok());
+        let undesked = configured("[nats]\nenabled = false\n", &[]);
+        assert_eq!(undesked.nats_url(), None);
+    }
+
+    /// A hub that isn't Desk's keeps the default server and any url it
+    /// names, as a deployment of several replicas on a shared NATS does.
+    #[test]
+    fn a_shared_hub_keeps_its_nats() {
+        assert_eq!(
+            configured("", &[]).nats_url().as_deref(),
+            Some("nats://localhost:4222")
+        );
+        let shared =
+            "[nats]\nurl = \"nats://nats:4222\"\nstream_replicas = 3\n[cluster]\nexpected = true\n";
+        let config = configured(shared, &[]);
+        assert_eq!(config.nats_url().as_deref(), Some("nats://nats:4222"));
+        assert_eq!(config.nats.stream_replicas, 3);
+        assert!(config.validate().is_ok());
+        let from_env = configured("", &[("WORKFORCE_NATS_URL", "nats://nats:4222")]);
+        assert_eq!(from_env.nats_url().as_deref(), Some("nats://nats:4222"));
+    }
+
+    /// A deployment that expects peers can't run with NATS off.
+    #[test]
+    fn an_expected_cluster_needs_nats() {
+        let off = configured("[nats]\nenabled = false\n[cluster]\nexpected = true\n", &[]);
+        let refused = off.validate().unwrap_err().to_string();
+        assert!(refused.contains("[cluster] expected"), "{refused}");
     }
 
     #[test]

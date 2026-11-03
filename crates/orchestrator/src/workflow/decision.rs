@@ -23,6 +23,9 @@ const MAX_OUTCOME: usize = 64;
 const MAX_CONFIRM: usize = 300;
 const MAX_TITLE: usize = 150;
 const MAX_CONTEXT: usize = 1_900;
+const MAX_PLACEHOLDER: usize = 150;
+const MAX_INPUT_CHARS: usize = 3_000;
+const DEFAULT_INPUT_CHARS: usize = 1_000;
 const MIN_EXPIRY_SECS: u64 = 60;
 const MAX_EXPIRY_SECS: u64 = 30 * 86_400;
 
@@ -71,6 +74,65 @@ pub struct DecisionButton {
     pub workflow: Option<ButtonWorkflow>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub set: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input: Option<ButtonInput>,
+}
+
+/// Text a press asks the decider for, written to `variable` when the press
+/// settles the decision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ButtonInput {
+    pub variable: String,
+    /// The question the form asks.
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placeholder: Option<String>,
+    #[serde(default = "default_max_chars", skip_serializing_if = "is_default_max")]
+    pub max_chars: usize,
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub required: bool,
+}
+
+/// A button's input as a run holds it: [`ButtonInput`] without
+/// `deny_unknown_fields`, so a run paused by a newer build still reads.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChoiceInput {
+    pub variable: String,
+    pub label: String,
+    #[serde(default)]
+    pub placeholder: Option<String>,
+    #[serde(default = "default_max_chars")]
+    pub max_chars: usize,
+    #[serde(default = "default_true")]
+    pub required: bool,
+}
+
+impl From<ButtonInput> for ChoiceInput {
+    fn from(input: ButtonInput) -> Self {
+        let ButtonInput {
+            variable,
+            label,
+            placeholder,
+            max_chars,
+            required,
+        } = input;
+        Self {
+            variable,
+            label,
+            placeholder,
+            max_chars,
+            required,
+        }
+    }
+}
+
+fn default_max_chars() -> usize {
+    DEFAULT_INPUT_CHARS
+}
+
+fn is_default_max(max: &usize) -> bool {
+    *max == DEFAULT_INPUT_CHARS
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -203,6 +265,29 @@ pub struct Choice {
     pub start: Option<ChildStart>,
     #[serde(default)]
     pub set: BTreeMap<String, String>,
+    #[serde(default)]
+    pub input: Option<ChoiceInput>,
+}
+
+/// What a press writes besides the button's `set`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Given {
+    Input { variable: String, text: String },
+    Feedback(String),
+    Nothing,
+}
+
+/// Why the text given with a press does not do.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum InputRefused {
+    #[error("{label} needs an answer to \"{question}\".")]
+    Needed { label: String, question: String },
+    #[error("{label} takes at most {max} characters; this was {given}.")]
+    TooLong {
+        label: String,
+        max: usize,
+        given: usize,
+    },
 }
 
 impl Choice {
@@ -210,6 +295,44 @@ impl Choice {
     pub fn done(&self) -> &str {
         self.done.as_deref().unwrap_or(&self.label)
     }
+
+    /// The write a press with `text` makes, or why the text does not do.
+    pub fn given(&self, text: Option<&str>) -> Result<Given, InputRefused> {
+        let Some(input) = &self.input else {
+            return Ok(text
+                .filter(|text| !text.trim().is_empty())
+                .map_or(Given::Nothing, |text| Given::Feedback(text.to_string())));
+        };
+        let text = text.map(normalised).unwrap_or_default();
+        let given = text.chars().count();
+        match () {
+            () if input.required && text.is_empty() => Err(InputRefused::Needed {
+                label: self.label.clone(),
+                question: input.label.clone(),
+            }),
+            () if given > input.max_chars => Err(InputRefused::TooLong {
+                label: self.label.clone(),
+                max: input.max_chars,
+                given,
+            }),
+            () => Ok(Given::Input {
+                variable: input.variable.clone(),
+                text,
+            }),
+        }
+    }
+}
+
+/// Text as a press stores it: line endings unified, control characters other
+/// than newline and tab removed, trimmed.
+fn normalised(text: &str) -> String {
+    text.replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .chars()
+        .filter(|c| !c.is_control() || matches!(c, '\n' | '\t'))
+        .collect::<String>()
+        .trim()
+        .to_string()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -300,6 +423,9 @@ pub enum Closed {
         followed: bool,
         #[serde(default)]
         child: Option<String>,
+        /// The text the press wrote to its input variable.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        input: Option<String>,
     },
     Stopped {
         by: Option<String>,
@@ -475,9 +601,17 @@ impl DecisionSpec {
                 Err("decision sets one of expires_after and on_expiry; they go together".into())
             }
             (Some(after), Some(outcome)) => {
-                if !self.buttons.iter().any(|b| &b.outcome == outcome) {
+                let Some(pressed) = self.buttons.iter().find(|b| &b.outcome == outcome) else {
                     return Err(format!(
                         "decision on_expiry '{outcome}' is not the outcome of any button"
+                    ));
+                };
+                if pressed.input.as_ref().is_some_and(|input| input.required) {
+                    return Err(format!(
+                        "decision on_expiry '{outcome}' presses button '{}', whose input is \
+                         required, and expiry types nothing: set `required = false` or expire \
+                         to another button",
+                        pressed.label.trim()
                     ));
                 }
                 let secs = workforce_common::temporal::parse_duration(after)
@@ -689,7 +823,42 @@ impl DecisionButton {
                 "decision button '{label}' confirm needs 1 to {MAX_CONFIRM} characters"
             ));
         }
-        Ok(())
+        self.input
+            .as_ref()
+            .map_or(Ok(()), |input| self.check_input(input, label))
+    }
+
+    fn check_input(&self, input: &ButtonInput, label: &str) -> Result<(), String> {
+        let within = |text: &str, max: usize| (1..=max).contains(&text.trim().chars().count());
+        let refused = match () {
+            () if self.confirm.is_some() => {
+                Some("asks for input in its form; drop `confirm`".into())
+            }
+            () if label.contains(':') => Some(
+                "asks for input, so its label cannot contain ':' (a reply types `<label>: <text>`)"
+                    .into(),
+            ),
+            () if !within(&input.label, MAX_LABEL) => Some(format!(
+                "input needs a label (the form's question) of 1 to {MAX_LABEL} characters"
+            )),
+            () if input
+                .placeholder
+                .as_deref()
+                .is_some_and(|placeholder| !within(placeholder, MAX_PLACEHOLDER)) =>
+            {
+                Some(format!(
+                    "input placeholder needs 1 to {MAX_PLACEHOLDER} characters"
+                ))
+            }
+            () if !(1..=MAX_INPUT_CHARS).contains(&input.max_chars) => Some(format!(
+                "input max_chars is {}; it must lie between 1 and {MAX_INPUT_CHARS}",
+                input.max_chars
+            )),
+            () => None,
+        };
+        refused.map_or(Ok(()), |why| {
+            Err(format!("decision button '{label}' {why}"))
+        })
     }
 
     fn check(&self, step: &StepDefinition, def: &WorkflowDefinition) -> Result<(), String> {
@@ -725,8 +894,10 @@ impl DecisionButton {
             }
         }
         let secret = |key: &str| def.variables.iter().any(|v| v.id == key && v.is_secret());
+        let writable =
+            |key: &str| is_set_key(key) && !key.starts_with('_') && key != "steps" && !secret(key);
         self.set.iter().try_for_each(|(key, value)| {
-            if !is_set_key(key) || key.starts_with('_') || key == "steps" || secret(key) {
+            if !writable(key) {
                 return Err(format!(
                     "decision button '{label}' sets '{key}': set keys match [A-Za-z0-9_], do not \
                      start with '_', and name neither `steps` nor a secret variable"
@@ -738,6 +909,25 @@ impl DecisionButton {
                 ));
             }
             Ok(())
+        })?;
+        let Some(variable) = self.input.as_ref().map(|input| input.variable.as_str()) else {
+            return Ok(());
+        };
+        let refused = match () {
+            () if !writable(variable) => Some(
+                "input variables match [A-Za-z0-9_], do not start with '_', and name neither \
+                 `steps` nor a secret variable",
+            ),
+            () if !def.variables.iter().any(|v| v.id == variable) => {
+                Some("declare it in [[variables]] so every template reads it before any press")
+            }
+            () if self.set.contains_key(variable) => Some("its `set` writes it too; drop one"),
+            () => None,
+        };
+        refused.map_or(Ok(()), |why| {
+            Err(format!(
+                "decision button '{label}' asks for input into '{variable}': {why}"
+            ))
         })
     }
 
@@ -847,6 +1037,7 @@ impl RunDecision {
                     next: button.route(step)?,
                     start,
                     set: button.set.clone(),
+                    input: button.input.clone().map(ChoiceInput::from),
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
@@ -957,6 +1148,28 @@ impl RunDecision {
             })
     }
 
+    /// The choice a reply typed in the run's thread presses, and the text it
+    /// gives: the whole reply naming a choice, or `<label or outcome>: <text>`
+    /// naming one that takes input.
+    pub fn typed(&self, reply: &str) -> Option<(&Choice, Option<String>)> {
+        self.choice(reply).map(|choice| (choice, None)).or_else(|| {
+            let (head, text) = reply.split_once(':')?;
+            self.choice(head)
+                .filter(|choice| choice.input.is_some())
+                .map(|choice| (choice, Some(text.to_string())))
+        })
+    }
+
+    /// Whether `slack_user` certainly cannot decide: every decider is known to
+    /// Slack and none is them.
+    pub fn surely_not_decider(&self, slack_user: &str) -> bool {
+        self.deciders.iter().all(|d| {
+            d.slack_user_id
+                .as_deref()
+                .is_some_and(|known| known != slack_user)
+        })
+    }
+
     /// The deciders who may decide: all of them, less the starter when the
     /// decision is not theirs to make.
     pub fn waiting_on(&self, starter: Option<&str>) -> Vec<&Decider> {
@@ -1034,28 +1247,29 @@ pub fn cards_to_close(instance: &WorkflowInstance) -> Option<RunDecision> {
 }
 
 /// Settle the open decision with `choice`: record it as a resume of the step,
-/// write the button's literals and any feedback, and run the run.
+/// write the button's literals and what the press gave, and run the run.
 pub fn settle(
     instance: &mut WorkflowInstance,
     choice: &Choice,
     by: DecidedBy,
-    feedback: Option<&str>,
+    given: Given,
     now: DateTime<Utc>,
 ) -> Result<(), NotOpen> {
     let decision = open_in(instance).ok_or(NotOpen)?;
+    let (written, input) = match given {
+        Given::Input { variable, text } => (Some((variable, text.clone())), Some(text)),
+        Given::Feedback(text) => (Some(("_human_feedback".to_string(), text)), None),
+        Given::Nothing => (None, None),
+    };
     if let Some(vars) = instance.variables.as_object_mut() {
         vars.extend(
             choice
                 .set
                 .iter()
-                .map(|(key, value)| (key.clone(), serde_json::Value::String(value.clone()))),
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .chain(written)
+                .map(|(key, value)| (key, serde_json::Value::String(value))),
         );
-        if let Some(feedback) = feedback {
-            vars.insert(
-                "_human_feedback".to_string(),
-                serde_json::Value::String(feedback.to_string()),
-            );
-        }
     }
     instance.preset_outcome(&decision.step_id, &choice.outcome, OutcomeBy::Resume);
     instance.status = InstanceStatus::Running;
@@ -1067,6 +1281,7 @@ pub fn settle(
             at: now,
             followed: false,
             child: None,
+            input,
         }),
         ..decision
     }
@@ -1832,7 +2047,7 @@ exit = true
             &mut instance,
             &escalate,
             by.clone(),
-            Some("looks off"),
+            Given::Feedback("looks off".into()),
             now(),
         )
         .unwrap();
@@ -1851,7 +2066,8 @@ exit = true
                 by,
                 at: now(),
                 followed: false,
-                child: None
+                child: None,
+                input: None,
             })
         );
         assert_eq!(settled.summary().as_deref(), Some("Escalate by Bob"));
@@ -1863,10 +2079,23 @@ exit = true
         let mut instance = paused_at_review(&def);
         let decision = opened(&def, &mut instance);
         let send = decision.choice("send").unwrap().clone();
-        settle(&mut instance, &send, DecidedBy::Expiry, None, now()).unwrap();
+        settle(
+            &mut instance,
+            &send,
+            DecidedBy::Expiry,
+            Given::Nothing,
+            now(),
+        )
+        .unwrap();
         instance.status = InstanceStatus::Paused;
         assert_eq!(
-            settle(&mut instance, &send, DecidedBy::Expiry, None, now()),
+            settle(
+                &mut instance,
+                &send,
+                DecidedBy::Expiry,
+                Given::Nothing,
+                now()
+            ),
             Err(NotOpen)
         );
     }
@@ -1892,7 +2121,7 @@ exit = true
                 &mut instance,
                 decision.choice(outcome).unwrap(),
                 by,
-                None,
+                Given::Nothing,
                 now(),
             )
             .unwrap();
@@ -1942,7 +2171,7 @@ exit = true
             &mut instance,
             decision.choice("redraft").unwrap(),
             DecidedBy::Expiry,
-            None,
+            Given::Nothing,
             now(),
         )
         .unwrap();
@@ -2025,6 +2254,345 @@ exit = true
                 .summary()
                 .as_deref(),
             Some("stopped by Carol; nothing was decided")
+        );
+    }
+
+    const REVISE: &str = "[[step.decision.buttons]]\nlabel = \"Revise\"\noutcome = \"revise\"\n\
+        goto = \"draft\"\ninput = { variable = \"review_notes\", label = \"What should change?\", \
+        placeholder = \"Shorter, totals first\", max_chars = 12 }\n\n";
+
+    /// The digest with a Revise button that asks for notes, `edit` applied.
+    fn revisable(edit: impl Fn(&str) -> String) -> eyre::Result<WorkflowDefinition> {
+        edited(|t| {
+            edit(
+                &t.replace(
+                    "[[step]]\nid = \"draft\"",
+                    "[[variables]]\nid = \"review_notes\"\nvalue = \"\"\n\n[[step]]\nid = \"draft\"",
+                )
+                .replace(
+                    "[[step]]\nid = \"send_email\"",
+                    &format!("{REVISE}[[step]]\nid = \"send_email\""),
+                ),
+            )
+        })
+    }
+
+    fn revise_choice(edit: impl Fn(&mut ChoiceInput)) -> Choice {
+        let def = revisable(|t| t.to_string()).unwrap();
+        let mut choice = opened(&def, &mut paused_at_review(&def))
+            .choice("revise")
+            .unwrap()
+            .clone();
+        edit(choice.input.as_mut().unwrap());
+        choice
+    }
+
+    #[test]
+    fn an_input_parses_with_its_defaults_and_round_trips_through_toml() {
+        let button: DecisionButton = toml::from_str(
+            "label = \"Revise\"\noutcome = \"revise\"\ngoto = \"draft\"\n\
+             input = { variable = \"notes\", label = \"Why?\" }\n",
+        )
+        .unwrap();
+        assert_eq!(
+            button.input,
+            Some(ButtonInput {
+                variable: "notes".into(),
+                label: "Why?".into(),
+                placeholder: None,
+                max_chars: 1_000,
+                required: true,
+            })
+        );
+        let written = toml::to_string(&button).unwrap();
+        assert!(!written.contains("max_chars") && !written.contains("required"));
+        assert_eq!(toml::from_str::<DecisionButton>(&written).unwrap(), button);
+
+        let def = revisable(|t| t.to_string()).unwrap();
+        let spec = def.get_step("review").unwrap().decision.clone().unwrap();
+        let again = WorkflowDefinition::from_toml(&toml::to_string(&def).unwrap()).unwrap();
+        assert_eq!(again.get_step("review").unwrap().decision, Some(spec));
+    }
+
+    #[test]
+    fn an_input_refuses_what_its_rules_forbid() {
+        type Edit = Box<dyn Fn(&str) -> String>;
+        let input = |from: &'static str, to: String| -> Edit {
+            Box::new(move |t: &str| t.replace(from, &to))
+        };
+        let cases: Vec<(&str, Edit, &str)> = vec![
+            (
+                "an undeclared variable",
+                input("variable = \"review_notes\"", "variable = \"notes\"".into()),
+                "asks for input into 'notes': declare it in [[variables]]",
+            ),
+            (
+                "a secret variable",
+                Box::new(|t| {
+                    t.replace(
+                        "[[step]]\nid = \"draft\"",
+                        "[[variables]]\nid = \"key\"\ntype = \"secret\"\nvalue = \"[[vault:agent:key]]\"\n\n[[step]]\nid = \"draft\"",
+                    )
+                    .replace("variable = \"review_notes\"", "variable = \"key\"")
+                }),
+                "asks for input into 'key': input variables match",
+            ),
+            (
+                "an engine variable",
+                input(
+                    "variable = \"review_notes\"",
+                    "variable = \"_run_as\"".into(),
+                ),
+                "asks for input into '_run_as': input variables match",
+            ),
+            (
+                "the steps",
+                input("variable = \"review_notes\"", "variable = \"steps\"".into()),
+                "asks for input into 'steps': input variables match",
+            ),
+            (
+                "a variable its set writes",
+                input(
+                    "goto = \"draft\"\ninput",
+                    "goto = \"draft\"\nset = { review_notes = \"x\" }\ninput".into(),
+                ),
+                "its `set` writes it too",
+            ),
+            (
+                "no characters",
+                input("max_chars = 12", "max_chars = 0".into()),
+                "max_chars is 0",
+            ),
+            (
+                "more characters than Slack takes",
+                input("max_chars = 12", "max_chars = 3001".into()),
+                "max_chars is 3001",
+            ),
+            (
+                "an empty question",
+                input("label = \"What should change?\"", "label = \" \"".into()),
+                "input needs a label",
+            ),
+            (
+                "a long question",
+                input(
+                    "label = \"What should change?\"",
+                    format!("label = \"{}\"", "q".repeat(76)),
+                ),
+                "input needs a label",
+            ),
+            (
+                "a colon in its label",
+                input("label = \"Revise\"", "label = \"Revise: notes\"".into()),
+                "cannot contain ':'",
+            ),
+            (
+                "a long placeholder",
+                input(
+                    "placeholder = \"Shorter, totals first\"",
+                    format!("placeholder = \"{}\"", "p".repeat(151)),
+                ),
+                "placeholder needs 1 to 150",
+            ),
+            (
+                "a confirm",
+                input(
+                    "goto = \"draft\"\ninput",
+                    "goto = \"draft\"\nconfirm = \"Sure?\"\ninput".into(),
+                ),
+                "drop `confirm`",
+            ),
+            (
+                "an expiry that presses it",
+                input("on_expiry = \"cancel\"", "on_expiry = \"revise\"".into()),
+                "presses button 'Revise', whose input is required",
+            ),
+            (
+                "an unknown input key",
+                input("max_chars = 12", "max_char = 12".into()),
+                "max_char",
+            ),
+        ];
+        for (case, edit, said) in cases {
+            let refused = revisable(edit).expect_err(case);
+            let text = format!("{refused:#}");
+            assert!(text.contains(said), "{case}: {text}");
+            assert!(
+                text.contains("button 'Revise") || case == "an unknown input key",
+                "{case}: {text}"
+            );
+        }
+        assert!(revisable(|t| t
+            .replace("max_chars = 12", "max_chars = 12, required = false")
+            .replace("on_expiry = \"cancel\"", "on_expiry = \"revise\""))
+        .is_ok());
+    }
+
+    #[test]
+    fn opening_freezes_a_buttons_input() {
+        let choice = revise_choice(|_| {});
+        assert_eq!(
+            choice.input.map(|input| (input.variable, input.max_chars)),
+            Some(("review_notes".to_string(), 12))
+        );
+    }
+
+    #[test]
+    fn a_press_gives_its_text_normalised_and_within_its_limits() {
+        let revise = revise_choice(|_| {});
+        let needed = Err(InputRefused::Needed {
+            label: "Revise".into(),
+            question: "What should change?".into(),
+        });
+        assert_eq!(revise.given(None), needed);
+        assert_eq!(revise.given(Some(" \r\n\t ")), needed);
+        let written = |text: &str| Given::Input {
+            variable: "review_notes".into(),
+            text: text.into(),
+        };
+        assert_eq!(
+            revise.given(Some("ééééééééééé€")),
+            Ok(written("ééééééééééé€"))
+        );
+        assert_eq!(
+            revise.given(Some("ééééééééééé€€")),
+            Err(InputRefused::TooLong {
+                label: "Revise".into(),
+                max: 12,
+                given: 13
+            })
+        );
+        assert_eq!(
+            revise.given(Some("  a\r\nb\rc\u{7}\td\u{0}  ")),
+            Ok(written("a\nb\nc\td"))
+        );
+        let optional = revise_choice(|input| input.required = false);
+        assert_eq!(optional.given(None), Ok(written("")));
+        assert_eq!(optional.given(Some("  ")), Ok(written("")));
+
+        let def = digest();
+        let send = opened(&def, &mut paused_at_review(&def))
+            .choice("send")
+            .unwrap()
+            .clone();
+        assert_eq!(
+            send.given(Some("looks off")),
+            Ok(Given::Feedback("looks off".into()))
+        );
+        assert_eq!(send.given(None), Ok(Given::Nothing));
+        assert_eq!(send.given(Some(" ")), Ok(Given::Nothing));
+    }
+
+    #[test]
+    fn settling_with_input_writes_its_variable_and_the_closed_decision() {
+        let def = revisable(|t| t.to_string()).unwrap();
+        let mut instance = paused_at_review(&def);
+        let revise = opened(&def, &mut instance)
+            .choice("revise")
+            .unwrap()
+            .clone();
+        let given = revise.given(Some("shorter")).unwrap();
+
+        settle(&mut instance, &revise, DecidedBy::Expiry, given, now()).unwrap();
+
+        assert_eq!(instance.variables["review_notes"], "shorter");
+        assert!(instance.variables.get("_human_feedback").is_none());
+        assert!(matches!(
+            awaiting_follow(&instance).unwrap().closed,
+            Some(Closed::Decided { input: Some(ref said), .. }) if said == "shorter"
+        ));
+    }
+
+    #[test]
+    fn a_typed_reply_names_a_choice_and_gives_text_only_to_an_input() {
+        let def = revisable(|t| t.to_string()).unwrap();
+        let decision = opened(&def, &mut paused_at_review(&def));
+        let typed = |reply| {
+            decision
+                .typed(reply)
+                .map(|(choice, text)| (choice.outcome.as_str(), text))
+        };
+        assert_eq!(typed("Revise"), Some(("revise", None)));
+        assert_eq!(
+            typed("revise:  two\nlines"),
+            Some(("revise", Some("  two\nlines".into())))
+        );
+        assert_eq!(typed("REVISE: x"), Some(("revise", Some(" x".into()))));
+        assert_eq!(typed("Send: x"), None);
+        assert_eq!(typed("Rewrite: x"), None);
+        assert_eq!(typed("send"), Some(("send", None)));
+    }
+
+    #[test]
+    fn someone_is_surely_not_a_decider_only_when_slack_knows_every_decider() {
+        let def = digest();
+        let mut decision = opened(&def, &mut paused_at_review(&def));
+        assert!(!decision.surely_not_decider("U9"), "unlinked deciders");
+        decision
+            .deciders
+            .iter_mut()
+            .zip(["U1", "U2"])
+            .for_each(|(d, id)| {
+                d.slack_user_id = Some(id.into());
+            });
+        assert!(decision.surely_not_decider("U9"));
+        assert!(!decision.surely_not_decider("U2"));
+    }
+
+    #[test]
+    fn a_decision_stored_before_inputs_still_reads() {
+        let def = digest();
+        let mut instance = paused_at_review(&def);
+        let decision = opened(&def, &mut instance);
+        settle(
+            &mut instance,
+            decision.choice("send").unwrap(),
+            DecidedBy::Expiry,
+            Given::Nothing,
+            now(),
+        )
+        .unwrap();
+        let mut stored = instance.variables[DECISION_KEY].clone();
+        stored["choices"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .for_each(|choice| {
+                choice.as_object_mut().unwrap().remove("input");
+            });
+        assert!(stored["closed"].get("input").is_none());
+
+        let read = RunDecision::read(&serde_json::json!({ DECISION_KEY: stored })).unwrap();
+
+        assert!(read.choices.iter().all(|c| c.input.is_none()));
+        assert!(matches!(
+            read.closed,
+            Some(Closed::Decided { input: None, .. })
+        ));
+    }
+
+    #[test]
+    fn a_choice_input_a_newer_build_wrote_still_reads() {
+        let def = revisable(|t| t.to_string()).unwrap();
+        let mut instance = paused_at_review(&def);
+        opened(&def, &mut instance);
+        let mut stored = instance.variables[DECISION_KEY].clone();
+        stored["choices"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .filter_map(|choice| choice["input"].as_object_mut())
+            .for_each(|input| {
+                input.insert("rows".into(), serde_json::json!(4));
+            });
+
+        let read = RunDecision::read(&serde_json::json!({ DECISION_KEY: stored })).unwrap();
+
+        assert_eq!(
+            read.choice("revise")
+                .and_then(|c| c.input.as_ref())
+                .map(|input| input.variable.as_str()),
+            Some("review_notes")
         );
     }
 }
