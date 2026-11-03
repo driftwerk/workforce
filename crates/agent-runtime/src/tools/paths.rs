@@ -81,6 +81,47 @@ pub fn resolve_against_root(path: &Path, roots: &[PathBuf]) -> PathBuf {
     }
 }
 
+tokio::task_local! {
+    /// How far the call in scope reaches beyond its tool's own roots, set by
+    /// the computer gate on a hub with `[desk]` for a call its agent's level
+    /// lets read or change anywhere. Unset (every other hub, every other
+    /// path), a tool keeps the roots it was given.
+    pub static REACH: Reach;
+}
+
+/// A call's reach beyond its tool's roots: anywhere, except `withheld` (Desk's
+/// data, the keychains). The tool's own roots are never withheld, so its own
+/// folder stays its own inside Desk's data.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Reach {
+    pub withheld: Vec<PathBuf>,
+}
+
+/// The reach in scope, if any.
+fn reach() -> Option<Reach> {
+    REACH.try_with(Clone::clone).ok()
+}
+
+/// Why a write to `real` is refused for a hard link: a file outside the
+/// tool's own roots with another name elsewhere, which writing would change
+/// there too. Only a call that reaches past its roots meets this.
+pub fn hard_link_refusal(real: &Path, roots: &CanonicalRoots) -> Option<String> {
+    if !roots.reaches() || roots.in_own(real) {
+        return None;
+    }
+    let meta = std::fs::symlink_metadata(real).ok()?;
+    #[cfg(unix)]
+    let links = std::os::unix::fs::MetadataExt::nlink(&meta);
+    #[cfg(not(unix))]
+    let links = 1u64;
+    (meta.is_file() && links > 1).then(|| {
+        format!(
+            "'{}' has another name elsewhere on this computer, so it wasn't changed.",
+            real.display()
+        )
+    })
+}
+
 /// Allowed roots with their real locations resolved once.
 ///
 /// Containment is decided against these, so a caller that checks many paths —
@@ -92,6 +133,9 @@ pub fn resolve_against_root(path: &Path, roots: &[PathBuf]) -> PathBuf {
 pub struct CanonicalRoots {
     roots: Vec<PathBuf>,
     withholds: Withholding,
+    /// The tool's own roots, and what the call's reach withholds past them:
+    /// `Some` only when the call reaches past its roots ([`REACH`]).
+    reach: Option<(Vec<PathBuf>, Vec<PathBuf>)>,
 }
 
 /// What a set of roots keeps a tool out of.
@@ -115,18 +159,50 @@ impl CanonicalRoots {
             .try_with(|user| user.clone())
             .ok()
             .filter(|user| !user.is_empty());
+        let mut real: Vec<PathBuf> = roots.iter().map(|root| resolve_real(root)).collect();
+        // No roots is already unrestricted; a reach widens only a set.
+        let reach = reach().filter(|_| !real.is_empty()).map(|reach| {
+            let own = real.clone();
+            real.push(PathBuf::from("/"));
+            let withheld = reach.withheld.iter().map(|w| resolve_real(w)).collect();
+            (own, withheld)
+        });
         Self {
-            roots: roots.iter().map(|root| resolve_real(root)).collect(),
+            roots: real,
             withholds: person.map_or(Withholding::PerPerson, Withholding::ForPerson),
+            reach,
         }
+    }
+
+    /// Whether these roots reach past the tool's own.
+    pub fn reaches(&self) -> bool {
+        self.reach.is_some()
+    }
+
+    /// Whether `real` lies inside the tool's own roots.
+    pub fn in_own(&self, real: &Path) -> bool {
+        match &self.reach {
+            Some((own, _)) => own.iter().any(|root| real.starts_with(root)),
+            None => self.roots.iter().any(|root| real.starts_with(root)),
+        }
+    }
+
+    /// Whether the call's reach withholds `real`: past the tool's own roots,
+    /// inside what Desk keeps from every agent.
+    fn reach_withholds(&self, real: &Path) -> bool {
+        self.reach.as_ref().is_some_and(|(own, withheld)| {
+            !own.iter().any(|root| real.starts_with(root))
+                && withheld.iter().any(|w| real.starts_with(w))
+        })
     }
 
     /// Roots the hub writes a person's own state through (their notes and
     /// profile), which nothing is withheld from.
     pub fn for_hub_state(roots: &[PathBuf]) -> Self {
         Self {
+            roots: roots.iter().map(|root| resolve_real(root)).collect(),
             withholds: Withholding::Nothing,
-            ..Self::new(roots)
+            reach: None,
         }
     }
 
@@ -157,6 +233,7 @@ impl CanonicalRoots {
     pub fn holds(&self, real: &Path) -> bool {
         (self.is_unrestricted() || self.roots.iter().any(|root| real.starts_with(root)))
             && !self.withheld(real)
+            && !self.reach_withholds(real)
     }
 
     pub fn contains(&self, path: &Path) -> bool {
@@ -246,6 +323,88 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().canonicalize().unwrap();
         (tmp, root)
+    }
+
+    /// Without a reach (every hub without `[desk]`, every call the gate
+    /// didn't widen) roots are the tool's own; with one, anywhere but the
+    /// withheld set, the own roots carved out of it.
+    #[tokio::test]
+    async fn a_reach_widens_roots_but_keeps_the_withheld_set() {
+        let (_tmp, base) = workspace();
+        let data = base.join("Desk");
+        let own = data.join("hub/data/agents/allan");
+        let other = data.join("hub/data/agents/ben/notes.md");
+        let elsewhere = base.join("dev/acme/a.rs");
+        for dir in [
+            &own,
+            &other.parent().unwrap().to_path_buf(),
+            &elsewhere.parent().unwrap().to_path_buf(),
+        ] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let narrow = CanonicalRoots::new(std::slice::from_ref(&own));
+        assert!(!narrow.reaches());
+        assert!(narrow.resolve(&elsewhere).is_none());
+        let reach = Reach {
+            withheld: vec![data.clone()],
+        };
+        let wide = REACH
+            .scope(reach.clone(), async {
+                CanonicalRoots::new(std::slice::from_ref(&own))
+            })
+            .await;
+        assert!(wide.reaches());
+        assert_eq!(
+            wide.workspace(),
+            Some(own.as_path()),
+            "relative paths still land home"
+        );
+        assert!(wide.resolve(&elsewhere).is_some());
+        assert!(wide.resolve(&own.join("notes.md")).is_some());
+        assert!(
+            wide.resolve(&other).is_none(),
+            "another agent's folder is withheld"
+        );
+        assert!(wide.resolve(&data.join("hub/data/vault.db")).is_none());
+        // No roots stays unrestricted, reach or not.
+        let open = REACH.scope(reach, async { CanonicalRoots::new(&[]) }).await;
+        assert!(!open.reaches());
+    }
+
+    #[tokio::test]
+    async fn a_hard_link_outside_the_own_roots_is_not_written_through() {
+        let (_tmp, base) = workspace();
+        let own = base.join("own");
+        std::fs::create_dir_all(&own).unwrap();
+        let outside = base.join("outside.txt");
+        std::fs::write(&outside, "x").unwrap();
+        let alias = base.join("alias.txt");
+        std::fs::hard_link(&outside, &alias).unwrap();
+        let inside = own.join("inside.txt");
+        std::fs::write(&inside, "x").unwrap();
+        std::fs::hard_link(&inside, own.join("inside2.txt")).unwrap();
+        let narrow = CanonicalRoots::new(std::slice::from_ref(&own));
+        assert_eq!(
+            hard_link_refusal(&alias, &narrow),
+            None,
+            "no reach, no change"
+        );
+        let wide = REACH
+            .scope(Reach::default(), async {
+                CanonicalRoots::new(std::slice::from_ref(&own))
+            })
+            .await;
+        assert!(hard_link_refusal(&alias, &wide)
+            .unwrap()
+            .contains("another name elsewhere"));
+        assert_eq!(
+            hard_link_refusal(&inside, &wide),
+            None,
+            "inside the own roots"
+        );
+        let single = base.join("single.txt");
+        std::fs::write(&single, "x").unwrap();
+        assert_eq!(hard_link_refusal(&single, &wide), None);
     }
 
     fn roots(dir: &Path) -> Vec<PathBuf> {

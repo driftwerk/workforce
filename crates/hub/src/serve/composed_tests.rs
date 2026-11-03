@@ -73,6 +73,7 @@ async fn the_job_runner_refuses_a_tool_that_requires_human_approval() {
         registry: Arc::clone(&registry),
         agent_id: "a".to_string(),
         capability_gate: Arc::new(parking_lot::RwLock::new(None)),
+        workspace: std::path::PathBuf::from("/nonexistent"),
     };
 
     let result = executor
@@ -144,6 +145,7 @@ async fn the_job_runner_gates_a_tool_call_as_the_person_the_job_runs_as() {
         registry,
         agent_id: "a".to_string(),
         capability_gate: Arc::new(parking_lot::RwLock::new(Some(gate))),
+        workspace: std::path::PathBuf::from("/nonexistent"),
     };
     let run_as = |who: Option<&str>| {
         let principal = TurnPrincipal::run_as(who.map(str::to_string));

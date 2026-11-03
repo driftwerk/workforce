@@ -209,6 +209,22 @@ impl Tool for CodeLintTool {
         "code.lint"
     }
 
+    fn effect(&self, input: &serde_json::Value) -> workforce_core::computer::Effect {
+        let cwd = super::utils::effect_cwd(input, &self.allowed_paths);
+        let cwd = match input["workdir"].as_str().filter(|w| !w.trim().is_empty()) {
+            Some(workdir) if input["repo"].as_str().is_none() => {
+                self.allowed_paths.first().map(|base| {
+                    workforce_agent::tools::computer::path_in(workdir, std::slice::from_ref(base))
+                })
+            }
+            _ => cwd,
+        };
+        workforce_core::computer::Effect::Exec {
+            command: "code.lint".into(),
+            cwd,
+        }
+    }
+
     fn description(&self) -> &str {
         "Run linters and formatters with auto-detection"
     }

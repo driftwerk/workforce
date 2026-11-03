@@ -957,6 +957,10 @@ pub fn router(
     desk.read_replies_with(&crew);
     sessions_router(desk.clone(), Arc::clone(&auth))
         .merge(crate::state::router(desk.clone(), Arc::clone(&auth)))
+        .merge(crate::computer::api::computer_router(
+            desk.clone(),
+            Arc::clone(&auth),
+        ))
         .merge(crate::crew_api::crew_router(desk, Arc::clone(&auth), crew))
         .merge(voice_router(Arc::clone(&auth), realtime, speech))
         .merge(providers_router(auth, accounts))

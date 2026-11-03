@@ -1012,6 +1012,12 @@ impl Tool for CodingFanoutTool {
         "coding.fanout"
     }
 
+    /// A session in a project workspace the hub sets up, which it names no
+    /// folder of before it runs.
+    fn effect(&self, _input: &serde_json::Value) -> workforce_core::computer::Effect {
+        workforce_core::computer::Effect::Session { cwd: None }
+    }
+
     fn description(&self) -> &str {
         "Divide a coding job into INDEPENDENT subtasks and implement them in parallel — each \
          subtask runs as its own Claude Code coder in an isolated worktree and opens its OWN PR. \

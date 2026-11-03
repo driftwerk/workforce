@@ -758,6 +758,7 @@ mod tests {
                     }),
                     permission_gate: Some(Arc::new(FixedCascade(cascade))),
                     surface_allows: None,
+                    computer_gate: None,
                     arguments: workforce_agent::tools::arguments::ArgumentValidation::default(),
                 },
                 policy: Arc::new(
@@ -1006,6 +1007,56 @@ mod tests {
             "a skill gate never offers Always-Allow: {payload}"
         );
         assert_eq!(ran, 0, "nothing ran");
+    }
+
+    /// A computer gate that asks about `test.whoami`, and runs it with
+    /// nobody to ask or not, as told.
+    struct ComputerAsks(bool);
+
+    impl workforce_agent::tools::computer::ComputerGate for ComputerAsks {
+        fn decides(&self, tool: &str) -> bool {
+            tool == "test.whoami"
+        }
+        fn verdict(
+            &self,
+            _: &str,
+            _: &workforce_core::computer::Effect,
+        ) -> workforce_core::computer::Verdict {
+            workforce_core::computer::Verdict::Ask {
+                choices: vec![
+                    workforce_core::computer::Choice::AllowOnce,
+                    workforce_core::computer::Choice::Deny,
+                ],
+                why: workforce_core::computer::Why::CantBeUndone,
+            }
+        }
+        fn record(&self, _: workforce_agent::tools::computer::Record) {}
+        fn unattended_runs(&self) -> bool {
+            self.0
+        }
+    }
+
+    /// A remote caller never answers its own computer ask: it is decided as
+    /// a run with nobody to ask, which runs it by default and refuses it
+    /// when the agent says so, and nothing is parked for `approval.decide`.
+    #[tokio::test]
+    async fn a_computer_ask_is_never_parked_for_the_caller_to_answer() {
+        for (runs_unattended, ran) in [(true, 1), (false, 0)] {
+            let bridge = Bridge::default();
+            let (surface, runs) = bridged_surface(&bridge);
+            let mut exec = executor_as(
+                "alice",
+                Arc::clone(&surface),
+                None,
+                CascadeState::Allow,
+                &bridge,
+            );
+            exec.site.gates.computer_gate = Some(Arc::new(ComputerAsks(runs_unattended)));
+            let (is_error, text) = text_of(&call(&surface, exec, "test_whoami").await);
+            assert_eq!(runs.load(Ordering::SeqCst), ran, "{text}");
+            assert_eq!(is_error, ran == 0, "{text}");
+            assert!(!text.contains("approval_pending"), "{text}");
+        }
     }
 
     #[tokio::test]

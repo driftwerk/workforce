@@ -145,6 +145,11 @@ impl Tool for WasmSkillPublishTool {
         "wasm_skill.publish"
     }
 
+    /// Opens a pull request from the installed skill's stored source.
+    fn effect(&self, _input: &serde_json::Value) -> workforce_core::computer::Effect {
+        workforce_core::computer::Effect::None
+    }
+
     fn description(&self) -> &str {
         "Open a pull request against a configured skill catalog repo containing an installed \
          WASM skill's stored source and its catalog.json entry, so a skill written in chat \

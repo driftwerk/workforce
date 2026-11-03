@@ -700,6 +700,12 @@ impl Tool for CodeRefactorTool {
         TOOL_NAME
     }
 
+    fn effect(&self, input: &serde_json::Value) -> workforce_core::computer::Effect {
+        workforce_core::computer::Effect::Write {
+            paths: super::utils::effect_paths(input, "path", &self.roots),
+        }
+    }
+
     fn description(&self) -> &str {
         "Structural code edits; prefer it to code.edit for renames and for rewriting a whole \
          function, method, struct, class or impl. replace_definition swaps the named definition \
