@@ -78,6 +78,10 @@ pub enum Wait {
     Working,
     /// The person is typing in its terminal.
     Typing,
+    /// Desk's breaker paused it: only the person's own messages go in.
+    Paused,
+    /// It is asking the person something: only the person answers it.
+    Asking,
 }
 
 /// One message on a line, as stored and as Desk shows it.
@@ -375,14 +379,15 @@ pub fn steering(
     when: When,
     person: bool,
     steer: Steer,
-    working: bool,
+    state: SessionState,
     name: &str,
 ) -> Result<Steering, Refusal> {
     match when {
         When::Queue => Ok(Steering::Queue),
         When::Now if !person => Err(Refusal::NotYours),
-        // Not working: the next idle is now.
-        When::Now if !working => Ok(Steering::Queue),
+        // Not working: the next idle is now. Waiting on a dialog (a
+        // permission, a question): never typed into it, it waits.
+        When::Now if state != SessionState::Working => Ok(Steering::Queue),
         When::Now => match steer {
             Steer::Paste => Ok(Steering::PasteNow),
             Steer::TurnSteer => Ok(Steering::TurnSteer),
@@ -434,7 +439,21 @@ pub fn label_of(p: &Party, hop: i16) -> String {
 /// answers. The person's own words go in as they wrote them. Anyone else's
 /// carry the marker and say who they are from: they are data, never the
 /// person's say-so.
+/// `text` as a terminal may be given it: no control characters but line
+/// breaks and tabs. A message is typed in as a bracketed paste, and one
+/// carrying ESC (or CR) could end the paste and type keys, a slash command
+/// among them, into the session it is for.
+pub fn typable(text: &str) -> String {
+    text.chars()
+        .filter(|c| !c.is_control() || matches!(c, '\n' | '\t'))
+        .collect()
+}
+
 pub fn render(msg: &LineMessage, question: Option<&str>) -> String {
+    typable(&render_raw(msg, question))
+}
+
+fn render_raw(msg: &LineMessage, question: Option<&str>) -> String {
     // The person's own words: what they write goes in as written, and an
     // answer says what it answers.
     if msg.from.kind == PartyKind::You {
@@ -792,28 +811,67 @@ mod tests {
     fn only_the_person_steers_and_only_where_the_engine_can() {
         use Steering::*;
         assert_eq!(
-            steering(When::Now, true, Steer::Paste, true, "w"),
+            steering(When::Now, true, Steer::Paste, SessionState::Working, "w"),
             Ok(PasteNow)
         );
         assert_eq!(
-            steering(When::Now, true, Steer::TurnSteer, true, "w"),
+            steering(
+                When::Now,
+                true,
+                Steer::TurnSteer,
+                SessionState::Working,
+                "w"
+            ),
             Ok(TurnSteer)
         );
         assert_eq!(
-            steering(When::Now, true, Steer::None, true, "w"),
+            steering(When::Now, true, Steer::None, SessionState::Working, "w"),
             Err(Refusal::NoSteer("w".into()))
         );
         assert_eq!(
-            steering(When::Now, true, Steer::None, false, "w"),
+            steering(When::Now, true, Steer::None, SessionState::Idle, "w"),
             Ok(Queue)
         );
         assert_eq!(
-            steering(When::Now, false, Steer::Paste, true, "w"),
+            steering(When::Now, false, Steer::Paste, SessionState::Working, "w"),
             Err(Refusal::NotYours)
         );
         assert_eq!(
-            steering(When::Queue, true, Steer::Paste, true, "w"),
+            steering(When::Queue, true, Steer::Paste, SessionState::Working, "w"),
             Ok(Queue)
+        );
+    }
+
+    #[test]
+    fn a_session_waiting_on_a_dialog_is_never_steered() {
+        assert_eq!(
+            steering(When::Now, true, Steer::Paste, SessionState::Blocked, "w"),
+            Ok(Steering::Queue)
+        );
+        assert_eq!(
+            steering(
+                When::Now,
+                true,
+                Steer::TurnSteer,
+                SessionState::Blocked,
+                "w"
+            ),
+            Ok(Steering::Queue)
+        );
+    }
+
+    #[test]
+    fn what_goes_into_a_terminal_carries_no_control_characters() {
+        let payload = "fine\x1b[201~\r/clear\r\x7f\u{9b}\x07 done\n\tnext";
+        assert_eq!(typable(payload), "fine[201~/clear done\n\tnext");
+        let from = Party::session(&session("evil\x1b[2J", Engine::Claude));
+        let m = LineMessage::new(from, Party::you(), LineKind::Tell, payload.into(), 1);
+        let text = render(&m, None);
+        assert!(
+            !text
+                .chars()
+                .any(|c| c.is_control() && c != '\n' && c != '\t'),
+            "{text:?}"
         );
     }
 

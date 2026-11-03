@@ -270,7 +270,7 @@ impl Desk {
             Send::Ask { to, text, .. } => (to, text, LineKind::Ask, When::Queue),
             Send::Tell { to, text, when } => (to, text, LineKind::Tell, when),
         };
-        let text = text.trim().to_string();
+        let text = line::typable(&text).trim().to_string();
         if text.is_empty() {
             return Err(Refusal::Missing("what to say").into());
         }
@@ -345,7 +345,7 @@ impl Desk {
                 when,
                 matches!(from, Sender::Person),
                 v.caps.steer,
-                matches!(v.state, SessionState::Working | SessionState::Blocked),
+                v.state,
                 v.label(),
             )?,
             None => Steering::Queue,
@@ -391,7 +391,7 @@ impl Desk {
         };
         match how {
             Steering::PasteNow => {
-                self.prompt(id, &m.text, None)?;
+                self.prompt(id, &m.text, Some(By::you()))?;
             }
             Steering::TurnSteer => {
                 let mut st = self.0.state.lock();
@@ -399,7 +399,7 @@ impl Desk {
                     .live
                     .get(&id)
                     .and_then(|l| l._codex.as_ref())
-                    .is_some_and(|c| c.steers.send(m.text.clone()).is_ok());
+                    .is_some_and(|c| c.line_steers.send(m.text.clone()).is_ok());
                 if !sent {
                     drop(st);
                     // No observer to steer through: it goes in at the
@@ -463,7 +463,7 @@ impl Desk {
         by: Sender,
         text: String,
     ) -> Result<LineMessage, LineError> {
-        let text = text.trim().to_string();
+        let text = line::typable(&text).trim().to_string();
         if text.is_empty() {
             return Err(Refusal::Missing("your answer").into());
         }
@@ -823,8 +823,27 @@ impl Desk {
         }
     }
 
+    /// Why `m` mustn't go into `view` now, whatever its engine could take:
+    /// a session Desk's breaker paused, or one asking the person something,
+    /// takes only the person's own messages.
+    fn line_gate(&self, view: &SessionView, m: &LineMessage) -> Option<Wait> {
+        if m.from.kind == PartyKind::You {
+            return None;
+        }
+        if self.breaker_refuses_prompt(view.id, None).is_err() {
+            return Some(Wait::Paused);
+        }
+        (view.state == SessionState::Asking).then_some(Wait::Asking)
+    }
+
+    /// Who a message is typed in for: the person's own, as theirs.
+    fn typed_by(m: &LineMessage) -> Option<By> {
+        (m.from.kind == PartyKind::You).then(By::you)
+    }
+
     async fn line_next_now(&self, caller: Uuid) -> Result<Option<Value>, LineError> {
-        if !self.view(caller)?.live {
+        let view = self.view(caller)?;
+        if !view.live {
             return Ok(None);
         }
         let inbox = self.0.store.line_inbox(&caller.to_string()).await?;
@@ -833,7 +852,7 @@ impl Desk {
             return Ok(None);
         }
         for m in inbox {
-            if self.waited_on(&m) {
+            if self.waited_on(&m) || self.line_gate(&view, &m).is_some() {
                 continue;
             }
             if let Some(taken) = self.0.store.line_take(m.id, Delivery::Handed).await? {
@@ -934,14 +953,14 @@ impl Desk {
                 self.0.store.put_line(&m).await?;
                 self.line_announce(&m);
             }
-            if now != Ok(Deliver::Paste) || typed_in {
+            if now != Ok(Deliver::Paste) || typed_in || self.line_gate(&view, &m).is_some() {
                 continue;
             }
             let Some(taken) = self.0.store.line_take(m.id, Delivery::Delivered).await? else {
                 continue;
             };
             let text = self.rendered(&taken).await;
-            if let Err(e) = self.prompt(id, &text, None) {
+            if let Err(e) = self.prompt(id, &text, Self::typed_by(&taken)) {
                 // Not typed in: it waits on.
                 let mut back = taken;
                 back.delivery = Delivery::Queued;
@@ -1107,6 +1126,7 @@ impl Desk {
                 Delivery::Held => Some(Wait::Stopped),
                 Delivery::Queued => match line::deliverable(&view, typed, plugin) {
                     Err(why) => Some(why),
+                    Ok(_) if self.line_gate(&view, m).is_some() => self.line_gate(&view, m),
                     Ok(Deliver::Submit)
                         if matches!(view.state, SessionState::Working | SessionState::Blocked) =>
                     {
@@ -1142,7 +1162,7 @@ impl Desk {
     /// The person changes (`Some`) or takes back (`None`) a message of
     /// theirs that hasn't gone out.
     pub async fn line_edit(&self, id: Uuid, text: Option<String>) -> Result<(), DeskError> {
-        let text = text.map(|t| t.trim().to_string());
+        let text = text.map(|t| line::typable(&t).trim().to_string());
         if text.as_deref().is_some_and(str::is_empty) {
             return Err(DeskError::Invalid("the message is empty".into()));
         }
@@ -1220,7 +1240,11 @@ impl Desk {
                     engine: m.from.engine,
                 },
                 ask: m.text.clone(),
-                why: m.escalation.as_ref().map(|e| e.why.clone()).filter(|w| !w.is_empty()),
+                why: m
+                    .escalation
+                    .as_ref()
+                    .map(|e| e.why.clone())
+                    .filter(|w| !w.is_empty()),
                 options: m
                     .escalation
                     .as_ref()

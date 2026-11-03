@@ -222,78 +222,56 @@ impl Action {
     }
 }
 
-const OUTWARD: &[&str] = &[
+/// Words that name pushing, deploying, deleting or sending: each word of a
+/// text is matched whole against `OUTWARD_WORDS`, and by its start against
+/// `OUTWARD_STEMS` (so pushing, deployment, publishing, merged, released
+/// and deleting are caught with push, deploy and the rest).
+const OUTWARD_STEMS: &[&str] = &[
     "push",
-    "pushes",
-    "pushed",
     "deploy",
-    "deploys",
-    "deployed",
     "ship",
-    "ships",
     "publish",
-    "publishes",
-    "published",
-    "release",
-    "releases",
-    "released",
-    "merge",
-    "merges",
-    "merged",
-    "pr",
-    "prs",
-    "delete",
-    "deletes",
-    "deleted",
-    "remove",
-    "removes",
-    "removed",
-    "rm",
-    "drop",
+    "releas",
+    "merg",
+    "delet",
+    "remov",
     "destroy",
-    "wipe",
-    "purge",
+    "wip",
+    "purg",
     "send",
-    "sends",
-    "sent",
+    "upload",
+    "submit",
+    "notif",
+    "announc",
+    "invit",
+    "purchas",
     "email",
-    "emails",
     "mail",
-    "post",
-    "posts",
-    "posted",
+    "messag",
     "tweet",
     "slack",
-    "message",
-    "messages",
-    "dm",
-    "share",
-    "shares",
-    "shared",
-    "upload",
-    "uploads",
-    "uploaded",
-    "submit",
-    "submits",
-    "submitted",
-    "notify",
-    "notifies",
-    "announce",
-    "invite",
-    "reply",
-    "pay",
-    "purchase",
-    "buy",
-    "order",
+    "migrat",
+    "commit",
+    "production",
+    "rollout",
+    "rebase",
+    "drop",
+    "force",
+];
+const OUTWARD_WORDS: &[&str] = &[
+    "sent", "post", "posts", "posted", "posting", "pr", "prs", "rm", "dm", "share", "shares",
+    "shared", "sharing", "reply", "replies", "replied", "pay", "pays", "paid", "buy", "order",
+    "prod", "apply", "applies", "applied", "applying", "reset",
 ];
 
-/// Whether `text` names something that pushes, deletes or sends. Words
-/// can't say all that a message leads to, so this only ever narrows what
-/// runs.
+/// Whether `text` names something that pushes, deploys, deletes or sends.
+/// Words can't say all that a message leads to ("may I go on?" with the
+/// push only in what came before), so this only ever narrows what runs.
 pub(crate) fn outward(text: &str) -> bool {
     text.to_lowercase()
         .split(|c: char| !c.is_alphanumeric())
-        .any(|w| OUTWARD.contains(&w))
+        .filter(|w| !w.is_empty())
+        .any(|w| OUTWARD_WORDS.contains(&w) || OUTWARD_STEMS.iter().any(|s| w.starts_with(s)))
 }
 
 /// Whether the overseer may do it now, or should suggest it instead.
@@ -587,7 +565,13 @@ impl CrewHub {
                 let name = self.session_name(*s);
                 let sender = match by.party.kind {
                     crew::PartyKind::Manager => workforce_desk::LineSender::Overseer(by),
-                    _ => workforce_desk::LineSender::Person,
+                    // The person, saying yes to a suggestion.
+                    crew::PartyKind::You => workforce_desk::LineSender::Person,
+                    crew::PartyKind::Agent | crew::PartyKind::Session | crew::PartyKind::Desk => {
+                        return Err(
+                            "Only the overseer or the person writes on a session's line.".into(),
+                        )
+                    }
                 };
                 let line = |e: workforce_desk::LineError| match e {
                     workforce_desk::LineError::Refused(r) => r.to_string(),
@@ -861,6 +845,32 @@ mod tests {
             "Reply to the thread when done",
         ] {
             assert!(outward(said), "{said}");
+        }
+        for said in [
+            "Pushing to main now",
+            "Deploying to staging",
+            "The deployment is ready",
+            "Publishing the crate",
+            "Merging the PR",
+            "Releasing 4.2",
+            "Deleting the old branch",
+            "Ship it to prod?",
+            "Roll it out to production",
+            "Run the migration",
+            "Migrate the database",
+            "Apply the terraform plan",
+            "Commit and push",
+            "May I commit this?",
+        ] {
+            assert!(outward(said), "{said}");
+        }
+        for said in [
+            "Which port does the test database use?",
+            "Is postgres on 5433?",
+            "What does the product page show?",
+            "Run the tests without the network ones",
+        ] {
+            assert!(!outward(said), "{said}");
         }
         assert!(!outward("Run the tests without the network ones"));
         assert!(!outward("Still on the provider tests, or stuck?"));

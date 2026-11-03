@@ -307,6 +307,8 @@ struct CodexLink {
     replies: mpsc::UnboundedSender<codex::Reply>,
     /// What its breaker says into its running turn, to its observer.
     steers: mpsc::UnboundedSender<String>,
+    /// The person's line messages said into its running turn.
+    line_steers: mpsc::UnboundedSender<String>,
 }
 
 impl CodexLink {
@@ -2988,8 +2990,12 @@ impl Desk {
             }
             Engine::Codex => {
                 let socket = self.0.opts.run_dir.join(format!("{}.sock", r.id.simple()));
-                let line = format!("{}/mcp/{}/{token}", self.0.hook_base, r.id);
-                let server = self.start_app_server(r.id, &socket, &line).await?;
+                let line = format!("{}/mcp/{}", self.0.hook_base, r.id);
+                let line = codex::LineMcp {
+                    url: &line,
+                    token: &token,
+                };
+                let server = self.start_app_server(r.id, &socket, line).await?;
                 let thread = r.cli_session_id.as_deref().filter(|_| resume);
                 let spec = codex::spawn(&codex::CodexSpawn {
                     program: self.program_of(Engine::Codex)?,
@@ -3099,7 +3105,7 @@ impl Desk {
         &self,
         id: Uuid,
         socket: &Path,
-        line: &str,
+        line: codex::LineMcp<'_>,
     ) -> Result<Server, DeskError> {
         let program = self.program_of(Engine::Codex)?;
         let Some(holder) = self.holder().await else {
@@ -3138,6 +3144,7 @@ impl Desk {
         let (tx, rx) = mpsc::channel(64);
         let (replies, answers) = mpsc::unbounded_channel();
         let (steers, steered) = mpsc::unbounded_channel();
+        let (line_steers, line_said) = mpsc::unbounded_channel();
         tokio::spawn({
             let socket = server.socket(&socket);
             let watch = watch.clone();
@@ -3149,8 +3156,10 @@ impl Desk {
                 follower
             };
             async move {
-                if let Err(e) =
-                    codex::observe(socket, follower, tx, answers, steered, plans, watch).await
+                if let Err(e) = codex::observe(
+                    socket, follower, tx, answers, steered, line_said, plans, watch,
+                )
+                .await
                 {
                     tracing::warn!(error = %e, "codex observer stopped");
                 }
@@ -3163,6 +3172,7 @@ impl Desk {
             watch,
             replies,
             steers,
+            line_steers,
         }
     }
 
@@ -3294,14 +3304,21 @@ impl Desk {
                 });
             }
             Hook::Prompt(p) => {
-                self.person_spoke(id);
-                // The person's own words: a session its breaker holds goes on.
-                self.breaker_turn(id, self.person_prompted(id, &p));
+                // The person's own words: a session its breaker holds goes
+                // on, and its line's loop guard starts again.
+                let person = self.person_prompted(id, &p);
+                if person {
+                    self.person_spoke(id);
+                }
+                self.breaker_turn(id, person);
                 self.prompted(id, p, true);
             }
-            // Desk's plugin submitted a line message: a turn starts as for
-            // a prompt, but the person didn't speak.
+            // A line message (Desk's plugin submitted it, or Desk typed it
+            // in): a turn starts as for a prompt, but the person didn't
+            // speak, and a hold stays.
             Hook::Delivered { prompt, mark } => {
+                let _ = self.person_prompted(id, &prompt);
+                self.breaker_turn(id, false);
                 self.line_heard(id, &mark).await;
                 self.prompted(id, prompt, false);
             }
@@ -3740,7 +3757,12 @@ impl Desk {
                 self.line_steer_refused(id, said).await;
                 continue;
             }
-            // A line message Desk typed in is not the person speaking.
+            // A line message Desk typed in is not the person speaking; whose
+            // a prompt is, is read once.
+            let prompted = match &event {
+                CodexEvent::Prompt(p) => Some(self.person_prompted(id, p)),
+                _ => None,
+            };
             let delivery = match &event {
                 CodexEvent::Prompt(p) => match crate::line::is_delivery(p) {
                     Some(mark) => {
@@ -3748,7 +3770,9 @@ impl Desk {
                         true
                     }
                     None => {
-                        self.person_spoke(id);
+                        if prompted == Some(true) {
+                            self.person_spoke(id);
+                        }
                         false
                     }
                 },
@@ -3861,9 +3885,8 @@ impl Desk {
                     }
                 }
                 CodexEvent::Failed(t) => self.breaker_failed(id, t),
-                CodexEvent::Prompt(p) => {
-                    let person = self.person_prompted(id, p);
-                    self.breaker_turn(id, person);
+                CodexEvent::Prompt(_) => {
+                    self.breaker_turn(id, prompted == Some(true) && !delivery);
                 }
                 _ => {}
             }
@@ -6861,6 +6884,7 @@ mod codex_stop_tests {
             watch: CancellationToken::new(),
             replies: mpsc::unbounded_channel().0,
             steers: mpsc::unbounded_channel().0,
+            line_steers: mpsc::unbounded_channel().0,
         };
         (link, pid, hdir)
     }

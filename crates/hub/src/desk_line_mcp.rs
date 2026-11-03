@@ -155,6 +155,21 @@ mod tests {
             .await;
             assert_eq!(refused["result"]["isError"], true, "{refused}");
 
+            // Codex's app-server sends the token as a bearer token.
+            let (bare, token) = url.rsplit_once('/').unwrap();
+            let bearer = |t: &str| {
+                reqwest::Client::new()
+                    .post(bare)
+                    .bearer_auth(t)
+                    .json(&json!({"jsonrpc": "2.0", "id": 5, "method": "tools/list"}))
+                    .send()
+            };
+            let ok = bearer(token).await.unwrap();
+            assert_eq!(ok.status(), reqwest::StatusCode::OK);
+            let listed: Value = ok.json().await.unwrap();
+            assert_eq!(listed["result"]["tools"].as_array().unwrap().len(), TOOLS.len());
+            assert_eq!(bearer("nope").await.unwrap().status(), reqwest::StatusCode::NOT_FOUND);
+
             // A wrong token is answered nothing.
             let wrong = format!("{}nope", &url[..url.rfind('/').unwrap() + 1]);
             let (status, body) = rpc(&wrong, json!({"jsonrpc": "2.0", "id": 4, "method": "tools/list"})).await;

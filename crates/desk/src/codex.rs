@@ -79,13 +79,30 @@ pub fn spawn(s: &CodexSpawn<'_>) -> Spawn {
     }
 }
 
+/// Where a session's app-server reaches Desk's line: its MCP address, and
+/// the session's token, which goes in the app-server's environment (as
+/// [`LINE_TOKEN`]), never in its arguments, which `ps` shows.
+#[derive(Debug, Clone, Copy)]
+pub struct LineMcp<'a> {
+    pub url: &'a str,
+    pub token: &'a str,
+}
+
+/// The variable a session's app-server reads its line token from.
+pub const LINE_TOKEN: &str = "DESK_LINE_TOKEN";
+
 /// The settings that give a session's app-server Desk's line ([`crate::line`])
-/// as the MCP server `desk` at `url`: its tools run in the app-server, not
-/// the TUI (`codex app-server -c key=value`, CLI 0.164). Its tools are
+/// as the MCP server `desk` at `url`, its token sent as a bearer token from
+/// [`LINE_TOKEN`]: its tools run in the app-server, not the TUI
+/// (`codex app-server -c key=value`, CLI 0.164). Its tools are
 /// pre-approved, and a waiting `ask` (up to 300 s) isn't cut off.
-pub fn line_settings(url: &str) -> [String; 3] {
+pub fn line_settings(url: &str) -> [String; 4] {
     [
         format!("mcp_servers.desk.url={}", toml_string(url)),
+        format!(
+            "mcp_servers.desk.bearer_token_env_var={}",
+            toml_string(LINE_TOKEN)
+        ),
         "mcp_servers.desk.tool_timeout_sec=330".to_string(),
         "mcp_servers.desk.default_tools_approval_mode=\"approve\"".to_string(),
     ]
@@ -102,15 +119,19 @@ pub fn app_server(
     program: &Path,
     socket: &Path,
     env: &BTreeMap<String, String>,
-    line: Option<&str>,
+    line: Option<LineMcp<'_>>,
 ) -> Spawn {
     let mut args = vec![
         "app-server".to_string(),
         "--listen".into(),
         format!("unix://{}", socket.display()),
     ];
-    for setting in line.map(line_settings).into_iter().flatten() {
-        args.extend(["-c".to_string(), setting]);
+    let mut env = env.clone();
+    if let Some(line) = line {
+        for setting in line_settings(line.url) {
+            args.extend(["-c".to_string(), setting]);
+        }
+        env.insert(LINE_TOKEN.into(), line.token.into());
     }
     Spawn {
         program: program.to_path_buf(),
@@ -118,7 +139,7 @@ pub fn app_server(
         cwd: socket
             .parent()
             .map_or_else(|| PathBuf::from("/"), Path::to_path_buf),
-        env: env.clone(),
+        env,
     }
 }
 
@@ -165,14 +186,14 @@ impl AppServer {
         program: &Path,
         socket: PathBuf,
         env: &BTreeMap<String, String>,
-        line: Option<&str>,
+        line: Option<LineMcp<'_>>,
     ) -> Result<Self> {
         prepare_socket(&socket).await?;
         let spec = app_server(program, &socket, env, line);
         let child = Command::new(&spec.program)
             .args(&spec.args)
             .env_clear()
-            .envs(env)
+            .envs(&spec.env)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -749,6 +770,10 @@ const LIMITS_READ: i64 = 2;
 const SUBSCRIBE: i64 = 3;
 /// The id it steers the session's turn under.
 const STEER: i64 = 4;
+/// The id it says the person's message on Desk's line into the turn under:
+/// apart from [`STEER`] (Desk's breaker), so a refusal is said only of the
+/// message it refused.
+const LINE_STEER: i64 = 5;
 
 /// Folds `from` into `into`: what it holds replaces what was known, and a
 /// value it leaves out or sends as null keeps it.
@@ -813,8 +838,8 @@ pub struct Follower {
     home: Option<PathBuf>,
     /// The thread's turn running now, which a steer must name.
     turn: Option<String>,
-    /// What was said into its turns, oldest first, until Codex answers
-    /// each (`turn/steer` answers in order).
+    /// The line's messages said into its turns, oldest first, until Codex
+    /// answers each (`turn/steer` answers in order).
     steering: std::collections::VecDeque<String>,
 }
 
@@ -867,7 +892,7 @@ impl Follower {
                 // status.
                 // A steer Codex refused (its turn had ended): what was
                 // said goes in at the next idle instead.
-                if id.as_i64() == Some(STEER) {
+                if id.as_i64() == Some(LINE_STEER) {
                     let said = self.steering.pop_front();
                     let refused =
                         v.get("error")
@@ -988,6 +1013,18 @@ impl Follower {
             "input": [{ "type": "text", "text": text }] } }))
     }
 
+    /// What to send to say the person's `text` on Desk's line into the
+    /// running turn, kept until Codex answers it; nothing while no turn
+    /// runs.
+    pub fn line_steer(&mut self, text: &str) -> Option<Value> {
+        let (thread, turn) = (self.thread.as_ref()?, self.turn.as_ref()?);
+        let send = json!({ "id": LINE_STEER, "method": "turn/steer", "params": {
+            "threadId": thread, "expectedTurnId": turn,
+            "input": [{ "type": "text", "text": text }] } });
+        self.steering.push_back(text.to_string());
+        Some(send)
+    }
+
     /// What to send for `reply`, and what to say of it: nothing is sent to
     /// a request already answered.
     pub fn reply(&mut self, reply: &Reply) -> (Option<Seen>, Option<Value>) {
@@ -1018,6 +1055,7 @@ pub async fn observe(
     events: mpsc::Sender<Seen>,
     mut replies: mpsc::UnboundedReceiver<Reply>,
     mut steers: mpsc::UnboundedReceiver<String>,
+    mut line_steers: mpsc::UnboundedReceiver<String>,
     plans: Option<Arc<dyn PlanSink>>,
     cancel: CancellationToken,
 ) -> Result<()> {
@@ -1046,25 +1084,29 @@ pub async fn observe(
     let mut limits: Option<Value> = None;
     let mut replying = true;
     let mut steering = true;
+    let mut line_steering = true;
     loop {
         tokio::select! {
             _ = cancel.cancelled() => return Ok(()),
             steer = steers.recv(), if steering => match steer {
                 Some(text) => {
-                    match follower.steer(&text) {
-                        Some(send) => {
-                            tx.send(Message::text(send.to_string())).await?;
-                            follower.steering.push_back(text);
-                        }
-                        // No turn runs: said at the next idle instead.
-                        None => {
-                            if let Some(thread) = follower.thread.clone() {
-                                events.send(Seen { thread, event: CodexEvent::SteerRefused(text) }).await?;
-                            }
-                        }
+                    if let Some(send) = follower.steer(&text) {
+                        tx.send(Message::text(send.to_string())).await?;
                     }
                 }
                 None => steering = false,
+            },
+            said = line_steers.recv(), if line_steering => match said {
+                Some(text) => match follower.line_steer(&text) {
+                    Some(send) => tx.send(Message::text(send.to_string())).await?,
+                    // No turn runs, or the thread isn't known yet: said at
+                    // the next idle instead.
+                    None => {
+                        let thread = follower.thread.clone().unwrap_or_default();
+                        events.send(Seen { thread, event: CodexEvent::SteerRefused(text) }).await?;
+                    }
+                },
+                None => line_steering = false,
             },
             reply = replies.recv(), if replying => match reply {
                 Some(reply) => {
@@ -1277,8 +1319,13 @@ pub(crate) mod tests {
         let mut f = Follower::new(Some("t1".into()), None);
         f.steering
             .extend(["skip the slow tests".to_string(), "then lint".to_string()]);
+        // The breaker's steer is its own: refused, it says nothing here.
         let (seen, _) =
             f.heard(&json!({"id": STEER, "error": {"code": -32600, "message": "no active turn"}}));
+        assert!(seen.is_empty());
+        let (seen, _) = f.heard(
+            &json!({"id": LINE_STEER, "error": {"code": -32600, "message": "no active turn"}}),
+        );
         assert!(matches!(
             seen.as_slice(),
             [Seen {
@@ -1286,8 +1333,9 @@ pub(crate) mod tests {
                 ..
             }] if said == "skip the slow tests"
         ));
-        let (seen, _) = f.heard(&json!({"id": STEER, "result": {}}));
+        let (seen, _) = f.heard(&json!({"id": LINE_STEER, "result": {}}));
         assert!(seen.is_empty());
+        assert!(f.steering.is_empty(), "each answer takes its own");
     }
 
     #[test]
@@ -1749,6 +1797,7 @@ pub(crate) mod tests {
             Follower::new(Some("t1".into()), None).at_once(),
             events,
             answers,
+            mpsc::unbounded_channel().1,
             mpsc::unbounded_channel().1,
             None,
             cancel.clone(),
