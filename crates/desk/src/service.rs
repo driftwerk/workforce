@@ -42,6 +42,8 @@ use crate::worktree;
 mod accounts;
 pub use accounts::Added;
 mod breaker;
+mod charge;
+pub use charge::ChargeView;
 mod codex_terminals;
 mod copies;
 mod groups;
@@ -413,6 +415,8 @@ struct State {
     switching: HashSet<Uuid>,
     /// What Desk's lines keep in memory.
     lines: line::Lines,
+    /// Which boss runs which session, and the person's input to each.
+    charges: charge::Charges,
 }
 
 /// How often a busy session's tool is recorded as `working`.
@@ -1036,6 +1040,8 @@ impl Desk {
         tokio::spawn(desk.clone().ledger_loop(ledger_jobs));
         desk.breaker_load().await;
         tokio::spawn(desk.clone().breaker_loop());
+        desk.charge_load().await;
+        tokio::spawn(desk.clone().charge_loop());
         tokio::spawn(desk.clone().watch_background());
         tokio::spawn(desk.clone().line_loop());
         recovered.into_iter().for_each(|r| desk.save(r));
@@ -3309,6 +3315,7 @@ impl Desk {
                 let person = self.person_prompted(id, &p);
                 if person {
                     self.person_spoke(id);
+                    self.person_drove(id);
                 }
                 self.breaker_turn(id, person);
                 self.prompted(id, p, true);
@@ -3772,6 +3779,7 @@ impl Desk {
                     None => {
                         if prompted == Some(true) {
                             self.person_spoke(id);
+                            self.person_drove(id);
                         }
                         false
                     }

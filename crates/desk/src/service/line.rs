@@ -825,13 +825,20 @@ impl Desk {
 
     /// Why `m` mustn't go into `view` now, whatever its engine could take:
     /// a session Desk's breaker paused, or one asking the person something,
-    /// takes only the person's own messages.
+    /// takes only the person's own messages; one the person drives, none
+    /// of its boss's.
     fn line_gate(&self, view: &SessionView, m: &LineMessage) -> Option<Wait> {
         if m.from.kind == PartyKind::You {
             return None;
         }
         if self.breaker_refuses_prompt(view.id, None).is_err() {
             return Some(Wait::Paused);
+        }
+        if m.from.kind == PartyKind::Manager
+            && m.kind == LineKind::Tell
+            && self.person_driving(view.id)
+        {
+            return Some(Wait::PersonDriving);
         }
         (view.state == SessionState::Asking).then_some(Wait::Asking)
     }
@@ -1148,15 +1155,18 @@ impl Desk {
         text: String,
         when: When,
     ) -> Result<LineMessage, LineError> {
-        self.line_send(
-            Sender::Person,
-            Send::Tell {
-                to: Target::Session(id),
-                text,
-                when,
-            },
-        )
-        .await
+        let m = self
+            .line_send(
+                Sender::Person,
+                Send::Tell {
+                    to: Target::Session(id),
+                    text,
+                    when,
+                },
+            )
+            .await?;
+        self.person_drove(id);
+        Ok(m)
     }
 
     /// The person changes (`Some`) or takes back (`None`) a message of

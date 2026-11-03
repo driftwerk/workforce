@@ -704,6 +704,8 @@ impl Capability {
                 "crew.restart",
                 "crew.start_session",
                 "crew.assign",
+                "crew.take_on",
+                "crew.release",
                 "wasm_skill.build",
             ],
             Capability::DatabaseWrite => &["database.execute"],
@@ -1051,7 +1053,7 @@ pub fn tool_capability(tool: &str, input: &serde_json::Value) -> Option<Capabili
         // The crew overseer reads and drives the same terminals.
         | "crew.overview" | "crew.activity" | "crew.history" | "crew.spend" | "crew.nudge" | "crew.escalate" | "crew.approve"
         | "crew.deny" | "crew.stop" | "crew.interrupt" | "crew.resume" | "crew.restart" | "crew.start_session"
-        | "crew.assign" => Some(Capability::ShellExec),
+        | "crew.assign" | "crew.take_on" | "crew.release" => Some(Capability::ShellExec),
         // A language server loads the project the way a build does (build
         // scripts, proc macros, compiler plugins), so every `code.refactor`
         // action it answers is this class too. Only `replace_definition`, a

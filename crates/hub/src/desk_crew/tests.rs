@@ -2766,3 +2766,164 @@ async fn an_answer_is_gated_by_the_switch_and_by_what_was_asked() {
     })
     .await;
 }
+
+/// Taking a session on is offered to the person unless they let the
+/// overseer take on every one; letting one go always runs; and a session
+/// it runs no longer wakes its DM when its turn ends.
+#[tokio::test(flavor = "multi_thread")]
+async fn taking_on_is_offered_unless_every_session_is_and_letting_go_always_runs() {
+    use super::actions::{Action, Gate};
+    use workforce_common::oversight::{Level, TakeOn};
+    use workforce_desk::charge::How;
+    use workforce_desk::crew::Event;
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, crew, d, _llm) = overseeing(
+            dir.path(),
+            pool,
+            "ok",
+            "[oversight]\nenabled = true\nlevel = \"act\"\n",
+            &[],
+        )
+        .await;
+        let s = new_session(&d, dir.path(), "acme-web").await;
+        let (_, mut o) = crew.overseer_service().unwrap();
+        let take = Action::TakeOn { session: s.id };
+        let release = Action::Release { session: s.id };
+        assert!(
+            matches!(crew.gate(&take, &o), Gate::Suggest(_)),
+            "handed only"
+        );
+        assert_eq!(crew.gate(&release, &o), Gate::Run);
+        o.work.take_on = TakeOn::All;
+        assert_eq!(crew.gate(&take, &o), Gate::Run);
+        o.level = Level::Suggest;
+        assert!(matches!(crew.gate(&take, &o), Gate::Suggest(_)));
+        assert_eq!(crew.gate(&release, &o), Gate::Run);
+        o.level = Level::Watch;
+        assert_eq!(crew.gate(&take, &o), Gate::Refuse);
+
+        let by = crew
+            .by_overseer("It is waiting for its next step.")
+            .unwrap();
+        let done = crew.perform(&take, by.clone()).await.unwrap();
+        assert_eq!(done, "took on acme-web");
+        let c = d.charge_of(s.id).unwrap();
+        assert_eq!((c.boss.as_str(), c.how), ("desk", How::Taken));
+        let me = workforce_desk::crew::Party::session(&d.view(s.id).unwrap());
+        let finished = Event::new(Kind::Finished, me.clone(), Some(me), "finished · Built.");
+        assert!(
+            crew.trigger_for(&finished, "desk", &o).is_none(),
+            "its own line wakes it instead"
+        );
+        assert!(crew.work_line(&finished).is_some());
+        let done = crew.perform(&release, by).await.unwrap();
+        assert_eq!(done, "let acme-web go");
+        assert!(crew.work_line(&finished).is_none());
+        assert!(crew.trigger_for(&finished, "desk", &o).is_some());
+        // The person saying yes to its offer hands it over.
+        let mut yes = By::you();
+        yes.suggestion_id = Some("s1".into());
+        crew.perform(&take, yes).await.unwrap();
+        assert_eq!(d.charge_of(s.id).unwrap().how, How::Handed);
+    })
+    .await;
+}
+
+/// A session the overseer runs wakes it on that session's own line when
+/// its turn ends, as a work turn; the overview says which it runs.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_session_the_overseer_runs_wakes_it_on_its_line_when_its_turn_ends() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, crew, d, _llm) = overseeing(
+            dir.path(),
+            pool,
+            "It is done; nothing more to do.",
+            "[oversight]\nenabled = true\nlevel = \"act\"\n[oversight.work]\nparallel = 3\n",
+            &[],
+        )
+        .await;
+        let s = new_session(&d, dir.path(), "acme-web").await;
+        let url = hook_url(dir.path(), s.id).await;
+        hook(
+            &url,
+            json!({"hook_event_name": "SessionStart", "session_id": s.id.to_string()}),
+        )
+        .await;
+        hook(
+            &url,
+            json!({"hook_event_name": "UserPromptSubmit", "prompt": "Upgrade the date picker"}),
+        )
+        .await;
+        let boss = workforce_desk::crew::Party::manager("desk", &super::name_of(&overseer));
+        d.take_on(
+            s.id,
+            &boss,
+            workforce_desk::charge::How::Handed,
+            &Default::default(),
+            &By::you(),
+        )
+        .await
+        .unwrap();
+        let overview = super::tools::CrewTool::for_level(&crew, false)
+            .into_iter()
+            .find(|t| workforce_agent::tools::Tool::name(t) == "crew.overview")
+            .unwrap();
+        let read = workforce_agent::tools::Tool::execute(&overview, json!({}))
+            .await
+            .unwrap()
+            .output;
+        assert_eq!(read["slots"], json!({"busy": 1, "parallel": 3}), "{read}");
+        let table = read["table"].as_str().unwrap();
+        assert!(table.contains("| You run it |"), "{table}");
+        assert!(table.contains("| yes |"), "{table}");
+        hook(
+            &url,
+            json!({"hook_event_name": "Stop", "last_assistant_message": "The date picker is on 4.2 and the tests pass."}),
+        )
+        .await;
+        let channel = super::line::line_channel(s.id);
+        let woke = eventually("the work turn", async || {
+            let line = overseer.sessions.find(&channel, PERSON).unwrap()?;
+            line.messages
+                .iter()
+                .find(|m| m.content.starts_with(super::work::WORK))
+                .cloned()
+        })
+        .await;
+        assert!(woke.content.contains("acme-web finished"), "{}", woke.content);
+        assert!(woke.content.contains(&format!("session_id {}", s.id)));
+    })
+    .await;
+}
+
+/// Set to take on every session, at `act`, the overseer takes one on as
+/// it appears, and never one the person took back.
+#[tokio::test(flavor = "multi_thread")]
+async fn set_to_take_on_every_session_it_does_but_never_one_taken_back() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, _crew, d, _llm) = overseeing(
+            dir.path(),
+            pool,
+            "ok",
+            "[oversight]\nenabled = true\nlevel = \"act\"\nwork = { take_on = \"all\" }\n",
+            &[],
+        )
+        .await;
+        let s = new_session(&d, dir.path(), "acme-web").await;
+        let c = eventually("it is taken on", async || {
+            d.charge_of(s.id).filter(|c| c.live())
+        })
+        .await;
+        assert_eq!(c.how, workforce_desk::charge::How::Taken);
+        d.release(s.id, &By::you()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            !d.charge_of(s.id).unwrap().live(),
+            "taken back, it stays the person's"
+        );
+    })
+    .await;
+}

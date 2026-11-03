@@ -82,6 +82,9 @@ pub enum Wait {
     Paused,
     /// It is asking the person something: only the person answers it.
     Asking,
+    /// The person has the wheel of a session a boss runs: the boss's
+    /// messages wait until they hand it back.
+    PersonDriving,
 }
 
 /// One message on a line, as stored and as Desk shows it.

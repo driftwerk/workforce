@@ -2,12 +2,14 @@
 //! doing it — for the overseer's tools, and for the person accepting one of
 //! its suggestions.
 
+use std::collections::HashSet;
 use std::path::Path;
 
 use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
-use workforce_common::oversight::{Act, Level, Oversight};
+use workforce_common::oversight::{Act, Level, Oversight, TakeOn};
+use workforce_desk::charge::How;
 use workforce_desk::crew::{self, By, Kind, Party};
 use workforce_desk::model::{Engine, NewSession, Origin};
 use workforce_desk::Speaker;
@@ -71,6 +73,15 @@ pub(crate) enum Action {
     Assign {
         agent: String,
         task: String,
+    },
+    /// Run a session for the person: it wakes the overseer at each turn's
+    /// end, and waits for it while the person isn't driving.
+    TakeOn {
+        session: Uuid,
+    },
+    /// Let a session it runs go: the person runs it on their own.
+    Release {
+        session: Uuid,
     },
 }
 
@@ -188,6 +199,12 @@ impl Action {
                 agent: text(i.agent_id, "which agent")?,
                 task: text(i.task, "the task")?,
             },
+            "crew.take_on" => Self::TakeOn {
+                session: session()?,
+            },
+            "crew.release" => Self::Release {
+                session: session()?,
+            },
             other => return Err(format!("{other} is not something the overseer can do")),
         })
     }
@@ -216,7 +233,9 @@ impl Action {
             | Self::Deny { .. }
             | Self::Stop { .. }
             | Self::Interrupt { .. }
-            | Self::Escalate { .. } => "",
+            | Self::Escalate { .. }
+            | Self::TakeOn { .. }
+            | Self::Release { .. } => "",
         };
         outward(said)
     }
@@ -274,6 +293,18 @@ pub(crate) fn outward(text: &str) -> bool {
         .any(|w| OUTWARD_WORDS.contains(&w) || OUTWARD_STEMS.iter().any(|s| w.starts_with(s)))
 }
 
+/// A charge refused in the words the person reads, as they are.
+fn charge_plain(e: workforce_desk::DeskError) -> String {
+    match e {
+        workforce_desk::DeskError::Conflict(why) | workforce_desk::DeskError::Invalid(why) => why,
+        workforce_desk::DeskError::NotFound => "That session isn’t there any more.".into(),
+        workforce_desk::DeskError::Internal(e) => {
+            tracing::warn!(error = %e, "a charge failed");
+            "Something went wrong on this Mac.".into()
+        }
+    }
+}
+
 /// Whether the overseer may do it now, or should suggest it instead.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Gate {
@@ -287,8 +318,9 @@ pub(crate) enum Gate {
 impl CrewHub {
     /// What `level` and `[oversight.act]` let the overseer do with `action`.
     pub(crate) fn gate(&self, action: &Action, o: &Oversight) -> Gate {
-        // Asking the person is always allowed.
-        if let Action::Escalate { .. } = action {
+        // Asking the person is always allowed, and so is letting a session
+        // go: the person runs it then, as before it was taken on.
+        if let Action::Escalate { .. } | Action::Release { .. } = action {
             return match o.level {
                 Level::Watch => Gate::Refuse,
                 Level::Suggest | Level::Act => Gate::Run,
@@ -298,6 +330,16 @@ impl CrewHub {
             Level::Watch => return Gate::Refuse,
             Level::Suggest => return Gate::Suggest("you suggest; the person decides"),
             Level::Act => {}
+        }
+        // Taking on a session the person runs is theirs to say, unless
+        // they let it take on every one.
+        if let Action::TakeOn { .. } = action {
+            return match o.work.take_on {
+                TakeOn::All => Gate::Run,
+                TakeOn::Handed => Gate::Suggest(
+                    "the person hands you the sessions you run; offer to take it on and they accept",
+                ),
+            };
         }
         if let Some(why) = self.uncontained(action, &o.act) {
             return Gate::Suggest(why);
@@ -354,6 +396,8 @@ impl CrewHub {
             }
             Action::Interrupt { .. } => o.act.interrupt,
             Action::Deny { .. } | Action::Stop { .. } => false,
+            // Decided above.
+            Action::TakeOn { .. } | Action::Release { .. } => true,
         };
         if allowed {
             Gate::Run
@@ -401,7 +445,9 @@ impl CrewHub {
             | Action::Deny { .. }
             | Action::Stop { .. }
             | Action::Interrupt { .. }
-            | Action::Escalate { .. } => true,
+            | Action::Escalate { .. }
+            | Action::TakeOn { .. }
+            | Action::Release { .. } => true,
             Action::Nudge {
                 to: Target::Agent(_),
                 ..
@@ -448,9 +494,9 @@ impl CrewHub {
             | Action::Stop { session: s }
             | Action::Interrupt { session: s }
             | Action::Resume { session: s, .. }
-            | Action::Restart { session: s, .. } => {
-                self.desk.view(*s).ok().map(|v| Party::session(&v))
-            }
+            | Action::Restart { session: s, .. }
+            | Action::TakeOn { session: s }
+            | Action::Release { session: s } => self.desk.view(*s).ok().map(|v| Party::session(&v)),
         }
     }
 
@@ -535,6 +581,12 @@ impl CrewHub {
                     crew::clip(task, 200)
                 )
             }
+            Action::TakeOn { session } => {
+                format!("Run {} for you", self.session_name(*session))
+            }
+            Action::Release { session } => {
+                format!("Let {} go: you run it", self.session_name(*session))
+            }
         }
     }
 
@@ -600,6 +652,11 @@ impl CrewHub {
                             )
                             .await
                             .map_err(line)?;
+                        if d.wheel_of(*s).is_some_and(|w| w.person()) {
+                            return Ok(format!(
+                                "told {name}; the person is driving it, so your message waits until they hand it back"
+                            ));
+                        }
                         Ok(match told.delivery {
                             workforce_desk::line::Delivery::Held => {
                                 format!("told {name}; it is stopped and gets it when it runs again")
@@ -706,6 +763,27 @@ impl CrewHub {
                     .await
                     .map_err(plain)?;
                 Ok(format!("started {} ({})", v.label(), v.id))
+            }
+            Action::TakeOn { session } => {
+                let (service, _) = self
+                    .overseer_service()
+                    .ok_or("No one oversees the crew to run it.")?;
+                let boss = Party::manager(service.agent_id.as_str(), &super::name_of(&service));
+                // The overseer taking it on by itself, or the person saying
+                // yes to its offer.
+                let how = match by.party.kind {
+                    crew::PartyKind::You => How::Handed,
+                    _ => How::Taken,
+                };
+                let c = d
+                    .take_on(*session, &boss, how, &HashSet::new(), &by)
+                    .await
+                    .map_err(charge_plain)?;
+                Ok(format!("took on {}", self.session_name(c.session)))
+            }
+            Action::Release { session } => {
+                let c = d.release(*session, &by).await.map_err(charge_plain)?;
+                Ok(format!("let {} go", self.session_name(c.session)))
             }
         }
     }

@@ -294,6 +294,11 @@ impl CrewHub {
         if subject.id == overseer || !tracked(o, subject) {
             return None;
         }
+        // A session it runs wakes it on its own line when its turn ends.
+        let runs = || subject.id.parse().is_ok_and(|s| self.runs(s, overseer));
+        if matches!(event.kind, Kind::Finished | Kind::Question) && runs() {
+            return None;
+        }
         let wanted = match event.kind {
             Kind::Finished | Kind::Question => o.wake.on_finish,
             Kind::Failed | Kind::Limit => o.wake.on_failure,

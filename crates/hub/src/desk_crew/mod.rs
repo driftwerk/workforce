@@ -35,6 +35,7 @@ mod reading;
 mod spend;
 mod tools;
 mod watcher;
+mod work;
 
 #[cfg(test)]
 pub(crate) mod tests;
@@ -110,6 +111,8 @@ pub struct CrewHub {
     /// answer, by message: an answer is gated by what was asked as well as
     /// by what it says. One not known here is the person's.
     questions: Mutex<HashMap<uuid::Uuid, String>>,
+    /// The work turns the overseer spent on its sessions' turn ends.
+    work: Mutex<work::WorkRun>,
 }
 
 static CREWS: Mutex<Vec<Weak<CrewHub>>> = Mutex::new(Vec::new());
@@ -187,6 +190,7 @@ impl CrewHub {
             tooled: Mutex::default(),
             poke: tokio::sync::Notify::new(),
             questions: Mutex::default(),
+            work: Mutex::default(),
         });
         {
             let mut crews = CREWS.lock();
