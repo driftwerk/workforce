@@ -1,9 +1,12 @@
 //! Codex: the real `codex` TUI attached to an app-server the hub runs per
 //! session (`--remote unix://…`). The hub joins the same app-server as a
 //! second client and reads the session's state from its notifications, so
-//! nothing is scraped off the screen.
+//! nothing is scraped off the screen. Subscribed to the session's thread
+//! (`thread/resume`), it is asked what the TUI is asked, and answers the
+//! command and file approvals the person answers in Desk; whoever answers
+//! first, Desk or the terminal, wins (verified on CLI 0.166).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -18,6 +21,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
 
 use crate::claude::tool_summary;
+use crate::model::Decision;
 use crate::pty::Spawn;
 use crate::usage::{LocalAccount, LocalPlan, PlanSink};
 
@@ -32,8 +36,20 @@ pub struct CodexSpawn<'a> {
     pub socket: &'a Path,
     pub launch: Launch<'a>,
     pub prompt: Option<&'a str>,
+    /// Codex's own reviewer answers its approvals.
+    pub approve_for_me: bool,
     pub env: &'a BTreeMap<String, String>,
 }
+
+/// What `--approve-for-me` sets, as settings: approvals go to Codex's
+/// automatic reviewer, in the workspace-write sandbox. Given to the TUI,
+/// whose own settings start (and resume) its thread: on the app-server
+/// alone they don't reach it (verified on CLI 0.166, `/status`).
+pub const APPROVE_FOR_ME: [&str; 3] = [
+    "approvals_reviewer=auto_review",
+    "approval_policy=on-request",
+    "sandbox_mode=workspace-write",
+];
 
 pub fn spawn(s: &CodexSpawn<'_>) -> Spawn {
     let remote = format!("unix://{}", s.socket.display());
@@ -47,6 +63,13 @@ pub fn spawn(s: &CodexSpawn<'_>) -> Spawn {
         "-C".to_string(),
         s.cwd.display().to_string(),
     ]);
+    if s.approve_for_me {
+        args.extend(
+            APPROVE_FOR_ME
+                .iter()
+                .flat_map(|c| ["-c".to_string(), c.to_string()]),
+        );
+    }
     args.extend(s.prompt.map(str::to_string));
     Spawn {
         program: s.program.to_path_buf(),
@@ -318,6 +341,191 @@ pub enum CodexEvent {
     Child(String),
     /// A model call's tokens, as the app-server reported them.
     Usage(crate::ledger::Spend),
+    /// It asks to run a command or change files, and Desk can answer.
+    Asks(Ask),
+    /// A request it asked was answered, by Desk or the terminal (the
+    /// request's JSON-RPC id).
+    Resolved(Value),
+    /// Desk's answer to a request went to Codex, still open.
+    Answered(Value),
+    /// Desk's answer came after the request was answered (in the
+    /// terminal): not sent.
+    Late(Value),
+    /// Who answers its thread's approvals, as Codex said when subscribed:
+    /// `user`, or `auto_review` ("Approve for me").
+    Reviewer(String),
+    /// Its automatic reviewer ("Approve for me") decided a request: what
+    /// it was, and the verdict in plain words.
+    Reviewed {
+        what: String,
+        verdict: &'static str,
+    },
+}
+
+/// A finished automatic review, as the activity line says it: `None` for
+/// one that was called off.
+fn reviewed(params: &Value) -> Option<CodexEvent> {
+    let verdict = match params.pointer("/review/status").and_then(Value::as_str)? {
+        "approved" => "allowed",
+        "denied" => "denied",
+        "timedOut" => "couldn't decide in time on",
+        _ => return None,
+    };
+    let action = params.get("action")?;
+    let what = match action.get("type").and_then(Value::as_str) {
+        Some("command") => action
+            .get("command")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        Some("execve") => action
+            .get("program")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        Some("applyPatch") => action.get("files").and_then(Value::as_array).map(|f| {
+            f.iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(", ")
+        }),
+        _ => None,
+    }
+    .filter(|w| !w.is_empty())
+    .unwrap_or_else(|| "a request".into());
+    Some(CodexEvent::Reviewed { what, verdict })
+}
+
+/// A command or file change Codex asks to be allowed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Ask {
+    /// The request's JSON-RPC id, to answer it under.
+    pub request: Value,
+    /// `Bash` or `Edit`, as a Claude Code session's requests are named.
+    pub tool: String,
+    /// The command, or the files.
+    pub detail: String,
+    /// Codex's reason, and where it runs.
+    pub why: Option<String>,
+    /// What it can be answered with, of what Desk offers.
+    pub choices: Vec<Decision>,
+}
+
+/// An answer to one of Codex's requests.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Reply {
+    pub request: Value,
+    pub decision: Decision,
+}
+
+/// Codex's word for `d`, in an approval's answer.
+pub fn codex_decision(d: Decision) -> Option<&'static str> {
+    match d {
+        Decision::Allow => Some("accept"),
+        Decision::AllowForSession => Some("acceptForSession"),
+        Decision::Deny => Some("decline"),
+        Decision::Cancel => Some("cancel"),
+        Decision::Terminal => None,
+    }
+}
+
+/// What a request can be answered with: of what it lists, the plain
+/// answers (a standing rule, the execpolicy and network amendments, is the
+/// terminal's to write); all four when it lists none.
+fn choices_of(params: &Value) -> Vec<Decision> {
+    let Some(listed) = params.get("availableDecisions").and_then(Value::as_array) else {
+        return vec![
+            Decision::Allow,
+            Decision::AllowForSession,
+            Decision::Deny,
+            Decision::Cancel,
+        ];
+    };
+    listed
+        .iter()
+        .filter_map(|d| match d.as_str()? {
+            "accept" => Some(Decision::Allow),
+            "acceptForSession" => Some(Decision::AllowForSession),
+            "decline" => Some(Decision::Deny),
+            "cancel" => Some(Decision::Cancel),
+            _ => None,
+        })
+        .collect()
+}
+
+/// `path` with the home folder as `~`.
+fn tilde(path: &str, home: Option<&Path>) -> String {
+    match home.and_then(|h| Path::new(path).strip_prefix(h).ok()) {
+        Some(rest) if rest.as_os_str().is_empty() => "~".into(),
+        Some(rest) => format!("~/{}", rest.display()),
+        None => path.to_string(),
+    }
+}
+
+/// "in ~/repo · Codex's reason".
+fn why_of(params: &Value, home: Option<&Path>) -> Option<String> {
+    let cwd = params
+        .get("cwd")
+        .and_then(Value::as_str)
+        .map(|c| format!("in {}", tilde(c, home)));
+    let reason = params
+        .get("reason")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|r| !r.is_empty())
+        .map(str::to_string);
+    let said: Vec<String> = cwd.into_iter().chain(reason).collect();
+    (!said.is_empty()).then(|| said.join(" · "))
+}
+
+/// The approval a server request is, when it is one Desk answers: a
+/// command's, or a file change's (whose files its item named, in `files`).
+pub fn ask_of(
+    method: &str,
+    id: &Value,
+    params: &Value,
+    files: &HashMap<String, Vec<String>>,
+    home: Option<&Path>,
+) -> Option<Seen> {
+    let thread = params.get("threadId")?.as_str()?.to_string();
+    let (tool, detail) = match method {
+        "item/commandExecution/requestApproval" => {
+            let actions: Vec<&str> = params
+                .get("commandActions")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|a| a.get("command").and_then(Value::as_str))
+                .collect();
+            let command = match actions.is_empty() {
+                true => params.get("command").and_then(Value::as_str)?.to_string(),
+                false => actions.join("; "),
+            };
+            ("Bash", command)
+        }
+        "item/fileChange/requestApproval" => {
+            let item = params.get("itemId").and_then(Value::as_str)?;
+            let named = files
+                .get(item)
+                .map(|f| {
+                    f.iter()
+                        .map(|p| tilde(p, home))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default();
+            ("Edit", named)
+        }
+        _ => return None,
+    };
+    Some(Seen {
+        thread,
+        event: CodexEvent::Asks(Ask {
+            request: id.clone(),
+            tool: tool.into(),
+            detail,
+            why: why_of(params, home),
+            choices: choices_of(params),
+        }),
+    })
 }
 
 /// What happened, and on which thread.
@@ -329,7 +537,8 @@ pub struct Seen {
 
 /// Maps one app-server notification to what the session card shows.
 /// Verified on CLI 0.164: `thread/started` and `thread/status/changed`
-/// reach every client; item notifications only reach a thread's subscribers.
+/// reach every client; item notifications, and the thread's requests, only
+/// reach its subscribers (0.166).
 pub fn interpret(method: &str, params: &Value) -> Option<Seen> {
     let s = |p: &str| {
         params
@@ -403,6 +612,7 @@ pub fn interpret(method: &str, params: &Value) -> Option<Seen> {
             };
             seen(s("/threadId"), event)
         }
+        "item/autoApprovalReview/completed" => seen(s("/threadId"), reviewed(params)?),
         "thread/tokenUsage/updated" => seen(
             s("/threadId"),
             CodexEvent::Usage(crate::ledger::codex_spend(params, chrono::Utc::now())?),
@@ -418,6 +628,8 @@ pub fn interpret(method: &str, params: &Value) -> Option<Seen> {
 
 /// The id the observer reads the account's rate limits under.
 const LIMITS_READ: i64 = 2;
+/// The id it subscribes to the session's thread under.
+const SUBSCRIBE: i64 = 3;
 
 /// Folds `from` into `into`: what it holds replaces what was known, and a
 /// value it leaves out or sends as null keeps it.
@@ -463,12 +675,180 @@ fn account_of(snapshot: &Value) -> LocalAccount {
     }
 }
 
+/// What the observer knows of the session's thread, and what it does
+/// with each message: kept apart from the socket, to be tested alone.
+pub struct Follower {
+    /// The session's thread: known at start when it is resumed or taken
+    /// back, else the first conversation it starts.
+    thread: Option<String>,
+    /// Subscribed to it, or asking to be.
+    subscribed: bool,
+    /// Subscribes as soon as it joins: a session taken back, whose TUI
+    /// already has its thread. Otherwise at the thread's first status, so
+    /// the TUI loads it first, with its own settings.
+    at_once: bool,
+    /// The files each file change item it started touches, by item id.
+    files: HashMap<String, Vec<String>>,
+    /// The requests it forwarded that nobody has answered, by id.
+    open: HashMap<String, String>,
+    home: Option<PathBuf>,
+}
+
+impl Follower {
+    pub fn new(thread: Option<String>, home: Option<PathBuf>) -> Self {
+        Self {
+            thread,
+            subscribed: false,
+            at_once: false,
+            files: HashMap::new(),
+            open: HashMap::new(),
+            home,
+        }
+    }
+
+    /// Subscribes as soon as it joins (see `at_once`).
+    pub fn at_once(mut self) -> Self {
+        self.at_once = true;
+        self
+    }
+
+    /// Subscribes to the thread, when it is known and not yet subscribed.
+    /// Without, it hears only the thread's status, never its requests.
+    fn subscribe(&mut self) -> Option<Value> {
+        let thread = self.thread.as_ref().filter(|_| !self.subscribed)?;
+        self.subscribed = true;
+        // Not its history, which can outgrow a frame: what it asks still
+        // comes.
+        Some(json!({ "id": SUBSCRIBE, "method": "thread/resume",
+            "params": { "threadId": thread, "excludeTurns": true } }))
+    }
+
+    /// What to send once joined.
+    pub fn joined(&mut self) -> Option<Value> {
+        // Otherwise at its first status.
+        self.at_once.then(|| self.subscribe()).flatten()
+    }
+
+    /// What `v` says, and what to send for it. A server request other than
+    /// a command's or a file change's approval is never answered here,
+    /// not even with an error: the first answer wins, and it is the TUI's.
+    pub fn heard(&mut self, v: &Value) -> (Vec<Seen>, Option<Value>) {
+        let method = v.get("method").and_then(Value::as_str);
+        match (v.get("id"), method) {
+            (Some(id), None) => {
+                // The thread can't be resumed before its first turn has
+                // written it down ("no rollout found"): again at its next
+                // status.
+                if id.as_i64() != Some(SUBSCRIBE) {
+                    return (Vec::new(), None);
+                }
+                if v.get("error").is_some() {
+                    tracing::debug!(error = %v["error"], "codex: not subscribed to the thread yet");
+                    self.subscribed = false;
+                    return (Vec::new(), None);
+                }
+                // What the thread runs with, as Codex says it.
+                let said = v
+                    .pointer("/result/approvalsReviewer")
+                    .and_then(Value::as_str)
+                    .zip(self.thread.clone())
+                    .map(|(reviewer, thread)| Seen {
+                        thread,
+                        event: CodexEvent::Reviewer(reviewer.to_string()),
+                    });
+                (said.into_iter().collect(), None)
+            }
+            (Some(id), Some(method)) => {
+                let params = v.get("params").cloned().unwrap_or(Value::Null);
+                let asks = ask_of(method, id, &params, &self.files, self.home.as_deref())
+                    .filter(|s| self.thread.as_deref() == Some(s.thread.as_str()));
+                if let Some(s) = &asks {
+                    self.open.insert(id.to_string(), s.thread.clone());
+                }
+                (asks.into_iter().collect(), None)
+            }
+            (None, Some(method)) => {
+                let params = v.get("params").cloned().unwrap_or(Value::Null);
+                if method == "item/started"
+                    && params.pointer("/item/type").and_then(Value::as_str) == Some("fileChange")
+                {
+                    if let Some(item) = params.pointer("/item/id").and_then(Value::as_str) {
+                        let paths = params
+                            .pointer("/item/changes")
+                            .and_then(Value::as_array)
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|c| c.get("path").and_then(Value::as_str))
+                            .map(str::to_string)
+                            .collect();
+                        self.files.insert(item.to_string(), paths);
+                    }
+                }
+                if method == "serverRequest/resolved" {
+                    if let Some(request) = params.get("requestId") {
+                        self.open.remove(&request.to_string());
+                    }
+                    let seen = params
+                        .get("threadId")
+                        .and_then(Value::as_str)
+                        .zip(params.get("requestId"))
+                        .map(|(thread, request)| Seen {
+                            thread: thread.to_string(),
+                            event: CodexEvent::Resolved(request.clone()),
+                        });
+                    return (seen.into_iter().collect(), None);
+                }
+                let seen = interpret(method, &params);
+                if let Some(Seen {
+                    thread,
+                    event: CodexEvent::Thread { .. },
+                }) = &seen
+                {
+                    self.thread.get_or_insert_with(|| thread.clone());
+                }
+                let send = match (method, params.get("threadId").and_then(Value::as_str)) {
+                    ("thread/status/changed", Some(t)) if self.thread.as_deref() == Some(t) => {
+                        self.subscribe()
+                    }
+                    _ => None,
+                };
+                (seen.into_iter().collect(), send)
+            }
+            (None, None) => (Vec::new(), None),
+        }
+    }
+}
+
+impl Follower {
+    /// What to send for `reply`, and what to say of it: nothing is sent to
+    /// a request already answered.
+    pub fn reply(&mut self, reply: &Reply) -> (Option<Seen>, Option<Value>) {
+        let thread = self.open.remove(&reply.request.to_string());
+        let answer = answer_of(reply).filter(|_| thread.is_some());
+        let event = match answer {
+            Some(_) => CodexEvent::Answered(reply.request.clone()),
+            None => CodexEvent::Late(reply.request.clone()),
+        };
+        let thread = thread.or_else(|| self.thread.clone());
+        (thread.map(|thread| Seen { thread, event }), answer)
+    }
+}
+
+/// The answer to send for `reply`.
+fn answer_of(reply: &Reply) -> Option<Value> {
+    let decision = codex_decision(reply.decision)?;
+    Some(json!({ "id": reply.request, "result": { "decision": decision } }))
+}
+
 /// Joins the app-server as a second client until `cancel` fires or the
 /// server goes away, forwarding what it sees, and the account's rate
-/// limits to `plans`.
+/// limits to `plans`; subscribed to `thread` (else the first it starts),
+/// it forwards what it is asked, and sends `replies`.
 pub async fn observe(
     socket: PathBuf,
+    mut follower: Follower,
     events: mpsc::Sender<Seen>,
+    mut replies: mpsc::UnboundedReceiver<Reply>,
     plans: Option<Arc<dyn PlanSink>>,
     cancel: CancellationToken,
 ) -> Result<()> {
@@ -491,10 +871,26 @@ pub async fn observe(
             "params": { "excludeResetCreditDetails": true } });
         tx.send(Message::text(read.to_string())).await?;
     }
+    if let Some(subscribe) = follower.joined() {
+        tx.send(Message::text(subscribe.to_string())).await?;
+    }
     let mut limits: Option<Value> = None;
+    let mut replying = true;
     loop {
         tokio::select! {
             _ = cancel.cancelled() => return Ok(()),
+            reply = replies.recv(), if replying => match reply {
+                Some(reply) => {
+                    let (seen, answer) = follower.reply(&reply);
+                    if let Some(answer) = answer {
+                        tx.send(Message::text(answer.to_string())).await?;
+                    }
+                    if let Some(seen) = seen {
+                        events.send(seen).await?;
+                    }
+                }
+                None => replying = false,
+            },
             msg = rx.next() => {
                 let Some(msg) = msg else { return Ok(()) };
                 let Message::Text(text) = msg? else { continue };
@@ -511,14 +907,12 @@ pub async fn observe(
                     plans.local(LocalPlan::Codex, merged.clone(), account_of(&merged));
                     limits = Some(merged);
                 }
-                // Server requests (approvals) belong to the TUI; never answered here.
-                if v.get("id").is_some() {
-                    continue;
+                let (seen, send) = follower.heard(&v);
+                if let Some(send) = send {
+                    tx.send(Message::text(send.to_string())).await?;
                 }
-                if let (Some(method), Some(params)) = (v.get("method").and_then(Value::as_str), v.get("params")) {
-                    if let Some(seen) = interpret(method, params) {
-                        events.send(seen).await?;
-                    }
+                for seen in seen {
+                    events.send(seen).await?;
                 }
             }
         }
@@ -576,7 +970,7 @@ pub fn rollouts(home: &Path) -> Vec<PathBuf> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -588,6 +982,7 @@ mod tests {
             socket: Path::new("/run/s.sock"),
             launch: Launch::Resume { thread_id: "t1" },
             prompt: None,
+            approve_for_me: false,
             env: &env,
         });
         assert_eq!(
@@ -601,6 +996,76 @@ mod tests {
                 "/repo"
             ]
         );
+    }
+
+    #[test]
+    fn approve_for_me_is_the_tuis_to_say() {
+        let env = BTreeMap::new();
+        for launch in [Launch::New, Launch::Resume { thread_id: "t1" }] {
+            let s = spawn(&CodexSpawn {
+                program: Path::new("/bin/codex"),
+                cwd: Path::new("/repo"),
+                socket: Path::new("/run/s.sock"),
+                launch,
+                prompt: Some("go"),
+                approve_for_me: true,
+                env: &env,
+            });
+            let tail: Vec<&str> = s
+                .args
+                .iter()
+                .rev()
+                .take(7)
+                .rev()
+                .map(String::as_str)
+                .collect();
+            assert_eq!(
+                tail,
+                [
+                    "-c",
+                    "approvals_reviewer=auto_review",
+                    "-c",
+                    "approval_policy=on-request",
+                    "-c",
+                    "sandbox_mode=workspace-write",
+                    "go"
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn its_reviewers_verdicts_are_said_plainly() {
+        let done = |status: &str, action: Value| {
+            interpret(
+                "item/autoApprovalReview/completed",
+                &json!({"threadId": "t1", "turnId": "u1", "reviewId": "r1", "startedAtMs": 1,
+                    "completedAtMs": 2, "decisionSource": "agent",
+                    "review": {"status": status}, "action": action}),
+            )
+            .map(|s| s.event)
+        };
+        let rm =
+            json!({"type": "command", "command": "rm a.txt", "cwd": "/repo", "source": "shell"});
+        assert_eq!(
+            done("approved", rm.clone()),
+            Some(CodexEvent::Reviewed {
+                what: "rm a.txt".into(),
+                verdict: "allowed"
+            })
+        );
+        assert_eq!(
+            done(
+                "denied",
+                json!({"type": "applyPatch", "cwd": "/repo", "files": ["a.rs", "b.rs"]})
+            ),
+            Some(CodexEvent::Reviewed {
+                what: "a.rs, b.rs".into(),
+                verdict: "denied"
+            })
+        );
+        assert_eq!(done("aborted", rm.clone()), None);
+        assert_eq!(done("inProgress", rm), None);
     }
 
     #[test]
@@ -771,5 +1236,311 @@ mod tests {
         assert_eq!(merged["rateLimits"]["planType"], "pro");
         assert_eq!(merged["accountId"], "acct-1");
         assert_eq!(merge_limits(Some(&first), &json!({"other": 1})), None);
+    }
+
+    /// The escalated command a spike on CLI 0.166 was asked, as it came.
+    fn escalated() -> Value {
+        json!({"kind": "command", "threadId": "t1", "turnId": "u1", "itemId": "exec-1",
+            "startedAtMs": 1793635270599_i64, "environmentId": "local",
+            "reason": "Do you want to allow deleting victim.txt?",
+            "command": "/bin/zsh -lc 'rm victim.txt'", "cwd": "/Users/k/repo",
+            "commandActions": [{"type": "unknown", "command": "rm victim.txt"}],
+            "proposedExecpolicyAmendment": ["rm", "victim.txt"],
+            "availableDecisions": ["accept",
+                {"acceptWithExecpolicyAmendment": {"execpolicy_amendment": ["rm", "victim.txt"]}},
+                "cancel"]})
+    }
+
+    #[test]
+    fn a_command_request_offers_what_codex_does_without_standing_rules() {
+        let home = Path::new("/Users/k");
+        let seen = ask_of(
+            "item/commandExecution/requestApproval",
+            &json!(0),
+            &escalated(),
+            &HashMap::new(),
+            Some(home),
+        )
+        .unwrap();
+        assert_eq!(seen.thread, "t1");
+        assert_eq!(
+            seen.event,
+            CodexEvent::Asks(Ask {
+                request: json!(0),
+                tool: "Bash".into(),
+                detail: "rm victim.txt".into(),
+                why: Some("in ~/repo · Do you want to allow deleting victim.txt?".into()),
+                choices: vec![Decision::Allow, Decision::Cancel],
+            }),
+            "the amendment writes a rule: the terminal's to offer"
+        );
+        let mut plain = escalated();
+        plain.as_object_mut().unwrap().remove("availableDecisions");
+        plain.as_object_mut().unwrap().remove("commandActions");
+        let Some(CodexEvent::Asks(ask)) = ask_of(
+            "item/commandExecution/requestApproval",
+            &json!(4),
+            &plain,
+            &HashMap::new(),
+            None,
+        )
+        .map(|s| s.event) else {
+            panic!("an ask")
+        };
+        assert_eq!(ask.detail, "/bin/zsh -lc 'rm victim.txt'");
+        assert_eq!(
+            ask.choices,
+            [
+                Decision::Allow,
+                Decision::AllowForSession,
+                Decision::Deny,
+                Decision::Cancel
+            ],
+            "unlisted: all four"
+        );
+        for other in [
+            "item/tool/requestUserInput",
+            "mcpServer/elicitation/request",
+            "execCommandApproval",
+        ] {
+            assert_eq!(
+                ask_of(other, &json!(1), &escalated(), &HashMap::new(), None),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn a_file_change_request_names_the_files_its_item_did() {
+        let mut f = Follower::new(Some("t1".into()), Some(PathBuf::from("/Users/k")));
+        f.heard(
+            &json!({"method": "item/started", "params": {"threadId": "t1",
+            "item": {"type": "fileChange", "id": "fc-1", "status": "inProgress",
+                "changes": [{"path": "/Users/k/repo/a.rs", "kind": "update", "diff": ""},
+                            {"path": "/etc/hosts", "kind": "update", "diff": ""}]}}}),
+        );
+        let (seen, send) = f.heard(
+            &json!({"id": 7, "method": "item/fileChange/requestApproval",
+            "params": {"threadId": "t1", "turnId": "u1", "itemId": "fc-1", "startedAtMs": 1,
+                "reason": "needs write access"}}),
+        );
+        assert_eq!(
+            send, None,
+            "a request is answered only when the person does"
+        );
+        let [Seen {
+            event: CodexEvent::Asks(ask),
+            ..
+        }] = &seen[..]
+        else {
+            panic!("{seen:?}")
+        };
+        assert_eq!(
+            (ask.tool.as_str(), ask.detail.as_str()),
+            ("Edit", "~/repo/a.rs, /etc/hosts")
+        );
+        assert_eq!(ask.why.as_deref(), Some("needs write access"));
+        assert_eq!(ask.request, json!(7));
+    }
+
+    #[test]
+    fn it_subscribes_to_its_thread_once_it_has_one_and_again_when_refused() {
+        let mut f = Follower::new(None, None);
+        assert_eq!(f.joined(), None, "no thread yet");
+        let active = json!({"method": "thread/status/changed",
+            "params": {"threadId": "t1", "status": {"type": "active", "activeFlags": []}}});
+        assert_eq!(f.heard(&active).1, None, "not its thread yet");
+        f.heard(
+            &json!({"method": "thread/started", "params": {"thread": {"id": "t1",
+            "environments": [{"cwd": "/repo"}]}}}),
+        );
+        let other = json!({"method": "thread/status/changed",
+            "params": {"threadId": "side", "status": {"type": "active", "activeFlags": []}}});
+        assert_eq!(f.heard(&other).1, None, "only its own thread");
+        let resume = json!({"id": SUBSCRIBE, "method": "thread/resume", "params": {"threadId": "t1", "excludeTurns": true}});
+        assert_eq!(f.heard(&active).1, Some(resume.clone()));
+        assert_eq!(f.heard(&active).1, None, "asked once");
+        f.heard(
+            &json!({"id": SUBSCRIBE, "error": {"code": -32600, "message": "no rollout found"}}),
+        );
+        assert_eq!(
+            f.heard(&active).1,
+            Some(resume),
+            "again, at its next status"
+        );
+        // Taken back: its thread is known, and it subscribes at once.
+        let mut launched = Follower::new(Some("t9".into()), None);
+        assert_eq!(
+            launched.joined(),
+            None,
+            "resumed: once its TUI has loaded it"
+        );
+        let status = json!({"method": "thread/status/changed",
+            "params": {"threadId": "t9", "status": {"type": "idle"}}});
+        assert!(launched.heard(&status).1.is_some());
+        let (seen, _) = launched
+            .heard(&json!({"id": SUBSCRIBE, "result": {"approvalsReviewer": "auto_review"}}));
+        assert_eq!(
+            seen,
+            [Seen {
+                thread: "t9".into(),
+                event: CodexEvent::Reviewer("auto_review".into())
+            }]
+        );
+        let mut back = Follower::new(Some("t9".into()), None).at_once();
+        assert_eq!(
+            back.joined(),
+            Some(
+                json!({"id": SUBSCRIBE, "method": "thread/resume", "params": {"threadId": "t9", "excludeTurns": true}})
+            )
+        );
+    }
+
+    #[test]
+    fn requests_of_another_thread_and_resolutions_are_told_apart() {
+        let mut f = Follower::new(Some("t1".into()), None);
+        let mut child = escalated();
+        child["threadId"] = json!("child");
+        let (seen, _) = f.heard(
+            &json!({"id": 0, "method": "item/commandExecution/requestApproval", "params": child}),
+        );
+        assert!(seen.is_empty(), "a sub-agent's asks stay its terminal's");
+        let (seen, _) = f.heard(&json!({"method": "serverRequest/resolved",
+            "params": {"threadId": "t1", "requestId": 0}}));
+        assert_eq!(
+            seen,
+            [Seen {
+                thread: "t1".into(),
+                event: CodexEvent::Resolved(json!(0))
+            }]
+        );
+        assert_eq!(
+            answer_of(&Reply {
+                request: json!(0),
+                decision: Decision::AllowForSession
+            }),
+            Some(json!({"id": 0, "result": {"decision": "acceptForSession"}}))
+        );
+        assert_eq!(
+            answer_of(&Reply {
+                request: json!(0),
+                decision: Decision::Terminal
+            }),
+            None
+        );
+    }
+
+    /// A stand-in app-server on a socket of its own: what each test does
+    /// with the connection the observer opens.
+    pub(crate) async fn fake_server(
+        socket: &Path,
+    ) -> tokio::task::JoinHandle<tokio_tungstenite::WebSocketStream<UnixStream>> {
+        let listener = tokio::net::UnixListener::bind(socket).unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            tokio_tungstenite::accept_async(stream).await.unwrap()
+        })
+    }
+
+    /// The next message the observer sends whose `method` (or answer) is
+    /// `what`, skipping the rest.
+    pub(crate) async fn next_sent(
+        ws: &mut tokio_tungstenite::WebSocketStream<UnixStream>,
+        what: impl Fn(&Value) -> bool,
+    ) -> Value {
+        loop {
+            let msg = tokio::time::timeout(Duration::from_secs(5), ws.next())
+                .await
+                .expect("in time")
+                .expect("open")
+                .unwrap();
+            if let Message::Text(t) = msg {
+                let v: Value = serde_json::from_str(&t).unwrap();
+                if what(&v) {
+                    return v;
+                }
+            }
+        }
+    }
+
+    pub(crate) async fn say(ws: &mut tokio_tungstenite::WebSocketStream<UnixStream>, v: Value) {
+        ws.send(Message::text(v.to_string())).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_observer_hears_what_codex_asks_and_answers_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("s.sock");
+        let server = fake_server(&socket).await;
+        let (events, mut seen) = mpsc::channel(16);
+        let (replies, answers) = mpsc::unbounded_channel();
+        let cancel = CancellationToken::new();
+        let observer = tokio::spawn(observe(
+            socket,
+            Follower::new(Some("t1".into()), None).at_once(),
+            events,
+            answers,
+            None,
+            cancel.clone(),
+        ));
+        let mut ws = server.await.unwrap();
+        let method = |m: &'static str| move |v: &Value| v["method"] == m;
+        next_sent(&mut ws, method("initialize")).await;
+        let resume = next_sent(&mut ws, method("thread/resume")).await;
+        assert_eq!(resume["params"]["threadId"], "t1");
+        say(
+            &mut ws,
+            json!({"id": resume["id"], "result": {"thread": {"id": "t1"}}}),
+        )
+        .await;
+        say(&mut ws, json!({"id": 0, "method": "item/commandExecution/requestApproval", "params": escalated()})).await;
+        // Something it is never to answer: the TUI's.
+        say(
+            &mut ws,
+            json!({"id": 1, "method": "item/tool/requestUserInput", "params": {"threadId": "t1"}}),
+        )
+        .await;
+        let got = tokio::time::timeout(Duration::from_secs(5), seen.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let CodexEvent::Asks(ask) = got.event else {
+            panic!("{got:?}")
+        };
+        replies
+            .send(Reply {
+                request: ask.request,
+                decision: Decision::Allow,
+            })
+            .unwrap();
+        let answer = next_sent(&mut ws, |v| v.get("result").is_some()).await;
+        assert_eq!(answer, json!({"id": 0, "result": {"decision": "accept"}}));
+        macro_rules! next {
+            () => {
+                tokio::time::timeout(Duration::from_secs(5), seen.recv())
+                    .await
+                    .unwrap()
+                    .unwrap()
+            };
+        }
+        assert_eq!(next!().event, CodexEvent::Answered(json!(0)));
+        say(&mut ws, json!({"method": "serverRequest/resolved", "params": {"threadId": "t1", "requestId": 0}})).await;
+        assert_eq!(next!().event, CodexEvent::Resolved(json!(0)));
+        // Answered again, after: not sent, and said so.
+        replies
+            .send(Reply {
+                request: json!(0),
+                decision: Decision::Allow,
+            })
+            .unwrap();
+        assert_eq!(next!().event, CodexEvent::Late(json!(0)));
+        // The server goes (without a goodbye): so does the observer, and
+        // what it forwards.
+        drop(ws);
+        let _ = tokio::time::timeout(Duration::from_secs(5), observer)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(seen.recv().await.is_none());
     }
 }

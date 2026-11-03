@@ -21,7 +21,7 @@ use crate::claude::{self, Hook};
 use crate::codex::{self, AppServer, CodexEvent, Seen};
 use crate::crew::{self, By, Event, Kind, Party};
 use crate::engine::{self, Installed, SignIns, View};
-use crate::floor::{Outcome, SubjectKey, TurnLog, TurnOp};
+use crate::floor::{Outcome, Scope, Subject, SubjectKey, Turn, TurnLog, TurnOp};
 use crate::holder::{Held, Holder};
 use crate::model::{
     Approvals, Decision, DeskEvent, Engine, NewSession, Origin, PendingApproval, SessionPatch,
@@ -44,6 +44,8 @@ mod copies;
 mod groups;
 mod lifecycle;
 pub use lifecycle::{Clearing, Hidden, Removal, Removed};
+#[cfg(test)]
+mod codex_asks_tests;
 mod ledger;
 #[cfg(test)]
 mod lifecycle_tests;
@@ -154,6 +156,28 @@ pub(crate) struct Live {
     reading: Option<u64>,
     /// Ended from Desk: closed, not stopped, once its process has gone.
     closing: bool,
+    /// The Codex requests Desk can answer, oldest first: its pending
+    /// approval is the first's.
+    codex_asks: Vec<CodexAsk>,
+    /// Answers Desk sent Codex, by request, until Codex is told them (or
+    /// was answered in the terminal first): what Activity then says.
+    codex_sent: HashMap<String, CodexSent>,
+}
+
+/// A Codex request Desk can answer: its JSON-RPC id, and the pending
+/// approval it is.
+#[derive(Debug, Clone)]
+struct CodexAsk {
+    request: Value,
+    pending: PendingApproval,
+}
+
+/// An answer Desk sent one of Codex's requests.
+#[derive(Debug, Clone)]
+struct CodexSent {
+    pending: PendingApproval,
+    decision: Decision,
+    by: By,
 }
 
 impl Live {
@@ -198,6 +222,8 @@ struct CodexLink {
     /// Where the app-server listens.
     socket: PathBuf,
     watch: CancellationToken,
+    /// Answers to what it asks, to its observer.
+    replies: mpsc::UnboundedSender<codex::Reply>,
 }
 
 impl CodexLink {
@@ -244,6 +270,8 @@ struct State {
     live: HashMap<Uuid, Live>,
     /// The `codex` process each terminal-hosted Codex session was bound to.
     codex_pids: HashMap<Uuid, u32>,
+    /// How far each Codex session's rollout was read, and what it said.
+    codex_marks: HashMap<Uuid, crate::codex_session::Mark>,
     /// Transcript mtimes already read for adopted sessions.
     seen_transcripts: HashMap<Uuid, SystemTime>,
     /// When each session came into the state it is in.
@@ -467,6 +495,97 @@ fn background_tasks(count: u32) -> String {
     }
 }
 
+/// Codex asks what Desk can answer: kept with the others it waits on (it
+/// can ask several at once), the same request again if it asks it again,
+/// as a late subscription hears. The first it asks becomes the "Answer in
+/// the terminal" request it already said it waits on.
+fn codex_asks(r: &mut SessionRecord, l: &mut Live, ask: codex::Ask) {
+    let known = l.codex_asks.iter().position(|a| a.request == ask.request);
+    let was = match known {
+        Some(i) => Some(l.codex_asks[i].pending.clone()),
+        None if l.codex_asks.is_empty() => l.pending.clone().filter(|p| !p.answerable),
+        None => None,
+    };
+    let pending = PendingApproval {
+        id: was.as_ref().map_or_else(Uuid::new_v4, |p| p.id),
+        since: was.as_ref().map_or_else(Utc::now, |p| p.since),
+        tool: ask.tool,
+        detail: ask.detail,
+        answerable: true,
+        choices: ask.choices,
+        why: ask.why,
+    };
+    let asked = CodexAsk {
+        request: ask.request,
+        pending,
+    };
+    match known {
+        Some(i) => l.codex_asks[i] = asked,
+        None => l.codex_asks.push(asked),
+    }
+    codex_front(r, l);
+}
+
+/// Its pending approval is the oldest of Codex's open requests; none left,
+/// it works on.
+fn codex_front(r: &mut SessionRecord, l: &mut Live) {
+    match l.codex_asks.first() {
+        Some(first) => {
+            l.pending = Some(first.pending.clone());
+            r.state = SessionState::Blocked;
+            r.asked = None;
+        }
+        None => {
+            l.pending = None;
+            if r.state == SessionState::Blocked {
+                r.state = SessionState::Working;
+            }
+        }
+    }
+}
+
+/// Codex's request `request` was answered, in Desk or its terminal: only
+/// that one goes.
+fn codex_resolved(r: &mut SessionRecord, l: &mut Live, request: &Value) {
+    let before = l.codex_asks.len();
+    l.codex_asks.retain(|a| a.request != *request);
+    if l.codex_asks.len() != before {
+        codex_front(r, l);
+    }
+}
+
+/// What Activity says of an answer `by` gave `p`.
+fn decided_note(
+    view: &SessionView,
+    p: &PendingApproval,
+    decision: Decision,
+    by: By,
+) -> Option<Event> {
+    let what = match p.tool.split('(').next().unwrap_or(&p.tool) {
+        "Bash" if !p.detail.is_empty() => format!("run {}", crew::clip(&p.detail, 120)),
+        "Edit" | "Write" | "MultiEdit" if !p.detail.is_empty() => {
+            format!("edit {}", crew::clip(&p.detail, 120))
+        }
+        _ => format!("use {}", crew::clip(&p.tool, 120)),
+    };
+    let me = Some(Party::session(view));
+    let label = view.label();
+    let (kind, text) = match decision {
+        Decision::Allow => (Kind::Approved, format!("allowed {label} to {what}")),
+        Decision::Deny => (Kind::Denied, format!("denied {label} to {what}")),
+        Decision::AllowForSession => (
+            Kind::Approved,
+            format!("allowed {label} to {what}, for the session"),
+        ),
+        Decision::Cancel => (
+            Kind::Denied,
+            format!("denied {label} to {what}, and stopped its turn"),
+        ),
+        Decision::Terminal => return None,
+    };
+    Some(by.event(kind, me, text).approval(p.id))
+}
+
 /// How a session's pending request reads in Activity.
 fn asking(p: &PendingApproval) -> String {
     let name = p.tool.split('(').next().unwrap_or(&p.tool);
@@ -569,6 +688,62 @@ async fn forget_hub_internal(store: &DeskStore, hub: &HubInternal, turns: Option
     }
 }
 
+/// The turns the floor's log has open for the sessions still at work
+/// across a restart (`records`, once the lost are marked), each session's
+/// latest: the desk carries on with them, so the floor sees them run as the
+/// sidebar does, and writes how they end. A lost session's turn is left
+/// for the floor to settle where it was last heard.
+async fn reopened_turns(
+    log: &dyn TurnLog,
+    records: &HashMap<Uuid, SessionRecord>,
+) -> HashMap<Uuid, OpenTurn> {
+    let sessions = Scope {
+        owner: String::new(),
+        personal: true,
+    };
+    match log.relevant(&sessions, Utc::now()).await {
+        Ok(logged) => still_open(records, &logged)
+            .into_iter()
+            .map(|(session, id)| {
+                (
+                    session,
+                    OpenTurn {
+                        id,
+                        progressed: None,
+                    },
+                )
+            })
+            .collect(),
+        Err(e) => {
+            tracing::warn!(
+                error = format!("{e:#}"),
+                "couldn't read the turns the floor has open; running sessions start new ones"
+            );
+            HashMap::new()
+        }
+    }
+}
+
+/// For each of `records` at work, the latest of its turns `logged` has open.
+fn still_open(records: &HashMap<Uuid, SessionRecord>, logged: &[Turn]) -> HashMap<Uuid, Uuid> {
+    let mut latest: HashMap<Uuid, &Turn> = HashMap::new();
+    for t in logged.iter().filter(|t| t.ended_at.is_none()) {
+        let Subject::Session { id, .. } = t.subject else {
+            continue;
+        };
+        let at_work = records.get(&id).is_some_and(|r| {
+            matches!(
+                r.state,
+                SessionState::Starting | SessionState::Working | SessionState::Blocked
+            )
+        });
+        if at_work && latest.get(&id).is_none_or(|l| t.started_at > l.started_at) {
+            latest.insert(id, t);
+        }
+    }
+    latest.into_iter().map(|(s, t)| (s, t.id)).collect()
+}
+
 impl Desk {
     /// Loads the registry, marks what was running as interrupted or stopped
     /// (its processes did not survive the hub), and starts the hook endpoint
@@ -618,6 +793,12 @@ impl Desk {
             records.insert(r.id, r);
         }
         let layout = prune_layout(&store, layout, &records).await;
+        // Taken up before anything the sessions do is seen, so what they do
+        // next carries on the turns they were in.
+        let turns = match floor.turns.as_deref() {
+            Some(log) => reopened_turns(log, &records).await,
+            None => HashMap::new(),
+        };
         let state_since = store.state_times().await?;
         let mut attention = store.attention_times().await?;
         // One lost while it worked failed: worth your attention, as one
@@ -649,6 +830,7 @@ impl Desk {
                 state_since,
                 attention,
                 hidden,
+                turns,
                 ..State::default()
             }),
             events: broadcast::channel(256).0,
@@ -781,7 +963,9 @@ impl Desk {
                     let socket = server.meta["socket"].as_str().map(PathBuf::from);
                     let (server_pty, _) = holder.adopt(&server, history);
                     let server = Server::Held(Arc::new(server_pty));
-                    socket.map(|socket| self.observe_codex(id, server, socket))
+                    socket.map(|socket| {
+                        self.observe_codex(id, server, socket, record.cli_session_id.clone(), true)
+                    })
                 }
                 other => {
                     held.strays.extend(other);
@@ -802,6 +986,8 @@ impl Desk {
                         detail: "Answer in the terminal".into(),
                         since: Utc::now(),
                         answerable: false,
+                        choices: Vec::new(),
+                        why: None,
                     }),
                     answer: None,
                     ended: false,
@@ -817,6 +1003,8 @@ impl Desk {
                     ends: 0,
                     reading: None,
                     closing: false,
+                    codex_asks: Vec::new(),
+                    codex_sent: HashMap::new(),
                 },
             );
             tokio::spawn(self.clone().on_exit(id, exit));
@@ -1269,7 +1457,8 @@ impl Desk {
                 ),
                 Transition::Unblocked { by_desk: true, .. }
                 | Transition::Spoke { .. }
-                | Transition::ToTerminal { .. } => None,
+                | Transition::ToTerminal { .. }
+                | Transition::Answerable { .. } => None,
                 Transition::Asked { asked, .. } => {
                     let text = match &asked.denied {
                         Some(d) => format!("stopped: {} was not allowed", d.name()),
@@ -1503,6 +1692,11 @@ impl Desk {
                 }
             });
         }
+        if new.approve_for_me && new.engine != Engine::Codex {
+            return Err(DeskError::Invalid(
+                "only Codex sessions can approve for you".into(),
+            ));
+        }
         let cwd = PathBuf::from(&new.cwd);
         if !cwd.is_dir() {
             return Err(DeskError::Invalid(format!("{} is not a folder", new.cwd)));
@@ -1529,6 +1723,7 @@ impl Desk {
             engine: new.engine,
             view,
             engine_version: self.version_of(new.engine),
+            approve_for_me: new.approve_for_me && new.engine == Engine::Codex,
             name: name.to_string(),
             goal: new.goal.trim().to_string(),
             cwd: cwd.to_string_lossy().into_owned(),
@@ -1848,6 +2043,16 @@ impl Desk {
         decision: Decision,
         by: Option<By>,
     ) -> Result<SessionView, DeskError> {
+        let codex = self
+            .0
+            .state
+            .lock()
+            .live
+            .get(&id)
+            .is_some_and(|l| l.codex_asks.iter().any(|a| a.pending.id == approval));
+        if codex {
+            return self.decide_codex(id, approval, decision, by);
+        }
         let asked = self
             .0
             .state
@@ -1868,6 +2073,11 @@ impl Desk {
                     "that approval is no longer pending".into(),
                 ));
             }
+            if matches!(decision, Decision::AllowForSession | Decision::Cancel) {
+                return Err(DeskError::Invalid(
+                    "only Codex's requests take that answer".into(),
+                ));
+            }
             let answer = live
                 .answer
                 .take()
@@ -1878,7 +2088,7 @@ impl Desk {
                         p.answerable = false;
                     }
                 }
-                Decision::Allow | Decision::Deny => {
+                Decision::Allow | Decision::Deny | Decision::AllowForSession | Decision::Cancel => {
                     live.pending = None;
                     st.decided.insert(approval);
                 }
@@ -1888,7 +2098,9 @@ impl Desk {
         let _ = answer.send(match decision {
             Decision::Allow => claude::allow(),
             Decision::Deny => claude::deny(),
-            Decision::Terminal => claude::ask_in_terminal(),
+            Decision::Terminal | Decision::AllowForSession | Decision::Cancel => {
+                claude::ask_in_terminal()
+            }
         });
         self.change_since(seen, id, |r, l| {
             if l.is_some_and(|l| l.pending.is_none()) {
@@ -1896,33 +2108,99 @@ impl Desk {
             }
         });
         let view = self.view(id)?;
-        if let (Some(by), Some(p)) = (by, asked) {
-            let what = match p.tool.split('(').next().unwrap_or(&p.tool) {
-                "Bash" if !p.detail.is_empty() => format!("run {}", crew::clip(&p.detail, 120)),
-                "Edit" | "Write" | "MultiEdit" if !p.detail.is_empty() => {
-                    format!("edit {}", crew::clip(&p.detail, 120))
-                }
-                _ => format!("use {}", crew::clip(&p.tool, 120)),
-            };
-            let me = Some(Party::session(&view));
-            let event = match decision {
-                Decision::Allow => Some(by.event(
-                    Kind::Approved,
-                    me,
-                    format!("allowed {} to {what}", view.label()),
-                )),
-                Decision::Deny => Some(by.event(
-                    Kind::Denied,
-                    me,
-                    format!("denied {} to {what}", view.label()),
-                )),
-                Decision::Terminal => None,
-            };
-            if let Some(e) = event {
-                self.note(e.approval(p.id));
-            }
+        if let Some(e) = by
+            .zip(asked)
+            .and_then(|(by, p)| decided_note(&view, &p, decision, by))
+        {
+            self.note(e);
         }
         Ok(view)
+    }
+
+    /// Answers one of Codex's requests. Only the person does: what Codex
+    /// asks is to leave its sandbox, which no agent's tool may grant (the
+    /// overseer's read-only rule reads Codex's words, not what runs).
+    /// Activity says it once Codex is told, or that the terminal answered
+    /// first.
+    fn decide_codex(
+        &self,
+        id: Uuid,
+        approval: Uuid,
+        decision: Decision,
+        by: Option<By>,
+    ) -> Result<SessionView, DeskError> {
+        let by = by
+            .filter(|b| b.party.kind == crew::PartyKind::You)
+            .ok_or_else(|| DeskError::Invalid("only the person answers Codex's requests".into()))?;
+        let seen = {
+            let mut guard = self.0.state.lock();
+            let st = &mut *guard;
+            let seen = st.records.get(&id).map(|r| Self::view_of(st, r));
+            let live = st
+                .live
+                .get_mut(&id)
+                .ok_or_else(|| DeskError::Conflict("session is not running".into()))?;
+            let at = live
+                .codex_asks
+                .iter()
+                .position(|a| a.pending.id == approval)
+                .ok_or_else(|| DeskError::Conflict("that approval is no longer pending".into()))?;
+            if decision == Decision::Terminal {
+                // Its terminal asks it too: Desk just stops offering it.
+                let asked = live.codex_asks.remove(at);
+                if live.pending.as_ref().is_some_and(|p| p.id == approval) {
+                    live.pending = Some(PendingApproval {
+                        answerable: false,
+                        ..asked.pending
+                    });
+                }
+                return self.view_after(seen, id);
+            }
+            let asked = &live.codex_asks[at];
+            if !asked.pending.choices.contains(&decision) {
+                return Err(DeskError::Invalid(
+                    "Codex doesn't offer that answer to this request".into(),
+                ));
+            }
+            let request = asked.request.clone();
+            let sent = live._codex.as_ref().is_some_and(|link| {
+                link.replies
+                    .send(codex::Reply {
+                        request: request.clone(),
+                        decision,
+                    })
+                    .is_ok()
+            });
+            if !sent {
+                return Err(DeskError::Conflict(
+                    "the terminal is asking for this one".into(),
+                ));
+            }
+            let asked = live.codex_asks.remove(at);
+            live.codex_sent.insert(
+                request.to_string(),
+                CodexSent {
+                    pending: asked.pending,
+                    decision,
+                    by,
+                },
+            );
+            st.decided.insert(approval);
+            seen
+        };
+        self.view_after(seen, id)
+    }
+
+    /// The session's view once a decision changed what it waits on.
+    fn view_after(&self, seen: Option<SessionView>, id: Uuid) -> Result<SessionView, DeskError> {
+        self.change_since(seen, id, |r, l| {
+            // Handed back to the terminal, it still waits; else on to the
+            // next it asks, or work.
+            if let Some(l) = l.filter(|l| l.pending.as_ref().is_none_or(|p| p.answerable)) {
+                codex_front(r, l);
+            }
+        });
+        self.view(id)
     }
 
     /// Types a prompt into a running session's terminal and submits it, as a
@@ -2432,18 +2710,21 @@ impl Desk {
             Engine::Codex => {
                 let socket = self.0.opts.run_dir.join(format!("{}.sock", r.id.simple()));
                 let server = self.start_app_server(r.id, &socket).await?;
+                let thread = r.cli_session_id.as_deref().filter(|_| resume);
                 let spec = codex::spawn(&codex::CodexSpawn {
                     program: self.program_of(Engine::Codex)?,
                     cwd,
                     socket: &socket,
-                    launch: match (resume, r.cli_session_id.as_deref()) {
-                        (true, Some(thread_id)) => codex::Launch::Resume { thread_id },
-                        _ => codex::Launch::New,
+                    launch: match thread {
+                        Some(thread_id) => codex::Launch::Resume { thread_id },
+                        None => codex::Launch::New,
                     },
                     prompt,
+                    approve_for_me: r.approve_for_me,
                     env: &env,
                 });
-                let link = self.observe_codex(r.id, server, socket);
+                let link =
+                    self.observe_codex(r.id, server, socket, thread.map(str::to_string), false);
                 (spec, Some(link))
             }
             Engine::Gemini
@@ -2495,6 +2776,8 @@ impl Desk {
                 ends: 0,
                 reading: None,
                 closing: false,
+                codex_asks: Vec::new(),
+                codex_sent: HashMap::new(),
             },
         );
         tokio::spawn(self.clone().on_exit(r.id, exit));
@@ -2535,16 +2818,32 @@ impl Desk {
         Ok(Server::Held(pty))
     }
 
-    /// Joins a Codex session's app-server as a second client to follow it.
-    fn observe_codex(&self, id: Uuid, server: Server, socket: PathBuf) -> CodexLink {
+    /// Joins a Codex session's app-server as a second client to follow it,
+    /// subscribed to `thread` when it is known (resumed, or taken back):
+    /// `at_once` when its TUI already runs it (taken back).
+    fn observe_codex(
+        &self,
+        id: Uuid,
+        server: Server,
+        socket: PathBuf,
+        thread: Option<String>,
+        at_once: bool,
+    ) -> CodexLink {
         let watch = self.0.cancel.child_token();
         let (tx, rx) = mpsc::channel(64);
+        let (replies, answers) = mpsc::unbounded_channel();
         tokio::spawn({
             let socket = server.socket(&socket);
             let watch = watch.clone();
             let plans = self.0.plans.clone();
+            let follower = codex::Follower::new(thread, self.0.env.get("HOME").map(PathBuf::from));
+            let follower = if at_once {
+                follower.at_once()
+            } else {
+                follower
+            };
             async move {
-                if let Err(e) = codex::observe(socket, tx, plans, watch).await {
+                if let Err(e) = codex::observe(socket, follower, tx, answers, plans, watch).await {
                     tracing::warn!(error = %e, "codex observer stopped");
                 }
             }
@@ -2554,6 +2853,7 @@ impl Desk {
             server,
             socket,
             watch,
+            replies,
         }
     }
 
@@ -2714,6 +3014,8 @@ impl Desk {
                         detail: message,
                         since: Utc::now(),
                         answerable: false,
+                        choices: Vec::new(),
+                        why: None,
                     });
                 }
             }),
@@ -2893,6 +3195,8 @@ impl Desk {
             detail,
             since: Utc::now(),
             answerable: desk_answers,
+            choices: Vec::new(),
+            why: None,
         };
         let (tx, rx) = oneshot::channel();
         self.change(id, |r, l| {
@@ -2973,6 +3277,61 @@ impl Desk {
             if ours.as_deref().is_some_and(|t| t != thread) {
                 continue;
             }
+            if let CodexEvent::Answered(request) | CodexEvent::Late(request) = &event {
+                // Said once Codex is told, or that its terminal had answered.
+                let sent = self
+                    .0
+                    .state
+                    .lock()
+                    .live
+                    .get_mut(&id)
+                    .and_then(|l| l.codex_sent.remove(&request.to_string()));
+                if let (Some(sent), Ok(view)) = (sent, self.view(id)) {
+                    let note = match event {
+                        CodexEvent::Answered(_) => {
+                            decided_note(&view, &sent.pending, sent.decision, sent.by)
+                        }
+                        _ => {
+                            let me = Party::session(&view);
+                            Some(
+                                Event::new(
+                                    Kind::Answered,
+                                    me.clone(),
+                                    Some(me),
+                                    "was answered in its terminal before Desk's answer reached it",
+                                )
+                                .approval(sent.pending.id),
+                            )
+                        }
+                    };
+                    if let Some(note) = note {
+                        self.note(note);
+                    }
+                }
+                continue;
+            }
+            if let CodexEvent::Reviewer(reviewer) = &event {
+                // Approve for me is the TUI's to set: if Codex says otherwise,
+                // the session's word for it is wrong.
+                let on = self.record(id).is_ok_and(|r| r.approve_for_me);
+                if on != (reviewer == "auto_review") {
+                    tracing::warn!(%id, %reviewer, approve_for_me = on, "codex runs with other approvals than the session says");
+                }
+                continue;
+            }
+            if let CodexEvent::Reviewed { what, verdict } = &event {
+                // What "Approve for me" decided shows as the session's activity.
+                if let Ok(view) = self.view(id) {
+                    let me = Party::session(&view);
+                    let kind = match *verdict {
+                        "allowed" => Kind::Approved,
+                        _ => Kind::Denied,
+                    };
+                    let text = format!("Codex's reviewer {verdict} {}", crew::clip(what, 160));
+                    self.note(Event::new(kind, me.clone(), Some(me), text));
+                }
+                continue;
+            }
             if matches!(event, CodexEvent::Idle) {
                 // Its rollout has the turn's calls, with their model.
                 self.spend_read(id);
@@ -3047,6 +3406,9 @@ impl Desk {
                             r.asked = None;
                             // A repeated notice is the same request, still asked.
                             let asked = l.pending.take();
+                            if !waiting {
+                                l.codex_asks.clear();
+                            }
                             l.pending = waiting.then(|| {
                                 asked.unwrap_or_else(|| PendingApproval {
                                     id: Uuid::new_v4(),
@@ -3054,6 +3416,8 @@ impl Desk {
                                     detail: "Answer in the terminal".into(),
                                     since: Utc::now(),
                                     answerable: false,
+                                    choices: Vec::new(),
+                                    why: None,
                                 })
                             });
                         }
@@ -3080,6 +3444,7 @@ impl Desk {
                         if let Some(l) = l {
                             l.current_tool = None;
                             l.pending = None;
+                            l.codex_asks.clear();
                             l.background =
                                 std::mem::take(&mut l.background).looked_if(running, Utc::now());
                         }
@@ -3091,19 +3456,46 @@ impl Desk {
                         }
                     }
                     CodexEvent::Tool(t) => {
-                        r.state = SessionState::Working;
+                        // A command it asks to run starts before it asks:
+                        // what it waits on still holds it.
+                        if l.as_ref().is_none_or(|l| l.pending.is_none()) {
+                            r.state = SessionState::Working;
+                        }
                         if let Some(l) = l {
                             l.current_tool = Some(t);
                         }
                     }
+                    CodexEvent::Asks(ask) => {
+                        if let Some(l) = l.filter(|_| !ask.choices.is_empty()) {
+                            codex_asks(r, l, ask);
+                        }
+                    }
+                    CodexEvent::Resolved(request) => {
+                        if let Some(l) = l {
+                            codex_resolved(r, l, &request);
+                        }
+                    }
+                    CodexEvent::Answered(_) | CodexEvent::Late(_) => {}
                     CodexEvent::Reply(text) => r.last_reply = Some(transcript::clip(&text)),
-                    CodexEvent::Child(_) | CodexEvent::Usage(_) => {}
+                    CodexEvent::Child(_)
+                    | CodexEvent::Usage(_)
+                    | CodexEvent::Reviewed { .. }
+                    | CodexEvent::Reviewer(_) => {}
                 }
             });
             if let (Some(reader), Some(end), Some(reply)) = (reader, read, said_whole) {
                 self.read_later(id, end, reader, reply);
             }
         }
+        // Its server went away: what it asked can't be answered from Desk.
+        self.change(id, |r, l| {
+            if let Some(l) = l {
+                if !l.codex_asks.is_empty() {
+                    l.codex_asks.clear();
+                    codex_front(r, l);
+                }
+            }
+        });
     }
 
     async fn adopt_loop(self, every: Duration) {
@@ -3271,6 +3663,7 @@ impl Desk {
                         engine: Engine::Claude,
                         view: View::Terminal,
                         engine_version: None,
+                        approve_for_me: false,
                         name: ext
                             .name
                             .clone()
@@ -3538,6 +3931,7 @@ mod tests {
                 worktree: None,
                 prompt: None,
                 approvals: None,
+                approve_for_me: false,
                 env: Default::default(),
             },
             None,
@@ -3713,11 +4107,16 @@ mod tests {
                 token: crate::holder::tests::TOKEN.into(),
             });
             DeskStore::migrate(&pool).await.unwrap();
+            let logged = Arc::new(Logged::default());
+            let floor = || Floor {
+                turns: Some(logged.clone()),
+                ..Default::default()
+            };
             let first_cancel = CancellationToken::new();
             let first = Desk::start(
                 DeskStore::from_pool(pool.clone()),
                 opts.clone(),
-                Default::default(),
+                floor(),
                 first_cancel.clone(),
             )
             .await
@@ -3732,6 +4131,8 @@ mod tests {
             )
             .await;
             let port = first.0.hook_port;
+            let turns = first.open_turns();
+            assert_eq!(turns.len(), 1, "its prompt began a turn");
             tokio::time::sleep(Duration::from_millis(200)).await;
             first_cancel.cancel();
             tokio::time::sleep(Duration::from_millis(300)).await;
@@ -3739,7 +4140,7 @@ mod tests {
             let second = Desk::start(
                 DeskStore::from_pool(pool.clone()),
                 opts.clone(),
-                Default::default(),
+                floor(),
                 CancellationToken::new(),
             )
             .await
@@ -3748,6 +4149,11 @@ mod tests {
             assert!(v.live, "taken back");
             assert_eq!(v.state, SessionState::Working, "not interrupted");
             assert!(second.restore_offer().is_empty(), "nothing to restore");
+            assert_eq!(
+                second.open_turns(),
+                turns,
+                "the turn it is in runs on the floor, as it does in the sidebar"
+            );
             assert_eq!(
                 second.attach(s.id).unwrap().pid(),
                 pid,
@@ -3767,6 +4173,15 @@ mod tests {
             assert_eq!(
                 (v.state, v.last_reply.as_deref()),
                 (SessionState::Done, Some("All green."))
+            );
+            let turn = turns.into_iter().next().unwrap();
+            assert!(
+                logs(&logged, |ops| ops.iter().any(|op| matches!(
+                    op,
+                    TurnOp::End { turn: t, outcome: Outcome::Finished, .. } if *t == turn
+                )))
+                .await,
+                "and ends when it does"
             );
 
             // Stopping it ends the held process for good.
@@ -3902,6 +4317,7 @@ mod tests {
                         worktree: None,
                         prompt: None,
                         approvals: None,
+                        approve_for_me: false,
                         env: BTreeMap::from([(PLUGIN_DIRS.into(), "/plugins/desk".into())]),
                     },
                     None,
@@ -3946,6 +4362,7 @@ mod tests {
                         worktree: None,
                         prompt: None,
                         approvals: None,
+                        approve_for_me: false,
                         env: BTreeMap::from([("NOT A NAME".into(), "x".into())]),
                     },
                     None,
@@ -3990,6 +4407,7 @@ mod tests {
                     worktree: None,
                     prompt: None,
                     approvals: None,
+                    approve_for_me: false,
                     env: added.clone(),
                 },
                 None,
@@ -4019,7 +4437,7 @@ mod tests {
         .await;
     }
 
-    /// Keeps every op the desk logs.
+    /// Keeps every op the desk logs, and reads back the turns they make.
     #[derive(Default)]
     pub(super) struct Logged(pub(super) Mutex<Vec<TurnOp>>);
 
@@ -4034,12 +4452,12 @@ mod tests {
             _: &crate::floor::Scope,
             _: DateTime<Utc>,
         ) -> eyre::Result<Vec<crate::floor::Turn>> {
-            Ok(vec![])
+            Ok(self.0.lock().iter().fold(Vec::new(), crate::floor::apply))
         }
     }
 
     /// Whether what `logged` holds comes to satisfy `f`.
-    async fn logs(logged: &Logged, f: impl Fn(&[TurnOp]) -> bool) -> bool {
+    pub(super) async fn logs(logged: &Logged, f: impl Fn(&[TurnOp]) -> bool) -> bool {
         for _ in 0..200 {
             if f(&logged.0.lock()) {
                 return true;
@@ -4413,6 +4831,7 @@ mod tests {
                         worktree: None,
                         prompt: None,
                         approvals: None,
+                        approve_for_me: false,
                         env: Default::default(),
                     },
                     Some(By::you()),
@@ -5706,6 +6125,7 @@ mod codex_stop_tests {
             server: Server::Held(Arc::new(pty)),
             socket: sock,
             watch: CancellationToken::new(),
+            replies: mpsc::unbounded_channel().0,
         };
         (link, pid, hdir)
     }

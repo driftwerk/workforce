@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 
 import { RichMarkdown } from "./RichMarkdown";
-import { RichHostProvider, type RichHost } from "./host";
+import { RichHostProvider, type RemoteImage, type RichHost } from "./host";
 import { dataImageOk, localImageSource, MAX_DATA_IMAGE, remoteImageLabel, remoteImageUrl } from "./images";
 
 afterEach(cleanup);
@@ -114,6 +114,47 @@ describe("remote images as links", () => {
     expect(imgs(container)).toEqual([]);
     const rendered = show("![a](desk://pic/1)", { linkSchemes: ["desk"] });
     expect(imgs(rendered.container)).toEqual([]);
+  });
+});
+
+describe("remote images the host draws", () => {
+  const drawn = vi.fn((image: RemoteImage) => (
+    <button type="button" data-url={image.url}>
+      Show {image.label} from {image.site}
+    </button>
+  ));
+  const HOST: RichHost = { remoteImages: "link", remoteImage: drawn };
+  afterEach(() => drawn.mockClear());
+
+  it("hands the host the image's address, site and alt text, and fetches nothing", () => {
+    const { container } = show("Here: ![A  burndown\nchart](https://cdn.example.com/b.png?x=1) done", HOST);
+    expect(container.querySelector("img")).toBeNull();
+    expect(container.querySelector("a")).toBeNull();
+    expect(drawn).toHaveBeenCalledWith({
+      url: "https://cdn.example.com/b.png?x=1",
+      site: "cdn.example.com",
+      alt: "A burndown chart",
+      label: "A burndown chart",
+    });
+    expect(screen.getByRole("button").textContent).toBe("Show A burndown chart from cdn.example.com");
+  });
+
+  it("reads a protocol-relative address as https", () => {
+    show("![](//cdn.example.com/b.png)", HOST);
+    expect(drawn).toHaveBeenCalledWith({ url: "https://cdn.example.com/b.png", site: "cdn.example.com", alt: "", label: "cdn.example.com" });
+  });
+
+  it("keeps an image inside a link as that link's text", () => {
+    const { container } = show("[![chart](https://cdn.example.com/b.png)](https://example.com/report)", HOST);
+    expect(drawn).not.toHaveBeenCalled();
+    expect(container.querySelector("button")).toBeNull();
+    expect(screen.getByRole("link", { name: "chart" }).getAttribute("href")).toBe("https://example.com/report");
+  });
+
+  it("isn't asked for the host's own images, or in render mode", () => {
+    show(`![local](${PNG}) ![blob](blob:http://x/1)`, HOST);
+    show("![chart](https://cdn.example.com/b.png)", { remoteImage: drawn });
+    expect(drawn).not.toHaveBeenCalled();
   });
 });
 

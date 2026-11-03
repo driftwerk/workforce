@@ -6,8 +6,9 @@
 // keeps a scheme beyond the web's only when the host declares it. An image is
 // drawn from the host's own sources (blob:, deskfile:, a small raster data: URL)
 // and from the web unless the host says remote images are links
-// (`remoteImages: "link"`): then one is a link to it, anything else is not
-// drawn, and the page never fetches either.
+// (`remoteImages: "link"`): then one is a link to it, or what the host draws
+// for it (`remoteImage`), anything else is not drawn, and the page never
+// fetches either.
 
 import { createContext, useContext, useMemo, useRef, type ComponentProps } from "react";
 import Markdown, { defaultUrlTransform, type Components, type ExtraProps, type Options } from "react-markdown";
@@ -55,10 +56,11 @@ const ImageIcon = () => (
 
 /** A markdown image: drawn, or, where the host keeps remote images from the page, a
  *  link to the one it names (an icon and the alt text, else the host) that
- *  opens as any link does. Its text is React text, never markup. */
+ *  opens as any link does, or the host's own placeholder for it. Its text is
+ *  React text, never markup. */
 function Image({ node, src, alt, ...props }: ComponentProps<"img"> & ExtraProps) {
   void node;
-  const { remoteImages } = useHost();
+  const { remoteImages, remoteImageSlot, latest } = useHost();
   const inLink = useContext(InLink);
   const held = remoteImages === "link" && typeof src === "string" && src !== "" ? src : null;
   const remote = held === null ? null : remoteImageUrl(held);
@@ -69,6 +71,11 @@ function Image({ node, src, alt, ...props }: ComponentProps<"img"> & ExtraProps)
     return <img {...props} src={src} alt={alt} loading="lazy" />;
   }
   const label = remoteImageLabel(alt, remote);
+  const draw = latest.current.remoteImage;
+  if (remoteImageSlot && draw && !inLink) {
+    const text = (alt ?? "").replace(/\s+/g, " ").trim();
+    return <>{draw({ url: remote.href, site: remote.hostname, alt: text, label })}</>;
+  }
   const body = (
     <>
       <ImageIcon />

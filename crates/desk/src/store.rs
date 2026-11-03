@@ -118,14 +118,14 @@ impl DeskStore {
                 "INSERT INTO sessions (id, engine, name, goal, cwd, branch, origin, state, \
                  approvals, cli_session_id, transcript, last_prompt, last_reply, external_pid, \
                  restore_offer, created_at, updated_at, terminal_id, display_name, asked, \
-                 state_at, view, engine_version) \
+                 state_at, view, engine_version, approve_for_me) \
                  VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20, \
-                 $17, $21, $22) \
+                 $17, $21, $22, $23) \
                  ON CONFLICT (id) DO UPDATE SET engine = $2, name = $3, goal = $4, cwd = $5, \
                  branch = $6, origin = $7, state = $8, approvals = $9, cli_session_id = $10, \
                  transcript = $11, last_prompt = $12, last_reply = $13, external_pid = $14, \
                  restore_offer = $15, updated_at = $17, terminal_id = $18, display_name = $19, \
-                 asked = $20, view = $21, engine_version = $22, \
+                 asked = $20, view = $21, engine_version = $22, approve_for_me = $23, \
                  state_at = CASE WHEN sessions.state = $8 THEN sessions.state_at ELSE $17 END",
                 &[
                     &r.id,
@@ -150,6 +150,7 @@ impl DeskStore {
                     &r.asked.as_ref().map(serde_json::to_value).transpose()?,
                     &r.view.as_str(),
                     &r.engine_version,
+                    &r.approve_for_me,
                 ],
             )
             .await
@@ -233,6 +234,7 @@ pub(crate) fn record(row: &Row) -> Result<SessionRecord> {
         engine: Engine::parse(row.try_get("engine")?)?,
         view: View::parse(row.try_get("view")?)?,
         engine_version: row.try_get("engine_version")?,
+        approve_for_me: row.try_get("approve_for_me")?,
         name: row.try_get("name")?,
         goal: row.try_get("goal")?,
         cwd: row.try_get("cwd")?,
@@ -283,6 +285,7 @@ pub(crate) mod tests {
             engine: Engine::Claude,
             view: View::Terminal,
             engine_version: Some("2.1.300".into()),
+            approve_for_me: false,
             name: name.into(),
             goal: "fix the auth race".into(),
             cwd: "/tmp/repo".into(),
@@ -302,6 +305,58 @@ pub(crate) mod tests {
             created_at: now,
             updated_at: now,
         }
+    }
+
+    /// The registry's migrations up to `V020__access`, as a hub that ran
+    /// them before Approve for me left it.
+    struct UpToAccess;
+
+    #[async_trait]
+    impl MigrationRun for UpToAccess {
+        async fn run(&self, client: &mut tokio_postgres::Client) -> Result<(), PostgresError> {
+            embedded::migrations::runner()
+                .set_target(refinery::Target::Version(20))
+                .run_async(client)
+                .await
+                .map_err(PostgresError::from)?;
+            Ok(())
+        }
+    }
+
+    /// Whether the registry's sessions have the Approve for me column.
+    async fn has(client: &tokio_postgres::Client) -> i64 {
+        client
+            .query_one(
+                "SELECT count(*) FROM information_schema.columns \
+                 WHERE table_schema = 'desk' AND table_name = 'sessions' \
+                 AND column_name = 'approve_for_me'",
+                &[],
+            )
+            .await
+            .unwrap()
+            .get::<_, i64>(0)
+    }
+
+    #[tokio::test]
+    async fn a_registry_that_ran_access_gains_approve_for_me() {
+        with_test_pool(build_pool, |pool| async move {
+            let set = MigrationSet::new(SCHEMA, Box::new(UpToAccess) as Box<dyn MigrationRun>);
+            MigrationRunner::run(&pool, &[set]).await.unwrap();
+            let client = pool.get().await.unwrap();
+            assert_eq!(has(&client).await, 0, "V020__access ran, not V021");
+            drop(client);
+            DeskStore::migrate(&pool).await.unwrap();
+            assert_eq!(has(&pool.get().await.unwrap()).await, 1);
+            let store = DeskStore::from_pool(pool);
+            let r = SessionRecord {
+                engine: Engine::Codex,
+                approve_for_me: true,
+                ..record_fixture("codex")
+            };
+            store.put(&r).await.unwrap();
+            assert!(store.get(r.id).await.unwrap().unwrap().approve_for_me);
+        })
+        .await;
     }
 
     #[tokio::test]

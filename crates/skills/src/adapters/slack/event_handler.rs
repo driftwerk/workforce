@@ -223,6 +223,20 @@ pub enum SlackAction {
         message_blocks: Option<Value>,
         /// Slack-provided URL for async responses (good for 30 minutes).
         response_url: String,
+        /// Opens a modal in answer to the click, for a few seconds.
+        trigger_id: Option<String>,
+    },
+    /// A modal the hub opened was submitted.
+    ViewSubmission {
+        workspace_id: String,
+        user: String,
+        /// The Slack team of the person who submitted, when Slack says.
+        user_team: Option<String>,
+        callback_id: String,
+        /// What the hub put in the modal when it opened it.
+        private_metadata: String,
+        /// The modal's `state.values`: block id → action id → element state.
+        values: Value,
     },
     /// Event was ignored (filtered out).
     Ignore,
@@ -423,6 +437,7 @@ impl SlackEventHandler {
             match tag {
                 "slash_command" => return self.handle_slash_command(&payload),
                 "interactive:block_actions" => return self.handle_block_actions(&payload),
+                "interactive:view_submission" => return self.handle_view_submission(&payload),
                 t if t.starts_with("interactive:") => return SlackAction::Ignore,
                 _ => {}
             }
@@ -800,10 +815,7 @@ impl SlackEventHandler {
 
     fn handle_block_actions(&self, payload: &Value) -> SlackAction {
         let user = payload["user"]["id"].as_str().unwrap_or("").to_string();
-        let user_team = payload["user"]["team_id"]
-            .as_str()
-            .filter(|team| !team.is_empty())
-            .map(str::to_string);
+        let user_team = user_team_of(payload);
         let channel = payload["channel"]["id"].as_str().unwrap_or("").to_string();
         let message_ts = payload["message"]["ts"].as_str().map(|s| s.to_string());
         let thread_ts = payload["message"]["thread_ts"]
@@ -811,6 +823,10 @@ impl SlackEventHandler {
             .map(|s| s.to_string())
             .or_else(|| message_ts.clone());
         let response_url = payload["response_url"].as_str().unwrap_or("").to_string();
+        let trigger_id = payload["trigger_id"]
+            .as_str()
+            .filter(|trigger| !trigger.is_empty())
+            .map(str::to_string);
 
         let actions = match payload.get("actions").and_then(|a| a.as_array()) {
             Some(a) if !a.is_empty() => a,
@@ -844,6 +860,28 @@ impl SlackEventHandler {
             value,
             message_blocks,
             response_url,
+            trigger_id,
+        }
+    }
+
+    fn handle_view_submission(&self, payload: &Value) -> SlackAction {
+        let view = &payload["view"];
+        match (
+            payload["user"]["id"].as_str().filter(|u| !u.is_empty()),
+            view["callback_id"].as_str().filter(|c| !c.is_empty()),
+        ) {
+            (Some(user), Some(callback_id)) => SlackAction::ViewSubmission {
+                workspace_id: self.workspace_id.clone(),
+                user: user.to_string(),
+                user_team: user_team_of(payload),
+                callback_id: callback_id.to_string(),
+                private_metadata: view["private_metadata"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+                values: view["state"]["values"].clone(),
+            },
+            _ => SlackAction::Ignore,
         }
     }
 
@@ -925,6 +963,14 @@ impl SlackEventHandler {
     }
 }
 
+/// The Slack team of the person an interaction came from, when Slack says.
+fn user_team_of(payload: &Value) -> Option<String> {
+    payload["user"]["team_id"]
+        .as_str()
+        .filter(|team| !team.is_empty())
+        .map(str::to_string)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -974,6 +1020,82 @@ mod tests {
 
         assert_eq!(team_of(guest).as_deref(), Some("T_GUEST"));
         assert_eq!(team_of(member), None);
+    }
+
+    #[tokio::test]
+    async fn block_actions_carry_the_trigger_that_opens_a_modal() {
+        let handler = make_handler();
+        let click = |trigger: serde_json::Value| {
+            serde_json::json!({
+                "_driftwerk_type": "interactive:block_actions",
+                "user": { "id": "U1" },
+                "channel": { "id": "C1" },
+                "message": { "ts": "1.0" },
+                "trigger_id": trigger,
+                "actions": [{ "action_id": "wf_decision_0", "value": "run|gate|revise" }],
+            })
+        };
+        let trigger_of = |action: SlackAction| match action {
+            SlackAction::InteractiveAction { trigger_id, .. } => trigger_id,
+            other => panic!("not an interactive action: {other:?}"),
+        };
+
+        assert_eq!(
+            trigger_of(handler.handle(click(serde_json::json!("13345.abc"))).await).as_deref(),
+            Some("13345.abc")
+        );
+        assert_eq!(
+            trigger_of(handler.handle(click(serde_json::Value::Null)).await),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn a_view_submission_carries_its_callback_metadata_values_and_team() {
+        let handler = make_handler();
+        let values = serde_json::json!({ "wf_decision_input": { "text": { "type": "plain_text_input", "value": "shorter" } } });
+        let submitted = handler
+            .handle(serde_json::json!({
+                "_driftwerk_type": "interactive:view_submission",
+                "user": { "id": "U1", "team_id": "T_HOME" },
+                "view": {
+                    "callback_id": "wf_decision_input",
+                    "private_metadata": "{\"run\":\"r\"}",
+                    "state": { "values": values },
+                },
+            }))
+            .await;
+
+        match submitted {
+            SlackAction::ViewSubmission {
+                workspace_id,
+                user,
+                user_team,
+                callback_id,
+                private_metadata,
+                values: got,
+            } => {
+                assert_eq!(workspace_id, "test");
+                assert_eq!(user, "U1");
+                assert_eq!(user_team.as_deref(), Some("T_HOME"));
+                assert_eq!(callback_id, "wf_decision_input");
+                assert_eq!(private_metadata, "{\"run\":\"r\"}");
+                assert_eq!(got, values);
+            }
+            other => panic!("not a view submission: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn other_interactive_payloads_and_a_submission_without_a_callback_are_ignored() {
+        let handler = make_handler();
+        for payload in [
+            serde_json::json!({ "_driftwerk_type": "interactive:view_closed", "user": { "id": "U1" }, "view": { "callback_id": "wf_decision_input" } }),
+            serde_json::json!({ "_driftwerk_type": "interactive:shortcut", "user": { "id": "U1" } }),
+            serde_json::json!({ "_driftwerk_type": "interactive:view_submission", "user": { "id": "U1" }, "view": {} }),
+        ] {
+            assert!(matches!(handler.handle(payload).await, SlackAction::Ignore));
+        }
     }
 
     #[test]

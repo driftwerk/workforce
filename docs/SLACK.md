@@ -416,6 +416,9 @@ The Slack skill uses Socket Mode (WebSocket) rather than the Events API (HTTP we
 - `app_mention` — When the bot is @mentioned
 - `reaction_added` — When a reaction is added to a message
 
+**Interactivity:**
+- On (Socket Mode delivers it): decision buttons and the forms an input button opens use it, and need no extra scope
+
 **App Home:**
 - Enable the **Messages Tab** to allow DMs with the bot
 

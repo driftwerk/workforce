@@ -149,6 +149,13 @@ pub enum DecideRef {
     /// hash of what the file held when it was shown: Allow uses it, Deny
     /// keeps the saved one.
     Config { agent_id: String, hash: String },
+    /// A Codex session's request, answered with one of what Codex offers
+    /// for it (an older Desk offers allow and deny, as for a session's).
+    Codex {
+        session_id: Uuid,
+        approval_id: Uuid,
+        choices: Vec<crate::model::Decision>,
+    },
 }
 
 /// A stretch of a turn that waited on the person: one per ask.

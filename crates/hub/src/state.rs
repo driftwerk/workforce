@@ -203,19 +203,31 @@ impl HubState {
         // `workforce_nats::client::connect` so auth (`credentials`, `token`)
         // and TLS settings from `[nats]` are applied; a direct
         // `async_nats::connect(url)` here silently ignored them.
-        let nats_config = workforce_nats::client::NatsConfig {
-            url: config.nats.url.clone(),
-            credentials_file: config
-                .nats
-                .credentials
-                .as_ref()
-                .map(std::path::PathBuf::from),
-            token: config.nats.token.clone(),
-            require_tls: config.nats.tls,
-            ..Default::default()
+        // With NATS off (`[nats] enabled = false`, or a Desk hub naming no
+        // url) nothing is dialled: the hub runs single-instance in process.
+        let nats_config = config
+            .nats_url()
+            .map(|url| workforce_nats::client::NatsConfig {
+                url,
+                credentials_file: config
+                    .nats
+                    .credentials
+                    .as_ref()
+                    .map(std::path::PathBuf::from),
+                token: config.nats.token.clone(),
+                require_tls: config.nats.tls,
+                ..Default::default()
+            });
+        let connected = match &nats_config {
+            Some(nats_config) => Some(workforce_nats::client::connect(nats_config).await),
+            None => {
+                tracing::info!("NATS off: running single-instance, turn control in process");
+                None
+            }
         };
-        let (nats, jetstream) = match workforce_nats::client::connect(&nats_config).await {
-            Ok((client, js)) => {
+        let (nats, jetstream) = match connected {
+            None => (None, None),
+            Some(Ok((client, js))) => {
                 // Bounded: this runs on the boot path before the gateway
                 // binds, and a wedged JetStream must degrade, not hang boot.
                 let stream_mgr = workforce_nats::streams::StreamManager::new(
@@ -234,7 +246,7 @@ impl HubState {
                 }
                 (Some(client), Some(js))
             }
-            Err(e) => {
+            Some(Err(e)) => {
                 tracing::warn!("NATS unavailable ({}), running in standalone mode", e);
                 (None, None)
             }
@@ -1104,6 +1116,27 @@ mod tests {
         HubState::from_config(config)
             .await
             .expect("hub must boot on a default sqlite config");
+    }
+
+    // A Desk hub naming no NATS url dials none, so no JetStream: `main.rs`
+    // then runs no election, and this instance is the leader of every
+    // singleton, as an unwired gate and the health gauge both report.
+    #[tokio::test]
+    async fn a_desk_hub_boots_with_no_nats_and_leads_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = WorkforceConfig::default();
+        config.hub.data_dir = dir.path().to_string_lossy().into_owned();
+        config.memory.db_path = dir.path().join("memory.db").to_string_lossy().into_owned();
+        config.desk.enabled = true;
+        config.nats.url = None;
+        let state = HubState::from_config(config)
+            .await
+            .expect("a Desk hub boots without NATS");
+        assert!(state.nats.is_none());
+        assert!(state.jetstream.is_none());
+        let gate = crate::leader_gate::LeaderGate::default();
+        assert!(gate.is_leader() && !gate.is_clustered());
+        assert!(crate::health_gauges::is_leader());
     }
 
     // SQLite telemetry carries no pool, so the shared wrapper resolves it per

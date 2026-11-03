@@ -40,16 +40,30 @@ impl Desk {
         deciders: impl FnOnce(&Hub) -> String,
         extra: &str,
     ) -> Self {
+        Self::of(visibility, by_others, |hub| {
+            decision_steps(&deciders(hub), extra)
+        })
+        .await
+    }
+
+    /// The desk with Revise's notes optional, and `extra` on the decision.
+    async fn optional_notes(extra: &str) -> Self {
+        Self::of(Visibility::Private, false, |hub| {
+            decision_steps(&hub.bob, extra)
+                .replace("max_chars = 20 }", "max_chars = 20, required = false }")
+        })
+        .await
+    }
+
+    async fn of(
+        visibility: Visibility,
+        by_others: bool,
+        steps: impl FnOnce(&Hub) -> String,
+    ) -> Self {
         let hub = hub().await;
         let surface = hub.with_slack();
         let dan = person(&hub, "Dan", None, None);
-        let key = hub
-            .define_steps(
-                visibility,
-                by_others,
-                &decision_steps(&deciders(&hub), extra),
-            )
-            .await;
+        let key = hub.define_steps(visibility, by_others, &steps(&hub)).await;
         Self {
             hub,
             surface,
@@ -87,17 +101,33 @@ impl Desk {
         who: &Steerer,
         choice: &str,
     ) -> Result<super::decision::DecisionMade, DecisionRefused> {
+        self.press_with(run, who, choice, None).await
+    }
+
+    /// A press that gives `text`.
+    async fn press_with(
+        &self,
+        run: &str,
+        who: &Steerer,
+        choice: &str,
+        text: Option<&str>,
+    ) -> Result<super::decision::DecisionMade, DecisionRefused> {
         self.runtime()
             .decide(
                 run,
                 DecisionAsk {
                     gate: Some(self.decision(run).gate),
                     choice: choice.into(),
-                    feedback: None,
+                    feedback: text.map(str::to_string),
                 },
                 who,
             )
             .await
+    }
+
+    /// What the run's draft said last.
+    async fn drafted(&self, run: &str) -> String {
+        self.hub.drafted(run).await.unwrap_or_default()
     }
 
     fn bob(&self) -> Steerer {
@@ -315,21 +345,21 @@ async fn a_typed_reply_and_a_press_race_to_one_winner() {
         .as_str()
         .unwrap()
         .to_string();
-    let (typed_run, gate, outcome) = desk
+    let typed = desk
         .runtime()
         .decision_reply(RUN_CHANNEL, &thread, "Cancel")
         .expect("the reply names a choice");
     assert_eq!(
-        (typed_run.as_str(), outcome.as_str()),
-        (run.as_str(), "cancel")
+        (typed.run.as_str(), typed.outcome.as_str(), typed.text),
+        (run.as_str(), "cancel", None)
     );
 
     let bob = desk.bob();
     let typed = desk.runtime().decide(
         &run,
         DecisionAsk {
-            gate: Some(gate),
-            choice: outcome,
+            gate: Some(typed.gate),
+            choice: typed.outcome,
             feedback: None,
         },
         &bob,
@@ -637,7 +667,7 @@ fn settle_only(desk: &Desk, run: &str, outcome: &str) {
                     display: "Bob".into(),
                     slack_user_id: None,
                 },
-                None,
+                run_decision::Given::Nothing,
                 chrono::Utc::now(),
             )
             .map_err(|e| eyre::eyre!(e))
@@ -1285,7 +1315,7 @@ async fn resuming_through_any_surface_presses_the_open_decision() {
         .await;
     assert!(matches!(
         missing,
-        Err(ResumeRefused::Decision(DecisionRefused::Choose { ref choices })) if choices == "Send · Redraft · Cancel · Done · Flag"
+        Err(ResumeRefused::Decision(DecisionRefused::Choose { ref choices })) if choices == "Send · Redraft · Cancel · Done · Flag · Revise"
     ));
     let stale = desk
         .runtime()
@@ -1305,4 +1335,326 @@ async fn resuming_through_any_surface_presses_the_open_decision() {
         .await;
     assert!(matches!(decided, Ok(Resumed::Decided(ref made)) if made.outcome == "send"));
     assert_eq!(desk.hub.ran(&run).await, ["draft", "review", "send"]);
+}
+
+fn needed() -> DecisionRefused {
+    DecisionRefused::Input(run_decision::InputRefused::Needed {
+        label: "Revise".into(),
+        question: "What should change?".into(),
+    })
+}
+
+#[tokio::test]
+async fn a_press_with_text_writes_its_variable_for_the_next_step_and_the_closed_card() {
+    let desk = Desk::new(|hub| hub.bob.clone(), "").await;
+    let run = desk.waiting().await;
+    let gate = desk.decision(&run).gate;
+
+    let made = desk
+        .press_with(&run, &desk.bob(), "revise", Some(" shorter\r\n"))
+        .await
+        .unwrap();
+
+    assert_eq!(made.summary, "Revise by Bob");
+    assert_eq!(desk.drafted(&run).await, "Drafted. Notes: shorter");
+    let instance = desk.instance(&run);
+    assert_eq!(instance.variables["review_notes"], "shorter");
+    assert!(instance.variables.get("_human_feedback").is_none());
+    assert_ne!(desk.decision(&run).gate, gate, "a fresh round");
+    assert!(
+        eventually(|| {
+            desk.surface.updated.try_lock().is_ok_and(|updated| {
+                updated.iter().any(|(_, _, m)| {
+                    serde_json::to_string(&m.blocks)
+                        .unwrap()
+                        .contains("\"shorter\"")
+                })
+            })
+        })
+        .await
+    );
+}
+
+#[tokio::test]
+async fn required_text_left_out_is_refused_on_every_surface_and_the_gate_stays_open() {
+    let desk = Desk::new(|hub| hub.bob.clone(), "").await;
+    let run = desk.waiting().await;
+    let gate = desk.decision(&run).gate;
+    let thread = desk.instance(&run).variables["_thread_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let pressed = desk
+        .press_with(&run, &desk.bob(), "revise", Some("  "))
+        .await;
+    let resumed = desk
+        .runtime()
+        .resume_as(
+            &run,
+            ResumeAsk {
+                outcome: Some("revise".into()),
+                gate: Some(gate),
+                feedback: None,
+                channel_id: None,
+                thread_id: None,
+                originating_agent_id: None,
+            },
+            &desk.bob(),
+        )
+        .await;
+    let typed = desk
+        .runtime()
+        .decision_reply(RUN_CHANNEL, &thread, "Revise")
+        .expect("the label names the button");
+    assert_eq!(typed.text, None);
+    let typed = desk
+        .runtime()
+        .decide(
+            &run,
+            DecisionAsk {
+                gate: Some(typed.gate),
+                choice: typed.outcome,
+                feedback: typed.text,
+            },
+            &desk.bob(),
+        )
+        .await;
+
+    assert_eq!(pressed.unwrap_err(), needed());
+    assert!(matches!(resumed, Err(ResumeRefused::Decision(ref refused)) if *refused == needed()));
+    assert_eq!(typed.unwrap_err(), needed());
+    assert!(needed()
+        .to_string()
+        .ends_with("`Revise: …` typed in the run's thread, or `feedback` on a resume."));
+    let decision = run_decision::open_in(&desk.instance(&run)).expect("still open");
+    assert_eq!(decision.gate, gate);
+}
+
+#[tokio::test]
+async fn a_typed_reply_gives_its_text_after_the_label() {
+    let desk = Desk::new(|hub| hub.bob.clone(), "").await;
+    let run = desk.waiting().await;
+    let thread = desk.instance(&run).variables["_thread_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let typed = desk
+        .runtime()
+        .decision_reply(RUN_CHANNEL, &thread, "revise: warmer tone")
+        .expect("an input button's typed form");
+    desk.runtime()
+        .decide(
+            &run,
+            DecisionAsk {
+                gate: Some(typed.gate),
+                choice: typed.outcome,
+                feedback: typed.text,
+            },
+            &desk.bob(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(desk.drafted(&run).await, "Drafted. Notes: warmer tone");
+    assert!(desk
+        .runtime()
+        .decision_reply(RUN_CHANNEL, &thread, "Send: now")
+        .is_none());
+}
+
+#[tokio::test]
+async fn text_longer_than_its_limit_is_refused_and_nothing_is_written() {
+    let desk = Desk::new(|hub| hub.bob.clone(), "").await;
+    let run = desk.waiting().await;
+
+    let refused = desk
+        .press_with(&run, &desk.bob(), "revise", Some(&"x".repeat(21)))
+        .await
+        .unwrap_err();
+
+    assert_eq!(
+        refused,
+        DecisionRefused::Input(run_decision::InputRefused::TooLong {
+            label: "Revise".into(),
+            max: 20,
+            given: 21
+        })
+    );
+    let instance = desk.instance(&run);
+    assert_eq!(instance.variables["review_notes"], "");
+    assert!(run_decision::open_in(&instance).is_some());
+}
+
+#[tokio::test]
+async fn two_deciders_giving_text_at_once_write_only_the_winners() {
+    let desk = Desk::new(|hub| format!("{}, {}", hub.bob, hub.carol), "").await;
+    let run = desk.waiting().await;
+    let (bob, carol) = (desk.bob(), desk.hub.admin());
+
+    let (by_bob, by_carol) = tokio::join!(
+        desk.press_with(&run, &bob, "revise", Some("from bob")),
+        desk.press_with(&run, &carol, "revise", Some("from carol"))
+    );
+
+    let (won, lost) = match (by_bob, by_carol) {
+        (Ok(_), Err(lost)) => ("from bob", lost),
+        (Err(lost), Ok(_)) => ("from carol", lost),
+        other => panic!("one press wins: {other:?}"),
+    };
+    assert!(matches!(lost, DecisionRefused::Decided { .. }), "{lost}");
+    assert_eq!(desk.drafted(&run).await, format!("Drafted. Notes: {won}"));
+    let variables = desk.instance(&run).variables.to_string();
+    let other = if won == "from bob" {
+        "from carol"
+    } else {
+        "from bob"
+    };
+    assert!(!variables.contains(other), "{variables}");
+}
+
+#[tokio::test]
+async fn text_from_someone_who_may_not_decide_is_never_written() {
+    let desk = Desk::new(
+        |hub| format!("{}, {}", hub.alice, hub.bob),
+        "allow_self_decision = false",
+    )
+    .await;
+    let run = desk.waiting().await;
+
+    let own = desk
+        .press_with(&run, &member(&desk.hub.alice), "revise", Some("by alice"))
+        .await;
+    let stranger = desk
+        .press_with(&run, &member(&desk.dan), "revise", Some("by dan"))
+        .await;
+
+    assert!(matches!(
+        own,
+        Err(DecisionRefused::Steer(SteerRefused::OwnDecision { .. }))
+    ));
+    assert!(matches!(
+        stranger,
+        Err(DecisionRefused::Steer(SteerRefused::NotDecider { .. }))
+    ));
+    let instance = desk.instance(&run);
+    assert_eq!(instance.variables["review_notes"], "");
+    assert!(run_decision::open_in(&instance).is_some());
+}
+
+#[tokio::test]
+async fn an_expiry_pressing_optional_input_writes_it_empty() {
+    let desk = Desk::optional_notes("expires_after = \"1h\"\non_expiry = \"revise\"").await;
+    let run = desk.waiting().await;
+    desk.runtime()
+        .set_instance_variable(&run, "review_notes", "stale")
+        .unwrap();
+    expire(&desk, &run);
+
+    desk.runtime().decision_sweep().await;
+
+    assert_eq!(desk.drafted(&run).await, "Drafted.");
+    assert_eq!(desk.instance(&run).variables["review_notes"], "");
+}
+
+#[tokio::test]
+async fn resuming_with_feedback_at_an_input_decision_settles_with_it() {
+    let desk = Desk::new(|hub| hub.bob.clone(), "").await;
+    let run = desk.waiting().await;
+
+    let resumed = desk
+        .runtime()
+        .resume_as(
+            &run,
+            ResumeAsk {
+                outcome: Some("revise".into()),
+                gate: None,
+                feedback: Some("lead with totals".into()),
+                channel_id: None,
+                thread_id: None,
+                originating_agent_id: None,
+            },
+            &desk.bob(),
+        )
+        .await;
+
+    assert!(matches!(resumed, Ok(Resumed::Decided(ref made)) if made.outcome == "revise"));
+    assert_eq!(desk.drafted(&run).await, "Drafted. Notes: lead with totals");
+}
+
+#[tokio::test]
+async fn the_decision_view_lists_each_choices_input() {
+    let desk = Desk::new(|hub| hub.bob.clone(), "").await;
+    let run = desk.waiting().await;
+    let row = desk.runtime().get_instance_status(&run).unwrap().unwrap();
+
+    let view = desk
+        .runtime()
+        .decision_view(&row, Some(&desk.hub.bob))
+        .unwrap();
+
+    assert_eq!(view["choices"][0]["input"], serde_json::Value::Null);
+    assert_eq!(
+        view["choices"][5]["input"],
+        serde_json::json!({
+            "label": "What should change?",
+            "placeholder": null,
+            "max_chars": 20,
+            "required": true,
+        })
+    );
+}
+
+#[tokio::test]
+async fn each_round_overwrites_the_text_and_an_empty_press_leaves_none_from_before() {
+    let desk = Desk::optional_notes("").await;
+    let run = desk.waiting().await;
+
+    desk.press_with(&run, &desk.bob(), "revise", Some("first"))
+        .await
+        .unwrap();
+    assert_eq!(desk.drafted(&run).await, "Drafted. Notes: first");
+    desk.press_with(&run, &desk.bob(), "revise", Some("second"))
+        .await
+        .unwrap();
+    assert_eq!(desk.drafted(&run).await, "Drafted. Notes: second");
+    desk.press_with(&run, &desk.bob(), "revise", None)
+        .await
+        .unwrap();
+
+    assert_eq!(desk.drafted(&run).await, "Drafted.");
+    assert_eq!(desk.instance(&run).variables["review_notes"], "");
+}
+
+#[tokio::test]
+async fn a_form_opens_only_for_an_input_button_and_never_for_someone_slack_rules_out() {
+    let desk = Desk::new(|hub| hub.bob.clone(), "").await;
+    link(&desk.hub, &desk.hub.bob, None, Some("U-BOB"));
+    let run = desk.waiting().await;
+    let gate = desk.decision(&run).gate;
+    let form = |outcome: &str, user: &str| desk.runtime().decision_form(&run, gate, outcome, user);
+
+    let opened = form("revise", "U-BOB").unwrap().expect("a form");
+    assert_eq!(
+        (
+            opened.title.as_str(),
+            opened.label.as_str(),
+            opened.in_thread
+        ),
+        ("Review the digest", "Revise", true)
+    );
+    assert_eq!(opened.input.variable, "review_notes");
+    assert_eq!(form("send", "U-BOB"), Ok(None));
+    assert_eq!(
+        form("revise", "U-OTHER"),
+        Err(DecisionRefused::Steer(SteerRefused::NotDecider {
+            deciders: "Bob".into()
+        }))
+    );
+    assert_eq!(
+        desk.runtime()
+            .decision_form(&run, uuid::Uuid::new_v4(), "revise", "U-BOB"),
+        Err(DecisionRefused::Outdated)
+    );
 }

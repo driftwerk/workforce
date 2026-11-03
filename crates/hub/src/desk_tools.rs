@@ -156,6 +156,7 @@ impl DeskTool {
                             worktree: i.worktree,
                             prompt: i.prompt,
                             approvals: None,
+                            approve_for_me: false,
                             env: Default::default(),
                         },
                         caller(),
@@ -191,6 +192,17 @@ impl DeskTool {
             }
             Verb::Approve => {
                 let i: ApproveInput = parse(input)?;
+                // What Codex asks is to leave its sandbox: the person's alone.
+                let codex = d
+                    .view(i.session_id)
+                    .ok()
+                    .and_then(|v| v.pending)
+                    .is_some_and(|p| p.id == i.approval_id && !p.choices.is_empty());
+                if codex {
+                    return Err(DeskError::Invalid(
+                        "Codex's requests are the person's to answer: tell them in Desk".into(),
+                    ));
+                }
                 let decision = if i.allow {
                     Decision::Allow
                 } else {

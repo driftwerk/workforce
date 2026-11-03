@@ -78,6 +78,8 @@ pub struct SessionRecord {
     pub view: View,
     /// The engine's version when it last started, as it reported it.
     pub engine_version: Option<String>,
+    /// Codex's own reviewer answers its approvals ("Approve for me").
+    pub approve_for_me: bool,
     pub name: String,
     pub goal: String,
     pub cwd: String,
@@ -112,6 +114,13 @@ pub struct PendingApproval {
     /// False when the terminal is asking (approvals = terminal), so Desk only
     /// shows that the session is waiting.
     pub answerable: bool,
+    /// What it can be answered with, when the engine says (Codex): empty
+    /// for allow or deny.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub choices: Vec<Decision>,
+    /// What the engine said about it, in plain words (where it runs, why).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub why: Option<String>,
 }
 
 /// The wire shape of a session: the record plus what only exists while it runs.
@@ -136,6 +145,8 @@ pub struct SessionView {
     pub current_tool: Option<String>,
     pub pending: Option<PendingApproval>,
     pub approvals: Approvals,
+    /// Codex's own reviewer answers its approvals ("Approve for me").
+    pub approve_for_me: bool,
     /// The Desk terminal it runs in, when it was started in one.
     pub terminal_id: Option<Uuid>,
     /// What the person calls it in Desk (`name` is the hub's own).
@@ -228,6 +239,7 @@ impl SessionView {
             current_tool,
             pending,
             approvals: r.approvals,
+            approve_for_me: r.approve_for_me,
             terminal_id: r.terminal_id,
             display_name: r.display_name.clone(),
             group: None,
@@ -315,6 +327,9 @@ pub struct NewSession {
     pub prompt: Option<String>,
     #[serde(default)]
     pub approvals: Option<Approvals>,
+    /// Codex only: its own reviewer answers its approvals.
+    #[serde(default)]
+    pub approve_for_me: bool,
     /// Added to the CLI's environment, as a terminal's is: Desk's plugin
     /// folder in `CLAUDE_CODE_PLUGIN_DIRS`.
     #[serde(default)]
@@ -341,12 +356,16 @@ where
     Option::<T>::deserialize(d).map(Some)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Decision {
     Allow,
     Deny,
     Terminal,
+    /// Allow it and what is like it for the rest of the session (Codex).
+    AllowForSession,
+    /// Deny it and end the turn (Codex).
+    Cancel,
 }
 
 #[cfg(test)]
