@@ -950,6 +950,12 @@ impl Tool for CodingSessionTool {
         "coding.session"
     }
 
+    /// A session in a project workspace the hub sets up, which it names no
+    /// folder of before it runs.
+    fn effect(&self, _input: &serde_json::Value) -> workforce_core::computer::Effect {
+        workforce_core::computer::Effect::Session { cwd: None }
+    }
+
     fn description(&self) -> &str {
         "Drive Claude Code in a persistent workspace. Omit `project` and you get your bench: a \
          private workspace that persists across calls, with git and gh authenticated, where \

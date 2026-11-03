@@ -2701,6 +2701,16 @@ impl AgentService {
         self.consolidation_runtime.get()
     }
 
+    /// What this agent may do on the person's computer, when the hub runs
+    /// `[desk]` and installed [`install_computer_gates`]; `None` elsewhere.
+    pub fn computer_gate(&self) -> Option<Arc<dyn workforce_agent::tools::computer::ComputerGate>> {
+        computer_gate_for(&ComputerSubject {
+            agent: self.agent_id.to_string(),
+            name: self.display_name(),
+            workspace: self.workspace.clone(),
+        })
+    }
+
     /// The authorisation inputs a tool call is gated with, for callers that
     /// dispatch a tool outside a runner turn (a CLI engine's round, the
     /// remote MCP server, a monitor), with the hub's surface allow list.
@@ -2715,6 +2725,7 @@ impl AgentService {
             capability_gate: self.capability_gate.read().clone(),
             permission_gate: self.permission_gate.read().clone(),
             surface_allows,
+            computer_gate: self.computer_gate(),
             arguments: self.config.tools.validation.mode,
         }
     }
@@ -3397,6 +3408,36 @@ impl AgentService {
             .await
     }
 }
+/// The agent a computer gate is built for.
+pub struct ComputerSubject {
+    pub agent: String,
+    /// What the person calls it, where it has a name.
+    pub name: Option<String>,
+    pub workspace: PathBuf,
+}
+
+/// Builds an agent's computer gate.
+pub type ComputerGates = Box<
+    dyn Fn(&ComputerSubject) -> Option<Arc<dyn workforce_agent::tools::computer::ComputerGate>>
+        + Send
+        + Sync,
+>;
+
+/// `subject`'s computer gate, when the hub installed [`install_computer_gates`].
+pub fn computer_gate_for(
+    subject: &ComputerSubject,
+) -> Option<Arc<dyn workforce_agent::tools::computer::ComputerGate>> {
+    COMPUTER_GATES.get().and_then(|gates| gates(subject))
+}
+
+static COMPUTER_GATES: std::sync::OnceLock<ComputerGates> = std::sync::OnceLock::new();
+
+/// Makes `gates` how every agent's computer gate is built, once: only a hub
+/// with `[desk]` installs it. Whether it was the first.
+pub fn install_computer_gates(gates: ComputerGates) -> bool {
+    COMPUTER_GATES.set(gates).is_ok()
+}
+
 #[cfg(test)]
 pub mod tests {
 

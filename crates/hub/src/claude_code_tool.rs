@@ -59,6 +59,15 @@ impl Tool for ClaudeCodeTool {
         "coding.claude"
     }
 
+    fn effect(&self, input: &serde_json::Value) -> workforce_core::computer::Effect {
+        workforce_core::computer::Effect::Session {
+            cwd: input["workdir"]
+                .as_str()
+                .filter(|w| !w.trim().is_empty())
+                .map(|w| workforce_agent::tools::computer::path_in(w, &self.allowed_paths)),
+        }
+    }
+
     fn description(&self) -> &str {
         "Delegate a complex coding task to Claude Code CLI (uses Max subscription). \
          Use for multi-file changes, refactoring, bug fixes, or implementation tasks \

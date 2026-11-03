@@ -53,6 +53,12 @@ impl Tool for ReadFile {
         "filesystem.read"
     }
 
+    fn effect(&self, input: &serde_json::Value) -> workforce_core::computer::Effect {
+        workforce_core::computer::Effect::Read {
+            paths: crate::tools::computer::paths_in(input, "path", &self.allowed_paths),
+        }
+    }
+
     fn description(&self) -> &str {
         "Read the contents of a file. Supports offset and limit for large files."
     }
@@ -136,6 +142,12 @@ struct WriteFileInput {
 impl Tool for WriteFile {
     fn name(&self) -> &str {
         "filesystem.write"
+    }
+
+    fn effect(&self, input: &serde_json::Value) -> workforce_core::computer::Effect {
+        workforce_core::computer::Effect::Write {
+            paths: crate::tools::computer::paths_in(input, "path", &self.allowed_paths),
+        }
     }
 
     fn description(&self) -> &str {
@@ -224,6 +236,12 @@ struct EditFileInput {
 impl Tool for EditFile {
     fn name(&self) -> &str {
         "filesystem.edit"
+    }
+
+    fn effect(&self, input: &serde_json::Value) -> workforce_core::computer::Effect {
+        workforce_core::computer::Effect::Write {
+            paths: crate::tools::computer::paths_in(input, "path", &self.allowed_paths),
+        }
     }
 
     fn description(&self) -> &str {
@@ -347,6 +365,12 @@ impl Tool for ListDir {
         "filesystem.list"
     }
 
+    fn effect(&self, input: &serde_json::Value) -> workforce_core::computer::Effect {
+        workforce_core::computer::Effect::Read {
+            paths: crate::tools::computer::paths_in(input, "path", &self.allowed_paths),
+        }
+    }
+
     fn description(&self) -> &str {
         "List the contents of a directory."
     }
@@ -445,6 +469,12 @@ const GREP_DEFAULT_MAX_MATCHES: usize = 200;
 impl Tool for Grep {
     fn name(&self) -> &str {
         "filesystem.grep"
+    }
+
+    fn effect(&self, input: &serde_json::Value) -> workforce_core::computer::Effect {
+        workforce_core::computer::Effect::Read {
+            paths: crate::tools::computer::paths_in(input, "path", &self.allowed_paths),
+        }
     }
 
     fn description(&self) -> &str {
@@ -549,6 +579,12 @@ const GLOB_DEFAULT_MAX_RESULTS: usize = 500;
 impl Tool for Glob {
     fn name(&self) -> &str {
         "filesystem.glob"
+    }
+
+    fn effect(&self, input: &serde_json::Value) -> workforce_core::computer::Effect {
+        workforce_core::computer::Effect::Read {
+            paths: crate::tools::computer::paths_in(input, "path", &self.allowed_paths),
+        }
     }
 
     fn description(&self) -> &str {

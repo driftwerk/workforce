@@ -584,6 +584,7 @@ pub async fn mount(
     if DESK.set(desk.clone()).is_err() {
         eyre::bail!("desk sessions started twice");
     }
+    crate::desk_computer::install(desk.computer(), Arc::new(config.clone()));
     for service in state.registry.all_services() {
         register_tools(&service);
     }

@@ -1409,6 +1409,8 @@ pub(super) struct RegistryToolExecutor {
     /// the call would in the turn that submitted it.
     pub(super) capability_gate:
         Arc<parking_lot::RwLock<Option<Arc<dyn workforce_agent::runner::CapabilityGate>>>>,
+    /// The agent's workspace, for its computer gate on a hub with `[desk]`.
+    pub(super) workspace: PathBuf,
 }
 
 impl RegistryToolExecutor {
@@ -1455,6 +1457,21 @@ impl crate::job_runner::ToolExecutor for RegistryToolExecutor {
     ) -> Option<String> {
         workforce_agent::tools::dispatch::unattended_refusal(&self.registry, tool_name)
             .or_else(|| self.denied(user, tool_name, params))
+            .or_else(|| {
+                // A job asks nobody: what the computer gate would ask about
+                // is refused here.
+                let gate = crate::serve::computer_gate_for(&crate::serve::ComputerSubject {
+                    agent: self.agent_id.clone(),
+                    name: None,
+                    workspace: self.workspace.clone(),
+                });
+                workforce_agent::tools::computer::unattended_refusal(
+                    gate.as_deref(),
+                    &self.registry,
+                    tool_name,
+                    params,
+                )
+            })
     }
 }
 
@@ -1797,6 +1814,19 @@ struct LlmStack {
     llm: Box<dyn workforce_agent::llm::provider::LlmProvider>,
     health_tracker: Option<Arc<HealthTracker>>,
     failover_ref: Option<Arc<FailoverProvider>>,
+}
+
+/// The paths an agent's tools may touch: its workspace (first, against
+/// which relative paths resolve), the worktrees, and the hot work roots. On a
+/// hub with `[desk]` these are its own folder.
+pub(crate) fn tool_roots(config: &WorkforceConfig, workspace: &Path) -> Vec<PathBuf> {
+    let mut roots = vec![workspace.to_path_buf()];
+    roots.push(crate::code::worktree::worktrees_dir(
+        Path::new(&config.hub.data_dir),
+        config.hub.worktree_root_path(),
+    ));
+    roots.extend(crate::hub_core::layout::WorkRoots::from_hub(&config.hub).hot);
+    roots
 }
 
 /// The tool registry, the paths its tools may touch, and the media config
@@ -2342,13 +2372,8 @@ impl Toolbox {
 
         // Build tools (wrapped in Arc early so system tools can share the reference)
         // Include worktrees dir so filesystem/exec tools can access workflow worktree files.
-        let mut tool_paths = vec![workspace.clone()];
-        let worktrees_dir = crate::code::worktree::worktrees_dir(
-            std::path::Path::new(&config.hub.data_dir),
-            config.hub.worktree_root_path(),
-        );
-        tool_paths.push(worktrees_dir.clone());
-        tool_paths.extend(crate::hub_core::layout::WorkRoots::from_hub(&config.hub).hot);
+        let tool_paths = tool_roots(config, workspace);
+        let worktrees_dir = tool_paths[1].clone();
         let tools = Arc::new(default_tools(tool_paths.clone(), tool_secrets));
 
         // Shared image-config handle and rebuild closure. Created early so the
@@ -4513,6 +4538,7 @@ impl JobRunning {
                     registry: Arc::clone(tools),
                     agent_id: agent_id.as_str().to_string(),
                     capability_gate: Arc::clone(&capability_gate),
+                    workspace: workspace.clone(),
                 });
 
             // Stats recorder — feeds job metrics into the telemetry store.

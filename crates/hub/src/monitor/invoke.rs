@@ -17,9 +17,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 use workforce_agent::runner::CURRENT_AGENT_ID;
 use workforce_agent::tools::access::ToolAccessSnapshot;
-use workforce_agent::tools::dispatch::{
-    execute_gated, gate_tool_call, unattended_refusal, GateOutcome, ToolGates,
-};
+use workforce_agent::tools::dispatch::{execute_gated, unattended_refusal, GateOutcome, ToolGates};
 use workforce_agent::tools::registry::ToolRegistry;
 use workforce_common::session::TurnPrincipal;
 use workforce_policy::engine::PolicyEngine;
@@ -144,7 +142,23 @@ impl GovernedInvoker {
             return Err(InvokeError::Denied(refusal));
         }
         let gates = (self.gates)();
-        let exec_input = match gate_tool_call(&gates, &self.policy, &self.tools, tool, &input) {
+        // A monitor asks nobody: what the computer gate would ask about runs
+        // or is refused as its agent's `[computer] unattended` says.
+        let (outcome, decided) = workforce_agent::tools::dispatch::gate_tool_call_unattended(
+            &gates,
+            &self.policy,
+            &self.tools,
+            tool,
+            &input,
+        );
+        workforce_agent::tools::computer::settle_gated(
+            gates.computer_gate.as_deref(),
+            tool,
+            decided.as_ref(),
+            &input,
+            &outcome,
+        );
+        let exec_input = match outcome {
             GateOutcome::Execute { exec_input, .. } => exec_input,
             GateOutcome::Blocked { reason, .. } => {
                 tracing::warn!(
@@ -279,6 +293,7 @@ mod tests {
                 capability_gate: None,
                 permission_gate: None,
                 surface_allows: None,
+                computer_gate: None,
                 arguments: ArgumentValidation::Off,
             }),
             Arc::new(ToolAccessSnapshot::default),
@@ -317,6 +332,7 @@ mod tests {
                 capability_gate: Some(Arc::new(OnlyFor("alice"))),
                 permission_gate: None,
                 surface_allows: None,
+                computer_gate: None,
                 arguments: ArgumentValidation::Off,
             }),
             Arc::new(move || ToolAccessSnapshot::new(blocked.clone())),

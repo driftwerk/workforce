@@ -273,6 +273,12 @@ impl Tool for CodeFindReplaceTool {
         "code.find_replace"
     }
 
+    fn effect(&self, input: &serde_json::Value) -> workforce_core::computer::Effect {
+        workforce_core::computer::Effect::Write {
+            paths: super::utils::effect_paths(input, "path", &self.allowed_paths),
+        }
+    }
+
     fn description(&self) -> &str {
         "Project-wide find and replace"
     }

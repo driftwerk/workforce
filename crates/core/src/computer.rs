@@ -99,6 +99,39 @@ pub struct ComputerAccess {
     pub autonomous: bool,
     /// Whether changes inside its own folder ask too.
     pub ask_in_own_folder: bool,
+    /// What happens at Full access to what would ask, where nobody can be
+    /// asked (a scheduled or background job, a workflow step).
+    #[serde(default)]
+    pub unattended: Unattended,
+}
+
+/// Where nobody can be asked, at Full access.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Unattended {
+    /// It runs, as before the asking: what the person set the agent to do
+    /// on its own is theirs to tighten.
+    #[default]
+    Run,
+    /// It is refused.
+    Refuse,
+}
+
+impl Unattended {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Run => "run",
+            Self::Refuse => "refuse",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "run" => Some(Self::Run),
+            "refuse" => Some(Self::Refuse),
+            _ => None,
+        }
+    }
 }
 
 /// What one tool call does to this computer or a connector, as the tool
@@ -205,6 +238,10 @@ pub enum By {
     Grant(Uuid),
     /// An allowance for this session.
     Session(Uuid),
+    /// Nobody could be asked, and at Full access the agent runs what would
+    /// ask (`[computer] unattended = "run"`, the default). Never a verdict's
+    /// own answer: the gate's, on a path with nobody on it.
+    Unattended,
 }
 
 /// Which rule refused a call.

@@ -2,6 +2,7 @@ pub mod access;
 pub mod approval;
 pub mod arguments;
 pub mod chart;
+pub mod computer;
 pub mod config_guard;
 pub mod data;
 pub mod database;
@@ -262,6 +263,16 @@ pub trait Tool: Send + Sync {
     /// `None`, the default, leaves the gate to the tool's namespace.
     fn surface_effect(&self, _input: &serde_json::Value) -> Option<SurfaceEffect> {
         None
+    }
+
+    /// What THIS call does to this computer: reads, writes or deletes which
+    /// paths, runs which command where, starts a session where. A hub with
+    /// `[desk]` decides a call in a namespace that touches this computer by
+    /// it ([`computer::ComputerGate`]); every other hub never reads it.
+    /// Paths are as the tool would resolve them: absolute and real.
+    /// `Unknown`, the default, counts as a change the tool can't name.
+    fn effect(&self, _input: &serde_json::Value) -> workforce_core::computer::Effect {
+        workforce_core::computer::Effect::Unknown
     }
 
     /// Collect what a call of this tool left running when its turn was

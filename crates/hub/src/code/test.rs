@@ -446,6 +446,10 @@ impl Tool for CodeTestTool {
         "code.test"
     }
 
+    fn effect(&self, input: &serde_json::Value) -> workforce_core::computer::Effect {
+        super::utils::effect_command(input, &self.allowed_paths, &["code.test"])
+    }
+
     fn description(&self) -> &str {
         "Run tests with framework auto-detection. IMPORTANT: Never run tests for the entire workspace — only test the specific crate/package you changed (e.g. use filter parameter or specify the crate path). For non-code changes (README, docs, config) skip tests entirely — CI handles full test runs."
     }

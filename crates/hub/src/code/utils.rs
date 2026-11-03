@@ -352,6 +352,43 @@ pub fn detect_project_type(root: &Path) -> Option<&'static str> {
     }
 }
 
+/// Where a `code.*` call acts: the repo it names (resolved as the tool
+/// resolves it), else the workspace; real, for the computer gate. `None`
+/// when the repo can't be found: the tool will fail on it too.
+pub(crate) fn effect_cwd(input: &serde_json::Value, allowed: &[PathBuf]) -> Option<PathBuf> {
+    let base = allowed.first()?;
+    let dir = match input["repo"].as_str().filter(|r| !r.trim().is_empty()) {
+        Some(repo) => resolve_repo_path(repo, base).ok()?,
+        None => base.clone(),
+    };
+    Some(workforce_agent::tools::paths::resolve_real(&dir))
+}
+
+/// The paths a `code.*` call names under `key`, against its repo or the
+/// workspace; that folder itself when it names none.
+pub(crate) fn effect_paths(
+    input: &serde_json::Value,
+    key: &str,
+    allowed: &[PathBuf],
+) -> Vec<PathBuf> {
+    let Some(root) = effect_cwd(input, allowed).or_else(|| allowed.first().cloned()) else {
+        return Vec::new();
+    };
+    workforce_agent::tools::computer::paths_in(input, key, &[root])
+}
+
+/// A `code.*` runner's call as a command run in its repo.
+pub(crate) fn effect_command(
+    input: &serde_json::Value,
+    allowed: &[PathBuf],
+    argv: &[&str],
+) -> workforce_core::computer::Effect {
+    workforce_core::computer::Effect::Exec {
+        command: workforce_agent::tools::computer::shell_line(argv),
+        cwd: effect_cwd(input, allowed),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
