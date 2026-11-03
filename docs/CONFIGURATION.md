@@ -145,7 +145,8 @@ url = "nats://localhost:4222"
 
 | Field | Type | Default | Env Override |
 |-------|------|---------|--------------|
-| `url` | String | `"nats://localhost:4222"` | `WORKFORCE_NATS_URL` |
+| `enabled` | Option\<bool\> | on, except a Desk hub naming no url | — |
+| `url` | Option\<String\> | `"nats://localhost:4222"` (none on a Desk hub) | `WORKFORCE_NATS_URL` |
 | `credentials` | Option\<String\> | None | — |
 | `stream_replicas` | usize | `1` | — |
 
@@ -156,6 +157,12 @@ workforce streams and the leader-election bucket — leave `1` on a single NATS
 server (which rejects higher values), set `3` on a 3-node cluster.
 
 NATS is optional — only needed for distributed multi-agent mode.
+`enabled = false` runs the hub as one instance with no bus, whatever names a
+url: turn control and follow-ups are applied in process, there is no leader
+election and no JetStream. A hub with `[desk] enabled` dials NATS only when its
+config or `WORKFORCE_NATS_URL` names a url (or with `enabled = true`), since
+port 4222 on a person's computer may be another project's server.
+`[cluster] expected = true` with NATS off is refused at startup.
 
 ### `[weaviate]` — Vector Memory
 

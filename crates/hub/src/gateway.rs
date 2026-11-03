@@ -17018,6 +17018,57 @@ mod turn_control_tests {
         assert!(!owns_session(&store, "no-such-session", "alice"));
     }
 
+    /// With NATS off a follow-up, an approval answer and a stop each reach
+    /// the turn running in this process, as the Desk hub sends them.
+    #[tokio::test]
+    async fn without_nats_a_running_turn_is_steered_in_process() {
+        use crate::serve::Compose as _;
+        use workforce_agent::runner::InjectedMessage;
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = workforce_common::settings::WorkforceConfig::default();
+        config.hub.data_dir = dir.path().to_string_lossy().into_owned();
+        config.memory.db_path = dir.path().join("memory.db").to_string_lossy().into_owned();
+        config.llm.api_key = Some("test-key".into());
+        config.desk.enabled = true;
+        let service = crate::serve::AgentService::from_config(config, None)
+            .await
+            .unwrap();
+        assert!(service.nats().is_none());
+        let (live, mut inbox) = service
+            .begin_live_turn("s1", SelfServe::Answerable, None)
+            .await
+            .expect("no turn running yet");
+
+        let follow_up = followup_injection("and the tests too", "u1", None, false);
+        assert_eq!(
+            steer(None, &service, "s1", follow_up).await,
+            Applied::Injected
+        );
+        assert!(matches!(
+            inbox.rx.recv().await,
+            Some(InjectedMessage::UserMessage { text, .. }) if text == "and the tests too"
+        ));
+        let answer = followup_injection("approve req-1", "u1", None, false);
+        assert_eq!(steer(None, &service, "s1", answer).await, Applied::Injected);
+        assert!(matches!(
+            inbox.rx.recv().await,
+            Some(InjectedMessage::ApprovalResponse { request_id, approved: true, .. }) if request_id == "req-1"
+        ));
+
+        let stop = tokio::spawn({
+            let service = Arc::clone(&service);
+            async move { steer(None, &service, "s1", TurnControl::Cancel).await }
+        });
+        live.cancel_token().cancelled().await;
+        drop(live);
+        assert!(stop.await.unwrap().applied(), "the stop is acknowledged");
+        assert_eq!(
+            steer(None, &service, "s1", TurnControl::Snapshot).await,
+            Applied::NotLive,
+            "nothing is left running"
+        );
+    }
+
     #[test]
     fn followup_injection_answers_prompts_and_forwards_everything_else() {
         assert_eq!(
