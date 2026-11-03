@@ -755,7 +755,9 @@ pub fn approval_summary(tool: &str, detail: &str) -> String {
     let name = tool.split('(').next().unwrap_or(tool).trim();
     let detail = detail.trim();
     match name {
-        "Input" => detail.to_string(),
+        "Input" | "Question" => detail.to_string(),
+        "Plan" if detail.is_empty() => "Approve the plan?".to_string(),
+        "Plan" => format!("Approve the plan: {detail}?"),
         "Bash" if !detail.is_empty() => format!("Run {detail}?"),
         "Edit" | "Write" | "MultiEdit" | "NotebookEdit" if !detail.is_empty() => {
             format!("Edit {detail}?")

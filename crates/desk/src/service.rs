@@ -169,6 +169,51 @@ pub(crate) struct Live {
     /// Answers Desk sent Codex, by request, until Codex is told them (or
     /// was answered in the terminal first): what Activity then says.
     codex_sent: HashMap<String, CodexSent>,
+    /// Who raised its pending wait, while one is: the main thread's (a
+    /// question, a permission) is not a sub-agent's to end.
+    held: Option<Raised>,
+}
+
+/// What raised a Claude Code session's pending wait (the one with `pending`'s
+/// id): the sub-agent it came from, if any, and the call that asked it, for
+/// a question, which only that call's end answers.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Raised {
+    pending: Uuid,
+    agent: Option<String>,
+    /// It is a question (or a plan) a tool asks, not a permission.
+    question: bool,
+    call: Option<String>,
+}
+
+impl Live {
+    /// What raised its pending wait, while it waits.
+    fn holder(&self) -> Option<&Raised> {
+        let pending = self.pending.as_ref()?;
+        self.held.as_ref().filter(|h| h.pending == pending.id)
+    }
+
+    /// Whether a hook from `inside` (a sub-agent, or the main thread) leaves
+    /// its pending wait be: a sub-agent's tools don't end what the main
+    /// thread waits on, and a question waits for its own call's end.
+    fn holds_against(&self, inside: Option<&str>, call: Option<&str>) -> bool {
+        if self.pending.is_none() {
+            return false;
+        }
+        let held = self.holder();
+        match inside {
+            Some(agent) => held.is_none_or(|h| h.agent.as_deref() != Some(agent)),
+            None => {
+                call.is_some()
+                    && held.is_some_and(|h| {
+                        h.question
+                            && h.agent.is_none()
+                            && h.call.is_some()
+                            && h.call.as_deref() != call
+                    })
+            }
+        }
+    }
 }
 
 /// A Codex request Desk can answer: its JSON-RPC id, and the pending
@@ -550,6 +595,7 @@ fn codex_asks(r: &mut SessionRecord, l: &mut Live, ask: codex::Ask) {
         answerable: true,
         choices: ask.choices,
         why: ask.why,
+        options: None,
     };
     let asked = CodexAsk {
         request: ask.request,
@@ -631,7 +677,8 @@ fn asking(p: &PendingApproval) -> String {
         p.detail.clone()
     };
     match name {
-        "Input" => format!("is asking: {}", crew::clip(&p.detail, 160)),
+        "Input" | "Question" => format!("is asking: {}", crew::clip(&p.detail, 160)),
+        "Plan" => "wants its plan approved".into(),
         "Bash" => format!("wants to run {}", crew::clip(&detail, 160)),
         "Edit" | "Write" | "MultiEdit" => format!("wants to edit {}", crew::clip(&detail, 160)),
         _ if !p.answerable && p.detail == "Answer in the terminal" => {
@@ -1036,6 +1083,7 @@ impl Desk {
                         answerable: false,
                         choices: Vec::new(),
                         why: None,
+                        options: None,
                     }),
                     answer: None,
                     ended: false,
@@ -1053,6 +1101,7 @@ impl Desk {
                     closing: false,
                     codex_asks: Vec::new(),
                     codex_sent: HashMap::new(),
+                    held: None,
                 },
             );
             tokio::spawn(self.clone().on_exit(id, exit));
@@ -2897,6 +2946,7 @@ impl Desk {
                 closing: false,
                 codex_asks: Vec::new(),
                 codex_sent: HashMap::new(),
+                held: None,
             },
         );
         tokio::spawn(self.clone().on_exit(r.id, exit));
@@ -3046,18 +3096,21 @@ impl Desk {
             false => empty(),
         };
         if let Some(agent) = &inside {
-            let idle = {
+            let (idle, held) = {
                 let mut st = self.0.state.lock();
                 let done = st
                     .records
                     .get(&id)
                     .is_some_and(|r| matches!(r.state, SessionState::Done | SessionState::Asking));
-                if let Some(l) = st.live.get_mut(&id) {
+                let held = st.live.get_mut(&id).is_some_and(|l| {
                     l.background = std::mem::take(&mut l.background).heard(agent, Utc::now());
-                }
-                done
+                    l.holds_against(Some(agent), None)
+                });
+                (done, held)
             };
-            if idle && matches!(hook, Hook::ToolStart { .. } | Hook::ToolEnd) {
+            // What the main thread waits on (a question, a permission)
+            // still waits while a sub-agent works on.
+            if (idle || held) && matches!(hook, Hook::ToolStart { .. } | Hook::ToolEnd { .. }) {
                 return answer();
             }
         }
@@ -3081,6 +3134,7 @@ impl Desk {
                 r.restore_offer = false;
                 if let Some(l) = l {
                     l.pending = None;
+                    l.held = None;
                     l.prompts += 1;
                     l.denials.clear();
                     l.reading = None;
@@ -3099,6 +3153,12 @@ impl Desk {
                     if inside.is_none() {
                         asking::went_on(&mut l.denials, false);
                     }
+                    // The main thread went on: the question it asked is over
+                    // (its own hook turned it down, or it was answered).
+                    if inside.is_none() && l.holder().is_some_and(|h| h.question) {
+                        l.pending = None;
+                        l.held = None;
+                    }
                 }
             }),
             Hook::Denied(denied) => {
@@ -3109,7 +3169,51 @@ impl Desk {
                     }
                 }
             }
-            Hook::ToolEnd => {
+            Hook::Question { id: call, question } => self.change(id, |r, l| {
+                let Some(l) = l else { return };
+                // The same call again (its permission check after its
+                // start) is the same question, still asked.
+                if l.holder()
+                    .is_some_and(|h| h.question && (call.is_none() || h.call == call))
+                {
+                    return;
+                }
+                r.state = SessionState::Blocked;
+                r.asked = None;
+                l.current_tool = None;
+                l.reading = None;
+                let pending = PendingApproval {
+                    id: Uuid::new_v4(),
+                    tool: question.tool,
+                    detail: question.detail,
+                    since: Utc::now(),
+                    // Only its terminal's dialog can answer it.
+                    answerable: false,
+                    choices: Vec::new(),
+                    why: question.why,
+                    options: question.options,
+                };
+                l.held = Some(Raised {
+                    pending: pending.id,
+                    agent: inside.clone(),
+                    question: true,
+                    call,
+                });
+                l.pending = Some(pending);
+                l.answer = None;
+            }),
+            Hook::ToolEnd { id: call } => {
+                let held = self
+                    .0
+                    .state
+                    .lock()
+                    .live
+                    .get(&id)
+                    .is_some_and(|l| l.holds_against(None, call.as_deref()));
+                // Another call ended (one run beside it): the question waits on.
+                if held {
+                    return answer();
+                }
                 self.change(id, |r, l| {
                     r.state = SessionState::Working;
                     if let Some(l) = l {
@@ -3127,7 +3231,7 @@ impl Desk {
             Hook::NeedsInput(message) => self.change(id, |r, l| {
                 if let Some(l) = l.filter(|l| l.pending.is_none()) {
                     r.state = SessionState::Blocked;
-                    l.pending = Some(PendingApproval {
+                    let pending = PendingApproval {
                         id: Uuid::new_v4(),
                         tool: "Input".into(),
                         detail: message,
@@ -3135,7 +3239,24 @@ impl Desk {
                         answerable: false,
                         choices: Vec::new(),
                         why: None,
+                        options: None,
+                    };
+                    l.held = Some(Raised {
+                        pending: pending.id,
+                        agent: inside.clone(),
+                        question: false,
+                        call: None,
                     });
+                    l.pending = Some(pending);
+                }
+            }),
+            Hook::InputAnswered => self.change(id, |r, l| {
+                if let Some(l) = l {
+                    if l.pending.as_ref().is_some_and(|p| p.tool == "Input") {
+                        l.pending = None;
+                        l.held = None;
+                        r.state = SessionState::Working;
+                    }
                 }
             }),
             Hook::Woken => self.change(id, |r, l| {
@@ -3252,7 +3373,7 @@ impl Desk {
                 self.spend_read(id);
             }
             Hook::Permission { tool, detail } => {
-                return self.await_permission(id, tool, detail).await
+                return self.await_permission(id, tool, detail, inside).await
             }
             Hook::Usage(limits) => self.report_usage(limits, Some(id)),
             Hook::Other => {}
@@ -3304,7 +3425,13 @@ impl Desk {
         });
     }
 
-    async fn await_permission(&self, id: Uuid, tool: String, detail: String) -> Value {
+    async fn await_permission(
+        &self,
+        id: Uuid,
+        tool: String,
+        detail: String,
+        inside: Option<String>,
+    ) -> Value {
         let desk_answers = self
             .record(id)
             .is_ok_and(|r| r.approvals == Approvals::Desk);
@@ -3316,12 +3443,19 @@ impl Desk {
             answerable: desk_answers,
             choices: Vec::new(),
             why: None,
+            options: None,
         };
         let (tx, rx) = oneshot::channel();
         self.change(id, |r, l| {
             r.state = SessionState::Blocked;
             if let Some(l) = l {
                 l.pending = Some(pending.clone());
+                l.held = Some(Raised {
+                    pending: pending.id,
+                    agent: inside,
+                    question: false,
+                    call: None,
+                });
                 l.answer = desk_answers.then_some(tx);
             }
         });
@@ -3537,6 +3671,7 @@ impl Desk {
                                     answerable: false,
                                     choices: Vec::new(),
                                     why: None,
+                                    options: None,
                                 })
                             });
                         }
@@ -5033,6 +5168,154 @@ mod tests {
             let p = d.view(s.id).unwrap().pending.unwrap();
             assert!(!p.answerable);
             assert!(d.decide(s.id, p.id, Decision::Allow, None).is_err());
+        })
+        .await;
+    }
+
+    /// A turn that asks two questions while a sub-agent it started works on,
+    /// replayed as Claude Code 2.1.317 fired it in auto mode: the question's
+    /// start, the sub-agent's own calls, and nothing more until the person
+    /// answered both in the terminal.
+    #[tokio::test]
+    async fn a_question_asked_in_the_terminal_needs_you_until_its_last_answer() {
+        with_test_pool(build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            DeskStore::migrate(&pool).await.unwrap();
+            let logged = Arc::new(Logged::default());
+            let d = Desk::start(
+                DeskStore::from_pool(pool),
+                options(dir.path()),
+                Floor {
+                    turns: Some(logged.clone()),
+                    plans: None,
+                    pricer: None,
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            let s = new_session(&d, dir.path()).await;
+            let questions = claude::tests::two_questions();
+            let asking = |d: &Desk| {
+                let v = d.view(s.id).unwrap();
+                let p = v.pending.clone();
+                (v.state, p.as_ref().map(|p| p.detail.clone()), p.and_then(|p| p.options).map(|o| o.len()))
+            };
+            let waiting = (
+                SessionState::Blocked,
+                Some("Send the three messages at once or one after another?".to_string()),
+                Some(3),
+            );
+            post(&d, s.id, json!({"hook_event_name": "UserPromptSubmit", "prompt": "plan the change"})).await;
+            post(&d, s.id, json!({"hook_event_name": "PreToolUse", "tool_name": "Agent", "tool_use_id": "toolu_a",
+                "tool_input": {"description": "Open the PR", "prompt": "…", "run_in_background": true}})).await;
+            post(&d, s.id, json!({"hook_event_name": "SubagentStart", "agent_id": "a1"})).await;
+            post(&d, s.id, json!({"hook_event_name": "PostToolUse", "tool_name": "Agent", "tool_use_id": "toolu_a"})).await;
+            let answer = post(&d, s.id, json!({"session_id": "s1", "permission_mode": "auto", "hook_event_name": "PreToolUse",
+                "tool_name": "AskUserQuestion", "tool_input": questions, "tool_use_id": "toolu_q"})).await;
+            assert_eq!(answer, json!({}), "the terminal's dialog asks it");
+            assert_eq!(asking(&d), waiting);
+            let first = d.view(s.id).unwrap().pending.unwrap();
+            assert!(!first.answerable);
+            assert_eq!(first.why.as_deref(), Some("(1 of 2 questions)"));
+
+            // The sub-agent works on, and ends: the question still waits.
+            for n in 0..3 {
+                post(&d, s.id, json!({"hook_event_name": "PreToolUse", "agent_id": "a1", "agent_type": "general-purpose",
+                    "tool_name": "Bash", "tool_input": {"command": format!("cargo test {n}")}, "tool_use_id": format!("toolu_s{n}")})).await;
+                assert_eq!(asking(&d), waiting, "a sub-agent's call {n}");
+                post(&d, s.id, json!({"hook_event_name": "PostToolUse", "agent_id": "a1", "agent_type": "general-purpose",
+                    "tool_name": "Bash", "tool_use_id": format!("toolu_s{n}")})).await;
+                assert_eq!(asking(&d), waiting, "a sub-agent's call {n} ended");
+            }
+            post(&d, s.id, json!({"hook_event_name": "SubagentStop", "agent_id": "a1"})).await;
+            // Its dialog's own notice, and a sign-in's, change nothing.
+            post(&d, s.id, json!({"hook_event_name": "Notification", "notification_type": "permission_prompt",
+                "message": "Claude needs your permission to use AskUserQuestion"})).await;
+            post(&d, s.id, json!({"hook_event_name": "Notification", "notification_type": "auth_success", "message": "Signed in"})).await;
+            // Its permission check, were it sent, is the same question.
+            let answer = post(&d, s.id, json!({"hook_event_name": "PermissionRequest", "tool_name": "AskUserQuestion",
+                "tool_input": claude::tests::two_questions(), "tool_use_id": "toolu_q"})).await;
+            assert_eq!(answer, claude::ask_in_terminal());
+            assert_eq!(d.view(s.id).unwrap().pending.unwrap().id, first.id, "the same question");
+            assert_eq!(asking(&d), waiting);
+
+            // On the floor: a question, with its options, answered in the terminal.
+            assert!(logs(&logged, |ops| ops.iter().any(|op| matches!(op, TurnOp::Wait { .. }))).await);
+            let needs = crate::floor::open_needs(&logged.0.lock().iter().fold(Vec::new(), crate::floor::apply));
+            let [need] = &needs[..] else { panic!("{needs:?}") };
+            assert_eq!(need.kind, crate::floor::NeedKind::Question);
+            assert_eq!(need.answer, crate::floor::Answer::Terminal);
+            assert_eq!(
+                need.ask,
+                "Send the three messages at once or one after another? (1 of 2 questions)"
+            );
+            assert_eq!(need.options.as_ref().map(Vec::len), Some(3));
+
+            // Both answered: the call ends, and so does the wait.
+            post(&d, s.id, json!({"hook_event_name": "PostToolUse", "tool_name": "AskUserQuestion",
+                "tool_use_id": "toolu_q", "tool_response": {"answers": {}}})).await;
+            assert_eq!(asking(&d), (SessionState::Working, None, None));
+            assert!(
+                logs(&logged, |ops| ops.iter().any(|op| matches!(op, TurnOp::Unwait { key, .. } if *key == first.id.to_string())))
+                    .await
+            );
+            assert!(crate::floor::open_needs(&logged.0.lock().iter().fold(Vec::new(), crate::floor::apply)).is_empty());
+
+            // A plan to approve waits the same way; turned down, it ends too.
+            post(&d, s.id, json!({"hook_event_name": "PreToolUse", "tool_name": "ExitPlanMode", "tool_use_id": "toolu_p",
+                "tool_input": {"plan": "# Shadow the reads\n1. Mirror the writes."}})).await;
+            let p = d.view(s.id).unwrap().pending.unwrap();
+            assert_eq!((p.tool.as_str(), p.detail.as_str()), ("Plan", "Shadow the reads"));
+            post(&d, s.id, json!({"hook_event_name": "PostToolUseFailure", "tool_name": "ExitPlanMode",
+                "tool_use_id": "toolu_p", "error": "The user doesn't want to proceed", "is_interrupt": true})).await;
+            assert_eq!(d.view(s.id).unwrap().pending, None);
+
+            // A question the next prompt answers (Esc, then typing).
+            post(&d, s.id, json!({"hook_event_name": "PreToolUse", "tool_name": "AskUserQuestion",
+                "tool_input": claude::tests::two_questions(), "tool_use_id": "toolu_q2"})).await;
+            assert_eq!(asking(&d).0, SessionState::Blocked);
+            post(&d, s.id, json!({"hook_event_name": "UserPromptSubmit", "prompt": "do the first"})).await;
+            assert_eq!(asking(&d), (SessionState::Working, None, None));
+        })
+        .await;
+    }
+
+    /// A sub-agent's calls while the main thread waits on a permission it
+    /// asked don't end that wait; the sub-agent's own permission ends with
+    /// its call.
+    #[tokio::test]
+    async fn a_sub_agent_ends_only_its_own_wait() {
+        with_test_pool(build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let d = desk(pool, dir.path()).await;
+            let s = new_session(&d, dir.path()).await;
+            d.update(s.id, SessionPatch { approvals: Some(Approvals::Terminal), ..Default::default() }).unwrap();
+            post(&d, s.id, json!({"hook_event_name": "UserPromptSubmit", "prompt": "clean up"})).await;
+            post(&d, s.id, json!({"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {"command": "rm -rf target"}})).await;
+            post(&d, s.id, json!({"hook_event_name": "PermissionRequest", "tool_name": "Bash", "tool_input": {"command": "rm -rf target"}})).await;
+            let main = d.view(s.id).unwrap().pending.unwrap();
+            post(&d, s.id, json!({"hook_event_name": "PreToolUse", "agent_id": "a1", "tool_name": "Read", "tool_input": {"file_path": "a.rs"}})).await;
+            post(&d, s.id, json!({"hook_event_name": "PostToolUse", "agent_id": "a1", "tool_name": "Read"})).await;
+            let v = d.view(s.id).unwrap();
+            assert_eq!((v.state, v.pending.map(|p| p.id)), (SessionState::Blocked, Some(main.id)));
+            post(&d, s.id, json!({"hook_event_name": "PostToolUse", "tool_name": "Bash"})).await;
+            let v = d.view(s.id).unwrap();
+            assert_eq!((v.state, v.pending), (SessionState::Working, None));
+
+            // The sub-agent's own ask ends with its own call.
+            post(&d, s.id, json!({"hook_event_name": "PermissionRequest", "agent_id": "a1", "tool_name": "Bash", "tool_input": {"command": "git push"}})).await;
+            assert_eq!(d.view(s.id).unwrap().state, SessionState::Blocked);
+            post(&d, s.id, json!({"hook_event_name": "PostToolUse", "agent_id": "a1", "tool_name": "Bash"})).await;
+            let v = d.view(s.id).unwrap();
+            assert_eq!((v.state, v.pending), (SessionState::Working, None));
+
+            // An MCP server's request for input waits until it is answered.
+            post(&d, s.id, json!({"hook_event_name": "Notification", "notification_type": "elicitation_dialog", "message": "An MCP server needs your input"})).await;
+            assert_eq!(d.view(s.id).unwrap().state, SessionState::Blocked);
+            post(&d, s.id, json!({"hook_event_name": "Notification", "notification_type": "elicitation_response", "message": "Elicitation response for server \"db\": accept"})).await;
+            let v = d.view(s.id).unwrap();
+            assert_eq!((v.state, v.pending), (SessionState::Working, None));
         })
         .await;
     }

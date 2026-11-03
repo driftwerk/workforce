@@ -166,6 +166,9 @@ pub struct Wait {
     pub to: Option<DateTime<Utc>>,
     pub ask: String,
     pub answer: Answer,
+    /// The answers a question it asks offers, as its terminal lists them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub options: Option<Vec<String>>,
 }
 
 /// Work a turn started that runs on while the turn itself waits for it.
@@ -427,6 +430,7 @@ pub fn apply(mut turns: Vec<Turn>, op: &TurnOp) -> Vec<Turn> {
                     Some(w) => {
                         w.ask = wait.ask.clone();
                         w.answer = wait.answer.clone();
+                        w.options = wait.options.clone();
                     }
                     None => t.waits.push(wait.clone()),
                 }
@@ -636,13 +640,13 @@ pub fn open_needs(turns: &[Turn]) -> Vec<Need> {
             .filter(|w| w.to.is_none())
             .map(move |w| Need {
                 id: format!("wait:{}:{}", t.id, w.key),
-                kind: match w.answer {
-                    Answer::Reply => NeedKind::Question,
-                    Answer::Decide { .. } | Answer::Terminal => NeedKind::Approval,
+                kind: match (&w.answer, &w.options) {
+                    (Answer::Reply, _) | (_, Some(_)) => NeedKind::Question,
+                    (Answer::Decide { .. } | Answer::Terminal, None) => NeedKind::Approval,
                 },
                 who: t.subject.who(&t.name),
                 ask: w.ask.clone(),
-                options: None,
+                options: w.options.clone(),
                 since: w.from,
                 place: t.place.clone(),
                 answer: w.answer.clone(),
@@ -1000,6 +1004,7 @@ mod tests {
             to: to.map(at),
             ask: "Run cargo test?".into(),
             answer,
+            options: None,
         }
     }
 
