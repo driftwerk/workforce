@@ -28,6 +28,10 @@ pub struct ToolRegistry {
 struct Upstream {
     source: Arc<ToolRegistry>,
     admits: Arc<dyn Fn(&str) -> bool + Send + Sync>,
+    /// Tools registered on the copy itself after it was made (a turn's own
+    /// overrides, such as a node-routed `exec.run`): never replaced from the
+    /// source.
+    own: RwLock<std::collections::BTreeSet<String>>,
 }
 
 impl ToolRegistry {
@@ -44,6 +48,9 @@ impl ToolRegistry {
     pub fn register(&self, tool: Arc<dyn Tool>) {
         let name = tool.name().to_string();
         tracing::info!(tool = %name, "Registered tool");
+        if let Some(upstream) = &self.upstream {
+            upstream.own.write().insert(name.clone());
+        }
         self.tools.write().insert(name, tool);
         self.generation.fetch_add(1, Ordering::Relaxed);
     }
@@ -156,34 +163,46 @@ impl ToolRegistry {
             upstream: Some(Upstream {
                 source: Arc::clone(source),
                 admits: Arc::new(admits),
+                own: RwLock::default(),
             }),
             ..source.clone_all()
         }
     }
 
     /// Take from the registry this one [follows](Self::follow) the tools in
-    /// `names` it lacks and admits, through every registry in between; the
-    /// names it took. A registry that follows none takes nothing.
+    /// `names` it admits and lacks, or holds in an older instance than the
+    /// source's (a skill re-enabled with new credentials), through every
+    /// registry in between; the names it took. A tool registered on the copy
+    /// itself is kept. A registry that follows none takes nothing.
     pub fn adopt(&self, names: &[String]) -> Vec<String> {
         let Some(upstream) = &self.upstream else {
             return Vec::new();
         };
-        let wanted: Vec<String> = names
-            .iter()
-            .filter(|name| !self.has(name) && (upstream.admits)(name))
-            .cloned()
-            .collect();
+        let wanted: Vec<String> = {
+            let own = upstream.own.read();
+            names
+                .iter()
+                .filter(|name| (upstream.admits)(name) && !own.contains(name.as_str()))
+                .cloned()
+                .collect()
+        };
         if wanted.is_empty() {
             return Vec::new();
         }
         upstream.source.adopt(&wanted);
+        let same = |a: &Arc<dyn Tool>, b: &Arc<dyn Tool>| {
+            std::ptr::addr_eq(Arc::as_ptr(a), Arc::as_ptr(b))
+        };
         let taken: Vec<String> = {
             let mut tools = self.tools.write();
             wanted
                 .into_iter()
                 .filter_map(|name| {
-                    let tool = upstream.source.get(&name)?;
-                    tools.insert(name.clone(), tool);
+                    let fresh = upstream.source.get(&name)?;
+                    if tools.get(&name).is_some_and(|held| same(held, &fresh)) {
+                        return None;
+                    }
+                    tools.insert(name.clone(), fresh);
                     Some(name)
                 })
                 .collect()
@@ -191,9 +210,7 @@ impl ToolRegistry {
         if !taken.is_empty() {
             let mut instances = self.instances.write();
             for (skill, source) in upstream.source.instances.read().iter() {
-                instances
-                    .entry(skill.clone())
-                    .or_insert_with(|| Arc::clone(source));
+                instances.insert(skill.clone(), Arc::clone(source));
             }
             self.generation.fetch_add(1, Ordering::Relaxed);
             tracing::info!(tools = ?taken, "Turn took tools registered during it");
@@ -425,6 +442,31 @@ mod tests {
         assert!(copy.has("jira.create_issue"));
         assert!(copy.generation() > before);
         assert!(copy.adopt(&["jira.create_issue".into()]).is_empty());
+    }
+
+    /// A skill re-enabled mid-turn (new credentials) re-registers its tools;
+    /// the copy swaps in the new instances, but keeps a tool it registered
+    /// itself.
+    #[test]
+    fn a_followed_copy_takes_a_reregistered_tool_but_keeps_its_own() {
+        let source = Arc::new(ToolRegistry::new());
+        source.register(named("jira.search"));
+        source.register(named("exec.run"));
+        let copy = ToolRegistry::follow(&source, |_| true);
+        let own = named("exec.run");
+        copy.register(Arc::clone(&own));
+        let reloaded = named("jira.search");
+        source.register(Arc::clone(&reloaded));
+        source.register(named("exec.run"));
+        let taken = copy.adopt(&["jira.search".into(), "exec.run".into()]);
+        assert_eq!(taken, ["jira.search"]);
+        let held = copy.get("jira.search").unwrap();
+        assert!(std::ptr::addr_eq(
+            Arc::as_ptr(&held),
+            Arc::as_ptr(&reloaded)
+        ));
+        let kept = copy.get("exec.run").unwrap();
+        assert!(std::ptr::addr_eq(Arc::as_ptr(&kept), Arc::as_ptr(&own)));
     }
 
     /// What a copy goes without stays out, through every copy in between.
