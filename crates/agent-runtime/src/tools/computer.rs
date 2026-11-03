@@ -94,6 +94,19 @@ pub trait ComputerGate: Send + Sync {
     fn reach(&self, _effect: &Effect) -> Option<crate::tools::paths::Reach> {
         None
     }
+    /// The card for `decision`: the answers its verdict offers ("for this
+    /// session", "always in this folder") and the facts it shows.
+    fn prompt(&self, _decision: &Decision) -> workforce_core::policy::PermissionPromptOptions {
+        once_or_deny()
+    }
+    /// Keeps a session or folder answer as Desk's grant.
+    fn keep(
+        &self,
+        _decision: &Decision,
+        _choice: workforce_core::policy::PermissionChoice,
+    ) -> eyre::Result<()> {
+        Ok(())
+    }
 }
 
 /// [`decide`] on a path where nobody can be asked: an ask becomes a run
@@ -200,16 +213,55 @@ fn held(response: PolicyResponse, why: &str, effect: &Effect) -> PolicyResponse 
     }
 }
 
-/// The answers a computer ask offers: Allow once and Deny. No "always"
-/// reaches the permission rules.
-pub fn prompt_options(_decision: &Decision) -> workforce_core::policy::PermissionPromptOptions {
+/// The answers a computer ask offers on its own: Allow once and Deny. No
+/// "always" reaches the permission rules.
+pub fn once_or_deny() -> workforce_core::policy::PermissionPromptOptions {
     workforce_core::policy::PermissionPromptOptions {
         allow_once: true,
         deny_once: true,
         allow_always: false,
         deny_always: false,
+        allow_session: false,
+        allow_in_folder: None,
+        facts: None,
     }
 }
+
+/// The answers the card for `decision` offers, and what it shows: the
+/// gate's, or Allow once and Deny without one. Never an "always" rule.
+pub fn prompt_options(
+    gate: Option<&dyn ComputerGate>,
+    decision: &Decision,
+) -> workforce_core::policy::PermissionPromptOptions {
+    let mut options = gate.map_or_else(once_or_deny, |g| g.prompt(decision));
+    options.allow_always = false;
+    options.deny_always = false;
+    options
+}
+
+/// Keeps a session or folder answer to `decision` as a grant; any other
+/// answer keeps nothing. A grant that can't be kept is logged: the call
+/// itself was still allowed once.
+pub fn keep_answer(
+    gate: Option<&dyn ComputerGate>,
+    decision: Option<&Decision>,
+    choice: Option<workforce_core::policy::PermissionChoice>,
+) {
+    use workforce_core::policy::PermissionChoice as C;
+    let (Some(gate), Some(decision), Some(choice @ (C::AllowSession | C::AllowInFolder))) =
+        (gate, decision, choice)
+    else {
+        return;
+    };
+    if let Err(e) = gate.keep(decision, choice) {
+        tracing::warn!(error = %format!("{e:#}"), "keeping a computer grant failed; allowed once");
+    }
+}
+
+/// Why an approved call no longer runs: what it would do now isn't what
+/// the card showed (a symlink swapped, a folder moved).
+pub const CHANGED_SINCE_ALLOWED: &str =
+    "What this call would change is no longer what you allowed (a file or folder moved after you allowed it), so nothing was done.";
 
 /// Why a call that would have asked ran: nobody could be asked.
 pub const UNATTENDED_RAN: &str =

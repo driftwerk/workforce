@@ -5862,7 +5862,13 @@ impl AgentRunner {
                                     workforce_core::computer::Verdict::Run { .. }
                                 ) =>
                             {
-                                (crate::tools::computer::prompt_options(d), None)
+                                (
+                                    crate::tools::computer::prompt_options(
+                                        self.config.computer_gate.as_deref(),
+                                        d,
+                                    ),
+                                    None,
+                                )
                             }
                             _ => held_prompt(
                                 allow_save_allow,
@@ -6043,10 +6049,23 @@ impl AgentRunner {
                                                         .scope(call.scope(scope_turn(
                                                             Some(ptx.clone()),
                                                             Some(Arc::clone(&ledger)),
-                                                            execute_approved(
-                                                                &gates, &policy, &tools, &access,
-                                                                &tool_name, &input,
-                                                            ),
+                                                            async {
+                                                                crate::tools::computer::keep_answer(
+                                                                    computer.as_deref(),
+                                                                    decided.as_ref(),
+                                                                    decision.choice,
+                                                                );
+                                                                execute_approved(
+                                                                    &gates,
+                                                                    &policy,
+                                                                    &tools,
+                                                                    &access,
+                                                                    &tool_name,
+                                                                    &input,
+                                                                    decided.as_ref(),
+                                                                )
+                                                                .await
+                                                            },
                                                         )))
                                                         .await;
                                                     if exec.is_error {
@@ -16181,7 +16200,11 @@ issue?"#;
         }
 
         /// A computer gate that asks about every call of the test tool.
-        struct AsksAboutEveryCall(std::sync::Mutex<Vec<crate::tools::computer::Outcome>>);
+        #[derive(Default)]
+        struct AsksAboutEveryCall(
+            std::sync::Mutex<Vec<crate::tools::computer::Outcome>>,
+            std::sync::Mutex<Vec<PermissionChoice>>,
+        );
 
         impl crate::tools::computer::ComputerGate for AsksAboutEveryCall {
             fn decides(&self, tool: &str) -> bool {
@@ -16202,6 +16225,26 @@ issue?"#;
             }
             fn record(&self, record: crate::tools::computer::Record) {
                 self.0.lock().unwrap().push(record.outcome);
+            }
+            fn prompt(
+                &self,
+                _: &crate::tools::computer::Decision,
+            ) -> workforce_core::policy::PermissionPromptOptions {
+                workforce_core::policy::PermissionPromptOptions {
+                    allow_session: true,
+                    allow_in_folder: Some("~/dev/acme-web".into()),
+                    // An "always" rule is never offered, whatever a gate says.
+                    allow_always: true,
+                    ..crate::tools::computer::once_or_deny()
+                }
+            }
+            fn keep(
+                &self,
+                _: &crate::tools::computer::Decision,
+                choice: PermissionChoice,
+            ) -> eyre::Result<()> {
+                self.1.lock().unwrap().push(choice);
+                Ok(())
             }
         }
 
@@ -16228,9 +16271,11 @@ issue?"#;
             for (sent, runs) in [
                 (PermissionChoice::AllowAlways, 1),
                 (PermissionChoice::DenyAlways, 0),
+                (PermissionChoice::AllowInFolder, 1),
+                (PermissionChoice::AllowSession, 1),
             ] {
                 let tool = Arc::new(RecordingTool::default());
-                let gate = Arc::new(AsksAboutEveryCall(Default::default()));
+                let gate = Arc::new(AsksAboutEveryCall::default());
                 let writer = Arc::new(KeepsChoices::default());
                 let tools = ToolRegistry::new();
                 tools.register(Arc::clone(&tool) as Arc<dyn crate::tools::Tool>);
@@ -16289,6 +16334,15 @@ issue?"#;
                 assert_eq!(offered.len(), 1, "{sent:?}");
                 let o = &offered[0];
                 assert!(o.allow_once && o.deny_once && !o.allow_always && !o.deny_always);
+                assert!(o.allow_session);
+                assert_eq!(o.allow_in_folder.as_deref(), Some("~/dev/acme-web"));
+                let kept = gate.1.lock().unwrap().clone();
+                match sent {
+                    PermissionChoice::AllowInFolder | PermissionChoice::AllowSession => {
+                        assert_eq!(kept, [sent], "kept as the gate's grant")
+                    }
+                    _ => assert!(kept.is_empty(), "{sent:?} keeps nothing"),
+                }
                 assert_eq!(tool.runs().len(), runs, "{sent:?}");
                 assert!(
                     writer.0.lock().unwrap().is_empty(),

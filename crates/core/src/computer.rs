@@ -262,6 +262,25 @@ pub struct Refusal {
     pub sentence: String,
 }
 
+/// What a call on this computer would do, as the hub resolved it and the
+/// card shows it: never the agent's own words.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ComputerFacts {
+    /// read | write | delete | exec | session | connector | unknown
+    pub effect: String,
+    /// The paths it names, real, as the person reads them (`~/…`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub paths: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connector: Option<String>,
+    /// The card's "why it asks" line.
+    pub why: String,
+}
+
 /// Why a card asks, as its one "why" line says it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

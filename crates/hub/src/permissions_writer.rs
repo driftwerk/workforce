@@ -73,7 +73,12 @@ fn choice_to_state(choice: PermissionChoice) -> Option<PermissionState> {
     match choice {
         PermissionChoice::AllowAlways => Some(PermissionState::Allow),
         PermissionChoice::DenyAlways => Some(PermissionState::Deny),
-        PermissionChoice::AllowOnce | PermissionChoice::DenyOnce => None,
+        // Session and folder answers are the computer gate's grants, never
+        // a permission rule.
+        PermissionChoice::AllowOnce
+        | PermissionChoice::DenyOnce
+        | PermissionChoice::AllowSession
+        | PermissionChoice::AllowInFolder => None,
     }
 }
 

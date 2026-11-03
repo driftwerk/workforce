@@ -70,6 +70,8 @@ pub fn choice_name(choice: PermissionChoice) -> &'static str {
         PermissionChoice::DenyOnce => "deny_once",
         PermissionChoice::AllowAlways => "allow_always",
         PermissionChoice::DenyAlways => "deny_always",
+        PermissionChoice::AllowSession => "allow_session",
+        PermissionChoice::AllowInFolder => "allow_in_folder",
     }
 }
 
@@ -81,6 +83,8 @@ pub fn offered(options: &PermissionPromptOptions, choice: PermissionChoice) -> b
         PermissionChoice::DenyOnce => options.deny_once,
         PermissionChoice::AllowAlways => options.allow_always,
         PermissionChoice::DenyAlways => options.deny_always,
+        PermissionChoice::AllowSession => options.allow_session,
+        PermissionChoice::AllowInFolder => options.allow_in_folder.is_some(),
     }
 }
 
@@ -302,6 +306,7 @@ impl PendingCall {
             &site.access,
             &self.tool_name,
             &self.input,
+            None,
         )
         .await;
         site.report(&tools, &self.tool_name, Held::ran(exec))
@@ -811,8 +816,16 @@ impl GatedExecutor {
         if let Err(refusal) = decision.verdict() {
             return refused(refusal, reason);
         }
-        let exec =
-            execute_approved(&site.gates, &site.policy, tools, &site.access, name, input).await;
+        let exec = execute_approved(
+            &site.gates,
+            &site.policy,
+            tools,
+            &site.access,
+            name,
+            input,
+            None,
+        )
+        .await;
         if exec.is_error {
             ledger.close(decision.call, Refusal::Failed);
         }

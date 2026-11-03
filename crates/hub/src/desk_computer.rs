@@ -18,11 +18,16 @@ use std::sync::Arc;
 use serde_json::json;
 use tracing::warn;
 use workforce_agent::runner::{CURRENT_SESSION_KEY, CURRENT_USER_ID};
+use workforce_agent::tools::computer::Decision;
 use workforce_agent::tools::computer::{describe, ComputerGate, Outcome, Record};
 use workforce_common::settings::{AgentWorkspaceConfig, WorkforceConfig};
 use workforce_core::computer::{By, ComputerAccess, Effect, Refusal, Refused, Verdict};
+use workforce_core::policy::PermissionChoice;
 use workforce_desk::computer::policy::{namespace, shown, Namespace};
-use workforce_desk::computer::{Activity, AgentPolicy, CallFacts, Computer};
+use workforce_desk::computer::{Activity, AgentPolicy, CallFacts, Computer, NewGrant};
+
+/// How long "Allow for this session" lasts at most.
+pub const SESSION_HOURS: i64 = 12;
 
 use crate::serve::ComputerSubject;
 
@@ -122,11 +127,111 @@ impl HubComputerGate {
             person: local(&CURRENT_USER_ID),
             session_id: local(&CURRENT_SESSION_KEY),
             run: None,
-            // "Always" answers come with grants (AC3d).
-            folder: None,
+            folder: folder_for(effect, &self.policy.home),
         }
     }
 
+    /// Reaches Postgres from the synchronous gate, or says why it can't.
+    fn block_on<T>(
+        &self,
+        fut: impl std::future::Future<Output = eyre::Result<T>>,
+    ) -> eyre::Result<T> {
+        let handle = tokio::runtime::Handle::try_current()
+            .map_err(|_| eyre::eyre!("no runtime to reach Desk's store"))?;
+        if handle.runtime_flavor() != tokio::runtime::RuntimeFlavor::MultiThread {
+            eyre::bail!("Desk's store is reached from the hub's multi-thread runtime only");
+        }
+        tokio::task::block_in_place(|| handle.block_on(fut))
+    }
+
+    /// The answers and facts the card for `effect` shows, given its verdict.
+    fn card(
+        &self,
+        effect: &Effect,
+        verdict: &Verdict,
+    ) -> workforce_core::policy::PermissionPromptOptions {
+        use workforce_core::computer::{Always, Choice};
+        let mut options = workforce_agent::tools::computer::once_or_deny();
+        let home = &self.policy.home;
+        let (choices, why) = match verdict {
+            Verdict::Ask { choices, why } => (choices.as_slice(), why.sentence()),
+            _ => (&[][..], "Asks first"),
+        };
+        let always = choices.iter().find_map(|c| match c {
+            Choice::Always(Always::Folder(f)) => Some(shown(f, home)),
+            Choice::Always(Always::Connector(c)) => Some(c.clone()),
+            _ => None,
+        });
+        // A session allowance is scoped to the same folder an "always" would
+        // be: where no folder can be offered, neither can it.
+        options.allow_session =
+            always.is_some() && choices.iter().any(|c| matches!(c, Choice::AllowSession));
+        options.allow_in_folder = always;
+        options.facts = Some(Box::new(facts_of(effect, home, why)));
+        options
+    }
+}
+
+/// What a card shows of `effect`, every path as the person reads it.
+fn facts_of(effect: &Effect, home: &Path, why: &str) -> workforce_core::computer::ComputerFacts {
+    let list = |paths: &[PathBuf]| paths.iter().map(|p| shown(p, home)).collect::<Vec<_>>();
+    let mut facts = workforce_core::computer::ComputerFacts {
+        why: why.to_string(),
+        ..Default::default()
+    };
+    match effect {
+        Effect::Read { paths } => (facts.effect, facts.paths) = ("read".into(), list(paths)),
+        Effect::Write { paths } => (facts.effect, facts.paths) = ("write".into(), list(paths)),
+        Effect::Delete { paths } => (facts.effect, facts.paths) = ("delete".into(), list(paths)),
+        Effect::Move { from, to } => {
+            facts.effect = "write".into();
+            facts.paths = list(from);
+            facts.paths.push(shown(to, home));
+        }
+        Effect::Exec { command, cwd } => {
+            facts.effect = "exec".into();
+            facts.command = Some(command.clone());
+            facts.cwd = cwd.as_ref().map(|c| shown(c, home));
+        }
+        Effect::Session { cwd } => {
+            facts.effect = "session".into();
+            facts.cwd = cwd.as_ref().map(|c| shown(c, home));
+        }
+        Effect::Connector { connector, .. } => {
+            facts.effect = "connector".into();
+            facts.connector = Some(connector.clone());
+        }
+        Effect::None | Effect::Unknown => facts.effect = "unknown".into(),
+    }
+    facts
+}
+
+/// The folder an "always" answer to `effect` would cover: the git work tree
+/// holding its target, else the target's folder (a command's or session's
+/// cwd itself). Never above home's own level: the verdict refuses to offer
+/// home, the root or a volume.
+fn folder_for(effect: &Effect, home: &Path) -> Option<PathBuf> {
+    let start = match effect {
+        Effect::Write { paths } | Effect::Delete { paths } | Effect::Read { paths } => {
+            paths.first()?.parent()?.to_path_buf()
+        }
+        Effect::Move { to, .. } => to.parent()?.to_path_buf(),
+        Effect::Exec { cwd, .. } | Effect::Session { cwd } => cwd.clone()?,
+        _ => return None,
+    };
+    let mut at = start.as_path();
+    loop {
+        if at.join(".git").exists() {
+            return Some(at.to_path_buf());
+        }
+        match at.parent() {
+            Some(up) if at != home && up != Path::new("/") => at = up,
+            _ => return Some(start),
+        }
+    }
+}
+
+impl HubComputerGate {
     fn unreachable(&self) -> Verdict {
         Verdict::Refuse {
             refusal: Refusal {
@@ -210,6 +315,77 @@ impl ComputerGate for HubComputerGate {
         reaches.then(|| workforce_agent::tools::paths::Reach {
             withheld: self.policy.withheld.clone(),
         })
+    }
+
+    fn prompt(&self, decision: &Decision) -> workforce_core::policy::PermissionPromptOptions {
+        self.card(&decision.effect, &decision.verdict)
+    }
+
+    fn keep(&self, decision: &Decision, choice: PermissionChoice) -> eyre::Result<()> {
+        use workforce_core::computer::Ability;
+        // Only what the card offered is kept: a client can send any answer.
+        let card = self.card(&decision.effect, &decision.verdict);
+        let offered = match choice {
+            PermissionChoice::AllowSession => card.allow_session,
+            PermissionChoice::AllowInFolder => card.allow_in_folder.is_some(),
+            _ => false,
+        };
+        if !offered {
+            eyre::bail!("{choice:?} wasn't offered for this call");
+        }
+        let facts = self.facts("", &decision.effect);
+        let person = facts
+            .person
+            .clone()
+            .ok_or_else(|| eyre::eyre!("nobody to keep it for"))?;
+        let (abilities, connector): (Vec<Ability>, Option<String>) = match &decision.effect {
+            Effect::Write { .. } => (vec![Ability::Write], None),
+            Effect::Delete { .. } => (vec![Ability::Delete], None),
+            Effect::Move { .. } => (vec![Ability::Write, Ability::Delete], None),
+            Effect::Exec { .. } => (vec![Ability::Run], None),
+            Effect::Session { .. } => (vec![Ability::Session], None),
+            Effect::Connector {
+                connector,
+                write: true,
+            } => (vec![Ability::ConnectorWrite], Some(connector.clone())),
+            _ => eyre::bail!("nothing to keep for this call"),
+        };
+        let session = matches!(choice, PermissionChoice::AllowSession);
+        let session_id = match session {
+            true => Some(
+                facts
+                    .session_id
+                    .clone()
+                    .ok_or_else(|| eyre::eyre!("no session"))?,
+            ),
+            false => None,
+        };
+        let folder = match connector {
+            Some(_) => None,
+            None => Some(
+                facts
+                    .folder
+                    .clone()
+                    .ok_or_else(|| eyre::eyre!("no folder"))?,
+            ),
+        };
+        for ability in abilities {
+            let grant = NewGrant {
+                hub: self.policy.hub.clone(),
+                agent: self.policy.agent.clone(),
+                person: person.clone(),
+                ability,
+                folder: folder.clone(),
+                connector: connector.clone(),
+                session_id: session_id.clone(),
+                expires_at: session
+                    .then(|| chrono::Utc::now() + chrono::Duration::hours(SESSION_HOURS)),
+                run: None,
+                run_name: None,
+            };
+            self.block_on(self.computer.store().add_grant(&grant))?;
+        }
+        Ok(())
     }
 
     fn unattended_runs(&self) -> bool {
@@ -660,6 +836,145 @@ mod tests {
             assert!(
                 !out.unwrap().contains("the readme text"),
                 "refused by the tool's roots"
+            );
+        })
+        .await;
+    }
+
+    /// A card offers "for this session" and "always in this folder" (the
+    /// repo holding the target), shows the hub's facts, and keeps an
+    /// answer as a grant that then lets the call run: the session's only in
+    /// its session. What wasn't offered is never kept.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn session_and_folder_answers_are_kept_as_grants_scoped_as_offered() {
+        with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+            let store = Arc::new(DeskStore::with_pool(pool).await.unwrap());
+            let hub = hub();
+            let repo = Path::new(&hub.config.hub.data_dir)
+                .ancestors()
+                .nth(3)
+                .unwrap()
+                .join("dev/acme-web");
+            std::fs::create_dir_all(repo.join(".git")).unwrap();
+            std::fs::create_dir_all(repo.join("src")).unwrap();
+            let gate = HubComputerGate::for_agent(
+                Computer::new(Arc::clone(&store)),
+                &hub.config,
+                &hub.subject,
+            );
+            let exec = |cwd: &Path, command: &str| Effect::Exec {
+                command: command.into(),
+                cwd: Some(cwd.to_path_buf()),
+            };
+            let decide = |effect: Effect| {
+                let verdict = as_sarah(|| gate.verdict("exec.run", &effect));
+                Decision {
+                    effect,
+                    verdict,
+                    reach: None,
+                }
+            };
+            let tests = decide(exec(&repo.join("src"), "npm test"));
+            let card = as_sarah(|| gate.prompt(&tests));
+            assert!(card.allow_once && card.deny_once && card.allow_session);
+            assert!(!card.allow_always && !card.deny_always);
+            assert_eq!(
+                card.allow_in_folder.as_deref(),
+                Some(shown(&repo, &gate.policy.home).as_str()),
+                "the repo, not its src"
+            );
+            let facts = card.facts.unwrap();
+            assert_eq!(facts.effect, "exec");
+            assert_eq!(facts.command.as_deref(), Some("npm test"));
+            assert_eq!(facts.why, "Runs on this computer");
+
+            // "For this session": runs in this session only.
+            as_sarah(|| gate.keep(&tests, PermissionChoice::AllowSession)).unwrap();
+            let again = decide(exec(&repo, "npm run lint"));
+            assert!(
+                matches!(again.verdict, Verdict::Run { by: By::Session(_) }),
+                "{:?}",
+                again.verdict
+            );
+            let elsewhere = CURRENT_USER_ID.sync_scope("sarah".into(), || {
+                CURRENT_SESSION_KEY
+                    .sync_scope("s2".into(), || gate.verdict("exec.run", &again.effect))
+            });
+            assert!(matches!(elsewhere, Verdict::Ask { .. }), "{elsewhere:?}");
+            // "Always in this folder": any session.
+            as_sarah(|| gate.keep(&tests, PermissionChoice::AllowInFolder)).unwrap();
+            let elsewhere = CURRENT_USER_ID.sync_scope("sarah".into(), || {
+                CURRENT_SESSION_KEY
+                    .sync_scope("s2".into(), || gate.verdict("exec.run", &again.effect))
+            });
+            assert!(
+                matches!(elsewhere, Verdict::Run { by: By::Grant(_) }),
+                "{elsewhere:?}"
+            );
+            let grants = store.grants(Some("allan")).await.unwrap();
+            assert_eq!(grants.len(), 2);
+            assert!(grants
+                .iter()
+                .all(|g| g.grant.folder.as_deref() == Some(repo.as_path())));
+            assert!(grants
+                .iter()
+                .any(|g| g.grant.session_id.as_deref() == Some("s1") && g.expires_at.is_some()));
+
+            // The always-asks set offers neither, and keeps neither.
+            let force = decide(exec(&repo, "git push --force"));
+            let card = as_sarah(|| gate.prompt(&force));
+            assert!(!card.allow_session && card.allow_in_folder.is_none());
+            assert!(as_sarah(|| gate.keep(&force, PermissionChoice::AllowInFolder)).is_err());
+            assert!(as_sarah(|| gate.keep(&force, PermissionChoice::AllowSession)).is_err());
+            assert_eq!(store.grants(Some("allan")).await.unwrap().len(), 2);
+        })
+        .await;
+    }
+
+    /// An approved call that would now do something else than the card
+    /// showed is refused, not run.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_approval_is_bound_to_what_the_card_showed() {
+        with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+            let store = Arc::new(DeskStore::with_pool(pool).await.unwrap());
+            let hub = hub();
+            let gate: Arc<dyn ComputerGate> = Arc::new(HubComputerGate::for_agent(
+                Computer::new(Arc::clone(&store)),
+                &hub.config,
+                &hub.subject,
+            ));
+            let tools = tools(&hub.subject.workspace);
+            let g = gates(Some(Arc::clone(&gate)));
+            let input = json!({"command": "echo hi"});
+            let shown = Decision {
+                effect: Effect::Exec {
+                    command: "echo hi".into(),
+                    cwd: Some(PathBuf::from("/somewhere/else")),
+                },
+                verdict: Verdict::Ask {
+                    choices: vec![],
+                    why: workforce_core::computer::Why::Runs,
+                },
+                reach: None,
+            };
+            let access = workforce_agent::tools::access::ToolAccessSnapshot::default();
+            let exec = CURRENT_USER_ID
+                .scope(
+                    "sarah".into(),
+                    workforce_agent::tools::dispatch::execute_approved(
+                        &g,
+                        &policy(),
+                        &tools,
+                        &access,
+                        "exec.run",
+                        &input,
+                        Some(&shown),
+                    ),
+                )
+                .await;
+            assert_eq!(
+                exec.deny_reason.as_deref(),
+                Some(workforce_agent::tools::computer::CHANGED_SINCE_ALLOWED)
             );
         })
         .await;

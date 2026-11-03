@@ -6205,6 +6205,8 @@ pub(crate) fn permission_ack_text(choice: workforce_core::policy::PermissionChoi
         PermissionChoice::DenyOnce => "🚫 denied for this call".to_string(),
         PermissionChoice::AllowAlways => "✅ allowed and saved for future calls".to_string(),
         PermissionChoice::DenyAlways => "🚫 denied and saved for future calls".to_string(),
+        PermissionChoice::AllowSession => "✅ allowed for this session".to_string(),
+        PermissionChoice::AllowInFolder => "✅ allowed from now on in this folder".to_string(),
     }
 }
 
