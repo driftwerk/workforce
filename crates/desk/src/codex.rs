@@ -343,6 +343,13 @@ pub enum CodexEvent {
     Usage(crate::ledger::Spend),
     /// It asks to run a command or change files, and Desk can answer.
     Asks(Ask),
+    /// It asks the person something only its terminal answers: a question
+    /// with its options (`item/tool/requestUserInput`), an MCP server's
+    /// request for input. The request's JSON-RPC id.
+    Question {
+        request: Value,
+        question: crate::claude::Question,
+    },
     /// A request it asked was answered, by Desk or the terminal (the
     /// request's JSON-RPC id).
     Resolved(Value),
@@ -525,6 +532,63 @@ pub fn ask_of(
             why: why_of(params, home),
             choices: choices_of(params),
         }),
+    })
+}
+
+/// The question a server request puts to the person, when it is one only
+/// the terminal answers: `item/tool/requestUserInput` that blocks the turn
+/// (its first question, and its options' labels), or an MCP server's
+/// `mcpServer/elicitation/request`. Shapes from 0.166's app-server schema.
+pub fn question_of(method: &str, id: &Value, params: &Value) -> Option<Seen> {
+    let thread = params.get("threadId")?.as_str()?.to_string();
+    let text = |v: &Value, k: &str| {
+        v.get(k)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(str::to_string)
+    };
+    let question = match method {
+        // One the turn goes on past (`isBlocking: false`) doesn't wait.
+        "item/tool/requestUserInput"
+            if params.get("isBlocking").and_then(Value::as_bool) != Some(false) =>
+        {
+            let questions = params.get("questions")?.as_array()?;
+            let first = questions.first()?;
+            let detail = text(first, "question").or_else(|| text(first, "header"))?;
+            let options: Vec<String> = first
+                .get("options")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|o| text(o, "label"))
+                .collect();
+            crate::claude::Question {
+                tool: "Question".into(),
+                detail: crate::crew::clip(&detail, 300),
+                why: (questions.len() > 1).then(|| format!("(1 of {} questions)", questions.len())),
+                options: (!options.is_empty()).then_some(options),
+            }
+        }
+        "mcpServer/elicitation/request" => {
+            let said = text(params, "message")
+                .or_else(|| text(params, "title"))
+                .unwrap_or_else(|| "An MCP server needs your input".into());
+            crate::claude::Question {
+                tool: "Input".into(),
+                detail: crate::crew::clip(&said, 300),
+                why: text(params, "serverName").map(|s| format!("({s})")),
+                options: None,
+            }
+        }
+        _ => return None,
+    };
+    Some(Seen {
+        thread,
+        event: CodexEvent::Question {
+            request: id.clone(),
+            question,
+        },
     })
 }
 
@@ -765,7 +829,13 @@ impl Follower {
                 if let Some(s) = &asks {
                     self.open.insert(id.to_string(), s.thread.clone());
                 }
-                (asks.into_iter().collect(), None)
+                // A question is the terminal's to answer: only shown.
+                let asked = asks
+                    .is_none()
+                    .then(|| question_of(method, id, &params))
+                    .flatten()
+                    .filter(|s| self.thread.as_deref() == Some(s.thread.as_str()));
+                (asks.into_iter().chain(asked).collect(), None)
             }
             (None, Some(method)) => {
                 let params = v.get("params").cloned().unwrap_or(Value::Null);
@@ -1308,6 +1378,35 @@ pub(crate) mod tests {
                 None
             );
         }
+    }
+
+    #[test]
+    fn a_question_or_an_mcp_request_is_the_terminal_s_to_answer() {
+        let mut f = Follower::new(Some("t1".into()), None);
+        let (seen, send) = f.heard(&json!({"id": 9, "method": "mcpServer/elicitation/request",
+            "params": {"threadId": "t1", "serverName": "db", "mode": "form",
+                "message": "Which database?", "requestedSchema": {"type": "object", "properties": {}}}}));
+        assert_eq!(send, None, "never answered from Desk");
+        let [Seen {
+            event: CodexEvent::Question { request, question },
+            ..
+        }] = &seen[..]
+        else {
+            panic!("{seen:?}")
+        };
+        assert_eq!(
+            (
+                request,
+                question.tool.as_str(),
+                question.detail.as_str(),
+                question.why.as_deref()
+            ),
+            (&json!(9), "Input", "Which database?", Some("(db)"))
+        );
+        let (seen, _) = f.heard(&json!({"id": 10, "method": "item/tool/requestUserInput",
+            "params": {"threadId": "other", "turnId": "u", "itemId": "i", "isBlocking": true,
+                "questions": [{"id": "a", "header": "H", "question": "Q?"}]}}));
+        assert!(seen.is_empty(), "another thread's");
     }
 
     #[test]
