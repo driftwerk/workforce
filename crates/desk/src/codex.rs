@@ -19,6 +19,7 @@ use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
 use crate::claude::tool_summary;
 use crate::model::Decision;
@@ -411,8 +412,8 @@ pub enum CodexEvent {
     /// terminal): not sent.
     Late(Value),
     /// What Desk said into its running turn (`turn/steer`) didn't go in:
-    /// no turn ran, or Codex refused it.
-    SteerRefused(String),
+    /// no turn ran, or Codex refused it. The line message's id.
+    SteerRefused(Uuid),
     /// Who answers its thread's approvals, as Codex said when subscribed:
     /// `user`, or `auto_review` ("Approve for me").
     Reviewer(String),
@@ -840,7 +841,7 @@ pub struct Follower {
     turn: Option<String>,
     /// The line's messages said into its turns, oldest first, until Codex
     /// answers each (`turn/steer` answers in order).
-    steering: std::collections::VecDeque<String>,
+    steering: std::collections::VecDeque<Uuid>,
 }
 
 impl Follower {
@@ -1013,15 +1014,15 @@ impl Follower {
             "input": [{ "type": "text", "text": text }] } }))
     }
 
-    /// What to send to say the person's `text` on Desk's line into the
-    /// running turn, kept until Codex answers it; nothing while no turn
+    /// What to send to say the person's `text` (line message `row`) into
+    /// the running turn, kept until Codex answers it; nothing while no turn
     /// runs.
-    pub fn line_steer(&mut self, text: &str) -> Option<Value> {
+    pub fn line_steer(&mut self, row: Uuid, text: &str) -> Option<Value> {
         let (thread, turn) = (self.thread.as_ref()?, self.turn.as_ref()?);
         let send = json!({ "id": LINE_STEER, "method": "turn/steer", "params": {
             "threadId": thread, "expectedTurnId": turn,
             "input": [{ "type": "text", "text": text }] } });
-        self.steering.push_back(text.to_string());
+        self.steering.push_back(row);
         Some(send)
     }
 
@@ -1055,7 +1056,7 @@ pub async fn observe(
     events: mpsc::Sender<Seen>,
     mut replies: mpsc::UnboundedReceiver<Reply>,
     mut steers: mpsc::UnboundedReceiver<String>,
-    mut line_steers: mpsc::UnboundedReceiver<String>,
+    mut line_steers: mpsc::UnboundedReceiver<(Uuid, String)>,
     plans: Option<Arc<dyn PlanSink>>,
     cancel: CancellationToken,
 ) -> Result<()> {
@@ -1097,13 +1098,13 @@ pub async fn observe(
                 None => steering = false,
             },
             said = line_steers.recv(), if line_steering => match said {
-                Some(text) => match follower.line_steer(&text) {
+                Some((row, text)) => match follower.line_steer(row, &text) {
                     Some(send) => tx.send(Message::text(send.to_string())).await?,
                     // No turn runs, or the thread isn't known yet: said at
                     // the next idle instead.
                     None => {
                         let thread = follower.thread.clone().unwrap_or_default();
-                        events.send(Seen { thread, event: CodexEvent::SteerRefused(text) }).await?;
+                        events.send(Seen { thread, event: CodexEvent::SteerRefused(row) }).await?;
                     }
                 },
                 None => line_steering = false,
@@ -1317,8 +1318,8 @@ pub(crate) mod tests {
     #[test]
     fn a_steer_codex_refuses_is_said_so_and_one_it_takes_is_not() {
         let mut f = Follower::new(Some("t1".into()), None);
-        f.steering
-            .extend(["skip the slow tests".to_string(), "then lint".to_string()]);
+        let (first, second) = (Uuid::new_v4(), Uuid::new_v4());
+        f.steering.extend([first, second]);
         // The breaker's steer is its own: refused, it says nothing here.
         let (seen, _) =
             f.heard(&json!({"id": STEER, "error": {"code": -32600, "message": "no active turn"}}));
@@ -1329,9 +1330,9 @@ pub(crate) mod tests {
         assert!(matches!(
             seen.as_slice(),
             [Seen {
-                event: CodexEvent::SteerRefused(said),
+                event: CodexEvent::SteerRefused(row),
                 ..
-            }] if said == "skip the slow tests"
+            }] if *row == first
         ));
         let (seen, _) = f.heard(&json!({"id": LINE_STEER, "result": {}}));
         assert!(seen.is_empty());

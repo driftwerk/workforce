@@ -38,9 +38,6 @@ pub(crate) struct Lines {
     /// Questions a tool call is waiting on the answer of, until when: the
     /// answer goes back as the call's result, not as a message.
     waiting: HashMap<Uuid, Instant>,
-    /// The row last said into each Codex session's turn (`turn/steer`),
-    /// until Codex has it.
-    steered: HashMap<Uuid, Uuid>,
     /// Sessions with messages waiting for them.
     pending: HashSet<Uuid>,
     /// Sessions whose Desk plugin was heard from: it takes their messages.
@@ -391,23 +388,30 @@ impl Desk {
         };
         match how {
             Steering::PasteNow => {
-                self.prompt(id, &m.text, Some(By::you()))?;
+                self.type_prompt(id, &m.text, Some(&By::you()))?;
             }
             Steering::TurnSteer => {
-                let mut st = self.0.state.lock();
-                let sent = st
+                // Said before it is sent: a refusal can come back at once,
+                // and must find it said to put it back in the queue.
+                let Some(taken) = self.0.store.line_take(m.id, Delivery::Delivered).await? else {
+                    return Ok(());
+                };
+                *m = taken;
+                self.line_announce(m);
+                let sent = self
+                    .0
+                    .state
+                    .lock()
                     .live
                     .get(&id)
                     .and_then(|l| l._codex.as_ref())
-                    .is_some_and(|c| c.line_steers.send(m.text.clone()).is_ok());
+                    .is_some_and(|c| c.line_steers.send((m.id, m.text.clone())).is_ok());
                 if !sent {
-                    drop(st);
                     // No observer to steer through: it goes in at the
                     // turn's end.
-                    self.line_pump_later(id);
-                    return Ok(());
+                    self.line_steer_refused(id, m.id).await;
                 }
-                st.lines.steered.insert(id, m.id);
+                return Ok(());
             }
             Steering::Queue => return Ok(()),
         }
@@ -418,31 +422,27 @@ impl Desk {
         Ok(())
     }
 
-    /// Codex didn't take what was said into its turn: it goes in at the
-    /// next idle instead.
-    pub(super) async fn line_steer_refused(&self, id: Uuid, said: &str) {
-        // Desk's breaker steers too: only the person's own message, as it
-        // was said, goes back to the queue.
-        let Some(row) = self.0.state.lock().lines.steered.get(&id).copied() else {
-            return;
-        };
-        let back = async {
-            let Some(mut m) = self
-                .0
-                .store
-                .line_message(row)
-                .await?
-                .filter(|m| m.text == said)
-            else {
-                return Ok(None);
+    /// Codex didn't take the line message `row` into its turn: it goes in
+    /// at the next idle instead. Each refusal names its own message, so
+    /// however many were said, each comes back and only it.
+    pub(super) async fn line_steer_refused(&self, id: Uuid, row: Uuid) {
+        let back =
+            async {
+                // Only one said to this session and not yet back: a message
+                // that was taken some other way stays taken.
+                let Some(mut m) =
+                    self.0.store.line_message(row).await?.filter(|m| {
+                        m.delivery == Delivery::Delivered && m.to_session() == Some(id)
+                    })
+                else {
+                    return Ok(None);
+                };
+                m.delivery = Delivery::Queued;
+                m.delivered_at = None;
+                m.updated_at = Utc::now();
+                self.0.store.put_line(&m).await?;
+                Ok::<_, eyre::Report>(Some(m))
             };
-            self.0.state.lock().lines.steered.remove(&id);
-            m.delivery = Delivery::Queued;
-            m.delivered_at = None;
-            m.updated_at = Utc::now();
-            self.0.store.put_line(&m).await?;
-            Ok::<_, eyre::Report>(Some(m))
-        };
         match back.await {
             Ok(None) => {}
             Ok(Some(m)) => {
@@ -960,7 +960,7 @@ impl Desk {
                 continue;
             };
             let text = self.rendered(&taken).await;
-            if let Err(e) = self.prompt(id, &text, Self::typed_by(&taken)) {
+            if let Err(e) = self.type_prompt(id, &text, Self::typed_by(&taken).as_ref()) {
                 // Not typed in: it waits on.
                 let mut back = taken;
                 back.delivery = Delivery::Queued;
@@ -1095,7 +1095,6 @@ impl Desk {
         let mut st = self.0.state.lock();
         st.lines.runs.remove(&id);
         st.lines.spoke.remove(&id);
-        st.lines.steered.remove(&id);
         st.lines.pending.remove(&id);
         st.lines.plugin.remove(&id);
         st.lines
