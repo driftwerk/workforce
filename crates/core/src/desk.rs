@@ -420,6 +420,9 @@ pub enum DeliveryKind {
     File,
     Resumed,
     Notice,
+    /// A question a session asked on Desk's line that the overseer gave
+    /// the person: it waits on them.
+    Question,
     /// One a newer hub or Desk names, read by one that doesn't know it.
     #[serde(other)]
     Other,

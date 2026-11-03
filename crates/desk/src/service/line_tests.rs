@@ -12,6 +12,7 @@ use workforce_postgres::test_support::with_test_pool;
 
 use super::super::tests::{desk, new_session, options};
 use super::*;
+use crate::crew::By;
 use crate::line::{Delivery, LineKind};
 use crate::model::{Engine, NewSession, SessionState};
 use crate::reads::Urgency;
@@ -706,6 +707,103 @@ async fn a_claude_session_without_desks_plugin_is_typed_into_at_its_prompt() {
                 .contains("then the docs")
         })
         .await;
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_question_given_to_the_person_is_a_floor_need_until_it_is_answered() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let s = new_session(&d, dir.path()).await;
+        idle(&d, s.id).await;
+        let r = d
+            .line_call(
+                s.id,
+                "ask",
+                &json!({"to": "you", "text": "Which branch?", "wait_seconds": 0}),
+                None,
+            )
+            .await
+            .unwrap();
+        let ask: Uuid = serde_json::from_value(r["id"].clone()).unwrap();
+        let needs = d.line_needs();
+        assert_eq!(needs.len(), 1, "asked of the person");
+        assert_eq!(needs[0].id, format!("line:{ask}"));
+        assert_eq!(needs[0].who.id, s.id.to_string());
+        let by = By::manager("sarah", "Sarah", "Pushing is the person's.");
+        let given = d
+            .line_escalate(
+                ask,
+                &by,
+                line::Escalation {
+                    why: "Pushing is the person's.".into(),
+                    options: vec!["main".into(), "release".into()],
+                    draft: Some("main".into()),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(given.asked, Some(Asked::Escalated));
+        assert_eq!(
+            d.line_needs()[0].options,
+            Some(vec!["main".into(), "release".into()])
+        );
+        d.line_answer(ask, Sender::Person, "main".into())
+            .await
+            .unwrap();
+        assert!(d.line_needs().is_empty(), "answered: no longer a need");
+        assert!(matches!(
+            d.line_escalate(
+                ask,
+                &by,
+                line::Escalation {
+                    why: "x".into(),
+                    options: vec![],
+                    draft: None
+                }
+            )
+            .await,
+            Err(LineError::Refused(Refusal::Answered))
+        ));
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn the_overseers_answer_counts_against_the_session_that_asked() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let s = new_session(&d, dir.path()).await;
+        idle(&d, s.id).await;
+        let r = d
+            .line_call(
+                s.id,
+                "ask",
+                &json!({"to": "you", "text": "Port?", "wait_seconds": 0}),
+                None,
+            )
+            .await
+            .unwrap();
+        let ask: Uuid = serde_json::from_value(r["id"].clone()).unwrap();
+        // A question to the person is answerable by the overseer when it was
+        // asked of it: here, asked of the person, the overseer can't.
+        let by = By::manager("sarah", "Sarah", "Routine.");
+        assert!(matches!(
+            d.line_answer(ask, Sender::Overseer(by.clone()), "5433".into())
+                .await,
+            Err(LineError::Refused(Refusal::NoSuchAsk(_)))
+        ));
+        let before = d.line_run(s.id).sent;
+        let mut q = row(&d, ask).await;
+        q.to = Party::manager("sarah", "Sarah");
+        d.0.store.put_line(&q).await.unwrap();
+        d.line_answer(ask, Sender::Overseer(by), "5433".into())
+            .await
+            .unwrap();
+        assert_eq!(d.line_run(s.id).sent, before + 1);
     })
     .await;
 }

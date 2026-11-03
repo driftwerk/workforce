@@ -454,11 +454,22 @@ fn config_needs(state: &GatewayState, caller: &FloorCaller) -> Vec<Need> {
         .collect()
 }
 
+/// The questions sessions asked on the Desk's lines that wait on the
+/// person who holds it.
+fn line_needs(sources: &Sources, caller: &FloorCaller) -> Vec<Need> {
+    match (caller.personal, (sources.desk)()) {
+        (true, Some(desk)) => desk.line_needs(),
+        _ => Vec::new(),
+    }
+}
+
 /// What still needs the person: what their turns wait on and ask, the
-/// routed approvals waiting on them, and their agents' settings changed
-/// outside the hub. The one source every count is a count of.
+/// routed approvals waiting on them, their agents' settings changed
+/// outside the hub, and their sessions' questions on Desk's lines. The one
+/// source every count is a count of.
 fn needs_of(
     state: &GatewayState,
+    sources: &Sources,
     caller: &FloorCaller,
     turns: &[Turn],
     now: DateTime<Utc>,
@@ -468,6 +479,7 @@ fn needs_of(
             .into_iter()
             .chain(routed_needs(state, caller, now)?)
             .chain(config_needs(state, caller))
+            .chain(line_needs(sources, caller))
             .collect(),
     ))
 }
@@ -484,6 +496,7 @@ pub(crate) async fn open_needs(
     let now = Utc::now();
     needs_of(
         state,
+        sources,
         caller,
         &turns(state, sources, caller, now - RECENT).await?,
         now,
@@ -567,7 +580,7 @@ async fn floor_view(State(r): S, headers: HeaderMap, Query(q): Query<FloorQuery>
     };
     let read = async {
         let turns = turns(&r.state, &sources, &caller, day.min(now - RECENT)).await?;
-        let needs = needs_of(&r.state, &caller, &turns, now)?;
+        let needs = needs_of(&r.state, &sources, &caller, &turns, now)?;
         let scope = caller.scope();
         let gists = sources.floor.store.gists(&scope).await.unwrap_or_else(|e| {
             tracing::warn!(target: "floor", error = %format!("{e:#}"), "reading the gists failed");

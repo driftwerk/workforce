@@ -468,12 +468,32 @@ pub struct Extras {
     pub approvals: Vec<MentionedApproval>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub suggestions: Vec<MentionedSuggestion>,
+    /// Questions sessions asked on Desk's line that the overseer gave the
+    /// person, answered in place.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub questions: Vec<MentionedQuestion>,
 }
 
 impl Extras {
     pub fn is_empty(&self) -> bool {
-        self.approvals.is_empty() && self.suggestions.is_empty()
+        self.approvals.is_empty() && self.suggestions.is_empty() && self.questions.is_empty()
     }
+}
+
+/// A question on a session's line, as the overseer's DM shows it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MentionedQuestion {
+    pub message_id: String,
+    pub session_id: String,
+    pub session: String,
+    pub ask: String,
+    #[serde(default)]
+    pub why: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub options: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub draft: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

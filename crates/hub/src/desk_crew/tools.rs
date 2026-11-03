@@ -24,8 +24,9 @@ pub const READ: [&str; 4] = [
     "crew.history",
     super::spend::NAME,
 ];
-pub const ACT: [&str; 9] = [
+pub const ACT: [&str; 10] = [
     "crew.nudge",
+    "crew.escalate",
     "crew.approve",
     "crew.deny",
     "crew.stop",
@@ -303,6 +304,7 @@ impl CrewTool {
         let by = crew
             .by_overseer(reason)
             .ok_or("You don’t oversee the crew any more.")?;
+        crew.know_question(&action).await;
         match crew.gate(&action, &oversight) {
             Gate::Refuse => {
                 Err("You only watch the crew: tell the person what you would do instead.".into())
@@ -313,6 +315,8 @@ impl CrewTool {
             }
             Gate::Suggest(why) => {
                 let s = crew.suggest(self.name, input, &action, &by).await?;
+                // An answer it may not send is a draft the person sends.
+                crew.answer_drafted(&action, &by, why).await;
                 Ok(json!({
                     "suggested": s.text,
                     "suggestion_id": s.id,
@@ -335,7 +339,8 @@ impl Tool for CrewTool {
             super::spend::NAME => super::spend::DESCRIPTION,
             "crew.activity" => "What happened on the crew, newest first: turns started and finished, questions, requests, failures, and what you and the person did. Filter to one agent or session with subject_id.",
             "crew.history" => "The recent messages of one agent's Desk DM with the person (agent_id), or one session's last prompt, reply, pending request and terminal (session_id).",
-            "crew.nudge" => "Send a short message to an agent's DM (agent_id) or type it into a running session (session_id): a check-in, a hint, a correction.",
+            "crew.nudge" => "Send a short message to an agent's DM (agent_id) or to a session on its Desk line (session_id): a check-in, a hint, a correction. A session gets it once its turn ends (crew.interrupt stops a turn now). With reply_to (a question's message id), it is your answer to what that session asked you.",
+            "crew.escalate" => "Give a question a session asked you on its Desk line to the person (message_id): say why in reason, offer answers in options, and draft one in draft if you can. Use it for anything that pushes, deletes, deploys, spends, sends to people or changes scope, and whenever you are unsure.",
             "crew.approve" => "Allow a session's pending request (session_id, approval_id from crew.overview).",
             "crew.deny" => "Deny a session's pending request (session_id, approval_id from crew.overview).",
             "crew.stop" => "Stop a running Desk session; its conversation is kept. A session the person started in a Desk terminal can't be stopped (the shell is theirs): interrupt it instead.",
@@ -372,9 +377,18 @@ impl Tool for CrewTool {
                 props(json!({
                     "agent_id": { "type": "string" },
                     "session_id": session_schema(),
-                    "message": { "type": "string" }
+                    "message": { "type": "string" },
+                    "reply_to": { "type": "string", "description": "The message id of the session's question this answers" }
                 })),
                 &["message"],
+            ),
+            "crew.escalate" => act(
+                props(json!({
+                    "message_id": { "type": "string", "description": "The message id of the session's question" },
+                    "options": { "type": "array", "items": { "type": "string" }, "maxItems": 6 },
+                    "draft": { "type": "string", "description": "The answer you would give, for the person to send or change" }
+                })),
+                &["message_id"],
             ),
             "crew.approve" | "crew.deny" => act(
                 props(json!({

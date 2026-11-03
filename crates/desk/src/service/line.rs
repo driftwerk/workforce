@@ -45,6 +45,9 @@ pub(crate) struct Lines {
     pending: HashSet<Uuid>,
     /// Sessions whose Desk plugin was heard from: it takes their messages.
     plugin: HashSet<Uuid>,
+    /// The questions waiting on the person: asked of them, or given to
+    /// them by the overseer. The Floor's `line:` needs.
+    for_you: HashMap<Uuid, LineMessage>,
     /// When each session's line last had a message for the person, and
     /// last an exchange of its own: what its thread is unread by.
     pub(crate) seen: HashMap<Uuid, Seen>,
@@ -101,6 +104,17 @@ pub trait SessionMcp: std::marker::Send + Sync {
     /// The JSON-RPC answer to `body` from `caller`'s engine, or none for a
     /// notification.
     async fn answer(&self, caller: Uuid, body: &str) -> Option<String>;
+}
+
+/// Whether `m` is a question waiting on the person: asked of them, or
+/// given to them by the overseer.
+fn needs_you(m: &LineMessage) -> bool {
+    m.kind == LineKind::Ask
+        && match m.asked {
+            Some(Asked::Escalated) => true,
+            Some(Asked::Open) => m.to.kind == PartyKind::You,
+            Some(Asked::Answered | Asked::Withdrawn) | None => false,
+        }
 }
 
 /// How long a message handed to Desk's plugin may wait for it to say the
@@ -160,8 +174,19 @@ impl Desk {
     }
 
     /// The overseer, while it answers sessions on their lines.
+    /// The hub's crew answers sessions on their lines from now on, when it
+    /// has an overseer that does.
+    pub fn answer_lines_with(&self, crew: &Arc<dyn crate::crew::Crew>) {
+        *self.0.line_crew.lock() = Some(Arc::downgrade(crew));
+    }
+
     fn line_overseer(&self) -> Option<Party> {
-        let crew = self.reader()?;
+        let crew = self
+            .0
+            .line_crew
+            .lock()
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)?;
         crew.answers_lines()
             .then(|| crew.overseer())
             .flatten()
@@ -215,6 +240,10 @@ impl Desk {
                     st.lines.pending.insert(to);
                 }
             }
+            match needs_you(m) {
+                true => st.lines.for_you.insert(m.id, m.clone()),
+                false => st.lines.for_you.remove(&m.id),
+            };
         }
         let _ = self.0.events.send(DeskEvent::Line {
             message: Box::new(m.clone()),
@@ -476,6 +505,11 @@ impl Desk {
             (Sender::Person, Some(v)) => self.person_spoke(v.id),
             (Sender::Session(id), _) => {
                 self.0.state.lock().lines.runs.entry(*id).or_default().sent += 1;
+            }
+            // The overseer's answers count against the session that asked:
+            // its budget holds the exchange, not the overseer's.
+            (Sender::Overseer(_), Some(v)) => {
+                self.0.state.lock().lines.runs.entry(v.id).or_default().sent += 1;
             }
             _ => {}
         }
@@ -932,6 +966,15 @@ impl Desk {
             }
             Err(e) => tracing::warn!(error = %e, "couldn't read what waits on Desk's lines"),
         }
+        match self.0.store.line_open_asks(None).await {
+            Ok(asks) => {
+                let mut st = self.0.state.lock();
+                for ask in asks.into_iter().filter(needs_you) {
+                    st.lines.for_you.insert(ask.id, ask);
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "couldn't read the questions waiting on you"),
+        }
         match self.0.store.line_latest().await {
             Ok(latest) => {
                 let mut st = self.0.state.lock();
@@ -1029,6 +1072,9 @@ impl Desk {
         st.lines.steered.remove(&id);
         st.lines.pending.remove(&id);
         st.lines.plugin.remove(&id);
+        st.lines
+            .for_you
+            .retain(|_, m| m.from_session() != Some(id) && m.to_session() != Some(id));
         st.lines.seen.remove(&id);
     }
 
@@ -1106,6 +1152,77 @@ impl Desk {
                 None => Err(DeskError::NotFound),
             },
         }
+    }
+
+    /// The overseer gives the question `ask` to the person, saying why and
+    /// offering `escalation`'s answers and draft. It waits on them (and
+    /// still on the overseer, who may answer first).
+    pub async fn line_escalate(
+        &self,
+        ask: Uuid,
+        by: &By,
+        escalation: line::Escalation,
+    ) -> Result<LineMessage, LineError> {
+        let mut q = self
+            .0
+            .store
+            .line_message(ask)
+            .await?
+            .filter(|q| q.kind == LineKind::Ask)
+            .ok_or(Refusal::NoSuchAsk(ask))?;
+        match q.asked {
+            Some(Asked::Open | Asked::Escalated) => {}
+            Some(Asked::Answered | Asked::Withdrawn) | None => return Err(Refusal::Answered.into()),
+        }
+        q.asked = Some(Asked::Escalated);
+        q.escalation = Some(escalation);
+        q.updated_at = Utc::now();
+        self.0.store.put_line(&q).await?;
+        let why = q.escalation.as_ref().map_or("", |e| e.why.as_str());
+        self.note(
+            by.event(
+                Kind::NeedsYou,
+                Some(q.from.clone()),
+                format!(
+                    "gave you {}'s question “{}”",
+                    q.from.name,
+                    crew::one_line(&q.text, 120)
+                ),
+            )
+            .reason(why)
+            .hop(q.hop),
+        );
+        self.line_announce(&q);
+        Ok(q)
+    }
+
+    /// The questions on Desk's lines waiting on the person, as the Floor
+    /// counts its needs: answered by a reply.
+    pub fn line_needs(&self) -> Vec<crate::floor::Need> {
+        let st = self.0.state.lock();
+        st.lines
+            .for_you
+            .values()
+            .map(|m| crate::floor::Need {
+                id: format!("line:{}", m.id),
+                kind: crate::floor::NeedKind::Question,
+                who: crate::floor::Who {
+                    kind: m.from.kind,
+                    id: m.from.id.clone(),
+                    name: m.from.name.clone(),
+                    engine: m.from.engine,
+                },
+                ask: m.text.clone(),
+                options: m
+                    .escalation
+                    .as_ref()
+                    .map(|e| e.options.clone())
+                    .filter(|o| !o.is_empty()),
+                since: m.at,
+                place: crate::floor::Place::Session,
+                answer: crate::floor::Answer::Reply,
+            })
+            .collect()
     }
 
     /// Whether `steer` lets the person's message into a working turn: what

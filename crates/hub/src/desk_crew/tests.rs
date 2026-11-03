@@ -1054,6 +1054,7 @@ async fn the_overseer_messages_the_crew_within_the_loop_guard() {
         let action = super::actions::Action::Nudge {
             to: super::actions::Target::Agent("scout".into()),
             message: "How is the staging check going?".into(),
+            reply_to: None,
         };
         let nudge = || crew.perform(&action, crew.by_overseer("Quiet for 40 min.").unwrap());
         let mut frames = crew.state.broadcast_tx.subscribe();
@@ -1164,7 +1165,15 @@ async fn the_overseer_only_suggests_what_it_would_have_an_agent_do() {
             .execute(json!({"session_id": s.id.to_string(), "message": "Finish the date picker", "reason": "Done."}))
             .await
             .unwrap();
-        assert_eq!(nudged.output["done"], "asked web", "{nudged:?}");
+        // On its line now: it gets it at its turn's end, never typed in
+        // over its work.
+        assert!(
+            nudged.output["done"].as_str().unwrap().starts_with("told web"),
+            "{nudged:?}"
+        );
+        let thread = d.line_thread(s.id, None, None).await.unwrap();
+        assert_eq!(thread.last().unwrap().text, "Finish the date picker");
+        assert_eq!(thread.last().unwrap().from.kind, PartyKind::Manager);
         // What that leads to waits on the person: running it is no read.
         let url = hook_url(dir.path(), s.id).await;
         let _asked = tokio::spawn(async move {
@@ -1261,6 +1270,7 @@ async fn messaging_agents_and_terminal_sessions_is_the_persons_to_switch_on() {
         let nudge = |to| Action::Nudge {
             to,
             message: "How is it going?".into(),
+            reply_to: None,
         };
         let resume = Action::Resume {
             session: terminal.id,
@@ -1501,6 +1511,7 @@ async fn a_crew_turn_answers_to_its_dm_and_does_not_post_elsewhere_unasked() {
         let nudge = super::actions::Action::Nudge {
             to: super::actions::Target::Agent("scout".into()),
             message: "WHERE-NOW?".into(),
+            reply_to: None,
         };
         let by = crew.by_overseer("Checking where it is.").unwrap();
         assert!(crew.perform(&nudge, by).await.is_ok());
@@ -2432,6 +2443,209 @@ async fn the_overseer_answers_which_session_spends_most_from_the_ledger_at_watch
         assert!(answer["usd_means"].as_str().unwrap().contains("API-equivalent"));
         let refused = spend.execute(json!({ "by": "planet" })).await.unwrap();
         assert!(!refused.success);
+    })
+    .await;
+}
+
+/// A session asks the overseer on its line: a routine question gets the
+/// overseer's answer as the session's tool result, and the DM a compact
+/// notice; one that reads as pushing comes to the person, with the
+/// overseer's reply as its draft, on the Floor and in the DM.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_overseer_answers_a_sessions_routine_question_and_gives_the_person_the_rest() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, crew, d, _llm) = overseeing(
+            dir.path(),
+            pool,
+            "5433",
+            "[oversight]\nenabled = true\nlevel = \"act\"\n",
+            &[],
+        )
+        .await;
+        assert!(crew.answers_lines());
+        let s = new_session(&d, dir.path(), "acme-web").await;
+        let asked = d
+            .line_call(
+                s.id,
+                "ask",
+                &json!({"to": "desk", "text": "Which port does the test database use?", "wait_seconds": 30}),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(asked["answer"], "5433", "{asked}");
+        assert_eq!(asked["from"], workforce_desk::crew::Party::manager("desk", &super::name_of(&overseer)).name);
+        // Its own conversation, not the DM's.
+        let channel = super::line::line_channel(s.id);
+        assert!(overseer.sessions.find(&channel, PERSON).unwrap().is_some());
+        let notice = eventually("the DM's notice", async || {
+            let dm = overseer.sessions.find(DESK_CHANNEL, PERSON).unwrap()?;
+            dm.messages
+                .iter()
+                .find(|m| m.content.starts_with("Answered acme-web"))
+                .cloned()
+        })
+        .await;
+        assert_eq!(
+            notice.desk.and_then(|m| m.delivery),
+            Some(workforce_common::channels::desk::DeliveryKind::Notice)
+        );
+
+        let pushing = d
+            .line_call(
+                s.id,
+                "ask",
+                &json!({"to": "desk", "text": "May I push to main?", "wait_seconds": 0}),
+                None,
+            )
+            .await
+            .unwrap();
+        let ask: uuid::Uuid = serde_json::from_value(pushing["id"].clone()).unwrap();
+        let need = eventually("the Floor's need", async || {
+            d.line_needs().into_iter().find(|n| n.id == format!("line:{ask}"))
+        })
+        .await;
+        assert_eq!(need.ask, "May I push to main?");
+        let given = d.store().line_message(ask).await.unwrap().unwrap();
+        assert_eq!(given.asked, Some(workforce_desk::line::Asked::Escalated));
+        assert_eq!(
+            given.escalation.as_ref().and_then(|e| e.draft.as_deref()),
+            Some("5433"),
+            "the overseer's reply is the person's draft"
+        );
+        let card = eventually("the DM's question card", async || {
+            let dm = overseer.sessions.find(DESK_CHANNEL, PERSON).unwrap()?;
+            dm.messages
+                .iter()
+                .find(|m| m.content.starts_with("acme-web asks: “May I push to main?”"))
+                .cloned()
+        })
+        .await;
+        let extras = d.store().extras(std::slice::from_ref(&card.id)).await.unwrap();
+        assert_eq!(extras[&card.id].questions[0].message_id, ask.to_string());
+        // The person answers from the Floor: the need goes.
+        d.line_answer(ask, workforce_desk::LineSender::Person, "Not yet".into())
+            .await
+            .unwrap();
+        assert!(d.line_needs().is_empty());
+    })
+    .await;
+}
+
+/// Watching only, the overseer takes no turn for a session's question: it
+/// goes to the person, saying so.
+#[tokio::test(flavor = "multi_thread")]
+async fn watching_only_a_sessions_question_goes_straight_to_the_person() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, _crew, d, _llm) = overseeing(
+            dir.path(),
+            pool,
+            "5433",
+            "[oversight]\nenabled = true\nlevel = \"watch\"\n",
+            &[],
+        )
+        .await;
+        let s = new_session(&d, dir.path(), "acme-web").await;
+        let r = d
+            .line_call(
+                s.id,
+                "ask",
+                &json!({"to": "desk", "text": "Which port?", "wait_seconds": 0}),
+                None,
+            )
+            .await
+            .unwrap();
+        let ask: uuid::Uuid = serde_json::from_value(r["id"].clone()).unwrap();
+        let given = eventually("the question given to the person", async || {
+            d.store()
+                .line_message(ask)
+                .await
+                .unwrap()
+                .filter(|m| m.asked == Some(workforce_desk::line::Asked::Escalated))
+        })
+        .await;
+        assert_eq!(
+            given.escalation.unwrap().why,
+            "You asked Desk only to watch."
+        );
+        let channel = super::line::line_channel(s.id);
+        assert!(
+            overseer.sessions.find(&channel, PERSON).unwrap().is_none(),
+            "no turn"
+        );
+    })
+    .await;
+}
+
+/// An answer to a session's question runs at `act` with `answer_sessions`
+/// on, unless the question or the answer reads as pushing, deleting or
+/// sending; giving a question to the person always runs.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_answer_is_gated_by_the_switch_and_by_what_was_asked() {
+    use super::actions::{Action, Gate, Target};
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, crew, d, _llm) = overseeing(
+            dir.path(),
+            pool,
+            "ok",
+            "[oversight]\nenabled = true\nlevel = \"act\"\n",
+            &[],
+        )
+        .await;
+        let s = new_session(&d, dir.path(), "acme-web").await;
+        let (_, mut o) = crew.overseer_service().unwrap();
+        let (routine, outward, unknown) = (
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+        );
+        crew.questions
+            .lock()
+            .insert(routine, "Which port does the test database use?".into());
+        crew.questions
+            .lock()
+            .insert(outward, "May I deploy to staging?".into());
+        let answer = |ask, message: &str| Action::Nudge {
+            to: Target::Session(s.id),
+            message: message.into(),
+            reply_to: Some(ask),
+        };
+        assert_eq!(crew.gate(&answer(routine, "5433"), &o), Gate::Run);
+        assert!(matches!(
+            crew.gate(&answer(routine, "Push it when green"), &o),
+            Gate::Suggest(_)
+        ));
+        assert!(matches!(
+            crew.gate(&answer(outward, "Yes"), &o),
+            Gate::Suggest(_)
+        ));
+        assert!(
+            matches!(crew.gate(&answer(unknown, "Yes"), &o), Gate::Suggest(_)),
+            "a question it can't read is the person's"
+        );
+        let escalate = Action::Escalate {
+            message: routine,
+            why: "Unsure.".into(),
+            options: vec![],
+            draft: None,
+        };
+        assert_eq!(crew.gate(&escalate, &o), Gate::Run);
+        o.act.answer_sessions = false;
+        assert!(matches!(
+            crew.gate(&answer(routine, "5433"), &o),
+            Gate::Suggest(_)
+        ));
+        o.level = workforce_common::oversight::Level::Suggest;
+        assert_eq!(
+            crew.gate(&escalate, &o),
+            Gate::Run,
+            "asking the person is always allowed"
+        );
+        o.level = workforce_common::oversight::Level::Watch;
+        assert_eq!(crew.gate(&escalate, &o), Gate::Refuse);
     })
     .await;
 }

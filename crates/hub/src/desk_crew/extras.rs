@@ -58,6 +58,7 @@ impl CrewHub {
         Extras {
             approvals,
             suggestions,
+            questions: Vec::new(),
         }
     }
 

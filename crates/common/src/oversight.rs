@@ -7,12 +7,18 @@
 //! enabled = true
 //! level = "watch" # watch | suggest | act
 //! track = { crew = true, desk_sessions = true, external_sessions = true, workspaces = false }
-//! wake = { waiting_minutes = 5, quiet_minutes = 30, remind_minutes = 120, on_finish = true, on_failure = true }
+//! wake = { waiting_minutes = 5, quiet_minutes = 30, remind_minutes = 120, on_finish = true, on_failure = true, on_message = true }
 //! summaries = { morning = "09:00", evening = "" }
 //! max_checkins_per_hour = 6
 //! max_checkins_per_day = 100
-//! act = { nudge = true, resume_restart = true, read_only_approvals = false, hand_out_work = false, interrupt = false, message_agents = false, message_terminal_sessions = false }
+//! act = { nudge = true, resume_restart = true, read_only_approvals = false, hand_out_work = false, interrupt = false, message_agents = false, message_terminal_sessions = false, answer_sessions = true }
 //! ```
+//!
+//! A session asks the overseer on Desk's line: with `on_message` it gets a
+//! turn of its own for that, else every question goes straight to the
+//! person. At `act`, `answer_sessions` lets it answer; anything that reads
+//! as pushing, deleting or sending, in the question or the answer, is the
+//! person's to answer, and the overseer can only draft it.
 //!
 //! What the overseer sends an agent, or a session started in another
 //! terminal, may lead to something done without asking: an agent acts under
@@ -76,6 +82,9 @@ pub struct Wake {
     pub remind_minutes: u32,
     pub on_finish: bool,
     pub on_failure: bool,
+    /// A session's message to it on Desk's line wakes it; off, sessions'
+    /// questions go to the person.
+    pub on_message: bool,
 }
 
 /// The local times of the morning and evening summaries, `None` when off.
@@ -103,6 +112,8 @@ pub struct Act {
     /// Nudging a session started in another terminal (with `nudge`), which
     /// may have been started not to ask before it acts.
     pub message_terminal_sessions: bool,
+    /// Answering what sessions ask it on Desk's line.
+    pub answer_sessions: bool,
 }
 
 /// An agent's `[oversight]`, every default filled in.
@@ -144,6 +155,7 @@ impl Default for Oversight {
                 remind_minutes: 120,
                 on_finish: true,
                 on_failure: true,
+                on_message: true,
             },
             summaries: Summaries {
                 morning: Some((9, 0)),
@@ -159,6 +171,7 @@ impl Default for Oversight {
                 interrupt: false,
                 message_agents: false,
                 message_terminal_sessions: false,
+                answer_sessions: true,
             },
         }
     }
@@ -317,6 +330,12 @@ impl Oversight {
                     d.wake.on_failure,
                     "speaking up when work fails",
                 )?,
+                on_message: switch(
+                    wake,
+                    "on_message",
+                    d.wake.on_message,
+                    "answering when a session asks it something",
+                )?,
             },
             summaries: Summaries {
                 morning: time(summaries, "morning", d.summaries.morning, "morning")?,
@@ -378,6 +397,12 @@ impl Oversight {
                     d.act.message_terminal_sessions,
                     "messaging sessions started in another terminal without asking",
                 )?,
+                answer_sessions: switch(
+                    act,
+                    "answer_sessions",
+                    d.act.answer_sessions,
+                    "answering sessions' questions without asking",
+                )?,
             },
         })
     }
@@ -395,6 +420,25 @@ mod tests {
     fn parse(source: &str) -> Result<Oversight, String> {
         let doc: Table = toml::from_str(source).unwrap();
         Oversight::of(doc.get("oversight"))
+    }
+
+    #[test]
+    fn answering_sessions_is_on_unless_switched_off_and_said_plainly_when_wrong() {
+        let o = parse("[oversight]\nenabled = true\n").unwrap();
+        assert!(o.act.answer_sessions && o.wake.on_message);
+        let off = parse(
+            "[oversight]\nact = { answer_sessions = false }\nwake = { on_message = false }\n",
+        )
+        .unwrap();
+        assert!(!off.act.answer_sessions && !off.wake.on_message);
+        assert_eq!(
+            parse("[oversight]\nact = { answer_sessions = \"yes\" }\n").unwrap_err(),
+            "Whether answering sessions' questions without asking is on or off must be true or false."
+        );
+        assert_eq!(
+            parse("[oversight]\nwake = { on_message = 1 }\n").unwrap_err(),
+            "Whether answering when a session asks it something is on or off must be true or false."
+        );
     }
 
     #[test]

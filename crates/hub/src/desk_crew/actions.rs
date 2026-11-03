@@ -24,9 +24,20 @@ pub(crate) enum Target {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Action {
+    /// A message to a session (on its line, waiting for its turn to end)
+    /// or an agent; with `reply_to`, the answer to that session's question.
     Nudge {
         to: Target,
         message: String,
+        reply_to: Option<Uuid>,
+    },
+    /// Give a session's question to the person: why, the answers to offer,
+    /// and a draft of one.
+    Escalate {
+        message: Uuid,
+        why: String,
+        options: Vec<String>,
+        draft: Option<String>,
     },
     Approve {
         session: Uuid,
@@ -75,6 +86,12 @@ struct Input {
     name: Option<String>,
     engine: Option<Engine>,
     task: Option<String>,
+    reply_to: Option<String>,
+    message_id: Option<String>,
+    reason: Option<String>,
+    #[serde(default)]
+    options: Vec<String>,
+    draft: Option<String>,
 }
 
 fn id(raw: Option<&str>, what: &str) -> Result<Uuid, String> {
@@ -106,11 +123,38 @@ impl Action {
                     (None, Some(a)) => Target::Agent(a.trim().to_string()),
                     (None, None) => return Err("Say which session or agent to nudge.".into()),
                 };
+                let reply_to = i
+                    .reply_to
+                    .as_deref()
+                    .filter(|r| !r.trim().is_empty())
+                    .map(|r| id(Some(r), "question (a message id from the line)"))
+                    .transpose()?;
+                if reply_to.is_some() && !matches!(to, Target::Session(_)) {
+                    return Err(
+                        "Only a session's question can be answered: say its session_id.".into(),
+                    );
+                }
                 Self::Nudge {
                     to,
                     message: text(i.message, "what to ask")?,
+                    reply_to,
                 }
             }
+            "crew.escalate" => Self::Escalate {
+                message: id(
+                    i.message_id.as_deref(),
+                    "question (a message id from the line)",
+                )?,
+                why: text(i.reason, "why it is the person's to answer")?,
+                options: i
+                    .options
+                    .into_iter()
+                    .map(|o| o.trim().to_string())
+                    .filter(|o| !o.is_empty())
+                    .take(6)
+                    .collect(),
+                draft: blank_none(i.draft),
+            },
             "crew.approve" | "crew.deny" => {
                 let session = session()?;
                 let approval = id(i.approval_id.as_deref(), "approval")?;
@@ -171,7 +215,8 @@ impl Action {
             Self::Approve { .. }
             | Self::Deny { .. }
             | Self::Stop { .. }
-            | Self::Interrupt { .. } => "",
+            | Self::Interrupt { .. }
+            | Self::Escalate { .. } => "",
         };
         outward(said)
     }
@@ -264,6 +309,13 @@ pub(crate) enum Gate {
 impl CrewHub {
     /// What `level` and `[oversight.act]` let the overseer do with `action`.
     pub(crate) fn gate(&self, action: &Action, o: &Oversight) -> Gate {
+        // Asking the person is always allowed.
+        if let Action::Escalate { .. } = action {
+            return match o.level {
+                Level::Watch => Gate::Refuse,
+                Level::Suggest | Level::Act => Gate::Run,
+            };
+        }
         match o.level {
             Level::Watch => return Gate::Refuse,
             Level::Suggest => return Gate::Suggest("you suggest; the person decides"),
@@ -272,13 +324,24 @@ impl CrewHub {
         if let Some(why) = self.uncontained(action, &o.act) {
             return Gate::Suggest(why);
         }
-        if action.outward() {
+        let asked_outward = match action {
+            Action::Nudge {
+                reply_to: Some(ask),
+                ..
+            } => self.questions.lock().get(ask).is_none_or(|q| outward(q)),
+            _ => false,
+        };
+        if action.outward() || asked_outward {
             return Gate::Suggest(
                 "anything that pushes, deletes or reaches outside Desk is the person's call",
             );
         }
         let allowed = match action {
+            Action::Nudge {
+                reply_to: Some(_), ..
+            } => o.act.answer_sessions,
             Action::Nudge { .. } => o.act.nudge,
+            Action::Escalate { .. } => true,
             // Switched on by `message_agents`, above.
             Action::Assign { .. } => true,
             Action::Resume { .. } | Action::Restart { .. } => o.act.resume_restart,
@@ -359,7 +422,8 @@ impl CrewHub {
             Action::Approve { .. }
             | Action::Deny { .. }
             | Action::Stop { .. }
-            | Action::Interrupt { .. } => true,
+            | Action::Interrupt { .. }
+            | Action::Escalate { .. } => true,
             Action::Nudge {
                 to: Target::Agent(_),
                 ..
@@ -396,7 +460,7 @@ impl CrewHub {
                 ..
             }
             | Action::Assign { agent: a, .. } => self.party_of_agent(a),
-            Action::StartSession { .. } => None,
+            Action::StartSession { .. } | Action::Escalate { .. } => None,
             Action::Nudge {
                 to: Target::Session(s),
                 ..
@@ -429,15 +493,32 @@ impl CrewHub {
             Action::Nudge {
                 to: Target::Session(s),
                 message,
+                reply_to: None,
             } => format!(
                 "Ask {}: “{}”",
                 self.session_name(*s),
                 crew::clip(message, 200)
             ),
             Action::Nudge {
+                to: Target::Session(s),
+                message,
+                reply_to: Some(_),
+            } => format!(
+                "Answer {}: “{}”",
+                self.session_name(*s),
+                crew::clip(message, 200)
+            ),
+            Action::Nudge {
                 to: Target::Agent(a),
                 message,
+                ..
             } => format!("Ask {}: “{}”", self.agent_name(a), crew::clip(message, 200)),
+            Action::Escalate { why, .. } => {
+                format!(
+                    "Give the person a session's question: {}",
+                    crew::clip(why, 200)
+                )
+            }
             Action::Approve { session, .. } => format!(
                 "Allow {}: {}",
                 self.session_name(*session),
@@ -501,13 +582,64 @@ impl CrewHub {
             Action::Nudge {
                 to: Target::Session(s),
                 message,
+                reply_to,
             } => {
-                let v = d.prompt(*s, message, Some(by)).map_err(plain)?;
-                Ok(format!("asked {}", v.label()))
+                let name = self.session_name(*s);
+                let sender = match by.party.kind {
+                    crew::PartyKind::Manager => workforce_desk::LineSender::Overseer(by),
+                    _ => workforce_desk::LineSender::Person,
+                };
+                let line = |e: workforce_desk::LineError| match e {
+                    workforce_desk::LineError::Refused(r) => r.to_string(),
+                    workforce_desk::LineError::Desk(e) => plain(e),
+                };
+                match reply_to {
+                    Some(ask) => {
+                        let answer = d
+                            .line_answer(*ask, sender, message.clone())
+                            .await
+                            .map_err(line)?;
+                        self.answered_notice(&answer).await;
+                        Ok(format!("answered {name}"))
+                    }
+                    // On its line: it gets it once its turn ends, never typed
+                    // in over what it is doing (Interrupt is for that).
+                    None => {
+                        let told = d
+                            .line_send(
+                                sender,
+                                workforce_desk::line::Send::Tell {
+                                    to: workforce_desk::line::Target::Session(*s),
+                                    text: message.clone(),
+                                    when: workforce_desk::line::When::Queue,
+                                },
+                            )
+                            .await
+                            .map_err(line)?;
+                        Ok(match told.delivery {
+                            workforce_desk::line::Delivery::Held => {
+                                format!("told {name}; it is stopped and gets it when it runs again")
+                            }
+                            workforce_desk::line::Delivery::Delivered => format!("told {name}"),
+                            _ => format!("told {name}; it gets it once its turn ends"),
+                        })
+                    }
+                }
+            }
+            Action::Escalate {
+                message,
+                why,
+                options,
+                draft,
+            } => {
+                self.escalate(*message, &by, why, options.clone(), draft.clone())
+                    .await?;
+                Ok("gave the question to the person".into())
             }
             Action::Nudge {
                 to: Target::Agent(a),
                 message,
+                ..
             } => self.message_agent(a, message, by, Kind::Nudged).await,
             Action::Assign { agent, task } => {
                 self.message_agent(agent, task, by, Kind::Assigned).await
@@ -759,7 +891,43 @@ mod tests {
             Action::parse("crew.nudge", &json!({"agent_id": "scout", "message": "hi"})).unwrap(),
             Action::Nudge {
                 to: Target::Agent("scout".into()),
-                message: "hi".into()
+                message: "hi".into(),
+                reply_to: None,
+            }
+        );
+        let s = Uuid::new_v4();
+        let q = Uuid::new_v4();
+        assert_eq!(
+            Action::parse(
+                "crew.nudge",
+                &json!({"session_id": s.to_string(), "reply_to": q.to_string(), "message": "5433"})
+            )
+            .unwrap(),
+            Action::Nudge {
+                to: Target::Session(s),
+                message: "5433".into(),
+                reply_to: Some(q),
+            }
+        );
+        assert!(
+            Action::parse(
+                "crew.nudge",
+                &json!({"agent_id": "scout", "reply_to": q.to_string(), "message": "x"})
+            )
+            .is_err(),
+            "only a session's question is answered"
+        );
+        assert_eq!(
+            Action::parse(
+                "crew.escalate",
+                &json!({"message_id": q.to_string(), "reason": "Pushing is yours.", "options": ["Yes", " ", "No"], "draft": "Yes"})
+            )
+            .unwrap(),
+            Action::Escalate {
+                message: q,
+                why: "Pushing is yours.".into(),
+                options: vec!["Yes".into(), "No".into()],
+                draft: Some("Yes".into()),
             }
         );
     }
