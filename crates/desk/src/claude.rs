@@ -350,7 +350,7 @@ pub fn question_of(tool: &str, input: Option<&Value>) -> Option<Question> {
                         .map(|l| l.trim().trim_start_matches('#').trim())
                         .find(|l| !l.is_empty())
                 })
-                .map(|l| clip(l))
+                .map(clip)
                 .unwrap_or_default();
             Some(Question {
                 tool: "Plan".into(),
