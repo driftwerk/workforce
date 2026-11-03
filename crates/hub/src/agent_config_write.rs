@@ -257,7 +257,7 @@ pub struct Elsewhere {
 }
 
 /// The sections whose changed fields a person is shown one by one.
-const DETAILED: [&str; 2] = ["access", "oversight"];
+const DETAILED: [&str; 3] = ["access", "oversight", "skills"];
 
 /// What differs between the `saved` file and the file as it is `now`.
 fn what_changed(saved: Option<&str>, now: Option<&str>) -> (Vec<String>, Vec<String>) {
@@ -287,7 +287,9 @@ fn what_changed(saved: Option<&str>, now: Option<&str>) -> (Vec<String>, Vec<Str
         keys.sort();
         keys.dedup();
         for key in keys {
-            if crate::config_tool::is_secret_name(key) || was.get(key) == is.get(key) {
+            let secret = crate::config_tool::is_secret_name(key)
+                && !crate::config_tool::is_binding(&[section, key.as_str()]);
+            if secret || was.get(key) == is.get(key) {
                 continue;
             }
             details.push(format!(
@@ -596,6 +598,25 @@ pub async fn record_revision(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_change_to_the_agents_connectors_is_in_the_revision_details() {
+        let (sections, details) = what_changed(
+            Some("[skills]\nenabled = []\n"),
+            Some("[skills]\nenabled = [\"linear\"]\nown_credential = [\"linear\"]\n"),
+        );
+        assert_eq!(sections, ["skills"]);
+        assert!(
+            details.iter().any(|d| d.starts_with("skills.enabled:")),
+            "{details:?}"
+        );
+        assert!(
+            details
+                .iter()
+                .any(|d| d.starts_with("skills.own_credential:")),
+            "{details:?}"
+        );
+    }
 
     /// Desk Helper's own additions before boot are the hub's own, for its own
     /// agent and as it makes them; nothing else is.

@@ -130,7 +130,11 @@ impl ConfigTool {
     async fn set(&self, key: &str, value: &serde_json::Value) -> Result<serde_json::Value, String> {
         let path = key_path(key)?;
         human_only(&path)?;
-        if let Some(secret) = path.iter().find(|segment| is_secret_name(segment)) {
+        if let Some(secret) = path
+            .iter()
+            .find(|segment| is_secret_name(segment))
+            .filter(|_| !is_binding(&path))
+        {
             return Err(format!(
                 "`{secret}` is a credential; store it in the vault, not config.toml"
             ));
@@ -210,6 +214,12 @@ fn human_only(path: &[&str]) -> Result<(), String> {
         ),
         _ => Ok(()),
     }
+}
+
+/// `[skills] own_credential`: which connectors use the agent's own
+/// connection. A binding, not a secret, though its name says credential.
+pub(crate) fn is_binding(path: &[&str]) -> bool {
+    path.first() == Some(&"skills") && path.get(1).is_none_or(|k| *k == "own_credential")
 }
 
 /// Key names whose values are credentials.

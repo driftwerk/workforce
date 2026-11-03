@@ -250,6 +250,16 @@ mod tests {
         let snapshot = policy.snapshot();
         assert!(!snapshot.is_blocked("linear.issue_get"));
         assert!(snapshot.is_blocked("github.pr_get"));
+        // Its own connection is a binding, not a secret the tool refuses.
+        let own = tool
+            .execute(serde_json::json!({
+                "action": "set",
+                "key": "skills.own_credential",
+                "value": ["linear"],
+            }))
+            .await
+            .unwrap();
+        assert!(own.success, "{:?}", own.error);
 
         let unset = tool
             .execute(serde_json::json!({ "action": "unset", "key": "skills.enabled" }))
