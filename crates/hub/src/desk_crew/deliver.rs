@@ -43,13 +43,31 @@ impl CrewHub {
         listed: Option<Vec<MentionedApproval>>,
         author: Option<Speaker>,
     ) -> Result<(String, String)> {
+        self.run_turn(service, owner, DESK_CHANNEL, prompt, hop, listed, author)
+            .await
+    }
+
+    /// [`Self::run_dm_turn`] in `service`'s conversation on `channel`: the
+    /// DM, or one of its own off it (a session's line, `desk:line:<id>`),
+    /// which keeps that work's context apart from the DM's history. What
+    /// such a turn posts goes to the DM, and no one is there to answer
+    /// what it asks: a write it would make off Desk is refused.
+    pub(crate) async fn run_turn(
+        &self,
+        service: &Arc<AgentService>,
+        owner: &str,
+        channel: &str,
+        prompt: &str,
+        hop: i16,
+        listed: Option<Vec<MentionedApproval>>,
+        author: Option<Speaker>,
+    ) -> Result<(String, String)> {
         let agent_id = service.agent_id.as_str();
+        let in_dm = channel == DESK_CHANNEL;
         // The session a DM already open is on: not rolled over here, or an
         // open socket (which only re-points on its own messages) would miss
         // the answer. The person's next connect rolls a stale one.
-        let session = service
-            .sessions
-            .get_or_create(DESK_CHANNEL, owner, agent_id)?;
+        let session = service.sessions.get_or_create(channel, owner, agent_id)?;
         let sid = session.id.clone();
         if hop > 0 {
             self.hops.lock().insert(sid.clone(), hop);
@@ -76,13 +94,13 @@ impl CrewHub {
         let scope = DeskScope {
             target: DeskTarget::of_turn(&DeskPlace::Dm, DESK_CHANNEL, None, false),
             owner: owner.to_string(),
-            attended: true,
+            attended: in_dm,
             relayed: true,
         };
         let progress = workforce_agent::runner::with_desk(
             Some(scope),
             service.process_message_with_progress(
-                DESK_CHANNEL,
+                channel,
                 owner,
                 None,
                 prompt,

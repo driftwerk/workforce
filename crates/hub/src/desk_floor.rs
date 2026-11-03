@@ -465,9 +465,19 @@ fn breaker_needs(sources: &Sources, caller: &FloorCaller) -> Vec<Need> {
     }
 }
 
+/// The questions sessions asked on the Desk's lines that wait on the
+/// person who holds it.
+fn line_needs(sources: &Sources, caller: &FloorCaller) -> Vec<Need> {
+    match (sources.desk)() {
+        Some(desk) if caller.personal => desk.line_needs(),
+        _ => Vec::new(),
+    }
+}
+
 /// What still needs the person: what their turns wait on and ask, the
-/// routed approvals waiting on them, and their agents' settings changed
-/// outside the hub. The one source every count is a count of.
+/// routed approvals waiting on them, their agents' settings changed
+/// outside the hub, and their sessions' questions on Desk's lines. The one
+/// source every count is a count of.
 fn needs_of(
     state: &GatewayState,
     sources: &Sources,
@@ -481,6 +491,7 @@ fn needs_of(
             .chain(routed_needs(state, caller, now)?)
             .chain(config_needs(state, caller))
             .chain(breaker_needs(sources, caller))
+            .chain(line_needs(sources, caller))
             .collect(),
     ))
 }

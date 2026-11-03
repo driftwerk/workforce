@@ -513,6 +513,8 @@ struct Inner {
     line_pump: tokio::sync::Mutex<()>,
     /// What answers sessions' MCP requests on their lines.
     line_mcp: std::sync::OnceLock<Arc<dyn line::SessionMcp>>,
+    /// The crew whose overseer answers sessions on their lines.
+    line_crew: Mutex<Option<Weak<dyn crew::Crew>>>,
 }
 
 #[derive(Clone)]
@@ -1026,6 +1028,7 @@ impl Desk {
             budget_tz: Mutex::new(None),
             line_pump: tokio::sync::Mutex::new(()),
             line_mcp: std::sync::OnceLock::new(),
+            line_crew: Mutex::new(None),
         }));
         tokio::spawn(persist_loop(store, floor.turns, persist_rx));
         tokio::spawn(desk.clone().read_engines());

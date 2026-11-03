@@ -28,6 +28,7 @@ use crate::serve::AgentService;
 mod actions;
 mod deliver;
 mod extras;
+mod line;
 mod observe;
 mod read_only;
 mod reading;
@@ -105,6 +106,10 @@ pub struct CrewHub {
     tooled: Mutex<Option<(String, String)>>,
     /// Ask the sync loop to look again now (a config was saved).
     poke: tokio::sync::Notify,
+    /// The words of sessions' questions on Desk's line the overseer may
+    /// answer, by message: an answer is gated by what was asked as well as
+    /// by what it says. One not known here is the person's.
+    questions: Mutex<HashMap<uuid::Uuid, String>>,
 }
 
 static CREWS: Mutex<Vec<Weak<CrewHub>>> = Mutex::new(Vec::new());
@@ -181,14 +186,18 @@ impl CrewHub {
             read: Mutex::default(),
             tooled: Mutex::default(),
             poke: tokio::sync::Notify::new(),
+            questions: Mutex::default(),
         });
         {
             let mut crews = CREWS.lock();
             crews.retain(|c| c.strong_count() > 0);
             crews.push(Arc::downgrade(&crew));
         }
+        crew.desk
+            .answer_lines_with(&(Arc::clone(&crew) as Arc<dyn Crew>));
         tokio::spawn(watcher::sync_loop(Arc::clone(&crew), cancel.clone()));
-        tokio::spawn(watcher::wake_loop(Arc::clone(&crew), cancel));
+        tokio::spawn(watcher::wake_loop(Arc::clone(&crew), cancel.clone()));
+        tokio::spawn(line::line_loop(Arc::clone(&crew), cancel));
         crew
     }
 
@@ -361,6 +370,10 @@ impl Crew for CrewHub {
 
     async fn asks(&self, reply: &str) -> Option<bool> {
         self.read_reply(reply).await
+    }
+
+    fn answers_lines(&self) -> bool {
+        self.overseer_service().is_some()
     }
 }
 
