@@ -162,11 +162,16 @@ fn gate_with(
     let effect = surface_effect_of(tools, tool_name, input);
     let to = effect.as_ref().and_then(SurfaceEffect::destination);
     let mut held = None;
+    let asks_nothing = gates
+        .computer_gate
+        .as_deref()
+        .is_some_and(|g| g.asks_nothing());
     let response = apply_surface_gate(
         response,
         effect.as_ref(),
         crate::runner::current_desk().as_ref(),
         input,
+        asks_nothing,
         || {
             *held.insert(kept(
                 gates.surface_allows.as_deref(),
@@ -549,13 +554,20 @@ pub fn kept(
 /// passes, and "Always allow" is offered where it can be kept. Only ever
 /// escalates an `Allow`; a run nobody attends, and any turn not from Desk,
 /// is untouched. `kept` is asked only of a write the gate would hold.
+/// `asks_nothing`: the agent is at Full access and asks before nothing
+/// ("do anything"), so the gate stands down; every other agent keeps its
+/// one card.
 pub fn apply_surface_gate(
     response: PolicyResponse,
     effect: Option<&SurfaceEffect>,
     desk: Option<&workforce_common::channels::desk::DeskScope>,
     input: &Value,
+    asks_nothing: bool,
     kept: impl FnOnce() -> Kept,
 ) -> PolicyResponse {
+    if asks_nothing {
+        return response;
+    }
     let (
         PolicyDecision::Allow,
         Some(SurfaceEffect::Writes {
@@ -1822,7 +1834,7 @@ mod tests {
             ..desk(true)
         };
         let asked = std::cell::Cell::new(false);
-        let gated = apply_surface_gate(allowed(), Some(&to), Some(&relayed), &input, || {
+        let gated = apply_surface_gate(allowed(), Some(&to), Some(&relayed), &input, false, || {
             asked.set(true);
             Kept::Allowed
         });
@@ -1838,9 +1850,14 @@ mod tests {
             gated.decision
         );
         assert!(!asked.get(), "the person's allow list isn't read for it");
-        let own = apply_surface_gate(allowed(), Some(&to), Some(&desk(true)), &input, || {
-            Kept::Allowed
-        });
+        let own = apply_surface_gate(
+            allowed(),
+            Some(&to),
+            Some(&desk(true)),
+            &input,
+            false,
+            || Kept::Allowed,
+        );
         assert_eq!(own.decision, PolicyDecision::Allow, "their own turn passes");
     }
 
@@ -1903,6 +1920,7 @@ mod tests {
             Some(&to("slack")),
             Some(&desk(true)),
             &input,
+            false,
             || Kept::NotYet,
         );
         match gated.decision {
@@ -1923,12 +1941,23 @@ mod tests {
             Some(&to("email")),
             Some(&desk(true)),
             &input,
+            false,
             || Kept::NotYet,
         );
         assert!(matches!(
             email.decision,
             PolicyDecision::RequireApproval { .. }
         ));
+        // "Do anything" (Full access, asking before nothing): no card.
+        let anything = apply_surface_gate(
+            allowed(),
+            Some(&to("slack")),
+            Some(&desk(true)),
+            &input,
+            true,
+            || Kept::NotYet,
+        );
+        assert_eq!(anything.decision, PolicyDecision::Allow);
         for (effect, scope) in [
             (Some(to("desk")), Some(desk(true))),
             (Some(to("slack")), Some(desk(false))),
@@ -1936,11 +1965,15 @@ mod tests {
             (Some(SurfaceEffect::Reads), Some(desk(true))),
             (None, Some(desk(true))),
         ] {
-            let decision =
-                apply_surface_gate(allowed(), effect.as_ref(), scope.as_ref(), &input, || {
-                    Kept::NotYet
-                })
-                .decision;
+            let decision = apply_surface_gate(
+                allowed(),
+                effect.as_ref(),
+                scope.as_ref(),
+                &input,
+                false,
+                || Kept::NotYet,
+            )
+            .decision;
             assert_eq!(decision, PolicyDecision::Allow, "{effect:?} {scope:?}");
         }
         let denied = PolicyResponse {
@@ -1955,6 +1988,7 @@ mod tests {
                 Some(&to("slack")),
                 Some(&desk(true)),
                 &input,
+                false,
                 || Kept::NotYet
             )
             .decision,
@@ -2157,14 +2191,19 @@ mod tests {
             ..allowed()
         };
         assert_eq!(
-            apply_surface_gate(asked.clone(), Some(&to), Some(&desk(true)), &input, || {
-                Kept::Allowed
-            })
+            apply_surface_gate(
+                asked.clone(),
+                Some(&to),
+                Some(&desk(true)),
+                &input,
+                false,
+                || { Kept::Allowed }
+            )
             .decision,
             asked.decision
         );
         let mut asked_of = 0;
-        apply_surface_gate(allowed(), Some(&to), None, &input, || {
+        apply_surface_gate(allowed(), Some(&to), None, &input, false, || {
             asked_of += 1;
             Kept::NotYet
         });

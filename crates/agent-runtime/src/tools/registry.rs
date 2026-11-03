@@ -18,6 +18,9 @@ pub struct ToolRegistry {
     tools: RwLock<BTreeMap<String, Arc<dyn Tool>>>,
     instances: RwLock<BTreeMap<String, Arc<dyn InstanceSource>>>,
     generation: AtomicU64,
+    /// Which vault tiers this agent's connectors read their keys from, kept
+    /// by every credential store its adapters load with. Empty: all of them.
+    credential_pins: Arc<workforce_common::credential_pin::PinSlot>,
     /// The registry this one was copied from, for a copy that may still take
     /// tools the source gains later ([`follow`](Self::follow)).
     upstream: Option<Upstream>,
@@ -40,8 +43,23 @@ impl ToolRegistry {
             tools: RwLock::new(BTreeMap::new()),
             instances: RwLock::new(BTreeMap::new()),
             generation: AtomicU64::new(0),
+            credential_pins: Arc::default(),
             upstream: None,
         }
+    }
+
+    /// An empty registry for the same agent as `source`: a skill it loads
+    /// later reads its keys as `source`'s agent's are pinned.
+    pub fn empty_like(source: &ToolRegistry) -> Self {
+        Self {
+            credential_pins: source.credential_pins(),
+            ..Self::new()
+        }
+    }
+
+    /// The slot this agent's credential pins go in.
+    pub fn credential_pins(&self) -> Arc<workforce_common::credential_pin::PinSlot> {
+        Arc::clone(&self.credential_pins)
     }
 
     /// Register a tool.
@@ -145,6 +163,7 @@ impl ToolRegistry {
             tools: RwLock::new(self.tools.read().clone()),
             instances: RwLock::new(self.instances.read().clone()),
             generation: AtomicU64::new(0),
+            credential_pins: Arc::clone(&self.credential_pins),
             upstream: None,
         }
     }

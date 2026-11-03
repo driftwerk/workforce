@@ -91,7 +91,12 @@ async fn save_over(
     expects: impl Fn(Option<&str>) -> bool,
     over: Over<'_>,
 ) -> Result<Saved, Refused> {
+    let before = crate::connector_pins::binding_in(&service.workspace);
     let saved = save_one(service, ref_id, store, body, edit, expects, over).await?;
+    if service.config.desk.enabled {
+        let after = crate::connector_pins::binding_in(&service.workspace);
+        crate::connector_pins::rebind(service, &before, &after).await;
+    }
     if oversees(body) {
         one_overseer(service, store).await;
     }

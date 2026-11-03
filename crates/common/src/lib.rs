@@ -41,6 +41,7 @@ pub mod private_fs;
 pub use workforce_postgres as postgres;
 pub mod computer_access;
 pub mod connector_binding;
+pub mod credential_pin;
 pub mod oversight;
 pub mod persona;
 pub mod pg_text;

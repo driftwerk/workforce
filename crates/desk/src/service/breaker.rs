@@ -58,7 +58,14 @@ pub(crate) struct LiveBreaker {
     hold_after: Option<u64>,
     /// A steer waiting for its next tool call to be delivered with.
     steer: Option<(Reason, String)>,
+    /// What Desk typed into it and has yet to hear submitted, and whether
+    /// the person sent it: the rest of what it is prompted with is typed
+    /// in its terminal.
+    typed: std::collections::VecDeque<(String, bool)>,
 }
+
+/// How many of Desk's own prompts are remembered until heard.
+const TYPED_KEPT: usize = 8;
 
 /// A breaker's subject key.
 pub fn session_subject(id: Uuid) -> String {
@@ -173,6 +180,27 @@ fn enforced(scope: &BudgetScope) -> bool {
     }
 }
 
+/// What the sessions of `pool` spent, of each session's `spent`: every
+/// session on Desk (one since forgotten too), or a group's members now.
+/// The breaker and Settings count a total by this one rule.
+fn sessions_used(
+    pool: &Pool,
+    spent: Option<&HashMap<Uuid, Used>>,
+    groups: &HashMap<Uuid, Option<String>>,
+) -> Used {
+    let mut total = Used::default();
+    for (id, u) in spent.into_iter().flatten() {
+        let counts = match pool {
+            Pool::Desk => true,
+            Pool::Group(g) => groups.get(id).and_then(|x| x.as_deref()) == Some(g.as_str()),
+        };
+        if counts {
+            total.add(*u);
+        }
+    }
+    total
+}
+
 /// A tool call's key: the same call hashes the same.
 fn key_of(label: &str) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -222,6 +250,19 @@ impl Desk {
                 _ = look.tick() => self.breaker_spend(None).await,
             }
         }
+    }
+
+    /// Counts budgets in `tz`, the person's (the hub's `user_timezone`, as
+    /// its cost governor counts agents' budgets).
+    pub fn count_budgets_in(&self, tz: chrono_tz::Tz) {
+        *self.0.budget_tz.lock() = Some(tz);
+    }
+
+    /// The timezone budgets are counted in: the hub's, else the crew's
+    /// once it is there; none before either says.
+    fn budget_tz(&self) -> Option<chrono_tz::Tz> {
+        let set = *self.0.budget_tz.lock();
+        set.or_else(|| self.reader().map(|c| c.timezone()))
     }
 
     fn rules(&self) -> Rules {
@@ -539,6 +580,20 @@ impl Desk {
         }
     }
 
+    /// Says `text` into a Codex session's running turn.
+    pub(super) fn steer_codex(&self, id: Uuid, text: String) {
+        if let Some(link) = self
+            .0
+            .state
+            .lock()
+            .live
+            .get(&id)
+            .and_then(|l| l._codex.as_ref())
+        {
+            let _ = link.steers.send(text);
+        }
+    }
+
     // ── What a session's hooks tell it ──────────────────────────────────
 
     /// A tool call starting in `id`: why it is refused, while its breaker
@@ -634,6 +689,52 @@ impl Desk {
         }
     }
 
+    /// Desk typed `text` into `id`, sent by `by`: what its prompt hook
+    /// then hears is that sender's, not the person's at the terminal.
+    pub(super) fn breaker_typed(&self, id: Uuid, text: &str, by: Option<&By>) {
+        let person = by.is_some_and(|b| b.party.kind == PartyKind::You);
+        if let Some(l) = self.0.state.lock().live.get_mut(&id) {
+            l.breaker.typed.push_back((text.trim().to_string(), person));
+            while l.breaker.typed.len() > TYPED_KEPT {
+                l.breaker.typed.pop_front();
+            }
+        }
+    }
+
+    /// Whether `prompt`, just submitted in `id`, is the person's own words:
+    /// not one Desk typed for someone else, not an engine's own (its
+    /// notices are `<…>`-tagged), and not the last one again (a loop or a
+    /// schedule submitting it once more).
+    pub(super) fn person_prompted(&self, id: Uuid, prompt: &str) -> bool {
+        let said = prompt.trim();
+        if said.is_empty() || said.starts_with('<') {
+            return false;
+        }
+        let mut st = self.0.state.lock();
+        let again = st
+            .records
+            .get(&id)
+            .and_then(|r| r.last_prompt.as_deref())
+            .is_some_and(|last| last.trim() == said);
+        let Some(l) = st.live.get_mut(&id) else {
+            return false;
+        };
+        if let Some(at) = l.breaker.typed.iter().position(|(t, _)| t == said) {
+            return l.breaker.typed.remove(at).is_some_and(|(_, person)| person);
+        }
+        !again
+    }
+
+    /// `id` was just started again (resumed, restarted): while its breaker
+    /// holds it, every turn of this run is held, the first too.
+    pub(super) fn breaker_launched(&self, id: Uuid) {
+        if self.held(&session_subject(id)).is_some() {
+            if let Some(l) = self.0.state.lock().live.get_mut(&id) {
+                l.breaker.hold_after = Some(0);
+            }
+        }
+    }
+
     // ── Spend ───────────────────────────────────────────────────────────
 
     /// Folds what `sessions` spent (every session, for `None`) into their
@@ -655,7 +756,10 @@ impl Desk {
             return;
         }
         let now = Utc::now();
-        let tz = self.timezone();
+        // Never on a guessed timezone: a day budget's day is the person's.
+        let Some(tz) = self.budget_tz() else {
+            return;
+        };
         let used = match self.used_by_period(&budgets, now, tz).await {
             Some(u) => u,
             None => return,
@@ -744,19 +848,10 @@ impl Desk {
         pools.sort();
         pools.dedup();
         for pool in pools {
-            let members = |id: &Uuid| match &pool {
-                Pool::Desk => true,
-                Pool::Group(g) => groups.get(id).and_then(|x| x.as_deref()) == Some(g.as_str()),
-            };
             let standings: Vec<Standing> = budget::pools(&budgets, &pool)
                 .into_iter()
                 .map(|b| {
-                    let mut total = Used::default();
-                    if let Some(m) = used.get(&b.period) {
-                        m.iter()
-                            .filter(|(id, _)| members(id))
-                            .for_each(|(_, u)| total.add(*u));
-                    }
+                    let mut total = sessions_used(&pool, used.get(&b.period), &groups);
                     total.add(self.agents_used(&pool, b.period, now));
                     standing(b, total.of(b.unit))
                 })
@@ -841,7 +936,8 @@ impl Desk {
         id: Uuid,
         by: Option<&By>,
     ) -> Result<(), DeskError> {
-        if by.is_none_or(|b| b.party.kind == PartyKind::You) {
+        // Only the person goes past a hold: no one named is not the person.
+        if by.is_some_and(|b| b.party.kind == PartyKind::You) {
             return Ok(());
         }
         let subject = session_subject(id);
@@ -919,7 +1015,9 @@ impl Desk {
     pub async fn budgets_view(&self) -> Result<BudgetsView, DeskError> {
         let budgets = self.budget_list();
         let now = Utc::now();
-        let tz = self.timezone();
+        let tz = self
+            .budget_tz()
+            .ok_or_else(|| DeskError::Conflict("Desk doesn't know your timezone yet".into()))?;
         let used = self
             .used_by_period(&budgets, now, tz)
             .await
@@ -955,14 +1053,8 @@ impl Desk {
                         Some(budget::standing_of(b, spent(id).of(b.unit), from, to))
                     }
                     BudgetScope::Desk => {
-                        let mut total = Used::default();
-                        groups
-                            .iter()
-                            .filter(|(_, g)| {
-                                b.group.is_none() || g.as_deref() == b.group.as_deref()
-                            })
-                            .for_each(|(id, _)| total.add(spent(id)));
                         let pool = b.group.clone().map_or(Pool::Desk, Pool::Group);
+                        let mut total = sessions_used(&pool, of_period, &groups);
                         total.add(self.agents_used(&pool, b.period, now));
                         Some(budget::standing_of(b, total.of(b.unit), from, to))
                     }

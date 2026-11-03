@@ -158,7 +158,7 @@ async fn a_loop_is_steered_in_its_turn_and_held_from_the_next_until_the_person_s
         assert!(denied(&refused), "{refused}");
         assert!(refused.pointer("/hookSpecificOutput/permissionDecisionReason").unwrap().as_str().unwrap().contains("Continue"));
         // The person typing to it lets it go on.
-        post(&d, s.id, prompt()).await;
+        post(&d, s.id, json!({"hook_event_name": "UserPromptSubmit", "prompt": "try another way"})).await;
         assert_eq!(post(&d, s.id, tool("ls")).await, json!({}));
         assert!(d.breaker_needs().is_empty());
     })
@@ -305,6 +305,111 @@ async fn a_budget_for_a_group_that_isnt_there_or_for_agents_here_is_refused() {
         assert_eq!(d.budget_list(), std::slice::from_ref(&kept));
         d.delete_budget(kept.id, By::you()).await.unwrap();
         assert!(d.budget_list().is_empty());
+    })
+    .await;
+}
+
+/// A session held by a loop, its turn over: what follows is a new turn.
+async fn held_session(d: &Desk, dir: &std::path::Path) -> Uuid {
+    d.set_breaker_rules(Rules { loops: true }).await.unwrap();
+    let s = new_session(d, dir).await;
+    post(d, s.id, prompt()).await;
+    for _ in 0..12 {
+        post(d, s.id, tool("cargo test")).await;
+    }
+    post(d, s.id, stop()).await;
+    assert_eq!(d.breaker_needs().len(), 1);
+    s.id
+}
+
+#[tokio::test]
+async fn only_words_the_person_typed_let_a_held_session_go_on() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let id = held_session(&d, dir.path()).await;
+        // No one named is not the person.
+        assert!(matches!(
+            d.prompt(id, "go on", None),
+            Err(DeskError::Conflict(_))
+        ));
+        // What Desk typed for someone else, heard as the session's prompt.
+        d.breaker_typed(id, "keep going", Some(&agent()));
+        post(
+            &d,
+            id,
+            json!({"hook_event_name": "UserPromptSubmit", "prompt": "keep going"}),
+        )
+        .await;
+        assert!(
+            denied(&post(&d, id, tool("ls")).await),
+            "an agent's words hold on"
+        );
+        // The same words again (a loop, a schedule).
+        post(
+            &d,
+            id,
+            json!({"hook_event_name": "UserPromptSubmit", "prompt": "keep going"}),
+        )
+        .await;
+        assert!(denied(&post(&d, id, tool("ls")).await), "a repeat holds on");
+        assert_eq!(d.breaker_needs().len(), 1);
+        // The person's own words.
+        post(
+            &d,
+            id,
+            json!({"hook_event_name": "UserPromptSubmit", "prompt": "fine, fix the test"}),
+        )
+        .await;
+        assert_eq!(post(&d, id, tool("ls")).await, json!({}));
+        assert!(d.breaker_needs().is_empty());
+        let mut continued = Vec::new();
+        for _ in 0..100 {
+            continued = d
+                .activity(crate::crew::Filter::All, None, 50)
+                .await
+                .unwrap()
+                .events
+                .into_iter()
+                .filter(|e| e.kind == crate::crew::Kind::Continued)
+                .collect();
+            if !continued.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(continued.len(), 1);
+        assert_eq!(continued[0].actor.kind, crate::crew::PartyKind::You);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn no_one_but_the_person_resumes_or_restarts_a_held_session() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let id = held_session(&d, dir.path()).await;
+        assert!(matches!(
+            d.restart(id, Some(crate::engine_accounts::CONTINUE.into()), agent())
+                .await,
+            Err(DeskError::Conflict(_))
+        ));
+        let crew = By {
+            party: Party::manager("desk", "Desk"),
+            reason: None,
+            suggestion_id: None,
+            hop: 0,
+        };
+        assert!(matches!(
+            d.restart(id, None, crew.clone()).await,
+            Err(DeskError::Conflict(_))
+        ));
+        assert!(matches!(
+            d.resume(id, Some("go".into()), Some(crew)).await,
+            Err(DeskError::Conflict(_))
+        ));
+        assert_eq!(d.breaker_needs().len(), 1, "still held");
     })
     .await;
 }

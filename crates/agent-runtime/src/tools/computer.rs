@@ -78,6 +78,17 @@ pub trait ComputerGate: Send + Sync {
     /// Whether `tool` is in a namespace the gate decides. Nothing else is
     /// asked of a tool outside them: its effect is never read.
     fn decides(&self, tool: &str) -> bool;
+    /// Whether the agent is at Full access and asks before nothing ("do
+    /// anything"): the surface gate then stands down too.
+    fn asks_nothing(&self) -> bool {
+        false
+    }
+    /// What `tool` does when it can't say itself (`effect` is the tool's
+    /// own): the hub names a connector's read or write from its tool name.
+    /// The tool's own effect stays first.
+    fn effect_of(&self, _tool: &str, effect: Effect) -> Effect {
+        effect
+    }
     /// The verdict on `effect`, made by `tool` in the turn in scope. A
     /// verdict that can't be reached is a refusal.
     fn verdict(&self, tool: &str, effect: &Effect) -> Verdict;
@@ -138,9 +149,12 @@ pub fn decide(
     input: &Value,
 ) -> Option<Decision> {
     let gate = gate.filter(|gate| gate.decides(tool_name))?;
-    let effect = tools
-        .get(tool_name)
-        .map_or(Effect::Unknown, |tool| tool.effect(input));
+    let effect = gate.effect_of(
+        tool_name,
+        tools
+            .get(tool_name)
+            .map_or(Effect::Unknown, |tool| tool.effect(input)),
+    );
     let verdict = gate.verdict(tool_name, &effect);
     let reach = gate.reach(&effect);
     Some(Decision {
