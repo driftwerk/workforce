@@ -78,6 +78,8 @@ pub struct SessionRecord {
     pub view: View,
     /// The engine's version when it last started, as it reported it.
     pub engine_version: Option<String>,
+    /// Codex's own reviewer answers its approvals ("Approve for me").
+    pub approve_for_me: bool,
     pub name: String,
     pub goal: String,
     pub cwd: String,
@@ -143,6 +145,8 @@ pub struct SessionView {
     pub current_tool: Option<String>,
     pub pending: Option<PendingApproval>,
     pub approvals: Approvals,
+    /// Codex's own reviewer answers its approvals ("Approve for me").
+    pub approve_for_me: bool,
     /// The Desk terminal it runs in, when it was started in one.
     pub terminal_id: Option<Uuid>,
     /// What the person calls it in Desk (`name` is the hub's own).
@@ -235,6 +239,7 @@ impl SessionView {
             current_tool,
             pending,
             approvals: r.approvals,
+            approve_for_me: r.approve_for_me,
             terminal_id: r.terminal_id,
             display_name: r.display_name.clone(),
             group: None,
@@ -322,6 +327,9 @@ pub struct NewSession {
     pub prompt: Option<String>,
     #[serde(default)]
     pub approvals: Option<Approvals>,
+    /// Codex only: its own reviewer answers its approvals.
+    #[serde(default)]
+    pub approve_for_me: bool,
     /// Added to the CLI's environment, as a terminal's is: Desk's plugin
     /// folder in `CLAUDE_CODE_PLUGIN_DIRS`.
     #[serde(default)]

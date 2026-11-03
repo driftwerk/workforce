@@ -899,7 +899,7 @@ impl Desk {
                     let (server_pty, _) = holder.adopt(&server, history);
                     let server = Server::Held(Arc::new(server_pty));
                     socket.map(|socket| {
-                        self.observe_codex(id, server, socket, record.cli_session_id.clone())
+                        self.observe_codex(id, server, socket, record.cli_session_id.clone(), true)
                     })
                 }
                 other => {
@@ -1622,6 +1622,11 @@ impl Desk {
                 }
             });
         }
+        if new.approve_for_me && new.engine != Engine::Codex {
+            return Err(DeskError::Invalid(
+                "only Codex sessions can approve for you".into(),
+            ));
+        }
         let cwd = PathBuf::from(&new.cwd);
         if !cwd.is_dir() {
             return Err(DeskError::Invalid(format!("{} is not a folder", new.cwd)));
@@ -1648,6 +1653,7 @@ impl Desk {
             engine: new.engine,
             view,
             engine_version: self.version_of(new.engine),
+            approve_for_me: new.approve_for_me && new.engine == Engine::Codex,
             name: name.to_string(),
             goal: new.goal.trim().to_string(),
             cwd: cwd.to_string_lossy().into_owned(),
@@ -2644,9 +2650,11 @@ impl Desk {
                         None => codex::Launch::New,
                     },
                     prompt,
+                    approve_for_me: r.approve_for_me,
                     env: &env,
                 });
-                let link = self.observe_codex(r.id, server, socket, thread.map(str::to_string));
+                let link =
+                    self.observe_codex(r.id, server, socket, thread.map(str::to_string), false);
                 (spec, Some(link))
             }
             Engine::Gemini
@@ -2741,13 +2749,15 @@ impl Desk {
     }
 
     /// Joins a Codex session's app-server as a second client to follow it,
-    /// subscribed to `thread` when it is known (resumed, or taken back).
+    /// subscribed to `thread` when it is known (resumed, or taken back):
+    /// `at_once` when its TUI already runs it (taken back).
     fn observe_codex(
         &self,
         id: Uuid,
         server: Server,
         socket: PathBuf,
         thread: Option<String>,
+        at_once: bool,
     ) -> CodexLink {
         let watch = self.0.cancel.child_token();
         let (tx, rx) = mpsc::channel(64);
@@ -2757,6 +2767,11 @@ impl Desk {
             let watch = watch.clone();
             let plans = self.0.plans.clone();
             let follower = codex::Follower::new(thread, self.0.env.get("HOME").map(PathBuf::from));
+            let follower = if at_once {
+                follower.at_once()
+            } else {
+                follower
+            };
             async move {
                 if let Err(e) = codex::observe(socket, follower, tx, answers, plans, watch).await {
                     tracing::warn!(error = %e, "codex observer stopped");
@@ -3225,6 +3240,28 @@ impl Desk {
                 }
                 continue;
             }
+            if let CodexEvent::Reviewer(reviewer) = &event {
+                // Approve for me is the TUI's to set: if Codex says otherwise,
+                // the session's word for it is wrong.
+                let on = self.record(id).is_ok_and(|r| r.approve_for_me);
+                if on != (reviewer == "auto_review") {
+                    tracing::warn!(%id, %reviewer, approve_for_me = on, "codex runs with other approvals than the session says");
+                }
+                continue;
+            }
+            if let CodexEvent::Reviewed { what, verdict } = &event {
+                // What "Approve for me" decided shows as the session's activity.
+                if let Ok(view) = self.view(id) {
+                    let me = Party::session(&view);
+                    let kind = match *verdict {
+                        "allowed" => Kind::Approved,
+                        _ => Kind::Denied,
+                    };
+                    let text = format!("Codex's reviewer {verdict} {}", crew::clip(what, 160));
+                    self.note(Event::new(kind, me.clone(), Some(me), text));
+                }
+                continue;
+            }
             if matches!(event, CodexEvent::Idle) {
                 // Its rollout has the turn's calls, with their model.
                 self.spend_read(id);
@@ -3370,7 +3407,10 @@ impl Desk {
                     }
                     CodexEvent::Answered(_) | CodexEvent::Late(_) => {}
                     CodexEvent::Reply(text) => r.last_reply = Some(transcript::clip(&text)),
-                    CodexEvent::Child(_) | CodexEvent::Usage(_) => {}
+                    CodexEvent::Child(_)
+                    | CodexEvent::Usage(_)
+                    | CodexEvent::Reviewed { .. }
+                    | CodexEvent::Reviewer(_) => {}
                 }
             });
             if let (Some(reader), Some(end), Some(reply)) = (reader, read, said_whole) {
@@ -3553,6 +3593,7 @@ impl Desk {
                         engine: Engine::Claude,
                         view: View::Terminal,
                         engine_version: None,
+                        approve_for_me: false,
                         name: ext
                             .name
                             .clone()
@@ -3820,6 +3861,7 @@ mod tests {
                 worktree: None,
                 prompt: None,
                 approvals: None,
+                approve_for_me: false,
                 env: Default::default(),
             },
             None,
@@ -4184,6 +4226,7 @@ mod tests {
                         worktree: None,
                         prompt: None,
                         approvals: None,
+                        approve_for_me: false,
                         env: BTreeMap::from([(PLUGIN_DIRS.into(), "/plugins/desk".into())]),
                     },
                     None,
@@ -4228,6 +4271,7 @@ mod tests {
                         worktree: None,
                         prompt: None,
                         approvals: None,
+                        approve_for_me: false,
                         env: BTreeMap::from([("NOT A NAME".into(), "x".into())]),
                     },
                     None,
@@ -4272,6 +4316,7 @@ mod tests {
                     worktree: None,
                     prompt: None,
                     approvals: None,
+                    approve_for_me: false,
                     env: added.clone(),
                 },
                 None,
@@ -4695,6 +4740,7 @@ mod tests {
                         worktree: None,
                         prompt: None,
                         approvals: None,
+                        approve_for_me: false,
                         env: Default::default(),
                     },
                     Some(By::you()),

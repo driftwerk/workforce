@@ -36,8 +36,20 @@ pub struct CodexSpawn<'a> {
     pub socket: &'a Path,
     pub launch: Launch<'a>,
     pub prompt: Option<&'a str>,
+    /// Codex's own reviewer answers its approvals.
+    pub approve_for_me: bool,
     pub env: &'a BTreeMap<String, String>,
 }
+
+/// What `--approve-for-me` sets, as settings: approvals go to Codex's
+/// automatic reviewer, in the workspace-write sandbox. Given to the TUI,
+/// whose own settings start (and resume) its thread: on the app-server
+/// alone they don't reach it (verified on CLI 0.166, `/status`).
+pub const APPROVE_FOR_ME: [&str; 3] = [
+    "approvals_reviewer=auto_review",
+    "approval_policy=on-request",
+    "sandbox_mode=workspace-write",
+];
 
 pub fn spawn(s: &CodexSpawn<'_>) -> Spawn {
     let remote = format!("unix://{}", s.socket.display());
@@ -51,6 +63,13 @@ pub fn spawn(s: &CodexSpawn<'_>) -> Spawn {
         "-C".to_string(),
         s.cwd.display().to_string(),
     ]);
+    if s.approve_for_me {
+        args.extend(
+            APPROVE_FOR_ME
+                .iter()
+                .flat_map(|c| ["-c".to_string(), c.to_string()]),
+        );
+    }
     args.extend(s.prompt.map(str::to_string));
     Spawn {
         program: s.program.to_path_buf(),
@@ -332,6 +351,47 @@ pub enum CodexEvent {
     /// Desk's answer came after the request was answered (in the
     /// terminal): not sent.
     Late(Value),
+    /// Who answers its thread's approvals, as Codex said when subscribed:
+    /// `user`, or `auto_review` ("Approve for me").
+    Reviewer(String),
+    /// Its automatic reviewer ("Approve for me") decided a request: what
+    /// it was, and the verdict in plain words.
+    Reviewed {
+        what: String,
+        verdict: &'static str,
+    },
+}
+
+/// A finished automatic review, as the activity line says it: `None` for
+/// one that was called off.
+fn reviewed(params: &Value) -> Option<CodexEvent> {
+    let verdict = match params.pointer("/review/status").and_then(Value::as_str)? {
+        "approved" => "allowed",
+        "denied" => "denied",
+        "timedOut" => "couldn't decide in time on",
+        _ => return None,
+    };
+    let action = params.get("action")?;
+    let what = match action.get("type").and_then(Value::as_str) {
+        Some("command") => action
+            .get("command")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        Some("execve") => action
+            .get("program")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        Some("applyPatch") => action.get("files").and_then(Value::as_array).map(|f| {
+            f.iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(", ")
+        }),
+        _ => None,
+    }
+    .filter(|w| !w.is_empty())
+    .unwrap_or_else(|| "a request".into());
+    Some(CodexEvent::Reviewed { what, verdict })
 }
 
 /// A command or file change Codex asks to be allowed.
@@ -552,6 +612,7 @@ pub fn interpret(method: &str, params: &Value) -> Option<Seen> {
             };
             seen(s("/threadId"), event)
         }
+        "item/autoApprovalReview/completed" => seen(s("/threadId"), reviewed(params)?),
         "thread/tokenUsage/updated" => seen(
             s("/threadId"),
             CodexEvent::Usage(crate::ledger::codex_spend(params, chrono::Utc::now())?),
@@ -622,6 +683,10 @@ pub struct Follower {
     thread: Option<String>,
     /// Subscribed to it, or asking to be.
     subscribed: bool,
+    /// Subscribes as soon as it joins: a session taken back, whose TUI
+    /// already has its thread. Otherwise at the thread's first status, so
+    /// the TUI loads it first, with its own settings.
+    at_once: bool,
     /// The files each file change item it started touches, by item id.
     files: HashMap<String, Vec<String>>,
     /// The requests it forwarded that nobody has answered, by id.
@@ -634,10 +699,17 @@ impl Follower {
         Self {
             thread,
             subscribed: false,
+            at_once: false,
             files: HashMap::new(),
             open: HashMap::new(),
             home,
         }
+    }
+
+    /// Subscribes as soon as it joins (see `at_once`).
+    pub fn at_once(mut self) -> Self {
+        self.at_once = true;
+        self
     }
 
     /// Subscribes to the thread, when it is known and not yet subscribed.
@@ -653,7 +725,8 @@ impl Follower {
 
     /// What to send once joined.
     pub fn joined(&mut self) -> Option<Value> {
-        self.subscribe()
+        // Otherwise at its first status.
+        self.at_once.then(|| self.subscribe()).flatten()
     }
 
     /// What `v` says, and what to send for it. A server request other than
@@ -666,11 +739,24 @@ impl Follower {
                 // The thread can't be resumed before its first turn has
                 // written it down ("no rollout found"): again at its next
                 // status.
-                if id.as_i64() == Some(SUBSCRIBE) && v.get("error").is_some() {
+                if id.as_i64() != Some(SUBSCRIBE) {
+                    return (Vec::new(), None);
+                }
+                if v.get("error").is_some() {
                     tracing::debug!(error = %v["error"], "codex: not subscribed to the thread yet");
                     self.subscribed = false;
+                    return (Vec::new(), None);
                 }
-                (Vec::new(), None)
+                // What the thread runs with, as Codex says it.
+                let said = v
+                    .pointer("/result/approvalsReviewer")
+                    .and_then(Value::as_str)
+                    .zip(self.thread.clone())
+                    .map(|(reviewer, thread)| Seen {
+                        thread,
+                        event: CodexEvent::Reviewer(reviewer.to_string()),
+                    });
+                (said.into_iter().collect(), None)
             }
             (Some(id), Some(method)) => {
                 let params = v.get("params").cloned().unwrap_or(Value::Null);
@@ -896,6 +982,7 @@ pub(crate) mod tests {
             socket: Path::new("/run/s.sock"),
             launch: Launch::Resume { thread_id: "t1" },
             prompt: None,
+            approve_for_me: false,
             env: &env,
         });
         assert_eq!(
@@ -909,6 +996,76 @@ pub(crate) mod tests {
                 "/repo"
             ]
         );
+    }
+
+    #[test]
+    fn approve_for_me_is_the_tuis_to_say() {
+        let env = BTreeMap::new();
+        for launch in [Launch::New, Launch::Resume { thread_id: "t1" }] {
+            let s = spawn(&CodexSpawn {
+                program: Path::new("/bin/codex"),
+                cwd: Path::new("/repo"),
+                socket: Path::new("/run/s.sock"),
+                launch,
+                prompt: Some("go"),
+                approve_for_me: true,
+                env: &env,
+            });
+            let tail: Vec<&str> = s
+                .args
+                .iter()
+                .rev()
+                .take(7)
+                .rev()
+                .map(String::as_str)
+                .collect();
+            assert_eq!(
+                tail,
+                [
+                    "-c",
+                    "approvals_reviewer=auto_review",
+                    "-c",
+                    "approval_policy=on-request",
+                    "-c",
+                    "sandbox_mode=workspace-write",
+                    "go"
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn its_reviewers_verdicts_are_said_plainly() {
+        let done = |status: &str, action: Value| {
+            interpret(
+                "item/autoApprovalReview/completed",
+                &json!({"threadId": "t1", "turnId": "u1", "reviewId": "r1", "startedAtMs": 1,
+                    "completedAtMs": 2, "decisionSource": "agent",
+                    "review": {"status": status}, "action": action}),
+            )
+            .map(|s| s.event)
+        };
+        let rm =
+            json!({"type": "command", "command": "rm a.txt", "cwd": "/repo", "source": "shell"});
+        assert_eq!(
+            done("approved", rm.clone()),
+            Some(CodexEvent::Reviewed {
+                what: "rm a.txt".into(),
+                verdict: "allowed"
+            })
+        );
+        assert_eq!(
+            done(
+                "denied",
+                json!({"type": "applyPatch", "cwd": "/repo", "files": ["a.rs", "b.rs"]})
+            ),
+            Some(CodexEvent::Reviewed {
+                what: "a.rs, b.rs".into(),
+                verdict: "denied"
+            })
+        );
+        assert_eq!(done("aborted", rm.clone()), None);
+        assert_eq!(done("inProgress", rm), None);
     }
 
     #[test]
@@ -1212,7 +1369,25 @@ pub(crate) mod tests {
             "again, at its next status"
         );
         // Taken back: its thread is known, and it subscribes at once.
-        let mut back = Follower::new(Some("t9".into()), None);
+        let mut launched = Follower::new(Some("t9".into()), None);
+        assert_eq!(
+            launched.joined(),
+            None,
+            "resumed: once its TUI has loaded it"
+        );
+        let status = json!({"method": "thread/status/changed",
+            "params": {"threadId": "t9", "status": {"type": "idle"}}});
+        assert!(launched.heard(&status).1.is_some());
+        let (seen, _) = launched
+            .heard(&json!({"id": SUBSCRIBE, "result": {"approvalsReviewer": "auto_review"}}));
+        assert_eq!(
+            seen,
+            [Seen {
+                thread: "t9".into(),
+                event: CodexEvent::Reviewer("auto_review".into())
+            }]
+        );
+        let mut back = Follower::new(Some("t9".into()), None).at_once();
         assert_eq!(
             back.joined(),
             Some(
@@ -1302,7 +1477,7 @@ pub(crate) mod tests {
         let cancel = CancellationToken::new();
         let observer = tokio::spawn(observe(
             socket,
-            Follower::new(Some("t1".into()), None),
+            Follower::new(Some("t1".into()), None).at_once(),
             events,
             answers,
             None,
