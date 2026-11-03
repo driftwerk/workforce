@@ -448,11 +448,14 @@ pub fn is_outbound_delivery_tool(name: &str) -> bool {
 /// Return a copy of `registry` with every outbound delivery tool removed (see
 /// [`is_outbound_delivery_tool`]). Used for turns where the caller owns delivery
 /// and the agent must not self-post (see [`SUPPRESS_DELIVERY_TOOLS`]). The shared
-/// registry is left untouched — `clone_all` shallow-clones the tool `Arc`s.
+/// registry is left untouched — the copy shallow-clones the tool `Arc`s — and a
+/// tool it gains mid-turn still reaches the copy, unless it delivers.
 pub fn without_delivery_tools(
-    registry: &crate::tools::registry::ToolRegistry,
+    registry: &Arc<crate::tools::registry::ToolRegistry>,
 ) -> crate::tools::registry::ToolRegistry {
-    let filtered = registry.clone_all();
+    let filtered = crate::tools::registry::ToolRegistry::follow(registry, |name| {
+        !is_outbound_delivery_tool(name)
+    });
     for name in filtered.names() {
         if is_outbound_delivery_tool(&name) {
             filtered.unregister(&name);
@@ -1796,6 +1799,18 @@ fn unwrap_failure(tool_use_id: String, input: serde_json::Value, message: String
 /// A result that loaded `loads` (internal names): the text the model reads —
 /// the result followed by the loaded tools' definitions — and the record a
 /// native wire renders instead.
+/// The tools a call made callable that this turn can offer: a tool the call
+/// registered in the agent's registry after the turn copied it is taken into
+/// the turn's registry first, so it is offered from the next round and runs in
+/// this turn. A tool the turn goes without is dropped.
+pub fn callable_loads(registry: &ToolRegistry, mut loads: Vec<String>) -> Vec<String> {
+    if !loads.is_empty() {
+        registry.adopt(&loads);
+        loads.retain(|name| registry.has(name));
+    }
+    loads
+}
+
 pub fn loaded_result(registry: &ToolRegistry, note: String, loads: &[String]) -> (String, Loaded) {
     let definitions: Vec<crate::tools::ToolDefinition> = loads
         .iter()
@@ -4707,6 +4722,7 @@ impl AgentRunner {
                     crate::spill::RetrievalSurface::from_registry(&self.tools),
                 );
                 let error = (!success).then(|| output_str.clone());
+                let loads = callable_loads(&self.tools, loads);
                 let output_str = match loads.is_empty() {
                     true => output_str,
                     false => {
@@ -6130,6 +6146,7 @@ impl AgentRunner {
                     crate::spill::RetrievalSurface::from_registry(&self.tools),
                 );
                 let error = (!success).then(|| output_str.clone());
+                let loads = callable_loads(&self.tools, loads);
                 let output_str = match loads.is_empty() {
                     true => output_str,
                     false => {
@@ -11791,6 +11808,7 @@ mod tests {
             "messaging.member_info",
             "data.query",
         ]);
+        let reg = Arc::new(reg);
         let before = reg.len();
         let filtered = without_delivery_tools(&reg);
         // Outbound delivery gone; read/context tools survive.
@@ -11802,6 +11820,14 @@ mod tests {
         // The shared source registry is untouched — clone_all is non-destructive.
         assert_eq!(reg.len(), before);
         assert!(reg.has("messaging.send"));
+        // A tool registered mid-turn reaches the copy when a call loads it,
+        // but a delivery tool never does.
+        reg.register(mock_tool("jira.create_issue"));
+        assert_eq!(
+            filtered.adopt(&["jira.create_issue".into(), "messaging.send".into()]),
+            ["jira.create_issue"]
+        );
+        assert!(!filtered.has("messaging.send"));
     }
 
     #[tokio::test]
@@ -15927,6 +15953,69 @@ issue?"#;
         assert!(content.contains("\"name\":\"vault_set\""));
         assert_eq!(loaded.unwrap().note, "{\"enabled\":true}");
         assert!(records(&result).contains(&("vault.set", "allow", true)));
+    }
+
+    /// A turn runs on a copy of the agent's registry. A skill enabled mid-turn
+    /// registers its tools in the agent's registry, not the copy; they must
+    /// still be offered and run in that same turn, through `tool_call` and
+    /// called directly, on both runner paths.
+    async fn tools_registered_mid_turn_run_in_that_turn(streaming: bool) {
+        struct Enable(Arc<ToolRegistry>);
+        #[async_trait]
+        impl Tool for Enable {
+            fn name(&self) -> &str {
+                "system.enable_skill"
+            }
+            fn description(&self) -> &str {
+                "Enable a skill."
+            }
+            fn input_schema(&self) -> serde_json::Value {
+                serde_json::json!({ "type": "object" })
+            }
+            async fn execute(&self, _: serde_json::Value) -> Result<crate::tools::ToolResult> {
+                self.0.register(mock_tool("tracker.create_issue"));
+                Ok(
+                    crate::tools::ToolResult::success(serde_json::json!({ "enabled": true }), 0)
+                        .loading(vec!["tracker.create_issue".to_string()]),
+                )
+            }
+        }
+        let agent = Arc::new(padded_registry(&["memory"]));
+        agent.register(Arc::new(Enable(Arc::clone(&agent))));
+        let turn = ToolRegistry::follow(&agent, |_| true);
+        let llm = ScriptedLoadingProvider::new(vec![
+            vec![("system_enable_skill", serde_json::json!({}))],
+            vec![(
+                "tool_call",
+                serde_json::json!({ "name": "tracker_create_issue", "arguments": {} }),
+            )],
+            vec![("tracker_create_issue", serde_json::json!({}))],
+        ]);
+        let runner = loading_runner_with(Arc::clone(&llm), &["system.enable_skill"], turn);
+        let result = run_either(&runner, streaming).await;
+
+        let seen = llm.seen.lock().unwrap();
+        let (content, loaded) = result_of(&seen[1].2, "tu_1_0");
+        assert!(
+            content.contains("\"name\":\"tracker_create_issue\""),
+            "the load carries the definition: {content}"
+        );
+        assert_eq!(loaded.unwrap().tools, ["tracker_create_issue"]);
+        let ran = records(&result)
+            .into_iter()
+            .filter(|record| *record == ("tracker.create_issue", "allow", true))
+            .count();
+        assert_eq!(ran, 2, "both calls ran: {:?}", records(&result));
+    }
+
+    #[tokio::test]
+    async fn tools_registered_mid_turn_run_in_that_turn_buffered() {
+        tools_registered_mid_turn_run_in_that_turn(false).await;
+    }
+
+    #[tokio::test]
+    async fn tools_registered_mid_turn_run_in_that_turn_streaming() {
+        tools_registered_mid_turn_run_in_that_turn(true).await;
     }
 
     #[tokio::test]

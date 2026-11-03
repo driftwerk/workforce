@@ -32,22 +32,28 @@ pub(crate) fn names_tool(entry: &str, name: &str) -> bool {
         .is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))
 }
 
-/// A snapshot of `source` holding only the tools `whitelist` names (by name
-/// or namespace) and retrieval ([`survives_exclusive_filter`]). An empty
-/// whitelist leaves retrieval alone. The copy is frozen: tools registered in
-/// `source` later never reach it.
+/// Whether an exclusive surface for `whitelist` keeps `name`.
+fn whitelisted(whitelist: &[String], name: &str) -> bool {
+    whitelist.iter().any(|entry| names_tool(entry, name)) || survives_exclusive_filter(name)
+}
+
+/// A copy of `source` holding only the tools `whitelist` names (by name or
+/// namespace) and retrieval ([`survives_exclusive_filter`]). An empty
+/// whitelist leaves retrieval alone. Tools registered in `source` later never
+/// reach it on their own; a call that loads one the whitelist names (enabling
+/// its skill) brings it in for the rest of the turn.
 pub(crate) fn exclusive_registry(
-    source: &workforce_agent::tools::registry::ToolRegistry,
+    source: &Arc<workforce_agent::tools::registry::ToolRegistry>,
     whitelist: &[String],
 ) -> workforce_agent::tools::registry::ToolRegistry {
-    let filtered = source.clone_all();
+    let kept = whitelist.to_vec();
+    let filtered = workforce_agent::tools::registry::ToolRegistry::follow(source, move |name| {
+        whitelisted(&kept, name)
+    });
     filtered
         .names()
         .into_iter()
-        .filter(|name| {
-            !whitelist.iter().any(|entry| names_tool(entry, name))
-                && !survives_exclusive_filter(name)
-        })
+        .filter(|name| !whitelisted(whitelist, name))
         .for_each(|name| {
             filtered.unregister(&name);
         });
@@ -191,7 +197,8 @@ fn without_disabled_tools(
     if !base.has(refactor) || service.refactor().is_some() {
         return base;
     }
-    let without = base.clone_all();
+    let without =
+        workforce_agent::tools::registry::ToolRegistry::follow(&base, move |name| name != refactor);
     without.unregister(refactor);
     Arc::new(without)
 }
@@ -235,7 +242,7 @@ async fn session_registry(
     if selected.is_none() && node_tools.is_empty() {
         return Arc::clone(&service.tools);
     }
-    let registry = service.tools.clone_all();
+    let registry = workforce_agent::tools::registry::ToolRegistry::follow(&service.tools, |_| true);
     if let Some((node, original_exec)) = selected.zip(service.tools.get("exec.run")) {
         registry.register(Arc::new(crate::local_agent_tool::LocalAgentExecTool::new(
             Arc::clone(agents),
@@ -288,8 +295,10 @@ pub(crate) mod tests {
         workforce_agent::spill::RETRIEVE_TOOL_NAME,
     ];
 
-    fn registry(names: &[&str]) -> ToolRegistry {
-        ToolRegistry::from_tools(names.iter().chain(RETRIEVAL.iter()).map(|name| named(name)))
+    fn registry(names: &[&str]) -> Arc<ToolRegistry> {
+        Arc::new(ToolRegistry::from_tools(
+            names.iter().chain(RETRIEVAL.iter()).map(|name| named(name)),
+        ))
     }
 
     fn sorted(mut names: Vec<String>) -> Vec<String> {
@@ -349,6 +358,19 @@ pub(crate) mod tests {
         assert!(source.has("github.issue_get"));
         assert!(!kept.has("github.issue_get"));
         assert!(kept.has("github.pr_list"));
+    }
+
+    /// A skill enabled mid-turn reaches a whitelisted turn only for the tools
+    /// its whitelist names.
+    #[test]
+    fn exclusive_registry_adopts_only_whitelisted_tools_a_call_loads() {
+        let source = registry(&["github.pr_list"]);
+        let kept = exclusive_registry(&source, &["github".into()]);
+        source.register(named("github.issue_get"));
+        source.register(named("messaging.send"));
+        let taken = kept.adopt(&["github.issue_get".into(), "messaging.send".into()]);
+        assert_eq!(taken, ["github.issue_get"]);
+        assert!(!kept.has("messaging.send"));
     }
 
     #[test]
@@ -491,6 +513,28 @@ pub(crate) mod tests {
             only_whitelisted_or_retrieval(&names, &["memory", "heartbeat"]),
             "{names:?}"
         );
+    }
+
+    /// The prod case: an agent not opted in to `code.refactor` runs every
+    /// turn on a copy of its registry. A skill enabled mid-turn lands in the
+    /// agent's registry; the turn's copy takes its tools when the call loads
+    /// them, and still never takes the tool it hides.
+    #[tokio::test]
+    async fn a_turns_copy_takes_tools_enabled_during_it_but_not_hidden_ones() {
+        let tmp = tempfile::tempdir().unwrap();
+        let service = plain_service(tmp.path()).await;
+        let session = automated_session(&service);
+        let refactor = crate::code::refactor::TOOL_NAME;
+        let turn = turn_tools(&service, &session, None).await;
+        assert!(!turn.registry.has(refactor), "the turn runs on a copy");
+
+        service.tools.register(named("tracker.create_issue"));
+        assert!(!turn.registry.has("tracker.create_issue"));
+        let taken = turn
+            .registry
+            .adopt(&["tracker.create_issue".into(), refactor.into()]);
+        assert_eq!(taken, ["tracker.create_issue"]);
+        assert!(!turn.registry.has(refactor));
     }
 
     #[tokio::test]
