@@ -47,6 +47,8 @@ pub(super) struct BreakerRun {
     budgets: Vec<Budget>,
     states: HashMap<String, pure::State>,
     rules: Rules,
+    /// What the hub calls its agents, as last told.
+    names: HashMap<String, String>,
 }
 
 /// What a running session's breaker has for it in this run.
@@ -114,6 +116,21 @@ impl BreakerOf {
     }
 }
 
+/// Reads what each local agent spent, every billing counted.
+pub trait AgentSpend: Send + Sync {
+    fn spent(&self, from: DateTime<Utc>, to: DateTime<Utc>) -> eyre::Result<Vec<(String, Used)>>;
+}
+
+/// Whether an agent's next turn may run, by its budgets.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AgentVerdict {
+    Proceed,
+    /// Near or over a budget that only warns: tell the person.
+    Warn(String),
+    /// Held: its turns are refused until the person says Continue.
+    Held(String),
+}
+
 /// A breaker as Desk shows it.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -169,15 +186,6 @@ pub struct BudgetPatch {
     pub amount: Option<f64>,
     pub warn_at: Option<f64>,
     pub on_exceed: Option<OnExceed>,
-}
-
-/// The scopes this hub enforces: sessions' and the totals. Agents' come
-/// with the hub's cost governor reading them.
-fn enforced(scope: &BudgetScope) -> bool {
-    match scope {
-        BudgetScope::Desk | BudgetScope::EachSession | BudgetScope::Session(_) => true,
-        BudgetScope::EachAgent | BudgetScope::Agent(_) => false,
-    }
 }
 
 /// What the sessions of `pool` spent, of each session's `spent`: every
@@ -286,7 +294,14 @@ impl Desk {
                 .view(*id)
                 .map(|v| v.label().to_string())
                 .unwrap_or_else(|_| "A session".into()),
-            BreakerOf::Agent(id) => id.clone(),
+            BreakerOf::Agent(id) => self
+                .0
+                .breakers
+                .lock()
+                .names
+                .get(id)
+                .cloned()
+                .unwrap_or_else(|| id.clone()),
             BreakerOf::Pool(Pool::Desk) => "Desk".into(),
             BreakerOf::Pool(Pool::Group(g)) => {
                 let st = self.0.state.lock();
@@ -428,9 +443,9 @@ impl Desk {
 
     /// Folds `signal` into `subject`'s breaker, keeps it, and does what it
     /// decides.
-    fn breaker_signal(&self, subject: &str, signal: Signal, by: Option<&By>) {
+    fn breaker_signal(&self, subject: &str, signal: Signal, by: Option<&By>) -> Vec<Step> {
         let Some(held) = BreakerOf::parse(subject) else {
-            return;
+            return Vec::new();
         };
         let now = Utc::now();
         let (before, after, steps) = {
@@ -450,7 +465,7 @@ impl Desk {
             (before, after, steps)
         };
         if before == after {
-            return;
+            return steps;
         }
         let store = std::sync::Arc::clone(&self.0.store);
         let (key, kept) = (subject.to_string(), after.clone());
@@ -469,6 +484,7 @@ impl Desk {
                 });
             }
         }
+        steps
     }
 
     fn subject_party(&self, held: &BreakerOf, name: &str) -> Party {
@@ -744,11 +760,7 @@ impl Desk {
         let (budgets, any_held) = {
             let run = self.0.breakers.lock();
             (
-                run.budgets
-                    .iter()
-                    .filter(|b| enforced(&b.scope))
-                    .cloned()
-                    .collect::<Vec<_>>(),
+                run.budgets.to_vec(),
                 run.states.values().any(pure::State::held),
             )
         };
@@ -764,6 +776,7 @@ impl Desk {
             Some(u) => u,
             None => return,
         };
+        let agents = self.agents_by_period(&budgets, now, tz).await;
         let groups: HashMap<Uuid, Option<String>> = {
             let st = self.0.state.lock();
             st.records
@@ -852,7 +865,7 @@ impl Desk {
                 .into_iter()
                 .map(|b| {
                     let mut total = sessions_used(&pool, used.get(&b.period), &groups);
-                    total.add(self.agents_used(&pool, b.period, now));
+                    total.add(self.agents_used(&pool, b.period, &agents));
                     standing(b, total.of(b.unit))
                 })
                 .collect();
@@ -860,10 +873,149 @@ impl Desk {
         }
     }
 
-    /// What the local agents spent toward `pool` in `period`: counted with
-    /// the hub's agent spend, once it is installed.
-    fn agents_used(&self, _pool: &Pool, _period: Period, _now: DateTime<Utc>) -> Used {
-        Used::default()
+    /// What the local agents spent toward `pool` in `period`.
+    fn agents_used(
+        &self,
+        pool: &Pool,
+        period: Period,
+        agents: &HashMap<Period, HashMap<String, Used>>,
+    ) -> Used {
+        let mut total = Used::default();
+        let Some(spent) = agents.get(&period) else {
+            return total;
+        };
+        for (agent, u) in spent {
+            let counts = match pool {
+                Pool::Desk => true,
+                Pool::Group(g) => {
+                    self.group_of_item(&super::local_agent_item(agent))
+                        .as_deref()
+                        == Some(g)
+                }
+            };
+            if counts {
+                total.add(*u);
+            }
+        }
+        total
+    }
+
+    /// Each local agent's spend from the start of every period `budgets`
+    /// use, every billing counted (a budget the person sets is about use):
+    /// none until the hub says how to read it.
+    async fn agents_by_period(
+        &self,
+        budgets: &[Budget],
+        now: DateTime<Utc>,
+        tz: chrono_tz::Tz,
+    ) -> HashMap<Period, HashMap<String, Used>> {
+        let Some(reader) = self.0.agent_spend.lock().clone() else {
+            return HashMap::new();
+        };
+        let mut periods: Vec<Period> = budgets.iter().map(|b| b.period).collect();
+        periods.sort();
+        periods.dedup();
+        let mut out = HashMap::new();
+        for p in periods {
+            let reader = std::sync::Arc::clone(&reader);
+            let from = budget::window_start(p, now, tz);
+            match tokio::task::spawn_blocking(move || reader.spent(from, now)).await {
+                Ok(Ok(spent)) => {
+                    out.insert(p, spent.into_iter().collect());
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!(error = format!("{e:#}"), "couldn't read agents' spend")
+                }
+                Err(e) => tracing::warn!(error = %e, "couldn't read agents' spend"),
+            }
+        }
+        out
+    }
+
+    /// Reads local agents' spend with `reader` from now on: the hub's
+    /// telemetry.
+    pub fn spend_agents_with(&self, reader: std::sync::Arc<dyn AgentSpend>) {
+        *self.0.agent_spend.lock() = Some(reader);
+    }
+
+    /// The budgets that apply to the agent `id`: its own, else its group's
+    /// default, else the ungrouped one.
+    pub fn agent_budgets(&self, id: &str) -> Vec<Budget> {
+        let group = self.group_of_item(&super::local_agent_item(id));
+        let run = self.0.breakers.lock();
+        budget::applying(
+            &run.budgets,
+            &Subject::Agent {
+                id,
+                group: group.as_deref(),
+            },
+        )
+        .into_iter()
+        .cloned()
+        .collect()
+    }
+
+    /// Folds where the agent `id` (called `name`) stands against its
+    /// budgets into its breaker: whether its next turn may run, and what to
+    /// tell the person if it is near or over.
+    ///
+    /// A `preflight` (a scheduled run asking first) holds or lets go as the
+    /// turn itself would, but says no warning: that is the turn's to say.
+    pub fn agent_stand(
+        &self,
+        id: &str,
+        name: &str,
+        standings: Vec<Standing>,
+        preflight: bool,
+    ) -> AgentVerdict {
+        self.0
+            .breakers
+            .lock()
+            .names
+            .insert(id.to_string(), name.to_string());
+        let subject = agent_subject(id);
+        if preflight {
+            let state = self
+                .0
+                .breakers
+                .lock()
+                .states
+                .get(&subject)
+                .cloned()
+                .unwrap_or_default();
+            let (_, steps) = pure::step(state, Signal::Spend(standings.clone()), Utc::now());
+            if steps
+                .iter()
+                .any(|s| matches!(s, Step::Hold { .. } | Step::Clear))
+            {
+                self.breaker_signal(&subject, Signal::Spend(standings), None);
+            }
+            return match self.agent_held(id) {
+                Some(why) => AgentVerdict::Held(why),
+                None => AgentVerdict::Proceed,
+            };
+        }
+        let steps = self.breaker_signal(&subject, Signal::Spend(standings.clone()), None);
+        if let Some(why) = self.agent_held(id) {
+            return AgentVerdict::Held(why);
+        }
+        let steered = steps.iter().any(|s| matches!(s, Step::Steer { .. }));
+        match budget::tightest(standings).filter(|_| steered) {
+            Some(st) => AgentVerdict::Warn(match st.status {
+                budget::Status::Over => format!(
+                    "{name} is over its {} budget ({}). The budget only warns.",
+                    st.period.words(),
+                    st.amounts()
+                ),
+                budget::Status::Warn | budget::Status::Under => format!(
+                    "{name} has used {} of its {} budget ({}).",
+                    st.percent(),
+                    st.period.words(),
+                    st.amounts()
+                ),
+            }),
+            None => AgentVerdict::Proceed,
+        }
     }
 
     /// Each session's spend from the start of every period `budgets` use.
@@ -1022,6 +1174,7 @@ impl Desk {
             .used_by_period(&budgets, now, tz)
             .await
             .ok_or_else(|| DeskError::Internal(eyre::eyre!("couldn't sum the ledger")))?;
+        let agents = self.agents_by_period(&budgets, now, tz).await;
         let groups: HashMap<Uuid, Option<String>> = {
             let st = self.0.state.lock();
             st.records
@@ -1048,6 +1201,13 @@ impl Desk {
                         .copied()
                         .unwrap_or_default()
                 };
+                let agent_spent = |id: &str| {
+                    agents
+                        .get(&b.period)
+                        .and_then(|m| m.get(id))
+                        .copied()
+                        .unwrap_or_default()
+                };
                 let standing = match &b.scope {
                     BudgetScope::Session(id) => {
                         Some(budget::standing_of(b, spent(id).of(b.unit), from, to))
@@ -1055,7 +1215,7 @@ impl Desk {
                     BudgetScope::Desk => {
                         let pool = b.group.clone().map_or(Pool::Desk, Pool::Group);
                         let mut total = sessions_used(&pool, of_period, &groups);
-                        total.add(self.agents_used(&pool, b.period, now));
+                        total.add(self.agents_used(&pool, b.period, &agents));
                         Some(budget::standing_of(b, total.of(b.unit), from, to))
                     }
                     BudgetScope::EachSession => {
@@ -1070,7 +1230,18 @@ impl Desk {
                                 .then(|| budget::standing_of(b, spent(id).of(b.unit), from, to))
                         }))
                     }
-                    BudgetScope::EachAgent | BudgetScope::Agent(_) => None,
+                    BudgetScope::Agent(id) => {
+                        let u = agent_spent(id);
+                        Some(budget::standing_of(b, u.of(b.unit), from, to))
+                    }
+                    BudgetScope::EachAgent => budget::tightest(
+                        agents
+                            .get(&b.period)
+                            .into_iter()
+                            .flatten()
+                            .filter(|(id, _)| self.agent_budgets(id).iter().any(|a| a.id == b.id))
+                            .map(|(_, u)| budget::standing_of(b, u.of(b.unit), from, to)),
+                    ),
                 };
                 BudgetView {
                     budget: b.clone(),
@@ -1087,11 +1258,6 @@ impl Desk {
 
     fn check_new(&self, b: &Budget) -> Result<(), DeskError> {
         budget::check(b).map_err(DeskError::Invalid)?;
-        if !enforced(&b.scope) {
-            return Err(DeskError::Invalid(
-                "this hub doesn't hold agents to budgets yet".into(),
-            ));
-        }
         if let Some(g) = &b.group {
             if !self.0.state.lock().layout.groups.iter().any(|x| x.id == *g) {
                 return Err(DeskError::Invalid(format!("there is no group {g:?}")));

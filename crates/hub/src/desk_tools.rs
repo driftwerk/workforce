@@ -326,7 +326,7 @@ impl Tool for DeskTool {
             Verb::Wait => "Wait until a session finishes its turn, needs an answer, or stops (default 10 minutes, at most 30). Returns its state either way.",
             Verb::Approve => "Answer a session's pending approval (from desk.read's pending.id) with allow or deny. Only for approvals the person asked you to handle.",
             Verb::Stop => "Stop a running session. Its conversation is kept and can be resumed in Desk. A session the person started in a Desk terminal can't be stopped (the shell is theirs): interrupt it instead.",
-            Verb::Budget => "The person's spend budgets on Desk, set when they ask. action=list shows each budget with where it stands, and what Desk's breaker holds. action=set sets one (one for the same scope, group, period and unit is replaced): scope is desk (everything together), each_session (each session without its own) or session:<id>; group limits it to a sidebar group's; period five_hours, day, week or month; unit usd (default) or tokens; warn_at between 0 and 1 (default 0.8); on_exceed pause (default: the session finishes its turn, then waits for the person; agents can't start new sessions while a total is held) or warn. action=remove removes budget_id. Only the person can let something held go on, on Desk's Floor.",
+            Verb::Budget => "The person's spend budgets on Desk, set when they ask. action=list shows each budget with where it stands, and what Desk's breaker holds. action=set sets one (one for the same scope, group, period and unit is replaced): scope is desk (everything together), each_session (each session without its own), session:<id>, each_agent (each agent without its own) or agent:<agent id>; group limits it to a sidebar group's; period five_hours, day, week or month; unit usd (default) or tokens; warn_at between 0 and 1 (default 0.8); on_exceed pause (default: the session finishes its turn, then waits for the person; an agent's next turns wait; agents can't start new sessions while a total is held) or warn. action=remove removes budget_id. Only the person can let something held go on, on Desk's Floor.",
             Verb::Interrupt => "End the turn a working session is on, as the person pressing Esc in its terminal would. The session and its terminal keep running, and a session the person started in a Desk terminal can be interrupted too; the shell stays theirs. Does nothing to a session that isn't working.",
         }
     }
@@ -380,7 +380,7 @@ impl Tool for DeskTool {
                 "type": "object",
                 "properties": {
                     "action": { "type": "string", "enum": ["list", "set", "remove"] },
-                    "scope": { "type": "string", "description": "desk, each_session, or session:<id>" },
+                    "scope": { "type": "string", "description": "desk, each_session, session:<id>, each_agent, or agent:<agent id>" },
                     "group": { "type": "string", "description": "A sidebar group's id, for that group's budget" },
                     "period": { "type": "string", "enum": ["five_hours", "day", "week", "month"] },
                     "unit": { "type": "string", "enum": ["usd", "tokens"] },

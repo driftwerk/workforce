@@ -1926,12 +1926,30 @@ impl Scheduler {
                 // FAILURE (feeding the consecutive-failure auto-disable)
                 // instead of delivering the same refusal to its channel on
                 // every fire. `process_message` still backstops this.
-                if let crate::cost_governor::Admission::Deny(reason) = service
+                match service
                     .cost_governor
-                    .admit_turn(service.agent_id.as_str(), job.effective_billing_identity())
+                    .preflight(service.agent_id.as_str(), job.effective_billing_identity())
                 {
-                    warn!(job_id = %job.id, name = %job.name, %reason, "Job run denied by budget");
-                    return self.finish_record(job, started_at, start, false, reason, false);
+                    crate::cost_governor::Admission::Deny(reason) => {
+                        warn!(job_id = %job.id, name = %job.name, %reason, "Job run denied by budget");
+                        return self.finish_record(job, started_at, start, false, reason, false);
+                    }
+                    // The person's budget on Desk holds the agent: the job
+                    // waits, it isn't failing. A skip, never counted toward
+                    // the auto-disable, and told nowhere (the Floor asks).
+                    crate::cost_governor::Admission::Held(reason) => {
+                        info!(job_id = %job.id, name = %job.name, %reason, "Job run held by the person's budget");
+                        return self.finish_record(
+                            job,
+                            started_at,
+                            start,
+                            true,
+                            format!("{SKIPPED_PREFIX} held by Desk's breaker: {reason}"),
+                            true,
+                        );
+                    }
+                    crate::cost_governor::Admission::Proceed
+                    | crate::cost_governor::Admission::Warn(_) => {}
                 }
 
                 // Always deliver to DM via open_conversation for reliability.
@@ -3157,6 +3175,61 @@ mod tests {
 
     fn suspended_names(service: &AgentService) -> impl Fn(&str) -> bool + '_ {
         |person| service.suspended(person).is_some()
+    }
+
+    /// The person's budget on Desk holding every agent, while `on`.
+    struct HeldByBudget(std::sync::atomic::AtomicBool);
+
+    impl crate::cost_governor::Ceilings for HeldByBudget {
+        fn budgets(&self, _: &str) -> Vec<workforce_core::budget::Budget> {
+            Vec::new()
+        }
+        fn held(&self, _: &str) -> Option<String> {
+            self.0
+                .load(std::sync::atomic::Ordering::SeqCst)
+                .then(|| "Atlas is at 104% of its day budget.".to_string())
+        }
+        fn stand(
+            &self,
+            agent: &str,
+            _: Vec<workforce_core::budget::Standing>,
+            _: bool,
+        ) -> crate::cost_governor::Verdict {
+            match self.held(agent) {
+                Some(why) => crate::cost_governor::Verdict::Held(why),
+                None => crate::cost_governor::Verdict::Proceed,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn an_hourly_job_through_a_six_hour_budget_hold_is_skipped_and_stays_on() {
+        let service = test_service().await;
+        let held = Arc::new(HeldByBudget(std::sync::atomic::AtomicBool::new(true)));
+        service.cost_governor.use_ceilings(held.clone());
+        let sched = Arc::new(Scheduler::new(Arc::clone(&service)));
+        let id = sched
+            .add_job("hourly digest", hourly(), turn_payload())
+            .await
+            .unwrap();
+        sched.set_ready();
+        for _ in 0..6 {
+            for job in sched.jobs.write().await.iter_mut() {
+                job.next_run = Some(Utc::now() - chrono::Duration::seconds(1));
+            }
+            sched.tick().await;
+        }
+        let runs = sched.run_history().await;
+        assert_eq!(runs.len(), 6);
+        assert!(
+            runs.iter()
+                .all(|r| r.success && r.output.starts_with(SKIPPED_PREFIX)),
+            "{runs:?}"
+        );
+        assert_eq!(outcomes(&runs, 6).skipped, 6);
+        let job = sched.get_job(&id).await.unwrap();
+        assert!(job.enabled, "a held job waits; it isn't failing");
+        assert_eq!(job.delivery_failures, 0);
     }
 
     #[tokio::test]

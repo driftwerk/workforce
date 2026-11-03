@@ -621,6 +621,21 @@ pub async fn mount(
     if DESK.set(desk.clone()).is_err() {
         eyre::bail!("desk sessions started twice");
     }
+    // The person's budgets reach agents through the cost governor, and
+    // agents' use counts toward Desk's totals: only on a hub running Desk.
+    let telemetry = state.telemetry_store.clone().or_else(|| {
+        state
+            .registry
+            .default_agent()
+            .map(|s| Arc::clone(&s.telemetry_store))
+    });
+    if let Some(telemetry) = telemetry {
+        desk.spend_agents_with(Arc::new(crate::desk_ceilings::HubAgentSpend(telemetry)));
+    }
+    crate::cost_governor::install_ceilings(Arc::new(crate::desk_ceilings::DeskCeilings {
+        desk: desk.clone(),
+        registry: Arc::clone(&state.registry),
+    }));
     let computer = desk.computer();
     crate::desk_computer::prune_daily(computer.clone(), cancel_crew.clone());
     crate::desk_computer::install(computer, Arc::new(config.clone()));

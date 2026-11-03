@@ -284,17 +284,12 @@ async fn a_desk_total_holds_agents_new_starts_never_the_persons_and_never_runnin
 }
 
 #[tokio::test]
-async fn a_budget_for_a_group_that_isnt_there_or_for_agents_here_is_refused() {
+async fn a_budget_for_a_group_that_isnt_there_is_refused() {
     with_test_pool(build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
         let d = desk(pool, dir.path()).await;
         let mut b = budget(BudgetScope::Desk, 5.0);
         b.group = Some("nowhere".into());
-        assert!(matches!(
-            d.put_budget(b, By::you()).await,
-            Err(DeskError::Invalid(_))
-        ));
-        let b = budget(BudgetScope::Agent("atlas".into()), 5.0);
         assert!(matches!(
             d.put_budget(b, By::you()).await,
             Err(DeskError::Invalid(_))
@@ -410,6 +405,119 @@ async fn no_one_but_the_person_resumes_or_restarts_a_held_session() {
             Err(DeskError::Conflict(_))
         ));
         assert_eq!(d.breaker_needs().len(), 1, "still held");
+    })
+    .await;
+}
+
+/// Two agents' use, every billing.
+struct Agents;
+
+impl super::AgentSpend for Agents {
+    fn spent(
+        &self,
+        _: chrono::DateTime<Utc>,
+        _: chrono::DateTime<Utc>,
+    ) -> eyre::Result<Vec<(String, crate::budget_store::Used)>> {
+        Ok(vec![(
+            "atlas".into(),
+            crate::budget_store::Used {
+                tokens: 10_000,
+                usd: 9.0,
+            },
+        )])
+    }
+}
+
+#[tokio::test]
+async fn an_agent_over_its_budget_has_its_next_turns_held_until_continue() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        assert!(d.agent_budgets("atlas").is_empty());
+        let each = d
+            .put_budget(budget(BudgetScope::EachAgent, 20.0), By::you())
+            .await
+            .unwrap();
+        let own = d
+            .put_budget(budget(BudgetScope::Agent("atlas".into()), 8.0), By::you())
+            .await
+            .unwrap();
+        assert_eq!(d.agent_budgets("atlas"), std::slice::from_ref(&own));
+        assert_eq!(d.agent_budgets("scout"), [each]);
+        let now = Utc::now();
+        let over = |used| {
+            vec![workforce_core::budget::standing_of(
+                &own,
+                used,
+                now - chrono::Duration::hours(1),
+                now + chrono::Duration::hours(1),
+            )]
+        };
+        // A scheduled run asking first says no warning, and leaves it for the turn.
+        assert_eq!(d.agent_stand("atlas", "Atlas", over(6.6), true), super::AgentVerdict::Proceed);
+        assert!(matches!(d.agent_stand("atlas", "Atlas", over(6.6), false), super::AgentVerdict::Warn(w) if w == "Atlas has used 82% of its day budget ($6.60 of $8)."));
+        assert_eq!(d.agent_stand("atlas", "Atlas", over(7.0), false), super::AgentVerdict::Proceed, "told once");
+        let super::AgentVerdict::Held(why) = d.agent_stand("atlas", "Atlas", over(8.4), false) else {
+            panic!("over its budget")
+        };
+        assert!(why.starts_with("Atlas is at 105% of its day budget ($8.40 of $8)."), "{why}");
+        let needs = d.breaker_needs();
+        assert_eq!((needs[0].who.name.as_str(), needs[0].id.as_str()), ("Atlas", "breaker:agent:atlas"));
+        assert!(d.agent_held("atlas").is_some());
+        d.breaker_continue(&super::agent_subject("atlas"), By::you()).unwrap();
+        assert!(d.agent_held("atlas").is_none());
+        assert_eq!(d.agent_stand("atlas", "Atlas", over(9.0), false), super::AgentVerdict::Proceed);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn agents_use_counts_toward_desks_total() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        d.spend_agents_with(std::sync::Arc::new(Agents));
+        d.put_budget(budget(BudgetScope::Desk, 10.0), By::you())
+            .await
+            .unwrap();
+        let view = d.budgets_view().await.unwrap();
+        assert_eq!(view.budgets[0].standing.as_ref().unwrap().used, 9.0);
+        d.breaker_spend(None).await;
+        assert_eq!(d.breaker_needs().len(), 1, "at 90%, new starts are held");
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn an_agents_hold_lapses_when_its_period_ends() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let own = d
+            .put_budget(budget(BudgetScope::Agent("atlas".into()), 8.0), By::you())
+            .await
+            .unwrap();
+        let ended = Utc::now() - chrono::Duration::minutes(1);
+        let at = |used, from: chrono::DateTime<Utc>, to| {
+            vec![workforce_core::budget::standing_of(&own, used, from, to)]
+        };
+        // Held over a period that has since ended.
+        assert!(matches!(
+            d.agent_stand(
+                "atlas",
+                "Atlas",
+                at(9.0, ended - chrono::Duration::days(1), ended),
+                true
+            ),
+            super::AgentVerdict::Held(_)
+        ));
+        let today = (ended, ended + chrono::Duration::days(1));
+        assert_eq!(
+            d.agent_stand("atlas", "Atlas", at(0.5, today.0, today.1), true),
+            super::AgentVerdict::Proceed,
+            "a new day, under its budget"
+        );
+        assert!(d.agent_held("atlas").is_none());
     })
     .await;
 }
