@@ -661,9 +661,12 @@ impl Capability {
                 "system.install_external_skill",
                 "system.uninstall_external_skill",
             ],
-            Capability::ConfigManage => {
-                &["system.set_model", "system.set_provider", "pricing.update"]
-            }
+            Capability::ConfigManage => &[
+                "system.set_model",
+                "system.set_provider",
+                "pricing.update",
+                "desk.budget",
+            ],
             Capability::HeartbeatManage => &[
                 "heartbeat.create",
                 "heartbeat.update",
@@ -939,7 +942,9 @@ pub fn tool_capability(tool: &str, input: &serde_json::Value) -> Option<Capabili
         | "system.set_failover_chain"
         | "system.set_max_tokens"
         | "system.set_max_rounds"
-        | "pricing.update" => Some(Capability::ConfigManage),
+        | "pricing.update"
+        // The person's budgets on Desk: spend limits, like the hub's own.
+        | "desk.budget" => Some(Capability::ConfigManage),
         // Its own config.toml, read redacted by anyone, changed like the
         // setters above; an action it does not know is treated as a change.
         "system.config" => match input.get("action").and_then(|a| a.as_str()) {
@@ -1732,6 +1737,7 @@ mod tests {
             ("system.set_max_tokens", Capability::ConfigManage),
             ("system.set_max_rounds", Capability::ConfigManage),
             ("pricing.update", Capability::ConfigManage),
+            ("desk.budget", Capability::ConfigManage),
             // Heartbeat management — own delegable capability, no per-user owner.
             ("heartbeat.create", Capability::HeartbeatManage),
             ("heartbeat.update", Capability::HeartbeatManage),

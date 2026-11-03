@@ -426,6 +426,7 @@ pub fn label_of(p: &Party, hop: i16) -> String {
         }
         PartyKind::You => "The person".to_string(),
         PartyKind::Agent => format!("{} (an agent)", p.name),
+        PartyKind::Desk => p.name.clone(),
     }
 }
 

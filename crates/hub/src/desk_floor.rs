@@ -317,6 +317,7 @@ fn routed_need(row: &PendingApproval, detail: &str, place: Place, name: String) 
             engine: None,
         },
         ask: crew::approval_summary(&row.tool_name, detail),
+        why: None,
         options: None,
         since: row.created_at,
         place,
@@ -413,6 +414,7 @@ pub(crate) fn config_need(
             engine: None,
         },
         ask,
+        why: None,
         options: None,
         since,
         place: Place::Dm,
@@ -454,11 +456,20 @@ fn config_needs(state: &GatewayState, caller: &FloorCaller) -> Vec<Need> {
         .collect()
 }
 
+/// What Desk's breaker holds, for the person who holds the hub: only they
+/// let it go on.
+fn breaker_needs(sources: &Sources, caller: &FloorCaller) -> Vec<Need> {
+    match (sources.desk)() {
+        Some(desk) if caller.personal => desk.breaker_needs(),
+        _ => Vec::new(),
+    }
+}
+
 /// The questions sessions asked on the Desk's lines that wait on the
 /// person who holds it.
 fn line_needs(sources: &Sources, caller: &FloorCaller) -> Vec<Need> {
-    match (caller.personal, (sources.desk)()) {
-        (true, Some(desk)) => desk.line_needs(),
+    match (sources.desk)() {
+        Some(desk) if caller.personal => desk.line_needs(),
         _ => Vec::new(),
     }
 }
@@ -479,6 +490,7 @@ fn needs_of(
             .into_iter()
             .chain(routed_needs(state, caller, now)?)
             .chain(config_needs(state, caller))
+            .chain(breaker_needs(sources, caller))
             .chain(line_needs(sources, caller))
             .collect(),
     ))
@@ -749,6 +761,26 @@ pub(crate) async fn answer(
                 Err(DeskError::NotFound) => Ok(Err(Unanswered::Unknown)),
                 Err(DeskError::Conflict(_)) => Ok(Err(Unanswered::AlreadyAnswered)),
                 Err(DeskError::Invalid(_)) => Ok(Err(Unanswered::NotOffered)),
+                Err(e) => Err(e.into()),
+            }
+        }
+        DecideRef::Breaker { subject } => {
+            // The person's alone: no agent or overseer path reaches here.
+            if !caller.personal {
+                return Ok(Err(Unanswered::NotYours));
+            }
+            let Some(desk) = (sources.desk)() else {
+                return Ok(Err(Unanswered::Unknown));
+            };
+            let answered = match choice {
+                Choice::Allow => desk.breaker_continue(subject, By::you()),
+                Choice::Deny => desk.breaker_keep(subject),
+                Choice::AllowForSession | Choice::Cancel => return Ok(Err(Unanswered::NotOffered)),
+            };
+            match answered {
+                Ok(_) => Ok(Ok(())),
+                Err(DeskError::NotFound) => Ok(Err(Unanswered::Unknown)),
+                Err(DeskError::Conflict(_)) => Ok(Err(Unanswered::AlreadyAnswered)),
                 Err(e) => Err(e.into()),
             }
         }

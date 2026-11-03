@@ -40,12 +40,12 @@ use crate::activity_log::{query_activities_postgres, ActivityQuery, ActivityReco
 use crate::admin::{AuditEntry, AuditOutcome};
 use crate::cost::TokenHistoryPoint;
 use crate::persistence::{
-    tier_column, AgentModelPreference, AgentUsageSummary, CacheStatusEntry, CostDetailFilter,
-    CostDetailPage, CostDetailRow, CostRecord, CostRecordView, CostScope, CostSplitRow,
-    DailyUsageRow, EfficiencyTrendPoint, InstanceFilter, MeteredSpend, ModelComparison,
-    PolicyProposalRow, RoundStats, RoundTelemetryRecord, ScheduledJobHistoryPage, ScheduledJobRow,
-    StoredModelPricing, TaskHistoryEntry, TaskHistoryFilter, TaskHistoryPage, TaskRow,
-    TaskTelemetryRecord, TaskTrace, TaskUsageRow, TicketCostSummary, ToolCostEntry,
+    tier_column, AgentModelPreference, AgentUsageSummary, AgentUse, CacheStatusEntry,
+    CostDetailFilter, CostDetailPage, CostDetailRow, CostRecord, CostRecordView, CostScope,
+    CostSplitRow, DailyUsageRow, EfficiencyTrendPoint, InstanceFilter, MeteredSpend,
+    ModelComparison, PolicyProposalRow, RoundStats, RoundTelemetryRecord, ScheduledJobHistoryPage,
+    ScheduledJobRow, StoredModelPricing, TaskHistoryEntry, TaskHistoryFilter, TaskHistoryPage,
+    TaskRow, TaskTelemetryRecord, TaskTrace, TaskUsageRow, TicketCostSummary, ToolCostEntry,
     ToolTelemetryRecord, ToolTurn, WorkflowInstanceRow,
 };
 use crate::postgres::{
@@ -2677,6 +2677,30 @@ impl TelemetryStore for PostgresTelemetryStore {
         })
     }
 
+    fn agent_use(&self, from: DateTime<Utc>, to: DateTime<Utc>) -> Result<Vec<AgentUse>> {
+        self.block_on(async move {
+            let conn = self.pool.get().await?;
+            let rows = conn
+                .query(
+                    "SELECT agent_id, COALESCE(SUM(cost_usd), 0)::float8,
+                       COALESCE(SUM(input_tokens + output_tokens + cache_creation_input_tokens
+                         + cache_read_input_tokens), 0)::int8
+                     FROM cost_records WHERE timestamp >= $1 AND timestamp <= $2
+                     GROUP BY agent_id",
+                    &[&from, &to],
+                )
+                .await?;
+            Ok(rows
+                .into_iter()
+                .map(|r| AgentUse {
+                    agent_id: r.get(0),
+                    cost_usd: r.get(1),
+                    tokens: u64::try_from(r.get::<_, i64>(2)).unwrap_or(0),
+                })
+                .collect())
+        })
+    }
+
     fn metered_spend(&self, from: DateTime<Utc>, to: DateTime<Utc>) -> Result<Vec<MeteredSpend>> {
         self.block_on(async move {
             let conn = self.pool.get().await?;
@@ -3597,6 +3621,39 @@ pub(crate) mod tests {
                 .total_cost(Utc::now() - chrono::Duration::hours(1), Utc::now())
                 .unwrap();
             assert!((total - 4.0).abs() < 1e-9, "{total}");
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pg_agent_use_counts_every_billing_and_every_token() {
+        with_embedded_pg(|store| async move {
+            let row = |agent: &str, billing, cost_usd| CostRecord {
+                agent_id: agent.into(),
+                model: "m".into(),
+                input_tokens: 10,
+                output_tokens: 5,
+                cache_read_input_tokens: 100,
+                cost_usd,
+                billing,
+                ..Default::default()
+            };
+            for record in [
+                row("allan", crate::subscription::Billing::Metered, 2.0),
+                row("allan", crate::subscription::Billing::Subscription, 3.0),
+                row("scout", crate::subscription::Billing::Metered, 1.0),
+            ] {
+                store.record_cost(&record).unwrap();
+            }
+            let mut used = store
+                .agent_use(Utc::now() - chrono::Duration::hours(1), Utc::now())
+                .unwrap();
+            used.sort_by(|a, b| a.agent_id.cmp(&b.agent_id));
+            let used: Vec<(&str, f64, u64)> = used
+                .iter()
+                .map(|u| (u.agent_id.as_str(), u.cost_usd, u.tokens))
+                .collect();
+            assert_eq!(used, [("allan", 5.0, 230), ("scout", 1.0, 115)]);
         })
         .await;
     }

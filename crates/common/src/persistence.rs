@@ -1054,6 +1054,29 @@ impl SqliteStore {
         })
     }
 
+    pub fn agent_use(&self, from: DateTime<Utc>, to: DateTime<Utc>) -> Result<Vec<AgentUse>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| eyre::eyre!("Lock poisoned: {}", e))?;
+        let mut stmt = conn.prepare(
+            "SELECT agent_id, COALESCE(SUM(cost_usd), 0), \
+               COALESCE(SUM(input_tokens + output_tokens + cache_creation_input_tokens \
+                 + cache_read_input_tokens), 0) \
+             FROM cost_records WHERE timestamp >= ?1 AND timestamp <= ?2 GROUP BY agent_id",
+        )?;
+        let rows = stmt
+            .query_map(params![from.to_rfc3339(), to.to_rfc3339()], |row| {
+                Ok(AgentUse {
+                    agent_id: row.get(0)?,
+                    cost_usd: row.get(1)?,
+                    tokens: u64::try_from(row.get::<_, i64>(2)?).unwrap_or(0),
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     pub fn metered_spend(
         &self,
         from: DateTime<Utc>,
@@ -3576,6 +3599,15 @@ pub struct MeteredSpend {
     pub agent_id: String,
     pub identity_id: Option<String>,
     pub cost_usd: f64,
+}
+
+/// What one agent used in a window, every billing counted: the dollars
+/// (a subscription call's at their estimated value) and every token.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AgentUse {
+    pub agent_id: String,
+    pub cost_usd: f64,
+    pub tokens: u64,
 }
 
 impl CostRecord {

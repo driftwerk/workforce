@@ -127,6 +127,7 @@ struct Payload {
     agent_id: Option<String>,
     reason: Option<String>,
     background_tasks: Option<Vec<BackgroundTask>>,
+    error: Option<String>,
 }
 
 /// One entry of a `Stop`'s `background_tasks`.
@@ -177,6 +178,9 @@ pub enum Hook {
         id: Option<String>,
         /// Esc stopped it (`PostToolUseFailure` with `is_interrupt`).
         interrupt: bool,
+        /// It failed (and not by Esc): the tool, and the error's first line,
+        /// for Desk's breaker.
+        failed: Option<String>,
     },
     /// Back at its prompt with nothing on screen (`idle_prompt`).
     AtPrompt,
@@ -253,6 +257,14 @@ pub fn parse_hook(body: &[u8]) -> eyre::Result<Hook> {
         "PostToolUse" | "PostToolUseFailure" => Hook::ToolEnd {
             id: p.tool_use_id.clone(),
             interrupt: p.is_interrupt == Some(true),
+            failed: (p.hook_event_name == "PostToolUseFailure" && p.is_interrupt != Some(true))
+                .then(|| {
+                    format!(
+                        "{}: {}",
+                        tool().0,
+                        clip(p.error.as_deref().unwrap_or_default())
+                    )
+                }),
         },
         "Notification" => match p.notification_type.as_deref() {
             // An older CLI says no kind: a dialog, as it only notified then.
@@ -442,6 +454,22 @@ pub fn allow_call() -> Value {
     json!({ "hookSpecificOutput": { "hookEventName": "PreToolUse",
         "permissionDecision": "allow",
         "permissionDecisionReason": "Allowed for this session in Desk." } })
+}
+
+/// A tool call refused before it runs, with why: Claude reads the reason
+/// and carries on without it (hooks reference, PreToolUse decision
+/// control).
+pub fn deny_call(reason: &str) -> Value {
+    json!({ "hookSpecificOutput": { "hookEventName": "PreToolUse",
+        "permissionDecision": "deny",
+        "permissionDecisionReason": reason } })
+}
+
+/// Words Claude reads beside a tool call's result, in its running turn
+/// (hooks reference, "Add context for Claude": `additionalContext` on
+/// PostToolUse and PostToolUseFailure).
+pub fn context(event: &str, text: &str) -> Value {
+    json!({ "hookSpecificOutput": { "hookEventName": event, "additionalContext": text } })
 }
 
 /// No decision: Claude Code shows its own permission dialog in the terminal.
@@ -675,7 +703,8 @@ pub(crate) mod tests {
             parse_hook(post.to_string().as_bytes()).unwrap(),
             Hook::ToolEnd {
                 id: Some("toolu_q1".into()),
-                interrupt: false
+                interrupt: false,
+                failed: None,
             }
         );
         // Esc on a running tool (a turned-down question fires none).
@@ -684,7 +713,8 @@ pub(crate) mod tests {
             parse_hook(stopped).unwrap(),
             Hook::ToolEnd {
                 id: Some("toolu_b1".into()),
-                interrupt: true
+                interrupt: true,
+                failed: None,
             }
         );
         // Without questions it is no question.

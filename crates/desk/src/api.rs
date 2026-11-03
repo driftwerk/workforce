@@ -151,6 +151,90 @@ fn spend_params(p: Result<Query<SpendParams>, QueryRejection>) -> Result<SpendPa
         .map_err(|e| DeskError::Invalid(e.body_text()))
 }
 
+/// The budgets, where each stands, the breakers and their rules.
+async fn budgets(State(s): S, h: HeaderMap, Query(q): Q) -> Response {
+    guarded!(s, h, q);
+    s.desk.budgets_view().await.map(Json).into_response()
+}
+
+async fn put_budget(
+    State(s): S,
+    h: HeaderMap,
+    Query(q): Q,
+    Json(b): Json<crate::service::NewBudget>,
+) -> Response {
+    guarded!(s, h, q);
+    s.desk
+        .put_budget(b, By::you())
+        .await
+        .map(Json)
+        .into_response()
+}
+
+async fn patch_budget(
+    State(s): S,
+    h: HeaderMap,
+    Query(q): Q,
+    Path(id): Path<Uuid>,
+    Json(p): Json<crate::service::BudgetPatch>,
+) -> Response {
+    guarded!(s, h, q);
+    s.desk
+        .patch_budget(id, p, By::you())
+        .await
+        .map(Json)
+        .into_response()
+}
+
+async fn delete_budget(State(s): S, h: HeaderMap, Query(q): Q, Path(id): Path<Uuid>) -> Response {
+    guarded!(s, h, q);
+    s.desk
+        .delete_budget(id, By::you())
+        .await
+        .map(|()| StatusCode::NO_CONTENT)
+        .into_response()
+}
+
+async fn breaker_rules(
+    State(s): S,
+    h: HeaderMap,
+    Query(q): Q,
+    Json(r): Json<crate::service::Rules>,
+) -> Response {
+    guarded!(s, h, q);
+    s.desk.set_breaker_rules(r).await.map(Json).into_response()
+}
+
+#[derive(Deserialize)]
+struct BreakerBody {
+    subject: String,
+}
+
+/// The person lets what a breaker holds go on.
+async fn breaker_continue(
+    State(s): S,
+    h: HeaderMap,
+    Query(q): Q,
+    Json(b): Json<BreakerBody>,
+) -> Response {
+    guarded!(s, h, q);
+    s.desk
+        .breaker_continue(&b.subject, By::you())
+        .map(Json)
+        .into_response()
+}
+
+/// The person leaves what a breaker holds paused.
+async fn breaker_keep(
+    State(s): S,
+    h: HeaderMap,
+    Query(q): Q,
+    Json(b): Json<BreakerBody>,
+) -> Response {
+    guarded!(s, h, q);
+    s.desk.breaker_keep(&b.subject).map(Json).into_response()
+}
+
 /// What sessions spent, summed and grouped.
 async fn spend(
     State(s): S,
@@ -1062,6 +1146,14 @@ pub fn sessions_router(desk: Desk, auth: Arc<dyn Authorize>) -> Router {
         .route("/api/desk/sessions/{id}/account", post(switch_account))
         .route("/api/desk/spend", get(spend))
         .route("/api/desk/ledger", get(ledger))
+        .route("/api/desk/budgets", get(budgets).post(put_budget))
+        .route(
+            "/api/desk/budgets/{id}",
+            patch(patch_budget).delete(delete_budget),
+        )
+        .route("/api/desk/breaker/rules", axum::routing::put(breaker_rules))
+        .route("/api/desk/breakers/continue", post(breaker_continue))
+        .route("/api/desk/breakers/keep", post(breaker_keep))
         .route("/api/desk/sessions/{id}", patch(update).delete(forget))
         .route("/api/desk/sessions/closed", get(closed))
         .route("/api/desk/sessions/hidden", get(hidden))

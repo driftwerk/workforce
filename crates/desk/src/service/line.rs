@@ -420,25 +420,32 @@ impl Desk {
 
     /// Codex didn't take what was said into its turn: it goes in at the
     /// next idle instead.
-    pub(super) async fn line_steer_refused(&self, id: Uuid) {
-        let Some(row) = self.0.state.lock().lines.steered.remove(&id) else {
+    pub(super) async fn line_steer_refused(&self, id: Uuid, said: &str) {
+        // Desk's breaker steers too: only the person's own message, as it
+        // was said, goes back to the queue.
+        let Some(row) = self.0.state.lock().lines.steered.get(&id).copied() else {
             return;
         };
         let back = async {
-            let mut m = self
+            let Some(mut m) = self
                 .0
                 .store
                 .line_message(row)
                 .await?
-                .ok_or_else(|| eyre::eyre!("gone"))?;
+                .filter(|m| m.text == said)
+            else {
+                return Ok(None);
+            };
+            self.0.state.lock().lines.steered.remove(&id);
             m.delivery = Delivery::Queued;
             m.delivered_at = None;
             m.updated_at = Utc::now();
             self.0.store.put_line(&m).await?;
-            Ok::<_, eyre::Report>(m)
+            Ok::<_, eyre::Report>(Some(m))
         };
         match back.await {
-            Ok(m) => {
+            Ok(None) => {}
+            Ok(Some(m)) => {
                 self.line_announce(&m);
                 self.line_pump_later(id);
             }
@@ -1213,6 +1220,7 @@ impl Desk {
                     engine: m.from.engine,
                 },
                 ask: m.text.clone(),
+                why: m.escalation.as_ref().map(|e| e.why.clone()).filter(|w| !w.is_empty()),
                 options: m
                     .escalation
                     .as_ref()
