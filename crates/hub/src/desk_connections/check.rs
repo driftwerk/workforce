@@ -40,6 +40,9 @@ impl Services {
             http: reqwest::Client::builder()
                 .timeout(Duration::from_secs(20))
                 .user_agent("workforce-desk")
+                // A redirect would carry the key's header to another host:
+                // a Test follows none, and an answer that redirects fails.
+                .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .unwrap_or_default(),
             github_api: "https://api.github.com".into(),
@@ -68,6 +71,28 @@ pub fn address(site: &str) -> String {
         true => site.to_string(),
         false => format!("https://{site}"),
     }
+}
+
+/// Whether `url` is on this computer: `127.0.0.1`, `::1` or `localhost`.
+pub fn is_loopback_url(url: &str) -> bool {
+    url::Url::parse(url).ok().is_some_and(|u| match u.host() {
+        Some(url::Host::Domain(d)) => d.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
+    })
+}
+
+/// [`address`], refusing plain http anywhere but this computer: a key is
+/// never sent unencrypted across a network.
+fn secure_address(name: &str, site: &str) -> Result<String, Found> {
+    let address = address(site);
+    if address.starts_with("http://") && !is_loopback_url(&address) {
+        return Err(Found::Refused(format!(
+            "{name}'s address must start with https://"
+        )));
+    }
+    Ok(address)
 }
 
 /// What a service's answer said, in its own words, short.
@@ -100,6 +125,11 @@ async fn answer(
         .await
         .map_err(|e| Found::Failed(format!("{name} couldn't be reached: {}", reach(&e))))?;
     let status = response.status();
+    if status.is_redirection() {
+        return Err(Found::Failed(format!(
+            "{name} answered with a redirect to another address; check the address"
+        )));
+    }
     let body = response.text().await.unwrap_or_default();
     Ok((status, body))
 }
@@ -167,8 +197,11 @@ impl Services {
             "jira" => {
                 let (status, body) = answer(
                     "Jira",
-                    http.get(format!("{}/rest/api/3/myself", address(field(f, "site"))))
-                        .basic_auth(field(f, "email"), Some(field(f, "api_token"))),
+                    http.get(format!(
+                        "{}/rest/api/3/myself",
+                        secure_address("Jira", field(f, "site"))?
+                    ))
+                    .basic_auth(field(f, "email"), Some(field(f, "api_token"))),
                 )
                 .await?;
                 match status.is_success() {
@@ -235,7 +268,7 @@ impl Services {
                     "Metabase",
                     http.get(format!(
                         "{}/api/user/current",
-                        address(field(f, "site_url"))
+                        secure_address("Metabase", field(f, "site_url"))?
                     ))
                     .header("x-api-key", field(f, "api_key")),
                 )
@@ -374,6 +407,25 @@ mod tests {
             "https://acme.atlassian.net"
         );
         assert_eq!(address("http://127.0.0.1:9"), "http://127.0.0.1:9");
+    }
+
+    #[test]
+    fn only_this_computer_is_loopback_and_plain_http_goes_nowhere_else() {
+        assert!(is_loopback_url(
+            "http://127.0.0.1:50111/api/auth/google/callback"
+        ));
+        assert!(is_loopback_url("http://localhost:8080/cb"));
+        assert!(is_loopback_url("http://[::1]:8080/cb"));
+        assert!(!is_loopback_url(
+            "https://hub.acme.example/api/auth/google/callback"
+        ));
+        assert!(!is_loopback_url("http://127.0.0.1.acme.example/cb"));
+        assert!(secure_address("Jira", "acme.atlassian.net").is_ok());
+        assert!(secure_address("Jira", "http://127.0.0.1:9").is_ok());
+        assert!(matches!(
+            secure_address("Jira", "http://jira.acme.example"),
+            Err(Found::Refused(_))
+        ));
     }
 
     #[test]

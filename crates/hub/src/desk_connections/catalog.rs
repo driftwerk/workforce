@@ -126,12 +126,13 @@ const EMAIL_FIELDS: &[Field] = &[
         "imap.gmail.com",
         "skills/email/accounts/default/imap_host",
     ),
-    optional(plain(
+    // The loader skips an account without one.
+    plain(
         "smtp_host",
         "SMTP server",
         "smtp.gmail.com",
         "skills/email/accounts/default/smtp_host",
-    )),
+    ),
 ];
 const JIRA_FIELDS: &[Field] = &[
     plain("site", "Site", "acme.atlassian.net", "skills/jira/site"),

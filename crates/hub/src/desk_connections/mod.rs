@@ -62,14 +62,65 @@ pub struct Agent {
     pub id: String,
     pub name: String,
     pub vault: Option<Arc<Vault>>,
+    /// Its `[skills]`, as its `config.toml` has it now.
+    pub binding: Binding,
+}
+
+/// An agent's `[skills]` as "Used by" reads it: which connectors are on,
+/// and which use its own connection. AC9a's grammar, read raw here so the
+/// listing follows it on any hub version.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Binding {
+    /// `None`: every connector, as before the key existed.
+    pub enabled: Option<Vec<String>>,
+    pub own: Vec<String>,
+}
+
+impl Binding {
+    /// `[skills]` of the `config.toml` in `workspace`.
+    pub fn read(workspace: &std::path::Path) -> Self {
+        let body = std::fs::read_to_string(
+            workspace.join(workforce_common::config_files::WORKSPACE_CONFIG),
+        )
+        .unwrap_or_default();
+        let Ok(doc) = body.parse::<toml::Table>() else {
+            return Self::default();
+        };
+        let skills = doc.get("skills").and_then(toml::Value::as_table);
+        let names = |key: &str| {
+            skills
+                .and_then(|t| t.get(key))
+                .and_then(toml::Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect::<Vec<_>>()
+                })
+        };
+        Self {
+            enabled: names("enabled"),
+            own: names("own_credential").unwrap_or_default(),
+        }
+    }
+
+    fn is_on(&self, connector: &str) -> bool {
+        self.enabled
+            .as_ref()
+            .is_none_or(|e| e.iter().any(|c| c == connector))
+    }
 }
 
 /// The hub's agents.
+#[async_trait]
 pub trait Agents: Send + Sync {
     fn all(&self) -> Vec<Agent>;
     fn get(&self, id: &str) -> Option<Agent> {
         self.all().into_iter().find(|a| a.id == id)
     }
+    /// Loads `connector` again for `agent`, as `person`, so an adapter that
+    /// copied its keys when it loaded (Email) or holds them in memory
+    /// (Slack) uses what is kept now.
+    async fn reload(&self, _agent: &str, _connector: &str, _person: &str) {}
 }
 
 /// Where what a check found is kept.
@@ -184,6 +235,16 @@ pub struct Started {
     pub user_code: Option<String>,
     pub verification_uri: Option<String>,
     pub expires_in: u64,
+}
+
+/// What a disconnect left.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Disconnected {
+    /// The tier a key of this level is still kept at, if any.
+    pub still_kept: Option<VaultSource>,
+    /// What to tell the person about it.
+    pub note: Option<String>,
 }
 
 /// Where a sign-in is.
@@ -391,10 +452,18 @@ impl Connections {
                     if let Some(tier) = own {
                         connections.push(self.view(&level, tier, checked(&level)));
                     }
-                    let connection = match (own, mine) {
-                        (Some(_), _) => "own",
-                        (None, Some(_)) => "mine",
-                        (None, None) => continue,
+                    // An agent whose `[skills]` turns the connector off
+                    // doesn't use it; one set to its own connection uses
+                    // only that.
+                    if !a.binding.is_on(c.id) {
+                        continue;
+                    }
+                    let bound_own = a.binding.own.iter().any(|o| o == c.id);
+                    let connection = match (own, mine, bound_own) {
+                        (Some(_), _, _) => "own",
+                        (None, _, true) => continue,
+                        (None, Some(_), false) => "mine",
+                        (None, None, false) => continue,
                     };
                     used_by.push(UsedBy {
                         agent: a.id.clone(),
@@ -543,6 +612,7 @@ impl Connections {
                 self.keep(c, &level, person, &fields)?;
                 self.record(c, &level, person, &Found::Works { account }, true)
                     .await;
+                self.reload(c, &level, person).await;
                 self.shown(c, &level, person).await
             }
             Found::Refused(e) => Err(Refusal::TestFailed {
@@ -617,7 +687,7 @@ impl Connections {
         id: &str,
         level: &str,
         agent: Option<&str>,
-    ) -> Result<(), Refusal> {
+    ) -> Result<Disconnected, Refusal> {
         let c = Self::connector(id)?;
         let level = self.level(level, agent)?;
         let tier = self
@@ -632,7 +702,31 @@ impl Connections {
         if let Err(e) = self.statuses.forget(c.id, &level, person).await {
             warn!(connector = c.id, error = %format!("{e:#}"), "a connection's checks weren't forgotten");
         }
-        Ok(())
+        self.reload(c, &level, person).await;
+        // A key kept at another tier of this level still connects it: an
+        // older one saved for the whole hub, say.
+        let still = self.held_at(c, &level, person);
+        Ok(Disconnected {
+            still_kept: still,
+            note: still.map(|tier| match tier {
+                VaultSource::Global => format!(
+                    "A {} key saved for everyone on this hub is still kept, so agents still reach {}. Remove it from the hub's vault to disconnect it fully.",
+                    c.name, c.name
+                ),
+                _ => format!("Another {} key is still kept, so agents still reach {}.", c.name, c.name),
+            }),
+        })
+    }
+
+    /// Loads `c` again on the agents a change at `level` reaches.
+    async fn reload(&self, c: &Connector, level: &Level, person: &str) {
+        let agents: Vec<String> = match level {
+            Level::All => self.agents.all().into_iter().map(|a| a.id).collect(),
+            Level::Agent(agent) => vec![agent.clone()],
+        };
+        for agent in agents {
+            self.agents.reload(&agent, c.id, person).await;
+        }
     }
 
     /// Keeps the person's own Google OAuth client, hub-wide, where the
@@ -865,6 +959,7 @@ impl Connections {
                                 account: account.clone(),
                             };
                             self.record(c, level, person, &found, true).await;
+                            self.reload(c, level, person).await;
                             FlowState::Connected { account }
                         }
                         Err(_) => FlowState::Failed {
@@ -904,6 +999,12 @@ impl Connections {
             ));
         };
         let redirect_uri = redirect.unwrap_or_else(|| self.google_redirect.clone());
+        if !check::is_loopback_url(&redirect_uri) {
+            return Err(Refusal::Invalid(format!(
+                "Desk signs in to Google on this computer only. Set your OAuth client's redirect to {} (a Desktop app client allows it).",
+                self.google_redirect
+            )));
+        }
         let creds = OAuthClientCreds {
             client_id,
             client_secret,
@@ -1004,6 +1105,7 @@ impl Connections {
             account: account.clone(),
         };
         self.record(c, &level, person, &found, true).await;
+        self.reload(c, &level, person).await;
         self.settle(
             flow,
             FlowState::Connected {
@@ -1034,7 +1136,15 @@ pub fn installed() -> Option<Arc<Connections>> {
 /// The hub's agents, from its registry.
 struct Registry(Arc<GatewayState>);
 
+#[async_trait]
 impl Agents for Registry {
+    async fn reload(&self, agent: &str, connector: &str, person: &str) {
+        let Some(service) = self.0.registry.get(agent) else {
+            return;
+        };
+        reload_service(&service, connector, person).await;
+    }
+
     fn all(&self) -> Vec<Agent> {
         let mut agents: Vec<Agent> = self
             .0
@@ -1045,6 +1155,7 @@ impl Agents for Registry {
                 id: s.agent_id.as_str().to_string(),
                 name: crate::desk_crew::name_of(s),
                 vault: s.vault.clone(),
+                binding: Binding::read(&s.workspace),
             })
             .collect();
         agents.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
@@ -1057,7 +1168,62 @@ impl Agents for Registry {
             id: s.agent_id.as_str().to_string(),
             name: crate::desk_crew::name_of(&s),
             vault: s.vault.clone(),
+            binding: Binding::read(&s.workspace),
         })
+    }
+}
+
+/// Loads `connector` again on `service`, as `person`: Slack reconnects
+/// with what is kept now; any other connector that is loaded is unloaded
+/// and loaded from the vault again, so one whose keys are gone stays
+/// unloaded.
+pub async fn reload_service(service: &crate::serve::AgentService, connector: &str, person: &str) {
+    if connector == "slack" {
+        if let Some(reload) = service.tools.get("system.reload_slack") {
+            let ran = workforce_agent::runner::CURRENT_USER_ID
+                .scope(person.to_string(), reload.execute(json!({})))
+                .await;
+            if let Err(e) = ran {
+                warn!(error = %format!("{e:#}"), "Slack didn't reconnect after a connection changed");
+            }
+        }
+        return;
+    }
+    if let Some(vault) = service.vault.clone() {
+        reload_skill(
+            connector,
+            vault,
+            service.global_vault.clone(),
+            &service.config,
+            &service.tools,
+            &service.skill_state,
+            person,
+        );
+    }
+}
+
+/// [`reload_service`] of one loaded skill.
+pub fn reload_skill(
+    connector: &str,
+    vault: Arc<Vault>,
+    global: Option<Arc<Vault>>,
+    config: &workforce_common::settings::WorkforceConfig,
+    tools: &workforce_agent::tools::registry::ToolRegistry,
+    state: &crate::skill_state::SkillStateTracker,
+    person: &str,
+) {
+    let loaded =
+        state.is_loaded(connector) || crate::skill_loader::skill_tools_registered(connector, tools);
+    if !loaded {
+        return;
+    }
+    crate::skill_loader::unload_skill(connector, tools);
+    state.mark_unloaded(connector);
+    let reloaded = workforce_agent::runner::CURRENT_USER_ID.sync_scope(person.to_string(), || {
+        crate::skill_loader::load_and_track(connector, vault, global, config, tools, state, "vault")
+    });
+    if let Err(e) = reloaded {
+        tracing::info!(connector, error = %format!("{e:#}"), "a connector stays unloaded after its connection changed");
     }
 }
 
@@ -1243,7 +1409,7 @@ async fn disconnect(
     r.connections
         .disconnect(&person, &connector, &at.level, at.agent.as_deref())
         .await
-        .map(|()| StatusCode::NO_CONTENT)
+        .map(Json)
         .into_response()
 }
 

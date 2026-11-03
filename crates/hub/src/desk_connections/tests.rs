@@ -53,11 +53,36 @@ impl Statuses for Kept {
     }
 }
 
-struct Crew(Vec<Agent>);
+#[derive(Default)]
+struct Crew {
+    agents: Mutex<Vec<Agent>>,
+    reloads: Mutex<Vec<(String, String)>>,
+}
 
+#[async_trait]
 impl Agents for Crew {
     fn all(&self) -> Vec<Agent> {
-        self.0.clone()
+        self.agents.lock().unwrap().clone()
+    }
+    async fn reload(&self, agent: &str, connector: &str, person: &str) {
+        assert_eq!(person, SARAH);
+        self.reloads
+            .lock()
+            .unwrap()
+            .push((agent.to_string(), connector.to_string()));
+    }
+}
+
+impl Crew {
+    fn bind(&self, agent: &str, binding: Binding) {
+        for a in self.agents.lock().unwrap().iter_mut() {
+            if a.id == agent {
+                a.binding = binding.clone();
+            }
+        }
+    }
+    fn reloaded(&self) -> Vec<(String, String)> {
+        std::mem::take(&mut *self.reloads.lock().unwrap())
     }
 }
 
@@ -156,6 +181,7 @@ struct Hub {
     ben: Arc<Vault>,
     kept: Arc<Kept>,
     github: Arc<Github>,
+    crew: Arc<Crew>,
     c: Arc<Connections>,
 }
 
@@ -166,21 +192,24 @@ async fn hub() -> Hub {
     let kept = Arc::new(Kept::default());
     let github = Arc::new(Github::default());
     *github.outcome.lock().unwrap() = "token";
-    let agents = Crew(vec![
+    let crew = Arc::new(Crew::default());
+    *crew.agents.lock().unwrap() = vec![
         Agent {
             id: "allan".into(),
             name: "Allan".into(),
             vault: Some(Arc::clone(&allan)),
+            binding: Binding::default(),
         },
         Agent {
             id: "ben".into(),
             name: "Ben".into(),
             vault: Some(Arc::clone(&ben)),
+            binding: Binding::default(),
         },
-    ]);
+    ];
     let c = Arc::new(Connections::new(
         Some(Arc::clone(&global)),
-        Arc::new(agents),
+        crew.clone(),
         kept.clone(),
         services(Arc::clone(&github)).await,
         Some("Iv1.driftwerk".into()),
@@ -193,6 +222,7 @@ async fn hub() -> Hub {
         ben,
         kept,
         github,
+        crew,
         c,
     }
 }
@@ -384,8 +414,195 @@ async fn a_key_saved_before_connections_still_counts_and_a_disconnect_removes_it
     assert_eq!(linear.connections[0].source, VaultSource::Global);
     assert_eq!(linear.connections[0].checked_at, None);
     assert_eq!(linear.used_by.len(), 2);
-    h.c.disconnect(SARAH, "linear", "all", None).await.unwrap();
+    let left = h.c.disconnect(SARAH, "linear", "all", None).await.unwrap();
+    assert_eq!(left.still_kept, None);
     assert!(keys(&h.global).is_empty());
+}
+
+#[tokio::test]
+async fn a_disconnect_says_when_a_hub_wide_key_still_connects_it() {
+    let h = hub().await;
+    h.global.set("skills/linear/api_key", "hub-wide").unwrap();
+    h.c.connect(SARAH, "linear", "all", None, linear(GOOD))
+        .await
+        .unwrap();
+    let left = h.c.disconnect(SARAH, "linear", "all", None).await.unwrap();
+    assert_eq!(keys(&h.global), ["skills/linear/api_key"]);
+    assert_eq!(left.still_kept, Some(VaultSource::Global));
+    assert!(left
+        .note
+        .unwrap()
+        .contains("saved for everyone on this hub"));
+}
+
+#[tokio::test]
+async fn a_connect_or_disconnect_loads_the_connector_again_where_it_reaches() {
+    let h = hub().await;
+    h.c.connect(SARAH, "linear", "all", None, linear(GOOD))
+        .await
+        .unwrap();
+    assert_eq!(
+        h.crew.reloaded(),
+        [
+            ("allan".into(), "linear".into()),
+            ("ben".into(), "linear".into())
+        ]
+    );
+    h.c.connect(SARAH, "linear", "agent", Some("ben"), linear(GOOD))
+        .await
+        .unwrap();
+    assert_eq!(h.crew.reloaded(), [("ben".into(), "linear".into())]);
+    h.c.disconnect(SARAH, "linear", "agent", Some("ben"))
+        .await
+        .unwrap();
+    assert_eq!(h.crew.reloaded(), [("ben".into(), "linear".into())]);
+    // A failed Test changes nothing, so nothing loads again.
+    h.c.connect(SARAH, "linear", "all", None, linear(BAD))
+        .await
+        .unwrap_err();
+    assert!(h.crew.reloaded().is_empty());
+}
+
+#[tokio::test]
+async fn used_by_follows_each_agents_skills() {
+    let h = hub().await;
+    h.c.connect(SARAH, "linear", "all", None, linear(GOOD))
+        .await
+        .unwrap();
+    h.crew.bind(
+        "allan",
+        Binding {
+            enabled: Some(vec![]),
+            own: vec![],
+        },
+    );
+    h.crew.bind(
+        "ben",
+        Binding {
+            enabled: Some(vec!["linear".into()]),
+            own: vec!["linear".into()],
+        },
+    );
+    let list = h.c.list(SARAH).await;
+    // Allan has Linear off; Ben uses only his own, which isn't connected.
+    assert!(connector(&list, "linear").used_by.is_empty());
+    h.crew.bind(
+        "ben",
+        Binding {
+            enabled: Some(vec!["linear".into()]),
+            own: vec![],
+        },
+    );
+    let list = h.c.list(SARAH).await;
+    assert_eq!(
+        connector(&list, "linear").used_by,
+        [UsedBy {
+            agent: "ben".into(),
+            name: "Ben".into(),
+            connection: "mine"
+        }]
+    );
+}
+
+#[test]
+fn a_binding_is_read_from_the_agents_config() {
+    let dir = tempfile::tempdir().unwrap();
+    assert_eq!(Binding::read(dir.path()), Binding::default());
+    std::fs::write(
+        dir.path()
+            .join(workforce_common::config_files::WORKSPACE_CONFIG),
+        "[skills]\nenabled = [\"linear\"]\nown_credential = [\"linear\"]\n",
+    )
+    .unwrap();
+    assert_eq!(
+        Binding::read(dir.path()),
+        Binding {
+            enabled: Some(vec!["linear".into()]),
+            own: vec!["linear".into()],
+        }
+    );
+}
+
+/// Email copies its keys when it loads: once disconnected, reloading it
+/// leaves it unloaded, so it stops at once.
+#[test]
+fn a_disconnected_email_stops_at_once() {
+    use workforce_agent::runner::CURRENT_USER_ID;
+    let dir = tempfile::tempdir().unwrap();
+    let agent = Arc::new(Vault::open(&dir.path().join("agent"), "test-key").unwrap());
+    let global = Arc::new(Vault::open(&dir.path().join("global"), "test-key").unwrap());
+    for (field, value) in [
+        ("username", "sarah@acme.example"),
+        ("password", "app-password"),
+        ("imap_host", "imap.acme.example"),
+        ("smtp_host", "smtp.acme.example"),
+    ] {
+        global
+            .set(
+                &mine(&format!("skills/email/accounts/default/{field}")),
+                value,
+            )
+            .unwrap();
+    }
+    let config = workforce_common::settings::WorkforceConfig::default();
+    let tools = workforce_agent::tools::registry::ToolRegistry::new();
+    let state = crate::skill_state::SkillStateTracker::new();
+    CURRENT_USER_ID
+        .sync_scope(SARAH.to_string(), || {
+            crate::skill_loader::load_and_track(
+                "email",
+                Arc::clone(&agent),
+                Some(Arc::clone(&global)),
+                &config,
+                &tools,
+                &state,
+                "vault",
+            )
+        })
+        .unwrap();
+    let accounts = |tools: &workforce_agent::tools::registry::ToolRegistry| {
+        let tool = tools.get("email.accounts");
+        async move {
+            match tool {
+                None => String::new(),
+                Some(t) => {
+                    let r = CURRENT_USER_ID
+                        .scope(SARAH.to_string(), t.execute(serde_json::json!({})))
+                        .await
+                        .unwrap();
+                    format!("{:?} {:?}", r.output, r.error)
+                }
+            }
+        }
+    };
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    assert!(runtime
+        .block_on(accounts(&tools))
+        .contains("sarah@acme.example"));
+    for key in global.list(None) {
+        global.delete(&key).unwrap();
+    }
+    reload_skill("email", agent, Some(global), &config, &tools, &state, SARAH);
+    // The copy it loaded with is gone: it reaches no mailbox.
+    assert!(!runtime
+        .block_on(accounts(&tools))
+        .contains("sarah@acme.example"));
+}
+
+#[tokio::test]
+async fn google_signs_in_on_this_computer_only() {
+    let h = hub().await;
+    h.c.keep_google_client(SARAH, "client", "secret").unwrap();
+    h.global
+        .set(
+            catalog::GOOGLE_REDIRECT_URI,
+            "https://hub.acme.example/api/auth/google/callback",
+        )
+        .unwrap();
+    match h.c.start(SARAH, "google", "all", None).await {
+        Err(Refusal::Invalid(said)) => assert!(said.contains("this computer only"), "{said}"),
+        other => panic!("{other:?}"),
+    }
 }
 
 #[tokio::test]
