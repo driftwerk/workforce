@@ -70,7 +70,8 @@ impl Desk {
                 engine: a.engine,
                 name: a.name.clone(),
                 is_default: a.is_default,
-                signed_in: keys.is_some_and(|k| k.get(a.id).ok().flatten().is_some()),
+                // As last seen: the store is never read under this lock.
+                signed_in: keys.is_some() && st.signed_in_accounts.contains(&a.id),
                 sessions: st
                     .records
                     .values()
@@ -171,7 +172,7 @@ impl Desk {
     /// What a session's account adds to its CLI's environment: its token,
     /// with what Claude Code would rank above it taken out. Nothing for a
     /// session on the CLI's own sign-in.
-    pub(super) fn account_env(
+    pub(super) async fn account_env(
         &self,
         engine: Engine,
         account: Option<Uuid>,
@@ -185,14 +186,23 @@ impl Desk {
                 "the account this session ran on was removed: choose another for it".into(),
             )
         })?;
-        let keys = self.keys()?;
-        let token = keys.get(id).map_err(DeskError::Internal)?.ok_or_else(|| {
-            DeskError::Conflict(format!(
-                "{}'s sign-in is no longer in {}: add the account again in Settings → Engines",
+        let keys = Arc::clone(self.keys()?);
+        let store = keys.name();
+        // The keychain may block (a locked keychain, a prompt): off the
+        // runtime's threads, and never under the state lock.
+        let read = tokio::task::spawn_blocking(move || keys.get(id))
+            .await
+            .map_err(|e| DeskError::Internal(e.into()))?
+            .map_err(DeskError::Internal)?;
+        let Some(token) = read else {
+            if self.0.state.lock().signed_in_accounts.remove(&id) {
+                self.announce_accounts();
+            }
+            return Err(DeskError::Conflict(format!(
+                "{}'s sign-in is no longer in {store}: add the account again in Settings → Engines",
                 a.name,
-                keys.name()
-            ))
-        })?;
+            )));
+        };
         match engine {
             Engine::Claude => {
                 for k in accounts::OUTRANKS_CLAUDE_TOKEN {
@@ -296,7 +306,7 @@ impl Desk {
                     .await
                     .map_err(DeskError::Invalid)?;
                 let account = self
-                    .keep_account(&*keys, new.engine, name, new.make_default, &token)
+                    .keep_account(keys, new.engine, name, new.make_default, &token)
                     .await?;
                 let view = self
                     .accounts()
@@ -315,7 +325,7 @@ impl Desk {
     /// is never listed without its sign-in.
     async fn keep_account(
         &self,
-        keys: &dyn accounts::Keys,
+        keys: Arc<dyn accounts::Keys>,
         engine: Engine,
         name: String,
         make_default: bool,
@@ -328,9 +338,14 @@ impl Desk {
             is_default: make_default,
             created_at: Utc::now(),
         };
-        keys.set(account.id, token).map_err(DeskError::Internal)?;
+        let (id, kept) = (account.id, token.clone());
+        let store = Arc::clone(&keys);
+        tokio::task::spawn_blocking(move || store.set(id, &kept))
+            .await
+            .map_err(|e| DeskError::Internal(e.into()))?
+            .map_err(DeskError::Internal)?;
         if let Err(e) = self.0.store.put_account(&account).await {
-            let _ = keys.delete(account.id);
+            let _ = tokio::task::spawn_blocking(move || keys.delete(id)).await;
             return Err(DeskError::Internal(e));
         }
         {
@@ -342,6 +357,7 @@ impl Desk {
                     .for_each(|a| a.is_default = false);
             }
             st.accounts.push(account.clone());
+            st.signed_in_accounts.insert(account.id);
         }
         self.announce_accounts();
         tracing::info!(account = %account.id, engine = engine.as_str(), "engine account added");
@@ -457,7 +473,7 @@ impl Desk {
                 let kept = match self.keys() {
                     Ok(keys) => {
                         let keys = Arc::clone(keys);
-                        self.keep_account(&*keys, engine, name.clone(), make_default, &token)
+                        self.keep_account(keys, engine, name.clone(), make_default, &token)
                             .await
                     }
                     Err(e) => Err(e),
@@ -608,14 +624,21 @@ impl Desk {
             .delete_account(id, to)
             .await
             .map_err(DeskError::Internal)?;
-        if let Ok(keys) = self.keys() {
-            if let Err(e) = keys.delete(id) {
-                tracing::warn!(account = %id, error = %e, "couldn't remove an engine account's sign-in");
+        if let Ok(keys) = self.keys().map(Arc::clone) {
+            match tokio::task::spawn_blocking(move || keys.delete(id)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    tracing::warn!(account = %id, error = %e, "couldn't remove an engine account's sign-in")
+                }
+                Err(e) => {
+                    tracing::warn!(account = %id, error = %e, "couldn't remove an engine account's sign-in")
+                }
             }
         }
         let moved: Vec<Uuid> = {
             let mut st = self.0.state.lock();
             st.accounts.retain(|o| o.id != id);
+            st.signed_in_accounts.remove(&id);
             st.switches.retain(|_, to| *to != Some(id));
             st.records
                 .values()

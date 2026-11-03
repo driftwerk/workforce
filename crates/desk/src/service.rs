@@ -313,6 +313,8 @@ struct State {
     /// Sessions moving to another account once their turn ends (`None`:
     /// the CLI's own sign-in).
     switches: HashMap<Uuid, Option<Uuid>>,
+    /// The accounts whose sign-in was in the store when last looked at.
+    signed_in_accounts: HashSet<Uuid>,
 }
 
 /// How often a busy session's tool is recorded as `working`.
@@ -773,6 +775,19 @@ impl Desk {
         let layout = store.layout().await?;
         let session_env = kept_session_env(&store).await;
         let engine_accounts = store.accounts().await?;
+        let signed_in_accounts = match opts.account_keys.clone() {
+            Some(keys) => {
+                let ids: Vec<Uuid> = engine_accounts.iter().map(|a| a.id).collect();
+                tokio::task::spawn_blocking(move || {
+                    ids.into_iter()
+                        .filter(|id| keys.get(*id).ok().flatten().is_some())
+                        .collect::<HashSet<Uuid>>()
+                })
+                .await
+                .unwrap_or_default()
+            }
+            None => HashSet::new(),
+        };
         let hidden = store
             .hidden()
             .await?
@@ -847,6 +862,7 @@ impl Desk {
                 hidden,
                 turns,
                 accounts: engine_accounts,
+                signed_in_accounts,
                 ..State::default()
             }),
             events: broadcast::channel(256).0,
@@ -2724,7 +2740,7 @@ impl Desk {
         }
         let mut env = self.with_added(&self.0.state.lock().session_env.clone());
         // Only now, and only into this CLI's own environment: never kept.
-        self.account_env(r.engine, r.account, &mut env)?;
+        self.account_env(r.engine, r.account, &mut env).await?;
         let (spec, codex) = match r.engine {
             Engine::Claude => {
                 let session_id = r.cli_session_id.as_deref().unwrap_or_default();

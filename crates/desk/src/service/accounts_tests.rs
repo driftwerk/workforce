@@ -416,6 +416,8 @@ async fn a_removed_account_moves_its_sessions_to_the_default_at_their_next_start
             .await
             .unwrap_err();
         assert!(gone.to_string().contains("add the account again"), "{gone}");
+        let work_view = d.accounts().into_iter().find(|a| a.id == work).unwrap();
+        assert!(!work_view.signed_in, "seen gone at launch, without reading the store again");
     })
     .await;
 }
