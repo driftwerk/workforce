@@ -274,7 +274,7 @@ fn named(turns: Vec<Turn>, name: impl Fn(&Subject) -> Option<String>) -> Vec<Tur
 
 /// The caller's turns since `since`, every open one and every question
 /// still asked, each open one settled by whether it still runs.
-async fn turns(
+pub(crate) async fn turns(
     state: &GatewayState,
     sources: &Sources,
     caller: &FloorCaller,

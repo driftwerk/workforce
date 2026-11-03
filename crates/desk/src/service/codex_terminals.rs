@@ -125,16 +125,24 @@ impl Desk {
                 (None, Some((id, ..))) => self.end_terminal_session(id, true),
                 (Some(p), tracked) => {
                     let wanted = session::resume_arg(&p.args);
+                    // Its process, when this hub has yet to learn it: the
+                    // terminal's session carried over a restart, read again
+                    // below to see whether `p` is still it.
+                    let mut carried: Option<(Uuid, String)> = None;
                     if let Some((id, cli, bound_to)) = &tracked {
                         // The same process, still on its session, unless it
                         // was told to resume another one.
-                        if *bound_to == Some(p.pid)
-                            && (wanted.is_none() || wanted == cli.as_deref())
-                        {
+                        let same = wanted.is_none() || wanted == cli.as_deref();
+                        if *bound_to == Some(p.pid) && same {
                             self.follow_codex_session(*id).await;
                             continue;
                         }
-                        self.end_terminal_session(*id, true);
+                        match cli {
+                            Some(cli) if bound_to.is_none() && same => {
+                                carried = Some((*id, cli.clone()));
+                            }
+                            _ => self.end_terminal_session(*id, true),
+                        }
                     }
                     if rollouts.is_none() {
                         let h = home.clone();
@@ -146,9 +154,19 @@ impl Desk {
                     let Some(all) = rollouts.clone() else {
                         continue;
                     };
-                    let Some(found) = self.bind_codex(&home, all, p, wanted).await else {
+                    let ours = carried.as_ref().map(|(_, cli)| cli.as_str());
+                    let Some(found) = self.bind_codex(&home, all, p, wanted, ours).await else {
                         continue;
                     };
+                    if let Some((id, cli)) = carried {
+                        if found.id == cli {
+                            // Still it: followed on, its turn with it.
+                            self.0.state.lock().codex_pids.insert(id, p.pid);
+                            self.follow_codex_session(id).await;
+                            continue;
+                        }
+                        self.end_terminal_session(id, true);
+                    }
                     let id = self.take_codex_session(terminal, pty, found).await;
                     self.0.state.lock().codex_pids.insert(id, p.pid);
                     self.follow_codex_session(id).await;
@@ -159,13 +177,15 @@ impl Desk {
     }
 
     /// The session the `codex` process `p` is: the one it was told to
-    /// resume, else the one it created.
+    /// resume, else the one it created; `ours`, the session its terminal
+    /// is followed as, is not another's to pass over.
     async fn bind_codex(
         &self,
         home: &std::path::Path,
         all: Arc<session::Rollouts>,
         p: &Proc,
         wanted: Option<&str>,
+        ours: Option<&str>,
     ) -> Option<Binding> {
         if let Some(id) = wanted {
             let (all, id) = (Arc::clone(&all), id.to_string());
@@ -189,6 +209,7 @@ impl Desk {
                 .filter_map(|id| st.records.get(id))
                 .filter(|r| r.engine == Engine::Codex)
                 .filter_map(|r| r.cli_session_id.clone())
+                .filter(|id| Some(id.as_str()) != ours)
                 .collect()
         };
         tokio::task::spawn_blocking(move || {
@@ -471,6 +492,139 @@ mod tests {
             assert_eq!(all.len(), 1, "no duplicate");
             assert_eq!(all[0].0, first.0);
             pty.write(b"\x03exit\n").unwrap();
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_codex_at_work_in_a_held_terminal_keeps_its_turn_across_a_hub_restart() {
+        use crate::floor::{Outcome, TurnOp};
+        with_test_pool(crate::store::build_pool, |pool| async move {
+            let (_hdir, socket, holder_cancel) = crate::holder::tests::holder().await;
+            let dir = tempfile::tempdir().unwrap();
+            let home = dir.path().join("home");
+            std::fs::create_dir_all(&home).unwrap();
+            let cwd = dir.path().to_string_lossy().into_owned();
+            rollout(&home, "th-2", &cwd, &["task_started"]);
+            {
+                use std::io::Write;
+                let prompt = serde_json::json!({"type": "response_item", "payload": {
+                    "type": "message", "role": "user",
+                    "content": [{"type": "input_text", "text": "fix the flaky test"}]}});
+                let file =
+                    home.join(".codex/sessions/2026/11/02/rollout-2026-11-02T10-00-00-th-2.jsonl");
+                let mut f = std::fs::OpenOptions::new().append(true).open(file).unwrap();
+                writeln!(f, "{prompt}").unwrap();
+            }
+            let bin = fake_codex(dir.path());
+            let mut opts = crate::testing::options(dir.path());
+            opts.env = std::collections::BTreeMap::from([
+                ("PATH".into(), "/usr/bin:/bin".into()),
+                ("SHELL".into(), "/bin/sh".into()),
+                ("HOME".into(), home.to_string_lossy().into_owned()),
+            ]);
+            opts.holder = Some(super::super::HolderOptions {
+                socket,
+                token: crate::holder::tests::TOKEN.into(),
+            });
+            crate::store::DeskStore::migrate(&pool).await.unwrap();
+            let logged = Arc::new(super::super::tests::Logged::default());
+            let floor = || super::super::Floor {
+                turns: Some(logged.clone()),
+                ..Default::default()
+            };
+            let working = |d: &Desk| {
+                d.0.state
+                    .lock()
+                    .records
+                    .values()
+                    .find(|r| r.engine == Engine::Codex && r.state == SessionState::Working)
+                    .map(|r| r.id)
+            };
+            let cancel = CancellationToken::new();
+            let d = Desk::start(
+                crate::store::DeskStore::from_pool(pool.clone()),
+                opts.clone(),
+                floor(),
+                cancel.clone(),
+            )
+            .await
+            .unwrap();
+            let t = d
+                .create_terminal(super::super::terminals::NewTerminal {
+                    id: None,
+                    name: None,
+                    cwd: cwd.clone(),
+                    env: Default::default(),
+                })
+                .await
+                .unwrap();
+            let pty = d.attach_terminal(t.id).unwrap();
+            pty.write(format!("{} resume th-2\n", bin.display()).as_bytes())
+                .unwrap();
+            let mut id = None;
+            for _ in 0..200 {
+                d.track_codex_terminals().await;
+                id = working(&d);
+                if id.is_some() && !d.open_turns().is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            let id = id.expect("the codex is followed as a session at work");
+            let turns = d.open_turns();
+            assert_eq!(turns.len(), 1);
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            cancel.cancel();
+            tokio::time::sleep(Duration::from_millis(300)).await;
+
+            // The hub comes back; the holder kept the terminal and its codex.
+            let d = Desk::start(
+                crate::store::DeskStore::from_pool(pool),
+                opts,
+                floor(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            for _ in 0..5 {
+                d.track_codex_terminals().await;
+            }
+            let v = d.view(id).unwrap();
+            assert_eq!((v.live, v.state), (true, SessionState::Working));
+            assert_eq!(
+                d.open_turns(),
+                turns,
+                "the turn it is in runs on the floor, as it does in the sidebar"
+            );
+            assert!(
+                !logged
+                    .0
+                    .lock()
+                    .iter()
+                    .any(|op| matches!(op, TurnOp::End { .. })),
+                "nothing ended it"
+            );
+
+            rollout(&home, "th-2", &cwd, &["task_started", "task_complete"]);
+            for _ in 0..200 {
+                d.track_codex_terminals().await;
+                if d.view(id).unwrap().state == SessionState::Done {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            let turn = turns.into_iter().next().unwrap();
+            assert!(
+                super::super::tests::logs(&logged, |ops| ops.iter().any(|op| matches!(
+                    op,
+                    TurnOp::End { turn: t, outcome: Outcome::Finished, .. } if *t == turn
+                )))
+                .await,
+                "its turn ends when it does"
+            );
+            d.close_terminal(t.id).unwrap();
+            holder_cancel.cancel();
         })
         .await;
     }

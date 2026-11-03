@@ -21,7 +21,7 @@ use crate::claude::{self, Hook};
 use crate::codex::{self, AppServer, CodexEvent, Seen};
 use crate::crew::{self, By, Event, Kind, Party};
 use crate::engine::{self, Installed, SignIns, View};
-use crate::floor::{Outcome, SubjectKey, TurnLog, TurnOp};
+use crate::floor::{Outcome, Scope, Subject, SubjectKey, Turn, TurnLog, TurnOp};
 use crate::holder::{Held, Holder};
 use crate::model::{
     Approvals, Decision, DeskEvent, Engine, NewSession, Origin, PendingApproval, SessionPatch,
@@ -686,6 +686,62 @@ async fn forget_hub_internal(store: &DeskStore, hub: &HubInternal, turns: Option
     }
 }
 
+/// The turns the floor's log has open for the sessions still at work
+/// across a restart (`records`, once the lost are marked), each session's
+/// latest: the desk carries on with them, so the floor sees them run as the
+/// sidebar does, and writes how they end. A lost session's turn is left
+/// for the floor to settle where it was last heard.
+async fn reopened_turns(
+    log: &dyn TurnLog,
+    records: &HashMap<Uuid, SessionRecord>,
+) -> HashMap<Uuid, OpenTurn> {
+    let sessions = Scope {
+        owner: String::new(),
+        personal: true,
+    };
+    match log.relevant(&sessions, Utc::now()).await {
+        Ok(logged) => still_open(records, &logged)
+            .into_iter()
+            .map(|(session, id)| {
+                (
+                    session,
+                    OpenTurn {
+                        id,
+                        progressed: None,
+                    },
+                )
+            })
+            .collect(),
+        Err(e) => {
+            tracing::warn!(
+                error = format!("{e:#}"),
+                "couldn't read the turns the floor has open; running sessions start new ones"
+            );
+            HashMap::new()
+        }
+    }
+}
+
+/// For each of `records` at work, the latest of its turns `logged` has open.
+fn still_open(records: &HashMap<Uuid, SessionRecord>, logged: &[Turn]) -> HashMap<Uuid, Uuid> {
+    let mut latest: HashMap<Uuid, &Turn> = HashMap::new();
+    for t in logged.iter().filter(|t| t.ended_at.is_none()) {
+        let Subject::Session { id, .. } = t.subject else {
+            continue;
+        };
+        let at_work = records.get(&id).is_some_and(|r| {
+            matches!(
+                r.state,
+                SessionState::Starting | SessionState::Working | SessionState::Blocked
+            )
+        });
+        if at_work && latest.get(&id).is_none_or(|l| t.started_at > l.started_at) {
+            latest.insert(id, t);
+        }
+    }
+    latest.into_iter().map(|(s, t)| (s, t.id)).collect()
+}
+
 impl Desk {
     /// Loads the registry, marks what was running as interrupted or stopped
     /// (its processes did not survive the hub), and starts the hook endpoint
@@ -735,6 +791,12 @@ impl Desk {
             records.insert(r.id, r);
         }
         let layout = prune_layout(&store, layout, &records).await;
+        // Taken up before anything the sessions do is seen, so what they do
+        // next carries on the turns they were in.
+        let turns = match floor.turns.as_deref() {
+            Some(log) => reopened_turns(log, &records).await,
+            None => HashMap::new(),
+        };
         let state_since = store.state_times().await?;
         let mut attention = store.attention_times().await?;
         // One lost while it worked failed: worth your attention, as one
@@ -766,6 +828,7 @@ impl Desk {
                 state_since,
                 attention,
                 hidden,
+                turns,
                 ..State::default()
             }),
             events: broadcast::channel(256).0,
@@ -4037,11 +4100,16 @@ mod tests {
                 token: crate::holder::tests::TOKEN.into(),
             });
             DeskStore::migrate(&pool).await.unwrap();
+            let logged = Arc::new(Logged::default());
+            let floor = || Floor {
+                turns: Some(logged.clone()),
+                ..Default::default()
+            };
             let first_cancel = CancellationToken::new();
             let first = Desk::start(
                 DeskStore::from_pool(pool.clone()),
                 opts.clone(),
-                Default::default(),
+                floor(),
                 first_cancel.clone(),
             )
             .await
@@ -4056,6 +4124,8 @@ mod tests {
             )
             .await;
             let port = first.0.hook_port;
+            let turns = first.open_turns();
+            assert_eq!(turns.len(), 1, "its prompt began a turn");
             tokio::time::sleep(Duration::from_millis(200)).await;
             first_cancel.cancel();
             tokio::time::sleep(Duration::from_millis(300)).await;
@@ -4063,7 +4133,7 @@ mod tests {
             let second = Desk::start(
                 DeskStore::from_pool(pool.clone()),
                 opts.clone(),
-                Default::default(),
+                floor(),
                 CancellationToken::new(),
             )
             .await
@@ -4072,6 +4142,11 @@ mod tests {
             assert!(v.live, "taken back");
             assert_eq!(v.state, SessionState::Working, "not interrupted");
             assert!(second.restore_offer().is_empty(), "nothing to restore");
+            assert_eq!(
+                second.open_turns(),
+                turns,
+                "the turn it is in runs on the floor, as it does in the sidebar"
+            );
             assert_eq!(
                 second.attach(s.id).unwrap().pid(),
                 pid,
@@ -4091,6 +4166,15 @@ mod tests {
             assert_eq!(
                 (v.state, v.last_reply.as_deref()),
                 (SessionState::Done, Some("All green."))
+            );
+            let turn = turns.into_iter().next().unwrap();
+            assert!(
+                logs(&logged, |ops| ops.iter().any(|op| matches!(
+                    op,
+                    TurnOp::End { turn: t, outcome: Outcome::Finished, .. } if *t == turn
+                )))
+                .await,
+                "and ends when it does"
             );
 
             // Stopping it ends the held process for good.
@@ -4346,7 +4430,7 @@ mod tests {
         .await;
     }
 
-    /// Keeps every op the desk logs.
+    /// Keeps every op the desk logs, and reads back the turns they make.
     #[derive(Default)]
     pub(super) struct Logged(pub(super) Mutex<Vec<TurnOp>>);
 
@@ -4361,7 +4445,7 @@ mod tests {
             _: &crate::floor::Scope,
             _: DateTime<Utc>,
         ) -> eyre::Result<Vec<crate::floor::Turn>> {
-            Ok(vec![])
+            Ok(self.0.lock().iter().fold(Vec::new(), crate::floor::apply))
         }
     }
 
