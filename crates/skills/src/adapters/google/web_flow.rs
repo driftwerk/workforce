@@ -26,6 +26,21 @@ pub struct WebFlowEntry {
     pub workspace: String,
     pub verifier: String,
     pub expires_at: Instant,
+    /// Set for a sign-in started from Desk's Connections: where its tokens
+    /// go and what it redirects to. `None` for every other flow, which the
+    /// callback completes as it always has.
+    pub desk: Option<DeskFlow>,
+}
+
+/// A Desk sign-in's own facts, carried through the redirect by `state`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeskFlow {
+    /// The flow Desk polls.
+    pub flow: String,
+    /// The agent the sign-in is just for; `None`: all the person's agents.
+    pub agent: Option<String>,
+    /// The redirect the authorization URL named, which the exchange repeats.
+    pub redirect_uri: String,
 }
 
 #[derive(Default)]
@@ -42,6 +57,18 @@ impl WebFlowStateStore {
     /// will carry through the redirect. Also prunes expired entries
     /// opportunistically — no background task required.
     pub fn insert(&self, state: String, uid: String, workspace: String, verifier: String) {
+        self.insert_flow(state, uid, workspace, verifier, None);
+    }
+
+    /// [`Self::insert`] for a flow Desk started, `desk` saying where it goes.
+    pub fn insert_flow(
+        &self,
+        state: String,
+        uid: String,
+        workspace: String,
+        verifier: String,
+        desk: Option<DeskFlow>,
+    ) {
         let now = Instant::now();
         let mut map = self.entries.lock().expect("web_flow state mutex poisoned");
         map.retain(|_, e| e.expires_at > now);
@@ -52,8 +79,18 @@ impl WebFlowStateStore {
                 workspace,
                 verifier,
                 expires_at: now + STATE_TTL,
+                desk,
             },
         );
+    }
+
+    /// Removes and returns Desk's flow for `state`, leaving any other flow
+    /// where it is: a cancelled Desk sign-in ends, an agent's waits on.
+    pub fn take_desk(&self, state: &str) -> Option<WebFlowEntry> {
+        let mut map = self.entries.lock().expect("web_flow state mutex poisoned");
+        map.get(state)?.desk.as_ref()?;
+        let entry = map.remove(state)?;
+        (entry.expires_at > Instant::now()).then_some(entry)
     }
 
     /// Remove and return the entry for `state`, if one exists and hasn't
@@ -119,6 +156,7 @@ mod tests {
                     workspace: "default".into(),
                     verifier: "v".into(),
                     expires_at: Instant::now() - Duration::from_secs(1),
+                    desk: None,
                 },
             );
         assert_eq!(store.len(), 1);
@@ -132,5 +170,27 @@ mod tests {
         assert_eq!(store.len(), 1, "stale entry should have been pruned");
         assert!(store.take("stale").is_none());
         assert!(store.take("fresh").is_some());
+    }
+
+    #[test]
+    fn an_agents_flow_carries_no_desk_target_and_desk_never_takes_it() {
+        let store = WebFlowStateStore::new();
+        store.insert("agent".into(), "kings".into(), "default".into(), "v".into());
+        let desk = DeskFlow {
+            flow: "f1".into(),
+            agent: Some("allan".into()),
+            redirect_uri: "http://127.0.0.1:1/api/auth/google/callback".into(),
+        };
+        store.insert_flow(
+            "desk".into(),
+            "kings".into(),
+            "default".into(),
+            "v".into(),
+            Some(desk.clone()),
+        );
+        assert!(store.take_desk("agent").is_none());
+        assert_eq!(store.len(), 2, "an agent's flow is left to its callback");
+        assert_eq!(store.take_desk("desk").unwrap().desk, Some(desk));
+        assert_eq!(store.take("agent").unwrap().desk, None);
     }
 }

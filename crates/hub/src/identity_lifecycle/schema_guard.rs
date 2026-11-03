@@ -165,6 +165,12 @@ const CLAIMS: &[(&str, &str, &str, Claim)] = &[
     ("desk", "attachments", "owner", By(C::Sessions)),
     (
         "desk",
+        "connections",
+        "person",
+        NotPersonal("`you`, the one person of the Desk whose own hub this is"),
+    ),
+    (
+        "desk",
         "reads",
         "owner",
         NotPersonal("`you`, the one person of the Desk whose own hub this is"),

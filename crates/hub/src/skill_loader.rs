@@ -730,6 +730,11 @@ After adding or changing credentials, call system.enable_skill('jira') to reload
                     description: "Datadog Application key (DD-APPLICATION-KEY header)",
                     required: true,
                 },
+                CredentialMeta {
+                    vault_path: "skills/datadog/site",
+                    description: "Datadog site (us1, us3, us5, eu1, ap1); us1 when unset",
+                    required: false,
+                },
             ],
             tool_prefix: "datadog",
             default_scope: CredScope::Either,
