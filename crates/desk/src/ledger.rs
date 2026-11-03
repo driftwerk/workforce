@@ -6,8 +6,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use chrono::{DateTime, Datelike, Duration, NaiveDate, Utc};
-use chrono_tz::Tz;
+use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
@@ -314,35 +313,7 @@ pub fn agent_turn(cwd: &str, name: &str) -> bool {
     under_turn || crate::gist::agent_turn_folder(name.trim())
 }
 
-text_enum!(Period {
-    FiveHours => "five_hours",
-    Day => "day",
-    Week => "week",
-    Month => "month",
-});
-
-/// Where a period began in `tz`: five hours ago, local midnight, Monday's
-/// midnight, the 1st's. A midnight a clock change skips is its first
-/// instant after.
-pub fn window_start(period: Period, now: DateTime<Utc>, tz: Tz) -> DateTime<Utc> {
-    let local = now.with_timezone(&tz).date_naive();
-    let day = match period {
-        Period::FiveHours => return now - Duration::hours(5),
-        Period::Day => local,
-        Period::Week => local - Duration::days(i64::from(local.weekday().num_days_from_monday())),
-        Period::Month => local.with_day(1).unwrap_or(local),
-    };
-    midnight(day, tz).unwrap_or(now - Duration::hours(24))
-}
-
-fn midnight(day: NaiveDate, tz: Tz) -> Option<DateTime<Utc>> {
-    (0..4).find_map(|hour| {
-        day.and_hms_opt(hour, 0, 0)?
-            .and_local_timezone(tz)
-            .earliest()
-            .map(|t| t.with_timezone(&Utc))
-    })
-}
+pub use workforce_core::budget::{window_start, Period};
 
 text_enum!(SpendBy {
     Session => "session",
@@ -554,6 +525,8 @@ pub fn fold(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Duration;
+    use chrono_tz::Tz;
 
     const CLAUDE: &str = include_str!("../fixtures/ledger/claude.jsonl");
     const CODEX: &str = include_str!("../fixtures/ledger/codex-rollout.jsonl");

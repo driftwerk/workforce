@@ -156,6 +156,10 @@ pub enum DecideRef {
         approval_id: Uuid,
         choices: Vec<crate::model::Decision>,
     },
+    /// A breaker holding a session, an agent or a pool's new starts
+    /// (`session:<id>`, `agent:<id>`, `pool:desk`, `pool:group:<id>`):
+    /// Allow is Continue, Deny is Keep paused. Only the person answers it.
+    Breaker { subject: String },
 }
 
 /// A stretch of a turn that waited on the person: one per ask.
@@ -526,6 +530,9 @@ pub struct Need {
     pub kind: NeedKind,
     pub who: Who,
     pub ask: String,
+    /// What the answers do, in plain words, when the ask needs it said.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub why: Option<String>,
     pub options: Option<Vec<String>>,
     pub since: DateTime<Utc>,
     pub place: Place,
@@ -646,6 +653,7 @@ pub fn open_needs(turns: &[Turn]) -> Vec<Need> {
                 },
                 who: t.subject.who(&t.name),
                 ask: w.ask.clone(),
+                why: None,
                 options: w.options.clone(),
                 since: w.from,
                 place: t.place.clone(),
@@ -659,6 +667,7 @@ pub fn open_needs(turns: &[Turn]) -> Vec<Need> {
             kind: NeedKind::Question,
             who: t.subject.who(&t.name),
             ask: q.text.clone(),
+            why: None,
             options: q.options.clone(),
             since: t.ended_at.unwrap_or(t.started_at),
             place: t.place.clone(),
@@ -1435,6 +1444,7 @@ mod tests {
             }
             .who("auth-fix"),
             ask: "Run npm test?".into(),
+            why: None,
             options: None,
             since: at("2026-10-29T16:30:00Z"),
             place: Place::Session,

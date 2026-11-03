@@ -342,8 +342,12 @@ impl Desk {
 
     fn tell_spend(&self) {
         let told: Vec<Uuid> = self.0.ledger.untold.lock().drain().collect();
-        for session in told {
-            let _ = self.0.events.send(DeskEvent::Spend { session });
+        for session in &told {
+            let _ = self.0.events.send(DeskEvent::Spend { session: *session });
+        }
+        if !told.is_empty() {
+            let desk = self.clone();
+            tokio::spawn(async move { desk.breaker_spend(Some(told)).await });
         }
     }
 

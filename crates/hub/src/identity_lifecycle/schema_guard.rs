@@ -164,6 +164,18 @@ const CLAIMS: &[(&str, &str, &str, Claim)] = &[
     ),
     (
         "desk",
+        "breakers",
+        "subject",
+        NotPersonal("the session, agent or spend total a breaker holds, never a person's id"),
+    ),
+    (
+        "desk",
+        "budgets",
+        "scope",
+        NotPersonal("what a budget counts: Desk, a default, or one session or agent"),
+    ),
+    (
+        "desk",
         "line_messages",
         "sender",
         NotPersonal("a session, the overseer agent, or `you`, the one person of the Desk"),

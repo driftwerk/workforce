@@ -621,9 +621,26 @@ pub async fn mount(
     let desk = Desk::start(store, options(config), floor, cancel)
         .await
         .context("starting desk sessions")?;
+    // Budgets' days are the person's, as the cost governor counts them.
+    desk.count_budgets_in(config.user_timezone());
     if DESK.set(desk.clone()).is_err() {
         eyre::bail!("desk sessions started twice");
     }
+    // The person's budgets reach agents through the cost governor, and
+    // agents' use counts toward Desk's totals: only on a hub running Desk.
+    let telemetry = state.telemetry_store.clone().or_else(|| {
+        state
+            .registry
+            .default_agent()
+            .map(|s| Arc::clone(&s.telemetry_store))
+    });
+    if let Some(telemetry) = telemetry {
+        desk.spend_agents_with(Arc::new(crate::desk_ceilings::HubAgentSpend(telemetry)));
+    }
+    crate::cost_governor::install_ceilings(Arc::new(crate::desk_ceilings::DeskCeilings {
+        desk: desk.clone(),
+        registry: Arc::clone(&state.registry),
+    }));
     desk.serve_lines(crate::desk_line_mcp::LineMcp::new(desk.clone()));
     let computer = desk.computer();
     crate::desk_computer::prune_daily(computer.clone(), cancel_crew.clone());

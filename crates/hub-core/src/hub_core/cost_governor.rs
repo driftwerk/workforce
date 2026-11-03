@@ -25,10 +25,42 @@ use tracing::warn;
 use workforce_common::persistence::MeteredSpend;
 use workforce_common::settings::BudgetConfig;
 use workforce_common::telemetry::TelemetryStore;
+use workforce_core::budget::{self, Budget, Period, Standing, Unit};
 
 use crate::hub_core::budget_overrides::{BudgetOverride, BudgetOverrideStore, OverrideScope};
 
 const SPEND_CACHE_TTL: Duration = Duration::from_secs(30);
+
+/// Limits on agents that another part of the hub sets: the person's budgets
+/// on Desk. Installed by `[desk]` alone, so a hub without Desk admits turns
+/// exactly as its `[budget]` says.
+pub trait Ceilings: Send + Sync {
+    /// The budgets that apply to `agent_id`.
+    fn budgets(&self, agent_id: &str) -> Vec<Budget>;
+    /// Why the agent's turns are held now, while they are.
+    fn held(&self, agent_id: &str) -> Option<String>;
+    /// Where it stands against its budgets: whether its next turn runs.
+    /// `preflight`: asked before a scheduled run, which says no warning.
+    fn stand(&self, agent_id: &str, standings: Vec<Standing>, preflight: bool) -> Verdict;
+}
+
+/// What [`Ceilings::stand`] decides.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Verdict {
+    Proceed,
+    Warn(String),
+    Held(String),
+}
+
+/// An agent's use: dollars and tokens.
+type Use = (f64, u64);
+
+static CEILINGS: std::sync::OnceLock<Arc<dyn Ceilings>> = std::sync::OnceLock::new();
+
+/// Makes `ceilings` the hub's; whether it was the first.
+pub fn install_ceilings(ceilings: Arc<dyn Ceilings>) -> bool {
+    CEILINGS.set(ceilings).is_ok()
+}
 
 /// How long a fetched override set is trusted before re-reading the store —
 /// the ceiling on how stale a freshly granted boost can be.
@@ -42,6 +74,9 @@ pub enum Admission {
     Warn(String),
     /// A ceiling is reached; the turn must not run.
     Deny(String),
+    /// The person's budget on Desk holds the agent until they say Continue
+    /// (or the period ends): not a failure of the work, which waits.
+    Held(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -101,6 +136,10 @@ pub struct CostGovernor {
     override_cache: Mutex<Option<(Instant, Vec<BudgetOverride>)>>,
     spend: Mutex<HashMap<Scope, (Instant, f64)>>,
     warned: Mutex<HashSet<(Scope, NaiveDate)>>,
+    /// The ceilings this governor alone reads (tests); else the hub's.
+    ceilings: std::sync::RwLock<Option<Arc<dyn Ceilings>>>,
+    /// Each agent's use since a period began, every billing: (usd, tokens).
+    used: Mutex<HashMap<(String, Period), (Instant, Use)>>,
 }
 
 impl CostGovernor {
@@ -132,6 +171,97 @@ impl CostGovernor {
             override_cache: Mutex::new(None),
             spend: Mutex::new(HashMap::new()),
             warned: Mutex::new(HashSet::new()),
+            ceilings: std::sync::RwLock::new(None),
+            used: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// This governor with `ceilings` in place of the hub's.
+    pub fn with_ceilings(self, ceilings: Arc<dyn Ceilings>) -> Self {
+        self.use_ceilings(ceilings);
+        self
+    }
+
+    /// Reads `ceilings` from now on, in place of the hub's.
+    pub fn use_ceilings(&self, ceilings: Arc<dyn Ceilings>) {
+        *self.ceilings.write().expect("ceilings lock") = Some(ceilings);
+    }
+
+    fn ceilings(&self) -> Option<Arc<dyn Ceilings>> {
+        self.ceilings
+            .read()
+            .expect("ceilings lock")
+            .clone()
+            .or_else(|| CEILINGS.get().cloned())
+    }
+
+    /// What `agent_id` used since `period` began, every billing counted;
+    /// cached as long as spend is.
+    fn used_since(
+        &self,
+        agent_id: &str,
+        period: Period,
+        now: DateTime<Utc>,
+    ) -> eyre::Result<(f64, u64)> {
+        let key = (agent_id.to_string(), period);
+        if let Some((at, used)) = self.used.lock().expect("used lock").get(&key) {
+            if at.elapsed() < SPEND_CACHE_TTL {
+                return Ok(*used);
+            }
+        }
+        let from = budget::window_start(period, now, self.tz);
+        let used = self
+            .store
+            .agent_use(from, now)?
+            .into_iter()
+            .find(|u| u.agent_id == agent_id)
+            .map_or((0.0, 0), |u| (u.cost_usd, u.tokens));
+        self.used
+            .lock()
+            .expect("used lock")
+            .insert(key, (Instant::now(), used));
+        Ok(used)
+    }
+
+    /// The person's budgets for `agent_id`, through the installed
+    /// ceilings: a hold refuses the turn; nothing installed, nothing said.
+    fn ceiling_admission(&self, agent_id: &str, preflight: bool) -> Admission {
+        let Some(ceilings) = self.ceilings() else {
+            return Admission::Proceed;
+        };
+        let held = ceilings.held(agent_id);
+        let budgets = ceilings.budgets(agent_id);
+        if budgets.is_empty() && held.is_none() {
+            return Admission::Proceed;
+        }
+        let now = Utc::now();
+        let mut standings = Vec::with_capacity(budgets.len());
+        for b in &budgets {
+            match self.used_since(agent_id, b.period, now) {
+                Ok((usd, tokens)) => {
+                    let used = match b.unit {
+                        Unit::Usd => usd,
+                        Unit::Tokens => tokens as f64,
+                    };
+                    standings.push(budget::standing_of(
+                        b,
+                        used,
+                        budget::window_start(b.period, now, self.tz),
+                        budget::window_end(b.period, now, self.tz),
+                    ));
+                }
+                Err(e) => {
+                    warn!(error = %e, agent = %agent_id, "Agent use lookup failed — admitting turn");
+                    // What already holds it still does.
+                    return held.map_or(Admission::Proceed, Admission::Held);
+                }
+            }
+        }
+        // Stood every time, held or not: a hold lapses when its period ends.
+        match ceilings.stand(agent_id, standings, preflight) {
+            Verdict::Proceed => Admission::Proceed,
+            Verdict::Warn(w) => Admission::Warn(w),
+            Verdict::Held(why) => Admission::Held(why),
         }
     }
 
@@ -195,6 +325,38 @@ impl CostGovernor {
     /// The first breached ceiling wins; warnings are collected only when
     /// nothing denies.
     pub fn admit_turn(&self, agent_id: &str, identity: Option<&str>) -> Admission {
+        self.admit(agent_id, identity, false)
+    }
+
+    /// What [`Self::admit_turn`] would decide, asked before a scheduled run:
+    /// holds and refuses as the turn would, but says no warning (the turn
+    /// says it, once).
+    pub fn preflight(&self, agent_id: &str, identity: Option<&str>) -> Admission {
+        self.admit(agent_id, identity, true)
+    }
+
+    fn admit(&self, agent_id: &str, identity: Option<&str>, preflight: bool) -> Admission {
+        // The person's budgets on Desk hold whatever `[budget]` says.
+        let ceiling = self.ceiling_admission(agent_id, preflight);
+        if let Admission::Held(_) = ceiling {
+            return ceiling;
+        }
+        // Each warning is said once a period: both are kept.
+        match (
+            ceiling,
+            self.admit_by_config(agent_id, identity, !preflight),
+        ) {
+            (_, Admission::Deny(why)) => Admission::Deny(why),
+            (_, Admission::Held(why)) => Admission::Held(why),
+            (Admission::Warn(a), Admission::Warn(b)) => Admission::Warn(format!("{a} {b}")),
+            (Admission::Warn(a), Admission::Proceed) => Admission::Warn(a),
+            (Admission::Proceed | Admission::Deny(_) | Admission::Held(_), decided) => decided,
+        }
+    }
+
+    /// `[budget]`'s rules, unchanged; `warn` false says no warning (and
+    /// keeps today's for later).
+    fn admit_by_config(&self, agent_id: &str, identity: Option<&str>, warn: bool) -> Admission {
         if !self.cfg.enabled {
             return Admission::Proceed;
         }
@@ -233,7 +395,10 @@ impl CostGovernor {
             if spent >= limit {
                 return Admission::Deny(deny_message(&scope, spent, limit));
             }
-            if spent >= limit * self.cfg.soft_warn_ratio && self.first_warning_today(&scope, day) {
+            if warn
+                && spent >= limit * self.cfg.soft_warn_ratio
+                && self.first_warning_today(&scope, day)
+            {
                 warning.get_or_insert_with(|| warn_message(&scope, spent, limit));
             }
         }
@@ -531,6 +696,94 @@ mod tests {
             identity_daily_usd: 10.0,
             ..BudgetConfig::default()
         }
+    }
+
+    /// The person's budgets on Desk, as a stand-in: held while any is over.
+    struct Budgets {
+        budgets: Vec<Budget>,
+        stood: Mutex<Vec<Standing>>,
+    }
+
+    impl Ceilings for Budgets {
+        fn budgets(&self, _: &str) -> Vec<Budget> {
+            self.budgets.clone()
+        }
+        fn held(&self, _: &str) -> Option<String> {
+            None
+        }
+        fn stand(&self, _: &str, standings: Vec<Standing>, _: bool) -> Verdict {
+            let over = standings.iter().any(|s| s.status == budget::Status::Over);
+            *self.stood.lock().unwrap() = standings;
+            match over {
+                true => Verdict::Held("Atlas is over its day budget.".into()),
+                false => Verdict::Proceed,
+            }
+        }
+    }
+
+    fn day_budget(unit: Unit, amount: f64) -> Budget {
+        Budget {
+            id: uuid::Uuid::new_v4(),
+            scope: budget::BudgetScope::Agent("a".into()),
+            group: None,
+            period: Period::Day,
+            unit,
+            amount,
+            warn_at: budget::WARN_AT,
+            on_exceed: budget::OnExceed::Pause,
+            updated_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn with_no_ceilings_installed_admission_is_the_configs_alone() {
+        let off = BudgetConfig {
+            enabled: false,
+            ..cfg()
+        };
+        let g = governor(off, &[record("a", Some("u"), 500.0)]);
+        assert!(g.ceilings().is_none());
+        assert_eq!(g.admit_turn("a", Some("u")), Admission::Proceed);
+        let g = governor(cfg(), &[record("a", Some("u"), 1.0)]);
+        assert_eq!(g.admit_turn("a", Some("u")), Admission::Proceed);
+    }
+
+    #[test]
+    fn a_ceiling_counts_subscription_use_and_holds_even_with_budget_off() {
+        let mut plan = record("a", None, 2.0);
+        plan.billing = workforce_common::subscription::Billing::Subscription;
+        let off = BudgetConfig {
+            enabled: false,
+            ..cfg()
+        };
+        let ceilings = Arc::new(Budgets {
+            budgets: vec![day_budget(Unit::Usd, 1.0), day_budget(Unit::Tokens, 100.0)],
+            stood: Mutex::new(Vec::new()),
+        });
+        let g = governor(off, &[plan]).with_ceilings(ceilings.clone());
+        assert_eq!(
+            g.admit_turn("a", None),
+            Admission::Held("Atlas is over its day budget.".into())
+        );
+        let stood = ceilings.stood.lock().unwrap().clone();
+        assert_eq!(stood.len(), 2);
+        assert!((stood[0].used - 2.0).abs() < 1e-9, "{stood:?}");
+        assert_eq!(stood[1].used, 2.0, "two tokens");
+        // Another agent's use is its own.
+        assert_eq!(g.admit_turn("b", None), Admission::Proceed);
+        assert_eq!(ceilings.stood.lock().unwrap()[0].used, 0.0);
+    }
+
+    #[test]
+    fn a_ceiling_under_its_budget_leaves_the_configs_answer() {
+        let ceilings = Arc::new(Budgets {
+            budgets: vec![day_budget(Unit::Usd, 100.0)],
+            stood: Mutex::new(Vec::new()),
+        });
+        let g = governor(cfg(), &[record("a", Some("u"), 12.0)]).with_ceilings(ceilings);
+        assert!(
+            matches!(g.admit_turn("a", Some("u")), Admission::Deny(m) if m.contains("identity_daily_usd"))
+        );
     }
 
     #[test]

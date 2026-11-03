@@ -1752,6 +1752,123 @@ mod floor {
             .unwrap_or("terminal")
     }
 
+    /// What Desk's breaker holds is a Floor need only the person who holds
+    /// the hub answers: Continue (Allow) or Keep paused (Deny), nothing else.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_breaker_need_is_the_persons_to_continue_or_keep_paused() {
+        with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+            with_test_pool(PgFloorStore::build_pool, |floor_pool| async move {
+                let dir = tempfile::tempdir().unwrap();
+                let (scout, _llm) = agent(dir.path(), "scout", "Done.").await;
+                let state = hub(std::slice::from_ref(&scout));
+                let installed = Installed::open(PgFloorStore::with_pool(floor_pool).await.unwrap());
+                let d = desk_with(
+                    pool,
+                    dir.path(),
+                    workforce_desk::Floor {
+                        turns: Some(Arc::clone(&installed.log)),
+                        plans: None,
+                        pricer: None,
+                    },
+                )
+                .await;
+                let sources = Sources::new(installed, {
+                    let d = d.clone();
+                    Arc::new(move || Some(d.clone()))
+                });
+                let s = new_session(&d, dir.path(), "acme-api").await;
+                let url = hook_url(dir.path(), s.id).await;
+                assert!(open_needs(&state, &sources, &me(true))
+                    .await
+                    .unwrap()
+                    .is_empty());
+                d.set_breaker_rules(workforce_desk::Rules { loops: true })
+                    .await
+                    .unwrap();
+                hook(
+                    &url,
+                    json!({"hook_event_name": "UserPromptSubmit", "prompt": "fix it"}),
+                )
+                .await;
+                for _ in 0..12 {
+                    hook(
+                        &url,
+                        json!({"hook_event_name": "PreToolUse", "tool_name": "Bash",
+                        "tool_input": {"command": "cargo test -p acme"}}),
+                    )
+                    .await;
+                }
+                let need = open_needs(&state, &sources, &me(true))
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .next()
+                    .unwrap();
+                assert_eq!(need.id, format!("breaker:session:{}", s.id));
+                assert!(need.ask.contains("kept running"), "{}", need.ask);
+                let Answer::Decide { at } = need.answer else {
+                    panic!("decided on the floor: {:?}", need.answer)
+                };
+                assert!(open_needs(&state, &sources, &me(false))
+                    .await
+                    .unwrap()
+                    .is_empty());
+                assert_eq!(
+                    answer(&state, &sources, &me(false), &at, Choice::Allow)
+                        .await
+                        .unwrap(),
+                    Err(Unanswered::NotYours)
+                );
+                assert_eq!(
+                    answer(&state, &sources, &me(true), &at, Choice::AllowForSession)
+                        .await
+                        .unwrap(),
+                    Err(Unanswered::NotOffered)
+                );
+                // Keep paused: the need goes; it is still held.
+                assert_eq!(
+                    answer(&state, &sources, &me(true), &at, Choice::Deny)
+                        .await
+                        .unwrap(),
+                    Ok(())
+                );
+                assert!(open_needs(&state, &sources, &me(true))
+                    .await
+                    .unwrap()
+                    .is_empty());
+                assert_eq!(
+                    answer(&state, &sources, &me(true), &at, Choice::Allow)
+                        .await
+                        .unwrap(),
+                    Ok(())
+                );
+                assert_eq!(
+                    answer(&state, &sources, &me(true), &at, Choice::Allow)
+                        .await
+                        .unwrap(),
+                    Err(Unanswered::AlreadyAnswered)
+                );
+            })
+            .await;
+        })
+        .await;
+    }
+
+    /// A boss never lets a breaker go: no crew tool answers a need, and
+    /// none is about the breaker.
+    #[test]
+    fn no_crew_tool_reaches_the_breaker() {
+        for name in super::super::tools::READ
+            .iter()
+            .chain(super::super::tools::ACT.iter())
+        {
+            assert!(
+                !name.contains("breaker") && !name.contains("budget"),
+                "{name}"
+            );
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn a_desk_sessions_needs_are_open_until_answered_anywhere() {
         with_test_pool(workforce_desk::store::build_pool, |pool| async move {

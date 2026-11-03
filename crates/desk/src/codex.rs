@@ -364,6 +364,9 @@ pub enum CodexEvent {
     Idle,
     Prompt(String),
     Tool(String),
+    /// A tool call it ran failed (a command's non-zero exit, a failed MCP
+    /// call).
+    Failed(String),
     Reply(String),
     /// A sub-agent thread it started.
     Child(String),
@@ -388,7 +391,7 @@ pub enum CodexEvent {
     Late(Value),
     /// What Desk said into its running turn (`turn/steer`) didn't go in:
     /// no turn ran, or Codex refused it.
-    SteerRefused,
+    SteerRefused(String),
     /// Who answers its thread's approvals, as Codex said when subscribed:
     /// `user`, or `auto_review` ("Approve for me").
     Reviewer(String),
@@ -717,6 +720,25 @@ pub fn interpret(method: &str, params: &Value) -> Option<Seen> {
         {
             seen(s("/threadId"), CodexEvent::Reply(s("/item/text")?))
         }
+        "item/completed" => {
+            let failed = params.pointer("/item/status").and_then(Value::as_str) == Some("failed")
+                || params
+                    .pointer("/item/exitCode")
+                    .and_then(Value::as_i64)
+                    .is_some_and(|c| c != 0);
+            let label = match params.pointer("/item/type").and_then(Value::as_str)? {
+                "commandExecution" => tool_summary("Bash", params.get("item")).0,
+                "mcpToolCall" => format!(
+                    "{} · {}",
+                    s("/item/server").unwrap_or_default(),
+                    s("/item/tool").unwrap_or_default()
+                ),
+                _ => return None,
+            };
+            failed
+                .then(|| seen(s("/threadId"), CodexEvent::Failed(label)))
+                .flatten()
+        }
         _ => None,
     }
 }
@@ -791,6 +813,9 @@ pub struct Follower {
     home: Option<PathBuf>,
     /// The thread's turn running now, which a steer must name.
     turn: Option<String>,
+    /// What was said into its turns, oldest first, until Codex answers
+    /// each (`turn/steer` answers in order).
+    steering: std::collections::VecDeque<String>,
 }
 
 impl Follower {
@@ -803,6 +828,7 @@ impl Follower {
             open: HashMap::new(),
             home,
             turn: None,
+            steering: std::collections::VecDeque::new(),
         }
     }
 
@@ -842,10 +868,15 @@ impl Follower {
                 // A steer Codex refused (its turn had ended): what was
                 // said goes in at the next idle instead.
                 if id.as_i64() == Some(STEER) {
-                    let refused = v.get("error").and(self.thread.clone()).map(|thread| Seen {
-                        thread,
-                        event: CodexEvent::SteerRefused,
-                    });
+                    let said = self.steering.pop_front();
+                    let refused =
+                        v.get("error")
+                            .and(said)
+                            .zip(self.thread.clone())
+                            .map(|(said, thread)| Seen {
+                                thread,
+                                event: CodexEvent::SteerRefused(said),
+                            });
                     return (refused.into_iter().collect(), None);
                 }
                 if id.as_i64() != Some(SUBSCRIBE) {
@@ -1021,11 +1052,14 @@ pub async fn observe(
             steer = steers.recv(), if steering => match steer {
                 Some(text) => {
                     match follower.steer(&text) {
-                        Some(send) => tx.send(Message::text(send.to_string())).await?,
+                        Some(send) => {
+                            tx.send(Message::text(send.to_string())).await?;
+                            follower.steering.push_back(text);
+                        }
                         // No turn runs: said at the next idle instead.
                         None => {
                             if let Some(thread) = follower.thread.clone() {
-                                events.send(Seen { thread, event: CodexEvent::SteerRefused }).await?;
+                                events.send(Seen { thread, event: CodexEvent::SteerRefused(text) }).await?;
                             }
                         }
                     }
@@ -1241,17 +1275,37 @@ pub(crate) mod tests {
     #[test]
     fn a_steer_codex_refuses_is_said_so_and_one_it_takes_is_not() {
         let mut f = Follower::new(Some("t1".into()), None);
+        f.steering
+            .extend(["skip the slow tests".to_string(), "then lint".to_string()]);
         let (seen, _) =
             f.heard(&json!({"id": STEER, "error": {"code": -32600, "message": "no active turn"}}));
         assert!(matches!(
             seen.as_slice(),
             [Seen {
-                event: CodexEvent::SteerRefused,
+                event: CodexEvent::SteerRefused(said),
                 ..
-            }]
+            }] if said == "skip the slow tests"
         ));
         let (seen, _) = f.heard(&json!({"id": STEER, "result": {}}));
         assert!(seen.is_empty());
+    }
+
+    #[test]
+    fn a_failed_command_or_mcp_call_is_a_failure_and_a_good_one_isnt() {
+        let item =
+            |item: Value| interpret("item/completed", &json!({"threadId": "t1", "item": item}));
+        let failed = item(
+            json!({"type": "commandExecution", "command": "cargo test", "status": "completed", "exitCode": 101}),
+        );
+        assert!(
+            matches!(failed, Some(Seen { event: CodexEvent::Failed(l), .. }) if l.contains("cargo test"))
+        );
+        let failed =
+            item(json!({"type": "mcpToolCall", "server": "gh", "tool": "pr", "status": "failed"}));
+        assert!(
+            matches!(failed, Some(Seen { event: CodexEvent::Failed(l), .. }) if l == "gh · pr")
+        );
+        assert!(item(json!({"type": "commandExecution", "command": "ls", "status": "completed", "exitCode": 0})).is_none());
     }
 
     #[test]

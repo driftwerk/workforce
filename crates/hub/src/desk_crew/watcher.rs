@@ -147,7 +147,7 @@ fn tracked(o: &Oversight, subject: &Party) -> bool {
             Some(Origin::External) => o.track.external_sessions,
             _ => o.track.desk_sessions,
         },
-        PartyKind::Manager | PartyKind::You => false,
+        PartyKind::Manager | PartyKind::You | PartyKind::Desk => false,
     }
 }
 
