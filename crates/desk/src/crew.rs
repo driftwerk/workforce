@@ -111,6 +111,8 @@ kinds! {
     Assigned => "assigned",
     Replied => "replied",
     Delivered => "delivered",
+    Asked => "asked",
+    Told => "told",
 }
 
 /// One thing that happened on the crew.
@@ -516,6 +518,11 @@ pub trait Crew: Send + Sync {
     /// hub has no model to ask, or it couldn't say.
     async fn asks(&self, _reply: &str) -> Option<bool> {
         None
+    }
+    /// Whether the overseer answers what sessions ask it on Desk's line;
+    /// otherwise their questions to it go to the person.
+    fn answers_lines(&self) -> bool {
+        false
     }
 }
 

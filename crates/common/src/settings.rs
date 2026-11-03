@@ -684,6 +684,11 @@ pub struct DeskConfig {
     /// offer them back (`ask`), resume them (`auto`), or neither (`off`).
     #[serde(default)]
     pub restore: DeskRestore,
+    /// Which sessions may message each other on Desk's line: only Desk and
+    /// you (`overseer`), those in the same sidebar group (`group`), or any
+    /// (`all`).
+    #[serde(default)]
+    pub line_reach: DeskLineReach,
     /// How long an approval waits in Desk before the terminal asks instead.
     #[serde(default = "default_desk_approval_timeout_secs")]
     pub approval_timeout_secs: u64,
@@ -754,6 +759,15 @@ pub enum DeskRestore {
     Off,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DeskLineReach {
+    Overseer,
+    #[default]
+    Group,
+    All,
+}
+
 impl Default for DeskConfig {
     fn default() -> Self {
         Self {
@@ -766,6 +780,7 @@ impl Default for DeskConfig {
             cursor: default_desk_cursor(),
             devin: default_desk_devin(),
             restore: DeskRestore::default(),
+            line_reach: DeskLineReach::default(),
             approval_timeout_secs: default_desk_approval_timeout_secs(),
             scrollback_kb: default_desk_scrollback_kb(),
             adopt_interval_secs: default_desk_adopt_interval_secs(),

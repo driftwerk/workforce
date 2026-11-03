@@ -1125,7 +1125,11 @@ pub fn sessions_router(desk: Desk, auth: Arc<dyn Authorize>) -> Router {
             "/api/desk/rooms/{id}/messages/{message}/copy",
             post(copy_message),
         )
-        .with_state(Arc::new(ApiState { desk, auth }))
+        .with_state(Arc::new(ApiState {
+            desk: desk.clone(),
+            auth: Arc::clone(&auth),
+        }))
+        .merge(crate::line_api::api_routes(desk, auth))
 }
 
 pub fn router(
@@ -1373,6 +1377,7 @@ pub(crate) fn hook_router(desk: Desk) -> Router {
     Router::new()
         .route("/hook/{id}/{token}", post(hook))
         .route("/hook/terminal/{terminal}/{token}", post(terminal_hook))
+        .merge(crate::line_api::hook_routes())
         .with_state(desk)
 }
 

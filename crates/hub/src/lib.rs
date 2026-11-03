@@ -105,6 +105,8 @@ pub mod desk_crew;
 pub mod desk_driver;
 #[cfg(feature = "postgres")]
 pub mod desk_ledger;
+#[cfg(feature = "postgres")]
+pub(crate) mod desk_line_mcp;
 pub(crate) mod desk_reads;
 pub(crate) mod desk_surface;
 #[cfg(feature = "postgres")]

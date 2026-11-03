@@ -45,6 +45,7 @@ mod codex_terminals;
 mod copies;
 mod groups;
 mod lifecycle;
+mod line;
 pub use lifecycle::{Clearing, Hidden, Removal, Removed};
 #[cfg(test)]
 mod accounts_tests;
@@ -66,6 +67,7 @@ pub use groups::{
 };
 
 pub use ledger::{LedgerPage, SpendQuery};
+pub use line::{LineError, Sender, SessionMcp};
 pub use terminals::{NewTerminal, TerminalPatch, TerminalRecord, TerminalState, TerminalView};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,6 +102,8 @@ pub struct Options {
     /// Where the person's engine accounts' sign-ins are kept; none: Desk
     /// keeps no accounts, and every session runs on its CLI's own sign-in.
     pub account_keys: Option<Arc<dyn crate::engine_accounts::Keys>>,
+    /// Which sessions may message each other on Desk's line.
+    pub line_reach: crate::line::Reach,
 }
 
 #[cfg(test)]
@@ -292,6 +296,8 @@ struct CodexLink {
     watch: CancellationToken,
     /// Answers to what it asks, to its observer.
     replies: mpsc::UnboundedSender<codex::Reply>,
+    /// What is said into its running turn, to its observer.
+    steers: mpsc::UnboundedSender<String>,
 }
 
 impl CodexLink {
@@ -394,6 +400,8 @@ struct State {
     removed_names: HashMap<Uuid, String>,
     /// Sessions whose switch of account is being carried out now.
     switching: HashSet<Uuid>,
+    /// What Desk's lines keep in memory.
+    lines: line::Lines,
 }
 
 /// How often a busy session's tool is recorded as `working`.
@@ -483,6 +491,11 @@ struct Inner {
     read_wait: Mutex<Duration>,
     /// Held while the accounts' needs are acted on.
     accounts_moving: tokio::sync::Mutex<()>,
+    /// Held while a session's line messages are delivered: one typed in
+    /// at a time.
+    line_pump: tokio::sync::Mutex<()>,
+    /// What answers sessions' MCP requests on their lines.
+    line_mcp: std::sync::OnceLock<Arc<dyn line::SessionMcp>>,
 }
 
 #[derive(Clone)]
@@ -991,12 +1004,15 @@ impl Desk {
             reader: Mutex::new(None),
             read_wait: Mutex::new(READ_LATER),
             accounts_moving: tokio::sync::Mutex::new(()),
+            line_pump: tokio::sync::Mutex::new(()),
+            line_mcp: std::sync::OnceLock::new(),
         }));
         tokio::spawn(persist_loop(store, floor.turns, persist_rx));
         tokio::spawn(desk.clone().read_engines());
         tokio::spawn(desk.clone().look_for_sign_ins());
         tokio::spawn(desk.clone().ledger_loop(ledger_jobs));
         tokio::spawn(desk.clone().watch_background());
+        tokio::spawn(desk.clone().line_loop());
         recovered.into_iter().for_each(|r| desk.save(r));
         for (id, at) in failed {
             let _ = desk.0.persist.send(Persist::Attention(id, at));
@@ -2175,12 +2191,14 @@ impl Desk {
         may: impl FnOnce(&State, &SessionRecord) -> Result<(), DeskError>,
     ) -> Result<oneshot::Receiver<bool>, DeskError> {
         self.load(id).await?;
+        let gone;
         let live = {
             let mut guard = self.0.state.lock();
             let st = &mut *guard;
             let r = st.records.get(&id).ok_or(DeskError::NotFound)?;
             may(st, r)?;
             let view = Self::view_of(st, r);
+            gone = view.clone();
             if let Some(h) = &hide {
                 // Hidden before the lock goes: adoption never sees it unhidden.
                 st.hidden.insert((h.engine, h.cli_session_id.clone()));
@@ -2200,6 +2218,7 @@ impl Desk {
             live.end();
         }
         drop(live);
+        self.line_forgotten(&gone).await;
         let (done, written) = oneshot::channel();
         let _ = self.0.persist.send(Persist::Forget {
             ids: vec![id],
@@ -2916,7 +2935,8 @@ impl Desk {
             }
             Engine::Codex => {
                 let socket = self.0.opts.run_dir.join(format!("{}.sock", r.id.simple()));
-                let server = self.start_app_server(r.id, &socket).await?;
+                let line = format!("{}/mcp/{}/{token}", self.0.hook_base, r.id);
+                let server = self.start_app_server(r.id, &socket, &line).await?;
                 let thread = r.cli_session_id.as_deref().filter(|_| resume);
                 let spec = codex::spawn(&codex::CodexSpawn {
                     program: self.program_of(Engine::Codex)?,
@@ -3021,14 +3041,20 @@ impl Desk {
 
     /// Starts a Codex session's app-server on `socket`: in the holder when
     /// there is one, so it outlives the hub with the TUI attached to it.
-    async fn start_app_server(&self, id: Uuid, socket: &Path) -> Result<Server, DeskError> {
+    async fn start_app_server(
+        &self,
+        id: Uuid,
+        socket: &Path,
+        line: &str,
+    ) -> Result<Server, DeskError> {
         let program = self.program_of(Engine::Codex)?;
         let Some(holder) = self.holder().await else {
-            let server = AppServer::start(program, socket.to_path_buf(), &self.0.env).await?;
+            let server =
+                AppServer::start(program, socket.to_path_buf(), &self.0.env, Some(line)).await?;
             return Ok(Server::Local(server));
         };
         codex::prepare_socket(socket).await?;
-        let spec = codex::app_server(program, socket, &self.0.env);
+        let spec = codex::app_server(program, socket, &self.0.env, Some(line));
         let meta = serde_json::json!({
             "kind": "codex-app-server",
             "session": id,
@@ -3057,6 +3083,7 @@ impl Desk {
         let watch = self.0.cancel.child_token();
         let (tx, rx) = mpsc::channel(64);
         let (replies, answers) = mpsc::unbounded_channel();
+        let (steers, steered) = mpsc::unbounded_channel();
         tokio::spawn({
             let socket = server.socket(&socket);
             let watch = watch.clone();
@@ -3068,7 +3095,9 @@ impl Desk {
                 follower
             };
             async move {
-                if let Err(e) = codex::observe(socket, follower, tx, answers, plans, watch).await {
+                if let Err(e) =
+                    codex::observe(socket, follower, tx, answers, steered, plans, watch).await
+                {
                     tracing::warn!(error = %e, "codex observer stopped");
                 }
             }
@@ -3079,6 +3108,7 @@ impl Desk {
             socket,
             watch,
             replies,
+            steers,
         }
     }
 
@@ -3184,21 +3214,16 @@ impl Desk {
                     }
                 });
             }
-            Hook::Prompt(p) => self.change(id, |r, l| {
-                r.state = SessionState::Working;
-                r.last_prompt = Some(p);
-                r.restore_offer = false;
-                if let Some(l) = l {
-                    l.pending = None;
-                    l.held = None;
-                    l.open_question = None;
-                    l.prompts += 1;
-                    l.denials.clear();
-                    l.reading = None;
-                    r.asked = None;
-                    l.interrupted = false;
-                }
-            }),
+            Hook::Prompt(p) => {
+                self.person_spoke(id);
+                self.prompted(id, p, true);
+            }
+            // Desk's plugin submitted a line message: a turn starts as for
+            // a prompt, but the person didn't speak.
+            Hook::Delivered { prompt, mark } => {
+                self.line_heard(id, &mark).await;
+                self.prompted(id, prompt, false);
+            }
             Hook::ToolStart { tool, .. } => self.change(id, |r, l| {
                 r.state = SessionState::Working;
                 r.asked = None;
@@ -3473,6 +3498,27 @@ impl Desk {
         answer()
     }
 
+    /// A turn started on `p`: the person's own words when `person`.
+    fn prompted(&self, id: Uuid, p: String, person: bool) {
+        self.change(id, |r, l| {
+            r.state = SessionState::Working;
+            r.last_prompt = Some(p);
+            r.restore_offer = false;
+            if let Some(l) = l {
+                l.pending = None;
+                l.held = None;
+                l.open_question = None;
+                if person {
+                    l.prompts += 1;
+                }
+                l.denials.clear();
+                l.reading = None;
+                r.asked = None;
+                l.interrupted = false;
+            }
+        })
+    }
+
     /// The hub's crew, to read replies with, while it is there.
     fn reader(&self) -> Option<Arc<dyn crew::Crew>> {
         self.0.reader.lock().as_ref().and_then(Weak::upgrade)
@@ -3594,6 +3640,24 @@ impl Desk {
                 self.spend_live(id, spend);
                 continue;
             }
+            if let CodexEvent::SteerRefused = event {
+                self.line_steer_refused(id).await;
+                continue;
+            }
+            // A line message Desk typed in is not the person speaking.
+            let delivery = match &event {
+                CodexEvent::Prompt(p) => match crate::line::is_delivery(p) {
+                    Some(mark) => {
+                        self.line_heard(id, &mark).await;
+                        true
+                    }
+                    None => {
+                        self.person_spoke(id);
+                        false
+                    }
+                },
+                _ => false,
+            };
             let ours = self.record(id).ok().and_then(|r| r.cli_session_id);
             let child = match &event {
                 CodexEvent::Child(child) if ours.as_deref().is_none_or(|t| t == thread) => {
@@ -3799,7 +3863,7 @@ impl Desk {
                     }
                     CodexEvent::Prompt(p) => {
                         r.last_prompt = Some(p);
-                        if let Some(l) = l {
+                        if let Some(l) = l.filter(|_| !delivery) {
                             l.prompts += 1;
                         }
                     }
@@ -3832,6 +3896,7 @@ impl Desk {
                     CodexEvent::Reply(text) => r.last_reply = Some(transcript::clip(&text)),
                     CodexEvent::Child(_)
                     | CodexEvent::Usage(_)
+                    | CodexEvent::SteerRefused
                     | CodexEvent::Reviewed { .. }
                     | CodexEvent::Reviewer(_) => {}
                 }
@@ -4257,6 +4322,7 @@ mod tests {
             holder: None,
             hub_internal: HubInternal::default(),
             account_keys: None,
+            line_reach: crate::line::Reach::Group,
         }
     }
 
@@ -5940,6 +6006,7 @@ mod tests {
                 Options {
                     hub_internal: HubInternal::new([PathBuf::from("/data")], None),
                     account_keys: None,
+                    line_reach: crate::line::Reach::Group,
                     ..options(dir.path())
                 },
                 Default::default(),
@@ -5981,6 +6048,7 @@ mod tests {
                 Options {
                     hub_internal: HubInternal::default().started_by(std::process::id()),
                     account_keys: None,
+                    line_reach: crate::line::Reach::Group,
                     ..options(dir.path())
                 },
                 Default::default(),
@@ -6057,6 +6125,7 @@ mod tests {
                 Options {
                     hub_internal: HubInternal::new([PathBuf::from("/data")], None),
                     account_keys: None,
+                    line_reach: crate::line::Reach::Group,
                     ..options(dir.path())
                 },
                 Floor {
@@ -6115,6 +6184,7 @@ mod tests {
                 Options {
                     hub_internal: HubInternal::new([PathBuf::from("/data")], None),
                     account_keys: None,
+                    line_reach: crate::line::Reach::Group,
                     ..options(dir.path())
                 },
                 Floor {
@@ -6648,7 +6718,7 @@ mod codex_stop_tests {
         let sock = dir.join("run/s.sock");
         codex::prepare_socket(&sock).await.unwrap();
         let env = BTreeMap::from([("PATH".to_string(), "/usr/bin:/bin".to_string())]);
-        let spec = codex::app_server(program, &sock, &env);
+        let spec = codex::app_server(program, &sock, &env, None);
         let (pty, _) = holder
             .spawn(
                 &spec,
@@ -6666,6 +6736,7 @@ mod codex_stop_tests {
             socket: sock,
             watch: CancellationToken::new(),
             replies: mpsc::unbounded_channel().0,
+            steers: mpsc::unbounded_channel().0,
         };
         (link, pid, hdir)
     }

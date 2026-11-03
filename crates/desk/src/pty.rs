@@ -186,6 +186,16 @@ pub struct Pty {
     screen: Arc<Screen>,
     io: Box<dyn Io>,
     pid: Option<u32>,
+    /// When the person last typed in it (ms since the epoch; 0 never):
+    /// Desk's line holds a paste while they do.
+    typed: std::sync::atomic::AtomicI64,
+}
+
+/// Whether a viewer's input is the person's keys, not the terminal's own
+/// answer to a query (a cursor report, colours), which comes as one escape
+/// sequence. Esc alone is a key.
+fn typed(bytes: &[u8]) -> bool {
+    !bytes.is_empty() && (bytes == b"\x1b" || !bytes.starts_with(b"\x1b"))
 }
 
 /// One viewer of a [`Pty`]; dropping it detaches it, giving up the active
@@ -197,7 +207,12 @@ pub struct Viewer {
 
 impl Pty {
     pub(crate) fn from_parts(screen: Arc<Screen>, io: Box<dyn Io>, pid: Option<u32>) -> Self {
-        Self { screen, io, pid }
+        Self {
+            screen,
+            io,
+            pid,
+            typed: Default::default(),
+        }
     }
 
     /// Starts `spec` as the hub's own child: it ends when this does.
@@ -256,6 +271,14 @@ impl Pty {
         self.io.write(input)
     }
 
+    /// When the person last typed in it, if they have since it started.
+    pub fn typed_at(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        match self.typed.load(std::sync::atomic::Ordering::Relaxed) {
+            0 => None,
+            ms => chrono::DateTime::from_timestamp_millis(ms),
+        }
+    }
+
     /// Resizes the terminal whoever is active.
     pub fn resize(&self, cols: u16, rows: u16) -> Result<()> {
         let (cols, rows) = (cols.max(2), rows.max(2));
@@ -311,6 +334,12 @@ impl Viewer {
     pub fn input(&self, bytes: &[u8]) -> Result<bool> {
         if !self.is_active() {
             return Ok(false);
+        }
+        if typed(bytes) {
+            self.pty.typed.store(
+                chrono::Utc::now().timestamp_millis(),
+                std::sync::atomic::Ordering::Relaxed,
+            );
         }
         self.pty.write(bytes).map(|()| true)
     }

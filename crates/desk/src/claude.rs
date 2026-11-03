@@ -150,6 +150,12 @@ pub enum Hook {
         resumed: bool,
     },
     Prompt(String),
+    /// A message on Desk's line that Desk's plugin submitted: not the
+    /// person's words. Its marker.
+    Delivered {
+        prompt: String,
+        mark: String,
+    },
     ToolStart {
         tool: String,
         call: Call,
@@ -219,7 +225,10 @@ pub fn parse_hook(body: &[u8]) -> eyre::Result<Hook> {
             {
                 Hook::Woken
             }
-            prompt => Hook::Prompt(prompt),
+            prompt => match crate::line::is_delivery(&prompt) {
+                Some(mark) => Hook::Delivered { prompt, mark },
+                None => Hook::Prompt(prompt),
+            },
         },
         "PreToolUse" | "PermissionRequest" if question.is_some() => Hook::Question {
             id: p.tool_use_id.clone(),
@@ -551,7 +560,13 @@ pub(crate) mod tests {
             Hook::Woken,
             "not the person's prompt"
         );
-        let inside = br#"{"hook_event_name":"PreToolUse","agent_id":"a471","agent_type":"general-purpose","tool_name":"Bash","tool_input":{"command":"sleep 20"}}"#;
+        // Claude Code says which plugin sent a prompt before its text.
+        let delivered = br#"{"hook_event_name":"UserPromptSubmit","prompt":"The desk plugin sent a message: [Desk m:7f3a09bc] Sarah answers you: 5433"}"#;
+        assert!(matches!(
+            parse_hook(delivered).unwrap(),
+            Hook::Delivered { mark, .. } if mark == "7f3a09bc"
+        ));
+        let inside =br#"{"hook_event_name":"PreToolUse","agent_id":"a471","agent_type":"general-purpose","tool_name":"Bash","tool_input":{"command":"sleep 20"}}"#;
         assert_eq!(agent_of(inside).as_deref(), Some("a471"));
         assert_eq!(
             parse_hook(inside).unwrap(),

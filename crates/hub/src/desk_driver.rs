@@ -21,7 +21,7 @@ use workforce_agent::llm::vertex_credentials::{
 };
 use workforce_common::secret::KeySlot;
 use workforce_common::settings::{
-    is_claude_oat, DeskRestore, LlmSpeechConfig, VaultActor, WorkforceConfig,
+    is_claude_oat, DeskLineReach, DeskRestore, LlmSpeechConfig, VaultActor, WorkforceConfig,
 };
 use workforce_common::subscription::SubscriptionKind;
 use workforce_desk::engine::Engine;
@@ -471,6 +471,11 @@ fn options(config: &WorkforceConfig) -> Options {
         holder: holder_options(desk),
         hub_internal: hub_internal(config),
         account_keys: account_keys(&desk.accounts),
+        line_reach: match desk.line_reach {
+            DeskLineReach::Overseer => workforce_desk::line::Reach::Overseer,
+            DeskLineReach::Group => workforce_desk::line::Reach::Group,
+            DeskLineReach::All => workforce_desk::line::Reach::All,
+        },
     }
 }
 
@@ -619,6 +624,7 @@ pub async fn mount(
     if DESK.set(desk.clone()).is_err() {
         eyre::bail!("desk sessions started twice");
     }
+    desk.serve_lines(crate::desk_line_mcp::LineMcp::new(desk.clone()));
     let computer = desk.computer();
     crate::desk_computer::prune_daily(computer.clone(), cancel_crew.clone());
     crate::desk_computer::install(computer, Arc::new(config.clone()));

@@ -162,6 +162,12 @@ const CLAIMS: &[(&str, &str, &str, Claim)] = &[
         "person",
         NotPersonal("`you`, the one person of the Desk whose own hub this is"),
     ),
+    (
+        "desk",
+        "line_messages",
+        "sender",
+        NotPersonal("a session, the overseer agent, or `you`, the one person of the Desk"),
+    ),
     ("desk", "attachments", "owner", By(C::Sessions)),
     ("desk", "connections", "person", By(C::Vault)),
     (
