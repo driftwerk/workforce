@@ -120,6 +120,22 @@ pub fn gate_tool_call_decided(
     (outcome, decision)
 }
 
+/// [`gate_tool_call_decided`] on a path where nobody can be asked: what
+/// the computer gate would ask about runs when it says so
+/// ([`computer::decide_unattended`]); every other gate decides as ever.
+pub fn gate_tool_call_unattended(
+    gates: &ToolGates,
+    policy: &PolicyEngine,
+    tools: &ToolRegistry,
+    tool_name: &str,
+    input: &Value,
+) -> (GateOutcome, Option<Decision>) {
+    let decision =
+        computer::decide_unattended(gates.computer_gate.as_deref(), tools, tool_name, input);
+    let outcome = gate_with(gates, policy, tools, tool_name, input, decision.as_ref());
+    (outcome, decision)
+}
+
 fn gate_with(
     gates: &ToolGates,
     policy: &PolicyEngine,

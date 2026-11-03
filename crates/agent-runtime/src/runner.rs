@@ -29,8 +29,8 @@ use crate::tools::access::{self, ToolAccess, ToolAccessSnapshot};
 use crate::tools::approval::{Decision, GatedCall, OpenPrompt, Refusal, TurnApprovals};
 pub use crate::tools::dispatch::{apply_capability_gate, apply_cascade_gate, ToolGates};
 use crate::tools::dispatch::{
-    execute_approved, execute_gated, gate_tool_call_decided, would_execute, GateOutcome,
-    ToolExecution,
+    execute_approved, execute_gated, gate_tool_call_decided, gate_tool_call_unattended,
+    would_execute, GateOutcome, ToolExecution,
 };
 use crate::tools::loading::{PlanContext, ToolPlan};
 use crate::tools::registry::ToolRegistry;
@@ -4522,8 +4522,9 @@ impl AgentRunner {
                     },
                     ..ToolGates::from(&self.config)
                 };
+                // No one watches a turn without progress: nobody can be asked.
                 let (outcome, decided) =
-                    gate_tool_call_decided(&gates, &self.policy, &self.tools, &tool_name, input);
+                    gate_tool_call_unattended(&gates, &self.policy, &self.tools, &tool_name, input);
                 crate::tools::computer::settle_gated(
                     self.config.computer_gate.as_deref(),
                     &tool_name,
@@ -5763,8 +5764,19 @@ impl AgentRunner {
                     },
                     ..ToolGates::from(&self.config)
                 };
-                let (outcome, decided) =
-                    gate_tool_call_decided(&gates, &self.policy, &self.tools, &tool_name, input);
+                let (outcome, decided) = match approvals {
+                    Some(_) => {
+                        gate_tool_call_decided(&gates, &self.policy, &self.tools, &tool_name, input)
+                    }
+                    // No card on this turn: nobody can be asked.
+                    None => gate_tool_call_unattended(
+                        &gates,
+                        &self.policy,
+                        &self.tools,
+                        &tool_name,
+                        input,
+                    ),
+                };
                 crate::tools::computer::settle_gated(
                     self.config.computer_gate.as_deref(),
                     &tool_name,
@@ -5829,13 +5841,25 @@ impl AgentRunner {
                         allow_save_allow,
                         holds,
                     } => {
-                        let (prompt_options, keeper) = held_prompt(
-                            allow_save_allow,
-                            holds,
-                            self.config.agent_id.as_str(),
-                            self.config.surface_allows.clone(),
-                            self.config.permission_writer.clone(),
-                        );
+                        let (prompt_options, keeper) = match &decided {
+                            // A computer ask offers Allow once and Deny, and
+                            // keeps no answer as a permission rule.
+                            Some(d)
+                                if !matches!(
+                                    d.verdict,
+                                    workforce_core::computer::Verdict::Run { .. }
+                                ) =>
+                            {
+                                (crate::tools::computer::prompt_options(d), None)
+                            }
+                            _ => held_prompt(
+                                allow_save_allow,
+                                holds,
+                                self.config.agent_id.as_str(),
+                                self.config.surface_allows.clone(),
+                                self.config.permission_writer.clone(),
+                            ),
+                        };
                         let agent_id_str = self.config.agent_id.to_string();
                         let acting_user_id = CURRENT_USER_ID
                             .try_with(|u| u.clone())
@@ -16141,6 +16165,130 @@ issue?"#;
                 result: run.await.expect("run task").expect("run completes"),
                 prompts,
                 elapsed: started.elapsed(),
+            }
+        }
+
+        /// A computer gate that asks about every call of the test tool.
+        struct AsksAboutEveryCall(std::sync::Mutex<Vec<crate::tools::computer::Outcome>>);
+
+        impl crate::tools::computer::ComputerGate for AsksAboutEveryCall {
+            fn decides(&self, tool: &str) -> bool {
+                tool == crate::tools::approval::testing::TOOL
+            }
+            fn verdict(
+                &self,
+                _: &str,
+                _: &workforce_core::computer::Effect,
+            ) -> workforce_core::computer::Verdict {
+                workforce_core::computer::Verdict::Ask {
+                    choices: vec![
+                        workforce_core::computer::Choice::AllowOnce,
+                        workforce_core::computer::Choice::Deny,
+                    ],
+                    why: workforce_core::computer::Why::Runs,
+                }
+            }
+            fn record(&self, record: crate::tools::computer::Record) {
+                self.0.lock().unwrap().push(record.outcome);
+            }
+        }
+
+        #[derive(Default)]
+        struct KeepsChoices(std::sync::Mutex<Vec<PermissionChoice>>);
+
+        #[async_trait::async_trait]
+        impl PermissionWriter for KeepsChoices {
+            async fn persist_user_choice(
+                &self,
+                _: &str,
+                _: &str,
+                choice: PermissionChoice,
+            ) -> eyre::Result<()> {
+                self.0.lock().unwrap().push(choice);
+                Ok(())
+            }
+        }
+
+        /// A computer ask offers Allow once and Deny only; an "always" sent
+        /// anyway runs or denies the call once and keeps no rule.
+        #[tokio::test]
+        async fn a_computer_ask_offers_once_or_deny_and_keeps_no_rule_whatever_is_sent() {
+            for (sent, runs) in [
+                (PermissionChoice::AllowAlways, 1),
+                (PermissionChoice::DenyAlways, 0),
+            ] {
+                let tool = Arc::new(RecordingTool::default());
+                let gate = Arc::new(AsksAboutEveryCall(Default::default()));
+                let writer = Arc::new(KeepsChoices::default());
+                let tools = ToolRegistry::new();
+                tools.register(Arc::clone(&tool) as Arc<dyn crate::tools::Tool>);
+                let config = RunnerConfig {
+                    agent_id: AgentId::new("agent"),
+                    model: Some("scripted".to_string()),
+                    computer_gate: Some(
+                        Arc::clone(&gate) as Arc<dyn crate::tools::computer::ComputerGate>
+                    ),
+                    permission_writer: Some(Arc::clone(&writer) as Arc<dyn PermissionWriter>),
+                    ..RunnerConfig::default()
+                };
+                let policy = PolicyEngine::from_yaml(
+                    "rules:\n  - name: allow-all\n    scope: global\n    tool: \"*\"\n    action: allow\n",
+                )
+                .unwrap();
+                let runner = AgentRunner::new(
+                    config,
+                    Arc::new(ScriptedModel::new([entry("figma")], entry("figma"), 1)),
+                    Arc::new(tools),
+                    Arc::new(policy),
+                );
+                let (progress_tx, mut progress_rx) = mpsc::channel(64);
+                let (inject_tx, inject_rx) = mpsc::channel(8);
+                let run = tokio::spawn(as_member(async move {
+                    runner
+                        .run_with_progress_and_history(
+                            vec![ContentBlock::Text { text: "go".into() }],
+                            Vec::new(),
+                            progress_tx,
+                            None,
+                            Some(inject_rx),
+                        )
+                        .await
+                }));
+                let mut offered = Vec::new();
+                while let Some(event) = progress_rx.recv().await {
+                    if let ProgressEvent::ApprovalRequired {
+                        request_id,
+                        options,
+                        ..
+                    } = event
+                    {
+                        offered.push(options);
+                        let _ = inject_tx
+                            .send(InjectedMessage::ApprovalResponse {
+                                request_id,
+                                approved: sent.is_allow(),
+                                user: MEMBER.into(),
+                                choice: Some(sent),
+                            })
+                            .await;
+                    }
+                }
+                run.await.unwrap().unwrap();
+                assert_eq!(offered.len(), 1, "{sent:?}");
+                let o = &offered[0];
+                assert!(o.allow_once && o.deny_once && !o.allow_always && !o.deny_always);
+                assert_eq!(tool.runs().len(), runs, "{sent:?}");
+                assert!(
+                    writer.0.lock().unwrap().is_empty(),
+                    "no rule kept for {sent:?}"
+                );
+                let settled = gate.0.lock().unwrap().clone();
+                let want = if runs == 1 {
+                    crate::tools::computer::Outcome::Allowed
+                } else {
+                    crate::tools::computer::Outcome::Declined
+                };
+                assert_eq!(settled, [want]);
             }
         }
 

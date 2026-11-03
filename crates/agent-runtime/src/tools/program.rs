@@ -21,7 +21,7 @@ use crate::security::external_content::wrap_external_content;
 use crate::tools::access::ToolAccessSnapshot;
 use crate::tools::arguments::ArgumentValidation;
 use crate::tools::dispatch::{
-    execute_gated, gate_tool_call_decided, GateOutcome, ToolExecution, ToolGates,
+    execute_gated, gate_tool_call_unattended, GateOutcome, ToolExecution, ToolGates,
 };
 use crate::tools::loading::{ToolPlan, CALL_TOOL, LOAD_TOOL};
 use crate::tools::registry::ToolRegistry;
@@ -412,7 +412,7 @@ impl GatedHost {
             ..self.ctx.gates.clone()
         };
         let (outcome, decided) =
-            gate_tool_call_decided(&gates, &self.ctx.policy, &self.ctx.tools, &name, &args);
+            gate_tool_call_unattended(&gates, &self.ctx.policy, &self.ctx.tools, &name, &args);
         let computer = gates.computer_gate.as_deref();
         crate::tools::computer::settle_gated(computer, &name, decided.as_ref(), &args, &outcome);
         if let GateOutcome::RequireApproval { reason, .. } = &outcome {

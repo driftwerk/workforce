@@ -172,6 +172,11 @@ impl ComputerGate for HubComputerGate {
         namespace(tool) == Some(Namespace::Computer)
     }
 
+    fn unattended_runs(&self) -> bool {
+        self.policy.access.access == workforce_core::computer::Access::Full
+            && self.policy.access.unattended == workforce_core::computer::Unattended::Run
+    }
+
     fn verdict(&self, tool: &str, effect: &Effect) -> Verdict {
         let facts = self.facts(tool, effect);
         // The dispatch gate is synchronous; the hub runs on a multi-thread
@@ -424,12 +429,12 @@ mod tests {
             assert_eq!(decide("memory.recall", json!({})), "run");
             assert_eq!(decide("web.fetch", json!({})), "run");
 
-            // Nobody to ask (a job, a workflow step): refused at once.
-            let refusal = as_sarah(|| {
+            // Nobody to ask (a job, a workflow step): at Full access it runs,
+            // as before.
+            let ran = as_sarah(|| {
                 unattended_refusal(Some(gate.as_ref()), &tools, "exec.run", &json!({"command": "npm test"}))
-            })
-            .unwrap();
-            assert!(refusal.contains("nobody can be asked here"), "{refusal}");
+            });
+            assert_eq!(ran, None);
 
             // The kill switch refuses even an own-folder write.
             store.set_access_stopped(true).await.unwrap();
@@ -474,6 +479,72 @@ mod tests {
                 ),
                 other => panic!("{other:?}"),
             }
+        })
+        .await;
+    }
+
+    /// With `unattended = "refuse"`, what would ask is refused at once where
+    /// nobody can be asked; what the level refuses stays refused either way.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn where_nobody_can_be_asked_an_ask_runs_unless_the_agent_says_refuse() {
+        with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+            let store = Arc::new(DeskStore::with_pool(pool).await.unwrap());
+            let hub = hub();
+            let tools = tools(&hub.subject.workspace);
+            let input = json!({"command": "npm test"});
+            let gate_with = |config: &str| -> Arc<dyn ComputerGate> {
+                std::fs::write(hub.subject.workspace.join("config.toml"), config).unwrap();
+                Arc::new(HubComputerGate::for_agent(
+                    Computer::new(Arc::clone(&store)),
+                    &hub.config,
+                    &hub.subject,
+                ))
+            };
+            let runs = gate_with("");
+            assert!(as_sarah(|| unattended_refusal(
+                Some(runs.as_ref()),
+                &tools,
+                "exec.run",
+                &input
+            ))
+            .is_none());
+            let (outcome, _) = as_sarah(|| {
+                workforce_agent::tools::dispatch::gate_tool_call_unattended(
+                    &gates(Some(Arc::clone(&runs))),
+                    &policy(),
+                    &tools,
+                    "exec.run",
+                    &input,
+                )
+            });
+            assert_eq!(kind(&outcome), "run");
+            let refuses = gate_with("[computer]\nunattended = \"refuse\"\n");
+            let refusal =
+                as_sarah(|| unattended_refusal(Some(refuses.as_ref()), &tools, "exec.run", &input))
+                    .unwrap();
+            assert!(refusal.contains("nobody can be asked here"), "{refusal}");
+            let (outcome, _) = as_sarah(|| {
+                workforce_agent::tools::dispatch::gate_tool_call_unattended(
+                    &gates(Some(refuses)),
+                    &policy(),
+                    &tools,
+                    "exec.run",
+                    &input,
+                )
+            });
+            assert_eq!(
+                kind(&outcome),
+                "asks once",
+                "the runner refuses it: no card"
+            );
+            let lower = gate_with("[computer]\naccess = \"own_folder\"\n");
+            assert!(as_sarah(|| unattended_refusal(
+                Some(lower.as_ref()),
+                &tools,
+                "exec.run",
+                &input
+            ))
+            .is_some());
         })
         .await;
     }

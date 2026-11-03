@@ -27,6 +27,7 @@ fn policy(access: Access) -> AgentPolicy {
             access,
             autonomous: false,
             ask_in_own_folder: false,
+            unattended: Default::default(),
         },
         own: vec![p(OWN)],
         withheld: vec![

@@ -79,6 +79,31 @@ pub trait ComputerGate: Send + Sync {
     fn verdict(&self, tool: &str, effect: &Effect) -> Verdict;
     /// Keeps what came of a call. Must neither block nor fail it.
     fn record(&self, record: Record);
+    /// Whether, where nobody can be asked, what would ask runs instead: the
+    /// agent is at Full access and its `[computer] unattended` is `run`, the
+    /// default, so jobs keep working as before. Never what is refused.
+    fn unattended_runs(&self) -> bool {
+        false
+    }
+}
+
+/// [`decide`] on a path where nobody can be asked: an ask becomes a run
+/// when the gate says so ([`ComputerGate::unattended_runs`]); a refusal
+/// stays one.
+pub fn decide_unattended(
+    gate: Option<&dyn ComputerGate>,
+    tools: &ToolRegistry,
+    tool_name: &str,
+    input: &Value,
+) -> Option<Decision> {
+    let mut decision = decide(gate, tools, tool_name, input)?;
+    let asks = matches!(decision.verdict, Verdict::Ask { .. } | Verdict::Review);
+    if asks && gate.is_some_and(|g| g.unattended_runs()) {
+        decision.verdict = Verdict::Run {
+            by: workforce_core::computer::By::Unattended,
+        };
+    }
+    Some(decision)
 }
 
 /// The gate's decision on `tool_name` with `input`, when the gate decides it.
@@ -161,6 +186,21 @@ fn held(response: PolicyResponse, why: &str, effect: &Effect) -> PolicyResponse 
     }
 }
 
+/// The answers a computer ask offers: Allow once and Deny. No "always"
+/// reaches the permission rules.
+pub fn prompt_options(_decision: &Decision) -> workforce_core::policy::PermissionPromptOptions {
+    workforce_core::policy::PermissionPromptOptions {
+        allow_once: true,
+        deny_once: true,
+        allow_always: false,
+        deny_always: false,
+    }
+}
+
+/// Why a call that would have asked ran: nobody could be asked.
+pub const UNATTENDED_RAN: &str =
+    "Nobody could be asked, and at Full access the agent runs it, as before";
+
 /// Records what came of a call the gate decided; nothing when it decided
 /// nothing.
 pub fn settle(
@@ -207,8 +247,9 @@ pub fn settle_gated(
     use crate::tools::dispatch::GateOutcome;
     let Some(d) = decision else { return };
     match (outcome, &d.verdict) {
-        (GateOutcome::Execute { .. }, Verdict::Run { .. }) => {
-            settle(gate, tool, decision, input, Outcome::Ran, None)
+        (GateOutcome::Execute { .. }, Verdict::Run { by }) => {
+            let why = (*by == workforce_core::computer::By::Unattended).then_some(UNATTENDED_RAN);
+            settle(gate, tool, decision, input, Outcome::Ran, why)
         }
         (GateOutcome::Blocked { reason, .. }, Verdict::Refuse { .. }) => {
             settle(gate, tool, decision, input, Outcome::Refused, Some(reason))
@@ -225,16 +266,18 @@ pub fn unattended_refusal(
     tool_name: &str,
     input: &Value,
 ) -> Option<String> {
-    let decision = decide(gate, tools, tool_name, input)?;
+    let decision = decide_unattended(gate, tools, tool_name, input)?;
     let gate = gate?;
     let reason = match &decision.verdict {
-        Verdict::Run { .. } => {
+        Verdict::Run { by } => {
+            let reason = (*by == workforce_core::computer::By::Unattended)
+                .then(|| UNATTENDED_RAN.to_string());
             gate.record(Record {
                 tool: tool_name.to_string(),
                 decision,
                 input: input.clone(),
                 outcome: Outcome::Ran,
-                reason: None,
+                reason,
             });
             return None;
         }
