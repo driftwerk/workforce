@@ -4,23 +4,28 @@
 //! ```toml
 //! [computer]
 //! access = "full"            # own_folder | read_anywhere | full
-//! autonomous = false         # at full: a check decides routine changes
+//! asks = "irreversible"      # at full: irreversible (the default) | never
 //! ask_in_own_folder = false  # true: changes in its own folder ask too
+//! unattended = "run"         # at full, with nobody to ask: run | refuse
 //! ```
 //!
-//! An agent with no `[computer]` is Full access, asking first, and changes
-//! in its own folder run without a card: what an agent did before the
-//! table existed only gains a question. A server hub never reads it.
+//! An agent with no `[computer]` is at Full access and asks only before what
+//! can't be undone (the always-asks list): everything else it did before
+//! the table existed runs as it did. `asks = "never"` asks before nothing.
+//! A server hub never reads it.
 //!
 //! The table is kept as a raw value and checked here, so what is wrong with
 //! it is said in plain words, without key names: Desk shows the refusal to
 //! the person as it is. Keys this hub does not know are ignored.
 
 use toml::Value;
-use workforce_core::computer::{Access, ComputerAccess};
+use workforce_core::computer::{Access, Asking, ComputerAccess, Unattended};
 
 type Table = toml::map::Map<String, Value>;
 
+const ASKS: &str =
+    "What the agent asks you about first must be irreversible things only, or never.";
+const UNATTENDED: &str = "What the agent does when nobody can be asked must be run or refuse.";
 const LEVEL: &str = "How far the agent reaches on this computer must be its own folder, read anywhere or full access.";
 
 fn switch(t: &Table, key: &str, default: bool, what: &str) -> Result<bool, String> {
@@ -48,9 +53,23 @@ pub fn from_value(value: &Value) -> Result<ComputerAccess, String> {
     if autonomous && access != Access::Full {
         return Err("An agent can work on its own only with full access to this computer.".into());
     }
+    let unattended = match t.get("unattended") {
+        None => d.unattended,
+        Some(Value::String(s)) => {
+            Unattended::parse(s.trim()).ok_or_else(|| UNATTENDED.to_string())?
+        }
+        Some(_) => return Err(UNATTENDED.into()),
+    };
+    let asks = match t.get("asks") {
+        None => d.asks,
+        Some(Value::String(s)) => Asking::parse(s.trim()).ok_or_else(|| ASKS.to_string())?,
+        Some(_) => return Err(ASKS.into()),
+    };
     Ok(ComputerAccess {
         access,
         autonomous,
+        unattended,
+        asks,
         ask_in_own_folder: switch(
             t,
             "ask_in_own_folder",
@@ -77,6 +96,11 @@ pub fn to_value(access: &ComputerAccess) -> Value {
         "ask_in_own_folder".into(),
         Value::Boolean(access.ask_in_own_folder),
     );
+    t.insert(
+        "unattended".into(),
+        Value::String(access.unattended.as_str().into()),
+    );
+    t.insert("asks".into(), Value::String(access.asks.as_str().into()));
     Value::Table(t)
 }
 
@@ -95,6 +119,14 @@ mod tests {
         assert_eq!(none.access, Access::Full);
         assert!(!none.autonomous);
         assert!(!none.ask_in_own_folder);
+        // Where nobody can be asked, it runs as before.
+        assert_eq!(none.unattended, Unattended::Run);
+        // At Full access it asks only before what can't be undone.
+        assert_eq!(none.asks, Asking::Irreversible);
+        assert_eq!(
+            parse("[computer]\nasks = \"never\"\n").unwrap().asks,
+            Asking::Never
+        );
         assert_eq!(parse("[computer]\n").unwrap(), none);
     }
 
@@ -127,11 +159,16 @@ mod tests {
     fn every_value_round_trips_through_the_table_desk_writes() {
         for access in [Access::OwnFolder, Access::ReadAnywhere, Access::Full] {
             for autonomous in [false, true] {
-                for ask_in_own_folder in [false, true] {
+                for (ask_in_own_folder, unattended, asks) in [
+                    (false, Unattended::Run, Asking::Irreversible),
+                    (true, Unattended::Refuse, Asking::Never),
+                ] {
                     let want = ComputerAccess {
                         access,
                         autonomous,
                         ask_in_own_folder,
+                        unattended,
+                        asks,
                     };
                     let written = to_value(&want);
                     let read = from_value(&written);
@@ -165,6 +202,11 @@ mod tests {
                 "only with full access",
             ),
             ("[computer]\nask_in_own_folder = 1\n", "true or false"),
+            ("[computer]\nunattended = \"ask\"\n", "run or refuse"),
+            (
+                "[computer]\nasks = \"always\"\n",
+                "irreversible things only, or never",
+            ),
             ("computer = \"full\"\n", "group of settings"),
         ] {
             let e = parse(source).unwrap_err();

@@ -53,6 +53,12 @@ impl Tool for ReadFile {
         "filesystem.read"
     }
 
+    fn effect(&self, input: &serde_json::Value) -> workforce_core::computer::Effect {
+        workforce_core::computer::Effect::Read {
+            paths: crate::tools::computer::paths_in(input, "path", &self.allowed_paths),
+        }
+    }
+
     fn description(&self) -> &str {
         "Read the contents of a file. Supports offset and limit for large files."
     }
@@ -138,6 +144,12 @@ impl Tool for WriteFile {
         "filesystem.write"
     }
 
+    fn effect(&self, input: &serde_json::Value) -> workforce_core::computer::Effect {
+        workforce_core::computer::Effect::Write {
+            paths: crate::tools::computer::paths_in(input, "path", &self.allowed_paths),
+        }
+    }
+
     fn description(&self) -> &str {
         "Write content to file, creates parent dirs if needed"
     }
@@ -169,6 +181,12 @@ impl Tool for WriteFile {
             ));
         };
 
+        if let Some(refused) = crate::tools::paths::hard_link_refusal(&real, &roots) {
+            return Ok(ToolResult::failure(
+                refused,
+                start.elapsed().as_millis() as u64,
+            ));
+        }
         let bytes_written = content.len();
         let written = tokio::task::spawn_blocking(move || {
             if let Some(parent) = real.parent() {
@@ -226,6 +244,12 @@ impl Tool for EditFile {
         "filesystem.edit"
     }
 
+    fn effect(&self, input: &serde_json::Value) -> workforce_core::computer::Effect {
+        workforce_core::computer::Effect::Write {
+            paths: crate::tools::computer::paths_in(input, "path", &self.allowed_paths),
+        }
+    }
+
     fn description(&self) -> &str {
         "Edit file by exact string find-and-replace"
     }
@@ -260,6 +284,12 @@ impl Tool for EditFile {
         if let Err(refused) = config_guard::check(&roots, &resolved) {
             return Ok(ToolResult::failure(
                 refused.to_string(),
+                start.elapsed().as_millis() as u64,
+            ));
+        }
+        if let Some(refused) = crate::tools::paths::hard_link_refusal(&resolved, &roots) {
+            return Ok(ToolResult::failure(
+                refused,
                 start.elapsed().as_millis() as u64,
             ));
         }
@@ -345,6 +375,12 @@ struct ListDirInput {
 impl Tool for ListDir {
     fn name(&self) -> &str {
         "filesystem.list"
+    }
+
+    fn effect(&self, input: &serde_json::Value) -> workforce_core::computer::Effect {
+        workforce_core::computer::Effect::Read {
+            paths: crate::tools::computer::paths_in(input, "path", &self.allowed_paths),
+        }
     }
 
     fn description(&self) -> &str {
@@ -445,6 +481,12 @@ const GREP_DEFAULT_MAX_MATCHES: usize = 200;
 impl Tool for Grep {
     fn name(&self) -> &str {
         "filesystem.grep"
+    }
+
+    fn effect(&self, input: &serde_json::Value) -> workforce_core::computer::Effect {
+        workforce_core::computer::Effect::Read {
+            paths: crate::tools::computer::paths_in(input, "path", &self.allowed_paths),
+        }
     }
 
     fn description(&self) -> &str {
@@ -549,6 +591,12 @@ const GLOB_DEFAULT_MAX_RESULTS: usize = 500;
 impl Tool for Glob {
     fn name(&self) -> &str {
         "filesystem.glob"
+    }
+
+    fn effect(&self, input: &serde_json::Value) -> workforce_core::computer::Effect {
+        workforce_core::computer::Effect::Read {
+            paths: crate::tools::computer::paths_in(input, "path", &self.allowed_paths),
+        }
     }
 
     fn description(&self) -> &str {

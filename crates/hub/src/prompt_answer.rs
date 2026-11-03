@@ -19,11 +19,13 @@ pub(crate) enum Unanswered {
 }
 
 /// Answer `request_id` in `session_id`'s live turn with `choice`, as
-/// `owner`, the person the session's turns run as.
+/// `owner`, the person the session's turns run as, from paired `device`
+/// where the answer names one.
 pub(crate) async fn answer(
     nats: Option<&async_nats::Client>,
     service: &AgentService,
     owner: &str,
+    device: Option<&str>,
     session_id: &str,
     request_id: &str,
     choice: PermissionChoice,
@@ -31,6 +33,12 @@ pub(crate) async fn answer(
     if !owns_session(service.sessions.as_ref(), session_id, owner) {
         return Err(Unanswered::NotYours);
     }
+    // Only an answer that may answer is noted as answering: the activity
+    // names the device it came from.
+    #[cfg(feature = "postgres")]
+    crate::desk_computer::answered_from(request_id, device);
+    #[cfg(not(feature = "postgres"))]
+    let _ = device;
     let control = TurnControl::Approval {
         request_id: request_id.to_string(),
         approved: choice.is_allow(),

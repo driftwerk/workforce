@@ -87,6 +87,11 @@ impl Tool for LocalAgentExecTool {
         "exec.run"
     }
 
+    /// As the exec it falls back to says: the command, where it runs.
+    fn effect(&self, input: &serde_json::Value) -> workforce_core::computer::Effect {
+        self.fallback_exec.effect(input)
+    }
+
     fn description(&self) -> &str {
         "Manage local agent processes"
     }

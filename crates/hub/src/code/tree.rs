@@ -223,6 +223,12 @@ impl Tool for CodeTreeTool {
         "code.tree"
     }
 
+    fn effect(&self, input: &serde_json::Value) -> workforce_core::computer::Effect {
+        workforce_core::computer::Effect::Read {
+            paths: super::utils::effect_paths(input, "path", &self.allowed_paths),
+        }
+    }
+
     fn description(&self) -> &str {
         "Show directory tree structure"
     }

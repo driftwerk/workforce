@@ -900,6 +900,12 @@ impl Tool for WasmSkillGuideTool {
         "wasm_skill.guide"
     }
 
+    /// Runs in, or changes, the hub's WASI skill store: nothing on this
+    /// computer's files.
+    fn effect(&self, _input: &serde_json::Value) -> workforce_core::computer::Effect {
+        workforce_core::computer::Effect::None
+    }
+
     fn description(&self) -> &str {
         "The complete WASM skill authoring guide: Skill.toml schema, the guest API, \
          credential/tool consent flow, sandbox limits, and workflow integration. Call \
@@ -1033,6 +1039,12 @@ struct TestInput {
 impl Tool for WasmSkillTestTool {
     fn name(&self) -> &str {
         "wasm_skill.test"
+    }
+
+    /// Runs in, or changes, the hub's WASI skill store: nothing on this
+    /// computer's files.
+    fn effect(&self, _input: &serde_json::Value) -> workforce_core::computer::Effect {
+        workforce_core::computer::Effect::None
     }
 
     fn description(&self) -> &str {
@@ -1336,6 +1348,19 @@ const GITHUB_PIN_RECIPE: &str = "Pin one of two ways: (1) reference an exact com
 impl Tool for WasmSkillInstallTool {
     fn name(&self) -> &str {
         "wasm_skill.install"
+    }
+
+    fn effect(&self, input: &serde_json::Value) -> workforce_core::computer::Effect {
+        let roots = &self.ctx.path_roots;
+        let mut paths = workforce_agent::tools::computer::paths_in(input, "wasm_path", roots);
+        if input["wasm_path"].as_str().is_none() {
+            paths = match input["project_path"].as_str() {
+                Some(_) => workforce_agent::tools::computer::paths_in(input, "project_path", roots),
+                // From a GitHub release: nothing here is read.
+                None => Vec::new(),
+            };
+        }
+        workforce_core::computer::Effect::Read { paths }
     }
 
     fn description(&self) -> &str {
@@ -1733,6 +1758,16 @@ impl Tool for WasmSkillRestoreSourceTool {
         "wasm_skill.restore_source"
     }
 
+    fn effect(&self, input: &serde_json::Value) -> workforce_core::computer::Effect {
+        workforce_core::computer::Effect::Write {
+            paths: workforce_agent::tools::computer::paths_in(
+                input,
+                "dest_dir",
+                &self.ctx.path_roots,
+            ),
+        }
+    }
+
     fn description(&self) -> &str {
         "Restore an installed WASM skill's source (Skill.toml, Cargo.toml, src/) from the \
          snapshot taken when it was built, into your workspace. Use this when the project \
@@ -1958,6 +1993,12 @@ impl Tool for WasmSkillExportTool {
         "wasm_skill.export"
     }
 
+    /// Runs in, or changes, the hub's WASI skill store: nothing on this
+    /// computer's files.
+    fn effect(&self, _input: &serde_json::Value) -> workforce_core::computer::Effect {
+        workforce_core::computer::Effect::None
+    }
+
     fn description(&self) -> &str {
         "Export an installed WASM skill as a downloadable zip (Skill.toml + binary + \
          provenance digest) for importing on another hub with wasm_skill.import. The \
@@ -2101,6 +2142,12 @@ impl Tool for WasmSkillImportTool {
         "wasm_skill.import"
     }
 
+    /// Runs in, or changes, the hub's WASI skill store: nothing on this
+    /// computer's files.
+    fn effect(&self, _input: &serde_json::Value) -> workforce_core::computer::Effect {
+        workforce_core::computer::Effect::None
+    }
+
     fn description(&self) -> &str {
         "Install a WASM skill from an uploaded export archive (.wfskill.zip produced by \
          wasm_skill.export on another hub). Pass the uploaded attachment's artifact id. \
@@ -2241,6 +2288,12 @@ impl Tool for WasmSkillUninstallTool {
         "wasm_skill.uninstall"
     }
 
+    /// Runs in, or changes, the hub's WASI skill store: nothing on this
+    /// computer's files.
+    fn effect(&self, _input: &serde_json::Value) -> workforce_core::computer::Effect {
+        workforce_core::computer::Effect::None
+    }
+
     fn description(&self) -> &str {
         "Uninstall a WASM skill, removing its tools and binary"
     }
@@ -2307,6 +2360,12 @@ impl WasmSkillListTool {
 impl Tool for WasmSkillListTool {
     fn name(&self) -> &str {
         "wasm_skill.list"
+    }
+
+    /// Runs in, or changes, the hub's WASI skill store: nothing on this
+    /// computer's files.
+    fn effect(&self, _input: &serde_json::Value) -> workforce_core::computer::Effect {
+        workforce_core::computer::Effect::None
     }
 
     fn description(&self) -> &str {
@@ -2393,6 +2452,12 @@ struct UpdateInput {
 impl Tool for WasmSkillUpdateTool {
     fn name(&self) -> &str {
         "wasm_skill.update"
+    }
+
+    /// Runs in, or changes, the hub's WASI skill store: nothing on this
+    /// computer's files.
+    fn effect(&self, _input: &serde_json::Value) -> workforce_core::computer::Effect {
+        workforce_core::computer::Effect::None
     }
 
     fn description(&self) -> &str {
@@ -2645,6 +2710,18 @@ impl Tool for WasmSkillBuildTool {
         "wasm_skill.build"
     }
 
+    /// A host build (`cargo build`) in the project.
+    fn effect(&self, input: &serde_json::Value) -> workforce_core::computer::Effect {
+        let cwd =
+            workforce_agent::tools::computer::paths_in(input, "project_path", &self.ctx.path_roots)
+                .into_iter()
+                .next();
+        workforce_core::computer::Effect::Exec {
+            command: "cargo build --release --target wasm32-wasip2".into(),
+            cwd,
+        }
+    }
+
     fn description(&self) -> &str {
         static DESC: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
             format!(
@@ -2841,6 +2918,16 @@ struct ScaffoldToolDef {
 impl Tool for WasmSkillScaffoldTool {
     fn name(&self) -> &str {
         "wasm_skill.scaffold"
+    }
+
+    fn effect(&self, input: &serde_json::Value) -> workforce_core::computer::Effect {
+        workforce_core::computer::Effect::Write {
+            paths: workforce_agent::tools::computer::paths_in(
+                input,
+                "output_dir",
+                &self.ctx.path_roots,
+            ),
+        }
     }
 
     fn description(&self) -> &str {

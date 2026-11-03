@@ -31,9 +31,13 @@ use workforce_agent::security::external_content::tokenize_for_egress;
 use workforce_agent::spill::{spill_tool_output, RetrievalSurface};
 use workforce_agent::tools::access::ToolAccessSnapshot;
 use workforce_agent::tools::approval::{GatedCall, Refusal, TurnApprovals};
+use workforce_agent::tools::computer::{
+    keep_answer, prompt_options, refused_as, settle, settle_answered, settle_gated, Decision,
+    Outcome,
+};
 use workforce_agent::tools::dispatch::{
-    execute_approved, execute_gated, gate_tool_call, prepare_allowed, GateOutcome, ToolExecution,
-    ToolGates,
+    execute_approved, execute_decided, gate_tool_call_decided, gate_tool_call_unattended,
+    prepare_allowed, GateOutcome, ToolExecution, ToolGates,
 };
 use workforce_agent::tools::image_gen::ImageSink;
 use workforce_agent::tools::image_view::ImageViewSink;
@@ -70,6 +74,8 @@ pub fn choice_name(choice: PermissionChoice) -> &'static str {
         PermissionChoice::DenyOnce => "deny_once",
         PermissionChoice::AllowAlways => "allow_always",
         PermissionChoice::DenyAlways => "deny_always",
+        PermissionChoice::AllowSession => "allow_session",
+        PermissionChoice::AllowInFolder => "allow_in_folder",
     }
 }
 
@@ -81,6 +87,8 @@ pub fn offered(options: &PermissionPromptOptions, choice: PermissionChoice) -> b
         PermissionChoice::DenyOnce => options.deny_once,
         PermissionChoice::AllowAlways => options.allow_always,
         PermissionChoice::DenyAlways => options.deny_always,
+        PermissionChoice::AllowSession => options.allow_session,
+        PermissionChoice::AllowInFolder => options.allow_in_folder.is_some(),
     }
 }
 
@@ -302,6 +310,7 @@ impl PendingCall {
             &site.access,
             &self.tool_name,
             &self.input,
+            None,
         )
         .await;
         site.report(&tools, &self.tool_name, Held::ran(exec))
@@ -463,6 +472,9 @@ struct Asked {
     reason: String,
     allow_save_allow: bool,
     holds: Option<Destination>,
+    /// The computer gate's decision, when it is what asks: its card, its
+    /// grants and its binding, never a permission rule.
+    decided: Option<Decision>,
 }
 
 impl GatedExecutor {
@@ -494,16 +506,54 @@ impl GatedExecutor {
         input: &serde_json::Value,
     ) -> Gated {
         let site = &self.site;
-        let outcome = match self.bridged(tool) {
-            true => prepare_allowed(&site.gates, name, input),
-            false => gate_tool_call(&site.gates, &site.policy, tools, name, input),
+        // Nobody answers a remote caller's computer asks but a person on a
+        // card: a parked call's caller can't decide its own, and a round
+        // with no card has nobody. Both are decided as a run with nobody to
+        // ask is (`[computer] unattended`).
+        let unattended = match &self.mode {
+            ApprovalMode::Park { .. } => true,
+            ApprovalMode::Hold { turn, .. } => turn.approvals.is_none(),
         };
+        let (outcome, decided) = match self.bridged(tool) {
+            true => (prepare_allowed(&site.gates, name, input), None),
+            false if unattended => {
+                gate_tool_call_unattended(&site.gates, &site.policy, tools, name, input)
+            }
+            false => gate_tool_call_decided(&site.gates, &site.policy, tools, name, input),
+        };
+        let computer = site.gates.computer_gate.as_deref();
+        settle_gated(computer, name, decided.as_ref(), input, &outcome);
+        let computer_asks = decided
+            .as_ref()
+            .filter(|d| !matches!(d.verdict, workforce_core::computer::Verdict::Run { .. }));
+        if let (true, Some(_), GateOutcome::RequireApproval { reason, .. }) =
+            (unattended, computer_asks, &outcome)
+        {
+            settle(
+                computer,
+                name,
+                decided.as_ref(),
+                input,
+                Outcome::Unattended,
+                Some(reason),
+            );
+            let reason = format!("{name} needs a person's say on this computer, and nobody can be asked here: {reason}");
+            return Gated::Settled(Held::refused(reason.clone(), reason));
+        }
         match outcome {
             GateOutcome::Blocked {
                 message, reason, ..
             } => Gated::Settled(Held::ran(ToolExecution::blocked(message, reason))),
             GateOutcome::Execute { exec_input, .. } => Gated::Settled(Held::ran(
-                execute_gated(tools, &site.access, name, input, exec_input).await,
+                execute_decided(
+                    tools,
+                    &site.access,
+                    name,
+                    input,
+                    exec_input,
+                    decided.as_ref(),
+                )
+                .await,
             )),
             GateOutcome::RequireApproval {
                 reason,
@@ -517,6 +567,7 @@ impl GatedExecutor {
                     reason,
                     allow_save_allow,
                     holds,
+                    decided: workforce_agent::tools::computer::asking(decided),
                 },
             ),
         }
@@ -769,13 +820,19 @@ impl GatedExecutor {
         asked: Asked,
     ) -> Held {
         let site = &self.site;
-        let (options, keeper) = held_prompt(
-            asked.allow_save_allow,
-            asked.holds,
-            &site.audit.agent_id,
-            site.gates.surface_allows.clone(),
-            turn.writer.clone(),
-        );
+        let computer = site.gates.computer_gate.as_deref();
+        let decided = asked.decided.clone();
+        let (options, keeper) = match decided.as_ref() {
+            // A computer ask: the gate's card, kept as its grants, never a rule.
+            Some(d) => (prompt_options(computer, d), None),
+            None => held_prompt(
+                asked.allow_save_allow,
+                asked.holds,
+                &site.audit.agent_id,
+                site.gates.surface_allows.clone(),
+                turn.writer.clone(),
+            ),
+        };
         let reason = asked.reason;
         let refused =
             |refusal: Refusal, reason| Held::refused(refusal.tool_result().into(), reason);
@@ -788,8 +845,19 @@ impl GatedExecutor {
         };
         let prompt = match ledger.open(call) {
             Ok(prompt) => prompt,
-            Err(refusal) => return refused(refusal, reason),
+            Err(refusal) => {
+                settle(
+                    computer,
+                    name,
+                    decided.as_ref(),
+                    input,
+                    refused_as(refusal),
+                    Some(&reason),
+                );
+                return refused(refusal, reason);
+            }
         };
+        let answered = prompt.request_id.clone();
         let detail = approval_detail(tools, name, input);
         let decision = await_approval(
             ApprovalAsk {
@@ -808,11 +876,31 @@ impl GatedExecutor {
             turn.patience,
         )
         .await;
+        settle_answered(
+            computer,
+            name,
+            decided.as_ref(),
+            input,
+            match decision.verdict() {
+                Ok(()) => Outcome::Allowed,
+                Err(refusal) => refused_as(refusal),
+            },
+            &answered,
+        );
         if let Err(refusal) = decision.verdict() {
             return refused(refusal, reason);
         }
-        let exec =
-            execute_approved(&site.gates, &site.policy, tools, &site.access, name, input).await;
+        keep_answer(computer, decided.as_ref(), decision.choice);
+        let exec = execute_approved(
+            &site.gates,
+            &site.policy,
+            tools,
+            &site.access,
+            name,
+            input,
+            decided.as_ref(),
+        )
+        .await;
         if exec.is_error {
             ledger.close(decision.call, Refusal::Failed);
         }
