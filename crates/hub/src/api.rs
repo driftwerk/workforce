@@ -1107,7 +1107,9 @@ fn resume_status(refused: &ResumeRefused) -> StatusCode {
             | DecisionRefused::WorkflowGone,
         ) => StatusCode::CONFLICT,
         ResumeRefused::Decision(
-            DecisionRefused::Choose { .. } | DecisionRefused::Unavailable(_),
+            DecisionRefused::Choose { .. }
+            | DecisionRefused::Unavailable(_)
+            | DecisionRefused::Input(_),
         )
         | ResumeRefused::Failed(_) => StatusCode::BAD_REQUEST,
     }
@@ -2317,6 +2319,10 @@ struct ResumePayload {
     /// The open decision's gate, from the instance's `decision`.
     #[serde(default)]
     gate: Option<String>,
+    /// The text a decision button with `input` asks for; otherwise the
+    /// feedback the resumed step reads.
+    #[serde(default)]
+    feedback: Option<String>,
     #[serde(default)]
     channel_id: Option<String>,
     #[serde(default)]
@@ -2347,7 +2353,7 @@ async fn resume_workflow_instance(
     let ask = ResumeAsk {
         outcome: body.outcome.clone(),
         gate,
-        feedback: None,
+        feedback: body.feedback,
         channel_id: body.channel_id,
         thread_id: body.thread_id,
         originating_agent_id: None,
@@ -3968,6 +3974,7 @@ mod steering_tests {
                 Json(ResumePayload {
                     outcome: None,
                     gate: None,
+                    feedback: None,
                     channel_id: Some(channel.into()),
                     thread_id: Some("9.9".into()),
                 }),
@@ -4028,6 +4035,7 @@ mod steering_tests {
             Json(ResumePayload {
                 outcome: Some(outcome.into()),
                 gate,
+                feedback: None,
                 channel_id: None,
                 thread_id: None,
             }),
@@ -4192,6 +4200,7 @@ mod steering_tests {
                 Json(ResumePayload {
                     outcome: outcome.map(str::to_string),
                     gate: None,
+                    feedback: None,
                     channel_id: None,
                     thread_id: None,
                 }),

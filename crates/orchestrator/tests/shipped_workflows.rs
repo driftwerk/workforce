@@ -79,3 +79,21 @@ fn the_documented_decide_first_example_saves() {
     assert_eq!(def.authoring_issues(), Vec::<String>::new());
     assert!(def.get_step("classify").unwrap().decide_first.is_some());
 }
+
+/// The worked example under Decisions in the end-user workflow docs saves,
+/// its input button included.
+#[test]
+fn the_documented_decision_example_saves() {
+    let docs = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../end-user-docs/concepts/workflows.mdx");
+    let docs = std::fs::read_to_string(&docs).unwrap();
+    let example = docs
+        .split("## Decisions")
+        .nth(1)
+        .and_then(|section| section.split("```toml\n").nth(1))
+        .and_then(|block| block.split("```").next())
+        .expect("a worked example under Decisions");
+    let def = WorkflowDefinition::from_toml(example).unwrap();
+    let decision = def.get_step("review").unwrap().decision.as_ref().unwrap();
+    assert!(decision.buttons.iter().any(|b| b.input.is_some()));
+}

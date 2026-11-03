@@ -15,8 +15,8 @@ use workforce_common::persistence::WorkflowInstanceRow;
 use workforce_identity::types::{Identity, IdentityStatus};
 use workforce_orchestrator::workflow::decision::DecisionSpec;
 use workforce_orchestrator::workflow::decision::{
-    self as run_decision, Card, CardTarget, Closed, DecidedBy, Decider, Opening, Person, Refusal,
-    RunDecision,
+    self as run_decision, Card, CardTarget, Choice, Closed, DecidedBy, Decider, Opening, Person,
+    Refusal, RunDecision,
 };
 use workforce_orchestrator::workflow::definition::{StepDefinition, WorkflowDefinition};
 use workforce_orchestrator::workflow::engine::WorkflowExecutor;
@@ -30,7 +30,8 @@ use super::{
 };
 use crate::def_write_auth::DefWriter;
 pub use crate::hub_core::workflows::{
-    DecisionAsk, DecisionMade, DecisionRefused, ResumeAsk, ResumeRefused, Resumed,
+    DecisionAsk, DecisionForm, DecisionMade, DecisionRefused, ResumeAsk, ResumeRefused, Resumed,
+    TypedPress,
 };
 use crate::recipients::{self, Recipient, RecipientRef};
 use crate::run_steering::{self, Standing, SteerAction, SteerRefused, Steerer};
@@ -70,6 +71,75 @@ enum Recorded {
 pub(super) enum Followed {
     Continue,
     Stop,
+}
+
+/// Why a press at `gate` finds no open decision on `instance`.
+fn not_open(instance: &WorkflowInstance, gate: Option<Uuid>) -> DecisionRefused {
+    match RunDecision::read(&instance.variables) {
+        _ if instance.is_terminal() => DecisionRefused::Ended {
+            status: instance.status.to_string(),
+        },
+        Some(held) if held.closed.is_some() && gate.is_none_or(|gate| gate == held.gate) => {
+            DecisionRefused::Decided {
+                summary: held.summary().unwrap_or_default(),
+            }
+        }
+        Some(held) if gate.is_some_and(|gate| gate != held.gate) => DecisionRefused::Outdated,
+        _ => DecisionRefused::NotWaiting,
+    }
+}
+
+/// The choice `asked` names on the open `decision`, pressed at `gate`.
+fn offered<'a>(
+    decision: &'a RunDecision,
+    gate: Option<Uuid>,
+    asked: &str,
+) -> Result<&'a Choice, DecisionRefused> {
+    if gate.is_some_and(|gate| gate != decision.gate) {
+        return Err(DecisionRefused::Outdated);
+    }
+    decision
+        .choice(asked)
+        .ok_or_else(|| DecisionRefused::Choose {
+            choices: choices_of(decision),
+        })
+}
+
+/// The choice a press makes on the open `decision` and who made it, once
+/// they may make it.
+fn admit(
+    decision: &RunDecision,
+    gate: Option<Uuid>,
+    asked: &str,
+    by: &SettledBy,
+    starter: Option<&str>,
+) -> Result<(Choice, DecidedBy), DecisionRefused> {
+    let choice = offered(decision, gate, asked)?.clone();
+    let SettledBy::Person {
+        person, display, ..
+    } = by
+    else {
+        return Ok((choice, DecidedBy::Expiry));
+    };
+    let deciders = || deciders_of(decision, starter);
+    match (decision.refusal(person.as_ref(), starter), person) {
+        (None, Some(person)) => Ok((
+            choice,
+            DecidedBy::Person {
+                id: person.id.clone(),
+                display: display.clone(),
+                slack_user_id: person.slack_user_id.clone(),
+            },
+        )),
+        (Some(Refusal::OwnDecision), _) => Err(SteerRefused::OwnDecision {
+            deciders: deciders(),
+        }
+        .into()),
+        (Some(Refusal::NotDecider), _) | (None, None) => Err(SteerRefused::NotDecider {
+            deciders: deciders(),
+        }
+        .into()),
+    }
 }
 
 /// The labels of `decision`'s choices, as a person reads them.
@@ -129,11 +199,15 @@ fn card_view<'a>(decision: &'a RunDecision, starter: Option<&str>) -> DecisionCa
     let state = match &decision.closed {
         None => CardState::Open,
         Some(Closed::Decided {
-            outcome, by, at, ..
+            outcome,
+            by,
+            at,
+            input,
+            ..
         }) => {
             let label = decision
                 .choice(outcome)
-                .map_or(outcome.as_str(), run_decision::Choice::done);
+                .map_or(outcome.as_str(), Choice::done);
             match by {
                 DecidedBy::Person {
                     display,
@@ -145,6 +219,7 @@ fn card_view<'a>(decision: &'a RunDecision, starter: Option<&str>) -> DecisionCa
                         .as_deref()
                         .map_or_else(|| display.clone(), |id| format!("<@{id}>")),
                     at: *at,
+                    said: input.as_deref(),
                 },
                 DecidedBy::Expiry => CardState::Expired { label, at: *at },
             }
@@ -717,7 +792,7 @@ impl WorkflowRuntime {
             Closed::Decided { outcome, by, .. } => {
                 let done = decision
                     .choice(outcome)
-                    .map_or(outcome.as_str(), run_decision::Choice::done);
+                    .map_or(outcome.as_str(), Choice::done);
                 match by {
                     DecidedBy::Person { display, .. } => {
                         format!("✅ *{done}*, decided by {display}")
@@ -812,65 +887,15 @@ impl WorkflowRuntime {
             .map(|owned| owned.def.steps.iter().map(|s| s.id.clone()).collect());
         let now = Utc::now();
         let settled = self.update_instance(instance_id, |i| {
-            let Some(decision) = run_decision::open_in(i) else {
-                let held = RunDecision::read(&i.variables);
-                return Err(match held {
-                    _ if i.is_terminal() => DecisionRefused::Ended {
-                        status: i.status.to_string(),
-                    },
-                    Some(held)
-                        if held.closed.is_some()
-                            && ask.gate.is_none_or(|gate| gate == held.gate) =>
-                    {
-                        DecisionRefused::Decided {
-                            summary: held.summary().unwrap_or_default(),
-                        }
-                    }
-                    Some(held) if ask.gate.is_some_and(|gate| gate != held.gate) => {
-                        DecisionRefused::Outdated
-                    }
-                    _ => DecisionRefused::NotWaiting,
-                });
-            };
-            if ask.gate.is_some_and(|gate| gate != decision.gate) {
-                return Err(DecisionRefused::Outdated);
-            }
-            let choice =
-                decision
-                    .choice(&ask.choice)
-                    .cloned()
-                    .ok_or_else(|| DecisionRefused::Choose {
-                        choices: choices_of(&decision),
-                    })?;
-            let by = match &ask.by {
-                SettledBy::Expiry => DecidedBy::Expiry,
-                SettledBy::Person {
-                    person, display, ..
-                } => {
-                    let deciders = || deciders_of(&decision, starter.as_deref());
-                    match decision.refusal(person.as_ref(), starter.as_deref()) {
-                        Some(Refusal::NotDecider) => {
-                            return Err(SteerRefused::NotDecider {
-                                deciders: deciders(),
-                            }
-                            .into())
-                        }
-                        Some(Refusal::OwnDecision) => {
-                            return Err(SteerRefused::OwnDecision {
-                                deciders: deciders(),
-                            }
-                            .into())
-                        }
-                        None => {}
-                    }
-                    let person = person.as_ref().expect("a decider is a person");
-                    DecidedBy::Person {
-                        id: person.id.clone(),
-                        display: display.clone(),
-                        slack_user_id: person.slack_user_id.clone(),
-                    }
-                }
-            };
+            let decision = run_decision::open_in(i).ok_or_else(|| not_open(i, ask.gate))?;
+            let (choice, by) = admit(
+                &decision,
+                ask.gate,
+                &ask.choice,
+                &ask.by,
+                starter.as_deref(),
+            )?;
+            let given = choice.given(ask.feedback.as_deref())?;
             match (&def_steps, &choice.next, &ask.by) {
                 (None, _, SettledBy::Person { .. }) => return Err(DecisionRefused::WorkflowGone),
                 (Some(steps), run_decision::Next::Step(step), _) if !steps.contains(step) => {
@@ -878,7 +903,7 @@ impl WorkflowRuntime {
                 }
                 _ => {}
             }
-            run_decision::settle(i, &choice, by, ask.feedback.as_deref(), now)
+            run_decision::settle(i, &choice, by, given, now)
                 .map_err(|_| DecisionRefused::NotWaiting)?;
             let decision = RunDecision::read(&i.variables).unwrap_or(decision);
             Ok((i.clone(), decision, choice))
@@ -915,6 +940,7 @@ impl WorkflowRuntime {
             run = %instance_id,
             gate = ?ask.gate,
             outcome = %ask.choice,
+            input_chars = ?ask.feedback.as_ref().map(|text| text.chars().count()),
             decided_by = ?steerer.actor,
             refused = settled.as_ref().err().map(tracing::field::display),
             "Workflow run decision"
@@ -1107,6 +1133,12 @@ impl WorkflowRuntime {
                 "outcome": c.outcome,
                 "style": c.style.map(|s| s.as_str()),
                 "confirm": c.confirm,
+                "input": c.input.as_ref().map(|input| serde_json::json!({
+                    "label": input.label,
+                    "placeholder": input.placeholder,
+                    "max_chars": input.max_chars,
+                    "required": input.required,
+                })),
             })).collect::<Vec<_>>(),
             "waiting_on": decision
                 .waiting_on(starter.as_deref())
@@ -1124,31 +1156,77 @@ impl WorkflowRuntime {
     }
 
     /// The press a reply typed in a run's thread makes: the run waiting on a
-    /// decision there, its gate, and the outcome the text names.
+    /// decision there, its gate, the outcome the text names and the text it
+    /// gives.
     pub(crate) fn decision_reply(
         &self,
         channel: &str,
         thread_ts: &str,
         text: &str,
-    ) -> Option<(String, Uuid, String)> {
+    ) -> Option<TypedPress> {
         let row = self
             .find_instance_by_thread(channel, thread_ts, &["paused"])
             .ok()
             .flatten()?;
         let instance = instance_of(row).ok()?;
         let decision = run_decision::open_in(&instance)?;
-        let outcome = decision.choice(text)?.outcome.clone();
-        Some((instance.id, decision.gate, outcome))
+        let (choice, text) = decision.typed(text)?;
+        Some(TypedPress {
+            run: instance.id,
+            gate: decision.gate,
+            outcome: choice.outcome.clone(),
+            text,
+        })
     }
 
-    /// What a thread is told about the decision its run waits on.
+    /// The form a press of `outcome` at `gate` opens, or why the press is
+    /// refused now, read from the stored run alone (no Slack call), so a
+    /// modal can open inside Slack's trigger window. `None` when the choice
+    /// asks for nothing and the press settles at once.
+    pub(crate) fn decision_form(
+        &self,
+        instance_id: &str,
+        gate: Uuid,
+        outcome: &str,
+        slack_user: &str,
+    ) -> Result<Option<DecisionForm>, DecisionRefused> {
+        let instance = self
+            .get_instance_status(instance_id)?
+            .map(instance_of)
+            .transpose()?
+            .ok_or(DecisionRefused::NotWaiting)?;
+        let decision =
+            run_decision::open_in(&instance).ok_or_else(|| not_open(&instance, Some(gate)))?;
+        let choice = offered(&decision, Some(gate), outcome)?;
+        let Some(input) = &choice.input else {
+            return Ok(None);
+        };
+        if decision.surely_not_decider(slack_user) {
+            return Err(SteerRefused::NotDecider {
+                deciders: deciders_of(&decision, starter_of(&instance).as_deref()),
+            }
+            .into());
+        }
+        Ok(Some(DecisionForm {
+            title: decision.title.clone(),
+            label: choice.label.clone(),
+            input: input.clone(),
+            in_thread: matches!(decision.target, CardTarget::Thread { .. }),
+        }))
+    }
+
+    /// What a thread is told about the decision its run waits on: each
+    /// choice as a reply presses it.
     pub(crate) fn decision_reminder(&self, row: &WorkflowInstanceRow) -> Option<String> {
         let instance = instance_of(row.clone()).ok()?;
         let decision = run_decision::open_in(&instance)?;
         let choices = decision
             .choices
             .iter()
-            .map(|c| format!("*{}*", c.label))
+            .map(|c| match c.input {
+                Some(_) => format!("`{}: …`", c.label),
+                None => format!("*{}*", c.label),
+            })
             .collect::<Vec<_>>()
             .join(" · ");
         let starter = starter_of(&instance);

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { choiceVariant, decisionBadge, expiryText, waitingOnSentence } from "./decision";
+import type { DecisionChoice } from "@/lib/api/workflows";
+import { choiceVariant, decisionBadge, expiryText, inputProblem, waitingOnSentence } from "./decision";
 
 describe("decision helpers", () => {
   it("maps choice styles to button variants", () => {
@@ -19,6 +20,24 @@ describe("decision helpers", () => {
     expect(waitingOnSentence(["Alice"])).toBe("Alice");
     expect(waitingOnSentence(["Alice", "Bob"])).toBe("Alice or Bob");
     expect(waitingOnSentence(["Alice", "Bob", "Ana"])).toBe("Alice, Bob or Ana");
+  });
+
+  it("finds what is wrong with the text a choice asks for", () => {
+    const revise: DecisionChoice = {
+      label: "Revise",
+      outcome: "revise",
+      style: null,
+      confirm: null,
+      input: { label: "What should change?", placeholder: null, max_chars: 3, required: true },
+    };
+    expect(inputProblem("", revise)).toBe('Revise needs an answer to "What should change?".');
+    expect(inputProblem(" \r\n\t", revise)).toBe('Revise needs an answer to "What should change?".');
+    expect(inputProblem("éé€", revise)).toBeNull();
+    expect(inputProblem(" a\r\nb ", revise)).toBeNull();
+    expect(inputProblem("abcd", revise)).toBe("Revise takes at most 3 characters; this was 4.");
+    const optional = { ...revise, input: { ...revise.input!, required: false } };
+    expect(inputProblem("", optional)).toBeNull();
+    expect(inputProblem("anything at all", { ...revise, input: null })).toBeNull();
   });
 
   it("words the expiry", () => {

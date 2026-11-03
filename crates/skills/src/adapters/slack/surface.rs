@@ -1738,6 +1738,14 @@ impl SlackSurface {
         Ok(())
     }
 
+    /// Open the modal `view` in answer to the interaction that gave
+    /// `trigger_id`.
+    pub async fn open_view(&self, trigger_id: &str, view: &serde_json::Value) -> Result<()> {
+        let body = serde_json::json!({ "trigger_id": trigger_id, "view": view });
+        let resp = self.slack_api_post(&self.url("views.open"), &body).await?;
+        check_ok(&resp, "views.open", None)
+    }
+
     pub async fn pin_message(&self, channel: &str, ts: &str) -> Result<()> {
         let body = serde_json::json!({ "channel": channel, "timestamp": ts });
         let resp = self.slack_api_post(&self.url("pins.add"), &body).await?;
@@ -3325,6 +3333,43 @@ pub(crate) mod tests {
             icon_url: None,
             blocks: None,
         }
+    }
+
+    #[tokio::test]
+    async fn open_view_posts_the_trigger_and_view_and_a_refusal_is_an_error() {
+        use wiremock::matchers::{body_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let view = serde_json::json!({ "type": "modal", "callback_id": "form" });
+        Mock::given(method("POST"))
+            .and(path("/views.open"))
+            .and(body_json(
+                serde_json::json!({ "trigger_id": "13345.abc", "view": view }),
+            ))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "ok": true })),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/views.open"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({ "ok": false, "error": "expired_trigger_id" }),
+                ),
+            )
+            .mount(&server)
+            .await;
+        let surface = SlackSurface::with_base_url("xoxb-bot", server.uri());
+
+        surface.open_view("13345.abc", &view).await.unwrap();
+        let refused = surface.open_view("old", &view).await.unwrap_err();
+
+        assert!(
+            refused.to_string().contains("expired_trigger_id"),
+            "{refused}"
+        );
     }
 
     async fn ok_post_message(server: &wiremock::MockServer) {
