@@ -69,8 +69,8 @@ pub use groups::{
 };
 
 pub use breaker::{
-    agent_subject, pool_subject, session_subject, BreakerOf, BreakerView, BudgetPatch, BudgetView,
-    BudgetsView, NewBudget, Rules,
+    agent_subject, pool_subject, session_subject, AgentSpend, AgentVerdict, BreakerOf, BreakerView,
+    BudgetPatch, BudgetView, BudgetsView, NewBudget, Rules,
 };
 pub use ledger::{LedgerPage, SpendQuery};
 pub use terminals::{NewTerminal, TerminalPatch, TerminalRecord, TerminalState, TerminalView};
@@ -435,6 +435,8 @@ struct Inner {
     accounts_moving: tokio::sync::Mutex<()>,
     /// The budgets and every subject's breaker.
     breakers: Mutex<breaker::BreakerRun>,
+    /// Reads the local agents' spend for budgets: the hub's telemetry.
+    agent_spend: Mutex<Option<Arc<dyn breaker::AgentSpend>>>,
 }
 
 #[derive(Clone)]
@@ -906,6 +908,7 @@ impl Desk {
             read_wait: Mutex::new(READ_LATER),
             accounts_moving: tokio::sync::Mutex::new(()),
             breakers: Mutex::new(breaker::BreakerRun::default()),
+            agent_spend: Mutex::new(None),
         }));
         tokio::spawn(persist_loop(store, floor.turns, persist_rx));
         tokio::spawn(desk.clone().read_engines());

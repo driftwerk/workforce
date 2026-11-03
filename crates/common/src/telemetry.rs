@@ -21,12 +21,13 @@ use crate::activity_log::{ActivityQuery, ActivityRecord};
 use crate::admin::{AuditEntry, AuditOutcome};
 use crate::cost::TokenHistoryPoint;
 use crate::persistence::{
-    AgentModelPreference, AgentUsageSummary, CacheStatusEntry, CostDetailFilter, CostDetailPage,
-    CostRecord, CostScope, CostSplitRow, DailyUsageRow, EfficiencyTrendPoint, InstanceFilter,
-    MeteredSpend, ModelComparison, PolicyProposalRow, RoundStats, RoundTelemetryRecord,
-    ScheduledJobHistoryPage, SqliteStore, StoredModelPricing, TaskHistoryEntry, TaskHistoryFilter,
-    TaskHistoryPage, TaskRow, TaskTelemetryRecord, TaskTrace, TaskUsageRow, TicketCostSummary,
-    ToolCostEntry, ToolTelemetryRecord, ToolTurn, WorkflowInstanceRow,
+    AgentModelPreference, AgentUsageSummary, AgentUse, CacheStatusEntry, CostDetailFilter,
+    CostDetailPage, CostRecord, CostScope, CostSplitRow, DailyUsageRow, EfficiencyTrendPoint,
+    InstanceFilter, MeteredSpend, ModelComparison, PolicyProposalRow, RoundStats,
+    RoundTelemetryRecord, ScheduledJobHistoryPage, SqliteStore, StoredModelPricing,
+    TaskHistoryEntry, TaskHistoryFilter, TaskHistoryPage, TaskRow, TaskTelemetryRecord, TaskTrace,
+    TaskUsageRow, TicketCostSummary, ToolCostEntry, ToolTelemetryRecord, ToolTurn,
+    WorkflowInstanceRow,
 };
 use crate::security_audit::{SecurityEvent, SecurityEventFilter, SecurityEventRow, SecurityStats};
 
@@ -338,6 +339,9 @@ pub trait TelemetryStore: Send + Sync + 'static {
     /// budgets count. A subscription call's estimated value is not money
     /// spent, so it never consumes a budget.
     fn metered_spend(&self, from: DateTime<Utc>, to: DateTime<Utc>) -> Result<Vec<MeteredSpend>>;
+    /// What each agent used in the window, every billing counted: what the
+    /// person's own budgets on Desk count.
+    fn agent_use(&self, from: DateTime<Utc>, to: DateTime<Utc>) -> Result<Vec<AgentUse>>;
     fn cost_by_model(&self, from: DateTime<Utc>, to: DateTime<Utc>) -> Result<Vec<(String, f64)>>;
     fn cost_token_totals(
         &self,
@@ -1258,6 +1262,9 @@ impl TelemetryStore for SqliteStore {
     }
     fn metered_spend(&self, from: DateTime<Utc>, to: DateTime<Utc>) -> Result<Vec<MeteredSpend>> {
         SqliteStore::metered_spend(self, from, to)
+    }
+    fn agent_use(&self, from: DateTime<Utc>, to: DateTime<Utc>) -> Result<Vec<AgentUse>> {
+        SqliteStore::agent_use(self, from, to)
     }
 
     // ─── Per-identity stats slices ───
