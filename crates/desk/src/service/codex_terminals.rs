@@ -256,6 +256,10 @@ impl Desk {
         };
         let read = rollout.clone();
         let prev = self.0.state.lock().codex_marks.get(&id).cloned();
+        // Its first read since it was bound (here, or again after a hub
+        // restart): what it says is where the session stood, not a turn
+        // that just ended.
+        let first = prev.is_none();
         let Ok((mark, tail)) = tokio::task::spawn_blocking(move || {
             (
                 session::activity(&read, prev.as_ref()),
@@ -277,8 +281,10 @@ impl Desk {
         let known = self.record(id).ok();
         let before = known.as_ref().map(|r| r.state);
         // A turn that ended since it was last read: it wasn't done, or its
-        // reply is a new one.
-        let ended_anew = activity == Activity::Done
+        // reply is a new one; never one that ended before it was bound (a
+        // resumed session's last turn).
+        let ended_anew = !first
+            && activity == Activity::Done
             && known.as_ref().is_none_or(|r| {
                 !matches!(r.state, SessionState::Done | SessionState::Asking)
                     || (tail.last_reply.is_some() && tail.last_reply != r.last_reply)
@@ -547,13 +553,21 @@ mod tests {
             track_until(|s| s[0].3 == SessionState::Stopped).await;
             assert!(!d.view(first.0).unwrap().live);
 
-            // Typed again: the same session, not a second.
+            // Its last turn, before it is resumed, ended on a question.
+            ends_on("Left it there. Should I open the PR?");
+            // Typed again: the same session, not a second; and that old
+            // question is where it stood, not something it asks now.
             pty.write(format!("{} resume th-1\n", bin.display()).as_bytes())
                 .unwrap();
             track_until(|s| s[0].3 != SessionState::Stopped).await;
             let all = sessions();
             assert_eq!(all.len(), 1, "no duplicate");
             assert_eq!(all[0].0, first.0);
+            for _ in 0..5 {
+                d.track_codex_terminals().await;
+            }
+            let v = d.view(first.0).unwrap();
+            assert_eq!((v.state, v.asked), (SessionState::Done, None));
             pty.write(b"\x03exit\n").unwrap();
         })
         .await;
