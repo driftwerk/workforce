@@ -314,6 +314,9 @@ pub enum DeskEvent {
     /// The person's engine accounts changed: all of them as they now are.
     Accounts {
         accounts: Vec<crate::engine_accounts::AccountView>,
+        needs: Vec<crate::engine_accounts::AccountNeed>,
+        #[serde(rename = "autoSwitch")]
+        auto_switch: bool,
     },
     /// Signing in to an account through its engine's own command moved on.
     AccountSignIn {

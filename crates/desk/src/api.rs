@@ -217,6 +217,8 @@ async fn accounts(State(s): S, h: HeaderMap, Query(q): Q) -> Response {
         "accounts": s.desk.accounts(),
         "store": s.desk.accounts_store(),
         "signIns": s.desk.account_sign_ins(),
+        "needs": s.desk.account_needs(),
+        "autoSwitch": s.desk.auto_switch(),
     }))
     .into_response()
 }
@@ -256,6 +258,57 @@ async fn remove_account(State(s): S, h: HeaderMap, Query(q): Q, Path(id): Path<U
     guarded!(s, h, q);
     s.desk
         .remove_account(id)
+        .await
+        .map(|()| StatusCode::NO_CONTENT)
+        .into_response()
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SwitchAllBody {
+    #[serde(default = "claude")]
+    engine: crate::engine::Engine,
+    /// The account they're on; `null`, the CLI's own sign-in.
+    from: Option<Uuid>,
+    to: Option<Uuid>,
+}
+
+fn claude() -> crate::engine::Engine {
+    crate::engine::Engine::Claude
+}
+
+/// Moves every session on one account to another: "Switch all".
+async fn switch_all(
+    State(s): S,
+    h: HeaderMap,
+    Query(q): Q,
+    Json(b): Json<SwitchAllBody>,
+) -> Response {
+    guarded!(s, h, q);
+    s.desk
+        .switch_all(b.engine, b.from, b.to)
+        .await
+        .map(Json)
+        .into_response()
+}
+
+/// "Not now" on an account need.
+async fn put_off_need(State(s): S, h: HeaderMap, Query(q): Q, Path(id): Path<String>) -> Response {
+    guarded!(s, h, q);
+    s.desk.put_off(&id);
+    StatusCode::NO_CONTENT.into_response()
+}
+
+#[derive(Deserialize)]
+struct OnBody {
+    on: bool,
+}
+
+/// "Switch automatically when an account hits its limit".
+async fn auto_switch(State(s): S, h: HeaderMap, Query(q): Q, Json(b): Json<OnBody>) -> Response {
+    guarded!(s, h, q);
+    s.desk
+        .set_auto_switch(b.on)
         .await
         .map(|()| StatusCode::NO_CONTENT)
         .into_response()
@@ -984,6 +1037,12 @@ pub fn sessions_router(desk: Desk, auth: Arc<dyn Authorize>) -> Router {
             patch(update_account).delete(remove_account),
         )
         .route("/api/desk/accounts/sign-ins/{id}/code", post(sign_in_code))
+        .route("/api/desk/accounts/switch-all", post(switch_all))
+        .route("/api/desk/accounts/needs/{id}/put-off", post(put_off_need))
+        .route(
+            "/api/desk/accounts/auto-switch",
+            axum::routing::put(auto_switch),
+        )
         .route(
             "/api/desk/accounts/sign-ins/{id}",
             axum::routing::delete(cancel_sign_in),
