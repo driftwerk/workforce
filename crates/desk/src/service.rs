@@ -323,6 +323,8 @@ struct State {
     put_off: HashSet<String>,
     /// Desk moves sessions off an account at its limit by itself.
     auto_switch: bool,
+    /// The accounts whose sign-in was in the store when last looked at.
+    signed_in_accounts: HashSet<Uuid>,
 }
 
 /// How often a busy session's tool is recorded as `working`.
@@ -410,6 +412,8 @@ struct Inner {
     reader: Mutex<Option<Weak<dyn crew::Crew>>>,
     /// How long it may take ([`READ_LATER`]; shorter in tests).
     read_wait: Mutex<Duration>,
+    /// Held while the accounts' needs are acted on.
+    accounts_moving: tokio::sync::Mutex<()>,
 }
 
 #[derive(Clone)]
@@ -790,6 +794,19 @@ impl Desk {
                 false
             }
         };
+        let signed_in_accounts = match opts.account_keys.clone() {
+            Some(keys) => {
+                let ids: Vec<Uuid> = engine_accounts.iter().map(|a| a.id).collect();
+                tokio::task::spawn_blocking(move || {
+                    ids.into_iter()
+                        .filter(|id| keys.get(*id).ok().flatten().is_some())
+                        .collect::<HashSet<Uuid>>()
+                })
+                .await
+                .unwrap_or_default()
+            }
+            None => HashSet::new(),
+        };
         let hidden = store
             .hidden()
             .await?
@@ -865,6 +882,7 @@ impl Desk {
                 turns,
                 accounts: engine_accounts,
                 auto_switch,
+                signed_in_accounts,
                 ..State::default()
             }),
             events: broadcast::channel(256).0,
@@ -879,6 +897,7 @@ impl Desk {
             ledger,
             reader: Mutex::new(None),
             read_wait: Mutex::new(READ_LATER),
+            accounts_moving: tokio::sync::Mutex::new(()),
         }));
         tokio::spawn(persist_loop(store, floor.turns, persist_rx));
         tokio::spawn(desk.clone().read_engines());
@@ -2766,7 +2785,7 @@ impl Desk {
         }
         let mut env = self.with_added(&self.0.state.lock().session_env.clone());
         // Only now, and only into this CLI's own environment: never kept.
-        self.account_env(r.engine, r.account, &mut env)?;
+        self.account_env(r.engine, r.account, &mut env).await?;
         let (spec, codex) = match r.engine {
             Engine::Claude => {
                 let session_id = r.cli_session_id.as_deref().unwrap_or_default();

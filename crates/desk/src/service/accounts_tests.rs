@@ -416,6 +416,11 @@ async fn a_removed_account_moves_its_sessions_to_the_default_at_their_next_start
             .await
             .unwrap_err();
         assert!(gone.to_string().contains("add the account again"), "{gone}");
+        let work_view = d.accounts().into_iter().find(|a| a.id == work).unwrap();
+        assert!(
+            !work_view.signed_in,
+            "seen gone at launch, without reading the store again"
+        );
     })
     .await;
 }
@@ -623,6 +628,93 @@ async fn with_switch_automatically_on_desk_moves_them_itself_and_never_when_all_
         )
         .await;
         assert!(back.auto_switch());
+    })
+    .await;
+}
+
+/// The hub's plan readings, as a test sees them: what each report was
+/// kept as, and a window parser that takes `[{used, resets}]`.
+#[derive(Default)]
+struct Plans(parking_lot::Mutex<Vec<crate::usage::LocalAccount>>);
+
+impl crate::usage::PlanSink for Plans {
+    fn local(
+        &self,
+        _: crate::usage::LocalPlan,
+        _: serde_json::Value,
+        account: crate::usage::LocalAccount,
+    ) {
+        self.0.lock().push(account);
+    }
+    fn windows(
+        &self,
+        _: crate::usage::LocalPlan,
+        payload: &serde_json::Value,
+    ) -> Vec<crate::usage::LimitWindow> {
+        payload
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|w| crate::usage::LimitWindow {
+                used_percent: w["used"].as_f64().unwrap_or_default(),
+                resets_at: w["resets"]
+                    .as_str()
+                    .and_then(|r| chrono::DateTime::parse_from_rfc3339(r).ok())
+                    .map(|r| r.to_utc()),
+                minutes: 10_080,
+            })
+            .collect()
+    }
+    fn account_key(&self, _: crate::usage::LocalPlan, ids: &[String]) -> Option<String> {
+        Some(format!("key:{}", ids.join(",")))
+    }
+}
+
+#[tokio::test]
+async fn a_full_weekly_window_reported_by_a_session_on_an_account_raises_its_need_and_is_that_accounts(
+) {
+    use crate::engine_accounts::AccountNeed;
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        DeskStore::migrate(&pool).await.unwrap();
+        let plans = Arc::new(Plans::default());
+        let d = Desk::start(
+            DeskStore::from_pool(pool),
+            account_options(dir.path(), Arc::new(MemoryKeys::default())),
+            super::Floor {
+                plans: Some(plans.clone()),
+                ..Default::default()
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        let (work, personal, a, _) = two_on_work(&d, dir.path()).await;
+        let resets = (chrono::Utc::now() + chrono::Duration::days(2)).to_rfc3339();
+        d.report_usage(
+            serde_json::json!([{ "used": 100.0, "resets": resets }]),
+            Some(a),
+        );
+        let need = until(|| d.account_needs().into_iter().next()).await;
+        assert!(
+            matches!(&need, AccountNeed::Limit { from, to, resets_at: Some(_), .. }
+                if from.id == Some(work) && to.id == Some(personal)),
+            "{need:?}"
+        );
+        // Kept as Work's reading, under the key its plan card is named by.
+        let kept = plans.0.lock().clone();
+        assert_eq!(
+            kept.last().unwrap().ids,
+            vec![format!("desk-account:{work}")]
+        );
+        let view = d.accounts().into_iter().find(|v| v.id == work).unwrap();
+        assert_eq!(view.plan_key, Some(format!("key:desk-account:{work}")));
+        // A report with room: Work isn't full any more.
+        d.report_usage(
+            serde_json::json!([{ "used": 20.0, "resets": resets }]),
+            Some(a),
+        );
+        until(|| d.account_needs().is_empty().then_some(())).await;
     })
     .await;
 }
