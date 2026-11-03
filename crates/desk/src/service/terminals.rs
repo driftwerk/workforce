@@ -821,6 +821,7 @@ impl Desk {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::floor::{Outcome, TurnOp};
     use crate::store::build_pool;
     use crate::testing::{desk_on, options};
     use tokio_util::sync::CancellationToken;
@@ -1457,11 +1458,16 @@ mod tests {
                 token: crate::holder::tests::TOKEN.into(),
             });
             crate::store::DeskStore::migrate(&pool).await.unwrap();
+            let logged = Arc::new(super::super::tests::Logged::default());
+            let floor = || super::super::Floor {
+                turns: Some(logged.clone()),
+                ..Default::default()
+            };
             let cancel = CancellationToken::new();
             let d = Desk::start(
                 crate::store::DeskStore::from_pool(pool.clone()),
                 opts.clone(),
-                Default::default(),
+                floor(),
                 cancel.clone(),
             )
             .await
@@ -1492,6 +1498,8 @@ mod tests {
                 .find(|s| s.terminal_id == Some(tid))
                 .unwrap();
             let port = d.0.hook_port;
+            let turns = d.open_turns();
+            assert_eq!(turns.len(), 1, "its prompt began a turn");
             tokio::time::sleep(Duration::from_millis(200)).await;
             cancel.cancel();
             tokio::time::sleep(Duration::from_millis(300)).await;
@@ -1499,7 +1507,7 @@ mod tests {
             let d = Desk::start(
                 crate::store::DeskStore::from_pool(pool),
                 opts,
-                Default::default(),
+                floor(),
                 CancellationToken::new(),
             )
             .await
@@ -1509,6 +1517,11 @@ mod tests {
             let v = d.view(s.id).unwrap();
             assert_eq!((v.live, v.state), (true, SessionState::Working));
             assert_eq!(d.0.hook_port, port);
+            assert_eq!(
+                d.open_turns(),
+                turns,
+                "the turn it is in runs on the floor, as it does in the sidebar"
+            );
             d.terminal_hook(
                 tid,
                 &token,
@@ -1521,6 +1534,15 @@ mod tests {
             .await
             .unwrap();
             assert_eq!(d.view(s.id).unwrap().state, SessionState::Done);
+            let turn = turns.into_iter().next().unwrap();
+            assert!(
+                super::super::tests::logs(&logged, |ops| ops.iter().any(|op| matches!(
+                    op,
+                    TurnOp::End { turn: t, outcome: Outcome::Finished, .. } if *t == turn
+                )))
+                .await,
+                "and ends when it does"
+            );
             d.close_terminal(tid).unwrap();
             holder_cancel.cancel();
         })

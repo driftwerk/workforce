@@ -1976,6 +1976,167 @@ mod floor {
         .await;
     }
 
+    /// A turn of session `r`'s, begun at `at` and not yet ended.
+    fn open_turn(
+        r: &workforce_desk::model::SessionRecord,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> workforce_desk::floor::Turn {
+        workforce_desk::floor::Turn {
+            id: uuid::Uuid::new_v4(),
+            owner: None,
+            subject: workforce_desk::floor::Subject::Session {
+                id: r.id,
+                engine: r.engine,
+            },
+            name: r.name.clone(),
+            place: Place::Session,
+            task: r.last_prompt.clone(),
+            doing: None,
+            started_at: at,
+            heard_at: at,
+            ended_at: None,
+            outcome: None,
+            answer: None,
+            question: None,
+            settled_at: None,
+            waits: vec![],
+            idle: vec![],
+            token: None,
+            instance: None,
+        }
+    }
+
+    /// A session another terminal runs as `pid`, at work.
+    fn working_elsewhere(name: &str, pid: i32) -> workforce_desk::model::SessionRecord {
+        use workforce_desk::model::{Approvals, Origin, SessionRecord, SessionState, View};
+        let now = chrono::Utc::now();
+        SessionRecord {
+            id: uuid::Uuid::new_v4(),
+            engine: Engine::Claude,
+            view: View::Terminal,
+            engine_version: None,
+            approve_for_me: false,
+            name: name.into(),
+            goal: String::new(),
+            cwd: "/tmp/repo".into(),
+            branch: None,
+            origin: Origin::External,
+            state: SessionState::Working,
+            approvals: Approvals::Terminal,
+            cli_session_id: Some(uuid::Uuid::new_v4().to_string()),
+            transcript: None,
+            last_prompt: Some("run the tests".into()),
+            last_reply: None,
+            external_pid: Some(pid),
+            restore_offer: false,
+            terminal_id: None,
+            display_name: None,
+            asked: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn after_a_restart_the_floor_runs_what_the_sidebar_does_and_settles_what_ended() {
+        use workforce_desk::floor::{Outcome, TurnOp};
+        use workforce_desk::model::SessionState;
+        with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+            with_test_pool(PgFloorStore::build_pool, |floor_pool| async move {
+                let dir = tempfile::tempdir().unwrap();
+                let (scout, _llm) = agent(dir.path(), "scout", "Done.").await;
+                let state = hub(std::slice::from_ref(&scout));
+                let installed = Installed::open(PgFloorStore::with_pool(floor_pool).await.unwrap());
+                let mut ended = std::process::Command::new("true").spawn().unwrap();
+                let dead = ended.id() as i32;
+                ended.wait().unwrap();
+                let alive = working_elsewhere("acme-api", std::process::id() as i32);
+                let gone = working_elsewhere("acme-web", dead);
+                let registry = DeskStore::with_pool(pool.clone()).await.unwrap();
+                registry.put(&alive).await.unwrap();
+                registry.put(&gone).await.unwrap();
+                // What the hub logged before it went down.
+                let at = chrono::Utc::now() - chrono::Duration::minutes(10);
+                let (kept, lost) = (open_turn(&alive, at), open_turn(&gone, at));
+                for t in [&kept, &lost] {
+                    installed.log.send(TurnOp::Begin {
+                        turn: Box::new(t.clone()),
+                        by_person: true,
+                    });
+                }
+                eventually("the turns to be logged", async || {
+                    let (a, b) = (
+                        installed.store.turn(kept.id).await,
+                        installed.store.turn(lost.id).await,
+                    );
+                    (a.unwrap().is_some() && b.unwrap().is_some()).then_some(())
+                })
+                .await;
+
+                // The hub comes back over the same registry and log.
+                let d = desk_with(
+                    pool,
+                    dir.path(),
+                    workforce_desk::Floor {
+                        turns: Some(Arc::clone(&installed.log)),
+                        plans: None,
+                        pricer: None,
+                    },
+                )
+                .await;
+                let store = Arc::clone(&installed.store);
+                let sources = Sources::new(installed, {
+                    let d = d.clone();
+                    Arc::new(move || Some(d.clone()))
+                });
+                let now = chrono::Utc::now();
+                let turns = crate::desk_floor::turns(
+                    &state,
+                    &sources,
+                    &me(true),
+                    now - chrono::Duration::hours(1),
+                )
+                .await
+                .unwrap();
+                let floor = workforce_desk::floor::view(
+                    &turns,
+                    vec![],
+                    &Default::default(),
+                    now - chrono::Duration::hours(1),
+                    now,
+                );
+                let sidebar = |id| d.view(id).unwrap().state;
+                assert_eq!(sidebar(alive.id), SessionState::Working);
+                let working: Vec<&str> = floor.working.iter().map(|w| w.who.id.as_str()).collect();
+                assert_eq!(
+                    working,
+                    [alive.id.to_string()],
+                    "the floor runs what the sidebar does"
+                );
+
+                assert_eq!(sidebar(gone.id), SessionState::Interrupted);
+                // Interrupted turns stay off the floor's done list; the
+                // settled turn itself says how it ended.
+                let settled = turns
+                    .iter()
+                    .find(|t| t.id == lost.id)
+                    .expect("the one that ended while the hub was down is still read");
+                assert_eq!(
+                    (settled.outcome, settled.ended_at),
+                    (Some(Outcome::Interrupted), Some(at)),
+                    "as it was last heard, not when the hub came back"
+                );
+                assert_eq!(
+                    store.turn(lost.id).await.unwrap().unwrap().ended_at,
+                    None,
+                    "reading the floor writes nothing to the log"
+                );
+            })
+            .await;
+        })
+        .await;
+    }
+
     async fn logged_turns() -> Vec<workforce_desk::floor::Turn> {
         let log: &dyn TurnLog = crate::floor::turns().unwrap().as_ref();
         log.relevant(
