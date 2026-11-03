@@ -52,7 +52,10 @@ impl CrewHub {
 
     /// What `event` adds to a work turn, and for which session: a turn's
     /// end of a session the overseer runs and drives, or the person
-    /// handing one back to it.
+    /// handing one back to it. A turn that ended asking the person waits on
+    /// them (its line holds what the overseer says until they answer), so
+    /// it reaches the overseer as any session's question does.
+    /// [`super::watcher`]'s check-ins leave out the same turn ends.
     pub(crate) fn work_line(&self, event: &Event) -> Option<(Uuid, String)> {
         let subject = event.subject.as_ref()?;
         if subject.kind != PartyKind::Session {
@@ -64,7 +67,7 @@ impl CrewHub {
             return None;
         }
         match event.kind {
-            Kind::Finished | Kind::Question if event.actor.kind == PartyKind::Session => {
+            Kind::Finished if event.actor.kind == PartyKind::Session => {
                 // The person drives it: its turns are theirs.
                 (self.desk.wheel_of(session) == Some(Wheel::Boss))
                     .then(|| (session, format!("{} {}", subject.name, event.text)))

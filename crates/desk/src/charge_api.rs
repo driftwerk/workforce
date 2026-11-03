@@ -67,6 +67,13 @@ async fn hand(
         return DeskError::Conflict("No agent oversees the crew to hand it to.".into())
             .into_response();
     };
+    if boss.level == "watch" {
+        return DeskError::Conflict(format!(
+            "{} only watches; set them to Act to run work.",
+            boss.name
+        ))
+        .into_response();
+    }
     if b.boss.as_deref().is_some_and(|wanted| wanted != boss.id) {
         return DeskError::Conflict(format!(
             "{} runs the sessions on this Desk; hand it to them.",

@@ -225,9 +225,10 @@ impl Desk {
         let view = self.view(id)?;
         charge::chargeable(&view, bossed)
             .map_err(|e: NotChargeable| DeskError::Conflict(e.to_string()))?;
-        if let Some(c) = self.charge_of(id).filter(|c| c.live() && c.boss == boss.id) {
+        let existing = self.charge_of(id).filter(Charge::live);
+        if let Some(c) = existing.as_ref().filter(|c| c.boss == boss.id) {
             let wheel = self.wheel_of(id).unwrap_or(Wheel::Boss);
-            return Ok(self.charge_view(&c, wheel));
+            return Ok(self.charge_view(c, wheel));
         }
         self.0
             .state
@@ -235,8 +236,17 @@ impl Desk {
             .charges
             .names
             .insert(boss.id.clone(), boss.name.clone());
-        let c = Charge::new(id, &boss.id, how, view.group.as_ref().map(|g| g.id.clone()));
-        let shown = self.put_charge(c, Wheel::Boss).await?;
+        let mut c = Charge::new(id, &boss.id, how, view.group.as_ref().map(|g| g.id.clone()));
+        // From another boss: the person driving it keeps driving.
+        let wheel = match existing {
+            Some(_) => self.wheel_of(id).unwrap_or(Wheel::Boss),
+            None => Wheel::Boss,
+        };
+        if wheel.person() {
+            c.wheel = wheel;
+            c.wheel_since = Some(c.since);
+        }
+        let shown = self.put_charge(c, wheel).await?;
         let name = view.label().to_string();
         let text = match by.party.kind {
             PartyKind::You => format!("handed {name} to {}", boss.name),

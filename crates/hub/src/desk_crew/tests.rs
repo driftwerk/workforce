@@ -2767,6 +2767,10 @@ async fn an_answer_is_gated_by_the_switch_and_by_what_was_asked() {
     .await;
 }
 
+fn me_again(d: &Desk, id: uuid::Uuid) -> workforce_desk::crew::Party {
+    workforce_desk::crew::Party::session(&d.view(id).unwrap())
+}
+
 /// Taking a session on is offered to the person unless they let the
 /// overseer take on every one; letting one go always runs; and a session
 /// it runs no longer wakes its DM when its turn ends.
@@ -2817,6 +2821,15 @@ async fn taking_on_is_offered_unless_every_session_is_and_letting_go_always_runs
             "its own line wakes it instead"
         );
         assert!(crew.work_line(&finished).is_some());
+        // One that ended asking the person waits on them, and wakes the DM.
+        let asked = Event::new(
+            Kind::Question,
+            me_again(&d, s.id),
+            Some(me_again(&d, s.id)),
+            "asked “Ship it?”",
+        );
+        assert!(crew.work_line(&asked).is_none());
+        assert!(crew.trigger_for(&asked, "desk", &o).is_some());
         let done = crew.perform(&release, by).await.unwrap();
         assert_eq!(done, "let acme-web go");
         assert!(crew.work_line(&finished).is_none());

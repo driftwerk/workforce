@@ -171,6 +171,19 @@ async fn ill_drive_keeps_the_wheel_and_a_release_keeps_the_row() {
         assert_eq!(d.drive(s.id).await.unwrap().wheel, Wheel::PersonPinned);
         d.charge_settle().await;
         assert_eq!(d.wheel_of(s.id), Some(Wheel::PersonPinned));
+        // Passed to another boss, the person keeps driving.
+        let mia = Party::manager("mia", "Mia");
+        let passed = d
+            .take_on(s.id, &mia, How::Taken, &HashSet::new(), &By::you())
+            .await
+            .unwrap();
+        assert_eq!(
+            (passed.boss.as_str(), passed.wheel),
+            ("mia", Wheel::PersonPinned)
+        );
+        d.take_on(s.id, &sarah(), How::Taken, &HashSet::new(), &By::you())
+            .await
+            .unwrap();
 
         let by = By::manager("sarah", "Sarah", "It's done.");
         let released = d.release(s.id, &by).await.unwrap();
