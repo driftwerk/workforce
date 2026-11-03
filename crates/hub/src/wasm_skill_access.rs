@@ -129,11 +129,20 @@ pub fn compose_tool_access(
     });
     let databases = database_tool_access(service.vault.clone(), service.global_vault.clone());
     let environments = crate::environments::EnvironmentToolAccess::policy(service.resolved.clone());
+    // Only a `[desk]` hub reads an agent's `[skills]`: every other hub
+    // offers its agents what it always did.
+    let connectors = service.config.desk.enabled.then(|| {
+        crate::connector_access::ConnectorToolAccess::policy(
+            service.workspace.clone(),
+            Arc::clone(&service.tools),
+        )
+    });
     Arc::new(workforce_agent::tools::access::CompositeToolAccess::new(
         std::iter::once(mcp)
             .chain(skills)
             .chain(databases)
             .chain(std::iter::once(environments))
+            .chain(connectors)
             .collect(),
     ))
 }
