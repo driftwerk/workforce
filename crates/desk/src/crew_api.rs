@@ -317,6 +317,7 @@ mod tests {
                 adopt_every: None,
                 holder: None,
                 hub_internal: Default::default(),
+                account_keys: None,
             },
             Default::default(),
             CancellationToken::new(),

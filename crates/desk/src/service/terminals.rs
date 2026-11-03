@@ -538,7 +538,7 @@ impl Desk {
             }
         };
         if let Hook::Usage(limits) = hook {
-            self.report_usage(limits);
+            self.report_usage(limits, None);
             return Some(Value::Object(Default::default()));
         }
         let cli = fields["session_id"].as_str().map(str::to_string);
@@ -682,6 +682,7 @@ impl Desk {
                     view: View::Terminal,
                     engine_version: self.version_of(engine),
                     approve_for_me: false,
+                    account: None,
                     name: term.map_or_else(|| folder_name(&cwd), |t| t.name),
                     goal: String::new(),
                     cwd,

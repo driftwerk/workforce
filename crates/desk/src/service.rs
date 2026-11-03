@@ -39,11 +39,15 @@ use crate::transcript;
 use crate::usage::{LocalPlan, PlanSink};
 use crate::worktree;
 
+mod accounts;
+pub use accounts::Added;
 mod codex_terminals;
 mod copies;
 mod groups;
 mod lifecycle;
 pub use lifecycle::{Clearing, Hidden, Removal, Removed};
+#[cfg(test)]
+mod accounts_tests;
 #[cfg(test)]
 mod codex_asks_tests;
 mod ledger;
@@ -93,6 +97,9 @@ pub struct Options {
     pub holder: Option<HolderOptions>,
     /// What the hub runs `claude` in and as itself: never adopted.
     pub hub_internal: HubInternal,
+    /// Where the person's engine accounts' sign-ins are kept; none: Desk
+    /// keeps no accounts, and every session runs on its CLI's own sign-in.
+    pub account_keys: Option<Arc<dyn crate::engine_accounts::Keys>>,
 }
 
 #[cfg(test)]
@@ -299,6 +306,33 @@ struct State {
     /// Sessions forgotten while this hub runs: the registry may still hold
     /// one until the persist queue reaches it, and it is never taken back.
     forgotten: HashSet<Uuid>,
+    /// The person's engine accounts.
+    accounts: Vec<crate::engine_accounts::Account>,
+    /// Signing in to new accounts, by sign-in.
+    sign_in_runs: HashMap<Uuid, accounts::SignInRun>,
+    /// Sessions moving to another account once their turn ends (`None`:
+    /// the CLI's own sign-in).
+    switches: HashMap<Uuid, Option<Uuid>>,
+    /// What Desk last read of each account's plan (`None`: the CLI's own
+    /// sign-in).
+    standing: HashMap<Option<Uuid>, crate::engine_accounts::Standing>,
+    /// Accounts sessions were moved off at their limit, until they reset
+    /// and the person is asked back.
+    moved_off: Vec<crate::engine_accounts::MovedOff>,
+    /// Account needs the person put off.
+    put_off: HashSet<String>,
+    /// Desk moves sessions off an account at its limit by itself.
+    auto_switch: bool,
+    /// The accounts whose sign-in was in the store when last looked at.
+    signed_in_accounts: HashSet<Uuid>,
+    /// What went wrong with accounts' sign-ins, by account: shown until it
+    /// is put right.
+    sign_in_problems: HashMap<Uuid, crate::engine_accounts::SignInProblem>,
+    /// The names of accounts removed while sessions still run on them,
+    /// until those sessions restart.
+    removed_names: HashMap<Uuid, String>,
+    /// Sessions whose switch of account is being carried out now.
+    switching: HashSet<Uuid>,
 }
 
 /// How often a busy session's tool is recorded as `working`.
@@ -386,6 +420,8 @@ struct Inner {
     reader: Mutex<Option<Weak<dyn crew::Crew>>>,
     /// How long it may take ([`READ_LATER`]; shorter in tests).
     read_wait: Mutex<Duration>,
+    /// Held while the accounts' needs are acted on.
+    accounts_moving: tokio::sync::Mutex<()>,
 }
 
 #[derive(Clone)]
@@ -758,6 +794,14 @@ impl Desk {
         forget_hub_internal(&store, &opts.hub_internal, floor.turns.as_deref()).await;
         let layout = store.layout().await?;
         let session_env = kept_session_env(&store).await;
+        let engine_accounts = store.accounts().await?;
+        let auto_switch = match store.state(accounts::AUTO_SWITCH).await {
+            Ok(kept) => kept.is_some_and(|e| e.value == serde_json::json!(true)),
+            Err(e) => {
+                tracing::warn!(error = %e, "couldn't read whether accounts switch by themselves");
+                false
+            }
+        };
         let hidden = store
             .hidden()
             .await?
@@ -831,6 +875,8 @@ impl Desk {
                 attention,
                 hidden,
                 turns,
+                accounts: engine_accounts,
+                auto_switch,
                 ..State::default()
             }),
             events: broadcast::channel(256).0,
@@ -845,9 +891,11 @@ impl Desk {
             ledger,
             reader: Mutex::new(None),
             read_wait: Mutex::new(READ_LATER),
+            accounts_moving: tokio::sync::Mutex::new(()),
         }));
         tokio::spawn(persist_loop(store, floor.turns, persist_rx));
         tokio::spawn(desk.clone().read_engines());
+        tokio::spawn(desk.clone().look_for_sign_ins());
         tokio::spawn(desk.clone().ledger_loop(ledger_jobs));
         tokio::spawn(desk.clone().watch_background());
         recovered.into_iter().for_each(|r| desk.save(r));
@@ -1041,6 +1089,7 @@ impl Desk {
             live.and_then(|l| l.pending.clone()),
         );
         view.group = Self::group_ref(&state.layout, &groups::session_item(r.id));
+        (view.account, view.switching_to) = Self::account_refs(state, r);
         view.background = live.and_then(|l| l.background.view());
         view.interrupted = live.is_some_and(|l| l.interrupted);
         view.reading = live.is_some_and(|l| l.reading.is_some());
@@ -1083,6 +1132,40 @@ impl Desk {
         let events = Self::session_events(st, &transitions, &view);
         let ops = Self::turn_ops(st, &transitions, &view);
         let id = r.id;
+        let r_account = r.account;
+        // A switch of account that waited for its turn to end.
+        let turn_over = transitions.iter().any(|t| {
+            matches!(
+                t,
+                Transition::Finished { .. }
+                    | Transition::Asked { .. }
+                    | Transition::Halted
+                    | Transition::Dismissed
+                    | Transition::Stopped { .. }
+                    | Transition::Interrupted
+            )
+        });
+        let hit_limit = view.engine == Engine::Claude
+            && transitions.iter().any(|t| match t {
+                Transition::Finished { reply } => {
+                    transition::finished(reply, &view).0 == crate::floor::Outcome::Limit
+                }
+                _ => false,
+            });
+        if hit_limit {
+            st.standing.entry(r_account).or_default().hit_at = Some(Utc::now());
+            let desk = self.clone();
+            tokio::spawn(async move { desk.accounts_moved().await });
+        }
+        // Carried out by the one driver of this session's switches.
+        if turn_over && st.switches.contains_key(&id) {
+            let desk = self.clone();
+            tokio::spawn(async move {
+                if let Err(e) = desk.drive_switch(id, None).await {
+                    tracing::warn!(session = %id, error = %e, "couldn't move a session to its account");
+                }
+            });
+        }
         let _ = self.0.persist.send(Persist::Put(Box::new(r)));
         if noticed {
             let _ = self.0.persist.send(Persist::Attention(id, view.updated_at));
@@ -1258,17 +1341,28 @@ impl Desk {
         Some((text(&out.stdout), text(&out.stderr)))
     }
 
-    /// Passes the plan's rate limits a Claude Code session on this Mac
-    /// reported to the hub.
-    fn report_usage(&self, limits: Value) {
-        if let Some(plans) = &self.0.plans {
-            let account = self
+    /// Passes the plan's rate limits a Claude Code session on this computer
+    /// reported to the hub: of its account when it runs on one, else of the
+    /// CLI's own sign-in.
+    fn report_usage(&self, limits: Value, session: Option<Uuid>) {
+        let Some(plans) = &self.0.plans else {
+            return;
+        };
+        let on = session.and_then(|id| self.0.state.lock().records.get(&id)?.account);
+        let account = match on {
+            Some(id) => crate::usage::LocalAccount {
+                ids: vec![accounts::plan_id(id)],
+                plan: None,
+            },
+            None => self
                 .sign_ins()
                 .of(Engine::Claude)
                 .plan_account()
-                .unwrap_or_default();
-            plans.local(LocalPlan::Claude, limits, account);
-        }
+                .unwrap_or_default(),
+        };
+        let windows = plans.windows(LocalPlan::Claude, &limits);
+        plans.local(LocalPlan::Claude, limits, account);
+        self.plan_read(on, windows);
     }
 
     /// The process a session's own background work runs under: its
@@ -1697,6 +1791,7 @@ impl Desk {
                 "only Codex sessions can approve for you".into(),
             ));
         }
+        let account = self.account_for(new.engine, new.account)?;
         let cwd = PathBuf::from(&new.cwd);
         if !cwd.is_dir() {
             return Err(DeskError::Invalid(format!("{} is not a folder", new.cwd)));
@@ -1724,6 +1819,7 @@ impl Desk {
             view,
             engine_version: self.version_of(new.engine),
             approve_for_me: new.approve_for_me && new.engine == Engine::Codex,
+            account,
             name: name.to_string(),
             goal: new.goal.trim().to_string(),
             cwd: cwd.to_string_lossy().into_owned(),
@@ -2686,7 +2782,15 @@ impl Desk {
         if !cwd.is_dir() {
             return Err(DeskError::Conflict(format!("{} no longer exists", r.cwd)));
         }
-        let env = self.with_added(&self.0.state.lock().session_env.clone());
+        let mut env = self.with_added(&self.0.state.lock().session_env.clone());
+        // Read only now; it reaches the CLI on a descriptor, never in an
+        // environment ([`crate::token_pipe`]).
+        let account_token = self.account_token(r.engine, r.account).await?;
+        if account_token.is_some() {
+            for k in crate::engine_accounts::OUTRANKS_CLAUDE_TOKEN {
+                env.remove(k);
+            }
+        }
         let (spec, codex) = match r.engine {
             Engine::Claude => {
                 let session_id = r.cli_session_id.as_deref().unwrap_or_default();
@@ -2745,6 +2849,21 @@ impl Desk {
             "token": token,
             "hookPort": self.0.hook_port,
         });
+        let spec = match account_token {
+            Some(account_token) => {
+                let fifo = crate::token_pipe::TokenFifo::new(&self.0.opts.run_dir)
+                    .map_err(DeskError::Internal)?;
+                let spec = fifo.wrap(spec);
+                let id = r.id;
+                tokio::task::spawn_blocking(move || {
+                    if let Err(e) = fifo.hand(&account_token) {
+                        tracing::warn!(session = %id, error = %e, "a session didn't take its account's token");
+                    }
+                });
+                spec
+            }
+            None => spec,
+        };
         let started = self.start_pty(&spec, meta).await;
         let (pty, exit) = match started {
             Ok(started) => started,
@@ -3135,7 +3254,7 @@ impl Desk {
             Hook::Permission { tool, detail } => {
                 return self.await_permission(id, tool, detail).await
             }
-            Hook::Usage(limits) => self.report_usage(limits),
+            Hook::Usage(limits) => self.report_usage(limits, Some(id)),
             Hook::Other => {}
         }
         answer()
@@ -3664,6 +3783,7 @@ impl Desk {
                         view: View::Terminal,
                         engine_version: None,
                         approve_for_me: false,
+                        account: None,
                         name: ext
                             .name
                             .clone()
@@ -3901,6 +4021,7 @@ mod tests {
             adopt_every: None,
             holder: None,
             hub_internal: HubInternal::default(),
+            account_keys: None,
         }
     }
 
@@ -3932,6 +4053,7 @@ mod tests {
                 prompt: None,
                 approvals: None,
                 approve_for_me: false,
+                account: None,
                 env: Default::default(),
             },
             None,
@@ -4318,6 +4440,7 @@ mod tests {
                         prompt: None,
                         approvals: None,
                         approve_for_me: false,
+                        account: None,
                         env: BTreeMap::from([(PLUGIN_DIRS.into(), "/plugins/desk".into())]),
                     },
                     None,
@@ -4363,6 +4486,7 @@ mod tests {
                         prompt: None,
                         approvals: None,
                         approve_for_me: false,
+                        account: None,
                         env: BTreeMap::from([("NOT A NAME".into(), "x".into())]),
                     },
                     None,
@@ -4408,6 +4532,7 @@ mod tests {
                     prompt: None,
                     approvals: None,
                     approve_for_me: false,
+                    account: None,
                     env: added.clone(),
                 },
                 None,
@@ -4832,6 +4957,7 @@ mod tests {
                         prompt: None,
                         approvals: None,
                         approve_for_me: false,
+                        account: None,
                         env: Default::default(),
                     },
                     Some(By::you()),
@@ -5403,6 +5529,7 @@ mod tests {
                 DeskStore::from_pool(pool),
                 Options {
                     hub_internal: HubInternal::new([PathBuf::from("/data")], None),
+                    account_keys: None,
                     ..options(dir.path())
                 },
                 Default::default(),
@@ -5443,6 +5570,7 @@ mod tests {
                 DeskStore::from_pool(pool),
                 Options {
                     hub_internal: HubInternal::default().started_by(std::process::id()),
+                    account_keys: None,
                     ..options(dir.path())
                 },
                 Default::default(),
@@ -5518,6 +5646,7 @@ mod tests {
                 DeskStore::from_pool(pool),
                 Options {
                     hub_internal: HubInternal::new([PathBuf::from("/data")], None),
+                    account_keys: None,
                     ..options(dir.path())
                 },
                 Floor {
@@ -5575,6 +5704,7 @@ mod tests {
                 DeskStore::from_pool(pool),
                 Options {
                     hub_internal: HubInternal::new([PathBuf::from("/data")], None),
+                    account_keys: None,
                     ..options(dir.path())
                 },
                 Floor {

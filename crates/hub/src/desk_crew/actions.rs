@@ -582,6 +582,7 @@ impl CrewHub {
                             prompt: Some(goal.clone()),
                             approvals: None,
                             approve_for_me: false,
+                            account: None,
                             env: Default::default(),
                         },
                         Some(by),

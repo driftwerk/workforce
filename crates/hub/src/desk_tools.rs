@@ -85,6 +85,8 @@ struct StartInput {
     goal: Option<String>,
     worktree: Option<String>,
     prompt: Option<String>,
+    /// The person's account to run on, by name; none: the default.
+    account: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -145,10 +147,15 @@ impl DeskTool {
             }
             Verb::Start => {
                 let i: StartInput = parse(input)?;
+                let engine = i.engine.unwrap_or(Engine::Claude);
+                let account = match i.account.as_deref().map(str::trim) {
+                    Some(name) if !name.is_empty() => Some(Some(d.account_named(engine, name)?)),
+                    _ => None,
+                };
                 out(d
                     .create(
                         NewSession {
-                            engine: i.engine.unwrap_or(Engine::Claude),
+                            engine,
                             view: None,
                             name: i.name,
                             cwd: i.cwd,
@@ -157,6 +164,7 @@ impl DeskTool {
                             prompt: i.prompt,
                             approvals: None,
                             approve_for_me: false,
+                            account,
                             env: Default::default(),
                         },
                         caller(),
@@ -279,7 +287,8 @@ impl Tool for DeskTool {
                     "cwd": { "type": "string", "description": "Absolute path of the repo or folder" },
                     "goal": { "type": "string", "description": "What the session is for, shown on its card" },
                     "worktree": { "type": "string", "description": "Branch for a new git worktree" },
-                    "prompt": { "type": "string", "description": "First prompt" }
+                    "prompt": { "type": "string", "description": "First prompt" },
+                    "account": { "type": "string", "description": "The person's account to run on, by name (Work, Personal); leave out for their default" }
                 },
                 "required": ["name", "cwd"]
             }),

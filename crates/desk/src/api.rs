@@ -209,6 +209,167 @@ async fn engines(State(s): S, h: HeaderMap, Query(q): Q) -> Response {
     Json(s.desk.engines()).into_response()
 }
 
+/// The person's engine accounts, the store their sign-ins are kept in
+/// (none: this Desk keeps none), and any sign-in under way.
+async fn accounts(State(s): S, h: HeaderMap, Query(q): Q) -> Response {
+    guarded!(s, h, q);
+    Json(json!({
+        "accounts": s.desk.accounts(),
+        "store": s.desk.accounts_store(),
+        "signIns": s.desk.account_sign_ins(),
+        "needs": s.desk.account_needs(),
+        "autoSwitch": s.desk.auto_switch(),
+        "problems": s.desk.sign_in_problems(),
+    }))
+    .into_response()
+}
+
+/// Adds an account: with a pasted token, kept once Claude Code signs in by
+/// it; without, signing in through `claude setup-token` begins.
+async fn add_account(
+    State(s): S,
+    h: HeaderMap,
+    Query(q): Q,
+    Json(new): Json<crate::engine_accounts::NewAccount>,
+) -> Response {
+    guarded!(s, h, q);
+    match s.desk.add_account(new).await {
+        Ok(added @ crate::service::Added::Account { .. }) => {
+            (StatusCode::CREATED, Json(added)).into_response()
+        }
+        Ok(added @ crate::service::Added::SignIn { .. }) => {
+            (StatusCode::ACCEPTED, Json(added)).into_response()
+        }
+        Err(e) => e.into_response(),
+    }
+}
+
+async fn update_account(
+    State(s): S,
+    h: HeaderMap,
+    Query(q): Q,
+    Path(id): Path<Uuid>,
+    Json(p): Json<crate::engine_accounts::AccountPatch>,
+) -> Response {
+    guarded!(s, h, q);
+    s.desk.update_account(id, p).await.map(Json).into_response()
+}
+
+async fn remove_account(State(s): S, h: HeaderMap, Query(q): Q, Path(id): Path<Uuid>) -> Response {
+    guarded!(s, h, q);
+    s.desk
+        .remove_account(id)
+        .await
+        .map(|()| StatusCode::NO_CONTENT)
+        .into_response()
+}
+
+/// "OK" on a sign-in problem the person has dealt with.
+async fn dismiss_problem(State(s): S, h: HeaderMap, Query(q): Q, Path(id): Path<Uuid>) -> Response {
+    guarded!(s, h, q);
+    s.desk.dismiss_sign_in_problem(id);
+    StatusCode::NO_CONTENT.into_response()
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SwitchAllBody {
+    #[serde(default = "claude")]
+    engine: crate::engine::Engine,
+    /// The account they're on; `null`, the CLI's own sign-in.
+    from: Option<Uuid>,
+    to: Option<Uuid>,
+}
+
+fn claude() -> crate::engine::Engine {
+    crate::engine::Engine::Claude
+}
+
+/// Moves every session on one account to another: "Switch all".
+async fn switch_all(
+    State(s): S,
+    h: HeaderMap,
+    Query(q): Q,
+    Json(b): Json<SwitchAllBody>,
+) -> Response {
+    guarded!(s, h, q);
+    s.desk
+        .switch_all(b.engine, b.from, b.to)
+        .await
+        .map(Json)
+        .into_response()
+}
+
+/// "Not now" on an account need.
+async fn put_off_need(State(s): S, h: HeaderMap, Query(q): Q, Path(id): Path<String>) -> Response {
+    guarded!(s, h, q);
+    s.desk.put_off(&id);
+    StatusCode::NO_CONTENT.into_response()
+}
+
+#[derive(Deserialize)]
+struct OnBody {
+    on: bool,
+}
+
+/// "Switch automatically when an account hits its limit".
+async fn auto_switch(State(s): S, h: HeaderMap, Query(q): Q, Json(b): Json<OnBody>) -> Response {
+    guarded!(s, h, q);
+    s.desk
+        .set_auto_switch(b.on)
+        .await
+        .map(|()| StatusCode::NO_CONTENT)
+        .into_response()
+}
+
+#[derive(Deserialize)]
+struct CodeBody {
+    code: String,
+}
+
+/// The code the sign-in page showed, typed into the sign-in waiting for it.
+async fn sign_in_code(
+    State(s): S,
+    h: HeaderMap,
+    Query(q): Q,
+    Path(id): Path<Uuid>,
+    Json(b): Json<CodeBody>,
+) -> Response {
+    guarded!(s, h, q);
+    s.desk.sign_in_code(id, &b.code).map(Json).into_response()
+}
+
+async fn cancel_sign_in(State(s): S, h: HeaderMap, Query(q): Q, Path(id): Path<Uuid>) -> Response {
+    guarded!(s, h, q);
+    s.desk
+        .cancel_sign_in(id)
+        .map(|()| StatusCode::NO_CONTENT)
+        .into_response()
+}
+
+#[derive(Deserialize)]
+struct SwitchBody {
+    /// The account; `null`, the CLI's own sign-in.
+    account: Option<Uuid>,
+}
+
+/// Moves a session to another account: now when it is idle, once its turn
+/// ends when it works.
+async fn switch_account(
+    State(s): S,
+    h: HeaderMap,
+    Query(q): Q,
+    Path(id): Path<Uuid>,
+    Json(b): Json<SwitchBody>,
+) -> Response {
+    guarded!(s, h, q);
+    s.desk
+        .switch_account(id, b.account, Some(By::you()))
+        .await
+        .map(Json)
+        .into_response()
+}
+
 async fn create(State(s): S, h: HeaderMap, Query(q): Q, Json(new): Json<NewSession>) -> Response {
     guarded!(s, h, q);
     s.desk
@@ -878,6 +1039,27 @@ pub fn sessions_router(desk: Desk, auth: Arc<dyn Authorize>) -> Router {
     Router::new()
         .route("/api/desk/sessions", get(list).post(create))
         .route("/api/desk/engines", get(engines))
+        .route("/api/desk/accounts", get(accounts).post(add_account))
+        .route(
+            "/api/desk/accounts/{id}",
+            patch(update_account).delete(remove_account),
+        )
+        .route("/api/desk/accounts/sign-ins/{id}/code", post(sign_in_code))
+        .route("/api/desk/accounts/switch-all", post(switch_all))
+        .route("/api/desk/accounts/needs/{id}/put-off", post(put_off_need))
+        .route(
+            "/api/desk/accounts/auto-switch",
+            axum::routing::put(auto_switch),
+        )
+        .route(
+            "/api/desk/accounts/problems/{id}/dismiss",
+            post(dismiss_problem),
+        )
+        .route(
+            "/api/desk/accounts/sign-ins/{id}",
+            axum::routing::delete(cancel_sign_in),
+        )
+        .route("/api/desk/sessions/{id}/account", post(switch_account))
         .route("/api/desk/spend", get(spend))
         .route("/api/desk/ledger", get(ledger))
         .route("/api/desk/sessions/{id}", patch(update).delete(forget))
