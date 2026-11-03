@@ -336,6 +336,9 @@ pub enum CodexEvent {
     Idle,
     Prompt(String),
     Tool(String),
+    /// A tool call it ran failed (a command's non-zero exit, a failed MCP
+    /// call).
+    Failed(String),
     Reply(String),
     /// A sub-agent thread it started.
     Child(String),
@@ -686,6 +689,25 @@ pub fn interpret(method: &str, params: &Value) -> Option<Seen> {
         {
             seen(s("/threadId"), CodexEvent::Reply(s("/item/text")?))
         }
+        "item/completed" => {
+            let failed = params.pointer("/item/status").and_then(Value::as_str) == Some("failed")
+                || params
+                    .pointer("/item/exitCode")
+                    .and_then(Value::as_i64)
+                    .is_some_and(|c| c != 0);
+            let label = match params.pointer("/item/type").and_then(Value::as_str)? {
+                "commandExecution" => tool_summary("Bash", params.get("item")).0,
+                "mcpToolCall" => format!(
+                    "{} · {}",
+                    s("/item/server").unwrap_or_default(),
+                    s("/item/tool").unwrap_or_default()
+                ),
+                _ => return None,
+            };
+            failed
+                .then(|| seen(s("/threadId"), CodexEvent::Failed(label)))
+                .flatten()
+        }
         _ => None,
     }
 }
@@ -694,6 +716,8 @@ pub fn interpret(method: &str, params: &Value) -> Option<Seen> {
 const LIMITS_READ: i64 = 2;
 /// The id it subscribes to the session's thread under.
 const SUBSCRIBE: i64 = 3;
+/// The id it steers the session's turn under.
+const STEER: i64 = 4;
 
 /// Folds `from` into `into`: what it holds replaces what was known, and a
 /// value it leaves out or sends as null keeps it.
@@ -756,6 +780,8 @@ pub struct Follower {
     /// The requests it forwarded that nobody has answered, by id.
     open: HashMap<String, String>,
     home: Option<PathBuf>,
+    /// The thread's turn running now, which a steer must name.
+    turn: Option<String>,
 }
 
 impl Follower {
@@ -767,6 +793,7 @@ impl Follower {
             files: HashMap::new(),
             open: HashMap::new(),
             home,
+            turn: None,
         }
     }
 
@@ -854,6 +881,18 @@ impl Follower {
                         self.files.insert(item.to_string(), paths);
                     }
                 }
+                let ours = params.get("threadId").and_then(Value::as_str).is_some()
+                    && params.get("threadId").and_then(Value::as_str) == self.thread.as_deref();
+                match method {
+                    "turn/started" if ours => {
+                        self.turn = params
+                            .pointer("/turn/id")
+                            .and_then(Value::as_str)
+                            .map(str::to_string);
+                    }
+                    "turn/completed" if ours => self.turn = None,
+                    _ => {}
+                }
                 if method == "serverRequest/resolved" {
                     if let Some(request) = params.get("requestId") {
                         self.open.remove(&request.to_string());
@@ -890,6 +929,16 @@ impl Follower {
 }
 
 impl Follower {
+    /// What to send to steer the thread's running turn with `text`
+    /// (`turn/steer`, which must name the running turn: verified in the
+    /// 0.166 schema); nothing while no turn runs.
+    pub fn steer(&self, text: &str) -> Option<Value> {
+        let (thread, turn) = (self.thread.as_ref()?, self.turn.as_ref()?);
+        Some(json!({ "id": STEER, "method": "turn/steer", "params": {
+            "threadId": thread, "expectedTurnId": turn,
+            "input": [{ "type": "text", "text": text }] } }))
+    }
+
     /// What to send for `reply`, and what to say of it: nothing is sent to
     /// a request already answered.
     pub fn reply(&mut self, reply: &Reply) -> (Option<Seen>, Option<Value>) {
@@ -919,6 +968,7 @@ pub async fn observe(
     mut follower: Follower,
     events: mpsc::Sender<Seen>,
     mut replies: mpsc::UnboundedReceiver<Reply>,
+    mut steers: mpsc::UnboundedReceiver<String>,
     plans: Option<Arc<dyn PlanSink>>,
     cancel: CancellationToken,
 ) -> Result<()> {
@@ -946,9 +996,18 @@ pub async fn observe(
     }
     let mut limits: Option<Value> = None;
     let mut replying = true;
+    let mut steering = true;
     loop {
         tokio::select! {
             _ = cancel.cancelled() => return Ok(()),
+            steer = steers.recv(), if steering => match steer {
+                Some(text) => {
+                    if let Some(send) = follower.steer(&text) {
+                        tx.send(Message::text(send.to_string())).await?;
+                    }
+                }
+                None => steering = false,
+            },
             reply = replies.recv(), if replying => match reply {
                 Some(reply) => {
                     let (seen, answer) = follower.reply(&reply);
@@ -1136,6 +1195,41 @@ pub(crate) mod tests {
         );
         assert_eq!(done("aborted", rm.clone()), None);
         assert_eq!(done("inProgress", rm), None);
+    }
+
+    #[test]
+    fn a_steer_names_the_running_turn_and_waits_for_one() {
+        let mut f = Follower::new(Some("t1".into()), None);
+        assert!(f.steer("stop").is_none(), "no turn runs");
+        f.heard(
+            &json!({"method": "turn/started", "params": {"threadId": "t1", "turn": {"id": "u9"}}}),
+        );
+        f.heard(&json!({"method": "turn/started", "params": {"threadId": "other", "turn": {"id": "x"}}}));
+        assert_eq!(
+            f.steer("stop").unwrap(),
+            json!({"id": STEER, "method": "turn/steer", "params": {"threadId": "t1",
+                "expectedTurnId": "u9", "input": [{"type": "text", "text": "stop"}]}})
+        );
+        f.heard(&json!({"method": "turn/completed", "params": {"threadId": "t1", "turn": {"id": "u9"}}}));
+        assert!(f.steer("stop").is_none());
+    }
+
+    #[test]
+    fn a_failed_command_or_mcp_call_is_a_failure_and_a_good_one_isnt() {
+        let item =
+            |item: Value| interpret("item/completed", &json!({"threadId": "t1", "item": item}));
+        let failed = item(
+            json!({"type": "commandExecution", "command": "cargo test", "status": "completed", "exitCode": 101}),
+        );
+        assert!(
+            matches!(failed, Some(Seen { event: CodexEvent::Failed(l), .. }) if l.contains("cargo test"))
+        );
+        let failed =
+            item(json!({"type": "mcpToolCall", "server": "gh", "tool": "pr", "status": "failed"}));
+        assert!(
+            matches!(failed, Some(Seen { event: CodexEvent::Failed(l), .. }) if l == "gh · pr")
+        );
+        assert!(item(json!({"type": "commandExecution", "command": "ls", "status": "completed", "exitCode": 0})).is_none());
     }
 
     #[test]
@@ -1579,6 +1673,7 @@ pub(crate) mod tests {
             Follower::new(Some("t1".into()), None).at_once(),
             events,
             answers,
+            mpsc::unbounded_channel().1,
             None,
             cancel.clone(),
         ));

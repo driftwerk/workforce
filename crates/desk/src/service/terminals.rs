@@ -657,6 +657,7 @@ impl Desk {
             held: None,
             open_question: None,
             codex_question: None,
+            breaker: Default::default(),
         };
         if existing.is_some_and(|id| self.0.state.lock().live.contains_key(&id)) {
             // Already running here: nothing to take back.
@@ -781,6 +782,7 @@ impl Desk {
                             held: None,
                             open_question: None,
                             codex_question: None,
+                            breaker: Default::default(),
                         },
                     );
                     self.publish(id);

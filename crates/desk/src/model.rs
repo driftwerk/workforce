@@ -4,32 +4,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-macro_rules! text_enum {
-    ($name:ident { $($variant:ident => $text:literal),+ $(,)? }) => {
-        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, ::serde::Serialize, ::serde::Deserialize)]
-        #[serde(rename_all = "lowercase")]
-        pub enum $name {
-            $($variant),+
-        }
-
-        impl $name {
-            pub fn as_str(self) -> &'static str {
-                match self {
-                    $(Self::$variant => $text),+
-                }
-            }
-
-            pub fn parse(s: &str) -> eyre::Result<Self> {
-                match s {
-                    $($text => Ok(Self::$variant),)+
-                    other => Err(eyre::eyre!(concat!("unknown ", stringify!($name), " {:?}"), other)),
-                }
-            }
-        }
-    };
-}
-
-pub(crate) use text_enum;
+pub(crate) use workforce_core::text_enum;
 
 pub use crate::engine::{Engine, View};
 
@@ -327,6 +302,14 @@ pub enum DeskEvent {
     AccountSignIn {
         #[serde(rename = "signIn")]
         sign_in: crate::engine_accounts::SignInView,
+    },
+    /// The budgets changed: all of them as they now are.
+    Budgets {
+        budgets: Vec<workforce_core::budget::Budget>,
+    },
+    /// Where a breaker stands changed.
+    Breaker {
+        breaker: Box<crate::service::BreakerView>,
     },
     /// A key of Desk's own state changed; `value` is `null` once removed.
     State {

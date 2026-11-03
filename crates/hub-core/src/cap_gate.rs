@@ -662,6 +662,7 @@ mod tests {
             "system.set_max_rounds",
             "system.config",
             "pricing.update",
+            "desk.budget",
         ];
         let (member_gate, member_uid) = gate_with(IdentityRole::Member, IdentityStatus::Active);
         let (admin_gate, admin_uid) = gate_with(IdentityRole::SystemAdmin, IdentityStatus::Active);

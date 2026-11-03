@@ -616,6 +616,8 @@ pub async fn mount(
     let desk = Desk::start(store, options(config), floor, cancel)
         .await
         .context("starting desk sessions")?;
+    // Budgets' days are the person's, as the cost governor counts them.
+    desk.count_budgets_in(config.user_timezone());
     if DESK.set(desk.clone()).is_err() {
         eyre::bail!("desk sessions started twice");
     }
