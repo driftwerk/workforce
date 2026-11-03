@@ -236,6 +236,28 @@ impl Tool for DeskTool {
         NAMES[VERBS.iter().position(|v| *v == self.verb).unwrap_or(0)]
     }
 
+    /// Starting a session is a session in its folder. Typing into one,
+    /// answering its approvals, stopping or interrupting it act on a session
+    /// the person can watch, under that session's own approvals, and reading
+    /// Desk touches no file: none of them is decided here.
+    fn effect(&self, input: &Value) -> workforce_core::computer::Effect {
+        match self.verb {
+            Verb::Start => workforce_core::computer::Effect::Session {
+                cwd: input["cwd"]
+                    .as_str()
+                    .filter(|c| !c.trim().is_empty())
+                    .map(|c| workforce_agent::tools::paths::resolve_real(std::path::Path::new(c))),
+            },
+            Verb::List
+            | Verb::Prompt
+            | Verb::Read
+            | Verb::Wait
+            | Verb::Approve
+            | Verb::Stop
+            | Verb::Interrupt => workforce_core::computer::Effect::None,
+        }
+    }
+
     fn description(&self) -> &str {
         match self.verb {
             Verb::List => "List the person's Claude Code and Codex sessions on this machine: displayName (what the person calls it — use it first), name (the hub's), cwd, group (the sidebar group it is in), goal, state (working, blocked = needs an answer, asking = its turn ended asking the person something, done, idle, interrupted, stopped), last prompt and reply. With query, only the sessions it names: matched on the person's names, the hub's, the folder and the group, ignoring case and on parts of words (\"ledger\", \"the Atlas sessions\").",

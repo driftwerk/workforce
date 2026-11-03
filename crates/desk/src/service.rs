@@ -1579,6 +1579,11 @@ impl Desk {
         &self.0.store
     }
 
+    /// What agents may touch on this computer, on this desk's registry.
+    pub fn computer(&self) -> crate::computer::Computer {
+        crate::computer::Computer::new(Arc::clone(&self.0.store))
+    }
+
     /// Reads the replies the rules can't tell about through `crew` (the
     /// hub's cheap model), for as long as it is there.
     pub fn read_replies_with(&self, crew: &Arc<dyn crew::Crew>) {

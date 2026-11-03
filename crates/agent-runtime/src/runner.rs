@@ -29,7 +29,8 @@ use crate::tools::access::{self, ToolAccess, ToolAccessSnapshot};
 use crate::tools::approval::{Decision, GatedCall, OpenPrompt, Refusal, TurnApprovals};
 pub use crate::tools::dispatch::{apply_capability_gate, apply_cascade_gate, ToolGates};
 use crate::tools::dispatch::{
-    execute_approved, execute_gated, gate_tool_call, would_execute, GateOutcome, ToolExecution,
+    execute_approved, execute_decided, gate_tool_call_decided, gate_tool_call_unattended,
+    would_execute, GateOutcome, ToolExecution,
 };
 use crate::tools::loading::{PlanContext, ToolPlan};
 use crate::tools::registry::ToolRegistry;
@@ -447,11 +448,14 @@ pub fn is_outbound_delivery_tool(name: &str) -> bool {
 /// Return a copy of `registry` with every outbound delivery tool removed (see
 /// [`is_outbound_delivery_tool`]). Used for turns where the caller owns delivery
 /// and the agent must not self-post (see [`SUPPRESS_DELIVERY_TOOLS`]). The shared
-/// registry is left untouched — `clone_all` shallow-clones the tool `Arc`s.
+/// registry is left untouched — the copy shallow-clones the tool `Arc`s — and a
+/// tool it gains mid-turn still reaches the copy, unless it delivers.
 pub fn without_delivery_tools(
-    registry: &crate::tools::registry::ToolRegistry,
+    registry: &Arc<crate::tools::registry::ToolRegistry>,
 ) -> crate::tools::registry::ToolRegistry {
-    let filtered = registry.clone_all();
+    let filtered = crate::tools::registry::ToolRegistry::follow(registry, |name| {
+        !is_outbound_delivery_tool(name)
+    });
     for name in filtered.names() {
         if is_outbound_delivery_tool(&name) {
             filtered.unregister(&name);
@@ -1108,6 +1112,9 @@ pub struct RunnerConfig {
     /// agent to write to from their Desk turns. `None` keeps no such
     /// choice, and "Always allow" is not offered for those writes.
     pub surface_allows: Option<Arc<dyn crate::tools::dispatch::SurfaceAllows>>,
+    /// What the agent may do on the person's computer, decided per call; set
+    /// only on a hub with `[desk]`. `None` leaves every call as it was.
+    pub computer_gate: Option<Arc<dyn crate::tools::computer::ComputerGate>>,
     /// Cascade gate consulted *after* the PolicyEngine. Can only further
     /// restrict the PolicyEngine decision — never relax it. When `None`
     /// (the `[permissions] enabled = false` case) the cascade arm is a
@@ -1187,6 +1194,7 @@ impl Default for RunnerConfig {
             trace_tags: Default::default(),
             permission_writer: None,
             surface_allows: None,
+            computer_gate: None,
             permission_gate: None,
             arguments: crate::tools::arguments::ArgumentValidation::default(),
             tool_loading: crate::tools::loading::ToolLoading::default(),
@@ -1791,6 +1799,18 @@ fn unwrap_failure(tool_use_id: String, input: serde_json::Value, message: String
 /// A result that loaded `loads` (internal names): the text the model reads —
 /// the result followed by the loaded tools' definitions — and the record a
 /// native wire renders instead.
+/// The tools a call made callable that this turn can offer: a tool the call
+/// registered in the agent's registry after the turn copied it is taken into
+/// the turn's registry first, so it is offered from the next round and runs in
+/// this turn. A tool the turn goes without is dropped.
+pub fn callable_loads(registry: &ToolRegistry, mut loads: Vec<String>) -> Vec<String> {
+    if !loads.is_empty() {
+        registry.adopt(&loads);
+        loads.retain(|name| registry.has(name));
+    }
+    loads
+}
+
 pub fn loaded_result(registry: &ToolRegistry, note: String, loads: &[String]) -> (String, Loaded) {
     let definitions: Vec<crate::tools::ToolDefinition> = loads
         .iter()
@@ -4517,7 +4537,16 @@ impl AgentRunner {
                     },
                     ..ToolGates::from(&self.config)
                 };
-                let outcome = gate_tool_call(&gates, &self.policy, &self.tools, &tool_name, input);
+                // No one watches a turn without progress: nobody can be asked.
+                let (outcome, decided) =
+                    gate_tool_call_unattended(&gates, &self.policy, &self.tools, &tool_name, input);
+                crate::tools::computer::settle_gated(
+                    self.config.computer_gate.as_deref(),
+                    &tool_name,
+                    decided.as_ref(),
+                    input,
+                    &outcome,
+                );
                 let tool_use_id = tool_use_id.to_string();
                 let input = (*input).clone();
                 let tools = Arc::clone(&self.tools);
@@ -4530,8 +4559,15 @@ impl AgentRunner {
                         let call = self.call_for(&mut round_calls, &tool_use_id, &input);
                         join_set.spawn(async move {
                             let fut = async move {
-                                let exec =
-                                    execute_gated(&tools, &access, &tn, &input, exec_input).await;
+                                let exec = execute_decided(
+                                    &tools,
+                                    &access,
+                                    &tn,
+                                    &input,
+                                    exec_input,
+                                    decided.as_ref(),
+                                )
+                                .await;
                                 executed_outcome(tool_use_id, tn, input, exec)
                             };
                             ctx.scope(call.scope(fut)).await
@@ -4558,6 +4594,7 @@ impl AgentRunner {
                         });
                     }
                     GateOutcome::RequireApproval { reason, .. } => {
+                        let decided = crate::tools::computer::asking(decided);
                         let tn = tool_name.clone();
                         let r = reason.clone();
                         match route_approval(
@@ -4601,6 +4638,14 @@ impl AgentRunner {
                                 });
                             }
                             RouteResolution::DenyUnreachable => {
+                                crate::tools::computer::settle(
+                                    self.config.computer_gate.as_deref(),
+                                    &tn,
+                                    decided.as_ref(),
+                                    &input,
+                                    crate::tools::computer::Outcome::Unattended,
+                                    Some(UNREACHABLE_APPROVER),
+                                );
                                 join_set.spawn(async move {
                                     let msg = UNREACHABLE_APPROVER.to_string();
                                     (
@@ -4622,6 +4667,14 @@ impl AgentRunner {
                             // no human is watching a non-progress turn, so the
                             // instant error stands.
                             RouteResolution::SelfServe => {
+                                crate::tools::computer::settle(
+                                    self.config.computer_gate.as_deref(),
+                                    &tn,
+                                    decided.as_ref(),
+                                    &input,
+                                    crate::tools::computer::Outcome::Unattended,
+                                    Some(&r),
+                                );
                                 join_set.spawn(async move {
                                     (
                                         tool_use_id,
@@ -4669,6 +4722,7 @@ impl AgentRunner {
                     crate::spill::RetrievalSurface::from_registry(&self.tools),
                 );
                 let error = (!success).then(|| output_str.clone());
+                let loads = callable_loads(&self.tools, loads);
                 let output_str = match loads.is_empty() {
                     true => output_str,
                     false => {
@@ -5734,7 +5788,26 @@ impl AgentRunner {
                     },
                     ..ToolGates::from(&self.config)
                 };
-                let outcome = gate_tool_call(&gates, &self.policy, &self.tools, &tool_name, input);
+                let (outcome, decided) = match approvals {
+                    Some(_) => {
+                        gate_tool_call_decided(&gates, &self.policy, &self.tools, &tool_name, input)
+                    }
+                    // No card on this turn: nobody can be asked.
+                    None => gate_tool_call_unattended(
+                        &gates,
+                        &self.policy,
+                        &self.tools,
+                        &tool_name,
+                        input,
+                    ),
+                };
+                crate::tools::computer::settle_gated(
+                    self.config.computer_gate.as_deref(),
+                    &tool_name,
+                    decided.as_ref(),
+                    input,
+                    &outcome,
+                );
                 let tool_use_id = tool_use_id.to_string();
                 let input = (*input).clone();
                 let ptx = progress_tx.clone();
@@ -5771,8 +5844,13 @@ impl AgentRunner {
                             let exec = scope_turn(
                                 Some(ptx.clone()),
                                 ledger,
-                                call.scope(ctx.scope(execute_gated(
-                                    &tools, &access, &tool_name, &input, exec_input,
+                                call.scope(ctx.scope(execute_decided(
+                                    &tools,
+                                    &access,
+                                    &tool_name,
+                                    &input,
+                                    exec_input,
+                                    decided.as_ref(),
                                 ))),
                             )
                             .await;
@@ -5792,13 +5870,32 @@ impl AgentRunner {
                         allow_save_allow,
                         holds,
                     } => {
-                        let (prompt_options, keeper) = held_prompt(
-                            allow_save_allow,
-                            holds,
-                            self.config.agent_id.as_str(),
-                            self.config.surface_allows.clone(),
-                            self.config.permission_writer.clone(),
-                        );
+                        let decided = crate::tools::computer::asking(decided);
+                        let (prompt_options, keeper) = match &decided {
+                            // A computer ask offers Allow once and Deny, and
+                            // keeps no answer as a permission rule.
+                            Some(d)
+                                if !matches!(
+                                    d.verdict,
+                                    workforce_core::computer::Verdict::Run { .. }
+                                ) =>
+                            {
+                                (
+                                    crate::tools::computer::prompt_options(
+                                        self.config.computer_gate.as_deref(),
+                                        d,
+                                    ),
+                                    None,
+                                )
+                            }
+                            _ => held_prompt(
+                                allow_save_allow,
+                                holds,
+                                self.config.agent_id.as_str(),
+                                self.config.surface_allows.clone(),
+                                self.config.permission_writer.clone(),
+                            ),
+                        };
                         let agent_id_str = self.config.agent_id.to_string();
                         let acting_user_id = CURRENT_USER_ID
                             .try_with(|u| u.clone())
@@ -5859,6 +5956,14 @@ impl AgentRunner {
                                 });
                             }
                             RouteResolution::DenyUnreachable => {
+                                crate::tools::computer::settle(
+                                    self.config.computer_gate.as_deref(),
+                                    &tool_name,
+                                    decided.as_ref(),
+                                    &input,
+                                    crate::tools::computer::Outcome::Unattended,
+                                    Some(UNREACHABLE_APPROVER),
+                                );
                                 join_set.spawn(async move {
                                     let msg = UNREACHABLE_APPROVER.to_string();
                                     let exec = ToolExecution::blocked(msg.clone(), msg);
@@ -5878,6 +5983,14 @@ impl AgentRunner {
                                     });
                                 match opened {
                                     Err(refusal) => {
+                                        crate::tools::computer::settle(
+                                            self.config.computer_gate.as_deref(),
+                                            &tool_name,
+                                            decided.as_ref(),
+                                            &input,
+                                            crate::tools::computer::refused_as(refusal),
+                                            Some(&reason),
+                                        );
                                         join_set.spawn(async move {
                                             refuse(
                                                 &ptx,
@@ -5902,6 +6015,8 @@ impl AgentRunner {
                                             self.call_for(&mut round_calls, &tool_use_id, &input);
                                         let policy = Arc::clone(&self.policy);
                                         let access = Arc::clone(&access_snapshot);
+                                        let computer = self.config.computer_gate.clone();
+                                        let answered = prompt.request_id.clone();
                                         join_set.spawn(async move {
                                             let decision = await_approval(
                                                 ApprovalAsk {
@@ -5920,6 +6035,21 @@ impl AgentRunner {
                                                 SELF_SERVE_APPROVAL_TIMEOUT,
                                             )
                                             .await;
+                                            crate::tools::computer::settle_answered(
+                                                computer.as_deref(),
+                                                &tool_name,
+                                                decided.as_ref(),
+                                                &input,
+                                                match decision.verdict() {
+                                                    Ok(()) => {
+                                                        crate::tools::computer::Outcome::Allowed
+                                                    }
+                                                    Err(refusal) => {
+                                                        crate::tools::computer::refused_as(refusal)
+                                                    }
+                                                },
+                                                &answered,
+                                            );
                                             match decision.verdict() {
                                                 Err(refusal) => {
                                                     refuse(
@@ -5938,10 +6068,23 @@ impl AgentRunner {
                                                         .scope(call.scope(scope_turn(
                                                             Some(ptx.clone()),
                                                             Some(Arc::clone(&ledger)),
-                                                            execute_approved(
-                                                                &gates, &policy, &tools, &access,
-                                                                &tool_name, &input,
-                                                            ),
+                                                            async {
+                                                                crate::tools::computer::keep_answer(
+                                                                    computer.as_deref(),
+                                                                    decided.as_ref(),
+                                                                    decision.choice,
+                                                                );
+                                                                execute_approved(
+                                                                    &gates,
+                                                                    &policy,
+                                                                    &tools,
+                                                                    &access,
+                                                                    &tool_name,
+                                                                    &input,
+                                                                    decided.as_ref(),
+                                                                )
+                                                                .await
+                                                            },
                                                         )))
                                                         .await;
                                                     if exec.is_error {
@@ -6003,6 +6146,7 @@ impl AgentRunner {
                     crate::spill::RetrievalSurface::from_registry(&self.tools),
                 );
                 let error = (!success).then(|| output_str.clone());
+                let loads = callable_loads(&self.tools, loads);
                 let output_str = match loads.is_empty() {
                     true => output_str,
                     false => {
@@ -8658,6 +8802,7 @@ mod tests {
             trace_tags: Default::default(),
             permission_writer: None,
             surface_allows: None,
+            computer_gate: None,
             permission_gate: None,
             arguments: crate::tools::arguments::ArgumentValidation::default(),
             tool_loading: crate::tools::loading::ToolLoading::default(),
@@ -8706,6 +8851,7 @@ mod tests {
             trace_tags: Default::default(),
             permission_writer: None,
             surface_allows: None,
+            computer_gate: None,
             permission_gate: None,
             arguments: crate::tools::arguments::ArgumentValidation::default(),
             tool_loading: crate::tools::loading::ToolLoading::default(),
@@ -11662,6 +11808,7 @@ mod tests {
             "messaging.member_info",
             "data.query",
         ]);
+        let reg = Arc::new(reg);
         let before = reg.len();
         let filtered = without_delivery_tools(&reg);
         // Outbound delivery gone; read/context tools survive.
@@ -11673,6 +11820,14 @@ mod tests {
         // The shared source registry is untouched — clone_all is non-destructive.
         assert_eq!(reg.len(), before);
         assert!(reg.has("messaging.send"));
+        // A tool registered mid-turn reaches the copy when a call loads it,
+        // but a delivery tool never does.
+        reg.register(mock_tool("jira.create_issue"));
+        assert_eq!(
+            filtered.adopt(&["jira.create_issue".into(), "messaging.send".into()]),
+            ["jira.create_issue"]
+        );
+        assert!(!filtered.has("messaging.send"));
     }
 
     #[tokio::test]
@@ -14734,6 +14889,7 @@ issue?"#;
             trace_tags: Default::default(),
             permission_writer: None,
             surface_allows: None,
+            computer_gate: None,
             permission_gate: None,
             arguments: crate::tools::arguments::ArgumentValidation::default(),
             tool_loading: crate::tools::loading::ToolLoading::default(),
@@ -15799,6 +15955,69 @@ issue?"#;
         assert!(records(&result).contains(&("vault.set", "allow", true)));
     }
 
+    /// A turn runs on a copy of the agent's registry. A skill enabled mid-turn
+    /// registers its tools in the agent's registry, not the copy; they must
+    /// still be offered and run in that same turn, through `tool_call` and
+    /// called directly, on both runner paths.
+    async fn tools_registered_mid_turn_run_in_that_turn(streaming: bool) {
+        struct Enable(Arc<ToolRegistry>);
+        #[async_trait]
+        impl Tool for Enable {
+            fn name(&self) -> &str {
+                "system.enable_skill"
+            }
+            fn description(&self) -> &str {
+                "Enable a skill."
+            }
+            fn input_schema(&self) -> serde_json::Value {
+                serde_json::json!({ "type": "object" })
+            }
+            async fn execute(&self, _: serde_json::Value) -> Result<crate::tools::ToolResult> {
+                self.0.register(mock_tool("tracker.create_issue"));
+                Ok(
+                    crate::tools::ToolResult::success(serde_json::json!({ "enabled": true }), 0)
+                        .loading(vec!["tracker.create_issue".to_string()]),
+                )
+            }
+        }
+        let agent = Arc::new(padded_registry(&["memory"]));
+        agent.register(Arc::new(Enable(Arc::clone(&agent))));
+        let turn = ToolRegistry::follow(&agent, |_| true);
+        let llm = ScriptedLoadingProvider::new(vec![
+            vec![("system_enable_skill", serde_json::json!({}))],
+            vec![(
+                "tool_call",
+                serde_json::json!({ "name": "tracker_create_issue", "arguments": {} }),
+            )],
+            vec![("tracker_create_issue", serde_json::json!({}))],
+        ]);
+        let runner = loading_runner_with(Arc::clone(&llm), &["system.enable_skill"], turn);
+        let result = run_either(&runner, streaming).await;
+
+        let seen = llm.seen.lock().unwrap();
+        let (content, loaded) = result_of(&seen[1].2, "tu_1_0");
+        assert!(
+            content.contains("\"name\":\"tracker_create_issue\""),
+            "the load carries the definition: {content}"
+        );
+        assert_eq!(loaded.unwrap().tools, ["tracker_create_issue"]);
+        let ran = records(&result)
+            .into_iter()
+            .filter(|record| *record == ("tracker.create_issue", "allow", true))
+            .count();
+        assert_eq!(ran, 2, "both calls ran: {:?}", records(&result));
+    }
+
+    #[tokio::test]
+    async fn tools_registered_mid_turn_run_in_that_turn_buffered() {
+        tools_registered_mid_turn_run_in_that_turn(false).await;
+    }
+
+    #[tokio::test]
+    async fn tools_registered_mid_turn_run_in_that_turn_streaming() {
+        tools_registered_mid_turn_run_in_that_turn(true).await;
+    }
+
     #[tokio::test]
     async fn the_round_cap_wrap_up_carries_no_catalogue() {
         let llm = ScriptedLoadingProvider::new(vec![
@@ -16069,6 +16288,165 @@ issue?"#;
                 result: run.await.expect("run task").expect("run completes"),
                 prompts,
                 elapsed: started.elapsed(),
+            }
+        }
+
+        /// A computer gate that asks about every call of the test tool.
+        #[derive(Default)]
+        struct AsksAboutEveryCall(
+            std::sync::Mutex<Vec<crate::tools::computer::Outcome>>,
+            std::sync::Mutex<Vec<PermissionChoice>>,
+        );
+
+        impl crate::tools::computer::ComputerGate for AsksAboutEveryCall {
+            fn decides(&self, tool: &str) -> bool {
+                tool == crate::tools::approval::testing::TOOL
+            }
+            fn verdict(
+                &self,
+                _: &str,
+                _: &workforce_core::computer::Effect,
+            ) -> workforce_core::computer::Verdict {
+                workforce_core::computer::Verdict::Ask {
+                    choices: vec![
+                        workforce_core::computer::Choice::AllowOnce,
+                        workforce_core::computer::Choice::Deny,
+                    ],
+                    why: workforce_core::computer::Why::Runs,
+                }
+            }
+            fn record(&self, record: crate::tools::computer::Record) {
+                self.0.lock().unwrap().push(record.outcome);
+            }
+            fn prompt(
+                &self,
+                _: &crate::tools::computer::Decision,
+            ) -> workforce_core::policy::PermissionPromptOptions {
+                workforce_core::policy::PermissionPromptOptions {
+                    allow_session: true,
+                    allow_in_folder: Some("~/dev/acme-web".into()),
+                    // An "always" rule is never offered, whatever a gate says.
+                    allow_always: true,
+                    ..crate::tools::computer::once_or_deny()
+                }
+            }
+            fn keep(
+                &self,
+                _: &crate::tools::computer::Decision,
+                choice: PermissionChoice,
+            ) -> eyre::Result<()> {
+                self.1.lock().unwrap().push(choice);
+                Ok(())
+            }
+        }
+
+        #[derive(Default)]
+        struct KeepsChoices(std::sync::Mutex<Vec<PermissionChoice>>);
+
+        #[async_trait::async_trait]
+        impl PermissionWriter for KeepsChoices {
+            async fn persist_user_choice(
+                &self,
+                _: &str,
+                _: &str,
+                choice: PermissionChoice,
+            ) -> eyre::Result<()> {
+                self.0.lock().unwrap().push(choice);
+                Ok(())
+            }
+        }
+
+        /// A computer ask offers Allow once and Deny only; an "always" sent
+        /// anyway runs or denies the call once and keeps no rule.
+        #[tokio::test]
+        async fn a_computer_ask_offers_once_or_deny_and_keeps_no_rule_whatever_is_sent() {
+            for (sent, runs) in [
+                (PermissionChoice::AllowAlways, 1),
+                (PermissionChoice::DenyAlways, 0),
+                (PermissionChoice::AllowInFolder, 1),
+                (PermissionChoice::AllowSession, 1),
+            ] {
+                let tool = Arc::new(RecordingTool::default());
+                let gate = Arc::new(AsksAboutEveryCall::default());
+                let writer = Arc::new(KeepsChoices::default());
+                let tools = ToolRegistry::new();
+                tools.register(Arc::clone(&tool) as Arc<dyn crate::tools::Tool>);
+                let config = RunnerConfig {
+                    agent_id: AgentId::new("agent"),
+                    model: Some("scripted".to_string()),
+                    computer_gate: Some(
+                        Arc::clone(&gate) as Arc<dyn crate::tools::computer::ComputerGate>
+                    ),
+                    permission_writer: Some(Arc::clone(&writer) as Arc<dyn PermissionWriter>),
+                    ..RunnerConfig::default()
+                };
+                let policy = PolicyEngine::from_yaml(
+                    "rules:\n  - name: allow-all\n    scope: global\n    tool: \"*\"\n    action: allow\n",
+                )
+                .unwrap();
+                let runner = AgentRunner::new(
+                    config,
+                    Arc::new(ScriptedModel::new([entry("figma")], entry("figma"), 1)),
+                    Arc::new(tools),
+                    Arc::new(policy),
+                );
+                let (progress_tx, mut progress_rx) = mpsc::channel(64);
+                let (inject_tx, inject_rx) = mpsc::channel(8);
+                let run = tokio::spawn(as_member(async move {
+                    runner
+                        .run_with_progress_and_history(
+                            vec![ContentBlock::Text { text: "go".into() }],
+                            Vec::new(),
+                            progress_tx,
+                            None,
+                            Some(inject_rx),
+                        )
+                        .await
+                }));
+                let mut offered = Vec::new();
+                while let Some(event) = progress_rx.recv().await {
+                    if let ProgressEvent::ApprovalRequired {
+                        request_id,
+                        options,
+                        ..
+                    } = event
+                    {
+                        offered.push(options);
+                        let _ = inject_tx
+                            .send(InjectedMessage::ApprovalResponse {
+                                request_id,
+                                approved: sent.is_allow(),
+                                user: MEMBER.into(),
+                                choice: Some(sent),
+                            })
+                            .await;
+                    }
+                }
+                run.await.unwrap().unwrap();
+                assert_eq!(offered.len(), 1, "{sent:?}");
+                let o = &offered[0];
+                assert!(o.allow_once && o.deny_once && !o.allow_always && !o.deny_always);
+                assert!(o.allow_session);
+                assert_eq!(o.allow_in_folder.as_deref(), Some("~/dev/acme-web"));
+                let kept = gate.1.lock().unwrap().clone();
+                match sent {
+                    PermissionChoice::AllowInFolder | PermissionChoice::AllowSession => {
+                        assert_eq!(kept, [sent], "kept as the gate's grant")
+                    }
+                    _ => assert!(kept.is_empty(), "{sent:?} keeps nothing"),
+                }
+                assert_eq!(tool.runs().len(), runs, "{sent:?}");
+                assert!(
+                    writer.0.lock().unwrap().is_empty(),
+                    "no rule kept for {sent:?}"
+                );
+                let settled = gate.0.lock().unwrap().clone();
+                let want = if runs == 1 {
+                    crate::tools::computer::Outcome::Allowed
+                } else {
+                    crate::tools::computer::Outcome::Declined
+                };
+                assert_eq!(settled, [want]);
             }
         }
 

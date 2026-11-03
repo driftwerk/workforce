@@ -92,6 +92,8 @@ pub mod freeagent_oauth_callback;
 pub use hub_core::fs_watcher;
 pub mod desk_attachments;
 #[cfg(feature = "postgres")]
+pub mod desk_computer;
+#[cfg(feature = "postgres")]
 pub mod desk_conversations;
 #[cfg(feature = "postgres")]
 pub mod desk_crew;

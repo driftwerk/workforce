@@ -304,6 +304,25 @@ impl Tool for CodeGitTool {
         "code.git"
     }
 
+    fn effect(&self, input: &serde_json::Value) -> workforce_core::computer::Effect {
+        let action = input["action"].as_str().unwrap_or_default();
+        if matches!(action, "status" | "log") {
+            return workforce_core::computer::Effect::Read {
+                paths: super::utils::effect_cwd(input, &self.allowed_paths)
+                    .into_iter()
+                    .collect(),
+            };
+        }
+        let mut argv = vec!["git", action];
+        if action == "push" || action == "pull" {
+            argv.extend(input["remote"].as_str().or(Some("origin")));
+            argv.extend(input["branch"].as_str());
+        } else if action == "branch" {
+            argv.extend(input["branch"].as_str());
+        }
+        super::utils::effect_command(input, &self.allowed_paths, &argv)
+    }
+
     fn description(&self) -> &str {
         "Execute git operations: status, commit, push, pull, log, branch, stage."
     }

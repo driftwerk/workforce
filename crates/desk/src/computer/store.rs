@@ -71,8 +71,11 @@ pub struct Activity {
     pub reason: Option<String>,
     pub exit_code: Option<i32>,
     pub duration_ms: Option<i32>,
-    /// Tokenised by the caller.
+    /// What the call was given, as the gate summarised it: its tool, its
+    /// targets and a short redacted line, never file contents.
     pub arguments: Value,
+    /// The paired device whose answer decided it, where a person answered.
+    pub device: Option<String>,
 }
 
 /// A recorded call.
@@ -146,6 +149,7 @@ fn activity_row(row: &Row) -> Result<ActivityRow> {
             exit_code: row.try_get("exit_code")?,
             duration_ms: row.try_get("duration_ms")?,
             arguments: row.try_get("arguments")?,
+            device: row.try_get("device")?,
         },
     })
 }
@@ -155,6 +159,18 @@ fn path_text(path: &Option<PathBuf>) -> Option<String> {
 }
 
 impl DeskStore {
+    /// Which state of the kill switch and grants is current: changes with
+    /// every write to them through this store.
+    pub fn access_version(&self) -> u64 {
+        self.access_version
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn access_changed(&self) {
+        self.access_version
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }
+
     /// Whether the person stopped all access to this computer. No row yet
     /// is not stopped.
     pub async fn access_stopped(&self) -> Result<bool> {
@@ -169,6 +185,7 @@ impl DeskStore {
 
     pub async fn set_access_stopped(&self, stopped: bool) -> Result<()> {
         let client = self.pool().get().await?;
+        self.access_changed();
         client
             .execute(
                 "INSERT INTO access_settings (id, stopped, updated_at) VALUES (true, $1, now())
@@ -215,6 +232,7 @@ impl DeskStore {
     pub async fn add_grant(&self, new: &NewGrant) -> Result<Grant> {
         let id = Uuid::new_v4();
         let client = self.pool().get().await?;
+        self.access_changed();
         client
             .execute(
                 "INSERT INTO access_grants
@@ -253,6 +271,7 @@ impl DeskStore {
     /// Whether there was such a grant.
     pub async fn revoke_grant(&self, id: Uuid) -> Result<bool> {
         let client = self.pool().get().await?;
+        self.access_changed();
         Ok(client
             .execute("DELETE FROM access_grants WHERE id = $1", &[&id])
             .await?
@@ -263,6 +282,7 @@ impl DeskStore {
     /// "Forget".
     pub async fn forget_session_grants(&self, session_id: &str) -> Result<u64> {
         let client = self.pool().get().await?;
+        self.access_changed();
         Ok(client
             .execute(
                 "DELETE FROM access_grants WHERE session_id = $1",
@@ -279,9 +299,9 @@ impl DeskStore {
                 "INSERT INTO access_activity
                    (id, hub, agent, person, session_id, request_id, kind, doing, folder, connector,
                     tool, vault_source, decided_by, outcome, reason, exit_code, duration_ms,
-                    arguments)
+                    arguments, device)
                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
-                         $17, $18)",
+                         $17, $18, $19)",
                 &[
                     &id,
                     &a.hub,
@@ -301,6 +321,7 @@ impl DeskStore {
                     &a.exit_code,
                     &a.duration_ms,
                     &a.arguments,
+                    &a.device,
                 ],
             )
             .await?;
@@ -329,6 +350,7 @@ impl DeskStore {
     /// start and daily, with `before` [`ACTIVITY_KEPT_DAYS`] ago.
     pub async fn prune_access(&self, before: DateTime<Utc>) -> Result<u64> {
         let client = self.pool().get().await?;
+        self.access_changed();
         let activity = client
             .execute("DELETE FROM access_activity WHERE at < $1", &[&before])
             .await?;
@@ -345,6 +367,7 @@ impl DeskStore {
     /// their turns.
     pub async fn erase_access_person(&self, person: &str) -> Result<u64> {
         let client = self.pool().get().await?;
+        self.access_changed();
         let grants = client
             .execute("DELETE FROM access_grants WHERE person = $1", &[&person])
             .await?;
@@ -397,6 +420,7 @@ mod tests {
             exit_code: Some(0),
             duration_ms: Some(12),
             arguments: json!({"command": "npm test"}),
+            device: Some("desk-device".into()),
         }
     }
 

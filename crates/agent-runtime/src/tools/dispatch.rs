@@ -24,6 +24,7 @@ use crate::tools::access::ToolAccessSnapshot;
 use crate::tools::arguments::{
     check_arguments, render_argument_problems, summarise_argument_problems, ArgumentValidation,
 };
+use crate::tools::computer::{self, ComputerGate, Decision};
 use crate::tools::registry::ToolRegistry;
 use crate::tools::{Destination, RateLimit, SurfaceEffect};
 use workforce_common::channels::CHAT_SURFACE_PLATFORMS;
@@ -47,6 +48,9 @@ pub struct ToolGates {
     pub capability_gate: Option<Arc<dyn CapabilityGate>>,
     pub permission_gate: Option<Arc<dyn PermissionGate>>,
     pub surface_allows: Option<Arc<dyn SurfaceAllows>>,
+    /// What the agent may do on the person's computer; wired only on a hub
+    /// with `[desk]` ([`crate::tools::computer`]).
+    pub computer_gate: Option<Arc<dyn ComputerGate>>,
     pub arguments: ArgumentValidation,
 }
 
@@ -59,6 +63,7 @@ impl From<&RunnerConfig> for ToolGates {
             capability_gate: config.capability_gate.clone(),
             permission_gate: config.permission_gate.clone(),
             surface_allows: config.surface_allows.clone(),
+            computer_gate: config.computer_gate.clone(),
             arguments: config.arguments,
         }
     }
@@ -98,6 +103,47 @@ pub fn gate_tool_call(
     tool_name: &str,
     input: &Value,
 ) -> GateOutcome {
+    gate_tool_call_decided(gates, policy, tools, tool_name, input).0
+}
+
+/// [`gate_tool_call`], with the computer gate's decision when it decided
+/// the call, for the caller to record where the call settles.
+pub fn gate_tool_call_decided(
+    gates: &ToolGates,
+    policy: &PolicyEngine,
+    tools: &ToolRegistry,
+    tool_name: &str,
+    input: &Value,
+) -> (GateOutcome, Option<Decision>) {
+    let decision = computer::decide(gates.computer_gate.as_deref(), tools, tool_name, input);
+    let outcome = gate_with(gates, policy, tools, tool_name, input, decision.as_ref());
+    (outcome, decision)
+}
+
+/// [`gate_tool_call_decided`] on a path where nobody can be asked: what
+/// the computer gate would ask about runs when it says so
+/// ([`computer::decide_unattended`]); every other gate decides as ever.
+pub fn gate_tool_call_unattended(
+    gates: &ToolGates,
+    policy: &PolicyEngine,
+    tools: &ToolRegistry,
+    tool_name: &str,
+    input: &Value,
+) -> (GateOutcome, Option<Decision>) {
+    let decision =
+        computer::decide_unattended(gates.computer_gate.as_deref(), tools, tool_name, input);
+    let outcome = gate_with(gates, policy, tools, tool_name, input, decision.as_ref());
+    (outcome, decision)
+}
+
+fn gate_with(
+    gates: &ToolGates,
+    policy: &PolicyEngine,
+    tools: &ToolRegistry,
+    tool_name: &str,
+    input: &Value,
+    decision: Option<&Decision>,
+) -> GateOutcome {
     let request = PolicyRequest {
         agent_id: gates.agent_id.clone(),
         tool_name: tool_name.to_string(),
@@ -132,7 +178,10 @@ pub fn gate_tool_call(
         },
     );
     let response = apply_relayed_gate(response, tool_name, crate::runner::current_desk().as_ref());
-    let holds = to.filter(|_| held == Some(Kept::NotYet));
+    let response = computer::apply(response, decision);
+    // A held computer call offers no "always": the surface's own allow list
+    // is not where its answer is kept.
+    let holds = to.filter(|_| held == Some(Kept::NotYet) && decision.is_none());
     if let PolicyDecision::Deny { reason } = response.decision {
         return GateOutcome::Blocked {
             message: format!("Policy denied: {reason}"),
@@ -768,6 +817,25 @@ pub async fn execute_gated(
     }
 }
 
+/// [`execute_gated`] with the computer gate's reach for the call in scope:
+/// a call its agent's level lets read or change past the tool's roots runs
+/// with them widened ([`crate::tools::paths::REACH`]). With no decision or
+/// no reach, the tool keeps its roots.
+pub async fn execute_decided(
+    tools: &ToolRegistry,
+    access: &ToolAccessSnapshot,
+    tool_name: &str,
+    input: &Value,
+    exec_input: Option<Value>,
+    decision: Option<&Decision>,
+) -> ToolExecution {
+    let run = execute_gated(tools, access, tool_name, input, exec_input);
+    match decision.and_then(|d| d.reach.clone()) {
+        Some(reach) => crate::tools::paths::REACH.scope(reach, run).await,
+        None => run.await,
+    }
+}
+
 /// Whether a call to `tool_name` with `input` would run right now, without
 /// prompting anyone: every check [`gate_tool_call`] and [`execute_gated`]
 /// apply, minus the execution.
@@ -792,6 +860,10 @@ pub fn would_execute(
 /// approval standing in for the prompt; secret markers are substituted and
 /// parameters scanned now, as for any allowed call. Must run inside the
 /// session's task-local scope.
+///
+/// `shown` is the computer gate's decision the person answered: when the
+/// call would now do something else (a path resolving elsewhere), it is
+/// refused rather than run on an approval of something it no longer is.
 pub async fn execute_approved(
     gates: &ToolGates,
     policy: &PolicyEngine,
@@ -799,18 +871,34 @@ pub async fn execute_approved(
     access: &ToolAccessSnapshot,
     tool_name: &str,
     input: &Value,
+    shown: Option<&Decision>,
 ) -> ToolExecution {
     let regate = ToolGates {
         arguments: ArgumentValidation::Off,
         ..gates.clone()
     };
-    let gated = match gate_tool_call(&regate, policy, tools, tool_name, input) {
+    let (gated, decided) = gate_tool_call_decided(&regate, policy, tools, tool_name, input);
+    if let (Some(shown), Some(now)) = (shown, decided.as_ref()) {
+        if shown.effect != now.effect {
+            let why = computer::CHANGED_SINCE_ALLOWED.to_string();
+            return ToolExecution::blocked(why.clone(), why);
+        }
+    }
+    let gated = match gated {
         GateOutcome::RequireApproval { .. } => prepare_allowed(gates, tool_name, input),
         settled => settled,
     };
     match gated {
         GateOutcome::Execute { exec_input, .. } => {
-            execute_gated(tools, access, tool_name, input, exec_input).await
+            execute_decided(
+                tools,
+                access,
+                tool_name,
+                input,
+                exec_input,
+                decided.as_ref(),
+            )
+            .await
         }
         GateOutcome::Blocked {
             message, reason, ..
@@ -882,6 +970,7 @@ mod tests {
                 state: cascade,
             })),
             surface_allows: None,
+            computer_gate: None,
             arguments: ArgumentValidation::default(),
         }
     }
@@ -1529,7 +1618,7 @@ mod tests {
             let tools = &tools;
             let access = &access;
             CURRENT_USER_ID.scope("alice".to_string(), async move {
-                execute_approved(&g, &permissive_policy(), tools, access, TOOL, &input).await
+                execute_approved(&g, &permissive_policy(), tools, access, TOOL, &input, None).await
             })
         };
 
@@ -1985,6 +2074,7 @@ mod tests {
         let allows = Arc::new(Allows::default());
         let g = ToolGates {
             surface_allows: Some(allows.clone()),
+            computer_gate: None,
             ..gates(&calls, None, CascadeState::Allow)
         };
         let gate_with = |g: &ToolGates, user: &'static str, tool: &'static str| {

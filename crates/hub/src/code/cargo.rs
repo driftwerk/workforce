@@ -288,6 +288,11 @@ impl Tool for CodeCargoTool {
         "code.cargo"
     }
 
+    fn effect(&self, input: &serde_json::Value) -> workforce_core::computer::Effect {
+        let action = input["action"].as_str().unwrap_or_default();
+        super::utils::effect_command(input, &self.allowed_paths, &["cargo", action])
+    }
+
     fn description(&self) -> &str {
         "Cargo tools: audit, outdated, tree, features, crate info"
     }
