@@ -96,6 +96,8 @@ pub mod desk_attachments;
 #[cfg(feature = "postgres")]
 pub mod desk_computer;
 #[cfg(feature = "postgres")]
+pub mod desk_connections;
+#[cfg(feature = "postgres")]
 pub mod desk_conversations;
 #[cfg(feature = "postgres")]
 pub mod desk_crew;

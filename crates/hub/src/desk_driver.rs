@@ -633,6 +633,11 @@ pub async fn mount(
         cancel_crew,
     );
     let voice = Realtime::new(Arc::new(VaultKeys(state.vault.clone())));
+    let app = app.merge(crate::gateway::hardened(crate::desk_connections::install(
+        state,
+        config,
+        desk.clone(),
+    )));
     Ok(app.merge(workforce_desk::router(
         desk,
         Arc::new(SystemAdmins(Arc::clone(state))),

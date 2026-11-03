@@ -709,6 +709,11 @@ pub struct DeskConfig {
     /// in days, so its history can still open it.
     #[serde(default = "default_desk_attachment_retention_days")]
     pub attachment_retention_days: u64,
+    /// The client ID of the GitHub OAuth app Connections signs in with,
+    /// through GitHub's device flow (no secret on this computer). Unset:
+    /// GitHub is connected with a token.
+    #[serde(default)]
+    pub github_client_id: Option<String>,
     /// Where the person's engine accounts' sign-ins are kept (`[desk.accounts]`).
     /// Unset: Desk keeps no accounts, and every session runs on the CLI's
     /// own sign-in on this computer.
@@ -768,6 +773,7 @@ impl Default for DeskConfig {
             pty_holder_token: None,
             attachment_max_mb: default_desk_attachment_max_mb(),
             attachment_retention_days: default_desk_attachment_retention_days(),
+            github_client_id: None,
             accounts: DeskAccounts::default(),
         }
     }
