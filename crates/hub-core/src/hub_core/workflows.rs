@@ -3,6 +3,7 @@
 use crate::run_steering::SteerRefused;
 use uuid::Uuid;
 use workforce_core::access::Visibility;
+use workforce_orchestrator::workflow::decision::{ButtonInput, InputRefused};
 
 /// A workflow lifecycle event delivered to a streaming HTTP trigger caller.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -88,6 +89,26 @@ pub struct DecisionAsk {
     pub feedback: Option<String>,
 }
 
+/// A reply typed in a run's thread that presses its open decision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TypedPress {
+    pub run: String,
+    pub gate: Uuid,
+    pub outcome: String,
+    pub text: Option<String>,
+}
+
+/// The form a press of a button that asks for input opens.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecisionForm {
+    pub title: String,
+    pub label: String,
+    pub input: ButtonInput,
+    /// Whether the card sits in the run's own thread, where a typed reply
+    /// presses it too.
+    pub in_thread: bool,
+}
+
 /// What a settlement decided.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecisionMade {
@@ -121,6 +142,19 @@ pub enum DecisionRefused {
     WorkflowGone,
     #[error("Could not record the decision: {0}")]
     Unavailable(String),
+    #[error("{}", with_surfaces(.0))]
+    Input(#[from] InputRefused),
+}
+
+/// An input refusal, with where to give the text when none was given.
+fn with_surfaces(refused: &InputRefused) -> String {
+    match refused {
+        InputRefused::Needed { label, .. } => format!(
+            "{refused} Give it with the press: the form on the card, `{label}: …` typed in the \
+             run's thread, or `feedback` on a resume."
+        ),
+        InputRefused::TooLong { .. } => refused.to_string(),
+    }
 }
 
 impl From<eyre::Report> for DecisionRefused {

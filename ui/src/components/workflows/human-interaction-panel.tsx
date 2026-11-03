@@ -5,7 +5,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { useResumeWorkflow, useRejectWorkflow } from "@/hooks/use-workflows";
 import type { Branch, DecisionChoice, DecisionView, TimelineStep, WorkflowInstance } from "@/lib/api/workflows";
-import { choiceVariant, expiryText, waitingOnSentence } from "@/lib/workflows/decision";
+import { choiceVariant, expiryText, inputProblem, waitingOnSentence } from "@/lib/workflows/decision";
 import { apiErrorMessage } from "@/lib/api-error";
 import { MessageSquare, Play, XCircle, ArrowRight } from "lucide-react";
 
@@ -151,13 +151,28 @@ interface DecisionPanelProps {
 
 function DecisionPanel({ instanceId, decision, children }: DecisionPanelProps) {
   const resumeMutation = useResumeWorkflow();
+  const [asking, setAsking] = useState<string | null>(null);
+  const [text, setText] = useState("");
   const deciders = waitingOnSentence(decision.waiting_on);
   const expiry = expiryText(decision.expires_at, decision.on_expiry);
+  const asked = decision.choices.find((choice) => choice.input && choice.outcome === asking);
+  const problem = asked ? inputProblem(text, asked) : null;
 
-  const decide = (choice: DecisionChoice) => {
+  const decide = (choice: DecisionChoice, feedback?: string) => {
     if (choice.confirm && !confirm(choice.confirm)) return;
-    resumeMutation.mutate({ id: instanceId, outcome: choice.outcome, gate: decision.gate });
+    resumeMutation.mutate(
+      { id: instanceId, outcome: choice.outcome, gate: decision.gate, feedback },
+      {
+        onSuccess: () => {
+          setAsking(null);
+          setText("");
+        },
+      },
+    );
   };
+
+  const press = (choice: DecisionChoice) =>
+    choice.input ? setAsking(asking === choice.outcome ? null : choice.outcome) : decide(choice);
 
   return (
     <div className="space-y-2">
@@ -177,7 +192,7 @@ function DecisionPanel({ instanceId, decision, children }: DecisionPanelProps) {
               size="sm"
               className="h-7 text-xs"
               disabled={resumeMutation.isPending}
-              onClick={() => decide(choice)}
+              onClick={() => press(choice)}
             >
               {choice.label}
             </Button>
@@ -185,6 +200,34 @@ function DecisionPanel({ instanceId, decision, children }: DecisionPanelProps) {
         </div>
       ) : (
         <div className="text-xs text-muted-foreground">Only {deciders} can decide this.</div>
+      )}
+      {decision.may_decide && asked?.input && (
+        <div className="space-y-1.5">
+          <label htmlFor="decision-input" className="text-xs font-medium text-muted-foreground">
+            {asked.input.label}
+          </label>
+          <textarea
+            id="decision-input"
+            className="w-full min-h-[72px] rounded-md border bg-background px-3 py-2 text-xs resize-y"
+            value={text}
+            onChange={(e) => setText(e.target.value)}
+            maxLength={asked.input.max_chars}
+            placeholder={asked.input.placeholder ?? undefined}
+            disabled={resumeMutation.isPending}
+          />
+          <div className="flex items-center gap-2">
+            <Button
+              variant={choiceVariant(asked.style)}
+              size="sm"
+              className="h-7 text-xs"
+              disabled={resumeMutation.isPending || problem !== null}
+              onClick={() => decide(asked, text)}
+            >
+              {asked.label}
+            </Button>
+            {problem && text && <span className="text-xs text-muted-foreground">{problem}</span>}
+          </div>
+        </div>
       )}
       {resumeMutation.error && <p className="text-xs text-destructive">{apiErrorMessage(resumeMutation.error)}</p>}
     </div>

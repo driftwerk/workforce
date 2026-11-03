@@ -17,6 +17,23 @@ export function choiceVariant(style: DecisionChoice["style"]): "default" | "dest
   }
 }
 
+/** Text as a press stores it: line endings unified, control characters other than newline and tab removed, trimmed. */
+function normalised(text: string): string {
+  return text
+    .replace(/\r\n?/g, "\n")
+    .replace(/\p{Cc}/gu, (c) => (c === "\n" || c === "\t" ? c : ""))
+    .trim();
+}
+
+/** Why `text` cannot go with a press of `choice`, in the hub's words, or null when it can. */
+export function inputProblem(text: string, { label, input }: DecisionChoice): string | null {
+  if (!input) return null;
+  const given = [...normalised(text)].length;
+  if (input.required && given === 0) return `${label} needs an answer to "${input.label}".`;
+  if (given > input.max_chars) return `${label} takes at most ${input.max_chars} characters; this was ${given}.`;
+  return null;
+}
+
 /** Names as one alternative: "Alice", "Alice or Bob", "Alice, Bob or Ana". */
 export function waitingOnSentence(names: string[]): string {
   if (names.length === 0) return "nobody";

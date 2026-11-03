@@ -40,8 +40,9 @@ use crate::hub_core::schedules::{
     EditRefused, JobEdit, JobPayload, JobRunRecord, Outcomes, Schedule, ScheduledJob,
 };
 use crate::hub_core::workflows::{
-    AutomatedRunBlock, ConsolidationTemplateSummary, DecisionAsk, DecisionMade, DecisionRefused,
-    ResumeAsk, ResumeRefused, Resumed, TriggerUrls, WorkflowStreamEvent, WorkflowSummary,
+    AutomatedRunBlock, ConsolidationTemplateSummary, DecisionAsk, DecisionForm, DecisionMade,
+    DecisionRefused, ResumeAsk, ResumeRefused, Resumed, TriggerUrls, TypedPress,
+    WorkflowStreamEvent, WorkflowSummary,
 };
 use crate::resource_access::DefListing;
 use crate::run_steering::{Steer, SteerAction, SteerRefused, Steerer};
@@ -784,12 +785,14 @@ pub trait WorkflowHost: DefinitionSurface + HubReads {
         row: &WorkflowInstanceRow,
         viewer: Option<&str>,
     ) -> Option<serde_json::Value>;
-    fn decision_reply(
+    fn decision_reply(&self, channel: &str, thread_ts: &str, text: &str) -> Option<TypedPress>;
+    fn decision_form(
         &self,
-        channel: &str,
-        thread_ts: &str,
-        text: &str,
-    ) -> Option<(String, Uuid, String)>;
+        instance_id: &str,
+        gate: Uuid,
+        outcome: &str,
+        slack_user: &str,
+    ) -> std::result::Result<Option<DecisionForm>, DecisionRefused>;
     fn decision_reminder(&self, row: &WorkflowInstanceRow) -> Option<String>;
     async fn repair_card(
         &self,

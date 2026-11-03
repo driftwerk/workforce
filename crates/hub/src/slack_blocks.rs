@@ -18,6 +18,8 @@ use uuid::Uuid;
 use workforce_orchestrator::workflow::decision::{ButtonStyle, Choice};
 use workforce_skills::adapters::slack::rich_text;
 
+use crate::hub_core::workflows::DecisionForm;
+
 /// Lifecycle of a single chat turn.
 #[derive(Debug, Clone)]
 pub enum TurnStatus {
@@ -967,6 +969,17 @@ const DECISION_CONFIRM_CHARS: usize = 300;
 const DECISION_CONFIRM_BUTTON_CHARS: usize = 30;
 /// Names a waiting line lists before it counts the rest.
 const NAMES_SHOWN: usize = 20;
+/// The most of a decider's text a closed card shows.
+const DECISION_SAID_CHARS: usize = 500;
+/// The callback id of the form a decision button that asks for input opens.
+pub const DECISION_INPUT_CALLBACK: &str = "wf_decision_input";
+/// The form's block and element that hold the decider's text.
+pub const DECISION_INPUT_BLOCK: &str = "wf_decision_input";
+pub const DECISION_INPUT_ACTION: &str = "text";
+/// Slack's limit for a modal's title and buttons.
+const MODAL_TITLE_CHARS: usize = 24;
+/// Slack's limit for a modal's `private_metadata`.
+const MODAL_METADATA_CHARS: usize = 3_000;
 
 /// Where a decision stands, as its card shows it.
 #[derive(Debug, Clone, PartialEq)]
@@ -976,6 +989,8 @@ pub enum CardState<'a> {
         label: &'a str,
         by_mention: String,
         at: DateTime<Utc>,
+        /// The text the press gave.
+        said: Option<&'a str>,
     },
     Expired {
         label: &'a str,
@@ -1035,9 +1050,101 @@ pub fn decision_card(
             json!({ "type": "divider" }),
             context_mrkdwn(&decision_status(view)),
         ])
+        .chain(decision_said(&view.state))
         .chain(actions)
         .collect();
     (view.title.to_string(), blocks)
+}
+
+/// The text a settling press gave, as plain text so nothing in it is live.
+fn decision_said(state: &CardState<'_>) -> Option<Value> {
+    match state {
+        CardState::Decided {
+            said: Some(said), ..
+        } if !said.trim().is_empty() => Some(json!({
+            "type": "context",
+            "elements": [{
+                "type": "plain_text",
+                "text": clip(&card_text(said), DECISION_SAID_CHARS),
+                "emoji": false,
+            }],
+        })),
+        _ => None,
+    }
+}
+
+/// Where a decision form's submission goes, carried in the form itself.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DecisionInputMeta {
+    pub run: String,
+    pub gate: Uuid,
+    pub outcome: String,
+    pub channel: String,
+    #[serde(default)]
+    pub ts: Option<String>,
+    #[serde(default)]
+    pub response_url: String,
+}
+
+/// `meta` as a form's `private_metadata`, without its `response_url` should
+/// it not fit.
+pub fn decision_input_meta(meta: &DecisionInputMeta) -> String {
+    let written = |meta: &DecisionInputMeta| serde_json::to_string(meta).unwrap_or_default();
+    Some(written(meta))
+        .filter(|full| full.chars().count() <= MODAL_METADATA_CHARS)
+        .unwrap_or_else(|| {
+            written(&DecisionInputMeta {
+                response_url: String::new(),
+                ..meta.clone()
+            })
+        })
+}
+
+/// A form's `private_metadata` read back, or `None` for one this build did
+/// not write.
+pub fn parse_decision_input_meta(meta: &str) -> Option<DecisionInputMeta> {
+    serde_json::from_str(meta).ok()
+}
+
+/// The modal a press of a button that asks for input opens: the decision's
+/// title and one text box, submitted as the press.
+pub fn decision_input_view(form: &DecisionForm, meta: &str) -> Value {
+    let plain = |text: &str| json!({ "type": "plain_text", "text": text });
+    let named = plain(&clip(&form.label, MODAL_TITLE_CHARS));
+    let element: serde_json::Map<String, Value> = [
+        ("type", json!("plain_text_input")),
+        ("action_id", json!(DECISION_INPUT_ACTION)),
+        ("multiline", json!(true)),
+        ("max_length", json!(form.input.max_chars)),
+    ]
+    .into_iter()
+    .chain(form.input.required.then(|| ("min_length", json!(1))))
+    .chain(
+        form.input
+            .placeholder
+            .as_deref()
+            .map(|placeholder| ("placeholder", plain(placeholder))),
+    )
+    .map(|(key, value)| (key.to_string(), value))
+    .collect();
+    json!({
+        "type": "modal",
+        "callback_id": DECISION_INPUT_CALLBACK,
+        "private_metadata": meta,
+        "title": named,
+        "submit": named,
+        "close": plain("Go back"),
+        "blocks": [
+            { "type": "section", "text": plain(&form.title) },
+            {
+                "type": "input",
+                "block_id": DECISION_INPUT_BLOCK,
+                "optional": !form.input.required,
+                "label": plain(&form.input.label),
+                "element": element,
+            },
+        ],
+    })
 }
 
 fn decision_button(choice: &Choice, at: usize, instance_id: &str, gate: Uuid) -> Value {
@@ -1071,6 +1178,7 @@ fn decision_status(view: &DecisionCardView<'_>) -> String {
             label,
             by_mention,
             at,
+            ..
         } => format!("✅ *{label}* by {by_mention} · {}", slack_date(*at)),
         CardState::Expired { label, at } => format!("⌛ Expired {} · *{label}*", slack_date(*at)),
         CardState::Stopped { by: Some(by) } => format!("⏹ Stopped by {by} · nothing was decided"),
@@ -2194,6 +2302,7 @@ mod tests {
                 next: Next::Complete,
                 start: None,
                 set: Default::default(),
+                input: None,
             }
         }
 
@@ -2286,6 +2395,7 @@ mod tests {
                 label: "Sent",
                 by_mention: "<@U1>".into(),
                 at: at(),
+                said: None,
             };
             let (_, blocks) = decision_card(&view(&choices, state), RUN, gate());
             assert!(!kinds(&blocks).contains(&"actions"));
@@ -2404,6 +2514,107 @@ mod tests {
             assert!(cleaned.contains("[REDACTED GITHUB_PAT]"), "{cleaned}");
             assert!(!cleaned.contains("ghp_"));
             assert!(!cleaned.contains("<!here>"));
+        }
+
+        #[test]
+        fn a_decided_card_shows_the_text_given_as_inert_clipped_plain_text() {
+            let choices = choices();
+            let said = format!("<!here> <@U9> {}", "word ".repeat(150));
+            let state = CardState::Decided {
+                label: "Revising",
+                by_mention: "<@U1>".into(),
+                at: at(),
+                said: Some(&said),
+            };
+            let (_, blocks) = decision_card(&view(&choices, state), RUN, gate());
+            let shown = blocks.last().unwrap();
+            assert_eq!(shown["type"], "context");
+            assert_eq!(shown["elements"][0]["type"], "plain_text");
+            let text = shown["elements"][0]["text"].as_str().unwrap();
+            assert_eq!(text.chars().count(), 500);
+            assert!(text.starts_with("<!\u{2060}here> <@U9>"), "{text}");
+            let blank = CardState::Decided {
+                label: "Revising",
+                by_mention: "<@U1>".into(),
+                at: at(),
+                said: Some(" "),
+            };
+            let (_, blocks) = decision_card(&view(&choices, blank), RUN, gate());
+            assert_eq!(blocks.last().unwrap()["elements"][0]["type"], "mrkdwn");
+        }
+
+        fn form(required: bool, placeholder: Option<&str>) -> DecisionForm {
+            DecisionForm {
+                title: "Send today's digest?".into(),
+                label: "Revise with a much longer label".into(),
+                input: workforce_orchestrator::workflow::decision::ButtonInput {
+                    variable: "review_notes".into(),
+                    label: "What should change?".into(),
+                    placeholder: placeholder.map(str::to_string),
+                    max_chars: 1_500,
+                    required,
+                },
+                in_thread: true,
+            }
+        }
+
+        #[test]
+        fn a_decision_form_asks_one_question_within_slacks_limits() {
+            let view = decision_input_view(&form(true, Some("Shorter")), "meta");
+            assert_eq!(view["callback_id"], DECISION_INPUT_CALLBACK);
+            assert_eq!(view["private_metadata"], "meta");
+            assert_eq!(view["title"]["text"], "Revise with a much long…");
+            assert_eq!(view["submit"], view["title"]);
+            assert_eq!(view["close"]["text"], "Go back");
+            assert_eq!(view["blocks"][0]["text"]["type"], "plain_text");
+            assert_eq!(view["blocks"][0]["text"]["text"], "Send today's digest?");
+            let input = &view["blocks"][1];
+            assert_eq!(input["block_id"], DECISION_INPUT_BLOCK);
+            assert_eq!(input["optional"], false);
+            assert_eq!(input["label"]["text"], "What should change?");
+            let element = &input["element"];
+            assert_eq!(element["action_id"], DECISION_INPUT_ACTION);
+            assert_eq!(element["multiline"], true);
+            assert_eq!(element["max_length"], 1_500);
+            assert_eq!(element["min_length"], 1);
+            assert_eq!(element["placeholder"]["text"], "Shorter");
+
+            let optional = decision_input_view(&form(false, None), "meta");
+            let element = &optional["blocks"][1]["element"];
+            assert_eq!(optional["blocks"][1]["optional"], true);
+            assert!(element.get("min_length").is_none());
+            assert!(element.get("placeholder").is_none());
+        }
+
+        #[test]
+        fn a_forms_metadata_round_trips_and_drops_the_response_url_past_slacks_limit() {
+            let meta = DecisionInputMeta {
+                run: RUN.into(),
+                gate: gate(),
+                outcome: "revise".into(),
+                channel: "C1".into(),
+                ts: Some("1.0".into()),
+                response_url: "https://hooks.example.com/r".into(),
+            };
+            assert_eq!(
+                parse_decision_input_meta(&decision_input_meta(&meta)),
+                Some(meta.clone())
+            );
+            let long = DecisionInputMeta {
+                response_url: format!("https://hooks.example.com/{}", "r".repeat(3_000)),
+                ..meta.clone()
+            };
+            let written = decision_input_meta(&long);
+            assert!(written.chars().count() <= 3_000);
+            assert_eq!(
+                parse_decision_input_meta(&written),
+                Some(DecisionInputMeta {
+                    response_url: String::new(),
+                    ..meta
+                })
+            );
+            assert_eq!(parse_decision_input_meta("run|gate|revise"), None);
+            assert_eq!(parse_decision_input_meta(""), None);
         }
     }
 }

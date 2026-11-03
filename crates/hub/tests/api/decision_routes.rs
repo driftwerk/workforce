@@ -1,5 +1,6 @@
 //! A decision is pressed over the admin API as the person behind the admin
-//! gate: a named decider decides, an administrator who is not named does not.
+//! gate: a named decider decides, an administrator who is not named does not,
+//! and a button that asks for input takes it as `feedback`.
 
 use std::sync::Arc;
 
@@ -70,11 +71,14 @@ async fn a_named_decider_presses_over_rest_and_an_admin_who_is_not_named_is_refu
         workflows.join("daily-digest-email.toml"),
         format!(
             "[workflow]\nid = \"daily-digest-email\"\nname = \"Digest\"\n\n\
+             [[variables]]\nid = \"review_notes\"\nvalue = \"\"\n\n\
              [[step]]\nid = \"review\"\nname = \"Review\"\nreport = \"Today.\"\n\
              report_render = \"template\"\npause = \"awaiting-approval\"\n\
              branches = [{{ when = \"send\", goto = \"send\" }}]\n\n\
              [step.decision]\nchannel = \"CRUN000001\"\ndeciders = \"{}\"\n\n\
              [[step.decision.buttons]]\nlabel = \"Send\"\noutcome = \"send\"\n\n\
+             [[step.decision.buttons]]\nlabel = \"Revise\"\noutcome = \"revise\"\n\
+             goto = \"send\"\ninput = {{ variable = \"review_notes\", label = \"What should change?\" }}\n\n\
              [[step]]\nid = \"send\"\nname = \"Send\"\nreport = \"Sent.\"\n\
              report_render = \"template\"\nexit = true\n",
             gateway.admin.id
@@ -164,14 +168,45 @@ async fn a_named_decider_presses_over_rest_and_an_admin_who_is_not_named_is_refu
     assert_eq!(refused, StatusCode::FORBIDDEN, "{body}");
     assert_eq!(body["error"], "Only Admin can decide this.");
 
+    let (needed, body) = call(
+        "POST",
+        resume.clone(),
+        gateway.admin_token(),
+        serde_json::json!({ "outcome": "revise", "gate": shown["decision"]["gate"] }),
+    )
+    .await;
+    assert_eq!(needed, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("Revise needs an answer to \"What should change?\"."),
+        "{body}"
+    );
+
     let (decided, body) = call(
         "POST",
         resume,
         gateway.admin_token(),
-        serde_json::json!({ "outcome": "send", "gate": shown["decision"]["gate"] }),
+        serde_json::json!({
+            "outcome": "revise",
+            "gate": shown["decision"]["gate"],
+            "feedback": "shorter",
+        }),
     )
     .await;
     assert_eq!(decided, StatusCode::OK, "{body}");
-    assert_eq!(body["decided"]["summary"], "Send by Admin");
+    assert_eq!(body["decided"]["summary"], "Revise by Admin");
     assert_eq!(listed().await, Some(serde_json::json!(false)));
+    let (_, variables) = call(
+        "GET",
+        format!("/api/workflow-instances/{run}/variables"),
+        gateway.admin_token(),
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(
+        variables["variables"]["review_notes"], "shorter",
+        "{variables}"
+    );
 }
