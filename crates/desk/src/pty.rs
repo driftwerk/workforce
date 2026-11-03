@@ -421,9 +421,13 @@ impl Local {
         let screen = Screen::new(cols, rows, history);
 
         let (sink, answer) = (Arc::clone(&screen), input.clone());
+        // Dropped when the reader has taken the last of the output, so the
+        // exit watcher can tell the output is all in the screen.
+        let (drained, drained_rx) = std::sync::mpsc::channel::<()>();
         std::thread::Builder::new()
             .name("desk-pty-read".into())
             .spawn(move || {
+                let _drained = drained;
                 let mut buf = [0u8; 8192];
                 while let Ok(n) = reader.read(&mut buf) {
                     if n == 0 {
@@ -445,6 +449,12 @@ impl Local {
                     .wait()
                     .ok()
                     .map(|s: portable_pty::ExitStatus| s.exit_code());
+                // The child can be reaped before the reader has taken its
+                // last output; announcing the end first would cut that
+                // output off for anyone who stops listening at the end. A
+                // descendant holding the terminal open must not hold this
+                // up for long, so the wait is bounded.
+                let _ = drained_rx.recv_timeout(std::time::Duration::from_secs(2));
                 ended.exited();
                 let _ = exit_tx.send(code);
             })
