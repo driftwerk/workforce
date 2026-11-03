@@ -5173,9 +5173,11 @@ mod tests {
     }
 
     /// A turn that asks two questions while a sub-agent it started works on,
-    /// replayed as Claude Code 2.1.317 fired it in auto mode: the question's
-    /// start, the sub-agent's own calls, and nothing more until the person
-    /// answered both in the terminal.
+    /// replayed in the order its Claude Code 2.1.317 transcript (auto mode)
+    /// kept: the question's start, the sub-agent's own calls, then the
+    /// question's end once both were answered in the terminal; and the
+    /// notice and permission check that may come between, which aren't
+    /// recorded.
     #[tokio::test]
     async fn a_question_asked_in_the_terminal_needs_you_until_its_last_answer() {
         with_test_pool(build_pool, |pool| async move {

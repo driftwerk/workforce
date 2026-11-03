@@ -304,9 +304,11 @@ const QUESTION_MAX: usize = 300;
 /// The question a call of `tool` asks, when it is one that waits on the
 /// person: `AskUserQuestion` (one dialog for all its questions, answered
 /// one after another, the call ending once the last is), or `ExitPlanMode`
-/// (its plan, to approve). Verified on Claude Code 2.1.317: each fires
-/// `PreToolUse` when its dialog opens and `PostToolUse` once it is
-/// answered, and nothing in between, in auto mode too.
+/// (its plan, to approve). Seen with AskUserQuestion on Claude Code
+/// 2.1.317 in auto mode: `PreToolUse` when its dialog opens, and one
+/// `PostToolUse` once its last question is answered. ExitPlanMode is taken
+/// to do the same. Whether a `Notification` or `PermissionRequest` also
+/// comes in between isn't recorded anywhere; either is the same question.
 pub fn question_of(tool: &str, input: Option<&Value>) -> Option<Question> {
     match tool {
         "AskUserQuestion" => {
