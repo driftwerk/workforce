@@ -5,10 +5,11 @@
 //! An account's sign-in is a long-lived token (`claude setup-token`). It is
 //! kept in the secret store Desk chose for its own secrets ([`Keys`]): the
 //! keychain, or a private file inside WSL and for development runs. Never in
-//! Postgres, events, logs, the hub's vault or the session's record. It
-//! reaches one place only: the environment of the session's own CLI, as
-//! `CLAUDE_CODE_OAUTH_TOKEN`, which Claude Code ranks above the keychain
-//! login (<https://code.claude.com/docs/en/authentication#authentication-precedence>).
+//! Postgres, events, logs, the hub's vault, the session's record or any
+//! process's environment. It reaches one place only: the session's own CLI,
+//! on a descriptor ([`crate::token_pipe`]). A token given to Claude Code
+//! that way ranks above its keychain login, as `CLAUDE_CODE_OAUTH_TOKEN` does
+//! (<https://code.claude.com/docs/en/authentication#authentication-precedence>).
 //! Transcripts stay in the shared `~/.claude`, so `--resume` works under
 //! any account.
 
@@ -67,6 +68,11 @@ pub trait Keys: Send + Sync {
     fn get(&self, account: Uuid) -> Result<Option<AccountToken>>;
     fn set(&self, account: Uuid, token: &AccountToken) -> Result<()>;
     fn delete(&self, account: Uuid) -> Result<()>;
+    /// Whether `account`'s item is there, without reading its secret where
+    /// the store can tell.
+    fn has(&self, account: Uuid) -> Result<bool> {
+        self.get(account).map(|t| t.is_some())
+    }
     /// What the person calls the store ("the keychain").
     fn name(&self) -> &'static str;
 }
@@ -145,24 +151,37 @@ impl Keys for FileKeys {
 /// Writes `contents` to a file only the user can read, atomically.
 fn write_private(path: &Path, contents: &str) -> Result<()> {
     use std::io::Write;
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt;
     let dir = path
         .parent()
         .ok_or_else(|| eyre::eyre!("{} has no folder", path.display()))?;
     std::fs::create_dir_all(dir)?;
-    let tmp = path.with_extension("tmp");
-    let mut f = std::fs::File::create(&tmp)?;
+    // Made 0600 and new from its first byte, under a name no one can guess
+    // or have made first.
+    let tmp = dir.join(format!(".accounts-{}.tmp", Uuid::new_v4().simple()));
+    let mut open = std::fs::OpenOptions::new();
+    open.write(true).create_new(true);
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    open.mode(0o600);
+    let mut f = open
+        .open(&tmp)
+        .with_context(|| format!("making {}", tmp.display()))?;
+    let written = f
+        .write_all(contents.as_bytes())
+        .and_then(|()| f.sync_all())
+        .and_then(|()| std::fs::rename(&tmp, path));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
     }
-    f.write_all(contents.as_bytes())?;
-    f.sync_all()?;
-    std::fs::rename(&tmp, path).with_context(|| format!("writing {}", path.display()))
+    written.with_context(|| format!("writing {}", path.display()))
 }
 
-/// Tokens in the keychain, each its own item under Desk's service. Made and
-/// read only by the hub, so the keychain never asks about them.
+/// Tokens in the keychain, each its own item under Desk's service. Only the
+/// hub writes these items (one writer per item, as with Desk's own bundles),
+/// so its signed binary is on each one's access list; a binary that isn't
+/// (an unsigned development build) would be asked, which is why development
+/// runs keep them in a private file instead.
 #[cfg(target_os = "macos")]
 pub struct SystemKeys {
     service: String,
@@ -202,6 +221,25 @@ impl Keys for SystemKeys {
             Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
             Err(e) => Err(e).context("removing an account's sign-in from the keychain"),
         }
+    }
+
+    /// `security find-generic-password` without `-w` reads only the item's
+    /// attributes, which the keychain gives without asking.
+    fn has(&self, account: Uuid) -> Result<bool> {
+        let status = std::process::Command::new("/usr/bin/security")
+            .args([
+                "find-generic-password",
+                "-s",
+                &self.service,
+                "-a",
+                &item_name(account),
+            ])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .context("asking the keychain for an account's sign-in")?;
+        Ok(status.success())
     }
 
     fn name(&self) -> &'static str {
@@ -264,6 +302,27 @@ pub struct AccountView {
     /// The sessions running on it now.
     pub sessions: Vec<Uuid>,
     pub created_at: DateTime<Utc>,
+}
+
+/// What is wrong with an account's sign-in in the store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SignInProblem {
+    /// It is no longer there: the account is to be added again.
+    Gone,
+    /// It couldn't be read just now (a locked keychain, a refused prompt).
+    Unreadable,
+    /// The account was removed, but its sign-in couldn't be deleted.
+    NotRemoved,
+}
+
+/// An account's sign-in problem, as Desk shows it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProblemView {
+    pub account: Uuid,
+    pub name: String,
+    pub problem: SignInProblem,
 }
 
 /// A session's account, as its view names it.
@@ -387,10 +446,11 @@ pub fn claude_token_works(status: &str) -> Result<(), String> {
         .map_err(|_| "Claude Code didn't say whether the token works".to_string())?;
     match (s.logged_in, s.auth_method.as_deref()) {
         (true, Some("oauth_token")) => Ok(()),
-        (true, Some(other)) => Err(format!(
-            "Claude Code signs in with {other} here, which comes before an account's token: \
-             remove it (an API key or apiKeyHelper in your settings) to use accounts"
-        )),
+        (true, Some(_)) => Err(
+            "Claude Code signs in with something that comes before an account's token here \
+             (an API key or apiKeyHelper in your settings): remove it to use accounts"
+                .into(),
+        ),
         _ => Err("Claude Code didn't accept that token".into()),
     }
 }
@@ -398,34 +458,62 @@ pub fn claude_token_works(status: &str) -> Result<(), String> {
 /// What a `claude setup-token` run shows, read from its screen.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SetupSaid {
-    /// The sign-in page it opens in the browser.
+    /// The sign-in page it opens in the browser: only ever a claude.ai or
+    /// anthropic.com page.
     pub url: Option<String>,
     /// It waits for the code the browser shows, when it didn't redirect.
     pub asks_code: bool,
-    /// What may be the token it printed: each one is checked before it is
-    /// kept, never trusted on its shape.
+    /// What may be the token it printed, from the lines after it says it is
+    /// the token: each is checked before it is kept, never trusted on its
+    /// shape.
     pub candidates: Vec<String>,
-    /// It said it failed.
-    pub failed: Option<String>,
+    /// It said it failed. What the person reads is a fixed sentence
+    /// ([`SETUP_FAILED`]), never the screen's text.
+    pub failed: bool,
 }
+
+/// What the person reads when `claude setup-token` says it failed.
+pub const SETUP_FAILED: &str =
+    "Claude Code's sign-in didn't finish: start it again, or paste a token instead";
+/// What they read when no token could be read before it ended.
+pub const SETUP_UNREAD: &str = "Desk couldn't read the token from Claude Code: paste it instead";
 
 /// The prefix Claude Code's long-lived tokens have had. Only narrows where
 /// to look; [`claude_token_works`] decides.
 const TOKEN_PREFIX: &str = "sk-ant-o";
 
+/// The hosts a sign-in page may be on.
+fn sign_in_host(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("https://") else {
+        return false;
+    };
+    let host = rest
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if host.contains(['@', ':']) {
+        return false;
+    }
+    ["claude.ai", "anthropic.com", "claude.com"]
+        .iter()
+        .any(|d| host == *d || host.ends_with(&format!(".{d}")))
+}
+
 /// Reads a `claude setup-token` screen (run wide enough that nothing
 /// wraps).
 pub fn setup_said(screen: &str) -> SetupSaid {
     let mut said = SetupSaid::default();
+    let mut after_token_line = false;
     for line in screen.lines() {
         let lower = line.to_lowercase();
         for word in line.split(|c: char| c.is_whitespace() || c == '│' || c == '"' || c == '\'') {
             let word = word.trim_matches(|c: char| matches!(c, '(' | ')' | '<' | '>' | ',' | '.'));
-            if said.url.is_none()
-                && word.starts_with("https://")
-                && (word.contains("oauth") || word.contains("authorize"))
-            {
+            if said.url.is_none() && sign_in_host(word) {
                 said.url = Some(word.to_string());
+            }
+            if !after_token_line {
+                continue;
             }
             if let Some(at) = word.find(TOKEN_PREFIX) {
                 let token: String = word[at..]
@@ -437,14 +525,14 @@ pub fn setup_said(screen: &str) -> SetupSaid {
                 }
             }
         }
+        if lower.contains("oauth token") {
+            after_token_line = true;
+        }
         if lower.contains("paste code") {
             said.asks_code = true;
         }
-        if said.failed.is_none()
-            && (lower.contains("error") || lower.contains("failed"))
-            && !lower.contains("if prompted")
-        {
-            said.failed = Some(line.trim().to_string());
+        if (lower.contains("error") || lower.contains("failed")) && !lower.contains("if prompted") {
+            said.failed = true;
         }
     }
     said
@@ -543,7 +631,10 @@ mod tests {
     fn a_token_works_only_when_claude_code_signs_in_by_it() {
         assert!(claude_token_works(r#"{"loggedIn":true,"authMethod":"oauth_token"}"#).is_ok());
         let key = claude_token_works(r#"{"loggedIn":true,"authMethod":"api_key"}"#).unwrap_err();
-        assert!(key.contains("api_key"), "{key}");
+        assert!(
+            key.contains("apiKeyHelper") && !key.contains("api_key"),
+            "{key}"
+        );
         assert!(claude_token_works(r#"{"loggedIn":false}"#).is_err());
         assert!(claude_token_works("Not json").is_err());
     }
@@ -567,12 +658,31 @@ mod tests {
             Some("https://claude.ai/oauth/authorize?code=true&client_id=abc&state=xyz")
         );
         assert!(said.asks_code);
-        assert_eq!(said.candidates, vec![t]);
-        assert_eq!(said.failed, None);
+        assert_eq!(said.candidates, vec![t.clone()]);
+        assert!(!said.failed);
         let failed = setup_said("OAuth error: Request failed with status code 400\n");
-        assert!(failed.failed.is_some());
+        assert!(failed.failed);
         assert!(failed.candidates.is_empty());
-        assert!(setup_said("sk-ant-oat01-short").candidates.is_empty());
+        let after = "Your OAuth token (valid for 1 year):\n";
+        assert!(setup_said(&format!("{after}sk-ant-oat01-short"))
+            .candidates
+            .is_empty());
+        // Only after the line that says it is the token.
+        assert!(setup_said(&format!("{t}\n{after}")).candidates.is_empty());
+        // Only a claude.ai or anthropic.com page.
+        for page in [
+            "https://evil.example/oauth/authorize",
+            "https://claude.ai.evil.example/oauth",
+            "https://user@claude.ai/oauth",
+            "http://claude.ai/oauth/authorize",
+        ] {
+            assert_eq!(setup_said(page).url, None, "{page}");
+        }
+        assert!(
+            setup_said("https://console.anthropic.com/oauth/code/callback")
+                .url
+                .is_some()
+        );
     }
 
     /// Run by hand before merging, on a computer with Claude Code and a

@@ -5,7 +5,7 @@
 //! A token is read from the store only to start a session's CLI, and goes
 //! only into that CLI's environment ([`Desk::account_env`]).
 
-use std::collections::BTreeMap;
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -59,6 +59,31 @@ impl Desk {
         })
     }
 
+    /// Which accounts' sign-ins are in the store, looked for once the hub
+    /// is up: only whether each item is there, never its secret, and never
+    /// holding up the hub's start.
+    pub(super) async fn look_for_sign_ins(self) {
+        let Some(keys) = self.0.opts.account_keys.clone() else {
+            return;
+        };
+        let ids: Vec<Uuid> = self.0.state.lock().accounts.iter().map(|a| a.id).collect();
+        let found = tokio::task::spawn_blocking(move || {
+            ids.into_iter()
+                .filter(|id| match keys.has(*id) {
+                    Ok(there) => there,
+                    Err(e) => {
+                        tracing::warn!(account = %id, error = %format!("{e:#}"), "couldn't look for an engine account's sign-in");
+                        false
+                    }
+                })
+                .collect::<HashSet<Uuid>>()
+        })
+        .await
+        .unwrap_or_default();
+        self.0.state.lock().signed_in_accounts.extend(found);
+        self.announce_accounts();
+    }
+
     /// Every account, as Settings shows them.
     pub fn accounts(&self) -> Vec<AccountView> {
         let st = self.0.state.lock();
@@ -89,6 +114,47 @@ impl Desk {
         self.0.opts.account_keys.as_ref().map(|k| k.name())
     }
 
+    /// What is wrong with accounts' sign-ins, for the Floor and Settings.
+    pub fn sign_in_problems(&self) -> Vec<accounts::ProblemView> {
+        let st = self.0.state.lock();
+        let mut problems: Vec<accounts::ProblemView> = st
+            .sign_in_problems
+            .iter()
+            .filter_map(|(id, problem)| {
+                let name = st
+                    .accounts
+                    .iter()
+                    .find(|a| a.id == *id)
+                    .map(|a| a.name.clone())
+                    .or_else(|| st.removed_names.get(id).cloned())?;
+                Some(accounts::ProblemView {
+                    account: *id,
+                    name,
+                    problem: *problem,
+                })
+            })
+            .collect();
+        problems.sort_by(|a, b| a.name.cmp(&b.name));
+        problems
+    }
+
+    /// Forgets a sign-in problem the person has dealt with.
+    pub fn dismiss_sign_in_problem(&self, account: Uuid) {
+        let removed = {
+            let mut st = self.0.state.lock();
+            let removed = st.sign_in_problems.remove(&account).is_some();
+            if !st.accounts.iter().any(|a| a.id == account)
+                && !st.records.values().any(|r| r.account == Some(account))
+            {
+                st.removed_names.remove(&account);
+            }
+            removed
+        };
+        if removed {
+            self.announce_accounts();
+        }
+    }
+
     /// The sign-ins under way, for a window that opens while one is.
     pub fn account_sign_ins(&self) -> Vec<SignInView> {
         let st = self.0.state.lock();
@@ -98,6 +164,7 @@ impl Desk {
     fn announce_accounts(&self) {
         self.announce(DeskEvent::Accounts {
             accounts: self.accounts(),
+            problems: self.sign_in_problems(),
         });
     }
 
@@ -169,95 +236,131 @@ impl Desk {
             })
     }
 
-    /// What a session's account adds to its CLI's environment: its token,
-    /// with what Claude Code would rank above it taken out. Nothing for a
-    /// session on the CLI's own sign-in.
-    pub(super) async fn account_env(
+    /// The token a session's account signs its CLI in with, read from the
+    /// store now; none for a session on the CLI's own sign-in. It is handed
+    /// over on a descriptor ([`crate::token_pipe`]), never put in an
+    /// environment.
+    pub(super) async fn account_token(
         &self,
         engine: Engine,
         account: Option<Uuid>,
-        env: &mut BTreeMap<String, String>,
-    ) -> Result<(), DeskError> {
+    ) -> Result<Option<AccountToken>, DeskError> {
         let Some(id) = account else {
-            return Ok(());
+            return Ok(None);
         };
         let a = self.account(id).map_err(|_| {
             DeskError::Conflict(
                 "the account this session ran on was removed: choose another for it".into(),
             )
         })?;
-        let keys = Arc::clone(self.keys()?);
-        let store = keys.name();
-        // The keychain may block (a locked keychain, a prompt): off the
-        // runtime's threads, and never under the state lock.
-        let read = tokio::task::spawn_blocking(move || keys.get(id))
-            .await
-            .map_err(|e| DeskError::Internal(e.into()))?
-            .map_err(DeskError::Internal)?;
-        let Some(token) = read else {
-            if self.0.state.lock().signed_in_accounts.remove(&id) {
-                self.announce_accounts();
-            }
-            return Err(DeskError::Conflict(format!(
-                "{}'s sign-in is no longer in {store}: add the account again in Settings → Engines",
-                a.name,
-            )));
-        };
         match engine {
-            Engine::Claude => {
-                for k in accounts::OUTRANKS_CLAUDE_TOKEN {
-                    env.remove(k);
-                }
-                env.insert(
-                    accounts::CLAUDE_TOKEN_ENV.into(),
-                    token.expose().to_string(),
-                );
-                Ok(())
-            }
+            Engine::Claude => {}
             Engine::Codex
             | Engine::Gemini
             | Engine::Copilot
             | Engine::OpenCode
             | Engine::Cursor
             | Engine::Devin
-            | Engine::Custom => Err(DeskError::Invalid(format!(
-                "{} sessions run on its own sign-in here",
-                engine.title()
-            ))),
+            | Engine::Custom => {
+                return Err(DeskError::Invalid(format!(
+                    "{} sessions run on its own sign-in here",
+                    engine.title()
+                )))
+            }
         }
+        self.read_token(&a).await.map(Some)
     }
 
-    /// The environment Claude Code runs a session on `token` in: a
-    /// session's, as Desk adds to it.
-    fn claude_env_with(&self, token: &AccountToken) -> BTreeMap<String, String> {
-        let mut env = self.with_added(&self.0.state.lock().session_env.clone());
-        for k in accounts::OUTRANKS_CLAUDE_TOKEN {
-            env.remove(k);
+    /// `a`'s token from the store, off the runtime's threads and never under
+    /// the state lock (a locked keychain or a prompt may block). A sign-in
+    /// that can't be read is a Floor need until it can.
+    pub(super) async fn read_token(&self, a: &Account) -> Result<AccountToken, DeskError> {
+        let keys = Arc::clone(self.keys()?);
+        let store = keys.name();
+        let id = a.id;
+        let read = tokio::task::spawn_blocking(move || keys.get(id))
+            .await
+            .map_err(|e| DeskError::Internal(e.into()));
+        let problem = match read {
+            Ok(Ok(Some(token))) => {
+                let changed = {
+                    let mut st = self.0.state.lock();
+                    st.sign_in_problems.remove(&id).is_some() | st.signed_in_accounts.insert(id)
+                };
+                if changed {
+                    self.announce_accounts();
+                }
+                return Ok(token);
+            }
+            Ok(Ok(None)) => accounts::SignInProblem::Gone,
+            Ok(Err(e)) | Err(DeskError::Internal(e)) => {
+                tracing::warn!(account = %id, error = %format!("{e:#}"), "couldn't read an engine account's sign-in");
+                accounts::SignInProblem::Unreadable
+            }
+            Err(e) => return Err(e),
+        };
+        {
+            let mut st = self.0.state.lock();
+            st.sign_in_problems.insert(id, problem);
+            if problem == accounts::SignInProblem::Gone {
+                st.signed_in_accounts.remove(&id);
+            }
         }
-        env.insert(
-            accounts::CLAUDE_TOKEN_ENV.into(),
-            token.expose().to_string(),
-        );
-        env
+        self.announce_accounts();
+        Err(DeskError::Conflict(match problem {
+            accounts::SignInProblem::Gone => format!(
+                "{}'s sign-in is no longer in {store}: add the account again in Settings → Engines",
+                a.name
+            ),
+            accounts::SignInProblem::Unreadable | accounts::SignInProblem::NotRemoved => format!(
+                "Desk couldn't read {}'s sign-in from {store} just now: nothing was switched",
+                a.name
+            ),
+        }))
     }
 
-    /// Whether Claude Code, run as a session on `token` is, signs in by it.
+    /// Whether Claude Code, run as a session on `token` is (the session's
+    /// environment, the token on descriptor 3), signs in by it.
     async fn check_claude_token(&self, token: &AccountToken) -> Result<(), String> {
+        use tokio::io::AsyncWriteExt;
         let program = self
             .program_of(Engine::Claude)
             .map_err(|e| e.to_string())?
             .to_path_buf();
-        let run = tokio::process::Command::new(program)
-            .args(["auth", "status", "--json"])
-            .env_clear()
-            .envs(self.claude_env_with(token))
-            .stdin(std::process::Stdio::null())
-            .kill_on_drop(true)
-            .output();
+        let mut env = self.with_added(&self.0.state.lock().session_env.clone());
+        for k in accounts::OUTRANKS_CLAUDE_TOKEN {
+            env.remove(k);
+        }
+        env.remove(accounts::CLAUDE_TOKEN_ENV);
+        env.insert(
+            crate::token_pipe::FD_ENV.into(),
+            crate::token_pipe::FD.into(),
+        );
+        let (sh, args) = crate::token_pipe::one_off(&program, &["auth", "status", "--json"]);
+        let run = async {
+            let mut child = tokio::process::Command::new(sh)
+                .args(args)
+                .env_clear()
+                .envs(env)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .kill_on_drop(true)
+                .spawn()
+                .map_err(|_| "Claude Code couldn't be run".to_string())?;
+            if let Some(mut stdin) = child.stdin.take() {
+                let mut line = token.expose().as_bytes().to_vec();
+                line.push(b'\n');
+                let _ = stdin.write_all(&line).await;
+            }
+            child
+                .wait_with_output()
+                .await
+                .map_err(|_| "Claude Code couldn't be run".to_string())
+        };
         let out = tokio::time::timeout(SIGN_IN_WAIT, run)
             .await
-            .map_err(|_| "Claude Code didn't answer in time".to_string())?
-            .map_err(|_| "Claude Code couldn't be run".to_string())?;
+            .map_err(|_| "Claude Code didn't answer in time".to_string())??;
         accounts::claude_token_works(&String::from_utf8_lossy(&out.stdout))
     }
 
@@ -437,6 +540,8 @@ impl Desk {
     ) {
         let started = tokio::time::Instant::now();
         let mut tried: Vec<String> = Vec::new();
+        // Why the last token read was refused, said if the run ends on it.
+        let mut refused: Option<String> = None;
         let mut exited = false;
         let outcome = loop {
             let Some((pty, make_default, engine, name)) = ({
@@ -465,10 +570,11 @@ impl Desk {
                     continue;
                 };
                 self.sign_in_moved(id, SignInState::Checking);
+                // A token drawn only in part fails the check: the run goes on,
+                // and the rest of it is read next time.
                 if let Err(why) = self.check_claude_token(&token).await {
-                    pty.kill();
-                    ended = Some(SignInState::Failed { why });
-                    break;
+                    refused = Some(why);
+                    continue;
                 }
                 let kept = match self.keys() {
                     Ok(keys) => {
@@ -481,7 +587,12 @@ impl Desk {
                 pty.kill();
                 ended = Some(match kept {
                     Ok(a) => SignInState::Done { account: a.id },
-                    Err(e) => SignInState::Failed { why: e.to_string() },
+                    Err(e) => {
+                        tracing::warn!(error = %format!("{e:#}"), "couldn't keep an engine account");
+                        SignInState::Failed {
+                            why: "Desk couldn't keep the sign-in: try again".into(),
+                        }
+                    }
                 });
                 break;
             }
@@ -490,9 +601,11 @@ impl Desk {
             }
             if exited {
                 break SignInState::Failed {
-                    why: said.failed.unwrap_or_else(|| {
-                        "Desk couldn't read the token from Claude Code: paste it instead".into()
-                    }),
+                    why: match (refused.take(), said.failed) {
+                        (Some(why), _) => why,
+                        (None, true) => accounts::SETUP_FAILED.into(),
+                        (None, false) => accounts::SETUP_UNREAD.into(),
+                    },
                 };
             }
             if started.elapsed() > SIGN_IN_FOR {
@@ -624,32 +737,57 @@ impl Desk {
             .delete_account(id, to)
             .await
             .map_err(DeskError::Internal)?;
-        if let Ok(keys) = self.keys().map(Arc::clone) {
-            match tokio::task::spawn_blocking(move || keys.delete(id)).await {
-                Ok(Ok(())) => {}
+        let deleted = match self.keys().map(Arc::clone) {
+            Ok(keys) => match tokio::task::spawn_blocking(move || keys.delete(id)).await {
+                Ok(Ok(())) => true,
                 Ok(Err(e)) => {
-                    tracing::warn!(account = %id, error = %e, "couldn't remove an engine account's sign-in")
+                    tracing::warn!(account = %id, error = %format!("{e:#}"), "couldn't remove an engine account's sign-in");
+                    false
                 }
                 Err(e) => {
-                    tracing::warn!(account = %id, error = %e, "couldn't remove an engine account's sign-in")
+                    tracing::warn!(account = %id, error = %e, "couldn't remove an engine account's sign-in");
+                    false
                 }
-            }
-        }
-        let moved: Vec<Uuid> = {
+            },
+            Err(_) => true,
+        };
+        let (running, stopped): (Vec<Uuid>, Vec<Uuid>) = {
             let mut st = self.0.state.lock();
             st.accounts.retain(|o| o.id != id);
             st.signed_in_accounts.remove(&id);
             st.switches.retain(|_, to| *to != Some(id));
-            st.records
+            st.sign_in_problems.remove(&id);
+            if !deleted {
+                st.sign_in_problems
+                    .insert(id, accounts::SignInProblem::NotRemoved);
+            }
+            let on: Vec<Uuid> = st
+                .records
                 .values()
                 .filter(|r| r.account == Some(id))
                 .map(|r| r.id)
-                .collect()
+                .collect();
+            // Running ones keep its name until they have moved.
+            if !deleted || on.iter().any(|s| st.live.contains_key(s)) {
+                st.removed_names.insert(id, a.name.clone());
+            }
+            on.into_iter().partition(|s| st.live.contains_key(s))
         };
-        for s in moved {
+        for s in stopped {
             self.change(s, |r, _| r.account = to);
         }
         self.announce_accounts();
+        // Running sessions move to the default as a switch does: idle ones
+        // now, working ones once their turn ends.
+        for s in running {
+            self.0.state.lock().switches.insert(s, to);
+            let desk = self.clone();
+            tokio::spawn(async move {
+                if let Err(e) = desk.drive_switch(s, None).await {
+                    tracing::warn!(session = %s, error = %e, "couldn't move a session off a removed account");
+                }
+            });
+        }
         Ok(())
     }
 
@@ -678,11 +816,13 @@ impl Desk {
         r: &crate::model::SessionRecord,
     ) -> (Option<AccountRef>, Option<AccountRef>) {
         let named = |id: Option<Uuid>| {
-            id.and_then(|id| st.accounts.iter().find(|a| a.id == id))
-                .map(|a| AccountRef {
-                    id: a.id,
-                    name: a.name.clone(),
-                })
+            let id = id?;
+            st.accounts
+                .iter()
+                .find(|a| a.id == id)
+                .map(|a| a.name.clone())
+                .or_else(|| st.removed_names.get(&id).map(|n| format!("{n} (removed)")))
+                .map(|name| AccountRef { id, name })
         };
         let to = st.switches.get(&r.id).map(|to| {
             named(*to).unwrap_or_else(|| AccountRef {
@@ -696,7 +836,11 @@ impl Desk {
     /// Moves a session to another account (`None`: the CLI's own sign-in).
     /// One idle or done is restarted on it now; one working, once its turn
     /// ends; one whose last turn stopped on its limit, now and told to
-    /// carry on; one not running, at its next start.
+    /// carry on; one not running, at its next start. The account it moves to
+    /// must be signed in now: if its sign-in can't be read, the session
+    /// stays where it is and the Floor says why. Switches of one session are
+    /// carried out one at a time, the latest asked for winning, with one
+    /// restart.
     pub async fn switch_account(
         &self,
         id: Uuid,
@@ -720,44 +864,103 @@ impl Desk {
                     .into(),
             ));
         }
-        let (live, hit_limit) = {
-            let st = self.0.state.lock();
-            let live = st.live.contains_key(&id);
-            let hit_limit = matches!(r.state, SessionState::Done | SessionState::Idle)
-                && r.last_reply
-                    .as_deref()
-                    .is_some_and(|reply| crew::outcome_of(Ok(reply)).0 == Outcome::Limit);
-            (live, hit_limit)
-        };
-        if r.account == to && !hit_limit {
-            self.0.state.lock().switches.remove(&id);
-            return self.view(id);
+        if let Some(to) = to {
+            let a = self.account(to)?;
+            self.read_token(&a).await?;
         }
+        self.0.state.lock().switches.insert(id, to);
+        self.drive_switch(id, by).await
+    }
+
+    /// Carries out the switch a session waits on, unless one is already
+    /// being carried out (that one takes the latest when it is done).
+    pub(super) async fn drive_switch(
+        &self,
+        id: Uuid,
+        by: Option<By>,
+    ) -> Result<SessionView, DeskError> {
+        if !self.0.state.lock().switching.insert(id) {
+            let view = self.view(id)?;
+            self.announce(DeskEvent::Session {
+                session: Box::new(view.clone()),
+            });
+            return Ok(view);
+        }
+        let result = self.drive_switch_now(id, by).await;
+        self.0.state.lock().switching.remove(&id);
+        result
+    }
+
+    async fn drive_switch_now(&self, id: Uuid, by: Option<By>) -> Result<SessionView, DeskError> {
         let by = by.unwrap_or_else(By::you);
-        match accounts::switch_when(r.state, live, hit_limit) {
-            SwitchWhen::NextStart => {
+        loop {
+            let Some(to) = self.0.state.lock().switches.get(&id).copied() else {
+                return self.view(id);
+            };
+            let r = self.record(id)?;
+            let (live, hit_limit) = {
+                let st = self.0.state.lock();
+                let live = st.live.contains_key(&id);
+                let hit_limit = matches!(r.state, SessionState::Done | SessionState::Idle)
+                    && r.last_reply
+                        .as_deref()
+                        .is_some_and(|reply| crew::outcome_of(Ok(reply)).0 == Outcome::Limit);
+                (live, hit_limit)
+            };
+            if r.account == to && !hit_limit {
                 self.0.state.lock().switches.remove(&id);
-                self.change(id, |r, _| r.account = to);
-                self.view(id)
+                return self.view(id);
             }
-            SwitchWhen::AfterTurn => {
-                self.0.state.lock().switches.insert(id, to);
+            let when = accounts::switch_when(r.state, live, hit_limit);
+            if when == SwitchWhen::AfterTurn {
                 let view = self.view(id)?;
                 self.announce(DeskEvent::Session {
                     session: Box::new(view.clone()),
                 });
-                Ok(view)
+                return Ok(view);
             }
-            SwitchWhen::Now => {
-                self.0.state.lock().switches.remove(&id);
-                self.change(id, |r, _| r.account = to);
-                self.restart(id, None, by).await
+            // Read again just before it is stopped: a sign-in gone since it
+            // was asked for leaves it where it is.
+            if let Some(to) = to {
+                let read = match self.account(to) {
+                    Ok(a) => self.read_token(&a).await.map(drop),
+                    Err(e) => Err(e),
+                };
+                if let Err(e) = read {
+                    self.0.state.lock().switches.remove(&id);
+                    if let Ok(view) = self.view(id) {
+                        self.announce(DeskEvent::Session {
+                            session: Box::new(view),
+                        });
+                    }
+                    return Err(e);
+                }
             }
-            SwitchWhen::NowWithContinue => {
-                self.0.state.lock().switches.remove(&id);
-                self.change(id, |r, _| r.account = to);
-                self.restart(id, Some(accounts::CONTINUE.into()), by).await
+            let from = r.account;
+            self.0.state.lock().switches.remove(&id);
+            self.change(id, |r, _| r.account = to);
+            {
+                // A removed account's name is kept only while something is on it.
+                let mut st = self.0.state.lock();
+                if let Some(from) = from {
+                    let still = st.records.values().any(|r| r.account == Some(from))
+                        || st.sign_in_problems.contains_key(&from);
+                    if !still {
+                        st.removed_names.remove(&from);
+                    }
+                }
             }
+            match when {
+                SwitchWhen::NextStart | SwitchWhen::AfterTurn => return self.view(id),
+                SwitchWhen::Now => {
+                    self.restart(id, None, by.clone()).await?;
+                }
+                SwitchWhen::NowWithContinue => {
+                    self.restart(id, Some(accounts::CONTINUE.into()), by.clone())
+                        .await?;
+                }
+            }
+            // A switch asked for while it restarted: carried out next.
         }
     }
 }

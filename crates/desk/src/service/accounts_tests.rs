@@ -36,7 +36,7 @@ fn claude(dir: &Path) -> PathBuf {
         format!(
             "#!/bin/sh\ncase \"$1 $2\" in\n\
              '--version ') echo '2.1.300 (Claude Code)' ;;\n\
-             'auth status') case \"$CLAUDE_CODE_OAUTH_TOKEN\" in\n\
+             'auth status') t=$(cat <&3 2>/dev/null); case \"$t\" in\n\
                sk-ant-oat01-good*) echo '{{\"loggedIn\":true,\"authMethod\":\"oauth_token\"}}' ;;\n\
                '') echo '{{\"loggedIn\":true,\"authMethod\":\"claude.ai\"}}' ;;\n\
                *) echo '{{\"loggedIn\":false}}' ;;\n\
@@ -49,7 +49,12 @@ fn claude(dir: &Path) -> PathBuf {
                echo 'Your OAuth token (valid for 1 year):'\n\
                echo \"sk-ant-oat01-good-$code-0123456789012345678901234567890123\"\n\
                sleep 30 ;;\n\
-             *) env > '{d}/env-'$$; echo \"$@\" > '{d}/args-'$$; exec sleep 60 ;;\n\
+             *) t=; [ -n \"$CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR\" ] && read -r t <&3\n\
+               again=$(sh -c 'cat <&3' 2>/dev/null)\n\
+               env > '{d}/envtmp-'$$\n\
+               echo \"TOKEN_ON_FD=$t\" >> '{d}/envtmp-'$$; echo \"CHILD_READ=$again\" >> '{d}/envtmp-'$$\n\
+               mv '{d}/envtmp-'$$ '{d}/env-'$$\n\
+               echo \"$@\" > '{d}/args-'$$; exec sleep 60 ;;\n\
              esac\n"
         ),
     )
@@ -174,7 +179,26 @@ async fn a_session_on_an_account_gets_its_token_alone_and_nothing_ranked_above_i
             Some("Work")
         );
         let (env, _) = started(dir.path(), on_work.id, 0).await;
-        assert_eq!(env.get(CLAUDE_TOKEN_ENV).map(String::as_str), Some(GOOD));
+        assert_eq!(
+            env.get("TOKEN_ON_FD").map(String::as_str),
+            Some(GOOD),
+            "read on descriptor 3"
+        );
+        assert_eq!(
+            env.get("CHILD_READ").map(String::as_str),
+            Some(""),
+            "a child reads nothing there"
+        );
+        assert_eq!(
+            env.get(crate::token_pipe::FD_ENV).map(String::as_str),
+            Some("3")
+        );
+        assert!(!env.contains_key(CLAUDE_TOKEN_ENV));
+        assert!(
+            !env.iter()
+                .any(|(k, v)| k != "TOKEN_ON_FD" && v.contains(GOOD)),
+            "no variable holds the token"
+        );
         assert!(
             !env.contains_key("ANTHROPIC_API_KEY"),
             "it would outrank the account"
@@ -189,6 +213,8 @@ async fn a_session_on_an_account_gets_its_token_alone_and_nothing_ranked_above_i
         assert_eq!(own.account, None);
         let (env, _) = started(dir.path(), own.id, 0).await;
         assert!(!env.contains_key(CLAUDE_TOKEN_ENV));
+        assert!(!env.contains_key(crate::token_pipe::FD_ENV));
+        assert_eq!(env["TOKEN_ON_FD"], "");
         assert_eq!(env["ANTHROPIC_API_KEY"], "sk-person-key");
 
         // The token is in no view, event, row or kept state.
@@ -257,7 +283,9 @@ async fn a_pasted_token_is_kept_only_once_claude_code_signs_in_by_it() {
         let back = desk(pool, account_options(dir.path(), keys)).await;
         let accounts = back.accounts();
         assert_eq!(accounts.len(), 1);
-        assert!(accounts[0].signed_in && !accounts[0].is_default);
+        assert!(!accounts[0].is_default);
+        // Looked for once the hub is up, without holding up its start.
+        until(|| back.accounts()[0].signed_in.then_some(())).await;
     })
     .await;
 }
@@ -346,7 +374,7 @@ async fn a_working_session_switches_after_its_turn_and_one_on_its_limit_carries_
             r.last_reply = Some("Fixed the race.".into());
         });
         let (env, args) = started(dir.path(), s.id, 1).await;
-        assert_eq!(env[CLAUDE_TOKEN_ENV], OTHER);
+        assert_eq!(env["TOKEN_ON_FD"], OTHER);
         assert!(args.starts_with("--resume"), "{args}");
         assert_eq!(d.view(s.id).unwrap().switching_to, None);
 
@@ -363,7 +391,7 @@ async fn a_working_session_switches_after_its_turn_and_one_on_its_limit_carries_
         });
         d.switch_account(s.id, Some(work), None).await.unwrap();
         let (env, args) = started(dir.path(), s.id, 2).await;
-        assert_eq!(env[CLAUDE_TOKEN_ENV], GOOD);
+        assert_eq!(env["TOKEN_ON_FD"], GOOD);
         assert!(args.trim_end().ends_with("Continue"), "{args}");
 
         // Not running: its next start.
@@ -394,7 +422,15 @@ async fn a_removed_account_moves_its_sessions_to_the_default_at_their_next_start
             .unwrap();
         d.remove_account(personal).await.unwrap();
         assert_eq!(keys.get(personal).unwrap(), None);
-        assert_eq!(d.view(s.id).unwrap().account.map(|a| a.id), Some(work));
+        // Still starting: it moves to Work once its turn is over.
+        until(|| {
+            d.view(s.id)
+                .ok()?
+                .switching_to
+                .filter(|a| a.id == work)
+                .map(drop)
+        })
+        .await;
 
         // No default left: the CLI's own sign-in.
         d.update_account(
@@ -436,6 +472,8 @@ async fn a_desk_that_keeps_no_accounts_starts_every_session_on_its_own_sign_in()
         assert_eq!(s.account, None);
         let (env, _) = started(dir.path(), s.id, 0).await;
         assert!(!env.contains_key(CLAUDE_TOKEN_ENV));
+        assert!(!env.contains_key(crate::token_pipe::FD_ENV));
+        assert_eq!(env["TOKEN_ON_FD"], "");
         assert_eq!(env["ANTHROPIC_API_KEY"], "sk-person-key");
         assert!(d
             .add_account(NewAccount {
@@ -470,7 +508,151 @@ fn accounts_and_sign_ins_reach_desk_in_its_wire_shape() {
     let added = serde_json::to_value(Added::SignIn { sign_in }).unwrap();
     assert_eq!(added["kind"], "signIn");
     assert_eq!(added["signIn"]["name"], "Work");
-    let accounts =
-        serde_json::to_value(crate::model::DeskEvent::Accounts { accounts: vec![] }).unwrap();
+    let accounts = serde_json::to_value(crate::model::DeskEvent::Accounts {
+        accounts: vec![],
+        problems: vec![],
+    })
+    .unwrap();
     assert_eq!(accounts["type"], "accounts");
+}
+
+#[tokio::test]
+async fn a_session_never_moves_to_an_account_whose_sign_in_cant_be_read() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = Arc::new(MemoryKeys::default());
+        let d = desk(pool, account_options(dir.path(), keys.clone())).await;
+        let work = paste(&d, "Work", GOOD, true).await;
+        let personal = paste(&d, "Personal", OTHER, false).await;
+        let s = d.create(session(dir.path(), None), None).await.unwrap();
+        started(dir.path(), s.id, 0).await;
+        d.change(s.id, |r, _| r.state = SessionState::Idle);
+        keys.delete(personal).unwrap();
+        let refused = d
+            .switch_account(s.id, Some(personal), None)
+            .await
+            .unwrap_err();
+        assert!(refused.to_string().contains("no longer in"), "{refused}");
+        let v = d.view(s.id).unwrap();
+        assert_eq!(
+            (v.account.map(|a| a.id), v.switching_to, v.live),
+            (Some(work), None, true)
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            std::fs::read_dir(dir.path())
+                .unwrap()
+                .flatten()
+                .filter(|e| e.file_name().to_string_lossy().starts_with("env-"))
+                .count(),
+            1,
+            "it was never stopped"
+        );
+        let problems = d.sign_in_problems();
+        assert_eq!(problems.len(), 1);
+        assert_eq!(
+            (problems[0].account, problems[0].problem),
+            (personal, crate::engine_accounts::SignInProblem::Gone)
+        );
+        // Added again: the problem clears once it reads.
+        keys.set(
+            personal,
+            &crate::engine_accounts::AccountToken::new(OTHER).unwrap(),
+        )
+        .unwrap();
+        d.switch_account(s.id, Some(personal), None).await.unwrap();
+        assert!(d.sign_in_problems().is_empty());
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn switches_of_one_session_are_carried_out_one_at_a_time_the_latest_winning() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(
+            pool,
+            account_options(dir.path(), Arc::new(MemoryKeys::default())),
+        )
+        .await;
+        let work = paste(&d, "Work", GOOD, true).await;
+        let personal = paste(&d, "Personal", OTHER, false).await;
+        let s = d.create(session(dir.path(), None), None).await.unwrap();
+        started(dir.path(), s.id, 0).await;
+        d.change(s.id, |r, _| r.state = SessionState::Working);
+        // Asked three times while it works: one restart, on the last asked.
+        d.switch_account(s.id, Some(personal), None).await.unwrap();
+        d.switch_account(s.id, None, None).await.unwrap();
+        d.switch_account(s.id, Some(personal), None).await.unwrap();
+        let v = d.view(s.id).unwrap();
+        assert_eq!(v.switching_to.map(|a| a.id), Some(personal));
+        // The turn ends, and the after-turn and a racing switch meet.
+        d.change(s.id, |r, _| {
+            r.state = SessionState::Done;
+            r.last_reply = Some("Done.".into());
+        });
+        let racing = d.drive_switch(s.id, None);
+        let (env, _) = started(dir.path(), s.id, 1).await;
+        racing.await.unwrap();
+        assert_eq!(env["TOKEN_ON_FD"], OTHER);
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let starts = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .filter_map(|e| {
+                std::fs::read_to_string(e.path())
+                    .ok()
+                    .filter(|_| e.file_name().to_string_lossy().starts_with("env-"))
+            })
+            .filter(|env| env.contains(&format!("/hook/{}/", s.id)))
+            .count();
+        assert_eq!(starts, 2, "started, then restarted once");
+        assert_ne!(d.view(s.id).unwrap().account.map(|a| a.id), Some(work));
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_removed_accounts_running_sessions_say_so_and_move_to_the_default() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(
+            pool,
+            account_options(dir.path(), Arc::new(MemoryKeys::default())),
+        )
+        .await;
+        let work = paste(&d, "Work", GOOD, true).await;
+        let personal = paste(&d, "Personal", OTHER, false).await;
+        let s = d
+            .create(session(dir.path(), Some(Some(personal))), None)
+            .await
+            .unwrap();
+        started(dir.path(), s.id, 0).await;
+        d.change(s.id, |r, _| r.state = SessionState::Working);
+        d.remove_account(personal).await.unwrap();
+        let v = d.view(s.id).unwrap();
+        assert_eq!(
+            v.account.map(|a| a.name).as_deref(),
+            Some("Personal (removed)")
+        );
+        assert_eq!(v.switching_to.map(|a| a.id), Some(work));
+        d.change(s.id, |r, _| {
+            r.state = SessionState::Done;
+            r.last_reply = Some("Done.".into());
+        });
+        let (env, _) = started(dir.path(), s.id, 1).await;
+        assert_eq!(env["TOKEN_ON_FD"], GOOD);
+        until(|| (d.view(s.id).ok()?.account?.id == work).then_some(())).await;
+    })
+    .await;
+}
+
+async fn until<T>(mut f: impl FnMut() -> Option<T>) -> T {
+    for _ in 0..400 {
+        if let Some(v) = f() {
+            return v;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("never came about");
 }

@@ -217,6 +217,7 @@ async fn accounts(State(s): S, h: HeaderMap, Query(q): Q) -> Response {
         "accounts": s.desk.accounts(),
         "store": s.desk.accounts_store(),
         "signIns": s.desk.account_sign_ins(),
+        "problems": s.desk.sign_in_problems(),
     }))
     .into_response()
 }
@@ -259,6 +260,13 @@ async fn remove_account(State(s): S, h: HeaderMap, Query(q): Q, Path(id): Path<U
         .await
         .map(|()| StatusCode::NO_CONTENT)
         .into_response()
+}
+
+/// "OK" on a sign-in problem the person has dealt with.
+async fn dismiss_problem(State(s): S, h: HeaderMap, Query(q): Q, Path(id): Path<Uuid>) -> Response {
+    guarded!(s, h, q);
+    s.desk.dismiss_sign_in_problem(id);
+    StatusCode::NO_CONTENT.into_response()
 }
 
 #[derive(Deserialize)]
@@ -984,6 +992,10 @@ pub fn sessions_router(desk: Desk, auth: Arc<dyn Authorize>) -> Router {
             patch(update_account).delete(remove_account),
         )
         .route("/api/desk/accounts/sign-ins/{id}/code", post(sign_in_code))
+        .route(
+            "/api/desk/accounts/problems/{id}/dismiss",
+            post(dismiss_problem),
+        )
         .route(
             "/api/desk/accounts/sign-ins/{id}",
             axum::routing::delete(cancel_sign_in),

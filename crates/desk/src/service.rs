@@ -315,6 +315,14 @@ struct State {
     switches: HashMap<Uuid, Option<Uuid>>,
     /// The accounts whose sign-in was in the store when last looked at.
     signed_in_accounts: HashSet<Uuid>,
+    /// What went wrong with accounts' sign-ins, by account: shown until it
+    /// is put right.
+    sign_in_problems: HashMap<Uuid, crate::engine_accounts::SignInProblem>,
+    /// The names of accounts removed while sessions still run on them,
+    /// until those sessions restart.
+    removed_names: HashMap<Uuid, String>,
+    /// Sessions whose switch of account is being carried out now.
+    switching: HashSet<Uuid>,
 }
 
 /// How often a busy session's tool is recorded as `working`.
@@ -775,19 +783,6 @@ impl Desk {
         let layout = store.layout().await?;
         let session_env = kept_session_env(&store).await;
         let engine_accounts = store.accounts().await?;
-        let signed_in_accounts = match opts.account_keys.clone() {
-            Some(keys) => {
-                let ids: Vec<Uuid> = engine_accounts.iter().map(|a| a.id).collect();
-                tokio::task::spawn_blocking(move || {
-                    ids.into_iter()
-                        .filter(|id| keys.get(*id).ok().flatten().is_some())
-                        .collect::<HashSet<Uuid>>()
-                })
-                .await
-                .unwrap_or_default()
-            }
-            None => HashSet::new(),
-        };
         let hidden = store
             .hidden()
             .await?
@@ -862,7 +857,6 @@ impl Desk {
                 hidden,
                 turns,
                 accounts: engine_accounts,
-                signed_in_accounts,
                 ..State::default()
             }),
             events: broadcast::channel(256).0,
@@ -880,6 +874,7 @@ impl Desk {
         }));
         tokio::spawn(persist_loop(store, floor.turns, persist_rx));
         tokio::spawn(desk.clone().read_engines());
+        tokio::spawn(desk.clone().look_for_sign_ins());
         tokio::spawn(desk.clone().ledger_loop(ledger_jobs));
         tokio::spawn(desk.clone().watch_background());
         recovered.into_iter().for_each(|r| desk.save(r));
@@ -1128,15 +1123,14 @@ impl Desk {
                     | Transition::Interrupted
             )
         });
-        if turn_over {
-            if let Some(to) = st.switches.remove(&id) {
-                let desk = self.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = desk.switch_account(id, to, None).await {
-                        tracing::warn!(session = %id, error = %e, "couldn't move a session to its account");
-                    }
-                });
-            }
+        // Carried out by the one driver of this session's switches.
+        if turn_over && st.switches.contains_key(&id) {
+            let desk = self.clone();
+            tokio::spawn(async move {
+                if let Err(e) = desk.drive_switch(id, None).await {
+                    tracing::warn!(session = %id, error = %e, "couldn't move a session to its account");
+                }
+            });
         }
         let _ = self.0.persist.send(Persist::Put(Box::new(r)));
         if noticed {
@@ -2739,8 +2733,14 @@ impl Desk {
             return Err(DeskError::Conflict(format!("{} no longer exists", r.cwd)));
         }
         let mut env = self.with_added(&self.0.state.lock().session_env.clone());
-        // Only now, and only into this CLI's own environment: never kept.
-        self.account_env(r.engine, r.account, &mut env).await?;
+        // Read only now; it reaches the CLI on a descriptor, never in an
+        // environment ([`crate::token_pipe`]).
+        let account_token = self.account_token(r.engine, r.account).await?;
+        if account_token.is_some() {
+            for k in crate::engine_accounts::OUTRANKS_CLAUDE_TOKEN {
+                env.remove(k);
+            }
+        }
         let (spec, codex) = match r.engine {
             Engine::Claude => {
                 let session_id = r.cli_session_id.as_deref().unwrap_or_default();
@@ -2799,6 +2799,21 @@ impl Desk {
             "token": token,
             "hookPort": self.0.hook_port,
         });
+        let spec = match account_token {
+            Some(account_token) => {
+                let fifo = crate::token_pipe::TokenFifo::new(&self.0.opts.run_dir)
+                    .map_err(DeskError::Internal)?;
+                let spec = fifo.wrap(spec);
+                let id = r.id;
+                tokio::task::spawn_blocking(move || {
+                    if let Err(e) = fifo.hand(&account_token) {
+                        tracing::warn!(session = %id, error = %e, "a session didn't take its account's token");
+                    }
+                });
+                spec
+            }
+            None => spec,
+        };
         let started = self.start_pty(&spec, meta).await;
         let (pty, exit) = match started {
             Ok(started) => started,
