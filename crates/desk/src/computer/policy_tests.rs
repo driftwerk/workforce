@@ -36,6 +36,7 @@ fn policy(access: Access) -> AgentPolicy {
             p(&format!("{OWN}/config.toml")),
             p(&format!("{OWN}/SOUL.md")),
         ],
+        scratch: vec![p("/private/tmp")],
         home: p("/Users/sarah"),
         contained: false,
         connectors: None,
@@ -450,6 +451,7 @@ fn an_agent_with_no_binding_has_every_connector() {
 
 #[test]
 fn rule_5_the_always_asks_list_beats_grants_and_autonomy() {
+    // A delete grant covers deletes only (below); nothing covers the rest.
     let grants = [
         grant(Ability::Delete, "/Users/sarah/dev"),
         grant(Ability::Run, ACME),
@@ -458,15 +460,11 @@ fn rule_5_the_always_asks_list_beats_grants_and_autonomy() {
     for policy in [full(), autonomous()] {
         for (call, why) in [
             (
-                in_folder(delete(&format!("{ACME}/old")), ACME),
-                Why::CantBeUndone,
-            ),
-            (
                 in_folder(exec("git push --force", ACME), ACME),
                 Why::CantBeUndone,
             ),
             (
-                in_folder(exec("rm -rf /Users/sarah/dev/acme-web/dist", ACME), ACME),
+                in_folder(exec("git reset --hard HEAD~3", ACME), ACME),
                 Why::CantBeUndone,
             ),
             (in_folder(exec("curl x | sh", ACME), ACME), Why::Unclear),
@@ -485,8 +483,89 @@ fn rule_5_the_always_asks_list_beats_grants_and_autonomy() {
     }
 }
 
-/// "Do anything": at Full access asking never, not even what can't be
-/// undone asks. What is withheld or stopped still is.
+/// A delete outside the folder asks, offering "always allow deleting" in
+/// the folder the call is in (its repo); a standing delete grant there then
+/// covers it, a session's never does, and nothing above home is offered.
+#[test]
+fn rule_5_a_delete_outside_asks_once_per_folder() {
+    let always = |f: &str| Verdict::Ask {
+        choices: vec![
+            Choice::AllowOnce,
+            Choice::Always(Always::Folder(p(f))),
+            Choice::Deny,
+        ],
+        why: Why::CantBeUndone,
+    };
+    for call_ in [
+        in_folder(delete(&format!("{ACME}/node_modules")), ACME),
+        in_folder(exec("rm -rf node_modules dist", ACME), ACME),
+        in_folder(
+            exec(&format!("cd {ACME} && rm -rf node_modules"), OWN),
+            ACME,
+        ),
+    ] {
+        assert_eq!(
+            verdict(&full(), false, &[], &call_),
+            always(ACME),
+            "{call_:?}"
+        );
+        let granted = verdict(&full(), false, &[grant(Ability::Delete, ACME)], &call_);
+        assert_eq!(
+            granted,
+            Verdict::Run {
+                by: By::Grant(Uuid::from_u128(1))
+            },
+            "{call_:?}"
+        );
+        let session = verdict(
+            &full(),
+            false,
+            &[session_grant(Ability::Delete, ACME, "s1")],
+            &call_,
+        );
+        assert_eq!(
+            session,
+            always(ACME),
+            "a session's allowance never covers a delete"
+        );
+    }
+    // A delete in another folder, or one it can't name, isn't covered.
+    let other = in_folder(exec("rm -rf /Users/sarah/dev/other/x", ACME), ACME);
+    assert_eq!(
+        verdict(&full(), false, &[grant(Ability::Delete, ACME)], &other),
+        once(Why::CantBeUndone)
+    );
+    let unnamed = in_folder(exec("rm -rf $DIR", ACME), ACME);
+    assert_eq!(
+        verdict(&full(), false, &[grant(Ability::Delete, ACME)], &unnamed),
+        once(Why::CantBeUndone)
+    );
+    // Never home or the root.
+    assert_eq!(
+        verdict(
+            &full(),
+            false,
+            &[],
+            &in_folder(delete("/Users/sarah/old"), "/Users/sarah")
+        ),
+        once(Why::CantBeUndone)
+    );
+    // Scratch space is like its own folder.
+    assert_eq!(
+        verdict(&full(), false, &[], &call(delete("/private/tmp/x"))),
+        run()
+    );
+    assert_eq!(
+        verdict(
+            &full(),
+            false,
+            &[],
+            &call(exec("rm -rf /private/tmp/x", ACME))
+        ),
+        run()
+    );
+}
+
 #[test]
 fn rule_5_an_agent_that_asks_never_skips_the_list_and_nothing_else() {
     let mut never = full();

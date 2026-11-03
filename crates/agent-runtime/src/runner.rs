@@ -5998,6 +5998,7 @@ impl AgentRunner {
                                         let policy = Arc::clone(&self.policy);
                                         let access = Arc::clone(&access_snapshot);
                                         let computer = self.config.computer_gate.clone();
+                                        let answered = prompt.request_id.clone();
                                         join_set.spawn(async move {
                                             let decision = await_approval(
                                                 ApprovalAsk {
@@ -6016,7 +6017,7 @@ impl AgentRunner {
                                                 SELF_SERVE_APPROVAL_TIMEOUT,
                                             )
                                             .await;
-                                            crate::tools::computer::settle(
+                                            crate::tools::computer::settle_answered(
                                                 computer.as_deref(),
                                                 &tool_name,
                                                 decided.as_ref(),
@@ -6029,7 +6030,7 @@ impl AgentRunner {
                                                         crate::tools::computer::refused_as(refusal)
                                                     }
                                                 },
-                                                None,
+                                                &answered,
                                             );
                                             match decision.verdict() {
                                                 Err(refusal) => {

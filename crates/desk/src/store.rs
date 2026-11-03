@@ -28,6 +28,9 @@ pub fn build_pool(config: &PostgresConfig) -> Result<PostgresPool, PostgresError
 
 pub struct DeskStore {
     pool: PostgresPool,
+    /// Bumped by every change to the kill switch or grants, so what reads
+    /// them per call can keep what it read until they change.
+    pub(crate) access_version: std::sync::atomic::AtomicU64,
 }
 
 impl DeskStore {
@@ -36,7 +39,10 @@ impl DeskStore {
     pub async fn connect(config: &PostgresConfig) -> Result<Self> {
         let pool = build_pool(config).context("building desk pool")?;
         Self::migrate(&pool).await?;
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            access_version: Default::default(),
+        })
     }
 
     pub async fn migrate(pool: &PostgresPool) -> Result<()> {
@@ -49,7 +55,10 @@ impl DeskStore {
     /// A store on `pool`, its migrations applied.
     pub async fn with_pool(pool: PostgresPool) -> Result<Self> {
         Self::migrate(&pool).await?;
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            access_version: Default::default(),
+        })
     }
 
     pub(crate) fn pool(&self) -> &PostgresPool {
@@ -58,7 +67,10 @@ impl DeskStore {
 
     #[cfg(test)]
     pub(crate) fn from_pool(pool: PostgresPool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            access_version: Default::default(),
+        }
     }
 
     pub async fn all(&self) -> Result<Vec<SessionRecord>> {

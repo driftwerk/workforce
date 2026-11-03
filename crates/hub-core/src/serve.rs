@@ -2704,7 +2704,9 @@ impl AgentService {
     /// What this agent may do on the person's computer, when the hub runs
     /// `[desk]` and installed [`install_computer_gates`]; `None` elsewhere.
     pub fn computer_gate(&self) -> Option<Arc<dyn workforce_agent::tools::computer::ComputerGate>> {
-        computer_gate_for(&ComputerSubject {
+        // Nothing to build on a hub that installed no gates.
+        let gates = COMPUTER_GATES.get()?;
+        gates(&ComputerSubject {
             agent: self.agent_id.to_string(),
             name: self.display_name(),
             workspace: self.workspace.clone(),
