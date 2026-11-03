@@ -61,6 +61,8 @@ pub struct HubSkillToolInvoker {
     handle: tokio::runtime::Handle,
     rate_limit_backoff: std::time::Duration,
     adapter_loader: Option<AdapterLoader>,
+    /// Which connectors' tools the agent's `[skills]` hides (a `[desk]` hub).
+    connectors: Option<Arc<dyn workforce_agent::tools::access::ToolAccess>>,
 }
 
 impl HubSkillToolInvoker {
@@ -79,7 +81,18 @@ impl HubSkillToolInvoker {
             handle,
             rate_limit_backoff: RATE_LIMIT_BACKOFF,
             adapter_loader: None,
+            connectors: None,
         }
+    }
+
+    /// Refuses a skill's inner call to a connector the agent's `[skills]`
+    /// turns off, or a write to one it makes read only.
+    pub fn with_connector_access(
+        mut self,
+        access: Option<Arc<dyn workforce_agent::tools::access::ToolAccess>>,
+    ) -> Self {
+        self.connectors = access;
+        self
     }
 }
 
@@ -318,6 +331,13 @@ impl HubSkillToolInvoker {
             "skill tool invocation dispatched"
         );
 
+        if let Some(reason) = self
+            .connectors
+            .as_ref()
+            .and_then(|c| c.snapshot().block_reason(tool).map(str::to_string))
+        {
+            return envelope(false, Value::Null, Some(reason));
+        }
         let Some(registered) = self.resolve(tool) else {
             return envelope(
                 false,
@@ -477,6 +497,52 @@ mod tests {
             tool: tool.into(),
             description: "test".into(),
             allowed_hosts: hosts.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    /// On a `[desk]` hub, a skill's inner call reaches a connector only as
+    /// the agent's own `[skills]` lets the agent itself.
+    #[tokio::test]
+    async fn a_skill_reaches_no_connector_the_agents_skills_turn_off() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path()
+                .join(workforce_common::config_files::WORKSPACE_CONFIG),
+            "[skills]\nenabled = []\n",
+        )
+        .unwrap();
+        let registry = Arc::new(ToolRegistry::new());
+        registry.register(Arc::new(Named("linear.issue_get")));
+        let access = crate::connector_access::ConnectorToolAccess::policy(
+            dir.path().to_path_buf(),
+            Arc::clone(&registry),
+        );
+        let invoker = invoker_with(Arc::clone(&registry)).with_connector_access(Some(access));
+        let out = invoker
+            .run(&ctx(), "linear.issue_get", serde_json::json!({}))
+            .await;
+        assert_eq!(out["success"], serde_json::json!(false), "{out}");
+        assert!(
+            out.to_string().contains("linear is off for this agent"),
+            "{out}"
+        );
+    }
+
+    struct Named(&'static str);
+
+    #[async_trait]
+    impl Tool for Named {
+        fn name(&self) -> &str {
+            self.0
+        }
+        fn description(&self) -> &str {
+            ""
+        }
+        fn input_schema(&self) -> Value {
+            serde_json::json!({ "type": "object" })
+        }
+        async fn execute(&self, _: Value) -> eyre::Result<ToolResult> {
+            Ok(ToolResult::success(serde_json::json!({ "ran": true }), 0))
         }
     }
 

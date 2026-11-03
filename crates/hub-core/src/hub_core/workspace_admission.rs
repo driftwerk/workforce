@@ -130,19 +130,43 @@ impl WorkspaceAdmission {
     fn review(&self, workspace: &AgentWorkspaceConfig) -> Result<Vec<Finding>, ConfigRefusal> {
         workspace.oversight().map_err(ConfigRefusal::Said)?;
         workspace.computer().map_err(ConfigRefusal::Said)?;
+        let connectors = self.connectors(workspace)?;
         let prospective = self
             .prospective(Some(workspace))
             .map_err(|e| ConfigRefusal::Parse(e.to_string()))?;
-        let findings = review_agent_llm(
+        let mut findings = review_agent_llm(
             &prospective.effective,
             &prospective.next,
             &Install::of(&self.config),
         );
+        findings.extend(connectors);
         if findings.iter().any(Finding::is_refused) {
             Err(ConfigRefusal::Refused(findings))
         } else {
             Ok(findings)
         }
+    }
+
+    /// What the agent's `[skills]` says. Only a `[desk]` hub reads it, so
+    /// only there is a malformed one refused; elsewhere it is ignored as it
+    /// always was, and an empty `enabled`, which would turn every connector
+    /// off on a `[desk]` hub, is said so nobody is surprised by it later.
+    fn connectors(&self, workspace: &AgentWorkspaceConfig) -> Result<Vec<Finding>, ConfigRefusal> {
+        let read = workspace.connectors();
+        if self.config.desk.enabled {
+            return read.map(|_| Vec::new()).map_err(ConfigRefusal::Said);
+        }
+        Ok(match read {
+            Ok(binding) if binding.enabled.as_ref().is_some_and(Vec::is_empty) => {
+                vec![Finding::warning(
+                    "skills",
+                    "[skills] enabled = [] turns every connector off, but only on a hub \
+                     running Desk; this hub ignores it."
+                        .into(),
+                )]
+            }
+            _ => Vec::new(),
+        })
     }
 
     /// [`Self::review`] of a `config.toml` body, parsed as boot reads it.
@@ -227,6 +251,42 @@ mod tests {
         let unchanged: AgentWorkspaceConfig = AgentWorkspaceConfig::parse("").unwrap();
         assert!(unchanged.computer.is_none());
         assert!(!toml::to_string(&unchanged).unwrap().contains("computer"));
+    }
+
+    /// `[skills]` is checked only where it is read: a `[desk]` hub refuses a
+    /// malformed one in plain words; any other hub admits what it admitted
+    /// before, and only says that `enabled = []` does nothing there.
+    #[test]
+    fn skills_are_checked_on_a_desk_hub_and_left_alone_elsewhere() {
+        let admission = |desk: bool| {
+            let mut config = WorkforceConfig::default();
+            config.desk.enabled = desk;
+            WorkspaceAdmission::new(
+                Arc::new(config),
+                "allan",
+                Arc::new(parking_lot::RwLock::new("anthropic".to_string())),
+            )
+        };
+        let (desk, server) = (admission(true), admission(false));
+        for ok in [
+            "",
+            "[skills]\nenabled = [\"linear\"]\nread_only = [\"linear\"]\nown_credential = [\"linear\"]\n",
+        ] {
+            assert!(desk.review_toml(ok).unwrap().is_empty(), "{ok}");
+            assert!(server.review_toml(ok).unwrap().is_empty(), "{ok}");
+        }
+        let malformed = "[skills]\nenabled = \"linear\"\n";
+        assert!(matches!(
+            desk.review_toml(malformed),
+            Err(ConfigRefusal::Said(_))
+        ));
+        assert!(server.review_toml(malformed).unwrap().is_empty());
+
+        let none = "[skills]\nenabled = []\n";
+        assert!(desk.review_toml(none).unwrap().is_empty());
+        let said = server.review_toml(none).unwrap();
+        assert_eq!(said.len(), 1);
+        assert_eq!(said[0].severity, Severity::Warning);
     }
 
     #[test]

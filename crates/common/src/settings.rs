@@ -7490,6 +7490,11 @@ pub struct AgentWorkspaceConfig {
     /// plain words.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub computer: Option<toml::Value>,
+    /// Per-agent `[skills]`: which connectors reach this agent, read only on
+    /// a hub with `[desk]`. Kept as written and read by
+    /// [`crate::connector_binding`]; absent, every connector does, as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skills: Option<toml::Value>,
 }
 
 impl AgentWorkspaceConfig {
@@ -7497,6 +7502,12 @@ impl AgentWorkspaceConfig {
     /// none, or what is wrong with it.
     pub fn computer(&self) -> Result<workforce_core::computer::ComputerAccess, String> {
         crate::computer_access::of(self.computer.as_ref())
+    }
+
+    /// This agent's connectors, every one where it has no `[skills]`, or
+    /// what is wrong with it.
+    pub fn connectors(&self) -> Result<crate::connector_binding::ConnectorBinding, String> {
+        crate::connector_binding::of(self.skills.as_ref())
     }
 
     /// This agent's `[oversight]`, its defaults (off) where it has none, or

@@ -53,6 +53,7 @@ pub mod compaction_tool;
 pub mod conclusion_review;
 pub mod config_tool;
 pub mod config_writer;
+pub mod connector_access;
 pub mod consolidation_runtime;
 pub mod context_fuse_tool;
 pub mod context_tool;
