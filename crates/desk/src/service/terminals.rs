@@ -654,6 +654,9 @@ impl Desk {
             closing: false,
             codex_asks: Vec::new(),
             codex_sent: HashMap::new(),
+            held: None,
+            open_question: None,
+            codex_question: None,
             breaker: Default::default(),
         };
         if existing.is_some_and(|id| self.0.state.lock().live.contains_key(&id)) {
@@ -776,6 +779,9 @@ impl Desk {
                             closing: false,
                             codex_asks: Vec::new(),
                             codex_sent: HashMap::new(),
+                            held: None,
+                            open_question: None,
+                            codex_question: None,
                             breaker: Default::default(),
                         },
                     );

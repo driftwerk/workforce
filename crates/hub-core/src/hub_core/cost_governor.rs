@@ -40,7 +40,8 @@ pub trait Ceilings: Send + Sync {
     /// Why the agent's turns are held now, while they are.
     fn held(&self, agent_id: &str) -> Option<String>;
     /// Where it stands against its budgets: whether its next turn runs.
-    fn stand(&self, agent_id: &str, standings: Vec<Standing>) -> Verdict;
+    /// `preflight`: asked before a scheduled run, which says no warning.
+    fn stand(&self, agent_id: &str, standings: Vec<Standing>, preflight: bool) -> Verdict;
 }
 
 /// What [`Ceilings::stand`] decides.
@@ -73,6 +74,9 @@ pub enum Admission {
     Warn(String),
     /// A ceiling is reached; the turn must not run.
     Deny(String),
+    /// The person's budget on Desk holds the agent until they say Continue
+    /// (or the period ends): not a failure of the work, which waits.
+    Held(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -133,7 +137,7 @@ pub struct CostGovernor {
     spend: Mutex<HashMap<Scope, (Instant, f64)>>,
     warned: Mutex<HashSet<(Scope, NaiveDate)>>,
     /// The ceilings this governor alone reads (tests); else the hub's.
-    ceilings: Option<Arc<dyn Ceilings>>,
+    ceilings: std::sync::RwLock<Option<Arc<dyn Ceilings>>>,
     /// Each agent's use since a period began, every billing: (usd, tokens).
     used: Mutex<HashMap<(String, Period), (Instant, Use)>>,
 }
@@ -167,19 +171,28 @@ impl CostGovernor {
             override_cache: Mutex::new(None),
             spend: Mutex::new(HashMap::new()),
             warned: Mutex::new(HashSet::new()),
-            ceilings: None,
+            ceilings: std::sync::RwLock::new(None),
             used: Mutex::new(HashMap::new()),
         }
     }
 
     /// This governor with `ceilings` in place of the hub's.
-    pub fn with_ceilings(mut self, ceilings: Arc<dyn Ceilings>) -> Self {
-        self.ceilings = Some(ceilings);
+    pub fn with_ceilings(self, ceilings: Arc<dyn Ceilings>) -> Self {
+        self.use_ceilings(ceilings);
         self
     }
 
+    /// Reads `ceilings` from now on, in place of the hub's.
+    pub fn use_ceilings(&self, ceilings: Arc<dyn Ceilings>) {
+        *self.ceilings.write().expect("ceilings lock") = Some(ceilings);
+    }
+
     fn ceilings(&self) -> Option<Arc<dyn Ceilings>> {
-        self.ceilings.clone().or_else(|| CEILINGS.get().cloned())
+        self.ceilings
+            .read()
+            .expect("ceilings lock")
+            .clone()
+            .or_else(|| CEILINGS.get().cloned())
     }
 
     /// What `agent_id` used since `period` began, every billing counted;
@@ -212,15 +225,13 @@ impl CostGovernor {
 
     /// The person's budgets for `agent_id`, through the installed
     /// ceilings: a hold refuses the turn; nothing installed, nothing said.
-    fn ceiling_admission(&self, agent_id: &str) -> Admission {
+    fn ceiling_admission(&self, agent_id: &str, preflight: bool) -> Admission {
         let Some(ceilings) = self.ceilings() else {
             return Admission::Proceed;
         };
-        if let Some(why) = ceilings.held(agent_id) {
-            return Admission::Deny(why);
-        }
+        let held = ceilings.held(agent_id);
         let budgets = ceilings.budgets(agent_id);
-        if budgets.is_empty() {
+        if budgets.is_empty() && held.is_none() {
             return Admission::Proceed;
         }
         let now = Utc::now();
@@ -241,14 +252,16 @@ impl CostGovernor {
                 }
                 Err(e) => {
                     warn!(error = %e, agent = %agent_id, "Agent use lookup failed — admitting turn");
-                    return Admission::Proceed;
+                    // What already holds it still does.
+                    return held.map_or(Admission::Proceed, Admission::Held);
                 }
             }
         }
-        match ceilings.stand(agent_id, standings) {
+        // Stood every time, held or not: a hold lapses when its period ends.
+        match ceilings.stand(agent_id, standings, preflight) {
             Verdict::Proceed => Admission::Proceed,
             Verdict::Warn(w) => Admission::Warn(w),
-            Verdict::Held(why) => Admission::Deny(why),
+            Verdict::Held(why) => Admission::Held(why),
         }
     }
 
@@ -312,22 +325,38 @@ impl CostGovernor {
     /// The first breached ceiling wins; warnings are collected only when
     /// nothing denies.
     pub fn admit_turn(&self, agent_id: &str, identity: Option<&str>) -> Admission {
+        self.admit(agent_id, identity, false)
+    }
+
+    /// What [`Self::admit_turn`] would decide, asked before a scheduled run:
+    /// holds and refuses as the turn would, but says no warning (the turn
+    /// says it, once).
+    pub fn preflight(&self, agent_id: &str, identity: Option<&str>) -> Admission {
+        self.admit(agent_id, identity, true)
+    }
+
+    fn admit(&self, agent_id: &str, identity: Option<&str>, preflight: bool) -> Admission {
         // The person's budgets on Desk hold whatever `[budget]` says.
-        let ceiling = self.ceiling_admission(agent_id);
-        if let Admission::Deny(_) = ceiling {
+        let ceiling = self.ceiling_admission(agent_id, preflight);
+        if let Admission::Held(_) = ceiling {
             return ceiling;
         }
         // Each warning is said once a period: both are kept.
-        match (ceiling, self.admit_by_config(agent_id, identity)) {
+        match (
+            ceiling,
+            self.admit_by_config(agent_id, identity, !preflight),
+        ) {
             (_, Admission::Deny(why)) => Admission::Deny(why),
+            (_, Admission::Held(why)) => Admission::Held(why),
             (Admission::Warn(a), Admission::Warn(b)) => Admission::Warn(format!("{a} {b}")),
             (Admission::Warn(a), Admission::Proceed) => Admission::Warn(a),
-            (Admission::Proceed | Admission::Deny(_), decided) => decided,
+            (Admission::Proceed | Admission::Deny(_) | Admission::Held(_), decided) => decided,
         }
     }
 
-    /// `[budget]`'s rules, unchanged.
-    fn admit_by_config(&self, agent_id: &str, identity: Option<&str>) -> Admission {
+    /// `[budget]`'s rules, unchanged; `warn` false says no warning (and
+    /// keeps today's for later).
+    fn admit_by_config(&self, agent_id: &str, identity: Option<&str>, warn: bool) -> Admission {
         if !self.cfg.enabled {
             return Admission::Proceed;
         }
@@ -366,7 +395,10 @@ impl CostGovernor {
             if spent >= limit {
                 return Admission::Deny(deny_message(&scope, spent, limit));
             }
-            if spent >= limit * self.cfg.soft_warn_ratio && self.first_warning_today(&scope, day) {
+            if warn
+                && spent >= limit * self.cfg.soft_warn_ratio
+                && self.first_warning_today(&scope, day)
+            {
                 warning.get_or_insert_with(|| warn_message(&scope, spent, limit));
             }
         }
@@ -679,7 +711,7 @@ mod tests {
         fn held(&self, _: &str) -> Option<String> {
             None
         }
-        fn stand(&self, _: &str, standings: Vec<Standing>) -> Verdict {
+        fn stand(&self, _: &str, standings: Vec<Standing>, _: bool) -> Verdict {
             let over = standings.iter().any(|s| s.status == budget::Status::Over);
             *self.stood.lock().unwrap() = standings;
             match over {
@@ -731,7 +763,7 @@ mod tests {
         let g = governor(off, &[plan]).with_ceilings(ceilings.clone());
         assert_eq!(
             g.admit_turn("a", None),
-            Admission::Deny("Atlas is over its day budget.".into())
+            Admission::Held("Atlas is over its day budget.".into())
         );
         let stood = ceilings.stood.lock().unwrap().clone();
         assert_eq!(stood.len(), 2);

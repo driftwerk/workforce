@@ -232,6 +232,9 @@ impl UserAwareVault {
 pub struct LayeredUserVault {
     agent_vault: Arc<Vault>,
     global_vault: Option<Arc<Vault>>,
+    /// Which tiers a connector's reads may come from for this agent (a
+    /// `[desk]` hub's `[skills]`); `None`, or an empty slot, is all four.
+    pins: Option<Arc<workforce_common::credential_pin::PinSlot>>,
 }
 
 impl LayeredUserVault {
@@ -239,7 +242,23 @@ impl LayeredUserVault {
         Self {
             agent_vault,
             global_vault,
+            pins: None,
         }
+    }
+
+    /// This store, its reads pinned by `pins` as they are filled. Writes are
+    /// never pinned.
+    pub fn with_pins(mut self, pins: Arc<workforce_common::credential_pin::PinSlot>) -> Self {
+        self.pins = Some(pins);
+        self
+    }
+
+    fn pin(&self, path: &str) -> workforce_common::credential_pin::TierPin {
+        self.pins
+            .as_ref()
+            .map_or(workforce_common::credential_pin::TierPin::All, |p| {
+                p.pin(path)
+            })
     }
 
     fn user_key(path: &str) -> Option<String> {
@@ -251,11 +270,17 @@ impl LayeredUserVault {
     /// (`user-workspace > user-flat > agent-workspace > agent-flat`) lives in
     /// one place.
     pub fn get_github_pat(&self, owner: &str) -> Option<String> {
-        resolve_github_pat(
-            Some(self.agent_vault.as_ref()),
-            self.global_vault.as_deref(),
-            owner,
-        )
+        use workforce_common::credential_pin::TierPin;
+        let (agent, global) = match self.pin(GITHUB_FLAT_TOKEN) {
+            TierPin::All => (
+                Some(self.agent_vault.as_ref()),
+                self.global_vault.as_deref(),
+            ),
+            TierPin::Mine => (None, self.global_vault.as_deref()),
+            TierPin::Own => (Some(self.agent_vault.as_ref()), None),
+            TierPin::Nothing => return None,
+        };
+        resolve_github_pat(agent, global, owner)
     }
 
     /// `(tier, vault, physical_key)` triples in resolution order for `path`,
@@ -265,11 +290,14 @@ impl LayeredUserVault {
         &self,
         path: &str,
     ) -> Vec<(workforce_common::settings::VaultSource, &Vault, String)> {
-        layered_tiers(
+        let pin = self.pin(path);
+        let mut tiers = layered_tiers(
             Some(self.agent_vault.as_ref()),
             self.global_vault.as_deref(),
             path,
-        )
+        );
+        tiers.retain(|(tier, _, _)| pin.admits(*tier));
+        tiers
     }
 
     /// Map a (path, tier) write target to `(vault, physical_key)`. Per-user
@@ -347,6 +375,40 @@ impl LayeredUserVault {
         }
     }
 
+    /// Where an unaddressed write of `path` lands. Unpinned, the default
+    /// tier. Pinned to a connection, the tier the value is read from now, else
+    /// the first the pin reads, so a refreshed token stays in the connection
+    /// it came from: one agent's own never lands in the person's shared slot.
+    /// A connector that is off takes no writes.
+    fn write_tier(&self, path: &str) -> eyre::Result<workforce_common::settings::VaultSource> {
+        use workforce_common::credential_pin::TierPin;
+        use workforce_common::settings::VaultSource;
+        let pin = self.pin(path);
+        match pin {
+            TierPin::All => return Ok(self.default_write_tier(path)),
+            TierPin::Nothing => {
+                return Err(eyre::eyre!(
+                    "`{path}` belongs to a connector that is off for this agent, so nothing was written"
+                ))
+            }
+            TierPin::Own | TierPin::Mine => {}
+        }
+        if let Some((tier, _, _)) = self
+            .tiers_in_order_for(path)
+            .into_iter()
+            .find(|(_, vault, key)| vault.get(key).is_some())
+        {
+            return Ok(tier);
+        }
+        let person = Self::user_key(path).is_some();
+        Ok(match (pin, person) {
+            (TierPin::Own, true) => VaultSource::AgentPerUser,
+            (TierPin::Own, false) => VaultSource::AgentSpecific,
+            (_, true) => VaultSource::GlobalPerUser,
+            (_, false) => VaultSource::Global,
+        })
+    }
+
     /// List entries at a user-scoped tier (T1/T2). `prefix` is the bare
     /// logical prefix; the per-user `users/{uid}/` segment is added before
     /// the list and stripped from the results.
@@ -405,7 +467,7 @@ impl workforce_common::settings::SecretStore for LayeredUserVault {
         value: &str,
         actor: workforce_common::settings::VaultActor<'_>,
     ) -> eyre::Result<()> {
-        let tier = self.default_write_tier(path);
+        let tier = self.write_tier(path)?;
         self.set_at_tier(path, value, tier, actor)
     }
 
@@ -454,11 +516,16 @@ impl workforce_common::settings::SecretStore for LayeredUserVault {
     }
 
     fn get_user_override(&self, path: &str) -> Option<String> {
-        user_override_layered(
-            Some(self.agent_vault.as_ref()),
-            self.global_vault.as_deref(),
-            path,
-        )
+        use workforce_common::settings::VaultSource;
+        let pin = self.pin(path);
+        let agent = pin
+            .admits(VaultSource::AgentPerUser)
+            .then_some(self.agent_vault.as_ref());
+        let global = self
+            .global_vault
+            .as_deref()
+            .filter(|_| pin.admits(VaultSource::GlobalPerUser));
+        user_override_layered(agent, global, path)
     }
 
     fn set_at_tier(
@@ -487,6 +554,9 @@ impl workforce_common::settings::SecretStore for LayeredUserVault {
         tier: workforce_common::settings::VaultSource,
     ) -> Vec<(String, workforce_common::settings::VaultEntry)> {
         use workforce_common::settings::VaultSource;
+        if !self.pin(prefix.unwrap_or_default()).admits(tier) {
+            return Vec::new();
+        }
         let user_prefix = current_identity_id().map(|uid| format!("{USER_PREFIX}{uid}/"));
         match tier {
             VaultSource::AgentPerUser => {
@@ -511,7 +581,7 @@ impl workforce_common::settings::SecretStore for LayeredUserVault {
         let targets = entries
             .iter()
             .map(|&(path, value)| {
-                self.resolve_write(path, self.default_write_tier(path))
+                self.resolve_write(path, self.write_tier(path)?)
                     .map(|(vault, key)| (vault, key, value))
             })
             .collect::<eyre::Result<Vec<_>>>()?;
@@ -533,7 +603,8 @@ impl workforce_common::settings::SecretStore for LayeredUserVault {
     }
 
     fn write_location(&self, path: &str) -> String {
-        self.resolve_write(path, self.default_write_tier(path))
+        self.write_tier(path)
+            .and_then(|tier| self.resolve_write(path, tier))
             .map_or_else(
                 |_| path.to_string(),
                 |(vault, key)| vault.write_location(&key),

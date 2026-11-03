@@ -69,6 +69,8 @@ pub(crate) fn install_desk_for_test(desk: Desk) -> bool {
 /// every agent at boot and for agents spawned later.
 pub fn register_tools(service: &AgentService) {
     let Some(desk) = DESK.get() else { return };
+    // Its connectors read their keys from the tiers its `[skills]` names.
+    crate::connector_pins::pin(service);
     for tool in DeskTool::all(desk) {
         if !service.tools.has(workforce_agent::tools::Tool::name(&tool)) {
             service.tools.register(Arc::new(tool));
@@ -614,6 +616,8 @@ pub async fn mount(
     let desk = Desk::start(store, options(config), floor, cancel)
         .await
         .context("starting desk sessions")?;
+    // Budgets' days are the person's, as the cost governor counts them.
+    desk.count_budgets_in(config.user_timezone());
     if DESK.set(desk.clone()).is_err() {
         eyre::bail!("desk sessions started twice");
     }

@@ -441,6 +441,7 @@ fn wait_of(session: Uuid, p: &PendingApproval) -> Wait {
             },
             (_, false) => Answer::Terminal,
         },
+        options: p.options.clone(),
     }
 }
 
@@ -495,6 +496,7 @@ mod tests {
             answerable: true,
             choices: Vec::new(),
             why: None,
+            options: None,
         }
     }
 
@@ -1123,6 +1125,7 @@ mod tests {
             answerable: true,
             choices: Vec::new(),
             why: None,
+            options: None,
         };
         for t in [
             Transition::Finished { reply: "" },

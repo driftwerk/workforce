@@ -158,7 +158,7 @@ async fn a_loop_is_steered_in_its_turn_and_held_from_the_next_until_the_person_s
         assert!(denied(&refused), "{refused}");
         assert!(refused.pointer("/hookSpecificOutput/permissionDecisionReason").unwrap().as_str().unwrap().contains("Continue"));
         // The person typing to it lets it go on.
-        post(&d, s.id, prompt()).await;
+        post(&d, s.id, json!({"hook_event_name": "UserPromptSubmit", "prompt": "try another way"})).await;
         assert_eq!(post(&d, s.id, tool("ls")).await, json!({}));
         assert!(d.breaker_needs().is_empty());
     })
@@ -304,6 +304,111 @@ async fn a_budget_for_a_group_that_isnt_there_is_refused() {
     .await;
 }
 
+/// A session held by a loop, its turn over: what follows is a new turn.
+async fn held_session(d: &Desk, dir: &std::path::Path) -> Uuid {
+    d.set_breaker_rules(Rules { loops: true }).await.unwrap();
+    let s = new_session(d, dir).await;
+    post(d, s.id, prompt()).await;
+    for _ in 0..12 {
+        post(d, s.id, tool("cargo test")).await;
+    }
+    post(d, s.id, stop()).await;
+    assert_eq!(d.breaker_needs().len(), 1);
+    s.id
+}
+
+#[tokio::test]
+async fn only_words_the_person_typed_let_a_held_session_go_on() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let id = held_session(&d, dir.path()).await;
+        // No one named is not the person.
+        assert!(matches!(
+            d.prompt(id, "go on", None),
+            Err(DeskError::Conflict(_))
+        ));
+        // What Desk typed for someone else, heard as the session's prompt.
+        d.breaker_typed(id, "keep going", Some(&agent()));
+        post(
+            &d,
+            id,
+            json!({"hook_event_name": "UserPromptSubmit", "prompt": "keep going"}),
+        )
+        .await;
+        assert!(
+            denied(&post(&d, id, tool("ls")).await),
+            "an agent's words hold on"
+        );
+        // The same words again (a loop, a schedule).
+        post(
+            &d,
+            id,
+            json!({"hook_event_name": "UserPromptSubmit", "prompt": "keep going"}),
+        )
+        .await;
+        assert!(denied(&post(&d, id, tool("ls")).await), "a repeat holds on");
+        assert_eq!(d.breaker_needs().len(), 1);
+        // The person's own words.
+        post(
+            &d,
+            id,
+            json!({"hook_event_name": "UserPromptSubmit", "prompt": "fine, fix the test"}),
+        )
+        .await;
+        assert_eq!(post(&d, id, tool("ls")).await, json!({}));
+        assert!(d.breaker_needs().is_empty());
+        let mut continued = Vec::new();
+        for _ in 0..100 {
+            continued = d
+                .activity(crate::crew::Filter::All, None, 50)
+                .await
+                .unwrap()
+                .events
+                .into_iter()
+                .filter(|e| e.kind == crate::crew::Kind::Continued)
+                .collect();
+            if !continued.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(continued.len(), 1);
+        assert_eq!(continued[0].actor.kind, crate::crew::PartyKind::You);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn no_one_but_the_person_resumes_or_restarts_a_held_session() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let id = held_session(&d, dir.path()).await;
+        assert!(matches!(
+            d.restart(id, Some(crate::engine_accounts::CONTINUE.into()), agent())
+                .await,
+            Err(DeskError::Conflict(_))
+        ));
+        let crew = By {
+            party: Party::manager("desk", "Desk"),
+            reason: None,
+            suggestion_id: None,
+            hop: 0,
+        };
+        assert!(matches!(
+            d.restart(id, None, crew.clone()).await,
+            Err(DeskError::Conflict(_))
+        ));
+        assert!(matches!(
+            d.resume(id, Some("go".into()), Some(crew)).await,
+            Err(DeskError::Conflict(_))
+        ));
+        assert_eq!(d.breaker_needs().len(), 1, "still held");
+    })
+    .await;
+}
+
 /// Two agents' use, every billing.
 struct Agents;
 
@@ -348,9 +453,11 @@ async fn an_agent_over_its_budget_has_its_next_turns_held_until_continue() {
                 now + chrono::Duration::hours(1),
             )]
         };
-        assert!(matches!(d.agent_stand("atlas", "Atlas", over(6.6)), super::AgentVerdict::Warn(w) if w == "Atlas has used 82% of its day budget ($6.60 of $8)."));
-        assert_eq!(d.agent_stand("atlas", "Atlas", over(7.0)), super::AgentVerdict::Proceed, "told once");
-        let super::AgentVerdict::Held(why) = d.agent_stand("atlas", "Atlas", over(8.4)) else {
+        // A scheduled run asking first says no warning, and leaves it for the turn.
+        assert_eq!(d.agent_stand("atlas", "Atlas", over(6.6), true), super::AgentVerdict::Proceed);
+        assert!(matches!(d.agent_stand("atlas", "Atlas", over(6.6), false), super::AgentVerdict::Warn(w) if w == "Atlas has used 82% of its day budget ($6.60 of $8)."));
+        assert_eq!(d.agent_stand("atlas", "Atlas", over(7.0), false), super::AgentVerdict::Proceed, "told once");
+        let super::AgentVerdict::Held(why) = d.agent_stand("atlas", "Atlas", over(8.4), false) else {
             panic!("over its budget")
         };
         assert!(why.starts_with("Atlas is at 105% of its day budget ($8.40 of $8)."), "{why}");
@@ -359,7 +466,7 @@ async fn an_agent_over_its_budget_has_its_next_turns_held_until_continue() {
         assert!(d.agent_held("atlas").is_some());
         d.breaker_continue(&super::agent_subject("atlas"), By::you()).unwrap();
         assert!(d.agent_held("atlas").is_none());
-        assert_eq!(d.agent_stand("atlas", "Atlas", over(9.0)), super::AgentVerdict::Proceed);
+        assert_eq!(d.agent_stand("atlas", "Atlas", over(9.0), false), super::AgentVerdict::Proceed);
     })
     .await;
 }
@@ -377,6 +484,40 @@ async fn agents_use_counts_toward_desks_total() {
         assert_eq!(view.budgets[0].standing.as_ref().unwrap().used, 9.0);
         d.breaker_spend(None).await;
         assert_eq!(d.breaker_needs().len(), 1, "at 90%, new starts are held");
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn an_agents_hold_lapses_when_its_period_ends() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let own = d
+            .put_budget(budget(BudgetScope::Agent("atlas".into()), 8.0), By::you())
+            .await
+            .unwrap();
+        let ended = Utc::now() - chrono::Duration::minutes(1);
+        let at = |used, from: chrono::DateTime<Utc>, to| {
+            vec![workforce_core::budget::standing_of(&own, used, from, to)]
+        };
+        // Held over a period that has since ended.
+        assert!(matches!(
+            d.agent_stand(
+                "atlas",
+                "Atlas",
+                at(9.0, ended - chrono::Duration::days(1), ended),
+                true
+            ),
+            super::AgentVerdict::Held(_)
+        ));
+        let today = (ended, ended + chrono::Duration::days(1));
+        assert_eq!(
+            d.agent_stand("atlas", "Atlas", at(0.5, today.0, today.1), true),
+            super::AgentVerdict::Proceed,
+            "a new day, under its budget"
+        );
+        assert!(d.agent_held("atlas").is_none());
     })
     .await;
 }

@@ -29,12 +29,12 @@ impl Ceilings for DeskCeilings {
         self.desk.agent_held(agent_id)
     }
 
-    fn stand(&self, agent_id: &str, standings: Vec<Standing>) -> Verdict {
+    fn stand(&self, agent_id: &str, standings: Vec<Standing>, preflight: bool) -> Verdict {
         let name = self
             .registry
             .get(agent_id)
             .map_or_else(|| agent_id.to_string(), |s| crate::desk_crew::name_of(&s));
-        match self.desk.agent_stand(agent_id, &name, standings) {
+        match self.desk.agent_stand(agent_id, &name, standings, preflight) {
             AgentVerdict::Proceed => Verdict::Proceed,
             AgentVerdict::Warn(w) => Verdict::Warn(w),
             AgentVerdict::Held(why) => Verdict::Held(why),

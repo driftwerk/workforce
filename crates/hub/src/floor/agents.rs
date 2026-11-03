@@ -257,6 +257,7 @@ impl Heard {
                         request_id: request_id.to_string(),
                     },
                 },
+                options: None,
             },
         });
     }

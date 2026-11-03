@@ -35,7 +35,9 @@ const TOOL_EVENTS: [&str; 5] = [
     "PreToolUse",
     "PermissionRequest",
     "PostToolUse",
-    // A tool call failed: what Desk's breaker counts as errors.
+    // A tool that failed ends too. A question or plan turned down in its
+    // dialog fires none (it ends in the permission phase): `idle_prompt`
+    // says so.
     "PostToolUseFailure",
     // Auto mode refused a tool: the turn may end stuck on it.
     "PermissionDenied",
@@ -116,6 +118,8 @@ struct Payload {
     prompt: Option<String>,
     tool_name: Option<String>,
     tool_input: Option<Value>,
+    tool_use_id: Option<String>,
+    is_interrupt: Option<bool>,
     notification_type: Option<String>,
     message: Option<String>,
     last_assistant_message: Option<String>,
@@ -124,7 +128,6 @@ struct Payload {
     reason: Option<String>,
     background_tasks: Option<Vec<BackgroundTask>>,
     error: Option<String>,
-    is_interrupt: Option<bool>,
 }
 
 /// One entry of a `Stop`'s `background_tasks`.
@@ -152,19 +155,32 @@ pub enum Hook {
         tool: String,
         call: Call,
     },
+    /// A tool that waits on the person until they answer it in the
+    /// terminal: a question it asks, its plan to approve. Its call's id,
+    /// when the CLI says, is what its end is matched by.
+    Question {
+        id: Option<String>,
+        question: Question,
+    },
     /// Auto mode refused a tool call.
     Denied(Denied),
     Permission {
         tool: String,
         detail: String,
     },
-    ToolEnd,
-    /// A tool call failed: the tool, and the error's first line.
-    ToolFailed {
-        tool: String,
-        error: String,
+    ToolEnd {
+        id: Option<String>,
+        /// Esc stopped it (`PostToolUseFailure` with `is_interrupt`).
+        interrupt: bool,
+        /// It failed (and not by Esc): the tool, and the error's first line,
+        /// for Desk's breaker.
+        failed: Option<String>,
     },
+    /// Back at its prompt with nothing on screen (`idle_prompt`).
+    AtPrompt,
     NeedsInput(String),
+    /// What a dialog asked was answered (an MCP server's request for input).
+    InputAnswered,
     Stop {
         transcript: Option<String>,
         reply: Option<String>,
@@ -189,6 +205,10 @@ pub fn parse_hook(body: &[u8]) -> eyre::Result<Hook> {
             p.tool_input.as_ref(),
         )
     };
+    let question = question_of(
+        p.tool_name.as_deref().unwrap_or_default(),
+        p.tool_input.as_ref(),
+    );
     Ok(match p.hook_event_name.as_str() {
         "SessionStart" => Hook::SessionStart {
             session_id: p.session_id,
@@ -204,6 +224,10 @@ pub fn parse_hook(body: &[u8]) -> eyre::Result<Hook> {
                 Hook::Woken
             }
             prompt => Hook::Prompt(prompt),
+        },
+        "PreToolUse" | "PermissionRequest" if question.is_some() => Hook::Question {
+            id: p.tool_use_id.clone(),
+            question: question.unwrap_or_default(),
         },
         "PreToolUse" => Hook::ToolStart {
             tool: tool().0,
@@ -221,16 +245,30 @@ pub fn parse_hook(body: &[u8]) -> eyre::Result<Hook> {
             let (tool, detail) = tool();
             Hook::Permission { tool, detail }
         }
-        "PostToolUse" => Hook::ToolEnd,
-        // The person pressing Esc ends a call as a failure: not one.
-        "PostToolUseFailure" if p.is_interrupt == Some(true) => Hook::Other,
-        "PostToolUseFailure" => Hook::ToolFailed {
-            tool: tool().0,
-            error: clip(p.error.as_deref().unwrap_or_default()),
+        "PostToolUse" | "PostToolUseFailure" => Hook::ToolEnd {
+            id: p.tool_use_id.clone(),
+            interrupt: p.is_interrupt == Some(true),
+            failed: (p.hook_event_name == "PostToolUseFailure" && p.is_interrupt != Some(true))
+                .then(|| {
+                    format!(
+                        "{}: {}",
+                        tool().0,
+                        clip(p.error.as_deref().unwrap_or_default())
+                    )
+                }),
         },
-        "Notification" if p.notification_type.as_deref() != Some("idle_prompt") => {
-            Hook::NeedsInput(p.message.unwrap_or_default())
-        }
+        "Notification" => match p.notification_type.as_deref() {
+            // An older CLI says no kind: a dialog, as it only notified then.
+            None => Hook::NeedsInput(p.message.unwrap_or_default()),
+            Some(kind) if WAITING_NOTICES.contains(&kind) => {
+                Hook::NeedsInput(p.message.unwrap_or_default())
+            }
+            Some(kind) if ANSWERED_NOTICES.contains(&kind) => Hook::InputAnswered,
+            Some("idle_prompt") => Hook::AtPrompt,
+            // Idle at its prompt (the turn's end says that), signed in,
+            // finished, and the like: nothing waits.
+            Some(_) => Hook::Other,
+        },
         "Stop" => Hook::Stop {
             transcript: p.transcript_path,
             reply: p.last_assistant_message.filter(|m| !m.trim().is_empty()),
@@ -254,6 +292,97 @@ pub fn parse_hook(body: &[u8]) -> eyre::Result<Hook> {
         "DeskUsage" => Hook::Usage(p.rate_limits.unwrap_or(Value::Null)),
         _ => Hook::Other,
     })
+}
+
+/// The `Notification` kinds that mean a dialog waits on the person, as
+/// Claude Code 2.1.317 names them. The rest (`idle_prompt`, `auth_success`,
+/// `agent_completed`, `computer_use_enter`, `quota_auto_resume_fired`, …)
+/// don't.
+const WAITING_NOTICES: [&str; 4] = [
+    "permission_prompt",
+    "elicitation_dialog",
+    "elicitation_url_dialog",
+    "worker_permission_prompt",
+];
+
+/// The `Notification` kinds that say an MCP server's request was answered.
+const ANSWERED_NOTICES: [&str; 2] = ["elicitation_response", "elicitation_complete"];
+
+/// What a tool that waits on the person asks them: one of its own dialogs,
+/// not a permission prompt.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Question {
+    /// `Question` or `Plan`.
+    pub tool: String,
+    pub detail: String,
+    pub why: Option<String>,
+    pub options: Option<Vec<String>>,
+}
+
+const QUESTION_MAX: usize = 300;
+
+/// The question a call of `tool` asks, when it is one that waits on the
+/// person: `AskUserQuestion` (one dialog for all its questions, answered
+/// one after another, the call ending once the last is), or `ExitPlanMode`
+/// (its plan, to approve). Seen with AskUserQuestion on Claude Code
+/// 2.1.317 in auto mode: `PreToolUse` when its dialog opens, and one
+/// `PostToolUse` once its last question is answered. ExitPlanMode is taken
+/// to do the same. Whether a `Notification` or `PermissionRequest` also
+/// comes in between isn't recorded anywhere; either is the same question.
+pub fn question_of(tool: &str, input: Option<&Value>) -> Option<Question> {
+    match tool {
+        "AskUserQuestion" => {
+            let questions = input?.get("questions")?.as_array()?;
+            let first = questions.first()?;
+            let text = |v: &Value, k: &str| {
+                v.get(k)
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|t| !t.is_empty())
+                    .map(str::to_string)
+            };
+            let detail = text(first, "question").or_else(|| text(first, "header"))?;
+            let options: Vec<String> = first
+                .get("options")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|o| text(o, "label"))
+                .collect();
+            let mut why = Vec::new();
+            if questions.len() > 1 {
+                why.push(format!("1 of {} questions", questions.len()));
+            }
+            if first.get("multiSelect").and_then(Value::as_bool) == Some(true) {
+                why.push("pick any".to_string());
+            }
+            Some(Question {
+                tool: "Question".into(),
+                detail: crate::crew::clip(&detail, QUESTION_MAX),
+                why: (!why.is_empty()).then(|| format!("({})", why.join(", "))),
+                options: (!options.is_empty()).then_some(options),
+            })
+        }
+        "ExitPlanMode" => {
+            let heading = input
+                .and_then(|i| i.get("plan"))
+                .and_then(Value::as_str)
+                .and_then(|plan| {
+                    plan.lines()
+                        .map(|l| l.trim().trim_start_matches('#').trim())
+                        .find(|l| !l.is_empty())
+                })
+                .map(clip)
+                .unwrap_or_default();
+            Some(Question {
+                tool: "Plan".into(),
+                detail: heading,
+                why: None,
+                options: None,
+            })
+        }
+        _ => None,
+    }
 }
 
 /// The sub-agent a hook fired inside, if it fired inside one.
@@ -340,7 +469,7 @@ pub fn ask_in_terminal() -> Value {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -485,11 +614,136 @@ mod tests {
             Hook::Usage(json!([{"kind": "five_hour", "percentUsed": 62}]))
         );
         let idle = br#"{"hook_event_name":"Notification","notification_type":"idle_prompt","message":"waiting"}"#;
-        assert_eq!(parse_hook(idle).unwrap(), Hook::Other);
+        assert_eq!(parse_hook(idle).unwrap(), Hook::AtPrompt);
         let ask = br#"{"hook_event_name":"Notification","notification_type":"permission_prompt","message":"Claude needs your permission"}"#;
         assert_eq!(
             parse_hook(ask).unwrap(),
             Hook::NeedsInput("Claude needs your permission".into())
+        );
+    }
+
+    /// An `AskUserQuestion` with two questions, as Claude Code 2.1.317's
+    /// hooks send it (the shape its transcript keeps; the words are
+    /// stand-ins).
+    pub(crate) fn two_questions() -> Value {
+        json!({"questions": [
+            {"question": "Send the three messages at once or one after another?", "header": "Sending",
+             "multiSelect": false, "options": [
+                {"label": "At once (Recommended)", "description": "About 5 seconds."},
+                {"label": "One after another", "description": "About 20 seconds."},
+                {"label": "Leave it", "description": "Keep what is there."}]},
+            {"question": "Run the read-only counts first?", "header": "Counts",
+             "multiSelect": false, "options": [
+                {"label": "Yes", "description": "Before the change."},
+                {"label": "No", "description": "Skip them."}]}]})
+    }
+
+    #[test]
+    fn a_question_or_a_plan_waits_on_the_person() {
+        let pre = json!({"session_id": "s1", "permission_mode": "auto", "hook_event_name": "PreToolUse",
+            "tool_name": "AskUserQuestion", "tool_input": two_questions(), "tool_use_id": "toolu_q1"});
+        let Hook::Question { id, question } = parse_hook(pre.to_string().as_bytes()).unwrap()
+        else {
+            panic!("not a question")
+        };
+        assert_eq!(id.as_deref(), Some("toolu_q1"));
+        assert_eq!(
+            question,
+            Question {
+                tool: "Question".into(),
+                detail: "Send the three messages at once or one after another?".into(),
+                why: Some("(1 of 2 questions)".into()),
+                options: Some(vec![
+                    "At once (Recommended)".into(),
+                    "One after another".into(),
+                    "Leave it".into()
+                ]),
+            }
+        );
+        // Its permission check, should one reach the hook, is the same question.
+        let perm = json!({"hook_event_name": "PermissionRequest", "tool_name": "AskUserQuestion",
+            "tool_input": two_questions(), "tool_use_id": "toolu_q1"});
+        assert!(matches!(
+            parse_hook(perm.to_string().as_bytes()).unwrap(),
+            Hook::Question { .. }
+        ));
+        let plan = json!({"hook_event_name": "PreToolUse", "tool_name": "ExitPlanMode",
+            "tool_input": {"plan": "\n# Move the reads to the replica\n\n1. Shadow them first."}, "tool_use_id": "toolu_p1"});
+        let Hook::Question { question, .. } = parse_hook(plan.to_string().as_bytes()).unwrap()
+        else {
+            panic!("not a plan")
+        };
+        assert_eq!(
+            (question.tool.as_str(), question.detail.as_str()),
+            ("Plan", "Move the reads to the replica")
+        );
+        assert_eq!(
+            crate::crew::approval_summary(&question.tool, &question.detail),
+            "Approve the plan: Move the reads to the replica?"
+        );
+        // Answered: its end carries the call's id.
+        let post = json!({"hook_event_name": "PostToolUse", "tool_name": "AskUserQuestion",
+            "tool_input": two_questions(), "tool_use_id": "toolu_q1", "tool_response": {"answers": {}}});
+        assert_eq!(
+            parse_hook(post.to_string().as_bytes()).unwrap(),
+            Hook::ToolEnd {
+                id: Some("toolu_q1".into()),
+                interrupt: false,
+                failed: None,
+            }
+        );
+        // Esc on a running tool (a turned-down question fires none).
+        let stopped = br#"{"hook_event_name":"PostToolUseFailure","tool_name":"Bash","tool_use_id":"toolu_b1","error":"Interrupted","is_interrupt":true}"#;
+        assert_eq!(
+            parse_hook(stopped).unwrap(),
+            Hook::ToolEnd {
+                id: Some("toolu_b1".into()),
+                interrupt: true,
+                failed: None,
+            }
+        );
+        // Without questions it is no question.
+        let empty = br#"{"hook_event_name":"PreToolUse","tool_name":"AskUserQuestion","tool_input":{"questions":[]}}"#;
+        assert!(matches!(parse_hook(empty).unwrap(), Hook::ToolStart { .. }));
+    }
+
+    #[test]
+    fn only_a_dialog_s_notification_waits_on_the_person() {
+        let notice = |kind: &str| {
+            parse_hook(
+                json!({"hook_event_name": "Notification", "notification_type": kind, "message": "m"})
+                    .to_string()
+                    .as_bytes(),
+            )
+            .unwrap()
+        };
+        for kind in WAITING_NOTICES {
+            assert_eq!(notice(kind), Hook::NeedsInput("m".into()), "{kind}");
+        }
+        for kind in ANSWERED_NOTICES {
+            assert_eq!(notice(kind), Hook::InputAnswered, "{kind}");
+        }
+        assert_eq!(notice("idle_prompt"), Hook::AtPrompt);
+        for kind in [
+            // The agents view's, about other sessions.
+            "agent_needs_input",
+            "auth_success",
+            "agent_completed",
+            "computer_use_enter",
+            "computer_use_exit",
+            "push_notification",
+            "quota_auto_resume_fired",
+            "model_refusal_fallback",
+        ] {
+            assert_eq!(notice(kind), Hook::Other, "{kind}");
+        }
+        assert_eq!(
+            parse_hook(
+                br#"{"hook_event_name":"Notification","message":"Claude needs your permission"}"#
+            )
+            .unwrap(),
+            Hook::NeedsInput("Claude needs your permission".into()),
+            "an older CLI's"
         );
     }
 

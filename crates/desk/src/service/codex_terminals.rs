@@ -13,6 +13,7 @@ use uuid::Uuid;
 
 use super::terminals::CWD_EVERY;
 use super::Desk;
+use crate::asking::{self, Reading};
 use crate::codex_session::{self as session, Activity, Binding};
 use crate::model::{Engine, SessionState};
 use crate::procs::{self, Proc};
@@ -255,6 +256,10 @@ impl Desk {
         };
         let read = rollout.clone();
         let prev = self.0.state.lock().codex_marks.get(&id).cloned();
+        // Its first read since it was bound (here, or again after a hub
+        // restart): what it says is where the session stood, not a turn
+        // that just ended.
+        let first = prev.is_none();
         let Ok((mark, tail)) = tokio::task::spawn_blocking(move || {
             (
                 session::activity(&read, prev.as_ref()),
@@ -273,24 +278,51 @@ impl Desk {
             }
             None => Activity::Idle,
         };
+        let known = self.record(id).ok();
+        let before = known.as_ref().map(|r| r.state);
+        // A turn that ended since it was last read: it wasn't done, or its
+        // reply is a new one; never one that ended before it was bound (a
+        // resumed session's last turn).
+        let ended_anew = !first
+            && activity == Activity::Done
+            && known.as_ref().is_none_or(|r| {
+                !matches!(r.state, SessionState::Done | SessionState::Asking)
+                    || (tail.last_reply.is_some() && tail.last_reply != r.last_reply)
+            });
+        // Such a turn asks the person when its reply says so, by the rules
+        // alone (no hook runs here to have the model read it). Once read,
+        // done or asking stands until it works again.
+        let asked = match tail.said.as_deref().map(asking::read) {
+            Some(Reading::Asks(asked)) if ended_anew => Some(asked),
+            _ => None,
+        };
         let state = match activity {
             Activity::Idle => SessionState::Idle,
             Activity::Working => SessionState::Working,
-            Activity::Done => SessionState::Done,
+            Activity::Done if ended_anew && asked.is_some() => SessionState::Asking,
+            Activity::Done if ended_anew => SessionState::Done,
+            Activity::Done => match before {
+                Some(SessionState::Asking) => SessionState::Asking,
+                _ => SessionState::Done,
+            },
         };
-        let unchanged = self.record(id).is_ok_and(|r| {
-            r.state == state
-                && tail
-                    .last_prompt
-                    .as_ref()
-                    .is_none_or(|p| r.last_prompt.as_ref() == Some(p))
-                && tail
-                    .last_reply
-                    .as_ref()
-                    .is_none_or(|p| r.last_reply.as_ref() == Some(p))
-        });
+        let unchanged = !ended_anew
+            && self.record(id).is_ok_and(|r| {
+                r.state == state
+                    && tail
+                        .last_prompt
+                        .as_ref()
+                        .is_none_or(|p| r.last_prompt.as_ref() == Some(p))
+                    && tail
+                        .last_reply
+                        .as_ref()
+                        .is_none_or(|p| r.last_reply.as_ref() == Some(p))
+            });
         if !unchanged {
             self.change(id, |r, _| {
+                if ended_anew || state != SessionState::Asking {
+                    r.asked = asked;
+                }
                 r.state = state;
                 // A tail that misses them keeps what was known.
                 r.last_prompt = tail.last_prompt.or(r.last_prompt.take());
@@ -490,17 +522,52 @@ mod tests {
             // It finishes its turn, then the person quits it.
             rollout(&home, "th-1", &cwd, &["task_started", "task_complete"]);
             track_until(|s| s[0].3 == SessionState::Done).await;
+
+            // Its next turn ends on a question: it asks, until it works again.
+            let ends_on = |said: &str| {
+                use std::io::Write;
+                let path = std::fs::read_dir(home.join(".codex/sessions/2026/11/02"))
+                    .unwrap()
+                    .next()
+                    .unwrap()
+                    .unwrap()
+                    .path();
+                let mut f = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+                for e in [
+                    serde_json::json!({"type": "event_msg", "payload": {"type": "task_started"}}),
+                    serde_json::json!({"type": "event_msg", "payload": {"type": "task_complete", "last_agent_message": said}}),
+                ] {
+                    writeln!(f, "{e}").unwrap();
+                }
+            };
+            ends_on("The build is green. Should I deploy main or release/4.2?");
+            track_until(|s| s[0].3 == SessionState::Asking).await;
+            let asked = d.view(first.0).unwrap().asked.unwrap();
+            assert_eq!(asked.ask, "Should I deploy main or release/4.2?");
+            d.track_codex_terminals().await;
+            assert_eq!(sessions()[0].3, SessionState::Asking, "read once, it stands");
+            ends_on("Deployed main.");
+            track_until(|s| s[0].3 == SessionState::Done).await;
+            assert_eq!(d.view(first.0).unwrap().asked, None);
             pty.write(b"\x03").unwrap();
             track_until(|s| s[0].3 == SessionState::Stopped).await;
             assert!(!d.view(first.0).unwrap().live);
 
-            // Typed again: the same session, not a second.
+            // Its last turn, before it is resumed, ended on a question.
+            ends_on("Left it there. Should I open the PR?");
+            // Typed again: the same session, not a second; and that old
+            // question is where it stood, not something it asks now.
             pty.write(format!("{} resume th-1\n", bin.display()).as_bytes())
                 .unwrap();
             track_until(|s| s[0].3 != SessionState::Stopped).await;
             let all = sessions();
             assert_eq!(all.len(), 1, "no duplicate");
             assert_eq!(all[0].0, first.0);
+            for _ in 0..5 {
+                d.track_codex_terminals().await;
+            }
+            let v = d.view(first.0).unwrap();
+            assert_eq!((v.state, v.asked), (SessionState::Done, None));
             pty.write(b"\x03exit\n").unwrap();
         })
         .await;

@@ -465,6 +465,7 @@ mod tests {
             answerable: true,
             choices: Vec::new(),
             why: None,
+            options: None,
         }
     }
 

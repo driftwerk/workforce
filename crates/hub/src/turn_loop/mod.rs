@@ -2903,6 +2903,10 @@ pub(crate) async fn admit_turn_or_deny(
             tracing::warn!(agent = %service.agent_id, %reason, "LLM turn denied by budget");
             Some(reason)
         }
+        crate::cost_governor::Admission::Held(reason) => {
+            tracing::info!(agent = %service.agent_id, %reason, "LLM turn held by the person's budget on Desk");
+            Some(reason)
+        }
     }
 }
 

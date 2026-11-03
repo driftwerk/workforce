@@ -976,6 +976,28 @@ fn namespaces_classify_tools_by_prefix() {
     assert!(sends_to_people("postmark.email_send_batch"));
     assert!(!sends_to_people("slack.channels_list"));
     assert!(!sends_to_people("email.draft"));
+    // Every tool Desk's connectors send to people with.
+    for send in [
+        "slack.send",
+        "slack.post_message",
+        "email.send",
+        "email.forward",
+        "google.gmail.send",
+        "google.gmail.draft_send",
+        "google.chat.messages_send",
+        "google.chat.dm_send",
+        "sendgrid.email_send",
+    ] {
+        assert!(sends_to_people(send), "{send} sends to people");
+    }
+    for not in [
+        "slack.read",
+        "slack.react",
+        "google.gmail.search",
+        "google.gmail.draft_create",
+    ] {
+        assert!(!sends_to_people(not), "{not} sends to nobody");
+    }
 }
 
 #[test]
