@@ -6,6 +6,18 @@
 import { createContext, useContext, useMemo, useRef, type ReactNode, type RefObject } from "react";
 
 import type { SubmitValue, TablePage } from "./spec";
+
+/** A remote markdown image, as {@link RichHost.remoteImage} is given it. */
+export interface RemoteImage {
+  /** Its absolute `http(s)` address (a protocol-relative one made `https:`). */
+  url: string;
+  /** The address's host name: the site the picture is on. */
+  site: string;
+  /** Its alt text, whitespace collapsed; empty when it has none. */
+  alt: string;
+  /** What a link to it would say: the alt text shortened, else the site. */
+  label: string;
+}
 import type { TableParams } from "./tableParams";
 
 export interface RichHost {
@@ -37,6 +49,13 @@ export interface RichHost {
    *  `"link"` mode any other source is not drawn at all. A declared link scheme
    *  is never an image source. */
   remoteImages?: "link" | "render";
+  /** In `"link"` mode, what a remote image is drawn as instead of the link:
+   *  a host that fetches pictures itself, once the person asks, shows its own
+   *  placeholder here. It stands where an inline image would, often inside a
+   *  paragraph, so it must be phrasing content (spans and buttons, no `div`).
+   *  An image inside a link is still only that link's text: a button can't go
+   *  in a link. Ignored in `"render"` mode. */
+  remoteImage?(image: RemoteImage): ReactNode;
   /** The form was answered already, here or before: it shows locked and says so. */
   answered?: boolean;
   /** Save a file the block generated (CSV, PNG, Excalidraw scene). Absent, the
@@ -57,6 +76,8 @@ interface HostHandle {
   forms: boolean;
   answered: boolean;
   remoteImages: "link" | "render";
+  /** Whether the host draws remote images itself (`remoteImage`). */
+  remoteImageSlot: boolean;
   /** `linkSchemes`, joined, so a host rebuilt with the same list keeps its renderers. */
   schemes: string;
 }
@@ -68,6 +89,7 @@ const NO_HOST: HostHandle = {
   forms: false,
   answered: false,
   remoteImages: "render",
+  remoteImageSlot: false,
   schemes: "",
 };
 
@@ -81,10 +103,11 @@ export function RichHostProvider({ host, children }: { host: RichHost; children:
   const forms = !!host.submitForm;
   const answered = !!host.answered;
   const remoteImages: HostHandle["remoteImages"] = host.remoteImages === "link" ? "link" : "render";
+  const remoteImageSlot = !!host.remoteImage;
   const schemes = (host.linkSchemes ?? []).join(",");
   const handle = useMemo(
-    () => ({ latest, tables, files, forms, answered, remoteImages, schemes }),
-    [tables, files, forms, answered, remoteImages, schemes],
+    () => ({ latest, tables, files, forms, answered, remoteImages, remoteImageSlot, schemes }),
+    [tables, files, forms, answered, remoteImages, remoteImageSlot, schemes],
   );
   return <HostContext.Provider value={handle}>{children}</HostContext.Provider>;
 }

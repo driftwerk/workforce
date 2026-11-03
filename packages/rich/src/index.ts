@@ -1,6 +1,6 @@
 export { RichBlock } from "./RichBlock";
 export { RichMarkdown } from "./RichMarkdown";
-export { RichHostProvider, TableExpired, type RichHost } from "./host";
+export { RichHostProvider, TableExpired, type RemoteImage, type RichHost } from "./host";
 export { chartTable } from "./chartTable";
 export { refreshRichTheme } from "./theme";
 export {
