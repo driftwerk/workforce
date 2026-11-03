@@ -317,6 +317,7 @@ pub enum DeskEvent {
         needs: Vec<crate::engine_accounts::AccountNeed>,
         #[serde(rename = "autoSwitch")]
         auto_switch: bool,
+        problems: Vec<crate::engine_accounts::ProblemView>,
     },
     /// Signing in to an account through its engine's own command moved on.
     AccountSignIn {

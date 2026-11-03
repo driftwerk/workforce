@@ -38,6 +38,7 @@ pub mod state;
 pub mod store;
 #[cfg(test)]
 mod testing;
+mod token_pipe;
 mod transcript;
 pub mod usage;
 mod vt;
