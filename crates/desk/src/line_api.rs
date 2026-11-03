@@ -64,8 +64,7 @@ macro_rules! caller {
 type P = Path<HashMap<String, String>>;
 
 async fn tools(State(desk): State<Desk>, Path(p): P) -> Response {
-    let id = caller!(desk, p);
-    desk.plugin_heard_from(id);
+    caller!(desk, p);
     Json(json!({ "tools": TOOLS.iter().map(|t| t.definition()).collect::<Vec<_>>() }))
         .into_response()
 }
@@ -140,7 +139,29 @@ async fn ack(State(desk): State<Desk>, Path(p): P, Json(b): Json<AckBody>) -> Re
 /// answers 202 with no body.
 async fn mcp(State(desk): State<Desk>, Path(p): P, body: String) -> Response {
     let id = caller!(desk, p);
-    match desk.line_mcp(id, &body).await {
+    answered(desk.line_mcp(id, &body).await)
+}
+
+/// MCP on a session's line from an engine that sends the session's token
+/// as a bearer token (Codex's app-server), not in its address.
+async fn mcp_bearer(
+    State(desk): State<Desk>,
+    Path(id): Path<Uuid>,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
+    let token = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "));
+    let Some(caller) = token.and_then(|t| desk.line_caller(id, t)) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    answered(desk.line_mcp(caller, &body).await)
+}
+
+fn answered(answer: Option<Option<String>>) -> Response {
+    match answer {
         None => StatusCode::NOT_FOUND.into_response(),
         Some(None) => StatusCode::ACCEPTED.into_response(),
         Some(Some(answer)) => (
@@ -163,7 +184,8 @@ pub(crate) fn hook_routes() -> Router<Desk> {
             .route(&format!("{at}/next"), get(next))
             .route(&format!("{at}/ack"), post(ack));
     }
-    r.route("/mcp/{id}/{token}", post(mcp))
+    r.route("/mcp/{id}", post(mcp_bearer))
+        .route("/mcp/{id}/{token}", post(mcp))
         .route("/mcp/terminal/{terminal}/{token}", post(mcp))
 }
 
