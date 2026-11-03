@@ -18,6 +18,16 @@ pub struct ToolRegistry {
     tools: RwLock<BTreeMap<String, Arc<dyn Tool>>>,
     instances: RwLock<BTreeMap<String, Arc<dyn InstanceSource>>>,
     generation: AtomicU64,
+    /// The registry this one was copied from, for a copy that may still take
+    /// tools the source gains later ([`follow`](Self::follow)).
+    upstream: Option<Upstream>,
+}
+
+/// Where a [followed](ToolRegistry::follow) copy takes later tools from, and
+/// which of them it lets in.
+struct Upstream {
+    source: Arc<ToolRegistry>,
+    admits: Arc<dyn Fn(&str) -> bool + Send + Sync>,
 }
 
 impl ToolRegistry {
@@ -26,6 +36,7 @@ impl ToolRegistry {
             tools: RwLock::new(BTreeMap::new()),
             instances: RwLock::new(BTreeMap::new()),
             generation: AtomicU64::new(0),
+            upstream: None,
         }
     }
 
@@ -127,7 +138,67 @@ impl ToolRegistry {
             tools: RwLock::new(self.tools.read().clone()),
             instances: RwLock::new(self.instances.read().clone()),
             generation: AtomicU64::new(0),
+            upstream: None,
         }
+    }
+
+    /// A copy of `source`, like [`clone_all`](Self::clone_all), that can
+    /// later [`adopt`](Self::adopt) tools `source` gains, when `admits` lets
+    /// them in. A turn runs on such a copy, so a tool its call registers in
+    /// the agent's registry mid-turn (`system.enable_skill`, a WASM install)
+    /// can still be offered and run in that same turn; `admits` keeps out the
+    /// tools the copy deliberately goes without.
+    pub fn follow(
+        source: &Arc<ToolRegistry>,
+        admits: impl Fn(&str) -> bool + Send + Sync + 'static,
+    ) -> ToolRegistry {
+        Self {
+            upstream: Some(Upstream {
+                source: Arc::clone(source),
+                admits: Arc::new(admits),
+            }),
+            ..source.clone_all()
+        }
+    }
+
+    /// Take from the registry this one [follows](Self::follow) the tools in
+    /// `names` it lacks and admits, through every registry in between; the
+    /// names it took. A registry that follows none takes nothing.
+    pub fn adopt(&self, names: &[String]) -> Vec<String> {
+        let Some(upstream) = &self.upstream else {
+            return Vec::new();
+        };
+        let wanted: Vec<String> = names
+            .iter()
+            .filter(|name| !self.has(name) && (upstream.admits)(name))
+            .cloned()
+            .collect();
+        if wanted.is_empty() {
+            return Vec::new();
+        }
+        upstream.source.adopt(&wanted);
+        let taken: Vec<String> = {
+            let mut tools = self.tools.write();
+            wanted
+                .into_iter()
+                .filter_map(|name| {
+                    let tool = upstream.source.get(&name)?;
+                    tools.insert(name.clone(), tool);
+                    Some(name)
+                })
+                .collect()
+        };
+        if !taken.is_empty() {
+            let mut instances = self.instances.write();
+            for (skill, source) in upstream.source.instances.read().iter() {
+                instances
+                    .entry(skill.clone())
+                    .or_insert_with(|| Arc::clone(source));
+            }
+            self.generation.fetch_add(1, Ordering::Relaxed);
+            tracing::info!(tools = ?taken, "Turn took tools registered during it");
+        }
+        taken
     }
 
     /// Record where `skill`'s instances come from, for the environments of the
@@ -337,6 +408,40 @@ mod tests {
         assert!(registry.unregister("test.dummy"));
         assert_eq!(registry.generation(), 3);
         assert_eq!(registry.clone_all().generation(), 0);
+    }
+
+    /// A followed copy takes, by name, a tool its source gained after the
+    /// copy was made, and moves its generation so a turn's plan rebuilds.
+    #[test]
+    fn a_followed_copy_adopts_tools_its_source_gains_later() {
+        let source = Arc::new(ToolRegistry::new());
+        source.register(named("alpha"));
+        let copy = ToolRegistry::follow(&source, |_| true);
+        source.register(named("jira.create_issue"));
+        assert!(!copy.has("jira.create_issue"), "nothing arrives unasked");
+        let before = copy.generation();
+        let taken = copy.adopt(&["jira.create_issue".into(), "alpha".into(), "nope".into()]);
+        assert_eq!(taken, ["jira.create_issue"]);
+        assert!(copy.has("jira.create_issue"));
+        assert!(copy.generation() > before);
+        assert!(copy.adopt(&["jira.create_issue".into()]).is_empty());
+    }
+
+    /// What a copy goes without stays out, through every copy in between.
+    #[test]
+    fn adoption_admits_only_what_every_copy_lets_in() {
+        let source = Arc::new(ToolRegistry::new());
+        let middle = Arc::new(ToolRegistry::follow(&source, |name| name != "hidden.one"));
+        let turn = ToolRegistry::follow(&middle, |name| name != "hidden.two");
+        for name in ["hidden.one", "hidden.two", "shown"] {
+            source.register(named(name));
+        }
+        let taken = turn.adopt(&["hidden.one".into(), "hidden.two".into(), "shown".into()]);
+        assert_eq!(taken, ["shown"]);
+        assert!(!turn.has("hidden.one") && !turn.has("hidden.two"));
+        assert!(!middle.has("hidden.one"));
+        assert!(ToolRegistry::new().adopt(&["shown".into()]).is_empty());
+        assert!(source.clone_all().adopt(&["shown".into()]).is_empty());
     }
 
     fn variants(instances: &[&str]) -> Arc<dyn InstanceSource> {
