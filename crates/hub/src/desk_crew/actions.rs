@@ -284,6 +284,16 @@ impl CrewHub {
             Action::Resume { .. } | Action::Restart { .. } => o.act.resume_restart,
             Action::StartSession { .. } => o.act.hand_out_work,
             Action::Approve { session, approval } => {
+                // Codex's requests are to leave its sandbox, and what it says
+                // of them isn't what runs: the person's alone.
+                let codex = self.desk.view(*session).ok().is_some_and(|v| {
+                    v.pending
+                        .as_ref()
+                        .is_some_and(|p| p.id == *approval && !p.choices.is_empty())
+                });
+                if codex {
+                    return Gate::Suggest("Codex's requests are the person's to answer");
+                }
                 if !o.act.read_only_approvals {
                     false
                 } else {

@@ -4,7 +4,7 @@
 //! environment, in Postgres: a terminal the holder kept is taken back as it
 //! is after a hub restart; one a reboot ended is reopened where it was.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -652,6 +652,8 @@ impl Desk {
             ends: 0,
             reading: None,
             closing: false,
+            codex_asks: Vec::new(),
+            codex_sent: HashMap::new(),
         };
         if existing.is_some_and(|id| self.0.state.lock().live.contains_key(&id)) {
             // Already running here: nothing to take back.
@@ -769,6 +771,8 @@ impl Desk {
                             ends: 0,
                             reading: None,
                             closing: false,
+                            codex_asks: Vec::new(),
+                            codex_sent: HashMap::new(),
                         },
                     );
                     self.publish(id);

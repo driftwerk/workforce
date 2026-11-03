@@ -589,15 +589,29 @@ async fn floor_view(State(r): S, headers: HeaderMap, Query(q): Query<FloorQuery>
 pub(crate) enum Choice {
     Allow,
     Deny,
+    /// Codex's: allow it, and what is like it, for the rest of the session.
+    AllowForSession,
+    /// Codex's: deny it and end the turn.
+    Cancel,
 }
 
 impl Choice {
     /// The answer to a prompt this is: for this call alone, as a quick
-    /// action never writes a standing rule.
-    fn permission(self) -> PermissionChoice {
+    /// action never writes a standing rule. Only Codex takes the others.
+    fn permission(self) -> Option<PermissionChoice> {
         match self {
-            Self::Allow => PermissionChoice::AllowOnce,
-            Self::Deny => PermissionChoice::DenyOnce,
+            Self::Allow => Some(PermissionChoice::AllowOnce),
+            Self::Deny => Some(PermissionChoice::DenyOnce),
+            Self::AllowForSession | Self::Cancel => None,
+        }
+    }
+
+    fn decision(self) -> Decision {
+        match self {
+            Self::Allow => Decision::Allow,
+            Self::Deny => Decision::Deny,
+            Self::AllowForSession => Decision::AllowForSession,
+            Self::Cancel => Decision::Cancel,
         }
     }
 }
@@ -622,6 +636,8 @@ pub(crate) enum Unanswered {
     Unknown,
     /// The settings file it would use is one the agent can't load.
     Unloadable(crate::workspace_admission::ConfigRefusal),
+    /// Not an answer it takes.
+    NotOffered,
 }
 
 /// Answers the need `at` points to with `choice`, as `caller`, through the
@@ -639,6 +655,9 @@ pub(crate) async fn answer(
             session_id,
             request_id,
         } => {
+            let Some(permission) = choice.permission() else {
+                return Ok(Err(Unanswered::NotOffered));
+            };
             let Some(service) = state.registry.get(agent_id) else {
                 return Ok(Err(Unanswered::Unknown));
             };
@@ -660,7 +679,7 @@ pub(crate) async fn answer(
                 &caller.id,
                 session_id,
                 request_id,
-                choice.permission(),
+                permission,
             )
             .await;
             Ok(answered.map_err(|why| match why {
@@ -670,11 +689,14 @@ pub(crate) async fn answer(
         }
         DecideRef::Routed { request_id } => {
             use crate::approvals::decide::{decide, DecideError, Decided, Decider};
+            let Some(permission) = choice.permission() else {
+                return Ok(Err(Unanswered::NotOffered));
+            };
             match decide(
                 &state.registry,
                 request_id,
                 Decider::Person(&caller.id),
-                choice.permission(),
+                permission,
             )
             .await
             {
@@ -688,21 +710,31 @@ pub(crate) async fn answer(
         DecideRef::Session {
             session_id,
             approval_id,
+        }
+        | DecideRef::Codex {
+            session_id,
+            approval_id,
+            ..
         } => {
             if !caller.personal {
                 return Ok(Err(Unanswered::NotYours));
             }
+            if matches!(at, DecideRef::Session { .. }) && choice.permission().is_none() {
+                return Ok(Err(Unanswered::NotOffered));
+            }
             let Some(desk) = (sources.desk)() else {
                 return Ok(Err(Unanswered::Unknown));
             };
-            let decision = match choice {
-                Choice::Allow => Decision::Allow,
-                Choice::Deny => Decision::Deny,
-            };
-            match desk.decide(*session_id, *approval_id, decision, Some(By::you())) {
+            match desk.decide(
+                *session_id,
+                *approval_id,
+                choice.decision(),
+                Some(By::you()),
+            ) {
                 Ok(_) => Ok(Ok(())),
                 Err(DeskError::NotFound) => Ok(Err(Unanswered::Unknown)),
                 Err(DeskError::Conflict(_)) => Ok(Err(Unanswered::AlreadyAnswered)),
+                Err(DeskError::Invalid(_)) => Ok(Err(Unanswered::NotOffered)),
                 Err(e) => Err(e.into()),
             }
         }
@@ -719,6 +751,7 @@ pub(crate) async fn answer(
                     use_changed(&service, state.def_store.as_deref(), hash, Some(&caller.id)).await
                 }
                 Choice::Deny => keep_saved(&service, hash),
+                Choice::AllowForSession | Choice::Cancel => return Ok(Err(Unanswered::NotOffered)),
             };
             match decided {
                 Ok(()) => Ok(Ok(())),
@@ -757,6 +790,7 @@ async fn decide(
             let (_, said) = crate::gateway::config_write_unloadable(agent, why);
             (StatusCode::UNPROCESSABLE_ENTITY, said).into_response()
         }
+        Ok(Err(Unanswered::NotOffered)) => refusal(StatusCode::UNPROCESSABLE_ENTITY, "not_offered"),
         Err(e) => failed(e),
     }
 }
