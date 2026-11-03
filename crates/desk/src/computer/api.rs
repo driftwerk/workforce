@@ -436,6 +436,7 @@ mod tests {
                         exit_code: None,
                         duration_ms: None,
                         arguments: json!({}),
+                        device: None,
                     })
                     .await
                     .unwrap();

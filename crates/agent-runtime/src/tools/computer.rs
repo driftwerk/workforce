@@ -69,6 +69,8 @@ pub struct Record {
     pub input: Value,
     pub outcome: Outcome,
     pub reason: Option<String>,
+    /// The prompt a person answered, where one did.
+    pub request_id: Option<String>,
 }
 
 /// The hub's side of the gate, one per agent.
@@ -222,6 +224,13 @@ fn held(response: PolicyResponse, why: &str, effect: &Effect) -> PolicyResponse 
     }
 }
 
+/// `decision` when it is what asks (the computer gate held the call), else
+/// `None`: a prompt another gate raised is that gate's, its card, keeper and
+/// activity included.
+pub fn asking(decision: Option<Decision>) -> Option<Decision> {
+    decision.filter(|d| !matches!(d.verdict, Verdict::Run { .. }))
+}
+
 /// The answers a computer ask offers on its own: Allow once and Deny. No
 /// "always" reaches the permission rules.
 pub fn once_or_deny() -> workforce_core::policy::PermissionPromptOptions {
@@ -276,6 +285,29 @@ pub const CHANGED_SINCE_ALLOWED: &str =
 pub const UNATTENDED_RAN: &str =
     "Nobody could be asked, and at Full access the agent runs it, as before";
 
+/// [`settle`] for a prompt a person answered: the answer's `request_id`
+/// goes with it, so the hub can say which device answered.
+pub fn settle_answered(
+    gate: Option<&dyn ComputerGate>,
+    tool: &str,
+    decision: Option<&Decision>,
+    input: &Value,
+    outcome: Outcome,
+    request_id: &str,
+) {
+    let (Some(gate), Some(decision)) = (gate, decision) else {
+        return;
+    };
+    gate.record(Record {
+        tool: tool.to_string(),
+        decision: decision.clone(),
+        input: input.clone(),
+        outcome,
+        reason: None,
+        request_id: Some(request_id.to_string()),
+    });
+}
+
 /// Records what came of a call the gate decided; nothing when it decided
 /// nothing.
 pub fn settle(
@@ -295,6 +327,7 @@ pub fn settle(
         input: input.clone(),
         outcome,
         reason: reason.map(str::to_string),
+        request_id: None,
     });
 }
 
@@ -353,6 +386,7 @@ pub fn unattended_refusal(
                 input: input.clone(),
                 outcome: Outcome::Ran,
                 reason,
+                request_id: None,
             });
             return None;
         }
@@ -372,6 +406,7 @@ pub fn unattended_refusal(
         input: input.clone(),
         outcome: reason.0,
         reason: Some(reason.1.clone()),
+        request_id: None,
     });
     Some(reason.1)
 }
