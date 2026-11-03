@@ -317,9 +317,12 @@ impl CostGovernor {
         if let Admission::Deny(_) = ceiling {
             return ceiling;
         }
-        match self.admit_by_config(agent_id, identity) {
-            Admission::Proceed => ceiling,
-            decided => decided,
+        // Each warning is said once a period: both are kept.
+        match (ceiling, self.admit_by_config(agent_id, identity)) {
+            (_, Admission::Deny(why)) => Admission::Deny(why),
+            (Admission::Warn(a), Admission::Warn(b)) => Admission::Warn(format!("{a} {b}")),
+            (Admission::Warn(a), Admission::Proceed) => Admission::Warn(a),
+            (Admission::Proceed | Admission::Deny(_), decided) => decided,
         }
     }
 
