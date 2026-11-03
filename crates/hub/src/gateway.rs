@@ -3032,6 +3032,7 @@ async fn handle_ws(
                                 nats.as_ref(),
                                 &service,
                                 &owner,
+                                ws_device_id.as_deref(),
                                 &sid,
                                 &request_id,
                                 choice,

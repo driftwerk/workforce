@@ -154,6 +154,12 @@ impl Tool for CodeFindTool {
         "code.find"
     }
 
+    fn effect(&self, input: &serde_json::Value) -> workforce_core::computer::Effect {
+        workforce_core::computer::Effect::Read {
+            paths: super::utils::effect_paths(input, "path", &self.allowed_paths),
+        }
+    }
+
     fn description(&self) -> &str {
         "Find files by name or glob pattern"
     }

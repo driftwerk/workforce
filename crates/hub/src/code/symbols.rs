@@ -419,6 +419,12 @@ impl Tool for CodeSymbolsTool {
         "code.symbols"
     }
 
+    fn effect(&self, input: &serde_json::Value) -> workforce_core::computer::Effect {
+        workforce_core::computer::Effect::Read {
+            paths: super::utils::effect_paths(input, "path", &self.allowed_paths),
+        }
+    }
+
     fn description(&self) -> &str {
         "Extract language-aware symbols (functions, structs, classes, interfaces) from"
     }

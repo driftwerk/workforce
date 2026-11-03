@@ -1,6 +1,9 @@
 //! The always-asks list for commands: what can't be undone, and what can't
-//! be read as simple commands. It is deterministic. No grant covers it, and
-//! the autonomy check never decides it: its card offers Allow once and Deny.
+//! be read as simple commands. It is deterministic, and the autonomy check
+//! never decides it. Its card offers Allow once and Deny; a delete of named
+//! paths outside the own folder ([`Asks::Deletes`]) may also be always
+//! allowed in the folder holding them, so `rm -rf node_modules` in a repo
+//! asks once per repo.
 //!
 //! The command is split as a POSIX shell would split it, closely enough to
 //! find every simple command it runs: `;`, `&&`, `||`, `|`, `&`, newlines
@@ -11,14 +14,23 @@
 //! here-string, backticks, `<(…)`, `case` and function definitions.
 //!
 //! Paths a command names are joined to its cwd lexically (no filesystem is
-//! read). A target that can't be resolved (`$VAR`, `~user`, a relative one
-//! with no cwd, what `xargs` feeds) counts as outside the own folder.
+//! read), a `cd` followed as it goes. A target that can't be resolved
+//! (`$VAR`, `~user`, a relative one with no cwd, what `xargs` feeds) counts
+//! as outside the own folder. `/tmp` and `$TMPDIR` count as inside it for
+//! deletes.
+//!
+//! Separately, [`publishes`] says whether a command publishes or deploys
+//! (a push to the default branch, `npm publish`, `gh release create`, …):
+//! what a boss's sessions hand to the person.
 
 use std::path::{Component, Path, PathBuf};
 
 /// Why a command always asks.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Asks {
+    /// It deletes only these paths, outside the own folder: an "always"
+    /// for the folder holding them may cover it.
+    Deletes(Vec<PathBuf>),
     /// It can't be undone.
     Irreversible,
     /// It can't be read as simple commands.
@@ -27,24 +39,61 @@ pub enum Asks {
 
 impl Asks {
     /// The card's "why it asks" line.
-    pub fn why(self) -> &'static str {
+    pub fn why(&self) -> &'static str {
         match self {
-            Self::Irreversible => "Can't be undone",
+            Self::Deletes(_) | Self::Irreversible => "Can't be undone",
             Self::Unclear => "Can't tell what this command runs",
+        }
+    }
+
+    /// The one that decides, of two a command's parts gave.
+    fn worst(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Unclear, _) | (_, Self::Unclear) => Self::Unclear,
+            (Self::Irreversible, _) | (_, Self::Irreversible) => Self::Irreversible,
+            (Self::Deletes(mut a), Self::Deletes(b)) => {
+                a.extend(b);
+                Self::Deletes(a)
+            }
         }
     }
 }
 
 /// Where a command's paths are read from, and what counts as its own folder.
 pub struct Place<'a> {
-    pub cwd: Option<&'a Path>,
+    pub cwd: Option<PathBuf>,
     pub own: &'a [PathBuf],
+    /// Scratch space a delete may clear without asking: `/tmp`, `$TMPDIR`.
+    pub scratch: &'a [PathBuf],
     pub home: &'a Path,
 }
 
 impl Place<'_> {
     fn inside(&self, path: &Path) -> bool {
         self.own.iter().any(|root| path.starts_with(root))
+    }
+
+    /// Inside the own folder or scratch space, for a delete.
+    fn deletable(&self, path: &Path) -> bool {
+        self.inside(path) || self.scratch.iter().any(|t| path.starts_with(t))
+    }
+
+    /// What deleting `targets` asks: nothing when each is resolved and
+    /// deletable, the outside ones when each is resolved, else that it
+    /// can't be undone.
+    fn deletes(&self, targets: &[&Word], unknown: bool) -> Option<Asks> {
+        if unknown {
+            return Some(Asks::Irreversible);
+        }
+        let mut outside = Vec::new();
+        for t in targets {
+            match self.resolve(t) {
+                None => return Some(Asks::Irreversible),
+                Some(p) if self.deletable(&p) => {}
+                Some(p) => outside.push(p),
+            }
+        }
+        (!outside.is_empty()).then_some(Asks::Deletes(outside))
     }
 
     /// `word` as a path, joined to the cwd; `None` when it can't be told.
@@ -62,7 +111,7 @@ impl Place<'_> {
         } else if Path::new(text).is_absolute() {
             PathBuf::from(text)
         } else {
-            self.cwd?.join(text)
+            self.cwd.as_ref()?.join(text)
         };
         Some(normalize(&joined))
     }
@@ -96,28 +145,86 @@ pub fn always_asks(command: &str, place: &Place<'_>) -> Option<Asks> {
         Ok(commands) => commands,
         Err(()) => return Some(Asks::Unclear),
     };
-    // A `cd` anywhere moves where later paths are read from: relative ones
-    // can't be told any more.
-    let moved = commands.iter().any(|c| {
-        c.words
-            .iter()
-            .find(|w| !is_assignment(w) && !KEYWORDS.contains(&w.text.as_str()))
-            .is_some_and(|w| matches!(w.text.as_str(), "cd" | "pushd" | "popd"))
-    });
-    let unmoved;
-    let place = if moved {
-        unmoved = Place {
-            cwd: None,
-            own: place.own,
-            home: place.home,
-        };
-        &unmoved
-    } else {
-        place
+    // Each command's paths are read where the `cd`s before it left it.
+    let mut here = Place {
+        cwd: place.cwd.clone(),
+        own: place.own,
+        scratch: place.scratch,
+        home: place.home,
     };
-    commands
-        .iter()
-        .find_map(|simple| classify(simple, place, false))
+    let mut found: Option<Asks> = None;
+    for simple in &commands {
+        let name = simple
+            .words
+            .iter()
+            .find(|w| !is_assignment(w) && !KEYWORDS.contains(&w.text.as_str()));
+        if let Some(name) = name.filter(|w| matches!(w.text.as_str(), "cd" | "pushd" | "popd")) {
+            let to = simple
+                .words
+                .iter()
+                .skip_while(|w| *w != name)
+                .skip(1)
+                .find(|w| !is_option(w));
+            here.cwd = match (name.text.as_str(), to) {
+                ("popd", _) => None,
+                (_, None) => Some(here.home.to_path_buf()),
+                (_, Some(w)) if w.text == "-" => None,
+                (_, Some(w)) => here.resolve(w),
+            };
+            continue;
+        }
+        if let Some(asks) = classify(simple, &here, false) {
+            found = Some(match found {
+                Some(was) => was.worst(asks),
+                None => asks,
+            });
+        }
+    }
+    found
+}
+
+/// Whether `command` publishes or deploys: a push to the default branch,
+/// `npm`/`cargo publish`, `gh release create`, a deploy. A boss's sessions
+/// hand these to the person; nothing else reads it yet.
+pub fn publishes(command: &str) -> bool {
+    let Ok(commands) = split(command) else {
+        return false;
+    };
+    commands.iter().any(|c| {
+        let words: Vec<&str> = c
+            .words
+            .iter()
+            .filter(|w| !is_assignment(w))
+            .map(|w| w.text.as_str())
+            .collect();
+        let name = words.first().map(|n| n.rsplit('/').next().unwrap_or(n));
+        let has = |w: &str| words.contains(&w);
+        match name {
+            Some("git") => {
+                let push = words.iter().position(|w| *w == "push");
+                push.is_some_and(|i| {
+                    words[i + 1..].iter().any(|w| {
+                        let dest = w.rsplit(':').next().unwrap_or(w).trim_start_matches('+');
+                        matches!(
+                            dest,
+                            "main" | "master" | "refs/heads/main" | "refs/heads/master"
+                        )
+                    })
+                })
+            }
+            Some("npm" | "pnpm" | "yarn" | "cargo" | "twine" | "gem") => {
+                has("publish") || has("upload") && name == Some("twine")
+            }
+            Some("gh") => has("release") && has("create"),
+            Some("fly" | "flyctl") => has("deploy"),
+            Some("vercel") => has("--prod") || has("deploy") && has("--prod"),
+            Some("netlify") => has("deploy") && has("--prod"),
+            Some("kubectl") => has("apply") || has("rollout"),
+            Some("terraform" | "tofu") => has("apply"),
+            Some("helm") => has("upgrade") || has("install"),
+            _ => false,
+        }
+    })
 }
 
 /// One word of a command, after quotes are removed.
@@ -243,10 +350,13 @@ impl Splitter {
     }
 
     /// The text up to the `)` closing a `$(` just read, nesting counted.
+    /// A heredoc's body inside it is taken as it is, never counted: a
+    /// commit message's "Don't" or "1)" is text, not shell.
     fn substitution(&mut self) -> Result<String, ()> {
         let mut depth = 1;
         let mut inner = String::new();
         let mut quote: Option<char> = None;
+        let mut heredocs: Vec<(String, bool)> = Vec::new();
         while let Some(c) = self.peek(0) {
             self.at += 1;
             match (quote, c) {
@@ -260,6 +370,79 @@ impl Splitter {
                     continue;
                 }
                 (Some(_), _) => {}
+                (None, '<') if self.peek(0) == Some('<') && self.peek(1) != Some('<') => {
+                    inner.push('<');
+                    inner.push('<');
+                    self.at += 1;
+                    let strip = self.peek(0) == Some('-');
+                    if strip {
+                        inner.push('-');
+                        self.at += 1;
+                    }
+                    while let Some(sp @ (' ' | '\t')) = self.peek(0) {
+                        inner.push(sp);
+                        self.at += 1;
+                    }
+                    let mut delimiter = String::new();
+                    match self.peek(0) {
+                        Some(q @ ('\'' | '"')) => {
+                            inner.push(q);
+                            self.at += 1;
+                            while let Some(d) = self.peek(0) {
+                                inner.push(d);
+                                self.at += 1;
+                                if d == q {
+                                    break;
+                                }
+                                delimiter.push(d);
+                            }
+                        }
+                        _ => {
+                            while let Some(d) = self.peek(0) {
+                                if d.is_whitespace() || ";|&()<>".contains(d) {
+                                    break;
+                                }
+                                inner.push(d);
+                                self.at += 1;
+                                delimiter.push(d);
+                            }
+                        }
+                    }
+                    if delimiter.is_empty() {
+                        return Err(());
+                    }
+                    heredocs.push((delimiter, strip));
+                    continue;
+                }
+                (None, '\n') if !heredocs.is_empty() => {
+                    inner.push('\n');
+                    for (delimiter, strip) in std::mem::take(&mut heredocs) {
+                        loop {
+                            if self.at >= self.chars.len() {
+                                return Err(());
+                            }
+                            let start = self.at;
+                            while self.at < self.chars.len() && self.chars[self.at] != '\n' {
+                                self.at += 1;
+                            }
+                            let line: String = self.chars[start..self.at].iter().collect();
+                            inner.push_str(&line);
+                            if self.at < self.chars.len() {
+                                inner.push('\n');
+                                self.at += 1;
+                            }
+                            let shown = if strip {
+                                line.trim_start_matches('\t')
+                            } else {
+                                line.as_str()
+                            };
+                            if shown == delimiter {
+                                break;
+                            }
+                        }
+                    }
+                    continue;
+                }
                 (None, '\'' | '"') => quote = Some(c),
                 (None, '(') => depth += 1,
                 (None, ')') => {
@@ -432,8 +615,34 @@ impl Splitter {
                 '(' | ')' => {
                     self.at += 1;
                     if c == '(' && self.word.is_some() {
-                        // `name()`: a function definition.
-                        return Err(());
+                        // `arr=(a b)`: an array assigned, its words data.
+                        let array = self.word.as_ref().is_some_and(|w| {
+                            w.text.strip_suffix('=').is_some_and(|name| {
+                                !name.is_empty()
+                                    && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                            })
+                        });
+                        if !array {
+                            // `name()`: a function definition.
+                            return Err(());
+                        }
+                        let mut quote: Option<char> = None;
+                        loop {
+                            match (quote, self.peek(0)) {
+                                (_, None) => return Err(()),
+                                (Some(q), Some(n)) if n == q => quote = None,
+                                (None, Some(q @ ('\'' | '"'))) => quote = Some(q),
+                                (None, Some('$' | '`')) => return Err(()),
+                                (None, Some(')')) => {
+                                    self.at += 1;
+                                    break;
+                                }
+                                _ => {}
+                            }
+                            self.at += 1;
+                        }
+                        self.push_char(')');
+                        continue;
                     }
                     self.end_command(false);
                 }
@@ -662,16 +871,43 @@ fn classify_words(
             .map(|_| Asks::Irreversible),
         "rm" | "rmdir" | "unlink" => {
             let targets = operands(args);
-            ((unknown || !targets.is_empty()) && !place.all_inside(&targets, unknown))
-                .then_some(Asks::Irreversible)
+            if targets.is_empty() && !unknown {
+                return None;
+            }
+            place.deletes(&targets, unknown)
         }
+        "rsync" => {
+            let deletes = args
+                .iter()
+                .any(|w| w.text.starts_with("--delete") || w.text == "--remove-source-files");
+            let dest = operands(args).last().copied();
+            match (deletes, dest) {
+                (false, _) => None,
+                (true, Some(dest)) => place.deletes(&[dest], unknown),
+                (true, None) => Some(Asks::Irreversible),
+            }
+        }
+        "gh" => {
+            let ops = operands(args);
+            let texts: Vec<&str> = ops.iter().map(|w| w.text.as_str()).collect();
+            (texts.len() >= 2 && texts[1] == "delete").then_some(Asks::Irreversible)
+        }
+        "terraform" | "tofu" => {
+            let destroy = operands(args).first().is_some_and(|w| w.text == "destroy")
+                || args.iter().any(|w| w.text == "-destroy");
+            destroy.then_some(Asks::Irreversible)
+        }
+        "kubectl" => operands(args)
+            .first()
+            .filter(|w| w.text == "delete")
+            .map(|_| Asks::Irreversible),
         "chmod" | "chown" => {
             let recursive = has_flag(args, 'R', &["recursive"]);
             let targets: Vec<&Word> = operands(args).into_iter().skip(1).collect();
             (recursive && !place.all_inside(&targets, unknown)).then_some(Asks::Irreversible)
         }
+        "git" => git(args, place),
         "find" => find(args, simple, place),
-        "git" => git(args),
         _ => None,
     }
 }
@@ -685,13 +921,17 @@ fn find(args: &[&Word], simple: &Simple, place: &Place<'_>) -> Option<Asks> {
         .copied()
         .collect();
     if args.iter().any(|w| w.text == "-delete") {
-        let inside = if starts.is_empty() {
-            place.cwd.is_some_and(|cwd| place.inside(cwd))
+        let asks = if starts.is_empty() {
+            match place.cwd.as_ref() {
+                Some(cwd) if place.deletable(cwd) => None,
+                Some(cwd) => Some(Asks::Deletes(vec![cwd.clone()])),
+                None => Some(Asks::Irreversible),
+            }
         } else {
-            place.all_inside(&starts, false)
+            place.deletes(&starts, false)
         };
-        if !inside {
-            return Some(Asks::Irreversible);
+        if asks.is_some() {
+            return asks;
         }
     }
     let mut i = 0;
@@ -719,7 +959,7 @@ fn find(args: &[&Word], simple: &Simple, place: &Place<'_>) -> Option<Asks> {
     None
 }
 
-fn git(args: &[&Word]) -> Option<Asks> {
+fn git(args: &[&Word], _place: &Place<'_>) -> Option<Asks> {
     // Global options before the subcommand; some take a value.
     let mut i = 0;
     while let Some(w) = args.get(i) {
@@ -736,9 +976,35 @@ fn git(args: &[&Word]) -> Option<Asks> {
             has_flag(
                 rest,
                 'f',
-                &["force", "force-with-lease", "force-if-includes", "mirror"],
-            ) || rest.iter().any(|w| w.text.starts_with('+'))
+                &[
+                    "force",
+                    "force-with-lease",
+                    "force-if-includes",
+                    "mirror",
+                    "delete",
+                ],
+            ) || has_flag(rest, 'd', &[])
+                || rest.iter().any(|w| {
+                    w.text.starts_with('+') || (w.text.starts_with(':') && w.text.len() > 1)
+                })
         }
+        // Discarding what isn't committed: `checkout -- .`, `checkout .`,
+        // `restore` of the working tree.
+        "checkout" => {
+            let ops = operands(rest);
+            rest.iter().any(|w| w.text == "--")
+                || ops.iter().any(|w| w.text == "." || w.text == "*")
+        }
+        "restore" => {
+            let staged_only =
+                has_flag(rest, 'S', &["staged"]) && !has_flag(rest, 'W', &["worktree"]);
+            !staged_only && !operands(rest).is_empty()
+        }
+        "stash" => rest
+            .iter()
+            .find(|w| !is_option(w))
+            .is_some_and(|w| matches!(w.text.as_str(), "drop" | "clear")),
+        "filter-branch" | "filter-repo" => true,
         "reset" => rest.iter().any(|w| w.text == "--hard"),
         "clean" => has_flag(rest, 'f', &["force"]),
         "branch" => {
@@ -754,14 +1020,23 @@ fn git(args: &[&Word]) -> Option<Asks> {
 mod tests {
     use super::*;
 
+    const SCRATCH: [&str; 2] = ["/tmp", "/private/var/folders/xy/T"];
+
     fn asks(command: &str) -> Option<Asks> {
         let own = [PathBuf::from("/Users/sarah/Desk/hub/agents/allan")];
+        let scratch = SCRATCH.map(PathBuf::from);
         let place = Place {
-            cwd: Some(Path::new("/Users/sarah/Desk/hub/agents/allan/work")),
+            cwd: Some(PathBuf::from("/Users/sarah/Desk/hub/agents/allan/work")),
             own: &own,
+            scratch: &scratch,
             home: Path::new("/Users/sarah"),
         };
         always_asks(command, &place)
+    }
+
+    /// It can't be undone, whether or not an "always" could cover it.
+    fn undoes(command: &str) -> bool {
+        matches!(asks(command), Some(I | Asks::Deletes(_)))
     }
 
     use Asks::{Irreversible as I, Unclear as U};
@@ -791,6 +1066,24 @@ mod tests {
             "for f in a b; do echo $f; done",
             "if true; then echo yes; fi",
             "find . -name '*.o' -delete",
+            "git commit -m \"$(cat <<'EOF'\nDon't retry\nEOF\n)\"",
+            "git commit -m \"$(cat <<'EOF'\nThe fix:\n1) the parser\n2) its tests\nEOF\n)\"",
+            "gh pr create --title x --body \"$(cat <<'EOF'\n- It's faster\nEOF\n)\"",
+            "arr=(a b c); echo ${arr[0]}",
+            "(cd /tmp && rm -rf x)",
+            "rm -rf /tmp/build-cache",
+            "rm -rf /private/var/folders/xy/T/scratch",
+            "cd /Users/sarah/Desk/hub/agents/allan/work && rm -rf build",
+            "cd .. && rm -rf work/tmp",
+            "git checkout -b feature",
+            "git checkout main",
+            "git restore --staged src/a.rs",
+            "git stash list",
+            "git stash pop",
+            "rsync -a ./ /Users/sarah/Desk/hub/agents/allan/copy/",
+            "kubectl get pods",
+            "terraform plan",
+            "gh repo view",
             "defaults read com.apple.dock",
             "echo $((1 + 2))",
             "# just a comment",
@@ -803,7 +1096,7 @@ mod tests {
     #[test]
     fn what_cant_be_undone_always_asks() {
         for command in [
-            "rm -rf /tmp/x",
+            "rm -rf /opt/x",
             "rm -rf ~/dev/acme-web",
             "rm -rf ~",
             "rm -rf ../../other",
@@ -845,10 +1138,25 @@ mod tests {
             "chmod -R 777 /Users/sarah",
             "chown --recursive bob /srv",
             "echo \"$(rm -rf /x)\"",
-            "(cd /tmp && rm -rf x)",
             "true || sudo x",
+            "git push --delete origin feature",
+            "git push -d origin feature",
+            "git push origin :feature",
+            "git checkout -- .",
+            "git checkout .",
+            "git restore .",
+            "git restore src/a.rs",
+            "git stash drop",
+            "git stash clear",
+            "git filter-branch --tree-filter x HEAD",
+            "git filter-repo --path secrets --invert-paths",
+            "rsync -a --delete ./ /Users/sarah/backup/",
+            "gh repo delete sarah/acme --yes",
+            "terraform destroy -auto-approve",
+            "terraform apply -destroy",
+            "kubectl delete pod web-1",
         ] {
-            assert_eq!(asks(command), Some(I), "{command:?}");
+            assert!(undoes(command), "{command:?} → {:?}", asks(command));
         }
     }
 
@@ -877,9 +1185,9 @@ mod tests {
 
     #[test]
     fn a_shell_given_a_script_is_read_as_that_script() {
-        assert_eq!(asks("sh -c 'cargo build && rm -rf /x'"), Some(I));
+        assert!(undoes("sh -c 'cargo build && rm -rf /x'"));
         assert_eq!(asks("bash -lc 'cargo build'"), None);
-        assert_eq!(asks("bash -lc 'rm -rf /x'"), Some(I));
+        assert!(undoes("bash -lc 'rm -rf /x'"));
         assert_eq!(asks("bash -c 'cargo build'"), None);
     }
 
@@ -889,6 +1197,7 @@ mod tests {
         let place = Place {
             cwd: None,
             own: &own,
+            scratch: &[],
             home: Path::new("/Users/sarah"),
         };
         assert_eq!(always_asks("rm -rf build", &place), Some(I));
@@ -900,6 +1209,64 @@ mod tests {
 
     #[test]
     fn a_sibling_folder_sharing_a_prefix_is_outside() {
-        assert_eq!(asks("rm -rf /Users/sarah/Desk/hub/agents/allan2"), Some(I));
+        assert!(undoes("rm -rf /Users/sarah/Desk/hub/agents/allan2"));
+    }
+
+    /// A delete of named paths says which, so an "always" for their folder
+    /// can cover it; anything else that can't be undone can't be.
+    #[test]
+    fn a_delete_of_named_paths_says_which_and_a_cd_is_followed() {
+        assert_eq!(
+            asks("rm -rf /Users/sarah/dev/acme-web/node_modules"),
+            Some(Asks::Deletes(vec![PathBuf::from(
+                "/Users/sarah/dev/acme-web/node_modules"
+            )]))
+        );
+        assert_eq!(
+            asks("cd /Users/sarah/dev/acme-web && rm -rf node_modules dist"),
+            Some(Asks::Deletes(vec![
+                PathBuf::from("/Users/sarah/dev/acme-web/node_modules"),
+                PathBuf::from("/Users/sarah/dev/acme-web/dist"),
+            ]))
+        );
+        assert_eq!(asks("rm -rf $DIR"), Some(I), "a target it can't name");
+        assert_eq!(
+            asks("rm -rf /Users/sarah/dev/a && git push -f"),
+            Some(I),
+            "the worst decides"
+        );
+        assert_eq!(asks("rm -rf /Users/sarah/dev/a; echo `x`"), Some(U));
+        assert_eq!(
+            asks("cd - && rm -rf build"),
+            Some(I),
+            "a cd it can't follow"
+        );
+    }
+
+    #[test]
+    fn publishing_and_deploying_are_told_apart() {
+        for command in [
+            "git push origin main",
+            "git push origin HEAD:main",
+            "git push origin +master",
+            "npm publish",
+            "cargo publish -p desk",
+            "gh release create v1.2.0",
+            "fly deploy",
+            "vercel --prod",
+            "kubectl apply -f deploy.yaml",
+            "terraform apply",
+        ] {
+            assert!(publishes(command), "{command:?}");
+        }
+        for command in [
+            "git push origin feature",
+            "npm test",
+            "cargo build",
+            "gh pr create",
+            "terraform plan",
+        ] {
+            assert!(!publishes(command), "{command:?}");
+        }
     }
 }

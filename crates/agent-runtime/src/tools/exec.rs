@@ -231,6 +231,21 @@ impl Tool for ExecCommand {
         "exec.run"
     }
 
+    fn effect(&self, input: &serde_json::Value) -> workforce_core::computer::Effect {
+        let roots: Vec<PathBuf> = self.workspace.iter().cloned().collect();
+        let cwd = match input["workdir"].as_str().filter(|w| !w.trim().is_empty()) {
+            Some(workdir) => Some(crate::tools::computer::path_in(workdir, &roots)),
+            None => self
+                .workspace
+                .as_deref()
+                .map(crate::tools::paths::resolve_real),
+        };
+        workforce_core::computer::Effect::Exec {
+            command: input["command"].as_str().unwrap_or_default().to_string(),
+            cwd,
+        }
+    }
+
     fn description(&self) -> &str {
         "Execute a shell command and return stdout, stderr, and exit code."
     }
