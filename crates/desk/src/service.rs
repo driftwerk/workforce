@@ -41,6 +41,7 @@ use crate::worktree;
 
 mod accounts;
 pub use accounts::Added;
+mod breaker;
 mod codex_terminals;
 mod copies;
 mod groups;
@@ -48,6 +49,8 @@ mod lifecycle;
 pub use lifecycle::{Clearing, Hidden, Removal, Removed};
 #[cfg(test)]
 mod accounts_tests;
+#[cfg(test)]
+mod breaker_tests;
 #[cfg(test)]
 mod codex_asks_tests;
 mod ledger;
@@ -65,6 +68,10 @@ pub use groups::{
     local_agent_item, session_item, Group, Import, Imported, Layout, Ungrouped, UNGROUPED,
 };
 
+pub use breaker::{
+    agent_subject, pool_subject, session_subject, BreakerOf, BreakerView, BudgetPatch, BudgetView,
+    BudgetsView, NewBudget, Rules,
+};
 pub use ledger::{LedgerPage, SpendQuery};
 pub use terminals::{NewTerminal, TerminalPatch, TerminalRecord, TerminalState, TerminalView};
 
@@ -169,6 +176,8 @@ pub(crate) struct Live {
     /// Answers Desk sent Codex, by request, until Codex is told them (or
     /// was answered in the terminal first): what Activity then says.
     codex_sent: HashMap<String, CodexSent>,
+    /// What its breaker has for it in this run: see [`breaker::LiveBreaker`].
+    breaker: breaker::LiveBreaker,
 }
 
 /// A Codex request Desk can answer: its JSON-RPC id, and the pending
@@ -231,6 +240,8 @@ struct CodexLink {
     watch: CancellationToken,
     /// Answers to what it asks, to its observer.
     replies: mpsc::UnboundedSender<codex::Reply>,
+    /// What its breaker says into its running turn, to its observer.
+    steers: mpsc::UnboundedSender<String>,
 }
 
 impl CodexLink {
@@ -422,6 +433,8 @@ struct Inner {
     read_wait: Mutex<Duration>,
     /// Held while the accounts' needs are acted on.
     accounts_moving: tokio::sync::Mutex<()>,
+    /// The budgets and every subject's breaker.
+    breakers: Mutex<breaker::BreakerRun>,
 }
 
 #[derive(Clone)]
@@ -892,11 +905,14 @@ impl Desk {
             reader: Mutex::new(None),
             read_wait: Mutex::new(READ_LATER),
             accounts_moving: tokio::sync::Mutex::new(()),
+            breakers: Mutex::new(breaker::BreakerRun::default()),
         }));
         tokio::spawn(persist_loop(store, floor.turns, persist_rx));
         tokio::spawn(desk.clone().read_engines());
         tokio::spawn(desk.clone().look_for_sign_ins());
         tokio::spawn(desk.clone().ledger_loop(ledger_jobs));
+        desk.breaker_load().await;
+        tokio::spawn(desk.clone().breaker_loop());
         tokio::spawn(desk.clone().watch_background());
         recovered.into_iter().for_each(|r| desk.save(r));
         for (id, at) in failed {
@@ -1053,6 +1069,7 @@ impl Desk {
                     closing: false,
                     codex_asks: Vec::new(),
                     codex_sent: HashMap::new(),
+                    breaker: Default::default(),
                 },
             );
             tokio::spawn(self.clone().on_exit(id, exit));
@@ -1755,6 +1772,7 @@ impl Desk {
         if name.is_empty() {
             return Err(DeskError::Invalid("a session needs a name".into()));
         }
+        self.breaker_refuses_start(by.as_ref())?;
         check_env(&new.env)?;
         let view = new
             .view
@@ -2306,6 +2324,7 @@ impl Desk {
         if text.trim().is_empty() {
             return Err(DeskError::Invalid("the prompt is empty".into()));
         }
+        self.breaker_refuses_prompt(id, by.as_ref())?;
         let pty = self.attach(id)?;
         let mut input = b"\x1b[200~".to_vec();
         input.extend_from_slice(text.as_bytes());
@@ -2897,6 +2916,7 @@ impl Desk {
                 closing: false,
                 codex_asks: Vec::new(),
                 codex_sent: HashMap::new(),
+                breaker: Default::default(),
             },
         );
         tokio::spawn(self.clone().on_exit(r.id, exit));
@@ -2951,6 +2971,7 @@ impl Desk {
         let watch = self.0.cancel.child_token();
         let (tx, rx) = mpsc::channel(64);
         let (replies, answers) = mpsc::unbounded_channel();
+        let (steers, steered) = mpsc::unbounded_channel();
         tokio::spawn({
             let socket = server.socket(&socket);
             let watch = watch.clone();
@@ -2962,7 +2983,9 @@ impl Desk {
                 follower
             };
             async move {
-                if let Err(e) = codex::observe(socket, follower, tx, answers, plans, watch).await {
+                if let Err(e) =
+                    codex::observe(socket, follower, tx, answers, steered, plans, watch).await
+                {
                     tracing::warn!(error = %e, "codex observer stopped");
                 }
             }
@@ -2973,6 +2996,7 @@ impl Desk {
             socket,
             watch,
             replies,
+            steers,
         }
     }
 
@@ -3041,9 +3065,27 @@ impl Desk {
                 .is_some_and(|l| l.allowed.contains(call)),
             _ => false,
         };
-        let answer = move || match allowed {
-            true => claude::allow_call(),
-            false => empty(),
+        // Desk's breaker holding it from this turn refuses the call, why
+        // said; otherwise the call is watched (when loops are).
+        let held = match &hook {
+            Hook::ToolStart { tool, .. } => self.breaker_tool(id, tool),
+            _ => None,
+        };
+        let answer = move || match (held, allowed) {
+            (Some(why), _) => claude::deny_call(&why),
+            (None, true) => claude::allow_call(),
+            (None, false) => empty(),
+        };
+        // A steer waiting for this tool call's result goes with it.
+        let steer = |desk: &Desk, event: &str| {
+            let text = desk
+                .0
+                .state
+                .lock()
+                .live
+                .get_mut(&id)
+                .and_then(Desk::take_steer)?;
+            Some(claude::context(event, &text))
         };
         if let Some(agent) = &inside {
             let idle = {
@@ -3060,6 +3102,12 @@ impl Desk {
             if idle && matches!(hook, Hook::ToolStart { .. } | Hook::ToolEnd) {
                 return answer();
             }
+            if idle {
+                if let Hook::ToolFailed { tool, error } = &hook {
+                    self.breaker_failed(id, &format!("{tool}: {error}"));
+                    return answer();
+                }
+            }
         }
         match hook {
             Hook::SessionStart {
@@ -3075,19 +3123,23 @@ impl Desk {
                     }
                 });
             }
-            Hook::Prompt(p) => self.change(id, |r, l| {
-                r.state = SessionState::Working;
-                r.last_prompt = Some(p);
-                r.restore_offer = false;
-                if let Some(l) = l {
-                    l.pending = None;
-                    l.prompts += 1;
-                    l.denials.clear();
-                    l.reading = None;
-                    r.asked = None;
-                    l.interrupted = false;
-                }
-            }),
+            Hook::Prompt(p) => {
+                // The person's words: a session its breaker holds goes on.
+                self.breaker_turn(id, true);
+                self.change(id, |r, l| {
+                    r.state = SessionState::Working;
+                    r.last_prompt = Some(p);
+                    r.restore_offer = false;
+                    if let Some(l) = l {
+                        l.pending = None;
+                        l.prompts += 1;
+                        l.denials.clear();
+                        l.reading = None;
+                        r.asked = None;
+                        l.interrupted = false;
+                    }
+                })
+            }
             Hook::ToolStart { tool, .. } => self.change(id, |r, l| {
                 r.state = SessionState::Working;
                 r.asked = None;
@@ -3123,6 +3175,18 @@ impl Desk {
                     }
                 });
                 self.spend_read_while_working(id);
+                if let Some(said) = steer(self, "PostToolUse") {
+                    return said;
+                }
+            }
+            // What a session's state shows is left as it was before Desk
+            // heard failures: only the breaker counts them.
+            Hook::ToolFailed { tool, error } => {
+                self.breaker_failed(id, &format!("{tool}: {error}"));
+                self.spend_read_while_working(id);
+                if let Some(said) = steer(self, "PostToolUseFailure") {
+                    return said;
+                }
             }
             Hook::NeedsInput(message) => self.change(id, |r, l| {
                 if let Some(l) = l.filter(|l| l.pending.is_none()) {
@@ -3138,15 +3202,18 @@ impl Desk {
                     });
                 }
             }),
-            Hook::Woken => self.change(id, |r, l| {
-                r.state = SessionState::Working;
-                if let Some(l) = l {
-                    l.pending = None;
-                    l.denials.clear();
-                    l.reading = None;
-                    r.asked = None;
-                }
-            }),
+            Hook::Woken => {
+                self.breaker_turn(id, false);
+                self.change(id, |r, l| {
+                    r.state = SessionState::Working;
+                    if let Some(l) = l {
+                        l.pending = None;
+                        l.denials.clear();
+                        l.reading = None;
+                        r.asked = None;
+                    }
+                })
+            }
             Hook::SubagentStart(agent) => self.change(id, |_, l| {
                 if let Some(l) = l {
                     l.background = std::mem::take(&mut l.background).started(
@@ -3244,6 +3311,7 @@ impl Desk {
                 }
                 // The turn's calls are in its transcript now.
                 self.spend_read(id);
+                self.breaker_settled(id);
             }
             Hook::SessionEnd => {
                 if let Some(l) = self.0.state.lock().live.get_mut(&id) {
@@ -3454,6 +3522,16 @@ impl Desk {
             if matches!(event, CodexEvent::Idle) {
                 // Its rollout has the turn's calls, with their model.
                 self.spend_read(id);
+                self.breaker_settled(id);
+            }
+            match &event {
+                CodexEvent::Tool(t) => {
+                    // Codex takes no answer before a call: it is only watched.
+                    let _ = self.breaker_tool(id, t);
+                }
+                CodexEvent::Failed(t) => self.breaker_failed(id, t),
+                CodexEvent::Prompt(_) => self.breaker_turn(id, true),
+                _ => {}
             }
             let turn_begins = matches!(event, CodexEvent::Working { .. })
                 && self.record(id).is_ok_and(|r| {
@@ -3594,7 +3672,7 @@ impl Desk {
                             codex_resolved(r, l, &request);
                         }
                     }
-                    CodexEvent::Answered(_) | CodexEvent::Late(_) => {}
+                    CodexEvent::Answered(_) | CodexEvent::Late(_) | CodexEvent::Failed(_) => {}
                     CodexEvent::Reply(text) => r.last_reply = Some(transcript::clip(&text)),
                     CodexEvent::Child(_)
                     | CodexEvent::Usage(_)
@@ -4062,7 +4140,7 @@ mod tests {
         .unwrap()
     }
 
-    async fn post(d: &Desk, id: Uuid, body: Value) -> Value {
+    pub(super) async fn post(d: &Desk, id: Uuid, body: Value) -> Value {
         let t = token(d, id);
         d.hook(id, &t, body.to_string().as_bytes()).await.unwrap()
     }
@@ -6256,6 +6334,7 @@ mod codex_stop_tests {
             socket: sock,
             watch: CancellationToken::new(),
             replies: mpsc::unbounded_channel().0,
+            steers: mpsc::unbounded_channel().0,
         };
         (link, pid, hdir)
     }

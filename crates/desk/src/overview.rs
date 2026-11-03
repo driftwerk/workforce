@@ -474,6 +474,7 @@ mod tests {
                 engine: None,
             },
             ask: "Ship it?".into(),
+            why: None,
             options: None,
             since: Utc::now() - Duration::minutes(5),
             place: Place::Dm,

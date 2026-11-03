@@ -31,10 +31,12 @@ pub struct ClaudeSpawn<'a> {
     pub env: &'a BTreeMap<String, String>,
 }
 
-const TOOL_EVENTS: [&str; 4] = [
+const TOOL_EVENTS: [&str; 5] = [
     "PreToolUse",
     "PermissionRequest",
     "PostToolUse",
+    // A tool call failed: what Desk's breaker counts as errors.
+    "PostToolUseFailure",
     // Auto mode refused a tool: the turn may end stuck on it.
     "PermissionDenied",
 ];
@@ -121,6 +123,8 @@ struct Payload {
     agent_id: Option<String>,
     reason: Option<String>,
     background_tasks: Option<Vec<BackgroundTask>>,
+    error: Option<String>,
+    is_interrupt: Option<bool>,
 }
 
 /// One entry of a `Stop`'s `background_tasks`.
@@ -155,6 +159,11 @@ pub enum Hook {
         detail: String,
     },
     ToolEnd,
+    /// A tool call failed: the tool, and the error's first line.
+    ToolFailed {
+        tool: String,
+        error: String,
+    },
     NeedsInput(String),
     Stop {
         transcript: Option<String>,
@@ -213,6 +222,12 @@ pub fn parse_hook(body: &[u8]) -> eyre::Result<Hook> {
             Hook::Permission { tool, detail }
         }
         "PostToolUse" => Hook::ToolEnd,
+        // The person pressing Esc ends a call as a failure: not one.
+        "PostToolUseFailure" if p.is_interrupt == Some(true) => Hook::Other,
+        "PostToolUseFailure" => Hook::ToolFailed {
+            tool: tool().0,
+            error: clip(p.error.as_deref().unwrap_or_default()),
+        },
         "Notification" if p.notification_type.as_deref() != Some("idle_prompt") => {
             Hook::NeedsInput(p.message.unwrap_or_default())
         }
@@ -301,6 +316,22 @@ pub fn allow_call() -> Value {
     json!({ "hookSpecificOutput": { "hookEventName": "PreToolUse",
         "permissionDecision": "allow",
         "permissionDecisionReason": "Allowed for this session in Desk." } })
+}
+
+/// A tool call refused before it runs, with why: Claude reads the reason
+/// and carries on without it (hooks reference, PreToolUse decision
+/// control).
+pub fn deny_call(reason: &str) -> Value {
+    json!({ "hookSpecificOutput": { "hookEventName": "PreToolUse",
+        "permissionDecision": "deny",
+        "permissionDecisionReason": reason } })
+}
+
+/// Words Claude reads beside a tool call's result, in its running turn
+/// (hooks reference, "Add context for Claude": `additionalContext` on
+/// PostToolUse and PostToolUseFailure).
+pub fn context(event: &str, text: &str) -> Value {
+    json!({ "hookSpecificOutput": { "hookEventName": event, "additionalContext": text } })
 }
 
 /// No decision: Claude Code shows its own permission dialog in the terminal.

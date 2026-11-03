@@ -18,6 +18,8 @@ pub enum PartyKind {
     Session,
     Manager,
     You,
+    /// Desk itself: its breaker.
+    Desk,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -56,6 +58,17 @@ impl Party {
         Self {
             kind: PartyKind::Manager,
             ..Self::agent(id, name)
+        }
+    }
+
+    /// Desk's breaker, which steers and pauses what has gone too far.
+    pub fn breaker() -> Self {
+        Self {
+            kind: PartyKind::Desk,
+            id: "breaker".into(),
+            name: "Desk's breaker".into(),
+            engine: None,
+            origin: None,
         }
     }
 
@@ -111,6 +124,10 @@ kinds! {
     Assigned => "assigned",
     Replied => "replied",
     Delivered => "delivered",
+    Steered => "steered",
+    Paused => "paused",
+    Continued => "continued",
+    Budgeted => "budgeted",
 }
 
 /// One thing that happened on the crew.

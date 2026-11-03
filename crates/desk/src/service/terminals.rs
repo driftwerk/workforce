@@ -654,6 +654,7 @@ impl Desk {
             closing: false,
             codex_asks: Vec::new(),
             codex_sent: HashMap::new(),
+            breaker: Default::default(),
         };
         if existing.is_some_and(|id| self.0.state.lock().live.contains_key(&id)) {
             // Already running here: nothing to take back.
@@ -775,6 +776,7 @@ impl Desk {
                             closing: false,
                             codex_asks: Vec::new(),
                             codex_sent: HashMap::new(),
+                            breaker: Default::default(),
                         },
                     );
                     self.publish(id);
