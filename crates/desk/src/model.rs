@@ -81,6 +81,25 @@ pub struct SessionRecord {
     pub updated_at: DateTime<Utc>,
 }
 
+impl SessionRecord {
+    /// What Desk can do with this session: its engine's [`crate::engine::caps`]
+    /// for the version it runs and where it runs. One adopted from another
+    /// terminal has no environment of Desk's, so no line.
+    pub fn caps(&self) -> crate::engine::Caps {
+        let mut caps = crate::engine::session_caps(
+            self.engine,
+            self.view,
+            self.engine_version.as_deref(),
+            self.terminal_id.is_some(),
+        );
+        if self.origin == Origin::External {
+            caps.line = crate::engine::Deliver::None;
+            caps.steer = crate::engine::Steer::None;
+        }
+        caps
+    }
+}
+
 /// An approval a session is waiting on, held open by its hook call.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -211,7 +230,7 @@ impl SessionView {
             id: r.id,
             engine: r.engine,
             view: r.view,
-            caps: crate::engine::caps(r.engine, r.view),
+            caps: r.caps(),
             name: r.name.clone(),
             goal: r.goal.clone(),
             cwd: r.cwd.clone(),
@@ -310,6 +329,13 @@ pub enum DeskEvent {
     /// Where a breaker stands changed.
     Breaker {
         breaker: Box<crate::service::BreakerView>,
+    },
+    /// A message on a session's line was sent, or moved on (delivered,
+    /// answered, edited); `removed` once the person took it back.
+    Line {
+        message: Box<crate::line::LineMessage>,
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        removed: bool,
     },
     /// A key of Desk's own state changed; `value` is `null` once removed.
     State {

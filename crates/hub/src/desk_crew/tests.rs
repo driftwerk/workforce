@@ -186,6 +186,7 @@ async fn desk_with(
             holder: None,
             hub_internal: Default::default(),
             account_keys: None,
+            line_reach: workforce_desk::line::Reach::Group,
         },
         floor,
         CancellationToken::new(),
@@ -195,7 +196,7 @@ async fn desk_with(
 }
 
 /// The hook URL a session's CLI was started with.
-async fn hook_url(dir: &Path, id: uuid::Uuid) -> String {
+pub(crate) async fn hook_url(dir: &Path, id: uuid::Uuid) -> String {
     for _ in 0..200 {
         for entry in std::fs::read_dir(dir).unwrap().flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
@@ -254,7 +255,11 @@ impl Authorize for Anyone {
     }
 }
 
-async fn new_session(d: &Desk, dir: &Path, name: &str) -> workforce_desk::model::SessionView {
+pub(crate) async fn new_session(
+    d: &Desk,
+    dir: &Path,
+    name: &str,
+) -> workforce_desk::model::SessionView {
     d.create(
         NewSession {
             engine: Engine::Claude,

@@ -183,7 +183,8 @@ impl DeskStore {
     }
 
     /// Forgets sessions all at once: their records, how far `owner` read
-    /// each, what Activity says they or anyone did to them, and how far
+    /// each, what Activity says they or anyone did to them, their lines
+    /// (but what they said to other sessions), and how far
     /// the ledger read their transcripts (what they spent is kept). How
     /// many records went.
     pub async fn forget_sessions(&self, ids: &[Uuid], owner: &str) -> Result<u64> {
@@ -217,6 +218,17 @@ pub(crate) async fn forget_in(
         "DELETE FROM reads WHERE owner = $1 \
          AND EXISTS (SELECT 1 FROM unnest($2::text[]) p WHERE left(place, length(p)) = p)",
         &[&owner, &places],
+    )
+    .await?;
+    // Its line, but what it exchanged with another session it doesn't
+    // forget: that is in the other's thread too.
+    tx.execute(
+        "DELETE FROM line_messages WHERE \
+         ((sender ->> 'kind' = 'session' AND sender ->> 'id' = ANY($1)) \
+          OR (recipient ->> 'kind' = 'session' AND recipient ->> 'id' = ANY($1))) \
+         AND NOT ((sender ->> 'kind' = 'session' AND NOT sender ->> 'id' = ANY($1)) \
+          OR (recipient ->> 'kind' = 'session' AND NOT recipient ->> 'id' = ANY($1)))",
+        &[&parties],
     )
     .await?;
     tx.execute(

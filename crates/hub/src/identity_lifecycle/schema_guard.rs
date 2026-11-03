@@ -174,6 +174,12 @@ const CLAIMS: &[(&str, &str, &str, Claim)] = &[
         "scope",
         NotPersonal("what a budget counts: Desk, a default, or one session or agent"),
     ),
+    (
+        "desk",
+        "line_messages",
+        "sender",
+        NotPersonal("a session, the overseer agent, or `you`, the one person of the Desk"),
+    ),
     ("desk", "attachments", "owner", By(C::Sessions)),
     ("desk", "connections", "person", By(C::Vault)),
     (

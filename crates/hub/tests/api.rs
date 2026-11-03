@@ -27,6 +27,10 @@ mod caller_identity_routes;
 mod desk_activity_routes;
 
 #[cfg(feature = "postgres")]
+#[path = "api/desk_line_routes.rs"]
+mod desk_line_routes;
+
+#[cfg(feature = "postgres")]
 #[path = "api/desk_conversation_routes.rs"]
 mod desk_conversation_routes;
 

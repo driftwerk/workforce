@@ -518,6 +518,50 @@ pub async fn run_stdio_server(
     Ok(())
 }
 
+/// Speaks MCP over stdio for a client that can't reach `url` itself (an ACP
+/// agent with no HTTP MCP): each JSON-RPC line read from `input` is posted
+/// to `url`, and its answer written back as a line. A notification's empty
+/// answer writes nothing; an answer that couldn't be had is an error reply,
+/// so the client isn't left waiting.
+pub async fn forward_stdio<R, W>(url: &str, input: R, mut output: W) -> eyre::Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let client = reqwest::Client::new();
+    let mut lines = BufReader::new(input).lines();
+    while let Some(line) = lines.next_line().await? {
+        let body = line.trim();
+        if body.is_empty() {
+            continue;
+        }
+        let answer = match client
+            .post(url)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(body.to_string())
+            .send()
+            .await
+        {
+            Ok(r) if r.status() == reqwest::StatusCode::ACCEPTED => None,
+            Ok(r) if r.status().is_success() => Some(r.text().await?),
+            Ok(r) => Some(McpEndpoint::refusal(
+                body,
+                &format!("Desk answered {}", r.status()),
+            )),
+            Err(e) => Some(McpEndpoint::refusal(
+                body,
+                &format!("Desk can't be reached: {e}"),
+            )),
+        };
+        if let Some(answer) = answer.filter(|a| !a.trim().is_empty()) {
+            output.write_all(answer.trim().as_bytes()).await?;
+            output.write_all(b"\n").await?;
+            output.flush().await?;
+        }
+    }
+    Ok(())
+}
+
 /// The key a client's `mcpServers` config names the hub under, and so the
 /// prefix Claude Code gives every tool served through it.
 pub const MCP_SERVER_KEY: &str = "workforce";
@@ -776,6 +820,41 @@ pub fn matches_any(name: &str, patterns: &[String]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn the_stdio_proxy_posts_each_line_and_writes_back_each_answer() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let app = axum::Router::new().route(
+            "/mcp",
+            axum::routing::post(|body: String| async move {
+                let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+                match v.get("id") {
+                    Some(id) => (
+                        axum::http::StatusCode::OK,
+                        serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {"echo": v["method"]}})
+                            .to_string(),
+                    ),
+                    None => (axum::http::StatusCode::ACCEPTED, String::new()),
+                }
+            }),
+        );
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let input = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}\n\n{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n";
+        let mut out = Vec::new();
+        forward_stdio(&url, &input[..], &mut out).await.unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert_eq!(out.lines().count(), 1, "{out}");
+        assert!(out.contains("\"echo\":\"tools/list\""));
+        // Nobody there: an error the client reads.
+        let mut out = Vec::new();
+        forward_stdio("http://127.0.0.1:9/mcp", &input[..], &mut out)
+            .await
+            .unwrap();
+        assert!(String::from_utf8(out)
+            .unwrap()
+            .contains("Desk can't be reached"));
+    }
+
     use super::*;
 
     fn fixed(tools: &ToolRegistry) -> Surface {

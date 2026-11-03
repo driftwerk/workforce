@@ -318,6 +318,7 @@ mod tests {
                 holder: None,
                 hub_internal: Default::default(),
                 account_keys: None,
+                line_reach: crate::line::Reach::Group,
             },
             Default::default(),
             CancellationToken::new(),

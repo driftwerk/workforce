@@ -26,6 +26,9 @@ pub mod gist;
 pub mod holder;
 pub mod ledger;
 pub mod ledger_store;
+pub mod line;
+mod line_api;
+pub mod line_store;
 pub mod local;
 pub mod model;
 pub mod overview;
@@ -62,8 +65,9 @@ pub use service::{
 };
 pub use service::{
     local_agent_item, session_item, Clearing, Desk, DeskError, Floor, Group, Hidden, HolderOptions,
-    Import, Imported, Layout, LedgerPage, NewTerminal, Options, Removal, Removed, RestorePolicy,
-    SpendQuery, TerminalPatch, TerminalState, TerminalView, Ungrouped, UNGROUPED,
+    Import, Imported, Layout, LedgerPage, LineError, NewTerminal, Options, Removal, Removed,
+    RestorePolicy, Sender as LineSender, SessionMcp, SpendQuery, TerminalPatch, TerminalState,
+    TerminalView, Ungrouped, UNGROUPED,
 };
 pub use speech::{Audio, Speak, SpeakError, Speech, SpeechProvider};
 pub use store::DeskStore;

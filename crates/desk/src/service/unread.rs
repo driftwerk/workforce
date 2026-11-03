@@ -40,6 +40,47 @@ pub fn session_unread(
     Some(SessionUnread { id, since, urgency })
 }
 
+/// What a session's line leaves unread after `point`: a message to you is
+/// for you; an exchange between it and Desk or another session is new.
+pub fn line_unread(
+    id: Uuid,
+    seen: super::line::Seen,
+    point: Option<&ReadPoint>,
+    floor: DateTime<Utc>,
+) -> Option<SessionUnread> {
+    let read = effective(point, floor);
+    let after = |t: Option<DateTime<Utc>>| t.filter(|t| t.trunc_subsecs(6) > read);
+    let (for_you, new) = (after(seen.for_you), after(seen.new));
+    let since = for_you.max(new)?;
+    let urgency = match for_you {
+        Some(_) => Urgency::ForYou,
+        None => Urgency::New,
+    };
+    Some(SessionUnread { id, since, urgency })
+}
+
+/// The more pressing of what a session's state and its line leave unread,
+/// as of the later of the two.
+fn stronger(a: Option<SessionUnread>, b: Option<SessionUnread>) -> Option<SessionUnread> {
+    let rank = |u: Urgency| match u {
+        Urgency::Needs => 2,
+        Urgency::ForYou => 1,
+        Urgency::New => 0,
+    };
+    match (a, b) {
+        (Some(a), Some(b)) => Some(SessionUnread {
+            id: a.id,
+            since: a.since.max(b.since),
+            urgency: if rank(a.urgency) >= rank(b.urgency) {
+                a.urgency
+            } else {
+                b.urgency
+            },
+        }),
+        (a, b) => a.or(b),
+    }
+}
+
 impl Desk {
     /// What is unread on this Desk for `owner`.
     pub async fn unread(&self, crew: &dyn Crew, owner: &str) -> Result<UnreadSummary, DeskError> {
@@ -98,7 +139,7 @@ impl Desk {
         })
     }
 
-    fn sessions_unread(
+    pub(super) fn sessions_unread(
         &self,
         points: &HashMap<ReadPlace, ReadPoint>,
         floor: DateTime<Utc>,
@@ -108,14 +149,16 @@ impl Desk {
             .records
             .values()
             .filter_map(|r| {
-                session_unread(
-                    r.id,
-                    r.state,
-                    r.last_reply.is_some(),
-                    *st.attention.get(&r.id)?,
-                    points.get(&ReadPlace::Session(r.id)),
-                    floor,
-                )
+                let point = points.get(&ReadPlace::Session(r.id));
+                let state = st.attention.get(&r.id).and_then(|since| {
+                    session_unread(r.id, r.state, r.last_reply.is_some(), *since, point, floor)
+                });
+                let line = st
+                    .lines
+                    .seen
+                    .get(&r.id)
+                    .and_then(|seen| line_unread(r.id, *seen, point, floor));
+                stronger(state, line)
             })
             .collect();
         unread.sort_by(|a, b| b.since.cmp(&a.since));
@@ -251,6 +294,39 @@ pub(crate) mod tests {
             .unwrap()
             .to_utc()
             + chrono::Duration::seconds(s)
+    }
+
+    #[test]
+    fn a_sessions_thread_is_for_you_when_it_wrote_to_you_and_new_when_it_talked_to_others() {
+        let id = Uuid::from_u128(1);
+        let point = ReadPoint {
+            at: at(10),
+            message: None,
+        };
+        let seen = |for_you, new| super::super::line::Seen { for_you, new };
+        let unread = |s| line_unread(id, s, Some(&point), at(0)).map(|u| (u.urgency, u.since));
+        assert_eq!(
+            unread(seen(Some(at(11)), Some(at(12)))),
+            Some((Urgency::ForYou, at(12)))
+        );
+        assert_eq!(
+            unread(seen(Some(at(9)), Some(at(12)))),
+            Some((Urgency::New, at(12)))
+        );
+        assert_eq!(unread(seen(Some(at(9)), None)), None, "read already");
+        assert_eq!(unread(seen(None, None)), None);
+        // The line's message for you beats a state that is only new.
+        let state = session_unread(
+            id,
+            SessionState::Stopped,
+            false,
+            at(13),
+            Some(&point),
+            at(0),
+        );
+        let line = line_unread(id, seen(Some(at(11)), None), Some(&point), at(0));
+        let both = stronger(state, line).unwrap();
+        assert_eq!((both.urgency, both.since), (Urgency::ForYou, at(13)));
     }
 
     #[test]

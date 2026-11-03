@@ -127,6 +127,41 @@ pub enum Interrupt {
     None,
 }
 
+/// How a message on Desk's line ([`crate::line`]) reaches a session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Deliver {
+    /// Desk's plugin takes it and submits it once the session is idle
+    /// (Claude Code's `$.prompt.submit`): never typed into its terminal.
+    Submit,
+    /// Typed into its terminal once it is idle and the person isn't typing
+    /// there (bracketed paste).
+    Paste,
+    /// It has no line: nothing reaches it, and it can't message anyone.
+    None,
+}
+
+/// How the person's **Send now** reaches a turn that is working.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Steer {
+    /// Typed into its terminal now: Claude Code takes input typed while it
+    /// works into its running turn.
+    Paste,
+    /// Codex's `turn/steer`, which adds to the running turn.
+    TurnSteer,
+    /// No documented way to add to a running turn: queue only.
+    None,
+}
+
+/// The first Claude Code that runs hooks modules (mods), which Desk's line
+/// tools and deliveries are: "Create a mod", code.claude.com/docs.
+pub const LINE_CLAUDE: Version = Version {
+    major: 2,
+    minor: 1,
+    patch: 287,
+};
+
 /// What an engine can do in a view, as Desk drives it today. The person's
 /// Desk shows only what this says.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -145,6 +180,10 @@ pub struct Caps {
     /// Whether its sessions can each run on one of several of the person's
     /// accounts, and how those sign in.
     pub accounts: crate::engine_accounts::AccountsVia,
+    /// How Desk's line reaches it ([`crate::line`]).
+    pub line: Deliver,
+    /// How the person's **Send now** reaches a working turn.
+    pub steer: Steer,
     /// What the person reads beside it, in the new session dialog and on
     /// its card.
     pub notes: Vec<&'static str>,
@@ -162,6 +201,8 @@ impl Caps {
             plan: None,
             approve_for_me: false,
             accounts: crate::engine_accounts::AccountsVia::None,
+            line: Deliver::None,
+            steer: Steer::None,
             notes: Vec::new(),
         }
     }
@@ -214,6 +255,8 @@ pub fn caps(engine: Engine, view: View) -> Caps {
             // `CLAUDE_CODE_OAUTH_TOKEN`, which Claude Code ranks above its
             // keychain login (code.claude.com/docs/en/authentication).
             accounts: crate::engine_accounts::AccountsVia::Token,
+            line: Deliver::Submit,
+            steer: Steer::Paste,
             notes: Vec::new(),
         },
         // Codex's TUI asks its approvals; Desk, subscribed to its thread,
@@ -227,6 +270,8 @@ pub fn caps(engine: Engine, view: View) -> Caps {
             plan: Some(LocalPlan::Codex),
             approve_for_me: true,
             accounts: crate::engine_accounts::AccountsVia::None,
+            line: Deliver::Paste,
+            steer: Steer::TurnSteer,
             notes: vec![
                 "Codex asks its approvals in its terminal; you can answer them from the Floor too.",
             ],
@@ -238,6 +283,33 @@ pub fn caps(engine: Engine, view: View) -> Caps {
         | Engine::Devin
         | Engine::Custom => Caps::none(),
     }
+}
+
+/// What one session of `engine` in `view` can do: [`caps`], narrowed by
+/// the version it runs and where it was started. A Claude Code too old for
+/// mods has no line; a Codex typed in a Desk terminal runs no app-server
+/// Desk joins, so its turn can't be steered (messages still reach it at
+/// its prompt).
+pub fn session_caps(engine: Engine, view: View, version: Option<&str>, tracked: bool) -> Caps {
+    let mut caps = caps(engine, view);
+    let version = version.and_then(Version::read);
+    match engine {
+        Engine::Claude if version.is_some_and(|v| v < LINE_CLAUDE) => {
+            caps.line = Deliver::None;
+            caps.notes
+                .push("Update Claude Code to 2.1.287 or later to message this session.");
+        }
+        Engine::Codex if tracked => caps.steer = Steer::None,
+        Engine::Claude
+        | Engine::Codex
+        | Engine::Gemini
+        | Engine::Copilot
+        | Engine::OpenCode
+        | Engine::Cursor
+        | Engine::Devin
+        | Engine::Custom => {}
+    }
+    caps
 }
 
 /// The bytes that end a working turn in `engine`'s terminal: Esc for both

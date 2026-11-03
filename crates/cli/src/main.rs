@@ -189,6 +189,13 @@ enum Commands {
         #[arg(long)]
         socket: PathBuf,
     },
+    /// Speak MCP over stdio to an HTTP MCP endpoint: for an agent that runs
+    /// MCP servers only as commands, given Desk's line for a session.
+    #[command(name = "mcp-proxy")]
+    McpProxy {
+        /// The endpoint, e.g. Desk's `http://127.0.0.1:<port>/mcp/<session>/<token>`.
+        url: String,
+    },
     /// Run a task using a team from the config.
     Team {
         /// The task description.
@@ -6281,6 +6288,10 @@ rules:
             serve(listener, Arc::new(LocalJobHandler))
                 .await
                 .map_err(|e| eyre::eyre!("exec runner error: {e}"))?;
+        }
+        Commands::McpProxy { url } => {
+            workforce_hub::mcp::forward_stdio(&url, tokio::io::stdin(), tokio::io::stdout())
+                .await?;
         }
         Commands::PtyHolder { socket } => {
             let _ = tracing_subscriber::fmt()

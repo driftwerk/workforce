@@ -577,6 +577,19 @@ impl Desk {
         Some(answer)
     }
 
+    /// The session running in `terminal` that the terminal's hook token
+    /// speaks for: one at a time runs in a terminal.
+    pub(crate) fn terminal_line_caller(&self, terminal: Uuid, token: &str) -> Option<Uuid> {
+        {
+            let st = self.0.state.lock();
+            let expected = st.terminals.get(&terminal)?.env.get(HOOK_TOKEN)?;
+            if !crate::holder::same_token(expected, token) {
+                return None;
+            }
+        }
+        self.terminal_session(terminal, None)
+    }
+
     /// The running session in `terminal` with this Claude Code session id
     /// (any, when the hook didn't say).
     pub(super) fn terminal_session(&self, terminal: Uuid, cli: Option<&str>) -> Option<Uuid> {
