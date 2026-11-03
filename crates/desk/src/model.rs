@@ -317,6 +317,7 @@ pub enum DeskEvent {
     },
     /// Signing in to an account through its engine's own command moved on.
     AccountSignIn {
+        #[serde(rename = "signIn")]
         sign_in: crate::engine_accounts::SignInView,
     },
     /// A key of Desk's own state changed; `value` is `null` once removed.

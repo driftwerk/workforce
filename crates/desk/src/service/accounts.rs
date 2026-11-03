@@ -37,7 +37,10 @@ pub enum Added {
     /// A pasted token was checked and kept.
     Account { account: AccountView },
     /// Signing in through the engine's own command began.
-    SignIn { sign_in: SignInView },
+    SignIn {
+        #[serde(rename = "signIn")]
+        sign_in: SignInView,
+    },
 }
 
 /// A sign-in running: the engine's command, read until it gives a token.

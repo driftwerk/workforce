@@ -444,3 +444,28 @@ async fn a_desk_that_keeps_no_accounts_starts_every_session_on_its_own_sign_in()
     })
     .await;
 }
+
+#[test]
+fn accounts_and_sign_ins_reach_desk_in_its_wire_shape() {
+    let sign_in = crate::engine_accounts::SignInView {
+        id: Uuid::nil(),
+        engine: Engine::Claude,
+        name: "Work".into(),
+        state: SignInState::Code {
+            url: Some("https://claude.ai/oauth/authorize".into()),
+        },
+    };
+    let event = serde_json::to_value(crate::model::DeskEvent::AccountSignIn {
+        sign_in: sign_in.clone(),
+    })
+    .unwrap();
+    assert_eq!(event["type"], "accountSignIn");
+    assert_eq!(event["signIn"]["state"], "code");
+    assert_eq!(event["signIn"]["url"], "https://claude.ai/oauth/authorize");
+    let added = serde_json::to_value(Added::SignIn { sign_in }).unwrap();
+    assert_eq!(added["kind"], "signIn");
+    assert_eq!(added["signIn"]["name"], "Work");
+    let accounts =
+        serde_json::to_value(crate::model::DeskEvent::Accounts { accounts: vec![] }).unwrap();
+    assert_eq!(accounts["type"], "accounts");
+}
