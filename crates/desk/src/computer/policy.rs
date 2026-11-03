@@ -110,12 +110,15 @@ pub struct AgentPolicy {
     /// What the person calls it ("Allan").
     pub name: String,
     pub access: ComputerAccess,
-    /// Its workspace and project work trees, canonical. Its config files are
-    /// in `withheld`, not here.
+    /// Its workspace and project work trees, canonical.
     pub own: Vec<PathBuf>,
-    /// What no agent reaches at any level: Desk's data, every agent's config
-    /// files, the keychains.
+    /// What no agent reaches at any level: Desk's data (other agents'
+    /// folders and their config files with it), the keychains. The own
+    /// folder is carved out of it: it may lie inside Desk's data.
     pub withheld: Vec<PathBuf>,
+    /// Its own config files and folders, inside its own folder: never
+    /// changed at any level. Reading them stays open, as before.
+    pub config: Vec<PathBuf>,
     pub home: PathBuf,
     /// Whether this computer can contain a command to the level (AC5).
     pub contained: bool,
@@ -190,8 +193,11 @@ impl AgentPolicy {
         self.own.iter().any(|root| path.starts_with(root))
     }
 
-    fn withheld(&self, path: &Path) -> bool {
-        self.withheld.iter().any(|w| path.starts_with(w))
+    /// Whether `path` is kept from the agent; `change` when the call would
+    /// change it.
+    fn withheld(&self, path: &Path, change: bool) -> bool {
+        (change && self.config.iter().any(|c| path.starts_with(c)))
+            || (self.withheld.iter().any(|w| path.starts_with(w)) && !self.inside(path))
     }
 
     fn shown(&self, path: &Path) -> String {
@@ -220,7 +226,7 @@ impl AgentPolicy {
             .filter(|c| matches!(c, std::path::Component::Normal(_)))
             .count();
         let volume_root = folder.starts_with("/Volumes") && depth <= 2;
-        depth > 0 && !volume_root && !self.home.starts_with(folder) && !self.withheld(folder)
+        depth > 0 && !volume_root && !self.home.starts_with(folder) && !self.withheld(folder, true)
     }
 }
 
@@ -353,7 +359,14 @@ pub fn verdict(p: &AgentPolicy, stopped: bool, grants: &[Grant], call: &CallFact
     }
 
     // 2. The withheld set.
-    if let Some(path) = paths(&call.effect).into_iter().find(|p_| p.withheld(p_)) {
+    let change = matches!(
+        call.effect,
+        Effect::Write { .. } | Effect::Delete { .. } | Effect::Move { .. }
+    );
+    if let Some(path) = paths(&call.effect)
+        .into_iter()
+        .find(|p_| p.withheld(p_, change))
+    {
         return refuse(
             Refused::Withheld,
             format!(

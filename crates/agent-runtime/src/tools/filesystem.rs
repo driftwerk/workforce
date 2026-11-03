@@ -181,6 +181,12 @@ impl Tool for WriteFile {
             ));
         };
 
+        if let Some(refused) = crate::tools::paths::hard_link_refusal(&real, &roots) {
+            return Ok(ToolResult::failure(
+                refused,
+                start.elapsed().as_millis() as u64,
+            ));
+        }
         let bytes_written = content.len();
         let written = tokio::task::spawn_blocking(move || {
             if let Some(parent) = real.parent() {
@@ -278,6 +284,12 @@ impl Tool for EditFile {
         if let Err(refused) = config_guard::check(&roots, &resolved) {
             return Ok(ToolResult::failure(
                 refused.to_string(),
+                start.elapsed().as_millis() as u64,
+            ));
+        }
+        if let Some(refused) = crate::tools::paths::hard_link_refusal(&resolved, &roots) {
+            return Ok(ToolResult::failure(
+                refused,
                 start.elapsed().as_millis() as u64,
             ));
         }
