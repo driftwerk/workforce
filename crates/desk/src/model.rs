@@ -124,6 +124,10 @@ pub struct PendingApproval {
     /// What the engine said about it, in plain words (where it runs, why).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub why: Option<String>,
+    /// The answers a question it asks offers, as the terminal lists them
+    /// (Claude Code's AskUserQuestion, Codex's request for input).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub options: Option<Vec<String>>,
 }
 
 /// The wire shape of a session: the record plus what only exists while it runs.

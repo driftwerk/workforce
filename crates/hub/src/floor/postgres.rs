@@ -858,6 +858,7 @@ mod tests {
                 to: None,
                 ask: "Run cargo test?".into(),
                 answer: Answer::Reply,
+                options: None,
             };
             let ops = vec![
                 begin(&first, true),
