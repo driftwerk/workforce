@@ -48,12 +48,25 @@ impl PolicyDecision {
 /// Set of options the surface should render at an `ask` / `always_ask`
 /// prompt. Decoupled from the choice enum so a single user click maps
 /// cleanly onto exactly one option.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PermissionPromptOptions {
     pub allow_once: bool,
     pub deny_once: bool,
     pub allow_always: bool,
     pub deny_always: bool,
+    /// "Allow for this session": a call on this computer allowed until the
+    /// conversation's session ends (12 hours at most).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub allow_session: bool,
+    /// "Always allow in this folder", the folder as the person reads it
+    /// (`~/dev/acme-web`), or the connector a write is always allowed to.
+    /// A surface that doesn't know it offers Allow once and Deny.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_in_folder: Option<String>,
+    /// What a call on this computer would do, as the hub resolved it, for
+    /// the card to show in place of the agent's own summary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub facts: Option<Box<crate::computer::ComputerFacts>>,
 }
 
 impl PermissionPromptOptions {
@@ -65,6 +78,9 @@ impl PermissionPromptOptions {
             deny_once: true,
             allow_always: allow_save_allow,
             deny_always: true,
+            allow_session: false,
+            allow_in_folder: None,
+            facts: None,
         }
     }
 }
@@ -88,16 +104,28 @@ pub enum PermissionChoice {
     AllowAlways,
     /// Deny this call AND save a User-scope `deny` rule.
     DenyAlways,
+    /// Allow this call, and calls like it on this computer for the rest of
+    /// the session. Kept as a grant of Desk's, never a permission rule.
+    AllowSession,
+    /// Allow this call, and calls like it in its folder (or to its
+    /// connector) from now on. Kept as a grant of Desk's, never a
+    /// permission rule.
+    AllowInFolder,
 }
 
 impl PermissionChoice {
     /// True for this call only.
     pub fn is_allow(&self) -> bool {
-        matches!(self, Self::AllowOnce | Self::AllowAlways)
+        matches!(
+            self,
+            Self::AllowOnce | Self::AllowAlways | Self::AllowSession | Self::AllowInFolder
+        )
     }
 
     /// True for choices that the runner must persist as a User-scope
-    /// rule before resolving the approval.
+    /// rule before resolving the approval. A session or folder answer is
+    /// kept by the computer gate as a grant, never as a rule, so it is not
+    /// one of them: on any other prompt it allows this call once.
     pub fn persists(&self) -> bool {
         matches!(self, Self::AllowAlways | Self::DenyAlways)
     }
@@ -180,6 +208,31 @@ impl PolicyDecision {
 
 #[cfg(test)]
 mod tests {
+    /// Additive on the wire: an older surface's options read as before and
+    /// an ordinary prompt's are written as before; the new answers allow.
+    #[test]
+    fn session_and_folder_answers_are_additive_and_never_rules() {
+        let old: super::PermissionPromptOptions = serde_json::from_str(
+            r#"{"allow_once":true,"deny_once":true,"allow_always":false,"deny_always":true}"#,
+        )
+        .unwrap();
+        assert!(!old.allow_session && old.allow_in_folder.is_none() && old.facts.is_none());
+        assert_eq!(
+            serde_json::to_string(&super::PermissionPromptOptions::ask(true)).unwrap(),
+            r#"{"allow_once":true,"deny_once":true,"allow_always":true,"deny_always":true}"#
+        );
+        for (choice, wire) in [
+            (super::PermissionChoice::AllowSession, "\"allow_session\""),
+            (
+                super::PermissionChoice::AllowInFolder,
+                "\"allow_in_folder\"",
+            ),
+        ] {
+            assert_eq!(serde_json::to_string(&choice).unwrap(), wire);
+            assert!(choice.is_allow() && !choice.persists());
+        }
+    }
+
     use super::*;
 
     #[test]

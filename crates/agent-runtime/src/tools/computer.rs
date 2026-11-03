@@ -69,6 +69,8 @@ pub struct Record {
     pub input: Value,
     pub outcome: Outcome,
     pub reason: Option<String>,
+    /// The prompt a person answered, where one did.
+    pub request_id: Option<String>,
 }
 
 /// The hub's side of the gate, one per agent.
@@ -93,6 +95,19 @@ pub trait ComputerGate: Send + Sync {
     /// roots.
     fn reach(&self, _effect: &Effect) -> Option<crate::tools::paths::Reach> {
         None
+    }
+    /// The card for `decision`: the answers its verdict offers ("for this
+    /// session", "always in this folder") and the facts it shows.
+    fn prompt(&self, _decision: &Decision) -> workforce_core::policy::PermissionPromptOptions {
+        once_or_deny()
+    }
+    /// Keeps a session or folder answer as Desk's grant.
+    fn keep(
+        &self,
+        _decision: &Decision,
+        _choice: workforce_core::policy::PermissionChoice,
+    ) -> eyre::Result<()> {
+        Ok(())
     }
 }
 
@@ -200,20 +215,89 @@ fn held(response: PolicyResponse, why: &str, effect: &Effect) -> PolicyResponse 
     }
 }
 
-/// The answers a computer ask offers: Allow once and Deny. No "always"
-/// reaches the permission rules.
-pub fn prompt_options(_decision: &Decision) -> workforce_core::policy::PermissionPromptOptions {
+/// `decision` when it is what asks (the computer gate held the call), else
+/// `None`: a prompt another gate raised is that gate's, its card, keeper and
+/// activity included.
+pub fn asking(decision: Option<Decision>) -> Option<Decision> {
+    decision.filter(|d| !matches!(d.verdict, Verdict::Run { .. }))
+}
+
+/// The answers a computer ask offers on its own: Allow once and Deny. No
+/// "always" reaches the permission rules.
+pub fn once_or_deny() -> workforce_core::policy::PermissionPromptOptions {
     workforce_core::policy::PermissionPromptOptions {
         allow_once: true,
         deny_once: true,
         allow_always: false,
         deny_always: false,
+        allow_session: false,
+        allow_in_folder: None,
+        facts: None,
     }
 }
+
+/// The answers the card for `decision` offers, and what it shows: the
+/// gate's, or Allow once and Deny without one. Never an "always" rule.
+pub fn prompt_options(
+    gate: Option<&dyn ComputerGate>,
+    decision: &Decision,
+) -> workforce_core::policy::PermissionPromptOptions {
+    let mut options = gate.map_or_else(once_or_deny, |g| g.prompt(decision));
+    options.allow_always = false;
+    options.deny_always = false;
+    options
+}
+
+/// Keeps a session or folder answer to `decision` as a grant; any other
+/// answer keeps nothing. A grant that can't be kept is logged: the call
+/// itself was still allowed once.
+pub fn keep_answer(
+    gate: Option<&dyn ComputerGate>,
+    decision: Option<&Decision>,
+    choice: Option<workforce_core::policy::PermissionChoice>,
+) {
+    use workforce_core::policy::PermissionChoice as C;
+    let (Some(gate), Some(decision), Some(choice @ (C::AllowSession | C::AllowInFolder))) =
+        (gate, decision, choice)
+    else {
+        return;
+    };
+    if let Err(e) = gate.keep(decision, choice) {
+        tracing::warn!(error = %format!("{e:#}"), "keeping a computer grant failed; allowed once");
+    }
+}
+
+/// Why an approved call no longer runs: what it would do now isn't what
+/// the card showed (a symlink swapped, a folder moved).
+pub const CHANGED_SINCE_ALLOWED: &str =
+    "What this call would change is no longer what you allowed (a file or folder moved after you allowed it), so nothing was done.";
 
 /// Why a call that would have asked ran: nobody could be asked.
 pub const UNATTENDED_RAN: &str =
     "Nobody could be asked, and at Full access the agent runs it, as before";
+
+/// [`settle`] for a prompt a person answered: the answer's `request_id`
+/// goes with it, so the hub can say which device answered.
+pub fn settle_answered(
+    gate: Option<&dyn ComputerGate>,
+    tool: &str,
+    decision: Option<&Decision>,
+    input: &Value,
+    outcome: Outcome,
+    request_id: &str,
+) {
+    let (Some(gate), Some(decision)) = (gate, decision) else {
+        return;
+    };
+    gate.record(Record {
+        tool: tool.to_string(),
+        decision: decision.clone(),
+        input: input.clone(),
+        outcome,
+        reason: None,
+        request_id: Some(request_id.to_string()),
+    });
+}
 
 /// Records what came of a call the gate decided; nothing when it decided
 /// nothing.
@@ -234,6 +318,7 @@ pub fn settle(
         input: input.clone(),
         outcome,
         reason: reason.map(str::to_string),
+        request_id: None,
     });
 }
 
@@ -292,6 +377,7 @@ pub fn unattended_refusal(
                 input: input.clone(),
                 outcome: Outcome::Ran,
                 reason,
+                request_id: None,
             });
             return None;
         }
@@ -311,6 +397,7 @@ pub fn unattended_refusal(
         input: input.clone(),
         outcome: reason.0,
         reason: Some(reason.1.clone()),
+        request_id: None,
     });
     Some(reason.1)
 }

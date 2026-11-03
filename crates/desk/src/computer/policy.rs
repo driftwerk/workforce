@@ -8,11 +8,14 @@
 //! 3. The call is outside the agent's level: refuse, in a plain sentence
 //!    naming the level and Settings.
 //! 4. A connector that is off, or read only and given a write: refuse.
-//! 5. The call is on the always-asks list: ask, offering Allow once and Deny.
-//! 6. A read, a change inside the own folder, or a contained command at a
-//!    lower level: run.
+//! 5. The call is on the always-asks list (it can't be undone, or can't be
+//!    read as simple commands): ask, offering Allow once and Deny. An agent
+//!    at Full access that asks never skips this.
+//! 6. Anything at Full access; a read, a change inside the own folder, or a
+//!    contained command at a lower level: run.
 //! 7. A grant or a session allowance covers it: run.
-//! 8. The agent works on its own: the check reviews it.
+//! 8. The agent works on its own: the check reviews it (not reached while
+//!    Full access runs everything past rule 5; kept for AC11).
 //! 9. Otherwise: ask, offering Allow once, for this session, always in the
 //!    folder, and Deny.
 //!
@@ -28,7 +31,8 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use workforce_core::computer::{
-    Ability, Access, Always, By, Choice, ComputerAccess, Effect, Refusal, Refused, Verdict, Why,
+    Ability, Access, Always, Asking, By, Choice, ComputerAccess, Effect, Refusal, Refused, Verdict,
+    Why,
 };
 
 use super::asks::{always_asks, Asks, Place};
@@ -119,6 +123,9 @@ pub struct AgentPolicy {
     /// Its own config files and folders, inside its own folder: never
     /// changed at any level. Reading them stays open, as before.
     pub config: Vec<PathBuf>,
+    /// Scratch space (`/tmp`, `$TMPDIR`), canonical: deleting in it is like
+    /// deleting in the own folder.
+    pub scratch: Vec<PathBuf>,
     pub home: PathBuf,
     /// Whether this computer can contain a command to the level (AC5).
     pub contained: bool,
@@ -195,6 +202,11 @@ impl AgentPolicy {
 
     /// Whether `path` is kept from the agent; `change` when the call would
     /// change it.
+    /// Inside the own folder or scratch space, for a delete.
+    fn deletable(&self, path: &Path) -> bool {
+        self.inside(path) || self.scratch.iter().any(|t| path.starts_with(t))
+    }
+
     fn withheld(&self, path: &Path, change: bool) -> bool {
         (change && self.config.iter().any(|c| path.starts_with(c)))
             || (self.withheld.iter().any(|w| path.starts_with(w)) && !self.inside(path))
@@ -331,6 +343,42 @@ fn granted(p: &AgentPolicy, grants: &[Grant], call: &CallFacts) -> Option<By> {
     by
 }
 
+/// A delete of `targets`, outside the own folder: a standing grant to
+/// delete in a folder holding every one lets it run; otherwise it asks,
+/// offering "always allow deleting" in the call's folder where that holds
+/// them all and may be offered. Never a session's allowance.
+fn deleting(p: &AgentPolicy, grants: &[Grant], call: &CallFacts, targets: &[PathBuf]) -> Verdict {
+    let applies = |g: &&Grant| {
+        g.hub == p.hub
+            && g.agent == p.agent
+            && g.session_id.is_none()
+            && g.ability == Ability::Delete
+            && call.person.as_deref() == Some(g.person.as_str())
+            && g.run
+                .as_ref()
+                .is_none_or(|run| call.run.as_ref() == Some(run))
+    };
+    if !targets.is_empty() {
+        if let Some(g) = grants.iter().filter(applies).find(|g| {
+            g.folder
+                .as_deref()
+                .is_some_and(|f| targets.iter().all(|t| t.starts_with(f)))
+        }) {
+            return Verdict::Run {
+                by: By::Grant(g.id),
+            };
+        }
+    }
+    let mut choices = vec![Choice::AllowOnce];
+    if let Some(folder) = call.folder.as_ref().filter(|f| {
+        !targets.is_empty() && targets.iter().all(|t| t.starts_with(f)) && p.offerable(f)
+    }) {
+        choices.push(Choice::Always(Always::Folder(folder.clone())));
+    }
+    choices.push(Choice::Deny);
+    ask(choices, Why::CantBeUndone)
+}
+
 /// What happens to `call`, given the kill switch and the agent's live
 /// grants. See the module for the rules.
 pub fn verdict(p: &AgentPolicy, stopped: bool, grants: &[Grant], call: &CallFacts) -> Verdict {
@@ -458,21 +506,26 @@ pub fn verdict(p: &AgentPolicy, stopped: bool, grants: &[Grant], call: &CallFact
         }
     }
 
-    // 5. The always-asks list.
+    // 5. The always-asks list, unless the agent at Full access asks never.
     let once = || vec![Choice::AllowOnce, Choice::Deny];
+    let never = access == Access::Full && p.access.asks == Asking::Never;
     match &call.effect {
+        _ if never => {}
         Effect::Delete { paths } | Effect::Move { from: paths, .. }
-            if paths.iter().any(|path| !p.inside(path)) =>
+            if paths.iter().any(|path| !p.deletable(path)) =>
         {
-            return ask(once(), Why::CantBeUndone);
+            let outside: Vec<PathBuf> = paths.iter().filter(|x| !p.deletable(x)).cloned().collect();
+            return deleting(p, grants, call, &outside);
         }
         Effect::Exec { command, cwd } => {
             let place = Place {
-                cwd: cwd.as_deref(),
+                cwd: cwd.clone(),
                 own: &p.own,
+                scratch: &p.scratch,
                 home: &p.home,
             };
             match always_asks(command, &place) {
+                Some(Asks::Deletes(targets)) => return deleting(p, grants, call, &targets),
                 Some(Asks::Irreversible) => return ask(once(), Why::CantBeUndone),
                 Some(Asks::Unclear) => return ask(once(), Why::Unclear),
                 None => {}
@@ -492,6 +545,8 @@ pub fn verdict(p: &AgentPolicy, stopped: bool, grants: &[Grant], call: &CallFact
     };
     let changes_inside = || inside() && !p.access.ask_in_own_folder;
     let runs = match &call.effect {
+        // Full access: whatever passed the always-asks list runs.
+        _ if access == Access::Full => true,
         Effect::Read { .. } | Effect::Connector { write: false, .. } => true,
         Effect::Write { .. } | Effect::Delete { .. } | Effect::Move { .. } => changes_inside(),
         // Contained to the level (checked in 3).

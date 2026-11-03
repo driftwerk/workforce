@@ -56,8 +56,8 @@ pub enum Access {
     OwnFolder,
     /// Reads anything but the withheld set; changes only its own folder.
     ReadAnywhere,
-    /// Reads anything but the withheld set; changes elsewhere ask first, or
-    /// are reviewed when it works on its own.
+    /// Reads, changes and runs anything but the withheld set; only what
+    /// [`Asking`] names asks first.
     #[default]
     Full,
 }
@@ -91,7 +91,7 @@ impl Access {
 }
 
 /// An agent's `[computer]`, every default filled in. An agent with none is
-/// `full`, asking first, and changes in its own folder run without a card.
+/// at Full access, asking only before what can't be undone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct ComputerAccess {
     pub access: Access,
@@ -103,6 +103,38 @@ pub struct ComputerAccess {
     /// asked (a scheduled or background job, a workflow step).
     #[serde(default)]
     pub unattended: Unattended,
+    /// At Full access, what still asks first.
+    #[serde(default)]
+    pub asks: Asking,
+}
+
+/// At Full access, what asks before it runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Asking {
+    /// What can't be undone or reaches people (the always-asks list); the
+    /// rest runs.
+    #[default]
+    Irreversible,
+    /// Nothing: it does anything its access reaches.
+    Never,
+}
+
+impl Asking {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Irreversible => "irreversible",
+            Self::Never => "never",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "irreversible" => Some(Self::Irreversible),
+            "never" => Some(Self::Never),
+            _ => None,
+        }
+    }
 }
 
 /// Where nobody can be asked, at Full access.
@@ -260,6 +292,25 @@ pub enum Refused {
 pub struct Refusal {
     pub rule: Refused,
     pub sentence: String,
+}
+
+/// What a call on this computer would do, as the hub resolved it and the
+/// card shows it: never the agent's own words.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ComputerFacts {
+    /// read | write | delete | exec | session | connector | unknown
+    pub effect: String,
+    /// The paths it names, real, as the person reads them (`~/…`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub paths: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connector: Option<String>,
+    /// The card's "why it asks" line.
+    pub why: String,
 }
 
 /// Why a card asks, as its one "why" line says it.

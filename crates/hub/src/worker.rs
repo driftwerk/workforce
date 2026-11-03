@@ -464,11 +464,13 @@ async fn execute_task(state: &HubState, assignment: &TaskAssignment) -> Result<T
         trace_tags: Default::default(),
         permission_writer: state.permission_writer().cloned(),
         surface_allows: None,
-        computer_gate: crate::serve::computer_gate_for(&crate::serve::ComputerSubject {
-            agent: assignment.agent_id.clone(),
-            name: None,
-            workspace: agent_workspace.clone(),
-        }),
+        computer_gate: crate::serve::computer_gates_installed()
+            .then(|| crate::serve::ComputerSubject {
+                agent: assignment.agent_id.clone(),
+                name: None,
+                workspace: agent_workspace.clone(),
+            })
+            .and_then(|subject| crate::serve::computer_gate_for(&subject)),
         permission_gate: state.permission_gate().cloned(),
         arguments: state.config.tools.validation.mode,
         tool_loading: workforce_agent::tools::loading::ToolLoading::default(),

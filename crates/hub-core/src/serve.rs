@@ -2704,7 +2704,9 @@ impl AgentService {
     /// What this agent may do on the person's computer, when the hub runs
     /// `[desk]` and installed [`install_computer_gates`]; `None` elsewhere.
     pub fn computer_gate(&self) -> Option<Arc<dyn workforce_agent::tools::computer::ComputerGate>> {
-        computer_gate_for(&ComputerSubject {
+        // Nothing to build on a hub that installed no gates.
+        let gates = COMPUTER_GATES.get()?;
+        gates(&ComputerSubject {
             agent: self.agent_id.to_string(),
             name: self.display_name(),
             workspace: self.workspace.clone(),
@@ -3431,6 +3433,12 @@ pub fn computer_gate_for(
 }
 
 static COMPUTER_GATES: std::sync::OnceLock<ComputerGates> = std::sync::OnceLock::new();
+
+/// Whether this hub builds computer gates at all (`[desk]` started): what a
+/// caller checks before building a [`ComputerSubject`].
+pub fn computer_gates_installed() -> bool {
+    COMPUTER_GATES.get().is_some()
+}
 
 /// Makes `gates` how every agent's computer gate is built, once: only a hub
 /// with `[desk]` installs it. Whether it was the first.

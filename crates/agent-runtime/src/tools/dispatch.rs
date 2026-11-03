@@ -860,6 +860,10 @@ pub fn would_execute(
 /// approval standing in for the prompt; secret markers are substituted and
 /// parameters scanned now, as for any allowed call. Must run inside the
 /// session's task-local scope.
+///
+/// `shown` is the computer gate's decision the person answered: when the
+/// call would now do something else (a path resolving elsewhere), it is
+/// refused rather than run on an approval of something it no longer is.
 pub async fn execute_approved(
     gates: &ToolGates,
     policy: &PolicyEngine,
@@ -867,12 +871,19 @@ pub async fn execute_approved(
     access: &ToolAccessSnapshot,
     tool_name: &str,
     input: &Value,
+    shown: Option<&Decision>,
 ) -> ToolExecution {
     let regate = ToolGates {
         arguments: ArgumentValidation::Off,
         ..gates.clone()
     };
     let (gated, decided) = gate_tool_call_decided(&regate, policy, tools, tool_name, input);
+    if let (Some(shown), Some(now)) = (shown, decided.as_ref()) {
+        if shown.effect != now.effect {
+            let why = computer::CHANGED_SINCE_ALLOWED.to_string();
+            return ToolExecution::blocked(why.clone(), why);
+        }
+    }
     let gated = match gated {
         GateOutcome::RequireApproval { .. } => prepare_allowed(gates, tool_name, input),
         settled => settled,
@@ -1607,7 +1618,7 @@ mod tests {
             let tools = &tools;
             let access = &access;
             CURRENT_USER_ID.scope("alice".to_string(), async move {
-                execute_approved(&g, &permissive_policy(), tools, access, TOOL, &input).await
+                execute_approved(&g, &permissive_policy(), tools, access, TOOL, &input, None).await
             })
         };
 
