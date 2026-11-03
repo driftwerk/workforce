@@ -166,6 +166,30 @@ async fn a_loop_is_steered_in_its_turn_and_held_from_the_next_until_the_person_s
 }
 
 #[tokio::test]
+async fn a_session_taken_back_mid_turn_while_held_finishes_that_turn() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        d.set_breaker_rules(Rules { loops: true }).await.unwrap();
+        let s = new_session(&d, dir.path()).await;
+        post(&d, s.id, prompt()).await;
+        for _ in 0..12 {
+            post(&d, s.id, tool("cargo test")).await;
+        }
+        assert_eq!(d.breaker_needs().len(), 1);
+        // As a hub that restarted knows it: held, with nothing of this run.
+        if let Some(l) = d.0.state.lock().live.get_mut(&s.id) {
+            l.breaker = Default::default();
+        }
+        assert!(!denied(&post(&d, s.id, tool("ls")).await), "the turn it is on finishes");
+        post(&d, s.id, stop()).await;
+        post(&d, s.id, json!({"hook_event_name": "UserPromptSubmit", "prompt": "<task-notification>x</task-notification>"})).await;
+        assert!(denied(&post(&d, s.id, tool("ls")).await), "the next is held");
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn a_session_over_its_budget_finishes_its_turn_and_waits_for_continue() {
     with_test_pool(build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();

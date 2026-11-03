@@ -546,11 +546,20 @@ impl Desk {
     pub(super) fn breaker_tool(&self, id: Uuid, label: &str) -> Option<String> {
         let subject = session_subject(id);
         if let Some(state) = self.held(&subject) {
+            // Held before this run of it began (a restart took it back
+            // mid-turn): the turn it is on finishes, and the next is held.
             let this_turn = {
-                let st = self.0.state.lock();
-                st.live
-                    .get(&id)
-                    .is_none_or(|l| l.breaker.hold_after.is_none_or(|h| l.breaker.turns > h))
+                let mut st = self.0.state.lock();
+                match st.live.get_mut(&id) {
+                    Some(l) => match l.breaker.hold_after {
+                        Some(h) => l.breaker.turns > h,
+                        None => {
+                            l.breaker.hold_after = Some(l.breaker.turns);
+                            false
+                        }
+                    },
+                    None => true,
+                }
             };
             if this_turn {
                 let ask = self
