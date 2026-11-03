@@ -713,7 +713,9 @@ pub fn build_mcp_registry(source: &ToolRegistry, patterns: &[String]) -> ToolReg
         return source.clone_all();
     }
 
-    let registry = ToolRegistry::new();
+    // The agent's credential pins come along, so a skill a worker loads into
+    // it later (a read source) reads its keys as the agent's are pinned.
+    let registry = ToolRegistry::empty_like(source);
     for name in source.names() {
         if matches_any(&name, patterns) {
             if let Some(tool) = source.get(&name) {

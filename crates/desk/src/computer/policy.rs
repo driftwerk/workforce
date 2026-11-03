@@ -90,8 +90,15 @@ pub fn namespace(tool: &str) -> Option<Namespace> {
 /// Whether a connector tool sends to other people: on the always-asks list.
 pub fn sends_to_people(tool: &str) -> bool {
     match tool.split_once('.') {
-        Some(("slack", name)) => name.contains("post"),
+        Some(("slack", name)) => {
+            name.contains("post") || name == "send" || name.starts_with("send_")
+        }
         Some(("email", name)) => matches!(name, "send" | "forward"),
+        // `google.gmail.send`, `google.gmail.draft_send`, `google.chat.dm_send`.
+        Some(("google", name)) => name
+            .rsplit('.')
+            .next()
+            .is_some_and(|n| n == "send" || n.ends_with("_send") || n == "forward"),
         Some(("postmark" | "sendgrid", name)) => name.starts_with("email_send"),
         _ => false,
     }
