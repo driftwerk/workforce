@@ -172,6 +172,10 @@ pub(crate) struct Live {
     /// Who raised its pending wait, while one is: the main thread's (a
     /// question, a permission) is not a sub-agent's to end.
     held: Option<Raised>,
+    /// The question the main thread asks, while it is open: kept apart, so
+    /// a sub-agent's permission shown in front of it, once that ends, gives
+    /// way to it again.
+    open_question: Option<(PendingApproval, Raised)>,
 }
 
 /// What raised a Claude Code session's pending wait (the one with `pending`'s
@@ -187,6 +191,14 @@ pub(crate) struct Raised {
 }
 
 impl Live {
+    /// The main thread's question is over: it no longer waits, nor shows.
+    fn end_question(&mut self) {
+        if self.open_question.take().is_some() && self.holder().is_some_and(|h| h.question) {
+            self.pending = None;
+            self.held = None;
+        }
+    }
+
     /// What raised its pending wait, while it waits.
     fn holder(&self) -> Option<&Raised> {
         let pending = self.pending.as_ref()?;
@@ -1102,6 +1114,7 @@ impl Desk {
                     codex_asks: Vec::new(),
                     codex_sent: HashMap::new(),
                     held: None,
+                    open_question: None,
                 },
             );
             tokio::spawn(self.clone().on_exit(id, exit));
@@ -2947,6 +2960,7 @@ impl Desk {
                 codex_asks: Vec::new(),
                 codex_sent: HashMap::new(),
                 held: None,
+                open_question: None,
             },
         );
         tokio::spawn(self.clone().on_exit(r.id, exit));
@@ -3135,6 +3149,7 @@ impl Desk {
                 if let Some(l) = l {
                     l.pending = None;
                     l.held = None;
+                    l.open_question = None;
                     l.prompts += 1;
                     l.denials.clear();
                     l.reading = None;
@@ -3155,9 +3170,8 @@ impl Desk {
                     }
                     // The main thread went on: the question it asked is over
                     // (its own hook turned it down, or it was answered).
-                    if inside.is_none() && l.holder().is_some_and(|h| h.question) {
-                        l.pending = None;
-                        l.held = None;
+                    if inside.is_none() {
+                        l.end_question();
                     }
                 }
             }),
@@ -3173,8 +3187,9 @@ impl Desk {
                 let Some(l) = l else { return };
                 // The same call again (its permission check after its
                 // start) is the same question, still asked.
-                if l.holder()
-                    .is_some_and(|h| h.question && (call.is_none() || h.call == call))
+                let same = |h: &Raised| h.question && (call.is_none() || h.call == call);
+                if l.holder().is_some_and(same)
+                    || l.open_question.as_ref().is_some_and(|(_, h)| same(h))
                 {
                     return;
                 }
@@ -3193,29 +3208,38 @@ impl Desk {
                     why: question.why,
                     options: question.options,
                 };
-                l.held = Some(Raised {
+                let raised = Raised {
                     pending: pending.id,
                     agent: inside.clone(),
                     question: true,
                     call,
-                });
+                };
+                if inside.is_none() {
+                    l.open_question = Some((pending.clone(), raised.clone()));
+                }
+                l.held = Some(raised);
                 l.pending = Some(pending);
                 l.answer = None;
             }),
-            Hook::ToolEnd { id: call } => {
-                let held = self
-                    .0
-                    .state
-                    .lock()
-                    .live
-                    .get(&id)
-                    .is_some_and(|l| l.holds_against(None, call.as_deref()));
-                // Another call ended (one run beside it): the question waits on.
-                if held {
+            Hook::ToolEnd {
+                id: call,
+                interrupt,
+            } => {
+                let skip = self.0.state.lock().live.get(&id).is_some_and(|l| {
+                    // Another call ended (one run beside it): the question
+                    // waits on. An interrupted call with nothing waiting
+                    // says nothing of the session: it isn't working on.
+                    l.holds_against(None, call.as_deref()) || (interrupt && l.pending.is_none())
+                });
+                if skip {
                     return answer();
                 }
                 self.change(id, |r, l| {
-                    r.state = SessionState::Working;
+                    r.state = match (interrupt, &inside) {
+                        // Esc ended the main thread's turn: no Stop follows.
+                        (true, None) => SessionState::Done,
+                        _ => SessionState::Working,
+                    };
                     if let Some(l) = l {
                         l.current_tool = None;
                         l.pending = None;
@@ -3223,6 +3247,20 @@ impl Desk {
                         // A tool ran: the turn got past what it was refused.
                         if inside.is_none() {
                             asking::went_on(&mut l.denials, true);
+                        }
+                        let ends_question = inside.is_none()
+                            && l.open_question.as_ref().is_some_and(|(_, h)| {
+                                call.is_none() || h.call.is_none() || h.call == call
+                            });
+                        if ends_question || (interrupt && inside.is_none()) {
+                            l.open_question = None;
+                        }
+                        // What else showed in front of the main thread's
+                        // question ended: the question shows again.
+                        if let Some((question, raised)) = l.open_question.clone() {
+                            l.pending = Some(question);
+                            l.held = Some(raised);
+                            r.state = SessionState::Blocked;
                         }
                     }
                 });
@@ -3250,6 +3288,16 @@ impl Desk {
                     l.pending = Some(pending);
                 }
             }),
+            // Back at its prompt, nothing on screen: a question it asked was
+            // turned down (Esc fires no hook of its own).
+            Hook::AtPrompt => self.change(id, |r, l| {
+                if let Some(l) = l.filter(|l| l.open_question.is_some()) {
+                    l.end_question();
+                    if l.pending.is_none() && r.state == SessionState::Blocked {
+                        r.state = SessionState::Done;
+                    }
+                }
+            }),
             Hook::InputAnswered => self.change(id, |r, l| {
                 if let Some(l) = l {
                     if l.pending.as_ref().is_some_and(|p| p.tool == "Input") {
@@ -3263,6 +3311,7 @@ impl Desk {
                 r.state = SessionState::Working;
                 if let Some(l) = l {
                     l.pending = None;
+                    l.open_question = None;
                     l.denials.clear();
                     l.reading = None;
                     r.asked = None;
@@ -3353,6 +3402,7 @@ impl Desk {
                     if let Some(l) = l {
                         l.current_tool = None;
                         l.pending = None;
+                        l.open_question = None;
                         l.answer = None;
                         l.denials.clear();
                         l.background = std::mem::take(&mut l.background)
@@ -5264,20 +5314,45 @@ mod tests {
             );
             assert!(crate::floor::open_needs(&logged.0.lock().iter().fold(Vec::new(), crate::floor::apply)).is_empty());
 
-            // A plan to approve waits the same way; turned down, it ends too.
+            // A plan to approve waits the same way. Turned down in its
+            // dialog, it fires no hook of its own (2.1.317): the session is
+            // back at its prompt, which `idle_prompt` says, and the wait goes.
             post(&d, s.id, json!({"hook_event_name": "PreToolUse", "tool_name": "ExitPlanMode", "tool_use_id": "toolu_p",
                 "tool_input": {"plan": "# Shadow the reads\n1. Mirror the writes."}})).await;
             let p = d.view(s.id).unwrap().pending.unwrap();
             assert_eq!((p.tool.as_str(), p.detail.as_str()), ("Plan", "Shadow the reads"));
-            post(&d, s.id, json!({"hook_event_name": "PostToolUseFailure", "tool_name": "ExitPlanMode",
-                "tool_use_id": "toolu_p", "error": "The user doesn't want to proceed", "is_interrupt": true})).await;
-            assert_eq!(d.view(s.id).unwrap().pending, None);
+            post(&d, s.id, json!({"hook_event_name": "Notification", "notification_type": "idle_prompt",
+                "message": "Claude is waiting for your input"})).await;
+            let v = d.view(s.id).unwrap();
+            assert_eq!((v.state, v.pending), (SessionState::Done, None));
+            // At its prompt with nothing asked, the notice changes nothing.
+            post(&d, s.id, json!({"hook_event_name": "Notification", "notification_type": "idle_prompt", "message": "m"})).await;
+            assert_eq!(d.view(s.id).unwrap().state, SessionState::Done);
+            // An interrupted call with nothing waiting doesn't make it work.
+            post(&d, s.id, json!({"hook_event_name": "PostToolUseFailure", "tool_name": "Bash",
+                "tool_use_id": "toolu_x", "error": "Interrupted", "is_interrupt": true})).await;
+            assert_eq!(d.view(s.id).unwrap().state, SessionState::Done);
 
             // A question the next prompt answers (Esc, then typing).
             post(&d, s.id, json!({"hook_event_name": "PreToolUse", "tool_name": "AskUserQuestion",
                 "tool_input": claude::tests::two_questions(), "tool_use_id": "toolu_q2"})).await;
             assert_eq!(asking(&d).0, SessionState::Blocked);
             post(&d, s.id, json!({"hook_event_name": "UserPromptSubmit", "prompt": "do the first"})).await;
+            assert_eq!(asking(&d), (SessionState::Working, None, None));
+
+            // A sub-agent's permission shown in front of the person's open
+            // question ends with its call; the question shows again.
+            post(&d, s.id, json!({"hook_event_name": "PreToolUse", "tool_name": "AskUserQuestion",
+                "tool_input": claude::tests::two_questions(), "tool_use_id": "toolu_q3"})).await;
+            let question = d.view(s.id).unwrap().pending.unwrap();
+            d.update(s.id, SessionPatch { approvals: Some(Approvals::Terminal), ..Default::default() }).unwrap();
+            post(&d, s.id, json!({"hook_event_name": "PermissionRequest", "agent_id": "a2", "tool_name": "Bash",
+                "tool_input": {"command": "git push"}})).await;
+            assert_eq!(d.view(s.id).unwrap().pending.unwrap().tool, "Bash(git push)");
+            post(&d, s.id, json!({"hook_event_name": "PostToolUse", "agent_id": "a2", "tool_name": "Bash"})).await;
+            let v = d.view(s.id).unwrap();
+            assert_eq!((v.state, v.pending.map(|p| p.id)), (SessionState::Blocked, Some(question.id)));
+            post(&d, s.id, json!({"hook_event_name": "PostToolUse", "tool_name": "AskUserQuestion", "tool_use_id": "toolu_q3"})).await;
             assert_eq!(asking(&d), (SessionState::Working, None, None));
         })
         .await;

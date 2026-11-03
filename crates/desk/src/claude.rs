@@ -35,7 +35,9 @@ const TOOL_EVENTS: [&str; 5] = [
     "PreToolUse",
     "PermissionRequest",
     "PostToolUse",
-    // A tool that failed, or was turned down in its dialog, ends too.
+    // A tool that failed ends too. A question or plan turned down in its
+    // dialog fires none (it ends in the permission phase): `idle_prompt`
+    // says so.
     "PostToolUseFailure",
     // Auto mode refused a tool: the turn may end stuck on it.
     "PermissionDenied",
@@ -117,6 +119,7 @@ struct Payload {
     tool_name: Option<String>,
     tool_input: Option<Value>,
     tool_use_id: Option<String>,
+    is_interrupt: Option<bool>,
     notification_type: Option<String>,
     message: Option<String>,
     last_assistant_message: Option<String>,
@@ -166,7 +169,11 @@ pub enum Hook {
     },
     ToolEnd {
         id: Option<String>,
+        /// Esc stopped it (`PostToolUseFailure` with `is_interrupt`).
+        interrupt: bool,
     },
+    /// Back at its prompt with nothing on screen (`idle_prompt`).
+    AtPrompt,
     NeedsInput(String),
     /// What a dialog asked was answered (an MCP server's request for input).
     InputAnswered,
@@ -236,6 +243,7 @@ pub fn parse_hook(body: &[u8]) -> eyre::Result<Hook> {
         }
         "PostToolUse" | "PostToolUseFailure" => Hook::ToolEnd {
             id: p.tool_use_id.clone(),
+            interrupt: p.is_interrupt == Some(true),
         },
         "Notification" => match p.notification_type.as_deref() {
             // An older CLI says no kind: a dialog, as it only notified then.
@@ -244,6 +252,7 @@ pub fn parse_hook(body: &[u8]) -> eyre::Result<Hook> {
                 Hook::NeedsInput(p.message.unwrap_or_default())
             }
             Some(kind) if ANSWERED_NOTICES.contains(&kind) => Hook::InputAnswered,
+            Some("idle_prompt") => Hook::AtPrompt,
             // Idle at its prompt (the turn's end says that), signed in,
             // finished, and the like: nothing waits.
             Some(_) => Hook::Other,
@@ -277,12 +286,11 @@ pub fn parse_hook(body: &[u8]) -> eyre::Result<Hook> {
 /// Claude Code 2.1.317 names them. The rest (`idle_prompt`, `auth_success`,
 /// `agent_completed`, `computer_use_enter`, `quota_auto_resume_fired`, …)
 /// don't.
-const WAITING_NOTICES: [&str; 5] = [
+const WAITING_NOTICES: [&str; 4] = [
     "permission_prompt",
     "elicitation_dialog",
     "elicitation_url_dialog",
     "worker_permission_prompt",
-    "agent_needs_input",
 ];
 
 /// The `Notification` kinds that say an MCP server's request was answered.
@@ -578,7 +586,7 @@ pub(crate) mod tests {
             Hook::Usage(json!([{"kind": "five_hour", "percentUsed": 62}]))
         );
         let idle = br#"{"hook_event_name":"Notification","notification_type":"idle_prompt","message":"waiting"}"#;
-        assert_eq!(parse_hook(idle).unwrap(), Hook::Other);
+        assert_eq!(parse_hook(idle).unwrap(), Hook::AtPrompt);
         let ask = br#"{"hook_event_name":"Notification","notification_type":"permission_prompt","message":"Claude needs your permission"}"#;
         assert_eq!(
             parse_hook(ask).unwrap(),
@@ -651,14 +659,17 @@ pub(crate) mod tests {
         assert_eq!(
             parse_hook(post.to_string().as_bytes()).unwrap(),
             Hook::ToolEnd {
-                id: Some("toolu_q1".into())
+                id: Some("toolu_q1".into()),
+                interrupt: false
             }
         );
-        let failed = br#"{"hook_event_name":"PostToolUseFailure","tool_name":"AskUserQuestion","tool_use_id":"toolu_q1","error":"rejected","is_interrupt":true}"#;
+        // Esc on a running tool (a turned-down question fires none).
+        let stopped = br#"{"hook_event_name":"PostToolUseFailure","tool_name":"Bash","tool_use_id":"toolu_b1","error":"Interrupted","is_interrupt":true}"#;
         assert_eq!(
-            parse_hook(failed).unwrap(),
+            parse_hook(stopped).unwrap(),
             Hook::ToolEnd {
-                id: Some("toolu_q1".into())
+                id: Some("toolu_b1".into()),
+                interrupt: true
             }
         );
         // Without questions it is no question.
@@ -682,8 +693,10 @@ pub(crate) mod tests {
         for kind in ANSWERED_NOTICES {
             assert_eq!(notice(kind), Hook::InputAnswered, "{kind}");
         }
+        assert_eq!(notice("idle_prompt"), Hook::AtPrompt);
         for kind in [
-            "idle_prompt",
+            // The agents view's, about other sessions.
+            "agent_needs_input",
             "auth_success",
             "agent_completed",
             "computer_use_enter",
