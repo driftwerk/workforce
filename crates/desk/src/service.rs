@@ -176,6 +176,10 @@ pub(crate) struct Live {
     /// a sub-agent's permission shown in front of it, once that ends, gives
     /// way to it again.
     open_question: Option<(PendingApproval, Raised)>,
+    /// The question Codex asks in its terminal (`item/tool/requestUserInput`,
+    /// an MCP server's request), by its request's id: only the terminal
+    /// answers it.
+    codex_question: Option<(Value, PendingApproval)>,
 }
 
 /// What raised a Claude Code session's pending wait (the one with `pending`'s
@@ -629,12 +633,44 @@ fn codex_front(r: &mut SessionRecord, l: &mut Live) {
             r.state = SessionState::Blocked;
             r.asked = None;
         }
-        None => {
-            l.pending = None;
-            if r.state == SessionState::Blocked {
-                r.state = SessionState::Working;
+        None => match &l.codex_question {
+            // What it asks in its terminal still waits.
+            Some((_, question)) => {
+                l.pending = Some(question.clone());
+                r.state = SessionState::Blocked;
+                r.asked = None;
             }
-        }
+            None => {
+                l.pending = None;
+                if r.state == SessionState::Blocked {
+                    r.state = SessionState::Working;
+                }
+            }
+        },
+    }
+}
+
+/// Codex asks the person something only its terminal answers: shown with
+/// its words and options, after what Desk can answer.
+fn codex_question(r: &mut SessionRecord, l: &mut Live, request: Value, q: claude::Question) {
+    // The generic wait its status said becomes this question.
+    let was = l
+        .pending
+        .clone()
+        .filter(|p| !p.answerable && l.codex_asks.is_empty());
+    let pending = PendingApproval {
+        id: Uuid::new_v4(),
+        since: was.as_ref().map_or_else(Utc::now, |p| p.since),
+        tool: q.tool,
+        detail: q.detail,
+        answerable: false,
+        choices: Vec::new(),
+        why: q.why,
+        options: q.options,
+    };
+    l.codex_question = Some((request, pending));
+    if l.codex_asks.is_empty() {
+        codex_front(r, l);
     }
 }
 
@@ -643,7 +679,11 @@ fn codex_front(r: &mut SessionRecord, l: &mut Live) {
 fn codex_resolved(r: &mut SessionRecord, l: &mut Live, request: &Value) {
     let before = l.codex_asks.len();
     l.codex_asks.retain(|a| a.request != *request);
-    if l.codex_asks.len() != before {
+    let asked = l.codex_question.as_ref().is_some_and(|(q, _)| q == request);
+    if asked {
+        l.codex_question = None;
+    }
+    if l.codex_asks.len() != before || asked {
         codex_front(r, l);
     }
 }
@@ -1115,6 +1155,7 @@ impl Desk {
                     codex_sent: HashMap::new(),
                     held: None,
                     open_question: None,
+                    codex_question: None,
                 },
             );
             tokio::spawn(self.clone().on_exit(id, exit));
@@ -2961,6 +3002,7 @@ impl Desk {
                 codex_sent: HashMap::new(),
                 held: None,
                 open_question: None,
+                codex_question: None,
             },
         );
         tokio::spawn(self.clone().on_exit(r.id, exit));
@@ -3711,6 +3753,7 @@ impl Desk {
                             let asked = l.pending.take();
                             if !waiting {
                                 l.codex_asks.clear();
+                                l.codex_question = None;
                             }
                             l.pending = waiting.then(|| {
                                 asked.unwrap_or_else(|| PendingApproval {
@@ -3749,6 +3792,7 @@ impl Desk {
                             l.current_tool = None;
                             l.pending = None;
                             l.codex_asks.clear();
+                            l.codex_question = None;
                             l.background =
                                 std::mem::take(&mut l.background).looked_if(running, Utc::now());
                         }
@@ -3774,6 +3818,11 @@ impl Desk {
                             codex_asks(r, l, ask);
                         }
                     }
+                    CodexEvent::Question { request, question } => {
+                        if let Some(l) = l {
+                            codex_question(r, l, request, question);
+                        }
+                    }
                     CodexEvent::Resolved(request) => {
                         if let Some(l) = l {
                             codex_resolved(r, l, &request);
@@ -3794,8 +3843,9 @@ impl Desk {
         // Its server went away: what it asked can't be answered from Desk.
         self.change(id, |r, l| {
             if let Some(l) = l {
-                if !l.codex_asks.is_empty() {
+                if !l.codex_asks.is_empty() || l.codex_question.is_some() {
                     l.codex_asks.clear();
+                    l.codex_question = None;
                     codex_front(r, l);
                 }
             }

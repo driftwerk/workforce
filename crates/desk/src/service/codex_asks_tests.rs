@@ -249,3 +249,75 @@ async fn approve_for_me_starts_codex_with_its_reviewer_and_stays_on() {
     })
     .await;
 }
+
+/// What Codex asks in its terminal (`item/tool/requestUserInput`, as
+/// 0.166's app-server schema has it) shows with its words and options,
+/// is never answered from Desk, and goes once it is answered.
+#[tokio::test]
+async fn a_codex_question_shows_its_words_until_the_terminal_answers_it() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        DeskStore::migrate(&pool).await.unwrap();
+        let logged = Arc::new(Logged::default());
+        let d = Desk::start(
+            DeskStore::from_pool(pool),
+            options(dir.path()).with_program(Engine::Codex, fake_codex(dir.path())),
+            Floor {
+                turns: Some(logged.clone()),
+                plans: None,
+                pricer: None,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        let server = serve(dir.path());
+        let s = d
+            .create(codex_session(dir.path(), false), None)
+            .await
+            .unwrap();
+        let mut ws = server.await.unwrap();
+        next_sent(&mut ws, |v| v["method"] == "initialized").await;
+        say(&mut ws, json!({"method": "thread/started", "params": {"thread": {"id": "t1",
+            "environments": [{"cwd": "/repo"}], "path": null}}})).await;
+        say(&mut ws, status(&[])).await;
+        let resume = next_sent(&mut ws, |v| v["method"] == "thread/resume").await;
+        say(&mut ws, json!({"id": resume["id"], "result": {"thread": {"id": "t1"}}})).await;
+
+        // Its status says it waits on the person, then the request says what for.
+        say(&mut ws, status(&["waitingOnUserInput"])).await;
+        until(|| d.view(s.id).unwrap().state == SessionState::Blocked).await;
+        let generic = d.view(s.id).unwrap().pending.unwrap();
+        say(&mut ws, json!({"id": 4, "method": "item/tool/requestUserInput", "params": {
+            "threadId": "t1", "turnId": "u1", "itemId": "q-1", "isBlocking": true,
+            "questions": [{"id": "where", "header": "Target", "question": "Deploy main or the release branch?",
+                "isOther": true, "isSecret": false, "options": [
+                    {"label": "main", "description": "What is on main now."},
+                    {"label": "release", "description": "The release branch."}]}]}})).await;
+        until(|| d.view(s.id).unwrap().pending.is_some_and(|p| p.tool == "Question")).await;
+        let p = d.view(s.id).unwrap().pending.unwrap();
+        assert_eq!(
+            (p.detail.as_str(), p.options.clone(), p.answerable, p.since),
+            ("Deploy main or the release branch?", Some(vec!["main".to_string(), "release".to_string()]), false, generic.since)
+        );
+        assert!(d.decide(s.id, p.id, Decision::Allow, None).is_err(), "the terminal's to answer");
+        assert!(
+            logs(&logged, |ops| ops.iter().any(|op| matches!(op, TurnOp::Wait { wait, .. }
+                if wait.options.is_some() && wait.answer == Answer::Terminal)))
+            .await
+        );
+        // A question the turn goes on past doesn't wait.
+        say(&mut ws, json!({"id": 5, "method": "item/tool/requestUserInput", "params": {
+            "threadId": "t1", "turnId": "u1", "itemId": "q-2", "isBlocking": false,
+            "questions": [{"id": "x", "header": "Later", "question": "Anything else?"}]}})).await;
+        // Answered in the terminal.
+        say(&mut ws, json!({"method": "serverRequest/resolved", "params": {"threadId": "t1", "requestId": 4}})).await;
+        until(|| d.view(s.id).unwrap().pending.is_none()).await;
+        assert_eq!(d.view(s.id).unwrap().state, SessionState::Working);
+        say(&mut ws, status(&[])).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let v = d.view(s.id).unwrap();
+        assert_eq!((v.state, v.pending), (SessionState::Working, None));
+    })
+    .await;
+}
