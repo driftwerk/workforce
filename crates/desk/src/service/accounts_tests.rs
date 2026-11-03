@@ -510,10 +510,252 @@ fn accounts_and_sign_ins_reach_desk_in_its_wire_shape() {
     assert_eq!(added["signIn"]["name"], "Work");
     let accounts = serde_json::to_value(crate::model::DeskEvent::Accounts {
         accounts: vec![],
+        needs: vec![],
+        auto_switch: true,
         problems: vec![],
     })
     .unwrap();
     assert_eq!(accounts["type"], "accounts");
+    assert_eq!(accounts["autoSwitch"], true);
+}
+
+/// Two sessions on Work, the default, both running.
+async fn two_on_work(d: &Desk, dir: &Path) -> (Uuid, Uuid, Uuid, Uuid) {
+    let work = paste(d, "Work", GOOD, true).await;
+    let personal = paste(d, "Personal", OTHER, false).await;
+    let a = d.create(session(dir, None), None).await.unwrap();
+    let b = d.create(session(dir, None), None).await.unwrap();
+    started(dir, a.id, 0).await;
+    started(dir, b.id, 0).await;
+    for id in [a.id, b.id] {
+        d.change(id, |r, _| r.state = SessionState::Idle);
+    }
+    (work, personal, a.id, b.id)
+}
+
+/// Session `id`'s turn ends on its plan's limit.
+fn stops_on_its_limit(d: &Desk, id: Uuid) {
+    d.change(id, |r, _| r.state = SessionState::Working);
+    d.change(id, |r, _| {
+        r.state = SessionState::Done;
+        r.last_reply = Some("You've hit your usage limit · resets Fri 9am".into());
+    });
+}
+
+async fn until<T>(mut f: impl FnMut() -> Option<T>) -> T {
+    for _ in 0..400 {
+        if let Some(v) = f() {
+            return v;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("never came about");
+}
+
+#[tokio::test]
+async fn an_account_at_its_limit_asks_to_switch_all_and_asks_back_once_it_resets() {
+    use crate::engine_accounts::AccountNeed;
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(
+            pool,
+            account_options(dir.path(), Arc::new(MemoryKeys::default())),
+        )
+        .await;
+        let (work, personal, a, b) = two_on_work(&d, dir.path()).await;
+        assert!(d.account_needs().is_empty());
+        stops_on_its_limit(&d, a);
+        let need = until(|| d.account_needs().into_iter().next()).await;
+        let AccountNeed::Limit {
+            id,
+            from,
+            to,
+            sessions,
+            ..
+        } = need.clone()
+        else {
+            panic!("{need:?}");
+        };
+        assert_eq!(
+            (from.id, to.id, sessions.len()),
+            (Some(work), Some(personal), 2)
+        );
+        // Not now: put off while it stands.
+        d.put_off(&id);
+        assert!(d.account_needs().is_empty());
+        d.0.state.lock().put_off.clear();
+
+        // Switch all: the one stopped on its limit carries on, the idle one
+        // restarts, both on Personal.
+        let done = d
+            .switch_all(Engine::Claude, Some(work), Some(personal))
+            .await
+            .unwrap();
+        assert_eq!(done.now.len(), 2, "{done:?}");
+        let (env, args) = started(dir.path(), a, 1).await;
+        assert_eq!(env["TOKEN_ON_FD"], OTHER);
+        assert!(args.trim_end().ends_with("Continue"), "{args}");
+        let (env, args) = started(dir.path(), b, 1).await;
+        assert_eq!(env["TOKEN_ON_FD"], OTHER);
+        assert!(!args.contains("Continue"), "{args}");
+        until(|| d.view(a).ok().filter(|v| v.live).map(drop)).await;
+        until(|| d.view(b).ok().filter(|v| v.live).map(drop)).await;
+        assert!(d.account_needs().is_empty(), "nothing left on Work");
+        for id in [a, b] {
+            d.change(id, |r, _| r.state = SessionState::Idle);
+        }
+
+        // Work reads with room again: asked back, never switched back alone.
+        d.0.state
+            .lock()
+            .standing
+            .get_mut(&Some(work))
+            .unwrap()
+            .hit_at = Some(chrono::Utc::now() - chrono::Duration::hours(6));
+        let need = until(|| d.account_needs().into_iter().next()).await;
+        assert!(
+            matches!(&need, AccountNeed::Reset { account, from, sessions, .. }
+                if account.id == Some(work) && from.id == Some(personal) && sessions.len() == 2),
+            "{need:?}"
+        );
+        assert_eq!(d.view(a).unwrap().account.map(|x| x.id), Some(personal));
+        d.switch_all(Engine::Claude, Some(personal), Some(work))
+            .await
+            .unwrap();
+        assert!(d.account_needs().is_empty());
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn with_switch_automatically_on_desk_moves_them_itself_and_never_when_all_are_full() {
+    use crate::engine_accounts::AccountNeed;
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(
+            pool.clone(),
+            account_options(dir.path(), Arc::new(MemoryKeys::default())),
+        )
+        .await;
+        let (work, personal, a, b) = two_on_work(&d, dir.path()).await;
+        // Both full: when each resets, and nothing moves.
+        d.0.state
+            .lock()
+            .standing
+            .entry(Some(personal))
+            .or_default()
+            .hit_at = Some(chrono::Utc::now());
+        d.set_auto_switch(true).await.unwrap();
+        stops_on_its_limit(&d, a);
+        let need = until(|| d.account_needs().into_iter().next()).await;
+        assert!(matches!(need, AccountNeed::AllFull { .. }), "{need:?}");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(d.view(b).unwrap().account.map(|x| x.id), Some(work));
+
+        // Personal has room: Desk switches by itself.
+        d.0.state.lock().standing.remove(&Some(personal));
+        d.accounts_moved().await;
+        let (env, _) = started(dir.path(), b, 1).await;
+        assert_eq!(env["TOKEN_ON_FD"], OTHER);
+        assert_eq!(d.view(b).unwrap().account.map(|x| x.id), Some(personal));
+
+        // The choice is kept.
+        drop(d);
+        let back = desk(
+            pool,
+            account_options(dir.path(), Arc::new(MemoryKeys::default())),
+        )
+        .await;
+        assert!(back.auto_switch());
+    })
+    .await;
+}
+
+/// The hub's plan readings, as a test sees them: what each report was
+/// kept as, and a window parser that takes `[{used, resets}]`.
+#[derive(Default)]
+struct Plans(parking_lot::Mutex<Vec<crate::usage::LocalAccount>>);
+
+impl crate::usage::PlanSink for Plans {
+    fn local(
+        &self,
+        _: crate::usage::LocalPlan,
+        _: serde_json::Value,
+        account: crate::usage::LocalAccount,
+    ) {
+        self.0.lock().push(account);
+    }
+    fn windows(
+        &self,
+        _: crate::usage::LocalPlan,
+        payload: &serde_json::Value,
+    ) -> Vec<crate::usage::LimitWindow> {
+        payload
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|w| crate::usage::LimitWindow {
+                used_percent: w["used"].as_f64().unwrap_or_default(),
+                resets_at: w["resets"]
+                    .as_str()
+                    .and_then(|r| chrono::DateTime::parse_from_rfc3339(r).ok())
+                    .map(|r| r.to_utc()),
+                minutes: 10_080,
+            })
+            .collect()
+    }
+    fn account_key(&self, _: crate::usage::LocalPlan, ids: &[String]) -> Option<String> {
+        Some(format!("key:{}", ids.join(",")))
+    }
+}
+
+#[tokio::test]
+async fn a_full_weekly_window_reported_by_a_session_on_an_account_raises_its_need_and_is_that_accounts(
+) {
+    use crate::engine_accounts::AccountNeed;
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        DeskStore::migrate(&pool).await.unwrap();
+        let plans = Arc::new(Plans::default());
+        let d = Desk::start(
+            DeskStore::from_pool(pool),
+            account_options(dir.path(), Arc::new(MemoryKeys::default())),
+            super::Floor {
+                plans: Some(plans.clone()),
+                ..Default::default()
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        let (work, personal, a, _) = two_on_work(&d, dir.path()).await;
+        let resets = (chrono::Utc::now() + chrono::Duration::days(2)).to_rfc3339();
+        d.report_usage(
+            serde_json::json!([{ "used": 100.0, "resets": resets }]),
+            Some(a),
+        );
+        let need = until(|| d.account_needs().into_iter().next()).await;
+        assert!(
+            matches!(&need, AccountNeed::Limit { from, to, resets_at: Some(_), .. }
+                if from.id == Some(work) && to.id == Some(personal)),
+            "{need:?}"
+        );
+        // Kept as Work's reading, under the key its plan card is named by.
+        let kept = plans.0.lock().clone();
+        assert_eq!(
+            kept.last().unwrap().ids,
+            vec![format!("desk-account:{work}")]
+        );
+        let view = d.accounts().into_iter().find(|v| v.id == work).unwrap();
+        assert_eq!(view.plan_key, Some(format!("key:desk-account:{work}")));
+        // A report with room: Work isn't full any more.
+        d.report_usage(
+            serde_json::json!([{ "used": 20.0, "resets": resets }]),
+            Some(a),
+        );
+        until(|| d.account_needs().is_empty().then_some(())).await;
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -647,12 +889,47 @@ async fn a_removed_accounts_running_sessions_say_so_and_move_to_the_default() {
     .await;
 }
 
-async fn until<T>(mut f: impl FnMut() -> Option<T>) -> T {
-    for _ in 0..400 {
-        if let Some(v) = f() {
-            return v;
+#[tokio::test]
+async fn switch_all_and_auto_switch_never_pick_an_account_whose_sign_in_cant_be_read() {
+    use crate::engine_accounts::AccountNeed;
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = Arc::new(MemoryKeys::default());
+        let d = desk(pool, account_options(dir.path(), keys.clone())).await;
+        let (work, personal, a, b) = two_on_work(&d, dir.path()).await;
+        keys.delete(personal).unwrap();
+        // Switch all to it: refused before any session is stopped.
+        let refused = d
+            .switch_all(Engine::Claude, Some(work), Some(personal))
+            .await
+            .unwrap_err();
+        assert!(refused.to_string().contains("no longer in"), "{refused}");
+        for s in [a, b] {
+            let v = d.view(s).unwrap();
+            assert_eq!((v.account.map(|x| x.id), v.live), (Some(work), true));
         }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    panic!("never came about");
+        // The Floor says why, and the limit need offers nothing to move to.
+        d.set_auto_switch(true).await.unwrap();
+        stops_on_its_limit(&d, a);
+        let needs = until(|| {
+            let n = d.account_needs();
+            n.iter()
+                .any(|n| matches!(n, AccountNeed::AllFull { .. }))
+                .then_some(n)
+        })
+        .await;
+        assert!(
+            needs.iter().any(
+                |n| matches!(n, AccountNeed::SignIn { account, .. } if account.id == Some(personal))
+            ),
+            "{needs:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            d.view(b).unwrap().account.map(|x| x.id),
+            Some(work),
+            "auto-switch moved nothing"
+        );
+    })
+    .await;
 }

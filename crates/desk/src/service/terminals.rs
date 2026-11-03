@@ -538,7 +538,7 @@ impl Desk {
             }
         };
         if let Hook::Usage(limits) = hook {
-            self.report_usage(limits);
+            self.report_usage(limits, None);
             return Some(Value::Object(Default::default()));
         }
         let cli = fields["session_id"].as_str().map(str::to_string);

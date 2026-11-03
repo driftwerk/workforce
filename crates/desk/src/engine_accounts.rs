@@ -299,6 +299,8 @@ pub struct AccountView {
     pub is_default: bool,
     /// Whether its sign-in is still in the store.
     pub signed_in: bool,
+    /// The key its plan readings have on the Floor's plan cards.
+    pub plan_key: Option<String>,
     /// The sessions running on it now.
     pub sessions: Vec<Uuid>,
     pub created_at: DateTime<Utc>,
@@ -538,6 +540,214 @@ pub fn setup_said(screen: &str) -> SetupSaid {
     said
 }
 
+/// One side of a switch: an account, or (`id: None`) the CLI's own sign-in
+/// on this computer.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Side {
+    pub id: Option<Uuid>,
+    pub name: String,
+}
+
+/// What the person calls the CLI's own sign-in.
+pub const OWN_SIGN_IN: &str = "this computer's sign-in";
+
+impl Side {
+    pub fn of(accounts: &[Account], id: Option<Uuid>) -> Self {
+        Self {
+            id,
+            name: id
+                .and_then(|id| accounts.iter().find(|a| a.id == id))
+                .map_or_else(|| OWN_SIGN_IN.to_string(), |a| a.name.clone()),
+        }
+    }
+}
+
+/// What Desk last read of one account's plan: its windows, and when one of
+/// its sessions last stopped on its limit.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Standing {
+    pub windows: Vec<crate::usage::LimitWindow>,
+    pub read_at: Option<DateTime<Utc>>,
+    pub hit_at: Option<DateTime<Utc>>,
+}
+
+/// How long a stop on the limit counts when no window says when it resets.
+const HIT_FOR: chrono::Duration = chrono::Duration::hours(5);
+
+impl Standing {
+    /// Whether the account is at its limit `now`, and when that ends (`None`
+    /// inside: not said).
+    pub fn full(&self, now: DateTime<Utc>) -> Option<Option<DateTime<Utc>>> {
+        let full_window = self
+            .windows
+            .iter()
+            .filter(|w| w.used_percent >= 100.0 && w.resets_at.is_none_or(|r| r > now))
+            .max_by_key(|w| w.resets_at);
+        if let Some(w) = full_window {
+            return Some(w.resets_at);
+        }
+        let hit = self.hit_at.filter(|at| now - *at < HIT_FOR)?;
+        // A reading after the stop that shows room: it has reset.
+        if self.read_at.is_some_and(|r| r > hit) && !self.windows.is_empty() {
+            return None;
+        }
+        Some(
+            self.windows
+                .iter()
+                .filter_map(|w| w.resets_at)
+                .filter(|r| *r > now)
+                .min(),
+        )
+    }
+}
+
+/// A Floor need about the person's accounts.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum AccountNeed {
+    /// `from` hit its limit while sessions run on it, and `to` has room:
+    /// "Work hit its weekly limit — switch 7 sessions to Personal?"
+    #[serde(rename_all = "camelCase")]
+    Limit {
+        id: String,
+        engine: Engine,
+        from: Side,
+        to: Side,
+        sessions: Vec<Uuid>,
+        resets_at: Option<DateTime<Utc>>,
+    },
+    /// Every account is at its limit: when each resets. Nothing switches.
+    #[serde(rename_all = "camelCase")]
+    AllFull {
+        id: String,
+        engine: Engine,
+        resets: Vec<(Side, Option<DateTime<Utc>>)>,
+    },
+    /// An account's sign-in can't be used: gone, unreadable, or left
+    /// behind when the account was removed. Nothing switches to it.
+    #[serde(rename_all = "camelCase")]
+    SignIn {
+        id: String,
+        engine: Engine,
+        account: Side,
+        problem: SignInProblem,
+    },
+    /// `account`, which sessions were moved off, has room again: "Work has
+    /// reset — switch back?"
+    #[serde(rename_all = "camelCase")]
+    Reset {
+        id: String,
+        engine: Engine,
+        account: Side,
+        from: Side,
+        sessions: Vec<Uuid>,
+    },
+}
+
+impl AccountNeed {
+    pub fn id(&self) -> &str {
+        match self {
+            AccountNeed::Limit { id, .. }
+            | AccountNeed::AllFull { id, .. }
+            | AccountNeed::SignIn { id, .. }
+            | AccountNeed::Reset { id, .. } => id,
+        }
+    }
+}
+
+/// Sessions were moved off `from` onto `to` because `from` was full.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MovedOff {
+    pub engine: Engine,
+    pub from: Option<Uuid>,
+    pub to: Option<Uuid>,
+}
+
+fn side_key(id: Option<Uuid>) -> String {
+    id.map_or_else(|| "own".to_string(), |id| id.simple().to_string())
+}
+
+/// The account needs, from what Desk read of each account's plan.
+/// `on` is the running sessions on each side; `own_signed_in` whether the
+/// CLI's own sign-in is a plan this computer can switch to.
+pub fn needs(
+    engine: Engine,
+    accounts: &[Account],
+    standing: &std::collections::HashMap<Option<Uuid>, Standing>,
+    on: &std::collections::HashMap<Option<Uuid>, Vec<Uuid>>,
+    moved_off: &[MovedOff],
+    own_signed_in: bool,
+    usable: &std::collections::HashSet<Uuid>,
+    now: DateTime<Utc>,
+) -> Vec<AccountNeed> {
+    // Only an account whose sign-in reads can be moved to.
+    let takes = |id: &Option<Uuid>| id.is_none_or(|id| usable.contains(&id));
+    let mut sides: Vec<Option<Uuid>> = accounts
+        .iter()
+        .filter(|a| a.engine == engine)
+        .map(|a| Some(a.id))
+        .collect();
+    // The default first, as a switch picks it.
+    sides.sort_by_key(|id| !accounts.iter().any(|a| Some(a.id) == *id && a.is_default));
+    if own_signed_in {
+        sides.push(None);
+    }
+    if sides.len() < 2 {
+        return Vec::new();
+    }
+    let full = |id: &Option<Uuid>| standing.get(id).and_then(|s| s.full(now));
+    let mut out = Vec::new();
+    for from in &sides {
+        let Some(resets_at) = full(from) else {
+            continue;
+        };
+        let sessions = on.get(from).cloned().unwrap_or_default();
+        if sessions.is_empty() {
+            continue;
+        }
+        match sides
+            .iter()
+            .find(|to| *to != from && full(to).is_none() && takes(to))
+        {
+            Some(to) => out.push(AccountNeed::Limit {
+                id: format!("limit:{}:{}", side_key(*from), side_key(*to)),
+                engine,
+                from: Side::of(accounts, *from),
+                to: Side::of(accounts, *to),
+                sessions,
+                resets_at,
+            }),
+            None => {
+                if !out.iter().any(|n| matches!(n, AccountNeed::AllFull { .. })) {
+                    out.push(AccountNeed::AllFull {
+                        id: "all-full".into(),
+                        engine,
+                        resets: sides
+                            .iter()
+                            .map(|s| (Side::of(accounts, *s), full(s).flatten()))
+                            .collect(),
+                    });
+                }
+            }
+        }
+    }
+    for m in moved_off.iter().filter(|m| m.engine == engine) {
+        let back = full(&m.from).is_none() && sides.contains(&m.from) && takes(&m.from);
+        let sessions = on.get(&m.to).cloned().unwrap_or_default();
+        if back && !sessions.is_empty() {
+            out.push(AccountNeed::Reset {
+                id: format!("reset:{}:{}", side_key(m.from), side_key(m.to)),
+                engine,
+                account: Side::of(accounts, m.from),
+                from: Side::of(accounts, m.to),
+                sessions,
+            });
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -682,6 +892,167 @@ mod tests {
             setup_said("https://console.anthropic.com/oauth/code/callback")
                 .url
                 .is_some()
+        );
+    }
+
+    fn standing(windows: &[(f64, Option<i64>)], read_at: i64, hit_at: Option<i64>) -> Standing {
+        let at = |m: i64| chrono::DateTime::from_timestamp(m * 60, 0).unwrap();
+        Standing {
+            windows: windows
+                .iter()
+                .map(|(used, reset)| crate::usage::LimitWindow {
+                    used_percent: *used,
+                    resets_at: reset.map(at),
+                    minutes: 10_080,
+                })
+                .collect(),
+            read_at: Some(at(read_at)),
+            hit_at: hit_at.map(at),
+        }
+    }
+
+    #[test]
+    fn an_account_is_full_until_its_window_resets_or_a_later_reading_has_room() {
+        let at = |m: i64| chrono::DateTime::from_timestamp(m * 60, 0).unwrap();
+        let full = standing(&[(100.0, Some(600))], 100, None);
+        assert_eq!(full.full(at(200)), Some(Some(at(600))));
+        assert_eq!(full.full(at(700)), None, "its window reset");
+        let hit = standing(&[(80.0, Some(600))], 100, Some(150));
+        assert_eq!(
+            hit.full(at(200)),
+            Some(Some(at(600))),
+            "stopped on its limit"
+        );
+        let after = standing(&[(10.0, Some(900))], 300, Some(150));
+        assert_eq!(after.full(at(310)), None, "read with room since");
+        assert_eq!(standing(&[(40.0, None)], 100, None).full(at(200)), None);
+    }
+
+    #[test]
+    fn a_full_account_asks_to_move_its_sessions_to_one_with_room_and_back_once_it_resets() {
+        use std::collections::HashMap;
+        let at = |m: i64| chrono::DateTime::from_timestamp(m * 60, 0).unwrap();
+        let account = |name: &str, is_default| Account {
+            id: Uuid::new_v4(),
+            engine: Engine::Claude,
+            name: name.into(),
+            is_default,
+            created_at: at(0),
+        };
+        let (work, personal) = (account("Work", true), account("Personal", false));
+        let accounts = vec![personal.clone(), work.clone()];
+        let all_usable: std::collections::HashSet<Uuid> = [work.id, personal.id].into();
+        let sessions: Vec<Uuid> = (0..7).map(|_| Uuid::new_v4()).collect();
+        let on = HashMap::from([(Some(work.id), sessions.clone())]);
+        let full = HashMap::from([(Some(work.id), standing(&[(100.0, Some(900))], 100, None))]);
+        let n = needs(
+            Engine::Claude,
+            &accounts,
+            &full,
+            &on,
+            &[],
+            false,
+            &all_usable,
+            at(200),
+        );
+        assert_eq!(n.len(), 1);
+        let AccountNeed::Limit {
+            from,
+            to,
+            sessions: s,
+            resets_at,
+            ..
+        } = &n[0]
+        else {
+            panic!("{n:?}");
+        };
+        assert_eq!(
+            (from.name.as_str(), to.name.as_str(), s.len()),
+            ("Work", "Personal", 7)
+        );
+        assert_eq!(*resets_at, Some(at(900)));
+        // No sessions on it: nothing to ask.
+        assert!(needs(
+            Engine::Claude,
+            &accounts,
+            &full,
+            &HashMap::new(),
+            &[],
+            false,
+            &all_usable,
+            at(200)
+        )
+        .is_empty());
+        // Both full: when each resets, and nothing to switch to.
+        let both = HashMap::from([
+            (Some(work.id), standing(&[(100.0, Some(900))], 100, None)),
+            (
+                Some(personal.id),
+                standing(&[(100.0, Some(1200))], 100, None),
+            ),
+        ]);
+        let n = needs(
+            Engine::Claude,
+            &accounts,
+            &both,
+            &on,
+            &[],
+            false,
+            &all_usable,
+            at(200),
+        );
+        assert!(
+            matches!(&n[..], [AccountNeed::AllFull { resets, .. }] if resets.len() == 2),
+            "{n:?}"
+        );
+        // Moved to Personal, and Work has reset: asks to switch back.
+        let moved = [MovedOff {
+            engine: Engine::Claude,
+            from: Some(work.id),
+            to: Some(personal.id),
+        }];
+        let on_personal = HashMap::from([(Some(personal.id), sessions.clone())]);
+        let n = needs(
+            Engine::Claude,
+            &accounts,
+            &full,
+            &on_personal,
+            &moved,
+            false,
+            &all_usable,
+            at(1000),
+        );
+        assert!(
+            matches!(&n[..], [AccountNeed::Reset { account, .. }] if account.name == "Work"),
+            "{n:?}"
+        );
+        // The CLI's own sign-in counts as a side when it is a plan.
+        let own = HashMap::from([(Some(work.id), sessions)]);
+        let one = vec![work.clone()];
+        assert!(needs(
+            Engine::Claude,
+            &one,
+            &full,
+            &own,
+            &[],
+            false,
+            &all_usable,
+            at(200)
+        )
+        .is_empty());
+        let n = needs(
+            Engine::Claude,
+            &one,
+            &full,
+            &own,
+            &[],
+            true,
+            &all_usable,
+            at(200),
+        );
+        assert!(
+            matches!(&n[..], [AccountNeed::Limit { to, .. }] if to.id.is_none()),
+            "{n:?}"
         );
     }
 

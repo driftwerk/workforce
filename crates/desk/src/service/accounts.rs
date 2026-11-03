@@ -30,6 +30,11 @@ const SIGN_IN_EVERY: Duration = Duration::from_millis(250);
 /// Wide enough that a token is never wrapped.
 const SIGN_IN_COLS: u16 = 1000;
 
+/// The id a Desk account's plan readings are known by.
+pub(super) fn plan_id(account: Uuid) -> String {
+    format!("desk-account:{account}")
+}
+
 /// What adding an account did.
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
@@ -95,6 +100,11 @@ impl Desk {
                 engine: a.engine,
                 name: a.name.clone(),
                 is_default: a.is_default,
+                plan_key: self
+                    .0
+                    .plans
+                    .as_ref()
+                    .and_then(|p| p.account_key(crate::usage::LocalPlan::Claude, &[plan_id(a.id)])),
                 // As last seen: the store is never read under this lock.
                 signed_in: keys.is_some() && st.signed_in_accounts.contains(&a.id),
                 sessions: st
@@ -161,9 +171,14 @@ impl Desk {
         st.sign_in_runs.values().map(|r| r.view.clone()).collect()
     }
 
-    fn announce_accounts(&self) {
+    pub(super) fn announce_accounts(&self) {
+        if self.0.opts.account_keys.is_none() {
+            return;
+        }
         self.announce(DeskEvent::Accounts {
             accounts: self.accounts(),
+            needs: self.account_needs(),
+            auto_switch: self.auto_switch(),
             problems: self.sign_in_problems(),
         });
     }
@@ -809,6 +824,16 @@ impl Desk {
         }
     }
 
+    /// What an account is called, for the ledger.
+    pub(super) fn account_name(&self, account: Option<Uuid>) -> Option<String> {
+        let id = account?;
+        let st = self.0.state.lock();
+        st.accounts
+            .iter()
+            .find(|a| a.id == id)
+            .map(|a| a.name.clone())
+    }
+
     /// The names of a session's account and of the one it moves to, for
     /// its view.
     pub(super) fn account_refs(
@@ -962,5 +987,232 @@ impl Desk {
             }
             // A switch asked for while it restarted: carried out next.
         }
+    }
+}
+
+/// Where the person's "switch automatically" choice is kept.
+pub(super) const AUTO_SWITCH: &str = "accounts.autoSwitch";
+
+/// Each sign-in problem as a Floor need.
+fn sign_in_needs(st: &super::State) -> Vec<accounts::AccountNeed> {
+    st.sign_in_problems
+        .iter()
+        .filter_map(|(id, problem)| {
+            let name = st
+                .accounts
+                .iter()
+                .find(|a| a.id == *id)
+                .map(|a| a.name.clone())
+                .or_else(|| st.removed_names.get(id).cloned())?;
+            Some(accounts::AccountNeed::SignIn {
+                id: format!("sign-in:{}", id.simple()),
+                engine: Engine::Claude,
+                account: accounts::Side {
+                    id: Some(*id),
+                    name,
+                },
+                problem: *problem,
+            })
+        })
+        .collect()
+}
+
+/// What moving every session off an account did.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SwitchedAll {
+    /// Restarted on the new account now.
+    pub now: Vec<Uuid>,
+    /// Restarted once their turn ends.
+    pub after_turn: Vec<Uuid>,
+    /// Not running: on the new account at their next start.
+    pub next_start: Vec<Uuid>,
+    /// Running in a terminal of their own: to be started again there.
+    pub in_terminals: Vec<Uuid>,
+}
+
+impl Desk {
+    /// The account needs the Floor shows, less those the person put off.
+    pub fn account_needs(&self) -> Vec<accounts::AccountNeed> {
+        let own_signed_in = self.sign_ins().of(Engine::Claude).on_plan();
+        let st = self.0.state.lock();
+        let mut on: std::collections::HashMap<Option<Uuid>, Vec<Uuid>> = Default::default();
+        for r in st
+            .records
+            .values()
+            .filter(|r| r.engine == Engine::Claude && st.live.contains_key(&r.id))
+        {
+            on.entry(r.account).or_default().push(r.id);
+        }
+        accounts::needs(
+            Engine::Claude,
+            &st.accounts,
+            &st.standing,
+            &on,
+            &st.moved_off,
+            own_signed_in,
+            &st.signed_in_accounts
+                .iter()
+                .filter(|id| !st.sign_in_problems.contains_key(id))
+                .copied()
+                .collect(),
+            Utc::now(),
+        )
+        .into_iter()
+        .chain(sign_in_needs(&st))
+        .filter(|n| !st.put_off.contains(n.id()))
+        .collect()
+    }
+
+    /// Whether Desk moves sessions off an account at its limit by itself.
+    pub fn auto_switch(&self) -> bool {
+        self.0.state.lock().auto_switch
+    }
+
+    pub async fn set_auto_switch(&self, on: bool) -> Result<(), DeskError> {
+        self.0
+            .store
+            .put_state(AUTO_SWITCH, &serde_json::json!(on))
+            .await
+            .map_err(DeskError::Internal)?;
+        self.0.state.lock().auto_switch = on;
+        self.accounts_moved().await;
+        Ok(())
+    }
+
+    /// Puts a need off until what it says changes.
+    pub fn put_off(&self, need: &str) {
+        self.0.state.lock().put_off.insert(need.to_string());
+        self.announce_accounts();
+    }
+
+    /// What a session on `account` reported of its plan's windows.
+    pub(super) fn plan_read(&self, account: Option<Uuid>, windows: Vec<crate::usage::LimitWindow>) {
+        if windows.is_empty() {
+            return;
+        }
+        {
+            let mut st = self.0.state.lock();
+            let s = st.standing.entry(account).or_default();
+            s.windows = windows;
+            s.read_at = Some(Utc::now());
+        }
+        let desk = self.clone();
+        tokio::spawn(async move { desk.accounts_moved().await });
+    }
+
+    /// The accounts' needs may have changed: what was put off and no longer
+    /// stands is forgotten, an account at its limit is switched off when the
+    /// person said so, and every Desk is told.
+    pub(super) async fn accounts_moved(&self) {
+        if self.0.opts.account_keys.is_none() {
+            return;
+        }
+        // One at a time: two reports close together never move the same
+        // sessions twice.
+        let Ok(_one) = self.0.accounts_moving.try_lock() else {
+            return;
+        };
+        let needs = self.account_needs_all();
+        {
+            let mut st = self.0.state.lock();
+            st.put_off.retain(|id| needs.iter().any(|n| n.id() == id));
+        }
+        if self.auto_switch() {
+            for n in &needs {
+                if let accounts::AccountNeed::Limit {
+                    engine, from, to, ..
+                } = n
+                {
+                    match self.switch_all(*engine, from.id, to.id).await {
+                        Ok(done) => tracing::info!(
+                            moved = done.now.len() + done.after_turn.len(),
+                            "sessions moved off an account at its limit"
+                        ),
+                        Err(e) => {
+                            tracing::warn!(error = %e, "couldn't move sessions off an account at its limit")
+                        }
+                    }
+                }
+            }
+        }
+        self.announce_accounts();
+    }
+
+    /// Every need, those put off too.
+    fn account_needs_all(&self) -> Vec<accounts::AccountNeed> {
+        let put_off = std::mem::take(&mut self.0.state.lock().put_off);
+        let needs = self.account_needs();
+        self.0.state.lock().put_off = put_off;
+        needs
+    }
+
+    /// Moves every session of `engine` on `from` to `to`, each as
+    /// [`Desk::switch_account`] does. Sessions in terminals of their own are
+    /// listed, to be started again there.
+    pub async fn switch_all(
+        &self,
+        engine: Engine,
+        from: Option<Uuid>,
+        to: Option<Uuid>,
+    ) -> Result<SwitchedAll, DeskError> {
+        if from == to {
+            return Err(DeskError::Invalid("they are the same account".into()));
+        }
+        if let Some(to) = to {
+            self.account_for(engine, Some(Some(to)))?;
+            // Its sign-in must read before any session is stopped.
+            let a = self.account(to)?;
+            self.read_token(&a).await?;
+        }
+        let (ids, full) = {
+            let st = self.0.state.lock();
+            let ids: Vec<(Uuid, bool, bool)> = st
+                .records
+                .values()
+                .filter(|r| {
+                    r.engine == engine && r.account == from && r.state != SessionState::Closed
+                })
+                .map(|r| {
+                    (
+                        r.id,
+                        r.terminal_id.is_some() || r.origin == crate::model::Origin::External,
+                        st.live.contains_key(&r.id),
+                    )
+                })
+                .collect();
+            let full = st
+                .standing
+                .get(&from)
+                .is_some_and(|s| s.full(Utc::now()).is_some());
+            (ids, full)
+        };
+        let mut done = SwitchedAll::default();
+        for (id, own_terminal, live) in ids {
+            if own_terminal {
+                done.in_terminals.push(id);
+                continue;
+            }
+            match self.switch_account(id, to, None).await {
+                Ok(v) if v.switching_to.is_some() => done.after_turn.push(id),
+                Ok(_) if live => done.now.push(id),
+                Ok(_) => done.next_start.push(id),
+                Err(e) => {
+                    tracing::warn!(session = %id, error = %e, "couldn't move a session to another account")
+                }
+            }
+        }
+        {
+            let mut st = self.0.state.lock();
+            // Moving back settles it; moving off a full account is kept
+            // until it resets and the person is asked back.
+            st.moved_off
+                .retain(|m| !(m.engine == engine && (m.from == to || m.to == from)));
+            if full {
+                st.moved_off.push(accounts::MovedOff { engine, from, to });
+            }
+        }
+        self.announce_accounts();
+        Ok(done)
     }
 }

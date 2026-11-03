@@ -91,19 +91,23 @@ impl LedgerRun {
     }
 
     /// How `spend` of `engine` was paid and by which account: what its
-    /// record says, else the sign-in Desk saw when it was made.
-    fn stamp(&self, engine: Engine, spend: Spend) -> Kept {
+    /// record says; a session on one of the person's accounts, that
+    /// account's plan; else the sign-in Desk saw when it was made.
+    fn stamp(&self, engine: Engine, spend: Spend, on: Option<String>) -> Kept {
         let signed = self.signed.lock().get(&engine).cloned();
-        let (billing, account) = match signed {
-            Some((SignIn::In { via, who, ids, .. }, since)) if spend.at >= since => (
-                match via {
-                    Via::Plan => Billing::Plan,
-                    Via::Key => Billing::Key,
-                    Via::Vendor => Billing::Vendor,
-                },
-                who.or_else(|| ids.into_iter().next()),
-            ),
-            _ => (Billing::Unknown, None),
+        let (billing, account) = match (on, signed) {
+            (Some(name), _) => (Billing::Plan, Some(name)),
+            (None, signed) => match signed {
+                Some((SignIn::In { via, who, ids, .. }, since)) if spend.at >= since => (
+                    match via {
+                        Via::Plan => Billing::Plan,
+                        Via::Key => Billing::Key,
+                        Via::Vendor => Billing::Vendor,
+                    },
+                    who.or_else(|| ids.into_iter().next()),
+                ),
+                _ => (Billing::Unknown, None),
+            },
         };
         let billing = spend.billing.unwrap_or(billing);
         let mut spend = spend;
@@ -344,10 +348,14 @@ impl Desk {
     }
 
     async fn keep_live(&self, session: Uuid, spend: Spend) {
-        let Some(engine) = self.session_record(session).await.map(|r| r.engine) else {
+        let Some(r) = self.session_record(session).await else {
             return;
         };
-        let kept = self.0.ledger.stamp(engine, spend);
+        let engine = r.engine;
+        let kept = self
+            .0
+            .ledger
+            .stamp(engine, spend, self.account_name(r.account));
         match self
             .0
             .store
@@ -444,10 +452,11 @@ impl Desk {
             if step.cursor == cursor && step.spends.is_empty() {
                 return Ok(());
             }
+            let on = self.account_name(r.account);
             let kept: Vec<Kept> = step
                 .spends
                 .into_iter()
-                .map(|s| self.0.ledger.stamp(r.engine, s))
+                .map(|s| self.0.ledger.stamp(r.engine, s, on.clone()))
                 .collect();
             let changed = self
                 .0
@@ -815,6 +824,7 @@ mod tests {
         let now = run.stamp(
             Engine::Claude,
             spend("2026-10-31T09:30:00Z", "claude-opus-5-5"),
+            None,
         );
         assert_eq!(
             (
@@ -834,6 +844,7 @@ mod tests {
         let before = run.stamp(
             Engine::Claude,
             spend("2026-10-30T22:00:00Z", "claude-opus-5-5"),
+            None,
         );
         assert_eq!(
             (before.billing, before.account),
@@ -843,6 +854,7 @@ mod tests {
         let unknown = run.stamp(
             Engine::Claude,
             spend("2026-10-31T09:30:00Z", "claude-mystery-1"),
+            None,
         );
         assert_eq!(
             (unknown.spend.usd, unknown.spend.priced),
@@ -854,7 +866,18 @@ mod tests {
                 billing: Some(Billing::Plan),
                 ..spend("2026-10-31T09:30:00Z", "gpt-5.6-sol")
             },
+            None,
         );
         assert_eq!(codex.billing, Billing::Plan, "what the record says wins");
+        let work = run.stamp(
+            Engine::Claude,
+            spend("2026-10-30T22:00:00Z", "claude-opus-5-5"),
+            Some("Work".into()),
+        );
+        assert_eq!(
+            (work.billing, work.account.as_deref()),
+            (Billing::Plan, Some("Work")),
+            "a session on one of the person's accounts is that account's"
+        );
     }
 }

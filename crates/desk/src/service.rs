@@ -313,6 +313,16 @@ struct State {
     /// Sessions moving to another account once their turn ends (`None`:
     /// the CLI's own sign-in).
     switches: HashMap<Uuid, Option<Uuid>>,
+    /// What Desk last read of each account's plan (`None`: the CLI's own
+    /// sign-in).
+    standing: HashMap<Option<Uuid>, crate::engine_accounts::Standing>,
+    /// Accounts sessions were moved off at their limit, until they reset
+    /// and the person is asked back.
+    moved_off: Vec<crate::engine_accounts::MovedOff>,
+    /// Account needs the person put off.
+    put_off: HashSet<String>,
+    /// Desk moves sessions off an account at its limit by itself.
+    auto_switch: bool,
     /// The accounts whose sign-in was in the store when last looked at.
     signed_in_accounts: HashSet<Uuid>,
     /// What went wrong with accounts' sign-ins, by account: shown until it
@@ -410,6 +420,8 @@ struct Inner {
     reader: Mutex<Option<Weak<dyn crew::Crew>>>,
     /// How long it may take ([`READ_LATER`]; shorter in tests).
     read_wait: Mutex<Duration>,
+    /// Held while the accounts' needs are acted on.
+    accounts_moving: tokio::sync::Mutex<()>,
 }
 
 #[derive(Clone)]
@@ -783,6 +795,13 @@ impl Desk {
         let layout = store.layout().await?;
         let session_env = kept_session_env(&store).await;
         let engine_accounts = store.accounts().await?;
+        let auto_switch = match store.state(accounts::AUTO_SWITCH).await {
+            Ok(kept) => kept.is_some_and(|e| e.value == serde_json::json!(true)),
+            Err(e) => {
+                tracing::warn!(error = %e, "couldn't read whether accounts switch by themselves");
+                false
+            }
+        };
         let hidden = store
             .hidden()
             .await?
@@ -857,6 +876,7 @@ impl Desk {
                 hidden,
                 turns,
                 accounts: engine_accounts,
+                auto_switch,
                 ..State::default()
             }),
             events: broadcast::channel(256).0,
@@ -871,6 +891,7 @@ impl Desk {
             ledger,
             reader: Mutex::new(None),
             read_wait: Mutex::new(READ_LATER),
+            accounts_moving: tokio::sync::Mutex::new(()),
         }));
         tokio::spawn(persist_loop(store, floor.turns, persist_rx));
         tokio::spawn(desk.clone().read_engines());
@@ -1111,6 +1132,7 @@ impl Desk {
         let events = Self::session_events(st, &transitions, &view);
         let ops = Self::turn_ops(st, &transitions, &view);
         let id = r.id;
+        let r_account = r.account;
         // A switch of account that waited for its turn to end.
         let turn_over = transitions.iter().any(|t| {
             matches!(
@@ -1123,6 +1145,18 @@ impl Desk {
                     | Transition::Interrupted
             )
         });
+        let hit_limit = view.engine == Engine::Claude
+            && transitions.iter().any(|t| match t {
+                Transition::Finished { reply } => {
+                    transition::finished(reply, &view).0 == crate::floor::Outcome::Limit
+                }
+                _ => false,
+            });
+        if hit_limit {
+            st.standing.entry(r_account).or_default().hit_at = Some(Utc::now());
+            let desk = self.clone();
+            tokio::spawn(async move { desk.accounts_moved().await });
+        }
         // Carried out by the one driver of this session's switches.
         if turn_over && st.switches.contains_key(&id) {
             let desk = self.clone();
@@ -1307,17 +1341,28 @@ impl Desk {
         Some((text(&out.stdout), text(&out.stderr)))
     }
 
-    /// Passes the plan's rate limits a Claude Code session on this Mac
-    /// reported to the hub.
-    fn report_usage(&self, limits: Value) {
-        if let Some(plans) = &self.0.plans {
-            let account = self
+    /// Passes the plan's rate limits a Claude Code session on this computer
+    /// reported to the hub: of its account when it runs on one, else of the
+    /// CLI's own sign-in.
+    fn report_usage(&self, limits: Value, session: Option<Uuid>) {
+        let Some(plans) = &self.0.plans else {
+            return;
+        };
+        let on = session.and_then(|id| self.0.state.lock().records.get(&id)?.account);
+        let account = match on {
+            Some(id) => crate::usage::LocalAccount {
+                ids: vec![accounts::plan_id(id)],
+                plan: None,
+            },
+            None => self
                 .sign_ins()
                 .of(Engine::Claude)
                 .plan_account()
-                .unwrap_or_default();
-            plans.local(LocalPlan::Claude, limits, account);
-        }
+                .unwrap_or_default(),
+        };
+        let windows = plans.windows(LocalPlan::Claude, &limits);
+        plans.local(LocalPlan::Claude, limits, account);
+        self.plan_read(on, windows);
     }
 
     /// The process a session's own background work runs under: its
@@ -3209,7 +3254,7 @@ impl Desk {
             Hook::Permission { tool, detail } => {
                 return self.await_permission(id, tool, detail).await
             }
-            Hook::Usage(limits) => self.report_usage(limits),
+            Hook::Usage(limits) => self.report_usage(limits, Some(id)),
             Hook::Other => {}
         }
         answer()
