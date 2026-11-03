@@ -3011,13 +3011,6 @@ async fn handle_ws(
                             let Some(choice) = client_msg.choice else {
                                 continue;
                             };
-                            // Which device answered, for the activity of a
-                            // call on this computer.
-                            #[cfg(feature = "postgres")]
-                            crate::desk_computer::answered_from(
-                                &request_id,
-                                ws_device_id.as_deref(),
-                            );
                             let owner = match ws_identity_id.as_deref().or(ws_device_id.as_deref())
                             {
                                 Some(o) => o.to_string(),
@@ -3039,6 +3032,7 @@ async fn handle_ws(
                                 nats.as_ref(),
                                 &service,
                                 &owner,
+                                ws_device_id.as_deref(),
                                 &sid,
                                 &request_id,
                                 choice,

@@ -658,6 +658,7 @@ pub(crate) async fn answer(
                 state.nats.as_ref(),
                 &service,
                 &caller.id,
+                None,
                 session_id,
                 request_id,
                 choice.permission(),

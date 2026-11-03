@@ -1459,7 +1459,11 @@ impl crate::job_runner::ToolExecutor for RegistryToolExecutor {
             .or_else(|| self.denied(user, tool_name, params))
             .or_else(|| {
                 // A job asks nobody: what the computer gate would ask about
-                // is refused here.
+                // is decided as with nobody to ask. Nothing is built on a hub
+                // without the gate.
+                if !crate::serve::computer_gates_installed() {
+                    return None;
+                }
                 let gate = crate::serve::computer_gate_for(&crate::serve::ComputerSubject {
                     agent: self.agent_id.clone(),
                     name: None,

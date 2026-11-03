@@ -3434,6 +3434,12 @@ pub fn computer_gate_for(
 
 static COMPUTER_GATES: std::sync::OnceLock<ComputerGates> = std::sync::OnceLock::new();
 
+/// Whether this hub builds computer gates at all (`[desk]` started): what a
+/// caller checks before building a [`ComputerSubject`].
+pub fn computer_gates_installed() -> bool {
+    COMPUTER_GATES.get().is_some()
+}
+
 /// Makes `gates` how every agent's computer gate is built, once: only a hub
 /// with `[desk]` installs it. Whether it was the first.
 pub fn install_computer_gates(gates: ComputerGates) -> bool {

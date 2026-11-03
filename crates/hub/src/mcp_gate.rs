@@ -567,7 +567,7 @@ impl GatedExecutor {
                     reason,
                     allow_save_allow,
                     holds,
-                    decided,
+                    decided: workforce_agent::tools::computer::asking(decided),
                 },
             ),
         }

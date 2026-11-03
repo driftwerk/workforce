@@ -4579,6 +4579,7 @@ impl AgentRunner {
                         });
                     }
                     GateOutcome::RequireApproval { reason, .. } => {
+                        let decided = crate::tools::computer::asking(decided);
                         let tn = tool_name.clone();
                         let r = reason.clone();
                         match route_approval(
@@ -5853,6 +5854,7 @@ impl AgentRunner {
                         allow_save_allow,
                         holds,
                     } => {
+                        let decided = crate::tools::computer::asking(decided);
                         let (prompt_options, keeper) = match &decided {
                             // A computer ask offers Allow once and Deny, and
                             // keeps no answer as a permission rule.

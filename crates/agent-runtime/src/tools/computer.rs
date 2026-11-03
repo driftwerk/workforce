@@ -215,6 +215,13 @@ fn held(response: PolicyResponse, why: &str, effect: &Effect) -> PolicyResponse 
     }
 }
 
+/// `decision` when it is what asks (the computer gate held the call), else
+/// `None`: a prompt another gate raised is that gate's, its card, keeper and
+/// activity included.
+pub fn asking(decision: Option<Decision>) -> Option<Decision> {
+    decision.filter(|d| !matches!(d.verdict, Verdict::Run { .. }))
+}
+
 /// The answers a computer ask offers on its own: Allow once and Deny. No
 /// "always" reaches the permission rules.
 pub fn once_or_deny() -> workforce_core::policy::PermissionPromptOptions {
