@@ -29,7 +29,7 @@ use crate::tools::access::{self, ToolAccess, ToolAccessSnapshot};
 use crate::tools::approval::{Decision, GatedCall, OpenPrompt, Refusal, TurnApprovals};
 pub use crate::tools::dispatch::{apply_capability_gate, apply_cascade_gate, ToolGates};
 use crate::tools::dispatch::{
-    execute_approved, execute_gated, gate_tool_call_decided, gate_tool_call_unattended,
+    execute_approved, execute_decided, gate_tool_call_decided, gate_tool_call_unattended,
     would_execute, GateOutcome, ToolExecution,
 };
 use crate::tools::loading::{PlanContext, ToolPlan};
@@ -4559,8 +4559,15 @@ impl AgentRunner {
                         let call = self.call_for(&mut round_calls, &tool_use_id, &input);
                         join_set.spawn(async move {
                             let fut = async move {
-                                let exec =
-                                    execute_gated(&tools, &access, &tn, &input, exec_input).await;
+                                let exec = execute_decided(
+                                    &tools,
+                                    &access,
+                                    &tn,
+                                    &input,
+                                    exec_input,
+                                    decided.as_ref(),
+                                )
+                                .await;
                                 executed_outcome(tool_use_id, tn, input, exec)
                             };
                             ctx.scope(call.scope(fut)).await
@@ -5836,8 +5843,13 @@ impl AgentRunner {
                             let exec = scope_turn(
                                 Some(ptx.clone()),
                                 ledger,
-                                call.scope(ctx.scope(execute_gated(
-                                    &tools, &access, &tool_name, &input, exec_input,
+                                call.scope(ctx.scope(execute_decided(
+                                    &tools,
+                                    &access,
+                                    &tool_name,
+                                    &input,
+                                    exec_input,
+                                    decided.as_ref(),
                                 ))),
                             )
                             .await;

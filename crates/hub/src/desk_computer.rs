@@ -12,7 +12,7 @@
 //! An agent with no `[computer]` is Full access, asking first; its own
 //! folder is the roots its tools already have (`tool_roots`).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde_json::json;
@@ -53,6 +53,33 @@ fn access_of(subject: &ComputerSubject) -> ComputerAccess {
     }
 }
 
+/// What no agent reaches on this computer: Desk's data (the hub's data, its
+/// Postgres, vault, memory and logs, Desk's own secrets and the PTY holder's
+/// socket, every other agent's folder) and the keychains. On Desk the hub's
+/// data is `…/Desk/hub/data`, so Desk's folder is two up; elsewhere the
+/// hub's data folder alone. An agent's own folder is carved out by the
+/// verdict.
+fn withheld(config: &WorkforceConfig, home: &Path) -> Vec<PathBuf> {
+    let data = workforce_agent::tools::paths::resolve_real(Path::new(&config.hub.data_dir));
+    let desk = data
+        .parent()
+        .filter(|hub| hub.file_name().is_some_and(|n| n == "hub"))
+        .and_then(Path::parent)
+        .map(Path::to_path_buf);
+    let mut out = vec![desk.unwrap_or(data)];
+    out.push(home.join("Library/Keychains"));
+    out
+}
+
+/// An agent's own config files and folders, which no call changes.
+fn own_config(workspace: &Path) -> Vec<PathBuf> {
+    let root = workforce_agent::tools::paths::resolve_real(workspace);
+    workforce_common::config_files::agent_config_files()
+        .chain(workforce_common::config_files::AGENT_CONFIG_DIRS)
+        .map(|name| root.join(name))
+        .collect()
+}
+
 impl HubComputerGate {
     pub fn for_agent(
         computer: Computer,
@@ -75,10 +102,8 @@ impl HubComputerGate {
                     .unwrap_or_else(|| subject.agent.clone()),
                 access: access_of(subject),
                 own,
-                // The rest of the withheld set (Desk's data, every agent's
-                // config files) lands with the roots per level (AC3c); the
-                // file tools keep off config files already.
-                withheld: vec![home.join("Library/Keychains")],
+                withheld: withheld(config, &home),
+                config: own_config(&subject.workspace),
                 home,
                 // Commands can't be contained yet (AC5).
                 contained: false,
@@ -170,6 +195,21 @@ impl HubComputerGate {
 impl ComputerGate for HubComputerGate {
     fn decides(&self, tool: &str) -> bool {
         namespace(tool) == Some(Namespace::Computer)
+    }
+
+    fn reach(&self, effect: &Effect) -> Option<workforce_agent::tools::paths::Reach> {
+        use workforce_core::computer::Access;
+        let level = self.policy.access.access;
+        let reaches = match effect {
+            Effect::Read { .. } => level != Access::OwnFolder,
+            Effect::Write { .. } | Effect::Delete { .. } | Effect::Move { .. } => {
+                level == Access::Full
+            }
+            _ => false,
+        };
+        reaches.then(|| workforce_agent::tools::paths::Reach {
+            withheld: self.policy.withheld.clone(),
+        })
     }
 
     fn unattended_runs(&self) -> bool {
@@ -280,6 +320,9 @@ mod tests {
             ExecCommand::default().with_workspace(workspace.to_path_buf()),
         ));
         tools.register(Arc::new(WriteFile::new(vec![workspace.to_path_buf()])));
+        tools.register(Arc::new(workforce_agent::tools::filesystem::ReadFile::new(
+            vec![workspace.to_path_buf()],
+        )));
         tools.register(Arc::new(Elsewhere("memory.recall")));
         tools.register(Arc::new(Elsewhere("web.fetch")));
         tools
@@ -305,11 +348,13 @@ mod tests {
     }
 
     fn hub() -> Hub {
+        // Desk's layout: the hub's data in `…/Desk/hub/data`, agents in it.
         let dir = tempfile::tempdir().unwrap();
-        let workspace = dir.path().join("agents/allan");
+        let data = dir.path().canonicalize().unwrap().join("Desk/hub/data");
+        let workspace = data.join("agents/allan");
         std::fs::create_dir_all(&workspace).unwrap();
         let mut config = WorkforceConfig::default();
-        config.hub.data_dir = dir.path().to_string_lossy().into_owned();
+        config.hub.data_dir = data.to_string_lossy().into_owned();
         Hub {
             config,
             subject: ComputerSubject {
@@ -483,6 +528,143 @@ mod tests {
         .await;
     }
 
+    /// Run `tool` as the gates decide it, with the reach they give it.
+    async fn run(
+        gates: &ToolGates,
+        tools: &ToolRegistry,
+        tool: &str,
+        input: Value,
+    ) -> (&'static str, Option<String>) {
+        let (outcome, decided) = as_sarah(|| {
+            workforce_agent::tools::dispatch::gate_tool_call_decided(
+                gates,
+                &policy(),
+                tools,
+                tool,
+                &input,
+            )
+        });
+        let GateOutcome::Execute { exec_input, .. } = outcome else {
+            return (kind(&outcome), None);
+        };
+        let access = workforce_agent::tools::access::ToolAccessSnapshot::default();
+        let exec = CURRENT_USER_ID
+            .scope(
+                "sarah".into(),
+                workforce_agent::tools::dispatch::execute_decided(
+                    tools,
+                    &access,
+                    tool,
+                    &input,
+                    exec_input,
+                    decided.as_ref(),
+                ),
+            )
+            .await;
+        ("run", Some(exec.output_text))
+    }
+
+    /// Roots follow the level: Full access reads (and, asked, changes)
+    /// anywhere but Desk's data; Own folder reads only its own; a hub
+    /// without `[desk]` keeps the tool's roots.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn file_tools_reach_as_far_as_the_level_and_never_into_desks_data() {
+        with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+            let store = Arc::new(DeskStore::with_pool(pool).await.unwrap());
+            let hub = hub();
+            let data = Path::new(&hub.config.hub.data_dir).to_path_buf();
+            let desk = data.parent().unwrap().parent().unwrap().to_path_buf();
+            let elsewhere = desk.parent().unwrap().join("dev/acme/README.md");
+            std::fs::create_dir_all(elsewhere.parent().unwrap()).unwrap();
+            std::fs::write(&elsewhere, "the readme text").unwrap();
+            let ben = data.join("agents/ben/notes.md");
+            std::fs::create_dir_all(ben.parent().unwrap()).unwrap();
+            std::fs::write(&ben, "ben's").unwrap();
+            let tools = tools(&hub.subject.workspace);
+            let read = |path: &Path| json!({"path": path.to_string_lossy()});
+            let gate_at = |config: &str| -> ToolGates {
+                std::fs::write(hub.subject.workspace.join("config.toml"), config).unwrap();
+                gates(Some(Arc::new(HubComputerGate::for_agent(
+                    Computer::new(Arc::clone(&store)),
+                    &hub.config,
+                    &hub.subject,
+                ))))
+            };
+
+            let full = gate_at("");
+            let (ran, out) = run(&full, &tools, "filesystem.read", read(&elsewhere)).await;
+            assert_eq!(ran, "run");
+            assert!(out.unwrap().contains("the readme text"));
+            assert_eq!(
+                run(&full, &tools, "filesystem.read", read(&ben)).await.0,
+                "refused"
+            );
+            assert_eq!(
+                run(
+                    &full,
+                    &tools,
+                    "filesystem.read",
+                    read(&data.join("vault.db"))
+                )
+                .await
+                .0,
+                "refused"
+            );
+            // Its own config reads as before; changing it is refused.
+            assert_eq!(
+                run(
+                    &full,
+                    &tools,
+                    "filesystem.read",
+                    json!({"path": "config.toml"})
+                )
+                .await
+                .0,
+                "run"
+            );
+            assert_eq!(
+                run(
+                    &full,
+                    &tools,
+                    "filesystem.write",
+                    json!({"path": "config.toml", "content": "x"})
+                )
+                .await
+                .0,
+                "refused"
+            );
+            // A change outside asks first.
+            assert_eq!(
+                run(
+                    &full,
+                    &tools,
+                    "filesystem.write",
+                    json!({"path": elsewhere.to_string_lossy(), "content": "x"})
+                )
+                .await
+                .0,
+                "asks once"
+            );
+
+            let own = gate_at("[computer]\naccess = \"own_folder\"\n");
+            assert_eq!(
+                run(&own, &tools, "filesystem.read", read(&elsewhere))
+                    .await
+                    .0,
+                "refused"
+            );
+
+            // No gate: the tool's own roots, as on main.
+            let (ran, out) = run(&gates(None), &tools, "filesystem.read", read(&elsewhere)).await;
+            assert_eq!(ran, "run");
+            assert!(
+                !out.unwrap().contains("the readme text"),
+                "refused by the tool's roots"
+            );
+        })
+        .await;
+    }
+
     /// With `unattended = "refuse"`, what would ask is refused at once where
     /// nobody can be asked; what the level refuses stays refused either way.
     #[tokio::test(flavor = "multi_thread")]
@@ -565,7 +747,11 @@ mod tests {
             let effect = tools.get("exec.run").unwrap().effect(&input);
             let verdict = as_sarah(|| gate.verdict("exec.run", &effect));
             assert!(matches!(verdict, Verdict::Ask { .. }));
-            let decision = Decision { effect, verdict };
+            let decision = Decision {
+                effect,
+                verdict,
+                reach: None,
+            };
             for outcome in [Outcome::Allowed, Outcome::Declined, Outcome::NotAnswered] {
                 as_sarah(|| {
                     settle(

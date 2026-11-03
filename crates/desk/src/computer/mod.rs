@@ -2,6 +2,7 @@
 //! always-asks list for commands, and the kill switch, grants and activity
 //! kept in Postgres. Nothing here is wired into a hub yet.
 
+pub(crate) mod api;
 pub mod asks;
 pub mod policy;
 mod store;

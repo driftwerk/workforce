@@ -30,10 +30,10 @@ fn policy(access: Access) -> AgentPolicy {
             unattended: Default::default(),
         },
         own: vec![p(OWN)],
-        withheld: vec![
-            p(DATA),
+        withheld: vec![p(DATA), p("/Users/sarah/Library/Keychains")],
+        config: vec![
             p(&format!("{OWN}/config.toml")),
-            p("/Users/sarah/Library/Keychains"),
+            p(&format!("{OWN}/SOUL.md")),
         ],
         home: p("/Users/sarah"),
         contained: false,
@@ -240,6 +240,49 @@ fn rule_2_the_withheld_set_is_refused_at_every_level_whatever_is_granted() {
         refused(&v).unwrap().1,
         "Allan can't use ~/Desk/hub/agents/allan/config.toml: Desk keeps it from every agent."
     );
+}
+
+/// The own folder may lie inside Desk's data: it stays the agent's, while
+/// the rest (other agents, the vault) is withheld. Its config files are
+/// read as before, never changed.
+#[test]
+fn the_own_folder_is_carved_out_of_the_withheld_set_and_its_config_only_read() {
+    let data = "/Users/sarah/Library/Application Support/Desk";
+    let own = format!("{data}/hub/data/agents/allan");
+    let mut inside = full();
+    inside.own = vec![p(&own)];
+    inside.config = vec![p(&format!("{own}/config.toml"))];
+    assert_eq!(
+        verdict(
+            &inside,
+            false,
+            &[],
+            &call(write(&format!("{own}/notes.md")))
+        ),
+        run()
+    );
+    assert_eq!(
+        verdict(
+            &inside,
+            false,
+            &[],
+            &call(read(&format!("{own}/config.toml")))
+        ),
+        run()
+    );
+    for effect in [
+        write(&format!("{own}/config.toml")),
+        read(&format!("{data}/hub/data/agents/ben/notes.md")),
+        read(&format!("{data}/hub/data/vault/global.db")),
+        exec("ls", &format!("{data}/hub")),
+    ] {
+        let v = verdict(&inside, false, &[], &call(effect.clone()));
+        assert_eq!(
+            refused(&v).map(|r| r.0),
+            Some(Refused::Withheld),
+            "{effect:?}"
+        );
+    }
 }
 
 #[test]

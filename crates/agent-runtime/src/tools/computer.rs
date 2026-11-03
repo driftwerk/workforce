@@ -56,6 +56,8 @@ impl Outcome {
 pub struct Decision {
     pub effect: Effect,
     pub verdict: Verdict,
+    /// How far the call reaches past its tool's roots when it runs.
+    pub reach: Option<crate::tools::paths::Reach>,
 }
 
 /// One settled call, to record.
@@ -84,6 +86,13 @@ pub trait ComputerGate: Send + Sync {
     /// default, so jobs keep working as before. Never what is refused.
     fn unattended_runs(&self) -> bool {
         false
+    }
+    /// How far a call with `effect` reaches past its tool's own roots, at
+    /// the agent's level: reads anywhere but the withheld set from Read
+    /// anywhere up, changes anywhere at Full access. `None` keeps the tool's
+    /// roots.
+    fn reach(&self, _effect: &Effect) -> Option<crate::tools::paths::Reach> {
+        None
     }
 }
 
@@ -118,7 +127,12 @@ pub fn decide(
         .get(tool_name)
         .map_or(Effect::Unknown, |tool| tool.effect(input));
     let verdict = gate.verdict(tool_name, &effect);
-    Some(Decision { effect, verdict })
+    let reach = gate.reach(&effect);
+    Some(Decision {
+        effect,
+        verdict,
+        reach,
+    })
 }
 
 /// What a call does, as a card or a refusal names it.
@@ -359,6 +373,7 @@ mod tests {
 
     fn decision(verdict: Verdict) -> Decision {
         Decision {
+            reach: None,
             effect: Effect::Exec {
                 command: "npm test".into(),
                 cwd: Some("/w".into()),

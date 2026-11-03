@@ -817,6 +817,25 @@ pub async fn execute_gated(
     }
 }
 
+/// [`execute_gated`] with the computer gate's reach for the call in scope:
+/// a call its agent's level lets read or change past the tool's roots runs
+/// with them widened ([`crate::tools::paths::REACH`]). With no decision or
+/// no reach, the tool keeps its roots.
+pub async fn execute_decided(
+    tools: &ToolRegistry,
+    access: &ToolAccessSnapshot,
+    tool_name: &str,
+    input: &Value,
+    exec_input: Option<Value>,
+    decision: Option<&Decision>,
+) -> ToolExecution {
+    let run = execute_gated(tools, access, tool_name, input, exec_input);
+    match decision.and_then(|d| d.reach.clone()) {
+        Some(reach) => crate::tools::paths::REACH.scope(reach, run).await,
+        None => run.await,
+    }
+}
+
 /// Whether a call to `tool_name` with `input` would run right now, without
 /// prompting anyone: every check [`gate_tool_call`] and [`execute_gated`]
 /// apply, minus the execution.
@@ -853,13 +872,22 @@ pub async fn execute_approved(
         arguments: ArgumentValidation::Off,
         ..gates.clone()
     };
-    let gated = match gate_tool_call(&regate, policy, tools, tool_name, input) {
+    let (gated, decided) = gate_tool_call_decided(&regate, policy, tools, tool_name, input);
+    let gated = match gated {
         GateOutcome::RequireApproval { .. } => prepare_allowed(gates, tool_name, input),
         settled => settled,
     };
     match gated {
         GateOutcome::Execute { exec_input, .. } => {
-            execute_gated(tools, access, tool_name, input, exec_input).await
+            execute_decided(
+                tools,
+                access,
+                tool_name,
+                input,
+                exec_input,
+                decided.as_ref(),
+            )
+            .await
         }
         GateOutcome::Blocked {
             message, reason, ..
