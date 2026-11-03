@@ -468,6 +468,39 @@ fn options(config: &WorkforceConfig) -> Options {
             .then(|| Duration::from_secs(desk.adopt_interval_secs)),
         holder: holder_options(desk),
         hub_internal: hub_internal(config),
+        account_keys: account_keys(&desk.accounts),
+    }
+}
+
+/// Where `[desk.accounts]` says the person's engine accounts' sign-ins are
+/// kept: Desk Helper names the store Desk chose for its own secrets. None
+/// (and a warning) when it names one this computer hasn't.
+fn account_keys(
+    config: &workforce_common::settings::DeskAccounts,
+) -> Option<Arc<dyn workforce_desk::engine_accounts::Keys>> {
+    use workforce_common::settings::DeskAccountsStore;
+    use workforce_desk::engine_accounts as accounts;
+    match config.store? {
+        DeskAccountsStore::File => match config.file.as_deref().map(Path::new) {
+            Some(file) if file.is_absolute() => Some(Arc::new(accounts::FileKeys::new(file))),
+            _ => {
+                tracing::warn!(
+                    "[desk.accounts] store = \"file\" needs an absolute file: no accounts kept"
+                );
+                None
+            }
+        },
+        #[cfg(target_os = "macos")]
+        DeskAccountsStore::System => Some(Arc::new(accounts::SystemKeys::new(
+            config.service.as_deref().unwrap_or("xyz.driftwerk.desk"),
+        ))),
+        #[cfg(not(target_os = "macos"))]
+        DeskAccountsStore::System => {
+            tracing::warn!(
+                "[desk.accounts] store = \"system\" is the macOS keychain: no accounts kept"
+            );
+            None
+        }
     }
 }
 

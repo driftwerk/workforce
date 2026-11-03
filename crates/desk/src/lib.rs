@@ -17,6 +17,7 @@ mod crew_api;
 mod crew_store;
 mod cwd;
 pub mod engine;
+pub mod engine_accounts;
 pub mod floor;
 pub mod gist;
 pub mod holder;
@@ -37,6 +38,7 @@ pub mod state;
 pub mod store;
 #[cfg(test)]
 mod testing;
+mod token_pipe;
 mod transcript;
 pub mod usage;
 mod vt;

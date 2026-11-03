@@ -39,11 +39,15 @@ use crate::transcript;
 use crate::usage::{LocalPlan, PlanSink};
 use crate::worktree;
 
+mod accounts;
+pub use accounts::Added;
 mod codex_terminals;
 mod copies;
 mod groups;
 mod lifecycle;
 pub use lifecycle::{Clearing, Hidden, Removal, Removed};
+#[cfg(test)]
+mod accounts_tests;
 #[cfg(test)]
 mod codex_asks_tests;
 mod ledger;
@@ -93,6 +97,9 @@ pub struct Options {
     pub holder: Option<HolderOptions>,
     /// What the hub runs `claude` in and as itself: never adopted.
     pub hub_internal: HubInternal,
+    /// Where the person's engine accounts' sign-ins are kept; none: Desk
+    /// keeps no accounts, and every session runs on its CLI's own sign-in.
+    pub account_keys: Option<Arc<dyn crate::engine_accounts::Keys>>,
 }
 
 #[cfg(test)]
@@ -299,6 +306,23 @@ struct State {
     /// Sessions forgotten while this hub runs: the registry may still hold
     /// one until the persist queue reaches it, and it is never taken back.
     forgotten: HashSet<Uuid>,
+    /// The person's engine accounts.
+    accounts: Vec<crate::engine_accounts::Account>,
+    /// Signing in to new accounts, by sign-in.
+    sign_in_runs: HashMap<Uuid, accounts::SignInRun>,
+    /// Sessions moving to another account once their turn ends (`None`:
+    /// the CLI's own sign-in).
+    switches: HashMap<Uuid, Option<Uuid>>,
+    /// The accounts whose sign-in was in the store when last looked at.
+    signed_in_accounts: HashSet<Uuid>,
+    /// What went wrong with accounts' sign-ins, by account: shown until it
+    /// is put right.
+    sign_in_problems: HashMap<Uuid, crate::engine_accounts::SignInProblem>,
+    /// The names of accounts removed while sessions still run on them,
+    /// until those sessions restart.
+    removed_names: HashMap<Uuid, String>,
+    /// Sessions whose switch of account is being carried out now.
+    switching: HashSet<Uuid>,
 }
 
 /// How often a busy session's tool is recorded as `working`.
@@ -758,6 +782,7 @@ impl Desk {
         forget_hub_internal(&store, &opts.hub_internal, floor.turns.as_deref()).await;
         let layout = store.layout().await?;
         let session_env = kept_session_env(&store).await;
+        let engine_accounts = store.accounts().await?;
         let hidden = store
             .hidden()
             .await?
@@ -831,6 +856,7 @@ impl Desk {
                 attention,
                 hidden,
                 turns,
+                accounts: engine_accounts,
                 ..State::default()
             }),
             events: broadcast::channel(256).0,
@@ -848,6 +874,7 @@ impl Desk {
         }));
         tokio::spawn(persist_loop(store, floor.turns, persist_rx));
         tokio::spawn(desk.clone().read_engines());
+        tokio::spawn(desk.clone().look_for_sign_ins());
         tokio::spawn(desk.clone().ledger_loop(ledger_jobs));
         tokio::spawn(desk.clone().watch_background());
         recovered.into_iter().for_each(|r| desk.save(r));
@@ -1041,6 +1068,7 @@ impl Desk {
             live.and_then(|l| l.pending.clone()),
         );
         view.group = Self::group_ref(&state.layout, &groups::session_item(r.id));
+        (view.account, view.switching_to) = Self::account_refs(state, r);
         view.background = live.and_then(|l| l.background.view());
         view.interrupted = live.is_some_and(|l| l.interrupted);
         view.reading = live.is_some_and(|l| l.reading.is_some());
@@ -1083,6 +1111,27 @@ impl Desk {
         let events = Self::session_events(st, &transitions, &view);
         let ops = Self::turn_ops(st, &transitions, &view);
         let id = r.id;
+        // A switch of account that waited for its turn to end.
+        let turn_over = transitions.iter().any(|t| {
+            matches!(
+                t,
+                Transition::Finished { .. }
+                    | Transition::Asked { .. }
+                    | Transition::Halted
+                    | Transition::Dismissed
+                    | Transition::Stopped { .. }
+                    | Transition::Interrupted
+            )
+        });
+        // Carried out by the one driver of this session's switches.
+        if turn_over && st.switches.contains_key(&id) {
+            let desk = self.clone();
+            tokio::spawn(async move {
+                if let Err(e) = desk.drive_switch(id, None).await {
+                    tracing::warn!(session = %id, error = %e, "couldn't move a session to its account");
+                }
+            });
+        }
         let _ = self.0.persist.send(Persist::Put(Box::new(r)));
         if noticed {
             let _ = self.0.persist.send(Persist::Attention(id, view.updated_at));
@@ -1697,6 +1746,7 @@ impl Desk {
                 "only Codex sessions can approve for you".into(),
             ));
         }
+        let account = self.account_for(new.engine, new.account)?;
         let cwd = PathBuf::from(&new.cwd);
         if !cwd.is_dir() {
             return Err(DeskError::Invalid(format!("{} is not a folder", new.cwd)));
@@ -1724,6 +1774,7 @@ impl Desk {
             view,
             engine_version: self.version_of(new.engine),
             approve_for_me: new.approve_for_me && new.engine == Engine::Codex,
+            account,
             name: name.to_string(),
             goal: new.goal.trim().to_string(),
             cwd: cwd.to_string_lossy().into_owned(),
@@ -2686,7 +2737,15 @@ impl Desk {
         if !cwd.is_dir() {
             return Err(DeskError::Conflict(format!("{} no longer exists", r.cwd)));
         }
-        let env = self.with_added(&self.0.state.lock().session_env.clone());
+        let mut env = self.with_added(&self.0.state.lock().session_env.clone());
+        // Read only now; it reaches the CLI on a descriptor, never in an
+        // environment ([`crate::token_pipe`]).
+        let account_token = self.account_token(r.engine, r.account).await?;
+        if account_token.is_some() {
+            for k in crate::engine_accounts::OUTRANKS_CLAUDE_TOKEN {
+                env.remove(k);
+            }
+        }
         let (spec, codex) = match r.engine {
             Engine::Claude => {
                 let session_id = r.cli_session_id.as_deref().unwrap_or_default();
@@ -2745,6 +2804,21 @@ impl Desk {
             "token": token,
             "hookPort": self.0.hook_port,
         });
+        let spec = match account_token {
+            Some(account_token) => {
+                let fifo = crate::token_pipe::TokenFifo::new(&self.0.opts.run_dir)
+                    .map_err(DeskError::Internal)?;
+                let spec = fifo.wrap(spec);
+                let id = r.id;
+                tokio::task::spawn_blocking(move || {
+                    if let Err(e) = fifo.hand(&account_token) {
+                        tracing::warn!(session = %id, error = %e, "a session didn't take its account's token");
+                    }
+                });
+                spec
+            }
+            None => spec,
+        };
         let started = self.start_pty(&spec, meta).await;
         let (pty, exit) = match started {
             Ok(started) => started,
@@ -3664,6 +3738,7 @@ impl Desk {
                         view: View::Terminal,
                         engine_version: None,
                         approve_for_me: false,
+                        account: None,
                         name: ext
                             .name
                             .clone()
@@ -3901,6 +3976,7 @@ mod tests {
             adopt_every: None,
             holder: None,
             hub_internal: HubInternal::default(),
+            account_keys: None,
         }
     }
 
@@ -3932,6 +4008,7 @@ mod tests {
                 prompt: None,
                 approvals: None,
                 approve_for_me: false,
+                account: None,
                 env: Default::default(),
             },
             None,
@@ -4318,6 +4395,7 @@ mod tests {
                         prompt: None,
                         approvals: None,
                         approve_for_me: false,
+                        account: None,
                         env: BTreeMap::from([(PLUGIN_DIRS.into(), "/plugins/desk".into())]),
                     },
                     None,
@@ -4363,6 +4441,7 @@ mod tests {
                         prompt: None,
                         approvals: None,
                         approve_for_me: false,
+                        account: None,
                         env: BTreeMap::from([("NOT A NAME".into(), "x".into())]),
                     },
                     None,
@@ -4408,6 +4487,7 @@ mod tests {
                     prompt: None,
                     approvals: None,
                     approve_for_me: false,
+                    account: None,
                     env: added.clone(),
                 },
                 None,
@@ -4832,6 +4912,7 @@ mod tests {
                         prompt: None,
                         approvals: None,
                         approve_for_me: false,
+                        account: None,
                         env: Default::default(),
                     },
                     Some(By::you()),
@@ -5403,6 +5484,7 @@ mod tests {
                 DeskStore::from_pool(pool),
                 Options {
                     hub_internal: HubInternal::new([PathBuf::from("/data")], None),
+                    account_keys: None,
                     ..options(dir.path())
                 },
                 Default::default(),
@@ -5443,6 +5525,7 @@ mod tests {
                 DeskStore::from_pool(pool),
                 Options {
                     hub_internal: HubInternal::default().started_by(std::process::id()),
+                    account_keys: None,
                     ..options(dir.path())
                 },
                 Default::default(),
@@ -5518,6 +5601,7 @@ mod tests {
                 DeskStore::from_pool(pool),
                 Options {
                     hub_internal: HubInternal::new([PathBuf::from("/data")], None),
+                    account_keys: None,
                     ..options(dir.path())
                 },
                 Floor {
@@ -5575,6 +5659,7 @@ mod tests {
                 DeskStore::from_pool(pool),
                 Options {
                     hub_internal: HubInternal::new([PathBuf::from("/data")], None),
+                    account_keys: None,
                     ..options(dir.path())
                 },
                 Floor {
