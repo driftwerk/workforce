@@ -105,6 +105,7 @@ impl Desk {
             let mut st = self.0.state.lock();
             let live: std::collections::HashSet<Uuid> = st.live.keys().copied().collect();
             st.codex_pids.retain(|id, _| live.contains(id));
+            st.codex_marks.retain(|id, _| live.contains(id));
             st.terminal_ptys
                 .iter()
                 .map(|(id, p)| (*id, Arc::clone(p)))
@@ -232,15 +233,24 @@ impl Desk {
             return;
         };
         let read = rollout.clone();
-        let Ok((activity, tail)) = tokio::task::spawn_blocking(move || {
+        let prev = self.0.state.lock().codex_marks.get(&id).cloned();
+        let Ok((mark, tail)) = tokio::task::spawn_blocking(move || {
             (
-                session::activity(&read),
+                session::activity(&read, prev.as_ref()),
                 transcript::read_codex_tail(&read).unwrap_or_default(),
             )
         })
         .await
         else {
             return;
+        };
+        let activity = match mark {
+            Some(m) => {
+                let a = m.activity;
+                self.0.state.lock().codex_marks.insert(id, m);
+                a
+            }
+            None => Activity::Idle,
         };
         let state = match activity {
             Activity::Idle => SessionState::Idle,

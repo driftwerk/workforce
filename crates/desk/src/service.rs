@@ -270,6 +270,8 @@ struct State {
     live: HashMap<Uuid, Live>,
     /// The `codex` process each terminal-hosted Codex session was bound to.
     codex_pids: HashMap<Uuid, u32>,
+    /// How far each Codex session's rollout was read, and what it said.
+    codex_marks: HashMap<Uuid, crate::codex_session::Mark>,
     /// Transcript mtimes already read for adopted sessions.
     seen_transcripts: HashMap<Uuid, SystemTime>,
     /// When each session came into the state it is in.

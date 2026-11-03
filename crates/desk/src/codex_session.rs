@@ -133,32 +133,97 @@ pub fn started(
         .min_by_key(|b| b.created)
 }
 
-/// Where the rollout's turns stand, from its tail.
-pub fn activity(rollout: &Path) -> Activity {
-    use std::io::{Read, Seek, SeekFrom};
-    const TAIL: u64 = 256 * 1024;
-    let Ok(mut file) = std::fs::File::open(rollout) else {
-        return Activity::Idle;
-    };
-    let len = file.metadata().map_or(0, |m| m.len());
-    let start = len.saturating_sub(TAIL);
-    let mut raw = Vec::new();
-    if file.seek(SeekFrom::Start(start)).is_err() || file.take(TAIL).read_to_end(&mut raw).is_err()
-    {
-        return Activity::Idle;
+/// What was last learned of a rollout's turns: how far it was read (up to
+/// the end of its last whole line) and the state its latest turn marker
+/// said, so a later look reads only the bytes added since.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Mark {
+    rollout: PathBuf,
+    read: u64,
+    pub activity: Activity,
+}
+
+/// The state a line says, when it is a turn marker (`task_started`,
+/// `task_complete`, `turn_aborted`). Only the event kind is read.
+fn marker(line: &str) -> Option<Activity> {
+    // Cheap test first: most lines are tool calls and output.
+    if !line.contains("\"event_msg\"") || !line.contains("\"task_") && !line.contains("\"turn_") {
+        return None;
     }
-    let text = String::from_utf8_lossy(&raw);
-    text.lines()
-        .skip(usize::from(start > 0))
-        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
-        .filter(|v| v["type"] == "event_msg")
-        .filter_map(|v| match v["payload"]["type"].as_str()? {
-            "task_started" => Some(Activity::Working),
-            "task_complete" | "turn_aborted" => Some(Activity::Done),
-            _ => None,
-        })
-        .last()
-        .unwrap_or(Activity::Idle)
+    let v: Value = serde_json::from_str(line).ok()?;
+    if v["type"] != "event_msg" {
+        return None;
+    }
+    match v["payload"]["type"].as_str()? {
+        "task_started" => Some(Activity::Working),
+        "task_complete" | "turn_aborted" => Some(Activity::Done),
+        _ => None,
+    }
+}
+
+/// The latest marker among the whole lines of `bytes`, and how many bytes
+/// those lines take (a half-written last line is left for next time).
+fn scan(bytes: &[u8]) -> (Option<Activity>, usize) {
+    let whole = bytes.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
+    let latest = String::from_utf8_lossy(&bytes[..whole])
+        .lines()
+        .filter_map(marker)
+        .next_back();
+    (latest, whole)
+}
+
+fn read_range(file: &mut std::fs::File, from: u64, to: u64) -> Option<Vec<u8>> {
+    use std::io::{Read, Seek, SeekFrom};
+    file.seek(SeekFrom::Start(from)).ok()?;
+    let mut raw = Vec::new();
+    file.take(to - from).read_to_end(&mut raw).ok()?;
+    Some(raw)
+}
+
+/// Where the rollout's turns stand: its latest turn marker, wherever in the
+/// file it is. Searched back from the end in growing chunks (a turn of
+/// hundreds of tool calls starts far from the end), up to `FAR`, then the
+/// whole file. With `prev` (from an earlier look), only the bytes added
+/// since are read; no new marker leaves the state as it was, and a file
+/// that got shorter is read afresh. `None` when it can't be read.
+pub fn activity(rollout: &Path, prev: Option<&Mark>) -> Option<Mark> {
+    const FIRST: u64 = 256 * 1024;
+    const FAR: u64 = 32 * 1024 * 1024;
+    let mut file = std::fs::File::open(rollout).ok()?;
+    let len = file.metadata().ok()?.len();
+    let mark = |read, activity| Mark {
+        rollout: rollout.to_path_buf(),
+        read,
+        activity,
+    };
+    if let Some(p) = prev.filter(|p| p.rollout == rollout && p.read <= len) {
+        let bytes = read_range(&mut file, p.read, len)?;
+        let (latest, whole) = scan(&bytes);
+        return Some(mark(p.read + whole as u64, latest.unwrap_or(p.activity)));
+    }
+    let mut window = FIRST;
+    loop {
+        let start = len.saturating_sub(window);
+        let mut bytes = read_range(&mut file, start, len)?;
+        let mut skipped = 0;
+        if start > 0 {
+            // Begins mid-line, probably: from the first whole line.
+            skipped = bytes
+                .iter()
+                .position(|b| *b == b'\n')
+                .map_or(bytes.len(), |i| i + 1);
+            bytes.drain(..skipped);
+        }
+        let (latest, whole) = scan(&bytes);
+        let read = start + (skipped + whole) as u64;
+        if let Some(a) = latest {
+            return Some(mark(read, a));
+        }
+        if start == 0 {
+            return Some(mark(read, Activity::Idle));
+        }
+        window = if window >= FAR { len } else { window * 2 };
+    }
 }
 
 /// Whether a `codex` command line is the interactive TUI: not `exec`,
@@ -356,7 +421,11 @@ mod tests {
     #[test]
     fn a_turn_is_working_from_its_start_to_its_end() {
         let home = tempfile::tempdir().unwrap();
-        let at = |tail: &[&str]| activity(&session(home.path(), "s", "/w", None, tail));
+        let at = |tail: &[&str]| {
+            activity(&session(home.path(), "s", "/w", None, tail), None)
+                .unwrap()
+                .activity
+        };
         assert_eq!(at(&[]), Activity::Idle);
         assert_eq!(at(&["task_started", "token_count"]), Activity::Working);
         assert_eq!(at(&["task_started", "task_complete"]), Activity::Done);
@@ -365,6 +434,110 @@ mod tests {
             Activity::Working
         );
         assert_eq!(at(&["task_started", "turn_aborted"]), Activity::Done);
+    }
+
+    fn append(path: &Path, kinds: &[&str], filler: usize) {
+        let mut f = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+        for kind in kinds {
+            let line = serde_json::json!({"type": "event_msg", "payload": {"type": kind}});
+            writeln!(f, "{line}").unwrap();
+        }
+        for _ in 0..filler {
+            let line = serde_json::json!({"type": "response_item", "payload": {"type": "function_call", "pad": "x".repeat(1000)}});
+            writeln!(f, "{line}").unwrap();
+        }
+    }
+
+    #[test]
+    fn a_turn_that_began_far_back_is_still_working() {
+        let home = tempfile::tempdir().unwrap();
+        let path = session(
+            home.path(),
+            "s",
+            "/w",
+            None,
+            &["task_complete", "task_started"],
+        );
+        // Well over the first 256 KB window, and over the second.
+        append(&path, &[], 1500);
+        assert!(std::fs::metadata(&path).unwrap().len() > 1024 * 1024);
+        let m = activity(&path, None).unwrap();
+        assert_eq!(m.activity, Activity::Working);
+        // Never a marker anywhere: idle, however long.
+        let none = session(home.path(), "t", "/w", None, &[]);
+        append(&none, &[], 600);
+        assert_eq!(activity(&none, None).unwrap().activity, Activity::Idle);
+    }
+
+    #[test]
+    fn later_bytes_are_all_that_is_read_and_a_marker_among_them_wins() {
+        let home = tempfile::tempdir().unwrap();
+        let path = session(home.path(), "s", "/w", None, &["task_started"]);
+        append(&path, &[], 400);
+        let first = activity(&path, None).unwrap();
+        assert_eq!(first.activity, Activity::Working);
+        // Nothing new, or no new marker: as it was.
+        assert_eq!(activity(&path, Some(&first)).unwrap(), first);
+        append(&path, &[], 10);
+        let more = activity(&path, Some(&first)).unwrap();
+        assert_eq!(more.activity, Activity::Working);
+        assert!(more.read > first.read);
+        append(&path, &["task_complete"], 3);
+        let done = activity(&path, Some(&more)).unwrap();
+        assert_eq!(done.activity, Activity::Done);
+        append(&path, &["task_started"], 0);
+        assert_eq!(
+            activity(&path, Some(&done)).unwrap().activity,
+            Activity::Working
+        );
+    }
+
+    #[test]
+    fn a_half_written_line_waits_for_its_end() {
+        let home = tempfile::tempdir().unwrap();
+        let path = session(home.path(), "s", "/w", None, &["task_started"]);
+        let m = activity(&path, None).unwrap();
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        write!(
+            f,
+            "{{\"type\":\"event_msg\",\"payload\":{{\"type\":\"task_comp"
+        )
+        .unwrap();
+        let m = activity(&path, Some(&m)).unwrap();
+        assert_eq!(m.activity, Activity::Working);
+        writeln!(f, "lete\"}}}}").unwrap();
+        assert_eq!(activity(&path, Some(&m)).unwrap().activity, Activity::Done);
+    }
+
+    #[test]
+    fn a_file_that_shrank_or_was_replaced_is_read_again() {
+        let home = tempfile::tempdir().unwrap();
+        let path = session(home.path(), "s", "/w", None, &["task_started"]);
+        append(&path, &[], 100);
+        let m = activity(&path, None).unwrap();
+        assert_eq!(m.activity, Activity::Working);
+        // Replaced by a shorter one that says the turn ended.
+        let path = session(
+            home.path(),
+            "s",
+            "/w",
+            None,
+            &["task_started", "task_complete"],
+        );
+        assert!(std::fs::metadata(&path).unwrap().len() < m.read);
+        assert_eq!(activity(&path, Some(&m)).unwrap().activity, Activity::Done);
+        // A mark of another file is not used.
+        let other = session(home.path(), "u", "/w", None, &["task_started"]);
+        assert_eq!(
+            activity(&other, Some(&activity(&path, None).unwrap()))
+                .unwrap()
+                .activity,
+            Activity::Working
+        );
+        assert_eq!(activity(&home.path().join("gone"), None), None);
     }
 
     #[test]
