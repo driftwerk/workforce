@@ -340,7 +340,7 @@ mod tests {
         }
     }
 
-    /// Driftwerk and Patchwork run no `[desk]`: nothing installs the gate,
+    /// A server hub runs no `[desk]`: nothing installs the gate,
     /// a composed agent has none, and its calls are decided as on main.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_hub_without_desk_has_no_gate_and_decides_as_before() {
