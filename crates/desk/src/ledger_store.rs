@@ -52,6 +52,9 @@ pub struct LedgerRow {
     pub priced: Priced,
     pub billing: Billing,
     pub account: Option<String>,
+    /// The board's ticket the session was working on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ticket: Option<Uuid>,
 }
 
 /// Where a page of rows ends: the next page starts after it.
@@ -127,7 +130,10 @@ impl DeskStore {
     /// fork of it) is kept once, by the session that had it first; a later
     /// reading that knows more of it (its model, its price, a streamed
     /// call's final counts, its account) completes it. How many rows were
-    /// added or completed.
+    /// added or completed. A new row is stamped with the ticket the session
+    /// was assigned last before the call was made, while it still is; a
+    /// completed row keeps its stamp, so records read late never stamp
+    /// calls made before an assignment.
     pub async fn ledger_write(
         &self,
         session: Uuid,
@@ -150,8 +156,13 @@ impl DeskStore {
             changed = tx
                 .execute(
                     "INSERT INTO ledger (engine, key, session, at, model, input, output, \
-                     cache_read, cache_write, reasoning, usd, priced, billing, account) \
-                     SELECT $1, k, $2, a, m, i, o, cr, cw, r, u, p, b, acc FROM UNNEST( \
+                     cache_read, cache_write, reasoning, usd, priced, billing, account, ticket) \
+                     SELECT $1, k, $2, a, m, i, o, cr, cw, r, u, p, b, acc, ( \
+                       SELECT l.ticket FROM ticket_links l JOIN tickets t ON t.id = l.ticket \
+                       WHERE l.kind = 'session' AND l.target = CAST($2::uuid AS text) \
+                         AND l.at <= a AND t.assignee ->> 'kind' = 'session' \
+                         AND t.assignee ->> 'id' = CAST($2::uuid AS text) \
+                       ORDER BY l.at DESC LIMIT 1) FROM UNNEST( \
                        $3::text[], $4::timestamptz[], $5::text[], $6::int8[], $7::int8[], \
                        $8::int8[], $9::int8[], $10::int8[], $11::float8[], $12::text[], \
                        $13::text[], $14::text[]) AS t(k, a, m, i, o, cr, cw, r, u, p, b, acc) \
@@ -274,7 +285,7 @@ impl DeskStore {
         let rows = client
             .query(
                 "SELECT session, key, at, engine, model, input, output, cache_read, \
-                   cache_write, reasoning, usd, priced, billing, account \
+                   cache_write, reasoning, usd, priced, billing, account, ticket \
                  FROM ledger WHERE at >= $1 AND at < $2 \
                    AND ($3::text IS NULL OR engine = $3) \
                    AND ($4::text IS NULL OR account = $4) \
@@ -308,6 +319,7 @@ impl DeskStore {
                     priced: Priced::parse(r.try_get(11)?)?,
                     billing: Billing::parse(r.try_get(12)?)?,
                     account: r.try_get(13)?,
+                    ticket: r.try_get(14)?,
                 })
             })
             .collect()

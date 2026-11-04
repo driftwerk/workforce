@@ -780,6 +780,7 @@ impl Desk {
                     .map_err(say)?;
                 Ok(json!({ "id": a.id }))
             }
+            Call::Ticket(call) => self.ticket_call(caller, call).await,
             Call::Inbox => {
                 let taken = self.line_take_inbox(caller).await.map_err(say)?;
                 Ok(json!({ "messages": taken }))

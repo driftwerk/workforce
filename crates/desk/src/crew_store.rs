@@ -24,6 +24,16 @@ pub struct CheckIn {
     pub reply: Option<String>,
 }
 
+/// Whose history a page of Activity is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum History {
+    /// A board's ticket's.
+    Ticket(uuid::Uuid),
+    /// A session's or an agent's, by its id: what it did, and what was
+    /// done to it.
+    Of(String),
+}
+
 fn party(v: Option<Value>) -> Result<Option<Party>> {
     v.filter(|v| !v.is_null())
         .map(serde_json::from_value)
@@ -52,6 +62,7 @@ fn event(row: &Row) -> Result<Event> {
             .transpose()
             .context("reading an event's place")?,
         message: row.try_get("message")?,
+        ticket: row.try_get("ticket")?,
     })
 }
 
@@ -87,8 +98,8 @@ impl DeskStore {
         client
             .execute(
                 "INSERT INTO activity (id, at, kind, actor, subject, text, reason, suggestion_id, \
-                 approval_id, hop, detail, place, message) \
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) ON CONFLICT (id) DO NOTHING",
+                 approval_id, hop, detail, place, message, ticket) \
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) ON CONFLICT (id) DO NOTHING",
                 &[
                     &e.id,
                     &e.at,
@@ -103,6 +114,7 @@ impl DeskStore {
                     &e.detail,
                     &e.place.as_ref().map(serde_json::to_value).transpose()?,
                     &e.message,
+                    &e.ticket,
                 ],
             )
             .await
@@ -150,6 +162,56 @@ impl DeskStore {
         let rows = match &cursor {
             Some((at, id)) => client.query(&sql, &[&take, at, id]).await?,
             None => client.query(&sql, &[&take]).await?,
+        };
+        let mut events = rows.iter().map(event).collect::<Result<Vec<_>>>()?;
+        let more = events.len() as i64 > limit;
+        events.truncate(limit as usize);
+        Ok((events, more))
+    }
+
+    /// A page of `of`'s history, newest first, from before the event
+    /// `before`; and whether more remain.
+    pub async fn history(
+        &self,
+        of: &History,
+        before: Option<&str>,
+        limit: i64,
+    ) -> Result<(Vec<Event>, bool)> {
+        let client = self.pool().get().await?;
+        let (wher, key): (&str, String) = match of {
+            History::Ticket(id) => ("ticket = $1::text::uuid", id.to_string()),
+            History::Of(id) => ("(subject ->> 'id' = $1 OR actor ->> 'id' = $1)", id.clone()),
+        };
+        let take = limit + 1;
+        let rows = match before {
+            Some(before) => {
+                let Some(row) = client
+                    .query_opt("SELECT at FROM activity WHERE id = $1", &[&before])
+                    .await?
+                else {
+                    return Ok((vec![], false));
+                };
+                let at: DateTime<Utc> = row.try_get("at")?;
+                client
+                    .query(
+                        &format!(
+                            "SELECT * FROM activity WHERE {wher} AND (at, id) < ($3, $4) \
+                             ORDER BY at DESC, id DESC LIMIT $2"
+                        ),
+                        &[&key, &take, &at, &before],
+                    )
+                    .await?
+            }
+            None => {
+                client
+                    .query(
+                        &format!(
+                            "SELECT * FROM activity WHERE {wher} ORDER BY at DESC, id DESC LIMIT $2"
+                        ),
+                        &[&key, &take],
+                    )
+                    .await?
+            }
         };
         let mut events = rows.iter().map(event).collect::<Result<Vec<_>>>()?;
         let more = events.len() as i64 > limit;
