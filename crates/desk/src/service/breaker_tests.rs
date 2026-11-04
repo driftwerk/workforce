@@ -409,6 +409,64 @@ async fn no_one_but_the_person_resumes_or_restarts_a_held_session() {
     .await;
 }
 
+/// A boss running a session the breaker holds answers nothing for it:
+/// only the person lets it go on.
+#[tokio::test]
+async fn a_boss_never_answers_for_a_session_the_breaker_holds() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let id = held_session(&d, dir.path()).await;
+        let sarah = Party::manager("sarah", "Sarah");
+        d.take_on(
+            id,
+            &sarah,
+            crate::charge::How::Handed,
+            &Default::default(),
+            &By::you(),
+        )
+        .await
+        .unwrap();
+        d.boss_bounds_with(crate::charge::Bounds {
+            home: dir.path().to_path_buf(),
+            ..Default::default()
+        });
+        let asking = {
+            let d = d.clone();
+            tokio::spawn(async move {
+                post(
+                    &d,
+                    id,
+                    json!({"hook_event_name": "PermissionRequest", "tool_name": "Bash",
+                        "tool_input": {"command": "cargo test"}}),
+                )
+                .await
+            })
+        };
+        let mut approval = None;
+        for _ in 0..200 {
+            approval = d.view(id).unwrap().pending.map(|p| p.id);
+            if approval.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let approval = approval.expect("it asks");
+        let boss = By::manager("sarah", "Sarah", "Tests are fine.");
+        for decision in [crate::model::Decision::Allow, crate::model::Decision::Deny] {
+            match d.decide(id, approval, decision, Some(boss.clone())) {
+                Err(DeskError::Conflict(why)) => assert!(why.contains("breaker"), "{why}"),
+                other => panic!("a boss answered for a held session: {other:?}"),
+            }
+        }
+        assert_eq!(d.breaker_needs().len(), 1, "still held");
+        d.decide(id, approval, crate::model::Decision::Deny, Some(By::you()))
+            .unwrap();
+        asking.await.unwrap();
+    })
+    .await;
+}
+
 /// Two agents' use, every billing.
 struct Agents;
 

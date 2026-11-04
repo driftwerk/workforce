@@ -519,6 +519,9 @@ struct Inner {
     line_mcp: std::sync::OnceLock<Arc<dyn line::SessionMcp>>,
     /// The crew whose overseer answers sessions on their lines.
     line_crew: Mutex<Option<Weak<dyn crew::Crew>>>,
+    /// Where a boss's answers for its sessions are judged; none until the
+    /// hub says, and until then no boss answers a request.
+    boss_bounds: Mutex<Option<crate::charge::Bounds>>,
 }
 
 #[derive(Clone)]
@@ -1035,6 +1038,7 @@ impl Desk {
             line_pump: tokio::sync::Mutex::new(()),
             line_mcp: std::sync::OnceLock::new(),
             line_crew: Mutex::new(None),
+            boss_bounds: Mutex::new(None),
         }));
         tokio::spawn(persist_loop(store, floor.turns, persist_rx));
         tokio::spawn(desk.clone().read_engines());
@@ -2323,6 +2327,12 @@ impl Desk {
         decision: Decision,
         by: Option<By>,
     ) -> Result<SessionView, DeskError> {
+        if let Some(boss) = by
+            .as_ref()
+            .filter(|b| b.party.kind == crew::PartyKind::Manager)
+        {
+            self.boss_decides(id, approval, decision, boss)?;
+        }
         let codex = self
             .0
             .state
@@ -2349,9 +2359,7 @@ impl Desk {
                 .get_mut(&id)
                 .ok_or_else(|| DeskError::Conflict("session is not running".into()))?;
             if live.pending.as_ref().map(|p| p.id) != Some(approval) {
-                return Err(DeskError::Conflict(
-                    "that approval is no longer pending".into(),
-                ));
+                return Err(DeskError::Conflict("already answered".into()));
             }
             if matches!(decision, Decision::AllowForSession | Decision::Cancel) {
                 return Err(DeskError::Invalid(
@@ -2409,8 +2417,15 @@ impl Desk {
         decision: Decision,
         by: Option<By>,
     ) -> Result<SessionView, DeskError> {
+        // The boss of a session it runs, checked in `decide`.
+        let charged = |b: &By| {
+            b.party.kind == crew::PartyKind::Manager
+                && self
+                    .charge_of(id)
+                    .is_some_and(|c| c.live() && c.boss == b.party.id)
+        };
         let by = by
-            .filter(|b| b.party.kind == crew::PartyKind::You)
+            .filter(|b| b.party.kind == crew::PartyKind::You || charged(b))
             .ok_or_else(|| DeskError::Invalid("only the person answers Codex's requests".into()))?;
         let seen = {
             let mut guard = self.0.state.lock();
@@ -2424,7 +2439,7 @@ impl Desk {
                 .codex_asks
                 .iter()
                 .position(|a| a.pending.id == approval)
-                .ok_or_else(|| DeskError::Conflict("that approval is no longer pending".into()))?;
+                .ok_or_else(|| DeskError::Conflict("already answered".into()))?;
             if decision == Decision::Terminal {
                 // Its terminal asks it too: Desk just stops offering it.
                 let asked = live.codex_asks.remove(at);

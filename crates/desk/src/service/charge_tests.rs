@@ -491,3 +491,115 @@ async fn a_session_passes_to_the_new_boss_or_is_let_go_once_ended() {
     })
     .await;
 }
+
+/// What its session asks, open until answered.
+fn ask_permission(d: &Desk, id: Uuid, command: &str) -> tokio::task::JoinHandle<Value> {
+    let d = d.clone();
+    let body = json!({"hook_event_name": "PermissionRequest", "tool_name": "Bash",
+        "tool_input": {"command": command}});
+    tokio::spawn(async move { hook(&d, id, body).await })
+}
+
+async fn asked(d: &Desk, id: Uuid, command: &str) -> Uuid {
+    for _ in 0..200 {
+        if let Some(p) = d.view(id).unwrap().pending.filter(|p| p.detail == command) {
+            return p.id;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("{command} was never asked");
+}
+
+/// Desk itself holds a boss to what it may answer on a session it runs:
+/// what can't be undone, a session another boss runs or the person
+/// drives, and the rest of the session are the person's; an answer after
+/// the person's is told it was already answered.
+#[tokio::test]
+async fn desk_holds_a_boss_to_what_it_may_answer_for_its_session() {
+    use crate::model::Decision;
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let s = new_session(&d, dir.path()).await;
+        idle(&d, s.id).await;
+        d.take_on(s.id, &sarah(), How::Handed, &HashSet::new(), &By::you())
+            .await
+            .unwrap();
+        let sarah_by = By::manager("sarah", "Sarah", "It's the plan.");
+        let refused = |r: Result<crate::model::SessionView, DeskError>| match r {
+            Err(DeskError::Conflict(why) | DeskError::Invalid(why)) => why,
+            other => panic!("not refused: {other:?}"),
+        };
+
+        // Until the hub says where answers are judged, none is the boss's.
+        let tests = ask_permission(&d, s.id, "cargo test");
+        let a = asked(&d, s.id, "cargo test").await;
+        assert_eq!(
+            refused(d.decide(s.id, a, Decision::Allow, Some(sarah_by.clone()))),
+            "Desk can't judge requests for a boss yet: it's the person's to allow"
+        );
+        d.boss_bounds_with(crate::charge::Bounds {
+            home: dir.path().to_path_buf(),
+            scratch: vec![],
+            withheld: vec![],
+        });
+        assert_eq!(
+            refused(d.decide(s.id, a, Decision::AllowForSession, Some(sarah_by.clone()))),
+            "only the person answers for the rest of a session"
+        );
+        let mia = By::manager("mia", "Mia", "Mine now.");
+        assert!(
+            refused(d.decide(s.id, a, Decision::Allow, Some(mia))).contains("another boss runs")
+        );
+        d.decide(s.id, a, Decision::Allow, Some(sarah_by.clone()))
+            .unwrap();
+        assert_eq!(
+            tests.await.unwrap()["hookSpecificOutput"]["decision"]["behavior"],
+            "allow"
+        );
+
+        // What can't be undone is the person's; denying it is the boss's.
+        let force = ask_permission(&d, s.id, "git push --force origin feat");
+        let a = asked(&d, s.id, "git push --force origin feat").await;
+        assert_eq!(
+            refused(d.decide(s.id, a, Decision::Allow, Some(sarah_by.clone()))),
+            "can't be undone: it's the person's to allow"
+        );
+        d.decide(s.id, a, Decision::Deny, Some(sarah_by.clone()))
+            .unwrap();
+        assert_eq!(
+            force.await.unwrap()["hookSpecificOutput"]["decision"]["behavior"],
+            "deny"
+        );
+
+        // The person answered first.
+        let build = ask_permission(&d, s.id, "cargo build");
+        let a = asked(&d, s.id, "cargo build").await;
+        d.decide(s.id, a, Decision::Allow, Some(By::you())).unwrap();
+        build.await.unwrap();
+        assert_eq!(
+            refused(d.decide(s.id, a, Decision::Allow, Some(sarah_by.clone()))),
+            "already answered"
+        );
+        assert_eq!(
+            refused(d.decide(s.id, a, Decision::Allow, Some(By::you()))),
+            "already answered"
+        );
+
+        // The person drives it: theirs to answer.
+        let lint = ask_permission(&d, s.id, "cargo clippy");
+        let a = asked(&d, s.id, "cargo clippy").await;
+        d.drive(s.id).await.unwrap();
+        assert!(
+            refused(d.decide(s.id, a, Decision::Allow, Some(sarah_by.clone())))
+                .contains("the person is driving")
+        );
+        assert!(
+            refused(d.decide(s.id, a, Decision::Deny, Some(sarah_by.clone())))
+                .contains("the person is driving")
+        );
+        d.decide(s.id, a, Decision::Allow, Some(By::you())).unwrap();
+        lint.await.unwrap();
+    })
+    .await;
+}

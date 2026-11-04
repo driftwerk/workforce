@@ -207,7 +207,7 @@ pub enum Refusal {
     Gone(String),
     #[error("There is no question {0} waiting on you.")]
     NoSuchAsk(Uuid),
-    #[error("That question was already answered.")]
+    #[error("Already answered: the first answer to that question stands.")]
     Answered,
     #[error("{0} can't take a message in the middle of its turn; send it to wait for the turn's end instead.")]
     NoSteer(String),
