@@ -424,6 +424,35 @@ async fn a_boss_is_called_by_its_name_after_a_restart_and_never_by_its_id() {
     .await;
 }
 
+/// A charge made for a session that then didn't start is let go where
+/// Desk shows it, so none is left behind.
+#[tokio::test]
+async fn a_charge_for_a_start_that_failed_is_let_go_where_desk_shows_it() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let id = Uuid::new_v4();
+        d.charge_started(id, &sarah(), None).await.unwrap();
+        assert_eq!(d.charges().len(), 1);
+        let (_, mut rx) = d.subscribe();
+        d.charge_forget(id);
+        let shown = loop {
+            match tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .unwrap()
+                .unwrap()
+            {
+                DeskEvent::Charge { charge } if charge.session == id => break charge,
+                _ => {}
+            }
+        };
+        assert!(shown.released_at.is_some(), "{shown:?}");
+        assert!(d.charges().is_empty());
+        assert!(d.charge_of(id).is_none());
+    })
+    .await;
+}
+
 fn boss_tell(text: &str, to: Uuid) -> Send {
     Send::Tell {
         to: Target::Session(to),

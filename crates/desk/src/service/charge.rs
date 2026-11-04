@@ -475,9 +475,19 @@ impl Desk {
         self.put_charge(c, Wheel::Boss).await.map(drop)
     }
 
-    /// Forgets `id`'s charge in memory: it never ran.
+    /// Forgets `id`'s charge: it never ran. Desk is told it is let go, as
+    /// for any charge that ends, so none is left showing.
     pub(super) fn charge_forget(&self, id: Uuid) {
-        self.0.state.lock().charges.rows.remove(&id);
+        let Some(mut c) = self.0.state.lock().charges.rows.remove(&id) else {
+            return;
+        };
+        let now = crew::now();
+        c.released_at = Some(now);
+        c.updated_at = now;
+        let view = self.charge_view(&c, Wheel::Boss);
+        let _ = self.0.events.send(DeskEvent::Charge {
+            charge: Box::new(view),
+        });
     }
 
     /// Notes in `view`'s thread that `boss`, which started it, runs it.
