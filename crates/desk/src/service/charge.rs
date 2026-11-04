@@ -54,6 +54,9 @@ pub struct ChargeView {
     pub released_at: Option<DateTime<Utc>>,
 }
 
+#[cfg(test)]
+use crate::crew::UNNAMED_BOSS;
+
 /// How often who has the wheel is looked at.
 const SETTLE_EVERY: Duration = Duration::from_secs(5);
 
@@ -102,16 +105,29 @@ impl Desk {
         crew.overseer()
     }
 
+    /// What the boss `id` is called: as the hub's roster says now, which
+    /// outlives a restart, else as it was when it took a session on. Never
+    /// its id: one with no name of its own is [`crate::crew::UNNAMED_BOSS`].
     fn boss_name(&self, id: &str) -> String {
-        if let Some(o) = self.boss().filter(|o| o.id == id) {
-            return o.name;
+        let named = |n: &str| !n.trim().is_empty() && n != id;
+        let crew = self
+            .0
+            .line_crew
+            .lock()
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade);
+        if let Some(crew) = crew {
+            if let Some(n) = crew
+                .overseer()
+                .filter(|o| o.id == id && named(&o.name))
+                .map(|o| o.name)
+                .or_else(|| crew.agent_name(id).filter(|n| named(n)))
+            {
+                return n;
+            }
         }
         let st = self.0.state.lock();
-        st.charges
-            .names
-            .get(id)
-            .cloned()
-            .unwrap_or_else(|| id.to_string())
+        crew::shown_name(id, st.charges.names.get(id).map(String::as_str), true)
     }
 
     /// The person gave `id` a prompt or wrote to it: they take its wheel.
@@ -439,6 +455,49 @@ impl Desk {
         )
         .await;
         Ok(shown)
+    }
+
+    /// `id`, a session about to start, is `boss`'s from the start, in
+    /// `group`: the boss started it.
+    pub(super) async fn charge_started(
+        &self,
+        id: Uuid,
+        boss: &Party,
+        group: Option<&str>,
+    ) -> Result<(), DeskError> {
+        self.0
+            .state
+            .lock()
+            .charges
+            .names
+            .insert(boss.id.clone(), boss.name.clone());
+        let c = Charge::new(id, &boss.id, How::Started, group.map(str::to_string));
+        self.put_charge(c, Wheel::Boss).await.map(drop)
+    }
+
+    /// Forgets `id`'s charge: it never ran. Desk is told it is let go, as
+    /// for any charge that ends, so none is left showing.
+    pub(super) fn charge_forget(&self, id: Uuid) {
+        let Some(mut c) = self.0.state.lock().charges.rows.remove(&id) else {
+            return;
+        };
+        let now = crew::now();
+        c.released_at = Some(now);
+        c.updated_at = now;
+        let view = self.charge_view(&c, Wheel::Boss);
+        let _ = self.0.events.send(DeskEvent::Charge {
+            charge: Box::new(view),
+        });
+    }
+
+    /// Notes in `view`'s thread that `boss`, which started it, runs it.
+    pub(super) async fn started_note(&self, view: &crate::model::SessionView, boss: &Party) {
+        self.charge_note(
+            view,
+            boss,
+            "I started this session for the person and I'm running it with them. Ask me (to: \"desk\") when you're unsure; they can take over at any time.",
+        )
+        .await;
     }
 
     /// `id`, which a boss no longer overseeing ran, passes to `boss`; or,

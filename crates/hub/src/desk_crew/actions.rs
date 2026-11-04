@@ -12,6 +12,7 @@ use uuid::Uuid;
 use workforce_common::oversight::{Act, Level, Oversight, TakeOn};
 use workforce_desk::charge::How;
 use workforce_desk::crew::{self, By, Kind, Party};
+use workforce_desk::engine::{self, Deliver, View};
 use workforce_desk::model::{Engine, NewSession, Origin};
 use workforce_desk::Speaker;
 
@@ -65,11 +66,16 @@ pub(crate) enum Action {
         session: Uuid,
         prompt: Option<String>,
     },
+    /// A visible session the overseer runs from the start.
     StartSession {
-        path: String,
+        folder: String,
         goal: String,
         name: Option<String>,
+        /// None: `[oversight.work] engine`.
         engine: Option<Engine>,
+        view: Option<View>,
+        /// A new branch to work on, in a worktree of its own.
+        worktree: Option<String>,
     },
     Assign {
         agent: String,
@@ -93,10 +99,14 @@ struct Input {
     approval_id: Option<String>,
     message: Option<String>,
     prompt: Option<String>,
+    /// `path` before it was `folder`: suggestions kept from then say it.
     path: Option<String>,
+    folder: Option<String>,
     goal: Option<String>,
     name: Option<String>,
     engine: Option<Engine>,
+    view: Option<View>,
+    worktree: Option<String>,
     task: Option<String>,
     reply_to: Option<String>,
     message_id: Option<String>,
@@ -191,10 +201,12 @@ impl Action {
                 prompt: blank_none(i.prompt),
             },
             "crew.start_session" => Self::StartSession {
-                path: text(i.path, "the project's folder")?,
+                folder: text(blank_none(i.folder).or(i.path), "the project's folder")?,
                 goal: text(i.goal, "the goal")?,
                 name: blank_none(i.name),
                 engine: i.engine,
+                view: i.view,
+                worktree: blank_none(i.worktree),
             },
             "crew.assign" => Self::Assign {
                 agent: text(i.agent_id, "which agent")?,
@@ -570,7 +582,7 @@ impl CrewHub {
     fn agent_name(&self, id: &str) -> String {
         self.party_of_agent(id)
             .map(|p| p.name)
-            .unwrap_or_else(|| id.to_string())
+            .unwrap_or_else(|| crew::shown_name(id, None, false))
     }
 
     /// What the action is about.
@@ -668,8 +680,8 @@ impl CrewHub {
                 ),
                 None => format!("Restart {}", self.session_name(*session)),
             },
-            Action::StartSession { path, goal, .. } => {
-                format!("Start a session in {path} to {}", crew::clip(goal, 200))
+            Action::StartSession { folder, goal, .. } => {
+                format!("Start a session in {folder} to {}", crew::clip(goal, 200))
             }
             Action::Assign { agent, task } => {
                 format!(
@@ -838,37 +850,7 @@ impl CrewHub {
                     .map_err(plain)?;
                 Ok(format!("restarted {}", v.label()))
             }
-            Action::StartSession {
-                path,
-                goal,
-                name,
-                engine,
-            } => {
-                let folder = Path::new(path)
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| "session".into());
-                let v = d
-                    .create(
-                        NewSession {
-                            engine: engine.unwrap_or(Engine::Claude),
-                            view: None,
-                            name: name.clone().unwrap_or(folder),
-                            cwd: path.clone(),
-                            goal: goal.clone(),
-                            worktree: None,
-                            prompt: Some(goal.clone()),
-                            approvals: None,
-                            approve_for_me: false,
-                            account: None,
-                            env: Default::default(),
-                        },
-                        Some(by),
-                    )
-                    .await
-                    .map_err(plain)?;
-                Ok(format!("started {} ({})", v.label(), v.id))
-            }
+            Action::StartSession { .. } => self.start_session(action, by).await,
             Action::TakeOn { session } => {
                 let (service, _) = self
                     .overseer_service()
@@ -897,6 +879,179 @@ impl CrewHub {
                 Ok(format!("let {} go", self.session_name(c.session)))
             }
         }
+    }
+
+    /// Starts the session `action` asks for, as `by`: a visible one the
+    /// overseer runs from the start, in its group. The overseer starts no
+    /// more than `[oversight.work] parallel` at once (counted with the
+    /// start, so two at once can't both take the last slot); the person
+    /// saying yes to its suggestion is theirs to decide, and starts it.
+    async fn start_session(&self, action: &Action, by: By) -> Result<String, String> {
+        let Action::StartSession {
+            folder,
+            goal,
+            name,
+            engine,
+            view,
+            worktree,
+        } = action
+        else {
+            return Err("That isn't a session to start.".into());
+        };
+        let (service, o) = self
+            .overseer_service()
+            .ok_or("No one oversees the crew to start sessions for.")?;
+        let boss = Party::manager(service.agent_id.as_str(), &super::name_of(&service));
+        let engine = match engine {
+            Some(e) => *e,
+            None => Engine::parse(o.work.engine.trim()).map_err(|_| {
+                format!(
+                    "Your default engine, {}, isn't one Desk can start; say engine ({}).",
+                    o.work.engine,
+                    self.engines_to_start().join(" or ")
+                )
+            })?,
+        };
+        let view = self.startable(engine, *view)?;
+        let _one = self.starting.lock().await;
+        if by.party.kind == crew::PartyKind::Manager {
+            let busy = self.desk.charges_busy(&boss.id);
+            let parallel = o.work.parallel as usize;
+            if busy >= parallel {
+                return Err(format!(
+                    "You already run {busy} sessions that are starting or working, the most you may run at once ({parallel}). Wait for one to finish, or ask the person to let you run more."
+                ));
+            }
+        }
+        let label = name.clone().unwrap_or_else(|| {
+            Path::new(folder)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "session".into())
+        });
+        let v = self
+            .desk
+            .create_for(
+                NewSession {
+                    engine,
+                    view: Some(view),
+                    name: label,
+                    cwd: folder.clone(),
+                    goal: goal.clone(),
+                    worktree: worktree.clone(),
+                    prompt: Some(goal.clone()),
+                    approvals: None,
+                    approve_for_me: false,
+                    account: None,
+                    env: Default::default(),
+                    group: self.boss_group(&boss.id),
+                },
+                &boss,
+                by,
+            )
+            .await
+            .map_err(|e| match e {
+                workforce_desk::DeskError::Internal(e) => {
+                    tracing::warn!(error = %e, "a session didn't start");
+                    "Something went wrong on this Mac.".to_string()
+                }
+                other => {
+                    let s = other.to_string();
+                    let mut c = s.chars();
+                    c.next()
+                        .map(|f| f.to_uppercase().chain(c).collect::<String>() + ".")
+                        .unwrap_or(s)
+                }
+            })?;
+        Ok(format!(
+            "started {} ({}); you run it, and the person can watch it, type into it and take it over",
+            v.label(),
+            v.id
+        ))
+    }
+
+    /// Whether the overseer (`by`) may suggest one more start: the sessions
+    /// it runs that are starting or working, and the starts it suggested
+    /// that the person hasn't answered, are fewer than its limit.
+    pub(crate) async fn start_suggestable(&self, by: &By, o: &Oversight) -> Result<(), String> {
+        let busy = self.desk.charges_busy(&by.party.id);
+        let open = self
+            .desk
+            .store()
+            .open_suggestions(&by.party.id, "crew.start_session")
+            .await
+            .map_err(|e| {
+                tracing::warn!(error = %e, "couldn't count the starts the overseer suggested");
+                "Something went wrong on this Mac.".to_string()
+            })?;
+        let held = busy + usize::try_from(open).unwrap_or(usize::MAX);
+        let parallel = o.work.parallel as usize;
+        if held >= parallel {
+            return Err(format!(
+                "You already run or have suggested {held} sessions, the most you may run at once ({parallel}). Wait for one to finish, or for the person to answer the starts you suggested."
+            ));
+        }
+        Ok(())
+    }
+
+    /// The sidebar group the overseer `boss` is in, which the sessions it
+    /// starts go into. One scope today: a boss that runs a group of its own
+    /// comes with groups' bosses.
+    fn boss_group(&self, boss: &str) -> Option<String> {
+        self.desk
+            .layout()
+            .group_of(&workforce_desk::local_agent_item(boss))
+            .map(|g| g.id.clone())
+    }
+
+    /// `engine` in `view` (its default when none), when the overseer may
+    /// start it: Desk runs it there, it has a line to run it on, and it is
+    /// installed on this computer.
+    fn startable(&self, engine: Engine, view: Option<View>) -> Result<View, String> {
+        let title = engine.title();
+        let view = view
+            .or_else(|| engine::views(engine).first().copied())
+            .filter(|&v| engine::runs(engine, v))
+            .ok_or_else(|| match view {
+                Some(v) => format!(
+                    "Desk can't start {title} sessions in its {} view.",
+                    v.as_str()
+                ),
+                None => format!("Desk can't start {title} sessions yet."),
+            })?;
+        if engine::caps(engine, view).line == Deliver::None {
+            return Err(format!(
+                "{title} sessions have no line for you to run them on."
+            ));
+        }
+        let installed = self
+            .desk
+            .engines()
+            .into_iter()
+            .find(|e| e.engine == engine)
+            .is_some_and(|e| e.program.is_some() && e.installed != Some(false));
+        if !installed {
+            return Err(format!(
+                "{title} isn't installed on this computer; start {} instead.",
+                self.engines_to_start().join(" or ")
+            ));
+        }
+        Ok(view)
+    }
+
+    /// The engines the overseer can start sessions of now, by name.
+    pub(crate) fn engines_to_start(&self) -> Vec<&'static str> {
+        self.desk
+            .engines()
+            .into_iter()
+            .filter(|e| e.program.is_some() && e.installed != Some(false))
+            .filter(|e| {
+                e.views
+                    .first()
+                    .is_some_and(|&v| engine::caps(e.engine, v).line != Deliver::None)
+            })
+            .map(|e| e.engine.as_str())
+            .collect()
     }
 
     /// Sends `text` into `agent`'s Desk DM with the person, as the overseer

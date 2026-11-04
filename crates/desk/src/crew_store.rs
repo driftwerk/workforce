@@ -265,6 +265,19 @@ impl DeskStore {
         rows.iter().map(suggestion).collect()
     }
 
+    /// How many of `agent_id`'s suggestions to use `tool` are still open.
+    pub async fn open_suggestions(&self, agent_id: &str, tool: &str) -> Result<i64> {
+        let client = self.pool().get().await?;
+        let row = client
+            .query_one(
+                "SELECT count(*) FROM suggestions WHERE agent_id = $1 AND state = 'open' \
+                 AND action ->> 'tool' = $2",
+                &[&agent_id, &tool],
+            )
+            .await?;
+        Ok(row.get(0))
+    }
+
     /// Suggestions `agent_id` made since `since`, oldest first.
     pub async fn suggestions_since(
         &self,
