@@ -8,6 +8,7 @@ publish = false
 description = "Desk sessions: real Claude Code and Codex terminals the hub owns, tracks and restores"
 
 [dependencies]
+unicode-normalization = { workspace = true }
 async-trait = { workspace = true }
 axum = { workspace = true }
 bytes = { workspace = true }

@@ -470,7 +470,7 @@ pub fn answerable(
     };
     // A session working in the home folder (or above it) has no folder of
     // its own to speak of: nothing counts as inside it.
-    let broad = bounds.home.starts_with(&own_real);
+    let broad = boss::fold(&bounds.home).starts_with(boss::fold(&own_real));
     let own = (!broad).then_some(own_real.as_path());
     let inside = |p: &Path| {
         own.is_some_and(|o| p.starts_with(o)) || bounds.scratch.iter().any(|t| p.starts_with(t))
@@ -957,7 +957,13 @@ mod tests {
         );
         assert_eq!(command_in(&wt, "rm -rf ../dist"), Ok(()));
 
-        // A session in the home folder has no folder of its own.
+        // A session in the home folder has no folder of its own, however
+        // its case is written.
+        let shouting = acme("/users/SAM");
+        assert_eq!(
+            command_in(&shouting, "rm -rf ~/dev"),
+            Err("deletes outside SAM".into())
+        );
         let home = acme("/Users/sam");
         assert_eq!(command_in(&home, "cargo test"), Ok(()));
         assert_eq!(

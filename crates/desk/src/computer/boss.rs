@@ -398,21 +398,41 @@ const START_FILES: &[&str] = &[
     "Library/LaunchAgents",
 ];
 
-/// `path` with every component case-folded: the person's disk is most
-/// likely case-insensitive (APFS), so `.GIT` is `.git` and `~/.SSH` is
-/// `~/.ssh`.
-fn fold(path: &Path) -> PathBuf {
+/// `path` with every component as a case-insensitive disk (APFS) compares
+/// it: compatibility-normalized (NFKC: `ſ` is `s`, `ﬀ` is `ff`) and
+/// case-folded, so `.GIT` is `.git` and `~/.ſſh` is `~/.ssh`.
+pub fn fold(path: &Path) -> PathBuf {
+    use unicode_normalization::UnicodeNormalization;
     path.components()
         .map(|c| match c {
-            Component::Normal(n) => PathBuf::from(n.to_string_lossy().to_lowercase()),
+            Component::Normal(n) => {
+                let once: String = n
+                    .to_string_lossy()
+                    .nfkc()
+                    .collect::<String>()
+                    .to_lowercase();
+                PathBuf::from(once.nfkc().collect::<String>())
+            }
             other => PathBuf::from(other.as_os_str()),
         })
         .collect()
 }
 
+/// Whether a component is a dot-name spelled with anything but ASCII:
+/// what folding might still miss, never the boss's to touch.
+fn odd_dot_name(path: &Path) -> bool {
+    path.components().any(|c| {
+        let name = c.as_os_str().to_string_lossy();
+        name.starts_with('.') && !name.is_ascii()
+    })
+}
+
 /// Whether `path` is where secrets or Desk's own data are kept, compared
 /// without regard to case.
 pub fn secret(path: &Path, home: &Path, withheld: &[PathBuf]) -> bool {
+    if odd_dot_name(path) {
+        return true;
+    }
     let path = fold(path);
     if withheld.iter().any(|w| path.starts_with(fold(w))) {
         return true;
@@ -2765,6 +2785,7 @@ pub(crate) mod tests {
         std::fs::create_dir_all(own.join(".git/hooks")).unwrap();
         std::fs::create_dir_all(own.join("src")).unwrap();
         std::fs::create_dir_all(base.join(".ssh")).unwrap();
+        std::fs::create_dir_all(own.join(".husky")).unwrap();
         let withheld = [base.join("Library/Application Support/Desk")];
         std::fs::create_dir_all(&withheld[0]).unwrap();
         let scratch: [PathBuf; 0] = [];
@@ -2793,6 +2814,10 @@ pub(crate) mod tests {
             desk.as_str(),
             "mkdir n && touch n/../m/../x",
             "mkdir -p n/../m/../x",
+            "touch .hu\u{17f}ky/pre-push",
+            "cat ~/.\u{17f}\u{17f}h/id_rsa",
+            "touch .git/hooks/\u{fb00}",
+            "touch \u{fb00}/.\u{fb00}x",
         ] {
             assert!(
                 judge(command, &here).is_err(),

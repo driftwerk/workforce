@@ -11899,6 +11899,7 @@ dependencies = [
  "tokio-util",
  "tower",
  "tracing",
+ "unicode-normalization",
  "uuid",
  "vt100",
  "workforce-build-support",
