@@ -590,6 +590,38 @@ async fn a_session_moves_and_comments_on_its_own_ticket_and_no_one_elses() {
         assert_eq!(v[0].ticket.state, TicketState::Backlog);
         assert_eq!(v[0].ticket.created_by.name, "acme-web");
         assert_eq!(v[0].ticket.body, "for Safari's sign-in");
+        // Handed on, a ticket the session wrote is its note, not the
+        // person's words.
+        d.assign_ticket(v[0].ticket.id, Some(AssignTo::Session(other.id)), &By::you())
+            .await
+            .unwrap();
+        let thread = d.line_thread(other.id, None, None).await.unwrap();
+        let told = thread
+            .iter()
+            .find(|m| m.kind == LineKind::Tell && m.text.starts_with("ACM-3"))
+            .unwrap();
+        assert!(told.text.contains("acme-web added it to the board"));
+        assert!(told.text.contains("> for Safari's sign-in"));
+        // Another group's board is out of its reach.
+        d.change_layout(|l| l.create("g-atlas", "Atlas", &[], None))
+            .await
+            .unwrap();
+        let atlas = d
+            .create_board(NewBoard {
+                name: "Atlas".into(),
+                group: Some("g-atlas".into()),
+                prefix: None,
+            })
+            .await
+            .unwrap();
+        ticket(&d, atlas.id, "Atlas's own", TicketState::Todo).await;
+        assert_eq!(
+            call(json!({"action": "get", "key": "ATL-1"})).await,
+            Err("No board you can reach has keys starting ATL.".into())
+        );
+        assert!(call(json!({"action": "create", "key": "ATL", "text": "Sneak in"}))
+            .await
+            .is_err());
         // The tool is on the line's list.
         assert!(crate::line::TOOLS.iter().any(|t| t.name == "ticket"));
     })

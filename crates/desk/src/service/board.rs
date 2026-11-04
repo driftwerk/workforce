@@ -1031,7 +1031,8 @@ impl Desk {
                     .board_by_prefix(&prefix)
                     .await
                     .map_err(|e| fail(internal(e)))?
-                    .ok_or_else(|| format!("No board's keys start with {prefix}."))?;
+                    .filter(|b| self.reaches_board(caller, b))
+                    .ok_or_else(|| format!("No board you can reach has keys starting {prefix}."))?;
                 self.0
                     .store
                     .ticket_by_number(b.id, n)
@@ -1055,6 +1056,12 @@ impl Desk {
                 }
             }
         }
+    }
+
+    /// Whether the session `caller` may read and write tickets on `b`.
+    fn reaches_board(&self, caller: Uuid, b: &Board) -> bool {
+        let group = self.view(caller).ok().and_then(|v| v.group.map(|g| g.id));
+        board::board_reachable(self.line_reach(), group.as_deref(), b.group.as_deref())
     }
 
     /// What a session reads of a ticket.
@@ -1092,7 +1099,8 @@ impl Desk {
                 .board_by_prefix(&p)
                 .await
                 .map_err(fail)?
-                .ok_or_else(|| format!("No board's keys start with {p}."));
+                .filter(|b| self.reaches_board(caller, b))
+                .ok_or_else(|| format!("No board you can reach has keys starting {p}."));
         }
         let mine = self.0.store.session_tickets(caller).await.map_err(fail)?;
         if let Some(t) = mine.iter().max_by_key(|t| t.updated_at) {
@@ -1101,8 +1109,9 @@ impl Desk {
             }
         }
         let mut boards = self.0.store.boards().await.map_err(fail)?;
+        boards.retain(|b| self.reaches_board(caller, b));
         match boards.len() {
-            0 => Err("There's no board on this Desk yet; ask the person to make one.".into()),
+            0 => Err("There's no board here you can reach; ask the person to make one.".into()),
             1 => Ok(boards.remove(0)),
             _ => {
                 let prefixes: Vec<String> = boards.into_iter().filter_map(|b| b.prefix).collect();
