@@ -2957,3 +2957,171 @@ async fn set_to_take_on_every_session_it_does_but_never_one_taken_back() {
     })
     .await;
 }
+
+/// The overseer answers for a session it runs all but what can't be
+/// undone, denies and interrupts it whatever `[oversight.act]` says of
+/// other sessions, and only suggests while the person drives it; a
+/// session it doesn't run keeps the read-only rule, and an answer after
+/// the person's is told it was already answered.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_overseer_answers_for_its_session_all_but_what_cant_be_undone() {
+    use super::actions::{Action, Gate, Target};
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, crew, d, _llm) = overseeing(
+            dir.path(),
+            pool,
+            "ok",
+            "[oversight]\nenabled = true\nlevel = \"act\"\n",
+            &[],
+        )
+        .await;
+        eventually("the overseer's tools", async || {
+            overseer.tools.has("crew.approve").then_some(())
+        })
+        .await;
+        d.boss_bounds_with(workforce_desk::charge::Bounds {
+            home: dir.path().to_path_buf(),
+            ..Default::default()
+        });
+        let s = new_session(&d, dir.path(), "acme-web").await;
+        let url = hook_url(dir.path(), s.id).await;
+        let boss = workforce_desk::crew::Party::manager("desk", &super::name_of(&overseer));
+        d.take_on(
+            s.id,
+            &boss,
+            workforce_desk::charge::How::Handed,
+            &Default::default(),
+            &By::you(),
+        )
+        .await
+        .unwrap();
+        let tool = |name: &str| overseer.tools.get(name).unwrap();
+        let ask = |url: &str, command: &str| {
+            let url = url.to_string();
+            let body = json!({"hook_event_name": "PermissionRequest", "tool_name": "Bash",
+                "tool_input": {"command": command}});
+            tokio::spawn(async move { hook(&url, body).await })
+        };
+        let pending = |id: uuid::Uuid, command: &'static str| {
+            let d = d.clone();
+            async move {
+                eventually(command, async || {
+                    d.view(id).unwrap().pending.filter(|p| p.detail == command)
+                })
+                .await
+                .id
+            }
+        };
+        let decided = |v: Value| v["hookSpecificOutput"]["decision"]["behavior"].clone();
+        let approve = |session: uuid::Uuid, approval: uuid::Uuid| {
+            json!({"session_id": session.to_string(), "approval_id": approval.to_string(), "reason": "It's the plan."})
+        };
+
+        // Ordinary work is its to answer.
+        for command in ["cargo test -p acme", "git commit -m 'Fix the date picker'"] {
+            let asked = ask(&url, command);
+            let id = eventually(command, async || {
+                d.view(s.id).unwrap().pending.filter(|p| p.detail == command)
+            })
+            .await
+            .id;
+            let done = tool("crew.approve").execute(approve(s.id, id)).await.unwrap();
+            assert!(done.output["done"].is_string(), "{command}: {done:?}");
+            assert_eq!(decided(asked.await.unwrap()), "allow", "{command}");
+        }
+
+        // What can't be undone goes to the person, saying why; it may deny.
+        let asked = ask(&url, "git push --force origin feat");
+        let id = pending(s.id, "git push --force origin feat").await;
+        let held = tool("crew.approve").execute(approve(s.id, id)).await.unwrap();
+        assert!(held.output["suggested"].is_string(), "{held:?}");
+        let note = held.output["note"].as_str().unwrap();
+        assert!(note.contains("can't be undone"), "{note}");
+        let denied = tool("crew.deny").execute(approve(s.id, id)).await.unwrap();
+        assert!(denied.output["done"].is_string(), "{denied:?}");
+        assert_eq!(decided(asked.await.unwrap()), "deny");
+
+        // Interrupting, resuming and restarting what it runs are its own,
+        // whatever the switches say of other sessions.
+        let (_, mut o) = crew.overseer_service().unwrap();
+        o.act.interrupt = false;
+        o.act.resume_restart = false;
+        for action in [
+            Action::Interrupt { session: s.id },
+            Action::Resume { session: s.id, prompt: None },
+            Action::Restart { session: s.id, prompt: Some("Skip the network tests.".into()) },
+        ] {
+            assert_eq!(crew.gate(&action, &o), Gate::Run, "{action:?}");
+        }
+        assert!(matches!(crew.gate(&Action::Stop { session: s.id }, &o), Gate::Suggest(_)));
+
+        // A session it doesn't run keeps the read-only rule.
+        let other = new_session(&d, dir.path(), "acme-api").await;
+        let other_url = hook_url(dir.path(), other.id).await;
+        let tests = ask(&other_url, "cargo test -p acme");
+        let id = pending(other.id, "cargo test -p acme").await;
+        let approving = Action::Approve { session: other.id, approval: id };
+        assert!(matches!(crew.gate(&approving, &o), Gate::Suggest(_)));
+        o.act.read_only_approvals = true;
+        assert!(
+            matches!(crew.gate(&approving, &o), Gate::Suggest(_)),
+            "a build isn't a read"
+        );
+        assert!(matches!(crew.gate(&Action::Interrupt { session: other.id }, &o), Gate::Suggest(_)));
+        d.decide(other.id, id, workforce_desk::model::Decision::Deny, Some(By::you()))
+            .unwrap();
+        tests.await.unwrap();
+        let status = ask(&other_url, "git status");
+        let id = pending(other.id, "git status").await;
+        assert_eq!(
+            crew.gate(&Action::Approve { session: other.id, approval: id }, &o),
+            Gate::Run
+        );
+        d.decide(other.id, id, workforce_desk::model::Decision::Allow, Some(By::you()))
+            .unwrap();
+        status.await.unwrap();
+
+        // The person drives it: everything it would do is a suggestion,
+        // and Desk refuses what gets past.
+        d.drive(s.id).await.unwrap();
+        let asked = ask(&url, "cargo build");
+        let id = pending(s.id, "cargo build").await;
+        for action in [
+            Action::Approve { session: s.id, approval: id },
+            Action::Deny { session: s.id, approval: id },
+            Action::Nudge {
+                to: Target::Session(s.id),
+                message: "Yes, 5433.".into(),
+                reply_to: Some(uuid::Uuid::new_v4()),
+            },
+            Action::Interrupt { session: s.id },
+            Action::Resume { session: s.id, prompt: None },
+            Action::Restart { session: s.id, prompt: None },
+            Action::Stop { session: s.id },
+        ] {
+            match crew.gate(&action, &o) {
+                Gate::Suggest(why) => assert!(why.contains("the person is driving acme-web"), "{action:?}: {why}"),
+                other => panic!("{action:?} while the person drives: {other:?}"),
+            }
+        }
+        let by = crew.by_overseer("It's the plan.").unwrap();
+        let refused = crew
+            .perform(&Action::Approve { session: s.id, approval: id }, by.clone())
+            .await
+            .unwrap_err();
+        assert!(refused.contains("person is driving"), "{refused}");
+        d.hand_back(s.id).await.unwrap();
+
+        // The person answered first.
+        d.decide(s.id, id, workforce_desk::model::Decision::Allow, Some(By::you()))
+            .unwrap();
+        asked.await.unwrap();
+        let late = crew
+            .perform(&Action::Approve { session: s.id, approval: id }, by)
+            .await
+            .unwrap_err();
+        assert!(late.starts_with("Already answered"), "{late}");
+    })
+    .await;
+}

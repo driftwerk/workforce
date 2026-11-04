@@ -129,6 +129,18 @@ fn withheld(config: &WorkforceConfig, home: &Path) -> Vec<PathBuf> {
     out
 }
 
+/// Where a boss's answers for the sessions it runs are judged: the same
+/// home, scratch space and withheld set (Desk's data, every agent's
+/// settings in it, the keychains) as the agents' own calls.
+pub fn boss_bounds(config: &WorkforceConfig) -> workforce_desk::charge::Bounds {
+    let home = home();
+    workforce_desk::charge::Bounds {
+        withheld: withheld(config, &home),
+        scratch: scratch(),
+        home,
+    }
+}
+
 /// Scratch space a delete may clear as freely as its own folder: `/tmp` and
 /// `$TMPDIR`, real.
 fn scratch() -> Vec<PathBuf> {
