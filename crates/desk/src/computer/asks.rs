@@ -13,17 +13,24 @@
 //! expanded at run time, `eval`, a shell fed from a pipe, a heredoc or a
 //! here-string, backticks, `<(…)`, `case` and function definitions.
 //!
-//! Paths a command names are joined to its cwd lexically (no filesystem is
-//! read), a `cd` followed as it goes. A target that can't be resolved
-//! (`$VAR`, `~user`, a relative one with no cwd, what `xargs` feeds) counts
-//! as outside the own folder. `/tmp` and `$TMPDIR` count as inside it for
-//! deletes.
+//! Paths a command deletes, moves onto or overwrites are joined to its
+//! cwd and resolved as the filesystem resolves them ([`resolve_real`]):
+//! links followed where they stand, a `cd` followed along `&&`. A target
+//! that can't be resolved (`$VAR`, `~user`, a brace, a relative one with no
+//! known cwd, a link to nothing, `..` after what isn't there, what `xargs`
+//! feeds, or one under a folder that doesn't exist yet once an earlier
+//! command of the line may have made it) asks. Scratch space (`/tmp`,
+//! `$TMPDIR`) counts as inside the own folder, but never its root.
+//! Comparisons with the own folder use the disk's own spelling; only
+//! protected names are compared case-folded.
 //!
 //! Separately, [`publishes`] says whether a command publishes or deploys
 //! (a push to the default branch, `npm publish`, `gh release create`, …):
 //! what a boss's sessions hand to the person.
 
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
+
+use super::boss::resolve_real;
 
 /// Why a command always asks.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -66,28 +73,113 @@ pub struct Place<'a> {
     /// Scratch space a delete may clear without asking: `/tmp`, `$TMPDIR`.
     pub scratch: &'a [PathBuf],
     pub home: &'a Path,
+    /// An earlier command of the line could have made a link (`ln` in any
+    /// spelling, `cp -a`, `mv`, an interpreter, a program Desk doesn't
+    /// know): what isn't there yet may be one by the time a later command
+    /// runs.
+    later: bool,
+}
+
+/// `path` as the disk spells it: the folders holding it canonicalized (the
+/// real case on a case-insensitive disk), its last part as written, never
+/// followed (a link is itself).
+fn on_disk(path: &Path) -> PathBuf {
+    let Some(name) = path.file_name() else {
+        return path.to_path_buf();
+    };
+    let mut existing = path.parent().unwrap_or(Path::new("/")).to_path_buf();
+    let mut rest = vec![name.to_os_string()];
+    loop {
+        if let Ok(real) = std::fs::canonicalize(&existing) {
+            return rest
+                .iter()
+                .rev()
+                .fold(real, |acc: PathBuf, part| acc.join(part));
+        }
+        match (
+            existing.file_name().map(|n| n.to_os_string()),
+            existing.parent(),
+        ) {
+            (Some(name), Some(parent)) => {
+                rest.push(name);
+                existing = parent.to_path_buf();
+            }
+            _ => return path.to_path_buf(),
+        }
+    }
+}
+
+impl<'a> Place<'a> {
+    pub fn new(
+        cwd: Option<PathBuf>,
+        own: &'a [PathBuf],
+        scratch: &'a [PathBuf],
+        home: &'a Path,
+    ) -> Self {
+        Self {
+            cwd,
+            own,
+            scratch,
+            home,
+            later: false,
+        }
+    }
 }
 
 impl Place<'_> {
+    /// Under one of the own folders, as the disk spells both: a name in a
+    /// different case is a different folder on a case-sensitive disk.
     fn inside(&self, path: &Path) -> bool {
-        self.own.iter().any(|root| path.starts_with(root))
+        let path = on_disk(path);
+        self.own.iter().any(|root| path.starts_with(on_disk(root)))
     }
 
-    /// Inside the own folder or scratch space, for a delete.
+    /// Inside the own folder or scratch space, for a delete; never a
+    /// scratch root itself.
     fn deletable(&self, path: &Path) -> bool {
-        self.inside(path) || self.scratch.iter().any(|t| path.starts_with(t))
+        let disk = on_disk(path);
+        self.inside(path)
+            || self.scratch.iter().any(|t| {
+                let t = on_disk(t);
+                disk.starts_with(&t) && disk != t
+            })
+    }
+
+    /// Whether `word`, after an earlier command of the line that could
+    /// make links, names a path that doesn't exist yet, or lies under one
+    /// that doesn't: it may be a link by then.
+    fn made_later(&self, word: &Word) -> bool {
+        if !self.later || word.dynamic || word.brace {
+            return false;
+        }
+        let text = word.text.trim_end_matches('/');
+        let joined = if let Some(rest) = text.strip_prefix("~/") {
+            self.home.join(rest)
+        } else if Path::new(text).is_absolute() {
+            PathBuf::from(text)
+        } else {
+            match self.cwd.as_ref() {
+                Some(c) => c.join(text),
+                None => return true,
+            }
+        };
+        std::fs::symlink_metadata(&joined).is_err()
     }
 
     /// What deleting `targets` asks: nothing when each is resolved and
     /// deletable, the outside ones when each is resolved, else that it
-    /// can't be undone.
+    /// can't be undone. A link named itself is what goes, not where it
+    /// leads (`rm l`, `rm -rf l`); `l/` and what is under it lead.
     fn deletes(&self, targets: &[&Word], unknown: bool) -> Option<Asks> {
         if unknown {
             return Some(Asks::Irreversible);
         }
         let mut outside = Vec::new();
         for t in targets {
-            match self.resolve(t) {
+            if self.made_later(t) {
+                return Some(Asks::Irreversible);
+            }
+            match self.resolve_link(t) {
                 None => return Some(Asks::Irreversible),
                 Some(p) if self.deletable(&p) => {}
                 Some(p) => outside.push(p),
@@ -96,10 +188,119 @@ impl Place<'_> {
         (!outside.is_empty()).then_some(Asks::Deletes(outside))
     }
 
-    /// `word` as a path, joined to the cwd; `None` when it can't be told.
-    fn resolve(&self, word: &Word) -> Option<PathBuf> {
-        if word.dynamic {
+    /// What writing over `targets` asks: as a delete, but a new file
+    /// outside the folder (none there yet) is made, not lost.
+    fn overwrites(&self, targets: &[&Word], unknown: bool) -> Option<Asks> {
+        if unknown {
+            return Some(Asks::Irreversible);
+        }
+        let mut outside = Vec::new();
+        for t in targets {
+            if self.made_later(t) {
+                return Some(Asks::Irreversible);
+            }
+            match self.resolve(t) {
+                None => return Some(Asks::Irreversible),
+                Some(p) if self.deletable(&p) => {}
+                Some(p) if std::fs::symlink_metadata(&p).is_ok() => outside.push(p),
+                Some(_) => {}
+            }
+        }
+        (!outside.is_empty()).then_some(Asks::Deletes(outside))
+    }
+
+    /// What copying `sources` onto `dest` writes over: the file there, or,
+    /// into a folder, the file of each source's name in it.
+    fn copies_onto(&self, dest: &Word, sources: &[&Word], unknown: bool) -> Option<Asks> {
+        if unknown || self.made_later(dest) {
+            return Some(Asks::Irreversible);
+        }
+        let Some(to) = self.resolve(dest) else {
+            return Some(Asks::Irreversible);
+        };
+        if self.deletable(&to) {
             return None;
+        }
+        // A folder's contents (`./`, `src/.`) land all over the destination.
+        let contents = sources.iter().any(|s| {
+            let t = s.text.as_str();
+            t.ends_with('/') || t == "." || t.ends_with("/.")
+        });
+        if contents && std::fs::symlink_metadata(&to).is_ok() {
+            return Some(Asks::Deletes(vec![to]));
+        }
+        let over: Vec<PathBuf> = match to.is_dir() {
+            true => sources
+                .iter()
+                .filter_map(|s| Path::new(s.text.trim_end_matches('/')).file_name())
+                .map(|n| to.join(n))
+                .filter(|p| std::fs::symlink_metadata(p).is_ok())
+                .collect(),
+            false if std::fs::symlink_metadata(&to).is_ok() => vec![to.clone()],
+            false => Vec::new(),
+        };
+        (!over.is_empty()).then_some(Asks::Deletes(over))
+    }
+
+    /// [`Self::resolve`], but a link named as the last part is itself.
+    fn resolve_link(&self, word: &Word) -> Option<PathBuf> {
+        if word.dynamic || word.brace || word.text.is_empty() {
+            return None;
+        }
+        let text = word.text.as_str();
+        let plain = !word.glob && !text.ends_with('/') && !matches!(text, "." | ".." | "~");
+        match (plain, text.rsplit_once('/')) {
+            (true, Some((dir, name))) if !name.is_empty() && name != ".." && name != "." => {
+                let held = Word {
+                    text: if dir.is_empty() {
+                        "/".into()
+                    } else {
+                        dir.to_string()
+                    },
+                    ..word.clone()
+                };
+                self.resolve(&held).map(|d| d.join(name))
+            }
+            (true, None) if !text.starts_with('~') => self
+                .cwd
+                .as_ref()
+                .map(|c| on_disk(c).join(text))
+                .and_then(|p| resolve_real(p.parent()?).map(|d| d.join(text))),
+            _ => self.resolve(word),
+        }
+    }
+
+    /// `word` as a path, joined to the cwd and resolved as the filesystem
+    /// does ([`resolve_real`]); `None` when it can't be told: expanded at
+    /// run time, a brace, a pattern anywhere but its last part, a link to
+    /// nothing, `..` after what doesn't exist yet. A pattern in its last
+    /// part (`target/*`) is where the folder holding it is, unless it could
+    /// match `..` (`.*`).
+    fn resolve(&self, word: &Word) -> Option<PathBuf> {
+        if word.dynamic || word.brace {
+            return None;
+        }
+        if word.glob {
+            let (dir, last) = word.text.rsplit_once('/').unwrap_or((".", &word.text));
+            let pattern_in_dir = dir.contains(['*', '?', '[']);
+            if pattern_in_dir
+                || last.starts_with('.')
+                || dir.is_empty() && word.text.starts_with('/')
+            {
+                return None;
+            }
+            let held = Word {
+                text: if dir.is_empty() {
+                    "/".into()
+                } else {
+                    dir.to_string()
+                },
+                dynamic: false,
+                glob: false,
+                brace: false,
+            };
+            // The folder it matches in, and something in it.
+            return self.resolve(&held).map(|d| d.join("*"));
         }
         let text = word.text.as_str();
         let joined = if text == "~" {
@@ -113,7 +314,7 @@ impl Place<'_> {
         } else {
             self.cwd.as_ref()?.join(text)
         };
-        Some(normalize(&joined))
+        resolve_real(&joined)
     }
 
     /// Whether every target is resolved and inside the own folder.
@@ -125,20 +326,6 @@ impl Place<'_> {
     }
 }
 
-fn normalize(path: &Path) -> PathBuf {
-    let mut out = PathBuf::new();
-    for part in path.components() {
-        match part {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                out.pop();
-            }
-            other => out.push(other),
-        }
-    }
-    out
-}
-
 /// Whether `command`, run in `place`, is on the always-asks list.
 pub fn always_asks(command: &str, place: &Place<'_>) -> Option<Asks> {
     let commands = match split(command) {
@@ -146,14 +333,21 @@ pub fn always_asks(command: &str, place: &Place<'_>) -> Option<Asks> {
         Err(()) => return Some(Asks::Unclear),
     };
     // Each command's paths are read where the `cd`s before it left it.
-    let mut here = Place {
-        cwd: place.cwd.clone(),
-        own: place.own,
-        scratch: place.scratch,
-        home: place.home,
-    };
+    let mut here = Place::new(place.cwd.clone(), place.own, place.scratch, place.home);
+    let mut moved = false;
     let mut found: Option<Asks> = None;
+    let mut add = |asks: Asks| {
+        found = Some(match found.take() {
+            Some(was) => was.worst(asks),
+            None => asks,
+        });
+    };
     for simple in &commands {
+        // After a `cd`, where a command runs is known only along `&&`: a
+        // `cd` that failed leaves the rest where they were.
+        if moved && !simple.after_and {
+            here.cwd = None;
+        }
         let name = simple
             .words
             .iter()
@@ -169,18 +363,72 @@ pub fn always_asks(command: &str, place: &Place<'_>) -> Option<Asks> {
                 ("popd", _) => None,
                 (_, None) => Some(here.home.to_path_buf()),
                 (_, Some(w)) if w.text == "-" => None,
+                // A bare name may be found through `CDPATH` (set here or in
+                // the person's profile): known only when it is right here.
+                (_, Some(w)) if !w.text.starts_with(['/', '.', '~']) => here
+                    .cwd
+                    .as_ref()
+                    .filter(|c| c.join(&w.text).is_dir())
+                    .and_then(|_| here.resolve(w)),
                 (_, Some(w)) => here.resolve(w),
             };
+            moved = true;
             continue;
         }
-        if let Some(asks) = classify(simple, &here, false) {
-            found = Some(match found {
-                Some(was) => was.worst(asks),
-                None => asks,
-            });
+        // Files a redirection empties: `>` truncates, `>>` only adds.
+        for (target, append) in &simple.writes {
+            if *append
+                || matches!(
+                    target.text.as_str(),
+                    "/dev/null" | "/dev/stdout" | "/dev/stderr" | "/dev/tty"
+                )
+            {
+                continue;
+            }
+            if let Some(asks) = here.overwrites(&[target], false) {
+                add(asks);
+            }
         }
+        if let Some(asks) = classify(simple, &here, false) {
+            add(asks);
+        }
+        here.later |= makes_links(simple);
     }
     found
+}
+
+/// Whether `simple` could make a link for what follows it on the line:
+/// `ln` in any spelling, a copy that keeps links, a move, an interpreter,
+/// anything Desk doesn't know. Making folders, files and builds don't.
+fn makes_links(simple: &Simple) -> bool {
+    let words: Vec<&Word> = simple
+        .words
+        .iter()
+        .skip_while(|w| is_assignment(w) || KEYWORDS.contains(&w.text.as_str()))
+        .collect();
+    let Some(first) = words.first() else {
+        return false;
+    };
+    if first.dynamic {
+        return true;
+    }
+    let name = first.text.rsplit('/').next().unwrap_or(&first.text);
+    let args = &words[1..];
+    match name {
+        "cp" => {
+            has_flag(args, 'a', &["archive"])
+                || has_flag(args, 'P', &["no-dereference"])
+                || has_flag(args, 'R', &["recursive"])
+                || has_flag(args, 'r', &[])
+                || has_flag(args, 'd', &[])
+        }
+        "mkdir" | "touch" | "cd" | "pushd" | "popd" | "echo" | "printf" | "true" | "false"
+        | ":" | "test" | "[" | "ls" | "cat" | "grep" | "rg" | "wc" | "head" | "tail" | "sort"
+        | "uniq" | "diff" | "pwd" | "which" | "rm" | "rmdir" | "git" | "cargo" | "npm" | "pnpm"
+        | "yarn" | "go" | "make" | "pytest" | "tsc" | "jest" | "vitest" | "sleep" | "date"
+        | "chmod" | "tee" | "sed" => false,
+        _ => true,
+    }
 }
 
 /// Whether `command` publishes or deploys: a push to the default branch,
@@ -287,6 +535,11 @@ struct Word {
     text: String,
     /// Holds something the shell expands at run time (`$X`, `$(…)`).
     dynamic: bool,
+    /// Holds an unquoted pattern the shell expands (`*`, `?`, `[`) or a
+    /// brace (`{a,b}`, `{1..3}`).
+    glob: bool,
+    /// Holds an unquoted brace: what it expands to can't be told.
+    brace: bool,
 }
 
 /// One simple command.
@@ -297,6 +550,11 @@ struct Simple {
     piped_in: bool,
     /// Its stdin is a heredoc or a here-string.
     fed: bool,
+    /// It runs only if the command before it succeeded (`&&`).
+    after_and: bool,
+    /// Files it writes by redirection (`>`, `>|`, `&>`), and whether each
+    /// only appends (`>>`).
+    writes: Vec<(Word, bool)>,
 }
 
 struct Splitter {
@@ -309,6 +567,8 @@ struct Splitter {
     heredocs: Vec<(String, bool)>,
     /// The next word is a redirection's target, dropped.
     redirect: bool,
+    /// That target is a file written: whether it is appended to.
+    redirect_to: Option<bool>,
     /// The next word is a heredoc's delimiter.
     delimiter: Option<bool>,
 }
@@ -322,6 +582,7 @@ fn split(command: &str) -> Result<Vec<Simple>, ()> {
         word: None,
         heredocs: vec![],
         redirect: false,
+        redirect_to: None,
         delimiter: None,
     };
     s.run()?;
@@ -338,6 +599,8 @@ impl Splitter {
             .get_or_insert_with(|| Word {
                 text: String::new(),
                 dynamic: false,
+                glob: false,
+                brace: false,
             })
             .text
             .push(c);
@@ -348,6 +611,8 @@ impl Splitter {
             .get_or_insert_with(|| Word {
                 text: String::new(),
                 dynamic: false,
+                glob: false,
+                brace: false,
             })
             .dynamic = true;
     }
@@ -360,6 +625,9 @@ impl Splitter {
             self.heredocs.push((word.text, strip));
         } else if self.redirect {
             self.redirect = false;
+            if let Some(append) = self.redirect_to.take() {
+                self.current.writes.push((word, append));
+            }
         } else {
             self.current.words.push(word);
         }
@@ -640,15 +908,19 @@ impl Splitter {
                     if self.peek(0) == Some('>') {
                         self.end_word();
                         self.at += 1;
-                        if self.peek(0) == Some('>') {
+                        let append = self.peek(0) == Some('>');
+                        if append {
                             self.at += 1;
                         }
                         self.redirect = true;
+                        self.redirect_to = Some(append);
                     } else {
-                        if self.peek(0) == Some('&') {
+                        let and = self.peek(0) == Some('&');
+                        if and {
                             self.at += 1;
                         }
                         self.end_command(false);
+                        self.current.after_and = and;
                     }
                 }
                 '|' => {
@@ -701,6 +973,14 @@ impl Splitter {
                     self.end_command(false);
                 }
                 '<' | '>' => self.redirection(c)?,
+                '*' | '?' | '[' | '{' => {
+                    self.push_char(c);
+                    if let Some(w) = self.word.as_mut() {
+                        w.glob = true;
+                        w.brace |= c == '{';
+                    }
+                    self.at += 1;
+                }
                 _ => {
                     self.push_char(c);
                     self.at += 1;
@@ -719,6 +999,8 @@ impl Splitter {
         self.word.get_or_insert_with(|| Word {
             text: String::new(),
             dynamic: false,
+            glob: false,
+            brace: false,
         });
     }
 
@@ -755,15 +1037,25 @@ impl Splitter {
             self.delimiter = Some(strip);
             return Ok(());
         }
+        let mut append = false;
         match self.peek(0) {
-            Some('>' | '|') if c == '>' => self.at += 1,
+            Some('>') if c == '>' => {
+                append = true;
+                self.at += 1
+            }
+            Some('|') if c == '>' => self.at += 1,
             Some('>') if c == '<' => self.at += 1,
             _ => {}
         }
+        // `>&2`, `>&-`: onto another descriptor, no file. `>&file` writes
+        // the file, as `&>` does.
+        let dup = self.peek(0) == Some('&')
+            && self.peek(1).is_some_and(|d| d.is_ascii_digit() || d == '-');
         if self.peek(0) == Some('&') {
             self.at += 1;
         }
         self.redirect = true;
+        self.redirect_to = (c == '>' && !dup).then_some(append);
         Ok(())
     }
 }
@@ -801,6 +1093,21 @@ fn has_flag(args: &[&Word], short: char, long: &[&str]) -> bool {
         if let Some(name) = t.strip_prefix("--") {
             long.iter()
                 .any(|l| name == *l || name.starts_with(&format!("{l}=")))
+        } else {
+            t.strip_prefix('-').is_some_and(|s| s.contains(short))
+        }
+    })
+}
+
+/// [`has_flag`] as git reads long options: any prefix (`--f`, `--de`,
+/// `--forc`) stands for the options it begins. When one of those it could
+/// stand for is asked about, it counts, however short.
+fn git_flag(args: &[&Word], short: char, long: &[&str]) -> bool {
+    args.iter().any(|w| {
+        let t = w.text.as_str();
+        if let Some(name) = t.strip_prefix("--") {
+            let name = name.split_once('=').map_or(name, |(n, _)| n);
+            !name.is_empty() && long.iter().any(|l| l.starts_with(name))
         } else {
             t.strip_prefix('-').is_some_and(|s| s.contains(short))
         }
@@ -930,16 +1237,195 @@ fn classify_words(
             }
             place.deletes(&targets, unknown)
         }
+        // Moving takes each source away from where it was, and replaces
+        // what was at the destination.
+        "mv" => {
+            let targets = operands(args);
+            if targets.is_empty() && !unknown {
+                return None;
+            }
+            let into = args
+                .iter()
+                .position(|w| w.text == "-t" || w.text == "--target-directory")
+                .and_then(|i| args.get(i + 1))
+                .copied();
+            let mut all = targets;
+            all.extend(into);
+            place.deletes(&all, unknown)
+        }
         "rsync" => {
             let deletes = args
                 .iter()
                 .any(|w| w.text.starts_with("--delete") || w.text == "--remove-source-files");
-            let dest = operands(args).last().copied();
-            match (deletes, dest) {
-                (false, _) => None,
-                (true, Some(dest)) => place.deletes(&[dest], unknown),
+            let ops = operands(args);
+            match (deletes, ops.split_last()) {
+                (true, Some((dest, _))) => place.deletes(&[*dest], unknown),
                 (true, None) => Some(Asks::Irreversible),
+                (false, Some((dest, sources))) if !sources.is_empty() => {
+                    place.copies_onto(dest, sources, unknown)
+                }
+                (false, _) => None,
             }
+        }
+        // What a copy, an install or a forced link writes over.
+        "cp" | "install" | "ln" => {
+            if name == "ln" && !has_flag(args, 'f', &["force"]) {
+                return None;
+            }
+            let into = args
+                .iter()
+                .position(|w| w.text == "-t" || w.text.starts_with("--target-directory"))
+                .and_then(|i| match args[i].text.split_once('=') {
+                    Some((_, _)) => Some(args[i]),
+                    None => args.get(i + 1).copied(),
+                });
+            let ops = operands(args);
+            match (into, ops.split_last()) {
+                (Some(dir), _) => place.copies_onto(dir, &ops, unknown),
+                (None, Some((dest, sources))) if !sources.is_empty() => {
+                    place.copies_onto(dest, sources, unknown)
+                }
+                _ => None,
+            }
+        }
+        "tee" if !has_flag(args, 'a', &["append"]) => place.overwrites(&operands(args), unknown),
+        "truncate" => {
+            let mut targets = Vec::new();
+            let mut skip = false;
+            for w in args {
+                if skip {
+                    skip = false;
+                } else if matches!(w.text.as_str(), "-s" | "-r" | "--reference") {
+                    skip = true;
+                } else if !is_option(w) {
+                    targets.push(*w);
+                }
+            }
+            place.overwrites(&targets, unknown)
+        }
+        "shred" => place.deletes(&operands(args), unknown),
+        "sed"
+            if args.iter().any(|w| {
+                w.text == "-i"
+                    || w.text.starts_with("-i") && !w.text.starts_with("--")
+                    || w.text.starts_with("--in-place")
+            }) =>
+        {
+            // Its script is the first operand unless given with -e/-f.
+            let scripted = args
+                .iter()
+                .any(|w| matches!(w.text.as_str(), "-e" | "-f" | "--expression" | "--file"));
+            let mut files = Vec::new();
+            let mut skip = false;
+            let mut script_seen = scripted;
+            for w in args {
+                if skip {
+                    skip = false;
+                } else if matches!(w.text.as_str(), "-e" | "-f" | "--expression" | "--file") {
+                    skip = true;
+                } else if is_option(w) {
+                } else if !script_seen {
+                    script_seen = true;
+                } else {
+                    files.push(*w);
+                }
+            }
+            place.overwrites(&files, unknown)
+        }
+        "curl" | "wget" => {
+            let flags: &[&str] = match name {
+                "curl" => &["-o", "--output"],
+                _ => &["-O", "--output-document"],
+            };
+            // `-o out`, `-sSLo out`, `-oout`, `--output out`, `--output=out`.
+            let letter = flags[0].chars().nth(1).unwrap_or('o');
+            let mut targets: Vec<Word> = Vec::new();
+            for (i, w) in args.iter().enumerate() {
+                let t = w.text.as_str();
+                let cluster = t.strip_prefix('-').filter(|c| !c.starts_with('-'));
+                if let Some(at) = cluster.and_then(|c| c.find(letter)) {
+                    let rest = &t[1 + at + 1..];
+                    match rest.is_empty() {
+                        true => targets.extend(args.get(i + 1).map(|w| (*w).clone())),
+                        false => targets.push(Word {
+                            text: rest.to_string(),
+                            ..(*w).clone()
+                        }),
+                    }
+                } else if flags.contains(&t) {
+                    targets.extend(args.get(i + 1).map(|w| (*w).clone()));
+                } else if let Some((f, v)) = w.text.split_once('=') {
+                    if flags.contains(&f) {
+                        targets.push(Word {
+                            text: v.to_string(),
+                            ..(*w).clone()
+                        });
+                    }
+                }
+            }
+            targets.retain(|w| w.text != "-" && w.text != "/dev/null");
+            let refs: Vec<&Word> = targets.iter().collect();
+            place.overwrites(&refs, unknown)
+        }
+        // Editors that write the files they are given: `perl -pi`, `ruby
+        // -i`, `awk -i inplace`, `ex`, and `vim` told what to do.
+        "perl" | "ruby"
+            if args.iter().any(|w| {
+                w.text.starts_with('-') && !w.text.starts_with("--") && w.text[1..].contains('i')
+            }) =>
+        {
+            let scripted = args.iter().any(|w| {
+                w.text.starts_with('-') && !w.text.starts_with("--") && w.text.contains('e')
+            });
+            let mut ops = operands(args);
+            if !scripted && !ops.is_empty() {
+                ops.remove(0);
+            }
+            // The script given with -e is a word of its own.
+            let scripts: Vec<&Word> = args
+                .windows(2)
+                .filter(|p| p[0].text.starts_with('-') && p[0].text.ends_with('e'))
+                .map(|p| p[1])
+                .collect();
+            ops.retain(|o| !scripts.iter().any(|s| std::ptr::eq(*s, *o)));
+            place.overwrites(&ops, unknown)
+        }
+        "awk" | "gawk"
+            if args
+                .windows(2)
+                .any(|p| p[0].text == "-i" && p[1].text == "inplace")
+                || args
+                    .iter()
+                    .any(|w| w.text == "--inplace" || w.text == "-iinplace") =>
+        {
+            let mut ops: Vec<&Word> = operands(args)
+                .into_iter()
+                .filter(|o| o.text != "inplace")
+                .collect();
+            if !args.iter().any(|w| w.text == "-f") && !ops.is_empty() {
+                ops.remove(0);
+            }
+            place.overwrites(&ops, unknown)
+        }
+        "ex" => place.overwrites(&operands(args), unknown),
+        "vim" | "vi" | "nvim"
+            if args.iter().any(|w| {
+                matches!(w.text.as_str(), "-c" | "-e" | "-es" | "-s" | "-E" | "-Es")
+                    || w.text.starts_with('+')
+            }) =>
+        {
+            let mut files = Vec::new();
+            let mut skip = false;
+            for w in args {
+                if skip {
+                    skip = false;
+                } else if matches!(w.text.as_str(), "-c" | "--cmd" | "-S" | "-u" | "-i") {
+                    skip = true;
+                } else if !is_option(w) && !w.text.starts_with('+') {
+                    files.push(*w);
+                }
+            }
+            place.overwrites(&files, unknown)
         }
         "gh" => {
             let ops = operands(args);
@@ -1013,7 +1499,7 @@ fn find(args: &[&Word], simple: &Simple, place: &Place<'_>) -> Option<Asks> {
     None
 }
 
-fn git(args: &[&Word], _place: &Place<'_>) -> Option<Asks> {
+fn git(args: &[&Word], place: &Place<'_>) -> Option<Asks> {
     // Global options before the subcommand; some take a value.
     let mut i = 0;
     while let Some(w) = args.get(i) {
@@ -1027,7 +1513,7 @@ fn git(args: &[&Word], _place: &Place<'_>) -> Option<Asks> {
     let rest = &args[i + 1..];
     let irreversible = match sub.text.as_str() {
         "push" => {
-            has_flag(
+            git_flag(
                 rest,
                 'f',
                 &[
@@ -1036,19 +1522,32 @@ fn git(args: &[&Word], _place: &Place<'_>) -> Option<Asks> {
                     "force-if-includes",
                     "mirror",
                     "delete",
+                    "prune",
                 ],
-            ) || has_flag(rest, 'd', &[])
+            ) || git_flag(rest, 'd', &[])
                 || rest.iter().any(|w| {
                     w.text.starts_with('+') || (w.text.starts_with(':') && w.text.len() > 1)
                 })
         }
-        // Discarding what isn't committed: `checkout -- .`, `checkout .`,
-        // `restore` of the working tree.
+        // Discarding what isn't committed: forced, or naming files.
         "checkout" => {
             let ops = operands(rest);
-            rest.iter().any(|w| w.text == "--")
-                || ops.iter().any(|w| w.text == "." || w.text == "*")
+            git_flag(rest, 'f', &["force"])
+                || rest.iter().any(|w| w.text == "--")
+                || ops.iter().any(|w| {
+                    w.text == "."
+                        || w.glob
+                        || place
+                            .cwd
+                            .as_ref()
+                            .is_some_and(|c| std::fs::symlink_metadata(c.join(&w.text)).is_ok())
+                })
         }
+        "switch" => git_flag(rest, 'f', &["force", "discard-changes"]),
+        "reflog" => operands(rest)
+            .first()
+            .is_some_and(|w| matches!(w.text.as_str(), "expire" | "delete")),
+        "gc" => rest.iter().any(|w| w.text.starts_with("--prune")),
         "restore" => {
             let staged_only =
                 has_flag(rest, 'S', &["staged"]) && !has_flag(rest, 'W', &["worktree"]);
@@ -1059,11 +1558,28 @@ fn git(args: &[&Word], _place: &Place<'_>) -> Option<Asks> {
             .find(|w| !is_option(w))
             .is_some_and(|w| matches!(w.text.as_str(), "drop" | "clear")),
         "filter-branch" | "filter-repo" => true,
-        "reset" => rest.iter().any(|w| w.text == "--hard"),
-        "clean" => has_flag(rest, 'f', &["force"]),
+        "update-ref" => git_flag(rest, 'd', &[]),
+        // A worktree removed by force loses what wasn't committed in it;
+        // one outside the folder is someone else's.
+        "worktree" => {
+            let ops = operands(rest);
+            match ops.first().map(|w| w.text.as_str()) {
+                Some("remove") => {
+                    git_flag(rest, 'f', &["force"])
+                        || !ops
+                            .get(1)
+                            .and_then(|w| place.resolve(w))
+                            .is_some_and(|p| place.inside(&p))
+                }
+                Some("prune") => true,
+                _ => false,
+            }
+        }
+        "reset" => git_flag(rest, '\0', &["hard"]),
+        "clean" => git_flag(rest, 'f', &["force"]),
         "branch" => {
-            has_flag(rest, 'D', &[])
-                || (has_flag(rest, 'd', &["delete"]) && has_flag(rest, 'f', &["force"]))
+            git_flag(rest, 'D', &[])
+                || (git_flag(rest, 'd', &["delete"]) && git_flag(rest, 'f', &["force"]))
         }
         _ => false,
     };
@@ -1074,18 +1590,70 @@ fn git(args: &[&Word], _place: &Place<'_>) -> Option<Asks> {
 mod tests {
     use super::*;
 
-    const SCRATCH: [&str; 2] = ["/tmp", "/private/var/folders/xy/T"];
+    const SCRATCH: [&str; 3] = ["/tmp", "/private/tmp", "/private/var/folders/xy/T"];
+
+    thread_local! {
+        /// Each test's own disk, removed when its thread ends.
+        static FIXTURE: (tempfile::TempDir, String) = {
+            // Never under scratch space (`/tmp` on Linux): there every
+            // delete is the agent's to make.
+            let temp = std::env::temp_dir();
+            let parent = match temp.starts_with("/tmp") {
+                true => PathBuf::from("/var/tmp"),
+                false => temp,
+            };
+            let dir = tempfile::tempdir_in(parent).unwrap();
+            let base = std::fs::canonicalize(dir.path()).unwrap();
+            for d in [
+                "Users/sarah/Desk/hub/agents/allan/work/target",
+                "Users/sarah/Desk/hub/agents/allan/work/src",
+                "Users/sarah/dev/acme-web/src",
+            ] {
+                std::fs::create_dir_all(base.join(d)).unwrap();
+            }
+            std::fs::write(base.join("Users/sarah/dev/acme-web/README.md"), "x").unwrap();
+            std::fs::write(base.join("Users/sarah/.zshrc"), "x").unwrap();
+            std::fs::write(base.join("Users/sarah/Desk/hub/agents/allan/work/src/a.rs"), "x").unwrap();
+            let allan = base.join("Users/sarah/Desk/hub/agents/allan");
+            // A link in the folder to the next repository, and one to nothing.
+            std::os::unix::fs::symlink(base.join("Users/sarah/dev/acme-web"), allan.join("l")).unwrap();
+            std::os::unix::fs::symlink(base.join("Users/sarah/nowhere/x"), allan.join("out")).unwrap();
+            // A chain of 41 links.
+            let mut target = allan.join("work/target");
+            for i in 0..41 {
+                let link = allan.join(format!("c{i}"));
+                std::os::unix::fs::symlink(&target, &link).unwrap();
+                target = link;
+            }
+            let shown = base.display().to_string();
+            (dir, shown)
+        };
+    }
+
+    fn base() -> String {
+        FIXTURE.with(|(_, b)| b.clone())
+    }
+
+    /// `/Users/sarah/…` on the fixtures' disk.
+    fn p(path: &str) -> PathBuf {
+        PathBuf::from(format!("{}{path}", base()))
+    }
+
+    fn in_fixture(command: &str) -> String {
+        command.replace("/Users/sarah", &format!("{}/Users/sarah", base()))
+    }
 
     fn asks(command: &str) -> Option<Asks> {
-        let own = [PathBuf::from("/Users/sarah/Desk/hub/agents/allan")];
+        let own = [p("/Users/sarah/Desk/hub/agents/allan")];
         let scratch = SCRATCH.map(PathBuf::from);
-        let place = Place {
-            cwd: Some(PathBuf::from("/Users/sarah/Desk/hub/agents/allan/work")),
-            own: &own,
-            scratch: &scratch,
-            home: Path::new("/Users/sarah"),
-        };
-        always_asks(command, &place)
+        let home = p("/Users/sarah");
+        let place = Place::new(
+            Some(p("/Users/sarah/Desk/hub/agents/allan/work")),
+            &own,
+            &scratch,
+            &home,
+        );
+        always_asks(&in_fixture(command), &place)
     }
 
     /// It can't be undone, whether or not an "always" could cover it.
@@ -1099,6 +1667,7 @@ mod tests {
     fn ordinary_commands_do_not_always_ask() {
         for command in [
             "cargo test -p desk",
+            "rm -rf ./build ../work/tmp",
             "npm test && npm run build",
             "git status; git diff --stat",
             "git push origin main",
@@ -1108,7 +1677,6 @@ mod tests {
             "git branch -d merged",
             "ls -la | grep foo > out.txt 2>&1",
             "rm -rf target",
-            "rm -rf ./build ../work/tmp",
             "rm /Users/sarah/Desk/hub/agents/allan/scratch.txt",
             "chmod -R u+w ./dist",
             "chmod +x /usr/local/bin/tool",
@@ -1144,6 +1712,200 @@ mod tests {
             "",
         ] {
             assert_eq!(asks(command), None, "{command:?}");
+        }
+    }
+
+    /// What the first security review found the person's own mode let
+    /// through: each delete, move or truncate whose target can't be told,
+    /// or lies outside the folder, asks.
+    #[test]
+    fn a_target_desk_cant_place_or_outside_the_folder_asks() {
+        let mut wrong = Vec::new();
+        for command in [
+            "rm -rf {~,x}",
+            "rm -rf {..,x}/acme-web",
+            "cd /tmp/nope; rm -rf ../acme-web",
+            "export CDPATH=/Users/sarah/dev; cd acme-web; rm -rf src",
+            "CDPATH=/Users/sarah/dev cd acme-web && rm -rf src",
+            "ln -s /Users/sarah/dev/acme-web l2 && rm -rf l2/*",
+            "ln -s /Users/sarah/dev/acme-web l2 && rm -rf l2/src",
+            "mv /Users/sarah/dev/acme-web /tmp/gone",
+            "mv notes.txt /Users/sarah/dev/acme-web/README.md",
+            ": > /Users/sarah/dev/acme-web/README.md",
+            "echo x > /Users/sarah/.zshrc",
+            "git worktree remove --force /Users/sarah/dev/other",
+            "git worktree remove /Users/sarah/dev/other",
+            "git worktree remove --force ../work",
+            "git update-ref -d refs/heads/main",
+            // Through a link in the folder, and `..` after it.
+            "rm -rf ../l/src",
+            "rm -rf ../l/../x",
+            // `..` after what doesn't exist yet.
+            "rm -rf nope/../../../../../dev/acme-web",
+            // A link to nothing.
+            ": > ../out",
+            "rm -rf ../out/x",
+            // More links than the kernel follows.
+            "rm -rf ../c40/x",
+            // A scratch root.
+            "rm -rf /tmp",
+            "rm -rf /private/tmp/",
+            // A pattern that could match `..`.
+            "rm -rf .*",
+            "rm -rf */x",
+        ] {
+            if asks(command).is_none() {
+                wrong.push(command);
+            }
+        }
+        assert!(wrong.is_empty(), "these didn't ask: {wrong:#?}");
+    }
+
+    /// The review of the first fix: links and folders made earlier in the
+    /// line by any command, `>&file`, writes over files outside the
+    /// folder, git's prefixed long options and discards.
+    #[test]
+    fn what_an_earlier_command_made_writes_over_and_discards_ask() {
+        let mut wrong = Vec::new();
+        for command in [
+            "/bin/ln -s /Users/sarah/dev/acme-web l2 && rm -rf l2/*",
+            "command ln -s /Users/sarah/dev/acme-web l2 && rm -rf l2/src",
+            "env ln -s /Users/sarah/dev/acme-web l2 && rm -rf l2/src",
+            "python3 -c \"import os; os.symlink('/Users/sarah/dev/acme-web', 'l2')\" && rm -rf l2/src",
+            "cp -a ../l l2 && rm -rf l2/src",
+            "/bin/ln -s /Users/sarah/dev/acme-web l2 && : > l2/README.md",
+            ": >& /Users/sarah/dev/acme-web/README.md",
+            "echo x | tee /Users/sarah/dev/acme-web/README.md",
+            "truncate -s0 /Users/sarah/dev/acme-web/README.md",
+            "shred /Users/sarah/dev/acme-web/README.md",
+            "cp a.txt /Users/sarah/dev/acme-web/README.md",
+            "cp README.md /Users/sarah/dev/acme-web/",
+            "install a.txt /Users/sarah/dev/acme-web/README.md",
+            "rsync -a x /Users/sarah/dev/acme-web/README.md",
+            "ln -sf x /Users/sarah/dev/acme-web/README.md",
+            "sed -i 's/a/b/' /Users/sarah/dev/acme-web/README.md",
+            "curl -o /Users/sarah/dev/acme-web/README.md https://x.example",
+            "wget -O /Users/sarah/dev/acme-web/README.md https://x.example",
+            "git push --mirro",
+            "git push origin --dele x",
+            "git push --forc",
+            "git push --prune origin",
+            "git reset --har",
+            "git checkout -f",
+            "git checkout --force main",
+            "git switch --discard-changes main",
+            "git switch -f main",
+            "git checkout src/a.rs",
+            "git restore src/a.rs",
+            "git reflog expire --all",
+            "git gc --prune=now",
+            "git stash drop",
+            "git stash clear",
+            "cd nope && rm -rf build",
+        ] {
+            if asks(command).is_none() {
+                wrong.push(command);
+            }
+        }
+        assert!(wrong.is_empty(), "these didn't ask: {wrong:#?}");
+        for ok in [
+            "rm -rf ../l",
+            "rm ../l",
+            "cd src && rm -rf build",
+            "echo x | tee -a /Users/sarah/notes.md",
+            "echo x | tee out.txt",
+            "cp a.txt /Users/sarah/dev/acme-web/new.txt",
+            "curl -o out.html https://x.example",
+            "sed -i 's/a/b/' src/a.rs",
+            "git checkout -b feat/x",
+            "git switch feat/x",
+            "echo x >&2",
+        ] {
+            assert_eq!(asks(ok), None, "{ok}");
+        }
+    }
+
+    /// The re-check of the review: a link made at the target itself,
+    /// contents copies, clustered output flags, git's short prefixes and
+    /// in-place editors.
+    #[test]
+    fn links_at_the_target_contents_copies_and_in_place_editors_ask() {
+        let mut wrong = Vec::new();
+        for command in [
+            "/bin/ln -s /Users/sarah/dev/acme-web/README.md f && echo x > f",
+            "/bin/ln -s /Users/sarah/dev/acme-web/README.md f && cp notes.txt f",
+            "/bin/ln -s /Users/sarah/dev/acme-web l2 && rm -rf l2/",
+            "cp -a ../l l2 && rm -rf l2/",
+            "rsync -a ./ /Users/sarah/dev/acme-web/",
+            "cp -R ./ /Users/sarah/dev/acme-web",
+            "curl -sSLo /Users/sarah/dev/acme-web/README.md https://x.example",
+            "curl -o/Users/sarah/dev/acme-web/README.md https://x.example",
+            "wget -qO /Users/sarah/dev/acme-web/README.md https://x.example",
+            "git push --de x",
+            "git push --mi",
+            "git clean --f -d",
+            "git reset --ha",
+            "git switch --di main",
+            "perl -pi -e 's/a/b/' /Users/sarah/dev/acme-web/README.md",
+            "perl -i -pe 's/a/b/' /Users/sarah/dev/acme-web/README.md",
+            "ruby -pi -e 'x' /Users/sarah/dev/acme-web/README.md",
+            "awk -i inplace '{print}' /Users/sarah/dev/acme-web/README.md",
+            "ex -sc 'wq' /Users/sarah/dev/acme-web/README.md",
+            "vim -c 'wq' /Users/sarah/dev/acme-web/README.md",
+            "vim -es /Users/sarah/dev/acme-web/README.md",
+        ] {
+            if asks(command).is_none() {
+                wrong.push(command);
+            }
+        }
+        assert!(wrong.is_empty(), "these didn't ask: {wrong:#?}");
+    }
+
+    /// The own folder as the disk spells it: on a case-sensitive disk a name
+    /// in another case is another folder, and deleting there asks.
+    #[test]
+    fn the_own_folder_is_compared_as_the_disk_spells_it() {
+        let shouting = p("/Users/sarah/Desk/hub/agents/ALLAN");
+        let case_blind = shouting.exists();
+        assert_eq!(
+            asks("rm -rf ../../ALLAN/work/target").is_some(),
+            !case_blind,
+            "case-insensitive disk: {case_blind}"
+        );
+    }
+
+    /// Ordinary work keeps running without asking.
+    #[test]
+    fn ordinary_work_still_runs_without_asking() {
+        for command in [
+            "cargo build --release",
+            "cargo test -p desk && npm run build",
+            "rm -rf target",
+            "rm -rf target/*",
+            "rm -rf ./target/debug",
+            "rm -f *.log",
+            "cd target && rm -rf debug",
+            "cd .. && rm -rf work/target",
+            "git push origin feat/date-picker",
+            "git push -u origin HEAD",
+            "git worktree remove ../.worktrees/x",
+            "echo ok > out.txt",
+            "cargo build > build.log 2>&1",
+            "echo note >> /Users/sarah/notes.md",
+            "ls > /dev/null",
+            "mv old.txt new.txt",
+            "mv a.txt /tmp/a.txt",
+            "rm -rf /tmp/acme-cache",
+            "ln -s ../target t && ls t",
+            "mkdir dist && echo ok > dist/x",
+            "mkdir -p out && cargo build > out/log 2>&1",
+            "rsync -a ./ ../work/target/copy/",
+            "curl -sSLo out.html https://x.example",
+            "perl -pi -e 's/a/b/' src/a.rs",
+            "git push --set-upstream origin feat/x",
+            "git clean --dry-run",
+        ] {
+            assert_eq!(asks(command), None, "{command}");
         }
     }
 
@@ -1247,16 +2009,15 @@ mod tests {
 
     #[test]
     fn a_relative_target_with_no_cwd_is_outside() {
-        let own = [PathBuf::from("/Users/sarah/Desk/hub/agents/allan")];
-        let place = Place {
-            cwd: None,
-            own: &own,
-            scratch: &[],
-            home: Path::new("/Users/sarah"),
-        };
+        let own = [p("/Users/sarah/Desk/hub/agents/allan")];
+        let home = p("/Users/sarah");
+        let place = Place::new(None, &own, &[], &home);
         assert_eq!(always_asks("rm -rf build", &place), Some(I));
         assert_eq!(
-            always_asks("rm /Users/sarah/Desk/hub/agents/allan/x", &place),
+            always_asks(
+                &in_fixture("rm /Users/sarah/Desk/hub/agents/allan/x"),
+                &place
+            ),
             None
         );
     }
@@ -1272,15 +2033,15 @@ mod tests {
     fn a_delete_of_named_paths_says_which_and_a_cd_is_followed() {
         assert_eq!(
             asks("rm -rf /Users/sarah/dev/acme-web/node_modules"),
-            Some(Asks::Deletes(vec![PathBuf::from(
+            Some(Asks::Deletes(vec![p(
                 "/Users/sarah/dev/acme-web/node_modules"
             )]))
         );
         assert_eq!(
             asks("cd /Users/sarah/dev/acme-web && rm -rf node_modules dist"),
             Some(Asks::Deletes(vec![
-                PathBuf::from("/Users/sarah/dev/acme-web/node_modules"),
-                PathBuf::from("/Users/sarah/dev/acme-web/dist"),
+                p("/Users/sarah/dev/acme-web/node_modules"),
+                p("/Users/sarah/dev/acme-web/dist"),
             ]))
         );
         assert_eq!(asks("rm -rf $DIR"), Some(I), "a target it can't name");

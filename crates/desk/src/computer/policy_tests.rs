@@ -1007,3 +1007,55 @@ fn paths_are_shown_under_home_with_a_tilde() {
     assert_eq!(shown(Path::new("/Users/sarah/dev"), home), "~/dev");
     assert_eq!(shown(Path::new("/etc/hosts"), home), "/etc/hosts");
 }
+
+/// Protected names are compared as a case-insensitive disk compares them:
+/// a different case, a long s or a ligature names the same file.
+#[test]
+fn the_withheld_set_and_config_are_compared_as_the_disk_compares_names() {
+    for effect in [
+        read("/users/SARAH/library/application support/desk/vault.db"),
+        read("/Users/\u{17f}arah/Library/Keychains/login.keychain-db"),
+        write(&format!("{OWN}/CONFIG.TOML")),
+        write(&format!("{OWN}/soul.md")),
+    ] {
+        let v = verdict(&full(), false, &[], &call(effect.clone()));
+        assert_eq!(
+            refused(&v).map(|r| r.0),
+            Some(Refused::Withheld),
+            "{effect:?}"
+        );
+    }
+}
+
+/// At Full access, writing or moving onto a file outside the folder that is
+/// there already asks; a new file there doesn't.
+#[test]
+fn writing_over_a_file_outside_the_folder_asks_at_full_access() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = std::fs::canonicalize(dir.path()).unwrap();
+    std::fs::create_dir_all(base.join("own")).unwrap();
+    std::fs::create_dir_all(base.join("elsewhere")).unwrap();
+    std::fs::write(base.join("elsewhere/there.txt"), "x").unwrap();
+    let mut policy = full();
+    policy.own = vec![base.join("own")];
+    policy.scratch = vec![];
+    let there = base.join("elsewhere/there.txt").display().to_string();
+    let new = base.join("elsewhere/new.txt").display().to_string();
+    let v = verdict(&policy, false, &[], &call(write(&there)));
+    assert!(matches!(v, Verdict::Ask { .. }), "{v:?}");
+    let v = verdict(&policy, false, &[], &call(write(&new)));
+    assert!(matches!(v, Verdict::Run { .. }), "{v:?}");
+    let moved = Effect::Move {
+        from: vec![base.join("own/a.txt")],
+        to: PathBuf::from(&there),
+    };
+    let v = verdict(&policy, false, &[], &call(moved));
+    assert!(matches!(v, Verdict::Ask { .. }), "{v:?}");
+    let v = verdict(
+        &policy,
+        false,
+        &[],
+        &call(write(&base.join("own/a.txt").display().to_string())),
+    );
+    assert!(matches!(v, Verdict::Run { .. }), "{v:?}");
+}

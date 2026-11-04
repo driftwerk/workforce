@@ -24,7 +24,8 @@
 //!
 //! Paths are canonical by the time they reach here: the caller resolves
 //! them, finds the folder a grant would cover, and drops grants that have
-//! expired. Nothing here reads the filesystem or the clock.
+//! expired. Nothing here reads the clock, and the filesystem only to tell
+//! whether a write outside the own folder would replace a file there.
 
 use std::path::{Path, PathBuf};
 
@@ -36,6 +37,7 @@ use workforce_core::computer::{
 };
 
 use super::asks::{always_asks, Asks, Place};
+use super::boss::fold;
 
 /// What a namespace's tools touch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -183,6 +185,22 @@ enum Change<'a> {
     Unnamed,
 }
 
+/// What a write or a move's destination replaces outside the own folder
+/// and scratch: files there already. `None` when it replaces none.
+fn replaced(p: &AgentPolicy, effect: &Effect, paths: &[PathBuf]) -> Option<Vec<PathBuf>> {
+    let targets: Vec<&PathBuf> = match effect {
+        Effect::Write { .. } => paths.iter().collect(),
+        Effect::Move { to, .. } => vec![to],
+        _ => return None,
+    };
+    let over: Vec<PathBuf> = targets
+        .into_iter()
+        .filter(|t| !p.deletable(t) && std::fs::symlink_metadata(t).is_ok())
+        .cloned()
+        .collect();
+    (!over.is_empty()).then_some(over)
+}
+
 fn refuse(rule: Refused, sentence: String) -> Verdict {
     Verdict::Refuse {
         refusal: Refusal { rule, sentence },
@@ -202,21 +220,32 @@ pub fn shown(path: &Path, home: &Path) -> String {
     }
 }
 
+/// Whether `path` lies under `root`, compared as a case-insensitive disk
+/// (APFS) compares names ([`fold`]).
+fn under(path: &Path, root: &Path) -> bool {
+    fold(path).starts_with(fold(root))
+}
+
 impl AgentPolicy {
     fn inside(&self, path: &Path) -> bool {
-        self.own.iter().any(|root| path.starts_with(root))
+        self.own.iter().any(|root| under(path, root))
+    }
+
+    /// Inside the own folder or scratch space, for a delete; never a
+    /// scratch root itself.
+    fn deletable(&self, path: &Path) -> bool {
+        self.inside(path)
+            || self
+                .scratch
+                .iter()
+                .any(|t| under(path, t) && fold(path) != fold(t))
     }
 
     /// Whether `path` is kept from the agent; `change` when the call would
     /// change it.
-    /// Inside the own folder or scratch space, for a delete.
-    fn deletable(&self, path: &Path) -> bool {
-        self.inside(path) || self.scratch.iter().any(|t| path.starts_with(t))
-    }
-
     fn withheld(&self, path: &Path, change: bool) -> bool {
-        (change && self.config.iter().any(|c| path.starts_with(c)))
-            || (self.withheld.iter().any(|w| path.starts_with(w)) && !self.inside(path))
+        (change && self.config.iter().any(|c| under(path, c)))
+            || (self.withheld.iter().any(|w| under(path, w)) && !self.inside(path))
     }
 
     fn shown(&self, path: &Path) -> String {
@@ -524,13 +553,16 @@ pub fn verdict(p: &AgentPolicy, stopped: bool, grants: &[Grant], call: &CallFact
             let outside: Vec<PathBuf> = paths.iter().filter(|x| !p.deletable(x)).cloned().collect();
             return deleting(p, grants, call, &outside);
         }
+        // Writing over a file outside the folder loses what was there; a
+        // new file there loses nothing.
+        Effect::Write { paths } | Effect::Move { to: _, from: paths }
+            if replaced(p, &call.effect, paths).is_some() =>
+        {
+            let over = replaced(p, &call.effect, paths).unwrap_or_default();
+            return deleting(p, grants, call, &over);
+        }
         Effect::Exec { command, cwd } => {
-            let place = Place {
-                cwd: cwd.clone(),
-                own: &p.own,
-                scratch: &p.scratch,
-                home: &p.home,
-            };
+            let place = Place::new(cwd.clone(), &p.own, &p.scratch, &p.home);
             match always_asks(command, &place) {
                 Some(Asks::Deletes(targets)) => return deleting(p, grants, call, &targets),
                 Some(Asks::Irreversible) => return ask(once(), Why::CantBeUndone),
