@@ -203,7 +203,27 @@ impl Tool for SubAgentTool {
     }
 }
 
+/// Why an overseer that prefers real sessions may not spawn a full
+/// sub-agent: the work is to be seen. Read-only lookups (`worker`) run.
+const PREFER_SESSIONS: &str = "Desk is set to prefer real sessions: start one with crew.start_session so the person can watch it. Sub-agents here are for read-only lookups (profile \"worker\").";
+
 impl SubAgentTool {
+    /// Why `profile` may not run for this agent: it oversees the crew and
+    /// prefers real sessions (`[oversight.work] prefer_sessions`), and the
+    /// sub-agent would do work rather than look things up.
+    fn prefers_sessions(&self, profile: AgentProfile) -> Option<&'static str> {
+        if profile == AgentProfile::Worker {
+            return None;
+        }
+        let oversight =
+            workforce_common::settings::AgentWorkspaceConfig::load(&self.service.workspace)
+                .ok()
+                .flatten()
+                .and_then(|c| c.oversight().ok())
+                .unwrap_or_default();
+        (oversight.enabled && oversight.work.prefer_sessions).then_some(PREFER_SESSIONS)
+    }
+
     async fn handle_spawn(&self, input: SubAgentInput, start: Instant) -> Result<ToolResult> {
         let task = match input.task {
             Some(t) if !t.is_empty() => t,
@@ -214,6 +234,13 @@ impl SubAgentTool {
                 ))
             }
         };
+        let profile = match input.profile.as_deref() {
+            Some("worker") => AgentProfile::Worker,
+            _ => AgentProfile::Full,
+        };
+        if let Some(why) = self.prefers_sessions(profile) {
+            return Ok(ToolResult::failure(why, start.elapsed().as_millis() as u64));
+        }
         let Some(runner) = self.runner() else {
             return Ok(ToolResult::failure(
                 "Background execution is not available",
@@ -233,10 +260,6 @@ impl SubAgentTool {
         }
 
         let timeout_secs = input.timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS);
-        let profile = match input.profile.as_deref() {
-            Some("worker") => AgentProfile::Worker,
-            _ => AgentProfile::Full,
-        };
 
         // Resolve messaging context so the runner announces the result in-thread.
         let (channel_id, thread_id) = if input.channel_id.is_some() {
@@ -540,6 +563,52 @@ mod tests {
         let plain = handed_back("j1", "completed", Some(prose.clone()), None, None, None);
         assert_eq!(plain["result"], prose);
         assert!(plain.get("package").is_none());
+    }
+
+    /// An overseer that prefers real sessions spawns only read-only
+    /// lookups; with the setting off, or for any other agent, both run.
+    #[tokio::test]
+    async fn an_overseer_preferring_real_sessions_spawns_only_lookups() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = crate::serve::testing::plain_service(dir.path()).await;
+        std::fs::create_dir_all(&service.workspace).unwrap();
+        let tool = SubAgentTool::new(Arc::clone(&service));
+        let spawn = |profile: Option<&str>| {
+            let mut input = serde_json::json!({ "action": "spawn", "task": "Fix the date picker" });
+            if let Some(p) = profile {
+                input["profile"] = p.into();
+            }
+            input
+        };
+        let said = |r: ToolResult| {
+            r.error
+                .or(r.output.as_str().map(str::to_string))
+                .unwrap_or_default()
+        };
+        let config = |toml: &str| {
+            workforce_common::settings::AgentWorkspaceConfig::write(&service.workspace, toml)
+                .unwrap()
+        };
+
+        // Not an overseer: as before (this one can't run agents, so each
+        // goes as far as the runner).
+        for p in [None, Some("full"), Some("worker")] {
+            let r = tool.execute(spawn(p)).await.unwrap();
+            assert_ne!(said(r), PREFER_SESSIONS, "{p:?}");
+        }
+        config("[oversight]\nenabled = true\nlevel = \"act\"\n");
+        for p in [None, Some("full")] {
+            let r = tool.execute(spawn(p)).await.unwrap();
+            assert!(!r.success);
+            assert_eq!(said(r), PREFER_SESSIONS, "{p:?}");
+        }
+        let r = tool.execute(spawn(Some("worker"))).await.unwrap();
+        assert_ne!(said(r), PREFER_SESSIONS);
+        config("[oversight]\nenabled = true\n[oversight.work]\nprefer_sessions = false\n");
+        for p in [None, Some("full"), Some("worker")] {
+            let r = tool.execute(spawn(p)).await.unwrap();
+            assert_ne!(said(r), PREFER_SESSIONS, "{p:?}");
+        }
     }
 
     #[test]
