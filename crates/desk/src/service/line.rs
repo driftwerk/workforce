@@ -45,6 +45,9 @@ pub(crate) struct Lines {
     /// The questions waiting on the person: asked of them, or given to
     /// them by the overseer. The Floor's `line:` needs.
     for_you: HashMap<Uuid, LineMessage>,
+    /// The questions to the person their sessions went ahead without,
+    /// until they are answered or set aside: the Floor's "went ahead".
+    went_ahead: HashMap<Uuid, LineMessage>,
     /// When each session's line last had a message for the person, and
     /// last an exchange of its own: what its thread is unread by.
     pub(crate) seen: HashMap<Uuid, Seen>,
@@ -110,8 +113,20 @@ fn needs_you(m: &LineMessage) -> bool {
         && match m.asked {
             Some(Asked::Escalated) => true,
             Some(Asked::Open) => m.to.kind == PartyKind::You,
-            Some(Asked::Answered | Asked::Withdrawn) | None => false,
+            Some(Asked::Answered | Asked::Withdrawn | Asked::Lapsed | Asked::Dismissed) | None => {
+                false
+            }
         }
+}
+
+/// What a draft types: `text` as one bracketed paste, cleaned of control
+/// characters (so it can't end the paste early or press Enter), and no
+/// Enter after it.
+fn draft_bytes(text: &str) -> Vec<u8> {
+    let mut input = b"\x1b[200~".to_vec();
+    input.extend_from_slice(line::typable(text).as_bytes());
+    input.extend_from_slice(b"\x1b[201~");
+    input
 }
 
 /// How long a message handed to Desk's plugin may wait for it to say the
@@ -269,6 +284,10 @@ impl Desk {
                 true => st.lines.for_you.insert(m.id, m.clone()),
                 false => st.lines.for_you.remove(&m.id),
             };
+            match m.kind == LineKind::Ask && m.asked == Some(Asked::Lapsed) {
+                true => st.lines.went_ahead.insert(m.id, m.clone()),
+                false => st.lines.went_ahead.remove(&m.id),
+            };
         }
         let _ = self.0.events.send(DeskEvent::Line {
             message: Box::new(m.clone()),
@@ -364,6 +383,12 @@ impl Desk {
         };
         let mut m = LineMessage::new(party, recipient, kind, text, hop);
         m.group = group;
+        if let Send::Ask { chose, .. } = &hop_send {
+            m.chose = chose
+                .as_deref()
+                .map(|c| line::typable(c).trim().to_string())
+                .filter(|c| !c.is_empty());
+        }
         let recipient = m.to_session().and_then(find).cloned();
         let steering = match &recipient {
             Some(v) => line::steering(
@@ -385,6 +410,17 @@ impl Desk {
             Some(_) => {}
         }
         self.0.store.put_line(&m).await?;
+        // A session's question is waited on from the moment it is told of:
+        // whoever takes it up (the overseer giving it to the person) finds
+        // its call still waiting, not gone ahead.
+        if let (Sender::Session(_), Send::Ask { wait, .. }) = (&from, &hop_send) {
+            self.0
+                .state
+                .lock()
+                .lines
+                .waiting
+                .insert(m.id, Instant::now() + *wait);
+        }
         match &from {
             Sender::Session(id) => {
                 self.0.state.lock().lines.runs.entry(*id).or_default().sent += 1;
@@ -502,6 +538,9 @@ impl Desk {
             .await?
             .filter(|q| q.kind == LineKind::Ask)
             .ok_or(Refusal::NoSuchAsk(ask))?;
+        if question.asked == Some(Asked::Dismissed) {
+            return Err(Refusal::SetAside.into());
+        }
         let party = match &by {
             Sender::Session(id) if question.to_session() == Some(*id) => {
                 Party::session(&self.view(*id)?)
@@ -571,6 +610,10 @@ impl Desk {
     ) -> Result<Option<LineMessage>, LineError> {
         self.0.state.lock().lines.waiting.insert(ask, until);
         let mut rx = self.0.events.subscribe();
+        // Set aside between the plugin's polls: its event has gone by.
+        if self.set_aside(ask).await {
+            return Ok(None);
+        }
         let deadline = tokio::time::Instant::now() + wait;
         let found = loop {
             if let Some(a) = self.0.store.line_reply_to(ask).await? {
@@ -580,6 +623,12 @@ impl Desk {
                 Err(_) => break None,
                 Ok(Ok(DeskEvent::Line { message, .. }))
                     if message.in_reply_to == Some(ask) && message.kind == LineKind::Answer => {}
+                // The person set it aside: no answer is coming.
+                Ok(Ok(DeskEvent::Line { message, .. }))
+                    if message.id == ask && message.asked == Some(Asked::Dismissed) =>
+                {
+                    break None
+                }
                 Ok(Ok(_)) | Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
                 Ok(Err(broadcast::error::RecvError::Closed)) => break None,
             }
@@ -612,10 +661,31 @@ impl Desk {
         Ok(Some(answer))
     }
 
-    /// What an `ask` call answers: the answer, or that it will come later.
+    /// What an `ask` call answers: the answer; that the person set it
+    /// aside; or, once it waited all it would, that the session goes on
+    /// without one, which may still come later.
     fn ask_result(m: &LineMessage, answer: Option<&LineMessage>, more: bool) -> Value {
         match answer {
             Some(a) => json!({ "answer": a.text, "from": a.from.name }),
+            None if m.asked == Some(Asked::Dismissed) => json!({
+                "pending": "The person dismissed this question; carry on with your best judgement and say what you chose.",
+                "id": m.id,
+                "more": false,
+            }),
+            None if !more => {
+                let routed = (m.to.kind == PartyKind::You).then_some(
+                    "Desk has no overseer answering sessions, so your question went to the person.",
+                );
+                json!({
+                    "pending": format!(
+                        "No answer from {} in time. Go on with your own judgement; if they answer later, it reaches you as a message quoting your question.",
+                        m.to.name
+                    ),
+                    "id": m.id,
+                    "note": routed,
+                    "more": false,
+                })
+            }
             None => {
                 let routed = (m.to.kind == PartyKind::You).then_some(
                     "Desk has no overseer answering sessions, so your question went to the person.",
@@ -655,10 +725,23 @@ impl Desk {
             }
         };
         match call {
-            Call::Ask { to, text, wait } => {
+            Call::Ask {
+                to,
+                text,
+                wait,
+                chose,
+            } => {
                 let to = line::target_of(&to, &sessions).map_err(|r| r.to_string())?;
                 let m = self
-                    .line_send(Sender::Session(caller), Send::Ask { to, text, wait })
+                    .line_send(
+                        Sender::Session(caller),
+                        Send::Ask {
+                            to,
+                            text,
+                            wait,
+                            chose,
+                        },
+                    )
                     .await
                     .map_err(say)?;
                 let now = wait.min(step.unwrap_or(wait));
@@ -666,10 +749,11 @@ impl Desk {
                     .line_wait_answer(m.id, now, Instant::now() + wait)
                     .await
                     .map_err(say)?;
-                let more = answer.is_none() && now < wait;
-                if answer.is_none() && !more {
-                    self.line_waited_out(m.id);
-                }
+                let more = answer.is_none() && now < wait && !self.set_aside(m.id).await;
+                let m = match answer.is_none() && !more {
+                    true => self.line_waited_out(m).await,
+                    false => m,
+                };
                 Ok(Self::ask_result(&m, answer.as_ref(), more))
             }
             Call::Tell { to, text } => {
@@ -763,16 +847,119 @@ impl Desk {
             .line_wait_answer(ask, now, until)
             .await
             .map_err(|e| e.to_string())?;
-        let more = answer.is_none() && now < left;
-        if answer.is_none() && !more {
-            self.line_waited_out(ask);
-        }
+        let more = answer.is_none() && now < left && !self.set_aside(ask).await;
+        let m = match answer.is_none() && !more {
+            true => self.line_waited_out(m).await,
+            false => m,
+        };
         Ok(Self::ask_result(&m, answer.as_ref(), more))
     }
 
-    /// No tool call waits on `ask` any more: its answer comes as a message.
-    fn line_waited_out(&self, ask: Uuid) {
-        self.0.state.lock().lines.waiting.remove(&ask);
+    /// No tool call waits on `ask` any more: the session goes on without
+    /// an answer, and one given later comes as a message. A question that
+    /// waited on the person no longer does. The ask as it now is.
+    async fn line_waited_out(&self, ask: LineMessage) -> LineMessage {
+        self.0.state.lock().lines.waiting.remove(&ask.id);
+        self.line_went_ahead(ask.id).await.unwrap_or(ask)
+    }
+
+    /// `ask` went ahead without the person's answer, when it waited on
+    /// them; told of. The row as it now is, when it moved.
+    async fn line_went_ahead(&self, ask: Uuid) -> Option<LineMessage> {
+        match self.0.store.line_went_ahead(ask, true).await {
+            Ok(Some(m)) => {
+                self.line_announce(&m);
+                Some(m)
+            }
+            Ok(None) => self.0.store.line_message(ask).await.ok().flatten(),
+            Err(e) => {
+                tracing::warn!(%ask, error = %e, "couldn't say a question went ahead without its answer");
+                None
+            }
+        }
+    }
+
+    /// Questions no `ask` call waits on any more stop waiting on the
+    /// person: a wait that ran out with no one asking again (the turn was
+    /// stopped, the engine quit), and, after a restart, any older than the
+    /// longest wait.
+    pub(super) async fn line_sweep_waits(&self) {
+        let now = Instant::now();
+        let expired: Vec<Uuid> = {
+            let mut st = self.0.state.lock();
+            let gone: Vec<Uuid> = st
+                .lines
+                .waiting
+                .iter()
+                .filter(|(_, until)| **until <= now)
+                .map(|(id, _)| *id)
+                .collect();
+            for id in &gone {
+                st.lines.waiting.remove(id);
+            }
+            gone
+        };
+        for ask in expired {
+            self.line_went_ahead(ask).await;
+        }
+        let before = Utc::now()
+            - chrono::Duration::from_std(line::ASK_WAIT_MAX + PUMP_EVERY).unwrap_or_default();
+        let stale = match self.0.store.line_stale_asks(before).await {
+            Ok(stale) => stale,
+            Err(e) => {
+                tracing::warn!(error = %e, "couldn't read the questions no one waits on");
+                return;
+            }
+        };
+        for ask in stale {
+            if self.0.state.lock().lines.waiting.contains_key(&ask.id) {
+                continue;
+            }
+            self.line_went_ahead(ask.id).await;
+        }
+    }
+
+    /// The person sets the question `ask` aside unanswered: it leaves what
+    /// needs them, and nothing goes to the session (an `ask` call still
+    /// waiting on it is told to go on).
+    pub async fn line_dismiss(&self, ask: Uuid) -> Result<LineMessage, LineError> {
+        match self.0.store.line_dismiss(ask).await? {
+            Some(m) => {
+                self.line_announce(&m);
+                Ok(m)
+            }
+            None => match self.0.store.line_message(ask).await? {
+                Some(q) if q.kind == LineKind::Ask => Err(match q.asked {
+                    Some(Asked::Answered) => Refusal::Answered,
+                    Some(Asked::Dismissed) => Refusal::SetAside,
+                    _ => Refusal::NotWaitingOnYou,
+                }
+                .into()),
+                _ => Err(Refusal::NoSuchAsk(ask).into()),
+            },
+        }
+    }
+
+    /// Whether the person set the question `ask` aside: no answer comes.
+    async fn set_aside(&self, ask: Uuid) -> bool {
+        self.0
+            .store
+            .line_message(ask)
+            .await
+            .ok()
+            .flatten()
+            .is_some_and(|q| q.asked == Some(Asked::Dismissed))
+    }
+
+    /// Whether a tool call still waits on the question `ask`.
+    fn waited_on_ask(&self, ask: Uuid) -> bool {
+        self.0
+            .state
+            .lock()
+            .lines
+            .waiting
+            .get(&ask)
+            .is_some_and(|until| *until > Instant::now())
     }
 
     /// Whether the answer `m` is one a tool call still waits on.
@@ -1035,11 +1222,17 @@ impl Desk {
             }
             Err(e) => tracing::warn!(error = %e, "couldn't read what waits on Desk's lines"),
         }
+        // After a restart no call waits on what was asked before it.
+        self.line_sweep_waits().await;
         match self.0.store.line_open_asks(None).await {
             Ok(asks) => {
                 let mut st = self.0.state.lock();
-                for ask in asks.into_iter().filter(needs_you) {
-                    st.lines.for_you.insert(ask.id, ask);
+                for ask in asks {
+                    if needs_you(&ask) {
+                        st.lines.for_you.insert(ask.id, ask);
+                    } else if ask.asked == Some(Asked::Lapsed) {
+                        st.lines.went_ahead.insert(ask.id, ask);
+                    }
                 }
             }
             Err(e) => tracing::warn!(error = %e, "couldn't read the questions waiting on you"),
@@ -1062,6 +1255,7 @@ impl Desk {
                         Err(e) => tracing::warn!(error = %e, "couldn't requeue stale line hand-offs"),
                     }
                     self.line_pump_pending().await;
+                    self.line_sweep_waits().await;
                 }
                 ev = rx.recv() => match ev {
                     Ok(DeskEvent::Session { session }) => {
@@ -1142,6 +1336,9 @@ impl Desk {
         st.lines.plugin.remove(&id);
         st.lines
             .for_you
+            .retain(|_, m| m.from_session() != Some(id) && m.to_session() != Some(id));
+        st.lines
+            .went_ahead
             .retain(|_, m| m.from_session() != Some(id) && m.to_session() != Some(id));
         st.lines.seen.remove(&id);
     }
@@ -1248,7 +1445,22 @@ impl Desk {
             .ok_or(Refusal::NoSuchAsk(ask))?;
         match q.asked {
             Some(Asked::Open | Asked::Escalated) => {}
+            // The session went on without an answer: nothing to give the
+            // person now.
+            Some(Asked::Lapsed) => return Err(Refusal::WentAhead.into()),
+            Some(Asked::Dismissed) => return Err(Refusal::SetAside.into()),
             Some(Asked::Answered | Asked::Withdrawn) | None => return Err(Refusal::Answered.into()),
+        }
+        // Given to the person after its call stopped waiting: it went
+        // ahead without them.
+        if q.from_session().is_some() && !self.waited_on_ask(q.id) {
+            return match self.0.store.line_went_ahead(q.id, false).await? {
+                Some(m) => {
+                    self.line_announce(&m);
+                    Err(Refusal::WentAhead.into())
+                }
+                None => Err(Refusal::WentAhead.into()),
+            };
         }
         q.asked = Some(Asked::Escalated);
         q.escalation = Some(escalation);
@@ -1304,6 +1516,59 @@ impl Desk {
                 answer: crate::floor::Answer::Reply,
             })
             .collect()
+    }
+
+    /// The questions to the person their sessions went ahead without,
+    /// oldest first, until answered or set aside: what the Floor lists
+    /// under "went ahead without you".
+    pub fn line_went_ahead_list(&self) -> Vec<crate::floor::WentAhead> {
+        let st = self.0.state.lock();
+        let mut out: Vec<_> = st
+            .lines
+            .went_ahead
+            .values()
+            .map(|m| crate::floor::WentAhead {
+                id: format!("line:{}", m.id),
+                who: crate::floor::Who {
+                    kind: m.from.kind,
+                    id: m.from.id.clone(),
+                    name: m.from.name.clone(),
+                    engine: m.from.engine,
+                },
+                ask: m.text.clone(),
+                chose: m.chose.clone(),
+                asked_at: m.at,
+                // No later than its longest wait: one found after a restart
+                // went ahead long before it was marked.
+                went_ahead_at: m
+                    .updated_at
+                    .min(m.at + chrono::Duration::from_std(line::ASK_WAIT_MAX).unwrap_or_default()),
+            })
+            .collect();
+        out.sort_by_key(|w| w.asked_at);
+        out
+    }
+
+    /// The person's draft for `id`, put in its prompt without sending it:
+    /// typed in as a paste, with no Enter, for them to add to and send
+    /// themselves. Refused while a dialog (a permission) has the terminal,
+    /// where it would answer the dialog instead.
+    pub fn line_draft(&self, id: Uuid, text: &str) -> Result<SessionView, DeskError> {
+        let text = line::typable(text);
+        if text.trim().is_empty() {
+            return Err(DeskError::Invalid("there is nothing to put in".into()));
+        }
+        let view = self.view(id)?;
+        if view.state == SessionState::Blocked {
+            return Err(DeskError::Conflict(
+                "It's showing a dialog in its terminal; answer that first.".into(),
+            ));
+        }
+        let pty = self.attach(id)?;
+        pty.write(&draft_bytes(&text))?;
+        // Theirs, waiting in the prompt: nothing is typed in over it.
+        pty.person_typed();
+        Ok(view)
     }
 
     /// Whether `steer` lets the person's message into a working turn: what

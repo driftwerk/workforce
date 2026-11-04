@@ -131,7 +131,7 @@ async fn a_question_for_desk_with_no_overseer_reaches_the_person_and_their_answe
 }
 
 #[tokio::test]
-async fn an_unanswered_question_says_pending_and_its_answer_comes_later_as_a_message() {
+async fn an_unanswered_question_went_ahead_and_a_later_answer_comes_as_a_message_quoting_it() {
     with_test_pool(build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
         let d = desk(pool, dir.path()).await;
@@ -146,9 +146,22 @@ async fn an_unanswered_question_says_pending_and_its_answer_comes_later_as_a_mes
             )
             .await
             .unwrap();
-        assert!(result["pending"].as_str().unwrap().contains("No answer"));
+        assert!(result["pending"]
+            .as_str()
+            .unwrap()
+            .contains("Go on with your own judgement"));
         assert_eq!(result["more"], false);
         let ask: Uuid = serde_json::from_value(result["id"].clone()).unwrap();
+        // Its call stopped waiting: it went on without the person, who it
+        // no longer waits on, and its thread still has it.
+        assert_eq!(row(&d, ask).await.asked, Some(Asked::Lapsed));
+        assert!(d.line_needs().is_empty());
+        assert!(d
+            .line_thread(s.id, None, None)
+            .await
+            .unwrap()
+            .iter()
+            .any(|m| m.id == ask && m.asked == Some(Asked::Lapsed)));
         // The plugin asks again while a longer wait has time left.
         let result = d
             .line_call(
@@ -160,16 +173,23 @@ async fn an_unanswered_question_says_pending_and_its_answer_comes_later_as_a_mes
             .await
             .unwrap();
         assert_eq!(result["more"], true);
+        let tests_too: Uuid = serde_json::from_value(result["id"].clone()).unwrap();
+        assert_eq!(
+            row(&d, tests_too).await.asked,
+            Some(Asked::Open),
+            "still waited on"
+        );
+        // The person may still answer the one it went ahead on.
         let answer = d
             .line_answer(ask, Sender::Person, "Yes".into())
             .await
             .unwrap();
         let next = d.line_next(s.id, Duration::from_secs(2)).await.unwrap();
         assert_eq!(next["id"], json!(answer.id));
-        assert!(next["text"]
-            .as_str()
-            .unwrap()
-            .starts_with("You asked me “Ship it?”. Yes"));
+        assert!(next["text"].as_str().unwrap().starts_with(
+            "Earlier you asked me “Ship it?” and went ahead without my answer. My answer: Yes"
+        ));
+        assert_eq!(row(&d, ask).await.asked, Some(Asked::Answered));
     })
     .await;
 }
@@ -374,6 +394,7 @@ async fn a_hand_off_chain_is_refused_past_its_hops() {
                     to: Target::Person,
                     text: "stuck".into(),
                     wait: Duration::ZERO,
+                    chose: None,
                 },
             )
             .await
@@ -906,15 +927,17 @@ async fn a_question_given_to_the_person_is_a_floor_need_until_it_is_answered() {
         let d = desk(pool, dir.path()).await;
         let s = new_session(&d, dir.path()).await;
         idle(&d, s.id).await;
+        // Its call still waits (Desk's plugin asks again while `more`).
         let r = d
             .line_call(
                 s.id,
                 "ask",
-                &json!({"to": "you", "text": "Which branch?", "wait_seconds": 0}),
-                None,
+                &json!({"to": "you", "text": "Which branch?", "wait_seconds": 60}),
+                Some(Duration::from_millis(10)),
             )
             .await
             .unwrap();
+        assert_eq!(r["more"], true);
         let ask: Uuid = serde_json::from_value(r["id"].clone()).unwrap();
         let needs = d.line_needs();
         assert_eq!(needs.len(), 1, "asked of the person");
@@ -1149,9 +1172,344 @@ async fn a_message_that_would_end_the_paste_is_typed_in_whole_and_harmless() {
     .await;
 }
 
+/// A question to the person whose `ask` call still waits, as Desk's plugin
+/// leaves it between its polls.
+async fn waiting_ask(d: &Desk, id: Uuid, text: &str) -> Uuid {
+    let r = d
+        .line_call(
+            id,
+            "ask",
+            &json!({"to": "you", "text": text, "wait_seconds": 60}),
+            Some(Duration::from_millis(10)),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r["more"], true);
+    serde_json::from_value(r["id"].clone()).unwrap()
+}
+
+#[tokio::test]
+async fn a_wait_that_runs_out_with_no_one_asking_again_goes_ahead_and_so_does_one_from_before_a_restart(
+) {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let s = new_session(&d, dir.path()).await;
+        idle(&d, s.id).await;
+        // The turn was stopped: its plugin never asks again.
+        let ask = waiting_ask(&d, s.id, "Which branch?").await;
+        assert_eq!(d.line_needs().len(), 1);
+        d.0.state.lock().lines.waiting.insert(ask, Instant::now());
+        d.line_sweep_waits().await;
+        assert_eq!(row(&d, ask).await.asked, Some(Asked::Lapsed));
+        assert!(d.line_needs().is_empty());
+
+        // Asked overnight, before the hub restarted: nothing waits on it.
+        let mut old = LineMessage::new(
+            Party::session(&s),
+            Party::you(),
+            LineKind::Ask,
+            "Keep the old table?".into(),
+            1,
+        );
+        old.at = Utc::now() - chrono::Duration::hours(8);
+        old.delivery = Delivery::Delivered;
+        d.0.store.put_line(&old).await.unwrap();
+        // One asked just now still may be.
+        let fresh = waiting_ask(&d, s.id, "Tests too?").await;
+        d.line_sweep_waits().await;
+        assert_eq!(row(&d, old.id).await.asked, Some(Asked::Lapsed));
+        assert_eq!(row(&d, fresh).await.asked, Some(Asked::Open));
+        // It went ahead when its longest wait ran out, not when it was found.
+        let listed = d.line_went_ahead_list();
+        let found = listed
+            .iter()
+            .find(|w| w.id == format!("line:{}", old.id))
+            .unwrap();
+        assert!(found.went_ahead_at <= old.at + chrono::Duration::minutes(5));
+        // An answered one stays answered.
+        d.line_answer(fresh, Sender::Person, "Yes".into())
+            .await
+            .unwrap();
+        d.0.state.lock().lines.waiting.insert(fresh, Instant::now());
+        d.line_sweep_waits().await;
+        assert_eq!(row(&d, fresh).await.asked, Some(Asked::Answered));
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_question_is_waited_on_from_when_it_is_told_of() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let s = new_session(&d, dir.path()).await;
+        idle(&d, s.id).await;
+        // The overseer takes a question up as soon as it hears of it, which
+        // may be before the call that asked starts waiting.
+        let mut rx = d.0.events.subscribe();
+        let asking = {
+            let d = d.clone();
+            tokio::spawn(async move {
+                d.line_call(
+                    s.id,
+                    "ask",
+                    &json!({"to": "you", "text": "May I push?", "wait_seconds": 60}),
+                    Some(Duration::from_millis(200)),
+                )
+                .await
+            })
+        };
+        let ask = loop {
+            if let Ok(DeskEvent::Line { message, .. }) = rx.recv().await {
+                if message.kind == LineKind::Ask {
+                    break message.id;
+                }
+            }
+        };
+        assert!(d.waited_on_ask(ask), "waited on as soon as it is heard of");
+        asking.await.unwrap().unwrap();
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_question_given_to_the_person_after_its_session_went_ahead_doesnt_need_them() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let s = new_session(&d, dir.path()).await;
+        idle(&d, s.id).await;
+        // Asked of the overseer, which didn't get to it before the wait ran
+        // out.
+        let mut q = LineMessage::new(
+            Party::session(&s),
+            Party::manager("sarah", "Sarah"),
+            LineKind::Ask,
+            "May I push?".into(),
+            1,
+        );
+        q.delivery = Delivery::Delivered;
+        d.0.store.put_line(&q).await.unwrap();
+        let by = By::manager("sarah", "Sarah", "Pushing is the person's.");
+        let given = d
+            .line_escalate(
+                q.id,
+                &by,
+                line::Escalation {
+                    why: "Pushing is the person's.".into(),
+                    options: vec![],
+                    draft: None,
+                },
+            )
+            .await;
+        assert!(matches!(given, Err(LineError::Refused(Refusal::WentAhead))));
+        assert_eq!(row(&d, q.id).await.asked, Some(Asked::Lapsed));
+        assert!(d.line_needs().is_empty());
+        // The overseer's answer still reaches it, later.
+        d.line_answer(q.id, Sender::Overseer(by), "Not to main.".into())
+            .await
+            .unwrap();
+        assert_eq!(row(&d, q.id).await.asked, Some(Asked::Answered));
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn the_person_sets_a_question_aside_and_nothing_goes_to_the_session() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let s = new_session(&d, dir.path()).await;
+        idle(&d, s.id).await;
+        // A call waiting on its answer is told to go on at once.
+        let asking = {
+            let d = d.clone();
+            tokio::spawn(async move {
+                d.line_call(
+                    s.id,
+                    "ask",
+                    &json!({"to": "you", "text": "Which branch?", "wait_seconds": 60}),
+                    Some(Duration::from_secs(20)),
+                )
+                .await
+            })
+        };
+        until(|| d.line_needs().len() == 1).await;
+        let ask: Uuid = d.line_needs()[0].id["line:".len()..].parse().unwrap();
+        let set = d.line_dismiss(ask).await.unwrap();
+        assert_eq!(set.asked, Some(Asked::Dismissed));
+        let result = tokio::time::timeout(Duration::from_secs(5), asking)
+            .await
+            .expect("woken")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            result["pending"],
+            "The person dismissed this question; carry on with your best judgement and say what you chose."
+        );
+        assert_eq!(result["more"], false);
+        assert!(d.line_needs().is_empty());
+        assert!(
+            d.0.store
+                .line_inbox(&s.id.to_string())
+                .await
+                .unwrap()
+                .is_empty(),
+            "nothing sent"
+        );
+        assert_eq!(row(&d, ask).await.asked, Some(Asked::Dismissed));
+        assert!(matches!(
+            d.line_dismiss(ask).await,
+            Err(LineError::Refused(Refusal::SetAside))
+        ));
+        assert!(matches!(
+            d.line_answer(ask, Sender::Person, "main".into()).await,
+            Err(LineError::Refused(Refusal::SetAside))
+        ));
+        // One the session went ahead on is set aside too; an answered one
+        // isn't.
+        let r = d
+            .line_call(
+                s.id,
+                "ask",
+                &json!({"to": "you", "text": "Tests too?", "wait_seconds": 0}),
+                None,
+            )
+            .await
+            .unwrap();
+        let went: Uuid = serde_json::from_value(r["id"].clone()).unwrap();
+        assert_eq!(
+            d.line_dismiss(went).await.unwrap().asked,
+            Some(Asked::Dismissed)
+        );
+        let answered = waiting_ask(&d, s.id, "Lint too?").await;
+        d.line_answer(answered, Sender::Person, "Yes".into())
+            .await
+            .unwrap();
+        assert!(matches!(
+            d.line_dismiss(answered).await,
+            Err(LineError::Refused(Refusal::Answered))
+        ));
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn setting_a_question_aside_over_http_takes_it_off_what_needs_you() {
+    use tower::ServiceExt;
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let s = new_session(&d, dir.path()).await;
+        idle(&d, s.id).await;
+        let ask = waiting_ask(&d, s.id, "Which branch?").await;
+        let post = |auth| {
+            let app = crate::api::sessions_router(d.clone(), auth);
+            async move {
+                let req = axum::http::Request::post(format!("/api/desk/line/{ask}/dismiss"))
+                    .body(axum::body::Body::empty())
+                    .unwrap();
+                let res = app.oneshot(req).await.unwrap();
+                let status = res.status();
+                let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                (
+                    status,
+                    serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null),
+                )
+            }
+        };
+        let (status, _) = post(crate::testing::deny_all()).await;
+        assert_eq!(status, axum::http::StatusCode::UNAUTHORIZED);
+        assert_eq!(d.line_needs().len(), 1);
+        let (status, body) = post(crate::testing::allow_all()).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(body["asked"], "dismissed");
+        assert!(d.line_needs().is_empty());
+        let (status, body) = post(crate::testing::allow_all()).await;
+        assert_eq!(status, axum::http::StatusCode::CONFLICT);
+        assert_eq!(body["error"], "The person set that question aside.");
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn what_a_session_goes_ahead_with_is_kept_and_listed_with_what_it_went_ahead_without() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let s = new_session(&d, dir.path()).await;
+        idle(&d, s.id).await;
+        let r = d
+            .line_call(
+                s.id,
+                "ask",
+                &json!({"to": "you", "text": "Keep the old table?", "default": " keep it\x1b[2J ", "wait_seconds": 0}),
+                None,
+            )
+            .await
+            .unwrap();
+        let ask: Uuid = serde_json::from_value(r["id"].clone()).unwrap();
+        let q = row(&d, ask).await;
+        assert_eq!(q.chose.as_deref(), Some("keep it[2J"), "kept, cleaned");
+        assert_eq!(q.asked, Some(Asked::Lapsed));
+        let went = d.line_went_ahead_list();
+        assert_eq!(went.len(), 1);
+        assert_eq!(went[0].id, format!("line:{ask}"));
+        assert_eq!(went[0].ask, "Keep the old table?");
+        assert_eq!(went[0].chose.as_deref(), Some("keep it[2J"));
+        assert_eq!(went[0].who.id, s.id.to_string());
+        let json = serde_json::to_value(&went[0]).unwrap();
+        assert!(json.get("askedAt").is_some() && json.get("wentAheadAt").is_some());
+        d.line_dismiss(ask).await.unwrap();
+        assert!(d.line_went_ahead_list().is_empty(), "dismissed: gone");
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn the_persons_draft_goes_in_its_prompt_unsent_and_holds_what_desk_would_type_in() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let s = new_session(&d, dir.path()).await;
+        idle(&d, s.id).await;
+        assert!(!d.typed_since_idle(s.id));
+        d.line_draft(s.id, "About your questions:\n- one\r\x1b[201~\r")
+            .unwrap();
+        assert!(d.typed_since_idle(s.id), "the pump waits for them");
+        assert!(matches!(
+            d.line_draft(s.id, "  "),
+            Err(DeskError::Invalid(_))
+        ));
+        d.change(s.id, |r, _| r.state = SessionState::Blocked);
+        assert!(matches!(
+            d.line_draft(s.id, "About your questions:"),
+            Err(DeskError::Conflict(_))
+        ));
+    })
+    .await;
+}
+
+#[test]
+fn a_draft_is_one_paste_with_no_enter() {
+    let bytes = draft_bytes("About it:\n- one\r\x1b[201~\r/clear\r");
+    assert_eq!(
+        bytes,
+        b"\x1b[200~About it:\n- one[201~/clear\x1b[201~".to_vec()
+    );
+    assert!(!bytes.contains(&b'\r'));
+}
+
 #[test]
 fn a_line_kind_reads_back() {
     for k in [LineKind::Ask, LineKind::Tell, LineKind::Answer] {
         assert_eq!(LineKind::parse(k.as_str()).unwrap(), k);
     }
+    for a in [Asked::Lapsed, Asked::Dismissed] {
+        assert_eq!(Asked::parse(a.as_str()).unwrap(), a);
+    }
+    assert_eq!(serde_json::to_value(Asked::Lapsed).unwrap(), "lapsed");
 }

@@ -539,6 +539,21 @@ pub struct Need {
     pub answer: Answer,
 }
 
+/// A question to the person its session went ahead without, waiting
+/// to be answered late or set aside.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WentAhead {
+    pub id: String,
+    pub who: Who,
+    pub ask: String,
+    /// What the session said it would go ahead with.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chose: Option<String>,
+    pub asked_at: DateTime<Utc>,
+    pub went_ahead_at: DateTime<Utc>,
+}
+
 /// A turn running, or one that finished.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -605,6 +620,10 @@ pub struct More {
 pub struct FloorView {
     pub as_of: DateTime<Utc>,
     pub needs: Vec<Need>,
+    /// Questions their sessions went ahead without: they no longer need
+    /// the person, who may still look at them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub went_ahead: Vec<WentAhead>,
     pub working: Vec<Work>,
     pub done: Vec<Work>,
     pub lanes: Vec<Lane>,
@@ -901,6 +920,7 @@ pub fn view(
     FloorView {
         as_of: now,
         needs,
+        went_ahead: Vec::new(),
         working,
         done: done.into_iter().take(DONE_CAP).collect(),
         lanes: lanes.into_iter().take(LANE_CAP).collect(),

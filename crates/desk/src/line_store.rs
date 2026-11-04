@@ -13,7 +13,12 @@ use crate::line::{Asked, Delivery, LineKind, LineMessage};
 use crate::store::DeskStore;
 
 const COLUMNS: &str = "id, at, sender, recipient, kind, text, in_reply_to, hop, delivery, \
-    asked, escalation, group_id, delivered_at, updated_at";
+    asked, escalation, group_id, delivered_at, updated_at, chose";
+
+/// A question waiting on the person: asked of them, or given to them by
+/// the overseer (as [`crate::service`]'s `needs_you` reads a row).
+const WAITS_ON_YOU: &str =
+    "(asked = 'escalated' OR (asked = 'open' AND recipient ->> 'kind' = 'you'))";
 
 fn message(row: &Row) -> Result<LineMessage> {
     let party = |c: &str| -> Result<Party> { Ok(serde_json::from_value(row.try_get(c)?)?) };
@@ -34,6 +39,7 @@ fn message(row: &Row) -> Result<LineMessage> {
         escalation: row
             .try_get::<_, Option<serde_json::Value>>("escalation")?
             .and_then(|v| serde_json::from_value(v).ok()),
+        chose: row.try_get("chose")?,
         group: row.try_get("group_id")?,
         delivered_at: row.try_get("delivered_at")?,
         updated_at: row.try_get("updated_at")?,
@@ -57,7 +63,7 @@ impl DeskStore {
             .execute(
                 &format!(
                     "INSERT INTO line_messages ({COLUMNS}) \
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15) \
                      ON CONFLICT (id) DO UPDATE SET recipient = EXCLUDED.recipient, \
                      text = EXCLUDED.text, delivery = EXCLUDED.delivery, \
                      asked = EXCLUDED.asked, escalation = EXCLUDED.escalation, \
@@ -81,6 +87,7 @@ impl DeskStore {
                     &m.group,
                     &m.delivered_at,
                     &m.updated_at,
+                    &m.chose,
                 ],
             )
             .await?;
@@ -302,7 +309,8 @@ impl DeskStore {
             .collect()
     }
 
-    /// Questions still waiting on an answer: asked of `recipient` (a
+    /// Questions still waiting on an answer, and the ones their session
+    /// went ahead without (still answerable): asked of `recipient` (a
     /// party's id) when given, else all.
     pub async fn line_open_asks(&self, recipient: Option<&str>) -> Result<Vec<LineMessage>> {
         let client = self.pool().get().await?;
@@ -310,7 +318,7 @@ impl DeskStore {
             .query(
                 &format!(
                     "SELECT {COLUMNS} FROM line_messages \
-                     WHERE kind = 'ask' AND asked IN ('open', 'escalated') \
+                     WHERE kind = 'ask' AND asked IN ('open', 'escalated', 'lapsed') \
                      AND ($1::text IS NULL OR recipient ->> 'id' = $1) ORDER BY at"
                 ),
                 &[&recipient],
@@ -319,6 +327,69 @@ impl DeskStore {
             .iter()
             .map(message)
             .collect()
+    }
+
+    /// The asker stopped waiting for the answer to `ask` and went on
+    /// without it. With `on_you`, only a question waiting on the person
+    /// moves (asked of them, or given to them); else any still open. One
+    /// statement, so an answer or a dismissal that came first stands. The
+    /// row as it now is, or `None` when it didn't move.
+    pub async fn line_went_ahead(&self, ask: Uuid, on_you: bool) -> Result<Option<LineMessage>> {
+        let client = self.pool().get().await?;
+        let which = match on_you {
+            true => WAITS_ON_YOU,
+            false => "asked IN ('open', 'escalated')",
+        };
+        client
+            .query_opt(
+                &format!(
+                    "UPDATE line_messages SET asked = 'lapsed', updated_at = now() \
+                     WHERE id = $1 AND kind = 'ask' AND {which} RETURNING {COLUMNS}"
+                ),
+                &[&ask],
+            )
+            .await?
+            .as_ref()
+            .map(message)
+            .transpose()
+    }
+
+    /// The questions sessions asked before `before` that still wait on the
+    /// person: no `ask` call can be waiting on them any more.
+    pub async fn line_stale_asks(&self, before: DateTime<Utc>) -> Result<Vec<LineMessage>> {
+        let client = self.pool().get().await?;
+        client
+            .query(
+                &format!(
+                    "SELECT {COLUMNS} FROM line_messages WHERE kind = 'ask' \
+                     AND sender ->> 'kind' = 'session' AND at < $1 AND {WAITS_ON_YOU} ORDER BY at"
+                ),
+                &[&before],
+            )
+            .await?
+            .iter()
+            .map(message)
+            .collect()
+    }
+
+    /// The person sets `ask` aside unanswered: one waiting on them, or one
+    /// its session went ahead without. The row as it now is, or `None`
+    /// when it wasn't theirs to set aside (answered first, among others).
+    pub async fn line_dismiss(&self, ask: Uuid) -> Result<Option<LineMessage>> {
+        let client = self.pool().get().await?;
+        client
+            .query_opt(
+                &format!(
+                    "UPDATE line_messages SET asked = 'dismissed', updated_at = now() \
+                     WHERE id = $1 AND kind = 'ask' \
+                     AND ({WAITS_ON_YOU} OR asked = 'lapsed') RETURNING {COLUMNS}"
+                ),
+                &[&ask],
+            )
+            .await?
+            .as_ref()
+            .map(message)
+            .transpose()
     }
 
     /// Answers `ask` with `answer`, in one transaction: the first answer
@@ -342,13 +413,17 @@ impl DeskStore {
             return Ok(Err(NotAnswered::NoSuchAsk));
         };
         let mut asked = message(&row)?;
-        if !matches!(asked.asked, Some(Asked::Open | Asked::Escalated)) {
+        // One the session went ahead without is still answered: late.
+        if !matches!(
+            asked.asked,
+            Some(Asked::Open | Asked::Escalated | Asked::Lapsed)
+        ) {
             return Ok(Err(NotAnswered::Already));
         }
         tx.execute(
             &format!(
                 "INSERT INTO line_messages ({COLUMNS}) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)"
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)"
             ),
             &[
                 &answer.id,
@@ -369,6 +444,7 @@ impl DeskStore {
                 &answer.group,
                 &answer.delivered_at,
                 &answer.updated_at,
+                &answer.chose,
             ],
         )
         .await?;

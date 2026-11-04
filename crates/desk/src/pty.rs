@@ -271,6 +271,15 @@ impl Pty {
         self.io.write(input)
     }
 
+    /// The person's words were put in its prompt for them (not sent): it
+    /// holds what Desk would type in, as their own typing does.
+    pub fn person_typed(&self) {
+        self.typed.store(
+            chrono::Utc::now().timestamp_millis(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
     /// When the person last typed in it, if they have since it started.
     pub fn typed_at(&self) -> Option<chrono::DateTime<chrono::Utc>> {
         match self.typed.load(std::sync::atomic::Ordering::Relaxed) {
