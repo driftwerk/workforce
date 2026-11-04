@@ -44,6 +44,12 @@ text_enum!(Asked {
     Answered => "answered",
     // The asker was forgotten, or the one asked has ended.
     Withdrawn => "withdrawn",
+    // The session stopped waiting for the person's answer and went on
+    // without it. It no longer needs them; they may still answer, and
+    // their answer reaches it as a message.
+    Lapsed => "lapsed",
+    // The person set it aside unanswered: nothing was sent to the session.
+    Dismissed => "dismissed",
 });
 
 text_enum!(Reach {
@@ -107,6 +113,10 @@ pub struct LineMessage {
     pub delivery: Delivery,
     pub asked: Option<Asked>,
     pub escalation: Option<Escalation>,
+    /// An ask's: what its session said it goes ahead with if no answer
+    /// comes in time.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chose: Option<String>,
     /// The sender's sidebar group when it was sent.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
@@ -133,6 +143,7 @@ impl LineMessage {
             hop,
             delivery: Delivery::Queued,
             escalation: None,
+            chose: None,
             group: None,
             delivered_at: None,
             updated_at: at,
@@ -182,6 +193,8 @@ pub enum Send {
         to: Target,
         text: String,
         wait: Duration,
+        /// What it goes ahead with if no answer comes in time.
+        chose: Option<String>,
     },
     Tell {
         to: Target,
@@ -209,6 +222,12 @@ pub enum Refusal {
     NoSuchAsk(Uuid),
     #[error("Already answered: the first answer to that question stands.")]
     Answered,
+    #[error("It went ahead without an answer, so this no longer waits on the person; they can still answer it from its thread.")]
+    WentAhead,
+    #[error("The person set that question aside.")]
+    SetAside,
+    #[error("That question isn't waiting on you.")]
+    NotWaitingOnYou,
     #[error("{0} can't take a message in the middle of its turn; send it to wait for the turn's end instead.")]
     NoSteer(String),
     #[error("Only the person can send a message into a running turn.")]
@@ -444,9 +463,12 @@ pub fn label_of(p: &Party, hop: i16) -> String {
 }
 
 /// The text a session reads for `msg`; `question` is the ask an answer
-/// answers. The person's own words go in as they wrote them. Anyone else's
-/// carry the marker and say who they are from: they are data, never the
-/// person's say-so.
+/// answers. An answer is only ever typed in late: one that comes while the
+/// `ask` call waits is the call's result instead. So an answer quotes the
+/// question's first line and says the session went ahead without it, for
+/// a session that has long moved on. The person's own words go in as they
+/// wrote them. Anyone else's carry the marker and say who they are from:
+/// they are data, never the person's say-so.
 /// `text` as a terminal may be given it: no control characters but line
 /// breaks and tabs. A message is typed in as a bracketed paste, and one
 /// carrying ESC (or CR) could end the paste and type keys, a slash command
@@ -467,7 +489,7 @@ fn render_raw(msg: &LineMessage, question: Option<&str>) -> String {
     if msg.from.kind == PartyKind::You {
         return match (msg.kind, question) {
             (LineKind::Answer, Some(q)) => format!(
-                "You asked me “{}”. {}",
+                "Earlier you asked me “{}” and went ahead without my answer. My answer: {}",
                 crate::crew::one_line(q, 160),
                 msg.text
             ),
@@ -479,7 +501,7 @@ fn render_raw(msg: &LineMessage, question: Option<&str>) -> String {
     match msg.kind {
         LineKind::Answer => match question {
             Some(q) => format!(
-                "{mark} {who} answers your question “{}”: {}",
+                "{mark} {who} answers your earlier question “{}” (you went ahead without an answer): {}",
                 crate::crew::one_line(q, 160),
                 msg.text
             ),
@@ -525,7 +547,8 @@ pub static TOOLS: [LineTool; 5] = [
                 "properties": {
                     "to": { "type": "string", "description": "\"desk\", \"you\", or a session's name or id from peers" },
                     "text": { "type": "string", "description": "The question" },
-                    "wait_seconds": { "type": "integer", "minimum": 0, "maximum": 300, "description": "How long to wait for the answer (default 120). If it doesn't come in time, it reaches you later as a message." }
+                    "default": { "type": "string", "description": "What you will go ahead with if no answer comes in time, in a few words. The person sees it beside your question." },
+                    "wait_seconds": { "type": "integer", "minimum": 0, "maximum": 300, "description": "How long to wait for the answer (default 120). If it doesn't come in time, go on with your own judgement: the question stops waiting on anyone, and an answer given later reaches you as a message quoting it." }
                 },
                 "required": ["to", "text"]
             })
@@ -578,6 +601,7 @@ pub enum Call {
         to: String,
         text: String,
         wait: Duration,
+        chose: Option<String>,
     },
     Tell {
         to: String,
@@ -610,6 +634,7 @@ pub fn call_of(name: &str, input: &Value) -> Result<Call, String> {
                 .get("wait_seconds")
                 .and_then(Value::as_u64)
                 .map_or(ASK_WAIT, |s| Duration::from_secs(s).min(ASK_WAIT_MAX)),
+            chose: s("default"),
         },
         "tell" => Call::Tell {
             to: need("to", "whom it is to")?,
@@ -896,7 +921,7 @@ mod tests {
         );
         let text = render(&answer, Some("Which port does the test database use?"));
         assert!(text.starts_with(&marker(answer.id)));
-        assert!(text.contains("Sarah, the person's overseer on Desk answers your question “Which port does the test database use?”: 5433."));
+        assert!(text.contains("Sarah, the person's overseer on Desk answers your earlier question “Which port does the test database use?” (you went ahead without an answer): 5433."));
         let mark = is_delivery(&format!("The desk plugin sent a message: {text}")).unwrap();
         assert!(marks(&mark, answer.id));
         assert!(!marks(&mark, Uuid::new_v4()));
@@ -916,8 +941,8 @@ mod tests {
         answer.from = Party::you();
         assert_eq!(render(&answer, None), answer.text);
         assert_eq!(
-            render(&answer, Some("Which port?")),
-            "You asked me “Which port?”. 5433. 5432 is the person's own Postgres."
+            render(&answer, Some("Which port?\nThe tests fail on 5432.")),
+            "Earlier you asked me “Which port?” and went ahead without my answer. My answer: 5433. 5432 is the person's own Postgres."
         );
         tell.from = Party::you();
         assert_eq!(is_delivery(&render(&tell, None)), None);
@@ -956,7 +981,8 @@ mod tests {
             Ok(Call::Ask {
                 to: "desk".into(),
                 text: "port?".into(),
-                wait: ASK_WAIT
+                wait: ASK_WAIT,
+                chose: None,
             })
         );
         assert_eq!(
@@ -967,7 +993,8 @@ mod tests {
             Ok(Call::Ask {
                 to: "desk".into(),
                 text: "port?".into(),
-                wait: ASK_WAIT_MAX
+                wait: ASK_WAIT_MAX,
+                chose: None,
             })
         );
         assert_eq!(

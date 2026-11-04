@@ -474,6 +474,15 @@ fn line_needs(sources: &Sources, caller: &FloorCaller) -> Vec<Need> {
     }
 }
 
+/// The questions sessions asked the person who holds the Desk on its
+/// lines, and went ahead without.
+fn line_went_ahead(sources: &Sources, caller: &FloorCaller) -> Vec<floor::WentAhead> {
+    match (sources.desk)() {
+        Some(desk) if caller.personal => desk.line_went_ahead_list(),
+        _ => Vec::new(),
+    }
+}
+
 /// What still needs the person: what their turns wait on and ask, the
 /// routed approvals waiting on them, their agents' settings changed
 /// outside the hub, and their sessions' questions on Desk's lines. The one
@@ -599,6 +608,7 @@ async fn floor_view(State(r): S, headers: HeaderMap, Query(q): Query<FloorQuery>
             floor::Gists::new()
         });
         let mut view = floor::view(&turns, needs, &gists, day, now);
+        view.went_ahead = line_went_ahead(&sources, &caller);
         let happening = floor::happening(&view, now);
         view.summary = sources.floor.gists.summary(&scope, happening, now).await;
         eyre::Ok(view)

@@ -71,7 +71,7 @@ pub(crate) fn settle(reply: Result<&str, ()>, still_open: usize) -> Vec<Settle> 
 /// if it does.
 pub(crate) fn straight_to_person(o: &Oversight, hop: i16) -> Option<&'static str> {
     if o.level == Level::Watch {
-        return Some("You asked Desk only to watch.");
+        return Some("Desk only watches, so this came to you.");
     }
     if !o.wake.on_message {
         return Some("Desk is set to give you sessions' questions.");
@@ -359,7 +359,7 @@ impl CrewHub {
                                 .escalate(
                                     ask.id,
                                     &by,
-                                    "You asked Desk only to watch.",
+                                    "Desk only watches, so this came to you.",
                                     Vec::new(),
                                     None,
                                 )
@@ -650,7 +650,7 @@ mod tests {
         o.level = Level::Watch;
         assert_eq!(
             straight_to_person(&o, 1),
-            Some("You asked Desk only to watch.")
+            Some("Desk only watches, so this came to you.")
         );
     }
 

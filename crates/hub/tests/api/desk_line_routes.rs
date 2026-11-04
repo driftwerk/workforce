@@ -52,6 +52,11 @@ async fn a_hub_without_desk_serves_no_line_routes() {
         ),
         (reqwest::Method::PATCH, format!("/api/desk/line/{id}")),
         (reqwest::Method::POST, format!("/api/desk/line/{id}/answer")),
+        (reqwest::Method::POST, format!("/api/desk/line/{id}/dismiss")),
+        (
+            reqwest::Method::POST,
+            format!("/api/desk/sessions/{id}/draft"),
+        ),
     ] {
         let status = client
             .request(method.clone(), format!("http://{addr}{path}"))

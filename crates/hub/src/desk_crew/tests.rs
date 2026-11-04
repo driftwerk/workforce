@@ -2627,8 +2627,9 @@ async fn the_overseer_answers_a_sessions_routine_question_and_gives_the_person_t
             .line_call(
                 s.id,
                 "ask",
-                &json!({"to": "desk", "text": "May I push to main?", "wait_seconds": 0}),
-                None,
+                &json!({"to": "desk", "text": "May I push to main?", "wait_seconds": 60}),
+                // Its call still waits, as between the plugin's polls.
+                Some(std::time::Duration::from_millis(10)),
             )
             .await
             .unwrap();
@@ -2683,8 +2684,9 @@ async fn watching_only_a_sessions_question_goes_straight_to_the_person() {
             .line_call(
                 s.id,
                 "ask",
-                &json!({"to": "desk", "text": "Which port?", "wait_seconds": 0}),
-                None,
+                &json!({"to": "desk", "text": "Which port?", "wait_seconds": 60}),
+                // Its call still waits, as between the plugin's polls.
+                Some(std::time::Duration::from_millis(10)),
             )
             .await
             .unwrap();
@@ -2699,7 +2701,7 @@ async fn watching_only_a_sessions_question_goes_straight_to_the_person() {
         .await;
         assert_eq!(
             given.escalation.unwrap().why,
-            "You asked Desk only to watch."
+            "Desk only watches, so this came to you."
         );
         let channel = super::line::line_channel(s.id);
         assert!(

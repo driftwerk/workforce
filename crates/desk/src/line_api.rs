@@ -2,7 +2,8 @@
 //! per-launch token is the credential: the routes Desk's Claude Code
 //! plugin uses (`/line/…`) and the MCP endpoint other engines use
 //! (`/mcp/…`). On the API, for the person: a session's thread, the
-//! composer, editing what hasn't gone out, and answering.
+//! composer, editing what hasn't gone out, answering, and setting a
+//! question aside.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -313,11 +314,37 @@ async fn answer(
         .into_response()
 }
 
+/// The person sets a question aside unanswered: it leaves what needs
+/// them, and nothing is sent to the session.
+async fn dismiss(
+    State(s): S,
+    h: HeaderMap,
+    Query(q): Query<TokenQuery>,
+    Path(id): Path<Uuid>,
+) -> Response {
+    guarded!(s, h, q.token.as_deref());
+    s.desk.line_dismiss(id).await.map(Json).into_response()
+}
+
+/// The person's words put in a session's prompt without sending them.
+async fn draft(
+    State(s): S,
+    h: HeaderMap,
+    Query(q): Query<TokenQuery>,
+    Path(id): Path<Uuid>,
+    Json(b): Json<TextBody>,
+) -> Response {
+    guarded!(s, h, q.token.as_deref());
+    s.desk.line_draft(id, &b.text).map(Json).into_response()
+}
+
 /// The person's line routes.
 pub(crate) fn api_routes(desk: Desk, auth: Arc<dyn Authorize>) -> Router {
     Router::new()
         .route("/api/desk/sessions/{id}/line", get(thread).post(post_line))
+        .route("/api/desk/sessions/{id}/draft", post(draft))
         .route("/api/desk/line/{id}", patch(edit).delete(take_back))
         .route("/api/desk/line/{id}/answer", post(answer))
+        .route("/api/desk/line/{id}/dismiss", post(dismiss))
         .with_state(Arc::new(Api { desk, auth }))
 }
