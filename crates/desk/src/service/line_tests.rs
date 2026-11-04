@@ -672,6 +672,190 @@ async fn a_codex_session_gets_messages_typed_in_at_idle_while_the_person_isnt_ty
     .await;
 }
 
+/// A Codex session at work, its app-server a stand-in this end speaks for:
+/// with a turn running when `turn` says so.
+async fn codex_working(
+    pool: workforce_postgres::PostgresPool,
+    dir: &Path,
+    turn: bool,
+) -> (
+    Desk,
+    Uuid,
+    tokio_tungstenite::WebSocketStream<tokio::net::UnixStream>,
+) {
+    use crate::codex::tests::{next_sent, say};
+    DeskStore::migrate(&pool).await.unwrap();
+    let d = Desk::start(
+        DeskStore::from_pool(pool),
+        options(dir).with_program(Engine::Codex, fake_codex(dir)),
+        Default::default(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    let server = serve(dir);
+    let s = d
+        .create(
+            NewSession {
+                engine: Engine::Codex,
+                view: None,
+                name: "acme-api".into(),
+                cwd: dir.to_string_lossy().into_owned(),
+                goal: String::new(),
+                worktree: None,
+                prompt: None,
+                approvals: None,
+                approve_for_me: false,
+                account: None,
+                env: Default::default(),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    let mut ws = server.await.unwrap();
+    next_sent(&mut ws, |v| v["method"] == "initialize").await;
+    say(
+        &mut ws,
+        json!({"method": "thread/started", "params": {"thread": {"id": "t1", "ephemeral": false}}}),
+    )
+    .await;
+    say(&mut ws, json!({"method": "thread/status/changed", "params": {"threadId": "t1", "status": {"type": "active", "activeFlags": []}}})).await;
+    if turn {
+        say(
+            &mut ws,
+            json!({"method": "turn/started", "params": {"threadId": "t1", "turn": {"id": "u1"}}}),
+        )
+        .await;
+    }
+    until(|| d.view(s.id).unwrap().state == SessionState::Working).await;
+    (d, s.id, ws)
+}
+
+#[tokio::test]
+async fn two_send_nows_in_one_codex_turn_each_come_back_when_refused() {
+    use crate::codex::tests::{next_sent, say};
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (d, id, mut ws) = codex_working(pool, dir.path(), true).await;
+        let first = d
+            .line_post(id, "skip the slow tests".into(), When::Now)
+            .await
+            .unwrap();
+        next_sent(&mut ws, |v| v["method"] == "turn/steer").await;
+        let second = d
+            .line_post(id, "then the linter".into(), When::Now)
+            .await
+            .unwrap();
+        next_sent(&mut ws, |v| v["method"] == "turn/steer").await;
+        assert_eq!(row(&d, first.id).await.delivery, Delivery::Delivered);
+        assert_eq!(row(&d, second.id).await.delivery, Delivery::Delivered);
+        // The turn had ended: Codex refuses both, in the order it got them.
+        let refused = json!({"id": 5, "error": {"code": -32600, "message": "no active turn"}});
+        say(&mut ws, refused.clone()).await;
+        say(&mut ws, refused).await;
+        for m in [first.id, second.id] {
+            until_async(|| {
+                let d = d.clone();
+                async move { row(&d, m).await.delivery == Delivery::Queued }
+            })
+            .await;
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_send_now_refused_at_once_is_queued_and_never_marked_said() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        // Working, but no turn to steer yet: refused before it is sent.
+        let (d, id, _ws) = codex_working(pool, dir.path(), false).await;
+        let m = d
+            .line_post(id, "skip the slow tests".into(), When::Now)
+            .await
+            .unwrap();
+        until_async(|| {
+            let d = d.clone();
+            async move { row(&d, m.id).await.delivery == Delivery::Queued }
+        })
+        .await;
+        // It stays queued: nothing marks it said after the fact.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let back = row(&d, m.id).await;
+        assert_eq!((back.delivery, back.delivered_at), (Delivery::Queued, None));
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_refusal_puts_back_only_the_message_it_names() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (d, id, _ws) = codex_working(pool, dir.path(), true).await;
+        let said = d
+            .line_post(id, "skip the slow tests".into(), When::Now)
+            .await
+            .unwrap();
+        let other = d
+            .line_post(id, "then the linter".into(), When::Queue)
+            .await
+            .unwrap();
+        d.line_steer_refused(id, other.id).await;
+        assert_eq!(row(&d, said.id).await.delivery, Delivery::Delivered);
+        assert_eq!(row(&d, other.id).await.delivery, Delivery::Queued);
+        d.line_steer_refused(id, said.id).await;
+        assert_eq!(row(&d, said.id).await.delivery, Delivery::Queued);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_prompt_typed_in_is_cleaned_and_a_line_delivery_notes_once() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let s = new_session(&d, dir.path()).await;
+        d.prompt(s.id, "hi\x1b[201~\r/clear", None).unwrap();
+        until(|| {
+            d.terminal_text(s.id, 2000)
+                .unwrap()
+                .contains("hi[201~/clear")
+        })
+        .await;
+        assert!(
+            d.prompt(s.id, "\x1b\r", None).is_err(),
+            "nothing typable is empty"
+        );
+
+        hook(
+            &d,
+            s.id,
+            json!({"hook_event_name": "UserPromptSubmit", "prompt": "build it"}),
+        )
+        .await;
+        let mut events = d.0.events.subscribe();
+        d.line_post(s.id, "use the staging DB".into(), When::Now)
+            .await
+            .unwrap();
+        let mut notes = Vec::new();
+        while let Ok(e) = events.try_recv() {
+            if let DeskEvent::Activity { event } = e {
+                notes.push(event.kind);
+            }
+        }
+        assert_eq!(
+            notes
+                .iter()
+                .filter(|k| **k == crate::crew::Kind::Nudged)
+                .count(),
+            0,
+            "{notes:?}"
+        );
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn a_claude_session_without_desks_plugin_is_typed_into_at_its_prompt() {
     with_test_pool(build_pool, |pool| async move {

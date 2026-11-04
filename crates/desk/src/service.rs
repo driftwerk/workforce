@@ -309,8 +309,8 @@ struct CodexLink {
     replies: mpsc::UnboundedSender<codex::Reply>,
     /// What its breaker says into its running turn, to its observer.
     steers: mpsc::UnboundedSender<String>,
-    /// The person's line messages said into its running turn.
-    line_steers: mpsc::UnboundedSender<String>,
+    /// The person's line messages (row and text) said into its running turn.
+    line_steers: mpsc::UnboundedSender<(Uuid, String)>,
 }
 
 impl CodexLink {
@@ -2484,17 +2484,7 @@ impl Desk {
     /// person at the keyboard would (bracketed paste, so newlines stay in
     /// the prompt).
     pub fn prompt(&self, id: Uuid, text: &str, by: Option<By>) -> Result<SessionView, DeskError> {
-        if text.trim().is_empty() {
-            return Err(DeskError::Invalid("the prompt is empty".into()));
-        }
-        self.breaker_refuses_prompt(id, by.as_ref())?;
-        let pty = self.attach(id)?;
-        self.breaker_typed(id, text, by.as_ref());
-        let mut input = b"\x1b[200~".to_vec();
-        input.extend_from_slice(text.as_bytes());
-        input.extend_from_slice(b"\x1b[201~\r");
-        pty.write(&input)?;
-        let view = self.view(id)?;
+        let view = self.type_prompt(id, text, by.as_ref())?;
         if let Some(by) = by {
             self.note(by.event(
                 Kind::Nudged,
@@ -2503,6 +2493,29 @@ impl Desk {
             ));
         }
         Ok(view)
+    }
+
+    /// [`Self::prompt`] without the Activity note, for a line delivery that
+    /// has its own. The text goes in without its control characters: one
+    /// carrying ESC could end the paste and type keys into the terminal.
+    pub(super) fn type_prompt(
+        &self,
+        id: Uuid,
+        text: &str,
+        by: Option<&By>,
+    ) -> Result<SessionView, DeskError> {
+        let text = crate::line::typable(text);
+        if text.trim().is_empty() {
+            return Err(DeskError::Invalid("the prompt is empty".into()));
+        }
+        self.breaker_refuses_prompt(id, by)?;
+        let pty = self.attach(id)?;
+        self.breaker_typed(id, &text, by);
+        let mut input = b"\x1b[200~".to_vec();
+        input.extend_from_slice(text.as_bytes());
+        input.extend_from_slice(b"\x1b[201~\r");
+        pty.write(&input)?;
+        self.view(id)
     }
 
     /// Ends the turn a running session is working on, as Esc in its terminal
@@ -3760,8 +3773,8 @@ impl Desk {
                 self.spend_live(id, spend);
                 continue;
             }
-            if let CodexEvent::SteerRefused(said) = &event {
-                self.line_steer_refused(id, said).await;
+            if let CodexEvent::SteerRefused(row) = &event {
+                self.line_steer_refused(id, *row).await;
                 continue;
             }
             // A line message Desk typed in is not the person speaking; whose
