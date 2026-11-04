@@ -36,6 +36,7 @@ use workforce_core::computer::{
 };
 
 use super::asks::{always_asks, Asks, Place};
+use super::boss::fold;
 
 /// What a namespace's tools touch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -202,21 +203,32 @@ pub fn shown(path: &Path, home: &Path) -> String {
     }
 }
 
+/// Whether `path` lies under `root`, compared as a case-insensitive disk
+/// (APFS) compares names ([`fold`]).
+fn under(path: &Path, root: &Path) -> bool {
+    fold(path).starts_with(fold(root))
+}
+
 impl AgentPolicy {
     fn inside(&self, path: &Path) -> bool {
-        self.own.iter().any(|root| path.starts_with(root))
+        self.own.iter().any(|root| under(path, root))
+    }
+
+    /// Inside the own folder or scratch space, for a delete; never a
+    /// scratch root itself.
+    fn deletable(&self, path: &Path) -> bool {
+        self.inside(path)
+            || self
+                .scratch
+                .iter()
+                .any(|t| under(path, t) && fold(path) != fold(t))
     }
 
     /// Whether `path` is kept from the agent; `change` when the call would
     /// change it.
-    /// Inside the own folder or scratch space, for a delete.
-    fn deletable(&self, path: &Path) -> bool {
-        self.inside(path) || self.scratch.iter().any(|t| path.starts_with(t))
-    }
-
     fn withheld(&self, path: &Path, change: bool) -> bool {
-        (change && self.config.iter().any(|c| path.starts_with(c)))
-            || (self.withheld.iter().any(|w| path.starts_with(w)) && !self.inside(path))
+        (change && self.config.iter().any(|c| under(path, c)))
+            || (self.withheld.iter().any(|w| under(path, w)) && !self.inside(path))
     }
 
     fn shown(&self, path: &Path) -> String {

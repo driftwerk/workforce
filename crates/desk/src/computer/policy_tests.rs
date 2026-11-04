@@ -1007,3 +1007,22 @@ fn paths_are_shown_under_home_with_a_tilde() {
     assert_eq!(shown(Path::new("/Users/sarah/dev"), home), "~/dev");
     assert_eq!(shown(Path::new("/etc/hosts"), home), "/etc/hosts");
 }
+
+/// Protected names are compared as a case-insensitive disk compares them:
+/// a different case, a long s or a ligature names the same file.
+#[test]
+fn the_withheld_set_and_config_are_compared_as_the_disk_compares_names() {
+    for effect in [
+        read("/users/SARAH/library/application support/desk/vault.db"),
+        read("/Users/\u{17f}arah/Library/Keychains/login.keychain-db"),
+        write(&format!("{OWN}/CONFIG.TOML")),
+        write(&format!("{OWN}/soul.md")),
+    ] {
+        let v = verdict(&full(), false, &[], &call(effect.clone()));
+        assert_eq!(
+            refused(&v).map(|r| r.0),
+            Some(Refused::Withheld),
+            "{effect:?}"
+        );
+    }
+}
