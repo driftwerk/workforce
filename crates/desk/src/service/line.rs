@@ -224,6 +224,34 @@ impl Desk {
         typed.is_some_and(|t| spoke.is_none_or(|s| t > s))
     }
 
+    /// Rows put back in the queue from a hand-off, told of. A boss's tell to
+    /// a session it no longer runs (let go, or passed to another boss since
+    /// it was handed) is withdrawn instead: it never goes in. A session no
+    /// boss ever ran keeps the overseer's nudges, and so does one while
+    /// Desk can't yet read who runs it (its line holds them meanwhile).
+    pub(super) async fn line_requeued(&self, back: Vec<LineMessage>) {
+        for m in back {
+            let let_go = m.from.kind == PartyKind::Manager
+                && m.kind == LineKind::Tell
+                && self.charges_loaded()
+                && m.to_session()
+                    .and_then(|s| self.charge_of(s))
+                    .is_some_and(|c| !c.live() || c.boss != m.from.id);
+            if !let_go {
+                self.line_announce(&m);
+                continue;
+            }
+            match self.0.store.line_withdraw_queued(m.id).await {
+                Ok(Some(withdrawn)) => self.line_announce(&withdrawn),
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(id = %m.id, error = %e, "couldn't withdraw a boss's message to a session it let go");
+                    self.line_announce(&m);
+                }
+            }
+        }
+    }
+
     /// Records `m` in Activity and tells every window, and what its
     /// sessions' threads are unread by.
     fn line_announce(&self, m: &LineMessage) {
@@ -893,9 +921,8 @@ impl Desk {
                 self.line_delivered_into(caller, &m);
             }
         } else {
-            for m in self.0.store.line_requeue(Some(m.id), Utc::now()).await? {
-                self.line_announce(&m);
-            }
+            let back = self.0.store.line_requeue(Some(m.id), Utc::now()).await?;
+            self.line_requeued(back).await;
         }
         Ok(())
     }
@@ -1028,7 +1055,7 @@ impl Desk {
                 _ = self.0.cancel.cancelled() => return,
                 _ = tick.tick() => {
                     match self.0.store.line_requeue(None, Utc::now() - HANDED_FOR).await {
-                        Ok(back) => back.iter().for_each(|m| self.line_announce(m)),
+                        Ok(back) => self.line_requeued(back).await,
                         Err(e) => tracing::warn!(error = %e, "couldn't requeue stale line hand-offs"),
                     }
                     self.line_pump_pending().await;

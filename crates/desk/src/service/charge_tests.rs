@@ -288,6 +288,91 @@ async fn a_release_withdraws_what_the_boss_said_and_starts_no_turn() {
     .await;
 }
 
+/// A boss's message already handed to Desk's plugin when the person takes
+/// the session back is withdrawn when it comes back to the queue, dropped
+/// by the plugin or stale, never typed into the session they now run
+/// alone; a session no boss ran keeps the overseer's nudge.
+#[tokio::test]
+async fn a_handed_message_that_comes_back_after_a_release_is_withdrawn() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let s = new_session(&d, dir.path()).await;
+        idle(&d, s.id).await;
+        d.take_on(s.id, &sarah(), How::Handed, &HashSet::new(), &By::you())
+            .await
+            .unwrap();
+        let by = By::manager("sarah", "Sarah", "Next.");
+        let send = |text: &str, to: Uuid| {
+            let d = d.clone();
+            let by = by.clone();
+            let text = text.to_string();
+            async move {
+                d.line_send(Sender::Overseer(by), boss_tell(&text, to))
+                    .await
+                    .unwrap()
+            }
+        };
+        let delivery = |id: Uuid| {
+            let d = d.clone();
+            async move { d.0.store.line_message(id).await.unwrap().unwrap().delivery }
+        };
+
+        // Dropped by the plugin after the release.
+        let dropped = send("Run the tests.", s.id).await;
+        let next = d.line_next(s.id, Duration::from_secs(1)).await.unwrap();
+        assert_eq!(next["id"], json!(dropped.id));
+        assert_eq!(delivery(dropped.id).await, Delivery::Handed);
+        d.release(s.id, &By::you()).await.unwrap();
+        assert_eq!(
+            delivery(dropped.id).await,
+            Delivery::Handed,
+            "a release leaves what the plugin has"
+        );
+        d.line_ack(s.id, dropped.id, false).await.unwrap();
+        assert_eq!(delivery(dropped.id).await, Delivery::Withdrawn);
+        assert!(d
+            .line_next(s.id, Duration::from_millis(300))
+            .await
+            .is_none());
+
+        // Stale, after the session passed to another boss.
+        let mia = Party::manager("mia", "Mia");
+        d.take_on(s.id, &sarah(), How::Handed, &HashSet::new(), &By::you())
+            .await
+            .unwrap();
+        let stale = send("Carry on.", s.id).await;
+        let next = d.line_next(s.id, Duration::from_secs(1)).await.unwrap();
+        assert_eq!(next["id"], json!(stale.id));
+        d.take_on(s.id, &mia, How::Handed, &HashSet::new(), &By::you())
+            .await
+            .unwrap();
+        let back =
+            d.0.store
+                .line_requeue(None, Utc::now() + chrono::Duration::seconds(1))
+                .await
+                .unwrap();
+        assert_eq!(back.len(), 1);
+        d.line_requeued(back).await;
+        assert_eq!(delivery(stale.id).await, Delivery::Withdrawn);
+
+        // A session no boss ever ran: the nudge comes back and goes in.
+        let other = new_session(&d, dir.path()).await;
+        idle(&d, other.id).await;
+        let nudge = send("How is it going?", other.id).await;
+        let next = d.line_next(other.id, Duration::from_secs(1)).await.unwrap();
+        assert_eq!(next["id"], json!(nudge.id));
+        d.line_ack(other.id, nudge.id, false).await.unwrap();
+        assert_eq!(delivery(nudge.id).await, Delivery::Queued);
+        let again = take_next(&d, other.id, Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!(again["id"], json!(nudge.id));
+        assert_eq!(delivery(nudge.id).await, Delivery::Delivered);
+    })
+    .await;
+}
+
 /// The person's message goes ahead of a boss's that was waiting for the
 /// same idle.
 #[tokio::test]
