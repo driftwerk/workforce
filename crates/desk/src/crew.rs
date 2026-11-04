@@ -540,6 +540,16 @@ pub trait Crew: Send + Sync {
     fn overseer(&self) -> Option<Overseer>;
     /// The hub's agents, with the turn each is running.
     fn agents(&self) -> Vec<CrewAgent>;
+    /// What the agent `id` is called, as the hub's roster says now; `None`
+    /// when it has no name of its own (it is known only by its id) or
+    /// isn't on the roster.
+    fn agent_name(&self, id: &str) -> Option<String> {
+        self.agents()
+            .into_iter()
+            .find(|a| a.id == id)
+            .map(|a| a.name)
+            .filter(|n| !n.trim().is_empty() && n != id)
+    }
     /// The start of today, in the person's time.
     fn midnight(&self) -> DateTime<Utc>;
     /// The person's timezone, which days and weeks of spend are counted in.

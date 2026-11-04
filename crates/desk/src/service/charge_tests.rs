@@ -1,6 +1,7 @@
 //! Charges end to end in the desk: taking a session on and letting it go,
 //! the person taking the wheel, and the boss's messages waiting for it.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{json, Value};
@@ -344,6 +345,81 @@ async fn a_session_a_boss_starts_is_its_and_in_its_group_before_it_runs() {
         }
         assert_eq!(d.list().len(), before);
         assert_eq!(d.charges().len(), 1);
+    })
+    .await;
+}
+
+/// A hub whose roster calls each agent by the name given here.
+struct Roster(Vec<(&'static str, &'static str)>);
+
+#[async_trait::async_trait]
+impl crew::Crew for Roster {
+    fn overseer(&self) -> Option<crew::Overseer> {
+        None
+    }
+    fn agents(&self) -> Vec<crew::CrewAgent> {
+        self.0
+            .iter()
+            .map(|(id, name)| crew::CrewAgent {
+                id: id.to_string(),
+                name: name.to_string(),
+                live: None,
+            })
+            .collect()
+    }
+    fn midnight(&self) -> chrono::DateTime<Utc> {
+        Utc::now()
+    }
+    async fn accept(&self, _: &crew::Suggestion) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+/// A boss is called what the hub's roster calls it now, so its name
+/// outlives a restart; one known only by its id is never shown by it.
+#[tokio::test]
+async fn a_boss_is_called_by_its_name_after_a_restart_and_never_by_its_id() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let s = new_session(&d, dir.path()).await;
+        idle(&d, s.id).await;
+        d.take_on(s.id, &sarah(), How::Handed, &HashSet::new(), &By::you())
+            .await
+            .unwrap();
+        let name = |d: &Desk| d.charges()[0].boss_name.clone();
+        assert_eq!(name(&d), "Sarah");
+
+        // After a restart only the rows are known: not what she was called.
+        d.0.state.lock().charges.names.clear();
+        assert_eq!(name(&d), UNNAMED_BOSS, "never her id");
+
+        // The hub's roster says.
+        let roster: Arc<dyn crew::Crew> = Arc::new(Roster(vec![("sarah", "Sarah")]));
+        d.answer_lines_with(&roster);
+        assert_eq!(name(&d), "Sarah");
+        d.hand_back(s.id).await.unwrap_or_else(|e| panic!("{e:?}"));
+        let mut said = String::new();
+        for _ in 0..200 {
+            let page = d.activity(crew::Filter::All, None, 5).await.unwrap();
+            if let Some(e) = page.events.iter().find(|e| e.text.contains(" back to ")) {
+                said = e.text.clone();
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(said.ends_with("back to Sarah"), "{said}");
+
+        // An agent with no name of its own: its id is no name.
+        let roster: Arc<dyn crew::Crew> = Arc::new(Roster(vec![("sarah", "sarah")]));
+        d.answer_lines_with(&roster);
+        assert_eq!(name(&d), UNNAMED_BOSS);
+        d.0.state
+            .lock()
+            .charges
+            .names
+            .insert("sarah".into(), "sarah".into());
+        assert_eq!(name(&d), UNNAMED_BOSS);
     })
     .await;
 }

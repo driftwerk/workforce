@@ -54,6 +54,9 @@ pub struct ChargeView {
     pub released_at: Option<DateTime<Utc>>,
 }
 
+/// What a boss with no name of its own is called where its name is shown.
+pub const UNNAMED_BOSS: &str = "Boss";
+
 /// How often who has the wheel is looked at.
 const SETTLE_EVERY: Duration = Duration::from_secs(5);
 
@@ -102,16 +105,34 @@ impl Desk {
         crew.overseer()
     }
 
+    /// What the boss `id` is called: as the hub's roster says now, which
+    /// outlives a restart, else as it was when it took a session on. Never
+    /// its id: one with no name of its own is "the boss" ([`UNNAMED_BOSS`]).
     fn boss_name(&self, id: &str) -> String {
-        if let Some(o) = self.boss().filter(|o| o.id == id) {
-            return o.name;
+        let named = |n: &str| !n.trim().is_empty() && n != id;
+        let crew = self
+            .0
+            .line_crew
+            .lock()
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade);
+        if let Some(crew) = crew {
+            if let Some(n) = crew
+                .overseer()
+                .filter(|o| o.id == id && named(&o.name))
+                .map(|o| o.name)
+                .or_else(|| crew.agent_name(id).filter(|n| named(n)))
+            {
+                return n;
+            }
         }
         let st = self.0.state.lock();
         st.charges
             .names
             .get(id)
+            .filter(|n| named(n))
             .cloned()
-            .unwrap_or_else(|| id.to_string())
+            .unwrap_or_else(|| UNNAMED_BOSS.to_string())
     }
 
     /// The person gave `id` a prompt or wrote to it: they take its wheel.

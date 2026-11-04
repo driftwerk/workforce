@@ -332,6 +332,14 @@ impl Crew for CrewHub {
             .collect()
     }
 
+    fn agent_name(&self, id: &str) -> Option<String> {
+        self.state
+            .registry
+            .get(id)
+            .and_then(|s| s.display_name())
+            .filter(|n| !n.trim().is_empty() && n != id)
+    }
+
     fn timezone(&self) -> chrono_tz::Tz {
         self.services()
             .first()
