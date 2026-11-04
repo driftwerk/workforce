@@ -410,6 +410,17 @@ impl Desk {
             Some(_) => {}
         }
         self.0.store.put_line(&m).await?;
+        // A session's question is waited on from the moment it is told of:
+        // whoever takes it up (the overseer giving it to the person) finds
+        // its call still waiting, not gone ahead.
+        if let (Sender::Session(_), Send::Ask { wait, .. }) = (&from, &hop_send) {
+            self.0
+                .state
+                .lock()
+                .lines
+                .waiting
+                .insert(m.id, Instant::now() + *wait);
+        }
         match &from {
             Sender::Session(id) => {
                 self.0.state.lock().lines.runs.entry(*id).or_default().sent += 1;
@@ -599,6 +610,10 @@ impl Desk {
     ) -> Result<Option<LineMessage>, LineError> {
         self.0.state.lock().lines.waiting.insert(ask, until);
         let mut rx = self.0.events.subscribe();
+        // Set aside between the plugin's polls: its event has gone by.
+        if self.set_aside(ask).await {
+            return Ok(None);
+        }
         let deadline = tokio::time::Instant::now() + wait;
         let found = loop {
             if let Some(a) = self.0.store.line_reply_to(ask).await? {
@@ -1523,7 +1538,11 @@ impl Desk {
                 ask: m.text.clone(),
                 chose: m.chose.clone(),
                 asked_at: m.at,
-                went_ahead_at: m.updated_at,
+                // No later than its longest wait: one found after a restart
+                // went ahead long before it was marked.
+                went_ahead_at: m
+                    .updated_at
+                    .min(m.at + chrono::Duration::from_std(line::ASK_WAIT_MAX).unwrap_or_default()),
             })
             .collect();
         out.sort_by_key(|w| w.asked_at);

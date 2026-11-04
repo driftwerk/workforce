@@ -1220,6 +1220,13 @@ async fn a_wait_that_runs_out_with_no_one_asking_again_goes_ahead_and_so_does_on
         d.line_sweep_waits().await;
         assert_eq!(row(&d, old.id).await.asked, Some(Asked::Lapsed));
         assert_eq!(row(&d, fresh).await.asked, Some(Asked::Open));
+        // It went ahead when its longest wait ran out, not when it was found.
+        let listed = d.line_went_ahead_list();
+        let found = listed
+            .iter()
+            .find(|w| w.id == format!("line:{}", old.id))
+            .unwrap();
+        assert!(found.went_ahead_at <= old.at + chrono::Duration::minutes(5));
         // An answered one stays answered.
         d.line_answer(fresh, Sender::Person, "Yes".into())
             .await
@@ -1227,6 +1234,41 @@ async fn a_wait_that_runs_out_with_no_one_asking_again_goes_ahead_and_so_does_on
         d.0.state.lock().lines.waiting.insert(fresh, Instant::now());
         d.line_sweep_waits().await;
         assert_eq!(row(&d, fresh).await.asked, Some(Asked::Answered));
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_question_is_waited_on_from_when_it_is_told_of() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let s = new_session(&d, dir.path()).await;
+        idle(&d, s.id).await;
+        // The overseer takes a question up as soon as it hears of it, which
+        // may be before the call that asked starts waiting.
+        let mut rx = d.0.events.subscribe();
+        let asking = {
+            let d = d.clone();
+            tokio::spawn(async move {
+                d.line_call(
+                    s.id,
+                    "ask",
+                    &json!({"to": "you", "text": "May I push?", "wait_seconds": 60}),
+                    Some(Duration::from_millis(200)),
+                )
+                .await
+            })
+        };
+        let ask = loop {
+            if let Ok(DeskEvent::Line { message, .. }) = rx.recv().await {
+                if message.kind == LineKind::Ask {
+                    break message.id;
+                }
+            }
+        };
+        assert!(d.waited_on_ask(ask), "waited on as soon as it is heard of");
+        asking.await.unwrap().unwrap();
     })
     .await;
 }
