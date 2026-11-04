@@ -73,8 +73,10 @@ pub struct Place<'a> {
     /// Scratch space a delete may clear without asking: `/tmp`, `$TMPDIR`.
     pub scratch: &'a [PathBuf],
     pub home: &'a Path,
-    /// An earlier command of the line ran: it may have made what a later
-    /// target's folders are (`ln -s …`, `cp -a …`, a script).
+    /// An earlier command of the line could have made a link (`ln` in any
+    /// spelling, `cp -a`, `mv`, an interpreter, a program Desk doesn't
+    /// know): what isn't there yet may be one by the time a later command
+    /// runs.
     later: bool,
 }
 
@@ -143,9 +145,9 @@ impl Place<'_> {
             })
     }
 
-    /// Whether `word`, after an earlier command of the line, names a path
-    /// under a folder that doesn't exist yet: what that command made there
-    /// can't be told.
+    /// Whether `word`, after an earlier command of the line that could
+    /// make links, names a path that doesn't exist yet, or lies under one
+    /// that doesn't: it may be a link by then.
     fn made_later(&self, word: &Word) -> bool {
         if !self.later || word.dynamic || word.brace {
             return false;
@@ -161,7 +163,7 @@ impl Place<'_> {
                 None => return true,
             }
         };
-        joined.parent().is_some_and(|p| !p.exists())
+        std::fs::symlink_metadata(&joined).is_err()
     }
 
     /// What deleting `targets` asks: nothing when each is resolved and
@@ -218,6 +220,14 @@ impl Place<'_> {
         };
         if self.deletable(&to) {
             return None;
+        }
+        // A folder's contents (`./`, `src/.`) land all over the destination.
+        let contents = sources.iter().any(|s| {
+            let t = s.text.as_str();
+            t.ends_with('/') || t == "." || t.ends_with("/.")
+        });
+        if contents && std::fs::symlink_metadata(&to).is_ok() {
+            return Some(Asks::Deletes(vec![to]));
         }
         let over: Vec<PathBuf> = match to.is_dir() {
             true => sources
@@ -382,9 +392,43 @@ pub fn always_asks(command: &str, place: &Place<'_>) -> Option<Asks> {
         if let Some(asks) = classify(simple, &here, false) {
             add(asks);
         }
-        here.later = true;
+        here.later |= makes_links(simple);
     }
     found
+}
+
+/// Whether `simple` could make a link for what follows it on the line:
+/// `ln` in any spelling, a copy that keeps links, a move, an interpreter,
+/// anything Desk doesn't know. Making folders, files and builds don't.
+fn makes_links(simple: &Simple) -> bool {
+    let words: Vec<&Word> = simple
+        .words
+        .iter()
+        .skip_while(|w| is_assignment(w) || KEYWORDS.contains(&w.text.as_str()))
+        .collect();
+    let Some(first) = words.first() else {
+        return false;
+    };
+    if first.dynamic {
+        return true;
+    }
+    let name = first.text.rsplit('/').next().unwrap_or(&first.text);
+    let args = &words[1..];
+    match name {
+        "cp" => {
+            has_flag(args, 'a', &["archive"])
+                || has_flag(args, 'P', &["no-dereference"])
+                || has_flag(args, 'R', &["recursive"])
+                || has_flag(args, 'r', &[])
+                || has_flag(args, 'd', &[])
+        }
+        "mkdir" | "touch" | "cd" | "pushd" | "popd" | "echo" | "printf" | "true" | "false"
+        | ":" | "test" | "[" | "ls" | "cat" | "grep" | "rg" | "wc" | "head" | "tail" | "sort"
+        | "uniq" | "diff" | "pwd" | "which" | "rm" | "rmdir" | "git" | "cargo" | "npm" | "pnpm"
+        | "yarn" | "go" | "make" | "pytest" | "tsc" | "jest" | "vitest" | "sleep" | "date"
+        | "chmod" | "tee" | "sed" => false,
+        _ => true,
+    }
 }
 
 /// Whether `command` publishes or deploys: a push to the default branch,
@@ -1047,10 +1091,23 @@ fn has_flag(args: &[&Word], short: char, long: &[&str]) -> bool {
     args.iter().any(|w| {
         let t = w.text.as_str();
         if let Some(name) = t.strip_prefix("--") {
-            // Git takes any unambiguous prefix of a long option
-            // (`--forc`, `--dele`): a prefix of one asked about counts.
+            long.iter()
+                .any(|l| name == *l || name.starts_with(&format!("{l}=")))
+        } else {
+            t.strip_prefix('-').is_some_and(|s| s.contains(short))
+        }
+    })
+}
+
+/// [`has_flag`] as git reads long options: any prefix (`--f`, `--de`,
+/// `--forc`) stands for the options it begins. When one of those it could
+/// stand for is asked about, it counts, however short.
+fn git_flag(args: &[&Word], short: char, long: &[&str]) -> bool {
+    args.iter().any(|w| {
+        let t = w.text.as_str();
+        if let Some(name) = t.strip_prefix("--") {
             let name = name.split_once('=').map_or(name, |(n, _)| n);
-            name.len() >= 3 && long.iter().any(|l| l.starts_with(name))
+            !name.is_empty() && long.iter().any(|l| l.starts_with(name))
         } else {
             t.strip_prefix('-').is_some_and(|s| s.contains(short))
         }
@@ -1280,10 +1337,22 @@ fn classify_words(
                 "curl" => &["-o", "--output"],
                 _ => &["-O", "--output-document"],
             };
-            // `-o out`, `--output out`, `--output=out`.
+            // `-o out`, `-sSLo out`, `-oout`, `--output out`, `--output=out`.
+            let letter = flags[0].chars().nth(1).unwrap_or('o');
             let mut targets: Vec<Word> = Vec::new();
             for (i, w) in args.iter().enumerate() {
-                if flags.contains(&w.text.as_str()) {
+                let t = w.text.as_str();
+                let cluster = t.strip_prefix('-').filter(|c| !c.starts_with('-'));
+                if let Some(at) = cluster.and_then(|c| c.find(letter)) {
+                    let rest = &t[1 + at + 1..];
+                    match rest.is_empty() {
+                        true => targets.extend(args.get(i + 1).map(|w| (*w).clone())),
+                        false => targets.push(Word {
+                            text: rest.to_string(),
+                            ..(*w).clone()
+                        }),
+                    }
+                } else if flags.contains(&t) {
                     targets.extend(args.get(i + 1).map(|w| (*w).clone()));
                 } else if let Some((f, v)) = w.text.split_once('=') {
                     if flags.contains(&f) {
@@ -1297,6 +1366,66 @@ fn classify_words(
             targets.retain(|w| w.text != "-" && w.text != "/dev/null");
             let refs: Vec<&Word> = targets.iter().collect();
             place.overwrites(&refs, unknown)
+        }
+        // Editors that write the files they are given: `perl -pi`, `ruby
+        // -i`, `awk -i inplace`, `ex`, and `vim` told what to do.
+        "perl" | "ruby"
+            if args.iter().any(|w| {
+                w.text.starts_with('-') && !w.text.starts_with("--") && w.text[1..].contains('i')
+            }) =>
+        {
+            let scripted = args.iter().any(|w| {
+                w.text.starts_with('-') && !w.text.starts_with("--") && w.text.contains('e')
+            });
+            let mut ops = operands(args);
+            if !scripted && !ops.is_empty() {
+                ops.remove(0);
+            }
+            // The script given with -e is a word of its own.
+            let scripts: Vec<&Word> = args
+                .windows(2)
+                .filter(|p| p[0].text.starts_with('-') && p[0].text.ends_with('e'))
+                .map(|p| p[1])
+                .collect();
+            ops.retain(|o| !scripts.iter().any(|s| std::ptr::eq(*s, *o)));
+            place.overwrites(&ops, unknown)
+        }
+        "awk" | "gawk"
+            if args
+                .windows(2)
+                .any(|p| p[0].text == "-i" && p[1].text == "inplace")
+                || args
+                    .iter()
+                    .any(|w| w.text == "--inplace" || w.text == "-iinplace") =>
+        {
+            let mut ops: Vec<&Word> = operands(args)
+                .into_iter()
+                .filter(|o| o.text != "inplace")
+                .collect();
+            if !args.iter().any(|w| w.text == "-f") && !ops.is_empty() {
+                ops.remove(0);
+            }
+            place.overwrites(&ops, unknown)
+        }
+        "ex" => place.overwrites(&operands(args), unknown),
+        "vim" | "vi" | "nvim"
+            if args.iter().any(|w| {
+                matches!(w.text.as_str(), "-c" | "-e" | "-es" | "-s" | "-E" | "-Es")
+                    || w.text.starts_with('+')
+            }) =>
+        {
+            let mut files = Vec::new();
+            let mut skip = false;
+            for w in args {
+                if skip {
+                    skip = false;
+                } else if matches!(w.text.as_str(), "-c" | "--cmd" | "-S" | "-u" | "-i") {
+                    skip = true;
+                } else if !is_option(w) && !w.text.starts_with('+') {
+                    files.push(*w);
+                }
+            }
+            place.overwrites(&files, unknown)
         }
         "gh" => {
             let ops = operands(args);
@@ -1384,7 +1513,7 @@ fn git(args: &[&Word], place: &Place<'_>) -> Option<Asks> {
     let rest = &args[i + 1..];
     let irreversible = match sub.text.as_str() {
         "push" => {
-            has_flag(
+            git_flag(
                 rest,
                 'f',
                 &[
@@ -1395,17 +1524,15 @@ fn git(args: &[&Word], place: &Place<'_>) -> Option<Asks> {
                     "delete",
                     "prune",
                 ],
-            ) || has_flag(rest, 'd', &[])
+            ) || git_flag(rest, 'd', &[])
                 || rest.iter().any(|w| {
                     w.text.starts_with('+') || (w.text.starts_with(':') && w.text.len() > 1)
                 })
         }
-        // Discarding what isn't committed: `checkout -- .`, `checkout .`,
-        // `restore` of the working tree.
         // Discarding what isn't committed: forced, or naming files.
         "checkout" => {
             let ops = operands(rest);
-            has_flag(rest, 'f', &["force"])
+            git_flag(rest, 'f', &["force"])
                 || rest.iter().any(|w| w.text == "--")
                 || ops.iter().any(|w| {
                     w.text == "."
@@ -1416,7 +1543,7 @@ fn git(args: &[&Word], place: &Place<'_>) -> Option<Asks> {
                             .is_some_and(|c| std::fs::symlink_metadata(c.join(&w.text)).is_ok())
                 })
         }
-        "switch" => has_flag(rest, 'f', &["force", "discard-changes"]),
+        "switch" => git_flag(rest, 'f', &["force", "discard-changes"]),
         "reflog" => operands(rest)
             .first()
             .is_some_and(|w| matches!(w.text.as_str(), "expire" | "delete")),
@@ -1431,14 +1558,14 @@ fn git(args: &[&Word], place: &Place<'_>) -> Option<Asks> {
             .find(|w| !is_option(w))
             .is_some_and(|w| matches!(w.text.as_str(), "drop" | "clear")),
         "filter-branch" | "filter-repo" => true,
-        "update-ref" => has_flag(rest, 'd', &[]),
+        "update-ref" => git_flag(rest, 'd', &[]),
         // A worktree removed by force loses what wasn't committed in it;
         // one outside the folder is someone else's.
         "worktree" => {
             let ops = operands(rest);
             match ops.first().map(|w| w.text.as_str()) {
                 Some("remove") => {
-                    has_flag(rest, 'f', &["force"])
+                    git_flag(rest, 'f', &["force"])
                         || !ops
                             .get(1)
                             .and_then(|w| place.resolve(w))
@@ -1448,11 +1575,11 @@ fn git(args: &[&Word], place: &Place<'_>) -> Option<Asks> {
                 _ => false,
             }
         }
-        "reset" => has_flag(rest, '\0', &["hard"]),
-        "clean" => has_flag(rest, 'f', &["force"]),
+        "reset" => git_flag(rest, '\0', &["hard"]),
+        "clean" => git_flag(rest, 'f', &["force"]),
         "branch" => {
-            has_flag(rest, 'D', &[])
-                || (has_flag(rest, 'd', &["delete"]) && has_flag(rest, 'f', &["force"]))
+            git_flag(rest, 'D', &[])
+                || (git_flag(rest, 'd', &["delete"]) && git_flag(rest, 'f', &["force"]))
         }
         _ => false,
     };
@@ -1698,6 +1825,42 @@ mod tests {
         }
     }
 
+    /// The re-check of the review: a link made at the target itself,
+    /// contents copies, clustered output flags, git's short prefixes and
+    /// in-place editors.
+    #[test]
+    fn links_at_the_target_contents_copies_and_in_place_editors_ask() {
+        let mut wrong = Vec::new();
+        for command in [
+            "/bin/ln -s /Users/sarah/dev/acme-web/README.md f && echo x > f",
+            "/bin/ln -s /Users/sarah/dev/acme-web/README.md f && cp notes.txt f",
+            "/bin/ln -s /Users/sarah/dev/acme-web l2 && rm -rf l2/",
+            "cp -a ../l l2 && rm -rf l2/",
+            "rsync -a ./ /Users/sarah/dev/acme-web/",
+            "cp -R ./ /Users/sarah/dev/acme-web",
+            "curl -sSLo /Users/sarah/dev/acme-web/README.md https://x.example",
+            "curl -o/Users/sarah/dev/acme-web/README.md https://x.example",
+            "wget -qO /Users/sarah/dev/acme-web/README.md https://x.example",
+            "git push --de x",
+            "git push --mi",
+            "git clean --f -d",
+            "git reset --ha",
+            "git switch --di main",
+            "perl -pi -e 's/a/b/' /Users/sarah/dev/acme-web/README.md",
+            "perl -i -pe 's/a/b/' /Users/sarah/dev/acme-web/README.md",
+            "ruby -pi -e 'x' /Users/sarah/dev/acme-web/README.md",
+            "awk -i inplace '{print}' /Users/sarah/dev/acme-web/README.md",
+            "ex -sc 'wq' /Users/sarah/dev/acme-web/README.md",
+            "vim -c 'wq' /Users/sarah/dev/acme-web/README.md",
+            "vim -es /Users/sarah/dev/acme-web/README.md",
+        ] {
+            if asks(command).is_none() {
+                wrong.push(command);
+            }
+        }
+        assert!(wrong.is_empty(), "these didn't ask: {wrong:#?}");
+    }
+
     /// The own folder as the disk spells it: on a case-sensitive disk a name
     /// in another case is another folder, and deleting there asks.
     #[test]
@@ -1734,6 +1897,13 @@ mod tests {
             "mv a.txt /tmp/a.txt",
             "rm -rf /tmp/acme-cache",
             "ln -s ../target t && ls t",
+            "mkdir dist && echo ok > dist/x",
+            "mkdir -p out && cargo build > out/log 2>&1",
+            "rsync -a ./ ../work/target/copy/",
+            "curl -sSLo out.html https://x.example",
+            "perl -pi -e 's/a/b/' src/a.rs",
+            "git push --set-upstream origin feat/x",
+            "git clean --dry-run",
         ] {
             assert_eq!(asks(command), None, "{command}");
         }
