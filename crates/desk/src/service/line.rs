@@ -509,6 +509,9 @@ impl Desk {
             Sender::Overseer(b)
                 if question.to.kind == PartyKind::Manager && question.to.id == b.party.id =>
             {
+                if let Some(asker) = question.from_session() {
+                    self.boss_holds(asker, Some(b))?;
+                }
                 b.party.clone()
             }
             Sender::Person => Party::you(),

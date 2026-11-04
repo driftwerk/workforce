@@ -598,6 +598,15 @@ async fn desk_holds_a_boss_to_what_it_may_answer_for_its_session() {
             refused(d.decide(s.id, a, Decision::Deny, Some(sarah_by.clone())))
                 .contains("the person is driving")
         );
+        assert!(
+            refused(d.interrupt(s.id, Some(sarah_by.clone()))).contains("the person is driving")
+        );
+        assert!(refused(d.resume(s.id, None, Some(sarah_by.clone())).await)
+            .contains("the person is driving"));
+        assert!(refused(d.restart(s.id, None, sarah_by.clone()).await)
+            .contains("the person is driving"));
+        let mia = By::manager("mia", "Mia", "Mine now.");
+        assert!(refused(d.interrupt(s.id, Some(mia))).contains("another boss runs"));
         d.decide(s.id, a, Decision::Allow, Some(By::you())).unwrap();
         lint.await.unwrap();
     })

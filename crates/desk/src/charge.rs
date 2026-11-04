@@ -406,10 +406,19 @@ pub fn answerable(facts: &Facts, bounds: &Bounds) -> Result<(), Irreversible> {
     if !facts.own.is_absolute() || facts.own.parent().is_none() {
         return no("Desk can't tell which folder this session works in".into());
     }
-    let own = std::slice::from_ref(&facts.own);
-    let inside = |p: &Path| p.starts_with(&facts.own);
+    // A session working in the home folder (or above it) has no folder of
+    // its own to speak of: nothing counts as inside it.
+    let broad = bounds.home.starts_with(&facts.own);
+    let own: &[PathBuf] = match broad {
+        true => &[],
+        false => std::slice::from_ref(&facts.own),
+    };
+    let inside = |p: &Path| !broad && p.starts_with(&facts.own);
     let scratch = |p: &Path| bounds.scratch.iter().any(|t| p.starts_with(t));
-    let withheld = |p: &Path| !inside(p) && bounds.withheld.iter().any(|w| p.starts_with(w));
+    // Desk's data is never the boss's to answer for, unless the session
+    // itself works inside it.
+    let in_withheld = |p: &Path| bounds.withheld.iter().any(|w| p.starts_with(w));
+    let withheld = |p: &Path| in_withheld(p) && !(inside(p) && in_withheld(&facts.own));
     match &facts.what {
         What::Command { command, cwd } => {
             let place = Place {
@@ -734,13 +743,16 @@ mod tests {
             .map_err(|e| e.to_string())
     }
 
-    fn command(c: &str) -> Result<(), String> {
-        let s = acme("/Users/sam/dev/acme-web");
+    fn command_in(s: &SessionView, c: &str) -> Result<(), String> {
         judged(
             Engine::Claude,
             &asking("Bash", json!({ "command": c }), None),
-            &s,
+            s,
         )
+    }
+
+    fn command(c: &str) -> Result<(), String> {
+        command_in(&acme("/Users/sam/dev/acme-web"), c)
     }
 
     #[test]
@@ -971,6 +983,27 @@ mod tests {
         assert_eq!(
             judged(Engine::Claude, &asking("Bash", json!({}), None), &s),
             Err("Desk can't tell what a command Desk wasn't sent does".into())
+        );
+        // A session in the home folder has no folder of its own.
+        let home = acme("/Users/sam");
+        assert_eq!(command_in(&home, "cargo test"), Ok(()));
+        assert_eq!(
+            command_in(&home, "rm -rf ~/dev"),
+            Err("deletes outside sam".into())
+        );
+        let config = asking(
+            "Edit",
+            json!({ "file_path": "/Users/sam/Library/Application Support/Desk/hub/agents/desk/workforce.toml" }),
+            None,
+        );
+        assert_eq!(
+            judged(Engine::Claude, &config, &home),
+            Err("changes Desk's own data".into())
+        );
+        let notes = asking("Edit", json!({ "file_path": "/Users/sam/notes.md" }), None);
+        assert_eq!(
+            judged(Engine::Claude, &notes, &home),
+            Err("changes a file outside sam".into())
         );
         let nowhere = acme("relative");
         assert!(judged(

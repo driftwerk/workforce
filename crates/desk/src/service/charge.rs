@@ -209,6 +209,33 @@ impl Desk {
         charge::answerable(&facts, &bounds)
     }
 
+    /// Whether `by`, when it is a boss, may act on `id` now: a session a
+    /// boss runs is acted on only by that boss, and only while it has the
+    /// wheel. Anyone else, and a session no boss runs, is the hub's rule.
+    pub(crate) fn boss_holds(&self, id: Uuid, by: Option<&By>) -> Result<(), DeskError> {
+        let Some(boss) = by.filter(|b| b.party.kind == PartyKind::Manager) else {
+            return Ok(());
+        };
+        let Some(c) = self.charge_of(id).filter(Charge::live) else {
+            return Ok(());
+        };
+        let name = self
+            .view(id)
+            .map(|v| v.label().to_string())
+            .unwrap_or_else(|_| "that session".into());
+        if c.boss != boss.party.id {
+            return Err(DeskError::Conflict(format!(
+                "another boss runs {name}; it's theirs or the person's to act on"
+            )));
+        }
+        if self.wheel_of(id).is_some_and(Wheel::person) {
+            return Err(DeskError::Conflict(format!(
+                "the person is driving {name}, so it's theirs to act on now"
+            )));
+        }
+        Ok(())
+    }
+
     /// `id`'s open request `approval`: the one it waits on, or another of
     /// Codex's.
     fn pending_of(&self, id: Uuid, approval: Uuid) -> Option<crate::model::PendingApproval> {
@@ -234,23 +261,10 @@ impl Desk {
         boss: &By,
     ) -> Result<(), DeskError> {
         use crate::model::Decision;
-        let Some(c) = self.charge_of(id).filter(Charge::live) else {
+        if !self.charge_of(id).is_some_and(|c| c.live()) {
             return Ok(());
-        };
-        let name = self
-            .view(id)
-            .map(|v| v.label().to_string())
-            .unwrap_or_else(|_| "that session".into());
-        if c.boss != boss.party.id {
-            return Err(DeskError::Conflict(format!(
-                "another boss runs {name}; it's theirs or the person's to answer"
-            )));
         }
-        if self.wheel_of(id).is_some_and(Wheel::person) {
-            return Err(DeskError::Conflict(format!(
-                "the person is driving {name}, so it's theirs to answer"
-            )));
-        }
+        self.boss_holds(id, Some(boss))?;
         self.breaker_refuses_prompt(id, Some(boss))?;
         if self.pending_of(id, approval).is_none() {
             return Err(DeskError::Conflict("already answered".into()));

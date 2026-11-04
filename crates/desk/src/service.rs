@@ -2107,6 +2107,7 @@ impl Desk {
         // A session Desk's breaker holds goes on only by the person: anyone
         // else's resume, or a prompt with it, is refused. A restore at start
         // (no one, no prompt) starts no turn, and the hold stays.
+        self.boss_holds(id, by.as_ref())?;
         if by.is_some() || prompt.is_some() {
             self.breaker_refuses_prompt(id, by.as_ref())?;
         }
@@ -2184,6 +2185,7 @@ impl Desk {
         by: By,
     ) -> Result<SessionView, DeskError> {
         self.record(id)?;
+        self.boss_holds(id, Some(&by))?;
         // A session Desk's breaker holds goes on only by the person.
         self.breaker_refuses_prompt(id, Some(&by))?;
         let running = self.0.state.lock().live.contains_key(&id);
@@ -2540,6 +2542,7 @@ impl Desk {
     /// does, for Claude Code and Codex alike. Its process (and a tracked
     /// one's shell) goes on. Not working, it does nothing.
     pub fn interrupt(&self, id: Uuid, by: Option<By>) -> Result<SessionView, DeskError> {
+        self.boss_holds(id, by.as_ref())?;
         let pty = {
             let st = self.0.state.lock();
             let live = st

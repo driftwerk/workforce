@@ -45,7 +45,7 @@ async fn agent_calling(
     reply: &str,
     calls: &[(&str, &str)],
 ) -> (Arc<AgentService>, wiremock::MockServer) {
-    use wiremock::matchers::{body_partial_json, body_string_contains, method, path};
+    use wiremock::matchers::{body_partial_json, method, path};
     use wiremock::{Mock, ResponseTemplate};
     let (config, server) = crate::serve::testing::mock_llm_config(&dir.join(id), |c| {
         c.agents = vec![AgentConfig {
@@ -56,30 +56,7 @@ async fn agent_calling(
     .await;
     let chunk = |body: Value| format!("data: {body}\n\n");
     for (marker, tool) in calls {
-        let call = [
-            chunk(json!({"id": "c0", "object": "chat.completion.chunk", "model": "mock",
-                "choices": [{"index": 0, "delta": {"role": "assistant", "tool_calls": [{"index": 0,
-                    "id": "call_1", "type": "function", "function": {"name": tool, "arguments": "{}"}}]},
-                    "finish_reason": null}]})),
-            chunk(json!({"id": "c0", "object": "chat.completion.chunk", "model": "mock",
-                "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
-                "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}})),
-            "data: [DONE]\n\n".to_string(),
-        ]
-        .concat();
-        Mock::given(method("POST"))
-            .and(path("/v1/chat/completions"))
-            .and(body_string_contains(*marker))
-            .and(body_partial_json(json!({"stream": true})))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .insert_header("content-type", "text/event-stream")
-                    .set_body_string(call),
-            )
-            .up_to_n_times(1)
-            .with_priority(1)
-            .mount(&server)
-            .await;
+        calls_tool_once(&server, marker, tool, json!({})).await;
     }
     let sse = [
         chunk(json!({"id": "c1", "object": "chat.completion.chunk", "model": "mock",
@@ -114,6 +91,43 @@ async fn agent_calling(
     let service = AgentService::from_config(config, None).await.unwrap();
     std::fs::create_dir_all(&service.workspace).unwrap();
     (service, server)
+}
+
+/// The mock model answers the first request carrying `marker` with a call
+/// to `tool` given `arguments`.
+async fn calls_tool_once(
+    server: &wiremock::MockServer,
+    marker: &str,
+    tool: &str,
+    arguments: Value,
+) {
+    use wiremock::matchers::{body_partial_json, body_string_contains, method, path};
+    use wiremock::{Mock, ResponseTemplate};
+    let chunk = |body: Value| format!("data: {body}\n\n");
+    let call = [
+        chunk(json!({"id": "c0", "object": "chat.completion.chunk", "model": "mock",
+            "choices": [{"index": 0, "delta": {"role": "assistant", "tool_calls": [{"index": 0,
+                "id": "call_1", "type": "function", "function": {"name": tool, "arguments": arguments.to_string()}}]},
+                "finish_reason": null}]})),
+        chunk(json!({"id": "c0", "object": "chat.completion.chunk", "model": "mock",
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}})),
+        "data: [DONE]\n\n".to_string(),
+    ]
+    .concat();
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_string_contains(marker))
+        .and(body_partial_json(json!({"stream": true})))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(call),
+        )
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(server)
+        .await;
 }
 
 fn write_config(service: &AgentService, toml: &str) {
@@ -3122,6 +3136,94 @@ async fn the_overseer_answers_for_its_session_all_but_what_cant_be_undone() {
             .await
             .unwrap_err();
         assert!(late.starts_with("Already answered"), "{late}");
+    })
+    .await;
+}
+
+/// A request from a session the overseer runs wakes it on that session's
+/// line, and it answers: the session's hook hears allow, with no one else
+/// calling a tool.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_request_from_a_session_it_runs_wakes_the_overseer_and_it_answers() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, _crew, d, llm) = overseeing(
+            dir.path(),
+            pool,
+            "Answered.",
+            "[oversight]\nenabled = true\nlevel = \"act\"\n",
+            &[],
+        )
+        .await;
+        eventually("the overseer's tools", async || {
+            overseer.tools.has("crew.approve").then_some(())
+        })
+        .await;
+        d.boss_bounds_with(workforce_desk::charge::Bounds {
+            home: dir.path().to_path_buf(),
+            ..Default::default()
+        });
+        let s = new_session(&d, dir.path(), "acme-web").await;
+        let url = hook_url(dir.path(), s.id).await;
+        hook(
+            &url,
+            json!({"hook_event_name": "SessionStart", "session_id": s.id.to_string()}),
+        )
+        .await;
+        let boss = workforce_desk::crew::Party::manager("desk", &super::name_of(&overseer));
+        d.take_on(
+            s.id,
+            &boss,
+            workforce_desk::charge::How::Handed,
+            &Default::default(),
+            &By::you(),
+        )
+        .await
+        .unwrap();
+        let asked = tokio::spawn({
+            let url = url.clone();
+            async move {
+                hook(
+                    &url,
+                    json!({"hook_event_name": "PermissionRequest", "tool_name": "Bash",
+                    "tool_input": {"command": "cargo test -p acme"}}),
+                )
+                .await
+            }
+        });
+        let pending = eventually("the request", async || d.view(s.id).unwrap().pending).await;
+        calls_tool_once(
+            &llm,
+            &pending.id.to_string(),
+            "crew_approve",
+            json!({"session_id": s.id.to_string(), "approval_id": pending.id.to_string(),
+                "reason": "Running the tests is the plan."}),
+        )
+        .await;
+        let answered = tokio::time::timeout(Duration::from_secs(20), asked)
+            .await
+            .expect("the overseer answers it")
+            .unwrap();
+        assert_eq!(
+            answered["hookSpecificOutput"]["decision"]["behavior"],
+            "allow"
+        );
+        let channel = super::line::line_channel(s.id);
+        let woke = eventually("the work turn", async || {
+            let line = overseer.sessions.find(&channel, PERSON).unwrap()?;
+            line.messages
+                .iter()
+                .find(|m| m.content.starts_with(super::work::WORK))
+                .cloned()
+        })
+        .await;
+        assert!(
+            woke.content
+                .contains(&format!("approval_id {}", pending.id)),
+            "{}",
+            woke.content
+        );
+        assert!(woke.content.contains("crew.approve"), "{}", woke.content);
     })
     .await;
 }
