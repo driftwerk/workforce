@@ -24,7 +24,8 @@
 //!
 //! Paths are canonical by the time they reach here: the caller resolves
 //! them, finds the folder a grant would cover, and drops grants that have
-//! expired. Nothing here reads the filesystem or the clock.
+//! expired. Nothing here reads the clock, and the filesystem only to tell
+//! whether a write outside the own folder would replace a file there.
 
 use std::path::{Path, PathBuf};
 
@@ -182,6 +183,22 @@ enum Change<'a> {
     Connector(&'a str),
     /// Nothing a grant can name.
     Unnamed,
+}
+
+/// What a write or a move's destination replaces outside the own folder
+/// and scratch: files there already. `None` when it replaces none.
+fn replaced(p: &AgentPolicy, effect: &Effect, paths: &[PathBuf]) -> Option<Vec<PathBuf>> {
+    let targets: Vec<&PathBuf> = match effect {
+        Effect::Write { .. } => paths.iter().collect(),
+        Effect::Move { to, .. } => vec![to],
+        _ => return None,
+    };
+    let over: Vec<PathBuf> = targets
+        .into_iter()
+        .filter(|t| !p.deletable(t) && std::fs::symlink_metadata(t).is_ok())
+        .cloned()
+        .collect();
+    (!over.is_empty()).then_some(over)
 }
 
 fn refuse(rule: Refused, sentence: String) -> Verdict {
@@ -536,13 +553,16 @@ pub fn verdict(p: &AgentPolicy, stopped: bool, grants: &[Grant], call: &CallFact
             let outside: Vec<PathBuf> = paths.iter().filter(|x| !p.deletable(x)).cloned().collect();
             return deleting(p, grants, call, &outside);
         }
+        // Writing over a file outside the folder loses what was there; a
+        // new file there loses nothing.
+        Effect::Write { paths } | Effect::Move { to: _, from: paths }
+            if replaced(p, &call.effect, paths).is_some() =>
+        {
+            let over = replaced(p, &call.effect, paths).unwrap_or_default();
+            return deleting(p, grants, call, &over);
+        }
         Effect::Exec { command, cwd } => {
-            let place = Place {
-                cwd: cwd.clone(),
-                own: &p.own,
-                scratch: &p.scratch,
-                home: &p.home,
-            };
+            let place = Place::new(cwd.clone(), &p.own, &p.scratch, &p.home);
             match always_asks(command, &place) {
                 Some(Asks::Deletes(targets)) => return deleting(p, grants, call, &targets),
                 Some(Asks::Irreversible) => return ask(once(), Why::CantBeUndone),
