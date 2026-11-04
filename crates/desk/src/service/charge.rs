@@ -441,6 +441,39 @@ impl Desk {
         Ok(shown)
     }
 
+    /// `id`, a session about to start, is `boss`'s from the start, in
+    /// `group`: the boss started it.
+    pub(super) async fn charge_started(
+        &self,
+        id: Uuid,
+        boss: &Party,
+        group: Option<&str>,
+    ) -> Result<(), DeskError> {
+        self.0
+            .state
+            .lock()
+            .charges
+            .names
+            .insert(boss.id.clone(), boss.name.clone());
+        let c = Charge::new(id, &boss.id, How::Started, group.map(str::to_string));
+        self.put_charge(c, Wheel::Boss).await.map(drop)
+    }
+
+    /// Forgets `id`'s charge in memory: it never ran.
+    pub(super) fn charge_forget(&self, id: Uuid) {
+        self.0.state.lock().charges.rows.remove(&id);
+    }
+
+    /// Notes in `view`'s thread that `boss`, which started it, runs it.
+    pub(super) async fn started_note(&self, view: &crate::model::SessionView, boss: &Party) {
+        self.charge_note(
+            view,
+            boss,
+            "I started this session for the person and I'm running it with them. Ask me (to: \"desk\") when you're unsure; they can take over at any time.",
+        )
+        .await;
+    }
+
     /// `id`, which a boss no longer overseeing ran, passes to `boss`; or,
     /// when it can't be run any more (it ended), is let go.
     pub async fn pass_charge(

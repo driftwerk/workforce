@@ -241,6 +241,113 @@ async fn an_ended_session_cant_be_taken_on_and_says_why() {
     .await;
 }
 
+fn start_in(dir: &std::path::Path, group: Option<&str>) -> crate::model::NewSession {
+    crate::model::NewSession {
+        engine: crate::engine::Engine::Claude,
+        view: None,
+        name: "acme-web".into(),
+        cwd: dir.to_string_lossy().into_owned(),
+        goal: "Upgrade the date picker".into(),
+        worktree: None,
+        prompt: None,
+        approvals: None,
+        approve_for_me: false,
+        account: None,
+        env: Default::default(),
+        group: group.map(Into::into),
+    }
+}
+
+/// A session a boss starts is in its charge and its group before it runs:
+/// the first the sidebar hears of it, it is already both, and both are
+/// kept before it can spend anything.
+#[tokio::test]
+async fn a_session_a_boss_starts_is_its_and_in_its_group_before_it_runs() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        d.change_layout(|l| l.create("g-acme", "Acme", &[], None))
+            .await
+            .unwrap();
+        let (_, mut rx) = d.subscribe();
+        let by = By::manager("sarah", "Sarah", "Acme's web upgrade");
+        let s = d
+            .create_for(start_in(dir.path(), Some("g-acme")), &sarah(), by)
+            .await
+            .unwrap();
+        assert_eq!(s.group.as_ref().map(|g| g.id.as_str()), Some("g-acme"));
+
+        // In the order the sidebar heard it: charged, then placed, and its
+        // first appearance already in Acme.
+        let mut charged = false;
+        loop {
+            match tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .unwrap()
+                .unwrap()
+            {
+                DeskEvent::Charge { charge } if charge.session == s.id => {
+                    assert_eq!(
+                        (charge.how, charge.boss_name.as_str()),
+                        (How::Started, "Sarah")
+                    );
+                    assert_eq!(charge.group.as_deref(), Some("g-acme"));
+                    charged = true;
+                }
+                DeskEvent::Session { session } if session.id == s.id => {
+                    assert!(charged, "charged before it is first seen");
+                    assert_eq!(
+                        session.group.as_ref().map(|g| g.id.as_str()),
+                        Some("g-acme"),
+                        "in Acme from the first"
+                    );
+                    break;
+                }
+                _ => {}
+            }
+        }
+        // Kept, not only in memory.
+        let kept = d.0.store.charges().await.unwrap();
+        assert!(kept
+            .iter()
+            .any(|c| c.session == s.id && c.boss == "sarah" && c.how == How::Started));
+        let layout = d.0.store.layout().await.unwrap();
+        assert_eq!(
+            layout
+                .group_of(&super::super::session_item(s.id))
+                .map(|g| g.id.as_str()),
+            Some("g-acme")
+        );
+        assert_eq!(d.charges_busy("sarah"), 1, "starting holds a slot");
+        // Its thread says who runs it, and no turn starts for it.
+        let thread = d.line_thread(s.id, None, None).await.unwrap();
+        assert!(thread
+            .last()
+            .unwrap()
+            .text
+            .contains("I started this session for the person"));
+
+        // A group the sidebar doesn't have starts nothing.
+        let before = d.list().len();
+        match d
+            .create_for(
+                start_in(dir.path(), Some("g-atlas")),
+                &sarah(),
+                By::manager("sarah", "Sarah", ""),
+            )
+            .await
+        {
+            Err(DeskError::Invalid(why)) => {
+                assert_eq!(why, "there's no group g-atlas in the sidebar")
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(d.list().len(), before);
+        assert_eq!(d.charges().len(), 1);
+    })
+    .await;
+}
+
 fn boss_tell(text: &str, to: Uuid) -> Send {
     Send::Tell {
         to: Target::Session(to),

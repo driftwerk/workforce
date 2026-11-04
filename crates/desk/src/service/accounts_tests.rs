@@ -98,6 +98,7 @@ fn session(dir: &Path, account: Option<Option<Uuid>>) -> NewSession {
         approve_for_me: false,
         account,
         env: Default::default(),
+        group: None,
     }
 }
 

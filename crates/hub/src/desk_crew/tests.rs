@@ -287,6 +287,7 @@ pub(crate) async fn new_session(
             approve_for_me: false,
             account: None,
             env: Default::default(),
+            group: None,
         },
         Some(By::you()),
     )

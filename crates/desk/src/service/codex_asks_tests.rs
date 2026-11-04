@@ -89,6 +89,7 @@ fn codex_session(dir: &Path, approve_for_me: bool) -> NewSession {
         approve_for_me,
         account: None,
         env: Default::default(),
+        group: None,
     }
 }
 

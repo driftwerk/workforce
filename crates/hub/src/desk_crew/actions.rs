@@ -862,6 +862,7 @@ impl CrewHub {
                             approve_for_me: false,
                             account: None,
                             env: Default::default(),
+                            group: None,
                         },
                         Some(by),
                     )
