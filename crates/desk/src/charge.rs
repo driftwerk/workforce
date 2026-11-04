@@ -314,17 +314,9 @@ fn path_of(raw: &str, cwd: Option<&Path>, home: &Path) -> Option<PathBuf> {
     } else {
         cwd?.join(&text)
     };
-    let mut out = PathBuf::new();
-    for part in joined.components() {
-        match part {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                out.pop();
-            }
-            other => out.push(other),
-        }
-    }
-    Some(out)
+    // `.` and `..` stay as written: what they mean after a symlink is the
+    // filesystem's to say.
+    Some(joined)
 }
 
 /// What a pattern reads under: the part before its first wildcard.
@@ -467,13 +459,15 @@ fn what_of(engine: Engine, r: &Request, cwd: Option<&Path>, home: &Path) -> What
 pub fn answerable(
     facts: &Facts,
     bounds: &Bounds,
-    real: &dyn Fn(&Path) -> PathBuf,
+    real: &dyn Fn(&Path) -> Option<PathBuf>,
 ) -> Result<(), Irreversible> {
     let no = |why: String| Err(Irreversible(why));
     if !facts.own.is_absolute() || facts.own.parent().is_none() {
         return no("Desk can't tell which folder this session works in".into());
     }
-    let own_real = real(&facts.own);
+    let Some(own_real) = real(&facts.own) else {
+        return no("Desk can't tell which folder this session works in".into());
+    };
     // A session working in the home folder (or above it) has no folder of
     // its own to speak of: nothing counts as inside it.
     let broad = bounds.home.starts_with(&own_real);
@@ -496,20 +490,28 @@ pub fn answerable(
             };
             boss::judge(command, &here).map_err(Irreversible)
         }
-        What::Read(paths) => match paths
-            .iter()
-            .any(|p| boss::secret(&real(p), &bounds.home, &bounds.withheld))
-        {
-            true => no(boss::SECRETS.into()),
-            false => Ok(()),
-        },
+        What::Read(paths) => {
+            for p in paths {
+                match real(p) {
+                    Some(p) if boss::secret(&p, &bounds.home, &bounds.withheld) => {
+                        return no(boss::SECRETS.into())
+                    }
+                    Some(_) => {}
+                    None => return no("reads through a link to nothing".into()),
+                }
+            }
+            Ok(())
+        }
         What::Web { carries: true } => no("Desk can't tell what this address sends".into()),
         What::Web { carries: false } | What::Inside => Ok(()),
         What::Change(paths) => {
             if paths.is_empty() {
                 return no("Desk can't tell what it changes".into());
             }
-            for p in paths.iter().map(|p| real(p)) {
+            for p in paths {
+                let Some(p) = real(p) else {
+                    return no("changes a file through a link to nothing".into());
+                };
                 if boss::settings(&p, &bounds.home, &bounds.withheld) {
                     return no(boss::SETTINGS.into());
                 }
@@ -539,31 +541,6 @@ pub fn answerable(
             }
         }
         What::Unknown(what) => no(format!("Desk can't tell what {what} does")),
-    }
-}
-
-/// `path` through the symlinks that exist: its longest existing part
-/// resolved, the rest joined on. What doesn't exist yet is as written.
-pub fn real_path(path: &Path) -> PathBuf {
-    let mut existing = path.to_path_buf();
-    let mut rest = Vec::new();
-    loop {
-        if let Ok(r) = std::fs::canonicalize(&existing) {
-            return rest
-                .iter()
-                .rev()
-                .fold(r, |acc: PathBuf, part| acc.join(part));
-        }
-        match (
-            existing.file_name().map(|n| n.to_os_string()),
-            existing.parent(),
-        ) {
-            (Some(name), Some(parent)) => {
-                rest.push(name);
-                existing = parent.to_path_buf();
-            }
-            _ => return path.to_path_buf(),
-        }
     }
 }
 
@@ -820,12 +797,29 @@ mod tests {
         s
     }
 
-    /// The folder's `l` links into Desk's data.
-    fn real(p: &Path) -> PathBuf {
-        match p.strip_prefix("/Users/sam/dev/acme-web/l") {
-            Ok(rest) => Path::new("/Users/sam/Library/Application Support/Desk").join(rest),
-            Err(_) => p.to_path_buf(),
+    /// As the kernel resolves: the folder's `l` links into Desk's data,
+    /// `m` to the next repository, and `out` to nothing.
+    fn real(p: &Path) -> Option<PathBuf> {
+        let mut out = PathBuf::from("/");
+        for c in p.components() {
+            match c {
+                Component::ParentDir => {
+                    out.pop();
+                }
+                Component::Normal(n) => {
+                    out.push(n);
+                    if out == Path::new("/Users/sam/dev/acme-web/l") {
+                        out = PathBuf::from("/Users/sam/Library/Application Support/Desk");
+                    } else if out == Path::new("/Users/sam/dev/acme-web/m") {
+                        out = PathBuf::from("/Users/sam/dev/acme-api");
+                    } else if out == Path::new("/Users/sam/dev/acme-web/out") {
+                        return None;
+                    }
+                }
+                _ => {}
+            }
         }
+        Some(out)
     }
 
     fn judged_moved(
@@ -1120,21 +1114,56 @@ mod tests {
     }
 
     #[test]
-    fn a_path_leads_where_its_symlinks_do() {
+    fn a_path_leads_where_its_symlinks_do_and_never_through_one_to_nothing() {
         let dir = tempfile::tempdir().unwrap();
-        let outside = dir.path().join("outside");
-        let own = dir.path().join("own");
-        std::fs::create_dir_all(&outside).unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let sibling = base.join("sibling");
+        let own = base.join("own");
+        std::fs::create_dir_all(sibling.join("deep")).unwrap();
         std::fs::create_dir_all(&own).unwrap();
-        std::os::unix::fs::symlink(&outside, own.join("l")).unwrap();
-        let real_outside = std::fs::canonicalize(&outside).unwrap();
+        std::os::unix::fs::symlink(sibling.join("deep"), own.join("l")).unwrap();
+        std::os::unix::fs::symlink(base.join("nowhere/x.plist"), own.join("out")).unwrap();
+        let real = boss::resolve_real;
         assert_eq!(
-            real_path(&own.join("l/new/file.txt")),
-            real_outside.join("new/file.txt")
+            real(&own.join("l/new/file.txt")),
+            Some(sibling.join("deep/new/file.txt"))
         );
         assert_eq!(
-            real_path(&own.join("src/new.rs")),
-            std::fs::canonicalize(&own).unwrap().join("src/new.rs")
+            real(&own.join("l/../x")),
+            Some(sibling.join("x")),
+            "`..` after a link is the parent of where it leads"
         );
+        assert_eq!(real(&own.join("src/../new.rs")), Some(own.join("new.rs")));
+        assert_eq!(real(&own.join("out")), None, "a link to nothing");
+        assert_eq!(real(&own.join("out/../y")), None);
+        // Edits judged the same way.
+        let s = acme("/Users/sam/dev/acme-web");
+        let edit = |path: &str| {
+            judged(
+                Engine::Claude,
+                &asking("Write", json!({ "file_path": path }), None),
+                &s,
+            )
+        };
+        assert_eq!(
+            edit("m/../x"),
+            Err("changes a file outside acme-web".into())
+        );
+        assert_eq!(
+            edit("out"),
+            Err("changes a file through a link to nothing".into())
+        );
+        for gate in [
+            ".husky/pre-commit",
+            ".cargo/config.toml",
+            ".github/workflows/ci.yml",
+            ".github/actions/a/action.yml",
+            ".gitlab-ci.yml",
+            ".circleci/config.yml",
+            ".buildkite/pipeline.yml",
+        ] {
+            assert_eq!(edit(gate), Err(boss::SETTINGS.into()), "{gate}");
+        }
+        assert_eq!(edit(".github/CODEOWNERS"), Ok(()));
     }
 }

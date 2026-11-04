@@ -983,18 +983,25 @@ impl Follower {
             }
             (None, Some(method)) => {
                 let params = v.get("params").cloned().unwrap_or(Value::Null);
-                if method == "item/started"
+                // Its files as it starts, and every one a later word about
+                // it adds: what it asks to change is all of them.
+                if method.starts_with("item/")
                     && params.pointer("/item/type").and_then(Value::as_str) == Some("fileChange")
                 {
                     if let Some(item) = params.pointer("/item/id").and_then(Value::as_str) {
-                        let paths = params
+                        let paths: Vec<String> = params
                             .pointer("/item/changes")
                             .and_then(Value::as_array)
                             .into_iter()
                             .flatten()
                             .flat_map(changed_paths)
                             .collect();
-                        self.files.insert(item.to_string(), paths);
+                        let known = self.files.entry(item.to_string()).or_default();
+                        for p in paths {
+                            if !known.contains(&p) {
+                                known.push(p);
+                            }
+                        }
                     }
                 }
                 let ours = params.get("threadId").and_then(Value::as_str).is_some()
@@ -1686,6 +1693,12 @@ pub(crate) mod tests {
                 "changes": [{"path": "/Users/k/repo/a.rs",
                     "kind": {"type": "update", "move_path": "/Users/k/other/a.rs"}, "diff": ""}]}}}),
         );
+        // A later word about the item names another file.
+        f.heard(
+            &json!({"method": "item/updated", "params": {"threadId": "t1",
+            "item": {"type": "fileChange", "id": "fc-2",
+                "changes": [{"path": "/Users/k/.zshrc", "kind": "update", "diff": ""}]}}}),
+        );
         let (seen, _) = f.heard(
             &json!({"id": 8, "method": "item/fileChange/requestApproval",
             "params": {"threadId": "t1", "turnId": "u1", "itemId": "fc-2",
@@ -1701,7 +1714,7 @@ pub(crate) mod tests {
         let whole = ask.whole.as_ref().unwrap();
         assert_eq!(
             whole.input,
-            json!({"paths": ["/Users/k/repo/a.rs", "/Users/k/other/a.rs"], "grantRoot": "/Users/k"})
+            json!({"paths": ["/Users/k/repo/a.rs", "/Users/k/other/a.rs", "/Users/k/.zshrc"], "grantRoot": "/Users/k"})
         );
     }
 

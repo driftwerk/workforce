@@ -612,3 +612,79 @@ async fn desk_holds_a_boss_to_what_it_may_answer_for_its_session() {
     })
     .await;
 }
+
+fn git(dir: &std::path::Path, args: &[&str]) {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "git {args:?}: {out:?}");
+}
+
+/// A push is judged by the repository it runs in: the own folder's, on a
+/// branch that isn't the default one. From another repository (another
+/// cwd, a nested one) the boss can't tell what it pushes.
+#[tokio::test]
+async fn a_push_is_judged_by_the_repository_it_runs_in() {
+    use crate::model::Decision;
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let own = base.join("acme-web");
+        let other = base.join("acme-api");
+        for (repo, branch) in [(&own, "feat/x"), (&other, "main")] {
+            std::fs::create_dir_all(repo).unwrap();
+            git(repo, &["init", "-q", "-b", branch]);
+        }
+        let d = desk(pool, dir.path()).await;
+        let s = new_session(&d, &own).await;
+        idle(&d, s.id).await;
+        d.take_on(s.id, &sarah(), How::Handed, &HashSet::new(), &By::you())
+            .await
+            .unwrap();
+        d.boss_bounds_with(crate::charge::Bounds {
+            home: base.clone(),
+            ..Default::default()
+        });
+        let boss = By::manager("sarah", "Sarah", "It's the plan.");
+        let ask = |cwd: &std::path::Path| {
+            let d = d.clone();
+            let body = json!({"hook_event_name": "PermissionRequest", "tool_name": "Bash",
+                "tool_input": {"command": "git push origin HEAD"}, "cwd": cwd});
+            tokio::spawn(async move { hook(&d, s.id, body).await })
+        };
+        let open = || async {
+            for _ in 0..200 {
+                if let Some(p) = d.view(s.id).unwrap().pending {
+                    return p.id;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            panic!("never asked");
+        };
+
+        let elsewhere = ask(&other);
+        let a = open().await;
+        assert_eq!(
+            d.boss_answerable(s.id, a).unwrap_err().to_string(),
+            "Desk can't tell which branch this pushes"
+        );
+        d.decide(s.id, a, Decision::Deny, Some(boss.clone()))
+            .unwrap();
+        elsewhere.await.unwrap();
+
+        let here = ask(&own);
+        let a = open().await;
+        assert_eq!(d.boss_answerable(s.id, a), Ok(()));
+        d.decide(s.id, a, Decision::Allow, Some(boss)).unwrap();
+        assert_eq!(
+            here.await.unwrap()["hookSpecificOutput"]["decision"]["behavior"],
+            "allow"
+        );
+    })
+    .await;
+}

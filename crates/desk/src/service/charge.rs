@@ -207,15 +207,25 @@ impl Desk {
         };
         let moved = self.0.state.lock().live.get(&id).is_some_and(|l| l.moved);
         let mut facts = charge::facts_of(view.engine, &pending, &view, &bounds.home, moved);
-        // The repository says which branch it is on and which is its
-        // default, now: not what Desk last saw.
-        facts.branch = git_line(&facts.own, &["symbolic-ref", "--short", "-q", "HEAD"]);
-        facts.default_branch = git_line(
-            &facts.own,
-            &["symbolic-ref", "--short", "-q", "refs/remotes/origin/HEAD"],
-        )
-        .map(|d| d.strip_prefix("origin/").map(str::to_string).unwrap_or(d));
-        charge::answerable(&facts, &bounds, &charge::real_path)
+        // The repository the request runs in says which branch it is on
+        // and which is its default, now: not what Desk last saw. Only the
+        // own folder's repository counts: a push from another one (a
+        // nested repository, a submodule, a cwd elsewhere) has no branch
+        // the boss may push.
+        if let Some(cwd) = facts.cwd.clone() {
+            let top = git_line(&cwd, &["rev-parse", "--show-toplevel"])
+                .and_then(|t| crate::computer::boss::resolve_real(std::path::Path::new(&t)));
+            let own = crate::computer::boss::resolve_real(&facts.own);
+            if top.is_some() && top == own {
+                facts.branch = git_line(&cwd, &["symbolic-ref", "--short", "-q", "HEAD"]);
+                facts.default_branch = git_line(
+                    &cwd,
+                    &["symbolic-ref", "--short", "-q", "refs/remotes/origin/HEAD"],
+                )
+                .map(|d| d.strip_prefix("origin/").map(str::to_string).unwrap_or(d));
+            }
+        }
+        charge::answerable(&facts, &bounds, &crate::computer::boss::resolve_real)
     }
 
     /// Whether `by`, when it is a boss, may act on `id` now: a session a
