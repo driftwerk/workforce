@@ -3422,3 +3422,39 @@ async fn an_agent_with_no_name_of_its_own_is_never_shown_by_its_id() {
     write_config(&s, "[oversight]\nenabled = true\n");
     assert_eq!(super::name_of(&s), "Boss");
 }
+
+/// At suggest, the overseer suggests no more starts than it has free
+/// slots: the starts it suggested that the person hasn't answered hold one.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_overseer_suggests_no_more_starts_than_it_has_free_slots() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, _crew, _d, _llm) = overseeing(
+            dir.path(),
+            pool,
+            "ok",
+            "[oversight]\nenabled = true\nlevel = \"suggest\"\n[oversight.work]\nparallel = 2\n",
+            &[],
+        )
+        .await;
+        eventually("the overseer's tools", async || {
+            overseer.tools.has("crew.start_session").then_some(())
+        })
+        .await;
+        let start = overseer.tools.get("crew.start_session").unwrap();
+        let input = |n: usize| {
+            json!({"folder": dir.path().to_string_lossy(), "goal": format!("Fix bug {n}"), "reason": "Sam asked"})
+        };
+        for n in 1..=2 {
+            let r = start.execute(input(n)).await.unwrap();
+            assert!(r.output["suggestion_id"].is_string(), "{r:?}");
+        }
+        let r = start.execute(input(3)).await.unwrap();
+        assert!(!r.success);
+        assert_eq!(
+            r.error.as_deref(),
+            Some("You already run or have suggested 2 sessions, the most you may run at once (2). Wait for one to finish, or for the person to answer the starts you suggested.")
+        );
+    })
+    .await;
+}

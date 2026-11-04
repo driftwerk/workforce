@@ -970,6 +970,30 @@ impl CrewHub {
         ))
     }
 
+    /// Whether the overseer (`by`) may suggest one more start: the sessions
+    /// it runs that are starting or working, and the starts it suggested
+    /// that the person hasn't answered, are fewer than its limit.
+    pub(crate) async fn start_suggestable(&self, by: &By, o: &Oversight) -> Result<(), String> {
+        let busy = self.desk.charges_busy(&by.party.id);
+        let open = self
+            .desk
+            .store()
+            .open_suggestions(&by.party.id, "crew.start_session")
+            .await
+            .map_err(|e| {
+                tracing::warn!(error = %e, "couldn't count the starts the overseer suggested");
+                "Something went wrong on this Mac.".to_string()
+            })?;
+        let held = busy + usize::try_from(open).unwrap_or(usize::MAX);
+        let parallel = o.work.parallel as usize;
+        if held >= parallel {
+            return Err(format!(
+                "You already run or have suggested {held} sessions, the most you may run at once ({parallel}). Wait for one to finish, or for the person to answer the starts you suggested."
+            ));
+        }
+        Ok(())
+    }
+
     /// The sidebar group the overseer `boss` is in, which the sessions it
     /// starts go into. One scope today: a boss that runs a group of its own
     /// comes with groups' bosses.

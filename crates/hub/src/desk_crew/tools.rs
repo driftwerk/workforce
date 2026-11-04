@@ -344,6 +344,9 @@ impl CrewTool {
                 Ok(json!({ "done": done }))
             }
             Gate::Suggest(why) => {
+                if matches!(action, Action::StartSession { .. }) {
+                    crew.start_suggestable(&by, &oversight).await?;
+                }
                 let s = crew.suggest(self.name, input, &action, &by).await?;
                 // An answer it may not send is a draft the person sends.
                 crew.answer_drafted(&action, &by, &why).await;
