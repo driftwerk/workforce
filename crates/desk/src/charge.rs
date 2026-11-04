@@ -187,15 +187,18 @@ fn idle(state: SessionState) -> bool {
 }
 
 /// Who has the wheel of `c` at `now`, given when the person last gave the
-/// session input (typed in its terminal, prompted it, wrote to it) and its
-/// state. Only input since the boss last had the wheel counts: since it
-/// was charged, or handed back. The person keeps it while they give input,
-/// and while the session works on it; it comes back after [`QUIET`] with
-/// none and the session idle, unless they pinned it.
+/// session input (typed in its terminal, prompted it, wrote to it), its
+/// state, and since when it is in that state. Only input since the boss
+/// last had the wheel counts: since it was charged, or handed back. The
+/// person keeps it while they give input, and while the session works on
+/// it; it comes back after [`QUIET`] with no input and the session idle
+/// all that time, unless they pinned it. A long turn the person started
+/// keeps it theirs for [`QUIET`] after it ends.
 pub fn wheel(
     c: &Charge,
     last_person_input: Option<DateTime<Utc>>,
     state: SessionState,
+    state_since: Option<DateTime<Utc>>,
     now: DateTime<Utc>,
 ) -> Wheel {
     let taken = match c.wheel {
@@ -208,10 +211,16 @@ pub fn wheel(
         Wheel::Person | Wheel::PersonPinned => c.since,
     };
     let input = last_person_input.filter(|t| *t > boss_since);
-    match taken.max(input) {
-        None => Wheel::Boss,
-        Some(last) if idle(state) && now - last >= QUIET => Wheel::Boss,
-        Some(_) => Wheel::Person,
+    let Some(last) = taken.max(input) else {
+        return Wheel::Boss;
+    };
+    // Quiet from whichever came later: their last input, or the session
+    // coming to rest (unknown is now: it has only just been seen idle).
+    let quiet_from = last.max(state_since.unwrap_or(now));
+    if idle(state) && now - quiet_from >= QUIET {
+        Wheel::Boss
+    } else {
+        Wheel::Person
     }
 }
 
@@ -348,42 +357,78 @@ mod tests {
         let mut c = Charge::new(Uuid::new_v4(), "sarah", How::Handed, None);
         c.since = ago(60);
         let idle = SessionState::Idle;
-        assert_eq!(wheel(&c, None, idle, now), Wheel::Boss);
+        assert_eq!(wheel(&c, None, idle, Some(ago(60)), now), Wheel::Boss);
         assert_eq!(
-            wheel(&c, Some(ago(61)), idle, now),
+            wheel(&c, Some(ago(61)), idle, Some(ago(60)), now),
             Wheel::Boss,
             "input before the charge doesn't count"
         );
-        assert_eq!(wheel(&c, Some(ago(1)), idle, now), Wheel::Person);
-        assert_eq!(wheel(&c, Some(ago(9)), idle, now), Wheel::Person);
-        assert_eq!(wheel(&c, Some(ago(10)), idle, now), Wheel::Boss);
         assert_eq!(
-            wheel(&c, Some(ago(30)), SessionState::Working, now),
+            wheel(&c, Some(ago(1)), idle, Some(ago(60)), now),
+            Wheel::Person
+        );
+        assert_eq!(
+            wheel(&c, Some(ago(9)), idle, Some(ago(60)), now),
+            Wheel::Person
+        );
+        assert_eq!(
+            wheel(&c, Some(ago(10)), idle, Some(ago(60)), now),
+            Wheel::Boss
+        );
+        assert_eq!(
+            wheel(&c, Some(ago(30)), SessionState::Working, Some(ago(60)), now),
             Wheel::Person,
             "it stays the person's while the session works on what they said"
         );
         assert_eq!(
-            wheel(&c, Some(ago(30)), SessionState::Blocked, now),
+            wheel(&c, Some(ago(30)), SessionState::Blocked, Some(ago(60)), now),
             Wheel::Person
         );
 
         // Handed back: what they typed before doesn't take it again.
         c.wheel = Wheel::Boss;
         c.wheel_since = Some(ago(2));
-        assert_eq!(wheel(&c, Some(ago(3)), idle, now), Wheel::Boss);
-        assert_eq!(wheel(&c, Some(ago(1)), idle, now), Wheel::Person);
+        assert_eq!(
+            wheel(&c, Some(ago(3)), idle, Some(ago(60)), now),
+            Wheel::Boss
+        );
+        assert_eq!(
+            wheel(&c, Some(ago(1)), idle, Some(ago(60)), now),
+            Wheel::Person
+        );
 
         // Taken by a click with no input since: it still comes back.
         c.wheel = Wheel::Person;
         c.wheel_since = Some(ago(11));
-        assert_eq!(wheel(&c, None, idle, now), Wheel::Boss);
+        assert_eq!(wheel(&c, None, idle, Some(ago(60)), now), Wheel::Boss);
         c.wheel_since = Some(ago(5));
-        assert_eq!(wheel(&c, None, idle, now), Wheel::Person);
+        assert_eq!(wheel(&c, None, idle, Some(ago(60)), now), Wheel::Person);
+
+        // A long turn the person started: quiet counts from its end.
+        c.wheel = Wheel::Boss;
+        c.wheel_since = None;
+        assert_eq!(
+            wheel(&c, Some(ago(30)), idle, Some(ago(1)), now),
+            Wheel::Person,
+            "it only just came to rest"
+        );
+        assert_eq!(
+            wheel(&c, Some(ago(30)), idle, Some(ago(10)), now),
+            Wheel::Boss
+        );
+        assert_eq!(
+            wheel(&c, Some(ago(30)), idle, None, now),
+            Wheel::Person,
+            "not known when it came to rest: from now"
+        );
 
         // Pinned, it stays.
         c.wheel = Wheel::PersonPinned;
         c.wheel_since = Some(ago(600));
-        assert_eq!(wheel(&c, None, idle, now), Wheel::PersonPinned);
+        assert_eq!(
+            wheel(&c, None, idle, Some(ago(60)), now),
+            Wheel::PersonPinned
+        );
     }
 
     #[test]

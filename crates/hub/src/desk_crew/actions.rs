@@ -333,7 +333,12 @@ impl CrewHub {
         }
         // Taking on a session the person runs is theirs to say, unless
         // they let it take on every one.
-        if let Action::TakeOn { .. } = action {
+        if let Action::TakeOn { session } = action {
+            if self.taken_back(*session) {
+                return Gate::Suggest(
+                    "the person took this session back from you; offer to take it on again and they accept",
+                );
+            }
             return match o.work.take_on {
                 TakeOn::All => Gate::Run,
                 TakeOn::Handed => Gate::Suggest(
@@ -461,6 +466,12 @@ impl CrewHub {
         (!held).then_some(
             "what it leads to wouldn't wait on the person: a session Desk didn't start may not ask before it acts",
         )
+    }
+
+    /// Whether a boss ran `session` and it was let go: only the person
+    /// hands it back.
+    fn taken_back(&self, session: Uuid) -> bool {
+        self.desk.charge_of(session).is_some_and(|c| !c.live())
     }
 
     fn session_name(&self, id: Uuid) -> String {
@@ -773,6 +784,12 @@ impl CrewHub {
                 // yes to its offer.
                 let how = match by.party.kind {
                     crew::PartyKind::You => How::Handed,
+                    _ if self.taken_back(*session) => {
+                        return Err(format!(
+                            "The person took {} back; only they can hand it to you again.",
+                            self.session_name(*session)
+                        ))
+                    }
                     _ => How::Taken,
                 };
                 let c = d

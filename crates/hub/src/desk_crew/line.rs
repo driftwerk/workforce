@@ -580,6 +580,13 @@ pub(super) async fn line_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
             else {
                 continue;
             };
+            // Let go, or taken over, while it waited: no work turn.
+            if !ended.is_empty() && !crew.still_works(session) {
+                ended.clear();
+                if messages.is_empty() {
+                    continue;
+                }
+            }
             // Out of work turns for the hour: its turn's end waits for the
             // next, and what it asked goes on.
             if !ended.is_empty() && !crew.spend_work_turn() {

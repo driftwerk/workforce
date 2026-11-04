@@ -2817,9 +2817,15 @@ async fn taking_on_is_offered_unless_every_session_is_and_letting_go_always_runs
         let me = workforce_desk::crew::Party::session(&d.view(s.id).unwrap());
         let finished = Event::new(Kind::Finished, me.clone(), Some(me), "finished · Built.");
         assert!(
+            crew.trigger_for(&finished, "desk", &o).is_some(),
+            "watching only, its turn's end is a check-in as before"
+        );
+        o.level = Level::Act;
+        assert!(
             crew.trigger_for(&finished, "desk", &o).is_none(),
             "its own line wakes it instead"
         );
+        assert!(crew.still_works(s.id));
         assert!(crew.work_line(&finished).is_some());
         // One that ended asking the person waits on them, and wakes the DM.
         let asked = Event::new(
@@ -2833,7 +2839,18 @@ async fn taking_on_is_offered_unless_every_session_is_and_letting_go_always_runs
         let done = crew.perform(&release, by).await.unwrap();
         assert_eq!(done, "let acme-web go");
         assert!(crew.work_line(&finished).is_none());
+        assert!(
+            !crew.still_works(s.id),
+            "a turn's end gathered before is dropped"
+        );
         assert!(crew.trigger_for(&finished, "desk", &o).is_some());
+        // Let go, it is never taken on again by the overseer alone, even
+        // set to take on every session.
+        o.work.take_on = TakeOn::All;
+        assert!(matches!(crew.gate(&take, &o), Gate::Suggest(_)));
+        let by = crew.by_overseer("Again.").unwrap();
+        assert!(crew.perform(&take, by).await.is_err());
+        assert!(!d.charge_of(s.id).unwrap().live());
         // The person saying yes to its offer hands it over.
         let mut yes = By::you();
         yes.suggestion_id = Some("s1".into());

@@ -754,9 +754,15 @@ impl Desk {
 
     /// Takes everything waiting for `caller`, as its `inbox` tool reads it.
     async fn line_take_inbox(&self, caller: Uuid) -> Result<Vec<Value>, LineError> {
+        let view = self.view(caller)?;
         let mut out = Vec::new();
         for m in self.0.store.line_inbox(&caller.to_string()).await? {
-            if m.delivery == Delivery::Handed || self.waited_on(&m) {
+            // What waits for the person (a breaker's hold, their answer,
+            // their wheel) waits here too.
+            if m.delivery == Delivery::Handed
+                || self.waited_on(&m)
+                || self.line_gate(&view, &m).is_some()
+            {
                 continue;
             }
             if let Some(taken) = self.0.store.line_take(m.id, Delivery::Delivered).await? {
@@ -1140,7 +1146,11 @@ impl Desk {
                     }
                     Ok(_) => None,
                 },
-                Delivery::Handed | Delivery::Delivered | Delivery::Refused => None,
+                Delivery::Handed
+                | Delivery::Delivered
+                | Delivery::Refused
+                | Delivery::Withdrawn
+                | Delivery::Noted => None,
             };
         }
         Ok(rows)
@@ -1154,18 +1164,18 @@ impl Desk {
         text: String,
         when: When,
     ) -> Result<LineMessage, LineError> {
-        let m = self
-            .line_send(
-                Sender::Person,
-                Send::Tell {
-                    to: Target::Session(id),
-                    text,
-                    when,
-                },
-            )
-            .await?;
+        // Theirs before it is queued: a boss's message waiting for the same
+        // idle can't go in ahead of it.
         self.person_drove(id);
-        Ok(m)
+        self.line_send(
+            Sender::Person,
+            Send::Tell {
+                to: Target::Session(id),
+                text,
+                when,
+            },
+        )
+        .await
     }
 
     /// The person changes (`Some`) or takes back (`None`) a message of

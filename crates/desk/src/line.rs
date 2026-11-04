@@ -31,6 +31,11 @@ text_enum!(Delivery {
     Held => "held",
     // Never delivered: the recipient has gone.
     Refused => "refused",
+    // Never delivered: its sender stopped running the session before it
+    // went in, and the person runs it now.
+    Withdrawn => "withdrawn",
+    // Shown in the thread only, never typed into the session.
+    Noted => "noted",
 });
 
 text_enum!(Asked {

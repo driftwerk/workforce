@@ -21,7 +21,7 @@ use uuid::Uuid;
 use super::{Desk, DeskError};
 use crate::charge::{self, Charge, How, NotChargeable, Wheel};
 use crate::crew::{self, By, Kind, Party, PartyKind};
-use crate::line::{self, LineKind};
+use crate::line::{Delivery, LineKind, LineMessage};
 use crate::model::{DeskEvent, SessionState};
 
 /// What the desk keeps of charges in memory: every row, and when the
@@ -33,6 +33,10 @@ pub(crate) struct Charges {
     driven: HashMap<Uuid, DateTime<Utc>>,
     /// What each boss that took a session on is called, by agent id.
     names: HashMap<String, String>,
+    /// Whether the rows were read. Until they are, Desk doesn't know which
+    /// sessions a boss runs or who drives them: every boss's message to a
+    /// session waits, and nothing is taken on.
+    loaded: bool,
 }
 
 /// A charge as Desk shows it: its boss by name, and who has the wheel now.
@@ -54,15 +58,37 @@ pub struct ChargeView {
 const SETTLE_EVERY: Duration = Duration::from_secs(5);
 
 impl Desk {
-    /// Reads the charges as kept.
-    pub(super) async fn charge_load(&self) {
+    /// Reads the charges as kept; whether they were. What the person
+    /// typed before a restart isn't known after it, so a wheel of theirs
+    /// counts its quiet from now.
+    pub(super) async fn charge_load(&self) -> bool {
         match self.0.store.charges().await {
             Ok(rows) => {
-                self.0.state.lock().charges.rows =
-                    rows.into_iter().map(|c| (c.session, c)).collect();
+                let now = crew::now();
+                let rows = rows.into_iter().map(|mut c| {
+                    if c.wheel == Wheel::Person {
+                        c.wheel_since = Some(now);
+                    }
+                    (c.session, c)
+                });
+                let mut st = self.0.state.lock();
+                st.charges.rows = rows.collect();
+                st.charges.loaded = true;
+                true
             }
-            Err(e) => tracing::warn!(error = format!("{e:#}"), "couldn't read charges"),
+            Err(e) => {
+                tracing::warn!(
+                    error = format!("{e:#}"),
+                    "couldn't read charges; bosses' messages wait until they are"
+                );
+                false
+            }
         }
+    }
+
+    /// Whether Desk knows which sessions bosses run.
+    pub fn charges_loaded(&self) -> bool {
+        self.0.state.lock().charges.loaded
     }
 
     /// The boss there is now: the overseer of the hub's crew.
@@ -106,7 +132,8 @@ impl Desk {
             .records
             .get(&c.session)
             .map_or(SessionState::Closed, |r| r.state);
-        charge::wheel(c, Self::last_input(st, c.session), state, Utc::now())
+        let since = st.state_since.get(&c.session).copied();
+        charge::wheel(c, Self::last_input(st, c.session), state, since, Utc::now())
     }
 
     fn charge_view(&self, c: &Charge, wheel: Wheel) -> ChargeView {
@@ -155,7 +182,8 @@ impl Desk {
     /// Whether the person has the wheel of `id`, which a boss runs: its
     /// boss's messages to it wait.
     pub(crate) fn person_driving(&self, id: Uuid) -> bool {
-        self.wheel_of(id).is_some_and(Wheel::person)
+        // Not knowing who drives, it is held.
+        !self.charges_loaded() || self.wheel_of(id).is_some_and(Wheel::person)
     }
 
     /// How many of `boss`'s sessions are starting or working: the slots
@@ -191,22 +219,44 @@ impl Desk {
         Ok(view)
     }
 
-    /// Tells `id`, on its line, `text` from `boss`; what goes wrong is
-    /// only logged (a session that can't hear it still has its charge).
-    async fn charge_tell(&self, id: Uuid, boss: &Party, text: String) {
-        let by = By::manager(&boss.id, &boss.name, "");
-        if let Err(e) = self
-            .line_send(
-                super::Sender::Overseer(by),
-                line::Send::Tell {
-                    to: line::Target::Session(id),
-                    text,
-                    when: line::When::Queue,
-                },
-            )
-            .await
-        {
-            tracing::info!(session = %id, error = %e, "a session wasn't told of its charge");
+    /// Notes on `id`'s line, in its thread, `text` from `boss`: never typed
+    /// in, so it starts no turn (a session just started, or one the person
+    /// now runs alone, does nothing because of it). What goes wrong is only
+    /// logged: the charge stands either way.
+    async fn charge_note(&self, view: &crate::model::SessionView, boss: &Party, text: &str) {
+        let mut m = LineMessage::new(
+            boss.clone(),
+            Party::session(view),
+            LineKind::Tell,
+            text.to_string(),
+            1,
+        );
+        m.delivery = Delivery::Noted;
+        if let Err(e) = self.0.store.put_line(&m).await {
+            tracing::info!(session = %view.id, error = %e, "a session's charge wasn't noted on its line");
+            return;
+        }
+        let _ = self.0.events.send(DeskEvent::Line {
+            message: Box::new(m),
+            removed: false,
+        });
+    }
+
+    /// What `id`'s boss said to it that hasn't gone in never will: it no
+    /// longer runs the session. Each is marked withdrawn in the thread.
+    async fn charge_withdraw(&self, id: Uuid) {
+        match self.0.store.line_withdraw_overseers(&id.to_string()).await {
+            Ok(rows) => {
+                for m in rows {
+                    let _ = self.0.events.send(DeskEvent::Line {
+                        message: Box::new(m),
+                        removed: false,
+                    });
+                }
+            }
+            Err(e) => {
+                tracing::warn!(session = %id, error = %e, "couldn't withdraw a boss's messages")
+            }
         }
     }
 
@@ -223,6 +273,11 @@ impl Desk {
         by: &By,
     ) -> Result<ChargeView, DeskError> {
         let view = self.view(id)?;
+        if !self.charges_loaded() {
+            return Err(DeskError::Conflict(
+                "Desk can't read which sessions bosses run just now; try again shortly.".into(),
+            ));
+        }
         charge::chargeable(&view, bossed)
             .map_err(|e: NotChargeable| DeskError::Conflict(e.to_string()))?;
         let existing = self.charge_of(id).filter(Charge::live);
@@ -253,14 +308,32 @@ impl Desk {
             _ => format!("took on {name}"),
         };
         self.note(by.event(Kind::TakenOn, Some(Party::session(&view)), text));
-        self.charge_tell(
-            id,
+        self.charge_note(
+            &view,
             boss,
-            "I'm running this session with the person now. Ask me (to: \"desk\") when you're unsure; they can take over at any time."
-                .into(),
+            "I'm running this session with the person now. Ask me (to: \"desk\") when you're unsure; they can take over at any time.",
         )
         .await;
         Ok(shown)
+    }
+
+    /// `id`, which a boss no longer overseeing ran, passes to `boss`; or,
+    /// when it can't be run any more (it ended), is let go.
+    pub async fn pass_charge(
+        &self,
+        id: Uuid,
+        boss: &Party,
+        bossed: &HashSet<String>,
+        by: &By,
+    ) -> Result<ChargeView, DeskError> {
+        let view = self.view(id)?;
+        match charge::chargeable(&view, bossed) {
+            Ok(()) => {
+                let how = self.charge_of(id).map_or(How::Taken, |c| c.how);
+                self.take_on(id, boss, how, bossed, by).await
+            }
+            Err(_) => self.release(id, by).await,
+        }
     }
 
     /// `id`'s boss lets it go, or the person takes it back (`by`). Its row
@@ -270,22 +343,26 @@ impl Desk {
         let Some(mut c) = self.charge_of(id).filter(Charge::live) else {
             return Err(DeskError::Conflict("No boss runs that session.".into()));
         };
+        // What it said and the person held goes nowhere: before the release
+        // lets it through, and again for anything said meanwhile.
+        self.charge_withdraw(id).await;
         let now = crew::now();
         c.released_at = Some(now);
         c.updated_at = now;
         let boss = Party::manager(&c.boss, &self.boss_name(&c.boss));
         let wheel = c.wheel;
         let shown = self.put_charge(c, wheel).await?;
+        self.charge_withdraw(id).await;
         let name = view.label().to_string();
         let text = match by.party.kind {
             PartyKind::You => format!("took {name} back from {}", boss.name),
             _ => format!("let {name} go"),
         };
         self.note(by.event(Kind::Released, Some(Party::session(&view)), text));
-        self.charge_tell(
-            id,
+        self.charge_note(
+            &view,
             &boss,
-            "I'm no longer running this session: the person runs it on their own now.".into(),
+            "I'm no longer running this session: the person runs it on their own now.",
         )
         .await;
         Ok(shown)
@@ -427,6 +504,18 @@ impl Desk {
     /// The charges' own loop: who has each wheel is written down as it
     /// changes hands, and a forgotten session's charge goes with it.
     pub(super) async fn charge_loop(self) {
+        // Read again until they are, waiting longer each time.
+        let mut wait = Duration::from_secs(1);
+        while !self.charges_loaded() {
+            tokio::select! {
+                _ = self.0.cancel.cancelled() => return,
+                _ = tokio::time::sleep(wait) => {}
+            }
+            if self.charge_load().await {
+                break;
+            }
+            wait = (wait * 2).min(Duration::from_secs(60));
+        }
         let mut rx = self.0.events.subscribe();
         let mut tick = tokio::time::interval(SETTLE_EVERY);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);

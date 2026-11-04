@@ -9,7 +9,7 @@ use workforce_postgres::test_support::with_test_pool;
 
 use super::super::tests::{desk, new_session};
 use super::*;
-use crate::line::{Send, Target, Wait, When};
+use crate::line::{Delivery, Send, Target, Wait, When};
 use crate::service::Sender;
 use crate::store::build_pool;
 
@@ -55,15 +55,19 @@ async fn a_persons_prompt_holds_the_bosss_queued_tell_and_hand_back_delivers_it(
             .await
             .unwrap();
         assert_eq!((c.boss_name.as_str(), c.wheel), ("Sarah", Wheel::Boss));
-        // The session is told who runs it with the person.
-        let told = take_next(&d, s.id, Duration::from_secs(1)).await.unwrap();
+        // Its thread says who runs it with the person, and no turn starts.
         assert!(
-            told["text"]
-                .as_str()
-                .unwrap()
-                .contains("I'm running this session with the person now"),
-            "{told}"
+            d.line_next(s.id, Duration::from_millis(200))
+                .await
+                .is_none(),
+            "the note isn't typed in"
         );
+        let thread = d.line_thread(s.id, None, None).await.unwrap();
+        let note = thread.last().unwrap();
+        assert_eq!(note.delivery, Delivery::Noted);
+        assert!(note
+            .text
+            .contains("I'm running this session with the person now"));
 
         // The person prompts it: theirs now.
         hook(
@@ -97,6 +101,8 @@ async fn a_persons_prompt_holds_the_bosss_queued_tell_and_hand_back_delivers_it(
                 .is_none(),
             "held while the person drives"
         );
+        let inbox = d.line_call(s.id, "inbox", &json!({}), None).await.unwrap();
+        assert_eq!(inbox["messages"], json!([]), "nor read from its inbox");
         let thread = d.line_thread(s.id, None, None).await.unwrap();
         let waiting = thread.iter().find(|r| r.id == m.id).unwrap();
         assert_eq!(waiting.waiting, Some(Wait::PersonDriving));
@@ -231,6 +237,172 @@ async fn an_ended_session_cant_be_taken_on_and_says_why() {
             other => panic!("{other:?}"),
         }
         assert!(d.charge_of(s.id).is_none());
+    })
+    .await;
+}
+
+fn boss_tell(text: &str, to: Uuid) -> Send {
+    Send::Tell {
+        to: Target::Session(to),
+        text: text.into(),
+        when: When::Queue,
+    }
+}
+
+/// Let go while the person drives, what the boss said and the person held
+/// is withdrawn, never typed into a session the person now runs alone.
+#[tokio::test]
+async fn a_release_withdraws_what_the_boss_said_and_starts_no_turn() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let s = new_session(&d, dir.path()).await;
+        idle(&d, s.id).await;
+        d.take_on(s.id, &sarah(), How::Handed, &HashSet::new(), &By::you())
+            .await
+            .unwrap();
+        d.person_drove(s.id);
+        let by = By::manager("sarah", "Sarah", "Next.");
+        let held = d
+            .line_send(Sender::Overseer(by.clone()), boss_tell("Push it.", s.id))
+            .await
+            .unwrap();
+        d.release(s.id, &By::you()).await.unwrap();
+        assert!(
+            d.line_next(s.id, Duration::from_millis(300))
+                .await
+                .is_none(),
+            "nothing goes in"
+        );
+        let thread = d.line_thread(s.id, None, None).await.unwrap();
+        let withdrawn = thread.iter().find(|m| m.id == held.id).unwrap();
+        assert_eq!(withdrawn.delivery, Delivery::Withdrawn);
+        assert_eq!(
+            serde_json::to_value(withdrawn).unwrap()["delivery"],
+            "withdrawn"
+        );
+        let note = thread.last().unwrap();
+        assert_eq!(note.delivery, Delivery::Noted);
+        assert!(note.text.contains("I'm no longer running this session"));
+    })
+    .await;
+}
+
+/// The person's message goes ahead of a boss's that was waiting for the
+/// same idle.
+#[tokio::test]
+async fn the_persons_message_goes_ahead_of_the_bosss_waiting_one() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let s = new_session(&d, dir.path()).await;
+        idle(&d, s.id).await;
+        d.take_on(s.id, &sarah(), How::Handed, &HashSet::new(), &By::you())
+            .await
+            .unwrap();
+        let by = By::manager("sarah", "Sarah", "Next.");
+        let boss = d
+            .line_send(Sender::Overseer(by), boss_tell("Run the tests.", s.id))
+            .await
+            .unwrap();
+        let mine = d
+            .line_post(s.id, "Stop, try the other fix".into(), When::Queue)
+            .await
+            .unwrap();
+        let next = take_next(&d, s.id, Duration::from_secs(1)).await.unwrap();
+        assert_eq!(next["id"], json!(mine.id));
+        assert!(row_waits(&d, boss.id).await);
+    })
+    .await;
+}
+
+async fn row_waits(d: &Desk, id: Uuid) -> bool {
+    d.0.store.line_message(id).await.unwrap().unwrap().waits()
+}
+
+/// Until Desk has read which sessions bosses run, every boss's message to
+/// a session waits and nothing is taken on; after a restart, a wheel the
+/// person had counts its quiet from then.
+#[tokio::test]
+async fn not_knowing_who_runs_what_holds_the_bosss_messages_and_a_restart_keeps_the_wheel() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let s = new_session(&d, dir.path()).await;
+        idle(&d, s.id).await;
+        d.take_on(s.id, &sarah(), How::Handed, &HashSet::new(), &By::you())
+            .await
+            .unwrap();
+        let other = new_session(&d, dir.path()).await;
+        idle(&d, other.id).await;
+        d.0.state.lock().charges.loaded = false;
+        let by = By::manager("sarah", "Sarah", "Next.");
+        let held = d
+            .line_send(Sender::Overseer(by), boss_tell("Carry on.", other.id))
+            .await
+            .unwrap();
+        assert!(d
+            .line_next(other.id, Duration::from_millis(200))
+            .await
+            .is_none());
+        assert!(row_waits(&d, held.id).await);
+        assert!(matches!(
+            d.take_on(other.id, &sarah(), How::Handed, &HashSet::new(), &By::you())
+                .await,
+            Err(DeskError::Conflict(_))
+        ));
+
+        // The person drove before a restart, long enough ago to be quiet.
+        let mut c = d.charge_of(s.id).unwrap();
+        c.wheel = Wheel::Person;
+        c.wheel_since = Some(crew::now() - chrono::Duration::hours(1));
+        d.0.store.put_charge(&c).await.unwrap();
+        assert!(d.charge_load().await);
+        assert_eq!(
+            d.wheel_of(s.id),
+            Some(Wheel::Person),
+            "quiet from the restart"
+        );
+        let next = take_next(&d, other.id, Duration::from_secs(1)).await;
+        assert_eq!(
+            next.unwrap()["id"],
+            json!(held.id),
+            "known again, it goes in"
+        );
+    })
+    .await;
+}
+
+/// A session a boss no longer overseeing ran passes to the new one, or is
+/// let go once it has ended.
+#[tokio::test]
+async fn a_session_passes_to_the_new_boss_or_is_let_go_once_ended() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let (a, b) = (
+            new_session(&d, dir.path()).await,
+            new_session(&d, dir.path()).await,
+        );
+        for s in [&a, &b] {
+            d.take_on(s.id, &sarah(), How::Handed, &HashSet::new(), &By::you())
+                .await
+                .unwrap();
+        }
+        d.0.state.lock().records.get_mut(&b.id).unwrap().state = SessionState::Closed;
+        let mia = Party::manager("mia", "Mia");
+        let by = By::manager("mia", "Mia", "Its boss no longer oversees.");
+        let passed = d
+            .pass_charge(a.id, &mia, &HashSet::new(), &by)
+            .await
+            .unwrap();
+        assert_eq!((passed.boss.as_str(), passed.how), ("mia", How::Handed));
+        let ended = d
+            .pass_charge(b.id, &mia, &HashSet::new(), &by)
+            .await
+            .unwrap();
+        assert!(ended.released_at.is_some());
+        assert_eq!(d.charges().len(), 1);
     })
     .await;
 }

@@ -83,6 +83,17 @@ impl CrewHub {
         }
     }
 
+    /// Whether a work turn for `session` is still wanted: the overseer runs
+    /// it and has its wheel (it may have been let go, or the person taken
+    /// over, while its turn's end waited).
+    pub(crate) fn still_works(&self, session: Uuid) -> bool {
+        self.overseer_service().is_some_and(|(s, o)| {
+            o.level != Level::Watch
+                && self.runs(session, s.agent_id.as_str())
+                && self.desk.wheel_of(session) == Some(Wheel::Boss)
+        })
+    }
+
     /// Spends one of the hour's work turns if there is one left. When none
     /// is, the person is told once that the overseer is pacing itself.
     pub(crate) fn spend_work_turn(&self) -> bool {
@@ -127,41 +138,44 @@ impl CrewHub {
 
     /// Takes on every session it can, when the overseer is set to and may
     /// act; and passes the sessions a boss no longer overseeing ran to the
-    /// one that does.
+    /// one that does, or lets them go where they can't be run any more.
+    /// Nothing, until Desk knows which sessions bosses run.
     pub(crate) async fn take_on_all(&self) {
         let Some((service, o)) = self.overseer_service() else {
             return;
         };
         // Watching only, it runs nothing.
-        if o.level == Level::Watch {
+        if o.level == Level::Watch || !self.desk.charges_loaded() {
             return;
         }
         let boss = Party::manager(service.agent_id.as_str(), &name_of(&service));
         let none = HashSet::new();
+        let by = |why: &str| By::manager(&boss.id, &boss.name, why);
+        for c in self
+            .desk
+            .charges()
+            .into_iter()
+            .filter(|c| c.boss != boss.id)
+        {
+            let by = by("Its boss no longer oversees.");
+            if let Err(e) = self.desk.pass_charge(c.session, &boss, &none, &by).await {
+                tracing::info!(session = %c.session, error = %e, "a session wasn't passed on");
+            }
+        }
+        if o.level != Level::Act || o.work.take_on != TakeOn::All {
+            return;
+        }
         for s in self.desk.list() {
             let existing = self.desk.charge_of(s.id);
-            let how = match &existing {
-                // Run by a boss that doesn't oversee any more.
-                Some(c) if c.live() && c.boss != boss.id => c.how,
-                Some(_) => continue,
-                None if o.level == Level::Act
-                    && charge::takes_automatically(
-                        o.work.take_on == TakeOn::All,
-                        &s,
-                        None,
-                        &none,
-                    ) =>
-                {
-                    charge::How::Taken
-                }
-                None => continue,
-            };
-            let by = By::manager(
-                &boss.id,
-                &boss.name,
-                "The person lets me take on every session.",
-            );
-            if let Err(e) = self.desk.take_on(s.id, &boss, how, &none, &by).await {
+            if !charge::takes_automatically(true, &s, existing.as_ref(), &none) {
+                continue;
+            }
+            let by = by("The person lets me take on every session.");
+            if let Err(e) = self
+                .desk
+                .take_on(s.id, &boss, charge::How::Taken, &none, &by)
+                .await
+            {
                 tracing::info!(session = %s.id, error = %e, "a session wasn't taken on");
             }
         }
