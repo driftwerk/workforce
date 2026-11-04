@@ -1918,11 +1918,51 @@ impl Desk {
     /// Starts a session; `by` is who asked (none: the session's own
     /// `started` is recorded).
     pub async fn create(&self, new: NewSession, by: Option<By>) -> Result<SessionView, DeskError> {
+        self.start_session(new, None, by).await
+    }
+
+    /// Starts a session for `boss`, which runs it from the start: it is in
+    /// the boss's charge ([`crate::charge::How::Started`]), and in
+    /// `new.group`, before it runs, so nothing it does or spends is ever
+    /// outside them.
+    pub async fn create_for(
+        &self,
+        new: NewSession,
+        boss: &Party,
+        by: By,
+    ) -> Result<SessionView, DeskError> {
+        self.start_session(new, Some(boss), Some(by)).await
+    }
+
+    async fn start_session(
+        &self,
+        new: NewSession,
+        boss: Option<&Party>,
+        by: Option<By>,
+    ) -> Result<SessionView, DeskError> {
         let name = new.name.trim();
         if name.is_empty() {
             return Err(DeskError::Invalid("a session needs a name".into()));
         }
         self.breaker_refuses_start(by.as_ref())?;
+        let group = new
+            .group
+            .as_deref()
+            .map(str::trim)
+            .filter(|g| !g.is_empty() && *g != UNGROUPED)
+            .map(str::to_string);
+        if let Some(g) = &group {
+            if !self.layout().groups.iter().any(|x| &x.id == g) {
+                return Err(DeskError::Invalid(format!(
+                    "there's no group {g} in the sidebar"
+                )));
+            }
+        }
+        if boss.is_some() && !self.charges_loaded() {
+            return Err(DeskError::Conflict(
+                "Desk can't read which sessions bosses run just now; try again shortly.".into(),
+            ));
+        }
         check_env(&new.env)?;
         let view = new
             .view
@@ -1939,6 +1979,12 @@ impl Desk {
                 })
             })?;
         self.program_of(new.engine)?;
+        if boss.is_some() && engine::caps(new.engine, view).line == engine::Deliver::None {
+            return Err(DeskError::Invalid(format!(
+                "{} sessions have no line for a boss to talk on",
+                new.engine.title()
+            )));
+        }
         let changed = !new.env.is_empty() && {
             let mut st = self.0.state.lock();
             let changed = st.session_env != new.env;
@@ -2012,8 +2058,16 @@ impl Desk {
             updated_at: now,
         };
         self.0.state.lock().records.insert(id, record.clone());
-        if let Err(e) = self.launch(&record, false, new.prompt.as_deref()).await {
+        // Where it belongs, before it can do or spend anything.
+        let placed = self.start_placed(id, group.as_deref(), boss).await;
+        let launched = match placed {
+            Ok(()) => self.launch(&record, false, new.prompt.as_deref()).await,
+            Err(e) => Err(e),
+        };
+        if let Err(e) = launched {
             self.0.state.lock().records.remove(&id);
+            self.start_unplaced(id, group.is_some(), boss.is_some())
+                .await;
             return Err(e);
         }
         // Persist what hooks may already have changed since launch.
@@ -2024,7 +2078,40 @@ impl Desk {
             Some(by) => by.event(Kind::Started, Some(me), format!("started {}", view.label())),
             None => Event::new(Kind::Started, me.clone(), Some(me), "started"),
         });
+        if let Some(boss) = boss {
+            self.started_note(&view, boss).await;
+        }
         Ok(view)
+    }
+
+    /// Puts `id`, about to run, in `group` and in `boss`'s charge.
+    async fn start_placed(
+        &self,
+        id: Uuid,
+        group: Option<&str>,
+        boss: Option<&Party>,
+    ) -> Result<(), DeskError> {
+        if let Some(boss) = boss {
+            self.charge_started(id, boss, group).await?;
+        }
+        if let Some(g) = group {
+            let item = groups::session_item(id);
+            self.change_layout(|l| l.put(&item, g, None)).await?;
+        }
+        Ok(())
+    }
+
+    /// Undoes [`Self::start_placed`] for a session that didn't run.
+    async fn start_unplaced(&self, id: Uuid, grouped: bool, charged: bool) {
+        if charged {
+            self.charge_forget(id);
+            if let Err(e) = self.0.store.delete(id).await {
+                tracing::warn!(%id, error = format!("{e:#}"), "a session that didn't start keeps its charge's row until it is forgotten");
+            }
+        }
+        if grouped {
+            self.drop_from_layout(id).await;
+        }
     }
 
     pub fn update(&self, id: Uuid, patch: SessionPatch) -> Result<SessionView, DeskError> {
@@ -4579,6 +4666,7 @@ mod tests {
                 approve_for_me: false,
                 account: None,
                 env: Default::default(),
+                group: None,
             },
             None,
         )
@@ -4966,6 +5054,7 @@ mod tests {
                         approve_for_me: false,
                         account: None,
                         env: BTreeMap::from([(PLUGIN_DIRS.into(), "/plugins/desk".into())]),
+                        group: None,
                     },
                     None,
                 )
@@ -5012,6 +5101,7 @@ mod tests {
                         approve_for_me: false,
                         account: None,
                         env: BTreeMap::from([("NOT A NAME".into(), "x".into())]),
+                        group: None,
                     },
                     None,
                 )
@@ -5058,6 +5148,7 @@ mod tests {
                     approve_for_me: false,
                     account: None,
                     env: added.clone(),
+                    group: None,
                 },
                 None,
             )
@@ -5483,6 +5574,7 @@ mod tests {
                         approve_for_me: false,
                         account: None,
                         env: Default::default(),
+                        group: None,
                     },
                     Some(By::you()),
                 )

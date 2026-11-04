@@ -613,6 +613,7 @@ async fn a_codex_session_gets_messages_typed_in_at_idle_while_the_person_isnt_ty
                     approve_for_me: false,
                     account: None,
                     env: Default::default(),
+                    group: None,
                 },
                 None,
             )
@@ -729,6 +730,7 @@ async fn codex_working(
                 approve_for_me: false,
                 account: None,
                 env: Default::default(),
+                group: None,
             },
             None,
         )

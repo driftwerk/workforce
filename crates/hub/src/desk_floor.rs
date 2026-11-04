@@ -361,7 +361,10 @@ fn routed_needs(
             let name = service
                 .as_ref()
                 .filter(|s| s.agent_id.as_str() == row.agent_id)
-                .map_or_else(|| row.agent_id.clone(), |s| crate::desk_crew::name_of(s));
+                .map_or_else(
+                    || workforce_desk::crew::shown_name(&row.agent_id, None, false),
+                    |s| crate::desk_crew::name_of(s),
+                );
             routed_need(row, &detail, place, name)
         })
         .collect())

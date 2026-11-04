@@ -1,6 +1,7 @@
 //! Charges end to end in the desk: taking a session on and letting it go,
 //! the person taking the wheel, and the boss's messages waiting for it.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{json, Value};
@@ -237,6 +238,217 @@ async fn an_ended_session_cant_be_taken_on_and_says_why() {
             other => panic!("{other:?}"),
         }
         assert!(d.charge_of(s.id).is_none());
+    })
+    .await;
+}
+
+fn start_in(dir: &std::path::Path, group: Option<&str>) -> crate::model::NewSession {
+    crate::model::NewSession {
+        engine: crate::engine::Engine::Claude,
+        view: None,
+        name: "acme-web".into(),
+        cwd: dir.to_string_lossy().into_owned(),
+        goal: "Upgrade the date picker".into(),
+        worktree: None,
+        prompt: None,
+        approvals: None,
+        approve_for_me: false,
+        account: None,
+        env: Default::default(),
+        group: group.map(Into::into),
+    }
+}
+
+/// A session a boss starts is in its charge and its group before it runs:
+/// the first the sidebar hears of it, it is already both, and both are
+/// kept before it can spend anything.
+#[tokio::test]
+async fn a_session_a_boss_starts_is_its_and_in_its_group_before_it_runs() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        d.change_layout(|l| l.create("g-acme", "Acme", &[], None))
+            .await
+            .unwrap();
+        let (_, mut rx) = d.subscribe();
+        let by = By::manager("sarah", "Sarah", "Acme's web upgrade");
+        let s = d
+            .create_for(start_in(dir.path(), Some("g-acme")), &sarah(), by)
+            .await
+            .unwrap();
+        assert_eq!(s.group.as_ref().map(|g| g.id.as_str()), Some("g-acme"));
+
+        // In the order the sidebar heard it: charged, then placed, and its
+        // first appearance already in Acme.
+        let mut charged = false;
+        loop {
+            match tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .unwrap()
+                .unwrap()
+            {
+                DeskEvent::Charge { charge } if charge.session == s.id => {
+                    assert_eq!(
+                        (charge.how, charge.boss_name.as_str()),
+                        (How::Started, "Sarah")
+                    );
+                    assert_eq!(charge.group.as_deref(), Some("g-acme"));
+                    charged = true;
+                }
+                DeskEvent::Session { session } if session.id == s.id => {
+                    assert!(charged, "charged before it is first seen");
+                    assert_eq!(
+                        session.group.as_ref().map(|g| g.id.as_str()),
+                        Some("g-acme"),
+                        "in Acme from the first"
+                    );
+                    break;
+                }
+                _ => {}
+            }
+        }
+        // Kept, not only in memory.
+        let kept = d.0.store.charges().await.unwrap();
+        assert!(kept
+            .iter()
+            .any(|c| c.session == s.id && c.boss == "sarah" && c.how == How::Started));
+        let layout = d.0.store.layout().await.unwrap();
+        assert_eq!(
+            layout
+                .group_of(&super::super::session_item(s.id))
+                .map(|g| g.id.as_str()),
+            Some("g-acme")
+        );
+        assert_eq!(d.charges_busy("sarah"), 1, "starting holds a slot");
+        // Its thread says who runs it, and no turn starts for it.
+        let thread = d.line_thread(s.id, None, None).await.unwrap();
+        assert!(thread
+            .last()
+            .unwrap()
+            .text
+            .contains("I started this session for the person"));
+
+        // A group the sidebar doesn't have starts nothing.
+        let before = d.list().len();
+        match d
+            .create_for(
+                start_in(dir.path(), Some("g-atlas")),
+                &sarah(),
+                By::manager("sarah", "Sarah", ""),
+            )
+            .await
+        {
+            Err(DeskError::Invalid(why)) => {
+                assert_eq!(why, "there's no group g-atlas in the sidebar")
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(d.list().len(), before);
+        assert_eq!(d.charges().len(), 1);
+    })
+    .await;
+}
+
+/// A hub whose roster calls each agent by the name given here.
+struct Roster(Vec<(&'static str, &'static str)>);
+
+#[async_trait::async_trait]
+impl crew::Crew for Roster {
+    fn overseer(&self) -> Option<crew::Overseer> {
+        None
+    }
+    fn agents(&self) -> Vec<crew::CrewAgent> {
+        self.0
+            .iter()
+            .map(|(id, name)| crew::CrewAgent {
+                id: id.to_string(),
+                name: name.to_string(),
+                live: None,
+            })
+            .collect()
+    }
+    fn midnight(&self) -> chrono::DateTime<Utc> {
+        Utc::now()
+    }
+    async fn accept(&self, _: &crew::Suggestion) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+/// A boss is called what the hub's roster calls it now, so its name
+/// outlives a restart; one known only by its id is never shown by it.
+#[tokio::test]
+async fn a_boss_is_called_by_its_name_after_a_restart_and_never_by_its_id() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let s = new_session(&d, dir.path()).await;
+        idle(&d, s.id).await;
+        d.take_on(s.id, &sarah(), How::Handed, &HashSet::new(), &By::you())
+            .await
+            .unwrap();
+        let name = |d: &Desk| d.charges()[0].boss_name.clone();
+        assert_eq!(name(&d), "Sarah");
+
+        // After a restart only the rows are known: not what she was called.
+        d.0.state.lock().charges.names.clear();
+        assert_eq!(name(&d), UNNAMED_BOSS, "never her id");
+
+        // The hub's roster says.
+        let roster: Arc<dyn crew::Crew> = Arc::new(Roster(vec![("sarah", "Sarah")]));
+        d.answer_lines_with(&roster);
+        assert_eq!(name(&d), "Sarah");
+        d.hand_back(s.id).await.unwrap_or_else(|e| panic!("{e:?}"));
+        let mut said = String::new();
+        for _ in 0..200 {
+            let page = d.activity(crew::Filter::All, None, 5).await.unwrap();
+            if let Some(e) = page.events.iter().find(|e| e.text.contains(" back to ")) {
+                said = e.text.clone();
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(said.ends_with("back to Sarah"), "{said}");
+
+        // An agent with no name of its own: its id is no name.
+        let roster: Arc<dyn crew::Crew> = Arc::new(Roster(vec![("sarah", "sarah")]));
+        d.answer_lines_with(&roster);
+        assert_eq!(name(&d), UNNAMED_BOSS);
+        d.0.state
+            .lock()
+            .charges
+            .names
+            .insert("sarah".into(), "sarah".into());
+        assert_eq!(name(&d), UNNAMED_BOSS);
+    })
+    .await;
+}
+
+/// A charge made for a session that then didn't start is let go where
+/// Desk shows it, so none is left behind.
+#[tokio::test]
+async fn a_charge_for_a_start_that_failed_is_let_go_where_desk_shows_it() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let id = Uuid::new_v4();
+        d.charge_started(id, &sarah(), None).await.unwrap();
+        assert_eq!(d.charges().len(), 1);
+        let (_, mut rx) = d.subscribe();
+        d.charge_forget(id);
+        let shown = loop {
+            match tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .unwrap()
+                .unwrap()
+            {
+                DeskEvent::Charge { charge } if charge.session == id => break charge,
+                _ => {}
+            }
+        };
+        assert!(shown.released_at.is_some(), "{shown:?}");
+        assert!(d.charges().is_empty());
+        assert!(d.charge_of(id).is_none());
     })
     .await;
 }

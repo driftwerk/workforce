@@ -113,6 +113,9 @@ pub struct CrewHub {
     questions: Mutex<HashMap<uuid::Uuid, String>>,
     /// The work turns the overseer spent on its sessions' turn ends.
     work: Mutex<work::WorkRun>,
+    /// Held while the overseer starts a session: counting its busy
+    /// sessions and starting one more are one step.
+    starting: tokio::sync::Mutex<()>,
 }
 
 static CREWS: Mutex<Vec<Weak<CrewHub>>> = Mutex::new(Vec::new());
@@ -154,10 +157,21 @@ pub(crate) fn config_saved(service: &AgentService) {
     }
 }
 
+/// What `service` is shown as in Desk: its own name, never its id; one
+/// with none is "Boss" when it oversees the crew, else "Agent".
 pub(crate) fn name_of(service: &AgentService) -> String {
-    service
-        .display_name()
-        .unwrap_or_else(|| service.agent_id.as_str().to_string())
+    let id = service.agent_id.as_str();
+    let name = service.display_name();
+    let unnamed = name
+        .as_deref()
+        .is_none_or(|n| n.trim().is_empty() || n == id);
+    let boss = unnamed
+        && AgentWorkspaceConfig::load(&service.workspace)
+            .ok()
+            .flatten()
+            .and_then(|c| c.oversight().ok())
+            .is_some_and(|o| o.enabled);
+    workforce_desk::crew::shown_name(id, name.as_deref(), boss)
 }
 
 fn mtime(workspace: &Path) -> Option<SystemTime> {
@@ -191,6 +205,7 @@ impl CrewHub {
             poke: tokio::sync::Notify::new(),
             questions: Mutex::default(),
             work: Mutex::default(),
+            starting: tokio::sync::Mutex::new(()),
         });
         {
             let mut crews = CREWS.lock();
@@ -326,6 +341,14 @@ impl Crew for CrewHub {
                 }
             })
             .collect()
+    }
+
+    fn agent_name(&self, id: &str) -> Option<String> {
+        self.state
+            .registry
+            .get(id)
+            .and_then(|s| s.display_name())
+            .filter(|n| !n.trim().is_empty() && n != id)
     }
 
     fn timezone(&self) -> chrono_tz::Tz {

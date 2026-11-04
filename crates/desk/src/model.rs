@@ -410,6 +410,10 @@ pub struct NewSession {
     /// folder in `CLAUDE_CODE_PLUGIN_DIRS`.
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    /// The sidebar group it starts in, before it runs; none, where new
+    /// sessions go.
+    #[serde(default)]
+    pub group: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

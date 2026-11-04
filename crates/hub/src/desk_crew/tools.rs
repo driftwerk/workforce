@@ -344,6 +344,9 @@ impl CrewTool {
                 Ok(json!({ "done": done }))
             }
             Gate::Suggest(why) => {
+                if matches!(action, Action::StartSession { .. }) {
+                    crew.start_suggestable(&by, &oversight).await?;
+                }
                 let s = crew.suggest(self.name, input, &action, &by).await?;
                 // An answer it may not send is a draft the person sends.
                 crew.answer_drafted(&action, &by, &why).await;
@@ -377,7 +380,7 @@ impl Tool for CrewTool {
             "crew.interrupt" => "End the turn a working session is on, as Esc in its terminal: it, and the terminal it runs in, keep running, and the shell stays the person's. Works for sessions started in a Desk terminal too.",
             "crew.resume" => "Resume a stopped session, optionally with a prompt. A session in another terminal can only be resumed once it has ended there.",
             "crew.restart" => "Stop a session and resume it with a new prompt, e.g. to get it unstuck.",
-            "crew.start_session" => "Start a Claude Code (default) or Codex session in a project folder with a goal.",
+            "crew.start_session" => "Start a real, visible session (Claude Code, Codex) in a project folder with a goal: it shows on the person's Floor and sidebar, they can watch it, type into it and take it over, and you run it from the start (its turn ends wake you). engine defaults to your default engine; worktree names a new branch to work on in a worktree of its own. You run at most your limit of sessions starting or working at once (crew.overview's slots).",
             "crew.assign" => "Hand a task to one of the crew's agents, in its DM.",
             "crew.take_on" => "Run a session for the person (session_id): it wakes you each time its turn ends, so you can tell it the next step. You take it on yourself only when the person lets you take on every session; otherwise this offers it to them. The person can take over any time by typing in it, and your messages wait until they hand it back.",
             "crew.release" => "Let a session you run go (session_id): the person runs it on their own, and its turn ends no longer wake you. Say why in reason.",
@@ -440,15 +443,25 @@ impl Tool for CrewTool {
                 })),
                 &["session_id"],
             ),
-            "crew.start_session" => act(
-                props(json!({
-                    "path": { "type": "string", "description": "Absolute path of the project folder" },
-                    "goal": { "type": "string" },
-                    "name": { "type": "string" },
-                    "engine": { "type": "string", "enum": workforce_desk::engine::startable() }
-                })),
-                &["path", "goal"],
-            ),
+            "crew.start_session" => {
+                let engines = self
+                    .crew
+                    .upgrade()
+                    .map(|c| c.engines_to_start())
+                    .filter(|e| !e.is_empty())
+                    .unwrap_or_else(workforce_desk::engine::startable);
+                act(
+                    props(json!({
+                        "folder": { "type": "string", "description": "Absolute path of the project folder" },
+                        "goal": { "type": "string", "description": "What it is to do: its first prompt" },
+                        "name": { "type": "string" },
+                        "engine": { "type": "string", "enum": engines },
+                        "view": { "type": "string", "enum": ["terminal"], "description": "Where it runs (default terminal)" },
+                        "worktree": { "type": "string", "description": "A new branch to work on, in a worktree of its own" }
+                    })),
+                    &["folder", "goal"],
+                )
+            }
             "crew.assign" => act(
                 props(json!({
                     "agent_id": { "type": "string" },

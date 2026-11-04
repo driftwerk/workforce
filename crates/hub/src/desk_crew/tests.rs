@@ -48,8 +48,12 @@ async fn agent_calling(
     use wiremock::matchers::{body_partial_json, method, path};
     use wiremock::{Mock, ResponseTemplate};
     let (config, server) = crate::serve::testing::mock_llm_config(&dir.join(id), |c| {
+        // Named as the person named it: Scout for `scout`.
+        let mut name = id.to_string();
+        name[..1].make_ascii_uppercase();
         c.agents = vec![AgentConfig {
             id: id.into(),
+            name: Some(name),
             ..Default::default()
         }];
     })
@@ -184,12 +188,23 @@ async fn desk_with(
     floor: workforce_desk::Floor,
 ) -> Desk {
     let cli = fake_cli(dir);
+    desk_running(pool, dir, floor, cli.clone(), cli).await
+}
+
+/// A desk whose Claude Code is `claude` and Codex `codex`.
+async fn desk_running(
+    pool: workforce_postgres::PostgresPool,
+    dir: &Path,
+    floor: workforce_desk::Floor,
+    claude: PathBuf,
+    codex: PathBuf,
+) -> Desk {
     Desk::start(
         DeskStore::with_pool(pool).await.unwrap(),
         Options {
             programs: BTreeMap::from([
-                (workforce_desk::engine::Engine::Claude, cli.clone()),
-                (workforce_desk::engine::Engine::Codex, cli),
+                (workforce_desk::engine::Engine::Claude, claude),
+                (workforce_desk::engine::Engine::Codex, codex),
             ]),
             env: BTreeMap::from([("PATH".into(), "/usr/bin:/bin".into())]),
             run_dir: dir.join("run"),
@@ -287,6 +302,7 @@ pub(crate) async fn new_session(
             approve_for_me: false,
             account: None,
             env: Default::default(),
+            group: None,
         },
         Some(By::you()),
     )
@@ -1073,7 +1089,7 @@ async fn the_overseer_messages_the_crew_within_the_loop_guard() {
         let nudge = || crew.perform(&action, crew.by_overseer("Quiet for 40 min.").unwrap());
         let mut frames = crew.state.broadcast_tx.subscribe();
         let done = nudge().await;
-        assert_eq!(done.as_deref(), Ok("asked scout"), "{done:?}");
+        assert_eq!(done.as_deref(), Ok("asked Scout"), "{done:?}");
         // The overseer's message goes out live to Scout's open DM before the
         // answer starts, and is the overseer's in the DM's history.
         let (said, before) = relayed_frame(&mut frames, &dm.id).await;
@@ -1081,10 +1097,10 @@ async fn the_overseer_messages_the_crew_within_the_loop_guard() {
             !before.iter().any(|t| t.starts_with("stream")),
             "{before:?}"
         );
-        assert_eq!(said.content, "desk asks: How is the staging check going?");
+        assert_eq!(said.content, "Desk asks: How is the staging check going?");
         assert_eq!(
             said.author,
-            Some(json!({"kind": "overseer", "id": "desk", "name": "desk"}))
+            Some(json!({"kind": "overseer", "id": "desk", "name": "Desk"}))
         );
         let item = history_item(&crew, &scout, PERSON, said.id.as_deref().unwrap()).await;
         assert_eq!(item["from"], "user");
@@ -1099,7 +1115,7 @@ async fn the_overseer_messages_the_crew_within_the_loop_guard() {
         .await;
         assert_eq!(
             started.text,
-            "started “desk asks: How is the staging check going?”"
+            "started “Desk asks: How is the staging check going?”"
         );
         assert_eq!(started.hop, 1, "a hand-off from the overseer");
         let asked = d
@@ -1110,7 +1126,7 @@ async fn the_overseer_messages_the_crew_within_the_loop_guard() {
             .into_iter()
             .find(|e| e.kind == Kind::Nudged)
             .unwrap();
-        assert_eq!(asked.text, "asked scout “How is the staging check going?”");
+        assert_eq!(asked.text, "asked Scout “How is the staging check going?”");
         assert_eq!(asked.reason.as_deref(), Some("Quiet for 40 min."));
 
         for _ in 1..super::TURN_BUDGET {
@@ -1263,7 +1279,7 @@ async fn messaging_agents_and_terminal_sessions_is_the_persons_to_switch_on() {
             .execute(json!({"agent_id": "scout", "message": "How is the staging check going?", "reason": "Quiet."}))
             .await
             .unwrap();
-        assert_eq!(nudged.output["done"], "asked scout", "{nudged:?}");
+        assert_eq!(nudged.output["done"], "asked Scout", "{nudged:?}");
         let assigned = tool("crew.assign")
             .execute(json!({"agent_id": "scout", "task": "Check the date picker build", "reason": "Next up."}))
             .await
@@ -1707,7 +1723,7 @@ async fn a_suggestion_said_yes_to_is_yours_and_worded_with_your_name() {
             page.messages.into_iter().find(|m| m.text == "On it.")
         })
         .await;
-        assert_eq!(answer.author, workforce_desk::Speaker::agent("scout", "scout"));
+        assert_eq!(answer.author, workforce_desk::Speaker::agent("scout", "Scout"));
     })
     .await;
 }
@@ -3227,6 +3243,218 @@ async fn a_request_from_a_session_it_runs_wakes_the_overseer_and_it_answers() {
             woke.content
         );
         assert!(woke.content.contains("crew.approve"), "{}", woke.content);
+    })
+    .await;
+}
+
+/// [`fake_cli`] that says its version, as an installed Claude Code does.
+fn installed_cli(dir: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join("installed-claude");
+    std::fs::write(
+        &path,
+        format!(
+            "#!/bin/sh\ncase \"$1\" in --version) echo '2.1.300 (Claude Code)'; exit 0;; auth) exit 1;; esac\nprintf '%s\\n' \"$@\" > \"{}/args-$$\"\nexec sleep 60\n",
+            dir.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+/// A program that isn't the engine it is named for: it says no version.
+fn not_installed(dir: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join("not-codex");
+    std::fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+/// The overseer starts real sessions it runs from the start, in its group,
+/// on its default engine, no more than its limit at once; taking one on is
+/// never refused for the limit, and the person saying yes to a start is
+/// theirs to decide.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_overseer_starts_real_sessions_it_runs_up_to_its_limit() {
+    use super::actions::{Action, Gate};
+    use workforce_desk::charge::How;
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, _llm) = agent(dir.path(), "desk", "ok").await;
+        write_config(
+            &overseer,
+            "[oversight]\nenabled = true\nlevel = \"act\"\n[oversight.act]\nhand_out_work = true\n[oversight.work]\ntake_on = \"all\"\n",
+        );
+        let state = hub(std::slice::from_ref(&overseer));
+        let d = desk_running(
+            pool,
+            dir.path(),
+            Default::default(),
+            installed_cli(dir.path()),
+            not_installed(dir.path()),
+        )
+        .await;
+        let crew = CrewHub::start(state, d.clone(), FAST, CancellationToken::new());
+        // The boss sits in Acme in the sidebar: what it starts goes there.
+        d.change_layout(|l| {
+            l.create(
+                "g-acme",
+                "Acme",
+                &[workforce_desk::local_agent_item("desk")],
+                None,
+            )
+        })
+        .await
+        .unwrap();
+        eventually("Desk to read its engines", async || {
+            let e = d.engines();
+            let installed = |x: Engine| e.iter().find(|v| v.engine == x).and_then(|v| v.installed);
+            (installed(Engine::Claude) == Some(true) && installed(Engine::Codex) == Some(false))
+                .then_some(())
+        })
+        .await;
+        assert_eq!(crew.engines_to_start(), ["claude"]);
+
+        let start = |n: usize| {
+            Action::parse(
+                "crew.start_session",
+                &json!({
+                    "folder": dir.path().to_string_lossy(),
+                    "goal": format!("Fix the flaky test #{n}"),
+                    "name": format!("acme-web-{n}"),
+                    "reason": "Sam asked for it",
+                }),
+            )
+            .unwrap()
+        };
+        let (_, o) = crew.overseer_service().unwrap();
+        assert_eq!(crew.gate(&start(1), &o), Gate::Run);
+        let mut started = Vec::new();
+        for n in 1..=4 {
+            let by = crew.by_overseer("Sam asked for it").unwrap();
+            let done = crew.perform(&start(n), by).await.unwrap();
+            assert!(done.starts_with(&format!("started acme-web-{n}")), "{done}");
+            started.push(
+                d.list()
+                    .into_iter()
+                    .find(|v| v.name == format!("acme-web-{n}"))
+                    .unwrap(),
+            );
+        }
+        for v in &started {
+            // A real session, in Acme, on the default engine, the boss's.
+            assert_eq!(v.engine, Engine::Claude);
+            assert_eq!(v.group.as_ref().map(|g| g.id.as_str()), Some("g-acme"));
+            let c = d.charge_of(v.id).unwrap();
+            assert_eq!((c.boss.as_str(), c.how), ("desk", How::Started));
+            assert_eq!(c.group.as_deref(), Some("g-acme"));
+        }
+        assert_eq!(d.charges_busy("desk"), 4);
+
+        // The fifth is refused in plain words, and starts nothing.
+        let by = crew.by_overseer("One more").unwrap();
+        let refused = crew.perform(&start(5), by).await.unwrap_err();
+        assert_eq!(
+            refused,
+            "You already run 4 sessions that are starting or working, the most you may run at once (4). Wait for one to finish, or ask the person to let you run more."
+        );
+        assert_eq!(d.list().len(), 4);
+
+        // Taking on a session the person started is never refused for it.
+        let mine = new_session(&d, dir.path(), "acme-api").await;
+        let take = Action::TakeOn { session: mine.id };
+        assert_eq!(crew.gate(&take, &o), Gate::Run);
+        let by = crew.by_overseer("It is in Acme").unwrap();
+        assert_eq!(crew.perform(&take, by).await.unwrap(), "took on acme-api");
+        assert_eq!(d.charges_busy("desk"), 5);
+
+        // The person saying yes to a start the overseer suggested decides:
+        // it starts, and the overseer runs it.
+        let mut yes = By::you();
+        yes.suggestion_id = Some("s1".into());
+        crew.perform(&start(6), yes).await.unwrap();
+        let sixth = d
+            .list()
+            .into_iter()
+            .find(|v| v.name == "acme-web-6")
+            .unwrap();
+        assert_eq!(d.charge_of(sixth.id).unwrap().how, How::Started);
+
+        // An engine that isn't installed here is refused, and so is a
+        // default engine Desk can't start; a start kept from before, which
+        // said `path`, still reads.
+        let codex = Action::parse(
+            "crew.start_session",
+            &json!({"path": dir.path().to_string_lossy(), "goal": "Port it", "engine": "codex"}),
+        )
+        .unwrap();
+        assert!(matches!(&codex, Action::StartSession { folder, .. } if !folder.is_empty()));
+        let by = crew.by_overseer("Try Codex").unwrap();
+        assert_eq!(
+            crew.perform(&codex, by).await.unwrap_err(),
+            "Codex isn't installed on this computer; start claude instead."
+        );
+        write_config(
+            &overseer,
+            "[oversight]\nenabled = true\nlevel = \"act\"\n[oversight.act]\nhand_out_work = true\n[oversight.work]\nengine = \"gemini\"\nparallel = 12\n",
+        );
+        super::config_saved(&overseer);
+        let by = crew.by_overseer("Default").unwrap();
+        assert_eq!(
+            crew.perform(&start(7), by).await.unwrap_err(),
+            "Desk can't start Gemini CLI sessions yet."
+        );
+    })
+    .await;
+}
+
+/// An agent with no name of its own is never shown by its id: an overseer
+/// is "Boss", any other "Agent".
+#[tokio::test]
+async fn an_agent_with_no_name_of_its_own_is_never_shown_by_its_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = crate::serve::testing::plain_service(dir.path()).await;
+    std::fs::create_dir_all(&s.workspace).unwrap();
+    assert!(s.display_name().is_none());
+    assert_eq!(super::name_of(&s), "Agent");
+    write_config(&s, "[oversight]\nenabled = true\n");
+    assert_eq!(super::name_of(&s), "Boss");
+}
+
+/// At suggest, the overseer suggests no more starts than it has free
+/// slots: the starts it suggested that the person hasn't answered hold one.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_overseer_suggests_no_more_starts_than_it_has_free_slots() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, _crew, _d, _llm) = overseeing(
+            dir.path(),
+            pool,
+            "ok",
+            "[oversight]\nenabled = true\nlevel = \"suggest\"\n[oversight.work]\nparallel = 2\n",
+            &[],
+        )
+        .await;
+        eventually("the overseer's tools", async || {
+            overseer.tools.has("crew.start_session").then_some(())
+        })
+        .await;
+        let start = overseer.tools.get("crew.start_session").unwrap();
+        let input = |n: usize| {
+            json!({"folder": dir.path().to_string_lossy(), "goal": format!("Fix bug {n}"), "reason": "Sam asked"})
+        };
+        for n in 1..=2 {
+            let r = start.execute(input(n)).await.unwrap();
+            assert!(r.output["suggestion_id"].is_string(), "{r:?}");
+        }
+        let r = start.execute(input(3)).await.unwrap();
+        assert!(!r.success);
+        assert_eq!(
+            r.error.as_deref(),
+            Some("You already run or have suggested 2 sessions, the most you may run at once (2). Wait for one to finish, or for the person to answer the starts you suggested.")
+        );
     })
     .await;
 }
