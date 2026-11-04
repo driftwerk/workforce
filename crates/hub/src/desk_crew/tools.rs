@@ -4,6 +4,7 @@
 //! for anything not allowed, an action becomes a suggestion the person
 //! accepts or dismisses in Desk.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Weak};
 use std::time::Instant;
 
@@ -11,6 +12,7 @@ use async_trait::async_trait;
 use eyre::Result;
 use serde_json::{json, Value};
 use workforce_agent::tools::{Tool, ToolResult};
+use workforce_desk::charge::Wheel;
 use workforce_desk::crew::{self, Filter, Item, ItemState};
 
 use super::actions::{Action, Gate};
@@ -24,7 +26,7 @@ pub const READ: [&str; 4] = [
     "crew.history",
     super::spend::NAME,
 ];
-pub const ACT: [&str; 10] = [
+pub const ACT: [&str; 12] = [
     "crew.nudge",
     "crew.escalate",
     "crew.approve",
@@ -35,6 +37,8 @@ pub const ACT: [&str; 10] = [
     "crew.restart",
     "crew.start_session",
     "crew.assign",
+    "crew.take_on",
+    "crew.release",
 ];
 
 pub struct CrewTool {
@@ -80,8 +84,21 @@ fn cell(s: &str) -> String {
     s.replace('|', "/").replace('\n', " ")
 }
 
+/// Who has the wheel of each session the overseer runs, by session id.
+type Charged = HashMap<String, Wheel>;
+
+/// Whether the overseer runs it, and who drives it now.
+fn charge_cell(i: &Item, charged: &Charged) -> &'static str {
+    match charged.get(&i.id) {
+        None => "",
+        Some(Wheel::Boss) => "yes",
+        Some(Wheel::Person) => "yes · the person is driving",
+        Some(Wheel::PersonPinned) => "yes · the person is driving until they hand it back",
+    }
+}
+
 /// One row of the overview's table.
-fn row(i: &Item) -> String {
+fn row(i: &Item, charged: &Charged) -> String {
     let kind = match (i.kind, i.engine, i.origin) {
         (crew::ItemKind::Agent, ..) => "agent".to_string(),
         (_, Some(engine), Some(origin)) => format!(
@@ -115,7 +132,7 @@ fn row(i: &Item) -> String {
         format!("{} ({})", i.name, also.join(", "))
     };
     format!(
-        "| {} | {} | {} | {} | {} | {} | {} |\n",
+        "| {} | {} | {} | {} | {} | {} | {} | {} |\n",
         cell(&who),
         kind,
         i.id,
@@ -123,14 +140,14 @@ fn row(i: &Item) -> String {
         cell(i.task.as_deref().unwrap_or("")),
         cell(&detail),
         i.since.map(|t| t.to_rfc3339()).unwrap_or_default(),
+        charge_cell(i, charged),
     )
 }
 
 /// The overview as tables the overseer reads and can act from: one per
 /// sidebar group, in the person's order, then whatever is in none.
-fn table(items: &[Item], groups: &[String]) -> String {
-    const HEAD: &str =
-        "| Who | Kind | Id | State | Doing | Detail | Since |\n|---|---|---|---|---|---|---|\n";
+fn table(items: &[Item], groups: &[String], charged: &Charged) -> String {
+    const HEAD: &str = "| Who | Kind | Id | State | Doing | Detail | Since | You run it |\n|---|---|---|---|---|---|---|---|\n";
     let mut out = String::new();
     let mut section = |title: Option<&str>, rows: Vec<&Item>| {
         if rows.is_empty() {
@@ -142,7 +159,8 @@ fn table(items: &[Item], groups: &[String]) -> String {
             None => {}
         }
         out.push_str(HEAD);
-        rows.into_iter().for_each(|i| out.push_str(&row(i)));
+        rows.into_iter()
+            .for_each(|i| out.push_str(&row(i, charged)));
         out.push('\n');
     };
     for g in groups {
@@ -180,9 +198,21 @@ impl CrewTool {
                     .overview(crew.as_ref(), None)
                     .await
                     .map_err(internal)?;
+                let (boss, parallel) = crew
+                    .overseer_service()
+                    .map(|(s, o)| (s.agent_id.as_str().to_string(), o.work.parallel))
+                    .unwrap_or_default();
+                let charged: Charged = crew
+                    .desk
+                    .charges()
+                    .into_iter()
+                    .filter(|c| c.boss == boss)
+                    .map(|c| (c.session.to_string(), c.wheel))
+                    .collect();
                 Ok(json!({
                     "counts": o.counts,
-                    "table": reported(&table(&o.items, &o.groups), "the crew's sessions and agents"),
+                    "table": reported(&table(&o.items, &o.groups, &charged), "the crew's sessions and agents"),
+                    "slots": { "busy": crew.desk.charges_busy(&boss), "parallel": parallel },
                 }))
             }
             "crew.activity" => {
@@ -335,7 +365,7 @@ impl Tool for CrewTool {
 
     fn description(&self) -> &str {
         match self.name {
-            "crew.overview" => "Everyone on the crew now: the person's agents and their Claude Code and Codex sessions, each with its state (needs you, working, quiet, done today, idle, failed, stopped), what it's doing, what it asks (with approval ids), and since when. For what sessions spent (tokens, cost), use crew.spend.",
+            "crew.overview" => "Everyone on the crew now: the person's agents and their Claude Code and Codex sessions, each with its state (needs you, working, quiet, done today, idle, failed, stopped), what it's doing, what it asks (with approval ids), since when, and whether you run it for the person (and whether they are driving it now). slots says how many of the sessions you run are starting or working, of the most you may run at once. For what sessions spent (tokens, cost), use crew.spend.",
             super::spend::NAME => super::spend::DESCRIPTION,
             "crew.activity" => "What happened on the crew, newest first: turns started and finished, questions, requests, failures, and what you and the person did. Filter to one agent or session with subject_id.",
             "crew.history" => "The recent messages of one agent's Desk DM with the person (agent_id), or one session's last prompt, reply, pending request and terminal (session_id).",
@@ -349,6 +379,8 @@ impl Tool for CrewTool {
             "crew.restart" => "Stop a session and resume it with a new prompt, e.g. to get it unstuck.",
             "crew.start_session" => "Start a Claude Code (default) or Codex session in a project folder with a goal.",
             "crew.assign" => "Hand a task to one of the crew's agents, in its DM.",
+            "crew.take_on" => "Run a session for the person (session_id): it wakes you each time its turn ends, so you can tell it the next step. You take it on yourself only when the person lets you take on every session; otherwise this offers it to them. The person can take over any time by typing in it, and your messages wait until they hand it back.",
+            "crew.release" => "Let a session you run go (session_id): the person runs it on their own, and its turn ends no longer wake you. Say why in reason.",
             _ => "",
         }
     }
@@ -397,7 +429,7 @@ impl Tool for CrewTool {
                 })),
                 &["session_id", "approval_id"],
             ),
-            "crew.stop" | "crew.interrupt" => act(
+            "crew.stop" | "crew.interrupt" | "crew.take_on" | "crew.release" => act(
                 props(json!({ "session_id": session_schema() })),
                 &["session_id"],
             ),
@@ -481,7 +513,12 @@ mod tests {
             item("auth-fix", None, None),
             item("Ledger migration", Some("monorepo-fd"), Some("Atlas")),
         ];
-        let t = table(&items, &["Atlas".to_string(), "Empty".to_string()]);
+        let charged = Charged::from([(items[1].id.clone(), Wheel::Person)]);
+        let t = table(
+            &items,
+            &["Atlas".to_string(), "Empty".to_string()],
+            &charged,
+        );
         let atlas = t.find("Group “Atlas”:").expect("a Atlas section");
         let row = t
             .find("| Ledger migration (monorepo-fd, in /Users/k/dev/monorepo) |")
@@ -493,5 +530,7 @@ mod tests {
             "a group with nothing in it is left out"
         );
         assert!(t[rest..].contains("| auth-fix (in /Users/k/dev/monorepo) |"));
+        assert!(t.contains("| yes · the person is driving |\n"), "{t}");
+        assert!(t[rest..].trim_end().ends_with("|  |"), "{t}");
     }
 }

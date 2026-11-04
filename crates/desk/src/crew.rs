@@ -130,6 +130,10 @@ kinds! {
     Budgeted => "budgeted",
     Asked => "asked",
     Told => "told",
+    TakenOn => "taken_on",
+    Released => "released",
+    Driving => "driving",
+    HandedBack => "handed_back",
 }
 
 /// One thing that happened on the crew.

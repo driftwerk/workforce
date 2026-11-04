@@ -9,6 +9,9 @@ pub mod attachments;
 mod background;
 pub mod breaker;
 pub mod budget_store;
+pub mod charge;
+mod charge_api;
+pub mod charge_store;
 mod claude;
 mod codex;
 mod codex_session;
@@ -61,7 +64,7 @@ pub use providers::{AccountError, Accounts, Fields, Spec, Standing};
 pub use realtime::{KeySource, Provider, Realtime};
 pub use service::{
     agent_subject, pool_subject, session_subject, AgentSpend, AgentVerdict, BreakerOf, BreakerView,
-    BudgetPatch, BudgetView, BudgetsView, NewBudget, Rules,
+    BudgetPatch, BudgetView, BudgetsView, ChargeView, NewBudget, Rules,
 };
 pub use service::{
     local_agent_item, session_item, Clearing, Desk, DeskError, Floor, Group, Hidden, HolderOptions,

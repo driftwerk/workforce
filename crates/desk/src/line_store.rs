@@ -154,6 +154,25 @@ impl DeskStore {
             .collect()
     }
 
+    /// Withdraws what the overseer said to the session `recipient` that
+    /// hasn't gone in: it never will.
+    pub async fn line_withdraw_overseers(&self, recipient: &str) -> Result<Vec<LineMessage>> {
+        let client = self.pool().get().await?;
+        client
+            .query(
+                &format!(
+                    "UPDATE line_messages SET delivery = 'withdrawn', updated_at = now() \
+                     WHERE recipient ->> 'id' = $1 AND sender ->> 'kind' = 'manager' \
+                     AND kind = 'tell' AND delivery IN ('queued', 'held') RETURNING {COLUMNS}"
+                ),
+                &[&recipient],
+            )
+            .await?
+            .iter()
+            .map(message)
+            .collect()
+    }
+
     /// Everything waiting to go to a session, by session: what the pump
     /// starts from after a restart.
     pub async fn line_waiting(&self) -> Result<Vec<LineMessage>> {

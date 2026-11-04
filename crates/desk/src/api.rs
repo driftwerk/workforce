@@ -1221,7 +1221,8 @@ pub fn sessions_router(desk: Desk, auth: Arc<dyn Authorize>) -> Router {
             desk: desk.clone(),
             auth: Arc::clone(&auth),
         }))
-        .merge(crate::line_api::api_routes(desk, auth))
+        .merge(crate::line_api::api_routes(desk.clone(), Arc::clone(&auth)))
+        .merge(crate::charge_api::api_routes(desk, auth))
 }
 
 pub fn router(

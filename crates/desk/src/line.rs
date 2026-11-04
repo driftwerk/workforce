@@ -31,6 +31,11 @@ text_enum!(Delivery {
     Held => "held",
     // Never delivered: the recipient has gone.
     Refused => "refused",
+    // Never delivered: its sender stopped running the session before it
+    // went in, and the person runs it now.
+    Withdrawn => "withdrawn",
+    // Shown in the thread only, never typed into the session.
+    Noted => "noted",
 });
 
 text_enum!(Asked {
@@ -82,6 +87,9 @@ pub enum Wait {
     Paused,
     /// It is asking the person something: only the person answers it.
     Asking,
+    /// The person has the wheel of a session a boss runs: the boss's
+    /// messages wait until they hand it back.
+    PersonDriving,
 }
 
 /// One message on a line, as stored and as Desk shows it.

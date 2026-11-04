@@ -12,7 +12,13 @@
 //! max_checkins_per_hour = 6
 //! max_checkins_per_day = 100
 //! act = { nudge = true, resume_restart = true, read_only_approvals = false, hand_out_work = false, interrupt = false, message_agents = false, message_terminal_sessions = false, answer_sessions = true }
+//! work = { prefer_sessions = true, parallel = 4, take_on = "handed", engine = "claude", max_turns_per_hour = 60 }
 //! ```
+//!
+//! `[oversight.work]` is how it runs sessions for the person: the sessions
+//! in its charge (handed to it, or every one with `take_on = "all"`) wake
+//! it at each turn's end, up to `max_turns_per_hour` such turns, and at
+//! most `parallel` of them start or work at once.
 //!
 //! A session asks the overseer on Desk's line: with `on_message` it gets a
 //! turn of its own for that, else every question goes straight to the
@@ -116,6 +122,46 @@ pub struct Act {
     pub answer_sessions: bool,
 }
 
+/// Which sessions the overseer takes on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TakeOn {
+    /// Only the sessions it starts and the ones the person hands it.
+    #[default]
+    Handed,
+    /// Every session it can, as each appears.
+    All,
+}
+
+impl TakeOn {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Handed => "handed",
+            Self::All => "all",
+        }
+    }
+}
+
+/// How the overseer runs sessions for the person.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Work {
+    /// Real, visible sessions for the work; helpers only for read-only
+    /// lookups.
+    pub prefer_sessions: bool,
+    /// How many of its sessions may be starting or working at once.
+    pub parallel: u32,
+    pub take_on: TakeOn,
+    /// The engine new sessions run on when nothing says another.
+    pub engine: String,
+    /// Its turns for its sessions' turn ends, in any hour.
+    pub max_turns_per_hour: u32,
+}
+
+/// The most sessions an overseer may run at once.
+pub const MAX_PARALLEL: i64 = 12;
+/// The most turns an hour it may spend on its sessions' turn ends.
+pub const MAX_WORK_TURNS_PER_HOUR: i64 = 600;
+
 /// An agent's `[oversight]`, every default filled in.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Oversight {
@@ -129,6 +175,7 @@ pub struct Oversight {
     /// Check-ins in a day, the ceiling over the hourly budget.
     pub max_checkins_per_day: u32,
     pub act: Act,
+    pub work: Work,
 }
 
 /// The longest a minute threshold may be: a day.
@@ -172,6 +219,13 @@ impl Default for Oversight {
                 message_agents: false,
                 message_terminal_sessions: false,
                 answer_sessions: true,
+            },
+            work: Work {
+                prefer_sessions: true,
+                parallel: 4,
+                take_on: TakeOn::Handed,
+                engine: "claude".into(),
+                max_turns_per_hour: 60,
             },
         }
     }
@@ -271,6 +325,34 @@ impl Oversight {
             root.and_then(|t| t.get("act")),
             "what it may do without asking",
         )?;
+        let work = table(
+            root.and_then(|t| t.get("work")),
+            "how it runs sessions for you",
+        )?;
+        let take_on = match work.and_then(|t| t.get("take_on")) {
+            None => d.work.take_on,
+            Some(Value::String(s)) if s.trim() == "handed" => TakeOn::Handed,
+            Some(Value::String(s)) if s.trim() == "all" => TakeOn::All,
+            Some(_) => {
+                return Err("Whether it takes on sessions must be \"handed\" or \"all\".".into())
+            }
+        };
+        let engine = match work.and_then(|t| t.get("engine")) {
+            None => d.work.engine.clone(),
+            Some(Value::String(s))
+                if !s.trim().is_empty()
+                    && s.trim()
+                        .chars()
+                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()) =>
+            {
+                s.trim().to_string()
+            }
+            Some(_) => {
+                return Err(
+                    "Its default engine must be named in one word, such as claude or codex.".into(),
+                )
+            }
+        };
         let minutes = |key: &str, default: u32, what: &str| {
             whole(
                 wake,
@@ -404,6 +486,34 @@ impl Oversight {
                     "answering sessions' questions without asking",
                 )?,
             },
+            work: Work {
+                prefer_sessions: switch(
+                    work,
+                    "prefer_sessions",
+                    d.work.prefer_sessions,
+                    "preferring real sessions to helpers",
+                )?,
+                parallel: whole(
+                    work,
+                    "parallel",
+                    d.work.parallel,
+                    1..=MAX_PARALLEL,
+                    &format!(
+                        "How many sessions it may run at once must be a whole number from 1 to {MAX_PARALLEL}."
+                    ),
+                )?,
+                take_on,
+                engine,
+                max_turns_per_hour: whole(
+                    work,
+                    "max_turns_per_hour",
+                    d.work.max_turns_per_hour,
+                    1..=MAX_WORK_TURNS_PER_HOUR,
+                    &format!(
+                        "The most turns an hour it may spend on its sessions must be a whole number from 1 to {MAX_WORK_TURNS_PER_HOUR}."
+                    ),
+                )?,
+            },
         })
     }
 
@@ -523,6 +633,85 @@ mod tests {
                 "{source} → {e}"
             );
             assert!(!e.contains("message_"), "{source} → {e} names the key");
+        }
+    }
+
+    #[test]
+    fn how_it_runs_sessions_defaults_to_real_ones_four_at_a_time_only_those_handed_it() {
+        let d = parse("[oversight]\nenabled = true\n").unwrap().work;
+        assert!(d.prefer_sessions);
+        assert_eq!((d.parallel, d.take_on), (4, TakeOn::Handed));
+        assert_eq!((d.engine.as_str(), d.max_turns_per_hour), ("claude", 60));
+        let inline = parse(
+            "[oversight]\nwork = { prefer_sessions = false, parallel = 12, take_on = \"all\", engine = \"codex\", max_turns_per_hour = 1 }\n",
+        )
+        .unwrap();
+        let table = parse(
+            "[oversight]\n[oversight.work]\nprefer_sessions = false\nparallel = 12\ntake_on = \"all\"\nengine = \"codex\"\nmax_turns_per_hour = 1\n",
+        )
+        .unwrap();
+        assert_eq!(inline, table);
+        assert_eq!(
+            inline.work,
+            Work {
+                prefer_sessions: false,
+                parallel: 12,
+                take_on: TakeOn::All,
+                engine: "codex".into(),
+                max_turns_per_hour: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn each_wrong_way_of_running_sessions_is_said_in_its_own_plain_words() {
+        for (source, says) in [
+            (
+                "[oversight]\nwork = { parallel = 0 }\n",
+                "How many sessions it may run at once must be a whole number from 1 to 12.",
+            ),
+            (
+                "[oversight]\nwork = { parallel = 13 }\n",
+                "How many sessions it may run at once must be a whole number from 1 to 12.",
+            ),
+            (
+                "[oversight]\nwork = { parallel = \"4\" }\n",
+                "How many sessions it may run at once must be a whole number from 1 to 12.",
+            ),
+            (
+                "[oversight]\nwork = { take_on = \"some\" }\n",
+                "Whether it takes on sessions must be \"handed\" or \"all\".",
+            ),
+            (
+                "[oversight]\nwork = { take_on = true }\n",
+                "Whether it takes on sessions must be \"handed\" or \"all\".",
+            ),
+            (
+                "[oversight]\nwork = { prefer_sessions = \"yes\" }\n",
+                "Whether preferring real sessions to helpers is on or off must be true or false.",
+            ),
+            (
+                "[oversight]\nwork = { engine = \"Claude Code\" }\n",
+                "Its default engine must be named in one word, such as claude or codex.",
+            ),
+            (
+                "[oversight]\nwork = { engine = 3 }\n",
+                "Its default engine must be named in one word, such as claude or codex.",
+            ),
+            (
+                "[oversight]\nwork = { max_turns_per_hour = 0 }\n",
+                "The most turns an hour it may spend on its sessions must be a whole number from 1 to 600.",
+            ),
+            (
+                "[oversight]\nwork = 4\n",
+                "The settings for how it runs sessions for you need to be a group of settings.",
+            ),
+        ] {
+            let e = parse(source).unwrap_err();
+            assert_eq!(e, says, "{source}");
+            for key in ["parallel", "take_on", "prefer_sessions", "max_turns", "work"] {
+                assert!(!e.contains(key), "{source} → {e} names {key}");
+            }
         }
     }
 

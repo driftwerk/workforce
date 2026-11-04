@@ -164,6 +164,9 @@ impl DeskStore {
         client
             .execute("DELETE FROM sessions WHERE id = $1", &[&id])
             .await?;
+        client
+            .execute("DELETE FROM charges WHERE session = $1", &[&id])
+            .await?;
         Ok(())
     }
 
@@ -184,7 +187,7 @@ impl DeskStore {
 
     /// Forgets sessions all at once: their records, how far `owner` read
     /// each, what Activity says they or anyone did to them, their lines
-    /// (but what they said to other sessions), and how far
+    /// (but what they said to other sessions), their charges, and how far
     /// the ledger read their transcripts (what they spent is kept). How
     /// many records went.
     pub async fn forget_sessions(&self, ids: &[Uuid], owner: &str) -> Result<u64> {
@@ -236,6 +239,8 @@ pub(crate) async fn forget_in(
         &[&ids],
     )
     .await?;
+    tx.execute("DELETE FROM charges WHERE session = ANY($1)", &[&ids])
+        .await?;
     Ok(tx
         .execute("DELETE FROM sessions WHERE id = ANY($1)", &[&ids])
         .await?)

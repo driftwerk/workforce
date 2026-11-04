@@ -9,6 +9,9 @@
 //! What it gives the person shows three ways, from the one row: a Floor
 //! need, a question card in its DM, and the session's thread. Its routine
 //! answers show in its DM as one compact notice each.
+//!
+//! A session it runs ([`super::work`]) wakes it here at each turn's end
+//! too, gathered with the session's messages into one `[Desk work]` turn.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -257,9 +260,16 @@ impl CrewHub {
         }
     }
 
-    /// One turn of the overseer's on `session`'s line, for `messages`.
-    pub(crate) async fn answer_line(&self, session: Uuid, messages: Vec<LineMessage>) {
-        let asks: Vec<LineMessage> = messages
+    /// One turn of the overseer's on `session`'s line, for `messages`,
+    /// and for what `ended` says of its turn's end when the overseer runs
+    /// it (a work turn).
+    pub(crate) async fn answer_line(
+        &self,
+        session: Uuid,
+        mut messages: Vec<LineMessage>,
+        ended: Vec<String>,
+    ) {
+        let mut asks: Vec<LineMessage> = messages
             .iter()
             .filter(|m| m.kind == LineKind::Ask)
             .cloned()
@@ -272,7 +282,12 @@ impl CrewHub {
         let hop = messages.iter().map(|m| m.hop).max().unwrap_or(0);
         if let Some(why) = straight_to_person(&o, hop) {
             self.all_to_person(&asks, why).await;
-            return;
+            if ended.is_empty() {
+                return;
+            }
+            // Its turn's end is still the overseer's to follow up.
+            messages.retain(|m| m.kind != LineKind::Ask);
+            asks.clear();
         }
         let Some(owner) = self.person(Some(&service)) else {
             self.all_to_person(&asks, "Desk has no conversation with you to work from yet.")
@@ -285,7 +300,7 @@ impl CrewHub {
                 known.insert(a.id, a.text.clone());
             }
         }
-        let prompt = self.line_prompt(session, &messages, &o);
+        let prompt = self.line_prompt(session, &messages, &ended, &o);
         let ran = self
             .run_turn(
                 &service,
@@ -356,8 +371,15 @@ impl CrewHub {
         }
     }
 
-    /// What the overseer reads for a session's messages to it.
-    fn line_prompt(&self, session: Uuid, messages: &[LineMessage], o: &Oversight) -> String {
+    /// What the overseer reads for a session's messages to it, and its
+    /// turn's end (`ended`) when it runs it.
+    fn line_prompt(
+        &self,
+        session: Uuid,
+        messages: &[LineMessage],
+        ended: &[String],
+        o: &Oversight,
+    ) -> String {
         let about = match self.desk.view(session) {
             Ok(v) => {
                 let said = serde_json::json!({
@@ -382,6 +404,23 @@ impl CrewHub {
                 format!("- message {} ({kind}): {}", m.id, m.text)
             })
             .collect();
+        if !ended.is_empty() {
+            let said = match lines.is_empty() {
+                true => String::new(),
+                false => format!(
+                    "\n\nIt also wrote to you on Desk's line:\n{}\nFor each question: answer it with crew.nudge \
+                     (session_id, reply_to = the message id, message), or give it to the person with crew.escalate \
+                     (message_id, reason, options, draft).",
+                    reported(&lines.join("\n"), "the session")
+                ),
+            };
+            return format!(
+                "{}\n{about}{said}\n\nAlways give the person anything that pushes, deletes, deploys, spends, \
+                 sends to people or changes scope. {}",
+                self.work_intro(session, ended, o),
+                Self::level_line(o.level),
+            );
+        }
         format!(
             "{LINE} A session on Desk's line (session_id {session}) wrote to you, its overseer:\n{about}\n\n{}\n\n\
              For each question: answer it with crew.nudge (session_id, reply_to = the message id, message), \
@@ -445,18 +484,47 @@ impl CrewHub {
     }
 }
 
-/// Turns sessions' messages to the overseer into its line turns: each
-/// session's gathered for [`GATHER`], one turn at a time per session.
+/// What waits to become a session's next line turn.
+struct Gathered {
+    since: Instant,
+    messages: Vec<LineMessage>,
+    /// What its turn's end said, when the overseer runs it.
+    ended: Vec<String>,
+}
+
+impl Gathered {
+    fn new() -> Self {
+        Self {
+            since: Instant::now(),
+            messages: Vec::new(),
+            ended: Vec::new(),
+        }
+    }
+}
+
+/// Turns sessions' messages to the overseer, and the turn ends of the
+/// sessions it runs, into its line turns: each session's gathered for
+/// [`GATHER`], one turn at a time per session. It takes sessions on as
+/// they appear, when it is set to.
 pub(super) async fn line_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
     let (_, mut events) = crew.desk.subscribe();
-    let mut gathering: HashMap<Uuid, (Instant, Vec<LineMessage>)> = HashMap::new();
+    let mut gathering: HashMap<Uuid, Gathered> = HashMap::new();
     for (session, asks) in crew.take_up_open_asks().await {
-        gathering.insert(session, (Instant::now(), asks));
+        gathering.insert(
+            session,
+            Gathered {
+                messages: asks,
+                ..Gathered::new()
+            },
+        );
     }
     let mut running: HashMap<Uuid, tokio::task::JoinHandle<()>> = HashMap::new();
     let mut tick = tokio::time::interval(Duration::from_millis(500));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut taking_on: Option<tokio::task::JoinHandle<()>> = None;
+    let mut looked: Option<Instant> = None;
     loop {
+        let mut look = false;
         tokio::select! {
             () = cancel.cancelled() => return,
             received = events.recv() => match received {
@@ -468,30 +536,75 @@ pub(super) async fn line_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
                     if let (true, Some(session)) = (fresh, message.from_session()) {
                         gathering
                             .entry(session)
-                            .or_insert_with(|| (Instant::now(), Vec::new()))
-                            .1
+                            .or_insert_with(Gathered::new)
+                            .messages
                             .push(*message);
                     }
+                }
+                Ok(DeskEvent::Activity { event }) => {
+                    if let Some((session, line)) = crew.work_line(&event) {
+                        gathering
+                            .entry(session)
+                            .or_insert_with(Gathered::new)
+                            .ended
+                            .push(line);
+                    }
+                }
+                Ok(DeskEvent::Session { .. }) => {
+                    look = looked.is_none_or(|at| at.elapsed() >= Duration::from_secs(1));
                 }
                 Ok(_) | Err(RecvError::Lagged(_)) => {}
                 Err(RecvError::Closed) => return,
             },
             _ = tick.tick() => {}
         }
+        // New sessions as they appear, and all of them now and then.
+        look |= looked.is_none_or(|at| at.elapsed() >= crew.timing.tick);
+        if look && taking_on.as_ref().is_none_or(|h| h.is_finished()) {
+            looked = Some(Instant::now());
+            let crew = Arc::clone(&crew);
+            taking_on = Some(tokio::spawn(async move { crew.take_on_all().await }));
+        }
         running.retain(|_, h| !h.is_finished());
         let due: Vec<Uuid> = gathering
             .iter()
-            .filter(|(s, (since, _))| since.elapsed() >= GATHER && !running.contains_key(s))
+            .filter(|(s, g)| g.since.elapsed() >= GATHER && !running.contains_key(s))
             .map(|(s, _)| *s)
             .collect();
         for session in due {
-            let Some((_, messages)) = gathering.remove(&session) else {
+            let Some(Gathered {
+                messages,
+                mut ended,
+                ..
+            }) = gathering.remove(&session)
+            else {
                 continue;
             };
+            // Let go, or taken over, while it waited: no work turn.
+            if !ended.is_empty() && !crew.still_works(session) {
+                ended.clear();
+                if messages.is_empty() {
+                    continue;
+                }
+            }
+            // Out of work turns for the hour: its turn's end waits for the
+            // next, and what it asked goes on.
+            if !ended.is_empty() && !crew.spend_work_turn() {
+                gathering.insert(
+                    session,
+                    Gathered {
+                        ended: std::mem::take(&mut ended),
+                        ..Gathered::new()
+                    },
+                );
+                if messages.is_empty() {
+                    continue;
+                }
+            }
             let crew = Arc::clone(&crew);
             running.insert(
                 session,
-                tokio::spawn(async move { crew.answer_line(session, messages).await }),
+                tokio::spawn(async move { crew.answer_line(session, messages, ended).await }),
             );
         }
     }

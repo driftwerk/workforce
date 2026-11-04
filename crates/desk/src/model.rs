@@ -337,6 +337,10 @@ pub enum DeskEvent {
         #[serde(skip_serializing_if = "std::ops::Not::not")]
         removed: bool,
     },
+    /// A boss took a session on or let it go, or its wheel changed hands.
+    Charge {
+        charge: Box<crate::service::ChargeView>,
+    },
     /// A key of Desk's own state changed; `value` is `null` once removed.
     State {
         key: String,

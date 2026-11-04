@@ -754,9 +754,15 @@ impl Desk {
 
     /// Takes everything waiting for `caller`, as its `inbox` tool reads it.
     async fn line_take_inbox(&self, caller: Uuid) -> Result<Vec<Value>, LineError> {
+        let view = self.view(caller)?;
         let mut out = Vec::new();
         for m in self.0.store.line_inbox(&caller.to_string()).await? {
-            if m.delivery == Delivery::Handed || self.waited_on(&m) {
+            // What waits for the person (a breaker's hold, their answer,
+            // their wheel) waits here too.
+            if m.delivery == Delivery::Handed
+                || self.waited_on(&m)
+                || self.line_gate(&view, &m).is_some()
+            {
                 continue;
             }
             if let Some(taken) = self.0.store.line_take(m.id, Delivery::Delivered).await? {
@@ -825,13 +831,20 @@ impl Desk {
 
     /// Why `m` mustn't go into `view` now, whatever its engine could take:
     /// a session Desk's breaker paused, or one asking the person something,
-    /// takes only the person's own messages.
+    /// takes only the person's own messages; one the person drives, none
+    /// of its boss's.
     fn line_gate(&self, view: &SessionView, m: &LineMessage) -> Option<Wait> {
         if m.from.kind == PartyKind::You {
             return None;
         }
         if self.breaker_refuses_prompt(view.id, None).is_err() {
             return Some(Wait::Paused);
+        }
+        if m.from.kind == PartyKind::Manager
+            && m.kind == LineKind::Tell
+            && self.person_driving(view.id)
+        {
+            return Some(Wait::PersonDriving);
         }
         (view.state == SessionState::Asking).then_some(Wait::Asking)
     }
@@ -1133,7 +1146,11 @@ impl Desk {
                     }
                     Ok(_) => None,
                 },
-                Delivery::Handed | Delivery::Delivered | Delivery::Refused => None,
+                Delivery::Handed
+                | Delivery::Delivered
+                | Delivery::Refused
+                | Delivery::Withdrawn
+                | Delivery::Noted => None,
             };
         }
         Ok(rows)
@@ -1147,6 +1164,9 @@ impl Desk {
         text: String,
         when: When,
     ) -> Result<LineMessage, LineError> {
+        // Theirs before it is queued: a boss's message waiting for the same
+        // idle can't go in ahead of it.
+        self.person_drove(id);
         self.line_send(
             Sender::Person,
             Send::Tell {
