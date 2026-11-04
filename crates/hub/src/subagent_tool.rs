@@ -221,7 +221,9 @@ impl SubAgentTool {
                 .flatten()
                 .and_then(|c| c.oversight().ok())
                 .unwrap_or_default();
-        (oversight.enabled && oversight.work.prefer_sessions).then_some(PREFER_SESSIONS)
+        // Watching only, it starts no sessions: its sub-agents run as before.
+        let starts = oversight.level != workforce_common::oversight::Level::Watch;
+        (oversight.enabled && starts && oversight.work.prefer_sessions).then_some(PREFER_SESSIONS)
     }
 
     async fn handle_spawn(&self, input: SubAgentInput, start: Instant) -> Result<ToolResult> {
@@ -604,7 +606,13 @@ mod tests {
         }
         let r = tool.execute(spawn(Some("worker"))).await.unwrap();
         assert_ne!(said(r), PREFER_SESSIONS);
-        config("[oversight]\nenabled = true\n[oversight.work]\nprefer_sessions = false\n");
+        // Watching only, it has no sessions to start instead.
+        config("[oversight]\nenabled = true\nlevel = \"watch\"\n");
+        for p in [None, Some("full"), Some("worker")] {
+            let r = tool.execute(spawn(p)).await.unwrap();
+            assert_ne!(said(r), PREFER_SESSIONS, "{p:?}");
+        }
+        config("[oversight]\nenabled = true\nlevel = \"act\"\n[oversight.work]\nprefer_sessions = false\n");
         for p in [None, Some("full"), Some("worker")] {
             let r = tool.execute(spawn(p)).await.unwrap();
             assert_ne!(said(r), PREFER_SESSIONS, "{p:?}");
