@@ -470,6 +470,9 @@ pub struct Ask {
     pub why: Option<String>,
     /// What it can be answered with, of what Desk offers.
     pub choices: Vec<Decision>,
+    /// What it asks in full: the command as it runs, or every file it
+    /// changes.
+    pub whole: Option<crate::model::Request>,
 }
 
 /// An answer to one of Codex's requests.
@@ -549,7 +552,11 @@ pub fn ask_of(
     home: Option<&Path>,
 ) -> Option<Seen> {
     let thread = params.get("threadId")?.as_str()?.to_string();
-    let (tool, detail) = match method {
+    let cwd = params
+        .get("cwd")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let (tool, detail, input) = match method {
         "item/commandExecution/requestApproval" => {
             let actions: Vec<&str> = params
                 .get("commandActions")
@@ -558,14 +565,18 @@ pub fn ask_of(
                 .flatten()
                 .filter_map(|a| a.get("command").and_then(Value::as_str))
                 .collect();
+            let run = params.get("command").and_then(Value::as_str);
             let command = match actions.is_empty() {
-                true => params.get("command").and_then(Value::as_str)?.to_string(),
+                true => run?.to_string(),
                 false => actions.join("; "),
             };
-            ("Bash", command)
+            // What runs is `command`; its actions are Codex's reading of it.
+            let input = run.map(|c| json!({ "command": c }));
+            ("Bash", command, input)
         }
         "item/fileChange/requestApproval" => {
             let item = params.get("itemId").and_then(Value::as_str)?;
+            let input = files.get(item).map(|f| json!({ "paths": f }));
             let named = files
                 .get(item)
                 .map(|f| {
@@ -575,7 +586,7 @@ pub fn ask_of(
                         .join(", ")
                 })
                 .unwrap_or_default();
-            ("Edit", named)
+            ("Edit", named, input)
         }
         _ => return None,
     };
@@ -587,6 +598,12 @@ pub fn ask_of(
             detail,
             why: why_of(params, home),
             choices: choices_of(params),
+            whole: input.map(|input| crate::model::Request {
+                tool: tool.into(),
+                input,
+                cwd,
+                read_only: false,
+            }),
         }),
     })
 }
@@ -1560,6 +1577,12 @@ pub(crate) mod tests {
                 detail: "rm victim.txt".into(),
                 why: Some("in ~/repo · Do you want to allow deleting victim.txt?".into()),
                 choices: vec![Decision::Allow, Decision::Cancel],
+                whole: Some(crate::model::Request {
+                    tool: "Bash".into(),
+                    input: json!({"command": "/bin/zsh -lc 'rm victim.txt'"}),
+                    cwd: Some("/Users/k/repo".into()),
+                    read_only: false,
+                }),
             }),
             "the amendment writes a rule: the terminal's to offer"
         );

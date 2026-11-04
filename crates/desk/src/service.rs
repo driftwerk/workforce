@@ -648,6 +648,7 @@ fn codex_asks(r: &mut SessionRecord, l: &mut Live, ask: codex::Ask) {
         choices: ask.choices,
         why: ask.why,
         options: None,
+        request: ask.whole,
     };
     let asked = CodexAsk {
         request: ask.request,
@@ -703,6 +704,7 @@ fn codex_question(r: &mut SessionRecord, l: &mut Live, request: Value, q: claude
         choices: Vec::new(),
         why: q.why,
         options: q.options,
+        request: None,
     };
     l.codex_question = Some((request, pending));
     if l.codex_asks.is_empty() {
@@ -1183,6 +1185,7 @@ impl Desk {
                         choices: Vec::new(),
                         why: None,
                         options: None,
+                        request: None,
                     }),
                     answer: None,
                     ended: false,
@@ -3392,6 +3395,7 @@ impl Desk {
                     choices: Vec::new(),
                     why: question.why,
                     options: question.options,
+                    request: None,
                 };
                 let raised = Raised {
                     pending: pending.id,
@@ -3474,6 +3478,7 @@ impl Desk {
                         choices: Vec::new(),
                         why: None,
                         options: None,
+                        request: None,
                     };
                     l.held = Some(Raised {
                         pending: pending.id,
@@ -3622,8 +3627,14 @@ impl Desk {
                 }
                 self.spend_read(id);
             }
-            Hook::Permission { tool, detail } => {
-                return self.await_permission(id, tool, detail, inside).await
+            Hook::Permission {
+                tool,
+                detail,
+                request,
+            } => {
+                return self
+                    .await_permission(id, tool, detail, Some(request), inside)
+                    .await
             }
             Hook::Usage(limits) => self.report_usage(limits, Some(id)),
             Hook::Other => {}
@@ -3701,6 +3712,7 @@ impl Desk {
         id: Uuid,
         tool: String,
         detail: String,
+        request: Option<crate::model::Request>,
         inside: Option<String>,
     ) -> Value {
         let desk_answers = self
@@ -3715,6 +3727,7 @@ impl Desk {
             choices: Vec::new(),
             why: None,
             options: None,
+            request,
         };
         let (tx, rx) = oneshot::channel();
         self.change(id, |r, l| {
@@ -3995,6 +4008,7 @@ impl Desk {
                                     choices: Vec::new(),
                                     why: None,
                                     options: None,
+                                    request: None,
                                 })
                             });
                         }

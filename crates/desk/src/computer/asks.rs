@@ -185,11 +185,28 @@ pub fn always_asks(command: &str, place: &Place<'_>) -> Option<Asks> {
 
 /// Whether `command` publishes or deploys: a push to the default branch,
 /// `npm`/`cargo publish`, `gh release create`, a deploy. A boss's sessions
-/// hand these to the person; nothing else reads it yet.
+/// hand these to the person.
 pub fn publishes(command: &str) -> bool {
+    publishes_on(command, None)
+}
+
+/// The default branch's names: what a push to it is told by.
+const DEFAULT_BRANCHES: &[&str] = &["main", "master", "trunk"];
+
+fn default_branch(name: &str) -> bool {
+    let name = name.strip_prefix("refs/heads/").unwrap_or(name);
+    DEFAULT_BRANCHES.contains(&name)
+}
+
+/// [`publishes`], run on `branch` (the session's checked-out branch, when
+/// known): a bare `git push`, or one of `HEAD`, from the default branch
+/// pushes it too. A script a shell runs (`zsh -lc '…'`) and a command
+/// behind `env`, `command`, `nohup` and the like are read as what runs.
+pub fn publishes_on(command: &str, branch: Option<&str>) -> bool {
     let Ok(commands) = split(command) else {
         return false;
     };
+    let on_default = branch.is_some_and(default_branch);
     commands.iter().any(|c| {
         let words: Vec<&str> = c
             .words
@@ -197,34 +214,71 @@ pub fn publishes(command: &str) -> bool {
             .filter(|w| !is_assignment(w))
             .map(|w| w.text.as_str())
             .collect();
-        let name = words.first().map(|n| n.rsplit('/').next().unwrap_or(n));
-        let has = |w: &str| words.contains(&w);
-        match name {
-            Some("git") => {
-                let push = words.iter().position(|w| *w == "push");
-                push.is_some_and(|i| {
-                    words[i + 1..].iter().any(|w| {
-                        let dest = w.rsplit(':').next().unwrap_or(w).trim_start_matches('+');
-                        matches!(
-                            dest,
-                            "main" | "master" | "refs/heads/main" | "refs/heads/master"
-                        )
-                    })
-                })
-            }
-            Some("npm" | "pnpm" | "yarn" | "cargo" | "twine" | "gem") => {
-                has("publish") || has("upload") && name == Some("twine")
-            }
-            Some("gh") => has("release") && has("create"),
-            Some("fly" | "flyctl") => has("deploy"),
-            Some("vercel") => has("--prod") || has("deploy") && has("--prod"),
-            Some("netlify") => has("deploy") && has("--prod"),
-            Some("kubectl") => has("apply") || has("rollout"),
-            Some("terraform" | "tofu") => has("apply"),
-            Some("helm") => has("upgrade") || has("install"),
-            _ => false,
-        }
+        publishes_words(&words, on_default, branch)
     })
+}
+
+fn publishes_words(words: &[&str], on_default: bool, branch: Option<&str>) -> bool {
+    let Some(first) = words.first() else {
+        return false;
+    };
+    let name = first.rsplit('/').next().unwrap_or(first);
+    let args = &words[1..];
+    let has = |w: &str| args.contains(&w);
+    match name {
+        "exec" | "command" | "builtin" | "nohup" | "time" | "caffeinate" | "env" | "nice" => {
+            let skip = args
+                .iter()
+                .take_while(|w| w.starts_with('-') || w.contains('='))
+                .count();
+            publishes_words(&args[skip..], on_default, branch)
+        }
+        _ if SHELLS.contains(&name) => {
+            let at = args
+                .iter()
+                .position(|w| !w.starts_with("--") && w.starts_with('-') && w.contains('c'));
+            at.and_then(|at| args.get(at + 1))
+                .is_some_and(|script| publishes_on(script, branch))
+        }
+        "git" => {
+            let Some(push) = args.iter().position(|w| *w == "push") else {
+                return false;
+            };
+            let rest = &args[push + 1..];
+            if rest.iter().any(|w| matches!(*w, "--all" | "--mirror")) {
+                return true;
+            }
+            let operands: Vec<&str> = rest
+                .iter()
+                .filter(|w| !w.starts_with('-'))
+                .copied()
+                .collect();
+            // `git push [remote] [refspec…]`: no refspec pushes the branch
+            // it is on.
+            let refspecs = operands.get(1..).unwrap_or_default();
+            if refspecs.is_empty() {
+                return on_default;
+            }
+            refspecs.iter().any(|w| {
+                let w = w.trim_start_matches('+');
+                let dest = w.rsplit(':').next().unwrap_or(w);
+                default_branch(dest)
+                    || (on_default && matches!(dest, "HEAD" | "@"))
+                    || (on_default && branch == Some(dest))
+            })
+        }
+        "npm" | "pnpm" | "yarn" | "cargo" | "twine" | "gem" => {
+            has("publish") || has("upload") && name == "twine"
+        }
+        "gh" => (has("release") && has("create")) || (has("pr") && has("merge")),
+        "fly" | "flyctl" => has("deploy"),
+        "vercel" => has("--prod"),
+        "netlify" => has("deploy") && has("--prod"),
+        "kubectl" => has("apply") || has("rollout"),
+        "terraform" | "tofu" => has("apply"),
+        "helm" => has("upgrade") || has("install"),
+        _ => false,
+    }
 }
 
 /// One word of a command, after quotes are removed.
@@ -1261,6 +1315,7 @@ mod tests {
         }
         for command in [
             "git push origin feature",
+            "git push",
             "npm test",
             "cargo build",
             "gh pr create",
@@ -1268,5 +1323,22 @@ mod tests {
         ] {
             assert!(!publishes(command), "{command:?}");
         }
+        // What runs behind a shell or a wrapper, and merging a PR.
+        for command in [
+            "/bin/zsh -lc 'git push origin main'",
+            "env GIT_TRACE=1 git push origin main",
+            "gh pr merge 42 --squash",
+            "git push --all origin",
+            "git push --mirror backup",
+        ] {
+            assert!(publishes(command), "{command:?}");
+        }
+        // On the default branch, a bare push pushes it.
+        for command in ["git push", "git push origin", "git push -u origin HEAD"] {
+            assert!(publishes_on(command, Some("main")), "{command:?}");
+            assert!(!publishes_on(command, Some("feat/x")), "{command:?}");
+        }
+        assert!(!publishes_on("git push origin feat/x", Some("main")));
+        assert!(publishes_on("git push origin main", Some("feat/x")));
     }
 }

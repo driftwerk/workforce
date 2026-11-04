@@ -497,6 +497,7 @@ mod tests {
             choices: Vec::new(),
             why: None,
             options: None,
+            request: None,
         }
     }
 
@@ -1126,6 +1127,7 @@ mod tests {
             choices: Vec::new(),
             why: None,
             options: None,
+            request: None,
         };
         for t in [
             Transition::Finished { reply: "" },

@@ -466,6 +466,7 @@ mod tests {
             choices: Vec::new(),
             why: None,
             options: None,
+            request: None,
         }
     }
 

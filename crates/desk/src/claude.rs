@@ -128,6 +128,7 @@ struct Payload {
     reason: Option<String>,
     background_tasks: Option<Vec<BackgroundTask>>,
     error: Option<String>,
+    cwd: Option<String>,
 }
 
 /// One entry of a `Stop`'s `background_tasks`.
@@ -173,6 +174,8 @@ pub enum Hook {
     Permission {
         tool: String,
         detail: String,
+        /// What it asks in full: what a boss's answer is judged by.
+        request: crate::model::Request,
     },
     ToolEnd {
         id: Option<String>,
@@ -252,7 +255,17 @@ pub fn parse_hook(body: &[u8]) -> eyre::Result<Hook> {
         )),
         "PermissionRequest" => {
             let (tool, detail) = tool();
-            Hook::Permission { tool, detail }
+            Hook::Permission {
+                tool,
+                detail,
+                request: crate::model::Request {
+                    tool: p.tool_name.clone().unwrap_or_default(),
+                    input: p.tool_input.clone().unwrap_or(Value::Null),
+                    cwd: p.cwd.clone(),
+                    // Claude Code's hook doesn't say whether a tool only reads.
+                    read_only: false,
+                },
+            }
         }
         "PostToolUse" | "PostToolUseFailure" => Hook::ToolEnd {
             id: p.tool_use_id.clone(),
@@ -541,7 +554,13 @@ pub(crate) mod tests {
             parse_hook(perm).unwrap(),
             Hook::Permission {
                 tool: "Bash(cargo test -p hub…)".into(),
-                detail: "cargo test -p hub…".into()
+                detail: "cargo test -p hub…".into(),
+                request: crate::model::Request {
+                    tool: "Bash".into(),
+                    input: json!({"command": "cargo test -p hub\nmore"}),
+                    cwd: None,
+                    read_only: false,
+                },
             }
         );
         // What follows the first line runs too: the detail says it was cut.

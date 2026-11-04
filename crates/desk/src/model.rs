@@ -122,6 +122,25 @@ pub struct PendingApproval {
     /// (Claude Code's AskUserQuestion, Codex's request for input).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub options: Option<Vec<String>>,
+    /// What it asks to do in full, as its engine sent it: what a boss's
+    /// answer is judged by ([`crate::charge::facts_of`]). Never on the
+    /// wire; none when Desk wasn't sent it whole.
+    #[serde(skip)]
+    pub request: Option<Request>,
+}
+
+/// A session's request in full, as its engine sent it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Request {
+    /// The engine's own name for the tool: `Bash`, `Edit`,
+    /// `mcp__slack__chat_post_message`.
+    pub tool: String,
+    /// Its input, whole.
+    pub input: serde_json::Value,
+    /// Where it runs, when the engine says.
+    pub cwd: Option<String>,
+    /// The engine marks it as only reading.
+    pub read_only: bool,
 }
 
 /// The wire shape of a session: the record plus what only exists while it runs.
