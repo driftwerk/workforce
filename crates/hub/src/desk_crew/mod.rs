@@ -113,6 +113,9 @@ pub struct CrewHub {
     questions: Mutex<HashMap<uuid::Uuid, String>>,
     /// The work turns the overseer spent on its sessions' turn ends.
     work: Mutex<work::WorkRun>,
+    /// Held while the overseer starts a session: counting its busy
+    /// sessions and starting one more are one step.
+    starting: tokio::sync::Mutex<()>,
 }
 
 static CREWS: Mutex<Vec<Weak<CrewHub>>> = Mutex::new(Vec::new());
@@ -191,6 +194,7 @@ impl CrewHub {
             poke: tokio::sync::Notify::new(),
             questions: Mutex::default(),
             work: Mutex::default(),
+            starting: tokio::sync::Mutex::new(()),
         });
         {
             let mut crews = CREWS.lock();

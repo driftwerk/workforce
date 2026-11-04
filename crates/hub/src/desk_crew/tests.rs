@@ -184,12 +184,23 @@ async fn desk_with(
     floor: workforce_desk::Floor,
 ) -> Desk {
     let cli = fake_cli(dir);
+    desk_running(pool, dir, floor, cli.clone(), cli).await
+}
+
+/// A desk whose Claude Code is `claude` and Codex `codex`.
+async fn desk_running(
+    pool: workforce_postgres::PostgresPool,
+    dir: &Path,
+    floor: workforce_desk::Floor,
+    claude: PathBuf,
+    codex: PathBuf,
+) -> Desk {
     Desk::start(
         DeskStore::with_pool(pool).await.unwrap(),
         Options {
             programs: BTreeMap::from([
-                (workforce_desk::engine::Engine::Claude, cli.clone()),
-                (workforce_desk::engine::Engine::Codex, cli),
+                (workforce_desk::engine::Engine::Claude, claude),
+                (workforce_desk::engine::Engine::Codex, codex),
             ]),
             env: BTreeMap::from([("PATH".into(), "/usr/bin:/bin".into())]),
             run_dir: dir.join("run"),
@@ -3228,6 +3239,169 @@ async fn a_request_from_a_session_it_runs_wakes_the_overseer_and_it_answers() {
             woke.content
         );
         assert!(woke.content.contains("crew.approve"), "{}", woke.content);
+    })
+    .await;
+}
+
+/// [`fake_cli`] that says its version, as an installed Claude Code does.
+fn installed_cli(dir: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join("installed-claude");
+    std::fs::write(
+        &path,
+        format!(
+            "#!/bin/sh\ncase \"$1\" in --version) echo '2.1.300 (Claude Code)'; exit 0;; auth) exit 1;; esac\nprintf '%s\\n' \"$@\" > \"{}/args-$$\"\nexec sleep 60\n",
+            dir.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+/// A program that isn't the engine it is named for: it says no version.
+fn not_installed(dir: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join("not-codex");
+    std::fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+/// The overseer starts real sessions it runs from the start, in its group,
+/// on its default engine, no more than its limit at once; taking one on is
+/// never refused for the limit, and the person saying yes to a start is
+/// theirs to decide.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_overseer_starts_real_sessions_it_runs_up_to_its_limit() {
+    use super::actions::{Action, Gate};
+    use workforce_desk::charge::How;
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, _llm) = agent(dir.path(), "desk", "ok").await;
+        write_config(
+            &overseer,
+            "[oversight]\nenabled = true\nlevel = \"act\"\n[oversight.act]\nhand_out_work = true\n[oversight.work]\ntake_on = \"all\"\n",
+        );
+        let state = hub(std::slice::from_ref(&overseer));
+        let d = desk_running(
+            pool,
+            dir.path(),
+            Default::default(),
+            installed_cli(dir.path()),
+            not_installed(dir.path()),
+        )
+        .await;
+        let crew = CrewHub::start(state, d.clone(), FAST, CancellationToken::new());
+        // The boss sits in Acme in the sidebar: what it starts goes there.
+        d.change_layout(|l| {
+            l.create(
+                "g-acme",
+                "Acme",
+                &[workforce_desk::local_agent_item("desk")],
+                None,
+            )
+        })
+        .await
+        .unwrap();
+        eventually("Desk to read its engines", async || {
+            let e = d.engines();
+            let installed = |x: Engine| e.iter().find(|v| v.engine == x).and_then(|v| v.installed);
+            (installed(Engine::Claude) == Some(true) && installed(Engine::Codex) == Some(false))
+                .then_some(())
+        })
+        .await;
+        assert_eq!(crew.engines_to_start(), ["claude"]);
+
+        let start = |n: usize| {
+            Action::parse(
+                "crew.start_session",
+                &json!({
+                    "folder": dir.path().to_string_lossy(),
+                    "goal": format!("Fix the flaky test #{n}"),
+                    "name": format!("acme-web-{n}"),
+                    "reason": "Sam asked for it",
+                }),
+            )
+            .unwrap()
+        };
+        let (_, o) = crew.overseer_service().unwrap();
+        assert_eq!(crew.gate(&start(1), &o), Gate::Run);
+        let mut started = Vec::new();
+        for n in 1..=4 {
+            let by = crew.by_overseer("Sam asked for it").unwrap();
+            let done = crew.perform(&start(n), by).await.unwrap();
+            assert!(done.starts_with(&format!("started acme-web-{n}")), "{done}");
+            started.push(
+                d.list()
+                    .into_iter()
+                    .find(|v| v.name == format!("acme-web-{n}"))
+                    .unwrap(),
+            );
+        }
+        for v in &started {
+            // A real session, in Acme, on the default engine, the boss's.
+            assert_eq!(v.engine, Engine::Claude);
+            assert_eq!(v.group.as_ref().map(|g| g.id.as_str()), Some("g-acme"));
+            let c = d.charge_of(v.id).unwrap();
+            assert_eq!((c.boss.as_str(), c.how), ("desk", How::Started));
+            assert_eq!(c.group.as_deref(), Some("g-acme"));
+        }
+        assert_eq!(d.charges_busy("desk"), 4);
+
+        // The fifth is refused in plain words, and starts nothing.
+        let by = crew.by_overseer("One more").unwrap();
+        let refused = crew.perform(&start(5), by).await.unwrap_err();
+        assert_eq!(
+            refused,
+            "You already run 4 sessions that are starting or working, the most you may run at once (4). Wait for one to finish, or ask the person to let you run more."
+        );
+        assert_eq!(d.list().len(), 4);
+
+        // Taking on a session the person started is never refused for it.
+        let mine = new_session(&d, dir.path(), "acme-api").await;
+        let take = Action::TakeOn { session: mine.id };
+        assert_eq!(crew.gate(&take, &o), Gate::Run);
+        let by = crew.by_overseer("It is in Acme").unwrap();
+        assert_eq!(crew.perform(&take, by).await.unwrap(), "took on acme-api");
+        assert_eq!(d.charges_busy("desk"), 5);
+
+        // The person saying yes to a start the overseer suggested decides:
+        // it starts, and the overseer runs it.
+        let mut yes = By::you();
+        yes.suggestion_id = Some("s1".into());
+        crew.perform(&start(6), yes).await.unwrap();
+        let sixth = d
+            .list()
+            .into_iter()
+            .find(|v| v.name == "acme-web-6")
+            .unwrap();
+        assert_eq!(d.charge_of(sixth.id).unwrap().how, How::Started);
+
+        // An engine that isn't installed here is refused, and so is a
+        // default engine Desk can't start; a start kept from before, which
+        // said `path`, still reads.
+        let codex = Action::parse(
+            "crew.start_session",
+            &json!({"path": dir.path().to_string_lossy(), "goal": "Port it", "engine": "codex"}),
+        )
+        .unwrap();
+        assert!(matches!(&codex, Action::StartSession { folder, .. } if !folder.is_empty()));
+        let by = crew.by_overseer("Try Codex").unwrap();
+        assert_eq!(
+            crew.perform(&codex, by).await.unwrap_err(),
+            "Codex isn't installed on this computer; start claude instead."
+        );
+        write_config(
+            &overseer,
+            "[oversight]\nenabled = true\nlevel = \"act\"\n[oversight.act]\nhand_out_work = true\n[oversight.work]\nengine = \"gemini\"\nparallel = 12\n",
+        );
+        super::config_saved(&overseer);
+        let by = crew.by_overseer("Default").unwrap();
+        assert_eq!(
+            crew.perform(&start(7), by).await.unwrap_err(),
+            "Desk can't start Gemini CLI sessions yet."
+        );
     })
     .await;
 }
