@@ -800,9 +800,15 @@ mod tests {
     /// As the kernel resolves: the folder's `l` links into Desk's data,
     /// `m` to the next repository, and `out` to nothing.
     fn real(p: &Path) -> Option<PathBuf> {
+        let exists = |p: &Path| {
+            crate::computer::boss::tests::EXISTING
+                .iter()
+                .any(|e| Path::new(e).starts_with(p))
+        };
         let mut out = PathBuf::from("/");
         for c in p.components() {
             match c {
+                Component::ParentDir if !exists(&out) => return None,
                 Component::ParentDir => {
                     out.pop();
                 }
@@ -1133,7 +1139,11 @@ mod tests {
             Some(sibling.join("x")),
             "`..` after a link is the parent of where it leads"
         );
-        assert_eq!(real(&own.join("src/../new.rs")), Some(own.join("new.rs")));
+        assert_eq!(
+            real(&own.join("src/../new.rs")),
+            None,
+            "`..` after what isn't there yet"
+        );
         assert_eq!(real(&own.join("out")), None, "a link to nothing");
         assert_eq!(real(&own.join("out/../y")), None);
         // Edits judged the same way.

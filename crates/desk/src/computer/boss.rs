@@ -398,12 +398,26 @@ const START_FILES: &[&str] = &[
     "Library/LaunchAgents",
 ];
 
-/// Whether `path` is where secrets or Desk's own data are kept.
+/// `path` with every component case-folded: the person's disk is most
+/// likely case-insensitive (APFS), so `.GIT` is `.git` and `~/.SSH` is
+/// `~/.ssh`.
+fn fold(path: &Path) -> PathBuf {
+    path.components()
+        .map(|c| match c {
+            Component::Normal(n) => PathBuf::from(n.to_string_lossy().to_lowercase()),
+            other => PathBuf::from(other.as_os_str()),
+        })
+        .collect()
+}
+
+/// Whether `path` is where secrets or Desk's own data are kept, compared
+/// without regard to case.
 pub fn secret(path: &Path, home: &Path, withheld: &[PathBuf]) -> bool {
-    if withheld.iter().any(|w| path.starts_with(w)) {
+    let path = fold(path);
+    if withheld.iter().any(|w| path.starts_with(fold(w))) {
         return true;
     }
-    let Ok(rest) = path.strip_prefix(home) else {
+    let Ok(rest) = path.strip_prefix(fold(home)) else {
         return false;
     };
     // `~/.claude`, `~/.claude.json` and the like.
@@ -412,19 +426,26 @@ pub fn secret(path: &Path, home: &Path, withheld: &[PathBuf]) -> bool {
         .next()
         .map(|c| c.as_os_str().to_string_lossy().into_owned())
         .unwrap_or_default();
-    first.starts_with(".claude") || SECRET_DIRS.iter().any(|d| rest.starts_with(d))
+    first.starts_with(".claude")
+        || SECRET_DIRS
+            .iter()
+            .any(|d| rest.starts_with(d.to_lowercase()))
 }
 
 /// Whether writing `path` changes the session's own settings or checks:
 /// an engine's settings, git's own files and hooks, the project's CI and
 /// commit hooks, what a new shell runs, or Desk's data. A write there is
-/// never the boss's to allow.
+/// never the boss's to allow. Names are compared without regard to case.
 pub fn settings(path: &Path, home: &Path, withheld: &[PathBuf]) -> bool {
     if secret(path, home, withheld) {
         return true;
     }
-    if let Ok(rest) = path.strip_prefix(home) {
-        if START_FILES.iter().any(|f| rest.starts_with(f)) {
+    let path = fold(path);
+    if let Ok(rest) = path.strip_prefix(fold(home)) {
+        if START_FILES
+            .iter()
+            .any(|f| rest.starts_with(f.to_lowercase()))
+        {
             return true;
         }
     }
@@ -459,15 +480,17 @@ pub fn settings(path: &Path, home: &Path, withheld: &[PathBuf]) -> bool {
 /// or round in circles: writing through it would land where Desk can't
 /// tell. What doesn't exist yet is joined as written.
 pub fn resolve_real(path: &Path) -> Option<PathBuf> {
-    fn walk(path: &Path, depth: usize) -> Option<PathBuf> {
-        if depth > 40 {
-            return None;
-        }
+    /// The most links followed in one resolve, as the kernel allows.
+    const LINKS: usize = 40;
+    fn walk(path: &Path, links: &mut usize) -> Option<PathBuf> {
         let mut out = PathBuf::from("/");
         let mut missing = false;
         for part in path.components() {
             match part {
                 Component::RootDir | Component::Prefix(_) | Component::CurDir => {}
+                // `..` after what isn't there yet: where it leads depends on
+                // what is made there first.
+                Component::ParentDir if missing => return None,
                 Component::ParentDir => {
                     out.pop();
                 }
@@ -479,12 +502,16 @@ pub fn resolve_real(path: &Path) -> Option<PathBuf> {
                     }
                     match std::fs::symlink_metadata(&next) {
                         Ok(m) if m.file_type().is_symlink() => {
+                            *links += 1;
+                            if *links > LINKS {
+                                return None;
+                            }
                             let to = std::fs::read_link(&next).ok()?;
                             let to = match to.is_absolute() {
                                 true => to,
                                 false => out.join(to),
                             };
-                            let landed = walk(&to, depth + 1)?;
+                            let landed = walk(&to, links)?;
                             // A link to nothing.
                             if std::fs::symlink_metadata(&landed).is_err() {
                                 return None;
@@ -502,7 +529,7 @@ pub fn resolve_real(path: &Path) -> Option<PathBuf> {
         }
         Some(out)
     }
-    walk(path, 0)
+    walk(path, &mut 0)
 }
 
 impl Here<'_> {
@@ -1030,7 +1057,20 @@ fn one(walk: &mut Walk<'_, '_>, cmd: &Cmd, next: Option<Join>) -> Judged {
         for v in g.values(file_flags) {
             walk.reads(v)?;
         }
-        return g.operands.iter().try_for_each(|w| walk.reads(w));
+        // `uniq in out` writes its second operand.
+        if name == "uniq" {
+            if let Some(out) = g.operands.get(1) {
+                walk.changes(out, "writes")?;
+            }
+            if g.operands.len() > 2 {
+                return no(CANT_READ);
+            }
+        }
+        let read = match name {
+            "uniq" => &g.operands[..g.operands.len().min(1)],
+            _ => &g.operands[..],
+        };
+        return read.iter().try_for_each(|w| walk.reads(w));
     }
     match name {
         "cd" | "pushd" => {
@@ -1250,10 +1290,10 @@ fn one(walk: &mut Walk<'_, '_>, cmd: &Cmd, next: Option<Join>) -> Judged {
                     short: "u",
                     short_val: "t",
                     long: &["coverage", "runInBand", "silent", "ci"],
-                    long_val: &["testNamePattern"],
+                    long_val: &["testNamePattern", "config"],
                     ..Spec::default()
                 },
-                &[],
+                &["--config"],
             )
         }
         _ if dir.is_some() => {
@@ -1283,8 +1323,9 @@ fn tool(
     path_flags: &[&str],
 ) -> Judged {
     let g = parse(name, spec, args, false)?;
+    // A config or project a tool reads runs as its code does.
     for v in g.values(path_flags) {
-        walk.works_on(v)?;
+        walk.own_code(v)?;
     }
     walk.local(&g.operands)
 }
@@ -1308,6 +1349,18 @@ fn pytest(walk: &Walk<'_, '_>, args: &[Word]) -> Judged {
     let g = parse("pytest", &spec, args, false)?;
     for v in g.values(&["--junitxml"]) {
         walk.changes(v, "writes")?;
+    }
+    // `--cov-report=xml:out.xml` writes where it names.
+    for v in g.values(&["--cov-report"]) {
+        if let Some((_, to)) = v.text.split_once(':') {
+            walk.changes(
+                &Word {
+                    text: to.to_string(),
+                    glob: v.glob,
+                },
+                "writes",
+            )?;
+        }
     }
     walk.local(&g.operands)
 }
@@ -2157,8 +2210,12 @@ fn cargo(walk: &Walk<'_, '_>, args: &[Word]) -> Judged {
                     return no(PUBLISHES);
                 }
             }
-            for v in g.values(&["--target-dir", "--manifest-path"]) {
+            for v in g.values(&["--target-dir"]) {
                 walk.works_on(v)?;
+            }
+            // The manifest says what builds and runs.
+            for v in g.values(&["--manifest-path"]) {
+                walk.own_code(v)?;
             }
             // `nextest run`, `nextest list`.
             match (
@@ -2223,8 +2280,9 @@ fn node_pm(walk: &Walk<'_, '_>, pm: &str, args: &[Word]) -> Judged {
         .position(|a| a.text == "--")
         .unwrap_or(args.len());
     let g = parse(pm, &spec, &args[..cut], false)?;
+    // Where it runs is whose scripts run.
     for v in g.values(&["-C", "--dir", "--prefix"]) {
-        walk.works_on(v)?;
+        walk.own_code(v)?;
     }
     let ops: Vec<&str> = g.operands.iter().map(|o| o.text.as_str()).collect();
     let script = |name: Option<&&str>| match name {
@@ -2440,15 +2498,28 @@ fn script(walk: &Walk<'_, '_>, name: &str, args: &[Word]) -> Judged {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
+    /// What exists on the disk the fakes stand for: these folders and all
+    /// above them.
+    pub(crate) const EXISTING: &[&str] = &[
+        "/Users/sam/dev/acme-web/src",
+        "/Users/sam/dev/acme-web/.worktrees/date-picker/src",
+        "/Users/sam/dev/acme-api/src",
+        "/Users/sam/Library/Application Support/Desk",
+        "/tmp",
+    ];
+
     /// As the kernel resolves: `l` in the folder links to the next
-    /// repository, `out` to a file that isn't there.
+    /// repository, `out` to a file that isn't there, and `..` after what
+    /// doesn't exist can't be told.
     fn fake_real(p: &Path) -> Option<PathBuf> {
+        let exists = |p: &Path| EXISTING.iter().any(|e| Path::new(e).starts_with(p));
         let mut out = PathBuf::from("/");
         for c in p.components() {
             match c {
+                Component::ParentDir if !exists(&out) => return None,
                 Component::ParentDir => {
                     out.pop();
                 }
@@ -2641,6 +2712,132 @@ mod tests {
         ] {
             assert_eq!(judged(ok), Ok(()), "{ok}");
         }
+    }
+
+    /// The third review's probes, on the fakes.
+    #[test]
+    fn outputs_and_config_that_run_are_judged_as_writes_and_code() {
+        for command in [
+            "uniq README.md /Users/sam/.zshrc",
+            "uniq README.md /Users/sam/dev/acme-api/x",
+            "python -m pytest --cov-report=xml:/Users/sam/.zshrc",
+            "python -m pytest --cov-report xml:/Users/sam/dev/acme-api/cov.xml",
+            "cargo build --manifest-path /tmp/x/Cargo.toml",
+            "pnpm -C /tmp/x test",
+            "npm --prefix /tmp/x run build",
+            "eslint -c /tmp/x.js src",
+            "mypy --config-file /tmp/mypy.ini src",
+            "tsc -p /tmp/tsconfig.json",
+            "jest --config /tmp/jest.config.js",
+            "python -m pytest -c /tmp/pytest.ini",
+            "python -m pytest --rootdir /tmp",
+            "python -m pytest -p evil",
+            "mkdir n && touch n/../m/../x",
+            "mkdir -p n/../m/../x",
+            "cat ~/.SSH/id_rsa",
+            "touch .GIT/hooks/pre-commit",
+            "touch .Husky/pre-push",
+            "touch .GitHub/Workflows/x.yml",
+            "touch .Claude/settings.json",
+            "cat '/Users/sam/Library/application support/Desk/x'",
+        ] {
+            assert!(judged(command).is_err(), "{command}: {:?}", judged(command));
+        }
+        for ok in [
+            "uniq README.md",
+            "uniq README.md /tmp/u.txt",
+            "python -m pytest --cov-report=term-missing",
+            "python -m pytest --cov-report=xml:cov.xml",
+            "cargo build --manifest-path src/Cargo.toml",
+            "eslint -c src/eslint.config.js src",
+            "mkdir -p src/a/b",
+        ] {
+            assert_eq!(judged(ok), Ok(()), "{ok}");
+        }
+    }
+
+    /// Case and missing folders as a real, case-insensitive disk has them.
+    #[test]
+    fn on_the_real_disk_case_and_dot_dot_after_what_isnt_there_are_the_persons() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let own = base.join("acme-web");
+        std::fs::create_dir_all(own.join(".git/hooks")).unwrap();
+        std::fs::create_dir_all(own.join("src")).unwrap();
+        std::fs::create_dir_all(base.join(".ssh")).unwrap();
+        let withheld = [base.join("Library/Application Support/Desk")];
+        std::fs::create_dir_all(&withheld[0]).unwrap();
+        let scratch: [PathBuf; 0] = [];
+        let real = resolve_real;
+        let here = Here {
+            cwd: Some(own.clone()),
+            own: Some(&own),
+            folder: "acme-web",
+            home: &base,
+            scratch: &scratch,
+            withheld: &withheld,
+            real: &real,
+            branch: Some("feat/x"),
+            default_branch: Some("main"),
+        };
+        let desk = format!(
+            "cat '{}/library/application support/desk/x'",
+            base.display()
+        );
+        for command in [
+            "touch .GIT/hooks/pre-commit",
+            "cat ~/.SSH/id_rsa",
+            "touch .Husky/pre-push",
+            "touch .GitHub/Workflows/x.yml",
+            "touch .Claude/settings.json",
+            desk.as_str(),
+            "mkdir n && touch n/../m/../x",
+            "mkdir -p n/../m/../x",
+        ] {
+            assert!(
+                judge(command, &here).is_err(),
+                "{command}: {:?}",
+                judge(command, &here)
+            );
+        }
+        assert_eq!(judge("touch src/../src/x.rs", &here), Ok(()));
+        assert_eq!(judge("mkdir -p src/new/deeper", &here), Ok(()));
+    }
+
+    /// A fan of links resolves in kernel time, or not at all.
+    #[test]
+    fn a_chain_of_links_is_followed_at_most_forty_times() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        // Each link names the next twice: without a total count, every
+        // level doubles the work.
+        std::fs::create_dir_all(base.join("end")).unwrap();
+        let mut target = base.join("end");
+        for i in 0..24 {
+            let link = base.join(format!("l{i}"));
+            std::os::unix::fs::symlink(
+                format!(
+                    "{}/../{}",
+                    target.display(),
+                    target.file_name().unwrap().to_string_lossy()
+                ),
+                &link,
+            )
+            .unwrap();
+            target = link;
+        }
+        let started = std::time::Instant::now();
+        let got = resolve_real(&target.join("x"));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(got, None, "more than forty links");
+        assert!(
+            resolve_real(&base.join("l0/x")).is_some(),
+            "a few links are fine"
+        );
     }
 
     #[test]
