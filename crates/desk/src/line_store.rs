@@ -173,6 +173,26 @@ impl DeskStore {
             .collect()
     }
 
+    /// Withdraws one row the overseer said to a session, while it waits in
+    /// the queue: put back from a hand-off, it never goes in. The row as it
+    /// now is, or `None` when it had moved on.
+    pub async fn line_withdraw_queued(&self, id: Uuid) -> Result<Option<LineMessage>> {
+        let client = self.pool().get().await?;
+        client
+            .query_opt(
+                &format!(
+                    "UPDATE line_messages SET delivery = 'withdrawn', updated_at = now() \
+                     WHERE id = $1 AND sender ->> 'kind' = 'manager' AND kind = 'tell' \
+                     AND delivery = 'queued' RETURNING {COLUMNS}"
+                ),
+                &[&id],
+            )
+            .await?
+            .as_ref()
+            .map(message)
+            .transpose()
+    }
+
     /// Everything waiting to go to a session, by session: what the pump
     /// starts from after a restart.
     pub async fn line_waiting(&self) -> Result<Vec<LineMessage>> {

@@ -645,6 +645,7 @@ pub async fn mount(
     let computer = desk.computer();
     crate::desk_computer::prune_daily(computer.clone(), cancel_crew.clone());
     crate::desk_computer::install(computer, Arc::new(config.clone()));
+    desk.boss_bounds_with(crate::desk_computer::boss_bounds(config));
     for service in state.registry.all_services() {
         register_tools(&service);
     }

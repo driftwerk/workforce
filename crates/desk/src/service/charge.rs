@@ -186,6 +186,130 @@ impl Desk {
         !self.charges_loaded() || self.wheel_of(id).is_some_and(Wheel::person)
     }
 
+    /// Where a boss's answers for its sessions are judged, as the hub
+    /// running it says.
+    pub fn boss_bounds_with(&self, bounds: charge::Bounds) {
+        *self.0.boss_bounds.lock() = Some(bounds);
+    }
+
+    /// Whether the boss running `id` may answer its open request
+    /// `approval` itself; why not, in the person's words, when it may not.
+    pub fn boss_answerable(&self, id: Uuid, approval: Uuid) -> Result<(), charge::Irreversible> {
+        let no = |why: &str| Err(charge::Irreversible(why.into()));
+        let Some(bounds) = self.0.boss_bounds.lock().clone() else {
+            return no("Desk can't judge requests for a boss yet");
+        };
+        let Ok(view) = self.view(id) else {
+            return no("that session isn't there any more");
+        };
+        let Some(pending) = self.pending_of(id, approval) else {
+            return no("already answered");
+        };
+        let moved = self.0.state.lock().live.get(&id).is_some_and(|l| l.moved);
+        let mut facts = charge::facts_of(view.engine, &pending, &view, &bounds.home, moved);
+        // Its folder as the disk spells it.
+        if let Ok(own) = std::fs::canonicalize(&facts.own) {
+            facts.own = own;
+        }
+        // The repository the request runs in says which branch it is on
+        // and which is its default, now: not what Desk last saw. Only the
+        // own folder's repository counts: a push from another one (a
+        // nested repository, a submodule, a cwd elsewhere) has no branch
+        // the boss may push.
+        if let Some(cwd) = facts.cwd.clone() {
+            let top = git_line(&cwd, &["rev-parse", "--show-toplevel"])
+                .and_then(|t| crate::computer::boss::resolve_real(std::path::Path::new(&t)));
+            let own = crate::computer::boss::resolve_real(&facts.own);
+            if top.is_some() && top == own {
+                facts.branch = git_line(&cwd, &["symbolic-ref", "--short", "-q", "HEAD"]);
+                facts.default_branch = git_line(
+                    &cwd,
+                    &["symbolic-ref", "--short", "-q", "refs/remotes/origin/HEAD"],
+                )
+                .map(|d| d.strip_prefix("origin/").map(str::to_string).unwrap_or(d));
+            }
+        }
+        charge::answerable(&facts, &bounds, &crate::computer::boss::resolve_real)
+    }
+
+    /// Whether `by`, when it is a boss, may act on `id` now: a session a
+    /// boss runs is acted on only by that boss, and only while it has the
+    /// wheel. Anyone else, and a session no boss runs, is the hub's rule.
+    pub(crate) fn boss_holds(&self, id: Uuid, by: Option<&By>) -> Result<(), DeskError> {
+        let Some(boss) = by.filter(|b| b.party.kind == PartyKind::Manager) else {
+            return Ok(());
+        };
+        let Some(c) = self.charge_of(id).filter(Charge::live) else {
+            return Ok(());
+        };
+        let name = self
+            .view(id)
+            .map(|v| v.label().to_string())
+            .unwrap_or_else(|_| "that session".into());
+        if c.boss != boss.party.id {
+            return Err(DeskError::Conflict(format!(
+                "another boss runs {name}; it's theirs or the person's to act on"
+            )));
+        }
+        if self.wheel_of(id).is_some_and(Wheel::person) {
+            return Err(DeskError::Conflict(format!(
+                "the person is driving {name}, so it's theirs to act on now"
+            )));
+        }
+        Ok(())
+    }
+
+    /// `id`'s open request `approval`: the one it waits on, or another of
+    /// Codex's.
+    fn pending_of(&self, id: Uuid, approval: Uuid) -> Option<crate::model::PendingApproval> {
+        let st = self.0.state.lock();
+        let l = st.live.get(&id)?;
+        l.pending
+            .iter()
+            .chain(l.codex_asks.iter().map(|a| &a.pending))
+            .find(|p| p.id == approval)
+            .cloned()
+    }
+
+    /// Whether `boss` may make `decision` on `id`'s request `approval`:
+    /// on a session it runs, only while it has the wheel and Desk's breaker
+    /// doesn't hold it, never for the rest of the session, and to allow
+    /// only what [`charge::answerable`] says it may. A session no boss runs
+    /// is the hub's rule to judge.
+    pub(super) fn boss_decides(
+        &self,
+        id: Uuid,
+        approval: Uuid,
+        decision: crate::model::Decision,
+        boss: &By,
+    ) -> Result<(), DeskError> {
+        use crate::model::Decision;
+        // Not knowing yet which sessions bosses run, no boss answers.
+        if !self.charges_loaded() {
+            return Err(DeskError::Conflict(
+                "Desk can't read which sessions bosses run just now; it's the person's to answer"
+                    .into(),
+            ));
+        }
+        if !self.charge_of(id).is_some_and(|c| c.live()) {
+            return Ok(());
+        }
+        self.boss_holds(id, Some(boss))?;
+        self.breaker_refuses_prompt(id, Some(boss))?;
+        if self.pending_of(id, approval).is_none() {
+            return Err(DeskError::Conflict("already answered".into()));
+        }
+        match decision {
+            Decision::Deny | Decision::Cancel => Ok(()),
+            Decision::Allow => self
+                .boss_answerable(id, approval)
+                .map_err(|why| DeskError::Conflict(format!("{why}: it's the person's to allow"))),
+            Decision::AllowForSession | Decision::Terminal => Err(DeskError::Invalid(
+                "only the person answers for the rest of a session".into(),
+            )),
+        }
+    }
+
     /// How many of `boss`'s sessions are starting or working: the slots
     /// they hold.
     pub fn charges_busy(&self, boss: &str) -> usize {
@@ -540,6 +664,20 @@ impl Desk {
             }
         }
     }
+}
+
+/// One line git prints in `dir`, or `None` when it can't say.
+fn git_line(dir: &std::path::Path, args: &[&str]) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .ok()
+        .filter(|o| o.status.success())?;
+    let line = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!line.is_empty()).then_some(line)
 }
 
 #[cfg(test)]

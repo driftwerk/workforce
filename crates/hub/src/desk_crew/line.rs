@@ -352,7 +352,7 @@ impl CrewHub {
                             if let Err(e) = self.suggest("crew.nudge", &input, &action, &by).await {
                                 tracing::info!(error = %e, "an answer's suggestion wasn't kept");
                             }
-                            self.answer_drafted(&action, &by, why).await;
+                            self.answer_drafted(&action, &by, &why).await;
                         }
                         Gate::Refuse => {
                             let _ = self

@@ -470,6 +470,9 @@ pub struct Ask {
     pub why: Option<String>,
     /// What it can be answered with, of what Desk offers.
     pub choices: Vec<Decision>,
+    /// What it asks in full: the command as it runs, or every file it
+    /// changes.
+    pub whole: Option<crate::model::Request>,
 }
 
 /// An answer to one of Codex's requests.
@@ -539,6 +542,28 @@ fn why_of(params: &Value, home: Option<&Path>) -> Option<String> {
     (!said.is_empty()).then(|| said.join(" · "))
 }
 
+/// Every path one of a file change's changes touches: its own, and where a
+/// move takes it (`kind: {type: "update", move_path}`, either case).
+fn changed_paths(change: &Value) -> Vec<String> {
+    let mut out: Vec<String> = change
+        .get("path")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .into_iter()
+        .collect();
+    for at in [
+        "/kind/move_path",
+        "/kind/movePath",
+        "/move_path",
+        "/movePath",
+    ] {
+        if let Some(to) = change.pointer(at).and_then(Value::as_str) {
+            out.push(to.to_string());
+        }
+    }
+    out
+}
+
 /// The approval a server request is, when it is one Desk answers: a
 /// command's, or a file change's (whose files its item named, in `files`).
 pub fn ask_of(
@@ -549,7 +574,11 @@ pub fn ask_of(
     home: Option<&Path>,
 ) -> Option<Seen> {
     let thread = params.get("threadId")?.as_str()?.to_string();
-    let (tool, detail) = match method {
+    let cwd = params
+        .get("cwd")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let (tool, detail, input) = match method {
         "item/commandExecution/requestApproval" => {
             let actions: Vec<&str> = params
                 .get("commandActions")
@@ -558,14 +587,21 @@ pub fn ask_of(
                 .flatten()
                 .filter_map(|a| a.get("command").and_then(Value::as_str))
                 .collect();
+            let run = params.get("command").and_then(Value::as_str);
             let command = match actions.is_empty() {
-                true => params.get("command").and_then(Value::as_str)?.to_string(),
+                true => run?.to_string(),
                 false => actions.join("; "),
             };
-            ("Bash", command)
+            // What runs is `command`; its actions are Codex's reading of it.
+            let input = run.map(|c| json!({ "command": c }));
+            ("Bash", command, input)
         }
         "item/fileChange/requestApproval" => {
             let item = params.get("itemId").and_then(Value::as_str)?;
+            // A grant of a folder for the rest of the session rides along.
+            let input = files
+                .get(item)
+                .map(|f| json!({ "paths": f, "grantRoot": params.get("grantRoot") }));
             let named = files
                 .get(item)
                 .map(|f| {
@@ -575,7 +611,7 @@ pub fn ask_of(
                         .join(", ")
                 })
                 .unwrap_or_default();
-            ("Edit", named)
+            ("Edit", named, input)
         }
         _ => return None,
     };
@@ -587,6 +623,12 @@ pub fn ask_of(
             detail,
             why: why_of(params, home),
             choices: choices_of(params),
+            whole: input.map(|input| crate::model::Request {
+                tool: tool.into(),
+                input,
+                cwd,
+                read_only: false,
+            }),
         }),
     })
 }
@@ -941,19 +983,25 @@ impl Follower {
             }
             (None, Some(method)) => {
                 let params = v.get("params").cloned().unwrap_or(Value::Null);
-                if method == "item/started"
+                // Its files as it starts, and every one a later word about
+                // it adds: what it asks to change is all of them.
+                if method.starts_with("item/")
                     && params.pointer("/item/type").and_then(Value::as_str) == Some("fileChange")
                 {
                     if let Some(item) = params.pointer("/item/id").and_then(Value::as_str) {
-                        let paths = params
+                        let paths: Vec<String> = params
                             .pointer("/item/changes")
                             .and_then(Value::as_array)
                             .into_iter()
                             .flatten()
-                            .filter_map(|c| c.get("path").and_then(Value::as_str))
-                            .map(str::to_string)
+                            .flat_map(changed_paths)
                             .collect();
-                        self.files.insert(item.to_string(), paths);
+                        let known = self.files.entry(item.to_string()).or_default();
+                        for p in paths {
+                            if !known.contains(&p) {
+                                known.push(p);
+                            }
+                        }
                     }
                 }
                 let ours = params.get("threadId").and_then(Value::as_str).is_some()
@@ -1560,6 +1608,12 @@ pub(crate) mod tests {
                 detail: "rm victim.txt".into(),
                 why: Some("in ~/repo · Do you want to allow deleting victim.txt?".into()),
                 choices: vec![Decision::Allow, Decision::Cancel],
+                whole: Some(crate::model::Request {
+                    tool: "Bash".into(),
+                    input: json!({"command": "/bin/zsh -lc 'rm victim.txt'"}),
+                    cwd: Some("/Users/k/repo".into()),
+                    read_only: false,
+                }),
             }),
             "the amendment writes a rule: the terminal's to offer"
         );
@@ -1626,6 +1680,42 @@ pub(crate) mod tests {
             "params": {"threadId": "other", "turnId": "u", "itemId": "i", "isBlocking": true,
                 "questions": [{"id": "a", "header": "H", "question": "Q?"}]}}));
         assert!(seen.is_empty(), "another thread's");
+    }
+
+    /// A move's destination is one of the files a change touches, and a
+    /// grant of a folder rides with the request for Desk to refuse a boss.
+    #[test]
+    fn a_file_change_names_where_a_move_goes_and_any_grant_it_asks() {
+        let mut f = Follower::new(Some("t1".into()), Some(PathBuf::from("/Users/k")));
+        f.heard(
+            &json!({"method": "item/started", "params": {"threadId": "t1",
+            "item": {"type": "fileChange", "id": "fc-2", "status": "inProgress",
+                "changes": [{"path": "/Users/k/repo/a.rs",
+                    "kind": {"type": "update", "move_path": "/Users/k/other/a.rs"}, "diff": ""}]}}}),
+        );
+        // A later word about the item names another file.
+        f.heard(
+            &json!({"method": "item/updated", "params": {"threadId": "t1",
+            "item": {"type": "fileChange", "id": "fc-2",
+                "changes": [{"path": "/Users/k/.zshrc", "kind": "update", "diff": ""}]}}}),
+        );
+        let (seen, _) = f.heard(
+            &json!({"id": 8, "method": "item/fileChange/requestApproval",
+            "params": {"threadId": "t1", "turnId": "u1", "itemId": "fc-2",
+                "grantRoot": "/Users/k"}}),
+        );
+        let [Seen {
+            event: CodexEvent::Asks(ask),
+            ..
+        }] = &seen[..]
+        else {
+            panic!("{seen:?}")
+        };
+        let whole = ask.whole.as_ref().unwrap();
+        assert_eq!(
+            whole.input,
+            json!({"paths": ["/Users/k/repo/a.rs", "/Users/k/other/a.rs", "/Users/k/.zshrc"], "grantRoot": "/Users/k"})
+        );
     }
 
     #[test]

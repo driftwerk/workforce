@@ -2,6 +2,7 @@
 //! doing it — for the overseer's tools, and for the person accepting one of
 //! its suggestions.
 
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::path::Path;
 
@@ -310,7 +311,7 @@ fn charge_plain(e: workforce_desk::DeskError) -> String {
 pub(crate) enum Gate {
     Run,
     /// Suggest it; why, for the overseer.
-    Suggest(&'static str),
+    Suggest(Cow<'static, str>),
     /// It may not even suggest (level `watch`).
     Refuse,
 }
@@ -328,26 +329,25 @@ impl CrewHub {
         }
         match o.level {
             Level::Watch => return Gate::Refuse,
-            Level::Suggest => return Gate::Suggest("you suggest; the person decides"),
+            Level::Suggest => return Gate::Suggest("you suggest; the person decides".into()),
             Level::Act => {}
         }
         // Taking on a session the person runs is theirs to say, unless
         // they let it take on every one.
         if let Action::TakeOn { session } = action {
             if self.taken_back(*session) {
-                return Gate::Suggest(
-                    "the person took this session back from you; offer to take it on again and they accept",
-                );
+                return Gate::Suggest("the person took this session back from you; offer to take it on again and they accept".into());
             }
             return match o.work.take_on {
                 TakeOn::All => Gate::Run,
-                TakeOn::Handed => Gate::Suggest(
-                    "the person hands you the sessions you run; offer to take it on and they accept",
-                ),
+                TakeOn::Handed => Gate::Suggest("the person hands you the sessions you run; offer to take it on and they accept".into()),
             };
         }
+        if let Some(gate) = self.gate_charged(action, o) {
+            return gate;
+        }
         if let Some(why) = self.uncontained(action, &o.act) {
-            return Gate::Suggest(why);
+            return Gate::Suggest(why.into());
         }
         let asked_outward = match action {
             Action::Nudge {
@@ -358,7 +358,7 @@ impl CrewHub {
         };
         if action.outward() || asked_outward {
             return Gate::Suggest(
-                "anything that pushes, deletes or reaches outside Desk is the person's call",
+                "anything that pushes, deletes or reaches outside Desk is the person's call".into(),
             );
         }
         let allowed = match action {
@@ -380,7 +380,7 @@ impl CrewHub {
                         .is_some_and(|p| p.id == *approval && !p.choices.is_empty())
                 });
                 if codex {
-                    return Gate::Suggest("Codex's requests are the person's to answer");
+                    return Gate::Suggest("Codex's requests are the person's to answer".into());
                 }
                 if !o.act.read_only_approvals {
                     false
@@ -392,9 +392,7 @@ impl CrewHub {
                             .is_some_and(|p| p.id == *approval && read_only_in(&v.cwd, p))
                     });
                     if !ok {
-                        return Gate::Suggest(
-                            "only requests that just read inside the session's folder are allowed without the person",
-                        );
+                        return Gate::Suggest("only requests that just read inside the session's folder are allowed without the person".into());
                     }
                     true
                 }
@@ -407,7 +405,95 @@ impl CrewHub {
         if allowed {
             Gate::Run
         } else {
-            Gate::Suggest("the person hasn't let you do that without asking")
+            Gate::Suggest("the person hasn't let you do that without asking".into())
+        }
+    }
+
+    /// The session `action` is done to, when it is one.
+    fn session_of(action: &Action) -> Option<Uuid> {
+        match action {
+            Action::Nudge {
+                to: Target::Session(s),
+                ..
+            }
+            | Action::Approve { session: s, .. }
+            | Action::Deny { session: s, .. }
+            | Action::Stop { session: s }
+            | Action::Interrupt { session: s }
+            | Action::Resume { session: s, .. }
+            | Action::Restart { session: s, .. } => Some(*s),
+            _ => None,
+        }
+    }
+
+    /// Whether the overseer runs `session` now: it is in its charge.
+    fn overseer_runs(&self, session: Uuid) -> bool {
+        self.overseer_service()
+            .is_some_and(|(service, _)| self.runs(session, service.agent_id.as_str()))
+    }
+
+    /// What the overseer may do, at `act`, to a session it runs: answer
+    /// for it what Desk reads in full and judges safe (Desk checks again as
+    /// it answers), deny, and interrupt it whatever `[oversight.act]` says
+    /// of sessions it doesn't run; resuming and restarting it stay the
+    /// person's; only suggest while the person drives it. `None`: the usual rules decide (a plain
+    /// message waits on its line while the person drives).
+    fn gate_charged(&self, action: &Action, o: &Oversight) -> Option<Gate> {
+        let session = Self::session_of(action).filter(|s| self.overseer_runs(*s))?;
+        // What it leads to must wait on the person as for any session.
+        if let Some(why) = self.uncontained(action, &o.act) {
+            return Some(Gate::Suggest(why.into()));
+        }
+        let name = self.session_name(session);
+        if self.desk.wheel_of(session).is_some_and(|w| w.person()) {
+            return match action {
+                Action::Nudge { reply_to: None, .. } => None,
+                _ => Some(Gate::Suggest(
+                    format!(
+                        "the person is driving {name}, so I've held this for them as a suggestion"
+                    )
+                    .into(),
+                )),
+            };
+        }
+        let outward_said = || {
+            Some(Gate::Suggest(
+                "anything that pushes, deletes or reaches outside Desk is the person's call".into(),
+            ))
+        };
+        match action {
+            Action::Approve { approval, .. } => {
+                Some(match self.desk.boss_answerable(session, *approval) {
+                    Ok(()) => Gate::Run,
+                    Err(why) => Gate::Suggest(
+                        format!("it {why}, so it's the person's to allow; tell them why").into(),
+                    ),
+                })
+            }
+            Action::Deny { .. } => Some(Gate::Run),
+            Action::Nudge {
+                reply_to: Some(ask),
+                ..
+            } => {
+                let asked_outward = self.questions.lock().get(ask).is_none_or(|q| outward(q));
+                if action.outward() || asked_outward {
+                    return outward_said();
+                }
+                Some(match o.act.answer_sessions {
+                    true => Gate::Run,
+                    false => Gate::Suggest(
+                        "the person hasn't let you answer sessions without asking".into(),
+                    ),
+                })
+            }
+            Action::Interrupt { .. } => Some(Gate::Run),
+            // A session started again reads its settings again: changes to
+            // them it made by itself are the person's to let take effect.
+            Action::Resume { .. } | Action::Restart { .. } => Some(Gate::Suggest(
+                "starting it again loads whatever settings it changed; that's the person's call"
+                    .into(),
+            )),
+            _ => None,
         }
     }
 
@@ -708,13 +794,21 @@ impl CrewHub {
                 Ok(format!("allowed {}", v.label()))
             }
             Action::Deny { session, approval } => {
+                use workforce_desk::model::Decision;
+                // Codex may offer only to cancel its turn.
+                let offered = d
+                    .view(*session)
+                    .ok()
+                    .and_then(|v| v.pending)
+                    .filter(|p| p.id == *approval)
+                    .map(|p| p.choices)
+                    .unwrap_or_default();
+                let decision = match offered.is_empty() || offered.contains(&Decision::Deny) {
+                    true => Decision::Deny,
+                    false => Decision::Cancel,
+                };
                 let v = d
-                    .decide(
-                        *session,
-                        *approval,
-                        workforce_desk::model::Decision::Deny,
-                        Some(by),
-                    )
+                    .decide(*session, *approval, decision, Some(by))
                     .map_err(plain)?;
                 Ok(format!("denied {}", v.label()))
             }

@@ -179,6 +179,9 @@ pub(crate) struct Live {
     /// The Codex requests Desk can answer, oldest first: its pending
     /// approval is the first's.
     codex_asks: Vec<CodexAsk>,
+    /// One of its commands changed directory: where a later one runs is
+    /// what its engine says, or unknown.
+    moved: bool,
     /// Answers Desk sent Codex, by request, until Codex is told them (or
     /// was answered in the terminal first): what Activity then says.
     codex_sent: HashMap<String, CodexSent>,
@@ -519,6 +522,9 @@ struct Inner {
     line_mcp: std::sync::OnceLock<Arc<dyn line::SessionMcp>>,
     /// The crew whose overseer answers sessions on their lines.
     line_crew: Mutex<Option<Weak<dyn crew::Crew>>>,
+    /// Where a boss's answers for its sessions are judged; none until the
+    /// hub says, and until then no boss answers a request.
+    boss_bounds: Mutex<Option<crate::charge::Bounds>>,
 }
 
 #[derive(Clone)]
@@ -648,6 +654,7 @@ fn codex_asks(r: &mut SessionRecord, l: &mut Live, ask: codex::Ask) {
         choices: ask.choices,
         why: ask.why,
         options: None,
+        request: ask.whole,
     };
     let asked = CodexAsk {
         request: ask.request,
@@ -703,6 +710,7 @@ fn codex_question(r: &mut SessionRecord, l: &mut Live, request: Value, q: claude
         choices: Vec::new(),
         why: q.why,
         options: q.options,
+        request: None,
     };
     l.codex_question = Some((request, pending));
     if l.codex_asks.is_empty() {
@@ -1033,6 +1041,7 @@ impl Desk {
             line_pump: tokio::sync::Mutex::new(()),
             line_mcp: std::sync::OnceLock::new(),
             line_crew: Mutex::new(None),
+            boss_bounds: Mutex::new(None),
         }));
         tokio::spawn(persist_loop(store, floor.turns, persist_rx));
         tokio::spawn(desk.clone().read_engines());
@@ -1183,6 +1192,7 @@ impl Desk {
                         choices: Vec::new(),
                         why: None,
                         options: None,
+                        request: None,
                     }),
                     answer: None,
                     ended: false,
@@ -1199,6 +1209,7 @@ impl Desk {
                     reading: None,
                     closing: false,
                     codex_asks: Vec::new(),
+                    moved: false,
                     codex_sent: HashMap::new(),
                     held: None,
                     open_question: None,
@@ -2100,6 +2111,7 @@ impl Desk {
         // A session Desk's breaker holds goes on only by the person: anyone
         // else's resume, or a prompt with it, is refused. A restore at start
         // (no one, no prompt) starts no turn, and the hold stays.
+        self.boss_holds(id, by.as_ref())?;
         if by.is_some() || prompt.is_some() {
             self.breaker_refuses_prompt(id, by.as_ref())?;
         }
@@ -2177,6 +2189,7 @@ impl Desk {
         by: By,
     ) -> Result<SessionView, DeskError> {
         self.record(id)?;
+        self.boss_holds(id, Some(&by))?;
         // A session Desk's breaker holds goes on only by the person.
         self.breaker_refuses_prompt(id, Some(&by))?;
         let running = self.0.state.lock().live.contains_key(&id);
@@ -2320,6 +2333,12 @@ impl Desk {
         decision: Decision,
         by: Option<By>,
     ) -> Result<SessionView, DeskError> {
+        if let Some(boss) = by
+            .as_ref()
+            .filter(|b| b.party.kind == crew::PartyKind::Manager)
+        {
+            self.boss_decides(id, approval, decision, boss)?;
+        }
         let codex = self
             .0
             .state
@@ -2346,9 +2365,7 @@ impl Desk {
                 .get_mut(&id)
                 .ok_or_else(|| DeskError::Conflict("session is not running".into()))?;
             if live.pending.as_ref().map(|p| p.id) != Some(approval) {
-                return Err(DeskError::Conflict(
-                    "that approval is no longer pending".into(),
-                ));
+                return Err(DeskError::Conflict("already answered".into()));
             }
             if matches!(decision, Decision::AllowForSession | Decision::Cancel) {
                 return Err(DeskError::Invalid(
@@ -2406,8 +2423,15 @@ impl Desk {
         decision: Decision,
         by: Option<By>,
     ) -> Result<SessionView, DeskError> {
+        // The boss of a session it runs, checked in `decide`.
+        let charged = |b: &By| {
+            b.party.kind == crew::PartyKind::Manager
+                && self
+                    .charge_of(id)
+                    .is_some_and(|c| c.live() && c.boss == b.party.id)
+        };
         let by = by
-            .filter(|b| b.party.kind == crew::PartyKind::You)
+            .filter(|b| b.party.kind == crew::PartyKind::You || charged(b))
             .ok_or_else(|| DeskError::Invalid("only the person answers Codex's requests".into()))?;
         let seen = {
             let mut guard = self.0.state.lock();
@@ -2421,7 +2445,7 @@ impl Desk {
                 .codex_asks
                 .iter()
                 .position(|a| a.pending.id == approval)
-                .ok_or_else(|| DeskError::Conflict("that approval is no longer pending".into()))?;
+                .ok_or_else(|| DeskError::Conflict("already answered".into()))?;
             if decision == Decision::Terminal {
                 // Its terminal asks it too: Desk just stops offering it.
                 let asked = live.codex_asks.remove(at);
@@ -2522,6 +2546,7 @@ impl Desk {
     /// does, for Claude Code and Codex alike. Its process (and a tracked
     /// one's shell) goes on. Not working, it does nothing.
     pub fn interrupt(&self, id: Uuid, by: Option<By>) -> Result<SessionView, DeskError> {
+        self.boss_holds(id, by.as_ref())?;
         let pty = {
             let st = self.0.state.lock();
             let live = st
@@ -3097,6 +3122,7 @@ impl Desk {
                 reading: None,
                 closing: false,
                 codex_asks: Vec::new(),
+                moved: false,
                 codex_sent: HashMap::new(),
                 held: None,
                 open_question: None,
@@ -3249,6 +3275,18 @@ impl Desk {
     /// its background work, not the session working.
     async fn apply_hook(&self, id: Uuid, hook: Hook, inside: Option<String>) -> Value {
         let empty = || Value::Object(Default::default());
+        if let Hook::ToolStart { call, .. } = &hook {
+            let cd = call.tool == "Bash"
+                && call.input.as_deref().is_some_and(|c| {
+                    c.split(|ch: char| ch.is_whitespace() || ";&|(".contains(ch))
+                        .any(|w| matches!(w, "cd" | "pushd" | "popd"))
+                });
+            if cd {
+                if let Some(l) = self.0.state.lock().live.get_mut(&id) {
+                    l.moved = true;
+                }
+            }
+        }
         // A call the person allowed for the session runs without asking.
         let allowed = match &hook {
             Hook::ToolStart { call, .. } => self
@@ -3392,6 +3430,7 @@ impl Desk {
                     choices: Vec::new(),
                     why: question.why,
                     options: question.options,
+                    request: None,
                 };
                 let raised = Raised {
                     pending: pending.id,
@@ -3474,6 +3513,7 @@ impl Desk {
                         choices: Vec::new(),
                         why: None,
                         options: None,
+                        request: None,
                     };
                     l.held = Some(Raised {
                         pending: pending.id,
@@ -3622,8 +3662,14 @@ impl Desk {
                 }
                 self.spend_read(id);
             }
-            Hook::Permission { tool, detail } => {
-                return self.await_permission(id, tool, detail, inside).await
+            Hook::Permission {
+                tool,
+                detail,
+                request,
+            } => {
+                return self
+                    .await_permission(id, tool, detail, Some(request), inside)
+                    .await
             }
             Hook::Usage(limits) => self.report_usage(limits, Some(id)),
             Hook::Other => {}
@@ -3701,6 +3747,7 @@ impl Desk {
         id: Uuid,
         tool: String,
         detail: String,
+        request: Option<crate::model::Request>,
         inside: Option<String>,
     ) -> Value {
         let desk_answers = self
@@ -3715,6 +3762,7 @@ impl Desk {
             choices: Vec::new(),
             why: None,
             options: None,
+            request,
         };
         let (tx, rx) = oneshot::channel();
         self.change(id, |r, l| {
@@ -3995,6 +4043,7 @@ impl Desk {
                                     choices: Vec::new(),
                                     why: None,
                                     options: None,
+                                    request: None,
                                 })
                             });
                         }

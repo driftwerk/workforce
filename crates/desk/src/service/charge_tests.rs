@@ -288,6 +288,91 @@ async fn a_release_withdraws_what_the_boss_said_and_starts_no_turn() {
     .await;
 }
 
+/// A boss's message already handed to Desk's plugin when the person takes
+/// the session back is withdrawn when it comes back to the queue, dropped
+/// by the plugin or stale, never typed into the session they now run
+/// alone; a session no boss ran keeps the overseer's nudge.
+#[tokio::test]
+async fn a_handed_message_that_comes_back_after_a_release_is_withdrawn() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let s = new_session(&d, dir.path()).await;
+        idle(&d, s.id).await;
+        d.take_on(s.id, &sarah(), How::Handed, &HashSet::new(), &By::you())
+            .await
+            .unwrap();
+        let by = By::manager("sarah", "Sarah", "Next.");
+        let send = |text: &str, to: Uuid| {
+            let d = d.clone();
+            let by = by.clone();
+            let text = text.to_string();
+            async move {
+                d.line_send(Sender::Overseer(by), boss_tell(&text, to))
+                    .await
+                    .unwrap()
+            }
+        };
+        let delivery = |id: Uuid| {
+            let d = d.clone();
+            async move { d.0.store.line_message(id).await.unwrap().unwrap().delivery }
+        };
+
+        // Dropped by the plugin after the release.
+        let dropped = send("Run the tests.", s.id).await;
+        let next = d.line_next(s.id, Duration::from_secs(1)).await.unwrap();
+        assert_eq!(next["id"], json!(dropped.id));
+        assert_eq!(delivery(dropped.id).await, Delivery::Handed);
+        d.release(s.id, &By::you()).await.unwrap();
+        assert_eq!(
+            delivery(dropped.id).await,
+            Delivery::Handed,
+            "a release leaves what the plugin has"
+        );
+        d.line_ack(s.id, dropped.id, false).await.unwrap();
+        assert_eq!(delivery(dropped.id).await, Delivery::Withdrawn);
+        assert!(d
+            .line_next(s.id, Duration::from_millis(300))
+            .await
+            .is_none());
+
+        // Stale, after the session passed to another boss.
+        let mia = Party::manager("mia", "Mia");
+        d.take_on(s.id, &sarah(), How::Handed, &HashSet::new(), &By::you())
+            .await
+            .unwrap();
+        let stale = send("Carry on.", s.id).await;
+        let next = d.line_next(s.id, Duration::from_secs(1)).await.unwrap();
+        assert_eq!(next["id"], json!(stale.id));
+        d.take_on(s.id, &mia, How::Handed, &HashSet::new(), &By::you())
+            .await
+            .unwrap();
+        let back =
+            d.0.store
+                .line_requeue(None, Utc::now() + chrono::Duration::seconds(1))
+                .await
+                .unwrap();
+        assert_eq!(back.len(), 1);
+        d.line_requeued(back).await;
+        assert_eq!(delivery(stale.id).await, Delivery::Withdrawn);
+
+        // A session no boss ever ran: the nudge comes back and goes in.
+        let other = new_session(&d, dir.path()).await;
+        idle(&d, other.id).await;
+        let nudge = send("How is it going?", other.id).await;
+        let next = d.line_next(other.id, Duration::from_secs(1)).await.unwrap();
+        assert_eq!(next["id"], json!(nudge.id));
+        d.line_ack(other.id, nudge.id, false).await.unwrap();
+        assert_eq!(delivery(nudge.id).await, Delivery::Queued);
+        let again = take_next(&d, other.id, Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!(again["id"], json!(nudge.id));
+        assert_eq!(delivery(nudge.id).await, Delivery::Delivered);
+    })
+    .await;
+}
+
 /// The person's message goes ahead of a boss's that was waiting for the
 /// same idle.
 #[tokio::test]
@@ -403,6 +488,203 @@ async fn a_session_passes_to_the_new_boss_or_is_let_go_once_ended() {
             .unwrap();
         assert!(ended.released_at.is_some());
         assert_eq!(d.charges().len(), 1);
+    })
+    .await;
+}
+
+/// What its session asks, open until answered.
+fn ask_permission(d: &Desk, id: Uuid, command: &str) -> tokio::task::JoinHandle<Value> {
+    let d = d.clone();
+    let body = json!({"hook_event_name": "PermissionRequest", "tool_name": "Bash",
+        "tool_input": {"command": command}});
+    tokio::spawn(async move { hook(&d, id, body).await })
+}
+
+async fn asked(d: &Desk, id: Uuid, command: &str) -> Uuid {
+    for _ in 0..200 {
+        if let Some(p) = d.view(id).unwrap().pending.filter(|p| p.detail == command) {
+            return p.id;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("{command} was never asked");
+}
+
+/// Desk itself holds a boss to what it may answer on a session it runs:
+/// what can't be undone, a session another boss runs or the person
+/// drives, and the rest of the session are the person's; an answer after
+/// the person's is told it was already answered.
+#[tokio::test]
+async fn desk_holds_a_boss_to_what_it_may_answer_for_its_session() {
+    use crate::model::Decision;
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let s = new_session(&d, dir.path()).await;
+        idle(&d, s.id).await;
+        d.take_on(s.id, &sarah(), How::Handed, &HashSet::new(), &By::you())
+            .await
+            .unwrap();
+        let sarah_by = By::manager("sarah", "Sarah", "It's the plan.");
+        let refused = |r: Result<crate::model::SessionView, DeskError>| match r {
+            Err(DeskError::Conflict(why) | DeskError::Invalid(why)) => why,
+            other => panic!("not refused: {other:?}"),
+        };
+
+        // Until the hub says where answers are judged, none is the boss's.
+        let tests = ask_permission(&d, s.id, "cargo test");
+        let a = asked(&d, s.id, "cargo test").await;
+        assert_eq!(
+            refused(d.decide(s.id, a, Decision::Allow, Some(sarah_by.clone()))),
+            "Desk can't judge requests for a boss yet: it's the person's to allow"
+        );
+        d.boss_bounds_with(crate::charge::Bounds {
+            home: dir.path().to_path_buf(),
+            scratch: vec![],
+            withheld: vec![],
+        });
+        assert_eq!(
+            refused(d.decide(s.id, a, Decision::AllowForSession, Some(sarah_by.clone()))),
+            "only the person answers for the rest of a session"
+        );
+        let mia = By::manager("mia", "Mia", "Mine now.");
+        assert!(
+            refused(d.decide(s.id, a, Decision::Allow, Some(mia))).contains("another boss runs")
+        );
+        d.decide(s.id, a, Decision::Allow, Some(sarah_by.clone()))
+            .unwrap();
+        assert_eq!(
+            tests.await.unwrap()["hookSpecificOutput"]["decision"]["behavior"],
+            "allow"
+        );
+
+        // What can't be undone is the person's; denying it is the boss's.
+        let force = ask_permission(&d, s.id, "git push --force origin feat");
+        let a = asked(&d, s.id, "git push --force origin feat").await;
+        assert_eq!(
+            refused(d.decide(s.id, a, Decision::Allow, Some(sarah_by.clone()))),
+            "can't be undone: it's the person's to allow"
+        );
+        d.decide(s.id, a, Decision::Deny, Some(sarah_by.clone()))
+            .unwrap();
+        assert_eq!(
+            force.await.unwrap()["hookSpecificOutput"]["decision"]["behavior"],
+            "deny"
+        );
+
+        // The person answered first.
+        let build = ask_permission(&d, s.id, "cargo build");
+        let a = asked(&d, s.id, "cargo build").await;
+        d.decide(s.id, a, Decision::Allow, Some(By::you())).unwrap();
+        build.await.unwrap();
+        assert_eq!(
+            refused(d.decide(s.id, a, Decision::Allow, Some(sarah_by.clone()))),
+            "already answered"
+        );
+        assert_eq!(
+            refused(d.decide(s.id, a, Decision::Allow, Some(By::you()))),
+            "already answered"
+        );
+
+        // The person drives it: theirs to answer.
+        let lint = ask_permission(&d, s.id, "cargo clippy");
+        let a = asked(&d, s.id, "cargo clippy").await;
+        d.drive(s.id).await.unwrap();
+        assert!(
+            refused(d.decide(s.id, a, Decision::Allow, Some(sarah_by.clone())))
+                .contains("the person is driving")
+        );
+        assert!(
+            refused(d.decide(s.id, a, Decision::Deny, Some(sarah_by.clone())))
+                .contains("the person is driving")
+        );
+        assert!(
+            refused(d.interrupt(s.id, Some(sarah_by.clone()))).contains("the person is driving")
+        );
+        assert!(refused(d.resume(s.id, None, Some(sarah_by.clone())).await)
+            .contains("the person is driving"));
+        assert!(refused(d.restart(s.id, None, sarah_by.clone()).await)
+            .contains("the person is driving"));
+        let mia = By::manager("mia", "Mia", "Mine now.");
+        assert!(refused(d.interrupt(s.id, Some(mia))).contains("another boss runs"));
+        d.decide(s.id, a, Decision::Allow, Some(By::you())).unwrap();
+        lint.await.unwrap();
+    })
+    .await;
+}
+
+fn git(dir: &std::path::Path, args: &[&str]) {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "git {args:?}: {out:?}");
+}
+
+/// A push is judged by the repository it runs in: the own folder's, on a
+/// branch that isn't the default one. From another repository (another
+/// cwd, a nested one) the boss can't tell what it pushes.
+#[tokio::test]
+async fn a_push_is_judged_by_the_repository_it_runs_in() {
+    use crate::model::Decision;
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let own = base.join("acme-web");
+        let other = base.join("acme-api");
+        for (repo, branch) in [(&own, "feat/x"), (&other, "main")] {
+            std::fs::create_dir_all(repo).unwrap();
+            git(repo, &["init", "-q", "-b", branch]);
+        }
+        let d = desk(pool, dir.path()).await;
+        let s = new_session(&d, &own).await;
+        idle(&d, s.id).await;
+        d.take_on(s.id, &sarah(), How::Handed, &HashSet::new(), &By::you())
+            .await
+            .unwrap();
+        d.boss_bounds_with(crate::charge::Bounds {
+            home: base.clone(),
+            ..Default::default()
+        });
+        let boss = By::manager("sarah", "Sarah", "It's the plan.");
+        let ask = |cwd: &std::path::Path| {
+            let d = d.clone();
+            let body = json!({"hook_event_name": "PermissionRequest", "tool_name": "Bash",
+                "tool_input": {"command": "git push origin HEAD"}, "cwd": cwd});
+            tokio::spawn(async move { hook(&d, s.id, body).await })
+        };
+        let open = || async {
+            for _ in 0..200 {
+                if let Some(p) = d.view(s.id).unwrap().pending {
+                    return p.id;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            panic!("never asked");
+        };
+
+        let elsewhere = ask(&other);
+        let a = open().await;
+        assert_eq!(
+            d.boss_answerable(s.id, a).unwrap_err().to_string(),
+            "Desk can't tell which branch this pushes"
+        );
+        d.decide(s.id, a, Decision::Deny, Some(boss.clone()))
+            .unwrap();
+        elsewhere.await.unwrap();
+
+        let here = ask(&own);
+        let a = open().await;
+        assert_eq!(d.boss_answerable(s.id, a), Ok(()));
+        d.decide(s.id, a, Decision::Allow, Some(boss)).unwrap();
+        assert_eq!(
+            here.await.unwrap()["hookSpecificOutput"]["decision"]["behavior"],
+            "allow"
+        );
     })
     .await;
 }
