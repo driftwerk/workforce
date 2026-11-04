@@ -742,6 +742,12 @@ impl Desk {
                             approve_for_me: false,
                             account: None,
                             env: BTreeMap::new(),
+                            // The board's group, while the sidebar has it:
+                            // its session works where the board is.
+                            group: b
+                                .group
+                                .clone()
+                                .filter(|g| self.layout().groups.iter().any(|x| &x.id == g)),
                         },
                         Some(by.clone()),
                     )

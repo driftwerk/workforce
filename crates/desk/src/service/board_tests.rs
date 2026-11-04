@@ -34,6 +34,7 @@ async fn session(d: &Desk, dir: &Path, name: &str, goal: &str) -> SessionView {
             approve_for_me: false,
             account: None,
             env: Default::default(),
+            group: None,
         },
         None,
     )
@@ -438,7 +439,17 @@ async fn a_new_session_is_started_with_the_ticket_as_its_goal_and_prompt() {
     with_test_pool(build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
         let d = desk(pool, dir.path()).await;
-        let b = board(&d, "Acme").await;
+        d.change_layout(|l| l.create("g-acme", "Acme", &[], None))
+            .await
+            .unwrap();
+        let b = d
+            .create_board(NewBoard {
+                name: "Acme".into(),
+                group: Some("g-acme".into()),
+                prefix: None,
+            })
+            .await
+            .unwrap();
         let t = ticket(&d, b.id, "Fix the login", TicketState::Todo).await;
         let v = d
             .assign_ticket(
@@ -453,6 +464,11 @@ async fn a_new_session_is_started_with_the_ticket_as_its_goal_and_prompt() {
             .unwrap();
         let s = d.view(v.ticket.session().unwrap()).unwrap();
         assert_eq!(s.name, "ACM-1");
+        assert_eq!(
+            s.group.map(|g| g.id).as_deref(),
+            Some("g-acme"),
+            "where its board is"
+        );
         assert_eq!(s.goal, "ACM-1 · Fix the login");
         assert_eq!(v.ticket.state, TicketState::Doing);
         let thread = d.line_thread(s.id, None, None).await.unwrap();
