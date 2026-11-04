@@ -1267,7 +1267,14 @@ mod tests {
     fn base() -> &'static str {
         static BASE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
         BASE.get_or_init(|| {
-            let dir = tempfile::tempdir().unwrap().keep();
+            // Never under scratch space (`/tmp` on Linux): there every
+            // delete is the agent's to make.
+            let temp = std::env::temp_dir();
+            let parent = match temp.starts_with("/tmp") {
+                true => PathBuf::from("/var/tmp"),
+                false => temp,
+            };
+            let dir = tempfile::tempdir_in(parent).unwrap().keep();
             let base = std::fs::canonicalize(dir).unwrap();
             for d in [
                 "Users/sarah/Desk/hub/agents/allan/work/target",
