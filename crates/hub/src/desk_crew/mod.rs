@@ -157,10 +157,21 @@ pub(crate) fn config_saved(service: &AgentService) {
     }
 }
 
+/// What `service` is shown as in Desk: its own name, never its id; one
+/// with none is "Boss" when it oversees the crew, else "Agent".
 pub(crate) fn name_of(service: &AgentService) -> String {
-    service
-        .display_name()
-        .unwrap_or_else(|| service.agent_id.as_str().to_string())
+    let id = service.agent_id.as_str();
+    let name = service.display_name();
+    let unnamed = name
+        .as_deref()
+        .is_none_or(|n| n.trim().is_empty() || n == id);
+    let boss = unnamed
+        && AgentWorkspaceConfig::load(&service.workspace)
+            .ok()
+            .flatten()
+            .and_then(|c| c.oversight().ok())
+            .is_some_and(|o| o.enabled);
+    workforce_desk::crew::shown_name(id, name.as_deref(), boss)
 }
 
 fn mtime(workspace: &Path) -> Option<SystemTime> {

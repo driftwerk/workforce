@@ -48,8 +48,12 @@ async fn agent_calling(
     use wiremock::matchers::{body_partial_json, method, path};
     use wiremock::{Mock, ResponseTemplate};
     let (config, server) = crate::serve::testing::mock_llm_config(&dir.join(id), |c| {
+        // Named as the person named it: Scout for `scout`.
+        let mut name = id.to_string();
+        name[..1].make_ascii_uppercase();
         c.agents = vec![AgentConfig {
             id: id.into(),
+            name: Some(name),
             ..Default::default()
         }];
     })
@@ -1085,7 +1089,7 @@ async fn the_overseer_messages_the_crew_within_the_loop_guard() {
         let nudge = || crew.perform(&action, crew.by_overseer("Quiet for 40 min.").unwrap());
         let mut frames = crew.state.broadcast_tx.subscribe();
         let done = nudge().await;
-        assert_eq!(done.as_deref(), Ok("asked scout"), "{done:?}");
+        assert_eq!(done.as_deref(), Ok("asked Scout"), "{done:?}");
         // The overseer's message goes out live to Scout's open DM before the
         // answer starts, and is the overseer's in the DM's history.
         let (said, before) = relayed_frame(&mut frames, &dm.id).await;
@@ -1093,10 +1097,10 @@ async fn the_overseer_messages_the_crew_within_the_loop_guard() {
             !before.iter().any(|t| t.starts_with("stream")),
             "{before:?}"
         );
-        assert_eq!(said.content, "desk asks: How is the staging check going?");
+        assert_eq!(said.content, "Desk asks: How is the staging check going?");
         assert_eq!(
             said.author,
-            Some(json!({"kind": "overseer", "id": "desk", "name": "desk"}))
+            Some(json!({"kind": "overseer", "id": "desk", "name": "Desk"}))
         );
         let item = history_item(&crew, &scout, PERSON, said.id.as_deref().unwrap()).await;
         assert_eq!(item["from"], "user");
@@ -1111,7 +1115,7 @@ async fn the_overseer_messages_the_crew_within_the_loop_guard() {
         .await;
         assert_eq!(
             started.text,
-            "started “desk asks: How is the staging check going?”"
+            "started “Desk asks: How is the staging check going?”"
         );
         assert_eq!(started.hop, 1, "a hand-off from the overseer");
         let asked = d
@@ -1122,7 +1126,7 @@ async fn the_overseer_messages_the_crew_within_the_loop_guard() {
             .into_iter()
             .find(|e| e.kind == Kind::Nudged)
             .unwrap();
-        assert_eq!(asked.text, "asked scout “How is the staging check going?”");
+        assert_eq!(asked.text, "asked Scout “How is the staging check going?”");
         assert_eq!(asked.reason.as_deref(), Some("Quiet for 40 min."));
 
         for _ in 1..super::TURN_BUDGET {
@@ -1275,7 +1279,7 @@ async fn messaging_agents_and_terminal_sessions_is_the_persons_to_switch_on() {
             .execute(json!({"agent_id": "scout", "message": "How is the staging check going?", "reason": "Quiet."}))
             .await
             .unwrap();
-        assert_eq!(nudged.output["done"], "asked scout", "{nudged:?}");
+        assert_eq!(nudged.output["done"], "asked Scout", "{nudged:?}");
         let assigned = tool("crew.assign")
             .execute(json!({"agent_id": "scout", "task": "Check the date picker build", "reason": "Next up."}))
             .await
@@ -1719,7 +1723,7 @@ async fn a_suggestion_said_yes_to_is_yours_and_worded_with_your_name() {
             page.messages.into_iter().find(|m| m.text == "On it.")
         })
         .await;
-        assert_eq!(answer.author, workforce_desk::Speaker::agent("scout", "scout"));
+        assert_eq!(answer.author, workforce_desk::Speaker::agent("scout", "Scout"));
     })
     .await;
 }
@@ -3404,4 +3408,17 @@ async fn the_overseer_starts_real_sessions_it_runs_up_to_its_limit() {
         );
     })
     .await;
+}
+
+/// An agent with no name of its own is never shown by its id: an overseer
+/// is "Boss", any other "Agent".
+#[tokio::test]
+async fn an_agent_with_no_name_of_its_own_is_never_shown_by_its_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = crate::serve::testing::plain_service(dir.path()).await;
+    std::fs::create_dir_all(&s.workspace).unwrap();
+    assert!(s.display_name().is_none());
+    assert_eq!(super::name_of(&s), "Agent");
+    write_config(&s, "[oversight]\nenabled = true\n");
+    assert_eq!(super::name_of(&s), "Boss");
 }

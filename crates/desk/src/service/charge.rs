@@ -54,8 +54,8 @@ pub struct ChargeView {
     pub released_at: Option<DateTime<Utc>>,
 }
 
-/// What a boss with no name of its own is called where its name is shown.
-pub const UNNAMED_BOSS: &str = "Boss";
+#[cfg(test)]
+use crate::crew::UNNAMED_BOSS;
 
 /// How often who has the wheel is looked at.
 const SETTLE_EVERY: Duration = Duration::from_secs(5);
@@ -107,7 +107,7 @@ impl Desk {
 
     /// What the boss `id` is called: as the hub's roster says now, which
     /// outlives a restart, else as it was when it took a session on. Never
-    /// its id: one with no name of its own is "the boss" ([`UNNAMED_BOSS`]).
+    /// its id: one with no name of its own is [`crate::crew::UNNAMED_BOSS`].
     fn boss_name(&self, id: &str) -> String {
         let named = |n: &str| !n.trim().is_empty() && n != id;
         let crew = self
@@ -127,12 +127,7 @@ impl Desk {
             }
         }
         let st = self.0.state.lock();
-        st.charges
-            .names
-            .get(id)
-            .filter(|n| named(n))
-            .cloned()
-            .unwrap_or_else(|| UNNAMED_BOSS.to_string())
+        crew::shown_name(id, st.charges.names.get(id).map(String::as_str), true)
     }
 
     /// The person gave `id` a prompt or wrote to it: they take its wheel.

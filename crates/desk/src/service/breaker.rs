@@ -294,14 +294,11 @@ impl Desk {
                 .view(*id)
                 .map(|v| v.label().to_string())
                 .unwrap_or_else(|_| "A session".into()),
-            BreakerOf::Agent(id) => self
-                .0
-                .breakers
-                .lock()
-                .names
-                .get(id)
-                .cloned()
-                .unwrap_or_else(|| id.clone()),
+            BreakerOf::Agent(id) => {
+                let boss = self.boss().is_some_and(|b| b.id == *id);
+                let names = self.0.breakers.lock();
+                crate::crew::shown_name(id, names.names.get(id).map(String::as_str), boss)
+            }
             BreakerOf::Pool(Pool::Desk) => "Desk".into(),
             BreakerOf::Pool(Pool::Group(g)) => {
                 let st = self.0.state.lock();

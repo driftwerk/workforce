@@ -579,6 +579,22 @@ pub trait Crew: Send + Sync {
 
 // ── Words ────────────────────────────────────────────────────────────────
 
+/// What a boss with no name of its own is called where its name is shown.
+pub const UNNAMED_BOSS: &str = "Boss";
+/// What any other agent with no name of its own is called.
+pub const UNNAMED_AGENT: &str = "Agent";
+
+/// What the agent `id` is shown as: `name` when it is one of its own, never
+/// its id; else [`UNNAMED_BOSS`] for a boss and [`UNNAMED_AGENT`] for the
+/// rest.
+pub fn shown_name(id: &str, name: Option<&str>, boss: bool) -> String {
+    match name.map(str::trim) {
+        Some(n) if !n.is_empty() && n != id => n.to_string(),
+        _ if boss => UNNAMED_BOSS.into(),
+        _ => UNNAMED_AGENT.into(),
+    }
+}
+
 /// The first sentence (or line) of `text`, flattened and clipped to `max`
 /// characters.
 pub fn one_line(text: &str, max: usize) -> String {
@@ -843,6 +859,16 @@ pub fn session_state(state: SessionState) -> ItemState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_agent_is_shown_by_its_own_name_and_never_by_its_id() {
+        assert_eq!(shown_name("sarah", Some("Sarah"), true), "Sarah");
+        assert_eq!(shown_name("scout", Some("Scout"), false), "Scout");
+        for name in [None, Some(""), Some("  "), Some("sarah")] {
+            assert_eq!(shown_name("sarah", name, true), UNNAMED_BOSS, "{name:?}");
+            assert_eq!(shown_name("sarah", name, false), UNNAMED_AGENT, "{name:?}");
+        }
+    }
 
     #[test]
     fn ids_sort_as_they_were_made() {

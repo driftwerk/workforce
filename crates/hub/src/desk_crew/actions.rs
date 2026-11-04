@@ -582,7 +582,7 @@ impl CrewHub {
     fn agent_name(&self, id: &str) -> String {
         self.party_of_agent(id)
             .map(|p| p.name)
-            .unwrap_or_else(|| id.to_string())
+            .unwrap_or_else(|| crew::shown_name(id, None, false))
     }
 
     /// What the action is about.
