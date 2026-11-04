@@ -542,6 +542,28 @@ fn why_of(params: &Value, home: Option<&Path>) -> Option<String> {
     (!said.is_empty()).then(|| said.join(" · "))
 }
 
+/// Every path one of a file change's changes touches: its own, and where a
+/// move takes it (`kind: {type: "update", move_path}`, either case).
+fn changed_paths(change: &Value) -> Vec<String> {
+    let mut out: Vec<String> = change
+        .get("path")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .into_iter()
+        .collect();
+    for at in [
+        "/kind/move_path",
+        "/kind/movePath",
+        "/move_path",
+        "/movePath",
+    ] {
+        if let Some(to) = change.pointer(at).and_then(Value::as_str) {
+            out.push(to.to_string());
+        }
+    }
+    out
+}
+
 /// The approval a server request is, when it is one Desk answers: a
 /// command's, or a file change's (whose files its item named, in `files`).
 pub fn ask_of(
@@ -576,7 +598,10 @@ pub fn ask_of(
         }
         "item/fileChange/requestApproval" => {
             let item = params.get("itemId").and_then(Value::as_str)?;
-            let input = files.get(item).map(|f| json!({ "paths": f }));
+            // A grant of a folder for the rest of the session rides along.
+            let input = files
+                .get(item)
+                .map(|f| json!({ "paths": f, "grantRoot": params.get("grantRoot") }));
             let named = files
                 .get(item)
                 .map(|f| {
@@ -967,8 +992,7 @@ impl Follower {
                             .and_then(Value::as_array)
                             .into_iter()
                             .flatten()
-                            .filter_map(|c| c.get("path").and_then(Value::as_str))
-                            .map(str::to_string)
+                            .flat_map(changed_paths)
                             .collect();
                         self.files.insert(item.to_string(), paths);
                     }
@@ -1649,6 +1673,36 @@ pub(crate) mod tests {
             "params": {"threadId": "other", "turnId": "u", "itemId": "i", "isBlocking": true,
                 "questions": [{"id": "a", "header": "H", "question": "Q?"}]}}));
         assert!(seen.is_empty(), "another thread's");
+    }
+
+    /// A move's destination is one of the files a change touches, and a
+    /// grant of a folder rides with the request for Desk to refuse a boss.
+    #[test]
+    fn a_file_change_names_where_a_move_goes_and_any_grant_it_asks() {
+        let mut f = Follower::new(Some("t1".into()), Some(PathBuf::from("/Users/k")));
+        f.heard(
+            &json!({"method": "item/started", "params": {"threadId": "t1",
+            "item": {"type": "fileChange", "id": "fc-2", "status": "inProgress",
+                "changes": [{"path": "/Users/k/repo/a.rs",
+                    "kind": {"type": "update", "move_path": "/Users/k/other/a.rs"}, "diff": ""}]}}}),
+        );
+        let (seen, _) = f.heard(
+            &json!({"id": 8, "method": "item/fileChange/requestApproval",
+            "params": {"threadId": "t1", "turnId": "u1", "itemId": "fc-2",
+                "grantRoot": "/Users/k"}}),
+        );
+        let [Seen {
+            event: CodexEvent::Asks(ask),
+            ..
+        }] = &seen[..]
+        else {
+            panic!("{seen:?}")
+        };
+        let whole = ask.whole.as_ref().unwrap();
+        assert_eq!(
+            whole.input,
+            json!({"paths": ["/Users/k/repo/a.rs", "/Users/k/other/a.rs"], "grantRoot": "/Users/k"})
+        );
     }
 
     #[test]

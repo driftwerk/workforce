@@ -3061,12 +3061,13 @@ async fn the_overseer_answers_for_its_session_all_but_what_cant_be_undone() {
         let (_, mut o) = crew.overseer_service().unwrap();
         o.act.interrupt = false;
         o.act.resume_restart = false;
+        assert_eq!(crew.gate(&Action::Interrupt { session: s.id }, &o), Gate::Run);
+        // Started again it reads its settings again: the person's call.
         for action in [
-            Action::Interrupt { session: s.id },
             Action::Resume { session: s.id, prompt: None },
             Action::Restart { session: s.id, prompt: Some("Skip the network tests.".into()) },
         ] {
-            assert_eq!(crew.gate(&action, &o), Gate::Run, "{action:?}");
+            assert!(matches!(crew.gate(&action, &o), Gate::Suggest(_)), "{action:?}");
         }
         assert!(matches!(crew.gate(&Action::Stop { session: s.id }, &o), Gate::Suggest(_)));
 

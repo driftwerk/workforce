@@ -205,8 +205,17 @@ impl Desk {
         let Some(pending) = self.pending_of(id, approval) else {
             return no("already answered");
         };
-        let facts = charge::facts_of(view.engine, &pending, &view, &bounds.home);
-        charge::answerable(&facts, &bounds)
+        let moved = self.0.state.lock().live.get(&id).is_some_and(|l| l.moved);
+        let mut facts = charge::facts_of(view.engine, &pending, &view, &bounds.home, moved);
+        // The repository says which branch it is on and which is its
+        // default, now: not what Desk last saw.
+        facts.branch = git_line(&facts.own, &["symbolic-ref", "--short", "-q", "HEAD"]);
+        facts.default_branch = git_line(
+            &facts.own,
+            &["symbolic-ref", "--short", "-q", "refs/remotes/origin/HEAD"],
+        )
+        .map(|d| d.strip_prefix("origin/").map(str::to_string).unwrap_or(d));
+        charge::answerable(&facts, &bounds, &charge::real_path)
     }
 
     /// Whether `by`, when it is a boss, may act on `id` now: a session a
@@ -261,6 +270,13 @@ impl Desk {
         boss: &By,
     ) -> Result<(), DeskError> {
         use crate::model::Decision;
+        // Not knowing yet which sessions bosses run, no boss answers.
+        if !self.charges_loaded() {
+            return Err(DeskError::Conflict(
+                "Desk can't read which sessions bosses run just now; it's the person's to answer"
+                    .into(),
+            ));
+        }
         if !self.charge_of(id).is_some_and(|c| c.live()) {
             return Ok(());
         }
@@ -634,6 +650,20 @@ impl Desk {
             }
         }
     }
+}
+
+/// One line git prints in `dir`, or `None` when it can't say.
+fn git_line(dir: &std::path::Path, args: &[&str]) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .ok()
+        .filter(|o| o.status.success())?;
+    let line = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!line.is_empty()).then_some(line)
 }
 
 #[cfg(test)]

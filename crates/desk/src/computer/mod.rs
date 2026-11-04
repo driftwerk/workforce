@@ -4,6 +4,7 @@
 
 pub(crate) mod api;
 pub mod asks;
+pub mod boss;
 pub mod policy;
 mod store;
 

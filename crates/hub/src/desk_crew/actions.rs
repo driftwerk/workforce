@@ -433,13 +433,17 @@ impl CrewHub {
     }
 
     /// What the overseer may do, at `act`, to a session it runs: answer
-    /// for it all but what can't be undone (Desk checks again as it
-    /// answers), deny, interrupt, resume and restart it whatever
-    /// `[oversight.act]` says of sessions it doesn't run; only suggest
-    /// while the person drives it. `None`: the usual rules decide (a plain
+    /// for it what Desk reads in full and judges safe (Desk checks again as
+    /// it answers), deny, and interrupt it whatever `[oversight.act]` says
+    /// of sessions it doesn't run; resuming and restarting it stay the
+    /// person's; only suggest while the person drives it. `None`: the usual rules decide (a plain
     /// message waits on its line while the person drives).
     fn gate_charged(&self, action: &Action, o: &Oversight) -> Option<Gate> {
         let session = Self::session_of(action).filter(|s| self.overseer_runs(*s))?;
+        // What it leads to must wait on the person as for any session.
+        if let Some(why) = self.uncontained(action, &o.act) {
+            return Some(Gate::Suggest(why.into()));
+        }
         let name = self.session_name(session);
         if self.desk.wheel_of(session).is_some_and(|w| w.person()) {
             return match action {
@@ -482,12 +486,13 @@ impl CrewHub {
                     ),
                 })
             }
-            Action::Interrupt { .. } | Action::Resume { .. } | Action::Restart { .. } => {
-                if action.outward() {
-                    return outward_said();
-                }
-                Some(Gate::Run)
-            }
+            Action::Interrupt { .. } => Some(Gate::Run),
+            // A session started again reads its settings again: changes to
+            // them it made by itself are the person's to let take effect.
+            Action::Resume { .. } | Action::Restart { .. } => Some(Gate::Suggest(
+                "starting it again loads whatever settings it changed; that's the person's call"
+                    .into(),
+            )),
             _ => None,
         }
     }

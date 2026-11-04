@@ -179,6 +179,9 @@ pub(crate) struct Live {
     /// The Codex requests Desk can answer, oldest first: its pending
     /// approval is the first's.
     codex_asks: Vec<CodexAsk>,
+    /// One of its commands changed directory: where a later one runs is
+    /// what its engine says, or unknown.
+    moved: bool,
     /// Answers Desk sent Codex, by request, until Codex is told them (or
     /// was answered in the terminal first): what Activity then says.
     codex_sent: HashMap<String, CodexSent>,
@@ -1206,6 +1209,7 @@ impl Desk {
                     reading: None,
                     closing: false,
                     codex_asks: Vec::new(),
+                    moved: false,
                     codex_sent: HashMap::new(),
                     held: None,
                     open_question: None,
@@ -3118,6 +3122,7 @@ impl Desk {
                 reading: None,
                 closing: false,
                 codex_asks: Vec::new(),
+                moved: false,
                 codex_sent: HashMap::new(),
                 held: None,
                 open_question: None,
@@ -3270,6 +3275,18 @@ impl Desk {
     /// its background work, not the session working.
     async fn apply_hook(&self, id: Uuid, hook: Hook, inside: Option<String>) -> Value {
         let empty = || Value::Object(Default::default());
+        if let Hook::ToolStart { call, .. } = &hook {
+            let cd = call.tool == "Bash"
+                && call.input.as_deref().is_some_and(|c| {
+                    c.split(|ch: char| ch.is_whitespace() || ";&|(".contains(ch))
+                        .any(|w| matches!(w, "cd" | "pushd" | "popd"))
+                });
+            if cd {
+                if let Some(l) = self.0.state.lock().live.get_mut(&id) {
+                    l.moved = true;
+                }
+            }
+        }
         // A call the person allowed for the session runs without asking.
         let allowed = match &hook {
             Hook::ToolStart { call, .. } => self
