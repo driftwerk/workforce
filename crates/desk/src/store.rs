@@ -186,10 +186,11 @@ impl DeskStore {
     }
 
     /// Forgets sessions all at once: their records, how far `owner` read
-    /// each, what Activity says they or anyone did to them, their lines
-    /// (but what they said to other sessions), their charges, and how far
-    /// the ledger read their transcripts (what they spent is kept). How
-    /// many records went.
+    /// each, what Activity says they or anyone did to them (but on a
+    /// ticket), their lines (but what they said to other sessions), their
+    /// charges, the tickets assigned and linked to them, and how far the
+    /// ledger read their transcripts (what they spent is kept). How many
+    /// records went.
     pub async fn forget_sessions(&self, ids: &[Uuid], owner: &str) -> Result<u64> {
         let mut client = self.pool.get().await?;
         let tx = client.transaction().await?;
@@ -210,10 +211,29 @@ pub(crate) async fn forget_in(
         .map(|id| ReadPlace::Session(*id).to_string())
         .collect();
     let parties: Vec<String> = ids.iter().map(Uuid::to_string).collect();
+    // A ticket's history stays the ticket's: what a session did to it
+    // outlives the session.
     tx.execute(
-        "DELETE FROM activity \
-         WHERE (subject ->> 'kind' = 'session' AND subject ->> 'id' = ANY($1)) \
-         OR (actor ->> 'kind' = 'session' AND actor ->> 'id' = ANY($1))",
+        "DELETE FROM activity WHERE ticket IS NULL \
+         AND ((subject ->> 'kind' = 'session' AND subject ->> 'id' = ANY($1)) \
+         OR (actor ->> 'kind' = 'session' AND actor ->> 'id' = ANY($1)))",
+        &[&parties],
+    )
+    .await?;
+    tx.execute(
+        "UPDATE tickets SET assignee = NULL, updated_at = now(), version = version + 1 \
+         WHERE assignee ->> 'kind' = 'session' AND assignee ->> 'id' = ANY($1)",
+        &[&parties],
+    )
+    .await?;
+    tx.execute(
+        "UPDATE ticket_assignments SET until_at = now() \
+         WHERE session = ANY($1) AND until_at IS NULL",
+        &[&ids],
+    )
+    .await?;
+    tx.execute(
+        "DELETE FROM ticket_links WHERE kind = 'session' AND target = ANY($1)",
         &[&parties],
     )
     .await?;

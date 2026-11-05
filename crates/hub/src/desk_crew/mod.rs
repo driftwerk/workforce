@@ -402,6 +402,14 @@ impl Crew for CrewHub {
     fn answers_lines(&self) -> bool {
         self.overseer_service().is_some()
     }
+
+    async fn assign(&self, agent: &str, task: &str) -> Result<String, String> {
+        let action = actions::Action::Assign {
+            agent: agent.to_string(),
+            task: task.to_string(),
+        };
+        self.me().perform(&action, By::you()).await
+    }
 }
 
 /// Runs `service`'s morning or evening summary, for the scheduler.

@@ -7,6 +7,9 @@ pub mod api;
 pub mod asking;
 pub mod attachments;
 mod background;
+pub mod board;
+mod board_api;
+pub mod board_store;
 pub mod breaker;
 pub mod budget_store;
 pub mod charge;
@@ -71,6 +74,10 @@ pub use service::{
     Import, Imported, Layout, LedgerPage, LineError, NewTerminal, Options, Removal, Removed,
     RestorePolicy, Sender as LineSender, SessionMcp, SpendQuery, TerminalPatch, TerminalState,
     TerminalView, Ungrouped, UNGROUPED,
+};
+pub use service::{
+    AssignTo, BoardPatch, Move, NewBoard, NewSessionFor, NewTicket, TicketPatch, TicketQuery,
+    TicketView,
 };
 pub use speech::{Audio, Speak, SpeakError, Speech, SpeechProvider};
 pub use store::DeskStore;

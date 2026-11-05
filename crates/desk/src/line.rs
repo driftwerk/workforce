@@ -698,7 +698,7 @@ impl LineTool {
 pub const ASK_WAIT: Duration = Duration::from_secs(120);
 pub const ASK_WAIT_MAX: Duration = Duration::from_secs(300);
 
-pub static TOOLS: [LineTool; 5] = [
+pub static TOOLS: [LineTool; 6] = [
     LineTool {
         name: "ask",
         description: "Ask Desk (the person's overseer), the person, or another session a question, and wait for the answer. Routine questions are answered by Desk; anything that pushes, deletes, deploys, spends or changes scope goes to the person. to: \"desk\", \"you\" (the person), or a session's name or id from peers. Keep it short and structured: `question` is ONE line the person reads at a glance (at most 120 characters); put context, options and what you found in `details`; a one-line reason in `why`; the work item in `about` (like \"W7 · PR 2\"). Always say in `default` what you will do if no answer comes.",
@@ -756,6 +756,22 @@ pub static TOOLS: [LineTool; 5] = [
         description: "Who you can message on Desk's line: Desk, the person, and other sessions with their engine, folder and state.",
         schema: || json!({ "type": "object", "properties": {} }),
     },
+    LineTool {
+        name: "ticket",
+        description: "Desk's task board. mine: the tickets assigned to you. get: any ticket by its key (ACM-12). update: move your own ticket to doing, review or done as your work goes. comment: add a note to a ticket's history. create: add a ticket to the backlog (text: its title on the first line, then its description; key: the board's prefix when there is more than one board).",
+        schema: || {
+            json!({
+                "type": "object",
+                "properties": {
+                    "action": { "type": "string", "enum": ["mine", "get", "update", "comment", "create"] },
+                    "key": { "type": "string", "description": "The ticket's key (ACM-12); for update and comment, your own ticket when left out; for create, the board's prefix (ACM)" },
+                    "state": { "type": "string", "enum": ["doing", "review", "done"], "description": "For update: where your ticket goes" },
+                    "text": { "type": "string", "description": "For comment: the note. For create: the title, then the description on the following lines" }
+                },
+                "required": ["action"]
+            })
+        },
+    },
 ];
 
 /// A line tool's call, read from its input.
@@ -778,6 +794,7 @@ pub enum Call {
     },
     Inbox,
     Peers,
+    Ticket(crate::board::TicketCall),
 }
 
 /// Reads a call of the line tool `name`.
@@ -845,6 +862,7 @@ pub fn call_of(name: &str, input: &Value) -> Result<Call, String> {
         },
         "inbox" => Call::Inbox,
         "peers" => Call::Peers,
+        "ticket" => Call::Ticket(crate::board::ticket_call_of(input)?),
         other => return Err(format!("Desk's line has no tool called {other:?}.")),
     })
 }
