@@ -395,6 +395,7 @@ async fn a_hand_off_chain_is_refused_past_its_hops() {
                     text: "stuck".into(),
                     wait: Duration::ZERO,
                     chose: None,
+                    parts: Default::default(),
                 },
             )
             .await
@@ -1467,6 +1468,89 @@ async fn what_a_session_goes_ahead_with_is_kept_and_listed_with_what_it_went_ahe
         assert!(json.get("askedAt").is_some() && json.get("wentAheadAt").is_some());
         d.line_dismiss(ask).await.unwrap();
         assert!(d.line_went_ahead_list().is_empty(), "dismissed: gone");
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn an_ask_in_parts_is_kept_and_listed_and_a_long_question_is_sent_back() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let s = new_session(&d, dir.path()).await;
+        idle(&d, s.id).await;
+        // A question longer than a line isn't sent: the session reads how to
+        // ask it in parts.
+        let refused = d
+            .line_call(
+                s.id,
+                "ask",
+                &json!({"to": "you", "question": "Should PR 2 include the stub service?\nThe design lists it, the brief doesn't.", "wait_seconds": 0}),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(refused.contains("move the rest"), "{refused}");
+        assert!(d.line_went_ahead_list().is_empty(), "nothing was sent");
+        let r = d
+            .line_call(
+                s.id,
+                "ask",
+                &json!({
+                    "to": "you",
+                    "question": "Should PR 2 include the stub service?",
+                    "default": "include it",
+                    "why": "The design lists it.",
+                    "details": "- the stub\n- its `api_url`\x1b[2J",
+                    "about": "W7 · PR 2",
+                    "wait_seconds": 0,
+                }),
+                None,
+            )
+            .await
+            .unwrap();
+        let ask: Uuid = serde_json::from_value(r["id"].clone()).unwrap();
+        let q = row(&d, ask).await;
+        assert_eq!(q.text, "Should PR 2 include the stub service?");
+        assert_eq!(q.about.as_deref(), Some("W7 · PR 2"));
+        assert_eq!(q.why.as_deref(), Some("The design lists it."));
+        assert_eq!(q.details.as_deref(), Some("- the stub\n- its `api_url`[2J"), "kept, cleaned");
+        let json = serde_json::to_value(&q).unwrap();
+        assert_eq!(json["question"]["headline"], "Should PR 2 include the stub service?");
+        assert_eq!(json["question"]["details"], "- the stub\n- its `api_url`[2J");
+        let went = d.line_went_ahead_list();
+        assert_eq!(went[0].ask, "Should PR 2 include the stub service?");
+        assert_eq!(went[0].chose.as_deref(), Some("include it"));
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_question_stored_in_one_block_reads_as_a_headline_and_details() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let s = new_session(&d, dir.path()).await;
+        let wall = "Should the import keep the old table (see `docs/import.md`, step 2)? It still has rows from March. Default if no answer: keep it.";
+        let mut m = LineMessage::new(
+            Party::session(&d.view(s.id).unwrap()),
+            Party::you(),
+            LineKind::Ask,
+            wall.into(),
+            1,
+        );
+        m.asked = Some(Asked::Lapsed);
+        d.0.store.put_line(&m).await.unwrap();
+        let q = row(&d, m.id).await;
+        assert_eq!(q.text, wall, "stored as it was said");
+        assert_eq!(q.details, None);
+        let shown = q.question.clone().unwrap();
+        assert_eq!(shown.headline, "Should the import keep the old table (see `docs/import.md`, step 2)?");
+        assert_eq!(shown.details.as_deref(), Some("It still has rows from March. Default if no answer: keep it."));
+        // Written again (as a dismiss does), what is stored doesn't change.
+        d.0.store.put_line(&q).await.unwrap();
+        let again = row(&d, m.id).await;
+        assert_eq!((again.text.as_str(), again.details.as_deref()), (wall, None));
     })
     .await;
 }

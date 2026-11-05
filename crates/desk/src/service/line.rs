@@ -296,7 +296,7 @@ impl Desk {
     }
 
     fn line_noted(&self, m: &LineMessage) {
-        let what = crew::one_line(&m.text, 120);
+        let what = crew::one_line(m.headline(), 120);
         let (kind, text) = match m.kind {
             LineKind::Ask => (Kind::Asked, format!("asked {} “{what}”", m.to.name)),
             LineKind::Tell => (Kind::Told, format!("told {} “{what}”", m.to.name)),
@@ -383,11 +383,17 @@ impl Desk {
         };
         let mut m = LineMessage::new(party, recipient, kind, text, hop);
         m.group = group;
-        if let Send::Ask { chose, .. } = &hop_send {
-            m.chose = chose
-                .as_deref()
-                .map(|c| line::typable(c).trim().to_string())
-                .filter(|c| !c.is_empty());
+        if let Send::Ask { chose, parts, .. } = &hop_send {
+            let clean = |v: &Option<String>| {
+                v.as_deref()
+                    .map(|c| line::typable(c).trim().to_string())
+                    .filter(|c| !c.is_empty())
+            };
+            m.chose = clean(chose);
+            m.about = clean(&parts.about);
+            m.why = clean(&parts.why);
+            m.details = clean(&parts.details);
+            m.shape();
         }
         let recipient = m.to_session().and_then(find).cloned();
         let steering = match &recipient {
@@ -730,6 +736,7 @@ impl Desk {
                 text,
                 wait,
                 chose,
+                parts,
             } => {
                 let to = line::target_of(&to, &sessions).map_err(|r| r.to_string())?;
                 let m = self
@@ -740,6 +747,7 @@ impl Desk {
                             text,
                             wait,
                             chose,
+                            parts,
                         },
                     )
                     .await
@@ -1014,7 +1022,7 @@ impl Desk {
             Some(ask) => self.0.store.line_message(ask).await.ok().flatten(),
             None => None,
         };
-        line::render(m, question.as_ref().map(|q| q.text.as_str()))
+        line::render(m, question.as_ref().map(|q| q.headline()))
     }
 
     /// The next message for Desk's plugin to submit into `caller`, handed
@@ -1317,7 +1325,7 @@ impl Desk {
                 format!(
                     "{} has ended, so your question “{}” to it is withdrawn.",
                     gone.label(),
-                    crew::one_line(&ask.text, 120)
+                    crew::one_line(ask.headline(), 120)
                 ),
                 ask.hop,
             );
@@ -1474,7 +1482,7 @@ impl Desk {
                 format!(
                     "gave you {}'s question “{}”",
                     q.from.name,
-                    crew::one_line(&q.text, 120)
+                    crew::one_line(q.headline(), 120)
                 ),
             )
             .reason(why)
@@ -1500,7 +1508,8 @@ impl Desk {
                     name: m.from.name.clone(),
                     engine: m.from.engine,
                 },
-                ask: m.text.clone(),
+                ask: m.headline().to_string(),
+                chose: m.chose.clone(),
                 why: m
                     .escalation
                     .as_ref()
@@ -1535,7 +1544,7 @@ impl Desk {
                     name: m.from.name.clone(),
                     engine: m.from.engine,
                 },
-                ask: m.text.clone(),
+                ask: m.headline().to_string(),
                 chose: m.chose.clone(),
                 asked_at: m.at,
                 // No later than its longest wait: one found after a restart

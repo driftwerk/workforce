@@ -96,7 +96,7 @@ impl CrewHub {
             return;
         }
         if let Ok(Some(q)) = self.desk.store().line_message(*ask).await {
-            self.questions.lock().insert(*ask, q.text);
+            self.questions.lock().insert(*ask, q.full_text());
         }
     }
 
@@ -174,7 +174,7 @@ impl CrewHub {
         let text = format!(
             "{} asks: “{}”\n\n{}",
             q.from.name,
-            crew::one_line(&q.text, 400),
+            crew::one_line(q.headline(), 400),
             e.why
         );
         let target = DeskTarget::of_turn(&DeskPlace::Dm, DESK_CHANNEL, None, false);
@@ -197,7 +197,7 @@ impl CrewHub {
                 message_id: q.id.to_string(),
                 session_id: q.from.id.clone(),
                 session: q.from.name.clone(),
-                ask: q.text.clone(),
+                ask: q.headline().to_string(),
                 why: e.why,
                 options: e.options,
                 draft: e.draft,
@@ -231,7 +231,7 @@ impl CrewHub {
             answer.to.name,
             question.map_or_else(
                 || crew::one_line(&answer.text, 120),
-                |q| crew::one_line(&q.text, 120)
+                |q| crew::one_line(q.headline(), 120)
             )
         );
         let target = DeskTarget::of_turn(&DeskPlace::Dm, DESK_CHANNEL, None, false);
@@ -297,7 +297,7 @@ impl CrewHub {
         {
             let mut known = self.questions.lock();
             for a in &asks {
-                known.insert(a.id, a.text.clone());
+                known.insert(a.id, a.full_text());
             }
         }
         let prompt = self.line_prompt(session, &messages, &ended, &o);
@@ -401,7 +401,7 @@ impl CrewHub {
                     LineKind::Ask => "asks",
                     LineKind::Tell | LineKind::Answer => "tells you",
                 };
-                format!("- message {} ({kind}): {}", m.id, m.text)
+                format!("- message {} ({kind}): {}", m.id, m.full_text())
             })
             .collect();
         if !ended.is_empty() {

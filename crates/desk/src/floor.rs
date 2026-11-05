@@ -534,6 +534,10 @@ pub struct Need {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub why: Option<String>,
     pub options: Option<Vec<String>>,
+    /// A session's question: what it said it goes ahead with if no answer
+    /// comes in time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chose: Option<String>,
     pub since: DateTime<Utc>,
     pub place: Place,
     pub answer: Answer,
@@ -674,6 +678,7 @@ pub fn open_needs(turns: &[Turn]) -> Vec<Need> {
                 ask: w.ask.clone(),
                 why: None,
                 options: w.options.clone(),
+                chose: None,
                 since: w.from,
                 place: t.place.clone(),
                 answer: w.answer.clone(),
@@ -688,6 +693,7 @@ pub fn open_needs(turns: &[Turn]) -> Vec<Need> {
             ask: q.text.clone(),
             why: None,
             options: q.options.clone(),
+            chose: None,
             since: t.ended_at.unwrap_or(t.started_at),
             place: t.place.clone(),
             answer: Answer::Reply,
@@ -1466,6 +1472,7 @@ mod tests {
             ask: "Run npm test?".into(),
             why: None,
             options: None,
+            chose: None,
             since: at("2026-10-29T16:30:00Z"),
             place: Place::Session,
             answer: decide(),
