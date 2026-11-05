@@ -82,3 +82,4 @@ pub use service::{
 };
 pub use speech::{Audio, Speak, SpeakError, Speech, SpeechProvider};
 pub use store::DeskStore;
+pub use token_pipe::private_run_dir;

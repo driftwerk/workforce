@@ -491,13 +491,43 @@ pub const SETUP_UNREAD: &str = "Desk couldn't read the token from Claude Code: p
 /// to look; [`claude_token_works`] decides.
 const TOKEN_PREFIX: &str = "sk-ant-o";
 
-/// The hosts Claude's sign-in pages may be on.
-pub const CLAUDE_HOSTS: &[&str] = &["claude.ai", "anthropic.com", "claude.com"];
+/// A sign-in page Desk opens: on exactly this host, at exactly one of these
+/// paths, with a query only when `query` says so.
+pub struct SignInPage {
+    pub host: &'static str,
+    pub paths: &'static [&'static str],
+    pub query: bool,
+}
 
-/// `said` as a web page on one of `hosts` (or a subdomain of one), read as a
-/// browser reads it (so `\\`, `@` and escapes can't move its host): https,
-/// no user or password, the default port. None for anything else.
-pub fn page_on(said: &str, hosts: &[&str]) -> Option<url::Url> {
+/// The paths Claude Code's sign-in page is at (`claude setup-token` 2.1.318
+/// shows `https://claude.com/cai/oauth/authorize?…`; earlier ones
+/// `https://claude.ai/oauth/authorize?…`).
+const CLAUDE_PATHS: &[&str] = &["/oauth/authorize", "/cai/oauth/authorize"];
+
+/// Claude's sign-in pages: nothing else on its domains (a page someone
+/// published there) is ever taken for one.
+pub const CLAUDE_PAGES: &[SignInPage] = &[
+    SignInPage {
+        host: "claude.ai",
+        paths: CLAUDE_PATHS,
+        query: true,
+    },
+    SignInPage {
+        host: "claude.com",
+        paths: CLAUDE_PATHS,
+        query: true,
+    },
+    SignInPage {
+        host: "platform.claude.com",
+        paths: CLAUDE_PATHS,
+        query: true,
+    },
+];
+
+/// `said` as one of `pages`, read as a browser reads it (so `\\`, `@` and
+/// escapes can't move its host or path): https, no user, password, port or
+/// fragment, on exactly its host and path. None for anything else.
+pub fn page_on(said: &str, pages: &[SignInPage]) -> Option<url::Url> {
     if said.len() > 4096 || said.chars().any(|c| c.is_whitespace() || c.is_control()) {
         return None;
     }
@@ -506,6 +536,7 @@ pub fn page_on(said: &str, hosts: &[&str]) -> Option<url::Url> {
         || !page.username().is_empty()
         || page.password().is_some()
         || page.port().is_some()
+        || page.fragment().is_some()
     {
         return None;
     }
@@ -513,15 +544,17 @@ pub fn page_on(said: &str, hosts: &[&str]) -> Option<url::Url> {
         return None;
     };
     let host = host.to_ascii_lowercase();
-    hosts
+    pages
         .iter()
-        .any(|d| host == *d || host.ends_with(&format!(".{d}")))
+        .any(|p| {
+            host == p.host && p.paths.contains(&page.path()) && (p.query || page.query().is_none())
+        })
         .then_some(page)
 }
 
-/// Whether `url` is a page of Claude's own sign-in.
+/// Whether `url` is Claude's own sign-in page.
 fn sign_in_host(url: &str) -> bool {
-    page_on(url, CLAUDE_HOSTS).is_some()
+    page_on(url, CLAUDE_PAGES).is_some()
 }
 
 /// Reads a `claude setup-token` screen (run wide enough that nothing
@@ -846,6 +879,14 @@ mod tests {
         }
         assert!(!sign_in_host("https://evil.example\\@claude.ai/"));
         assert!(sign_in_host(
+            "https://platform.claude.com/oauth/authorize?code=true"
+        ));
+        // A page someone published on Claude's own domains is never one.
+        assert_eq!(
+            direct_sign_in("https://claude.ai/public/artifacts/x?redirect_uri=http%3A%2F%2Flocalhost%3A34503%2Fcallback"),
+            None
+        );
+        assert!(!sign_in_host(
             "https://platform.claude.com/oauth/code/callback"
         ));
     }
@@ -986,11 +1027,22 @@ mod tests {
         ] {
             assert_eq!(setup_said(page).url, None, "{page}");
         }
-        assert!(
-            setup_said("https://console.anthropic.com/oauth/code/callback")
-                .url
-                .is_some()
-        );
+        // Only the sign-in page itself, never another page on its domains.
+        for other in [
+            "https://console.anthropic.com/oauth/code/callback",
+            "https://claude.ai/public/artifacts/abc",
+            "https://claude.com/cai/oauth/authorize/../../public/x",
+            "https://platform.claude.com/oauth/code/callback",
+            "https://www.claude.ai/oauth/authorize",
+        ] {
+            assert_eq!(setup_said(other).url, None, "{other}");
+        }
+        for page in [
+            "https://claude.com/cai/oauth/authorize?code=true",
+            "https://platform.claude.com/oauth/authorize?code=true",
+        ] {
+            assert_eq!(setup_said(page).url.as_deref(), Some(page));
+        }
     }
 
     fn standing(windows: &[(f64, Option<i64>)], read_at: i64, hit_at: Option<i64>) -> Standing {
@@ -1344,7 +1396,7 @@ const LOWEST_CALLBACK_PORT: u16 = 1024;
 /// Claude's own hosts, and one `redirect_uri` that is exactly
 /// `http://localhost:{port}/callback` on an unprivileged port.
 pub fn direct_sign_in(said: &str) -> Option<Direct> {
-    let page = page_on(said.trim(), CLAUDE_HOSTS)?;
+    let page = page_on(said.trim(), CLAUDE_PAGES)?;
     let mut redirects = page.query_pairs().filter(|(k, _)| k == "redirect_uri");
     let (_, redirect) = redirects.next()?;
     if redirects.next().is_some() {

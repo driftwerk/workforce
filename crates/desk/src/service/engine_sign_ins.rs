@@ -80,12 +80,17 @@ pub struct DeviceSaid {
     pub refused: bool,
 }
 
-/// The hosts Codex's device page may be on: OpenAI's sign-in.
-pub const DEVICE_HOSTS: &[&str] = &["auth.openai.com", "chatgpt.com"];
+/// Codex's device page: exactly `https://auth.openai.com/codex/device`.
+pub const DEVICE_PAGES: &[crate::engine_accounts::SignInPage] =
+    &[crate::engine_accounts::SignInPage {
+        host: "auth.openai.com",
+        paths: &["/codex/device"],
+        query: false,
+    }];
 
 /// Whether `url` is Codex's device page, read as a browser reads it.
 fn device_host(url: &str) -> bool {
-    crate::engine_accounts::page_on(url, DEVICE_HOSTS).is_some()
+    crate::engine_accounts::page_on(url, DEVICE_PAGES).is_some()
 }
 
 /// A one-time code as Codex prints it: groups of capitals and digits
@@ -306,6 +311,18 @@ mod tests {
             assert_eq!(device_said(&screen).url, None, "{elsewhere}");
         }
         assert!(device_said("Error: device code login is not enabled for this workspace").refused);
+        // Only the device page itself: no other page there, no query.
+        for other in [
+            "https://auth.openai.com/codex/device?next=x",
+            "https://chatgpt.com/share/abc",
+            "https://auth.openai.com/other",
+        ] {
+            assert_eq!(
+                device_said(&SCREEN.replace("https://auth.openai.com/codex/device", other)).url,
+                None,
+                "{other}"
+            );
+        }
     }
 
     #[test]
