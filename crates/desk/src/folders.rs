@@ -45,7 +45,19 @@ pub struct Listing {
     pub truncated: bool,
 }
 
-/// Lists the folders in `requested` (none or empty: `home`). `sessions` are
+/// `~` and `~/x` mean the hub user's home: the part after the `~/` (empty
+/// for a bare `~`) is returned to be joined to home. `~user` is `None`: other
+/// people's homes are never listed. Any other path comes back unchanged.
+fn expand_tilde(r: &str) -> Option<&str> {
+    match r.strip_prefix('~') {
+        None => Some(r),
+        Some("") => Some(""),
+        Some(rest) => rest.strip_prefix('/').map(|x| x.trim_start_matches('/')),
+    }
+}
+
+/// Lists the folders in `requested` (none or empty: `home`; a leading `~`
+/// is `home`). `sessions` are
 /// the folders live sessions run in, which are allowed as well as `home`.
 pub fn list(
     requested: Option<&str>,
@@ -62,7 +74,10 @@ pub fn list(
 
     let wanted = match requested.map(str::trim).filter(|r| !r.is_empty()) {
         None => home.clone(),
-        Some(r) => home.join(r), // an absolute path replaces `home`
+        Some(r) => match expand_tilde(r) {
+            Some(rest) => home.join(rest),
+            None => return Err(FolderError::Outside), // `~user`
+        },
     };
     let dir = wanted.canonicalize().map_err(|e| match e.kind() {
         std::io::ErrorKind::NotFound => FolderError::NotFound,
@@ -237,6 +252,37 @@ mod tests {
             Err(FolderError::NotFound)
         );
         assert_eq!(list(None, false, None, &[]), Err(FolderError::NoHome));
+    }
+
+    #[test]
+    fn a_leading_tilde_means_home_and_other_users_homes_are_refused() {
+        let t = tree();
+        let home = list(None, false, Some(&t.home), &[]).unwrap();
+        for p in ["~", "~/", " ~ "] {
+            assert_eq!(
+                list(Some(p), false, Some(&t.home), &[]).unwrap(),
+                home,
+                "{p}"
+            );
+        }
+        let app = list(Some("app"), false, Some(&t.home), &[]).unwrap();
+        assert_eq!(list(Some("~/app"), false, Some(&t.home), &[]).unwrap(), app);
+        assert_eq!(
+            list(Some("~/nope"), false, Some(&t.home), &[]),
+            Err(FolderError::NotFound)
+        );
+        for p in ["~root", "~root/x", "~/../outside", "~/app/../../outside"] {
+            assert_eq!(
+                list(Some(p), false, Some(&t.home), &[]),
+                Err(FolderError::Outside),
+                "{p}"
+            );
+        }
+        // Only a leading tilde is special.
+        assert_eq!(
+            list(Some("app/~"), false, Some(&t.home), &[]),
+            Err(FolderError::NotFound)
+        );
     }
 
     #[test]
