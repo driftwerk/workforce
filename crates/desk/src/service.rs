@@ -816,7 +816,7 @@ async fn prune_layout(
         return layout;
     }
     match store.put_layout(&pruned).await {
-        Ok(()) => pruned,
+        Ok(_) => pruned,
         Err(e) => {
             tracing::warn!(
                 error = format!("{e:#}"),

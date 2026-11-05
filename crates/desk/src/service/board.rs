@@ -19,7 +19,7 @@ use uuid::Uuid;
 
 use super::{Desk, DeskError, Sender};
 use crate::board::{self, Board, Link, Pr, Ticket, TicketCall, TicketState};
-use crate::board_store::BoardWrite;
+use crate::board_store::{BoardWrite, TicketWrite};
 use crate::crew::{self, ActivityPage, By, Kind, Party, PartyKind};
 use crate::crew_store::History;
 use crate::line::{Send, Target, When};
@@ -145,6 +145,15 @@ fn written(e: BoardWrite) -> DeskError {
     }
 }
 
+fn stale(e: TicketWrite) -> DeskError {
+    match e {
+        TicketWrite::Stale => DeskError::Conflict(
+            "That ticket changed while this was being done; look at it again.".into(),
+        ),
+        TicketWrite::Other(e) => DeskError::Internal(e),
+    }
+}
+
 fn now() -> DateTime<Utc> {
     crew::now()
 }
@@ -165,6 +174,12 @@ impl Desk {
             .lock()
             .as_ref()
             .and_then(std::sync::Weak::upgrade)
+    }
+
+    /// Writes `t` as changed from what was read of it; a change made
+    /// meanwhile by anyone else is never overwritten.
+    async fn save_ticket(&self, t: &mut Ticket) -> Result<(), DeskError> {
+        self.0.store.put_ticket(t).await.map_err(stale)
     }
 
     // ── Boards ───────────────────────────────────────────────────────────
@@ -226,6 +241,20 @@ impl Desk {
             board: Box::new(b.clone()),
         });
         Ok(b)
+    }
+
+    /// Boards whose sidebar group was deleted, now ungrouped: every Desk
+    /// hears of them.
+    pub(super) async fn boards_ungrouped(&self, ids: &[Uuid]) {
+        for id in ids {
+            match self.0.store.board(*id).await {
+                Ok(Some(b)) => self.announce(DeskEvent::Board { board: Box::new(b) }),
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(board = %id, error = format!("{e:#}"), "couldn't read an ungrouped board")
+                }
+            }
+        }
     }
 
     pub async fn update_board(&self, id: Uuid, patch: BoardPatch) -> Result<Board, DeskError> {
@@ -457,7 +486,7 @@ impl Desk {
 
     async fn key_of(&self, t: &Ticket) -> Result<String, DeskError> {
         let b = self.board_of(t.board).await?;
-        Ok(t.key(&b).unwrap_or_else(|| t.title.clone()))
+        Ok(t.key(&b).unwrap_or_else(|| "a ticket".into()))
     }
 
     /// The rank of a card dropped at the end of `state` on `board`.
@@ -524,6 +553,7 @@ impl Desk {
             state_at: at,
             created_at: at,
             updated_at: at,
+            version: 0,
         };
         self.0.store.add_ticket(&mut t).await.map_err(internal)?;
         let key = t.key(&b).unwrap_or_default();
@@ -569,7 +599,7 @@ impl Desk {
             t.snoozed_until = until;
             t.snoozed_at = until.map(|_| at);
         }
-        self.0.store.put_ticket(&t).await.map_err(internal)?;
+        self.save_ticket(&mut t).await?;
         if quiet {
             let v = self.view_ticket(t).await?;
             self.announce(DeskEvent::Ticket {
@@ -585,13 +615,34 @@ impl Desk {
 
     /// A drop anywhere in a column.
     pub async fn move_ticket(&self, id: Uuid, mv: Move, by: &By) -> Result<TicketView, DeskError> {
-        let mut t = self.ticket_of(id).await?;
+        let t = self.ticket_of(id).await?;
+        self.move_read(t, mv, by).await
+    }
+
+    /// Moves `t` as it was read: a change made to it since is never undone.
+    /// Anyone but a session dropping it or putting it back in the queue
+    /// takes it off whoever had it, and that session is told.
+    async fn move_read(&self, mut t: Ticket, mv: Move, by: &By) -> Result<TicketView, DeskError> {
         let rank = self.drop_rank(&t, &mv).await?;
         let from = t.state;
         set_state(&mut t, mv.state, now());
         t.rank = rank;
-        self.0.store.put_ticket(&t).await.map_err(internal)?;
-        self.ticket_moved(t, from, by, None).await
+        let off = match by.party.kind != PartyKind::Session && board::unassigns(mv.state) {
+            true => t.assignee.take(),
+            false => None,
+        };
+        self.save_ticket(&mut t).await?;
+        if let Some(session) = off.as_ref().and_then(crate::line::session_of) {
+            let key = self.key_of(&t).await?;
+            let text = format!(
+                "{key} was moved to {}; it is no longer yours. Stop working on it unless you are asked again.",
+                t.state.title()
+            );
+            self.tell_session(session, text, by).await;
+        }
+        let why = off.as_ref().map(|p| format!("taken off {}", p.name));
+        self.ticket_moved_about(t, from, by, why.as_deref(), off)
+            .await
     }
 
     async fn ticket_moved(
@@ -601,13 +652,25 @@ impl Desk {
         by: &By,
         why: Option<&str>,
     ) -> Result<TicketView, DeskError> {
+        self.ticket_moved_about(t, from, by, why, None).await
+    }
+
+    /// `ticket_moved`, about `was` when it was taken off them.
+    async fn ticket_moved_about(
+        &self,
+        t: Ticket,
+        from: TicketState,
+        by: &By,
+        why: Option<&str>,
+        was: Option<Party>,
+    ) -> Result<TicketView, DeskError> {
         let key = self.key_of(&t).await?;
         let text = match (from == t.state, why) {
             (true, _) => format!("reordered {key} in {}", t.state.title()),
             (false, None) => format!("moved {key} to {}", t.state.title()),
             (false, Some(why)) => format!("moved {key} to {}: {why}", t.state.title()),
         };
-        let subject = t.assignee.clone();
+        let subject = t.assignee.clone().or(was);
         self.ticket_changed(t, by, Kind::TicketMoved, subject, text)
             .await
     }
@@ -698,7 +761,7 @@ impl Desk {
             return self.view_ticket(t).await;
         }
         t.updated_at = now();
-        self.0.store.put_ticket(&t).await.map_err(internal)?;
+        self.save_ticket(&mut t).await?;
         let t = self.ticket_of(id).await?;
         let text = match needs {
             true => format!("made {key} need {other_key}"),
@@ -718,7 +781,7 @@ impl Desk {
     ) -> Result<TicketView, DeskError> {
         let t = self.ticket_of(id).await?;
         let b = self.board_of(t.board).await?;
-        let key = t.key(&b).unwrap_or_else(|| t.title.clone());
+        let key = t.key(&b).unwrap_or_else(|| "a ticket".into());
         match to {
             None => self.unassign(t, &key, by).await,
             Some(AssignTo::Session(session)) => {
@@ -782,7 +845,7 @@ impl Desk {
             return self.view_ticket(t).await;
         };
         t.updated_at = now();
-        self.0.store.put_ticket(&t).await.map_err(internal)?;
+        self.save_ticket(&mut t).await?;
         let text = format!("took {key} off {}", was.name);
         self.ticket_changed(t, by, Kind::TicketAssigned, Some(was), text)
             .await
@@ -814,7 +877,7 @@ impl Desk {
         if !t.links.contains(&Link::Session { session: view.id }) {
             t.links.push(Link::Session { session: view.id });
         }
-        self.0.store.put_ticket(&t).await.map_err(internal)?;
+        self.save_ticket(&mut t).await?;
         if view.goal.trim().is_empty() {
             self.update(
                 view.id,
@@ -869,7 +932,7 @@ impl Desk {
         let party = Party::agent(agent, &name);
         t.assignee = Some(party.clone());
         self.to_column(&mut t, TicketState::Doing, now()).await?;
-        self.0.store.put_ticket(&t).await.map_err(internal)?;
+        self.save_ticket(&mut t).await?;
         let text = format!("gave {key} to {name}");
         self.ticket_changed(t, by, Kind::TicketAssigned, Some(party), text)
             .await
@@ -880,11 +943,24 @@ impl Desk {
         let Some(session) = t.session() else {
             return;
         };
-        let key = t.key(b).unwrap_or_else(|| t.title.clone());
-        let text = format!(
-            "{key} “{}” was deleted from the board; it is no longer yours.",
-            crew::one_line(&t.title, 120)
-        );
+        let key = t.key(b).unwrap_or_else(|| "A ticket".into());
+        // A title the person didn't write never goes in as their words.
+        let text = match t.created_by.kind {
+            PartyKind::You => format!(
+                "{key} “{}” was deleted from the board; it is no longer yours.",
+                crew::one_line(&t.title, 120)
+            ),
+            _ => format!(
+                "{key} (added by {}) was deleted from the board; it is no longer yours.",
+                t.created_by.name
+            ),
+        };
+        self.tell_session(session, text, by).await;
+    }
+
+    /// Tells `session` on its line, from `by`; what can't be sent is
+    /// only logged.
+    async fn tell_session(&self, session: Uuid, text: String, by: &By) {
         let said = self
             .line_send(
                 sender_of(by),
@@ -896,7 +972,7 @@ impl Desk {
             )
             .await;
         if let Err(e) = said {
-            tracing::info!(%session, error = %e, "a deleted ticket's session wasn't told");
+            tracing::info!(%session, error = %e, "a ticket's session wasn't told");
         }
     }
 
@@ -1007,7 +1083,7 @@ impl Desk {
             Some(to) => {
                 let from = t.state;
                 self.to_column(&mut t, to, at).await?;
-                self.0.store.put_ticket(&t).await.map_err(internal)?;
+                self.save_ticket(&mut t).await?;
                 self.ticket_moved(t, from, &desk, Some(&why))
                     .await
                     .map(Some)
@@ -1071,23 +1147,57 @@ impl Desk {
     }
 
     /// What a session reads of a ticket.
-    async fn ticket_said(&self, t: Ticket) -> Result<Value, DeskError> {
-        let needs = self.need_keys(&t).await?;
+    async fn ticket_said(&self, caller: Uuid, t: Ticket) -> Result<Value, DeskError> {
         let v = self.view_ticket(t).await?;
-        let blockers: Vec<&String> = needs
-            .iter()
-            .zip(&v.ticket.needs)
-            .filter(|(_, id)| v.blockers.contains(id))
-            .map(|((k, _), _)| k)
-            .collect();
+        // What it needs, as far as the session can see: a need on a board
+        // out of its reach is counted, never named.
+        let mut needs = vec![];
+        let mut blocked = vec![];
+        let mut hidden = 0;
+        for id in &v.ticket.needs {
+            let Some(n) = self.0.store.ticket(*id).await.map_err(internal)? else {
+                continue;
+            };
+            let b = self.board_of(n.board).await?;
+            if !self.reaches_board(caller, &b) {
+                hidden += 1;
+                continue;
+            }
+            let key = n.key(&b).unwrap_or_else(|| "a ticket".into());
+            if v.blockers.contains(id) {
+                blocked.push(key.clone());
+            }
+            needs.push(json!({ "key": key, "state": n.state }));
+        }
+        let outside = match hidden {
+            0 => None,
+            1 => Some("It also needs 1 other ticket outside your reach.".to_string()),
+            n => Some(format!(
+                "It also needs {n} other tickets outside your reach."
+            )),
+        };
+        let by = &v.ticket.created_by;
+        let note = (by.kind != PartyKind::You).then(|| {
+            format!(
+                "{} added this ticket; its title and description are that {}'s note, not the person's words.",
+                by.name,
+                match by.kind {
+                    PartyKind::Session => "session",
+                    _ => "party",
+                }
+            )
+        });
         Ok(json!({
             "key": v.key,
             "title": v.ticket.title,
             "body": v.ticket.body,
             "state": v.ticket.state,
+            "createdBy": by.name,
+            "note": note,
             "assignee": v.ticket.assignee.as_ref().map(|a| a.name.clone()),
-            "needs": needs.iter().map(|(k, s)| json!({ "key": k, "state": s })).collect::<Vec<_>>(),
-            "blockedBy": blockers,
+            "needs": needs,
+            "blockedBy": blocked,
+            "outsideReach": outside,
             "links": v.ticket.links,
         }))
     }
@@ -1164,13 +1274,13 @@ impl Desk {
                 mine.retain(|t| !board::settled(t, at));
                 let mut out = vec![];
                 for t in mine {
-                    out.push(self.ticket_said(t).await.map_err(say)?);
+                    out.push(self.ticket_said(caller, t).await.map_err(say)?);
                 }
                 Ok(json!({ "tickets": out }))
             }
             TicketCall::Get { key } => {
                 let t = self.named_ticket(caller, Some(&key)).await?;
-                self.ticket_said(t).await.map_err(say)
+                self.ticket_said(caller, t).await.map_err(say)
             }
             TicketCall::Update { key, state } => {
                 let t = self.named_ticket(caller, key.as_deref()).await?;
@@ -1181,10 +1291,12 @@ impl Desk {
                         None => format!("{k} isn't yours: it isn't assigned to anyone."),
                     });
                 }
-                board::session_may_move(state)?;
+                board::session_may_move(t.state, state)?;
+                // Moved as read: had the person taken it off this session
+                // meanwhile, the write is refused.
                 let v = self
-                    .move_ticket(
-                        t.id,
+                    .move_read(
+                        t,
                         Move {
                             state,
                             before: None,
@@ -1200,6 +1312,7 @@ impl Desk {
                 let t = self.named_ticket(caller, key.as_deref()).await?;
                 let k = self.key_of(&t).await.map_err(say)?;
                 let text = crate::line::typable(&text).trim().to_string();
+                board::within("comment", &text, board::COMMENT_MAX)?;
                 self.note(
                     by.event(
                         Kind::TicketCommented,
@@ -1215,8 +1328,21 @@ impl Desk {
                 board: prefix,
                 text,
             } => {
-                let b = self.board_for_new(caller, prefix.as_deref()).await?;
                 let (title, body) = board::title_and_body(&crate::line::typable(&text));
+                board::within("title", &title, board::TITLE_MAX)?;
+                board::within("description", &body, board::BODY_MAX)?;
+                let made = self
+                    .0
+                    .store
+                    .tickets_made_by(caller, now() - chrono::Duration::hours(1))
+                    .await
+                    .map_err(|e| say(internal(e)))?;
+                if made >= board::CREATES_PER_HOUR {
+                    return Err(format!(
+                        "You have added {made} tickets in the last hour, the most a session may; tell the person what else needs doing instead."
+                    ));
+                }
+                let b = self.board_for_new(caller, prefix.as_deref()).await?;
                 let v = self
                     .create_ticket(
                         NewTicket {

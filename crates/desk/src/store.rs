@@ -221,9 +221,15 @@ pub(crate) async fn forget_in(
     )
     .await?;
     tx.execute(
-        "UPDATE tickets SET assignee = NULL, updated_at = now() \
+        "UPDATE tickets SET assignee = NULL, updated_at = now(), version = version + 1 \
          WHERE assignee ->> 'kind' = 'session' AND assignee ->> 'id' = ANY($1)",
         &[&parties],
+    )
+    .await?;
+    tx.execute(
+        "UPDATE ticket_assignments SET until_at = now() \
+         WHERE session = ANY($1) AND until_at IS NULL",
+        &[&ids],
     )
     .await?;
     tx.execute(

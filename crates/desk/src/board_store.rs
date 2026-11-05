@@ -16,7 +16,7 @@ use crate::store::DeskStore;
 
 const BOARD: &str = "id, name, group_id, prefix, next_number, created_at, updated_at";
 const TICKET: &str = "id, board, number, title, body, state, rank, assignee, created_by, \
-                      pinned, snoozed_until, snoozed_at, state_at, created_at, updated_at";
+                      pinned, snoozed_until, snoozed_at, state_at, created_at, updated_at, version";
 
 fn board(row: &Row) -> Result<Board> {
     Ok(Board {
@@ -58,7 +58,36 @@ fn ticket(row: &Row) -> Result<Ticket> {
         state_at: row.try_get("state_at")?,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
+        version: row.try_get("version")?,
     })
+}
+
+/// Why a ticket couldn't be written.
+#[derive(Debug, thiserror::Error)]
+pub enum TicketWrite {
+    /// It changed since it was read: the write would undo that change.
+    #[error("the ticket changed since it was read")]
+    Stale,
+    #[error(transparent)]
+    Other(#[from] eyre::Report),
+}
+
+impl From<tokio_postgres::Error> for TicketWrite {
+    fn from(e: tokio_postgres::Error) -> Self {
+        Self::Other(eyre::Report::new(e).wrap_err("writing a ticket"))
+    }
+}
+
+impl From<workforce_postgres::PostgresError> for TicketWrite {
+    fn from(e: workforce_postgres::PostgresError) -> Self {
+        Self::Other(eyre::Report::new(e))
+    }
+}
+
+impl From<serde_json::Error> for TicketWrite {
+    fn from(e: serde_json::Error) -> Self {
+        Self::Other(eyre::Report::new(e))
+    }
 }
 
 /// Why a board couldn't be written, in the person's words.
@@ -165,7 +194,7 @@ impl DeskStore {
             .await
             .context("numbering a ticket")?;
         t.number = row.try_get(0)?;
-        put_ticket_in(&*tx, t).await?;
+        insert_ticket_in(&*tx, t).await?;
         for n in &t.needs {
             tx.execute(
                 "INSERT INTO ticket_needs (ticket, needs) VALUES ($1, $2) ON CONFLICT DO NOTHING",
@@ -177,10 +206,57 @@ impl DeskStore {
         Ok(())
     }
 
-    /// Writes `t`'s own row as it is now (not its needs or links).
-    pub async fn put_ticket(&self, t: &Ticket) -> Result<()> {
-        let client = self.pool().get().await?;
-        put_ticket_in(&**client, t).await
+    /// Writes `t`'s own row as it is now (not its needs or links), if it
+    /// is still as it was read; `t.version` moves on. Who works on it is
+    /// written down with it: the session it is assigned to works on it
+    /// from now while it is Doing or in Review, and no longer once it is
+    /// taken off it, Done or Dropped.
+    pub async fn put_ticket(&self, t: &mut Ticket) -> Result<(), TicketWrite> {
+        let mut client = self.pool().get().await?;
+        let tx = client.transaction().await?;
+        let row = tx
+            .query_opt(
+                "UPDATE tickets SET title = $3, body = $4, state = $5, rank = $6, \
+                 assignee = $7, pinned = $8, snoozed_until = $9, snoozed_at = $10, \
+                 state_at = $11, updated_at = $12, version = version + 1 \
+                 WHERE id = $1 AND version = $2 RETURNING version",
+                &[
+                    &t.id,
+                    &t.version,
+                    &t.title,
+                    &t.body,
+                    &t.state.as_str(),
+                    &t.rank,
+                    &t.assignee.as_ref().map(serde_json::to_value).transpose()?,
+                    &t.pinned,
+                    &t.snoozed_until,
+                    &t.snoozed_at,
+                    &t.state_at,
+                    &t.updated_at,
+                ],
+            )
+            .await?;
+        let Some(row) = row else {
+            return Err(TicketWrite::Stale);
+        };
+        let working = t.session().filter(|_| crate::board::worked_on(t.state));
+        let at = Utc::now();
+        tx.execute(
+            "UPDATE ticket_assignments SET until_at = $3 \
+             WHERE ticket = $1 AND until_at IS NULL AND session IS DISTINCT FROM $2",
+            &[&t.id, &working, &at],
+        )
+        .await?;
+        tx.execute(
+            "INSERT INTO ticket_assignments (ticket, session, from_at) \
+             SELECT $1, $2, $3 WHERE $2::uuid IS NOT NULL AND NOT EXISTS ( \
+               SELECT 1 FROM ticket_assignments WHERE ticket = $1 AND until_at IS NULL)",
+            &[&t.id, &working, &at],
+        )
+        .await?;
+        tx.commit().await?;
+        t.version = row.try_get(0)?;
+        Ok(())
     }
 
     pub async fn delete_ticket(&self, id: Uuid) -> Result<()> {
@@ -333,6 +409,19 @@ impl DeskStore {
         Ok(())
     }
 
+    /// How many tickets the session `id` added since `since`.
+    pub async fn tickets_made_by(&self, id: Uuid, since: DateTime<Utc>) -> Result<i64> {
+        let client = self.pool().get().await?;
+        Ok(client
+            .query_one(
+                "SELECT count(*) FROM tickets WHERE created_by ->> 'kind' = 'session' \
+                 AND created_by ->> 'id' = $1 AND created_at > $2",
+                &[&id.to_string(), &since],
+            )
+            .await?
+            .try_get(0)?)
+    }
+
     /// Every dependency there is, as `(ticket, needs)`.
     pub async fn ticket_edges(&self) -> Result<Vec<(Uuid, Uuid)>> {
         let client = self.pool().get().await?;
@@ -427,17 +516,12 @@ impl DeskStore {
     }
 }
 
-async fn put_ticket_in<C: tokio_postgres::GenericClient>(client: &C, t: &Ticket) -> Result<()> {
+async fn insert_ticket_in<C: tokio_postgres::GenericClient>(client: &C, t: &Ticket) -> Result<()> {
     client
         .execute(
             &format!(
                 "INSERT INTO tickets ({TICKET}) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15) \
-                 ON CONFLICT (id) DO UPDATE SET title = EXCLUDED.title, body = EXCLUDED.body, \
-                 state = EXCLUDED.state, rank = EXCLUDED.rank, assignee = EXCLUDED.assignee, \
-                 pinned = EXCLUDED.pinned, snoozed_until = EXCLUDED.snoozed_until, \
-                 snoozed_at = EXCLUDED.snoozed_at, state_at = EXCLUDED.state_at, \
-                 updated_at = EXCLUDED.updated_at"
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)"
             ),
             &[
                 &t.id,
@@ -455,6 +539,7 @@ async fn put_ticket_in<C: tokio_postgres::GenericClient>(client: &C, t: &Ticket)
                 &t.state_at,
                 &t.created_at,
                 &t.updated_at,
+                &t.version,
             ],
         )
         .await

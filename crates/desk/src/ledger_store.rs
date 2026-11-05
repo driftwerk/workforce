@@ -131,9 +131,8 @@ impl DeskStore {
     /// reading that knows more of it (its model, its price, a streamed
     /// call's final counts, its account) completes it. How many rows were
     /// added or completed. A new row is stamped with the ticket the session
-    /// was assigned last before the call was made, while it still is; a
-    /// completed row keeps its stamp, so records read late never stamp
-    /// calls made before an assignment.
+    /// worked on when the call was made (`ticket_assignments`), however
+    /// late its record is read; a completed row keeps its stamp.
     pub async fn ledger_write(
         &self,
         session: Uuid,
@@ -158,11 +157,10 @@ impl DeskStore {
                     "INSERT INTO ledger (engine, key, session, at, model, input, output, \
                      cache_read, cache_write, reasoning, usd, priced, billing, account, ticket) \
                      SELECT $1, k, $2, a, m, i, o, cr, cw, r, u, p, b, acc, ( \
-                       SELECT l.ticket FROM ticket_links l JOIN tickets t ON t.id = l.ticket \
-                       WHERE l.kind = 'session' AND l.target = CAST($2::uuid AS text) \
-                         AND l.at <= a AND t.assignee ->> 'kind' = 'session' \
-                         AND t.assignee ->> 'id' = CAST($2::uuid AS text) \
-                       ORDER BY l.at DESC LIMIT 1) FROM UNNEST( \
+                       SELECT w.ticket FROM ticket_assignments w \
+                       WHERE w.session = $2::uuid AND w.from_at <= a \
+                         AND (w.until_at IS NULL OR a < w.until_at) \
+                       ORDER BY w.from_at DESC LIMIT 1) FROM UNNEST( \
                        $3::text[], $4::timestamptz[], $5::text[], $6::int8[], $7::int8[], \
                        $8::int8[], $9::int8[], $10::int8[], $11::float8[], $12::text[], \
                        $13::text[], $14::text[]) AS t(k, a, m, i, o, cr, cw, r, u, p, b, acc) \

@@ -157,6 +157,9 @@ pub struct Ticket {
     pub state_at: DateTime<Utc>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// Which write it is as of: a write from an older read is refused.
+    #[serde(skip)]
+    pub version: i32,
 }
 
 impl Ticket {
@@ -458,9 +461,19 @@ pub fn ticket_call_of(input: &Value) -> Result<TicketCall, String> {
     })
 }
 
-/// Whether a session may move its own ticket to `to`: forward through its
-/// work, never Dropped or back to the queue, which are the person's.
-pub fn session_may_move(to: TicketState) -> Result<(), String> {
+/// Whether a session may move its own ticket from `from` to `to`: forward
+/// through its work, never Dropped or back to the queue, which are the
+/// person's; and never out of the person's queue or a Drop either.
+pub fn session_may_move(from: TicketState, to: TicketState) -> Result<(), String> {
+    match from {
+        TicketState::Doing | TicketState::Review | TicketState::Done => {}
+        TicketState::Dropped => {
+            return Err("The person dropped this ticket; only they bring it back.".into())
+        }
+        TicketState::Backlog | TicketState::Todo => {
+            return Err("This ticket is in the person's queue; only they hand it out again.".into())
+        }
+    }
     match to {
         TicketState::Doing | TicketState::Review | TicketState::Done => Ok(()),
         TicketState::Dropped => Err("Only the person drops a ticket; tell them why it should go.".into()),
@@ -468,6 +481,43 @@ pub fn session_may_move(to: TicketState) -> Result<(), String> {
             "A session moves its ticket to doing, review or done; the person puts it back in the queue."
                 .into(),
         ),
+    }
+}
+
+/// Whether a move by someone other than the session takes the ticket off
+/// whoever has it: a Drop, or back to the person's queue.
+pub fn unassigns(to: TicketState) -> bool {
+    match to {
+        TicketState::Dropped | TicketState::Backlog | TicketState::Todo => true,
+        TicketState::Doing | TicketState::Review | TicketState::Done => false,
+    }
+}
+
+/// Whether the session a ticket is assigned to works on it in `state`: its
+/// calls are the ticket's spend.
+pub fn worked_on(state: TicketState) -> bool {
+    match state {
+        TicketState::Doing | TicketState::Review => true,
+        TicketState::Backlog | TicketState::Todo | TicketState::Done | TicketState::Dropped => {
+            false
+        }
+    }
+}
+
+/// The most a session may write in a ticket's title, its description and
+/// a comment, in characters.
+pub const TITLE_MAX: usize = 200;
+pub const BODY_MAX: usize = 8_000;
+pub const COMMENT_MAX: usize = 4_000;
+/// How many tickets a session may add in an hour.
+pub const CREATES_PER_HOUR: i64 = 20;
+
+/// Refuses session-written text over `max` characters, naming `what`.
+pub fn within(what: &str, text: &str, max: usize) -> Result<(), String> {
+    let n = text.chars().count();
+    match n > max {
+        true => Err(format!("The {what} is {n} characters; keep it to {max}.")),
+        false => Ok(()),
     }
 }
 
@@ -532,6 +582,7 @@ mod tests {
             state_at: now,
             created_at: now,
             updated_at: now,
+            version: 0,
         }
     }
 
@@ -758,13 +809,29 @@ mod tests {
 
     #[test]
     fn a_session_moves_its_ticket_through_its_work_only() {
-        assert!(session_may_move(TicketState::Doing).is_ok());
-        assert!(session_may_move(TicketState::Review).is_ok());
-        assert!(session_may_move(TicketState::Done).is_ok());
-        assert!(session_may_move(TicketState::Dropped)
+        use TicketState::*;
+        assert!(session_may_move(Doing, Review).is_ok());
+        assert!(session_may_move(Review, Done).is_ok());
+        assert!(session_may_move(Done, Doing).is_ok());
+        assert!(session_may_move(Doing, Dropped)
             .unwrap_err()
             .contains("Only the person"));
-        assert!(session_may_move(TicketState::Todo).is_err());
+        assert!(session_may_move(Doing, Todo).is_err());
+        // The person's Drop and queue are theirs to undo.
+        assert!(session_may_move(Dropped, Doing)
+            .unwrap_err()
+            .contains("dropped"));
+        assert!(session_may_move(Todo, Doing).unwrap_err().contains("queue"));
+        assert!(session_may_move(Backlog, Review).is_err());
+        assert!(unassigns(Dropped) && unassigns(Todo) && unassigns(Backlog));
+        assert!(!unassigns(Review));
+        assert!(worked_on(Doing) && worked_on(Review));
+        assert!(!worked_on(Done) && !worked_on(Dropped));
+        assert!(within("title", "short", 10).is_ok());
+        assert_eq!(
+            within("title", "a long title", 5),
+            Err("The title is 12 characters; keep it to 5.".into())
+        );
     }
 
     #[test]

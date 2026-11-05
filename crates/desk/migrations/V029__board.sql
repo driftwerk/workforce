@@ -20,7 +20,8 @@ CREATE TABLE boards (
 -- `updated_at` moves with what the ticket says and who works on it, never
 -- with a pin or a snooze: a snoozed ticket wakes once it changes after
 -- `snoozed_at`. `state_at` is when it came into its state, which is how
--- long it has been Done.
+-- long it has been Done. `version` moves with every write: a write made
+-- from an older read is refused, so two changes never overwrite each other.
 CREATE TABLE tickets (
     id            UUID             PRIMARY KEY,
     board         UUID             NOT NULL REFERENCES boards (id) ON DELETE CASCADE,
@@ -36,6 +37,7 @@ CREATE TABLE tickets (
     snoozed_until TIMESTAMPTZ,
     snoozed_at    TIMESTAMPTZ,
     state_at      TIMESTAMPTZ      NOT NULL,
+    version       INTEGER          NOT NULL DEFAULT 0,
     created_at    TIMESTAMPTZ      NOT NULL,
     updated_at    TIMESTAMPTZ      NOT NULL,
     UNIQUE (board, number)
@@ -62,11 +64,23 @@ CREATE TABLE ticket_links (
     PRIMARY KEY (ticket, kind, target)
 );
 CREATE INDEX ticket_links_target ON ticket_links (kind, target);
+-- When each session worked on each ticket: from its assignment until it
+-- was taken off it, or the ticket was Done or Dropped. What the ledger
+-- stamps a session's calls by.
+CREATE TABLE ticket_assignments (
+    ticket   UUID        NOT NULL REFERENCES tickets (id) ON DELETE CASCADE,
+    session  UUID        NOT NULL,
+    from_at  TIMESTAMPTZ NOT NULL,
+    until_at TIMESTAMPTZ,
+    PRIMARY KEY (ticket, session, from_at)
+);
+CREATE INDEX ticket_assignments_session ON ticket_assignments (session, from_at);
+CREATE UNIQUE INDEX ticket_assignments_open ON ticket_assignments (ticket) WHERE until_at IS NULL;
 -- The activity log is the board's history: each ticket's events, and with
 -- `subject`, each session's and agent's.
 ALTER TABLE activity ADD COLUMN ticket UUID;
 CREATE INDEX activity_ticket ON activity (ticket, at DESC) WHERE ticket IS NOT NULL;
--- The ticket a session worked on when it made the call: the one it was
--- assigned last before the call, while it still is.
+-- The ticket a session worked on when it made the call, by
+-- `ticket_assignments`.
 ALTER TABLE ledger ADD COLUMN ticket UUID;
 CREATE INDEX ledger_ticket ON ledger (ticket, at) WHERE ticket IS NOT NULL;
