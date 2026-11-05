@@ -555,6 +555,12 @@ async fn run_arm(
     }
 }
 
+/// Where a grading falls in the judge's queue: a hash of the run's id, the
+/// turn and the pass, so neither arm nor question can be read off the order.
+fn grading_order(run_id: &str, turn_id: &str, pass: u8) -> String {
+    content_hash(&format!("{run_id}\n{turn_id}\n{pass}"))
+}
+
 /// Judge every answered turn that still lacks a reading, in an order that
 /// follows neither arms nor questions: by a hash seeded with the run's id.
 async fn grade_all(hub: &Hub, set: &EvalSet, store: &Store, options: &Options) -> Result<()> {
@@ -581,7 +587,7 @@ async fn grade_all(hub: &Hub, set: &EvalSet, store: &Store, options: &Options) -
             },
         )
         .map(|(question, turn, pass)| {
-            let order = content_hash(&format!("{run_id}\n{}\n{pass}", turn.turn_id));
+            let order = grading_order(run_id, &turn.turn_id, pass);
             (order, question, turn, pass)
         })
         .collect();
@@ -1155,10 +1161,25 @@ mod tests {
             (by_arm("analyst says"), by_arm("analyst-eval says")),
             (6, 6)
         );
-        let run_lengths = answers.windows(2).filter(|pair| pair[0] != pair[1]).count();
-        assert!(
-            run_lengths > 1,
-            "answers are not judged arm by arm: {answers:?}"
+        // The queue is a hash of ids drawn fresh each run, so its order is
+        // random: an arm-by-arm order is possible, if rare, for any one run.
+        // What is pinned is that the order is exactly the hash's, which
+        // never looks at the arm; that holds for every run.
+        let results = store.results().unwrap();
+        let mut due: Vec<(String, &str)> = Vec::new();
+        for arm in &store.manifest.arms {
+            for turn in results.current_turns(arm, &set).into_values() {
+                for pass in 1..=GRADE_PASSES {
+                    let order = grading_order(&store.manifest.run_id, &turn.turn_id, pass);
+                    due.push((order, turn.answer.as_str()));
+                }
+            }
+        }
+        due.sort();
+        let expected: Vec<&str> = due.into_iter().map(|(_, answer)| answer).collect();
+        assert_eq!(
+            answers, expected,
+            "answers are not judged in the order of the run's hash"
         );
     }
 
