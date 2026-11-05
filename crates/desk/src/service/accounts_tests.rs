@@ -546,6 +546,28 @@ async fn codex_signs_in_by_its_device_page_and_its_sign_in_is_read_again_at_once
     .await;
 }
 
+#[test]
+fn a_sign_ins_page_is_never_caught_under_a_folder_others_may_write_to() {
+    let dir = tempfile::tempdir().unwrap();
+    // One of the person's own that others could write to is closed to them first.
+    let open = dir.path().join("open-to-all");
+    std::fs::create_dir(&open).unwrap();
+    std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o777)).unwrap();
+    drop(super::accounts::Relay::new(&open).unwrap());
+    assert_eq!(
+        std::fs::metadata(&open).unwrap().permissions().mode() & 0o777,
+        0o755
+    );
+    // Someone else's (the system's own `/`) is never used.
+    assert!(super::accounts::Relay::new(Path::new("/")).is_err());
+    let mine = dir.path().join("mine");
+    let relay = super::accounts::Relay::new(&mine).unwrap();
+    let browser = std::fs::metadata(relay.browser()).unwrap();
+    assert_eq!(browser.permissions().mode() & 0o777, 0o700);
+    let folder = std::fs::metadata(relay.browser().parent().unwrap()).unwrap();
+    assert_eq!(folder.permissions().mode() & 0o777, 0o700);
+}
+
 #[tokio::test]
 async fn a_working_session_switches_after_its_turn_and_one_on_its_limit_carries_on() {
     with_test_pool(build_pool, |pool| async move {

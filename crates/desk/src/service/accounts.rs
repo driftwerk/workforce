@@ -69,11 +69,32 @@ pub(super) struct Relay {
 }
 
 impl Relay {
-    fn new(run_dir: &std::path::Path) -> eyre::Result<Self> {
+    pub(super) fn new(run_dir: &std::path::Path) -> eyre::Result<Self> {
         use eyre::WrapErr;
         use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
         std::fs::create_dir_all(run_dir)
             .wrap_err_with(|| format!("making {}", run_dir.display()))?;
+        // What runs from here runs as the person: never under a folder
+        // someone else owns (it is under the system's temp folder), and only
+        // once no one else may write to it, so the folder made below can't
+        // be swapped.
+        {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            let meta = std::fs::symlink_metadata(run_dir)
+                .wrap_err_with(|| format!("reading {}", run_dir.display()))?;
+            // SAFETY: geteuid has no preconditions.
+            let me = unsafe { libc::geteuid() };
+            if !meta.is_dir() || meta.uid() != me {
+                eyre::bail!("{} isn't this user's own folder", run_dir.display());
+            }
+            if meta.mode() & 0o022 != 0 {
+                std::fs::set_permissions(
+                    run_dir,
+                    std::fs::Permissions::from_mode(meta.mode() & 0o755),
+                )
+                .wrap_err_with(|| format!("closing {} to others", run_dir.display()))?;
+            }
+        }
         let dir = run_dir.join(format!("s-{}", Uuid::new_v4().simple()));
         std::fs::DirBuilder::new()
             .mode(0o700)
@@ -100,7 +121,7 @@ impl Relay {
     }
 
     /// What `BROWSER` names.
-    fn browser(&self) -> std::path::PathBuf {
+    pub(super) fn browser(&self) -> std::path::PathBuf {
         self.dir.join("open")
     }
 
