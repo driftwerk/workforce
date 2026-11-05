@@ -860,6 +860,12 @@ impl FailoverProvider {
         self.last_used_model.read().clone()
     }
 
+    /// The provider the chain wraps, without the chain: for a call that must
+    /// run on the primary alone and never fail over to another provider.
+    pub fn primary(&self) -> Arc<dyn LlmProvider> {
+        Arc::clone(&self.inner)
+    }
+
     /// Get a reference to the health tracker (for status endpoints).
     pub fn health_tracker(&self) -> &Arc<HealthTracker> {
         &self.health

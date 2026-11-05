@@ -874,20 +874,34 @@ fn person_of(owner: Option<&str>) -> Option<Uuid> {
 }
 
 /// Run a gist's model call on its own agent `service` as `principal`
-/// ([`principal_for`]), as background work that may have no owner. `None`,
-/// with no call made, when no login serves `model` on it.
+/// ([`principal_for`]). `quiet` (a personal hub's Desk) when the call may
+/// have no owner by design: a login it draws on with no identity in scope
+/// is then noted at debug, where a hub many people share warns of it.
+/// `None`, with no call made, when no login serves `model` on it.
 async fn written_on<F: std::future::Future>(
     service: &crate::serve::AgentService,
     principal: &workforce_common::session::TurnPrincipal,
     model: &str,
+    quiet: bool,
     call: F,
 ) -> Option<F::Output> {
-    crate::subscription::unowned_by_design(service.in_background(
-        principal,
-        crate::serve::Route::Model(Some(model)),
-        call,
-    ))
-    .await
+    let work = service.in_background(principal, crate::serve::Route::Model(Some(model)), call);
+    match quiet {
+        true => crate::subscription::unowned_by_design(work).await,
+        false => work.await,
+    }
+}
+
+/// The provider `service`'s own plan runs on, without its failover chain:
+/// what a fallback call is made on, so a login that fails there never
+/// falls through to a metered entry later in the chain.
+fn own_provider(
+    service: &crate::serve::AgentService,
+) -> Arc<dyn workforce_agent::llm::provider::LlmProvider> {
+    service
+        .failover_provider
+        .as_ref()
+        .map_or_else(|| Arc::clone(&service.llm), |chain| chain.primary())
 }
 
 /// Run a gist's model call on a fallback agent `service`, as `person` and
@@ -923,7 +937,7 @@ async fn written_for<F: std::future::Future>(
     model: &str,
     call: F,
 ) -> Option<F::Output> {
-    written_on(service, &principal_for(service, owner), model, call).await
+    written_on(service, &principal_for(service, owner), model, true, call).await
 }
 
 /// What a gist may fall back on when `primary`'s own plan has no usable
@@ -953,10 +967,24 @@ fn fallbacks<T>(
 /// A fallback is only for a person in scope, only on an agent that
 /// `admits` them (`(agent, person)`), and only on their own login
 /// ([`written_as`]); its cost is theirs, kept on `primary`'s ledger.
+#[cfg(test)]
 async fn answer_on(
     primary: Arc<crate::serve::AgentService>,
     others: Vec<Arc<crate::serve::AgentService>>,
     admits: impl Fn(&str, &str) -> bool,
+    owner: Option<&str>,
+    system: &str,
+    user: &str,
+) -> eyre::Result<String> {
+    answer_with(primary, others, admits, true, owner, system, user).await
+}
+
+/// [`answer_on`], `quiet` as [`written_on`] has it.
+async fn answer_with(
+    primary: Arc<crate::serve::AgentService>,
+    others: Vec<Arc<crate::serve::AgentService>>,
+    admits: impl Fn(&str, &str) -> bool,
+    quiet: bool,
     owner: Option<&str>,
     system: &str,
     user: &str,
@@ -994,7 +1022,11 @@ async fn answer_on(
     for (kind, service) in candidates {
         let model = floor_model(&service.tier_registry(), &service.tier_key.read())
             .unwrap_or_else(|| crate::turn_loop::cheap_model(&service));
-        let asked = with_served_log(with_reasoning_suppressed(service.llm.create_message(
+        let llm = match kind {
+            None => Arc::clone(&service.llm),
+            Some(_) => own_provider(&service),
+        };
+        let asked = with_served_log(with_reasoning_suppressed(llm.create_message(
             Some(system),
             &messages,
             &[],
@@ -1003,7 +1035,7 @@ async fn answer_on(
             true,
         )));
         let ran = match (kind, person) {
-            (None, _) => written_on(&service, &principal, &model, asked).await,
+            (None, _) => written_on(&service, &principal, &model, quiet, asked).await,
             (Some(kind), Some(person)) => written_as(&service, person, kind, asked).await,
             (Some(_), None) => None,
         };
@@ -1066,7 +1098,7 @@ impl Model for HubModel {
             false => vec![],
         };
         let admits = |agent: &str, person: &str| registry.admits(agent, person);
-        answer_on(service, others, admits, owner, system, user).await
+        answer_with(service, others, admits, self.fallback, owner, system, user).await
     }
 
     fn goal(&self, subject: &Subject) -> Option<String> {
@@ -2342,6 +2374,57 @@ mod tests {
         .await;
         assert!(answer.is_ok(), "{answer:?}");
         assert_eq!(bearers(&server).await, vec![format!("Bearer {alice}")]);
+    }
+
+    #[tokio::test]
+    async fn on_a_shared_hub_a_gist_with_no_owner_drawing_on_a_shared_login_is_still_warned_of() {
+        use workforce_agent::llm::types::LlmMessage;
+        let (lines, _guard, _others) = Lines::capture();
+        let tmp = tempfile::tempdir().unwrap();
+        let server = wiremock::MockServer::start().await;
+        let service = chatgpt_agent(tmp.path(), &server, None).await;
+        let shared = chatgpt_login_at(&service, "codex/auth_json", "shared");
+        crate::serve::testing::answer_bearer(&server, &shared).await;
+        let messages = [LlmMessage::user("user".to_string())];
+        let call = service.llm.create_message(
+            Some("system"),
+            &messages,
+            &[],
+            Some("gpt-6-luna"),
+            Some(400),
+            true,
+        );
+        let principal = principal_for(&service, None);
+        assert!(written_on(&service, &principal, "gpt-6-luna", false, call)
+            .await
+            .is_some());
+        assert!(!lines
+            .at(
+                "WARN",
+                "a subscription login served a call with no identity in scope"
+            )
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_fallback_is_made_on_the_agents_own_plan_never_its_failover_chain() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = wiremock::MockServer::start().await;
+        let chained = crate::serve::testing::chatgpt_service(tmp.path(), &server, |config| {
+            config.llm.failover = vec!["ollama:mock".into()];
+        })
+        .await;
+        let chain = chained
+            .failover_provider
+            .as_ref()
+            .expect("a failover chain");
+        let own = own_provider(&chained);
+        let same = |a: &Arc<dyn workforce_agent::llm::provider::LlmProvider>,
+                    b: &Arc<dyn workforce_agent::llm::provider::LlmProvider>| {
+            std::ptr::eq(Arc::as_ptr(a).cast::<()>(), Arc::as_ptr(b).cast::<()>())
+        };
+        assert!(same(&own, &chain.primary()), "the chain's own provider");
+        assert!(!same(&own, &chained.llm), "not the chain");
     }
 
     #[tokio::test]
