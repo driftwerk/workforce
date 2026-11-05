@@ -19,6 +19,22 @@ pub use crate::hub_core::owners::OwnerOverride;
 /// How long an owning team's members are trusted before they are read again.
 const TEAM_MEMBERS_TTL: Duration = Duration::from_secs(60);
 
+tokio::task_local! {
+    /// Set over background work that may have no identity in scope by design.
+    static UNOWNED_BY_DESIGN: ();
+}
+
+/// Run `work` as background work that may legitimately have no identity in
+/// scope, such as the floor's gists for a personal hub's Desk: a login it
+/// draws on is noted at debug, not warned of as an identity gap.
+pub async fn unowned_by_design<F: std::future::Future>(work: F) -> F::Output {
+    UNOWNED_BY_DESIGN.scope((), work).await
+}
+
+fn is_unowned_by_design() -> bool {
+    UNOWNED_BY_DESIGN.try_with(|_| ()).is_ok()
+}
+
 /// The owner as last looked up, and for which configured or overridden owner.
 struct CachedOwner {
     of: (Option<String>, OwnerType),
@@ -157,7 +173,14 @@ impl AgentLogins {
             CooldownStore::global(),
             chrono::Utc::now(),
         )?;
-        if payer == Payer::Unset {
+        if payer == Payer::Unset && is_unowned_by_design() {
+            tracing::debug!(
+                agent = %self.agent_id,
+                tier = login.tier.as_str(),
+                kind = kind.label(),
+                "a subscription login served background work that has no owner"
+            );
+        } else if payer == Payer::Unset {
             tracing::warn!(
                 agent = %self.agent_id,
                 session_key = %CURRENT_SESSION_KEY.try_with(String::clone).unwrap_or_default(),

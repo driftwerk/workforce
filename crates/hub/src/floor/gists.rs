@@ -3,14 +3,16 @@
 //! [`gist::due`] says, off the writer's path, and its owner's floor told it
 //! changed. The floor's paragraph is written from the gists when a read
 //! finds it out of date. Without a model nothing is written: the floor says
-//! each gist plainly from the turns.
+//! each gist plainly from the turns. When the model fails, the line is said
+//! plainly and why is logged, once a while per subject.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
+use std::time::Duration;
 use tokio::sync::{mpsc, Semaphore};
 use tokio::time::Instant;
 use tracing::{debug, warn};
@@ -28,6 +30,10 @@ const BACKLOG: usize = 1024;
 const CALLS: usize = 4;
 /// How many of a running subject's latest steps a gist is written from.
 const STEPS: usize = 12;
+/// How often one subject's model failures are logged.
+const WARN_EVERY: Duration = Duration::from_secs(10 * 60);
+/// Turns looked up to be adopted before the list is started again.
+const LOOKED: usize = 4096;
 
 /// What writes: the hub's cheap model, and what the hub knows of a subject
 /// beyond its turns.
@@ -132,6 +138,9 @@ enum Seen {
     Op(TurnOp),
     /// A subject's steps not yet said may be said now.
     Due(Whose),
+    /// A turn still open that this hub saw no beginning of: one begun
+    /// before it started, as logged.
+    Adopt(Box<Turn>),
 }
 
 /// The gists' writer, as the log's writer and the floor's reads use it.
@@ -148,6 +157,17 @@ struct Inner {
     calls: Semaphore,
     /// When each person's paragraph was last tried.
     tried: Mutex<HashMap<(String, bool), Instant>>,
+    /// When each subject's (or paragraph's) model failure was last logged.
+    warned: Mutex<HashMap<String, Instant>>,
+}
+
+/// What the writer knows of the turns running: each subject's, whose each
+/// turn is, and the turns looked up to be adopted.
+#[derive(Default)]
+struct Floor {
+    subjects: HashMap<Whose, Running>,
+    turns: HashMap<Uuid, Whose>,
+    looked: HashSet<Uuid>,
 }
 
 /// A subject as its running turn has it.
@@ -194,6 +214,7 @@ impl Gists {
             writing: Mutex::new(HashMap::new()),
             calls: Semaphore::new(CALLS),
             tried: Mutex::new(HashMap::new()),
+            warned: Mutex::new(HashMap::new()),
         }));
         tokio::spawn(gists.clone().read(rx));
         gists
@@ -217,66 +238,111 @@ impl Gists {
     }
 
     async fn read(self, mut rx: mpsc::Receiver<Seen>) {
-        let mut subjects: HashMap<Whose, Running> = HashMap::new();
-        let mut turns: HashMap<Uuid, Whose> = HashMap::new();
+        let mut floor = Floor::default();
         while let Some(seen) = rx.recv().await {
             match seen {
-                Seen::Op(op) => self.op(op, &mut subjects, &mut turns),
+                Seen::Op(op) => self.op(op, &mut floor),
                 Seen::Due(whose) => {
-                    if let Some(r) = subjects.get_mut(&whose) {
+                    if let Some(r) = floor.subjects.get_mut(&whose) {
                         r.deferred = false;
                         self.step(&whose, r);
                     }
                 }
+                Seen::Adopt(turn) => self.adopted(*turn, &mut floor),
             }
         }
     }
 
-    fn op(
-        &self,
-        op: TurnOp,
-        subjects: &mut HashMap<Whose, Running>,
-        turns: &mut HashMap<Uuid, Whose>,
-    ) {
+    /// Whether `turn` gets a gist: an agent's turn run as a Claude Code
+    /// session is the agent's, whose own turn has one, and a session the
+    /// hub ran itself is never the person's.
+    fn ours(&self, turn: &Turn) -> bool {
+        let agents =
+            matches!(turn.subject, Subject::Session { .. }) && gist::agent_turn_folder(&turn.name);
+        let hubs = self
+            .0
+            .model
+            .get()
+            .is_some_and(|m| m.hub_internal(&turn.subject));
+        !agents && !hubs
+    }
+
+    /// `turn`'s subject as running it, counted open once more.
+    fn opened<'a>(turn: &Turn, by_person: bool, floor: &'a mut Floor) -> (Whose, &'a mut Running) {
+        let whose = (turn.owner.clone(), turn.subject.key());
+        let r = floor
+            .subjects
+            .entry(whose.clone())
+            .or_insert_with(|| Running {
+                subject: turn.subject.clone(),
+                name: turn.name.clone(),
+                turn: turn.id,
+                place: turn.place.clone(),
+                ask: None,
+                by_person,
+                steps: VecDeque::new(),
+                unsaid: 0,
+                last: None,
+                deferred: false,
+                background: 0,
+                open: 0,
+            });
+        r.subject = turn.subject.clone();
+        r.name = turn.name.clone();
+        r.turn = turn.id;
+        r.place = turn.place.clone();
+        r.ask = turn.task.clone();
+        r.by_person = by_person;
+        r.steps.clear();
+        r.background = 0;
+        r.open += 1;
+        floor.turns.insert(turn.id, whose.clone());
+        (whose, r)
+    }
+
+    /// A step of a turn this hub saw no beginning of: the turn is looked up
+    /// in the log, once, and taken up if it is still open.
+    fn adopt(&self, turn: Uuid, floor: &mut Floor) {
+        if floor.looked.len() >= LOOKED {
+            floor.looked.clear();
+        }
+        if !floor.looked.insert(turn) {
+            return;
+        }
+        let gists = self.clone();
+        tokio::spawn(async move {
+            match gists.0.kept.turn(turn).await {
+                Ok(Some(t)) if t.ended_at.is_none() => {
+                    let _ = gists.0.tx.send(Seen::Adopt(Box::new(t))).await;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    warn!(target: "floor", error = %format!("{e:#}"), "reading a running turn for its gist failed")
+                }
+            }
+        });
+    }
+
+    /// A turn begun before this hub started, taken up as if it had been
+    /// seen beginning: its latest step, as logged, said now.
+    fn adopted(&self, turn: Turn, floor: &mut Floor) {
+        if floor.turns.contains_key(&turn.id) || !self.ours(&turn) {
+            return;
+        }
+        let doing = turn.doing.clone();
+        let (whose, r) = Self::opened(&turn, false, floor);
+        if let Some(doing) = doing {
+            r.steps.push_back(doing);
+            r.unsaid += 1;
+        }
+        self.step(&whose, r);
+    }
+
+    fn op(&self, op: TurnOp, floor: &mut Floor) {
         match op {
-            // An agent's turn run as a Claude Code session is the agent's,
-            // whose own turn has a gist.
-            TurnOp::Begin { turn, .. }
-                if matches!(turn.subject, Subject::Session { .. })
-                    && gist::agent_turn_folder(&turn.name) => {}
-            // Nor is a session the hub ran itself the person's.
-            TurnOp::Begin { turn, .. }
-                if self
-                    .0
-                    .model
-                    .get()
-                    .is_some_and(|m| m.hub_internal(&turn.subject)) => {}
+            TurnOp::Begin { turn, .. } if !self.ours(&turn) => {}
             TurnOp::Begin { turn, by_person } => {
-                let whose = (turn.owner.clone(), turn.subject.key());
-                let r = subjects.entry(whose.clone()).or_insert_with(|| Running {
-                    subject: turn.subject.clone(),
-                    name: turn.name.clone(),
-                    turn: turn.id,
-                    place: turn.place.clone(),
-                    ask: None,
-                    by_person,
-                    steps: VecDeque::new(),
-                    unsaid: 0,
-                    last: None,
-                    deferred: false,
-                    background: 0,
-                    open: 0,
-                });
-                r.subject = turn.subject.clone();
-                r.name = turn.name.clone();
-                r.turn = turn.id;
-                r.place = turn.place.clone();
-                r.ask = turn.task.clone();
-                r.by_person = by_person;
-                r.steps.clear();
-                r.background = 0;
-                r.open += 1;
-                turns.insert(turn.id, whose.clone());
+                let (whose, r) = Self::opened(&turn, by_person, floor);
                 self.write(&whose, r, Moment::Began { by_person }, None);
             }
             TurnOp::Progress {
@@ -284,8 +350,12 @@ impl Gists {
                 doing: Some(doing),
                 ..
             } => {
+                let Floor {
+                    subjects, turns, ..
+                } = &mut *floor;
                 let Some(whose) = turns.get(&turn) else {
-                    return;
+                    // Begun before this hub started: taken up from the log.
+                    return self.adopt(turn, floor);
                 };
                 let Some(r) = subjects.get_mut(whose) else {
                     return;
@@ -301,6 +371,9 @@ impl Gists {
                 self.step(&whose, r);
             }
             TurnOp::Background { turn, count, .. } => {
+                let Floor {
+                    subjects, turns, ..
+                } = floor;
                 if let Some(r) = turns.get(&turn).and_then(|w| subjects.get_mut(w)) {
                     r.background = count;
                 }
@@ -311,6 +384,12 @@ impl Gists {
                 answer,
                 ..
             } => {
+                let Floor {
+                    subjects,
+                    turns,
+                    looked,
+                } = floor;
+                looked.remove(&turn);
                 if matches!(outcome, Outcome::Stopped | Outcome::Interrupted) {
                     if let Some(whose) = turns.remove(&turn) {
                         Self::closed(&whose, subjects);
@@ -505,14 +584,33 @@ impl Gists {
         };
         let prompt = gist::prompt(&input);
         let asked = model.answer(Some(&job.subject), owner, gist::GIST_SYSTEM, &prompt);
+        let unwritten = |cause: String| {
+            self.unwritten(
+                &format!("{:?}", job.whose),
+                &cause,
+                "the model couldn't write a gist; it is said plainly",
+            )
+        };
         let written = match tokio::time::timeout(gist::WRITE_WITHIN, asked).await {
-            Ok(Ok(text)) => gist::parse(&text),
+            Ok(Ok(text)) => {
+                let written = gist::parse(&text);
+                if written.is_none() {
+                    unwritten(format!(
+                        "the model's answer ({} characters) had no line saying what it is doing now",
+                        text.chars().count()
+                    ));
+                }
+                written
+            }
             Ok(Err(e)) => {
-                debug!(target: "floor", error = %format!("{e:#}"), "no model to write a gist; said plainly");
+                unwritten(format!("the model call failed: {e:#}"));
                 None
             }
             Err(_) => {
-                debug!(target: "floor", "writing a gist took too long; said plainly");
+                unwritten(format!(
+                    "the model gave no answer within {} seconds",
+                    gist::WRITE_WITHIN.as_secs()
+                ));
                 None
             }
         };
@@ -533,24 +631,32 @@ impl Gists {
                     by_model: true,
                 }
             }
-            None if job.moment == Moment::Stepped
-                && kept
-                    .as_ref()
-                    .is_some_and(|k| k.by_model && k.turn == job.turn) =>
-            {
-                return;
-            }
             None => {
                 let (plain_purpose, now) = gist::plainly(&input);
-                // An agent's plain purpose follows its latest ask.
-                let fresh = plain_purpose.is_some()
-                    && (purpose.is_none()
-                        || (began.is_some()
-                            && gist::purpose_due(purpose_at, job.moment, false, at, began)));
+                let due = gist::purpose_due(purpose_at, job.moment, false, at, began);
+                let renewed = match (&purpose, &job.subject) {
+                    (None, _) => plain_purpose,
+                    // A session's stale purpose follows its goal, else its
+                    // latest prompt.
+                    (Some(_), Subject::Session { .. }) if due => gist::latest_plainly(&input),
+                    // An agent's follows its latest ask, while it has a
+                    // Desk conversation in the window.
+                    (Some(_), Subject::Agent { .. }) if due && began.is_some() => plain_purpose,
+                    _ => None,
+                };
+                let fresh = renewed.is_some();
+                // The model's line of this turn (or one said plainly in its
+                // place) that it can't say anew is said plainly, noted, so
+                // it never stands still unsaid; the model's next line has
+                // no note.
+                let unsaid = job.moment == Moment::Stepped
+                    && kept.as_ref().is_some_and(|k| {
+                        k.turn == job.turn && (k.by_model || gist::is_unsaid(&k.now))
+                    });
                 Gist {
-                    purpose: if fresh { plain_purpose } else { purpose },
+                    purpose: renewed.or(purpose),
                     purpose_at: if fresh { Some(at) } else { purpose_at },
-                    now,
+                    now: if unsaid { gist::unsaid(&now) } else { now },
                     now_at: at,
                     turn: job.turn,
                     by_model: false,
@@ -594,6 +700,33 @@ impl Gists {
         kept.map(|(paragraph, _)| paragraph)
     }
 
+    /// Logs that the model couldn't write for `subject`, and `cause`: at
+    /// WARN no more than once per subject every [`WARN_EVERY`], at debug in
+    /// between.
+    fn unwritten(&self, subject: &str, cause: &str, what: &str) {
+        if self.warn_due(subject) {
+            warn!(target: "floor", subject, cause, "{what}");
+        } else {
+            debug!(target: "floor", subject, cause, "{what}");
+        }
+    }
+
+    /// Whether `subject`'s failure is logged at WARN now.
+    fn warn_due(&self, subject: &str) -> bool {
+        let mut warned = self.0.warned.lock();
+        if warned
+            .get(subject)
+            .is_some_and(|at| at.elapsed() < WARN_EVERY)
+        {
+            return false;
+        }
+        if warned.len() >= LOOKED {
+            warned.retain(|_, at| at.elapsed() < WARN_EVERY);
+        }
+        warned.insert(subject.to_string(), Instant::now());
+        true
+    }
+
     fn try_summary(&self, scope: &Scope) -> bool {
         let mut tried = self.0.tried.lock();
         let key = (scope.owner.clone(), scope.personal);
@@ -611,14 +744,30 @@ impl Gists {
         };
         let prompt = gist::summary_prompt(entries);
         let asked = model.answer(None, Some(&scope.owner), gist::SUMMARY_SYSTEM, &prompt);
+        let unwritten = |cause: String| {
+            self.unwritten(
+                &format!("paragraph {:?} {}", scope.owner, scope.personal),
+                &cause,
+                "the model couldn't write the floor's paragraph; the last one stands",
+            )
+        };
         let text = match tokio::time::timeout(gist::WRITE_WITHIN, asked).await {
-            Ok(Ok(text)) => gist::parse_summary(&text),
+            Ok(Ok(text)) => {
+                let paragraph = gist::parse_summary(&text);
+                if paragraph.is_none() {
+                    unwritten("the model's answer was empty".into());
+                }
+                paragraph
+            }
             Ok(Err(e)) => {
-                debug!(target: "floor", error = %format!("{e:#}"), "no model to write the floor's paragraph");
+                unwritten(format!("the model call failed: {e:#}"));
                 None
             }
             Err(_) => {
-                debug!(target: "floor", "writing the floor's paragraph took too long");
+                unwritten(format!(
+                    "the model gave no answer within {} seconds",
+                    gist::WRITE_WITHIN.as_secs()
+                ));
                 None
             }
         };
@@ -671,56 +820,102 @@ pub(crate) struct HubModel {
     pub state: Arc<crate::gateway::GatewayState>,
 }
 
-/// Run a gist's model call as the person it is for, on their own login. The
-/// hub writes gists off the turn that caused them, where no identity is in
-/// scope, so a call made bare reaches no login of anyone's. `owner` is the
-/// floor's owner; with none (a personal hub's Desk) the call is the agent's
-/// own background work, paid by whoever pays for that. `None`, with no call
-/// made, when nobody's login serves `model`: the gist is then said plainly,
-/// as it is without a model.
+/// Who a gist's call for `owner` runs as on `service`: the person it is
+/// for, on their own login. The hub writes gists off the turn that caused
+/// them, where no identity is in scope, so a call made bare reaches no
+/// login of anyone's. `owner` is the floor's owner; with none (a personal
+/// hub's Desk) the call is the agent's own background work, paid by
+/// whoever pays for that.
+fn principal_for(
+    service: &crate::serve::AgentService,
+    owner: Option<&str>,
+) -> workforce_common::session::TurnPrincipal {
+    let person = owner
+        .and_then(|owner| workforce_common::subscription::Payer::classify(Some(owner)).person())
+        .map(|person| person.to_string());
+    service.background_principal(person.as_deref())
+}
+
+/// Run a gist's model call on `service` as `principal`
+/// ([`principal_for`]), as background work that may have no owner. `None`,
+/// with no call made, when no login serves `model` on it.
+async fn written_on<F: std::future::Future>(
+    service: &crate::serve::AgentService,
+    principal: &workforce_common::session::TurnPrincipal,
+    model: &str,
+    call: F,
+) -> Option<F::Output> {
+    crate::subscription::unowned_by_design(service.in_background(
+        principal,
+        crate::serve::Route::Model(Some(model)),
+        call,
+    ))
+    .await
+}
+
+/// A gist's model call for `owner` on `service`'s own login
+/// ([`written_on`]); `None` when nobody's login serves `model`: the gist is
+/// then said plainly, as it is without a model.
+#[cfg(test)]
 async fn written_for<F: std::future::Future>(
     service: &crate::serve::AgentService,
     owner: Option<&str>,
     model: &str,
     call: F,
 ) -> Option<F::Output> {
-    let person = owner
-        .and_then(|owner| workforce_common::subscription::Payer::classify(Some(owner)).person())
-        .map(|person| person.to_string());
-    service
-        .in_background(
-            &service.background_principal(person.as_deref()),
-            crate::serve::Route::Model(Some(model)),
-            call,
-        )
-        .await
+    written_on(service, &principal_for(service, owner), model, call).await
 }
 
-#[async_trait]
-impl Model for HubModel {
-    async fn answer(
-        &self,
-        subject: Option<&Subject>,
-        owner: Option<&str>,
-        system: &str,
-        user: &str,
-    ) -> eyre::Result<String> {
-        use workforce_agent::llm::provider::with_reasoning_suppressed;
-        use workforce_agent::llm::types::LlmMessage;
-        use workforce_agent::runner::with_served_log;
-        use workforce_common::cost::{CostEntry, TokenCounts};
-        use workforce_common::subscription::Origin;
+/// What a gist may fall back on when `primary`'s own plan has no usable
+/// login (signed out, cooling down or at its limit): of `others`, as
+/// `(provider, agent)`, one agent on each other subscription provider, in
+/// the order given. A metered provider is never fallen back on: a plan at
+/// its limit never runs up a bill.
+fn fallbacks<T>(primary: &str, others: impl IntoIterator<Item = (String, T)>) -> Vec<T> {
+    let mut seen = HashSet::from([primary.to_string()]);
+    others
+        .into_iter()
+        .filter(|(key, _)| {
+            workforce_agent::llm::provider::ProviderKind::from_str_loose(key)
+                .is_some_and(|kind| kind.is_subscription())
+        })
+        .filter_map(|(key, agent)| seen.insert(key).then_some(agent))
+        .collect()
+}
 
-        let registry = &self.state.registry;
-        let service = match subject {
-            Some(Subject::Agent { agent_id, .. }) => registry.get(agent_id),
-            _ => None,
-        }
-        .or_else(|| registry.default_agent())
-        .ok_or_else(|| eyre::eyre!("no agent to write with"))?;
+/// The answer to `system` and `user` for `owner`, on `primary`'s cheap
+/// model, else on another signed-in provider's ([`fallbacks`] of `others`)
+/// when `primary`'s plan has no usable login. Each call runs as `primary`
+/// has it run for `owner`, so a fallback never bills anyone else.
+async fn answer_on(
+    primary: Arc<crate::serve::AgentService>,
+    others: Vec<Arc<crate::serve::AgentService>>,
+    owner: Option<&str>,
+    system: &str,
+    user: &str,
+) -> eyre::Result<String> {
+    use workforce_agent::llm::provider::with_reasoning_suppressed;
+    use workforce_agent::llm::types::LlmMessage;
+    use workforce_agent::runner::with_served_log;
+    use workforce_common::cost::{CostEntry, TokenCounts};
+    use workforce_common::subscription::Origin;
+
+    let principal = principal_for(&primary, owner);
+    let mut others = others;
+    others.sort_by(|a, b| a.agent_id.as_str().cmp(b.agent_id.as_str()));
+    let others = others
+        .into_iter()
+        .filter(|s| s.agent_id != primary.agent_id)
+        .map(|s| {
+            let key = s.tier_key.read().clone();
+            (key, s)
+        });
+    let primary_key = primary.tier_key.read().clone();
+    let candidates = std::iter::once(Arc::clone(&primary)).chain(fallbacks(&primary_key, others));
+    let messages = [LlmMessage::user(user.to_string())];
+    for service in candidates {
         let model = floor_model(&service.tier_registry(), &service.tier_key.read())
             .unwrap_or_else(|| crate::turn_loop::cheap_model(&service));
-        let messages = [LlmMessage::user(user.to_string())];
         let asked = with_served_log(with_reasoning_suppressed(service.llm.create_message(
             Some(system),
             &messages,
@@ -729,9 +924,12 @@ impl Model for HubModel {
             Some(400),
             true,
         )));
-        let (response, served) = written_for(&service, owner, &model, asked)
-            .await
-            .ok_or_else(|| eyre::eyre!("no login to write with"))?;
+        let Some((response, served)) = written_on(&service, &principal, &model, asked).await else {
+            continue;
+        };
+        if service.agent_id != primary.agent_id {
+            debug!(target: "floor", agent = %primary.agent_id, on = %service.agent_id, "a gist is written on another signed-in plan");
+        }
         let response = response?;
         service.cost_tracker.record(CostEntry {
             task_type: Some("floor_gist"),
@@ -745,7 +943,30 @@ impl Model for HubModel {
                 Origin::Floor,
             )
         });
-        Ok(response.all_text().unwrap_or_default())
+        return Ok(response.all_text().unwrap_or_default());
+    }
+    Err(eyre::eyre!(
+        "no signed-in plan could take the call: each is signed out, cooling down or at its limit"
+    ))
+}
+
+#[async_trait]
+impl Model for HubModel {
+    async fn answer(
+        &self,
+        subject: Option<&Subject>,
+        owner: Option<&str>,
+        system: &str,
+        user: &str,
+    ) -> eyre::Result<String> {
+        let registry = &self.state.registry;
+        let service = match subject {
+            Some(Subject::Agent { agent_id, .. }) => registry.get(agent_id),
+            _ => None,
+        }
+        .or_else(|| registry.default_agent())
+        .ok_or_else(|| eyre::eyre!("no agent to write with"))?;
+        answer_on(service, registry.all_services(), owner, system, user).await
     }
 
     fn goal(&self, subject: &Subject) -> Option<String> {
@@ -784,6 +1005,8 @@ mod tests {
         /// What the log has of the subject's asks, and how it was asked.
         asked: Mutex<Asked>,
         reached: Mutex<Vec<Reach>>,
+        /// The turns as logged.
+        turns: Mutex<HashMap<Uuid, Turn>>,
     }
 
     #[async_trait]
@@ -823,8 +1046,8 @@ mod tests {
             Ok(self.asked.lock().clone())
         }
 
-        async fn turn(&self, _: Uuid) -> eyre::Result<Option<Turn>> {
-            Ok(None)
+        async fn turn(&self, id: Uuid) -> eyre::Result<Option<Turn>> {
+            Ok(self.turns.lock().get(&id).cloned())
         }
 
         async fn summary(
@@ -1054,21 +1277,93 @@ mod tests {
             !memory.written.lock()[0].by_model,
             "past its time it is said plainly"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_step_the_model_cant_say_is_said_plainly_and_noted_until_it_can() {
+        let model = Scripted::new(NOTE, Duration::ZERO);
+        let (gists, memory, told) = gists(Arc::clone(&model));
+        let id = Uuid::new_v4();
+        gists.saw(&begin_for(started(id), true));
+        settle().await;
+        let first = memory.written.lock()[0].clone();
+        assert!(first.by_model);
+
+        *model.say.lock() = String::new();
+        tokio::time::sleep(Duration::from_secs(3 * 60)).await;
+        gists.saw(&step(id, "● Bash cargo test"));
+        settle().await;
+        let noted = memory.written.lock()[1].clone();
+        assert!(!noted.by_model);
+        assert_eq!(
+            noted.now, "Working on it now. (Couldn't describe this right now.)",
+            "the line moves on, said plainly, and says why"
+        );
+        assert_eq!(noted.purpose, first.purpose, "the model's purpose stands");
+        assert_eq!(noted.purpose_at, first.purpose_at);
+        assert_eq!(*told.lock(), 2, "and its owner's floor told");
+
+        tokio::time::sleep(Duration::from_secs(3 * 60)).await;
+        gists.saw(&step(id, "● Read README"));
+        settle().await;
+        assert!(
+            gist::is_unsaid(&memory.written.lock()[2].now),
+            "still noted while the model can't say it"
+        );
+
+        *model.say.lock() = NOTE.into();
+        tokio::time::sleep(Duration::from_secs(3 * 60)).await;
+        gists.saw(&step(id, "● Bash cargo build"));
+        settle().await;
+        let next = memory.written.lock()[3].clone();
+        assert!(next.by_model);
+        assert_eq!(next.now, "Testing the build.", "the note clears");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn without_a_model_a_stale_sessions_purpose_follows_its_latest_prompt() {
+        let (gists, memory, _) = gists(Scripted::new("", Duration::ZERO));
+        let id = Uuid::new_v4();
+        let whose = (Some("u1".to_string()), SubjectKey::session(id));
+        *memory.asked.lock() = Asked {
+            asks: vec!["Plan the budget".into(), "Fix the login page".into()],
+            began: None,
+        };
+        let session = |task: &str| Turn {
+            subject: Subject::Session {
+                id,
+                engine: Engine::Claude,
+            },
+            name: "release".into(),
+            task: Some(task.into()),
+            ..started(Uuid::new_v4())
+        };
+        let budget = "Planning next year's budget.";
+        memory.gists.lock().insert(
+            whose.clone(),
+            kept_purpose(budget, chrono::Duration::minutes(10)),
+        );
+        gists.saw(&begin_for(session("Ship the release"), true));
+        settle().await;
+        assert_eq!(
+            memory.written.lock()[0].purpose.as_deref(),
+            Some(budget),
+            "a purpose inside its window stands"
+        );
+
         memory
             .gists
             .lock()
-            .values_mut()
-            .for_each(|g| g.by_model = true);
-        let before = memory.written.lock().len();
-        tokio::time::sleep(Duration::from_secs(3 * 60)).await;
-        gists.saw(&step(id, "● Bash cargo test"));
-        tokio::time::sleep(Duration::from_secs(61)).await;
+            .insert(whose, kept_purpose(budget, chrono::Duration::minutes(40)));
+        gists.saw(&begin_for(session("Ship the release"), true));
         settle().await;
+        let written = memory.written.lock()[1].clone();
         assert_eq!(
-            memory.written.lock().len(),
-            before,
-            "a step the model can't say leaves its gist of this turn as it was"
+            written.purpose.as_deref(),
+            Some("Ship the release."),
+            "a stale one follows its latest prompt"
         );
+        assert!(written.purpose_at > Some(crew::now() - chrono::Duration::minutes(1)));
     }
 
     #[tokio::test(start_paused = true)]
@@ -1491,6 +1786,297 @@ mod tests {
         settle().await;
         assert_eq!(model.asked.lock().len(), 2);
         assert!(memory.summaries.lock().contains_key(&("u1".into(), true)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_turn_begun_before_the_hub_started_is_taken_up_on_its_next_step() {
+        let model = Scripted::new(NOTE, Duration::ZERO);
+        let (gists, memory, told) = gists(Arc::clone(&model));
+        let id = Uuid::new_v4();
+        let mut running = started(id);
+        running.doing = Some("● Bash cargo test".into());
+        memory.turns.lock().insert(id, running);
+        let ended = Uuid::new_v4();
+        let mut done = started(ended);
+        done.ended_at = Some(crew::now());
+        memory.turns.lock().insert(ended, done);
+
+        gists.saw(&step(ended, "● Read README"));
+        settle().await;
+        assert!(
+            memory.written.lock().is_empty(),
+            "an ended turn is not taken up"
+        );
+
+        gists.saw(&step(id, "● Bash cargo test"));
+        gists.saw(&step(id, "● Read README"));
+        settle().await;
+        assert_eq!(memory.written.lock().len(), 1, "taken up and said at once");
+        assert!(memory.written.lock()[0].by_model);
+        assert_eq!(memory.written.lock()[0].turn, id);
+        assert!(model.asked.lock()[0].contains("- Bash cargo test"));
+        assert_eq!(*told.lock(), 1);
+
+        tokio::time::sleep(Duration::from_secs(2 * 60)).await;
+        gists.saw(&step(id, "● Bash cargo build"));
+        settle().await;
+        assert_eq!(memory.written.lock().len(), 2, "its line keeps moving");
+        assert!(model.asked.lock()[1].contains("- Bash cargo build"));
+
+        gists.saw(&TurnOp::End {
+            turn: id,
+            at: crew::now(),
+            outcome: Outcome::Finished,
+            answer: Some("It builds.".into()),
+            question: None,
+        });
+        settle().await;
+        assert_eq!(memory.written.lock().len(), 3, "and is said as it ends");
+        assert!(model.asked.lock()[2].contains("Its latest reply: It builds."));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_session_the_hub_ran_itself_is_not_taken_up_after_a_restart() {
+        let model = Scripted::new(NOTE, Duration::ZERO);
+        let (gists, memory, _) = gists(Arc::clone(&model));
+        let session = Uuid::new_v4();
+        model.hubs.lock().push(session);
+        let id = Uuid::new_v4();
+        memory.turns.lock().insert(
+            id,
+            Turn {
+                subject: Subject::Session {
+                    id: session,
+                    engine: Engine::Claude,
+                },
+                ..started(id)
+            },
+        );
+        gists.saw(&step(id, "● Bash cargo test"));
+        settle().await;
+        assert!(memory.written.lock().is_empty());
+        assert!(model.asked.lock().is_empty());
+    }
+
+    /// What the log says while the guard is held, every level from debug.
+    #[derive(Clone, Default)]
+    struct Lines(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Lines {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Lines {
+        fn capture() -> (Self, tracing::dispatcher::DefaultGuard, tracing::Dispatch) {
+            let lines = Self::default();
+            let writer = lines.clone();
+            let dispatch = tracing::Dispatch::new(
+                tracing_subscriber::fmt()
+                    .with_writer(move || writer.clone())
+                    .with_ansi(false)
+                    .with_max_level(tracing::Level::DEBUG)
+                    .finish(),
+            );
+            // A second dispatcher makes every callsite ask each one, so
+            // another test's thread can't leave one uninterested.
+            let others = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+            let guard = tracing::dispatcher::set_default(&dispatch);
+            (lines, guard, others)
+        }
+
+        /// The lines at `level` that say `text`.
+        fn at(&self, level: &str, text: &str) -> Vec<String> {
+            String::from_utf8_lossy(&self.0.lock())
+                .lines()
+                .filter(|l| l.contains(&format!(" {level} ")) && l.contains(text))
+                .map(str::to_string)
+                .collect()
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_gist_is_warned_of_with_its_cause_once_per_subject_every_ten_minutes() {
+        let (lines, _guard, _others) = Lines::capture();
+        let model = Scripted::new("", Duration::ZERO);
+        let (gists, _, _) = gists(Arc::clone(&model));
+        let failed = "the model couldn't write a gist";
+        let id = Uuid::new_v4();
+        gists.saw(&begin_for(started(id), true));
+        settle().await;
+        let warned = lines.at("WARN", failed);
+        assert_eq!(warned.len(), 1, "{warned:?}");
+        assert!(
+            warned[0].contains("the model call failed: no model"),
+            "{}",
+            warned[0]
+        );
+
+        tokio::time::sleep(Duration::from_secs(3 * 60)).await;
+        gists.saw(&step(id, "● Bash cargo test"));
+        settle().await;
+        assert_eq!(
+            lines.at("WARN", failed).len(),
+            1,
+            "not again inside ten minutes"
+        );
+        assert_eq!(lines.at("DEBUG", failed).len(), 1, "but kept at debug");
+
+        let other = Turn {
+            subject: Subject::Agent {
+                agent_id: "ranger".into(),
+                session_id: "dm".into(),
+            },
+            ..started(Uuid::new_v4())
+        };
+        gists.saw(&begin_for(other, true));
+        settle().await;
+        assert_eq!(
+            lines.at("WARN", failed).len(),
+            2,
+            "another subject is its own"
+        );
+
+        *model.say.lock() = "Sure, here is a note.".into();
+        tokio::time::sleep(Duration::from_secs(8 * 60)).await;
+        gists.saw(&step(id, "● Read README"));
+        settle().await;
+        let warned = lines.at("WARN", failed);
+        assert_eq!(warned.len(), 3, "ten minutes on, warned again");
+        assert!(
+            warned[2].contains("had no line saying what it is doing now"),
+            "{}",
+            warned[2]
+        );
+        assert!(
+            !warned[2].contains("Sure, here is a note"),
+            "its text is never logged"
+        );
+
+        let slow = Scripted::new(NOTE, Duration::from_secs(60));
+        let (gists, _, _) = self::gists(slow);
+        gists.saw(&begin_for(started(Uuid::new_v4()), true));
+        tokio::time::sleep(Duration::from_secs(46)).await;
+        settle().await;
+        assert!(lines
+            .at("WARN", failed)
+            .iter()
+            .any(|l| l.contains("no answer within 45 seconds")));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_paragraph_is_warned_of_with_its_cause() {
+        let (lines, _guard, _others) = Lines::capture();
+        let (gists, _, _) = gists(Scripted::new("", Duration::ZERO));
+        let scope = Scope {
+            owner: "u1".into(),
+            personal: true,
+        };
+        let entry = Happening {
+            who: Who {
+                kind: workforce_desk::crew::PartyKind::Agent,
+                id: "scout".into(),
+                name: "Scout".into(),
+                engine: None,
+            },
+            doing: Doing::Working,
+            gist: Said {
+                purpose: None,
+                now: "Testing.".into(),
+                at: crew::now(),
+            },
+        };
+        gists.summary(&scope, vec![entry], crew::now()).await;
+        settle().await;
+        let warned = lines.at("WARN", "the model couldn't write the floor's paragraph");
+        assert_eq!(warned.len(), 1);
+        assert!(warned[0].contains("the model call failed"), "{}", warned[0]);
+    }
+
+    #[test]
+    fn a_gist_falls_back_on_one_agent_of_each_other_signed_in_provider() {
+        let others = [
+            ("claude-code", "pair"),
+            ("anthropic", "metered"),
+            ("chatgpt", "allan"),
+            ("chatgpt", "allan-two"),
+            ("codex", "coder"),
+            ("gemini", "metered-too"),
+        ]
+        .map(|(key, agent)| (key.to_string(), agent));
+        assert_eq!(
+            fallbacks("claude-code", others),
+            vec!["allan", "coder"],
+            "its own provider and metered ones are never fallen back on"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_gist_whose_plan_has_no_login_is_written_on_another_signed_in_plan() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = wiremock::MockServer::start().await;
+        let primary = chatgpt_agent(tmp.path(), &server, None).await;
+        let other = tempfile::tempdir().unwrap();
+        let fallback = crate::serve::testing::chatgpt_service(other.path(), &server, |config| {
+            config.agents.push(workforce_common::settings::AgentConfig {
+                id: "coder".into(),
+                default: true,
+                ..Default::default()
+            });
+        })
+        .await;
+        // Another provider's agent, signed in on the shared login.
+        *fallback.tier_key.write() = "codex".into();
+        let shared = chatgpt_login_at(&fallback, "codex/auth_json", "shared");
+        crate::serve::testing::answer_bearer(&server, &shared).await;
+
+        let others = vec![Arc::clone(&primary), Arc::clone(&fallback)];
+        let answer = answer_on(Arc::clone(&primary), others, None, "system", "user").await;
+        assert!(answer.is_ok(), "{answer:?}");
+        assert_eq!(bearers(&server).await, vec![format!("Bearer {shared}")]);
+
+        let alone = answer_on(Arc::clone(&primary), vec![], None, "system", "user").await;
+        let error = format!("{:#}", alone.unwrap_err());
+        assert!(
+            error.contains("no signed-in plan could take the call"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_gist_with_no_owner_drawing_on_a_shared_login_is_not_warned_of() {
+        let (lines, _guard, _others) = Lines::capture();
+        let tmp = tempfile::tempdir().unwrap();
+        let server = wiremock::MockServer::start().await;
+        let service = chatgpt_agent(tmp.path(), &server, None).await;
+        let shared = chatgpt_login_at(&service, "codex/auth_json", "shared");
+        crate::serve::testing::answer_bearer(&server, &shared).await;
+        let gap = "a subscription login served a call with no identity in scope";
+
+        assert!(write_for(&service, None).await.is_some());
+        assert!(
+            lines.at("WARN", gap).is_empty(),
+            "{:?}",
+            lines.at("WARN", gap)
+        );
+        assert!(!lines
+            .at(
+                "DEBUG",
+                "a subscription login served background work that has no owner"
+            )
+            .is_empty());
+
+        // Anywhere else, a call with no identity is still an identity gap.
+        assert!(service
+            .logins
+            .resolve(workforce_common::subscription::SubscriptionKind::ChatGpt)
+            .is_ok());
+        assert_eq!(lines.at("WARN", gap).len(), 1);
     }
 
     const ALICE: &str = "6f1c1c3e-2a51-4a8e-9a57-0d6b1c9f2b11";

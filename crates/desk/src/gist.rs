@@ -639,6 +639,27 @@ pub fn plainly(input: &Input<'_>) -> (Option<String>, String) {
     (purpose, now)
 }
 
+/// A session's purpose said plainly once the one kept is
+/// [`PURPOSE_EVERY`] old: its goal, else the latest of what it was asked.
+pub fn latest_plainly(input: &Input<'_>) -> Option<String> {
+    let latest = input.asks.iter().rev().map(|a| Some(a.as_str()));
+    first_plain(std::iter::once(input.goal).chain([input.ask]).chain(latest)).map(|p| sentence(&p))
+}
+
+/// What a line said plainly in place of the model's adds while the model
+/// can't say the turn's steps; the next line the model writes has none.
+pub const UNSAID: &str = "(Couldn't describe this right now.)";
+
+/// `now` with [`UNSAID`] after it.
+pub fn unsaid(now: &str) -> String {
+    format!("{now} {UNSAID}")
+}
+
+/// Whether `now` carries [`UNSAID`].
+pub fn is_unsaid(now: &str) -> bool {
+    now.ends_with(UNSAID)
+}
+
 // ── What's happening ─────────────────────────────────────────────────────
 
 /// One subject working, waiting on its background work, or finished within
@@ -946,5 +967,51 @@ mod tests {
             .1,
             "Its turn is done; it is waiting on 1 background task it started."
         );
+    }
+
+    #[test]
+    fn a_stale_sessions_purpose_is_said_from_its_goal_else_its_latest_prompt() {
+        let asks = [
+            "Plan the budget".to_string(),
+            "Fix the login page".to_string(),
+        ];
+        let session = Input {
+            session: Some("Claude Code"),
+            asks: &asks,
+            ..Default::default()
+        };
+        assert_eq!(
+            latest_plainly(&session).as_deref(),
+            Some("Fix the login page."),
+            "its latest ask, where plainly says its first"
+        );
+        let asked = Input {
+            ask: Some("now ship the release"),
+            ..session
+        };
+        assert_eq!(
+            latest_plainly(&asked).as_deref(),
+            Some("Now ship the release.")
+        );
+        let goal = Input {
+            goal: Some("get the release out"),
+            ..asked
+        };
+        assert_eq!(
+            latest_plainly(&goal).as_deref(),
+            Some("Get the release out.")
+        );
+        assert_eq!(latest_plainly(&Input::default()), None);
+    }
+
+    #[test]
+    fn a_line_the_model_could_not_say_is_noted_and_known_by_its_note() {
+        let noted = unsaid("Now working on: Ship it.");
+        assert_eq!(
+            noted,
+            "Now working on: Ship it. (Couldn't describe this right now.)"
+        );
+        assert!(is_unsaid(&noted));
+        assert!(!is_unsaid("Now working on: Ship it."));
     }
 }
