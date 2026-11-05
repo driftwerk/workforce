@@ -598,6 +598,7 @@ pub async fn mount(
     if let Some(floor) = crate::floor::installed() {
         floor.gists.serve(Arc::new(crate::floor::gists::HubModel {
             state: Arc::clone(state),
+            fallback: config.floor.fallback_providers,
         }));
     }
     if !config.desk.enabled {

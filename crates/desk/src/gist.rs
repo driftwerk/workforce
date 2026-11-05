@@ -343,7 +343,7 @@ pub fn prompt(input: &Input<'_>) -> String {
         Some(g) => out.push_str(&format!(
             "The previous note:\nPURPOSE: {}\nNOW: {}\n",
             g.purpose.as_deref().unwrap_or("(none yet)"),
-            g.now
+            said(&g.now)
         )),
         None => out.push_str("There is no previous note.\n"),
     }
@@ -378,7 +378,7 @@ pub fn summary_prompt(entries: &[Happening]) -> String {
             if let Some(p) = &e.gist.purpose {
                 out.push_str(&format!(" {p}"));
             }
-            out.push_str(&format!(" {}\n", e.gist.now));
+            out.push_str(&format!(" {}\n", said(&e.gist.now)));
             out
         },
     )
@@ -637,6 +637,33 @@ pub fn plainly(input: &Input<'_>) -> (Option<String>, String) {
         Doing::Limit => "It stopped at its plan's limit.".to_string(),
     };
     (purpose, now)
+}
+
+/// A session's purpose said plainly once the one kept is
+/// [`PURPOSE_EVERY`] old: its goal, else the latest of what it was asked.
+pub fn latest_plainly(input: &Input<'_>) -> Option<String> {
+    let latest = input.asks.iter().rev().map(|a| Some(a.as_str()));
+    first_plain(std::iter::once(input.goal).chain([input.ask]).chain(latest)).map(|p| sentence(&p))
+}
+
+/// What a line said plainly in place of the model's adds while the model
+/// can't say the turn's steps; the next line the model writes has none.
+pub const UNSAID: &str = "(Couldn't describe this right now.)";
+
+/// `now` with [`UNSAID`] after it.
+pub fn unsaid(now: &str) -> String {
+    format!("{now} {UNSAID}")
+}
+
+/// Whether `now` carries [`UNSAID`].
+pub fn is_unsaid(now: &str) -> bool {
+    now.ends_with(UNSAID)
+}
+
+/// `now` without [`UNSAID`]: what a model is shown, so it never writes the
+/// note out again.
+fn said(now: &str) -> &str {
+    now.strip_suffix(UNSAID).map_or(now, str::trim_end)
 }
 
 // ── What's happening ─────────────────────────────────────────────────────
@@ -946,5 +973,76 @@ mod tests {
             .1,
             "Its turn is done; it is waiting on 1 background task it started."
         );
+    }
+
+    #[test]
+    fn a_stale_sessions_purpose_is_said_from_its_goal_else_its_latest_prompt() {
+        let asks = [
+            "Plan the budget".to_string(),
+            "Fix the login page".to_string(),
+        ];
+        let session = Input {
+            session: Some("Claude Code"),
+            asks: &asks,
+            ..Default::default()
+        };
+        assert_eq!(
+            latest_plainly(&session).as_deref(),
+            Some("Fix the login page."),
+            "its latest ask, where plainly says its first"
+        );
+        let asked = Input {
+            ask: Some("now ship the release"),
+            ..session
+        };
+        assert_eq!(
+            latest_plainly(&asked).as_deref(),
+            Some("Now ship the release.")
+        );
+        let goal = Input {
+            goal: Some("get the release out"),
+            ..asked
+        };
+        assert_eq!(
+            latest_plainly(&goal).as_deref(),
+            Some("Get the release out.")
+        );
+        assert_eq!(latest_plainly(&Input::default()), None);
+    }
+
+    #[test]
+    fn a_line_the_model_could_not_say_is_noted_and_known_by_its_note() {
+        let noted = unsaid("Now working on: Ship it.");
+        assert_eq!(
+            noted,
+            "Now working on: Ship it. (Couldn't describe this right now.)"
+        );
+        assert!(is_unsaid(&noted));
+        assert!(!is_unsaid("Now working on: Ship it."));
+        let kept = Gist {
+            purpose: None,
+            purpose_at: None,
+            now: noted.clone(),
+            now_at: crew::now(),
+            turn: Uuid::nil(),
+            by_model: false,
+        };
+        let asked = prompt(&Input {
+            kept: Some(&kept),
+            ..Default::default()
+        });
+        assert!(asked.contains("NOW: Now working on: Ship it.\n"), "{asked}");
+        assert!(!asked.contains(UNSAID), "the model is never shown the note");
+        let paragraph = summary_prompt(&[Happening {
+            who: Who {
+                kind: crate::crew::PartyKind::Agent,
+                id: "scout".into(),
+                name: "Scout".into(),
+                engine: None,
+            },
+            doing: Doing::Working,
+            gist: kept.said(),
+        }]);
+        assert!(!paragraph.contains(UNSAID), "{paragraph}");
     }
 }

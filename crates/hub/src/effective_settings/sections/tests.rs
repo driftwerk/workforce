@@ -71,6 +71,8 @@ const NOT_REPORTED: &[(&str, &[&str])] = &[
             "desk",
             "environments",
             "exec",
+            // The Floor's own page says what it shows.
+            "floor",
             "games",
             "github",
             "heartbeat",
