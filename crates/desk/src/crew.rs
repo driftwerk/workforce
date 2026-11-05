@@ -72,6 +72,18 @@ impl Party {
         }
     }
 
+    /// Desk itself, where it moves what follows from something it saw
+    /// (a ticket following its pull request).
+    pub fn desk() -> Self {
+        Self {
+            kind: PartyKind::Desk,
+            id: "desk".into(),
+            name: "Desk".into(),
+            engine: None,
+            origin: None,
+        }
+    }
+
     pub fn session(v: &SessionView) -> Self {
         Self {
             kind: PartyKind::Session,
@@ -134,6 +146,12 @@ kinds! {
     Released => "released",
     Driving => "driving",
     HandedBack => "handed_back",
+    TicketCreated => "ticket_created",
+    TicketMoved => "ticket_moved",
+    TicketAssigned => "ticket_assigned",
+    TicketEdited => "ticket_edited",
+    TicketCommented => "ticket_commented",
+    TicketDeleted => "ticket_deleted",
 }
 
 /// One thing that happened on the crew.
@@ -167,6 +185,9 @@ pub struct Event {
     /// The room message it is about.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<uuid::Uuid>,
+    /// The board's ticket it is about: the ticket's history.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ticket: Option<uuid::Uuid>,
 }
 
 /// Now, to the microsecond Postgres keeps.
@@ -193,7 +214,14 @@ impl Event {
             detail: None,
             place: None,
             message: None,
+            ticket: None,
         }
+    }
+
+    /// The event, about the board's ticket `id`.
+    pub fn about_ticket(mut self, id: uuid::Uuid) -> Self {
+        self.ticket = Some(id);
+        self
     }
 
     /// The event, where in Desk it happened and the message it is about.
@@ -574,6 +602,12 @@ pub trait Crew: Send + Sync {
     /// otherwise their questions to it go to the person.
     fn answers_lines(&self) -> bool {
         false
+    }
+    /// Gives the agent `agent` a task in its Desk conversation, as you,
+    /// as `crew.assign` does: what was done, or what went wrong, in plain
+    /// words.
+    async fn assign(&self, _agent: &str, _task: &str) -> Result<String, String> {
+        Err("There are no agents here to give it to.".into())
     }
 }
 

@@ -379,8 +379,9 @@ impl DeskStore {
         Ok(layout)
     }
 
-    /// Replaces the layout, in one transaction.
-    pub async fn put_layout(&self, layout: &Layout) -> Result<()> {
+    /// Replaces the layout, in one transaction. Boards in a group it no
+    /// longer has become ungrouped: which ones.
+    pub async fn put_layout(&self, layout: &Layout) -> Result<Vec<Uuid>> {
         let mut client = self.pool().get().await?;
         let tx = client.transaction().await?;
         tx.execute("DELETE FROM groups", &[]).await?;
@@ -408,8 +409,19 @@ impl DeskStore {
                 .await?;
             }
         }
+        let kept: Vec<&str> = layout.groups.iter().map(|g| g.id.as_str()).collect();
+        let ungrouped = tx
+            .query(
+                "UPDATE boards SET group_id = NULL, updated_at = now() \
+                 WHERE group_id IS NOT NULL AND NOT group_id = ANY($1) RETURNING id",
+                &[&kept],
+            )
+            .await?
+            .iter()
+            .map(|r| r.try_get(0))
+            .collect::<Result<Vec<Uuid>, _>>()?;
         tx.commit().await.context("saving the sidebar's groups")?;
-        Ok(())
+        Ok(ungrouped)
     }
 
     /// Whether the person has named or grouped anything yet.
@@ -478,8 +490,9 @@ impl Desk {
         if after == before {
             return Ok(after);
         }
-        self.0.store.put_layout(&after).await?;
+        let ungrouped = self.0.store.put_layout(&after).await?;
         self.0.state.lock().layout = after.clone();
+        self.boards_ungrouped(&ungrouped).await;
         self.announce(DeskEvent::Layout {
             layout: after.clone(),
         });

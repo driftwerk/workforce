@@ -360,6 +360,20 @@ pub enum DeskEvent {
     Charge {
         charge: Box<crate::service::ChargeView>,
     },
+    /// A board's ticket was made or changed.
+    Ticket {
+        ticket: Box<crate::service::TicketView>,
+    },
+    TicketRemoved {
+        id: Uuid,
+    },
+    /// A board was made or changed.
+    Board {
+        board: Box<crate::board::Board>,
+    },
+    BoardRemoved {
+        id: Uuid,
+    },
     /// A key of Desk's own state changed; `value` is `null` once removed.
     State {
         key: String,
@@ -414,7 +428,7 @@ pub struct SessionPatch {
 }
 
 /// A field that may be absent (`None`), `null` (`Some(None)`) or a value.
-fn present<'de, D, T>(d: D) -> Result<Option<Option<T>>, D::Error>
+pub(crate) fn present<'de, D, T>(d: D) -> Result<Option<Option<T>>, D::Error>
 where
     D: serde::Deserializer<'de>,
     T: Deserialize<'de>,
