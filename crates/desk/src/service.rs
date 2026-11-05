@@ -40,6 +40,7 @@ use crate::usage::{LocalPlan, PlanSink};
 use crate::worktree;
 
 mod accounts;
+mod engine_sign_ins;
 pub use accounts::Added;
 mod board;
 pub use board::{
@@ -398,6 +399,8 @@ struct State {
     accounts: Vec<crate::engine_accounts::Account>,
     /// Signing in to new accounts, by sign-in.
     sign_in_runs: HashMap<Uuid, accounts::SignInRun>,
+    /// Engines' own sign-ins under way (Codex's device sign-in), by sign-in.
+    engine_sign_ins: HashMap<Uuid, engine_sign_ins::EngineSignInRun>,
     /// Sessions moving to another account once their turn ends (`None`:
     /// the CLI's own sign-in).
     switches: HashMap<Uuid, Option<Uuid>>,
@@ -1461,6 +1464,17 @@ impl Desk {
             *self.0.engines.lock() = read;
             self.spend_signed_in();
         }
+    }
+
+    /// Reads `engine` again now, rather than at the next look: its sign-in
+    /// has just changed.
+    async fn read_engine_now(&self, engine: Engine) {
+        let Some(program) = self.program(engine).map(Path::to_path_buf) else {
+            return;
+        };
+        let read = self.read_engine(engine, &program).await;
+        self.0.engines.lock().insert(engine, read);
+        self.spend_signed_in();
     }
 
     /// What `engine`'s `program` says of its version and its sign-in.

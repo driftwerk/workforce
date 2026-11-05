@@ -293,6 +293,44 @@ async fn engines(State(s): S, h: HeaderMap, Query(q): Q) -> Response {
     Json(s.desk.engines()).into_response()
 }
 
+#[derive(Deserialize)]
+struct EngineBody {
+    engine: crate::engine::Engine,
+}
+
+/// Signs an engine's own CLI in where it has no browser (Codex's device
+/// sign-in): the page and the code to type there, once it shows them.
+async fn start_engine_sign_in(
+    State(s): S,
+    h: HeaderMap,
+    Query(q): Q,
+    Json(b): Json<EngineBody>,
+) -> Response {
+    guarded!(s, h, q);
+    match s.desk.start_engine_sign_in(b.engine) {
+        Ok(view) => (StatusCode::ACCEPTED, Json(view)).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+async fn engine_sign_in(State(s): S, h: HeaderMap, Query(q): Q, Path(id): Path<Uuid>) -> Response {
+    guarded!(s, h, q);
+    s.desk.engine_sign_in(id).map(Json).into_response()
+}
+
+async fn cancel_engine_sign_in(
+    State(s): S,
+    h: HeaderMap,
+    Query(q): Q,
+    Path(id): Path<Uuid>,
+) -> Response {
+    guarded!(s, h, q);
+    s.desk
+        .cancel_engine_sign_in(id)
+        .map(|()| StatusCode::NO_CONTENT)
+        .into_response()
+}
+
 /// The person's engine accounts, the store their sign-ins are kept in
 /// (none: this Desk keeps none), and any sign-in under way.
 async fn accounts(State(s): S, h: HeaderMap, Query(q): Q) -> Response {
@@ -1185,6 +1223,11 @@ pub fn sessions_router(desk: Desk, auth: Arc<dyn Authorize>) -> Router {
     Router::new()
         .route("/api/desk/sessions", get(list).post(create))
         .route("/api/desk/engines", get(engines))
+        .route("/api/desk/engines/sign-ins", post(start_engine_sign_in))
+        .route(
+            "/api/desk/engines/sign-ins/{id}",
+            get(engine_sign_in).delete(cancel_engine_sign_in),
+        )
         .route("/api/desk/accounts", get(accounts).post(add_account))
         .route(
             "/api/desk/accounts/{id}",

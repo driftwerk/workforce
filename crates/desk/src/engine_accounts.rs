@@ -348,6 +348,12 @@ pub struct NewAccount {
     pub token: Option<String>,
     #[serde(default)]
     pub make_default: bool,
+    /// The person signs in from another computer than the hub's (Desk on
+    /// their Mac, for a machine's hub): the page that comes back to the
+    /// hub's computer by itself is caught rather than opened here, and
+    /// given to Desk in [`SignInView::direct`].
+    #[serde(default)]
+    pub remote: bool,
 }
 
 impl std::fmt::Debug for NewAccount {
@@ -357,6 +363,7 @@ impl std::fmt::Debug for NewAccount {
             .field("name", &self.name)
             .field("token", &self.token.as_ref().map(|_| "…"))
             .field("make_default", &self.make_default)
+            .field("remote", &self.remote)
             .finish()
     }
 }
@@ -751,6 +758,69 @@ pub fn needs(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_claude_page_coming_back_to_a_localhost_callback_is_direct() {
+        let page = |redirect: &str| {
+            format!("https://claude.com/cai/oauth/authorize?code=true&client_id=c&response_type=code&redirect_uri={redirect}&scope=user%3Ainference&state=s")
+        };
+        let direct = direct_sign_in(&page("http%3A%2F%2Flocalhost%3A34503%2Fcallback")).unwrap();
+        assert_eq!(direct.port, 34503);
+        assert!(direct
+            .url
+            .starts_with("https://claude.com/cai/oauth/authorize?"));
+        assert_eq!(
+            direct_sign_in(&format!(
+                "{}\n",
+                page("http%3A%2F%2Flocalhost%3A34503%2Fcallback")
+            ))
+            .map(|d| d.port),
+            Some(34503)
+        );
+        // The page with a code, another host, port or path, or a second
+        // redirect, isn't one.
+        assert_eq!(
+            direct_sign_in(&page(
+                "https%3A%2F%2Fplatform.claude.com%2Foauth%2Fcode%2Fcallback"
+            )),
+            None
+        );
+        assert_eq!(
+            direct_sign_in(&page("http%3A%2F%2Fevil.example%3A34503%2Fcallback")),
+            None
+        );
+        assert_eq!(
+            direct_sign_in(&page("http%3A%2F%2Flocalhost%3A80%2Fcallback")),
+            None
+        );
+        assert_eq!(
+            direct_sign_in(&page("http%3A%2F%2Flocalhost%3A99999%2Fcallback")),
+            None
+        );
+        assert_eq!(
+            direct_sign_in(&page("http%3A%2F%2Flocalhost%3A34503%2Fother")),
+            None
+        );
+        assert_eq!(
+            direct_sign_in(&page("http%3A%2F%2Flocalhost%3A%2B34503%2Fcallback")),
+            None
+        );
+        assert_eq!(
+            direct_sign_in(&format!(
+                "{}&redirect_uri=http%3A%2F%2Flocalhost%3A1%2Fcallback",
+                page("http%3A%2F%2Flocalhost%3A34503%2Fcallback")
+            )),
+            None
+        );
+        assert_eq!(direct_sign_in("https://evil.example/oauth/authorize?redirect_uri=http%3A%2F%2Flocalhost%3A34503%2Fcallback"), None);
+        assert_eq!(direct_sign_in("http://claude.ai/oauth/authorize?redirect_uri=http%3A%2F%2Flocalhost%3A34503%2Fcallback"), None);
+        assert_eq!(
+            direct_sign_in(
+                "https://claude.ai/a b?redirect_uri=http%3A%2F%2Flocalhost%3A34503%2Fcallback"
+            ),
+            None
+        );
+    }
     use crate::model::SessionState as S;
 
     fn token() -> String {
@@ -1217,4 +1287,83 @@ pub struct SignInView {
     pub name: String,
     #[serde(flatten)]
     pub state: SignInState,
+    /// For a sign-in made from another computer: the page that comes back
+    /// by itself, once `claude setup-token` has made it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub direct: Option<Direct>,
+}
+
+/// The sign-in page `claude setup-token` would open in a browser on the
+/// hub's computer: approved, it comes back to `http://localhost:{port}/callback`,
+/// where the CLI listens, and the sign-in finishes with no code to type.
+/// From another computer, its browser reaches that port only through a
+/// forward to it (Desk's, for the length of the sign-in).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Direct {
+    pub url: String,
+    pub port: u16,
+}
+
+/// The lowest port a sign-in's page may come back to: never a system one.
+const LOWEST_CALLBACK_PORT: u16 = 1024;
+
+/// `said` as a page that comes back by itself: one line, a sign-in page on
+/// Claude's own hosts, and one `redirect_uri` that is exactly
+/// `http://localhost:{port}/callback` on an unprivileged port.
+pub fn direct_sign_in(said: &str) -> Option<Direct> {
+    let url = said.trim();
+    if url.is_empty()
+        || url.len() > 4096
+        || url.chars().any(|c| c.is_whitespace() || c.is_control())
+    {
+        return None;
+    }
+    if !sign_in_host(url) {
+        return None;
+    }
+    let query = url.split_once('?')?.1.split('#').next().unwrap_or_default();
+    let mut redirects = query
+        .split('&')
+        .filter_map(|kv| kv.strip_prefix("redirect_uri="));
+    let redirect = percent_decoded(redirects.next()?)?;
+    if redirects.next().is_some() {
+        return None;
+    }
+    let port: u16 = redirect
+        .strip_prefix("http://localhost:")?
+        .strip_suffix("/callback")?
+        .parse()
+        .ok()?;
+    (port >= LOWEST_CALLBACK_PORT && redirect == format!("http://localhost:{port}/callback")).then(
+        || Direct {
+            url: url.to_string(),
+            port,
+        },
+    )
+}
+
+/// A query value with its `%XX` escapes (and `+`) read; none when an
+/// escape is broken or it isn't UTF-8.
+fn percent_decoded(value: &str) -> Option<String> {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' => {
+                let hex = std::str::from_utf8(bytes.get(i + 1..i + 3)?).ok()?;
+                out.push(u8::from_str_radix(hex, 16).ok()?);
+                i += 3;
+            }
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8(out).ok()
 }

@@ -53,6 +53,78 @@ pub(super) struct SignInRun {
     view: SignInView,
     make_default: bool,
     pty: Arc<Pty>,
+    /// For a sign-in made from another computer: where the page that comes
+    /// back by itself is caught.
+    relay: Option<Arc<Relay>>,
+}
+
+/// What `claude setup-token` would open in a browser on this computer,
+/// caught for a sign-in made from another one: `BROWSER` names a script of
+/// Desk's that writes the page down, in a folder only this user can open,
+/// and says it couldn't open it, so the CLI also shows its page with a
+/// code (what the person falls back on when the page can't come back).
+/// The folder goes with the sign-in.
+pub(super) struct Relay {
+    dir: std::path::PathBuf,
+}
+
+impl Relay {
+    fn new(run_dir: &std::path::Path) -> eyre::Result<Self> {
+        use eyre::WrapErr;
+        use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+        std::fs::create_dir_all(run_dir)
+            .wrap_err_with(|| format!("making {}", run_dir.display()))?;
+        let dir = run_dir.join(format!("s-{}", Uuid::new_v4().simple()));
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&dir)
+            .wrap_err_with(|| format!("making {}", dir.display()))?;
+        let relay = Self { dir };
+        let page = shell_quoted(&relay.page().display().to_string());
+        let script = format!(
+            "#!/bin/sh\n\
+             # Desk: the sign-in page, for Desk to open on the person's own computer.\n\
+             umask 077\n\
+             printf '%s\\n' \"$1\" > {page}.new && mv -f {page}.new {page}\n\
+             exit 1\n"
+        );
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o700)
+            .open(relay.browser())
+            .wrap_err("making the sign-in's browser")?;
+        f.write_all(script.as_bytes())?;
+        Ok(relay)
+    }
+
+    /// What `BROWSER` names.
+    fn browser(&self) -> std::path::PathBuf {
+        self.dir.join("open")
+    }
+
+    fn page(&self) -> std::path::PathBuf {
+        self.dir.join("page")
+    }
+
+    /// The page, once the CLI has made it, and only one that comes back to
+    /// a localhost callback on Claude's own hosts.
+    fn direct(&self) -> Option<accounts::Direct> {
+        let said = std::fs::read_to_string(self.page()).ok()?;
+        accounts::direct_sign_in(&said)
+    }
+}
+
+impl Drop for Relay {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// `word` as one word to `sh`, in single quotes.
+fn shell_quoted(word: &str) -> String {
+    format!("'{}'", word.replace('\'', r"'\''"))
 }
 
 impl Desk {
@@ -434,7 +506,7 @@ impl Desk {
                 Ok(Added::Account { account: view })
             }
             None => self
-                .start_sign_in(new.engine, name, new.make_default)
+                .start_sign_in(new.engine, name, new.make_default, new.remote)
                 .map(|sign_in| Added::SignIn { sign_in }),
         }
     }
@@ -485,11 +557,16 @@ impl Desk {
     /// Starts `claude setup-token` on a terminal of the hub's own, which no
     /// one is shown: its screen is read here for the sign-in page, whether
     /// it asks for a code, and the token it prints.
+    ///
+    /// For a sign-in made from another computer (`remote`), the page the CLI
+    /// would open in a browser here is caught instead ([`Relay`]), for Desk
+    /// to open there.
     fn start_sign_in(
         &self,
         engine: Engine,
         name: String,
         make_default: bool,
+        remote: bool,
     ) -> Result<SignInView, DeskError> {
         let program = self.program_of(engine)?.to_path_buf();
         let mut env = self.with_added(&self.0.state.lock().session_env.clone());
@@ -497,6 +574,20 @@ impl Desk {
             env.remove(k);
         }
         env.remove(accounts::CLAUDE_TOKEN_ENV);
+        // Without one, the sign-in goes on with its page and a code.
+        let relay = match remote {
+            true => match Relay::new(&self.0.opts.run_dir) {
+                Ok(r) => Some(Arc::new(r)),
+                Err(e) => {
+                    tracing::warn!(error = %format!("{e:#}"), "couldn't catch a sign-in's page: it goes on with a code");
+                    None
+                }
+            },
+            false => None,
+        };
+        if let Some(r) = &relay {
+            env.insert("BROWSER".into(), r.browser().display().to_string());
+        }
         let spec = Spawn {
             program,
             args: vec!["setup-token".into()],
@@ -515,6 +606,7 @@ impl Desk {
             engine,
             name,
             state: SignInState::Starting,
+            direct: None,
         };
         self.0.state.lock().sign_in_runs.insert(
             view.id,
@@ -522,6 +614,7 @@ impl Desk {
                 view: view.clone(),
                 make_default,
                 pty: Arc::new(pty),
+                relay,
             },
         );
         self.announce(DeskEvent::AccountSignIn {
@@ -540,7 +633,28 @@ impl Desk {
             if run.view.state == state {
                 return;
             }
+            // Once it's over, there's no page to come back to.
+            if state.is_over() {
+                run.view.direct = None;
+                run.relay = None;
+            }
             run.view.state = state;
+            run.view.clone()
+        };
+        self.announce(DeskEvent::AccountSignIn { sign_in: view });
+    }
+
+    /// The page that comes back by itself, once its CLI has made it.
+    fn sign_in_direct(&self, id: Uuid, direct: accounts::Direct) {
+        let view = {
+            let mut st = self.0.state.lock();
+            let Some(run) = st.sign_in_runs.get_mut(&id) else {
+                return;
+            };
+            if run.view.direct.as_ref() == Some(&direct) || run.view.state.is_over() {
+                return;
+            }
+            run.view.direct = Some(direct);
             run.view.clone()
         };
         self.announce(DeskEvent::AccountSignIn { sign_in: view });
@@ -559,7 +673,7 @@ impl Desk {
         let mut refused: Option<String> = None;
         let mut exited = false;
         let outcome = loop {
-            let Some((pty, make_default, engine, name)) = ({
+            let Some((pty, make_default, engine, name, relay)) = ({
                 let st = self.0.state.lock();
                 st.sign_in_runs.get(&id).map(|r| {
                     (
@@ -567,11 +681,15 @@ impl Desk {
                         r.make_default,
                         r.view.engine,
                         r.view.name.clone(),
+                        r.relay.clone(),
                     )
                 })
             }) else {
                 return; // cancelled
             };
+            if let Some(direct) = relay.as_deref().and_then(Relay::direct) {
+                self.sign_in_direct(id, direct);
+            }
             let said = accounts::setup_said(&pty.text());
             let fresh: Vec<String> = said
                 .candidates
