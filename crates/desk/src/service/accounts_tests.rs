@@ -41,7 +41,8 @@ fn claude(dir: &Path) -> PathBuf {
                '') echo '{{\"loggedIn\":true,\"authMethod\":\"claude.ai\"}}' ;;\n\
                *) echo '{{\"loggedIn\":false}}' ;;\n\
              esac ;;\n\
-             'setup-token ') echo 'Browser did not open? Use the url below to sign in:'\n\
+             'setup-token ') [ -n \"$BROWSER\" ] && \"$BROWSER\" 'https://claude.ai/oauth/authorize?code=true&redirect_uri=http%3A%2F%2Flocalhost%3A45678%2Fcallback&state=s1'\n\
+               echo 'Browser did not open? Use the url below to sign in:'\n\
                echo 'https://claude.ai/oauth/authorize?code=true&state=s1'\n\
                printf 'Paste code here if prompted > '\n\
                read code\n\
@@ -151,6 +152,7 @@ async fn paste(d: &Desk, name: &str, token: &str, make_default: bool) -> Uuid {
             name: name.into(),
             token: Some(token.into()),
             make_default,
+            remote: false,
         })
         .await
         .unwrap()
@@ -252,6 +254,7 @@ async fn a_pasted_token_is_kept_only_once_claude_code_signs_in_by_it() {
                 name: "Work".into(),
                 token: Some("sk-ant-oat01-revoked-0123456789abcdefghijklmnop".into()),
                 make_default: false,
+                remote: false,
             })
             .await
             .unwrap_err();
@@ -264,6 +267,7 @@ async fn a_pasted_token_is_kept_only_once_claude_code_signs_in_by_it() {
                 name: "work".into(),
                 token: Some(OTHER.into()),
                 make_default: false,
+                remote: false,
             })
             .await
             .unwrap_err();
@@ -274,6 +278,7 @@ async fn a_pasted_token_is_kept_only_once_claude_code_signs_in_by_it() {
                 name: "Personal".into(),
                 token: Some(OTHER.into()),
                 make_default: false,
+                remote: false,
             })
             .await
             .unwrap_err();
@@ -304,6 +309,7 @@ async fn signing_in_reads_the_page_takes_the_code_and_keeps_the_token_it_prints(
                 name: "Personal".into(),
                 token: None,
                 make_default: true,
+                remote: false,
             })
             .await
             .unwrap()
@@ -352,6 +358,224 @@ async fn signing_in_reads_the_page_takes_the_code_and_keeps_the_token_it_prints(
         assert!(d.sign_in_code(sign_in.id, "late").is_err(), "it has ended");
     })
     .await;
+}
+
+#[tokio::test]
+async fn a_sign_in_from_another_computer_is_given_the_page_that_comes_back_by_itself() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = Arc::new(MemoryKeys::default());
+        let o = account_options(dir.path(), keys.clone());
+        let run_dir = o.run_dir.clone();
+        let d = desk(pool, o).await;
+        let start = |name: &str, remote: bool| {
+            d.add_account(NewAccount {
+                engine: Engine::Claude,
+                name: name.into(),
+                token: None,
+                make_default: true,
+                remote,
+            })
+        };
+        let Added::SignIn { sign_in } = start("Remote", true).await.unwrap() else {
+            panic!("no token: it signs in");
+        };
+        let view = || {
+            d.account_sign_ins()
+                .into_iter()
+                .find(|s| s.id == sign_in.id)
+                .unwrap()
+        };
+        let (_, mut events) = d.subscribe();
+        for _ in 0..200 {
+            if view().direct_ready && matches!(view().state, SignInState::Code { .. }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let direct = d
+            .sign_in_direct(sign_in.id)
+            .expect("the page that comes back");
+        while let Ok(e) = events.try_recv() {
+            assert!(
+                !serde_json::to_string(&e).unwrap().contains("45678"),
+                "never announced"
+            );
+        }
+        assert_eq!(direct.port, 45678);
+        assert!(direct
+            .url
+            .contains("redirect_uri=http%3A%2F%2Flocalhost%3A45678%2Fcallback"));
+        // The code is still there to fall back on.
+        assert!(matches!(view().state, SignInState::Code { url: Some(_) }));
+        let caught = || {
+            std::fs::read_dir(&run_dir)
+                .map(|r| {
+                    r.flatten()
+                        .filter(|e| e.file_name().to_string_lossy().starts_with("s-"))
+                        .count()
+                })
+                .unwrap_or(0)
+        };
+        assert_eq!(caught(), 1);
+        d.sign_in_code(sign_in.id, "c0de").unwrap();
+        for _ in 0..200 {
+            if matches!(view().state, SignInState::Done { .. }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(matches!(view().state, SignInState::Done { .. }));
+        assert_eq!(view().direct, None, "over: nothing to come back to");
+        assert!(d.sign_in_direct(sign_in.id).is_err());
+        assert_eq!(caught(), 0, "its folder goes with it");
+
+        // From this computer, the CLI opens its own browser as it always has.
+        let Added::SignIn { sign_in: here } = start("Here", false).await.unwrap() else {
+            panic!("no token: it signs in");
+        };
+        for _ in 0..200 {
+            if d.account_sign_ins()
+                .iter()
+                .any(|s| s.id == here.id && matches!(s.state, SignInState::Code { .. }))
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let here = d
+            .account_sign_ins()
+            .into_iter()
+            .find(|s| s.id == here.id)
+            .unwrap();
+        assert!(matches!(here.state, SignInState::Code { .. }));
+        assert_eq!(here.direct, None);
+        assert_eq!(caught(), 0);
+    })
+    .await;
+}
+
+/// A stand-in Codex: says its version, signs in by its device page once
+/// the test says the person approved it, and says whether it is signed in.
+fn codex(dir: &Path) -> PathBuf {
+    let path = dir.join("codex");
+    let d = dir.display();
+    std::fs::write(
+        &path,
+        format!(
+            "#!/bin/sh\ncase \"$1 $2\" in\n\
+             '--version ') echo 'codex-cli 0.166.0' ;;\n\
+             'login status') if [ -e '{d}/approved' ]; then echo 'Logged in using ChatGPT' >&2; else echo 'Not logged in' >&2; fi ;;\n\
+             'login --device-auth') echo 'Follow these steps to sign in with ChatGPT using device code authorization:'\n\
+               echo '1. Open this link in your browser and sign in to your account'\n\
+               echo '   https://auth.openai.com/codex/device'\n\
+               echo '2. Enter this one-time code (expires in 15 minutes)'\n\
+               echo '   WXYZ-98765'\n\
+               while [ ! -e '{d}/approved' ] && [ ! -e '{d}/refused' ]; do sleep 0.05; done\n\
+               [ -e '{d}/approved' ] || exit 1 ;;\n\
+             esac\n"
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+#[tokio::test]
+async fn codex_signs_in_by_its_device_page_and_its_sign_in_is_read_again_at_once() {
+    use super::engine_sign_ins::EngineSignInState;
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let mut o = account_options(dir.path(), Arc::new(MemoryKeys::default()));
+        o.programs.insert(Engine::Codex, codex(dir.path()));
+        let d = desk(pool, o).await;
+        assert!(
+            d.start_engine_sign_in(Engine::Claude).is_err(),
+            "Claude signs in another way"
+        );
+        let started = d.start_engine_sign_in(Engine::Codex).unwrap();
+        assert_eq!(started.state, EngineSignInState::Starting);
+        let state = || d.engine_sign_in(started.id).map(|v| v.state);
+        for _ in 0..200 {
+            if matches!(state(), Ok(EngineSignInState::Device { .. })) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert_eq!(
+            state().unwrap(),
+            EngineSignInState::Device {
+                url: "https://auth.openai.com/codex/device".into(),
+                code: "WXYZ-98765".into()
+            }
+        );
+        std::fs::write(dir.path().join("approved"), "").unwrap();
+        for _ in 0..200 {
+            if state().unwrap() == EngineSignInState::Done {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert_eq!(state().unwrap(), EngineSignInState::Done);
+        let mut signed_in = false;
+        for _ in 0..200 {
+            signed_in = d.engines().iter().any(|e| {
+                e.engine == Engine::Codex && matches!(e.sign_in, crate::engine::SignIn::In { .. })
+            });
+            if signed_in {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(signed_in, "read again at once, not at the next hourly look");
+
+        // A newer one ends the last; one the page never approved fails in plain words.
+        std::fs::remove_file(dir.path().join("approved")).unwrap();
+        let first = d.start_engine_sign_in(Engine::Codex).unwrap();
+        let second = d.start_engine_sign_in(Engine::Codex).unwrap();
+        assert!(d.engine_sign_in(first.id).is_err());
+        std::fs::write(dir.path().join("refused"), "").unwrap();
+        for _ in 0..200 {
+            if matches!(
+                d.engine_sign_in(second.id).unwrap().state,
+                EngineSignInState::Failed { .. }
+            ) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert_eq!(
+            d.engine_sign_in(second.id).unwrap().state,
+            EngineSignInState::Failed {
+                why: super::engine_sign_ins::DEVICE_FAILED.into()
+            }
+        );
+        assert!(d.cancel_engine_sign_in(second.id).is_ok());
+        assert!(d.engine_sign_in(second.id).is_err());
+    })
+    .await;
+}
+
+#[test]
+fn a_sign_ins_page_is_never_caught_under_a_folder_others_may_write_to() {
+    let dir = tempfile::tempdir().unwrap();
+    // One of the person's own that others could write to is closed to them first.
+    let open = dir.path().join("open-to-all");
+    std::fs::create_dir(&open).unwrap();
+    std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o777)).unwrap();
+    drop(super::accounts::Relay::new(&open).unwrap());
+    assert_eq!(
+        std::fs::metadata(&open).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    // Someone else's (the system's own `/`) is never used.
+    assert!(super::accounts::Relay::new(Path::new("/")).is_err());
+    let mine = dir.path().join("mine");
+    let relay = super::accounts::Relay::new(&mine).unwrap();
+    let browser = std::fs::metadata(relay.browser()).unwrap();
+    assert_eq!(browser.permissions().mode() & 0o777, 0o700);
+    let folder = std::fs::metadata(relay.browser().parent().unwrap()).unwrap();
+    assert_eq!(folder.permissions().mode() & 0o777, 0o700);
 }
 
 #[tokio::test]
@@ -482,6 +706,7 @@ async fn a_desk_that_keeps_no_accounts_starts_every_session_on_its_own_sign_in()
                 name: "Work".into(),
                 token: Some(GOOD.into()),
                 make_default: false,
+                remote: false,
             })
             .await
             .is_err());
@@ -498,6 +723,11 @@ fn accounts_and_sign_ins_reach_desk_in_its_wire_shape() {
         state: SignInState::Code {
             url: Some("https://claude.ai/oauth/authorize".into()),
         },
+        direct: Some(crate::engine_accounts::Direct {
+            url: "https://claude.ai/oauth/authorize?redirect_uri=x".into(),
+            port: 46009,
+        }),
+        direct_ready: true,
     };
     let event = serde_json::to_value(crate::model::DeskEvent::AccountSignIn {
         sign_in: sign_in.clone(),
@@ -506,6 +736,10 @@ fn accounts_and_sign_ins_reach_desk_in_its_wire_shape() {
     assert_eq!(event["type"], "accountSignIn");
     assert_eq!(event["signIn"]["state"], "code");
     assert_eq!(event["signIn"]["url"], "https://claude.ai/oauth/authorize");
+    // The page that comes back is never announced, only that it can be asked for.
+    assert!(event["signIn"].get("direct").is_none());
+    assert!(!event.to_string().contains("46009"));
+    assert_eq!(event["signIn"]["directReady"], true);
     let added = serde_json::to_value(Added::SignIn { sign_in }).unwrap();
     assert_eq!(added["kind"], "signIn");
     assert_eq!(added["signIn"]["name"], "Work");

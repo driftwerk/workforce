@@ -453,12 +453,61 @@ impl Accounts for HubAccounts {
     }
 }
 
+/// Where Desk's per-session sockets, sessions' token FIFOs and sign-ins'
+/// browsers go: a folder of this user's in the temp folder, never one every
+/// user shares. (Not `XDG_RUNTIME_DIR`: on a machine without linger it goes
+/// when the last login does, under the hub's running sessions.)
+fn run_dir() -> PathBuf {
+    #[cfg(unix)]
+    // SAFETY: geteuid has no preconditions.
+    let uid = unsafe { libc::geteuid() };
+    #[cfg(not(unix))]
+    let uid = 0;
+    run_dir_in(&std::env::temp_dir(), uid, workforce_desk::private_run_dir)
+}
+
+/// [`run_dir`] under `temp` for `uid`: `wf-desk-<uid>` (as root, as in a
+/// container, the `wf-desk` it has always been), once `private` takes it as
+/// this user's own. When it doesn't (someone else made it first, or it is a
+/// link), a new folder of this user's with a name no one can guess, so
+/// sessions still start.
+fn run_dir_in(temp: &Path, uid: u32, private: impl Fn(&Path) -> eyre::Result<()>) -> PathBuf {
+    let known = match uid {
+        0 => temp.join("wf-desk"),
+        uid => temp.join(format!("wf-desk-{uid}")),
+    };
+    match private(&known) {
+        Ok(()) => return known,
+        Err(e) => tracing::warn!(
+            dir = %known.display(),
+            error = %format!("{e:#}"),
+            "Desk's run folder isn't this user's own: using a new private one"
+        ),
+    }
+    for _ in 0..8 {
+        // Short: a session's socket path there is capped at 104 bytes on macOS.
+        let name = uuid::Uuid::new_v4().simple().to_string();
+        let dir = temp.join(format!("wfd-{}", &name[..10]));
+        #[cfg(unix)]
+        let made = {
+            use std::os::unix::fs::DirBuilderExt;
+            std::fs::DirBuilder::new().mode(0o700).create(&dir)
+        };
+        #[cfg(not(unix))]
+        let made = std::fs::create_dir(&dir);
+        if made.is_ok() && private(&dir).is_ok() {
+            return dir;
+        }
+    }
+    known
+}
+
 fn options(config: &WorkforceConfig) -> Options {
     let desk = &config.desk;
     Options {
         programs: programs(desk),
         env: std::env::vars().collect(),
-        run_dir: std::env::temp_dir().join("wf-desk"),
+        run_dir: run_dir(),
         scrollback_bytes: desk.scrollback_kb.saturating_mul(1024),
         approval_timeout: Duration::from_secs(desk.approval_timeout_secs.max(10)),
         restore: match desk.restore {
@@ -682,6 +731,32 @@ pub async fn mount(
 
 #[cfg(test)]
 mod tests {
+
+    #[cfg(unix)]
+    #[test]
+    fn a_run_folder_someone_else_made_first_is_passed_over_for_a_new_private_one() {
+        let temp = tempfile::tempdir().unwrap();
+        let mine = run_dir_in(temp.path(), 1000, workforce_desk::private_run_dir);
+        assert_eq!(mine, temp.path().join("wf-desk-1000"));
+        assert_eq!(
+            run_dir_in(temp.path(), 0, workforce_desk::private_run_dir),
+            temp.path().join("wf-desk")
+        );
+        // Made first as a link to somewhere else (as another user could).
+        let elsewhere = temp.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, temp.path().join("wf-desk-1001")).unwrap();
+        let other = run_dir_in(temp.path(), 1001, workforce_desk::private_run_dir);
+        assert_ne!(other, temp.path().join("wf-desk-1001"));
+        assert!(other.starts_with(temp.path()));
+        assert!(workforce_desk::private_run_dir(&other).is_ok());
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&other).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+    }
+
     use super::*;
     use crate::credentials::Modality;
     use axum::response::IntoResponse;

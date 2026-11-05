@@ -11900,6 +11900,7 @@ dependencies = [
  "tower",
  "tracing",
  "unicode-normalization",
+ "url",
  "uuid",
  "vt100",
  "workforce-build-support",
