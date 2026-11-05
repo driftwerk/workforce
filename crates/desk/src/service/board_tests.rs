@@ -1219,3 +1219,164 @@ async fn a_deleted_groups_boards_become_ungrouped() {
     })
     .await;
 }
+
+#[tokio::test]
+async fn an_assignment_made_over_a_change_meanwhile_keeps_it_and_links_once() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let b = board(&d, "Acme").await;
+        let t = ticket(&d, b.id, "Fix the login", TicketState::Todo).await;
+        let s = session(&d, dir.path(), "acme-web", "").await;
+        // As a new session's start does: the ticket was read before the
+        // person pinned it.
+        let read = d.0.store.ticket(t.ticket.id).await.unwrap().unwrap();
+        d.edit_ticket(
+            t.ticket.id,
+            TicketPatch {
+                pinned: Some(true),
+                ..Default::default()
+            },
+            &By::you(),
+        )
+        .await
+        .unwrap();
+        let v = d
+            .assign_session(read, "ACM-1", s.clone(), &By::you(), false)
+            .await
+            .unwrap();
+        assert_eq!(v.ticket.session(), Some(s.id));
+        assert!(v.ticket.pinned, "the pin made meanwhile stays");
+        let links = d.ticket(t.ticket.id).await.unwrap().ticket.links;
+        assert_eq!(links, vec![crate::board::Link::Session { session: s.id }]);
+        assert_eq!(d.list().len(), 1, "no second session");
+    })
+    .await;
+}
+
+/// An agent crew that checks the board already says the ticket is its
+/// when it is handed, and can refuse.
+struct Checking {
+    store: std::sync::Arc<crate::store::DeskStore>,
+    ticket: Uuid,
+    refuse: bool,
+}
+
+#[async_trait::async_trait]
+impl Crew for Checking {
+    fn overseer(&self) -> Option<Overseer> {
+        None
+    }
+    fn agents(&self) -> Vec<CrewAgent> {
+        vec![CrewAgent {
+            id: "scout".into(),
+            name: "Scout".into(),
+            live: None,
+        }]
+    }
+    fn midnight(&self) -> chrono::DateTime<Utc> {
+        Utc::now()
+    }
+    async fn accept(&self, _: &Suggestion) -> Result<(), String> {
+        Ok(())
+    }
+    async fn assign(&self, _: &str, _: &str) -> Result<String, String> {
+        let t = self.store.ticket(self.ticket).await.unwrap().unwrap();
+        assert_eq!(
+            t.assignee,
+            Some(Party::agent("scout", "Scout")),
+            "saved first"
+        );
+        match self.refuse {
+            true => Err("Scout is busy.".into()),
+            false => Ok("gave Scout".into()),
+        }
+    }
+}
+
+#[tokio::test]
+async fn an_agent_is_handed_a_ticket_only_once_the_board_says_its_its() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let b = board(&d, "Acme").await;
+        let t = ticket(&d, b.id, "Fix the login", TicketState::Todo).await;
+        let refusing: std::sync::Arc<dyn Crew> = std::sync::Arc::new(Checking {
+            store: d.0.store.clone(),
+            ticket: t.ticket.id,
+            refuse: true,
+        });
+        d.answer_lines_with(&refusing);
+        let refused = d
+            .assign_ticket(
+                t.ticket.id,
+                Some(AssignTo::Agent("scout".into())),
+                &By::you(),
+            )
+            .await;
+        assert!(
+            matches!(&refused, Err(DeskError::Conflict(m)) if m == "Scout is busy."),
+            "{refused:?}"
+        );
+        let v = d.ticket(t.ticket.id).await.unwrap();
+        assert_eq!(
+            (v.ticket.assignee, v.ticket.state),
+            (None, TicketState::Todo),
+            "not handed: put back"
+        );
+        let taking: std::sync::Arc<dyn Crew> = std::sync::Arc::new(Checking {
+            store: d.0.store.clone(),
+            ticket: t.ticket.id,
+            refuse: false,
+        });
+        d.answer_lines_with(&taking);
+        let v = d
+            .assign_ticket(
+                t.ticket.id,
+                Some(AssignTo::Agent("scout".into())),
+                &By::you(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(v.ticket.state, TicketState::Doing);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_board_whose_group_is_gone_is_ungrouped_when_the_hub_starts() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        crate::store::DeskStore::migrate(&pool).await.unwrap();
+        let store = crate::store::DeskStore::with_pool(pool.clone())
+            .await
+            .unwrap();
+        // A sidebar naming a session the registry no longer has, and a
+        // board in a group that is gone.
+        let layout = super::super::Layout {
+            groups: vec![super::super::Group {
+                id: "g-acme".into(),
+                name: "Acme".into(),
+                collapsed: false,
+                items: vec![super::super::session_item(Uuid::new_v4())],
+            }],
+            ungrouped: Default::default(),
+        };
+        store.put_layout(&layout).await.unwrap();
+        let id = Uuid::new_v4();
+        let client = pool.get().await.unwrap();
+        client
+            .execute(
+                "INSERT INTO boards (id, name, group_id, prefix, created_at, updated_at) \
+                 VALUES ($1, 'Atlas', 'g-gone', 'ATL', now(), now())",
+                &[&id],
+            )
+            .await
+            .unwrap();
+        drop(client);
+        let d = desk(pool, dir.path()).await;
+        let b = d.boards().await.unwrap().remove(0);
+        assert_eq!((b.id, b.group), (id, None));
+    })
+    .await;
+}

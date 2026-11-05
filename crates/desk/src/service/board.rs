@@ -815,7 +815,10 @@ impl Desk {
                         Some(by.clone()),
                     )
                     .await?;
-                // Its prompt is the ticket: no message on its line too.
+                // Its prompt is the ticket: no message on its line too. The
+                // ticket is read again: it may have changed while the
+                // session started, and is never started for twice.
+                let t = self.ticket_of(id).await?;
                 self.assign_session(t, &key, view, by, false).await
             }
             Some(AssignTo::Agent(agent)) => self.assign_agent(t, &key, &agent, by).await,
@@ -865,19 +868,30 @@ impl Desk {
                 view.label()
             )));
         }
-        let at = now();
         let party = Party::session(&view);
+        let mut at = now();
+        loop {
+            t.assignee = Some(party.clone());
+            self.to_column(&mut t, TicketState::Doing, at).await?;
+            match self.0.store.put_ticket(&mut t).await {
+                Ok(()) => break,
+                Err(TicketWrite::Stale) => {
+                    // Changed meanwhile (a pin, an edit): assigned over
+                    // what it is now.
+                    t = self.ticket_of(t.id).await?;
+                    at = now();
+                }
+                Err(e) => return Err(stale(e)),
+            }
+        }
         self.0
             .store
             .put_link(t.id, &Link::Session { session: view.id }, at)
             .await
             .map_err(internal)?;
-        t.assignee = Some(party.clone());
-        self.to_column(&mut t, TicketState::Doing, at).await?;
         if !t.links.contains(&Link::Session { session: view.id }) {
             t.links.push(Link::Session { session: view.id });
         }
-        self.save_ticket(&mut t).await?;
         if view.goal.trim().is_empty() {
             self.update(
                 view.id,
@@ -925,14 +939,30 @@ impl Desk {
             .find(|a| a.id == agent)
             .map(|a| a.name)
             .ok_or_else(|| DeskError::Invalid(format!("There's no agent called {agent} here.")))?;
-        let needs = self.need_keys(&t).await?;
-        crew.assign(agent, &board::handed_text(key, &t, &needs))
-            .await
-            .map_err(DeskError::Conflict)?;
         let party = Party::agent(agent, &name);
-        t.assignee = Some(party.clone());
-        self.to_column(&mut t, TicketState::Doing, now()).await?;
-        self.save_ticket(&mut t).await?;
+        let was = (t.assignee.clone(), t.state, t.rank, t.state_at);
+        loop {
+            t.assignee = Some(party.clone());
+            self.to_column(&mut t, TicketState::Doing, now()).await?;
+            match self.0.store.put_ticket(&mut t).await {
+                Ok(()) => break,
+                Err(TicketWrite::Stale) => t = self.ticket_of(t.id).await?,
+                Err(e) => return Err(stale(e)),
+            }
+        }
+        // Saved first: the agent is handed only what the board says is its.
+        let needs = self.need_keys(&t).await?;
+        if let Err(e) = crew
+            .assign(agent, &board::handed_text(key, &t, &needs))
+            .await
+        {
+            let mut back = t.clone();
+            (back.assignee, back.state, back.rank, back.state_at) = was;
+            if let Err(undo) = self.0.store.put_ticket(&mut back).await {
+                tracing::warn!(ticket = %t.id, error = %undo, "an agent's ticket stays assigned though it wasn't handed");
+            }
+            return Err(DeskError::Conflict(e));
+        }
         let text = format!("gave {key} to {name}");
         self.ticket_changed(t, by, Kind::TicketAssigned, Some(party), text)
             .await

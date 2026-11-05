@@ -805,24 +805,25 @@ fn cli_env(base: &BTreeMap<String, String>) -> BTreeMap<String, String> {
 
 /// The layout without sessions the registry no longer has (forgotten
 /// before the hub took them out of it, or by an older hub). A failure to
-/// save it is only logged: the next start tries again.
+/// save it is only logged: the next start tries again. With it, the boards
+/// it ungrouped (their group was gone).
 async fn prune_layout(
     store: &DeskStore,
     layout: Layout,
     records: &HashMap<Uuid, SessionRecord>,
-) -> Layout {
+) -> (Layout, Vec<Uuid>) {
     let pruned = layout.without_sessions(|id| !records.contains_key(&id));
     if pruned == layout {
-        return layout;
+        return (layout, vec![]);
     }
     match store.put_layout(&pruned).await {
-        Ok(_) => pruned,
+        Ok(ungrouped) => (pruned, ungrouped),
         Err(e) => {
             tracing::warn!(
                 error = format!("{e:#}"),
                 "couldn't take forgotten sessions out of the sidebar's layout"
             );
-            layout
+            (layout, vec![])
         }
     }
 }
@@ -984,7 +985,7 @@ impl Desk {
             }
             records.insert(r.id, r);
         }
-        let layout = prune_layout(&store, layout, &records).await;
+        let (layout, ungrouped_boards) = prune_layout(&store, layout, &records).await;
         // Taken up before anything the sessions do is seen, so what they do
         // next carries on the turns they were in.
         let turns = match floor.turns.as_deref() {
@@ -1056,6 +1057,7 @@ impl Desk {
         tokio::spawn(desk.clone().breaker_loop());
         desk.charge_load().await;
         tokio::spawn(desk.clone().charge_loop());
+        desk.boards_ungrouped(&ungrouped_boards).await;
         tokio::spawn(desk.clone().watch_background());
         tokio::spawn(desk.clone().line_loop());
         recovered.into_iter().for_each(|r| desk.save(r));
