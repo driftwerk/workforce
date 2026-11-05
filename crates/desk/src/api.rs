@@ -680,7 +680,7 @@ async fn pty(
 ) -> Response {
     guarded!(s, h, q);
     match s.desk.attach(id) {
-        Ok(pty) => ws.on_upgrade(move |socket| stream_pty(socket, pty)),
+        Ok(pty) => ws.on_upgrade(move |socket| stream_pty(socket, pty, "session", id)),
         Err(e) => e.into_response(),
     }
 }
@@ -708,14 +708,29 @@ fn pty_message(me: u64, frame: Frame) -> Option<Message> {
     }
 }
 
+/// Logs, when dropped, that a viewer left.
+struct Detached {
+    kind: &'static str,
+    id: Uuid,
+    me: u64,
+}
+
+impl Drop for Detached {
+    fn drop(&mut self) {
+        tracing::info!(kind = self.kind, id = %self.id, viewer = self.me, "terminal viewer detached");
+    }
+}
+
 /// Binary frames carry terminal bytes both ways; text frames carry control
 /// messages: `resize` and `claim` from the viewer, `size` and `role` to it.
 /// Only the active viewer's keys and size reach the terminal; a viewer that
 /// falls behind is sent the screen again rather than losing bytes.
-async fn stream_pty(socket: WebSocket, pty: Arc<crate::pty::Pty>) {
+async fn stream_pty(socket: WebSocket, pty: Arc<crate::pty::Pty>, kind: &'static str, id: Uuid) {
     let (mut tx, mut rx) = socket.split();
     let (viewer, frames, mut output) = pty.attach();
     let me = viewer.id();
+    tracing::info!(kind, id = %id, viewer = me, "terminal viewer attached");
+    let _detached = Detached { kind, id, me };
     for frame in frames {
         if let Some(m) = pty_message(me, frame) {
             if tx.send(m).await.is_err() {
@@ -758,13 +773,60 @@ async fn stream_pty(socket: WebSocket, pty: Arc<crate::pty::Pty>) {
                             tracing::debug!(error = %e, "terminal resize failed");
                         }
                     }
-                    Ok(Control::Claim) => viewer.claim(),
+                    Ok(Control::Claim) => {
+                        tracing::info!(kind, id = %id, viewer = me, "terminal viewer claimed");
+                        viewer.claim();
+                    }
                     Err(e) => tracing::debug!(error = %e, "unknown terminal control message"),
                 },
                 Some(Ok(Message::Close(_))) | None | Some(Err(_)) => return,
                 Some(Ok(_)) => {}
             },
         }
+    }
+}
+
+#[derive(Deserialize)]
+struct FolderParams {
+    token: Option<String>,
+    path: Option<String>,
+    #[serde(default)]
+    hidden: bool,
+}
+
+impl IntoResponse for crate::folders::FolderError {
+    fn into_response(self) -> Response {
+        use crate::folders::FolderError as E;
+        let status = match self {
+            E::Outside => StatusCode::FORBIDDEN,
+            E::NotFound => StatusCode::NOT_FOUND,
+            E::NotAFolder => StatusCode::BAD_REQUEST,
+            E::NoHome => StatusCode::CONFLICT,
+            E::Unreadable => StatusCode::INTERNAL_SERVER_ERROR,
+        };
+        (status, Json(json!({ "error": self.to_string() }))).into_response()
+    }
+}
+
+/// The folders under the hub user's home or a live session's folder, for
+/// choosing where a session runs.
+async fn folders(State(s): S, h: HeaderMap, Query(q): Query<FolderParams>) -> Response {
+    guarded!(s, h, q_token(&q));
+    let (home, live) = (s.desk.home_folder(), s.desk.live_folders());
+    let listing = tokio::task::spawn_blocking(move || {
+        crate::folders::list(q.path.as_deref(), q.hidden, home.as_deref(), &live)
+    })
+    .await;
+    match listing {
+        Ok(Ok(l)) => Json(l).into_response(),
+        Ok(Err(e)) => e.into_response(),
+        Err(_) => crate::folders::FolderError::Unreadable.into_response(),
+    }
+}
+
+fn q_token(q: &FolderParams) -> TokenQuery {
+    TokenQuery {
+        token: q.token.clone(),
     }
 }
 
@@ -826,7 +888,7 @@ async fn terminal_pty(
 ) -> Response {
     guarded!(s, h, q);
     match s.desk.attach_terminal(id) {
-        Ok(pty) => ws.on_upgrade(move |socket| stream_pty(socket, pty)),
+        Ok(pty) => ws.on_upgrade(move |socket| stream_pty(socket, pty, "terminal", id)),
         Err(e) => e.into_response(),
     }
 }
@@ -1175,6 +1237,7 @@ pub fn sessions_router(desk: Desk, auth: Arc<dyn Authorize>) -> Router {
             "/api/desk/sessions/{id}/name",
             axum::routing::put(name_session),
         )
+        .route("/api/desk/folders", get(folders))
         .route("/api/desk/layout", get(layout).put(replace_layout))
         .route("/api/desk/layout/import", post(import_layout))
         .route("/api/desk/groups", get(layout).post(create_group))
@@ -1648,6 +1711,38 @@ mod tests {
             status,
             serde_json::from_slice(&bytes).unwrap_or(Value::Null),
         )
+    }
+
+    #[tokio::test]
+    async fn folders_are_listed_from_home_and_a_path_out_of_it_is_refused() {
+        with_test_pool(build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let home = dir.path().join("home");
+            std::fs::create_dir_all(home.join("app/.git")).unwrap();
+            std::fs::write(home.join("a-file"), "x").unwrap();
+            DeskStore::migrate(&pool).await.unwrap();
+            let mut opts = options(dir.path());
+            opts.env = BTreeMap::from([("HOME".into(), home.to_string_lossy().into_owned())]);
+            let desk = crate::Desk::start(
+                DeskStore::from_pool(pool),
+                opts,
+                Default::default(),
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            let app = super::sessions_router(desk, allow_all());
+            let (status, l) = call(&app, "GET", "/api/desk/folders", None).await;
+            assert_eq!(status, 200, "{l}");
+            assert_eq!(l["folders"].as_array().unwrap().len(), 1);
+            assert_eq!(l["folders"][0]["git"], true);
+            for path in ["..", "/etc"] {
+                let (status, _) =
+                    call(&app, "GET", &format!("/api/desk/folders?path={path}"), None).await;
+                assert_eq!(status, 403, "{path}");
+            }
+        })
+        .await;
     }
 
     #[tokio::test]

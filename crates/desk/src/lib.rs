@@ -28,6 +28,7 @@ mod cwd;
 pub mod engine;
 pub mod engine_accounts;
 pub mod floor;
+pub mod folders;
 pub mod gist;
 pub mod holder;
 pub mod ledger;
