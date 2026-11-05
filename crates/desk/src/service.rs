@@ -1907,6 +1907,22 @@ impl Desk {
         )
     }
 
+    /// The folders live sessions run in.
+    pub fn live_folders(&self) -> Vec<PathBuf> {
+        let st = self.0.state.lock();
+        st.live
+            .keys()
+            .filter_map(|id| st.records.get(id))
+            .map(|r| PathBuf::from(&r.cwd))
+            .collect()
+    }
+
+    /// The hub user's home folder.
+    pub fn home_folder(&self) -> Option<PathBuf> {
+        (self.0.env.get("HOME").map(PathBuf::from))
+            .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
+    }
+
     pub fn attach(&self, id: Uuid) -> Result<Arc<Pty>, DeskError> {
         self.0
             .state
