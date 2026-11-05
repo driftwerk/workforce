@@ -22,17 +22,30 @@ const TEAM_MEMBERS_TTL: Duration = Duration::from_secs(60);
 tokio::task_local! {
     /// Set over background work that may have no identity in scope by design.
     static UNOWNED_BY_DESIGN: ();
+    /// Set over work that may draw only on the person's own logins.
+    static PERSONAL_ONLY: ();
 }
 
 /// Run `work` as background work that may legitimately have no identity in
 /// scope, such as the floor's gists for a personal hub's Desk: a login it
 /// draws on is noted at debug, not warned of as an identity gap.
-pub async fn unowned_by_design<F: std::future::Future>(work: F) -> F::Output {
+pub(crate) async fn unowned_by_design<F: std::future::Future>(work: F) -> F::Output {
     UNOWNED_BY_DESIGN.scope((), work).await
 }
 
 fn is_unowned_by_design() -> bool {
     UNOWNED_BY_DESIGN.try_with(|_| ()).is_ok()
+}
+
+/// Run `work` on the person's own logins only (their personal tiers),
+/// never a login an agent or the hub shares, whatever the agent's
+/// `[llm.logins]` allows.
+pub(crate) async fn personal_logins_only<F: std::future::Future>(work: F) -> F::Output {
+    PERSONAL_ONLY.scope((), work).await
+}
+
+fn is_personal_only() -> bool {
+    PERSONAL_ONLY.try_with(|_| ()).is_ok()
 }
 
 /// The owner as last looked up, and for which configured or overridden owner.
@@ -164,12 +177,16 @@ impl AgentLogins {
     /// allows, skipping logins at their usage limit or refused for good.
     pub fn resolve(&self, kind: SubscriptionKind) -> Result<Login, NoLogin> {
         let payer = crate::user_config::current_payer();
+        let mut policy = self.config.snapshot().logins.clone();
+        if is_personal_only() {
+            policy.tiers.retain(|tier| !tier.is_shared());
+        }
         let login = resolve(
             kind,
             &self.vaults(),
             &payer,
             &self.owner(),
-            &self.config.snapshot().logins,
+            &policy,
             CooldownStore::global(),
             chrono::Utc::now(),
         )?;

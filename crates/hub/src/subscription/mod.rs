@@ -33,7 +33,8 @@ pub use device_login::{
 pub use llm::{
     ChatGptBackend, CredentialScope, PlanLogins, SubscriptionError, SubscriptionProvider,
 };
-pub use logins::{unowned_by_design, AgentLogins, OwnerOverride};
+pub(crate) use logins::{personal_logins_only, unowned_by_design};
+pub use logins::{AgentLogins, OwnerOverride};
 pub use pools::{Pool, SubscriptionPools};
 pub use resolve::{
     known_slots, login_state, resolve, slot_for, Credential, Login, LoginKey, Miss, NoLogin,

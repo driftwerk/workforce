@@ -10,6 +10,17 @@ use crate::postgres::PostgresConfig;
 use crate::session::{CompactionConfig, SessionContextType, SpillConfig};
 use crate::subscription::{CredentialTier, SharedServes};
 
+/// How the Floor's "What's happening" lines are written (`[floor]`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FloorConfig {
+    /// When an agent's own plan has no usable login, write a person's line
+    /// on another signed-in subscription provider's cheap tier, on that
+    /// person's own login only. Off by default: on a hub many people share
+    /// the line waits for the agent's own plan; Desk's local hub turns it on.
+    #[serde(default)]
+    pub fallback_providers: bool,
+}
+
 /// Claim grounding — fact-checks a code-shaped answer's claims against the
 /// project source and flags any the source contradicts, so the human knows
 /// what to double-check. Off by default; flip to `true` to enable.
@@ -272,6 +283,10 @@ pub struct WorkforceConfig {
     /// Subscription routes install-wide (`[subscription]`). Read at boot.
     #[serde(default)]
     pub subscription: SubscriptionConfig,
+    /// How the Floor's "What's happening" lines are written (`[floor]`).
+    /// Install-wide and read at boot.
+    #[serde(default)]
+    pub floor: FloorConfig,
     /// How tool calls and tool definitions are handled on their way to and
     /// from the model (`[tools]`). Install-wide and read at boot.
     #[serde(default)]
