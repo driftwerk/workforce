@@ -343,7 +343,7 @@ pub fn prompt(input: &Input<'_>) -> String {
         Some(g) => out.push_str(&format!(
             "The previous note:\nPURPOSE: {}\nNOW: {}\n",
             g.purpose.as_deref().unwrap_or("(none yet)"),
-            g.now
+            said(&g.now)
         )),
         None => out.push_str("There is no previous note.\n"),
     }
@@ -378,7 +378,7 @@ pub fn summary_prompt(entries: &[Happening]) -> String {
             if let Some(p) = &e.gist.purpose {
                 out.push_str(&format!(" {p}"));
             }
-            out.push_str(&format!(" {}\n", e.gist.now));
+            out.push_str(&format!(" {}\n", said(&e.gist.now)));
             out
         },
     )
@@ -658,6 +658,12 @@ pub fn unsaid(now: &str) -> String {
 /// Whether `now` carries [`UNSAID`].
 pub fn is_unsaid(now: &str) -> bool {
     now.ends_with(UNSAID)
+}
+
+/// `now` without [`UNSAID`]: what a model is shown, so it never writes the
+/// note out again.
+fn said(now: &str) -> &str {
+    now.strip_suffix(UNSAID).map_or(now, str::trim_end)
 }
 
 // ── What's happening ─────────────────────────────────────────────────────
@@ -1013,5 +1019,30 @@ mod tests {
         );
         assert!(is_unsaid(&noted));
         assert!(!is_unsaid("Now working on: Ship it."));
+        let kept = Gist {
+            purpose: None,
+            purpose_at: None,
+            now: noted.clone(),
+            now_at: crew::now(),
+            turn: Uuid::nil(),
+            by_model: false,
+        };
+        let asked = prompt(&Input {
+            kept: Some(&kept),
+            ..Default::default()
+        });
+        assert!(asked.contains("NOW: Now working on: Ship it.\n"), "{asked}");
+        assert!(!asked.contains(UNSAID), "the model is never shown the note");
+        let paragraph = summary_prompt(&[Happening {
+            who: Who {
+                kind: crate::crew::PartyKind::Agent,
+                id: "scout".into(),
+                name: "Scout".into(),
+                engine: None,
+            },
+            doing: Doing::Working,
+            gist: kept.said(),
+        }]);
+        assert!(!paragraph.contains(UNSAID), "{paragraph}");
     }
 }

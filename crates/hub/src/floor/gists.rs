@@ -141,6 +141,8 @@ enum Seen {
     /// A turn still open that this hub saw no beginning of: one begun
     /// before it started, as logged.
     Adopt(Box<Turn>),
+    /// A turn whose lookup failed, to be looked up again.
+    Unlooked(Uuid),
 }
 
 /// The gists' writer, as the log's writer and the floor's reads use it.
@@ -249,6 +251,9 @@ impl Gists {
                     }
                 }
                 Seen::Adopt(turn) => self.adopted(*turn, &mut floor),
+                Seen::Unlooked(turn) => {
+                    floor.looked.remove(&turn);
+                }
             }
         }
     }
@@ -317,6 +322,8 @@ impl Gists {
                 }
                 Ok(_) => {}
                 Err(e) => {
+                    // Looked up again on its next step.
+                    let _ = gists.0.tx.send(Seen::Unlooked(turn)).await;
                     warn!(target: "floor", error = %format!("{e:#}"), "reading a running turn for its gist failed")
                 }
             }
@@ -886,10 +893,14 @@ fn fallbacks<T>(primary: &str, others: impl IntoIterator<Item = (String, T)>) ->
 /// The answer to `system` and `user` for `owner`, on `primary`'s cheap
 /// model, else on another signed-in provider's ([`fallbacks`] of `others`)
 /// when `primary`'s plan has no usable login. Each call runs as `primary`
-/// has it run for `owner`, so a fallback never bills anyone else.
+/// has it run for `owner`, so a fallback never bills anyone else, and only
+/// on an agent `admits` the person it runs as or is billed to: `(agent,
+/// person)`. Work with no one in scope (a personal hub's Desk) has one
+/// person's agents to draw on.
 async fn answer_on(
     primary: Arc<crate::serve::AgentService>,
     others: Vec<Arc<crate::serve::AgentService>>,
+    admits: impl Fn(&str, &str) -> bool,
     owner: Option<&str>,
     system: &str,
     user: &str,
@@ -906,6 +917,10 @@ async fn answer_on(
     let others = others
         .into_iter()
         .filter(|s| s.agent_id != primary.agent_id)
+        .filter(|s| {
+            let person = principal.run_as.as_deref().or(principal.bill_to.as_deref());
+            person.is_none_or(|person| admits(s.agent_id.as_str(), person))
+        })
         .map(|s| {
             let key = s.tier_key.read().clone();
             (key, s)
@@ -966,7 +981,16 @@ impl Model for HubModel {
         }
         .or_else(|| registry.default_agent())
         .ok_or_else(|| eyre::eyre!("no agent to write with"))?;
-        answer_on(service, registry.all_services(), owner, system, user).await
+        let admits = |agent: &str, person: &str| registry.admits(agent, person);
+        answer_on(
+            service,
+            registry.all_services(),
+            admits,
+            owner,
+            system,
+            user,
+        )
+        .await
     }
 
     fn goal(&self, subject: &Subject) -> Option<String> {
@@ -2036,16 +2060,71 @@ mod tests {
         crate::serve::testing::answer_bearer(&server, &shared).await;
 
         let others = vec![Arc::clone(&primary), Arc::clone(&fallback)];
-        let answer = answer_on(Arc::clone(&primary), others, None, "system", "user").await;
+        let anyone = |_: &str, _: &str| true;
+        let answer = answer_on(Arc::clone(&primary), others, anyone, None, "system", "user").await;
         assert!(answer.is_ok(), "{answer:?}");
         assert_eq!(bearers(&server).await, vec![format!("Bearer {shared}")]);
 
-        let alone = answer_on(Arc::clone(&primary), vec![], None, "system", "user").await;
+        let alone = answer_on(Arc::clone(&primary), vec![], anyone, None, "system", "user").await;
         let error = format!("{:#}", alone.unwrap_err());
         assert!(
             error.contains("no signed-in plan could take the call"),
             "{error}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_gist_never_falls_back_on_an_agent_its_person_may_not_use() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = wiremock::MockServer::start().await;
+        let primary = chatgpt_agent(tmp.path(), &server, None).await;
+        let other = tempfile::tempdir().unwrap();
+        let fallback = crate::serve::testing::chatgpt_service(other.path(), &server, |config| {
+            config.agents.push(workforce_common::settings::AgentConfig {
+                id: "coder".into(),
+                default: true,
+                ..Default::default()
+            });
+        })
+        .await;
+        *fallback.tier_key.write() = "codex".into();
+        let alice = chatgpt_login_at(&fallback, &format!("users/{ALICE}/codex/auth_json"), ALICE);
+        crate::serve::testing::answer_bearer(&server, &alice).await;
+        let others = || vec![Arc::clone(&primary), Arc::clone(&fallback)];
+        let asked = Mutex::new(vec![]);
+        let refused = |agent: &str, person: &str| {
+            asked.lock().push((agent.to_string(), person.to_string()));
+            false
+        };
+
+        let answer = answer_on(
+            Arc::clone(&primary),
+            others(),
+            refused,
+            Some(ALICE),
+            "s",
+            "u",
+        )
+        .await;
+        assert!(answer.is_err());
+        assert!(server.received_requests().await.unwrap().is_empty());
+        assert_eq!(
+            *asked.lock(),
+            vec![("coder".to_string(), ALICE.to_string())]
+        );
+
+        let admitted = |agent: &str, person: &str| agent == "coder" && person == ALICE;
+        let answer = answer_on(
+            Arc::clone(&primary),
+            others(),
+            admitted,
+            Some(ALICE),
+            "s",
+            "u",
+        )
+        .await;
+        assert!(answer.is_ok(), "{answer:?}");
+        assert_eq!(bearers(&server).await, vec![format!("Bearer {alice}")]);
     }
 
     #[tokio::test]
