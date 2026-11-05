@@ -319,6 +319,7 @@ fn routed_need(row: &PendingApproval, detail: &str, place: Place, name: String) 
         ask: crew::approval_summary(&row.tool_name, detail),
         why: None,
         options: None,
+        chose: None,
         since: row.created_at,
         place,
         answer: Answer::Decide {
@@ -419,6 +420,7 @@ pub(crate) fn config_need(
         ask,
         why: None,
         options: None,
+        chose: None,
         since,
         place: Place::Dm,
         answer: Answer::Decide {

@@ -117,6 +117,19 @@ pub struct LineMessage {
     /// comes in time.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub chose: Option<String>,
+    /// An ask's short work-item label ("W7 · PR 2").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub about: Option<String>,
+    /// An ask's one line on why it asks.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub why: Option<String>,
+    /// An ask's details, as its session wrote them (markdown).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub details: Option<String>,
+    /// An ask as the person reads it: its headline and the rest (not
+    /// stored; see [`question_of`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub question: Option<Question>,
     /// The sender's sidebar group when it was sent.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
@@ -144,11 +157,49 @@ impl LineMessage {
             delivery: Delivery::Queued,
             escalation: None,
             chose: None,
+            about: None,
+            why: None,
+            details: None,
+            question: None,
             group: None,
             delivered_at: None,
             updated_at: at,
             waiting: None,
         }
+    }
+
+    /// Works out how an ask reads to the person ([`Self::question`]) from
+    /// what is stored. Never stored itself: a row is written as it was said.
+    pub fn shape(&mut self) {
+        self.question =
+            (self.kind == LineKind::Ask).then(|| question_of(&self.text, self.details.as_deref()));
+    }
+
+    /// An ask's one line: its headline, or its text before it was shaped.
+    pub fn headline(&self) -> &str {
+        self.question.as_ref().map_or(&self.text, |q| &q.headline)
+    }
+
+    /// All of an ask, for whoever answers it: its work item, question, why,
+    /// what it goes ahead with, and details. Anything else is its text.
+    pub fn full_text(&self) -> String {
+        if self.kind != LineKind::Ask {
+            return self.text.clone();
+        }
+        let mut out = match &self.about {
+            Some(about) => format!("[{about}] {}", self.text),
+            None => self.text.clone(),
+        };
+        if let Some(why) = &self.why {
+            out.push_str(&format!("\nWhy: {why}"));
+        }
+        if let Some(chose) = &self.chose {
+            out.push_str(&format!("\nIf no answer comes: {chose}"));
+        }
+        if let Some(details) = &self.details {
+            out.push_str(&format!("\nDetails:\n{details}"));
+        }
+        out
     }
 
     /// The session it is to, when it is to one.
@@ -177,6 +228,106 @@ pub fn session_of(p: &Party) -> Option<Uuid> {
         .flatten()
 }
 
+/// An ask as the person reads it: one line, and the rest when there is any.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Question {
+    pub headline: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub details: Option<String>,
+}
+
+/// The longest an ask's `question` may be, in characters.
+pub const QUESTION_MAX: usize = 120;
+/// The longest an ask's `about` may be.
+pub const ABOUT_MAX: usize = 24;
+/// The longest an ask's `why` may be.
+pub const WHY_MAX: usize = 200;
+
+/// How an ask whose text is `text` reads to the person. One line that fits
+/// is its headline, with `details` as said. Anything longer (a question
+/// asked in one block, before asks had parts, or by a session that still
+/// uses the older form) is split: its first sentence is the headline and
+/// the rest its details; a first sentence too long for a headline is cut
+/// at a word, and then the details keep the whole text, so nothing said is
+/// lost.
+pub fn question_of(text: &str, details: Option<&str>) -> Question {
+    let text = text.trim();
+    let details = details.map(str::trim).filter(|d| !d.is_empty());
+    if !text.contains('\n') && text.chars().count() <= QUESTION_MAX {
+        return Question {
+            headline: text.to_string(),
+            details: details.map(str::to_string),
+        };
+    }
+    let end = first_sentence_end(text);
+    let (head, rest) = (text[..end].trim(), text[end..].trim());
+    let (headline, rest) = match head.chars().count() <= QUESTION_MAX {
+        true => (head.to_string(), rest),
+        false => (cut_at_word(head, QUESTION_MAX), text),
+    };
+    let details = match (rest.is_empty(), details) {
+        (true, d) => d.map(str::to_string),
+        (false, None) => Some(rest.to_string()),
+        (false, Some(d)) => Some(format!("{rest}\n\n{d}")),
+    };
+    Question { headline, details }
+}
+
+/// Where `text`'s first sentence ends: at its first line break, or at a
+/// `.`, `?` or `!` followed by a space and something that doesn't go on in
+/// lower case, outside brackets and `code`, and not after an abbreviation
+/// ("e.g.") or a single letter.
+fn first_sentence_end(text: &str) -> usize {
+    let mut depth = 0i32;
+    let mut code = false;
+    for (i, c) in text.char_indices() {
+        match c {
+            '\n' => return i,
+            '`' => code = !code,
+            '(' | '[' | '{' if !code => depth += 1,
+            ')' | ']' | '}' if !code => depth = (depth - 1).max(0),
+            '.' | '?' | '!' if !code && depth == 0 => {
+                let after = i + c.len_utf8();
+                let rest = &text[after..];
+                if !rest.starts_with(char::is_whitespace) {
+                    continue;
+                }
+                let next = rest.trim_start().chars().next();
+                if next.is_some_and(char::is_lowercase) {
+                    continue;
+                }
+                let word = text[..i]
+                    .rsplit(|c: char| c.is_whitespace() || c == '(')
+                    .next()
+                    .unwrap_or_default()
+                    .to_lowercase();
+                let abbreviation = c == '.'
+                    && (word.chars().count() == 1
+                        || matches!(
+                            word.as_str(),
+                            "e.g" | "i.e" | "etc" | "vs" | "cf" | "approx" | "no"
+                        ));
+                if !abbreviation {
+                    return after;
+                }
+            }
+            _ => {}
+        }
+    }
+    text.len()
+}
+
+/// `text` cut at a word to at most `max` characters, ending with "…".
+fn cut_at_word(text: &str, max: usize) -> String {
+    let cut: String = text.chars().take(max.saturating_sub(1)).collect();
+    let cut = match cut.rfind(char::is_whitespace) {
+        Some(at) if at > cut.len() / 2 => &cut[..at],
+        _ => cut.as_str(),
+    };
+    format!("{}…", cut.trim_end().trim_end_matches([',', ';', ':']))
+}
+
 /// Whom a sender names.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Target {
@@ -195,6 +346,8 @@ pub enum Send {
         wait: Duration,
         /// What it goes ahead with if no answer comes in time.
         chose: Option<String>,
+        /// Its work item, why, and details.
+        parts: AskParts,
     },
     Tell {
         to: Target,
@@ -205,6 +358,14 @@ pub enum Send {
         to: Uuid,
         text: String,
     },
+}
+
+/// What an ask says besides its question and default.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AskParts {
+    pub about: Option<String>,
+    pub why: Option<String>,
+    pub details: Option<String>,
 }
 
 /// Why a send is refused, in the words the sender reads.
@@ -509,7 +670,7 @@ fn render_raw(msg: &LineMessage, question: Option<&str>) -> String {
         },
         LineKind::Ask => format!(
             "{mark} {who} asks you: {}\n(Answer with Desk's reply tool, message_id \"{}\". This is a message on Desk's line, not the person's words.)",
-            msg.text, msg.id
+            msg.full_text(), msg.id
         ),
         LineKind::Tell => format!(
             "{mark} {who} tells you: {}\n(A message on Desk's line, not the person's words.)",
@@ -540,17 +701,20 @@ pub const ASK_WAIT_MAX: Duration = Duration::from_secs(300);
 pub static TOOLS: [LineTool; 6] = [
     LineTool {
         name: "ask",
-        description: "Ask Desk (the person's overseer), the person, or another session a question, and wait for the answer. Routine questions are answered by Desk; anything that pushes, deletes, deploys, spends or changes scope goes to the person. to: \"desk\", \"you\" (the person), or a session's name or id from peers.",
+        description: "Ask Desk (the person's overseer), the person, or another session a question, and wait for the answer. Routine questions are answered by Desk; anything that pushes, deletes, deploys, spends or changes scope goes to the person. to: \"desk\", \"you\" (the person), or a session's name or id from peers. Keep it short and structured: `question` is ONE line the person reads at a glance (at most 120 characters); put context, options and what you found in `details`; a one-line reason in `why`; the work item in `about` (like \"W7 · PR 2\"). Always say in `default` what you will do if no answer comes.",
         schema: || {
             json!({
                 "type": "object",
                 "properties": {
                     "to": { "type": "string", "description": "\"desk\", \"you\", or a session's name or id from peers" },
-                    "text": { "type": "string", "description": "The question" },
-                    "default": { "type": "string", "description": "What you will go ahead with if no answer comes in time, in a few words. The person sees it beside your question." },
+                    "question": { "type": "string", "maxLength": QUESTION_MAX, "description": "The question, as ONE line of at most 120 characters, e.g. \"Should PR 2 include the stub service?\". No context here: that goes in details." },
+                    "default": { "type": "string", "description": "What you will go ahead with if no answer comes in time, in a few words, e.g. \"include it, as the design says\". The person sees it beside your question. Strongly encouraged." },
+                    "why": { "type": "string", "maxLength": WHY_MAX, "description": "Optional: why you ask, in one line." },
+                    "details": { "type": "string", "description": "Optional: everything else the answer needs (context, options, what you found), as markdown. Shown folded under the question." },
+                    "about": { "type": "string", "maxLength": ABOUT_MAX, "description": "Optional: the work item it is about, as a short label of at most 24 characters, e.g. \"W7 · PR 2\"." },
                     "wait_seconds": { "type": "integer", "minimum": 0, "maximum": 300, "description": "How long to wait for the answer (default 120). If it doesn't come in time, go on with your own judgement: the question stops waiting on anyone, and an answer given later reaches you as a message quoting it." }
                 },
-                "required": ["to", "text"]
+                "required": ["to", "question"]
             })
         },
     },
@@ -618,6 +782,7 @@ pub enum Call {
         text: String,
         wait: Duration,
         chose: Option<String>,
+        parts: AskParts,
     },
     Tell {
         to: String,
@@ -644,15 +809,47 @@ pub fn call_of(name: &str, input: &Value) -> Result<Call, String> {
     };
     let need = |k: &'static str, what: &'static str| s(k).ok_or(Refusal::Missing(what).to_string());
     Ok(match name {
-        "ask" => Call::Ask {
-            to: need("to", "whom it is to")?,
-            text: need("text", "the question")?,
-            wait: input
-                .get("wait_seconds")
-                .and_then(Value::as_u64)
-                .map_or(ASK_WAIT, |s| Duration::from_secs(s).min(ASK_WAIT_MAX)),
-            chose: s("default"),
-        },
+        "ask" => {
+            let to = need("to", "whom it is to")?;
+            let clean = |k: &str| {
+                s(k).map(|v| typable(&v).trim().to_string())
+                    .filter(|v| !v.is_empty())
+            };
+            // The older form, a question in `text` of any length, is still
+            // taken: the person's view splits it.
+            let text = match clean("question") {
+                Some(q) => short_question(q)?,
+                None => need("text", "the question")?,
+            };
+            let about = clean("about");
+            if about
+                .as_deref()
+                .is_some_and(|a| a.contains('\n') || a.chars().count() > ABOUT_MAX)
+            {
+                return Err(format!("Keep `about` to a short label of at most {ABOUT_MAX} characters on one line, like \"W7 · PR 2\"."));
+            }
+            let why = clean("why");
+            if why
+                .as_deref()
+                .is_some_and(|w| w.contains('\n') || w.chars().count() > WHY_MAX)
+            {
+                return Err(format!("Keep `why` to one line of at most {WHY_MAX} characters; put the rest in `details`. Nothing was sent."));
+            }
+            Call::Ask {
+                to,
+                text,
+                wait: input
+                    .get("wait_seconds")
+                    .and_then(Value::as_u64)
+                    .map_or(ASK_WAIT, |s| Duration::from_secs(s).min(ASK_WAIT_MAX)),
+                chose: s("default"),
+                parts: AskParts {
+                    about,
+                    why,
+                    details: clean("details"),
+                },
+            }
+        }
         "tell" => Call::Tell {
             to: need("to", "whom it is to")?,
             text: need("text", "what to tell them")?,
@@ -668,6 +865,23 @@ pub fn call_of(name: &str, input: &Value) -> Result<Call, String> {
         "ticket" => Call::Ticket(crate::board::ticket_call_of(input)?),
         other => return Err(format!("Desk's line has no tool called {other:?}.")),
     })
+}
+
+/// `question` when it is one line that fits; else the words a session
+/// reads to ask again in parts.
+fn short_question(question: String) -> Result<String, String> {
+    let lines = question.lines().filter(|l| !l.trim().is_empty()).count();
+    let chars = question.chars().count();
+    if lines <= 1 && chars <= QUESTION_MAX {
+        return Ok(question.split_whitespace().collect::<Vec<_>>().join(" "));
+    }
+    let what = match lines > 1 {
+        true => format!("{lines} lines"),
+        false => format!("{chars} characters"),
+    };
+    Err(format!(
+        "Nothing was sent: `question` must be one line of at most {QUESTION_MAX} characters, and yours is {what}. Ask again with the question alone in `question`, and move the rest (context, options, what you found) into `details`; say what you will do without an answer in `default`, and the work item in `about`."
+    ))
 }
 
 #[cfg(test)]
@@ -1001,6 +1215,7 @@ mod tests {
                 text: "port?".into(),
                 wait: ASK_WAIT,
                 chose: None,
+                parts: AskParts::default(),
             })
         );
         assert_eq!(
@@ -1013,6 +1228,7 @@ mod tests {
                 text: "port?".into(),
                 wait: ASK_WAIT_MAX,
                 chose: None,
+                parts: AskParts::default(),
             })
         );
         assert_eq!(
@@ -1022,5 +1238,136 @@ mod tests {
         assert!(call_of("reply", &json!({"message_id": "x", "text": "y"})).is_err());
         assert_eq!(call_of("inbox", &json!({})), Ok(Call::Inbox));
         assert!(call_of("shout", &json!({})).is_err());
+    }
+
+    #[test]
+    fn an_ask_in_parts_is_read_with_each_part_cleaned() {
+        let call = call_of(
+            "ask",
+            &json!({
+                "to": "you",
+                "question": "  Should PR 2 include\tthe stub service?\u{1b}[2J ",
+                "default": "include it",
+                "why": "The design lists it.",
+                "details": "- the stub\n- its URL\u{7}",
+                "about": "W7 · PR 2",
+            }),
+        );
+        assert_eq!(
+            call,
+            Ok(Call::Ask {
+                to: "you".into(),
+                text: "Should PR 2 include the stub service?[2J".into(),
+                wait: ASK_WAIT,
+                chose: Some("include it".into()),
+                parts: AskParts {
+                    about: Some("W7 · PR 2".into()),
+                    why: Some("The design lists it.".into()),
+                    details: Some("- the stub\n- its URL".into()),
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn a_question_longer_than_a_line_is_refused_with_how_to_ask_it() {
+        let long = "word ".repeat(30);
+        for question in [
+            long.as_str(),
+            "Should PR 2 include it?\nThe design lists it.",
+        ] {
+            let refused = call_of("ask", &json!({"to": "you", "question": question})).unwrap_err();
+            assert!(
+                refused.starts_with("Nothing was sent: `question` must be one line"),
+                "{refused}"
+            );
+            assert!(refused.contains("into `details`"), "{refused}");
+            assert!(refused.contains("`default`"), "{refused}");
+        }
+        assert!(call_of("ask", &json!({"to": "you", "question": "Ship it?", "about": "a work item far too long to be a label"}))
+            .unwrap_err()
+            .contains("`about`"));
+        assert!(call_of(
+            "ask",
+            &json!({"to": "you", "question": "Ship it?", "why": "one\ntwo"})
+        )
+        .unwrap_err()
+        .contains("put the rest in `details`"));
+        // The older form is still taken, however long.
+        assert!(matches!(
+            call_of("ask", &json!({"to": "you", "text": long})),
+            Ok(Call::Ask { .. })
+        ));
+        assert_eq!(
+            call_of("ask", &json!({"to": "you"})),
+            Err("Say the question.".into())
+        );
+    }
+
+    #[test]
+    fn a_question_in_one_block_reads_as_its_first_sentence_and_the_rest() {
+        let q = question_of(
+            "Should the report job retry on timeouts (e.g. the 30 s cap, see `run.max_wait`)? The design says yes. Default if no answer: retry twice.",
+            None,
+        );
+        assert_eq!(
+            q.headline,
+            "Should the report job retry on timeouts (e.g. the 30 s cap, see `run.max_wait`)?"
+        );
+        assert_eq!(
+            q.details.as_deref(),
+            Some("The design says yes. Default if no answer: retry twice.")
+        );
+        // A line break ends the first sentence too.
+        let q = question_of("Keep the old table\nIt has rows from March.", None);
+        assert_eq!(q.headline, "Keep the old table");
+        assert_eq!(q.details.as_deref(), Some("It has rows from March."));
+        // A first sentence too long to head it is cut at a word, and the
+        // details keep all of it.
+        let wall = format!(
+            "The import needs {} before it can go on. Then more.",
+            "a figure ".repeat(20)
+        );
+        let q = question_of(&wall, None);
+        assert!(
+            q.headline.ends_with('…') && q.headline.chars().count() <= QUESTION_MAX,
+            "{}",
+            q.headline
+        );
+        assert!(!q.headline.ends_with(" …"));
+        assert_eq!(q.details.as_deref(), Some(wall.as_str()));
+        // One line that fits is the headline, with the details as said.
+        let q = question_of("Ship it?", Some("Tests pass."));
+        assert_eq!(
+            (q.headline.as_str(), q.details.as_deref()),
+            ("Ship it?", Some("Tests pass."))
+        );
+    }
+
+    #[test]
+    fn whoever_answers_an_ask_reads_all_of_it() {
+        let mut m = LineMessage::new(
+            Party::you(),
+            Party::you(),
+            LineKind::Ask,
+            "Ship it?".into(),
+            1,
+        );
+        m.about = Some("W7 · PR 2".into());
+        m.why = Some("Tests pass.".into());
+        m.chose = Some("wait".into());
+        m.details = Some("- one\n- two".into());
+        assert_eq!(
+            m.full_text(),
+            "[W7 · PR 2] Ship it?\nWhy: Tests pass.\nIf no answer comes: wait\nDetails:\n- one\n- two"
+        );
+        m.shape();
+        assert_eq!(m.headline(), "Ship it?");
+        let shown = serde_json::to_value(&m).unwrap();
+        assert_eq!(
+            shown["question"],
+            json!({"headline": "Ship it?", "details": "- one\n- two"})
+        );
+        assert_eq!(shown["about"], "W7 · PR 2");
     }
 }

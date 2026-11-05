@@ -13,7 +13,7 @@ use crate::line::{Asked, Delivery, LineKind, LineMessage};
 use crate::store::DeskStore;
 
 const COLUMNS: &str = "id, at, sender, recipient, kind, text, in_reply_to, hop, delivery, \
-    asked, escalation, group_id, delivered_at, updated_at, chose";
+    asked, escalation, group_id, delivered_at, updated_at, chose, about, why, details";
 
 /// A question waiting on the person: asked of them, or given to them by
 /// the overseer (as [`crate::service`]'s `needs_you` reads a row).
@@ -22,7 +22,7 @@ const WAITS_ON_YOU: &str =
 
 fn message(row: &Row) -> Result<LineMessage> {
     let party = |c: &str| -> Result<Party> { Ok(serde_json::from_value(row.try_get(c)?)?) };
-    Ok(LineMessage {
+    let mut m = LineMessage {
         id: row.try_get("id")?,
         at: row.try_get("at")?,
         from: party("sender")?,
@@ -40,11 +40,17 @@ fn message(row: &Row) -> Result<LineMessage> {
             .try_get::<_, Option<serde_json::Value>>("escalation")?
             .and_then(|v| serde_json::from_value(v).ok()),
         chose: row.try_get("chose")?,
+        about: row.try_get("about")?,
+        why: row.try_get("why")?,
+        details: row.try_get("details")?,
+        question: None,
         group: row.try_get("group_id")?,
         delivered_at: row.try_get("delivered_at")?,
         updated_at: row.try_get("updated_at")?,
         waiting: None,
-    })
+    };
+    m.shape();
+    Ok(m)
 }
 
 /// Why answering a question didn't take.
@@ -63,7 +69,7 @@ impl DeskStore {
             .execute(
                 &format!(
                     "INSERT INTO line_messages ({COLUMNS}) \
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18) \
                      ON CONFLICT (id) DO UPDATE SET recipient = EXCLUDED.recipient, \
                      text = EXCLUDED.text, delivery = EXCLUDED.delivery, \
                      asked = EXCLUDED.asked, escalation = EXCLUDED.escalation, \
@@ -88,6 +94,9 @@ impl DeskStore {
                     &m.delivered_at,
                     &m.updated_at,
                     &m.chose,
+                    &m.about,
+                    &m.why,
+                    &m.details,
                 ],
             )
             .await?;
@@ -423,7 +432,7 @@ impl DeskStore {
         tx.execute(
             &format!(
                 "INSERT INTO line_messages ({COLUMNS}) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)"
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)"
             ),
             &[
                 &answer.id,
@@ -445,6 +454,9 @@ impl DeskStore {
                 &answer.delivered_at,
                 &answer.updated_at,
                 &answer.chose,
+                &answer.about,
+                &answer.why,
+                &answer.details,
             ],
         )
         .await?;

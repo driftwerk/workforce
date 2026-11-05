@@ -428,6 +428,7 @@ impl Desk {
                     ask: view.ask?,
                     why: view.why,
                     options: None,
+                    chose: None,
                     since,
                     place,
                     answer: Answer::Decide {
