@@ -80,22 +80,12 @@ pub struct DeviceSaid {
     pub refused: bool,
 }
 
-/// The hosts the device page may be on.
+/// The hosts Codex's device page may be on: OpenAI's sign-in.
+pub const DEVICE_HOSTS: &[&str] = &["auth.openai.com", "chatgpt.com"];
+
+/// Whether `url` is Codex's device page, read as a browser reads it.
 fn device_host(url: &str) -> bool {
-    let Some(rest) = url.strip_prefix("https://") else {
-        return false;
-    };
-    let host = rest
-        .split(['/', '?', '#'])
-        .next()
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    if host.contains(['@', ':']) {
-        return false;
-    }
-    ["openai.com", "chatgpt.com"]
-        .iter()
-        .any(|d| host == *d || host.ends_with(&format!(".{d}")))
+    crate::engine_accounts::page_on(url, DEVICE_HOSTS).is_some()
 }
 
 /// A one-time code as Codex prints it: groups of capitals and digits
@@ -306,8 +296,15 @@ mod tests {
             device_said(&SCREEN[..SCREEN.find("ABCD").unwrap()]).code,
             None
         );
-        let elsewhere = SCREEN.replace("auth.openai.com", "openai.com.evil.example");
-        assert_eq!(device_said(&elsewhere).url, None);
+        for elsewhere in [
+            "openai.com.evil.example",
+            "evil.example\\@auth.openai.com",
+            "auth.openai.com:8443",
+            "platform.openai.com",
+        ] {
+            let screen = SCREEN.replace("auth.openai.com", elsewhere);
+            assert_eq!(device_said(&screen).url, None, "{elsewhere}");
+        }
         assert!(device_said("Error: device code login is not enabled for this workspace").refused);
     }
 

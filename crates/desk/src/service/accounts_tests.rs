@@ -386,13 +386,22 @@ async fn a_sign_in_from_another_computer_is_given_the_page_that_comes_back_by_it
                 .find(|s| s.id == sign_in.id)
                 .unwrap()
         };
+        let (_, mut events) = d.subscribe();
         for _ in 0..200 {
-            if view().direct.is_some() && matches!(view().state, SignInState::Code { .. }) {
+            if view().direct_ready && matches!(view().state, SignInState::Code { .. }) {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
-        let direct = view().direct.expect("the page that comes back");
+        let direct = d
+            .sign_in_direct(sign_in.id)
+            .expect("the page that comes back");
+        while let Ok(e) = events.try_recv() {
+            assert!(
+                !serde_json::to_string(&e).unwrap().contains("45678"),
+                "never announced"
+            );
+        }
         assert_eq!(direct.port, 45678);
         assert!(direct
             .url
@@ -418,6 +427,7 @@ async fn a_sign_in_from_another_computer_is_given_the_page_that_comes_back_by_it
         }
         assert!(matches!(view().state, SignInState::Done { .. }));
         assert_eq!(view().direct, None, "over: nothing to come back to");
+        assert!(d.sign_in_direct(sign_in.id).is_err());
         assert_eq!(caught(), 0, "its folder goes with it");
 
         // From this computer, the CLI opens its own browser as it always has.
@@ -556,7 +566,7 @@ fn a_sign_ins_page_is_never_caught_under_a_folder_others_may_write_to() {
     drop(super::accounts::Relay::new(&open).unwrap());
     assert_eq!(
         std::fs::metadata(&open).unwrap().permissions().mode() & 0o777,
-        0o755
+        0o700
     );
     // Someone else's (the system's own `/`) is never used.
     assert!(super::accounts::Relay::new(Path::new("/")).is_err());
@@ -713,7 +723,11 @@ fn accounts_and_sign_ins_reach_desk_in_its_wire_shape() {
         state: SignInState::Code {
             url: Some("https://claude.ai/oauth/authorize".into()),
         },
-        direct: None,
+        direct: Some(crate::engine_accounts::Direct {
+            url: "https://claude.ai/oauth/authorize?redirect_uri=x".into(),
+            port: 46009,
+        }),
+        direct_ready: true,
     };
     let event = serde_json::to_value(crate::model::DeskEvent::AccountSignIn {
         sign_in: sign_in.clone(),
@@ -722,7 +736,10 @@ fn accounts_and_sign_ins_reach_desk_in_its_wire_shape() {
     assert_eq!(event["type"], "accountSignIn");
     assert_eq!(event["signIn"]["state"], "code");
     assert_eq!(event["signIn"]["url"], "https://claude.ai/oauth/authorize");
+    // The page that comes back is never announced, only that it can be asked for.
     assert!(event["signIn"].get("direct").is_none());
+    assert!(!event.to_string().contains("46009"));
+    assert_eq!(event["signIn"]["directReady"], true);
     let added = serde_json::to_value(Added::SignIn { sign_in }).unwrap();
     assert_eq!(added["kind"], "signIn");
     assert_eq!(added["signIn"]["name"], "Work");

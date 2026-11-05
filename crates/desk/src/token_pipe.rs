@@ -40,6 +40,35 @@ const SESSION: &str = r#"exec 3<"$1" || exit 126; rm -f -- "$1"; shift; exec "$@
 /// Moves standard input to descriptor 3, and runs the command.
 const ONE_OFF: &str = r#"exec 3<&0 0</dev/null; exec "$@""#;
 
+/// Makes `run_dir` (where a session's token passes, and a sign-in's browser
+/// is made) this user's alone: made `0700` when it isn't there; refused when
+/// it is a link, not a folder, or someone else's; closed to everyone else
+/// when it is this user's but open to them. Only then can no one else swap
+/// a folder made in it before what goes into that folder is written.
+pub fn private_run_dir(run_dir: &Path) -> Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+    if let Some(parent) = run_dir.parent() {
+        std::fs::create_dir_all(parent).with_context(|| format!("making {}", parent.display()))?;
+    }
+    match std::fs::DirBuilder::new().mode(0o700).create(run_dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e).with_context(|| format!("making {}", run_dir.display())),
+    }
+    let meta = std::fs::symlink_metadata(run_dir)
+        .with_context(|| format!("reading {}", run_dir.display()))?;
+    // SAFETY: geteuid has no preconditions.
+    let me = unsafe { libc::geteuid() };
+    if !meta.file_type().is_dir() || meta.uid() != me {
+        eyre::bail!("{} isn't a folder of this user's own", run_dir.display());
+    }
+    if meta.mode() & 0o077 != 0 {
+        std::fs::set_permissions(run_dir, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("closing {} to others", run_dir.display()))?;
+    }
+    Ok(())
+}
+
 /// A FIFO waiting for a session's shell, in a folder of its own.
 pub struct TokenFifo {
     dir: PathBuf,
@@ -50,18 +79,11 @@ impl TokenFifo {
     /// A new FIFO under `run_dir`, only this user can open.
     pub fn new(run_dir: &Path) -> Result<Self> {
         use std::os::unix::fs::DirBuilderExt;
+        private_run_dir(run_dir)?;
         let dir = run_dir.join(format!("t-{}", Uuid::new_v4().simple()));
         std::fs::DirBuilder::new()
-            .recursive(false)
             .mode(0o700)
             .create(&dir)
-            .or_else(|e| match e.kind() {
-                std::io::ErrorKind::NotFound => {
-                    std::fs::create_dir_all(run_dir)?;
-                    std::fs::DirBuilder::new().mode(0o700).create(&dir)
-                }
-                _ => Err(e),
-            })
             .with_context(|| format!("making {}", dir.display()))?;
         let path = dir.join("token");
         let c = std::ffi::CString::new(path.as_os_str().as_bytes())?;
@@ -150,6 +172,35 @@ pub fn one_off(program: &Path, args: &[&str]) -> (PathBuf, Vec<String>) {
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn a_token_never_passes_through_a_folder_someone_else_could_swap() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        // Made new: this user's alone.
+        let new = dir.path().join("run");
+        drop(TokenFifo::new(&new).unwrap());
+        assert_eq!(
+            std::fs::metadata(&new).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        // This user's but open to others: closed first.
+        let open = dir.path().join("open");
+        std::fs::create_dir(&open).unwrap();
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o777)).unwrap();
+        drop(TokenFifo::new(&open).unwrap());
+        assert_eq!(
+            std::fs::metadata(&open).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        // A link to a folder (another user could make one where it goes), or
+        // a folder of someone else's (the system's `/`), is never used.
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&open, &link).unwrap();
+        assert!(TokenFifo::new(&link).is_err());
+        assert!(TokenFifo::new(Path::new("/")).is_err());
+        assert!(private_run_dir(Path::new("/")).is_err());
+    }
 
     #[tokio::test]
     async fn a_session_reads_its_token_on_descriptor_3_and_its_environment_and_children_never_see_it(

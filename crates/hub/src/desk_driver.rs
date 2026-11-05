@@ -453,12 +453,31 @@ impl Accounts for HubAccounts {
     }
 }
 
+/// Where Desk's per-session sockets, sessions' token FIFOs and sign-ins'
+/// browsers go: this user's own runtime folder when the system gives one
+/// (`XDG_RUNTIME_DIR`), else a folder of this user's in the temp folder,
+/// never one every user shares. (Desk refuses it if someone else owns it.)
+fn run_dir() -> PathBuf {
+    if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR").filter(|d| !d.is_empty()) {
+        let dir = PathBuf::from(dir);
+        if dir.is_absolute() {
+            return dir.join("wf-desk");
+        }
+    }
+    #[cfg(unix)]
+    // SAFETY: geteuid has no preconditions.
+    let uid = unsafe { libc::geteuid() };
+    #[cfg(not(unix))]
+    let uid = 0;
+    std::env::temp_dir().join(format!("wf-desk-{uid}"))
+}
+
 fn options(config: &WorkforceConfig) -> Options {
     let desk = &config.desk;
     Options {
         programs: programs(desk),
         env: std::env::vars().collect(),
-        run_dir: std::env::temp_dir().join("wf-desk"),
+        run_dir: run_dir(),
         scrollback_bytes: desk.scrollback_kb.saturating_mul(1024),
         approval_timeout: Duration::from_secs(desk.approval_timeout_secs.max(10)),
         restore: match desk.restore {

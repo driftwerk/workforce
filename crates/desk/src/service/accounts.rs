@@ -72,29 +72,7 @@ impl Relay {
     pub(super) fn new(run_dir: &std::path::Path) -> eyre::Result<Self> {
         use eyre::WrapErr;
         use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
-        std::fs::create_dir_all(run_dir)
-            .wrap_err_with(|| format!("making {}", run_dir.display()))?;
-        // What runs from here runs as the person: never under a folder
-        // someone else owns (it is under the system's temp folder), and only
-        // once no one else may write to it, so the folder made below can't
-        // be swapped.
-        {
-            use std::os::unix::fs::{MetadataExt, PermissionsExt};
-            let meta = std::fs::symlink_metadata(run_dir)
-                .wrap_err_with(|| format!("reading {}", run_dir.display()))?;
-            // SAFETY: geteuid has no preconditions.
-            let me = unsafe { libc::geteuid() };
-            if !meta.is_dir() || meta.uid() != me {
-                eyre::bail!("{} isn't this user's own folder", run_dir.display());
-            }
-            if meta.mode() & 0o022 != 0 {
-                std::fs::set_permissions(
-                    run_dir,
-                    std::fs::Permissions::from_mode(meta.mode() & 0o755),
-                )
-                .wrap_err_with(|| format!("closing {} to others", run_dir.display()))?;
-            }
-        }
+        crate::token_pipe::private_run_dir(run_dir)?;
         let dir = run_dir.join(format!("s-{}", Uuid::new_v4().simple()));
         std::fs::DirBuilder::new()
             .mode(0o700)
@@ -628,6 +606,7 @@ impl Desk {
             name,
             state: SignInState::Starting,
             direct: None,
+            direct_ready: false,
         };
         self.0.state.lock().sign_in_runs.insert(
             view.id,
@@ -657,6 +636,7 @@ impl Desk {
             // Once it's over, there's no page to come back to.
             if state.is_over() {
                 run.view.direct = None;
+                run.view.direct_ready = false;
                 run.relay = None;
             }
             run.view.state = state;
@@ -666,7 +646,7 @@ impl Desk {
     }
 
     /// The page that comes back by itself, once its CLI has made it.
-    fn sign_in_direct(&self, id: Uuid, direct: accounts::Direct) {
+    fn sign_in_direct_found(&self, id: Uuid, direct: accounts::Direct) {
         let view = {
             let mut st = self.0.state.lock();
             let Some(run) = st.sign_in_runs.get_mut(&id) else {
@@ -676,6 +656,7 @@ impl Desk {
                 return;
             }
             run.view.direct = Some(direct);
+            run.view.direct_ready = true;
             run.view.clone()
         };
         self.announce(DeskEvent::AccountSignIn { sign_in: view });
@@ -709,7 +690,7 @@ impl Desk {
                 return; // cancelled
             };
             if let Some(direct) = relay.as_deref().and_then(Relay::direct) {
-                self.sign_in_direct(id, direct);
+                self.sign_in_direct_found(id, direct);
             }
             let said = accounts::setup_said(&pty.text());
             let fresh: Vec<String> = said
@@ -800,6 +781,19 @@ impl Desk {
             tokio::time::sleep(Duration::from_secs(60)).await;
             desk.0.state.lock().sign_in_runs.remove(&id);
         });
+    }
+
+    /// The page that comes back by itself for sign-in `id`, while it runs
+    /// and has one: for the Desk that forwards its port, never announced.
+    pub fn sign_in_direct(&self, id: Uuid) -> Result<accounts::Direct, DeskError> {
+        self.0
+            .state
+            .lock()
+            .sign_in_runs
+            .get(&id)
+            .filter(|r| !r.view.state.is_over())
+            .and_then(|r| r.view.direct.clone())
+            .ok_or(DeskError::NotFound)
     }
 
     /// Types the code the browser showed into a sign-in waiting for it.

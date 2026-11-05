@@ -491,22 +491,37 @@ pub const SETUP_UNREAD: &str = "Desk couldn't read the token from Claude Code: p
 /// to look; [`claude_token_works`] decides.
 const TOKEN_PREFIX: &str = "sk-ant-o";
 
-/// The hosts a sign-in page may be on.
-fn sign_in_host(url: &str) -> bool {
-    let Some(rest) = url.strip_prefix("https://") else {
-        return false;
-    };
-    let host = rest
-        .split(['/', '?', '#'])
-        .next()
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    if host.contains(['@', ':']) {
-        return false;
+/// The hosts Claude's sign-in pages may be on.
+pub const CLAUDE_HOSTS: &[&str] = &["claude.ai", "anthropic.com", "claude.com"];
+
+/// `said` as a web page on one of `hosts` (or a subdomain of one), read as a
+/// browser reads it (so `\\`, `@` and escapes can't move its host): https,
+/// no user or password, the default port. None for anything else.
+pub fn page_on(said: &str, hosts: &[&str]) -> Option<url::Url> {
+    if said.len() > 4096 || said.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return None;
     }
-    ["claude.ai", "anthropic.com", "claude.com"]
+    let page = url::Url::parse(said).ok()?;
+    if page.scheme() != "https"
+        || !page.username().is_empty()
+        || page.password().is_some()
+        || page.port().is_some()
+    {
+        return None;
+    }
+    let Some(url::Host::Domain(host)) = page.host() else {
+        return None;
+    };
+    let host = host.to_ascii_lowercase();
+    hosts
         .iter()
         .any(|d| host == *d || host.ends_with(&format!(".{d}")))
+        .then_some(page)
+}
+
+/// Whether `url` is a page of Claude's own sign-in.
+fn sign_in_host(url: &str) -> bool {
+    page_on(url, CLAUDE_HOSTS).is_some()
 }
 
 /// Reads a `claude setup-token` screen (run wide enough that nothing
@@ -820,6 +835,19 @@ mod tests {
             ),
             None
         );
+        // Read as a browser reads it: a `\` or `@` doesn't keep Claude's host.
+        for bad in [
+            "https://evil.example\\@claude.ai/?redirect_uri=http%3A%2F%2Flocalhost%3A34503%2Fcallback",
+            "https://evil.example\\.claude.ai/?redirect_uri=http%3A%2F%2Flocalhost%3A34503%2Fcallback",
+            "https://claude.ai:8443/?redirect_uri=http%3A%2F%2Flocalhost%3A34503%2Fcallback",
+            "https://claude.ai/?redirect_uri=http%3A%2F%2Flocalhost%3A34503%2Fcallback%3Fx%3D1",
+        ] {
+            assert_eq!(direct_sign_in(bad), None, "{bad}");
+        }
+        assert!(!sign_in_host("https://evil.example\\@claude.ai/"));
+        assert!(sign_in_host(
+            "https://platform.claude.com/oauth/code/callback"
+        ));
     }
     use crate::model::SessionState as S;
 
@@ -1288,9 +1316,14 @@ pub struct SignInView {
     #[serde(flatten)]
     pub state: SignInState,
     /// For a sign-in made from another computer: the page that comes back
-    /// by itself, once `claude setup-token` has made it.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// by itself, once `claude setup-token` has made it. Never announced or
+    /// listed: only `GET /api/desk/accounts/sign-ins/{id}/direct` gives it,
+    /// to the Desk that forwards its port.
+    #[serde(skip)]
     pub direct: Option<Direct>,
+    /// Whether [`SignInView::direct`] can be asked for now.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub direct_ready: bool,
 }
 
 /// The sign-in page `claude setup-token` would open in a browser on the
@@ -1311,59 +1344,24 @@ const LOWEST_CALLBACK_PORT: u16 = 1024;
 /// Claude's own hosts, and one `redirect_uri` that is exactly
 /// `http://localhost:{port}/callback` on an unprivileged port.
 pub fn direct_sign_in(said: &str) -> Option<Direct> {
-    let url = said.trim();
-    if url.is_empty()
-        || url.len() > 4096
-        || url.chars().any(|c| c.is_whitespace() || c.is_control())
-    {
-        return None;
-    }
-    if !sign_in_host(url) {
-        return None;
-    }
-    let query = url.split_once('?')?.1.split('#').next().unwrap_or_default();
-    let mut redirects = query
-        .split('&')
-        .filter_map(|kv| kv.strip_prefix("redirect_uri="));
-    let redirect = percent_decoded(redirects.next()?)?;
+    let page = page_on(said.trim(), CLAUDE_HOSTS)?;
+    let mut redirects = page.query_pairs().filter(|(k, _)| k == "redirect_uri");
+    let (_, redirect) = redirects.next()?;
     if redirects.next().is_some() {
         return None;
     }
-    let port: u16 = redirect
-        .strip_prefix("http://localhost:")?
-        .strip_suffix("/callback")?
-        .parse()
-        .ok()?;
-    (port >= LOWEST_CALLBACK_PORT && redirect == format!("http://localhost:{port}/callback")).then(
-        || Direct {
-            url: url.to_string(),
-            port,
-        },
-    )
-}
-
-/// A query value with its `%XX` escapes (and `+`) read; none when an
-/// escape is broken or it isn't UTF-8.
-fn percent_decoded(value: &str) -> Option<String> {
-    let bytes = value.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'%' => {
-                let hex = std::str::from_utf8(bytes.get(i + 1..i + 3)?).ok()?;
-                out.push(u8::from_str_radix(hex, 16).ok()?);
-                i += 3;
-            }
-            b'+' => {
-                out.push(b' ');
-                i += 1;
-            }
-            b => {
-                out.push(b);
-                i += 1;
-            }
-        }
-    }
-    String::from_utf8(out).ok()
+    let back = url::Url::parse(&redirect).ok()?;
+    let port = back.port()?;
+    let exact = back.scheme() == "http"
+        && back.host() == Some(url::Host::Domain("localhost"))
+        && back.path() == "/callback"
+        && back.query().is_none()
+        && back.fragment().is_none()
+        && back.username().is_empty()
+        && back.password().is_none()
+        && redirect == format!("http://localhost:{port}/callback");
+    (exact && port >= LOWEST_CALLBACK_PORT).then(|| Direct {
+        url: page.to_string(),
+        port,
+    })
 }

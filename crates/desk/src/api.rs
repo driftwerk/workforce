@@ -461,6 +461,13 @@ async fn sign_in_code(
     s.desk.sign_in_code(id, &b.code).map(Json).into_response()
 }
 
+/// The page that comes back by itself for a sign-in made from another
+/// computer, for the Desk that forwards its port.
+async fn sign_in_direct(State(s): S, h: HeaderMap, Query(q): Q, Path(id): Path<Uuid>) -> Response {
+    guarded!(s, h, q);
+    s.desk.sign_in_direct(id).map(Json).into_response()
+}
+
 async fn cancel_sign_in(State(s): S, h: HeaderMap, Query(q): Q, Path(id): Path<Uuid>) -> Response {
     guarded!(s, h, q);
     s.desk
@@ -1234,6 +1241,10 @@ pub fn sessions_router(desk: Desk, auth: Arc<dyn Authorize>) -> Router {
             patch(update_account).delete(remove_account),
         )
         .route("/api/desk/accounts/sign-ins/{id}/code", post(sign_in_code))
+        .route(
+            "/api/desk/accounts/sign-ins/{id}/direct",
+            get(sign_in_direct),
+        )
         .route("/api/desk/accounts/switch-all", post(switch_all))
         .route("/api/desk/accounts/needs/{id}/put-off", post(put_off_need))
         .route(
