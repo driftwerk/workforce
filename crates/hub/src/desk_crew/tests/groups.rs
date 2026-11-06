@@ -927,3 +927,62 @@ async fn overseers_recall_apart_and_a_group_getting_a_boss_takes_its_sessions_fr
     })
     .await;
 }
+
+/// What a boss starts is its group's from its first word: nothing of its
+/// goal or its start reaches another scope, and placing it is no move.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_session_a_boss_starts_is_its_groups_from_its_first_row() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let c = clients(dir.path(), pool).await;
+        let r = "For the test.";
+        let folder = dir.path().to_string_lossy().to_string();
+        let started = c
+            .sarah
+            .tools
+            .get("crew.start_session")
+            .unwrap()
+            .execute(json!({ "folder": folder, "goal": format!("Check the {ACME_SECRET} copy"), "name": "acme-fix", "reason": r }))
+            .await
+            .unwrap();
+        assert!(started.output["done"].is_string(), "{started:?}");
+        let handed = c
+            .sarah
+            .tools
+            .get("crew.assign_ticket")
+            .unwrap()
+            .execute(json!({ "ticket": c.acme.ticket, "to": { "newSession": { "folder": folder } }, "reason": r }))
+            .await
+            .unwrap();
+        assert!(handed.success, "{handed:?}");
+        let mine: Vec<_> = c
+            .d
+            .list()
+            .into_iter()
+            .filter(|v| c.d.charge_of(v.id).is_some_and(|ch| ch.boss == "sarah"))
+            .collect();
+        assert_eq!(mine.len(), 2, "{mine:?}");
+        for v in &mine {
+            assert_eq!(v.group.as_ref().map(|g| g.id.as_str()), Some("acme"));
+            assert!(c.d.charge_of(v.id).unwrap().live(), "placing it is no move");
+        }
+        // Let what was noted land, then look from every other scope.
+        eventually("Acme's start in its activity", async || {
+            let a = c.sarah.tools.get("crew.activity").unwrap().execute(json!({})).await.unwrap();
+            a.output.to_string().contains("acme-fix").then_some(())
+        })
+        .await;
+        for other in [&c.desk, &c.mia] {
+            for name in ["crew.activity", "crew.overview", "crew.board", "crew.spend"] {
+                let said = other.tools.get(name).unwrap().execute(json!({})).await.unwrap();
+                let said = format!("{:?} {}", said.error, said.output);
+                assert!(
+                    !said.contains(ACME_SECRET) && !said.contains("acme-fix"),
+                    "{} {name}: {said}",
+                    other.agent_id
+                );
+            }
+        }
+    })
+    .await;
+}

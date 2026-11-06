@@ -278,6 +278,142 @@ impl Desk {
         }
     }
 
+    /// `id` moved from group `from` to `to`: across a boss boundary, what
+    /// [`crate::scope::move_effects`] says is done, as Desk. Its rows stay
+    /// where they were written.
+    pub(super) async fn moved_across(&self, id: Uuid, from: Option<&str>, to: Option<&str>) {
+        let bossed = self.bossed();
+        if crate::scope::scope_of(from, &bossed) == crate::scope::scope_of(to, &bossed)
+            || self.0.scopes.lock().placing.contains(&id)
+        {
+            return;
+        }
+        let was = self.seen_by(&crate::scope::scope_of(from, &bossed));
+        let mut tickets = Vec::new();
+        match self.0.store.session_tickets(id).await {
+            Ok(mine) => {
+                for t in mine {
+                    let group = self.group_of_board(t.board).await.ok().flatten();
+                    let open = !matches!(
+                        t.state,
+                        crate::board::TicketState::Done | crate::board::TicketState::Dropped
+                    );
+                    if open && was.sees(group.as_deref()) {
+                        tickets.push((t.id, t.state));
+                    }
+                }
+            }
+            Err(e) => tracing::warn!(%id, error = %e, "couldn't read a moved session's tickets"),
+        }
+        // A charge of the new scope's boss stays.
+        let new_scope = crate::scope::scope_of(to, &bossed);
+        let charged = self.charge_of(id).is_some_and(|c| {
+            c.live() && crate::scope::scope_of(c.group.as_deref(), &bossed) != new_scope
+        });
+        let ids: Vec<Uuid> = tickets.iter().map(|(t, _)| *t).collect();
+        let by = By {
+            party: Party::desk(),
+            reason: Some("It moved to another group.".into()),
+            suggestion_id: None,
+            hop: 0,
+        };
+        let mut said = Vec::new();
+        for effect in crate::scope::move_effects(from, to, &ids, charged, &bossed) {
+            match effect {
+                crate::scope::Effect::Unassign { ticket } => {
+                    let doing = tickets
+                        .iter()
+                        .any(|(t, s)| *t == ticket && !crate::board::unassigns(*s));
+                    let done = match doing {
+                        true => {
+                            let mv = crate::service::Move {
+                                state: crate::board::TicketState::Todo,
+                                before: None,
+                                after: None,
+                            };
+                            self.move_ticket(ticket, mv, &by).await.map(drop)
+                        }
+                        false => self.assign_ticket(ticket, None, &by).await.map(drop),
+                    };
+                    match done {
+                        Ok(()) => said
+                            .push("Your ticket from there is back in To do, and no longer yours."),
+                        Err(e) => {
+                            tracing::warn!(%id, error = %e, "a moved session's ticket wasn't unassigned")
+                        }
+                    }
+                }
+                crate::scope::Effect::WithdrawAsks => {
+                    let asks = match self.0.store.line_open_asks(None).await {
+                        Ok(asks) => asks,
+                        Err(e) => {
+                            tracing::warn!(%id, error = %e, "couldn't read a moved session's questions");
+                            continue;
+                        }
+                    };
+                    let mut withdrawn = false;
+                    for mut ask in asks.into_iter().filter(|a| {
+                        a.from_session() == Some(id)
+                            && a.to.kind == PartyKind::Manager
+                            && a.asked == Some(Asked::Open)
+                    }) {
+                        ask.asked = Some(Asked::Withdrawn);
+                        ask.updated_at = Utc::now();
+                        match self.0.store.put_line(&ask).await {
+                            Ok(()) => {
+                                self.line_announce(&ask);
+                                withdrawn = true;
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "couldn't withdraw a moved session's question")
+                            }
+                        }
+                    }
+                    if withdrawn {
+                        said.push("Your questions to the boss you had are withdrawn.");
+                    }
+                }
+                crate::scope::Effect::Release => {
+                    if let Err(e) = self.release(id, &by).await {
+                        tracing::warn!(%id, error = %e, "a moved session's boss didn't let it go");
+                    }
+                }
+                crate::scope::Effect::Tell => {
+                    let Ok(view) = self.view(id) else {
+                        continue;
+                    };
+                    let place = to
+                        .and_then(|g| self.group_name(g))
+                        .unwrap_or_else(|| "no group".into());
+                    let text = std::iter::once(format!(
+                        "You were moved to {place}, which another boss oversees."
+                    ))
+                    .chain(said.iter().map(|s| s.to_string()))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                    let mut note = LineMessage::new(
+                        Party::desk(),
+                        Party::session(&view),
+                        LineKind::Tell,
+                        text,
+                        0,
+                    );
+                    note.group = to.map(str::to_string);
+                    if !view.live {
+                        note.delivery = Delivery::Held;
+                    }
+                    match self.0.store.put_line(&note).await {
+                        Ok(()) => {
+                            self.line_announce(&note);
+                            self.line_pump_later(id);
+                        }
+                        Err(e) => tracing::warn!(%id, error = %e, "a moved session wasn't told"),
+                    }
+                }
+            }
+        }
+    }
+
     /// Records `m` in Activity and tells every window, and what its
     /// sessions' threads are unread by.
     fn line_announce(&self, m: &LineMessage) {

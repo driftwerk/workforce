@@ -564,7 +564,7 @@ impl Desk {
             if used.tokens == 0 && used.usd == 0.0 {
                 continue;
             }
-            let group = self.group_of_member(&super::local_agent_item(&agent));
+            let group = self.group_of_agent(&agent);
             if q.filter
                 .seen
                 .as_ref()
