@@ -4507,8 +4507,8 @@ pub(crate) async fn stream_admitted(
         voice_channel,
         desk,
     } = turn;
-    let (inject_rx, self_serve) = inbox.map_or((None, Default::default()), |inbox| {
-        (Some(inbox.rx), inbox.self_serve)
+    let (inject_rx, self_serve, heard) = inbox.map_or((None, Default::default(), None), |inbox| {
+        (Some(inbox.rx), inbox.self_serve, inbox.heard)
     });
     let (progress_tx, progress_rx) = tokio::sync::mpsc::channel(64);
 
@@ -5078,6 +5078,7 @@ pub(crate) async fn stream_admitted(
     let ls_sessions = Arc::clone(&service.sessions);
 
     let archive_base_for_task = archive_base;
+    let heard_for_task = heard;
     let kh_question = message.to_string();
     let session_key_for_task = channel.to_string();
     let session_id_for_task = current_session_id.clone();
@@ -5217,6 +5218,20 @@ pub(crate) async fn stream_admitted(
                             return Err(e);
                         }
                         tracing::error!(error = %e, "Agent run failed");
+                        let shared = session.is_shared_conversation();
+                        records::keep_failed_turn(
+                            &sessions,
+                            &mut session,
+                            records::FailedTurn {
+                                archive_base: archive_base_for_task,
+                                heard: heard_for_task.as_ref().map(crate::hub_core::live_turns::HeardLog::take).unwrap_or_default(),
+                                trust_level,
+                                desk: desk_for_task.as_ref(),
+                                asker: shared.then_some(user_id_for_attr.as_str()),
+                                error: &format!("Agent error: {e}"),
+                                ran: &turn_journal.rows(),
+                            },
+                        );
                         end_turn_record(&sessions, &session.id, &turn_token_for_task);
                         return Err(e);
                     }
@@ -5241,6 +5256,9 @@ pub(crate) async fn stream_admitted(
                 let (mut result, route) = match outcome {
                     crate::agent_turn::ChainOutcome::Served { result, route } => (*result, route),
                     crate::agent_turn::ChainOutcome::Notice { text } => {
+                        if let Some(log) = heard_for_task.as_ref() {
+                            records::keep_heard(&mut session, log.take(), trust_level, desk_for_task.as_ref());
+                        }
                         let saved = save_notice_turn(&me, &mut session, archive_base_for_task, &user_id_for_attr, &text, desk_for_task.as_ref());
                         turn_journal.clear();
                         end_turn_record(&sessions, &session.id, &turn_token_for_task);
@@ -5346,22 +5364,28 @@ pub(crate) async fn stream_admitted(
                     }
                 }
 
-                // Persist mid-run follow-ups the runner absorbed — they exist
-                // only in the run's in-memory conversation otherwise, and a
-                // later turn would be blind to them. System injections (job
-                // results) are tool-derived: never promote them into
-                // user-authored history.
-                for follow_up in result
-                    .injected_user_messages
-                    .iter()
-                    .filter(|f| f.user != "system")
-                {
-                    session.add_user_message_with_trust(
-                        &follow_up.text,
-                        follow_up.external_id.as_deref(),
-                        None,
-                        trust_level,
-                    );
+                // Persist the person's mid-run follow-ups — they exist only in
+                // the run's in-memory conversation otherwise, and a later turn
+                // would be blind to them. Where the live-turn registry fed the
+                // inbox, every follow-up it took in, as it arrived; else what
+                // the runner absorbed. System injections (job results) are
+                // tool-derived: never promote them into user-authored history.
+                match heard_for_task.as_ref() {
+                    Some(log) => records::keep_heard(&mut session, log.take(), trust_level, desk_for_task.as_ref()),
+                    None => {
+                        for follow_up in result
+                            .injected_user_messages
+                            .iter()
+                            .filter(|f| f.user != "system")
+                        {
+                            session.add_user_message_with_trust(
+                                &follow_up.text,
+                                follow_up.external_id.as_deref(),
+                                None,
+                                trust_level,
+                            );
+                        }
+                    }
                 }
                 let telemetry_provider = settle_served(&mut session, &result, route, reserved, desk_for_task.as_ref())
                     .map_or(telemetry_provider, str::to_string);

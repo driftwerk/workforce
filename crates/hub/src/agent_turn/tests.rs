@@ -233,6 +233,7 @@ impl Hub {
                 inject.map(|rx| crate::serve::TurnInbox {
                     rx,
                     self_serve: workforce_agent::tools::approval::SelfServe::Answerable,
+                    heard: None,
                 }),
                 None,
                 None,

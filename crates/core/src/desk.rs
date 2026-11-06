@@ -450,6 +450,11 @@ pub struct DeskMark {
     /// The tools that turn ran, in order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub steps: Vec<DeskStep>,
+    /// What the turn that asked `in_reply_to` failed with, said instead of
+    /// an answer: no one's message, kept so the conversation shows where it
+    /// failed, and folded away once a later answer replaces it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub failed: bool,
 }
 
 /// How far a person has read a place: through `at`, the item seen last

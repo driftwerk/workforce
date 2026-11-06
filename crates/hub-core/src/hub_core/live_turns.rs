@@ -97,11 +97,12 @@ impl From<TurnControl> for Control {
                 user,
                 place,
                 queue,
+                id,
             } => Self::FollowUp {
                 message: InjectedMessage::UserMessage {
                     text,
                     user,
-                    external_id: None,
+                    external_id: id,
                 },
                 place,
                 queue,
@@ -150,6 +151,52 @@ pub enum Ending {
     Failed(String),
 }
 
+/// A person's follow-up a live turn took in, as it arrived: what they said,
+/// the client's id for it, and when.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Heard {
+    pub text: String,
+    pub user: String,
+    pub external_id: Option<String>,
+    pub at: chrono::DateTime<chrono::Utc>,
+}
+
+/// The follow-ups a live turn took in, in the order they arrived. Kept
+/// beside the turn rather than in its run, so they are saved however the
+/// turn ends: a run that fails returns none of what it absorbed, and one
+/// that arrives after the run last looked was still told to the person as
+/// taken in.
+#[derive(Debug, Clone, Default)]
+pub struct HeardLog(Arc<Mutex<Vec<Heard>>>);
+
+impl HeardLog {
+    /// Notes `message` if it is something a person said: an approval answer
+    /// is no message, and the hub's own injections (a job's result) are no
+    /// one's.
+    fn note(&self, message: &InjectedMessage) {
+        if let InjectedMessage::UserMessage {
+            text,
+            user,
+            external_id,
+        } = message
+        {
+            if user != "system" {
+                self.0.lock().push(Heard {
+                    text: text.clone(),
+                    user: user.clone(),
+                    external_id: external_id.clone(),
+                    at: chrono::Utc::now(),
+                });
+            }
+        }
+    }
+
+    /// What has arrived so far, taken out of the log.
+    pub fn take(&self) -> Vec<Heard> {
+        std::mem::take(&mut *self.0.lock())
+    }
+}
+
 #[derive(Clone)]
 struct Entry {
     generation: u64,
@@ -157,6 +204,7 @@ struct Entry {
     settled: CancellationToken,
     answered: Arc<AtomicBool>,
     inject: mpsc::Sender<InjectedMessage>,
+    heard: HeardLog,
     desk: Option<Arc<DeskLive>>,
 }
 
@@ -250,8 +298,13 @@ impl Entry {
             self.stop().await;
             return Applied::NotLive;
         }
+        let heard = self.heard.clone();
+        let noted = message.clone();
         match self.inject.try_send(message) {
-            Ok(()) => Applied::Injected,
+            Ok(()) => {
+                heard.note(&noted);
+                Applied::Injected
+            }
             Err(_) => Applied::NotLive,
         }
     }
@@ -297,12 +350,14 @@ impl LiveTurns {
         nats: Option<async_nats::Client>,
     ) -> Result<(LiveTurn, TurnInbox), TurnBusy> {
         let (inject, rx) = mpsc::channel(INBOX_BUFFER);
+        let heard = HeardLog::default();
         let entry = Entry {
             generation: NEXT_GENERATION.fetch_add(1, Ordering::Relaxed),
             cancel: CancellationToken::new(),
             settled: CancellationToken::new(),
             answered: Arc::new(AtomicBool::new(false)),
             inject,
+            heard: heard.clone(),
             desk: desk.map(|desk| {
                 Arc::new(DeskLive {
                     place: desk.turn.place.clone(),
@@ -326,7 +381,14 @@ impl LiveTurns {
             pumps: Vec::new(),
         };
         turn.listen(session_id).await;
-        Ok((turn, TurnInbox { rx, self_serve }))
+        Ok((
+            turn,
+            TurnInbox {
+                rx,
+                self_serve,
+                heard: Some(heard),
+            },
+        ))
     }
 
     /// Steer the live turn for `session_id`. A stop resolves once the turn has
@@ -679,6 +741,66 @@ mod tests {
         assert_eq!(turns.apply("nope", Control::Cancel).await, Applied::NotLive);
     }
 
+    /// The turn keeps, beside it, each follow-up it took in as it arrived,
+    /// under the client's id for it: an approval answer and the hub's own
+    /// injections are no one's message, and a refused one never arrived.
+    #[tokio::test]
+    async fn the_follow_ups_a_turn_takes_in_are_heard_as_they_arrive() {
+        let turns = LiveTurns::new("allan");
+        let (turn, inbox) = begin(&turns, "s1").await;
+        let heard = inbox.heard.expect("a live turn's inbox logs what it hears");
+        let before = chrono::Utc::now();
+        assert_eq!(
+            turns
+                .apply(
+                    "s1",
+                    Control::from(TurnControl::FollowUp {
+                        text: "we talked about it".into(),
+                        user: "u1".into(),
+                        place: None,
+                        queue: false,
+                        id: Some("c-2".into()),
+                    })
+                )
+                .await,
+            Applied::Injected
+        );
+        turns
+            .apply(
+                "s1",
+                Control::Inject(InjectedMessage::UserMessage {
+                    text: "job finished".into(),
+                    user: "system".into(),
+                    external_id: None,
+                }),
+            )
+            .await;
+        turns
+            .apply(
+                "s1",
+                Control::from(TurnControl::Approval {
+                    request_id: "r1".into(),
+                    approved: true,
+                    user: "u1".into(),
+                    choice: None,
+                }),
+            )
+            .await;
+        turn.entry.cancel.cancel();
+        assert_eq!(
+            turns.apply("s1", follow_up("too late")).await,
+            Applied::NotLive
+        );
+        let taken = heard.take();
+        assert_eq!(taken.len(), 1, "{taken:?}");
+        assert_eq!(
+            (taken[0].text.as_str(), taken[0].external_id.as_deref()),
+            ("we talked about it", Some("c-2"))
+        );
+        assert!(taken[0].at >= before && taken[0].at <= chrono::Utc::now());
+        assert!(heard.take().is_empty(), "taken once");
+    }
+
     #[tokio::test]
     async fn a_message_after_the_answer_winds_the_turn_up_instead() {
         let turns = LiveTurns::new("allan");
@@ -823,6 +945,7 @@ mod tests {
                 user: "u1".into(),
                 place: Some(DeskPlace::Dm),
                 queue: true,
+                id: None,
             }),
             Control::FollowUp {
                 message: InjectedMessage::UserMessage {
@@ -832,6 +955,23 @@ mod tests {
                 place: Some(DeskPlace::Dm),
                 queue: true,
             }
+        ));
+        // The client's id for a follow-up is the one it is saved under.
+        assert!(matches!(
+            Control::from(TurnControl::FollowUp {
+                text: "hi".into(),
+                user: "u1".into(),
+                place: Some(DeskPlace::Dm),
+                queue: false,
+                id: Some("c-1".into()),
+            }),
+            Control::FollowUp {
+                message: InjectedMessage::UserMessage {
+                    external_id: Some(ref id),
+                    ..
+                },
+                ..
+            } if id == "c-1"
         ));
     }
 
@@ -1136,6 +1276,7 @@ mod tests {
             user: "u1".into(),
             place: Some(room_thread(3)),
             queue: false,
+            id: None,
         };
         let reply = request(&elsewhere).await.expect("the owner replies");
         let reply: TurnControlReply = serde_json::from_slice(&reply.payload).unwrap();

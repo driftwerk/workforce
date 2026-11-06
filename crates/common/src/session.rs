@@ -434,6 +434,15 @@ pub struct TranscriptEntry {
     /// [`SessionMessage::desk`] has it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub desk: Option<crate::channels::desk::DeskMark>,
+    /// The client's own id for the message ([`SessionMessage::external_id`]),
+    /// where the store keeps it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_id: Option<String>,
+    /// Where the message is in the archive's order: higher was archived
+    /// later, across every session of a thread. A store that keeps no such
+    /// order, or an entry read from the live transcript, has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seq: Option<i64>,
 }
 
 /// Metadata about a tool invocation.
@@ -5055,6 +5064,8 @@ pub fn message_to_transcript_entry(session_id: &str, msg: &SessionMessage) -> Tr
         tool_metadata,
         token_usage,
         desk: msg.desk.clone(),
+        external_id: msg.external_id.clone(),
+        seq: None,
     }
 }
 
@@ -8415,6 +8426,8 @@ mod tests {
                 tool_metadata: None,
                 token_usage: None,
                 desk: None,
+                external_id: None,
+                seq: None,
             })
             .collect();
 
@@ -8437,6 +8450,8 @@ mod tests {
                 tool_metadata: None,
                 token_usage: None,
                 desk: None,
+                external_id: None,
+                seq: None,
             })
             .collect();
 
@@ -8459,6 +8474,8 @@ mod tests {
                 tool_metadata: None,
                 token_usage: None,
                 desk: None,
+                external_id: None,
+                seq: None,
             })
             .collect();
 
@@ -8481,6 +8498,8 @@ mod tests {
                 tool_metadata: None,
                 token_usage: None,
                 desk: None,
+                external_id: None,
+                seq: None,
             })
             .collect();
 

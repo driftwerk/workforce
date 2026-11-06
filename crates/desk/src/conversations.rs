@@ -103,6 +103,14 @@ pub struct Said {
     /// transcript message's (`file:<artifact_id>`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<crate::attachments::Attachment>,
+    /// The client's own id for the message: what Desk sent it under, which
+    /// tells it the message it showed is this one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
+    /// Where the message is in the conversation's archive: higher was kept
+    /// later. A file that is a message of its own has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seq: Option<i64>,
 }
 
 /// Where a page of a conversation sits. A cursor names a message of the
@@ -452,6 +460,8 @@ mod tests {
                     desk: None,
                     mark: None,
                     attachments: Vec::new(),
+                    client_id: None,
+                    seq: None,
                 }],
                 more: true,
             })

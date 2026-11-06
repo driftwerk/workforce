@@ -1497,6 +1497,10 @@ const DESK_STREAM: &str = "desk.stream";
 /// steer it ([`workforce_gateway_client::protocol::SendMode::Queue`]).
 const DESK_QUEUE: &str = "desk.queue";
 const DESK_DELIVERIES: &str = "desk.deliveries";
+/// A Desk conversation's read names the client's own id for each message
+/// sent under one, and every kept row's place in the archive: Desk knows its
+/// copy by that id and orders by that place, not by words and times.
+const DESK_CLIENT_IDS: &str = "desk.client_ids";
 
 /// Frames only a Desk connection is sent; any other connection is sent the
 /// frames it always was.
@@ -1514,13 +1518,16 @@ const DESK_ONLY_FRAMES: &[&str] = &[
 pub(crate) fn desk_features(of_a_person: bool) -> Vec<String> {
     let deliveries = cfg!(feature = "postgres") && of_a_person;
     let signals = deliveries.then(floor_signals).into_iter().flatten();
-    let reads = (deliveries && crate::session_store_factory::keeps_desk_reads())
-        .then(|| workforce_common::channels::desk::DeskSignal::Read.feature());
+    // Both need the sessions in Postgres: its archive is what keeps read
+    // points beside it, and what numbers every row and keeps its client id.
+    let in_postgres = deliveries && crate::session_store_factory::keeps_desk_reads();
+    let reads = in_postgres.then(|| workforce_common::channels::desk::DeskSignal::Read.feature());
     [DESK_PLACE, DESK_STREAM, DESK_QUEUE]
         .into_iter()
         .chain(deliveries.then_some(DESK_DELIVERIES))
         .chain(signals)
         .chain(reads)
+        .chain(in_postgres.then_some(DESK_CLIENT_IDS))
         .map(str::to_string)
         .collect()
 }
@@ -2621,6 +2628,10 @@ async fn handle_ws(
                                         session_owner,
                                         desk.as_ref().map(|d| d.turn.place.clone()),
                                         queued,
+                                        desk.as_ref()
+                                            .and_then(|d| d.turn.message)
+                                            .map(|id| id.to_string())
+                                            .as_deref(),
                                     ),
                                 )
                                 .await;
@@ -3670,13 +3681,15 @@ fn applied_by(reply: &TurnControlReply) -> Applied {
 }
 
 /// A chat message offered to a live turn: an `approve <id>` / `reject <id>`
-/// answers one of its prompts, anything else is a follow-up from `place`.
-/// One sent to `queue` is always a follow-up, which waits for the turn.
+/// answers one of its prompts, anything else is a follow-up from `place`,
+/// saved under the client's `id` for it. One sent to `queue` is always a
+/// follow-up, which waits for the turn.
 fn followup_injection(
     content: &str,
     user: &str,
     place: Option<DeskPlace>,
     queue: bool,
+    id: Option<&str>,
 ) -> TurnControl {
     let trimmed = content.trim();
     let lowered = trimmed.to_lowercase();
@@ -3699,6 +3712,7 @@ fn followup_injection(
             user: user.to_string(),
             place,
             queue,
+            id: id.map(str::to_string),
         },
     }
 }
@@ -17040,7 +17054,7 @@ mod turn_control_tests {
             .await
             .expect("no turn running yet");
 
-        let follow_up = followup_injection("and the tests too", "u1", None, false);
+        let follow_up = followup_injection("and the tests too", "u1", None, false, None);
         assert_eq!(
             steer(None, &service, "s1", follow_up).await,
             Applied::Injected
@@ -17049,7 +17063,7 @@ mod turn_control_tests {
             inbox.rx.recv().await,
             Some(InjectedMessage::UserMessage { text, .. }) if text == "and the tests too"
         ));
-        let answer = followup_injection("approve req-1", "u1", None, false);
+        let answer = followup_injection("approve req-1", "u1", None, false, None);
         assert_eq!(steer(None, &service, "s1", answer).await, Applied::Injected);
         assert!(matches!(
             inbox.rx.recv().await,
@@ -17073,7 +17087,7 @@ mod turn_control_tests {
     #[test]
     fn followup_injection_answers_prompts_and_forwards_everything_else() {
         assert_eq!(
-            followup_injection("  Approve req-1 ", "u1", None, false),
+            followup_injection("  Approve req-1 ", "u1", None, false, None),
             TurnControl::Approval {
                 request_id: "req-1".into(),
                 approved: true,
@@ -17082,35 +17096,45 @@ mod turn_control_tests {
             }
         );
         assert!(matches!(
-            followup_injection("reject req-2", "u1", None, false),
+            followup_injection("reject req-2", "u1", None, false, None),
             TurnControl::Approval { approved: false, request_id, .. } if request_id == "req-2"
         ));
         assert_eq!(
-            followup_injection("approve ", "u1", None, false),
+            followup_injection("approve ", "u1", None, false, None),
             TurnControl::FollowUp {
                 text: "approve ".into(),
                 user: "u1".into(),
                 place: None,
                 queue: false,
+                id: None,
             },
             "no request id is a plain follow-up"
         );
         assert_eq!(
-            followup_injection("approved, ship it", "u1", Some(DeskPlace::Dm), false),
+            followup_injection(
+                "approved, ship it",
+                "u1",
+                Some(DeskPlace::Dm),
+                false,
+                Some("c-7")
+            ),
             TurnControl::FollowUp {
                 text: "approved, ship it".into(),
                 user: "u1".into(),
                 place: Some(DeskPlace::Dm),
                 queue: false,
-            }
+                id: Some("c-7".into()),
+            },
+            "a follow-up carries the client's id for it"
         );
         assert_eq!(
-            followup_injection("approve req-1", "u1", Some(DeskPlace::Dm), true),
+            followup_injection("approve req-1", "u1", Some(DeskPlace::Dm), true, None),
             TurnControl::FollowUp {
                 text: "approve req-1".into(),
                 user: "u1".into(),
                 place: Some(DeskPlace::Dm),
                 queue: true,
+                id: None,
             },
             "a queued message waits for the turn, whatever it says"
         );

@@ -3135,6 +3135,11 @@ pub struct MessageProgress {
 pub struct TurnInbox {
     pub rx: tokio::sync::mpsc::Receiver<InjectedMessage>,
     pub self_serve: workforce_agent::tools::approval::SelfServe,
+    /// The person's follow-ups as they arrived, where the live-turn registry
+    /// feeds the inbox: the turn saves these whether it answers or fails.
+    /// `None` for an inbox fed some other way, whose turn saves what its run
+    /// absorbed.
+    pub heard: Option<crate::hub_core::live_turns::HeardLog>,
 }
 
 /// Tool allowlist for [`crate::hub_core::jobs::AgentProfile::Worker`] — read-only

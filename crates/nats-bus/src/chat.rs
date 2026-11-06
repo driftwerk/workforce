@@ -64,6 +64,11 @@ pub enum TurnControl {
         /// it until the turn ends. An instance that predates it steers.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         queue: bool,
+        /// The client's own id for the message, which the turn saves it
+        /// under: Desk knows its copy by it. An instance that predates it
+        /// saves the follow-up without one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
     },
     /// An answer to one of the turn's approval prompts.
     Approval {
@@ -214,12 +219,14 @@ mod tests {
                 user: "u1".into(),
                 place: None,
                 queue: false,
+                id: None,
             },
             TurnControl::FollowUp {
                 text: "and the thread".into(),
                 user: "u1".into(),
                 place: Some(workforce_core::desk::DeskPlace::Dm),
                 queue: true,
+                id: Some("7a1c3e52-0b44-4d1e-9a51-2f7f5d0c1b9e".into()),
             },
             TurnControl::Approval {
                 request_id: "r1".into(),
@@ -248,6 +255,7 @@ mod tests {
                 user: "u1".into(),
                 place: None,
                 queue: false,
+                id: None,
             })
             .unwrap(),
             serde_json::json!({"kind": "follow_up", "text": "hi", "user": "u1"})
@@ -357,6 +365,7 @@ mod tests {
                 user: "u1".into(),
                 place: None,
                 queue: false,
+                id: None,
             }
         );
         let reply: TurnControlReply =

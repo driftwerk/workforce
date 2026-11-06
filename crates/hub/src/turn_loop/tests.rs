@@ -1211,3 +1211,278 @@ async fn a_desk_answer_names_the_message_its_turn_answers_and_a_resumed_one_none
     assert_eq!(resumed.delivery, Some(DeliveryKind::Resumed));
     assert_eq!((resumed.in_reply_to, resumed.steps.len()), (None, 0));
 }
+
+/// A Desk turn in the person's DM, asked with message `asked`.
+fn dm_turn(asked: uuid::Uuid) -> workforce_common::channels::desk::DeskTurnContext {
+    use workforce_common::channels::desk::{
+        DeskPlace, DeskSpeaker, DeskTurn, DeskTurnContext, DESK_CHANNEL,
+    };
+    let turn = DeskTurn {
+        place: DeskPlace::Dm,
+        speaker: DeskSpeaker::Person,
+        hop: 0,
+        context: Vec::new(),
+        message: Some(asked),
+        spoken: false,
+        voice: None,
+    };
+    DeskTurnContext::new(
+        turn,
+        DESK_CHANNEL,
+        None,
+        false,
+        Some("ref-1".into()),
+        uuid::Uuid::new_v4().to_string(),
+    )
+}
+
+/// Runs `question` as a Desk turn in `owner`'s DM, with `follow_up` sent
+/// now into it under the client's id `steered`, to its end.
+async fn steered_turn(
+    service: &std::sync::Arc<AgentService>,
+    owner: &str,
+    question: &str,
+    asked: uuid::Uuid,
+    follow_up: &str,
+    steered: uuid::Uuid,
+) -> (String, eyre::Result<workforce_agent::runner::RunResult>) {
+    use workforce_common::channels::desk::{DeskPlace, DESK_CHANNEL};
+    use workforce_nats::chat::TurnControl;
+    let desk = dm_turn(asked);
+    let session = service
+        .sessions
+        .get_or_create(DESK_CHANNEL, owner, service.agent_id.as_str())
+        .unwrap();
+    let (_live, inbox) = service
+        .begin_live_turn(
+            &session.id,
+            workforce_agent::tools::approval::SelfServe::Answerable,
+            Some(&desk),
+        )
+        .await
+        .expect("no turn running yet");
+    let applied = service
+        .live_turns
+        .apply(
+            &session.id,
+            TurnControl::FollowUp {
+                text: follow_up.into(),
+                user: owner.into(),
+                place: Some(DeskPlace::Dm),
+                queue: false,
+                id: Some(steered.to_string()),
+            }
+            .into(),
+        )
+        .await;
+    assert!(applied.applied(), "the follow-up joins the live turn");
+    let MessageProgress {
+        mut progress_rx,
+        handle,
+        session_id,
+        ..
+    } = service
+        .process_message_with_progress(
+            DESK_CHANNEL,
+            owner,
+            None,
+            question,
+            None,
+            Some(&session.id),
+            None,
+            None,
+            None,
+            None,
+            Some(inbox),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&desk),
+        )
+        .await
+        .unwrap();
+    while progress_rx.recv().await.is_some() {}
+    (session_id, handle.await.unwrap())
+}
+
+/// The DM as Desk reads it back: each message's words, client id and
+/// whether it is a failure.
+fn read_back(
+    service: &AgentService,
+    owner: &str,
+) -> Vec<(String, Option<String>, bool, Option<uuid::Uuid>)> {
+    let (page, _) = crate::desk_conversations::read(
+        service.sessions.as_ref(),
+        &workforce_desk::Speaker::agent(service.agent_id.as_str(), "Agent"),
+        owner,
+        workforce_common::channels::desk::DESK_CHANNEL,
+        workforce_desk::Cursor::Newest,
+        50,
+    )
+    .unwrap();
+    page.messages
+        .into_iter()
+        .map(|m| {
+            let mark = m.mark.unwrap_or_default();
+            (m.text, m.client_id, mark.failed, mark.in_reply_to)
+        })
+        .collect()
+}
+
+/// A turn that fails still keeps what it was asked, and what was sent into
+/// it with Send now, each under the client's id: the DM reads them back
+/// after a restart, then the failure, pointing at the question. The
+/// failure is the conversation's alone: the model never replays it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_turn_keeps_its_question_its_follow_up_and_where_it_failed() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    let tmp = tempfile::tempdir().unwrap();
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(400).set_body_string("the model refused the request"))
+        .mount(&server)
+        .await;
+    let mut config = workforce_common::settings::WorkforceConfig::default();
+    config.hub.data_dir = tmp.path().to_string_lossy().to_string();
+    config.memory.db_path = tmp.path().join("memory.db").to_string_lossy().into_owned();
+    config.llm.provider = "ollama".into();
+    config.llm.api_key = Some(server.uri());
+    config.llm.default_model = "mock".into();
+    config.desk.enabled = true;
+    let service = AgentService::from_config(config, None).await.unwrap();
+
+    let (asked, steered) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+    let before = Utc::now();
+    let (session_id, ran) = steered_turn(
+        &service,
+        "identity-1",
+        "what was that research called again?",
+        asked,
+        "we talked about it previously",
+        steered,
+    )
+    .await;
+    let failed = ran.expect_err("the model refused, so the turn failed");
+
+    assert_eq!(
+        read_back(&service, "identity-1"),
+        [
+            (
+                "what was that research called again?".to_string(),
+                Some(asked.to_string()),
+                false,
+                None
+            ),
+            (
+                "we talked about it previously".to_string(),
+                Some(steered.to_string()),
+                false,
+                None
+            ),
+            (format!("Agent error: {failed}"), None, true, Some(asked)),
+        ]
+    );
+    let session = service.sessions.get(&session_id).unwrap().unwrap();
+    let said: Vec<&str> = session
+        .messages
+        .iter()
+        .filter(|m| m.role != workforce_common::session::MessageRole::System)
+        .map(|m| m.content.as_str())
+        .collect();
+    assert_eq!(
+        said,
+        [
+            "what was that research called again?",
+            "we talked about it previously"
+        ],
+        "the transcript the model replays holds no failure"
+    );
+    let follow_up = &session.messages[session.messages.len() - 1];
+    assert!(
+        follow_up.timestamp >= before && follow_up.timestamp < Utc::now(),
+        "stamped when it arrived"
+    );
+}
+
+/// A follow-up sent now into a turn that answers is kept under the
+/// client's id, stamped when it arrived, between the question and the
+/// answer, which names the question it answers.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_follow_up_is_kept_under_its_client_id_before_the_answer() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (service, _server) =
+        crate::serve::testing::service_on_mock_llm_with(tmp.path(), |config| {
+            config.desk.enabled = true;
+        })
+        .await;
+    let (asked, steered) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+    let (_, ran) = steered_turn(
+        &service,
+        "identity-1",
+        "what was that research called again?",
+        asked,
+        "we talked about it previously",
+        steered,
+    )
+    .await;
+    ran.expect("the turn answers");
+    assert_eq!(
+        read_back(&service, "identity-1"),
+        [
+            (
+                "what was that research called again?".to_string(),
+                Some(asked.to_string()),
+                false,
+                None
+            ),
+            (
+                "we talked about it previously".to_string(),
+                Some(steered.to_string()),
+                false,
+                None
+            ),
+            ("done".to_string(), None, false, Some(asked)),
+        ]
+    );
+}
+
+/// What a failure keeps in the archive names the tools the turn ran.
+#[test]
+fn a_failure_row_carries_the_tools_its_turn_ran() {
+    let asked = uuid::Uuid::new_v4();
+    let ran = [workforce_common::session::SessionMessage::tool(
+        "web.search",
+        &serde_json::json!({"q": "research"}),
+        &serde_json::json!("results"),
+        true,
+        420,
+        None,
+    )];
+    let row = crate::turn_loop::records::failure_row(
+        &dm_turn(asked),
+        "Agent error: llm first-token timeout",
+        &ran,
+    );
+    assert_eq!(row.role, workforce_common::session::MessageRole::Assistant);
+    let mark = row.desk.unwrap();
+    assert!(mark.failed);
+    assert_eq!(mark.in_reply_to, Some(asked));
+    assert_eq!(
+        mark.steps,
+        [workforce_common::channels::desk::DeskStep::of(
+            "web.search",
+            true,
+            420
+        )]
+    );
+}

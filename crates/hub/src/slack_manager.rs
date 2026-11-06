@@ -3738,6 +3738,7 @@ pub fn spawn_slack_dispatch_loop(
                                     rx: inject_rx,
                                     self_serve:
                                         workforce_agent::tools::approval::SelfServe::Answerable,
+                                    heard: None,
                                 }),
                                 playbook_display.as_deref(),
                                 None,

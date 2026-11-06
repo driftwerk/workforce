@@ -1468,6 +1468,8 @@ mod tests {
                 tool_metadata: None,
                 token_usage: None,
                 desk: None,
+                external_id: None,
+                seq: None,
             })
             .collect();
 
@@ -1494,6 +1496,8 @@ mod tests {
             tool_metadata: None,
             token_usage: None,
             desk: None,
+            external_id: None,
+            seq: None,
         }];
 
         assert_eq!(

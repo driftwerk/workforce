@@ -1819,8 +1819,9 @@ impl SessionStore for PostgresSessionStore {
             scoped
                 .execute(
                     "INSERT INTO session_archive
-                     (tenant_id, session_id, message_id, role, content, tool_data, ts, tokens, desk)
-                     VALUES ($8, $1, $2, $3, $4, $5, $6, $7, $9)
+                     (tenant_id, session_id, message_id, role, content, tool_data, ts, tokens, desk,
+                      external_id)
+                     VALUES ($8, $1, $2, $3, $4, $5, $6, $7, $9, $10)
                      ON CONFLICT DO NOTHING",
                     &[
                         &id,
@@ -1832,6 +1833,7 @@ impl SessionStore for PostgresSessionStore {
                         &(message.tokens as i32),
                         &self.tenant_id(),
                         &desk,
+                        &message.external_id,
                     ],
                 )
                 .await?;
@@ -1906,7 +1908,7 @@ impl SessionStore for PostgresSessionStore {
                 Some(seq) => {
                     scoped
                         .query(
-                            "SELECT seq, message_id, role, content, tool_data, ts, tokens, desk
+                            "SELECT seq, message_id, role, content, tool_data, ts, tokens, desk, external_id
                              FROM session_archive
                              WHERE session_id = $1 AND seq < $2 AND tenant_id = $4
                              ORDER BY seq DESC LIMIT $3",
@@ -1917,7 +1919,7 @@ impl SessionStore for PostgresSessionStore {
                 None => {
                     scoped
                         .query(
-                            "SELECT seq, message_id, role, content, tool_data, ts, tokens, desk
+                            "SELECT seq, message_id, role, content, tool_data, ts, tokens, desk, external_id
                              FROM session_archive
                              WHERE session_id = $1 AND tenant_id = $3
                              ORDER BY seq DESC LIMIT $2",
@@ -2006,7 +2008,8 @@ impl SessionStore for PostgresSessionStore {
             let scoped = self.scope(&mut conn).await?;
             let row = scoped
                 .query_opt(
-                    "SELECT a.seq, a.message_id, a.role, a.content, a.tool_data, a.ts, a.tokens, a.desk
+                    "SELECT a.seq, a.message_id, a.role, a.content, a.tool_data, a.ts, a.tokens, a.desk,
+                            a.external_id
                      FROM session_archive a
                      JOIN sessions s ON s.id = a.session_id AND s.tenant_id = a.tenant_id
                      WHERE a.session_id = $1 AND a.message_id = $2
@@ -2314,7 +2317,7 @@ fn archive_row_to_entry(session_id: &str, r: &tokio_postgres::Row) -> Transcript
         tool_data: r.get(4),
         timestamp: r.get(5),
         tokens: r.get::<_, i32>(6) as u32,
-        external_id: None,
+        external_id: r.get(8),
         attachments: None,
         trust_level: None,
         actor: None,
@@ -2322,7 +2325,10 @@ fn archive_row_to_entry(session_id: &str, r: &tokio_postgres::Row) -> Transcript
             .get::<_, Option<serde_json::Value>>(7)
             .and_then(|mark| serde_json::from_value(mark).ok()),
     };
-    message_to_transcript_entry(session_id, &msg)
+    TranscriptEntry {
+        seq: Some(r.get(0)),
+        ..message_to_transcript_entry(session_id, &msg)
+    }
 }
 
 #[cfg(test)]

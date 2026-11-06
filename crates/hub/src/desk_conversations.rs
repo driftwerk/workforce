@@ -152,6 +152,8 @@ fn said(
         desk: None,
         mark,
         attachments,
+        client_id: entry.external_id.clone(),
+        seq: entry.seq,
     })
 }
 
@@ -290,6 +292,12 @@ fn read_with(
         return Err(unknown("after"));
     }
     gathered.reverse();
+    // Each message once, where it was first said: a successor not yet
+    // archived reads from its live transcript, which carries the turns its
+    // rollover kept verbatim under their own ids, already read from the
+    // predecessor's archive.
+    let mut seen = HashSet::new();
+    gathered.retain(|said| seen.insert(said.id.clone()));
     let more = match after {
         Some(_) => gathered.len() > limit,
         None => gathered.len() > limit || !exhausted,
@@ -896,6 +904,80 @@ mod tests {
         .await;
     }
 
+    /// On postgres every kept row reads with its place in the archive, in
+    /// the order they were kept, and what the person sent with the id their
+    /// client gave it; a turn's failure reads as the agent's, marked failed
+    /// and pointing at the question it failed on.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn on_postgres_each_row_reads_with_its_client_id_and_archive_order() {
+        use workforce_common::channels::desk::DeskMark;
+        use workforce_common::session_postgres::PostgresSessionStore;
+        workforce_postgres::test_support::with_test_pool(
+            PostgresSessionStore::build_pool,
+            |pool| async move {
+                let store = PostgresSessionStore::with_pool(pool, "scout")
+                    .await
+                    .expect("store");
+                let asked = uuid::Uuid::new_v4();
+                let mut session = store.get_or_create(DESK_CHANNEL, ME, "scout").unwrap();
+                session.add_user_message("the question", Some(&asked.to_string()));
+                session.add_user_message("sent now", Some("c-2"));
+                store.save(&session).unwrap();
+                for message in &session.messages {
+                    store.append_to_archive(&session.id, message).unwrap();
+                }
+                let mut failure = SessionMessage::tool(
+                    "x",
+                    &serde_json::json!({}),
+                    &serde_json::json!(""),
+                    false,
+                    0,
+                    None,
+                );
+                failure.role = MessageRole::Assistant;
+                failure.tool_data = None;
+                failure.content = "Agent error: no first token".into();
+                failure.desk = Some(DeskMark {
+                    in_reply_to: Some(asked),
+                    failed: true,
+                    ..DeskMark::default()
+                });
+                store.append_to_archive(&session.id, &failure).unwrap();
+
+                let read = page(
+                    store.as_ref(),
+                    &scout(),
+                    ME,
+                    DESK_CHANNEL,
+                    Cursor::Newest,
+                    10,
+                )
+                .unwrap();
+                let ids: Vec<Option<&str>> = read
+                    .messages
+                    .iter()
+                    .map(|m| m.client_id.as_deref())
+                    .collect();
+                let asked_id = asked.to_string();
+                assert_eq!(ids, [Some(asked_id.as_str()), Some("c-2"), None]);
+                let seqs: Vec<i64> = read
+                    .messages
+                    .iter()
+                    .map(|m| m.seq.expect("every kept row is numbered"))
+                    .collect();
+                assert!(seqs.windows(2).all(|w| w[0] < w[1]), "{seqs:?}");
+                let failed = read.messages[2].mark.clone().unwrap();
+                assert!(failed.failed);
+                assert_eq!(failed.in_reply_to, Some(asked));
+                assert_eq!(read.messages[2].from, Author::Agent);
+                let wire = serde_json::to_value(&read.messages[0]).unwrap();
+                assert_eq!(wire["client_id"], asked_id.as_str());
+                assert!(wire["seq"].is_i64(), "{wire}");
+            },
+        )
+        .await;
+    }
+
     /// A room's conversation pages forward after a message Desk already
     /// placed, across a rollover, and each message carries its place.
     /// Each page covers the time between its neighbours, so the files that
@@ -1339,6 +1421,32 @@ mod tests {
     }
 
     /// A dormant DM goes on in a successor; the read crosses the seam.
+    /// A rollover that carries its last turns verbatim leaves them in the
+    /// successor under the same ids; until the successor has an archive its
+    /// read falls back to that transcript, and still each message reads once.
+    #[test]
+    fn turns_a_rollover_carries_verbatim_read_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = JsonlSessionStore::new(dir.path()).unwrap();
+        exchange(&store, 0);
+        let mut old = store.find(DESK_CHANNEL, ME).unwrap().unwrap();
+        for message in &old.messages {
+            store.append_to_archive(&old.id, message).unwrap();
+        }
+        let successor = workforce_agent::rollover::seal_and_mint(&store, &mut old, 3).unwrap();
+        assert!(
+            successor.messages.iter().any(|m| m.content == "answer 0"),
+            "the successor carries the last turns verbatim"
+        );
+        let newest = page(&store, &scout(), ME, DESK_CHANNEL, Cursor::Newest, 200).unwrap();
+        assert_eq!(
+            texts(&newest),
+            [("question 0", Author::User), ("answer 0", Author::Agent)]
+        );
+        let ids: HashSet<&str> = newest.messages.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids.len(), newest.messages.len(), "every id once");
+    }
+
     #[test]
     fn a_rolled_over_conversation_reads_as_one() {
         let dir = tempfile::tempdir().unwrap();
