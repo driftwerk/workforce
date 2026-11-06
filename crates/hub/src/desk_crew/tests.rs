@@ -771,7 +771,7 @@ async fn a_blocked_session_wakes_the_overseer_and_its_answer_offers_the_approval
         assert_eq!(yours.approval_id, Some(pending.id.to_string()));
         // The check-in counted against the day's cap, and the overseer's own
         // turn is not crew activity.
-        assert_eq!(d.store().wake_ups_since(crew.midnight()).await.unwrap(), 1);
+        assert_eq!(d.store().wake_ups_since("desk", crew.midnight()).await.unwrap(), 1);
         let page = d.activity(Filter::All, None, 50).await.unwrap();
         assert!(page
             .events
@@ -885,7 +885,7 @@ async fn what_happens_together_is_one_check_in_and_the_day_has_a_cap() {
         assert_eq!(told.subject, None);
         tokio::time::sleep(Duration::from_millis(800)).await;
         assert_eq!(
-            d.store().wake_ups_since(chrono::Utc::now() - chrono::Duration::hours(1)).await.unwrap(),
+            d.store().wake_ups_since("desk", chrono::Utc::now() - chrono::Duration::hours(1)).await.unwrap(),
             1,
             "a day's check-ins are capped"
         );
@@ -936,7 +936,7 @@ async fn past_the_hours_check_ins_what_happens_waits_for_the_next() {
         .await;
         assert!(later.prompt.contains("merged"), "{}", later.prompt);
         assert_eq!(
-            d.store().wake_ups_since(chrono::Utc::now() - chrono::Duration::hours(1)).await.unwrap(),
+            d.store().wake_ups_since("desk", chrono::Utc::now() - chrono::Duration::hours(1)).await.unwrap(),
             2,
             "what waited is told, not dropped"
         );
@@ -976,7 +976,7 @@ async fn an_unchanged_question_wakes_the_overseer_once_and_what_it_raised_is_kep
         tokio::time::sleep(Duration::from_millis(600)).await;
         assert_eq!(
             d.store()
-                .wake_ups_since(chrono::Utc::now() - chrono::Duration::hours(1))
+                .wake_ups_since("desk", chrono::Utc::now() - chrono::Duration::hours(1))
                 .await
                 .unwrap(),
             1,
@@ -1048,7 +1048,10 @@ async fn summaries_are_scheduled_as_set_and_run_in_the_dm() {
             .unwrap();
         assert_eq!(brief.text, "Quiet night: nothing needs you.");
         assert_eq!(
-            d.store().wake_ups_since(crew.midnight()).await.unwrap(),
+            d.store()
+                .wake_ups_since("desk", crew.midnight())
+                .await
+                .unwrap(),
             0,
             "a summary is no check-in"
         );

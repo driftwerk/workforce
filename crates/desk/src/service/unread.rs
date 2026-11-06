@@ -416,6 +416,7 @@ pub(crate) mod tests {
                         agent: "allan".into(),
                     }],
                     default_member: None,
+                    ..Default::default()
                 })
                 .await
                 .unwrap();

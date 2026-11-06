@@ -505,6 +505,7 @@ impl Desk {
         }
         let ungrouped = self.0.store.put_layout(&after).await?;
         self.0.state.lock().layout = after.clone();
+        self.scopes_follow(&after);
         self.boards_ungrouped(&ungrouped).await;
         self.announce(DeskEvent::Layout {
             layout: after.clone(),

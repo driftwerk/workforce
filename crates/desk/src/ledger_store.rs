@@ -11,6 +11,7 @@ use uuid::Uuid;
 use crate::engine::Engine;
 use crate::ledger::{Billing, Cell, Priced, Spend, Tokens};
 use crate::model::SessionRecord;
+use crate::scope::{seen_sql, Seen, SeenParams};
 use crate::store::DeskStore;
 
 /// How far one of a session's records has been read.
@@ -36,6 +37,20 @@ pub struct Filter {
     pub engine: Option<Engine>,
     pub account: Option<String>,
     pub session: Option<Uuid>,
+    /// Only the rows an overseer of this scope sees, by the group each was
+    /// kept in; every row for none (the person).
+    pub seen: Option<Seen>,
+}
+
+impl Filter {
+    /// The scope's group and the groups with no boss, which [`seen_sql`] takes,
+    /// and whether every row is read (there is no scope to keep to).
+    fn seen_params(&self) -> (SeenParams, bool) {
+        match &self.seen {
+            Some(s) => (s.params(), false),
+            None => (SeenParams::default(), true),
+        }
+    }
 }
 
 /// One kept call, as the Ledger view lists it.
@@ -55,6 +70,9 @@ pub struct LedgerRow {
     /// The board's ticket the session was working on.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ticket: Option<Uuid>,
+    /// The sidebar group the session was in when the call was kept.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
 }
 
 /// Where a page of rows ends: the next page starts after it.
@@ -132,7 +150,8 @@ impl DeskStore {
     /// call's final counts, its account) completes it. How many rows were
     /// added or completed. A new row is stamped with the ticket the session
     /// worked on when the call was made (`ticket_assignments`), however
-    /// late its record is read; a completed row keeps its stamp.
+    /// late its record is read, and with the sidebar group the session is
+    /// in as it is kept; a completed row keeps its stamps.
     pub async fn ledger_write(
         &self,
         session: Uuid,
@@ -155,12 +174,15 @@ impl DeskStore {
             changed = tx
                 .execute(
                     "INSERT INTO ledger (engine, key, session, at, model, input, output, \
-                     cache_read, cache_write, reasoning, usd, priced, billing, account, ticket) \
+                     cache_read, cache_write, reasoning, usd, priced, billing, account, ticket, \
+                     group_id) \
                      SELECT $1, k, $2, a, m, i, o, cr, cw, r, u, p, b, acc, ( \
                        SELECT w.ticket FROM ticket_assignments w \
                        WHERE w.session = $2::uuid AND w.from_at <= a \
                          AND (w.until_at IS NULL OR a < w.until_at) \
-                       ORDER BY w.from_at DESC LIMIT 1) FROM UNNEST( \
+                       ORDER BY w.from_at DESC LIMIT 1), ( \
+                       SELECT NULLIF(g.group_id, 'ungrouped') FROM group_members g \
+                       WHERE g.item = 'session:' || $2::uuid::text) FROM UNNEST( \
                        $3::text[], $4::timestamptz[], $5::text[], $6::int8[], $7::int8[], \
                        $8::int8[], $9::int8[], $10::int8[], $11::float8[], $12::text[], \
                        $13::text[], $14::text[]) AS t(k, a, m, i, o, cr, cw, r, u, p, b, acc) \
@@ -228,19 +250,25 @@ impl DeskStore {
         filter: &Filter,
     ) -> Result<Vec<Cell>> {
         let client = self.pool().get().await?;
+        let (p, all) = filter.seen_params();
+        let sql = format!(
+            "SELECT session, engine, model, account, billing, \
+               (at AT TIME ZONE $3)::date AS day, \
+               SUM(input)::int8, SUM(output)::int8, SUM(cache_read)::int8, \
+               SUM(cache_write)::int8, SUM(reasoning)::int8, \
+               COALESCE(SUM(usd), 0)::float8, COUNT(*)::int8, \
+               (COUNT(*) FILTER (WHERE usd IS NULL))::int8, group_id \
+             FROM ledger WHERE at >= $1 AND at < $2 \
+               AND ($4::text IS NULL OR engine = $4) \
+               AND ($5::text IS NULL OR account = $5) \
+               AND ($6::uuid IS NULL OR session = $6) \
+               AND ($11::bool OR {}) \
+             GROUP BY 1, 2, 3, 4, 5, 6, 15",
+            seen_sql("group_id", "at", 7)
+        );
         let rows = client
             .query(
-                "SELECT session, engine, model, account, billing, \
-                   (at AT TIME ZONE $3)::date AS day, \
-                   SUM(input)::int8, SUM(output)::int8, SUM(cache_read)::int8, \
-                   SUM(cache_write)::int8, SUM(reasoning)::int8, \
-                   COALESCE(SUM(usd), 0)::float8, COUNT(*)::int8, \
-                   (COUNT(*) FILTER (WHERE usd IS NULL))::int8 \
-                 FROM ledger WHERE at >= $1 AND at < $2 \
-                   AND ($4::text IS NULL OR engine = $4) \
-                   AND ($5::text IS NULL OR account = $5) \
-                   AND ($6::uuid IS NULL OR session = $6) \
-                 GROUP BY 1, 2, 3, 4, 5, 6",
+                &sql,
                 &[
                     &from,
                     &to,
@@ -248,6 +276,11 @@ impl DeskStore {
                     &filter.engine.map(Engine::as_str),
                     &filter.account,
                     &filter.session,
+                    &p.group,
+                    &p.open,
+                    &p.groups,
+                    &p.since,
+                    &all,
                 ],
             )
             .await
@@ -256,6 +289,7 @@ impl DeskStore {
             .map(|r| {
                 Ok(Cell {
                     session: r.try_get(0)?,
+                    group: r.try_get(14)?,
                     engine: Engine::parse(r.try_get(1)?)?,
                     model: r.try_get(2)?,
                     account: r.try_get(3)?,
@@ -280,16 +314,22 @@ impl DeskStore {
         after: Option<&After>,
     ) -> Result<Vec<LedgerRow>> {
         let client = self.pool().get().await?;
+        let (p, all) = filter.seen_params();
+        let sql = format!(
+            "SELECT session, key, at, engine, model, input, output, cache_read, \
+               cache_write, reasoning, usd, priced, billing, account, ticket, group_id \
+             FROM ledger WHERE at >= $1 AND at < $2 \
+               AND ($3::text IS NULL OR engine = $3) \
+               AND ($4::text IS NULL OR account = $4) \
+               AND ($5::uuid IS NULL OR session = $5) \
+               AND ($6::timestamptz IS NULL OR (at, engine, key) < ($6, $7, $8)) \
+               AND ($14::bool OR {}) \
+             ORDER BY at DESC, engine DESC, key DESC LIMIT $9",
+            seen_sql("group_id", "at", 10)
+        );
         let rows = client
             .query(
-                "SELECT session, key, at, engine, model, input, output, cache_read, \
-                   cache_write, reasoning, usd, priced, billing, account, ticket \
-                 FROM ledger WHERE at >= $1 AND at < $2 \
-                   AND ($3::text IS NULL OR engine = $3) \
-                   AND ($4::text IS NULL OR account = $4) \
-                   AND ($5::uuid IS NULL OR session = $5) \
-                   AND ($6::timestamptz IS NULL OR (at, engine, key) < ($6, $7, $8)) \
-                 ORDER BY at DESC, engine DESC, key DESC LIMIT $9",
+                &sql,
                 &[
                     &from,
                     &to,
@@ -300,6 +340,11 @@ impl DeskStore {
                     &after.map(|a| a.engine.as_str()),
                     &after.map(|a| a.key.as_str()),
                     &PAGE,
+                    &p.group,
+                    &p.open,
+                    &p.groups,
+                    &p.since,
+                    &all,
                 ],
             )
             .await
@@ -318,6 +363,7 @@ impl DeskStore {
                     billing: Billing::parse(r.try_get(12)?)?,
                     account: r.try_get(13)?,
                     ticket: r.try_get(14)?,
+                    group: r.try_get(15)?,
                 })
             })
             .collect()

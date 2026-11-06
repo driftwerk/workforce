@@ -10,6 +10,7 @@ use tokio_postgres::Row;
 
 use crate::conversations::Speaker;
 use crate::crew::{Event, Extras, Filter, Kind, Party, Suggestion, SuggestionState};
+use crate::scope::{seen_sql, Seen};
 use crate::store::DeskStore;
 
 /// One of the overseer's unprompted turns.
@@ -63,6 +64,7 @@ fn event(row: &Row) -> Result<Event> {
             .context("reading an event's place")?,
         message: row.try_get("message")?,
         ticket: row.try_get("ticket")?,
+        group: row.try_get("group_id")?,
     })
 }
 
@@ -98,8 +100,9 @@ impl DeskStore {
         client
             .execute(
                 "INSERT INTO activity (id, at, kind, actor, subject, text, reason, suggestion_id, \
-                 approval_id, hop, detail, place, message, ticket) \
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) ON CONFLICT (id) DO NOTHING",
+                 approval_id, hop, detail, place, message, ticket, group_id) \
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) \
+                 ON CONFLICT (id) DO NOTHING",
                 &[
                     &e.id,
                     &e.at,
@@ -115,6 +118,7 @@ impl DeskStore {
                     &e.place.as_ref().map(serde_json::to_value).transpose()?,
                     &e.message,
                     &e.ticket,
+                    &e.group,
                 ],
             )
             .await
@@ -220,20 +224,37 @@ impl DeskStore {
     }
 
     /// Events since `since`, oldest first, about the subjects in `ids` (all
-    /// when empty), at most `limit`.
+    /// when empty), at most `limit`; with `seen`, only those an overseer of
+    /// that scope sees, by the group each was recorded in.
     pub async fn events_since(
         &self,
         since: DateTime<Utc>,
         ids: &[String],
         limit: i64,
+        seen: Option<&Seen>,
     ) -> Result<Vec<Event>> {
         let client = self.pool().get().await?;
+        let p = seen.map(Seen::params).unwrap_or_default();
+        let sql = format!(
+            "SELECT * FROM (SELECT * FROM activity WHERE at >= $1 \
+             AND (cardinality($2::text[]) = 0 OR subject ->> 'id' = ANY($2)) \
+             AND ($8::bool OR {}) \
+             ORDER BY at DESC, id DESC LIMIT $3) recent ORDER BY at, id",
+            seen_sql("group_id", "at", 4)
+        );
         let rows = client
             .query(
-                "SELECT * FROM (SELECT * FROM activity WHERE at >= $1 \
-                 AND (cardinality($2::text[]) = 0 OR subject ->> 'id' = ANY($2)) \
-                 ORDER BY at DESC, id DESC LIMIT $3) recent ORDER BY at, id",
-                &[&since, &ids, &limit],
+                &sql,
+                &[
+                    &since,
+                    &ids,
+                    &limit,
+                    &p.group,
+                    &p.open,
+                    &p.groups,
+                    &p.since,
+                    &seen.is_none(),
+                ],
             )
             .await?;
         rows.iter().map(event).collect()
@@ -483,25 +504,32 @@ impl DeskStore {
             .transpose()
     }
 
-    /// How many wake-ups (not summaries) there have been since `since`.
-    pub async fn wake_ups_since(&self, since: DateTime<Utc>) -> Result<i64> {
+    /// How many wake-ups (not summaries) the overseer `agent_id` has had
+    /// since `since`: each overseer's are its own to spend.
+    pub async fn wake_ups_since(&self, agent_id: &str, since: DateTime<Utc>) -> Result<i64> {
         let client = self.pool().get().await?;
         let row = client
             .query_one(
-                "SELECT count(*) AS n FROM check_ins WHERE kind = 'wake' AND at >= $1",
-                &[&since],
+                "SELECT count(*) AS n FROM check_ins \
+                 WHERE kind = 'wake' AND agent_id = $1 AND at >= $2",
+                &[&agent_id, &since],
             )
             .await?;
         Ok(row.try_get("n")?)
     }
 
-    /// When each wake-up since `since` was, earliest first.
-    pub async fn wakes_since(&self, since: DateTime<Utc>) -> Result<Vec<DateTime<Utc>>> {
+    /// When each of `agent_id`'s wake-ups since `since` was, earliest first.
+    pub async fn wakes_since(
+        &self,
+        agent_id: &str,
+        since: DateTime<Utc>,
+    ) -> Result<Vec<DateTime<Utc>>> {
         let client = self.pool().get().await?;
         let rows = client
             .query(
-                "SELECT at FROM check_ins WHERE kind = 'wake' AND at >= $1 ORDER BY at",
-                &[&since],
+                "SELECT at FROM check_ins WHERE kind = 'wake' AND agent_id = $1 AND at >= $2 \
+                 ORDER BY at",
+                &[&agent_id, &since],
             )
             .await?;
         rows.iter()
@@ -719,14 +747,23 @@ mod tests {
             assert_eq!(store.latest_check_in("desk").await.unwrap(), None);
             c.reply = Some("All quiet.".into());
             store.put_check_in(&c).await.unwrap();
-            assert_eq!(store.latest_check_in("desk").await.unwrap(), Some(c));
             assert_eq!(
-                store
-                    .wake_ups_since(Utc::now() - chrono::Duration::hours(1))
-                    .await
-                    .unwrap(),
-                1
+                store.latest_check_in("desk").await.unwrap(),
+                Some(c.clone())
             );
+            let hour_ago = Utc::now() - chrono::Duration::hours(1);
+            assert_eq!(store.wake_ups_since("desk", hour_ago).await.unwrap(), 1);
+            assert_eq!(
+                store.wake_ups_since("sarah", hour_ago).await.unwrap(),
+                0,
+                "each overseer's check-ins are its own"
+            );
+            assert!(store
+                .wakes_since("sarah", hour_ago)
+                .await
+                .unwrap()
+                .is_empty());
+            assert_eq!(store.wakes_since("desk", hour_ago).await.unwrap(), [c.at]);
         })
         .await;
     }

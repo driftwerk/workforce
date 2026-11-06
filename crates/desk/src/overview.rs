@@ -81,6 +81,7 @@ fn session_item(
         hub_name: v.display_name.as_ref().map(|_| v.name.clone()),
         cwd: Some(v.cwd.clone()),
         group: v.group.as_ref().map(|g| g.name.clone()),
+        group_id: v.group.as_ref().map(|g| g.id.clone()),
         engine: Some(v.engine),
         origin: Some(v.origin),
         state,
@@ -131,6 +132,7 @@ fn agent_item(
         hub_name: None,
         cwd: None,
         group: None,
+        group_id: None,
         engine: None,
         origin: None,
         state: ItemState::Idle,
@@ -319,6 +321,18 @@ impl Desk {
 
     /// The overview as of now, its needs `person`'s.
     pub async fn overview(&self, crew: &dyn Crew, person: Option<&str>) -> Result<Overview> {
+        self.overview_for(crew, person, None).await
+    }
+
+    /// The overview as an overseer that sees `seen` reads it: only what is
+    /// in its scope, counted, and only its scope's groups; everything for
+    /// none.
+    pub async fn overview_for(
+        &self,
+        crew: &dyn Crew,
+        person: Option<&str>,
+        seen: Option<&crate::scope::Seen>,
+    ) -> Result<Overview> {
         let now = Utc::now();
         let overseer = crew.overseer();
         let quiet = overseer
@@ -334,11 +348,15 @@ impl Desk {
         let layout = self.layout();
         items.extend(crew.agents().iter().map(|a| {
             let mut item = agent_item(a, latest.get(&a.id), now, midnight, quiet);
-            item.group = layout
-                .group_of(&crate::service::local_agent_item(&a.id))
-                .map(|g| g.name.clone());
+            let group = layout.group_of(&crate::service::local_agent_item(&a.id));
+            item.group = group.map(|g| g.name.clone());
+            item.group_id = group.map(|g| g.id.clone());
             item
         }));
+        // An overseer reads its own scope's alone.
+        if let Some(seen) = seen {
+            items.retain(|i| seen.sees(i.group_id.as_deref()));
+        }
         let needs = crew.open_needs(person).await;
         if let Some(needs) = &needs {
             items = items
@@ -356,15 +374,14 @@ impl Desk {
                 .iter()
                 .filter(|i| matches!(i.state, ItemState::Working | ItemState::Quiet))
                 .count(),
-            needs_you: needs.as_ref().map_or_else(
-                || {
-                    items
-                        .iter()
-                        .filter(|i| i.state == ItemState::NeedsYou)
-                        .count()
-                },
-                Vec::len,
-            ),
+            // The floor's needs are everyone's: a scope counts its own.
+            needs_you: match needs.as_ref().filter(|_| seen.is_none()) {
+                Some(needs) => needs.len(),
+                None => items
+                    .iter()
+                    .filter(|i| i.state == ItemState::NeedsYou)
+                    .count(),
+            },
             done_today: items.iter().filter(|i| i.state == ItemState::Done).count(),
         };
         let brief = match &overseer {
@@ -382,10 +399,15 @@ impl Desk {
             }),
         };
         Ok(Overview {
-            brief,
+            brief: brief.filter(|_| seen.is_none()),
             counts,
             items,
-            groups: layout.groups.iter().map(|g| g.name.clone()).collect(),
+            groups: layout
+                .groups
+                .iter()
+                .filter(|g| seen.is_none_or(|s| s.sees(Some(&g.id))))
+                .map(|g| g.name.clone())
+                .collect(),
         })
     }
 }
@@ -491,6 +513,7 @@ mod tests {
             hub_name: None,
             cwd: None,
             group: None,
+            group_id: None,
             engine: None,
             origin: None,
             state,

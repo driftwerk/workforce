@@ -519,6 +519,7 @@ mod tests {
                     name: "Atlas launch".into(),
                     members: vec![],
                     default_member: None,
+                    ..Default::default()
                 })
                 .await
                 .unwrap();

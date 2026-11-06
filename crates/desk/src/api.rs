@@ -142,6 +142,7 @@ impl SpendParams {
                 .map_err(|_| DeskError::Invalid("that isn't an engine".into()))?,
             account: self.account.clone(),
             session: self.session,
+            seen: None,
         })
     }
 }
@@ -248,7 +249,7 @@ async fn spend(
         let (from, to) = p.window(&s.desk)?;
         let by =
             crate::ledger::SpendBy::parse(p.by.as_deref().unwrap_or("session")).map_err(|_| {
-                DeskError::Invalid("by is session, project, day, engine or account".into())
+                DeskError::Invalid("by is session, project, day, engine, account or group".into())
             })?;
         s.desk
             .spend(&crate::service::SpendQuery {
@@ -1126,7 +1127,27 @@ async fn rooms(State(s): S, h: HeaderMap, Query(q): Q) -> Response {
 
 async fn create_room(State(s): S, h: HeaderMap, Query(q): Q, Json(new): Json<NewRoom>) -> Response {
     guarded!(s, h, q);
-    s.desk.create_room(new).await.map(Json).into_response()
+    let asks = s.desk.room_asks(
+        None,
+        Some(new.group.as_deref()),
+        &new.members,
+        &new.share_with,
+    );
+    room_saved(s.desk.create_room(new).await, asks)
+}
+
+/// A room saved, or why not: a room of a group with a boss whose
+/// conversation would go to a hub the person hasn't agreed to is a `409`
+/// naming those hubs, for Desk to ask about once.
+fn room_saved(saved: Result<crate::rooms::Room, DeskError>, asks: Vec<String>) -> Response {
+    match saved {
+        Err(DeskError::Conflict(why)) if !asks.is_empty() => (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": why, "hubs": asks })),
+        )
+            .into_response(),
+        other => other.map(Json).into_response(),
+    }
 }
 
 async fn update_room(
@@ -1137,7 +1158,16 @@ async fn update_room(
     Json(p): Json<RoomPatch>,
 ) -> Response {
     guarded!(s, h, q);
-    s.desk.update_room(id, p).await.map(Json).into_response()
+    let asks = match &p.members {
+        Some(members) => s.desk.room_asks(
+            Some(id),
+            p.group.as_ref().map(|g| g.as_deref()),
+            members,
+            &p.share_with,
+        ),
+        None => Vec::new(),
+    };
+    room_saved(s.desk.update_room(id, p).await, asks)
 }
 
 async fn delete_room(State(s): S, h: HeaderMap, Query(q): Q, Path(id): Path<Uuid>) -> Response {

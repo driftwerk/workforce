@@ -484,7 +484,11 @@ impl Desk {
         subject: Option<Party>,
         text: String,
     ) -> Result<TicketView, DeskError> {
-        self.note(by.event(kind, subject, text).about_ticket(t.id));
+        let group = self.board_of(t.board).await.ok().and_then(|b| b.group);
+        self.note(
+            by.event(kind, subject, text)
+                .about_ticket(t.id, group.as_deref()),
+        );
         let v = self.view_ticket(t).await?;
         self.announce(DeskEvent::Ticket {
             ticket: Box::new(v.clone()),
@@ -1091,7 +1095,7 @@ impl Desk {
                 t.assignee.clone(),
                 format!("deleted {key} “{}”", crew::one_line(&t.title, 120)),
             )
-            .about_ticket(id),
+            .about_ticket(id, b.group.as_deref()),
         );
         self.announce(DeskEvent::TicketRemoved { id });
         Ok(())
@@ -1414,6 +1418,7 @@ impl Desk {
                 let k = self.key_of(&t).await.map_err(say)?;
                 let text = crate::line::typable(&text).trim().to_string();
                 board::within("comment", &text, board::COMMENT_MAX)?;
+                let group = self.board_of(t.board).await.ok().and_then(|b| b.group);
                 self.note(
                     by.event(
                         Kind::TicketCommented,
@@ -1421,7 +1426,7 @@ impl Desk {
                         format!("commented on {k}: “{}”", crew::clip(&text, 400)),
                     )
                     .detail(json!({ "comment": text }))
-                    .about_ticket(t.id),
+                    .about_ticket(t.id, group.as_deref()),
                 );
                 Ok(json!({ "key": k, "commented": true }))
             }

@@ -188,6 +188,11 @@ pub struct Event {
     /// The board's ticket it is about: the ticket's history.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ticket: Option<uuid::Uuid>,
+    /// The sidebar group it was about when it was recorded (none:
+    /// ungrouped): what an overseer's scope sees it by. Stamped as it is
+    /// noted, so moving the item later never moves it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
 }
 
 /// Now, to the microsecond Postgres keeps.
@@ -215,12 +220,15 @@ impl Event {
             place: None,
             message: None,
             ticket: None,
+            group: None,
         }
     }
 
-    /// The event, about the board's ticket `id`.
-    pub fn about_ticket(mut self, id: uuid::Uuid) -> Self {
+    /// The event, about the board's ticket `id` on a board of `group`: a
+    /// ticket's events are its board's group's, whoever they name.
+    pub fn about_ticket(mut self, id: uuid::Uuid, group: Option<&str>) -> Self {
         self.ticket = Some(id);
+        self.group = group.map(str::to_string);
         self
     }
 
@@ -384,9 +392,12 @@ pub struct Item {
     /// A session's folder.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
-    /// The sidebar group it is in.
+    /// The sidebar group it is in, by name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
+    /// The sidebar group it is in, by id: what a scope sees it by.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_id: Option<String>,
     pub engine: Option<Engine>,
     pub origin: Option<Origin>,
     pub state: ItemState,

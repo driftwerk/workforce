@@ -106,10 +106,19 @@ impl DeskStore {
     }
 }
 
+/// Keys the hub keeps for itself: where the groups' boundaries are, which
+/// no route may read over, change or clear.
+const RESERVED: &str = "desk.groups.";
+
 fn check_key(key: &str) -> Result<(), DeskError> {
     if key.is_empty() || key.chars().count() > MAX_KEY_CHARS || key.chars().any(char::is_control) {
         return Err(DeskError::Invalid(format!(
             "a key is 1 to {MAX_KEY_CHARS} characters, none of them control characters"
+        )));
+    }
+    if key.starts_with(RESERVED) {
+        return Err(DeskError::Invalid(format!(
+            "keys starting {RESERVED} are the hub's own"
         )));
     }
     Ok(())
@@ -275,6 +284,18 @@ pub(crate) fn router(desk: Desk, auth: Arc<dyn Authorize>) -> Router {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_groups_boundaries_are_no_routes_to_change() {
+        for key in [
+            "desk.groups.bounded",
+            "desk.groups.opened",
+            "desk.groups.anything",
+        ] {
+            assert!(check_key(key).is_err(), "{key}");
+        }
+        assert!(check_key("desk.sidebar.width").is_ok());
+    }
     use crate::store::build_pool;
     use crate::testing::{allow_all, desk_on};
     use axum::body::Body;

@@ -233,6 +233,7 @@ impl CrewTool {
                             chrono::Utc::now() - chrono::Duration::days(7),
                             &[id.to_string()],
                             limit,
+                            None,
                         )
                         .await
                         .map(|mut e| {
@@ -569,6 +570,7 @@ mod tests {
             hub_name: hub_name.map(Into::into),
             cwd: Some("/Users/k/dev/monorepo".into()),
             group: group.map(Into::into),
+            group_id: group.map(Into::into),
             engine: Some(Engine::Claude),
             origin: Some(Origin::Desk),
             state: ItemState::Working,

@@ -492,6 +492,37 @@ mod tests {
     }
 
     #[test]
+    fn a_groups_budgets_apply_first_then_the_ungrouped_defaults_and_the_desk_wide_limit_always() {
+        let id = Uuid::new_v4();
+        let each = budget(BudgetScope::EachSession, None, 5.0);
+        let acme_each = budget(BudgetScope::EachSession, Some("acme"), 3.0);
+        let acme_total = budget(BudgetScope::Desk, Some("acme"), 30.0);
+        let desk_wide = budget(BudgetScope::Desk, None, 100.0);
+        let all = vec![
+            each.clone(),
+            acme_each.clone(),
+            acme_total.clone(),
+            desk_wide.clone(),
+        ];
+        let ids = |v: Vec<&Budget>| v.iter().map(|b| b.id).collect::<Vec<_>>();
+        let in_group = |g| Subject::Session { id, group: g };
+        // The group's own rows, else the ungrouped defaults.
+        assert_eq!(ids(applying(&all, &in_group(Some("acme")))), [acme_each.id]);
+        assert_eq!(ids(applying(&all, &in_group(Some("atlas")))), [each.id]);
+        // Then the pools: the group's total, and the Desk-wide limit over
+        // everything, whatever group it is in.
+        let pools_for = |g| {
+            pools_of(g)
+                .iter()
+                .flat_map(|p| ids(pools(&all, p)))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(pools_for(Some("acme")), [desk_wide.id, acme_total.id]);
+        assert_eq!(pools_for(Some("atlas")), [desk_wide.id]);
+        assert_eq!(pools_for(None), [desk_wide.id]);
+    }
+
+    #[test]
     fn the_tightest_standing_is_the_furthest_along_and_over_beats_warned() {
         let (from, to) = (at("2026-11-03T00:00:00Z"), at("2026-11-04T00:00:00Z"));
         let a = budget(BudgetScope::Desk, None, 10.0);

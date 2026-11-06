@@ -18,7 +18,7 @@ use uuid::Uuid;
 use super::{Desk, DeskError};
 use crate::engine::{Engine, SignIn, Via};
 use crate::ledger::{
-    self, Billing, CodexState, Label, Period, Priced, Pricer, Spend, SpendBy, SpendView,
+    self, Billing, CodexState, Label, Period, Priced, Pricer, Spend, SpendBy, SpendRow, SpendView,
 };
 use crate::ledger_store::{After, Cursor, Filter, Kept, LedgerRow, PAGE};
 use crate::model::{DeskEvent, SessionRecord};
@@ -509,6 +509,9 @@ impl Desk {
                 labels.insert(r.id, label_of(&r));
             }
         }
+        if q.by == SpendBy::Group {
+            return Ok(self.spend_by_group(&cells, q, &labels).await);
+        }
         Ok(ledger::fold(
             &cells,
             q.by,
@@ -517,6 +520,100 @@ impl Desk {
             q.from,
             q.to,
         ))
+    }
+
+    /// The ledger by group, per client: each group's sessions as their calls
+    /// were kept, and its local agents' spend from the hub's own records,
+    /// which keep no group, by the group each agent is in now. Named by the
+    /// sidebar's names, a deleted group's as it was.
+    async fn spend_by_group(
+        &self,
+        cells: &[ledger::Cell],
+        q: &SpendQuery,
+        labels: &HashMap<Uuid, Label>,
+    ) -> SpendView {
+        let mut view = ledger::fold(
+            cells,
+            SpendBy::Group,
+            |id| labels.get(&id).cloned(),
+            usize::MAX,
+            q.from,
+            q.to,
+        );
+        let reader = self.0.agent_spend.lock().clone();
+        // An agent's own spend is no session's: left out when only one is
+        // asked about.
+        let agents = match reader.filter(|_| q.filter.session.is_none()) {
+            Some(reader) => {
+                let (from, to) = (q.from, q.to);
+                match tokio::task::spawn_blocking(move || reader.spent(from, to)).await {
+                    Ok(Ok(spent)) => spent,
+                    Ok(Err(e)) => {
+                        tracing::warn!(error = format!("{e:#}"), "couldn't read agents' spend");
+                        Vec::new()
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "couldn't read agents' spend");
+                        Vec::new()
+                    }
+                }
+            }
+            None => Vec::new(),
+        };
+        for (agent, used) in agents {
+            if used.tokens == 0 && used.usd == 0.0 {
+                continue;
+            }
+            let group = self.group_of_member(&super::local_agent_item(&agent));
+            if q.filter
+                .seen
+                .as_ref()
+                .is_some_and(|s| !s.sees(group.as_deref()))
+            {
+                continue;
+            }
+            let key = group.clone().unwrap_or_default();
+            let at = match view.rows.iter().position(|r| r.key == key) {
+                Some(at) => at,
+                None => {
+                    view.rows.push(SpendRow {
+                        label: group
+                            .clone()
+                            .unwrap_or_else(|| ledger::UNGROUPED_SPEND.into()),
+                        key,
+                        session: None,
+                        engine: None,
+                        folder: None,
+                        totals: Default::default(),
+                        agents: None,
+                    });
+                    view.rows.len() - 1
+                }
+            };
+            let row = &mut view.rows[at];
+            let spent = row.agents.get_or_insert_with(Default::default);
+            spent.tokens += used.tokens;
+            spent.usd += used.usd;
+            row.totals.usd += used.usd;
+            view.total.usd += used.usd;
+        }
+        for r in &mut view.rows {
+            if !r.key.is_empty() {
+                if let Some(name) = self.group_name(&r.key) {
+                    r.label = name;
+                }
+            }
+        }
+        view.rows.sort_by(|a, b| {
+            b.totals
+                .usd
+                .total_cmp(&a.totals.usd)
+                .then(b.totals.tokens.total().cmp(&a.totals.tokens.total()))
+                .then(a.label.cmp(&b.label))
+        });
+        view.more = view.rows.len().saturating_sub(q.limit);
+        view.rows.truncate(q.limit);
+        view
     }
 
     /// Where `period` began, in the person's timezone.
