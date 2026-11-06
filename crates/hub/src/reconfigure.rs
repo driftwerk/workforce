@@ -95,6 +95,8 @@ pub(crate) async fn apply_config(service: &AgentService) -> eyre::Result<Vec<Str
         (m.consolidation, m.consolidation_interval_secs)
     };
     let rearm = consolidation(&service.resolved.snapshot().memory) != consolidation(&next.memory);
+    #[cfg(feature = "postgres")]
+    let next = crate::desk_crew::recall_kept_apart(service, next);
     service.resolved.store(next);
     if rearm {
         crate::memory_consolidation::rearm(service).await;

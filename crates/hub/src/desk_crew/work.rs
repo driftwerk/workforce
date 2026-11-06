@@ -182,6 +182,25 @@ impl CrewHub {
             if boss_of_its_scope {
                 continue;
             }
+            // In a group that has become another boss's boundary: its boss
+            // lets it go. (One not in a group yet is being placed.)
+            let boss_scope = overseers
+                .iter()
+                .find(|(s, _)| s.agent_id.as_str() == c.boss)
+                .map(|(_, o)| o.scope.clone());
+            if let (Some(g), Some(scope)) = (group.as_deref(), &boss_scope) {
+                if bossed.contains(g) && scope.group() != Some(g) {
+                    let by = By::manager(
+                        &c.boss,
+                        &c.boss_name,
+                        "Its group has a boss of its own now.",
+                    );
+                    if let Err(e) = self.desk.release(c.session, &by).await {
+                        tracing::info!(session = %c.session, error = %e, "a session wasn't let go");
+                    }
+                    continue;
+                }
+            }
             let still_boss = overseers.iter().any(|(s, _)| s.agent_id.as_str() == c.boss);
             // Its boss no longer oversees: passed on, within its scope, by
             // an overseer that acts.

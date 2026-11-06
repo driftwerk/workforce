@@ -44,14 +44,12 @@ impl CrewHub {
         }
     }
 
-    /// Whether `seen` holds the session `id`: refused when it is another
-    /// scope's. One that isn't there is said so where it is acted on.
+    /// Whether `seen` holds the session `id`: refused in the same words
+    /// whether it is another scope's or isn't there at all.
     pub(crate) fn session_seen(&self, id: Uuid, seen: &Seen) -> Result<(), String> {
         match self.desk.view(id) {
-            Ok(v) if !seen.sees(v.group.as_ref().map(|g| g.id.as_str())) => {
-                Err(self.not_ours(&seen.scope))
-            }
-            _ => Ok(()),
+            Ok(v) if seen.sees(v.group.as_ref().map(|g| g.id.as_str())) => Ok(()),
+            _ => Err(self.not_ours(&seen.scope)),
         }
     }
 
@@ -67,12 +65,14 @@ impl CrewHub {
     /// Whether `seen` holds the line message `id`: its session's group's.
     async fn message_seen(&self, id: Uuid, seen: &Seen) -> Result<(), String> {
         match self.desk.store().line_message(id).await {
-            Ok(Some(m)) if !seen.sees(m.group.as_deref()) => Err(self.not_ours(&seen.scope)),
+            Ok(Some(m)) if !seen.sees_row(m.group.as_deref(), m.at) => {
+                Err(self.not_ours(&seen.scope))
+            }
             Ok(Some(m)) => match m.from_session().or_else(|| m.to_session()) {
                 Some(s) => self.session_seen(s, seen),
                 None => Ok(()),
             },
-            _ => Ok(()),
+            _ => Err(self.not_ours(&seen.scope)),
         }
     }
 

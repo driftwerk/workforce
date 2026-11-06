@@ -165,9 +165,23 @@ pub(crate) fn config_saved(service: &AgentService) {
     }
 }
 
-/// Why `body`'s `[oversight]` can't be saved for `service`, when the desk
-/// is on for its hub: the group it oversees must be one of the sidebar's.
-pub(crate) fn oversight_refused(service: &AgentService, body: &str) -> Option<String> {
+/// Why `body`'s `[oversight]` can't be saved for `service` over `before`,
+/// when the desk is on for its hub: the group it oversees must be one of
+/// the sidebar's, and only a person changes who oversees what: never the
+/// agent itself (`agent_tool`).
+pub(crate) fn oversight_refused(
+    service: &AgentService,
+    before: Option<&str>,
+    body: &str,
+    via: &str,
+) -> Option<String> {
+    let oversight = |b: Option<&str>| {
+        b.and_then(|b| toml::from_str::<toml::Table>(b).ok())
+            .and_then(|t| t.get("oversight").cloned())
+    };
+    if via == "agent_tool" && oversight(before) != oversight(Some(body)) {
+        return Some("Who oversees what is the person's to set, in Desk.".to_string());
+    }
     let crew = for_service(service)?;
     match crate::agent_config_write::overseen(body)? {
         Scope::Group(g) if !crew.desk.is_group(&g) => {
@@ -175,6 +189,77 @@ pub(crate) fn oversight_refused(service: &AgentService, body: &str) -> Option<St
         }
         _ => None,
     }
+}
+
+/// After the person saved `body` for `service` over `before`: a group it
+/// no longer names, that no agent names now, has its boss taken off, and
+/// the main overseer sees it from now on.
+pub(crate) async fn oversight_saved(service: &AgentService, before: Option<&str>, body: &str) {
+    let Some(crew) = for_service(service) else {
+        return;
+    };
+    let Some(was) = before.and_then(group_named_in) else {
+        return;
+    };
+    if group_named_in(body).as_deref() == Some(was.as_str()) {
+        return;
+    }
+    let still = crew.services().iter().any(|s| {
+        s.agent_id != service.agent_id && named_group(&s.workspace).as_deref() == Some(&was)
+    });
+    if !still {
+        crew.desk.unbound_group(&was).await;
+    }
+}
+
+/// Whether the overseer `caller`, when it is one, may change or delete the
+/// agent `target`: only an agent of its own scope that oversees nothing.
+pub(crate) fn boss_may_change(caller: &str, target: &str) -> Result<(), String> {
+    let crew = CREWS
+        .lock()
+        .iter()
+        .filter_map(Weak::upgrade)
+        .find(|c| c.state.registry.get(caller).is_some());
+    let Some(crew) = crew else {
+        return Ok(());
+    };
+    let Some((_, o)) = crew.overseer_named(caller) else {
+        return Ok(());
+    };
+    if caller == target {
+        return Ok(());
+    }
+    let seen = crew.desk.seen_by(&o.scope);
+    let other_boss = crew.overseer_named(target).is_some()
+        || named_group(
+            &crew
+                .state
+                .registry
+                .get(target)
+                .map(|s| s.workspace.clone())
+                .unwrap_or_default(),
+        )
+        .is_some();
+    if other_boss || !crew.agent_in(target, &seen) {
+        return Err(crew.not_ours(&o.scope));
+    }
+    Ok(())
+}
+
+/// `service`'s settings as they are run: while any group has a boss of its
+/// own, an overseer recalls only its own memories, so no other agent's
+/// shared ones reach a client's boss or the main overseer.
+pub(crate) fn recall_kept_apart(
+    service: &AgentService,
+    mut next: crate::hub_core::resolved_config::ResolvedConfig,
+) -> crate::hub_core::resolved_config::ResolvedConfig {
+    let Some(crew) = for_service(service) else {
+        return next;
+    };
+    if crew.oversight_of(service).enabled && !crew.desk.bossed().is_empty() {
+        next.memory.agent_recall_scope = workforce_common::settings::AgentRecallScope::Isolated;
+    }
+    next
 }
 
 /// What `service` is shown as in Desk: its own name, never its id; one
@@ -192,6 +277,21 @@ pub(crate) fn name_of(service: &AgentService) -> String {
             .and_then(|c| c.oversight().ok())
             .is_some_and(|o| o.enabled);
     workforce_desk::crew::shown_name(id, name.as_deref(), boss)
+}
+
+/// The group `workspace`'s config.toml names in `[oversight] group`, read as
+/// leniently as can be: off, broken or not, it says a group has a boss.
+pub(crate) fn named_group(workspace: &Path) -> Option<String> {
+    let path = workspace.join(workforce_common::config_files::WORKSPACE_CONFIG);
+    let body = workforce_common::config_files::read(&path).ok().flatten()?;
+    group_named_in(&body)
+}
+
+/// The group `body` names in `[oversight] group`, however the rest reads.
+pub(crate) fn group_named_in(body: &str) -> Option<String> {
+    let doc: toml::Table = toml::from_str(body).ok()?;
+    let g = doc.get("oversight")?.get("group")?.as_str()?.trim();
+    (!g.is_empty() && g != workforce_desk::UNGROUPED).then(|| g.to_string())
 }
 
 fn mtime(workspace: &Path) -> Option<SystemTime> {
@@ -232,6 +332,9 @@ impl CrewHub {
             crews.retain(|c| c.strong_count() > 0);
             crews.push(Arc::downgrade(&crew));
         }
+        // Desk knows the bosses and the boundaries before any line is
+        // answered: never one scope for a moment at start.
+        crew.overseers();
         crew.desk
             .answer_lines_with(&(Arc::clone(&crew) as Arc<dyn Crew>));
         tokio::spawn(watcher::sync_loop(Arc::clone(&crew), cancel.clone()));
@@ -280,6 +383,18 @@ impl CrewHub {
     /// to the same scopes.
     pub(crate) fn overseers(&self) -> Vec<(Arc<AgentService>, Oversight)> {
         let mut by_scope: HashMap<Scope, (Arc<AgentService>, Oversight)> = HashMap::new();
+        // Every group any agent's config names for a boss is a boundary,
+        // whether that config loads, is on, or its agent serves: it stays
+        // one until the person takes the boss off it.
+        let named: Vec<String> = self
+            .services()
+            .iter()
+            .flat_map(|s| named_group(&s.workspace))
+            .collect();
+        if !named.is_empty() {
+            let desk = self.desk.clone();
+            tokio::spawn(async move { desk.bound_groups(named).await });
+        }
         for s in self.services() {
             let o = self.oversight_of(&s);
             if !o.enabled {

@@ -13,6 +13,7 @@ use workforce_agent::tools::{Tool, ToolResult};
 use workforce_core::budget::{BudgetScope, OnExceed, Period, Unit};
 use workforce_desk::crew::{By, Party};
 use workforce_desk::model::{Decision, Engine, NewSession, SessionState};
+use workforce_desk::scope::Seen;
 use workforce_desk::{Desk, DeskError, NewBudget};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -170,6 +171,28 @@ fn caller() -> Option<By> {
     })
 }
 
+/// What the agent calling the tool sees: its own group's scope, as the
+/// overseers' are kept to it, so no agent reads or acts on another
+/// scope's sessions for a boss that asked it to.
+fn seen(d: &Desk) -> Seen {
+    let id = workforce_agent::runner::CURRENT_AGENT_ID
+        .try_with(|a| a.clone())
+        .ok()
+        .filter(|a| !a.is_empty());
+    let group = id.as_deref().and_then(|a| d.group_of_agent(a));
+    d.seen_by(&d.scope_of_group(group.as_deref()))
+}
+
+/// `session`, when the caller's scope holds it; refused as one that isn't
+/// there otherwise.
+fn held(d: &Desk, seen: &Seen, session: Uuid) -> Result<(), DeskError> {
+    let v = d.view(session)?;
+    match seen.sees(v.group.as_ref().map(|g| g.id.as_str())) {
+        true => Ok(()),
+        false => Err(DeskError::NotFound),
+    }
+}
+
 fn out<T: serde::Serialize>(v: T) -> Result<Value, DeskError> {
     serde_json::to_value(v).map_err(|e| DeskError::Internal(e.into()))
 }
@@ -181,10 +204,23 @@ fn parse<T: serde::de::DeserializeOwned>(input: Value) -> Result<T, DeskError> {
 impl DeskTool {
     async fn run(&self, input: Value) -> Result<Value, DeskError> {
         let d = &self.desk;
+        let seen = seen(d);
+        let id = input
+            .get("session_id")
+            .and_then(Value::as_str)
+            .and_then(|s| s.parse::<Uuid>().ok());
+        if let Some(id) = id {
+            held(d, &seen, id)?;
+        }
         match self.verb {
             Verb::List => {
                 let query = input["query"].as_str().unwrap_or_default();
-                out(d.find_sessions(query))
+                let mine: Vec<_> = d
+                    .find_sessions(query)
+                    .into_iter()
+                    .filter(|v| seen.sees(v.group.as_ref().map(|g| g.id.as_str())))
+                    .collect();
+                out(mine)
             }
             Verb::Start => {
                 let i: StartInput = parse(input)?;
@@ -207,7 +243,8 @@ impl DeskTool {
                             approve_for_me: false,
                             account,
                             env: Default::default(),
-                            group: None,
+                            // In the caller's group when that is a boundary.
+                            group: seen.scope.group().map(str::to_string),
                         },
                         caller(),
                     )
@@ -273,13 +310,52 @@ impl DeskTool {
                 // What an agent changes is the person's, done as it: never
                 // a way to let anything the breaker holds go on.
                 let by = caller().unwrap_or_else(By::you);
+                // Only the caller's scope's budgets: while groups have bosses
+                // of their own, no other scope's numbers, and no breaker.
+                let ours = |b: &workforce_core::budget::Budget| match &b.scope {
+                    BudgetScope::Session(s) => held(d, &seen, *s).is_ok(),
+                    BudgetScope::Agent(a) => seen.sees(d.group_of_agent(a).as_deref()),
+                    _ => seen.sees(b.group.as_deref()),
+                };
                 match i.action {
-                    BudgetAction::List => out(d.budgets_view().await?),
-                    BudgetAction::Set => out(d.put_budget(i.new_budget()?, by).await?),
+                    BudgetAction::List => {
+                        let mut v = d.budgets_view().await?;
+                        v.budgets.retain(|b| ours(&b.budget));
+                        if !seen.bossed.is_empty() {
+                            v.breakers.clear();
+                        }
+                        out(v)
+                    }
+                    BudgetAction::Set => {
+                        let new = i.new_budget()?;
+                        let probe = workforce_core::budget::Budget {
+                            id: Uuid::nil(),
+                            scope: new.scope.clone(),
+                            group: new.group.clone(),
+                            period: new.period,
+                            unit: new.unit,
+                            amount: new.amount,
+                            warn_at: 0.8,
+                            on_exceed: OnExceed::Pause,
+                            updated_at: chrono::Utc::now(),
+                        };
+                        if !ours(&probe) {
+                            return Err(DeskError::NotFound);
+                        }
+                        out(d.put_budget(new, by).await?)
+                    }
                     BudgetAction::Remove => {
                         let id = i.budget_id.ok_or_else(|| {
                             DeskError::Invalid("remove needs budget_id (from list)".into())
                         })?;
+                        let theirs = d.budgets_view().await?;
+                        if !theirs
+                            .budgets
+                            .iter()
+                            .any(|b| b.budget.id == id && ours(&b.budget))
+                        {
+                            return Err(DeskError::NotFound);
+                        }
                         d.delete_budget(id, by).await?;
                         Ok(json!({ "removed": id }))
                     }

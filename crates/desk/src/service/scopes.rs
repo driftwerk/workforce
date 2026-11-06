@@ -218,6 +218,12 @@ impl Desk {
             .collect()
     }
 
+    /// The group the agent `id` counts in: an overseer's scope's, wherever
+    /// it sits; another agent's sidebar group's.
+    pub fn group_of_agent(&self, id: &str) -> Option<String> {
+        self.0.scopes.lock().party_group(&Party::agent(id, id))
+    }
+
     /// The boss of `scope`, when it has one.
     pub fn boss_of(&self, scope: &Scope) -> Option<Boss> {
         self.bosses().into_iter().find(|b| b.scope == *scope)

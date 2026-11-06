@@ -213,7 +213,11 @@ impl CrewHub {
                 for name in READ.iter().chain(ACT.iter()) {
                     s.tools.unregister(name);
                 }
-                crate::desk_driver::register_tools(&s);
+                // `desk.*` only on agents that oversee nothing.
+                match want.contains_key(s.agent_id.as_str()) {
+                    true => crate::connector_pins::pin(&s),
+                    false => crate::desk_driver::register_tools(&s),
+                }
             }
             for (s, o) in &current {
                 for name in DESK_TOOLS {
@@ -233,6 +237,13 @@ impl CrewHub {
                 .find(|(c, _)| c.agent_id == s.agent_id)
                 .map(|(_, o)| o.clone());
             self.sync_summaries(&s, o.as_ref()).await;
+            // An overseer recalls only its own memories while groups have
+            // bosses of their own.
+            let now = (*s.resolved.snapshot()).clone();
+            let kept = super::recall_kept_apart(&s, now.clone());
+            if kept.memory.agent_recall_scope != now.memory.agent_recall_scope {
+                s.resolved.store(kept);
+            }
         }
     }
 
@@ -826,6 +837,14 @@ pub(super) async fn wake_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
                 w.pending.clear();
                 continue;
             };
+            // What it gathered of a group that has since become another's
+            // boundary is not its any more.
+            let seen = crew.desk.seen_by(&o.scope);
+            w.pending.retain(|t| seen.sees(t.group.as_deref()));
+            if w.pending.is_empty() {
+                w.window = None;
+                continue;
+            }
             match crew.budget(&id, &o).await {
                 Ok(Budget::Open) => w.held_until = None,
                 Ok(Budget::Spent { until, daily }) => {

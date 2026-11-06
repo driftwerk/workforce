@@ -91,8 +91,13 @@ async fn save_over(
     expects: impl Fn(Option<&str>) -> bool,
     over: Over<'_>,
 ) -> Result<Saved, Refused> {
+    let was = config_files::read(&service.workspace.join(config_files::WORKSPACE_CONFIG))
+        .ok()
+        .flatten();
     #[cfg(feature = "postgres")]
-    if let Some(why) = crate::desk_crew::oversight_refused(service, body) {
+    if let Some(why) =
+        crate::desk_crew::oversight_refused(service, was.as_deref(), body, edit.edited_via)
+    {
         return Err(Refused::Unloadable(ConfigRefusal::Said(why)));
     }
     let before = crate::connector_pins::binding_in(&service.workspace);
@@ -105,7 +110,12 @@ async fn save_over(
         one_overseer(service, store).await;
     }
     #[cfg(feature = "postgres")]
-    crate::desk_crew::config_saved(service);
+    {
+        crate::desk_crew::oversight_saved(service, was.as_deref(), body).await;
+        crate::desk_crew::config_saved(service);
+    }
+    #[cfg(not(feature = "postgres"))]
+    let _ = was;
     Ok(saved)
 }
 

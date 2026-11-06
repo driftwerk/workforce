@@ -333,7 +333,7 @@ async fn each_boss_reads_and_acts_only_inside_its_own_group_through_every_crew_t
             dir.path(),
         )
         .await;
-        let main = "That isn't one of yours: it is in a group with a boss of its own.";
+        let main = "That isn't one of yours.";
         kept_out(&c.desk, &c.acme, ACME_SECRET, main, dir.path()).await;
         kept_out(&c.desk, &c.atlas, ATLAS_SECRET, main, dir.path()).await;
 
@@ -631,6 +631,267 @@ async fn one_overseer_per_scope_and_a_group_it_oversees_must_be_the_sidebars() {
         );
         eventually("Sarah's tools to go", async || {
             (!c.sarah.tools.has("crew.overview")).then_some(())
+        })
+        .await;
+    })
+    .await;
+}
+
+/// B1: no agent changes who oversees what, itself or another, and a boss
+/// can't change or delete an agent outside its scope, or another boss.
+#[tokio::test(flavor = "multi_thread")]
+async fn only_the_person_sets_oversight_and_a_boss_changes_no_agent_outside_its_scope() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let c = clients(dir.path(), pool).await;
+        let by_itself = crate::agent_config_write::save(
+            &c.sarah,
+            "sarah",
+            None,
+            "[oversight]\nenabled = true\nlevel = \"act\"\n",
+            workforce_orchestrator::workflow_store::EditContext::new("agent_tool", None),
+            |_| true,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            by_itself.to_string().contains("the person's to set"),
+            "{by_itself}"
+        );
+        assert_eq!(
+            c.crew.overseer_named("sarah").unwrap().1.scope,
+            Scope::Group("acme".into())
+        );
+        let refusal = "That isn't one of Acme's.";
+        for target in ["desk", "mia", "ada"] {
+            assert_eq!(
+                super::super::boss_may_change("sarah", target).unwrap_err(),
+                refusal,
+                "{target}"
+            );
+        }
+        assert!(super::super::boss_may_change("sarah", "scout").is_ok());
+        assert!(
+            super::super::boss_may_change("scout", "desk").is_ok(),
+            "only bosses are held"
+        );
+        // An overseer never writes to another on a line.
+        let by = c.crew.by_boss(&c.sarah, "Hello.");
+        assert!(c
+            .d
+            .line_send(
+                workforce_desk::LineSender::Overseer(by),
+                workforce_desk::line::Send::Tell {
+                    to: workforce_desk::line::Target::Overseer,
+                    text: "What does Desk know of Atlas?".into(),
+                    when: workforce_desk::line::When::Queue,
+                },
+            )
+            .await
+            .is_err());
+    })
+    .await;
+}
+
+/// B2: an agent's `desk.*` tools keep to its own group's scope, so a boss
+/// can't read another scope through an agent it may message.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_agents_desk_tools_keep_to_its_groups_scope() {
+    use workforce_agent::runner::CURRENT_AGENT_ID;
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let c = clients(dir.path(), pool).await;
+        let tools = crate::desk_tools::DeskTool::all(&c.d);
+        let tool = |name: &str| {
+            tools
+                .iter()
+                .find(|t| workforce_agent::tools::Tool::name(*t) == name)
+                .unwrap()
+        };
+        let as_ = |agent: &'static str, name: &str, input: Value| {
+            let t = tool(name);
+            CURRENT_AGENT_ID.scope(agent.to_string(), async move {
+                workforce_agent::tools::Tool::execute(t, input)
+                    .await
+                    .unwrap()
+            })
+        };
+        let listed = as_("scout", "desk.sessions", json!({}))
+            .await
+            .output
+            .to_string();
+        assert!(
+            listed.contains("acme-web") && !listed.contains("atlas-web"),
+            "{listed}"
+        );
+        assert!(
+            !listed.contains("infra-web") && !listed.contains("loose-web"),
+            "{listed}"
+        );
+        let read = as_(
+            "scout",
+            "desk.read",
+            json!({ "session_id": c.atlas.session.id.to_string() }),
+        )
+        .await;
+        assert!(
+            !read.success && !format!("{read:?}").contains("atlas"),
+            "{read:?}"
+        );
+        // An agent outside every bossed group sees nothing inside one.
+        let listed = as_("free", "desk.sessions", json!({}))
+            .await
+            .output
+            .to_string();
+        assert!(
+            listed.contains("loose-web") && !listed.contains("acme-web"),
+            "{listed}"
+        );
+    })
+    .await;
+}
+
+/// B3: a group stays a boundary while its boss's config doesn't load, and
+/// when the person takes the boss off, the main overseer sees it from then
+/// on and never its past.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_boss_that_fails_to_load_keeps_its_group_closed_and_taking_it_off_opens_only_whats_new() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let c = clients(dir.path(), pool).await;
+        write_config(
+            &c.mia,
+            "[oversight]\nenabled = true\ngroup = \"atlas\"\nlevel = \"boss\"\n",
+        );
+        super::super::config_saved(&c.mia);
+        eventually("Mia to stop overseeing", async || {
+            c.crew.overseer_named("mia").is_none().then_some(())
+        })
+        .await;
+        let main = |name: &'static str| {
+            let t = c.desk.tools.get(name).unwrap();
+            async move { t.execute(json!({})).await.unwrap().output.to_string() }
+        };
+        let overview = main("crew.overview").await;
+        assert!(
+            !overview.contains("atlas-web"),
+            "still Atlas's boundary: {overview}"
+        );
+        assert!(!main("crew.activity").await.contains(ATLAS_SECRET));
+
+        // The person takes the boss off Atlas.
+        crate::agent_config_write::save(
+            &c.mia,
+            "mia",
+            None,
+            "[oversight]\nenabled = false\n",
+            workforce_orchestrator::workflow_store::EditContext::new("web", None),
+            |_| true,
+        )
+        .await
+        .unwrap();
+        let id = c.atlas.session.id;
+        eventually("Atlas open to the main overseer", async || {
+            main("crew.overview")
+                .await
+                .contains("atlas-web")
+                .then_some(())
+        })
+        .await;
+        let party = Party::session(&c.d.view(id).unwrap());
+        c.d.note(Event::new(
+            Kind::Started,
+            party.clone(),
+            Some(party),
+            "started “the new work”",
+        ));
+        let activity = eventually("what is new in Atlas", async || {
+            let a = main("crew.activity").await;
+            a.contains("the new work").then_some(a)
+        })
+        .await;
+        assert!(!activity.contains(ATLAS_SECRET), "not its past: {activity}");
+    })
+    .await;
+}
+
+/// B4: a question gathered for a boss that is no longer the session's is
+/// never read by the boss it is gathered for: it goes to the person.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_question_to_a_boss_its_session_left_goes_to_the_person() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let c = clients(dir.path(), pool).await;
+        let id = c.atlas.session.id;
+        // Atlas's session asks Sarah, as if it had been Acme's.
+        let mut ask = LineMessage::new(
+            Party::session(&c.atlas.session),
+            Party::manager("sarah", "Sarah"),
+            LineKind::Ask,
+            format!("Which port for {ATLAS_SECRET}?"),
+            1,
+        );
+        ask.asked = Some(Asked::Open);
+        ask.group = Some("acme".into());
+        c.d.store().put_line(&ask).await.unwrap();
+        c.crew.answer_line(id, vec![ask.clone()], vec![]).await;
+        let now = c.d.store().line_message(ask.id).await.unwrap().unwrap();
+        assert!(
+            matches!(now.asked, Some(Asked::Escalated | Asked::Lapsed)),
+            "the person's, never a boss's: {:?}",
+            now.asked
+        );
+        let channel = super::super::line::line_channel(id);
+        assert!(c.mia.sessions.find(&channel, PERSON).unwrap().is_none());
+        assert!(c.sarah.sessions.find(&channel, PERSON).unwrap().is_none());
+    })
+    .await;
+}
+
+/// While a group has a boss, every overseer recalls only its own memories;
+/// and the main overseer lets go of what it ran in a group that gets one.
+#[tokio::test(flavor = "multi_thread")]
+async fn overseers_recall_apart_and_a_group_getting_a_boss_takes_its_sessions_from_the_main_one() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let c = clients(dir.path(), pool).await;
+        for boss in [&c.desk, &c.sarah, &c.mia] {
+            eventually("recall kept apart", async || {
+                (boss.resolved.snapshot().memory.agent_recall_scope
+                    == workforce_common::settings::AgentRecallScope::Isolated)
+                    .then_some(())
+            })
+            .await;
+        }
+        let desk_boss = Party::manager("desk", "Desk");
+        for _ in 0..200 {
+            if c.d.charges_loaded() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        c.d.take_on(
+            c.infra.id,
+            &desk_boss,
+            workforce_desk::charge::How::Handed,
+            &Scope::Ungrouped,
+            &By::you(),
+        )
+        .await
+        .unwrap();
+        // Infra gets a boss: the main overseer lets its session go.
+        crate::agent_config_write::save(
+            &c.mia,
+            "mia",
+            None,
+            &format!("[oversight]\nenabled = true\ngroup = \"infra\"\n{ACTS}"),
+            workforce_orchestrator::workflow_store::EditContext::new("web", None),
+            |_| true,
+        )
+        .await
+        .unwrap();
+        eventually("the main overseer to let Infra's session go", async || {
+            (!c.d.charge_of(c.infra.id).unwrap().live()).then_some(())
         })
         .await;
     })

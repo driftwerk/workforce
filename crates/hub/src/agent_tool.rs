@@ -529,6 +529,10 @@ impl Tool for AgentUpdateTool {
     async fn execute(&self, input: serde_json::Value) -> eyre::Result<ToolResult> {
         let start = Instant::now();
         let params: AgentUpdateInput = serde_json::from_value(input)?;
+        #[cfg(feature = "postgres")]
+        if let Err(why) = crate::desk_crew::boss_may_change(&self.ctx.agent_id, &params.agent_id) {
+            return Ok(ToolResult::failure(why, 0));
+        }
         let duration = || start.elapsed().as_millis() as u64;
 
         let config_path = match &self.ctx.config_path {
@@ -641,6 +645,10 @@ impl Tool for AgentDeleteTool {
     async fn execute(&self, input: serde_json::Value) -> eyre::Result<ToolResult> {
         let start = Instant::now();
         let params: AgentDeleteInput = serde_json::from_value(input)?;
+        #[cfg(feature = "postgres")]
+        if let Err(why) = crate::desk_crew::boss_may_change(&self.ctx.agent_id, &params.agent_id) {
+            return Ok(ToolResult::failure(why, 0));
+        }
         let duration = || start.elapsed().as_millis() as u64;
 
         let config_path = match &self.ctx.config_path {

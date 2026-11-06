@@ -274,20 +274,64 @@ impl CrewHub {
     pub(crate) async fn answer_line(
         &self,
         session: Uuid,
-        mut messages: Vec<LineMessage>,
+        messages: Vec<LineMessage>,
         ended: Vec<String>,
     ) {
+        // The overseer of the session's scope answers it, and no other.
+        let Some((service, o)) = self.overseer_of_session(session) else {
+            let asks: Vec<LineMessage> = messages
+                .into_iter()
+                .filter(|m| m.kind == LineKind::Ask)
+                .collect();
+            self.all_to_person(session, &asks, "No overseer answers sessions now.")
+                .await;
+            return;
+        };
+        // Each read again as it is now: one the session's move (or anyone)
+        // took from this overseer since it was gathered isn't its to read,
+        // and a question so taken is the person's.
+        let seen = self.desk.seen_by(&o.scope);
+        let mut kept: Vec<LineMessage> = Vec::new();
+        let mut taken = Vec::new();
+        for m in messages {
+            // Gathered twice (taken up at start and heard as it came): once.
+            if kept.iter().chain(taken.iter()).any(|k| k.id == m.id) {
+                continue;
+            }
+            let now = match self.desk.store().line_message(m.id).await {
+                Ok(Some(now)) => now,
+                _ => continue,
+            };
+            let ours = now.to.id == service.agent_id.as_str()
+                && seen.sees_row(now.group.as_deref(), now.at)
+                && (now.kind != LineKind::Ask || now.asked == Some(Asked::Open));
+            match (
+                ours,
+                now.kind == LineKind::Ask && now.asked == Some(Asked::Open),
+            ) {
+                (true, _) => kept.push(now),
+                (false, true) => taken.push(now),
+                (false, false) => {}
+            }
+        }
+        for ask in &taken {
+            let why = "The overseer it asked no longer oversees it, so this came to you.";
+            if let Err(e) = self
+                .escalate(ask.id, &By::you(), why, Vec::new(), None)
+                .await
+            {
+                tracing::info!(error = %e, "a question wasn't given to the person");
+            }
+        }
+        if kept.is_empty() && ended.is_empty() {
+            return;
+        }
+        let mut messages = kept;
         let mut asks: Vec<LineMessage> = messages
             .iter()
             .filter(|m| m.kind == LineKind::Ask)
             .cloned()
             .collect();
-        // The overseer of the session's scope answers it, and no other.
-        let Some((service, o)) = self.overseer_of_session(session) else {
-            self.all_to_person(session, &asks, "No overseer answers sessions now.")
-                .await;
-            return;
-        };
         let hop = messages.iter().map(|m| m.hop).max().unwrap_or(0);
         if let Some(why) = straight_to_person(&o, hop) {
             self.all_to_person(session, &asks, why).await;

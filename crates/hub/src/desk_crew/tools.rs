@@ -306,13 +306,8 @@ impl CrewTool {
                     let id: uuid::Uuid = session
                         .parse()
                         .map_err(|_| "That isn’t a session id from crew.overview.".to_string())?;
-                    let v = crew
-                        .desk
-                        .view(id)
-                        .map_err(|_| "That session isn’t there any more.".to_string())?;
-                    if !seen.sees(v.group.as_ref().map(|g| g.id.as_str())) {
-                        return Err(crew.not_ours(&self.scope));
-                    }
+                    crew.session_seen(id, seen)?;
+                    let v = crew.desk.view(id).map_err(|_| crew.not_ours(&self.scope))?;
                     let terminal = crew.desk.terminal_text(id, 3000).ok();
                     let said = json!({
                         "name": v.label(), "hub_name": v.name, "group": v.group.map(|g| g.name),

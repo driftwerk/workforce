@@ -204,9 +204,13 @@ fn key_path(key: &str) -> Result<Vec<&str>, String> {
 }
 
 /// Refuse the settings only a human changes: the agent's environments decide
-/// which instances it may reach, so it never edits them itself.
+/// which instances it may reach, and `[oversight]` what it oversees and may
+/// do there, so it never edits them itself.
 fn human_only(path: &[&str]) -> Result<(), String> {
     match path.first() {
+        Some(&"oversight") => Err(
+            "oversight is human-only: the person sets what an agent oversees in Desk".to_string(),
+        ),
         Some(&"environments") => Err(
             "environments are human-only: a person changes them with `cmd: env …` or in the \
              agent's settings"
@@ -425,6 +429,16 @@ voice_model = \"gemini-3.8-flash\" # spoken turns\n";
             assert!(err.contains("human-only"), "{key}: {err}");
         }
         assert!(human_only(&key_path("llm.voice_model").unwrap()).is_ok());
+        for key in [
+            "oversight",
+            "oversight.group",
+            "oversight.act.hand_out_work",
+        ] {
+            assert!(
+                human_only(&key_path(key).unwrap()).is_err(),
+                "{key} is the person's"
+            );
+        }
     }
 
     #[test]

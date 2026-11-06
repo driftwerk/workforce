@@ -3816,12 +3816,12 @@ mod board {
             assert_eq!(d.list().len(), 1);
             assert_eq!(state_of(&d, "ACM-2").await, (TicketState::Todo, None));
 
-            // A session that is gone is said so.
+            // A session that is gone is refused as one outside its scope is.
             let r = assign
                 .execute(json!({"ticket": "ACM-2", "to": {"session": uuid::Uuid::new_v4().to_string()}, "reason": "It is next."}))
                 .await
                 .unwrap();
-            assert_eq!(r.error.as_deref(), Some("That session isn’t there any more."));
+            assert_eq!(r.error.as_deref(), Some("That isn't one of yours."));
 
             // A session that is already there takes it, slots or not.
             let mine = new_session(&d, dir.path(), "acme-api").await;
