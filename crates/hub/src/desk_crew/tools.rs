@@ -20,13 +20,14 @@ use super::watcher::reported;
 use super::CrewHub;
 
 /// Every `crew.*` tool: the reading ones first.
-pub const READ: [&str; 4] = [
+pub const READ: [&str; 5] = [
     "crew.overview",
     "crew.activity",
     "crew.history",
     super::spend::NAME,
+    super::board::NAME,
 ];
-pub const ACT: [&str; 12] = [
+pub const ACT: [&str; 14] = [
     "crew.nudge",
     "crew.escalate",
     "crew.approve",
@@ -37,6 +38,8 @@ pub const ACT: [&str; 12] = [
     "crew.restart",
     "crew.start_session",
     "crew.assign",
+    "crew.assign_ticket",
+    "crew.move_ticket",
     "crew.take_on",
     "crew.release",
 ];
@@ -68,6 +71,10 @@ fn session_schema() -> Value {
     json!({ "type": "string", "description": "A session id from crew.overview" })
 }
 
+fn ticket_schema() -> Value {
+    json!({ "type": "string", "description": "A ticket's key from crew.board, like ACM-12" })
+}
+
 fn state_word(s: ItemState) -> &'static str {
     match s {
         ItemState::NeedsYou => "needs you",
@@ -80,7 +87,7 @@ fn state_word(s: ItemState) -> &'static str {
     }
 }
 
-fn cell(s: &str) -> String {
+pub(super) fn cell(s: &str) -> String {
     s.replace('|', "/").replace('\n', " ")
 }
 
@@ -317,6 +324,7 @@ impl CrewTool {
                 }))
             }
             super::spend::NAME => crew.spend(input).await,
+            super::board::NAME => crew.board().await,
             _ => Err("not a reading tool".into()),
         }
     }
@@ -344,7 +352,7 @@ impl CrewTool {
                 Ok(json!({ "done": done }))
             }
             Gate::Suggest(why) => {
-                if matches!(action, Action::StartSession { .. }) {
+                if action.starts_session() {
                     crew.start_suggestable(&by, &oversight).await?;
                 }
                 let s = crew.suggest(self.name, input, &action, &by).await?;
@@ -370,6 +378,7 @@ impl Tool for CrewTool {
         match self.name {
             "crew.overview" => "Everyone on the crew now: the person's agents and their Claude Code and Codex sessions, each with its state (needs you, working, quiet, done today, idle, failed, stopped), what it's doing, what it asks (with approval ids), since when, and whether you run it for the person (and whether they are driving it now). slots says how many of the sessions you run are starting or working, of the most you may run at once. For what sessions spent (tokens, cost), use crew.spend.",
             super::spend::NAME => super::spend::DESCRIPTION,
+            super::board::NAME => super::board::DESCRIPTION,
             "crew.activity" => "What happened on the crew, newest first: turns started and finished, questions, requests, failures, and what you and the person did. Filter to one agent or session with subject_id.",
             "crew.history" => "The recent messages of one agent's Desk DM with the person (agent_id), or one session's last prompt, reply, pending request and terminal (session_id).",
             "crew.nudge" => "Send a short message to an agent's DM (agent_id) or to a session on its Desk line (session_id): a check-in, a hint, a correction. A session gets it once its turn ends (crew.interrupt stops a turn now). With reply_to (a question's message id), it is your answer to what that session asked you.",
@@ -382,6 +391,8 @@ impl Tool for CrewTool {
             "crew.restart" => "Stop a session and resume it with a new prompt, e.g. to get it unstuck.",
             "crew.start_session" => "Start a real, visible session (Claude Code, Codex) in a project folder with a goal: it shows on the person's Floor and sidebar, they can watch it, type into it and take it over, and you run it from the start (its turn ends wake you). engine defaults to your default engine; worktree names a new branch to work on in a worktree of its own. You run at most your limit of sessions starting or working at once (crew.overview's slots).",
             "crew.assign" => "Hand a task to one of the crew's agents, in its DM.",
+            "crew.assign_ticket" => "Hand a ticket on the board (ticket, its key like ACM-12) to a session (to: { \"session\": id }), an agent (to: { \"agent\": id }) or a new session started for it, which you run (to: { \"newSession\": { \"folder\": path, \"engine\": optional } }). The ticket moves to Doing and its holder is told. Only a ready ticket can be handed out (crew.board); a new session counts against your limit of sessions at once. Handing out work is for what the person has let you hand out.",
+            "crew.move_ticket" => "Move a ticket on the board (ticket, its key like ACM-12) to a column (state): backlog, todo, doing, review or done. Dropping a ticket is always the person's call, so it becomes a suggestion for them.",
             "crew.take_on" => "Run a session for the person (session_id): it wakes you each time its turn ends, so you can tell it the next step. You take it on yourself only when the person lets you take on every session; otherwise this offers it to them. The person can take over any time by typing in it, and your messages wait until they hand it back.",
             "crew.release" => "Let a session you run go (session_id): the person runs it on their own, and its turn ends no longer wake you. Say why in reason.",
             _ => "",
@@ -399,6 +410,7 @@ impl Tool for CrewTool {
         match self.name {
             "crew.overview" => json!({ "type": "object", "properties": {} }),
             super::spend::NAME => super::spend::schema(),
+            super::board::NAME => super::board::schema(),
             "crew.activity" => json!({ "type": "object", "properties": {
                 "subject_id": { "type": "string", "description": "An agent or session id" },
                 "limit": { "type": "integer", "minimum": 1, "maximum": 100 }
@@ -468,6 +480,37 @@ impl Tool for CrewTool {
                     "task": { "type": "string" }
                 })),
                 &["agent_id", "task"],
+            ),
+            "crew.assign_ticket" => {
+                let engines = self
+                    .crew
+                    .upgrade()
+                    .map(|c| c.engines_to_start())
+                    .filter(|e| !e.is_empty())
+                    .unwrap_or_else(workforce_desk::engine::startable);
+                act(
+                    props(json!({
+                        "ticket": ticket_schema(),
+                        "to": { "type": "object", "description": "Who gets it: exactly one of session, agent or newSession",
+                            "properties": {
+                                "session": session_schema(),
+                                "agent": { "type": "string", "description": "An agent id from crew.overview" },
+                                "newSession": { "type": "object", "properties": {
+                                    "folder": { "type": "string", "description": "Absolute path of the project folder" },
+                                    "engine": { "type": "string", "enum": engines }
+                                }, "required": ["folder"] }
+                            }
+                        }
+                    })),
+                    &["ticket", "to"],
+                )
+            }
+            "crew.move_ticket" => act(
+                props(json!({
+                    "ticket": ticket_schema(),
+                    "state": { "type": "string", "enum": ["backlog", "todo", "doing", "review", "done", "dropped"] }
+                })),
+                &["ticket", "state"],
             ),
             _ => json!({ "type": "object", "properties": {} }),
         }

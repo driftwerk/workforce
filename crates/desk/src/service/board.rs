@@ -119,6 +119,14 @@ pub struct NewSessionFor {
     pub engine: Engine,
 }
 
+/// The boss a session started for a ticket is in the charge of, and the
+/// sidebar group it starts in.
+#[derive(Debug, Clone)]
+pub struct ChargedTo {
+    pub boss: Party,
+    pub group: Option<String>,
+}
+
 /// Which tickets of a board a list holds.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct TicketQuery {
@@ -779,6 +787,18 @@ impl Desk {
         to: Option<AssignTo>,
         by: &By,
     ) -> Result<TicketView, DeskError> {
+        self.assign_ticket_for(id, to, by, None).await
+    }
+
+    /// `assign_ticket`, where a new session is one a boss runs from the
+    /// start: in its charge, and in its group, before it runs.
+    pub async fn assign_ticket_for(
+        &self,
+        id: Uuid,
+        to: Option<AssignTo>,
+        by: &By,
+        charged: Option<&ChargedTo>,
+    ) -> Result<TicketView, DeskError> {
         let t = self.ticket_of(id).await?;
         let b = self.board_of(t.board).await?;
         let key = t.key(&b).unwrap_or_else(|| "a ticket".into());
@@ -791,30 +811,31 @@ impl Desk {
             Some(AssignTo::NewSession(new)) => {
                 let needs = self.need_keys(&t).await?;
                 let prompt = board::handed_text(&key, &t, &needs);
-                let view = self
-                    .create(
-                        NewSession {
-                            engine: new.engine,
-                            view: None,
-                            name: key.clone(),
-                            cwd: new.path,
-                            goal: board::goal_for(&key, &t.title),
-                            worktree: None,
-                            prompt: Some(prompt),
-                            approvals: None,
-                            approve_for_me: false,
-                            account: None,
-                            env: BTreeMap::new(),
-                            // The board's group, while the sidebar has it:
-                            // its session works where the board is.
-                            group: b
-                                .group
-                                .clone()
-                                .filter(|g| self.layout().groups.iter().any(|x| &x.id == g)),
-                        },
-                        Some(by.clone()),
-                    )
-                    .await?;
+                // The boss's group, else the board's while the sidebar has
+                // it: its session works where the boss or the board is.
+                let group = charged.and_then(|c| c.group.clone()).or_else(|| {
+                    b.group
+                        .clone()
+                        .filter(|g| self.layout().groups.iter().any(|x| &x.id == g))
+                });
+                let session = NewSession {
+                    engine: new.engine,
+                    view: None,
+                    name: key.clone(),
+                    cwd: new.path,
+                    goal: board::goal_for(&key, &t.title),
+                    worktree: None,
+                    prompt: Some(prompt),
+                    approvals: None,
+                    approve_for_me: false,
+                    account: None,
+                    env: BTreeMap::new(),
+                    group,
+                };
+                let view = match charged {
+                    Some(c) => self.create_for(session, &c.boss, by.clone()).await?,
+                    None => self.create(session, Some(by.clone())).await?,
+                };
                 // Its prompt is the ticket: no message on its line too. The
                 // ticket is read again: it may have changed while the
                 // session started, and is never started for twice.
@@ -823,6 +844,47 @@ impl Desk {
             }
             Some(AssignTo::Agent(agent)) => self.assign_agent(t, &key, &agent, by).await,
         }
+    }
+
+    /// The ticket `key` names (`ACM-12`).
+    pub async fn ticket_by_key(&self, key: &str) -> Result<TicketView, DeskError> {
+        let (prefix, n) = board::parse_key(key).ok_or_else(|| {
+            DeskError::Invalid(format!("{key:?} isn't a ticket's key, like ACM-12."))
+        })?;
+        let b = self
+            .0
+            .store
+            .board_by_prefix(&prefix)
+            .await
+            .map_err(internal)?
+            .ok_or_else(|| DeskError::Invalid(format!("No board has keys starting {prefix}.")))?;
+        let t = self
+            .0
+            .store
+            .ticket_by_number(b.id, n)
+            .await
+            .map_err(internal)?
+            .ok_or_else(|| DeskError::Invalid(format!("There's no {prefix}-{n}.")))?;
+        self.view_ticket(t).await
+    }
+
+    /// The key of the ticket assigned to `session` that is in Doing, when
+    /// there is one: a turn that ends with it still there has left it
+    /// unfinished or unmoved.
+    pub async fn doing_key(&self, session: Uuid) -> Option<String> {
+        let tickets = match self.0.store.session_tickets(session).await {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!(%session, error = %e, "a session's tickets weren't read");
+                return None;
+            }
+        };
+        let t = tickets
+            .into_iter()
+            .filter(|t| t.state == TicketState::Doing)
+            .max_by_key(|t| t.updated_at)?;
+        let b = self.board_of(t.board).await.ok()?;
+        t.key(&b)
     }
 
     /// The keys and states of what `t` needs.

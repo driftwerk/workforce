@@ -26,6 +26,7 @@ use crate::gateway::GatewayState;
 use crate::serve::AgentService;
 
 mod actions;
+mod board;
 mod deliver;
 mod extras;
 mod line;

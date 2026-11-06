@@ -3458,3 +3458,619 @@ async fn the_overseer_suggests_no_more_starts_than_it_has_free_slots() {
     })
     .await;
 }
+
+/// The board the overseer works from: an Acme board with a ticket in `state`
+/// per title, the first needing nothing; the tickets are ACM-1, ACM-2, ...
+mod board {
+    use super::*;
+    use workforce_desk::board::TicketState;
+    use workforce_desk::crew::Party;
+    use workforce_desk::{AssignTo, Move, NewBoard, NewTicket, TicketView};
+
+    async fn acme(d: &Desk) -> uuid::Uuid {
+        d.create_board(NewBoard {
+            name: "Acme".into(),
+            group: None,
+            prefix: None,
+        })
+        .await
+        .unwrap()
+        .id
+    }
+
+    async fn ticket(
+        d: &Desk,
+        board: uuid::Uuid,
+        title: &str,
+        state: TicketState,
+        needs: &[uuid::Uuid],
+    ) -> TicketView {
+        d.create_ticket(
+            NewTicket {
+                board,
+                title: title.into(),
+                body: String::new(),
+                state: Some(state),
+                needs: needs.to_vec(),
+            },
+            &By::you(),
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn state_of(d: &Desk, key: &str) -> (TicketState, Option<String>) {
+        let t = d.ticket_by_key(key).await.unwrap().ticket;
+        (t.state, t.assignee.map(|a| a.name))
+    }
+
+    const ACT: &str =
+        "[oversight]\nenabled = true\nlevel = \"act\"\n[oversight.act]\nhand_out_work = false\n";
+
+    /// Only what is ready, being done or blocked is listed, with keys, even
+    /// to an overseer that only watches.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn crew_board_lists_only_ready_doing_and_blocked_tickets_with_their_keys() {
+        with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let (overseer, _crew, d, _llm) = overseeing(
+                dir.path(),
+                pool,
+                "ok",
+                "[oversight]\nenabled = true\nlevel = \"watch\"\n",
+                &[],
+            )
+            .await;
+            let b = acme(&d).await;
+            let ready = ticket(&d, b, "Add the date picker", TicketState::Todo, &[]).await;
+            let waits = ticket(
+                &d,
+                b,
+                "Wire the picker to checkout",
+                TicketState::Todo,
+                &[ready.ticket.id],
+            )
+            .await;
+            let doing = ticket(&d, b, "Fix the flaky test", TicketState::Doing, &[]).await;
+            let s = new_session(&d, dir.path(), "acme-web").await;
+            d.assign_ticket(doing.ticket.id, Some(AssignTo::Session(s.id)), &By::you())
+                .await
+                .unwrap();
+            ticket(&d, b, "Someday the dark mode", TicketState::Backlog, &[]).await;
+            ticket(&d, b, "Review the copy", TicketState::Review, &[]).await;
+            ticket(&d, b, "Ship the footer", TicketState::Done, &[]).await;
+            ticket(&d, b, "Forget the banner", TicketState::Dropped, &[]).await;
+            assert_eq!(
+                (
+                    ready.key.as_deref(),
+                    waits.key.as_deref(),
+                    doing.key.as_deref()
+                ),
+                (Some("ACM-1"), Some("ACM-2"), Some("ACM-3"))
+            );
+            eventually("the overseer's tools", async || {
+                overseer.tools.has("crew.board").then_some(())
+            })
+            .await;
+            assert!(
+                !overseer.tools.has("crew.assign_ticket"),
+                "watching only reads"
+            );
+
+            let read = overseer
+                .tools
+                .get("crew.board")
+                .unwrap()
+                .execute(json!({}))
+                .await
+                .unwrap();
+            assert!(read.success, "{read:?}");
+            assert_eq!(
+                read.output["counts"],
+                json!({"ready": 1, "doing": 1, "blocked": 1})
+            );
+            let table = read.output["table"].as_str().unwrap();
+            assert!(table.contains("Board “Acme (ACM)”:"), "{table}");
+            assert!(
+                table.contains("| ACM-1 | Add the date picker | ready |  |  |"),
+                "{table}"
+            );
+            assert!(
+                table.contains(&format!(
+                    "| ACM-3 | Fix the flaky test | doing | acme-web (session {}) |  |",
+                    s.id
+                )),
+                "{table}"
+            );
+            assert!(
+                table.contains("| ACM-2 | Wire the picker to checkout | blocked |  | ACM-1 |"),
+                "{table}"
+            );
+            for left_out in ["dark mode", "Review the copy", "footer", "banner"] {
+                assert!(!table.contains(left_out), "{left_out}: {table}");
+            }
+        })
+        .await;
+    }
+
+    /// Handing out and moving are the person's to switch on with
+    /// `hand_out_work`; until then each is a suggestion and nothing changes.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn assigning_and_moving_tickets_are_gated_by_hand_out_work() {
+        with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let (overseer, _crew, d, _llm) =
+                overseeing(dir.path(), pool, "ok", ACT, &[]).await;
+            let b = acme(&d).await;
+            ticket(&d, b, "Add the date picker", TicketState::Todo, &[]).await;
+            ticket(&d, b, "Fix the flaky test", TicketState::Todo, &[]).await;
+            let s = new_session(&d, dir.path(), "acme-web").await;
+            eventually("the overseer's tools", async || {
+                overseer.tools.has("crew.assign_ticket").then_some(())
+            })
+            .await;
+            assert!(overseer.tools.has("crew.move_ticket"));
+            let tool = |name: &str| overseer.tools.get(name).unwrap();
+            let assign = |key: &str| {
+                json!({"ticket": key, "to": {"session": s.id.to_string()}, "reason": "It is next."})
+            };
+            let mv = |key: &str, state: &str| {
+                json!({"ticket": key, "state": state, "reason": "Work began."})
+            };
+
+            // Off: both become suggestions, in words that name the ticket.
+            let r = tool("crew.assign_ticket").execute(assign("ACM-1")).await.unwrap();
+            assert!(r.success, "{r:?}");
+            assert_eq!(r.output["suggested"], "Give ACM-1 to acme-web", "{r:?}");
+            let r = tool("crew.move_ticket").execute(mv("acm-2", "doing")).await.unwrap();
+            assert_eq!(r.output["suggested"], "Move ACM-2 to Doing", "{r:?}");
+            assert_eq!(state_of(&d, "ACM-1").await, (TicketState::Todo, None));
+            assert_eq!(state_of(&d, "ACM-2").await, (TicketState::Todo, None));
+
+            // On: they run.
+            write_config(
+                &overseer,
+                "[oversight]\nenabled = true\nlevel = \"act\"\n[oversight.act]\nhand_out_work = true\n",
+            );
+            super::super::config_saved(&overseer);
+            let r = eventually("hand_out_work to take effect", async || {
+                let r = tool("crew.assign_ticket")
+                    .execute(assign("ACM-1"))
+                    .await
+                    .unwrap();
+                r.output["done"].is_string().then_some(r)
+            })
+            .await;
+            assert_eq!(r.output["done"], "gave ACM-1 to acme-web");
+            assert_eq!(
+                state_of(&d, "ACM-1").await,
+                (TicketState::Doing, Some("acme-web".into()))
+            );
+            let r = tool("crew.move_ticket").execute(mv("ACM-2", "doing")).await.unwrap();
+            assert_eq!(r.output["done"], "moved ACM-2 to Doing", "{r:?}");
+            assert_eq!(state_of(&d, "ACM-2").await.0, TicketState::Doing);
+
+            // It is the overseer's doing in Activity, with its reason.
+            let page = d.activity(Filter::All, None, 50).await.unwrap();
+            assert!(page.events.iter().any(|e| e.kind == Kind::TicketMoved
+                && e.actor.kind == PartyKind::Manager
+                && e.reason.as_deref() == Some("Work began.")));
+            assert!(page.events.iter().any(|e| e.kind == Kind::TicketAssigned
+                && e.actor.kind == PartyKind::Manager));
+
+            // A ticket's key must be one, and a ticket must be there.
+            let r = tool("crew.move_ticket").execute(mv("ACM-99", "doing")).await.unwrap();
+            assert_eq!(r.error.as_deref(), Some("There's no ACM-99."));
+            let r = tool("crew.move_ticket").execute(mv("twelve", "doing")).await.unwrap();
+            assert_eq!(
+                r.error.as_deref(),
+                Some("\"twelve\" isn’t a ticket’s key, like ACM-12.")
+            );
+        })
+        .await;
+    }
+
+    /// Dropping a ticket is the person's even where the overseer hands out
+    /// work; they say yes to the suggestion and it moves.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dropping_a_ticket_is_always_a_suggestion() {
+        use super::super::actions::{Action, Gate};
+        with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let (overseer, crew, d, _llm) = overseeing(
+                dir.path(),
+                pool,
+                "ok",
+                "[oversight]\nenabled = true\nlevel = \"act\"\n[oversight.act]\nhand_out_work = true\n",
+                &[],
+            )
+            .await;
+            let b = acme(&d).await;
+            ticket(&d, b, "Add the date picker", TicketState::Todo, &[]).await;
+            eventually("the overseer's tools", async || {
+                overseer.tools.has("crew.move_ticket").then_some(())
+            })
+            .await;
+            let (_, o) = crew.overseer_service().unwrap();
+            let to = |state: &str| {
+                Action::parse(
+                    "crew.move_ticket",
+                    &json!({"ticket": "ACM-1", "state": state, "reason": "Not needed."}),
+                )
+                .unwrap()
+            };
+            assert_eq!(crew.gate(&to("doing"), &o), Gate::Run);
+            assert!(matches!(crew.gate(&to("dropped"), &o), Gate::Suggest(_)));
+
+            let r = overseer
+                .tools
+                .get("crew.move_ticket")
+                .unwrap()
+                .execute(json!({"ticket": "ACM-1", "state": "dropped", "reason": "Not needed."}))
+                .await
+                .unwrap();
+            assert_eq!(r.output["suggested"], "Move ACM-1 to Dropped", "{r:?}");
+            assert_eq!(state_of(&d, "ACM-1").await.0, TicketState::Todo);
+
+            let kept = d.store().suggestions(10).await.unwrap().remove(0);
+            crew.accept(&kept).await.unwrap();
+            assert_eq!(state_of(&d, "ACM-1").await.0, TicketState::Dropped);
+            let page = d.activity(Filter::All, None, 50).await.unwrap();
+            let moved = page
+                .events
+                .iter()
+                .find(|e| e.kind == Kind::TicketMoved && e.text.contains("Dropped"))
+                .unwrap();
+            assert_eq!(moved.actor.kind, PartyKind::You);
+        })
+        .await;
+    }
+
+    /// A session started for a ticket is one the overseer runs from the
+    /// start: it takes one of the `parallel` slots, is charged as a start
+    /// and is in the overseer's group; a full house refuses in plain
+    /// words and leaves the ticket as it was. Existing sessions take
+    /// tickets whatever the slots.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn assigning_to_a_new_session_counts_against_parallel_and_is_charged() {
+        use workforce_desk::charge::How;
+        with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let (overseer, _llm) = agent(dir.path(), "desk", "ok").await;
+            write_config(
+                &overseer,
+                "[oversight]\nenabled = true\nlevel = \"act\"\n[oversight.act]\nhand_out_work = true\n[oversight.work]\nparallel = 1\n",
+            );
+            let state = hub(std::slice::from_ref(&overseer));
+            let d = desk_running(
+                pool,
+                dir.path(),
+                Default::default(),
+                installed_cli(dir.path()),
+                not_installed(dir.path()),
+            )
+            .await;
+            let _crew = CrewHub::start(state, d.clone(), FAST, CancellationToken::new());
+            d.change_layout(|l| {
+                l.create(
+                    "g-acme",
+                    "Acme",
+                    &[workforce_desk::local_agent_item("desk")],
+                    None,
+                )
+            })
+            .await
+            .unwrap();
+            let b = acme(&d).await;
+            let first = ticket(&d, b, "Add the date picker", TicketState::Todo, &[]).await;
+            ticket(&d, b, "Fix the flaky test", TicketState::Todo, &[]).await;
+            ticket(&d, b, "Wire the picker to checkout", TicketState::Todo, &[first.ticket.id]).await;
+            eventually("the overseer's tools and engines", async || {
+                let e = d.engines();
+                let installed = e
+                    .iter()
+                    .find(|v| v.engine == Engine::Claude)
+                    .and_then(|v| v.installed);
+                (overseer.tools.has("crew.assign_ticket") && installed == Some(true)).then_some(())
+            })
+            .await;
+            let assign = overseer.tools.get("crew.assign_ticket").unwrap();
+            let new = |key: &str| {
+                json!({"ticket": key, "to": {"newSession": {"folder": dir.path().to_string_lossy()}}, "reason": "It is next."})
+            };
+
+            let r = assign.execute(new("ACM-1")).await.unwrap();
+            assert!(r.success, "{r:?}");
+            let done = r.output["done"].as_str().unwrap();
+            assert!(done.starts_with("gave ACM-1 to ACM-1, a session started for it"), "{done}");
+            let started = d
+                .list()
+                .into_iter()
+                .find(|v| v.name == "ACM-1")
+                .expect("a session named for the ticket");
+            assert_eq!(started.goal, "ACM-1 · Add the date picker");
+            assert_eq!(started.group.as_ref().map(|g| g.id.as_str()), Some("g-acme"));
+            let c = d.charge_of(started.id).unwrap();
+            assert_eq!((c.boss.as_str(), c.how), ("desk", How::Started));
+            assert_eq!(c.group.as_deref(), Some("g-acme"));
+            assert_eq!(d.charges_busy("desk"), 1);
+            assert_eq!(
+                state_of(&d, "ACM-1").await,
+                (TicketState::Doing, Some("ACM-1".into()))
+            );
+
+            // The one slot is taken: refused in plain words, nothing started.
+            let r = assign.execute(new("ACM-2")).await.unwrap();
+            assert_eq!(
+                r.error.as_deref(),
+                Some("You already run 1 sessions that are starting or working, the most you may run at once (1). Wait for one to finish, or ask the person to let you run more.")
+            );
+            assert_eq!(d.list().len(), 1);
+            assert_eq!(state_of(&d, "ACM-2").await, (TicketState::Todo, None));
+
+            // A session that is already there takes it, slots or not.
+            let mine = new_session(&d, dir.path(), "acme-api").await;
+            let r = assign
+                .execute(json!({"ticket": "ACM-2", "to": {"session": mine.id.to_string()}, "reason": "It is next."}))
+                .await
+                .unwrap();
+            assert_eq!(r.output["done"], "gave ACM-2 to acme-api", "{r:?}");
+            assert_eq!(d.charges_busy("desk"), 1);
+
+            // What waits on a ticket that isn't done is not handed out.
+            let r = assign.execute(new("ACM-3")).await.unwrap();
+            assert_eq!(
+                r.error.as_deref(),
+                Some("ACM-3 waits on ACM-1, which isn't done; hand it out once it is.")
+            );
+
+            // A ticket that is done is not handed out again.
+            d.move_ticket(
+                first.ticket.id,
+                Move { state: TicketState::Done, before: None, after: None },
+                &By::you(),
+            )
+            .await
+            .unwrap();
+            let r = assign.execute(new("ACM-1")).await.unwrap();
+            assert_eq!(
+                r.error.as_deref(),
+                Some("ACM-1 is done already; there is nothing to hand out.")
+            );
+        })
+        .await;
+    }
+
+    /// A ticket that became ready with no one on it wakes the overseer once,
+    /// and only where it may hand out work.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_ticket_becoming_ready_with_no_one_on_it_is_a_wake_when_hand_out_work_is_on() {
+        with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let (_overseer, crew, d, _llm) = overseeing(
+                dir.path(),
+                pool,
+                "ok",
+                "[oversight]\nenabled = true\nlevel = \"act\"\n[oversight.act]\nhand_out_work = true\n",
+                &[],
+            )
+            .await;
+            let (_, on) = crew.overseer_service().unwrap();
+            let mut off = on.clone();
+            off.act.hand_out_work = false;
+            let lines = |t: Vec<super::super::watcher::Trigger>| -> Vec<String> {
+                t.into_iter().map(|t| t.line).collect()
+            };
+            let mut seen = HashMap::new();
+            let b = acme(&d).await;
+
+            let first = ticket(&d, b, "Add the date picker", TicketState::Todo, &[]).await;
+            assert_eq!(
+                lines(crew.ready_unhanded(&mut seen, &on).await),
+                ["ACM-1 “Add the date picker” is ready on the board and has no one on it yet"]
+            );
+            assert!(crew.ready_unhanded(&mut seen, &on).await.is_empty(), "said once");
+
+            // Not ready, or already someone's: not a wake.
+            let waits = ticket(&d, b, "Wire the picker to checkout", TicketState::Todo, &[first.ticket.id]).await;
+            ticket(&d, b, "Someday the dark mode", TicketState::Backlog, &[]).await;
+            assert!(crew.ready_unhanded(&mut seen, &on).await.is_empty());
+            let s = new_session(&d, dir.path(), "acme-web").await;
+            d.assign_ticket(first.ticket.id, Some(AssignTo::Session(s.id)), &By::you())
+                .await
+                .unwrap();
+            assert!(crew.ready_unhanded(&mut seen, &on).await.is_empty());
+
+            // Its need done, it becomes ready: a wake.
+            d.move_ticket(
+                first.ticket.id,
+                Move { state: TicketState::Done, before: None, after: None },
+                &By::you(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                lines(crew.ready_unhanded(&mut seen, &on).await),
+                ["ACM-2 “Wire the picker to checkout” is ready on the board and has no one on it yet"]
+            );
+            assert_eq!(waits.key.as_deref(), Some("ACM-2"));
+
+            // With hand_out_work off it is no wake, and what waited then is
+            // not one when it is switched on.
+            ticket(&d, b, "Fix the flaky test", TicketState::Todo, &[]).await;
+            assert!(crew.ready_unhanded(&mut seen, &off).await.is_empty());
+            assert!(crew.ready_unhanded(&mut seen, &on).await.is_empty());
+            let mut watching = on.clone();
+            watching.level = workforce_common::oversight::Level::Watch;
+            ticket(&d, b, "Tidy the footer", TicketState::Todo, &[]).await;
+            assert!(crew.ready_unhanded(&mut seen, &watching).await.is_empty());
+        })
+        .await;
+    }
+
+    /// The same, through the watcher: the check-in the overseer gets says it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_ready_ticket_with_no_one_on_it_checks_the_overseer_in() {
+        with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let (_overseer, _crew, d, _llm) = overseeing(
+                dir.path(),
+                pool,
+                "I will hand it out.",
+                "[oversight]\nenabled = true\nlevel = \"act\"\n[oversight.act]\nhand_out_work = true\n",
+                &[],
+            )
+            .await;
+            let b = acme(&d).await;
+            // Let the watcher take its baseline before the ticket appears.
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            ticket(&d, b, "Add the date picker", TicketState::Todo, &[]).await;
+            let woke = eventually("a check-in about the ticket", async || {
+                d.store().latest_check_in("desk").await.unwrap()
+            })
+            .await;
+            assert!(
+                woke.prompt.contains("ACM-1 “Add the date picker” is ready on the board"),
+                "{}",
+                woke.prompt
+            );
+        })
+        .await;
+    }
+
+    /// A session finishing while its ticket is still Doing says so in the
+    /// check-in; once the ticket has moved it does not.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_session_finishing_with_its_ticket_still_doing_says_so_in_the_wake() {
+        use workforce_desk::crew::Event;
+        with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let (_overseer, crew, d, _llm) = overseeing(
+                dir.path(),
+                pool,
+                "ok",
+                "[oversight]\nenabled = true\nwake = { waiting_minutes = 0, quiet_minutes = 0 }\n",
+                &[],
+            )
+            .await;
+            let b = acme(&d).await;
+            let t = ticket(&d, b, "Add the date picker", TicketState::Todo, &[]).await;
+            let s = new_session(&d, dir.path(), "acme-web").await;
+            let party = Party::session(&s);
+            let finished = Event::new(
+                Kind::Finished,
+                party.clone(),
+                Some(party),
+                "finished · all green",
+            );
+
+            // Not on a ticket: the line as it was.
+            assert_eq!(
+                crew.with_doing(s.id, "acme-web finished".into()).await,
+                "acme-web finished"
+            );
+            d.assign_ticket(t.ticket.id, Some(AssignTo::Session(s.id)), &By::you())
+                .await
+                .unwrap();
+            assert_eq!(
+                crew.with_doing(s.id, "acme-web finished".into()).await,
+                "acme-web finished; ACM-1 is still Doing"
+            );
+            assert_eq!(
+                super::super::watcher::finished_session(&finished),
+                Some(s.id)
+            );
+
+            // Through the watcher.
+            d.note(finished.clone());
+            let woke = eventually("the check-in", async || {
+                d.store().latest_check_in("desk").await.unwrap()
+            })
+            .await;
+            assert!(
+                woke.prompt
+                    .contains("finished · all green; ACM-1 is still Doing"),
+                "{}",
+                woke.prompt
+            );
+
+            // Moved on to Review, it is no longer Doing.
+            d.move_ticket(
+                t.ticket.id,
+                Move {
+                    state: TicketState::Review,
+                    before: None,
+                    after: None,
+                },
+                &By::you(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                crew.with_doing(s.id, "acme-web finished".into()).await,
+                "acme-web finished"
+            );
+        })
+        .await;
+    }
+
+    /// For a session the overseer runs, the work turn its turn's end wakes
+    /// says the ticket is still Doing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_work_turn_for_a_session_with_its_ticket_in_doing_says_so() {
+        with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let (overseer, _crew, d, _llm) = overseeing(
+                dir.path(),
+                pool,
+                "Tell it to move the ticket.",
+                "[oversight]\nenabled = true\nlevel = \"act\"\n[oversight.work]\nparallel = 3\n",
+                &[],
+            )
+            .await;
+            let b = acme(&d).await;
+            let t = ticket(&d, b, "Add the date picker", TicketState::Todo, &[]).await;
+            let s = new_session(&d, dir.path(), "acme-web").await;
+            let url = hook_url(dir.path(), s.id).await;
+            hook(
+                &url,
+                json!({"hook_event_name": "SessionStart", "session_id": s.id.to_string()}),
+            )
+            .await;
+            hook(
+                &url,
+                json!({"hook_event_name": "UserPromptSubmit", "prompt": "Add the date picker"}),
+            )
+            .await;
+            let boss = Party::manager("desk", &super::super::name_of(&overseer));
+            d.take_on(
+                s.id,
+                &boss,
+                workforce_desk::charge::How::Handed,
+                &Default::default(),
+                &By::you(),
+            )
+            .await
+            .unwrap();
+            d.assign_ticket(t.ticket.id, Some(AssignTo::Session(s.id)), &By::you())
+                .await
+                .unwrap();
+            hook(
+                &url,
+                json!({"hook_event_name": "Stop", "last_assistant_message": "The date picker is in."}),
+            )
+            .await;
+            let channel = super::super::line::line_channel(s.id);
+            let woke = eventually("the work turn", async || {
+                let line = overseer.sessions.find(&channel, PERSON).unwrap()?;
+                line.messages
+                    .iter()
+                    .find(|m| m.content.starts_with(super::super::work::WORK))
+                    .cloned()
+            })
+            .await;
+            assert!(woke.content.contains("; ACM-1 is still Doing"), "{}", woke.content);
+        })
+        .await;
+    }
+}

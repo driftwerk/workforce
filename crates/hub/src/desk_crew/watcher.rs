@@ -678,6 +678,14 @@ impl CrewHub {
     }
 }
 
+/// The session whose turn `event` says ended, when it does.
+pub(super) fn finished_session(event: &Event) -> Option<uuid::Uuid> {
+    let subject = event.subject.as_ref()?;
+    (event.kind == Kind::Finished && subject.kind == PartyKind::Session)
+        .then(|| subject.id.parse().ok())
+        .flatten()
+}
+
 /// Runs [`CrewHub::sync`] every tick, and at once when a config is saved.
 pub(super) async fn sync_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
     loop {
@@ -700,6 +708,10 @@ pub(super) async fn wake_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
     let mut noted: HashSet<String> = HashSet::new();
     let mut firing: Option<tokio::task::JoinHandle<()>> = None;
     let mut raised = crew.raised().await;
+    // The ready tickets nobody has, so that one that becomes so wakes it.
+    let mut ready_seen = HashMap::new();
+    crew.ready_unhanded(&mut ready_seen, &Oversight::default())
+        .await;
     // Until when check-ins are spent, and the pause the person was told of.
     let mut held_until: Option<DateTime<Utc>> = None;
     let mut told: Option<DateTime<Utc>> = None;
@@ -710,7 +722,17 @@ pub(super) async fn wake_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
             received = events.recv() => match received {
                 Ok(DeskEvent::Activity { event }) => {
                     if let Some((s, o)) = crew.overseer_service() {
-                        found.extend(crew.trigger_for(&event, s.agent_id.as_str(), &o));
+                        if let Some(mut t) = crew.trigger_for(&event, s.agent_id.as_str(), &o) {
+                            if let Some(session) = finished_session(&event) {
+                                t.line = crew.with_doing(session, t.line).await;
+                            }
+                            found.push(t);
+                        }
+                    }
+                }
+                Ok(DeskEvent::Ticket { .. }) => {
+                    if let Some((_, o)) = crew.overseer_service() {
+                        found.extend(crew.ready_unhanded(&mut ready_seen, &o).await);
                     }
                 }
                 Ok(_) | Err(RecvError::Lagged(_)) => {}

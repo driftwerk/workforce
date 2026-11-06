@@ -10,11 +10,12 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
 use workforce_common::oversight::{Act, Level, Oversight, TakeOn};
+use workforce_desk::board::TicketState;
 use workforce_desk::charge::How;
 use workforce_desk::crew::{self, By, Kind, Party};
 use workforce_desk::engine::{self, Deliver, View};
 use workforce_desk::model::{Engine, NewSession, Origin};
-use workforce_desk::Speaker;
+use workforce_desk::{AssignTo, ChargedTo, Move, NewSessionFor, Speaker};
 
 use super::read_only::read_only_in;
 use super::CrewHub;
@@ -24,6 +25,19 @@ use super::CrewHub;
 pub(crate) enum Target {
     Session(Uuid),
     Agent(String),
+}
+
+/// Whom a ticket is handed to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Handout {
+    Session(Uuid),
+    Agent(String),
+    /// A session started for it, which the overseer runs: `engine` None is
+    /// `[oversight.work] engine`.
+    NewSession {
+        folder: String,
+        engine: Option<Engine>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,6 +95,17 @@ pub(crate) enum Action {
         agent: String,
         task: String,
     },
+    /// Hand a ticket on the board (by its key) to a session, an agent or a
+    /// session started for it.
+    AssignTicket {
+        ticket: String,
+        to: Handout,
+    },
+    /// Move a ticket on the board (by its key) to a column.
+    MoveTicket {
+        ticket: String,
+        state: TicketState,
+    },
     /// Run a session for the person: it wakes the overseer at each turn's
     /// end, and waits for it while the person isn't driving.
     TakeOn {
@@ -108,6 +133,9 @@ struct Input {
     view: Option<View>,
     worktree: Option<String>,
     task: Option<String>,
+    ticket: Option<String>,
+    to: Option<Value>,
+    state: Option<TicketState>,
     reply_to: Option<String>,
     message_id: Option<String>,
     reason: Option<String>,
@@ -127,6 +155,54 @@ fn text(raw: Option<String>, what: &str) -> Result<String, String> {
     raw.map(|t| t.trim().to_string())
         .filter(|t| !t.is_empty())
         .ok_or_else(|| format!("Say {what}."))
+}
+
+/// The key of a ticket as typed: `acm-12` is `ACM-12`.
+fn ticket_key(raw: Option<String>) -> Result<String, String> {
+    let key = text(raw, "which ticket, by its key (like ACM-12)")?;
+    workforce_desk::board::parse_key(&key)
+        .map(|(prefix, n)| format!("{prefix}-{n}"))
+        .ok_or_else(|| format!("{key:?} isn’t a ticket’s key, like ACM-12."))
+}
+
+/// Who `to` hands a ticket to: `{ "session": id }`, `{ "agent": id }` or
+/// `{ "newSession": { "folder", "engine" } }`.
+fn handout(to: Option<Value>) -> Result<Handout, String> {
+    let say = || {
+        "Say who gets it: { \"session\": id from crew.overview }, { \"agent\": id } or { \"newSession\": { \"folder\": path, \"engine\": optional } }.".to_string()
+    };
+    let to = to.ok_or_else(say)?;
+    fn word(v: &Value) -> Option<&str> {
+        v.as_str().map(str::trim).filter(|v| !v.is_empty())
+    }
+    if let Some(s) = to.get("session") {
+        return Ok(Handout::Session(id(word(s), "session")?));
+    }
+    if let Some(a) = to.get("agent") {
+        return Ok(Handout::Agent(
+            word(a)
+                .ok_or_else(|| "Say which agent.".to_string())?
+                .into(),
+        ));
+    }
+    if let Some(n) = to.get("newSession").or_else(|| to.get("new_session")) {
+        let folder = n
+            .get("folder")
+            .or_else(|| n.get("path"))
+            .and_then(word)
+            .ok_or_else(|| "Say the project’s folder for the new session.".to_string())?;
+        let engine = match n.get("engine").and_then(word) {
+            Some(e) => {
+                Some(Engine::parse(e).map_err(|_| format!("{e} isn’t an engine Desk knows."))?)
+            }
+            None => None,
+        };
+        return Ok(Handout::NewSession {
+            folder: folder.into(),
+            engine,
+        });
+    }
+    Err(say())
 }
 
 fn blank_none(raw: Option<String>) -> Option<String> {
@@ -212,6 +288,16 @@ impl Action {
                 agent: text(i.agent_id, "which agent")?,
                 task: text(i.task, "the task")?,
             },
+            "crew.assign_ticket" => Self::AssignTicket {
+                ticket: ticket_key(i.ticket)?,
+                to: handout(i.to)?,
+            },
+            "crew.move_ticket" => Self::MoveTicket {
+                ticket: ticket_key(i.ticket)?,
+                state: i
+                    .state
+                    .ok_or("Say which column: backlog, todo, doing, review, done or dropped.")?,
+            },
             "crew.take_on" => Self::TakeOn {
                 session: session()?,
             },
@@ -220,6 +306,18 @@ impl Action {
             },
             other => return Err(format!("{other} is not something the overseer can do")),
         })
+    }
+
+    /// Whether it starts a session.
+    pub(crate) fn starts_session(&self) -> bool {
+        matches!(
+            self,
+            Self::StartSession { .. }
+                | Self::AssignTicket {
+                    to: Handout::NewSession { .. },
+                    ..
+                }
+        )
     }
 
     /// The action a suggestion holds.
@@ -242,7 +340,9 @@ impl Action {
             }
             Self::StartSession { goal, .. } => goal.as_str(),
             Self::Assign { task, .. } => task.as_str(),
-            Self::Approve { .. }
+            Self::AssignTicket { .. }
+            | Self::MoveTicket { .. }
+            | Self::Approve { .. }
             | Self::Deny { .. }
             | Self::Stop { .. }
             | Self::Interrupt { .. }
@@ -318,6 +418,18 @@ fn charge_plain(e: workforce_desk::DeskError) -> String {
     }
 }
 
+/// A board change refused, in the words the person reads, as they are.
+fn board_plain(e: workforce_desk::DeskError) -> String {
+    match e {
+        workforce_desk::DeskError::Conflict(why) | workforce_desk::DeskError::Invalid(why) => why,
+        workforce_desk::DeskError::NotFound => "That ticket isn’t there any more.".into(),
+        workforce_desk::DeskError::Internal(e) => {
+            tracing::warn!(error = %e, "a board change failed");
+            "Something went wrong on this Mac.".into()
+        }
+    }
+}
+
 /// Whether the overseer may do it now, or should suggest it instead.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Gate {
@@ -373,6 +485,15 @@ impl CrewHub {
                 "anything that pushes, deletes or reaches outside Desk is the person's call".into(),
             );
         }
+        // Letting go of a ticket for good is the person's, whatever else
+        // they let it hand out.
+        if let Action::MoveTicket {
+            state: TicketState::Dropped,
+            ..
+        } = action
+        {
+            return Gate::Suggest("dropping a ticket is the person's call".into());
+        }
         let allowed = match action {
             Action::Nudge {
                 reply_to: Some(_), ..
@@ -383,6 +504,8 @@ impl CrewHub {
             Action::Assign { .. } => true,
             Action::Resume { .. } | Action::Restart { .. } => o.act.resume_restart,
             Action::StartSession { .. } => o.act.hand_out_work,
+            Action::AssignTicket { .. } => o.act.hand_out_work,
+            Action::MoveTicket { .. } => o.act.hand_out_work,
             Action::Approve { session, approval } => {
                 // Codex's requests are to leave its sandbox, and what it says
                 // of them isn't what runs: the person's alone.
@@ -544,6 +667,27 @@ impl CrewHub {
                 started_here(s)
             }
             Action::StartSession { .. } => true,
+            // What a ticket's session or agent is told is a message to it.
+            Action::AssignTicket {
+                to: Handout::Session(s),
+                ..
+            } => match self.desk.view(*s).map(|v| v.origin) {
+                Ok(Origin::External) => act.message_terminal_sessions,
+                _ => true,
+            },
+            Action::AssignTicket {
+                to: Handout::Agent(_),
+                ..
+            } => {
+                return (!act.message_agents).then_some(
+                    "the person hasn't let you message agents without asking: an agent acts on a message under its own permissions",
+                );
+            }
+            Action::AssignTicket {
+                to: Handout::NewSession { .. },
+                ..
+            }
+            | Action::MoveTicket { .. } => true,
             Action::Approve { .. }
             | Action::Deny { .. }
             | Action::Stop { .. }
@@ -593,7 +737,21 @@ impl CrewHub {
                 ..
             }
             | Action::Assign { agent: a, .. } => self.party_of_agent(a),
-            Action::StartSession { .. } | Action::Escalate { .. } => None,
+            Action::AssignTicket {
+                to: Handout::Agent(a),
+                ..
+            } => self.party_of_agent(a),
+            Action::AssignTicket {
+                to: Handout::Session(s),
+                ..
+            } => self.desk.view(*s).ok().map(|v| Party::session(&v)),
+            Action::StartSession { .. }
+            | Action::AssignTicket {
+                to: Handout::NewSession { .. },
+                ..
+            }
+            | Action::MoveTicket { .. }
+            | Action::Escalate { .. } => None,
             Action::Nudge {
                 to: Target::Session(s),
                 ..
@@ -689,6 +847,16 @@ impl CrewHub {
                     self.agent_name(agent),
                     crew::clip(task, 200)
                 )
+            }
+            Action::AssignTicket { ticket, to } => match to {
+                Handout::Session(s) => format!("Give {ticket} to {}", self.session_name(*s)),
+                Handout::Agent(a) => format!("Give {ticket} to {}", self.agent_name(a)),
+                Handout::NewSession { folder, .. } => {
+                    format!("Start a session in {folder} for {ticket}")
+                }
+            },
+            Action::MoveTicket { ticket, state } => {
+                format!("Move {ticket} to {}", state.title())
             }
             Action::TakeOn { session } => {
                 format!("Run {} for you", self.session_name(*session))
@@ -851,6 +1019,19 @@ impl CrewHub {
                 Ok(format!("restarted {}", v.label()))
             }
             Action::StartSession { .. } => self.start_session(action, by).await,
+            Action::AssignTicket { .. } => self.assign_ticket(action, by).await,
+            Action::MoveTicket { ticket, state } => {
+                let t = d.ticket_by_key(ticket).await.map_err(board_plain)?;
+                let mv = Move {
+                    state: *state,
+                    before: None,
+                    after: None,
+                };
+                d.move_ticket(t.ticket.id, mv, &by)
+                    .await
+                    .map_err(board_plain)?;
+                Ok(format!("moved {ticket} to {}", state.title()))
+            }
             Action::TakeOn { session } => {
                 let (service, _) = self
                     .overseer_service()
@@ -902,27 +1083,10 @@ impl CrewHub {
             .overseer_service()
             .ok_or("No one oversees the crew to start sessions for.")?;
         let boss = Party::manager(service.agent_id.as_str(), &super::name_of(&service));
-        let engine = match engine {
-            Some(e) => *e,
-            None => Engine::parse(o.work.engine.trim()).map_err(|_| {
-                format!(
-                    "Your default engine, {}, isn't one Desk can start; say engine ({}).",
-                    o.work.engine,
-                    self.engines_to_start().join(" or ")
-                )
-            })?,
-        };
+        let engine = self.engine_or_default(*engine, &o)?;
         let view = self.startable(engine, *view)?;
         let _one = self.starting.lock().await;
-        if by.party.kind == crew::PartyKind::Manager {
-            let busy = self.desk.charges_busy(&boss.id);
-            let parallel = o.work.parallel as usize;
-            if busy >= parallel {
-                return Err(format!(
-                    "You already run {busy} sessions that are starting or working, the most you may run at once ({parallel}). Wait for one to finish, or ask the person to let you run more."
-                ));
-            }
-        }
+        self.slot_free(&boss, &o, &by)?;
         let label = name.clone().unwrap_or_else(|| {
             Path::new(folder)
                 .file_name()
@@ -968,6 +1132,110 @@ impl CrewHub {
             v.label(),
             v.id
         ))
+    }
+
+    /// `engine`, or the overseer's default one.
+    fn engine_or_default(&self, engine: Option<Engine>, o: &Oversight) -> Result<Engine, String> {
+        match engine {
+            Some(e) => Ok(e),
+            None => Engine::parse(o.work.engine.trim()).map_err(|_| {
+                format!(
+                    "Your default engine, {}, isn't one Desk can start; say engine ({}).",
+                    o.work.engine,
+                    self.engines_to_start().join(" or ")
+                )
+            }),
+        }
+    }
+
+    /// Whether `boss` has a slot free for one more session it starts, when
+    /// `by` is the overseer itself: the person saying yes to a start is
+    /// theirs to decide. Call it holding `starting`.
+    fn slot_free(&self, boss: &Party, o: &Oversight, by: &By) -> Result<(), String> {
+        if by.party.kind != crew::PartyKind::Manager {
+            return Ok(());
+        }
+        let busy = self.desk.charges_busy(&boss.id);
+        let parallel = o.work.parallel as usize;
+        if busy >= parallel {
+            return Err(format!(
+                "You already run {busy} sessions that are starting or working, the most you may run at once ({parallel}). Wait for one to finish, or ask the person to let you run more."
+            ));
+        }
+        Ok(())
+    }
+
+    /// Hands the ticket `action` names to a session, an agent, or a session
+    /// started for it, as `by`. One that is started is the overseer's to
+    /// run from the start: it counts against `[oversight.work] parallel`
+    /// as any start does, and is in the overseer's charge and group.
+    async fn assign_ticket(&self, action: &Action, by: By) -> Result<String, String> {
+        let Action::AssignTicket { ticket: key, to } = action else {
+            return Err("That isn't a ticket to hand out.".into());
+        };
+        let d = &self.desk;
+        let t = d.ticket_by_key(key).await.map_err(board_plain)?;
+        if matches!(t.ticket.state, TicketState::Done | TicketState::Dropped) {
+            return Err(format!(
+                "{key} is {} already; there is nothing to hand out.",
+                t.ticket.state.title().to_lowercase()
+            ));
+        }
+        if !t.blockers.is_empty() {
+            let mut waits = Vec::new();
+            for b in &t.blockers {
+                if let Ok(n) = d.ticket(*b).await {
+                    waits.push(n.key.unwrap_or_else(|| "another ticket".into()));
+                }
+            }
+            return Err(format!(
+                "{key} waits on {}, which isn't done; hand it out once it is.",
+                waits.join(", ")
+            ));
+        }
+        let id = t.ticket.id;
+        let given = match to {
+            Handout::Session(s) => d
+                .assign_ticket(id, Some(AssignTo::Session(*s)), &by)
+                .await
+                .map_err(board_plain)?,
+            Handout::Agent(a) => d
+                .assign_ticket(id, Some(AssignTo::Agent(a.clone())), &by)
+                .await
+                .map_err(board_plain)?,
+            Handout::NewSession { folder, engine } => {
+                let (service, o) = self
+                    .overseer_service()
+                    .ok_or("No one oversees the crew to start sessions for.")?;
+                let boss = Party::manager(service.agent_id.as_str(), &super::name_of(&service));
+                let engine = self.engine_or_default(*engine, &o)?;
+                self.startable(engine, None)?;
+                let _one = self.starting.lock().await;
+                self.slot_free(&boss, &o, &by)?;
+                let charged = ChargedTo {
+                    group: self.boss_group(&boss.id),
+                    boss,
+                };
+                let new = AssignTo::NewSession(NewSessionFor {
+                    path: folder.clone(),
+                    engine,
+                });
+                d.assign_ticket_for(id, Some(new), &by, Some(&charged))
+                    .await
+                    .map_err(board_plain)?
+            }
+        };
+        let who = given
+            .ticket
+            .assignee
+            .map(|a| a.name)
+            .unwrap_or_else(|| "no one".into());
+        Ok(match to {
+            Handout::NewSession { .. } => format!(
+                "gave {key} to {who}, a session started for it; you run it, and the person can watch it, type into it and take it over"
+            ),
+            _ => format!("gave {key} to {who}"),
+        })
     }
 
     /// Whether the overseer (`by`) may suggest one more start: the sessions
