@@ -1762,6 +1762,7 @@ impl SessionStore for PostgresSessionStore {
                      JOIN sessions s ON s.id = a.session_id AND s.tenant_id = a.tenant_id
                      WHERE s.agent_id = $1 AND s.tenant_id = $4
                        AND a.content_tsv @@ plainto_tsquery('english', $2)
+                       AND NOT COALESCE((a.desk->>'failed')::boolean, false)
                      ORDER BY rank DESC, a.ts DESC
                      LIMIT $3",
                     &[&self.agent_id, &query, &fetch, &self.tenant_id()],
@@ -2281,6 +2282,7 @@ impl PostgresSessionStore {
                      SELECT seq, role, content,
                             row_number() OVER (ORDER BY seq) AS rn
                      FROM session_archive WHERE session_id = $1 AND tenant_id = $4
+                       AND NOT COALESCE((desk->>'failed')::boolean, false)
                  ),
                  hit AS (SELECT rn FROM ordered WHERE seq = $2)
                  SELECT o.seq, o.role, o.content

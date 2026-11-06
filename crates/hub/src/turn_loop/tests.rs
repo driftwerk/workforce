@@ -1562,3 +1562,288 @@ async fn a_stopped_turn_keeps_its_question() {
         )]
     );
 }
+
+/// A room's failed turn keeps its question but leaves no failure row: what a
+/// room's conversation keeps is posted to the room as the agent's reply, and
+/// read by the other agents in it.
+#[test]
+fn a_failed_room_turn_adds_no_room_message() {
+    use workforce_common::channels::desk::{DeskPlace, DeskSpeaker, DeskTurn, DeskTurnContext};
+    use workforce_common::session::SessionStore;
+    let dir = tempfile::tempdir().unwrap();
+    let store: std::sync::Arc<dyn SessionStore> =
+        std::sync::Arc::new(workforce_common::session::JsonlSessionStore::new(dir.path()).unwrap());
+    let room = uuid::Uuid::new_v4();
+    let channel = format!("desk:{room}");
+    let asked = uuid::Uuid::new_v4();
+    let turn = DeskTurn {
+        place: DeskPlace::Room {
+            room,
+            name: "Atlas".into(),
+            thread: None,
+        },
+        speaker: DeskSpeaker::Person,
+        hop: 0,
+        context: Vec::new(),
+        message: Some(asked),
+        spoken: false,
+        voice: None,
+    };
+    let desk = DeskTurnContext::new(turn, &channel, None, false, None, "reply".into());
+    let mut session = store
+        .get_or_create(&channel, "identity-1", "scout")
+        .unwrap();
+    session.add_user_message("what's open?", Some(&asked.to_string()));
+    store.save(&session).unwrap();
+    store
+        .append_to_archive(&session.id, session.messages.last().unwrap())
+        .unwrap();
+    let upto = session.messages.len();
+    crate::turn_loop::records::keep_failed_turn(
+        &store,
+        &mut session,
+        crate::turn_loop::records::FailedTurn {
+            archive_base: upto - 1,
+            archived_upto: upto,
+            heard: Vec::new(),
+            trust_level: None,
+            desk: Some(&desk),
+            asker: None,
+            error: "Agent error: boom",
+            ran: &[],
+        },
+    );
+    let page = store.read_archive_page(&session.id, None, 10).unwrap();
+    let said: Vec<&str> = page.messages.iter().map(|m| m.content.as_str()).collect();
+    assert_eq!(said, ["what's open?"]);
+}
+
+/// A turn whose transcript an urgent compaction shortens still archives its
+/// question, under the client's id.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_turn_that_compacts_still_archives_its_question() {
+    use workforce_common::channels::desk::DESK_CHANNEL;
+    let tmp = tempfile::tempdir().unwrap();
+    let (service, _server) =
+        crate::serve::testing::service_on_mock_llm_with(tmp.path(), |config| {
+            config.desk.enabled = true;
+        })
+        .await;
+    let mut tight = service.current_compaction_config();
+    tight.max_context_tokens = 60_000;
+    tight.keep_recent_messages = 4;
+    tight.min_messages_to_compact = 2;
+    *service.active_compaction.write() = Some(tight);
+    let mut session = service
+        .sessions
+        .get_or_create(DESK_CHANNEL, "identity-1", service.agent_id.as_str())
+        .unwrap();
+    let long = "the quarterly figures again, line by line. ".repeat(400);
+    for n in 0..40 {
+        session.add_user_message(&format!("{n}: {long}"), None);
+        session.add_assistant_message(&format!("noted {n}"), 5);
+    }
+    service.sessions.save(&session).unwrap();
+    let before = session.messages.len();
+
+    let asked = uuid::Uuid::new_v4();
+    let desk = dm_turn(asked);
+    let MessageProgress {
+        mut progress_rx,
+        handle,
+        session_id,
+        ..
+    } = service
+        .process_message_with_progress(
+            DESK_CHANNEL,
+            "identity-1",
+            None,
+            "and the totals?",
+            None,
+            Some(&session.id),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&desk),
+        )
+        .await
+        .unwrap();
+    while progress_rx.recv().await.is_some() {}
+    handle.await.unwrap().unwrap();
+    let after = service.sessions.get(&session_id).unwrap().unwrap();
+    assert!(after.messages.len() < before, "the turn compacted");
+    let read = read_back(&service, "identity-1");
+    assert!(
+        read.iter().any(|(text, id, _, _)| text == "and the totals?"
+            && id.as_deref() == Some(asked.to_string().as_str())),
+        "{read:?}"
+    );
+}
+
+/// A follow-up sent now into a turn that is then stopped is still the
+/// person's: kept, as said, once the turn's task is gone.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stopped_turn_keeps_what_was_sent_into_it() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    use workforce_common::channels::desk::{DeskPlace, DESK_CHANNEL};
+    use workforce_nats::chat::TurnControl;
+    let tmp = tempfile::tempdir().unwrap();
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(5)))
+        .mount(&server)
+        .await;
+    let mut config = workforce_common::settings::WorkforceConfig::default();
+    config.hub.data_dir = tmp.path().to_string_lossy().to_string();
+    config.memory.db_path = tmp.path().join("memory.db").to_string_lossy().into_owned();
+    config.llm.provider = "ollama".into();
+    config.llm.api_key = Some(server.uri());
+    config.llm.default_model = "mock".into();
+    config.desk.enabled = true;
+    let service = AgentService::from_config(config, None).await.unwrap();
+    let (asked, steered) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+    let desk = dm_turn(asked);
+    let session = service
+        .sessions
+        .get_or_create(DESK_CHANNEL, "identity-1", service.agent_id.as_str())
+        .unwrap();
+    let (_live, inbox) = service
+        .begin_live_turn(
+            &session.id,
+            workforce_agent::tools::approval::SelfServe::Answerable,
+            Some(&desk),
+        )
+        .await
+        .unwrap();
+    let MessageProgress { handle, .. } = service
+        .process_message_with_progress(
+            DESK_CHANNEL,
+            "identity-1",
+            None,
+            "what was that research called again?",
+            None,
+            Some(&session.id),
+            None,
+            None,
+            None,
+            None,
+            Some(inbox),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&desk),
+        )
+        .await
+        .unwrap();
+    for _ in 0..200 {
+        if !server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .is_empty()
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    assert!(service
+        .live_turns
+        .apply(
+            &session.id,
+            TurnControl::FollowUp {
+                text: "we talked about it previously".into(),
+                user: "identity-1".into(),
+                place: Some(DeskPlace::Dm),
+                queue: false,
+                id: Some(steered.to_string()),
+            }
+            .into(),
+        )
+        .await
+        .applied());
+    handle.abort();
+    let _ = handle.await;
+    let mut read = Vec::new();
+    for _ in 0..100 {
+        read = read_back(&service, "identity-1");
+        if read.len() == 2 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    assert_eq!(
+        read.iter()
+            .map(|(t, id, _, _)| (t.as_str(), id.clone()))
+            .collect::<Vec<_>>(),
+        [
+            (
+                "what was that research called again?",
+                Some(asked.to_string())
+            ),
+            ("we talked about it previously", Some(steered.to_string())),
+        ]
+    );
+}
+
+/// What the run read of the follow-ups heard is kept as answered; what it
+/// never read is apart, to ask again.
+#[test]
+fn follow_ups_split_by_what_the_run_read() {
+    use crate::hub_core::live_turns::Heard;
+    use workforce_agent::runner::InjectedUserMessage;
+    let heard = |text: &str, id: Option<&str>| Heard {
+        text: text.into(),
+        user: "u1".into(),
+        external_id: id.map(str::to_string),
+        at: Utc::now(),
+    };
+    let (read, unread) = crate::turn_loop::records::read_by_run(
+        vec![
+            heard("same words", Some("a")),
+            heard("same words", Some("b")),
+            heard("no id", None),
+        ],
+        &[InjectedUserMessage {
+            user: "u1".into(),
+            text: "same words".into(),
+            external_id: Some("b".into()),
+        }],
+    );
+    assert_eq!(
+        read.iter()
+            .map(|h| h.external_id.as_deref())
+            .collect::<Vec<_>>(),
+        [Some("b")]
+    );
+    assert_eq!(
+        unread
+            .iter()
+            .map(|h| h.external_id.as_deref())
+            .collect::<Vec<_>>(),
+        [Some("a"), None]
+    );
+}

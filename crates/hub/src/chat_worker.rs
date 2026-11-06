@@ -393,6 +393,7 @@ fn chat_progress(
             model,
             elapsed_secs,
         }),
+        ProgressEvent::Requeued { id, text } => desk.then_some(ChatProgress::Requeued { id, text }),
         ProgressEvent::Snapshot(snapshot) => desk.then_some(ChatProgress::Snapshot(snapshot)),
         ProgressEvent::File(file) => desk.then_some(ChatProgress::File(file)),
         ProgressEvent::SecretConsumed { .. } => None,

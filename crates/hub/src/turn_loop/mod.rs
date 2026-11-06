@@ -809,10 +809,24 @@ pub(crate) async fn assemble_code_context(
 
 /// Save a turn no route served with the notice its person was given as
 /// its answer; nothing is billed, reviewed or learnt from it.
+/// Where the turn's question `asked` is in `session`, which may have been
+/// compacted since it was added at `added`: found by its id, else where it
+/// was added, held to the transcript.
+pub(crate) fn asked_at(session: &Session, asked: Option<&str>, added: usize) -> usize {
+    asked
+        .and_then(|id| session.messages.iter().rposition(|m| m.id == id))
+        .unwrap_or(added.min(session.messages.len()))
+}
+
+/// Saves a turn answered by a notice. Its messages from `archive_base` are
+/// attributed to `user` in a shared session, and those from `archive_from`
+/// archived (a streamed turn archived its question already).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn save_notice_turn(
     service: &AgentService,
     session: &mut workforce_common::session::Session,
     archive_base: usize,
+    archive_from: usize,
     user: &str,
     notice: &str,
     desk: Option<&workforce_common::channels::desk::DeskTurnContext>,
@@ -823,7 +837,7 @@ pub(crate) fn save_notice_turn(
     }
     service.sessions.save_refreshing(session)?;
     persist_turn_owned_metadata(&service.sessions, session);
-    for msg in session.messages.get(archive_base..).unwrap_or_default() {
+    for msg in session.messages.get(archive_from..).unwrap_or_default() {
         if let Err(e) = service.sessions.append_to_archive(&session.id, msg) {
             warn!(error = %e, "Failed to append to session archive");
         }
@@ -3581,7 +3595,15 @@ pub(crate) async fn process_admitted(
     let (mut result, route) = match outcome {
         crate::agent_turn::ChainOutcome::Served { result, route } => (*result, route),
         crate::agent_turn::ChainOutcome::Notice { text } => {
-            save_notice_turn(service, &mut session, archive_base, user, &text, None)?;
+            save_notice_turn(
+                service,
+                &mut session,
+                archive_base,
+                archive_base,
+                user,
+                &text,
+                None,
+            )?;
             turn_journal.clear();
             return Ok(TurnOutcome::Answered(text));
         }
@@ -4760,6 +4782,16 @@ pub(crate) async fn stream_admitted(
     }
     // The message this turn answers, for the resume sweep.
     let turn_message_id = session.messages.get(archive_base).map(|m| m.id.clone());
+    // The question goes to the archive now, before anything can rewrite the
+    // transcript (an urgent compaction shortens it): the conversation reads
+    // it whether the turn answers, fails or is stopped (which ends the task
+    // before anything after the run), numbered ahead of whatever is
+    // delivered while the turn runs.
+    for msg in session.messages.get(archive_base..).unwrap_or_default() {
+        if let Err(e) = service.sessions.append_to_archive(&session.id, msg) {
+            warn!(error = %e, "Failed to archive the turn's question");
+        }
+    }
 
     turn_claim.unless_cancelled(&cancel_token).await?;
     stamp_tool_whitelist(&mut session);
@@ -4934,6 +4966,9 @@ pub(crate) async fn stream_admitted(
     // Save session with user message NOW (before spawning task) so that
     // subsequent calls see the latest messages. The spawned task will
     // update it again after the assistant response is ready.
+    // Where the question is now: an urgent compaction above may have
+    // shortened the transcript ahead of it.
+    let archive_base = asked_at(&session, turn_message_id.as_deref(), archive_base);
     // Attribute the user message before the pre-run save so a shared session
     // labels the speaker even if the turn is interrupted before it completes.
     if session.is_shared_conversation() {
@@ -4944,20 +4979,9 @@ pub(crate) async fn stream_admitted(
     // turn's own metadata (lessons, round-cap continuation) at the stored
     // version.
     service.sessions.save_refreshing(&mut session)?;
-    // The question goes to the archive now, not when the turn ends: the
-    // conversation reads it whether the turn answers, fails, or is stopped
-    // (which ends the task before anything after the run), and it is
-    // numbered ahead of whatever is delivered while the turn runs.
+    // What the turn adds from here on is archived when it ends; the
+    // question already is.
     let archived_upto = session.messages.len();
-    for msg in session
-        .messages
-        .get(archive_base..archived_upto)
-        .unwrap_or_default()
-    {
-        if let Err(e) = service.sessions.append_to_archive(&session.id, msg) {
-            warn!(error = %e, "Failed to archive the turn's question");
-        }
-    }
 
     // Open the turn record only once the message it answers is durable: a
     // crash between the two loses the recovery, never the transcript, and
@@ -5137,6 +5161,20 @@ pub(crate) async fn stream_admitted(
     let turn_served = ServedLog::default();
     let served = turn_served.clone();
     let turn_claim_id = turn_claim.claim_id().to_string();
+    // Whatever the turn leaves of the follow-ups it took in when its task
+    // ends (a stop aborts it before either end path runs) is still the
+    // person's: kept, as said, once it is over.
+    let turn_over = tokio_util::sync::CancellationToken::new();
+    if let Some(log) = heard_for_task.clone() {
+        tokio::spawn(records::keep_heard_left(
+            turn_over.clone(),
+            log,
+            Arc::clone(&service.sessions),
+            current_session_id.clone(),
+            trust_level,
+            desk.cloned(),
+        ));
+    }
     let handle = tokio::spawn(workforce_agent::runner::with_desk(desk_scope_for_task, CURRENT_BILLING_IDENTITY.scope(
         billing_identity_for_task.unwrap_or_default(),
         CURRENT_VOICE_CHANNEL.scope(
@@ -5157,6 +5195,7 @@ pub(crate) async fn stream_admitted(
                 // Hold (and background-renew) the fleet-wide turn claim
                 // until every exit path of this task has run.
                 let _turn_claim = turn_claim;
+                let _turn_over = turn_over.drop_guard();
                 let started_at = chrono::Utc::now();
                 // Cloned before the run consumes the runner's sender: the
                 // answer streams during the run, so the grounding block (nag
@@ -5274,7 +5313,7 @@ pub(crate) async fn stream_admitted(
                         if let Some(log) = heard_for_task.as_ref() {
                             records::keep_heard(&mut session, log.take(), trust_level, desk_for_task.as_ref());
                         }
-                        let saved = save_notice_turn(&me, &mut session, archive_base_for_task, &user_id_for_attr, &text, desk_for_task.as_ref());
+                        let saved = save_notice_turn(&me, &mut session, archive_base_for_task, archived_upto, &user_id_for_attr, &text, desk_for_task.as_ref());
                         turn_journal.clear();
                         end_turn_record(&sessions, &session.id, &turn_token_for_task);
                         saved?;
@@ -5385,8 +5424,25 @@ pub(crate) async fn stream_admitted(
                 // inbox, every follow-up it took in, as it arrived; else what
                 // the runner absorbed. System injections (job results) are
                 // tool-derived: never promote them into user-authored history.
+                // One the run never read (taken in after its last look) is
+                // not answered: a Desk asks it again, under its id, once this
+                // turn ends.
                 match heard_for_task.as_ref() {
-                    Some(log) => records::keep_heard(&mut session, log.take(), trust_level, desk_for_task.as_ref()),
+                    Some(log) => {
+                        let (read, unread) =
+                            records::read_by_run(log.take(), &result.injected_user_messages);
+                        records::keep_heard(&mut session, read, trust_level, desk_for_task.as_ref());
+                        for follow_up in unread {
+                            match (desk_for_task.is_some(), follow_up.external_id.clone()) {
+                                (true, Some(id)) => {
+                                    let _ = grounding_progress
+                                        .send(ProgressEvent::Requeued { id, text: follow_up.text })
+                                        .await;
+                                }
+                                _ => records::keep_heard(&mut session, vec![follow_up], trust_level, desk_for_task.as_ref()),
+                            }
+                        }
+                    }
                     None => {
                         for follow_up in result
                             .injected_user_messages

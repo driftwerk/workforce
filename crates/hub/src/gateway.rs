@@ -1508,6 +1508,7 @@ const DESK_ONLY_FRAMES: &[&str] = &[
     crate::broadcast::TURN_END,
     crate::broadcast::TURN_SNAPSHOT,
     crate::broadcast::DESK_DELIVERED,
+    REQUEUED,
 ];
 
 /// What a declared Desk connection is offered, on its `connected`. The hub
@@ -3306,6 +3307,7 @@ pub(crate) async fn forward_local_progress(
                 "slow_model_failover",
                 slow_model_line(&model, elapsed_secs),
             )),
+            ProgressEvent::Requeued { id, text } => Some(requeued(sid.clone(), id, text)),
             ProgressEvent::SubActivity { source, detail } => Some(BroadcastMessage::silent(
                 sid.clone(),
                 "tool_start",
@@ -3717,6 +3719,17 @@ fn followup_injection(
     }
 }
 
+/// The frame telling a Desk that the follow-up it sent under `id` was taken
+/// in too late for the turn to read: it queues it for the next one.
+fn requeued(session_id: String, id: String, text: String) -> BroadcastMessage {
+    let mut frame = BroadcastMessage::new(session_id, REQUEUED, text);
+    frame.id = Some(id);
+    frame
+}
+
+/// [`requeued`]'s frame type.
+const REQUEUED: &str = "requeued";
+
 /// The agent a frame addresses: its own `agent_id`, else the agent the
 /// connection was opened for, else the default.
 fn frame_agent<'a>(
@@ -3978,6 +3991,7 @@ pub(crate) fn chat_progress_to_broadcast(
             "slow_model_failover",
             slow_model_line(&model, elapsed_secs),
         )),
+        ChatProgress::Requeued { id, text } => Some(requeued(session_id.to_string(), id, text)),
         ChatProgress::Snapshot(snapshot) => {
             Some(BroadcastMessage::turn_snapshot(session_id, snapshot))
         }
@@ -4570,6 +4584,11 @@ async fn session_transcript(
         .read_thread_page(&session_id, before_session, before, limit)
     {
         Ok(mut page) => {
+            // A Desk turn's failure reads as a notice, not as the agent's
+            // answer.
+            for entry in page.messages.iter_mut().filter(|e| e.is_failure()) {
+                entry.role = workforce_common::session::MessageRole::System;
+            }
             if let Ok(Some(session)) = service.sessions.get(&session_id) {
                 for entry in &mut page.messages {
                     if entry.role == workforce_common::session::MessageRole::Assistant {

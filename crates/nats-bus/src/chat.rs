@@ -193,6 +193,9 @@ pub enum ChatProgress {
     RateLimited { wait_secs: u64, attempt: u32 },
     /// The model was silent too long and the turn switches to the next one.
     SlowModelFailover { model: String, elapsed_secs: u64 },
+    /// A follow-up the turn took in that its run never read: the client asks
+    /// it again, under its id `id`, once the turn ends.
+    Requeued { id: String, text: String },
     /// The live Desk turn as it stands.
     Snapshot(workforce_core::desk::TurnSnapshot),
     /// A file a tool delivered into the live Desk turn.

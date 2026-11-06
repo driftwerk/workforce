@@ -1,3 +1,6 @@
+-- Never queue behind a long read of the archive in production: fail fast,
+-- in this migration's own transaction only, and let the next boot apply it.
+SET LOCAL lock_timeout = '5s';
 -- The client's own id for an archived message (Desk's id for what the
 -- person sent), so a Desk conversation's read can say which stored row a
 -- message it showed became. Additive, so a replica on the previous binary

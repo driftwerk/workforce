@@ -406,6 +406,63 @@ pub(crate) fn keep_heard(
     }
 }
 
+/// The follow-ups `heard` that the run read (`absorbed`), and those it never
+/// did, each in the order it arrived. One the client named is known by its
+/// id; one it didn't, by who said what.
+pub(crate) fn read_by_run(
+    heard: Vec<crate::hub_core::live_turns::Heard>,
+    absorbed: &[workforce_agent::runner::InjectedUserMessage],
+) -> (
+    Vec<crate::hub_core::live_turns::Heard>,
+    Vec<crate::hub_core::live_turns::Heard>,
+) {
+    let mut left: Vec<&workforce_agent::runner::InjectedUserMessage> = absorbed.iter().collect();
+    heard.into_iter().partition(|h| {
+        let found = left.iter().position(|a| match &h.external_id {
+            Some(id) => a.external_id.as_deref() == Some(id.as_str()),
+            None => a.external_id.is_none() && a.text == h.text && a.user == h.user,
+        });
+        found.map(|at| left.remove(at)).is_some()
+    })
+}
+
+/// Once `over` (the turn's task has ended, however), keeps the follow-ups
+/// still in `heard`: those of a turn stopped or cut short, which no end path
+/// took. They are added to the session's transcript and its archive as they
+/// arrived.
+pub(crate) async fn keep_heard_left(
+    over: tokio_util::sync::CancellationToken,
+    heard: crate::hub_core::live_turns::HeardLog,
+    sessions: Arc<dyn workforce_common::session::SessionStore>,
+    session_id: String,
+    trust_level: Option<workforce_common::trust::TrustLevel>,
+    desk: Option<workforce_common::channels::desk::DeskTurnContext>,
+) {
+    over.cancelled().await;
+    let left = heard.take();
+    if left.is_empty() {
+        return;
+    }
+    let kept = tokio::task::spawn_blocking(move || -> eyre::Result<()> {
+        let Some(mut session) = sessions.get(&session_id)? else {
+            return Ok(());
+        };
+        let from = session.messages.len();
+        keep_heard(&mut session, left, trust_level, desk.as_ref());
+        sessions.save_refreshing(&mut session)?;
+        for msg in session.messages.get(from..).unwrap_or_default() {
+            sessions.append_to_archive(&session.id, msg)?;
+        }
+        Ok(())
+    })
+    .await;
+    match kept {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => tracing::warn!(error = %e, "Failed to keep a stopped turn's follow-ups"),
+        Err(e) => tracing::warn!(error = %e, "Keeping a stopped turn's follow-ups panicked"),
+    }
+}
+
 /// What a turn that failed leaves to keep: where its messages start in the
 /// session, the follow-ups it took in, and what it failed with after
 /// running which tools.
@@ -427,10 +484,12 @@ pub(crate) struct FailedTurn<'a> {
 
 /// Keeps what a failed turn was asked: its prompt is saved and archived
 /// already, and the follow-ups it took in go to the transcript and the
-/// archive, so the conversation still reads them after a restart. A Desk turn's failure is
-/// archived too, as the agent's row marked failed, pointing at the message
-/// the turn was asked with and carrying the tools it ran. That row is for
-/// the conversation alone: it never enters the transcript the model replays.
+/// archive, so the conversation still reads them after a restart. A DM
+/// turn's failure is archived too, as the agent's row marked failed,
+/// pointing at the message the turn was asked with and carrying the tools it
+/// ran. That row is for the person's DM alone: it never enters the
+/// transcript the model replays, and a room's turn leaves none, since what a
+/// room's conversation keeps is posted to the room as the agent's reply.
 pub(crate) fn keep_failed_turn(
     sessions: &Arc<dyn workforce_common::session::SessionStore>,
     session: &mut Session,
@@ -456,7 +515,12 @@ pub(crate) fn keep_failed_turn(
             tracing::warn!(error = %e, "Failed to archive a failed turn's message");
         }
     }
-    let Some(desk) = turn.desk else {
+    let Some(desk) = turn.desk.filter(|desk| {
+        matches!(
+            desk.turn.place,
+            workforce_common::channels::desk::DeskPlace::Dm
+        )
+    }) else {
         return;
     };
     let failure = failure_row(desk, turn.error, turn.ran);
