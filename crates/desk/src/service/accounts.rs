@@ -459,13 +459,19 @@ impl Desk {
     }
 
     /// Whether `engine`'s CLI may be signed in on this computer by itself:
-    /// false only once it says it isn't. Not yet read: read now. Still
-    /// unreadable: left to it, as before accounts.
+    /// false only once it says it isn't. A "logged out" read before is read
+    /// again (a login since is honoured at once), as is one never read; one
+    /// that can't be read is left to the CLI, as before accounts, and isn't
+    /// asked again for each session.
     async fn own_sign_in_works(&self, engine: Engine) -> bool {
-        if *self.sign_ins().of(engine) == engine::SignIn::Unknown {
-            self.read_engine_now(engine).await;
+        match self.engine_read(engine) {
+            Some(engine::SignIn::In { .. } | engine::SignIn::Unknown) => return true,
+            Some(engine::SignIn::Out) | None => {}
         }
-        *self.sign_ins().of(engine) != engine::SignIn::Out
+        self.read_engine_since(engine, self.read_asked(), super::Since::Ended)
+            .await;
+        self.spend_signed_in();
+        self.engine_read(engine) != Some(engine::SignIn::Out)
     }
 
     /// `a`'s token from the store, off the runtime's threads and never under
