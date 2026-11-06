@@ -399,7 +399,8 @@ pub fn check_name(name: &str, taken: impl IntoIterator<Item = String>) -> Result
 }
 
 /// The account a new session of `engine` runs on when the person names
-/// none: the default, else the CLI's own sign-in (`None`).
+/// none: the default, else the CLI's own sign-in (`None`), which a
+/// computer whose CLI isn't signed in swaps for its first account that is.
 pub fn default_of(accounts: &[Account], engine: Engine) -> Option<Uuid> {
     accounts
         .iter()

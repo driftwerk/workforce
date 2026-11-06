@@ -3238,7 +3238,18 @@ impl Desk {
         let mut env = self.with_added(&self.0.state.lock().session_env.clone());
         // Read only now; it reaches the CLI on a descriptor, never in an
         // environment ([`crate::token_pipe`]).
-        let account_token = self.account_token(r.engine, r.account).await?;
+        let account_token = match r.account {
+            Some(_) => self.account_token(r.engine, r.account).await?,
+            // No sign-in of the CLI's own here: on an account, kept as the
+            // session's so its plan readings and switches are that account's.
+            None => match self.instead_of_own(r.engine).await? {
+                Some((account, token)) => {
+                    self.change(r.id, |r, _| r.account = Some(account));
+                    Some(token)
+                }
+                None => None,
+            },
+        };
         if account_token.is_some() {
             for k in crate::engine_accounts::OUTRANKS_CLAUDE_TOKEN {
                 env.remove(k);

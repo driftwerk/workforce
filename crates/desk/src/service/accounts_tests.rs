@@ -25,7 +25,9 @@ use crate::store::{build_pool, DeskStore};
 const GOOD: &str = "sk-ant-oat01-good-0123456789abcdefghijklmnopqrstuvwxyz";
 const OTHER: &str = "sk-ant-oat01-good-other-9876543210zyxwvutsrqponmlkjihgf";
 
-/// A stand-in Claude Code: says its version, signs in by a "good" token,
+/// A stand-in Claude Code: says its version, signs in by a "good" token
+/// (and by itself, unless `SIGNED_OUT_HERE` is set: a computer it was never
+/// logged in on),
 /// runs `setup-token` as the real one shows it, and otherwise keeps its
 /// environment and arguments where the test reads them.
 fn claude(dir: &Path) -> PathBuf {
@@ -38,7 +40,7 @@ fn claude(dir: &Path) -> PathBuf {
              '--version ') echo '2.1.300 (Claude Code)' ;;\n\
              'auth status') t=$(cat <&3 2>/dev/null); case \"$t\" in\n\
                sk-ant-oat01-good*) echo '{{\"loggedIn\":true,\"authMethod\":\"oauth_token\"}}' ;;\n\
-               '') echo '{{\"loggedIn\":true,\"authMethod\":\"claude.ai\"}}' ;;\n\
+               '') if [ -n \"$SIGNED_OUT_HERE\" ]; then echo '{{\"loggedIn\":false}}'; else echo '{{\"loggedIn\":true,\"authMethod\":\"claude.ai\"}}'; fi ;;\n\
                *) echo '{{\"loggedIn\":false}}' ;;\n\
              esac ;;\n\
              'setup-token ') [ -n \"$BROWSER\" ] && \"$BROWSER\" 'https://claude.ai/oauth/authorize?code=true&redirect_uri=http%3A%2F%2Flocalhost%3A45678%2Fcallback&state=s1'\n\
@@ -1256,7 +1258,7 @@ async fn api(
     app: &axum::Router,
     method: &str,
     uri: &str,
-    _: Option<()>,
+    body: Option<serde_json::Value>,
 ) -> (u16, serde_json::Value) {
     use tower::ServiceExt;
     let response = app
@@ -1266,7 +1268,10 @@ async fn api(
                 .method(method)
                 .uri(uri)
                 .header("authorization", "Bearer hub-token")
-                .body(axum::body::Body::empty())
+                .header("content-type", "application/json")
+                .body(body.map_or_else(axum::body::Body::empty, |b| {
+                    axum::body::Body::from(b.to_string())
+                }))
                 .unwrap(),
         )
         .await
@@ -1321,6 +1326,197 @@ async fn only_the_hubs_own_token_is_handed_a_sign_in_and_only_once_a_minute() {
         )
         .await;
         assert_eq!(code, 200);
+    })
+    .await;
+}
+
+/// A computer Claude Code was never logged in on (a machine of the
+/// person's, before or after "Use this Mac's accounts").
+fn signed_out_options(dir: &Path, keys: Arc<MemoryKeys>) -> Options {
+    let mut o = account_options(dir, keys);
+    o.env.insert("SIGNED_OUT_HERE".into(), "1".into());
+    o
+}
+
+#[tokio::test]
+async fn with_no_sign_in_of_its_own_a_session_starts_on_the_first_account_never_at_a_login() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = Arc::new(MemoryKeys::default());
+        let d = desk(pool, signed_out_options(dir.path(), keys.clone())).await;
+        // As copying this Mac's accounts left them: none the default.
+        let work = paste(&d, "Work", GOOD, false).await;
+        let personal = paste(&d, "Personal", OTHER, false).await;
+
+        // Absent: no default, and no sign-in here, so the first account.
+        let s = d.create(session(dir.path(), None), None).await.unwrap();
+        assert_eq!(s.account.as_ref().map(|a| a.id), Some(work));
+        let (env, _) = started(dir.path(), s.id, 0).await;
+        assert_eq!(env["TOKEN_ON_FD"], GOOD, "signed in by Work's token");
+        assert!(!env.contains_key("ANTHROPIC_API_KEY"));
+        assert!(matches!(
+            d.sign_ins().of(Engine::Claude),
+            crate::engine::SignIn::Out
+        ));
+
+        // `null` (this computer's sign-in, which it hasn't): Work too, and kept
+        // as the session's for its readings and switches.
+        let own = d
+            .create(session(dir.path(), Some(None)), None)
+            .await
+            .unwrap();
+        assert_eq!(own.account.as_ref().map(|a| a.id), Some(work));
+        let (env, _) = started(dir.path(), own.id, 0).await;
+        assert_eq!(env["TOKEN_ON_FD"], GOOD);
+
+        // The default comes first, as a switch takes them.
+        d.update_account(
+            personal,
+            AccountPatch {
+                name: None,
+                is_default: Some(true),
+            },
+        )
+        .await
+        .unwrap();
+        let p = d
+            .create(session(dir.path(), Some(None)), None)
+            .await
+            .unwrap();
+        assert_eq!(p.account.as_ref().map(|a| a.id), Some(personal));
+        let (env, _) = started(dir.path(), p.id, 0).await;
+        assert_eq!(env["TOKEN_ON_FD"], OTHER);
+
+        // Work's sign-in gone: the next that reads.
+        d.update_account(
+            personal,
+            AccountPatch {
+                name: None,
+                is_default: Some(false),
+            },
+        )
+        .await
+        .unwrap();
+        keys.delete(work).unwrap();
+        let next = d.create(session(dir.path(), None), None).await.unwrap();
+        assert_eq!(next.account.as_ref().map(|a| a.id), Some(personal));
+
+        // None reads: said plainly, and nothing starts.
+        keys.delete(personal).unwrap();
+        let none = d.create(session(dir.path(), None), None).await.unwrap_err();
+        assert!(
+            none.to_string()
+                .contains("Claude Code isn't signed in on this computer, and none of its accounts"),
+            "{none}"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn with_no_sign_in_of_its_own_the_first_account_switches_to_the_next_at_its_limit() {
+    use crate::engine_accounts::AccountNeed;
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(
+            pool,
+            signed_out_options(dir.path(), Arc::new(MemoryKeys::default())),
+        )
+        .await;
+        let work = paste(&d, "Work", GOOD, false).await;
+        let personal = paste(&d, "Personal", OTHER, false).await;
+        d.set_auto_switch(true).await.unwrap();
+        let a = d.create(session(dir.path(), None), None).await.unwrap().id;
+        let b = d.create(session(dir.path(), None), None).await.unwrap().id;
+        started(dir.path(), a, 0).await;
+        started(dir.path(), b, 0).await;
+        for id in [a, b] {
+            assert_eq!(d.view(id).unwrap().account.map(|x| x.id), Some(work));
+            d.change(id, |r, _| r.state = SessionState::Idle);
+        }
+        // This computer's own sign-in is never a side to switch to.
+        stops_on_its_limit(&d, a);
+        let (env, args) = started(dir.path(), a, 1).await;
+        assert_eq!(env["TOKEN_ON_FD"], OTHER);
+        assert!(args.trim_end().ends_with("Continue"), "{args}");
+        let (env, _) = started(dir.path(), b, 1).await;
+        assert_eq!(env["TOKEN_ON_FD"], OTHER);
+        for id in [a, b] {
+            assert_eq!(d.view(id).unwrap().account.map(|x| x.id), Some(personal));
+        }
+        assert!(!d
+            .account_needs()
+            .iter()
+            .any(|n| matches!(n, AccountNeed::Limit { to, .. } if to.id.is_none())));
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn after_copying_accounts_to_a_computer_never_logged_in_a_session_started_there_is_signed_in()
+{
+    // The whole path over the hub's routes, as Desk drives a machine's hub:
+    // its engines read, the accounts posted as "Use this Mac's accounts"
+    // posts them, then the new session dialog's start.
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(
+            pool,
+            signed_out_options(dir.path(), Arc::new(MemoryKeys::default())),
+        )
+        .await;
+        let hub = crate::api::sessions_router(d.clone(), crate::testing::allow_all());
+        // Read as the hub reads its engines (every engine's at start; just
+        // Claude Code's here).
+        d.read_engine_now(Engine::Claude).await;
+        let (code, engines) = api(&hub, "GET", "/api/desk/engines", None).await;
+        assert_eq!(code, 200, "{engines}");
+        let claude = engines
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["engine"] == "claude")
+            .unwrap();
+        assert_eq!(claude["signIn"]["state"], "out", "{claude}");
+        for (name, token) in [("Work", GOOD), ("Personal", OTHER)] {
+            let (code, body) = api(
+                &hub,
+                "POST",
+                "/api/desk/accounts",
+                Some(serde_json::json!({
+                    "engine": "claude", "name": name, "token": token, "makeDefault": false,
+                })),
+            )
+            .await;
+            assert_eq!(code, 201, "{body}");
+        }
+        let (_, listed) = api(&hub, "GET", "/api/desk/accounts", None).await;
+        let work = listed["accounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["name"] == "Work")
+            .unwrap()["id"]
+            .clone();
+        let cwd = dir.path().to_string_lossy().into_owned();
+        // The dialog as it was (this computer's sign-in), and as it is now
+        // (the first account), both signed in by Work.
+        for account in [serde_json::Value::Null, work.clone()] {
+            let (code, s) = api(
+                &hub,
+                "POST",
+                "/api/desk/sessions",
+                Some(serde_json::json!({
+                    "engine": "claude", "name": "auth-fix", "cwd": cwd, "account": account,
+                })),
+            )
+            .await;
+            assert!(code == 200 || code == 201, "{code} {s}");
+            assert_eq!(s["account"]["id"], work, "{s}");
+            let id: Uuid = s["id"].as_str().unwrap().parse().unwrap();
+            let (env, _) = started(dir.path(), id, 0).await;
+            assert_eq!(env["TOKEN_ON_FD"], GOOD);
+        }
     })
     .await;
 }
