@@ -542,7 +542,10 @@ pub(super) async fn line_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
                     }
                 }
                 Ok(DeskEvent::Activity { event }) => {
-                    if let Some((session, line)) = crew.work_line(&event) {
+                    if let Some((session, mut line)) = crew.work_line(&event) {
+                        if super::watcher::finished_session(&event).is_some() {
+                            line = crew.with_doing(session, line).await;
+                        }
                         gathering
                             .entry(session)
                             .or_insert_with(Gathered::new)

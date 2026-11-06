@@ -77,8 +77,8 @@ pub use service::{
     TerminalView, Ungrouped, UNGROUPED,
 };
 pub use service::{
-    AssignTo, BoardPatch, Move, NewBoard, NewSessionFor, NewTicket, TicketPatch, TicketQuery,
-    TicketView,
+    AssignTo, BoardPatch, ChargedTo, Move, NewBoard, NewSessionFor, NewTicket, TicketPatch,
+    TicketQuery, TicketView,
 };
 pub use speech::{Audio, Speak, SpeakError, Speech, SpeechProvider};
 pub use store::DeskStore;

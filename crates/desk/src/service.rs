@@ -44,8 +44,8 @@ mod engine_sign_ins;
 pub use accounts::Added;
 mod board;
 pub use board::{
-    AssignTo, BoardPatch, Move, NewBoard, NewSessionFor, NewTicket, TicketPatch, TicketQuery,
-    TicketView,
+    AssignTo, BoardPatch, ChargedTo, Move, NewBoard, NewSessionFor, NewTicket, TicketPatch,
+    TicketQuery, TicketView,
 };
 mod breaker;
 mod charge;

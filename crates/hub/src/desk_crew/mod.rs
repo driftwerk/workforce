@@ -26,6 +26,7 @@ use crate::gateway::GatewayState;
 use crate::serve::AgentService;
 
 mod actions;
+mod board;
 mod deliver;
 mod extras;
 mod line;
@@ -409,6 +410,14 @@ impl Crew for CrewHub {
             task: task.to_string(),
         };
         self.me().perform(&action, By::you()).await
+    }
+
+    async fn assign_as(&self, agent: &str, task: &str, by: &By) -> Result<String, String> {
+        let action = actions::Action::Assign {
+            agent: agent.to_string(),
+            task: task.to_string(),
+        };
+        self.me().perform(&action, by.clone()).await
     }
 }
 
