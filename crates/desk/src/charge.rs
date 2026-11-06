@@ -24,6 +24,7 @@ use crate::computer::boss;
 use crate::computer::policy::sends_to_people;
 use crate::engine::{Deliver, Engine};
 use crate::model::{text_enum, Origin, PendingApproval, Request, SessionState, SessionView};
+use crate::scope::{sees, Scope};
 
 text_enum!(How {
     // The boss started it.
@@ -127,13 +128,21 @@ pub enum NotChargeable {
     /// It is in a group with a boss of its own.
     #[error("It's in {0}, which has a boss of its own.")]
     OtherScope(String),
+    /// It is outside the group the boss runs.
+    #[error("It isn't in the group you oversee.")]
+    Outside,
     #[error("It has ended.")]
     Ended,
 }
 
-/// Whether `s` can be taken on by a boss that doesn't run the groups in
-/// `bossed` (each run by a boss of its own): it needs a line from Desk.
-pub fn chargeable(s: &SessionView, bossed: &HashSet<String>) -> Result<(), NotChargeable> {
+/// Whether `s` can be taken on by the boss of `scope`, the groups in
+/// `bossed` each having a boss of its own: it needs a line from Desk, and
+/// to be in that boss's scope.
+pub fn chargeable(
+    s: &SessionView,
+    scope: &Scope,
+    bossed: &HashSet<String>,
+) -> Result<(), NotChargeable> {
     if s.origin == Origin::External {
         return Err(NotChargeable::External);
     }
@@ -150,9 +159,12 @@ pub fn chargeable(s: &SessionView, bossed: &HashSet<String>) -> Result<(), NotCh
         );
         return Err(NotChargeable::NoLine(why));
     }
+    if sees(scope, s.group.as_ref().map(|g| g.id.as_str()), bossed) {
+        return Ok(());
+    }
     match &s.group {
         Some(g) if bossed.contains(&g.id) => Err(NotChargeable::OtherScope(g.name.clone())),
-        _ => Ok(()),
+        _ => Err(NotChargeable::Outside),
     }
 }
 
@@ -162,9 +174,10 @@ pub fn takes_automatically(
     all: bool,
     s: &SessionView,
     existing: Option<&Charge>,
+    scope: &Scope,
     bossed: &HashSet<String>,
 ) -> bool {
-    all && existing.is_none() && chargeable(s, bossed).is_ok()
+    all && existing.is_none() && chargeable(s, scope, bossed).is_ok()
 }
 
 /// How many of `charges` hold one of their boss's slots: starting or
@@ -584,8 +597,9 @@ mod tests {
     #[test]
     fn only_a_session_with_a_line_from_desk_can_be_taken_on_and_why_not_is_said() {
         let none = HashSet::new();
-        assert_eq!(chargeable(&session(Engine::Claude), &none), Ok(()));
-        assert_eq!(chargeable(&session(Engine::Codex), &none), Ok(()));
+        let main = Scope::Ungrouped;
+        assert_eq!(chargeable(&session(Engine::Claude), &main, &none), Ok(()));
+        assert_eq!(chargeable(&session(Engine::Codex), &main, &none), Ok(()));
 
         let mut external = session(Engine::Claude);
         external.origin = Origin::External;
@@ -603,7 +617,7 @@ mod tests {
         let bossed = HashSet::from(["g-atlas".to_string()]);
 
         let said = |s: &SessionView, bossed: &HashSet<String>| {
-            chargeable(s, bossed).unwrap_err().to_string()
+            chargeable(s, &main, bossed).unwrap_err().to_string()
         };
         assert_eq!(
             said(&external, &none),
@@ -623,26 +637,38 @@ mod tests {
             "It's in Atlas, which has a boss of its own."
         );
         assert_eq!(
-            chargeable(&atlas, &none),
+            chargeable(&atlas, &main, &none),
             Ok(()),
             "a group with no boss is the main boss's"
+        );
+        let mia = Scope::Group("g-atlas".into());
+        assert_eq!(chargeable(&atlas, &mia, &bossed), Ok(()), "its own boss's");
+        assert_eq!(
+            chargeable(&session(Engine::Claude), &mia, &bossed)
+                .unwrap_err()
+                .to_string(),
+            "It isn't in the group you oversee."
         );
     }
 
     #[test]
     fn a_boss_that_takes_on_everything_never_takes_back_a_released_session() {
         let none = HashSet::new();
+        let m = Scope::Ungrouped;
         let s = session(Engine::Claude);
-        assert!(takes_automatically(true, &s, None, &none));
-        assert!(!takes_automatically(false, &s, None, &none), "only handed");
+        assert!(takes_automatically(true, &s, None, &m, &none));
+        assert!(
+            !takes_automatically(false, &s, None, &m, &none),
+            "only handed"
+        );
         let mut released = Charge::new(s.id, "sarah", How::Taken, None);
         released.released_at = Some(Utc::now());
-        assert!(!takes_automatically(true, &s, Some(&released), &none));
+        assert!(!takes_automatically(true, &s, Some(&released), &m, &none));
         let charged = Charge::new(s.id, "sarah", How::Handed, None);
-        assert!(!takes_automatically(true, &s, Some(&charged), &none));
+        assert!(!takes_automatically(true, &s, Some(&charged), &m, &none));
         let mut external = session(Engine::Claude);
         external.origin = Origin::External;
-        assert!(!takes_automatically(true, &external, None, &none));
+        assert!(!takes_automatically(true, &external, None, &m, &none));
     }
 
     #[test]

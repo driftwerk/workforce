@@ -524,12 +524,18 @@ pub fn within(what: &str, text: &str, max: usize) -> Result<(), String> {
 /// Whether a session in `session_group` may read and write a board in
 /// `board_group` under the line's reach: with any but `all`, only its own
 /// group's boards (ungrouped with ungrouped), as it may message only its
-/// own group's sessions.
+/// own group's sessions. Never a board of another scope, whatever the
+/// reach: a group with a boss of its own (`bossed`) keeps its boards.
 pub fn board_reachable(
     policy: crate::line::Reach,
     session_group: Option<&str>,
     board_group: Option<&str>,
+    bossed: &std::collections::HashSet<String>,
 ) -> bool {
+    use crate::scope::scope_of;
+    if scope_of(session_group, bossed) != scope_of(board_group, bossed) {
+        return false;
+    }
     match policy {
         crate::line::Reach::All => true,
         crate::line::Reach::Group | crate::line::Reach::Overseer => session_group == board_group,
@@ -874,19 +880,43 @@ mod tests {
     #[test]
     fn a_session_reaches_its_own_groups_boards_unless_reach_is_all() {
         use crate::line::Reach;
+        let none = std::collections::HashSet::new();
         assert!(board_reachable(
             Reach::Group,
             Some("g-acme"),
-            Some("g-acme")
+            Some("g-acme"),
+            &none
         ));
-        assert!(board_reachable(Reach::Group, None, None));
+        assert!(board_reachable(Reach::Group, None, None, &none));
         assert!(!board_reachable(
             Reach::Group,
             Some("g-acme"),
-            Some("g-atlas")
+            Some("g-atlas"),
+            &none
         ));
-        assert!(!board_reachable(Reach::Overseer, None, Some("g-atlas")));
-        assert!(board_reachable(Reach::All, Some("g-acme"), None));
+        assert!(!board_reachable(
+            Reach::Overseer,
+            None,
+            Some("g-atlas"),
+            &none
+        ));
+        assert!(board_reachable(Reach::All, Some("g-acme"), None, &none));
+        // A bossed group's boards are its own, whatever the reach.
+        let bossed = std::collections::HashSet::from(["g-acme".to_string()]);
+        assert!(!board_reachable(Reach::All, Some("g-acme"), None, &bossed));
+        assert!(!board_reachable(Reach::All, None, Some("g-acme"), &bossed));
+        assert!(!board_reachable(
+            Reach::All,
+            Some("g-atlas"),
+            Some("g-acme"),
+            &bossed
+        ));
+        assert!(board_reachable(
+            Reach::All,
+            Some("g-acme"),
+            Some("g-acme"),
+            &bossed
+        ));
     }
 
     #[test]

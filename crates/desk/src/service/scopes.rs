@@ -21,6 +21,8 @@ pub struct Boss {
     pub agent: String,
     pub name: String,
     pub scope: Scope,
+    /// `watch`, `suggest` or `act`.
+    pub level: String,
 }
 
 #[derive(Debug, Default)]
@@ -196,6 +198,7 @@ impl Desk {
                 agent: o.id,
                 name: o.name,
                 scope: Scope::Ungrouped,
+                level: o.level,
             })
             .into_iter()
             .collect()

@@ -39,10 +39,21 @@ impl CrewHub {
         };
         let listed = self.listed.lock().get(sid).cloned().unwrap_or_default();
         let mut approvals: Vec<MentionedApproval> = Vec::new();
+        // Only its own scope's requests are offered in its DM.
+        let seen = self
+            .desk
+            .scope_of_boss(agent_id)
+            .map(|scope| self.desk.seen_by(&scope));
         for v in self.desk.list() {
             let Some(p) = v.pending.as_ref().filter(|_| v.live) else {
                 continue;
             };
+            if !seen
+                .as_ref()
+                .is_some_and(|s| s.sees(v.group.as_ref().map(|g| g.id.as_str())))
+            {
+                continue;
+            }
             let id = p.id.to_string();
             let named = text.contains(&v.name)
                 || v.display_name.as_deref().is_some_and(|n| text.contains(n))
@@ -104,10 +115,7 @@ impl CrewHub {
 /// overseer and `sid` its Desk DM.
 pub(crate) fn mentions_for(service: &AgentService, sid: &str) -> Option<Mentions> {
     let crew = super::for_service(service)?;
-    let (overseer, _) = crew.overseer_service()?;
-    if overseer.agent_id != service.agent_id {
-        return None;
-    }
+    crew.overseer_named(service.agent_id.as_str())?;
     let session = service.sessions.get(sid).ok().flatten()?;
     if session.channel != DESK_CHANNEL {
         return None;

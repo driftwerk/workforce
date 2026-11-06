@@ -3939,8 +3939,10 @@ impl Desk {
     fn read_later(&self, id: Uuid, end: u64, reader: Arc<dyn crew::Crew>, reply: String) {
         let desk = self.clone();
         let wait = *self.0.read_wait.lock();
+        let group = self.group_of_member(&session_item(id));
         tokio::spawn(async move {
-            let yes = match tokio::time::timeout(wait, reader.asks(&reply)).await {
+            let yes = match tokio::time::timeout(wait, reader.asks(&reply, group.as_deref())).await
+            {
                 Ok(said) => said == Some(true),
                 Err(_) => {
                     tracing::info!(%id, "reading a turn's reply took too long; it is done");
@@ -6767,7 +6769,7 @@ mod tests {
         async fn accept(&self, _: &crew::Suggestion) -> Result<(), String> {
             Ok(())
         }
-        async fn asks(&self, _: &str) -> Option<bool> {
+        async fn asks(&self, _: &str, _: Option<&str>) -> Option<bool> {
             tokio::time::sleep(self.wait).await;
             self.asks
         }

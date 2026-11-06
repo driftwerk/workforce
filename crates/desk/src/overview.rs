@@ -346,11 +346,16 @@ impl Desk {
             .collect();
         let latest = self.store().latest_turn_events().await?;
         let layout = self.layout();
+        let bosses = self.bosses();
         items.extend(crew.agents().iter().map(|a| {
             let mut item = agent_item(a, latest.get(&a.id), now, midnight, quiet);
             let group = layout.group_of(&crate::service::local_agent_item(&a.id));
             item.group = group.map(|g| g.name.clone());
-            item.group_id = group.map(|g| g.id.clone());
+            // A boss is its scope's, wherever its agent sits.
+            item.group_id = match bosses.iter().find(|b| b.agent == a.id) {
+                Some(b) => b.scope.group().map(str::to_string),
+                None => group.map(|g| g.id.clone()),
+            };
             item
         }));
         // An overseer reads its own scope's alone.

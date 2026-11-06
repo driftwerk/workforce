@@ -152,18 +152,25 @@ impl CrewHub {
         Ok(())
     }
 
-    /// The overseer and the person its DM is with, while there are both.
-    fn dm(&self) -> Option<(Arc<AgentService>, String)> {
-        let (service, _) = self.overseer_service()?;
+    /// The overseer `boss` and the person its DM is with, while there are
+    /// both.
+    fn dm(&self, boss: &str) -> Option<(Arc<AgentService>, String)> {
+        let (service, _) = self.overseer_named(boss)?;
         let owner = self.person(Some(&service))?;
         Some((service, owner))
     }
 
-    /// Puts the question `q`, given to the person, in the overseer's DM as
-    /// a question card. With no DM yet, the Floor and the session's thread
-    /// still show it.
+    /// Puts the question `q`, given to the person, in the DM of the
+    /// overseer it was asked of (by its scope) as a question card. With no
+    /// DM yet, the Floor and the session's thread still show it.
     async fn post_question(&self, q: &LineMessage) {
-        let Some((service, owner)) = self.dm() else {
+        let boss = match q.to.kind {
+            PartyKind::Manager => Some(q.to.id.clone()),
+            _ => self
+                .overseer_of_group(q.group.as_deref())
+                .map(|(s, _)| s.agent_id.as_str().to_string()),
+        };
+        let Some((service, owner)) = boss.and_then(|b| self.dm(&b)) else {
             return;
         };
         let e = q.escalation.clone().unwrap_or(Escalation {
@@ -219,7 +226,7 @@ impl CrewHub {
         if answer.from.kind != PartyKind::Manager {
             return;
         }
-        let Some((service, owner)) = self.dm() else {
+        let Some((service, owner)) = self.dm(&answer.from.id) else {
             return;
         };
         let question = match answer.in_reply_to {
@@ -247,9 +254,10 @@ impl CrewHub {
         }
     }
 
-    /// Gives every question in `asks` to the person, saying `why`.
-    async fn all_to_person(&self, asks: &[LineMessage], why: &'static str) {
-        let by = match self.overseer_service() {
+    /// Gives every question in `asks` (of `session`) to the person, saying
+    /// `why`: as the overseer of its scope, when there is one.
+    async fn all_to_person(&self, session: Uuid, asks: &[LineMessage], why: &'static str) {
+        let by = match self.overseer_of_session(session) {
             Some((service, _)) => By::manager(service.agent_id.as_str(), &name_of(&service), why),
             None => By::you(),
         };
@@ -274,14 +282,15 @@ impl CrewHub {
             .filter(|m| m.kind == LineKind::Ask)
             .cloned()
             .collect();
-        let Some((service, o)) = self.overseer_service() else {
-            self.all_to_person(&asks, "No overseer answers sessions now.")
+        // The overseer of the session's scope answers it, and no other.
+        let Some((service, o)) = self.overseer_of_session(session) else {
+            self.all_to_person(session, &asks, "No overseer answers sessions now.")
                 .await;
             return;
         };
         let hop = messages.iter().map(|m| m.hop).max().unwrap_or(0);
         if let Some(why) = straight_to_person(&o, hop) {
-            self.all_to_person(&asks, why).await;
+            self.all_to_person(session, &asks, why).await;
             if ended.is_empty() {
                 return;
             }
@@ -290,8 +299,12 @@ impl CrewHub {
             asks.clear();
         }
         let Some(owner) = self.person(Some(&service)) else {
-            self.all_to_person(&asks, "Desk has no conversation with you to work from yet.")
-                .await;
+            self.all_to_person(
+                session,
+                &asks,
+                "Desk has no conversation with you to work from yet.",
+            )
+            .await;
             return;
         };
         {
@@ -442,8 +455,10 @@ impl CrewHub {
     }
 
     /// Questions asked of an overseer that is gone, or never got their
-    /// turn (the hub stopped first): taken up by the overseer now, or given
-    /// to the person when there is none.
+    /// turn (the hub stopped first): taken up by the overseer of the
+    /// session's scope now, or given to the person when there is none. One
+    /// asked in another scope than the session's now is never re-pointed
+    /// to this one's overseer: it goes to the person.
     async fn take_up_open_asks(&self) -> HashMap<Uuid, Vec<LineMessage>> {
         let mut by_session: HashMap<Uuid, Vec<LineMessage>> = HashMap::new();
         let asks = match self.desk.store().line_open_asks(None).await {
@@ -453,9 +468,6 @@ impl CrewHub {
                 return by_session;
             }
         };
-        let current = self
-            .overseer_service()
-            .map(|(s, _)| s.agent_id.as_str().to_string());
         for mut ask in asks {
             if ask.to.kind != PartyKind::Manager || ask.asked != Some(Asked::Open) {
                 continue;
@@ -463,11 +475,13 @@ impl CrewHub {
             let Some(session) = ask.from_session() else {
                 continue;
             };
-            match &current {
-                Some(id) if *id != ask.to.id => {
-                    // Re-pointed to the overseer there is now.
-                    if let Some((service, _)) = self.overseer_service() {
-                        ask.to = crew::Party::manager(id, &name_of(&service));
+            let asked_in = self.desk.scope_of_group(ask.group.as_deref());
+            match self.overseer_of_session(session) {
+                Some((service, o)) if o.scope == asked_in => {
+                    if service.agent_id.as_str() != ask.to.id {
+                        // Re-pointed to the overseer its scope has now.
+                        ask.to =
+                            crew::Party::manager(service.agent_id.as_str(), &name_of(&service));
                         ask.updated_at = crew::now();
                         if let Err(e) = self.desk.store().put_line(&ask).await {
                             tracing::warn!(error = %e, "re-pointing a question failed");
@@ -475,7 +489,19 @@ impl CrewHub {
                         }
                     }
                 }
-                Some(_) => {}
+                // Asked in another scope than the session is in now: never
+                // this one's overseer's, so the person's.
+                Some(_) => {
+                    let why = "The overseer it asked no longer oversees it, so this came to you.";
+                    if let Err(e) = self
+                        .escalate(ask.id, &By::you(), why, Vec::new(), None)
+                        .await
+                    {
+                        tracing::info!(error = %e, "a question wasn't given to the person");
+                    }
+                    continue;
+                }
+                // Its line turn gives it to the person.
                 None => {}
             }
             by_session.entry(session).or_default().push(ask);
@@ -592,7 +618,7 @@ pub(super) async fn line_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
             }
             // Out of work turns for the hour: its turn's end waits for the
             // next, and what it asked goes on.
-            if !ended.is_empty() && !crew.spend_work_turn() {
+            if !ended.is_empty() && !crew.spend_work_turn(session) {
                 gathering.insert(
                     session,
                     Gathered {

@@ -35,14 +35,16 @@ pub(super) fn verdict(text: &str) -> Option<bool> {
 }
 
 impl CrewHub {
-    /// The service whose model reads replies: the overseer's. Without one
-    /// nobody has asked for it, so nothing is spent and the rules decide.
-    fn reader(&self) -> Option<Arc<AgentService>> {
-        self.overseer_service().map(|(s, _)| s)
+    /// The service whose model reads a reply of a session in `group`: the
+    /// overseer of that session's scope, so no other scope's model reads
+    /// its words. Without one nobody has asked for it, so nothing is spent
+    /// and the rules decide.
+    fn reader(&self, group: Option<&str>) -> Option<Arc<AgentService>> {
+        self.overseer_of_group(group).map(|(s, _)| s)
     }
 
-    pub(super) async fn read_reply(&self, reply: &str) -> Option<bool> {
-        let service = self.reader()?;
+    pub(super) async fn read_reply(&self, reply: &str, group: Option<&str>) -> Option<bool> {
+        let service = self.reader(group)?;
         let skip = reply.chars().count().saturating_sub(READ_CHARS);
         let tail: String = reply.chars().skip(skip).collect();
         let model = crate::turn_loop::cheap_model(&service);

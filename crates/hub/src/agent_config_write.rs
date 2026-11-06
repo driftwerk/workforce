@@ -91,6 +91,10 @@ async fn save_over(
     expects: impl Fn(Option<&str>) -> bool,
     over: Over<'_>,
 ) -> Result<Saved, Refused> {
+    #[cfg(feature = "postgres")]
+    if let Some(why) = crate::desk_crew::oversight_refused(service, body) {
+        return Err(Refused::Unloadable(ConfigRefusal::Said(why)));
+    }
     let before = crate::connector_pins::binding_in(&service.workspace);
     let saved = save_one(service, ref_id, store, body, edit, expects, over).await?;
     if service.config.desk.enabled {
@@ -107,10 +111,16 @@ async fn save_over(
 
 /// Whether a config.toml body makes its agent the crew's overseer.
 pub(crate) fn oversees(body: &str) -> bool {
+    overseen(body).is_some()
+}
+
+/// The scope a config.toml body makes its agent oversee, if it does.
+pub(crate) fn overseen(body: &str) -> Option<workforce_common::oversight::Scope> {
     workforce_common::settings::AgentWorkspaceConfig::parse(body)
         .ok()
         .and_then(|c| c.oversight().ok())
-        .is_some_and(|o| o.enabled)
+        .filter(|o| o.enabled)
+        .map(|o| o.scope)
 }
 
 /// `body` with its `[oversight]` switched off and everything else as it was,
@@ -130,10 +140,22 @@ pub(crate) fn oversight_off(body: &str) -> Option<String> {
     Some(doc.to_string())
 }
 
-/// Switches every agent but `keep` that oversees the crew off, through the
-/// same write path (history, admission, hot reload).
+/// Switches every agent but `keep` that oversees what `keep` oversees off,
+/// through the same write path (history, admission, hot reload): one
+/// overseer per scope, the main one and each group's boss apart.
 pub(crate) async fn one_overseer(keep: &AgentService, store: Option<&WorkflowStore>) {
     let Some(registry) = keep.agent_registry.get().and_then(std::sync::Weak::upgrade) else {
+        return;
+    };
+    let mine = workforce_common::config_files::read(
+        &keep
+            .workspace
+            .join(workforce_common::config_files::WORKSPACE_CONFIG),
+    )
+    .ok()
+    .flatten()
+    .and_then(|body| overseen(&body));
+    let Some(mine) = mine else {
         return;
     };
     for other in registry.all_services() {
@@ -146,7 +168,7 @@ pub(crate) async fn one_overseer(keep: &AgentService, store: Option<&WorkflowSto
         let Ok(Some(current)) = workforce_common::config_files::read(&path) else {
             continue;
         };
-        if !oversees(&current) {
+        if overseen(&current).as_ref() != Some(&mine) {
             continue;
         }
         let Some(off) = oversight_off(&current) else {

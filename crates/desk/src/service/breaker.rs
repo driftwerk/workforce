@@ -295,7 +295,7 @@ impl Desk {
                 .map(|v| v.label().to_string())
                 .unwrap_or_else(|_| "A session".into()),
             BreakerOf::Agent(id) => {
-                let boss = self.boss().is_some_and(|b| b.id == *id);
+                let boss = self.scope_of_boss(id).is_some();
                 let names = self.0.breakers.lock();
                 crate::crew::shown_name(id, names.names.get(id).map(String::as_str), boss)
             }

@@ -3,18 +3,18 @@
 //! its suggestions.
 
 use std::borrow::Cow;
-use std::collections::HashSet;
 use std::path::Path;
 
 use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
-use workforce_common::oversight::{Act, Level, Oversight, TakeOn};
+use workforce_common::oversight::{Act, Level, Oversight, Scope, TakeOn};
 use workforce_desk::board::TicketState;
 use workforce_desk::charge::How;
 use workforce_desk::crew::{self, By, Kind, Party};
 use workforce_desk::engine::{self, Deliver, View};
 use workforce_desk::model::{Engine, NewSession, Origin};
+use workforce_desk::scope::Seen;
 use workforce_desk::{AssignTo, ChargedTo, Move, NewSessionFor, Speaker};
 
 use super::read_only::read_only_in;
@@ -638,9 +638,10 @@ impl CrewHub {
         }
     }
 
-    /// Whether the overseer runs `session` now: it is in its charge.
-    fn overseer_runs(&self, session: Uuid) -> bool {
-        self.overseer_service()
+    /// Whether the overseer of `scope` runs `session` now: it is in its
+    /// charge.
+    fn overseer_runs(&self, session: Uuid, scope: &Scope) -> bool {
+        self.overseer_for(scope)
             .is_some_and(|(service, _)| self.runs(session, service.agent_id.as_str()))
     }
 
@@ -651,7 +652,7 @@ impl CrewHub {
     /// person's; only suggest while the person drives it. `None`: the usual rules decide (a plain
     /// message waits on its line while the person drives).
     fn gate_charged(&self, action: &Action, o: &Oversight) -> Option<Gate> {
-        let session = Self::session_of(action).filter(|s| self.overseer_runs(*s))?;
+        let session = Self::session_of(action).filter(|s| self.overseer_runs(*s, &o.scope))?;
         // What it leads to must wait on the person as for any session.
         if let Some(why) = self.uncontained(action, &o.act) {
             return Some(Gate::Suggest(why.into()));
@@ -1100,7 +1101,7 @@ impl CrewHub {
             Action::MoveTicket {
                 ticket, id, state, ..
             } => {
-                let t = self.ticket_named(ticket, *id).await?;
+                let t = self.ticket_named(ticket, *id, None).await?;
                 let mv = Move {
                     state: *state,
                     before: None,
@@ -1112,8 +1113,9 @@ impl CrewHub {
                 Ok(format!("moved {ticket} to {}", state.title()))
             }
             Action::TakeOn { session } => {
-                let (service, _) = self
-                    .overseer_service()
+                let (service, o) = self
+                    .boss_for(&by)
+                    .await
                     .ok_or("No one oversees the crew to run it.")?;
                 let boss = Party::manager(service.agent_id.as_str(), &super::name_of(&service));
                 // The overseer taking it on by itself, or the person saying
@@ -1129,7 +1131,7 @@ impl CrewHub {
                     _ => How::Taken,
                 };
                 let c = d
-                    .take_on(*session, &boss, how, &HashSet::new(), &by)
+                    .take_on(*session, &boss, how, &o.scope, &by)
                     .await
                     .map_err(charge_plain)?;
                 Ok(format!("took on {}", self.session_name(c.session)))
@@ -1159,7 +1161,8 @@ impl CrewHub {
             return Err("That isn't a session to start.".into());
         };
         let (service, o) = self
-            .overseer_service()
+            .boss_for(&by)
+            .await
             .ok_or("No one oversees the crew to start sessions for.")?;
         let boss = Party::manager(service.agent_id.as_str(), &super::name_of(&service));
         let engine = self.engine_or_default(*engine, &o)?;
@@ -1187,7 +1190,7 @@ impl CrewHub {
                     approve_for_me: false,
                     account: None,
                     env: Default::default(),
-                    group: self.boss_group(&boss.id),
+                    group: self.boss_group(&service, &o),
                 },
                 &boss,
                 by,
@@ -1245,17 +1248,29 @@ impl CrewHub {
     }
 
     /// The ticket by its id when it has one (a suggestion's), else by its
-    /// key.
+    /// key; with `seen`, only one on a board its scope sees: one on another
+    /// scope's board is refused in the words one that isn't there is, so
+    /// a key never says what another scope holds.
     async fn ticket_named(
         &self,
         key: &str,
         id: Option<Uuid>,
+        seen: Option<&Seen>,
     ) -> Result<workforce_desk::TicketView, String> {
         let t = match id {
             Some(id) => self.desk.ticket(id).await,
             None => self.desk.ticket_by_key(key).await,
+        };
+        if let Some(seen) = seen {
+            let group = match &t {
+                Ok(t) => self.desk.group_of_board(t.ticket.board).await.ok(),
+                Err(_) => None,
+            };
+            if !group.is_some_and(|g| seen.sees(g.as_deref())) {
+                return Err(format!("There's no {key}."));
+            }
         }
-        .map_err(board_plain)?;
+        let t = t.map_err(board_plain)?;
         // A suggestion's id is only good for the ticket it was made about.
         if id.is_some() && t.key.as_deref() != Some(key) {
             return Err(format!(
@@ -1267,13 +1282,18 @@ impl CrewHub {
 
     /// Fills in the ticket `action` is about, before it is gated: its id
     /// (the suggestion keeps that, not the key), its words, and where it
-    /// stands. Other actions are left as they are.
-    pub(crate) async fn resolve_ticket(&self, action: &mut Action) -> Result<(), String> {
+    /// stands. With `seen`, a ticket on a board outside that scope is
+    /// refused. Other actions are left as they are.
+    pub(crate) async fn resolve_ticket(
+        &self,
+        action: &mut Action,
+        seen: Option<&Seen>,
+    ) -> Result<(), String> {
         match action {
             Action::AssignTicket {
                 ticket, id, text, ..
             } => {
-                let t = self.ticket_named(ticket, *id).await?;
+                let t = self.ticket_named(ticket, *id, seen).await?;
                 *id = Some(t.ticket.id);
                 if let Some(key) = &t.key {
                     ticket.clone_from(key);
@@ -1287,7 +1307,7 @@ impl CrewHub {
                 was,
                 off_external,
             } => {
-                let t = self.ticket_named(ticket, *id).await?;
+                let t = self.ticket_named(ticket, *id, seen).await?;
                 *id = Some(t.ticket.id);
                 if let Some(key) = &t.key {
                     ticket.clone_from(key);
@@ -1323,7 +1343,7 @@ impl CrewHub {
         // its turn: a hand-out made meanwhile, or a suggestion accepted
         // after one, finds it taken.
         let _one = self.starting.lock().await;
-        let t = self.ticket_named(key, *id).await?;
+        let t = self.ticket_named(key, *id, None).await?;
         if matches!(t.ticket.state, TicketState::Done | TicketState::Dropped) {
             return Err(format!(
                 "{key} is {} already; there is nothing to hand out.",
@@ -1370,14 +1390,15 @@ impl CrewHub {
                 .map_err(board_plain)?,
             Handout::NewSession { folder, engine } => {
                 let (service, o) = self
-                    .overseer_service()
+                    .boss_for(&by)
+                    .await
                     .ok_or("No one oversees the crew to start sessions for.")?;
                 let boss = Party::manager(service.agent_id.as_str(), &super::name_of(&service));
                 let engine = self.engine_or_default(*engine, &o)?;
                 self.startable(engine, None)?;
                 self.slot_free(&boss, &o, &by)?;
                 let charged = ChargedTo {
-                    group: self.boss_group(&boss.id),
+                    group: self.boss_group(&service, &o),
                     boss,
                 };
                 let new = AssignTo::NewSession(NewSessionFor {
@@ -1424,14 +1445,41 @@ impl CrewHub {
         Ok(())
     }
 
-    /// The sidebar group the overseer `boss` is in, which the sessions it
-    /// starts go into. One scope today: a boss that runs a group of its own
-    /// comes with groups' bosses.
-    fn boss_group(&self, boss: &str) -> Option<String> {
-        self.desk
-            .layout()
-            .group_of(&workforce_desk::local_agent_item(boss))
-            .map(|g| g.id.clone())
+    /// The sidebar group the sessions the overseer `service` starts go into:
+    /// its scope's group for a group's boss; for the main overseer, the
+    /// group its agent sits in when that group has no boss of its own
+    /// (which is still its scope), else none.
+    fn boss_group(&self, service: &crate::serve::AgentService, o: &Oversight) -> Option<String> {
+        if let Some(g) = o.scope.group() {
+            return Some(g.to_string());
+        }
+        let g = self
+            .desk
+            .group_of_member(&workforce_desk::local_agent_item(service.agent_id.as_str()))?;
+        (self.desk.scope_of_group(Some(&g)) == o.scope).then_some(g)
+    }
+
+    /// The overseer `by` acts for: itself, or for the person saying yes to
+    /// a suggestion, the overseer that made it, while it still oversees.
+    pub(crate) async fn boss_for(
+        &self,
+        by: &By,
+    ) -> Option<(std::sync::Arc<crate::serve::AgentService>, Oversight)> {
+        match by.party.kind {
+            crew::PartyKind::Manager => self.overseer_named(&by.party.id),
+            // A suggestion Desk no longer has: the main overseer, as
+            // before groups had bosses; what it may run is still its scope's.
+            _ => {
+                let made = match by.suggestion_id.as_deref() {
+                    Some(id) => self.desk.store().suggestion(id).await.ok().flatten(),
+                    None => None,
+                };
+                match made {
+                    Some(s) => self.overseer_named(&s.agent_id),
+                    None => self.overseer_for(&Scope::Ungrouped),
+                }
+            }
+        }
     }
 
     /// `engine` in `view` (its default when none), when the overseer may

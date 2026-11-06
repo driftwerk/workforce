@@ -1,4 +1,6 @@
-//! The crew manager's hub side: who oversees the crew (`[oversight]`),
+//! The crew manager's hub side: who oversees the crew (`[oversight]`, one
+//! overseer per scope: the main one over everything ungrouped, and a boss
+//! for each sidebar group that has one, each seeing only its own scope),
 //! what the hub's agents are doing (recorded from their turns as
 //! activity), the overseer's `crew.*` tools and its suggestions, and its
 //! wake-ups and summaries, run as turns in its Desk DM with the person.
@@ -16,7 +18,7 @@ use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
 use tokio_util::sync::CancellationToken;
 use workforce_common::channels::DESK_CHANNEL;
-use workforce_common::oversight::Oversight;
+use workforce_common::oversight::{Oversight, Scope};
 use workforce_common::settings::AgentWorkspaceConfig;
 use workforce_desk::crew::{By, Crew, CrewAgent, LiveTurn, Overseer, Party, Suggestion};
 use workforce_desk::floor::Need;
@@ -33,6 +35,7 @@ mod line;
 mod observe;
 mod read_only;
 mod reading;
+mod scope;
 mod spend;
 mod tools;
 mod watcher;
@@ -94,8 +97,9 @@ pub struct CrewHub {
     running: Mutex<HashMap<String, Running>>,
     /// The hop count a turn about to start in a session carries.
     hops: Mutex<HashMap<String, i16>>,
-    /// The hop of the wake-up the overseer is answering, if it is.
-    wake_hop: Mutex<Option<i16>>,
+    /// The hop of the wake-up each overseer is answering, while it is, by
+    /// its agent.
+    wake_hop: Mutex<HashMap<String, i16>>,
     /// When the overseer's turns in its DM started, by session.
     manager_turns: Mutex<HashMap<String, DateTime<Utc>>>,
     /// Pending approvals a wake-up listed, by the overseer's DM session.
@@ -104,16 +108,18 @@ pub struct CrewHub {
     sent: Mutex<Vec<DateTime<Utc>>>,
     /// Each agent's `[oversight]`, by the config.toml mtime it was read at.
     read: Mutex<HashMap<String, (Option<SystemTime>, Oversight)>>,
-    /// The overseer the tools were last set up for, and at which level.
-    tooled: Mutex<Option<(String, String)>>,
+    /// The overseers the tools were last set up for, by agent: each one's
+    /// scope and level.
+    tooled: Mutex<HashMap<String, (Scope, String)>>,
     /// Ask the sync loop to look again now (a config was saved).
     poke: tokio::sync::Notify,
     /// The words of sessions' questions on Desk's line the overseer may
     /// answer, by message: an answer is gated by what was asked as well as
     /// by what it says. One not known here is the person's.
     questions: Mutex<HashMap<uuid::Uuid, String>>,
-    /// The work turns the overseer spent on its sessions' turn ends.
-    work: Mutex<work::WorkRun>,
+    /// The work turns each overseer spent on its sessions' turn ends, by
+    /// its agent.
+    work: Mutex<HashMap<String, work::WorkRun>>,
     /// Held while the overseer starts a session: counting its busy
     /// sessions and starting one more are one step.
     starting: tokio::sync::Mutex<()>,
@@ -150,11 +156,24 @@ pub(crate) fn for_state(state: &Arc<GatewayState>) -> Option<Arc<CrewHub>> {
 }
 
 /// Tells `service`'s crew a config was saved, so a new overseer gets its
-/// tools and summaries at once.
+/// tools and summaries at once, and Desk knows its scope as it is now.
 pub(crate) fn config_saved(service: &AgentService) {
     if let Some(crew) = for_service(service) {
         crew.read.lock().remove(service.agent_id.as_str());
+        crew.overseers();
         crew.poke.notify_one();
+    }
+}
+
+/// Why `body`'s `[oversight]` can't be saved for `service`, when the desk
+/// is on for its hub: the group it oversees must be one of the sidebar's.
+pub(crate) fn oversight_refused(service: &AgentService, body: &str) -> Option<String> {
+    let crew = for_service(service)?;
+    match crate::agent_config_write::overseen(body)? {
+        Scope::Group(g) if !crew.desk.is_group(&g) => {
+            Some(workforce_common::oversight::NOT_A_GROUP.to_string())
+        }
+        _ => None,
     }
 }
 
@@ -254,17 +273,100 @@ impl CrewHub {
         o
     }
 
-    /// The agent overseeing the crew and its settings: the one whose config
-    /// says so (the most recently written, should two).
-    pub(crate) fn overseer_service(&self) -> Option<(Arc<AgentService>, Oversight)> {
-        self.services()
+    /// The overseers and their settings, one per scope: the agents whose
+    /// config says so (the most recently written in a scope, should two),
+    /// a boss's group being one of the sidebar's. The main overseer first,
+    /// then the groups' bosses by group. Desk is told, so its own rules keep
+    /// to the same scopes.
+    pub(crate) fn overseers(&self) -> Vec<(Arc<AgentService>, Oversight)> {
+        let mut by_scope: HashMap<Scope, (Arc<AgentService>, Oversight)> = HashMap::new();
+        for s in self.services() {
+            let o = self.oversight_of(&s);
+            if !o.enabled {
+                continue;
+            }
+            if let Scope::Group(g) = &o.scope {
+                if !self.desk.is_group(g) {
+                    continue;
+                }
+            }
+            match by_scope.get(&o.scope) {
+                Some((kept, _)) if mtime(&kept.workspace) > mtime(&s.workspace) => {}
+                _ => {
+                    by_scope.insert(o.scope.clone(), (s, o));
+                }
+            }
+        }
+        let mut list: Vec<(Arc<AgentService>, Oversight)> = by_scope.into_values().collect();
+        list.sort_by(|(_, a), (_, b)| a.scope.group().cmp(&b.scope.group()));
+        self.desk.set_bosses(
+            list.iter()
+                .map(|(s, o)| workforce_desk::Boss {
+                    agent: s.agent_id.as_str().to_string(),
+                    name: name_of(s),
+                    scope: o.scope.clone(),
+                    level: o.level.as_str().to_string(),
+                })
+                .collect(),
+        );
+        list
+    }
+
+    /// The overseer of `scope` and its settings, while it has one.
+    pub(crate) fn overseer_for(&self, scope: &Scope) -> Option<(Arc<AgentService>, Oversight)> {
+        self.overseers()
             .into_iter()
-            .map(|s| {
-                let o = self.oversight_of(&s);
-                (s, o)
-            })
-            .filter(|(_, o)| o.enabled)
-            .max_by_key(|(s, _)| mtime(&s.workspace))
+            .find(|(_, o)| o.scope == *scope)
+    }
+
+    /// The overseer `agent` and its settings, while it oversees.
+    pub(crate) fn overseer_named(&self, agent: &str) -> Option<(Arc<AgentService>, Oversight)> {
+        self.overseers()
+            .into_iter()
+            .find(|(s, _)| s.agent_id.as_str() == agent)
+    }
+
+    /// The overseer of the scope a row of `group` is in now.
+    pub(crate) fn overseer_of_group(
+        &self,
+        group: Option<&str>,
+    ) -> Option<(Arc<AgentService>, Oversight)> {
+        // The one whose scope sees it: none for a group gone from the
+        // sidebar.
+        self.overseers()
+            .into_iter()
+            .find(|(_, o)| self.desk.seen_by(&o.scope).sees(group))
+    }
+
+    /// The overseer of the scope `session` is in now.
+    pub(crate) fn overseer_of_session(
+        &self,
+        session: uuid::Uuid,
+    ) -> Option<(Arc<AgentService>, Oversight)> {
+        let group = self
+            .desk
+            .group_of_member(&workforce_desk::session_item(session));
+        self.overseer_of_group(group.as_deref())
+    }
+
+    /// What `scope` is called where an overseer reads it: its group's name;
+    /// none for the main overseer's.
+    pub(crate) fn scope_name(&self, scope: &Scope) -> Option<String> {
+        scope
+            .group()
+            .map(|g| self.desk.group_name(g).unwrap_or_else(|| g.to_string()))
+    }
+
+    /// The refusal of an id outside `scope`, in the words its overseer reads.
+    pub(crate) fn not_ours(&self, scope: &Scope) -> String {
+        workforce_desk::scope::not_ours(self.scope_name(scope).as_deref())
+    }
+
+    /// The main overseer: over everything ungrouped. For tests that set up
+    /// one overseer; the hub always says which scope it means.
+    #[cfg(test)]
+    pub(crate) fn overseer_service(&self) -> Option<(Arc<AgentService>, Oversight)> {
+        self.overseer_for(&Scope::Ungrouped)
     }
 
     /// The person whose Desk this is: who last spoke with `preferred` on
@@ -287,13 +389,20 @@ impl CrewHub {
         })
     }
 
-    /// The overseer acting, `reason` its stated reason, at the hop of the
-    /// wake-up it answers.
+    /// The overseer `service` acting, `reason` its stated reason, at the
+    /// hop of the wake-up it answers.
+    pub(crate) fn by_boss(&self, service: &AgentService, reason: &str) -> By {
+        let id = service.agent_id.as_str();
+        let mut by = By::manager(id, &name_of(service), reason);
+        by.hop = self.wake_hop.lock().get(id).map_or(1, |h| h + 1);
+        by
+    }
+
+    /// The main overseer acting: for tests that set up one overseer.
+    #[cfg(test)]
     pub(crate) fn by_overseer(&self, reason: &str) -> Option<By> {
         let (service, _) = self.overseer_service()?;
-        let mut by = By::manager(service.agent_id.as_str(), &name_of(&service), reason);
-        by.hop = self.wake_hop.lock().map_or(1, |h| h + 1);
-        Some(by)
+        Some(self.by_boss(&service, reason))
     }
 
     fn party_of_agent(&self, id: &str) -> Option<Party> {
@@ -309,8 +418,9 @@ impl CrewHub {
 
 #[async_trait]
 impl Crew for CrewHub {
+    /// The main overseer: over everything ungrouped.
     fn overseer(&self) -> Option<Overseer> {
-        let (service, o) = self.overseer_service()?;
+        let (service, o) = self.overseer_for(&Scope::Ungrouped)?;
         Some(Overseer {
             id: service.agent_id.as_str().to_string(),
             name: name_of(&service),
@@ -396,12 +506,12 @@ impl Crew for CrewHub {
             .ok()
     }
 
-    async fn asks(&self, reply: &str) -> Option<bool> {
-        self.read_reply(reply).await
+    async fn asks(&self, reply: &str, group: Option<&str>) -> Option<bool> {
+        self.read_reply(reply, group).await
     }
 
     fn answers_lines(&self) -> bool {
-        self.overseer_service().is_some()
+        !self.overseers().is_empty()
     }
 
     async fn assign(&self, agent: &str, task: &str) -> Result<String, String> {
