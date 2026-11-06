@@ -34,6 +34,12 @@ pub const SCHEDULED_IDLE: Duration = Duration::from_secs(5 * 60);
 /// realistic per-agent count updated within one interval.
 const MAX_SESSIONS_PER_SWEEP: usize = 100_000;
 
+/// Sessions one scheduled sweep redacts at most, oldest first. A first sweep
+/// starts in 1970, so a store's whole backlog is due at once: in batches, it
+/// drains over a few sweeps instead of loading and rewriting every session
+/// in one go.
+const SWEEP_BATCH: usize = 500;
+
 /// Aggregate outcome of a redaction sweep.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct RedactionReport {
@@ -120,11 +126,15 @@ pub fn run_scheduled_sweep(
 
     let idle = chrono::Duration::from_std(idle).unwrap_or_else(|_| chrono::Duration::minutes(5));
     let now = Utc::now();
-    let processed: Vec<(String, DateTime<Utc>)> = sessions
+    let mut processed: Vec<(String, DateTime<Utc>)> = sessions
         .into_iter()
         .filter(|s| now.signed_duration_since(s.updated_at) >= idle)
         .map(|s| (s.id, s.updated_at))
         .collect();
+    // Oldest first, so the cursor only passes what was done: every idle
+    // session is older than every one still too recent to touch.
+    processed.sort_by_key(|(_, t)| *t);
+    processed.truncate(SWEEP_BATCH);
 
     let ids: Vec<String> = processed.iter().map(|(id, _)| id.clone()).collect();
     let report = redact_session_ids(store, &ids, false);
@@ -184,6 +194,27 @@ mod tests {
         assert!(!store.get(&id).unwrap().unwrap().messages[0]
             .content
             .contains("ABCDEFGHIJKLMNOPQRSTUVWXYZ"));
+    }
+
+    #[test]
+    fn a_backlog_is_redacted_in_batches_oldest_first() {
+        let store: Arc<dyn SessionStore> = Arc::new(InMemorySessionStore::new());
+        let ws = tempfile::tempdir().unwrap();
+        let total = SWEEP_BATCH + 3;
+        for i in 0..total {
+            let mut s = store
+                .get_or_create("slack", &format!("u{i}"), "agent")
+                .unwrap();
+            s.add_user_message(&format!("token {GH_SECRET}"), None);
+            s.updated_at =
+                Utc::now() - chrono::Duration::hours(2) - chrono::Duration::seconds(i as i64);
+            store.save(&s).unwrap();
+        }
+        let idle = Duration::from_secs(300);
+        let first = run_scheduled_sweep(&store, "agent", ws.path(), idle);
+        assert_eq!(first.sessions_redacted, SWEEP_BATCH);
+        let second = run_scheduled_sweep(&store, "agent", ws.path(), idle);
+        assert_eq!(second.sessions_redacted, 3);
     }
 
     #[test]
