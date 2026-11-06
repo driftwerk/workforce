@@ -100,6 +100,11 @@ pub struct CrewHub {
     /// The hop of the wake-up each overseer is answering, while it is, by
     /// its agent.
     wake_hop: Mutex<HashMap<String, i16>>,
+    /// The sessions whose boss, still an agent here, has read as no
+    /// overseer on every look since: how many looks, and since when. One is
+    /// let go only once that has lasted ([`work::LET_GO_AFTER_LOOKS`]), never
+    /// on a config that failed to read once.
+    unbossed: Mutex<HashMap<uuid::Uuid, (u32, std::time::Instant)>>,
     /// When the overseer's turns in its DM started, by session.
     manager_turns: Mutex<HashMap<String, DateTime<Utc>>>,
     /// Pending approvals a wake-up listed, by the overseer's DM session.
@@ -315,6 +320,7 @@ impl CrewHub {
             running: Mutex::default(),
             hops: Mutex::default(),
             wake_hop: Mutex::default(),
+            unbossed: Mutex::default(),
             manager_turns: Mutex::default(),
             listed: Mutex::default(),
             sent: Mutex::default(),

@@ -1779,6 +1779,64 @@ async fn an_unprompted_answer_reaches_a_dm_left_open_for_days() {
 /// agents and Desk sessions log, and answering it in place.
 mod groups;
 
+/// A boss still among the hub's agents whose config fails to read for a
+/// moment keeps the sessions it runs; one that stays no overseer lets them
+/// go once that has lasted.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_boss_whose_config_fails_to_read_for_a_moment_keeps_its_sessions() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (boss, _llm) = agent(dir.path(), "desk", "ok").await;
+        let good = "[oversight]\nenabled = true\nlevel = \"act\"\n";
+        write_config(&boss, good);
+        let d = desk(pool, dir.path()).await;
+        let session = new_session(&d, dir.path(), "web").await;
+        eventually("Desk to know who runs what", async || {
+            d.charges_loaded().then_some(())
+        })
+        .await;
+        d.take_on(
+            session.id,
+            &workforce_desk::crew::Party::manager("desk", "Desk"),
+            workforce_desk::charge::How::Handed,
+            &workforce_common::oversight::Scope::Ungrouped,
+            &By::you(),
+        )
+        .await
+        .unwrap();
+        let _crew = CrewHub::start(
+            hub(&[Arc::clone(&boss)]),
+            d.clone(),
+            FAST,
+            CancellationToken::new(),
+        );
+        let config = boss
+            .workspace
+            .join(workforce_common::config_files::WORKSPACE_CONFIG);
+        // Unreadable for a few looks, then itself again.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        std::fs::write(&config, "[oversight\nbroken").unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            d.charge_of(session.id).unwrap().live(),
+            "kept while it can't be read"
+        );
+        std::fs::write(&config, good).unwrap();
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        assert!(
+            d.charge_of(session.id).unwrap().live(),
+            "kept once it reads again"
+        );
+        // No overseer for good: let go once that has lasted.
+        std::fs::write(&config, "[oversight\nbroken").unwrap();
+        eventually("a boss that stays no overseer to let go", async || {
+            (!d.charge_of(session.id).unwrap().live()).then_some(())
+        })
+        .await;
+    })
+    .await;
+}
+
 /// A session a boss ran is let go once no boss can run it: on a hub that
 /// serves no agents (a machine's, upgraded), every one its old Desk agent
 /// ran, so Desk offers no hand back to a boss that isn't there.

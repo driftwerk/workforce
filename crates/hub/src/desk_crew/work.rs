@@ -18,6 +18,10 @@ use workforce_desk::charge::{self, Wheel};
 use workforce_desk::crew::{By, Event, Kind, Party, PartyKind};
 
 use super::{name_of, CrewHub};
+
+/// How many looks in a row a boss still among the hub's agents must read as
+/// no overseer before the sessions it ran are let go.
+pub(crate) const LET_GO_AFTER_LOOKS: u32 = 3;
 use crate::serve::AgentService;
 
 /// What a work turn's prompt starts with: the person never typed it.
@@ -156,6 +160,22 @@ impl CrewHub {
         )
     }
 
+    /// Whether session `session`'s boss `boss` is past running it: gone
+    /// from the hub's agents, or read as no overseer on
+    /// [`LET_GO_AFTER_LOOKS`] looks in a row over five of the crew's minutes.
+    /// Each call is one look.
+    fn settled_unbossed(&self, session: Uuid, boss: &str) -> bool {
+        if self.state.registry.get(boss).is_none() {
+            return true;
+        }
+        let mut unbossed = self.unbossed.lock();
+        let (looks, since) = unbossed
+            .entry(session)
+            .or_insert_with(|| (0, Instant::now()));
+        *looks += 1;
+        *looks >= LET_GO_AFTER_LOOKS && since.elapsed() >= self.timing.minute * 5
+    }
+
     /// Takes on every session it can, for each overseer set to and that
     /// may act, each in its own scope; and passes the sessions a boss no
     /// longer overseeing ran to the overseer of their scope now, or lets
@@ -171,7 +191,11 @@ impl CrewHub {
         let overseers = self.overseers();
         let bossed = self.desk.bossed();
         let party = |s: &AgentService| Party::manager(s.agent_id.as_str(), &name_of(s));
-        for c in self.desk.charges() {
+        let charges = self.desk.charges();
+        self.unbossed
+            .lock()
+            .retain(|session, _| charges.iter().any(|c| c.session == *session));
+        for c in charges {
             let group = self
                 .desk
                 .view(c.session)
@@ -205,21 +229,29 @@ impl CrewHub {
             }
             let still_boss = overseers.iter().any(|(s, _)| s.agent_id.as_str() == c.boss);
             if still_boss {
+                self.unbossed.lock().remove(&c.session);
                 continue;
             }
             // Its boss no longer oversees: passed on, within its scope, by
-            // an overseer that acts; let go where none can run it (on a hub
-            // that serves no agents, a machine's, none ever can). Never while
-            // its boss is only starting or failed to load: it may yet serve.
+            // an overseer that acts; let go where none can run it. At once
+            // when its boss is no agent here at all (on a hub that serves
+            // none, a machine's, every old boss); one still here only once it
+            // has stayed no overseer (`settled_unbossed`), never on a config
+            // that failed to read once. Never while its boss is only starting
+            // or failed to load: it may yet serve.
             match its.filter(|(_, o)| o.level != Level::Watch) {
                 Some((s, o)) => {
+                    self.unbossed.lock().remove(&c.session);
                     let boss = party(s);
                     let by = By::manager(&boss.id, &boss.name, "Its boss no longer oversees.");
                     if let Err(e) = self.desk.pass_charge(c.session, &boss, &o.scope, &by).await {
                         tracing::info!(session = %c.session, error = %e, "a session wasn't passed on");
                     }
                 }
-                None if self.state.registry.not_serving(&c.boss).is_none() => {
+                None if self.state.registry.not_serving(&c.boss).is_none()
+                    && self.settled_unbossed(c.session, &c.boss) =>
+                {
+                    self.unbossed.lock().remove(&c.session);
                     let by = By::manager(
                         &c.boss,
                         &c.boss_name,
