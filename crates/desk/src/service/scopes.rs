@@ -42,6 +42,8 @@ pub(crate) struct Scopes {
     /// When each group that was a boundary stopped being one: the main
     /// overseer sees its rows from then on, never its past. Kept too.
     opened: HashMap<String, DateTime<Utc>>,
+    /// Sessions being put in their group as they start: not a move.
+    pub(crate) placing: HashSet<uuid::Uuid>,
 }
 
 /// Where the boundaries are kept across restarts.

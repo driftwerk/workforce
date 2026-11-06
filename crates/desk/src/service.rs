@@ -2139,7 +2139,11 @@ impl Desk {
         }
         if let Some(g) = group {
             let item = groups::session_item(id);
-            self.change_layout(|l| l.put(&item, g, None)).await?;
+            // Starting in its group is no move: nothing of a move is done.
+            self.0.scopes.lock().placing.insert(id);
+            let put = self.change_layout(|l| l.put(&item, g, None)).await;
+            self.0.scopes.lock().placing.remove(&id);
+            put?;
         }
         Ok(())
     }

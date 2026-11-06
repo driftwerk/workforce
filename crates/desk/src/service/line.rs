@@ -283,7 +283,9 @@ impl Desk {
     /// where they were written.
     pub(super) async fn moved_across(&self, id: Uuid, from: Option<&str>, to: Option<&str>) {
         let bossed = self.bossed();
-        if crate::scope::scope_of(from, &bossed) == crate::scope::scope_of(to, &bossed) {
+        if crate::scope::scope_of(from, &bossed) == crate::scope::scope_of(to, &bossed)
+            || self.0.scopes.lock().placing.contains(&id)
+        {
             return;
         }
         let was = self.seen_by(&crate::scope::scope_of(from, &bossed));
@@ -303,7 +305,11 @@ impl Desk {
             }
             Err(e) => tracing::warn!(%id, error = %e, "couldn't read a moved session's tickets"),
         }
-        let charged = self.charge_of(id).is_some_and(|c| c.live());
+        // A charge of the new scope's boss stays.
+        let new_scope = crate::scope::scope_of(to, &bossed);
+        let charged = self.charge_of(id).is_some_and(|c| {
+            c.live() && crate::scope::scope_of(c.group.as_deref(), &bossed) != new_scope
+        });
         let ids: Vec<Uuid> = tickets.iter().map(|(t, _)| *t).collect();
         let by = By {
             party: Party::desk(),
