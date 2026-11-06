@@ -701,21 +701,45 @@ async fn an_agents_desk_tools_keep_to_its_groups_scope() {
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
         let c = clients(dir.path(), pool).await;
-        let tools = crate::desk_tools::DeskTool::all(&c.d);
-        let tool = |name: &str| {
-            tools
-                .iter()
-                .find(|t| workforce_agent::tools::Tool::name(*t) == name)
+        let tool = |agent: &str, name: &str| {
+            crate::desk_tools::DeskTool::all(&c.d, agent)
+                .into_iter()
+                .find(|t| workforce_agent::tools::Tool::name(t) == name)
                 .unwrap()
         };
         let as_ = |agent: &'static str, name: &str, input: Value| {
-            let t = tool(name);
+            let t = tool(agent, name);
             CURRENT_AGENT_ID.scope(agent.to_string(), async move {
-                workforce_agent::tools::Tool::execute(t, input)
+                workforce_agent::tools::Tool::execute(&t, input)
                     .await
                     .unwrap()
             })
         };
+        // With no turn's agent known, a tool still keeps to the agent it is
+        // registered for; registered for none, it sees nothing; run by
+        // another agent than its own, it refuses.
+        let bare =
+            workforce_agent::tools::Tool::execute(&tool("scout", "desk.sessions"), json!({}))
+                .await
+                .unwrap()
+                .output
+                .to_string();
+        assert!(
+            bare.contains("acme-web") && !bare.contains("loose-web"),
+            "{bare}"
+        );
+        let nobody = workforce_agent::tools::Tool::execute(&tool("", "desk.sessions"), json!({}))
+            .await
+            .unwrap();
+        assert_eq!(nobody.output, json!([]), "{nobody:?}");
+        let other = CURRENT_AGENT_ID
+            .scope("desk".to_string(), async {
+                workforce_agent::tools::Tool::execute(&tool("scout", "desk.sessions"), json!({}))
+                    .await
+                    .unwrap()
+            })
+            .await;
+        assert!(!other.success, "{other:?}");
         let listed = as_("scout", "desk.sessions", json!({}))
             .await
             .output
@@ -764,9 +788,15 @@ async fn a_boss_that_fails_to_load_keeps_its_group_closed_and_taking_it_off_open
             "[oversight]\nenabled = true\ngroup = \"atlas\"\nlevel = \"boss\"\n",
         );
         super::super::config_saved(&c.mia);
-        eventually("Mia to stop overseeing", async || {
-            c.crew.overseer_named("mia").is_none().then_some(())
-        })
+        eventually(
+            "Mia to stop overseeing, and the tools to settle",
+            async || {
+                (c.crew.overseer_named("mia").is_none()
+                    && !c.mia.tools.has("crew.overview")
+                    && c.desk.tools.has("crew.overview"))
+                .then_some(())
+            },
+        )
         .await;
         let main = |name: &'static str| {
             let t = c.desk.tools.get(name).unwrap();

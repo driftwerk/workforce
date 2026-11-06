@@ -204,9 +204,7 @@ pub(crate) async fn oversight_saved(service: &AgentService, before: Option<&str>
     if group_named_in(body).as_deref() == Some(was.as_str()) {
         return;
     }
-    let still = crew.services().iter().any(|s| {
-        s.agent_id != service.agent_id && named_group(&s.workspace).as_deref() == Some(&was)
-    });
+    let still = crew.named_on_disk(Some(&service.workspace)).contains(&was);
     if !still {
         crew.desk.unbound_group(&was).await;
     }
@@ -386,14 +384,10 @@ impl CrewHub {
         // Every group any agent's config names for a boss is a boundary,
         // whether that config loads, is on, or its agent serves: it stays
         // one until the person takes the boss off it.
-        let named: Vec<String> = self
-            .services()
-            .iter()
-            .flat_map(|s| named_group(&s.workspace))
-            .collect();
-        if !named.is_empty() {
+        // In force at once; kept for the next start behind it.
+        if self.desk.bound_groups_now(self.named_on_disk(None)) {
             let desk = self.desk.clone();
-            tokio::spawn(async move { desk.bound_groups(named).await });
+            tokio::spawn(async move { desk.keep_boundaries().await });
         }
         for s in self.services() {
             let o = self.oversight_of(&s);
@@ -425,6 +419,33 @@ impl CrewHub {
                 .collect(),
         );
         list
+    }
+
+    /// Every group an agent's config.toml on disk names in `[oversight]
+    /// group`: every agent's whose workspace is beside one of this hub's,
+    /// served or not; `except` one workspace.
+    pub(crate) fn named_on_disk(&self, except: Option<&Path>) -> Vec<String> {
+        let mut dirs: Vec<std::path::PathBuf> = self
+            .services()
+            .iter()
+            .filter_map(|s| s.workspace.parent().map(Path::to_path_buf))
+            .collect();
+        dirs.sort();
+        dirs.dedup();
+        let mut named = Vec::new();
+        for dir in dirs {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for e in entries.flatten() {
+                let path = e.path();
+                if except.is_some_and(|x| x == path) {
+                    continue;
+                }
+                named.extend(named_group(&path));
+            }
+        }
+        named
     }
 
     /// The overseer of `scope` and its settings, while it has one.

@@ -71,7 +71,7 @@ pub fn register_tools(service: &AgentService) {
     let Some(desk) = DESK.get() else { return };
     // Its connectors read their keys from the tiers its `[skills]` names.
     crate::connector_pins::pin(service);
-    for tool in DeskTool::all(desk) {
+    for tool in DeskTool::all(desk, service.agent_id.as_str()) {
         if !service.tools.has(workforce_agent::tools::Tool::name(&tool)) {
             service.tools.register(Arc::new(tool));
         }

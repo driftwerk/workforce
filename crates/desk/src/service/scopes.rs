@@ -128,6 +128,11 @@ impl Desk {
             .unwrap_or_default();
     }
 
+    /// Keeps the boundaries as they are now, for the next start.
+    pub async fn keep_boundaries(&self) {
+        self.scopes_keep().await;
+    }
+
     async fn scopes_keep(&self) {
         let (bounded, opened) = {
             let s = self.0.scopes.lock();

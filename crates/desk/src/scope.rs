@@ -68,6 +68,11 @@ impl Seen {
         }
     }
 
+    /// A view of nothing at all: for a caller Desk can't place.
+    pub fn nothing() -> Self {
+        Self::new(Scope::Group(String::new()), HashSet::new(), HashSet::new())
+    }
+
     /// Whether it sees what is in `group` now: [`sees`], and never a group
     /// that is no longer in the sidebar.
     pub fn sees(&self, group: Option<&str>) -> bool {

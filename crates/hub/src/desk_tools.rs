@@ -59,15 +59,19 @@ const TERMINAL_CHARS: usize = 4000;
 pub struct DeskTool {
     verb: Verb,
     desk: Desk,
+    /// The agent it is registered for: what it reads and acts on is that
+    /// agent's scope's.
+    agent: String,
 }
 
 impl DeskTool {
-    pub fn all(desk: &Desk) -> Vec<Self> {
+    pub fn all(desk: &Desk, agent: &str) -> Vec<Self> {
         VERBS
             .into_iter()
             .map(|verb| Self {
                 verb,
                 desk: desk.clone(),
+                agent: agent.to_string(),
             })
             .collect()
     }
@@ -157,30 +161,35 @@ struct ApproveInput {
     allow: bool,
 }
 
-/// The agent calling the tool, as the actor of what it does.
-fn caller() -> Option<By> {
-    let id = workforce_agent::runner::CURRENT_AGENT_ID
-        .try_with(|a| a.clone())
-        .ok()
-        .filter(|a| !a.is_empty())?;
+/// The agent the tool is registered for, as the actor of what it does.
+fn caller(id: &str) -> Option<By> {
+    let id = (!id.is_empty()).then_some(id)?;
     Some(By {
-        party: Party::agent(&id, &id),
+        party: Party::agent(id, id),
         reason: None,
         suggestion_id: None,
         hop: 0,
     })
 }
 
-/// What the agent calling the tool sees: its own group's scope, as the
-/// overseers' are kept to it, so no agent reads or acts on another
-/// scope's sessions for a boss that asked it to.
-fn seen(d: &Desk) -> Seen {
-    let id = workforce_agent::runner::CURRENT_AGENT_ID
+/// What the agent `agent` the tool is registered for sees: its own
+/// group's scope, as the overseers' are kept to it, so no agent reads or
+/// acts on another scope's sessions for a boss that asked it to. The agent
+/// running the turn must be that agent; one that isn't, or none at all,
+/// sees nothing.
+fn seen(d: &Desk, agent: &str) -> Result<Seen, DeskError> {
+    let running = workforce_agent::runner::CURRENT_AGENT_ID
         .try_with(|a| a.clone())
         .ok()
         .filter(|a| !a.is_empty());
-    let group = id.as_deref().and_then(|a| d.group_of_agent(a));
-    d.seen_by(&d.scope_of_group(group.as_deref()))
+    if running.as_deref().is_some_and(|r| r != agent) {
+        return Err(DeskError::Invalid("this tool is another agent's".into()));
+    }
+    if agent.is_empty() {
+        return Ok(Seen::nothing());
+    }
+    let group = d.group_of_agent(agent);
+    Ok(d.seen_by(&d.scope_of_group(group.as_deref())))
 }
 
 /// `session`, when the caller's scope holds it; refused as one that isn't
@@ -204,7 +213,7 @@ fn parse<T: serde::de::DeserializeOwned>(input: Value) -> Result<T, DeskError> {
 impl DeskTool {
     async fn run(&self, input: Value) -> Result<Value, DeskError> {
         let d = &self.desk;
-        let seen = seen(d);
+        let seen = seen(d, &self.agent)?;
         let id = input
             .get("session_id")
             .and_then(Value::as_str)
@@ -246,13 +255,13 @@ impl DeskTool {
                             // In the caller's group when that is a boundary.
                             group: seen.scope.group().map(str::to_string),
                         },
-                        caller(),
+                        caller(&self.agent),
                     )
                     .await?)
             }
             Verb::Prompt => {
                 let i: PromptInput = parse(input)?;
-                out(d.prompt(i.session_id, &i.prompt, caller())?)
+                out(d.prompt(i.session_id, &i.prompt, caller(&self.agent))?)
             }
             Verb::Read => {
                 let i: ReadInput = parse(input)?;
@@ -295,21 +304,21 @@ impl DeskTool {
                 } else {
                     Decision::Deny
                 };
-                out(d.decide(i.session_id, i.approval_id, decision, caller())?)
+                out(d.decide(i.session_id, i.approval_id, decision, caller(&self.agent))?)
             }
             Verb::Stop => {
                 let i: IdInput = parse(input)?;
-                out(d.stop(i.session_id, caller())?)
+                out(d.stop(i.session_id, caller(&self.agent))?)
             }
             Verb::Interrupt => {
                 let i: IdInput = parse(input)?;
-                out(d.interrupt(i.session_id, caller())?)
+                out(d.interrupt(i.session_id, caller(&self.agent))?)
             }
             Verb::Budget => {
                 let i: BudgetInput = parse(input)?;
                 // What an agent changes is the person's, done as it: never
                 // a way to let anything the breaker holds go on.
-                let by = caller().unwrap_or_else(By::you);
+                let by = caller(&self.agent).unwrap_or_else(By::you);
                 // Only the caller's scope's budgets: while groups have bosses
                 // of their own, no other scope's numbers, and no breaker.
                 let ours = |b: &workforce_core::budget::Budget| match &b.scope {
