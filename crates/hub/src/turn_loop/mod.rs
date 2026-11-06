@@ -4944,6 +4944,20 @@ pub(crate) async fn stream_admitted(
     // turn's own metadata (lessons, round-cap continuation) at the stored
     // version.
     service.sessions.save_refreshing(&mut session)?;
+    // The question goes to the archive now, not when the turn ends: the
+    // conversation reads it whether the turn answers, fails, or is stopped
+    // (which ends the task before anything after the run), and it is
+    // numbered ahead of whatever is delivered while the turn runs.
+    let archived_upto = session.messages.len();
+    for msg in session
+        .messages
+        .get(archive_base..archived_upto)
+        .unwrap_or_default()
+    {
+        if let Err(e) = service.sessions.append_to_archive(&session.id, msg) {
+            warn!(error = %e, "Failed to archive the turn's question");
+        }
+    }
 
     // Open the turn record only once the message it answers is durable: a
     // crash between the two loses the recovery, never the transcript, and
@@ -5224,6 +5238,7 @@ pub(crate) async fn stream_admitted(
                             &mut session,
                             records::FailedTurn {
                                 archive_base: archive_base_for_task,
+                                archived_upto,
                                 heard: heard_for_task.as_ref().map(crate::hub_core::live_turns::HeardLog::take).unwrap_or_default(),
                                 trust_level,
                                 desk: desk_for_task.as_ref(),
@@ -5407,7 +5422,8 @@ pub(crate) async fn stream_admitted(
                 // and the means to recover it in one step.
                 end_turn_record(&sessions, &session.id, &turn_token_for_task);
 
-                for msg in session.messages.get(archive_base_for_task..).unwrap_or_default() {
+                // Everything after the question, which went before the run.
+                for msg in session.messages.get(archived_upto..).unwrap_or_default() {
                     if let Err(e) = sessions.append_to_archive(&session.id, msg) {
                         warn!(error = %e, "Failed to append to session archive");
                     }

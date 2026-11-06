@@ -411,6 +411,9 @@ pub(crate) fn keep_heard(
 /// running which tools.
 pub(crate) struct FailedTurn<'a> {
     pub archive_base: usize,
+    /// Where the messages not archived yet start: the question went before
+    /// the run.
+    pub archived_upto: usize,
     pub heard: Vec<crate::hub_core::live_turns::Heard>,
     pub trust_level: Option<workforce_common::trust::TrustLevel>,
     pub desk: Option<&'a workforce_common::channels::desk::DeskTurnContext>,
@@ -422,9 +425,9 @@ pub(crate) struct FailedTurn<'a> {
     pub ran: &'a [workforce_common::session::SessionMessage],
 }
 
-/// Keeps what a failed turn was asked: its prompt, already saved, and the
-/// follow-ups it took in go to the transcript and the archive, so the
-/// conversation still reads them after a restart. A Desk turn's failure is
+/// Keeps what a failed turn was asked: its prompt is saved and archived
+/// already, and the follow-ups it took in go to the transcript and the
+/// archive, so the conversation still reads them after a restart. A Desk turn's failure is
 /// archived too, as the agent's row marked failed, pointing at the message
 /// the turn was asked with and carrying the tools it ran. That row is for
 /// the conversation alone: it never enters the transcript the model replays.
@@ -444,7 +447,7 @@ pub(crate) fn keep_failed_turn(
     }
     for msg in session
         .messages
-        .get(turn.archive_base..)
+        .get(turn.archived_upto..)
         .unwrap_or_default()
         .iter()
         .filter(|m| m.role == workforce_common::session::MessageRole::User)

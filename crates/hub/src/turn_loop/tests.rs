@@ -1486,3 +1486,79 @@ fn a_failure_row_carries_the_tools_its_turn_ran() {
         )]
     );
 }
+
+/// A turn stopped mid-call (its task aborted, as a stop does) still leaves
+/// its question in the conversation, under the client's id: it went to the
+/// archive before the run.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stopped_turn_keeps_its_question() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    let tmp = tempfile::tempdir().unwrap();
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(5)))
+        .mount(&server)
+        .await;
+    let mut config = workforce_common::settings::WorkforceConfig::default();
+    config.hub.data_dir = tmp.path().to_string_lossy().to_string();
+    config.memory.db_path = tmp.path().join("memory.db").to_string_lossy().into_owned();
+    config.llm.provider = "ollama".into();
+    config.llm.api_key = Some(server.uri());
+    config.llm.default_model = "mock".into();
+    config.desk.enabled = true;
+    let service = AgentService::from_config(config, None).await.unwrap();
+    let asked = uuid::Uuid::new_v4();
+    let desk = dm_turn(asked);
+    let MessageProgress { handle, .. } = service
+        .process_message_with_progress(
+            workforce_common::channels::desk::DESK_CHANNEL,
+            "identity-1",
+            None,
+            "what was that research called again?",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&desk),
+        )
+        .await
+        .unwrap();
+    for _ in 0..200 {
+        if !server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .is_empty()
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    handle.abort();
+    let _ = handle.await;
+    assert_eq!(
+        read_back(&service, "identity-1"),
+        [(
+            "what was that research called again?".to_string(),
+            Some(asked.to_string()),
+            false,
+            None
+        )]
+    );
+}
