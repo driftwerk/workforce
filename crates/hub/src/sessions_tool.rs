@@ -247,7 +247,11 @@ impl SessionsTool {
             );
         };
         let entry = match self.scope(&session_id, &identity_id) {
-            Scope::Visible => self.sessions.read_archive_message(&session_id, &message_id),
+            // A turn's failure is no one's words: not read back as said.
+            Scope::Visible => self
+                .sessions
+                .read_archive_message(&session_id, &message_id)
+                .map(|entry| entry.filter(|e| !e.is_failure())),
             Scope::Eval | Scope::OtherUser | Scope::Missing => Ok(None),
         };
         let elapsed = start.elapsed().as_millis() as u64;

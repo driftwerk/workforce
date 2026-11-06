@@ -25,6 +25,7 @@ use workforce_common::text::truncate_with_ellipsis;
 pub(crate) mod citations;
 pub(crate) mod extraction;
 pub(crate) mod grounding;
+pub(crate) mod next_turn;
 pub(crate) mod prompt;
 pub(crate) mod recall;
 pub(crate) mod records;
@@ -809,10 +810,37 @@ pub(crate) async fn assemble_code_context(
 
 /// Save a turn no route served with the notice its person was given as
 /// its answer; nothing is billed, reviewed or learnt from it.
+/// Where in `session` the person's message kept under the client's id `id`
+/// is, when nothing has answered it yet.
+pub(crate) fn unanswered_question(session: &Session, id: &str) -> Option<usize> {
+    let at = session.messages.iter().rposition(|m| {
+        m.role == workforce_common::session::MessageRole::User
+            && m.external_id.as_deref() == Some(id)
+    })?;
+    session.messages[at + 1..]
+        .iter()
+        .all(|m| m.role != workforce_common::session::MessageRole::Assistant)
+        .then_some(at)
+}
+
+/// Where the turn's question `asked` is in `session`, which may have been
+/// compacted since it was added at `added`: found by its id, else where it
+/// was added, held to the transcript.
+pub(crate) fn asked_at(session: &Session, asked: Option<&str>, added: usize) -> usize {
+    asked
+        .and_then(|id| session.messages.iter().rposition(|m| m.id == id))
+        .unwrap_or(added.min(session.messages.len()))
+}
+
+/// Saves a turn answered by a notice. Its messages from `archive_base` are
+/// attributed to `user` in a shared session, and those from `archive_from`
+/// archived (a streamed turn archived its question already).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn save_notice_turn(
     service: &AgentService,
     session: &mut workforce_common::session::Session,
     archive_base: usize,
+    archive_from: usize,
     user: &str,
     notice: &str,
     desk: Option<&workforce_common::channels::desk::DeskTurnContext>,
@@ -823,7 +851,7 @@ pub(crate) fn save_notice_turn(
     }
     service.sessions.save_refreshing(session)?;
     persist_turn_owned_metadata(&service.sessions, session);
-    for msg in session.messages.get(archive_base..).unwrap_or_default() {
+    for msg in session.messages.get(archive_from..).unwrap_or_default() {
         if let Err(e) = service.sessions.append_to_archive(&session.id, msg) {
             warn!(error = %e, "Failed to append to session archive");
         }
@@ -3581,7 +3609,15 @@ pub(crate) async fn process_admitted(
     let (mut result, route) = match outcome {
         crate::agent_turn::ChainOutcome::Served { result, route } => (*result, route),
         crate::agent_turn::ChainOutcome::Notice { text } => {
-            save_notice_turn(service, &mut session, archive_base, user, &text, None)?;
+            save_notice_turn(
+                service,
+                &mut session,
+                archive_base,
+                archive_base,
+                user,
+                &text,
+                None,
+            )?;
             turn_journal.clear();
             return Ok(TurnOutcome::Answered(text));
         }
@@ -4507,8 +4543,8 @@ pub(crate) async fn stream_admitted(
         voice_channel,
         desk,
     } = turn;
-    let (inject_rx, self_serve) = inbox.map_or((None, Default::default()), |inbox| {
-        (Some(inbox.rx), inbox.self_serve)
+    let (inject_rx, self_serve, heard) = inbox.map_or((None, Default::default(), None), |inbox| {
+        (Some(inbox.rx), inbox.self_serve, inbox.heard)
     });
     let (progress_tx, progress_rx) = tokio::sync::mpsc::channel(64);
 
@@ -4558,6 +4594,19 @@ pub(crate) async fn stream_admitted(
         &service.sessions,
         &current_session_id,
     )?;
+    // A question the conversation holds already, unanswered, under the id
+    // this turn names (one the hub runs as the next turn, after the turn it
+    // was sent into never read it): the turn answers it where it is. A turn
+    // the hub runs for a follow-up answers it there or not at all, before it
+    // does anything else: never one it would save a second time (the person
+    // asked again meanwhile, or a rollover left it behind).
+    let room_message = desk.and_then(|d| d.turn.message).map(|id| id.to_string());
+    let held = room_message
+        .as_deref()
+        .and_then(|id| unanswered_question(&session, id));
+    if held.is_none() && next_turn::held_only() {
+        return Err(next_turn::NothingHeld.into());
+    }
 
     // Classify the session's context once (DM vs shared channel/thread) so
     // relationship capture (DM-only) and per-type reset policies have a
@@ -4736,14 +4785,21 @@ pub(crate) async fn stream_admitted(
     let archive_base = session.messages.len();
 
     let store_content = display_content.unwrap_or(message);
-    let room_message = desk.and_then(|d| d.turn.message).map(|id| id.to_string());
-    session.add_user_message_with_trust(
-        store_content,
-        external_id.or(room_message.as_deref()),
-        attachments.clone(),
-        trust_level,
-    );
-    if let Some(desk) = desk {
+    // Where the held question is now, past whatever opening the journal
+    // added to the transcript.
+    let held = room_message
+        .as_deref()
+        .and_then(|id| unanswered_question(&session, id));
+    let archive_base = held.unwrap_or(archive_base);
+    if held.is_none() {
+        session.add_user_message_with_trust(
+            store_content,
+            external_id.or(room_message.as_deref()),
+            attachments.clone(),
+            trust_level,
+        );
+    }
+    if let Some(desk) = desk.filter(|_| held.is_none()) {
         let files = crate::desk_attachments::carried(
             Arc::clone(&service.sessions),
             service.agent_id.as_str(),
@@ -4934,6 +4990,9 @@ pub(crate) async fn stream_admitted(
     // Save session with user message NOW (before spawning task) so that
     // subsequent calls see the latest messages. The spawned task will
     // update it again after the assistant response is ready.
+    // Where the question is now: an urgent compaction above may have
+    // shortened the transcript ahead of it.
+    let archive_base = asked_at(&session, turn_message_id.as_deref(), archive_base);
     // Attribute the user message before the pre-run save so a shared session
     // labels the speaker even if the turn is interrupted before it completes.
     if session.is_shared_conversation() {
@@ -4944,6 +5003,24 @@ pub(crate) async fn stream_admitted(
     // turn's own metadata (lessons, round-cap continuation) at the stored
     // version.
     service.sessions.save_refreshing(&mut session)?;
+    // The question goes to the archive now that the transcript holds it and
+    // the turn holds the session, not when the turn ends: the conversation
+    // reads it whether the turn answers, fails or is stopped (which ends the
+    // task before anything after the run), numbered ahead of whatever is
+    // delivered while the turn runs. One the conversation held already was
+    // archived when it was saved.
+    let archived_upto = session.messages.len();
+    if held.is_none() {
+        for msg in session
+            .messages
+            .get(archive_base..archived_upto)
+            .unwrap_or_default()
+        {
+            if let Err(e) = service.sessions.append_to_archive(&session.id, msg) {
+                warn!(error = %e, "Failed to archive the turn's question");
+            }
+        }
+    }
 
     // Open the turn record only once the message it answers is durable: a
     // crash between the two loses the recovery, never the transcript, and
@@ -5078,8 +5155,10 @@ pub(crate) async fn stream_admitted(
     let ls_sessions = Arc::clone(&service.sessions);
 
     let archive_base_for_task = archive_base;
+    let heard_for_task = heard;
     let kh_question = message.to_string();
     let session_key_for_task = channel.to_string();
+    let session_key_for_next = channel.to_string();
     let session_id_for_task = current_session_id.clone();
     let user_id_for_task = principal.to_string();
     // Separate owned copy for shared-session attribution: `user_id_for_task`
@@ -5122,6 +5201,24 @@ pub(crate) async fn stream_admitted(
     let turn_served = ServedLog::default();
     let served = turn_served.clone();
     let turn_claim_id = turn_claim.claim_id().to_string();
+    // Whatever the turn leaves of the follow-ups it took in when its task
+    // ends (a stop aborts it before either end path runs) is still the
+    // person's: kept, as said, once it is over.
+    let turn_over = tokio_util::sync::CancellationToken::new();
+    if let Some(log) = heard_for_task.clone() {
+        log.arm();
+        tokio::spawn(records::keep_heard_left(
+            turn_over.clone(),
+            log,
+            Arc::clone(&service.sessions),
+            current_session_id.clone(),
+            trust_level,
+            desk.cloned(),
+        ));
+    }
+    // Made here and moved in, so a task aborted before it first runs still
+    // drops it.
+    let turn_over = turn_over.drop_guard();
     let handle = tokio::spawn(workforce_agent::runner::with_desk(desk_scope_for_task, CURRENT_BILLING_IDENTITY.scope(
         billing_identity_for_task.unwrap_or_default(),
         CURRENT_VOICE_CHANNEL.scope(
@@ -5142,6 +5239,7 @@ pub(crate) async fn stream_admitted(
                 // Hold (and background-renew) the fleet-wide turn claim
                 // until every exit path of this task has run.
                 let _turn_claim = turn_claim;
+                let _turn_over = turn_over;
                 let started_at = chrono::Utc::now();
                 // Cloned before the run consumes the runner's sender: the
                 // answer streams during the run, so the grounding block (nag
@@ -5217,6 +5315,21 @@ pub(crate) async fn stream_admitted(
                             return Err(e);
                         }
                         tracing::error!(error = %e, "Agent run failed");
+                        let shared = session.is_shared_conversation();
+                        records::keep_failed_turn(
+                            &sessions,
+                            &mut session,
+                            records::FailedTurn {
+                                archive_base: archive_base_for_task,
+                                archived_upto,
+                                heard: heard_for_task.as_ref().map(crate::hub_core::live_turns::HeardLog::take).unwrap_or_default(),
+                                trust_level,
+                                desk: desk_for_task.as_ref(),
+                                asker: shared.then_some(user_id_for_attr.as_str()),
+                                error: &format!("Agent error: {e}"),
+                                ran: &turn_journal.rows(),
+                            },
+                        );
                         end_turn_record(&sessions, &session.id, &turn_token_for_task);
                         return Err(e);
                     }
@@ -5241,7 +5354,10 @@ pub(crate) async fn stream_admitted(
                 let (mut result, route) = match outcome {
                     crate::agent_turn::ChainOutcome::Served { result, route } => (*result, route),
                     crate::agent_turn::ChainOutcome::Notice { text } => {
-                        let saved = save_notice_turn(&me, &mut session, archive_base_for_task, &user_id_for_attr, &text, desk_for_task.as_ref());
+                        if let Some(log) = heard_for_task.as_ref() {
+                            records::keep_heard(&mut session, log.take(), trust_level, desk_for_task.as_ref());
+                        }
+                        let saved = save_notice_turn(&me, &mut session, archive_base_for_task, archived_upto, &user_id_for_attr, &text, desk_for_task.as_ref());
                         turn_journal.clear();
                         end_turn_record(&sessions, &session.id, &turn_token_for_task);
                         saved?;
@@ -5346,25 +5462,44 @@ pub(crate) async fn stream_admitted(
                     }
                 }
 
-                // Persist mid-run follow-ups the runner absorbed — they exist
-                // only in the run's in-memory conversation otherwise, and a
-                // later turn would be blind to them. System injections (job
-                // results) are tool-derived: never promote them into
-                // user-authored history.
-                for follow_up in result
-                    .injected_user_messages
-                    .iter()
-                    .filter(|f| f.user != "system")
-                {
-                    session.add_user_message_with_trust(
-                        &follow_up.text,
-                        follow_up.external_id.as_deref(),
-                        None,
-                        trust_level,
-                    );
+                // Persist the person's mid-run follow-ups — they exist only in
+                // the run's in-memory conversation otherwise, and a later turn
+                // would be blind to them. Where the live-turn registry fed the
+                // inbox, every follow-up it took in, as it arrived; else what
+                // the runner absorbed. System injections (job results) are
+                // tool-derived: never promote them into user-authored history.
+                // One the run never read (taken in after its last look) is
+                // not answered: in the person's DM it is kept after the
+                // answer and is the conversation's next turn, which the hub
+                // runs; anywhere else it is kept as it always was.
+                let mut next_up = Vec::new();
+                match heard_for_task.as_ref() {
+                    Some(log) => {
+                        let (read, unread) =
+                            records::read_by_run(log.take(), &result.injected_user_messages);
+                        records::keep_heard(&mut session, read, trust_level, desk_for_task.as_ref());
+                        let unread = next_turn::unread_plan(desk_for_task.as_ref(), unread);
+                        records::keep_heard(&mut session, unread.now, trust_level, desk_for_task.as_ref());
+                        next_up = unread.after;
+                    }
+                    None => {
+                        for follow_up in result
+                            .injected_user_messages
+                            .iter()
+                            .filter(|f| f.user != "system")
+                        {
+                            session.add_user_message_with_trust(
+                                &follow_up.text,
+                                follow_up.external_id.as_deref(),
+                                None,
+                                trust_level,
+                            );
+                        }
+                    }
                 }
                 let telemetry_provider = settle_served(&mut session, &result, route, reserved, desk_for_task.as_ref())
                     .map_or(telemetry_provider, str::to_string);
+                records::keep_heard(&mut session, next_up.clone(), trust_level, desk_for_task.as_ref());
                 // Attribute this turn's tool messages to the asker so a shared
                 // session's later replay drops them for every other speaker.
                 if session.is_shared_conversation() {
@@ -5383,10 +5518,28 @@ pub(crate) async fn stream_admitted(
                 // and the means to recover it in one step.
                 end_turn_record(&sessions, &session.id, &turn_token_for_task);
 
-                for msg in session.messages.get(archive_base_for_task..).unwrap_or_default() {
+                // Everything after the question, which went before the run.
+                for msg in session.messages.get(archived_upto..).unwrap_or_default() {
                     if let Err(e) = sessions.append_to_archive(&session.id, msg) {
                         warn!(error = %e, "Failed to append to session archive");
                     }
+                }
+                if let Some((desk, prompt)) = desk_for_task
+                    .as_ref()
+                    .and_then(|desk| next_turn::next_of(desk, &next_up))
+                {
+                    tokio::spawn(next_turn::answer_left(
+                        Arc::clone(&me),
+                        next_turn::NextTurn {
+                            session_id: session.id.clone(),
+                            channel: session_key_for_next.clone(),
+                            user: user_id_for_attr.clone(),
+                            run_as: principal_for_task.clone(),
+                            trust_level,
+                            desk,
+                            prompt,
+                        },
+                    ));
                 }
 
                 // Infer semantic task type from prompt + tool usage

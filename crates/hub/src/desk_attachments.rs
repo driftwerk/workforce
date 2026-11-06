@@ -569,6 +569,8 @@ mod kept {
             desk: None,
             mark: None,
             attachments: vec![k.shown()],
+            client_id: None,
+            seq: None,
         }));
         // Stable: a file said at the same moment as a message follows it.
         page.messages.sort_by_key(|m| m.at);

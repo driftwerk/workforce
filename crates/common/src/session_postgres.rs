@@ -292,15 +292,62 @@ impl PostgresSessionStore {
 
 /// Apply the embedded sessions migration set (V001..) against a pool.
 /// Idempotent — refinery records applied versions and skips them.
+///
+/// A migration that gives up waiting for its table's lock (V014 bounds its
+/// wait to 5s, so it never queues behind long reads) is tried again with
+/// backoff for [`LOCK_RETRY_FOR`] before the boot fails: two replicas
+/// booting together, or a long read, only delay it.
 pub async fn run_session_migrations(pool: &PostgresPool) -> Result<()> {
-    let set = MigrationSet::new(
-        PostgresSessionStore::SCHEMA,
-        Box::new(EmbeddedSessionMigrations) as Box<dyn MigrationRun>,
-    );
-    MigrationRunner::run(pool, &[set])
-        .await
-        .context("running session migrations")?;
-    Ok(())
+    retry_lock_timeouts(LOCK_RETRY_FOR, LOCK_RETRY_FIRST, || async {
+        let set = MigrationSet::new(
+            PostgresSessionStore::SCHEMA,
+            Box::new(EmbeddedSessionMigrations) as Box<dyn MigrationRun>,
+        );
+        MigrationRunner::run(pool, &[set])
+            .await
+            .context("running session migrations")
+    })
+    .await
+}
+
+/// How long session migrations are retried while they time out on a lock.
+pub const LOCK_RETRY_FOR: std::time::Duration = std::time::Duration::from_secs(120);
+/// The first wait between them; each later one doubles, up to 15s.
+const LOCK_RETRY_FIRST: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Runs `attempt` until it succeeds, fails other than by a lock timeout, or
+/// `budget` is spent waiting `first` and then twice as long each time.
+pub(crate) async fn retry_lock_timeouts<F, Fut>(
+    budget: std::time::Duration,
+    first: std::time::Duration,
+    mut attempt: F,
+) -> Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    let started = tokio::time::Instant::now();
+    let mut wait = first;
+    loop {
+        match attempt().await {
+            Err(e) if lock_timed_out(&e) && started.elapsed() + wait <= budget => {
+                tracing::warn!(error = %format!("{e:#}"), wait_secs = wait.as_secs_f32(), "a session migration waited too long for a lock; trying again");
+                tokio::time::sleep(wait).await;
+                wait = (wait * 2).min(std::time::Duration::from_secs(15));
+            }
+            done => return done,
+        }
+    }
+}
+
+/// Whether `error` is Postgres giving up on a lock (`lock_timeout`,
+/// `55P03`), as the shared runner reports it.
+fn lock_timed_out(error: &eyre::Report) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<workforce_postgres::PostgresError>()
+            .is_some_and(workforce_postgres::PostgresError::is_lock_not_available)
+    })
 }
 
 struct EmbeddedSessionMigrations;
@@ -1762,6 +1809,7 @@ impl SessionStore for PostgresSessionStore {
                      JOIN sessions s ON s.id = a.session_id AND s.tenant_id = a.tenant_id
                      WHERE s.agent_id = $1 AND s.tenant_id = $4
                        AND a.content_tsv @@ plainto_tsquery('english', $2)
+                       AND NOT COALESCE((a.desk->>'failed')::boolean, false)
                      ORDER BY rank DESC, a.ts DESC
                      LIMIT $3",
                     &[&self.agent_id, &query, &fetch, &self.tenant_id()],
@@ -1819,8 +1867,9 @@ impl SessionStore for PostgresSessionStore {
             scoped
                 .execute(
                     "INSERT INTO session_archive
-                     (tenant_id, session_id, message_id, role, content, tool_data, ts, tokens, desk)
-                     VALUES ($8, $1, $2, $3, $4, $5, $6, $7, $9)
+                     (tenant_id, session_id, message_id, role, content, tool_data, ts, tokens, desk,
+                      external_id)
+                     VALUES ($8, $1, $2, $3, $4, $5, $6, $7, $9, $10)
                      ON CONFLICT DO NOTHING",
                     &[
                         &id,
@@ -1832,6 +1881,7 @@ impl SessionStore for PostgresSessionStore {
                         &(message.tokens as i32),
                         &self.tenant_id(),
                         &desk,
+                        &message.external_id,
                     ],
                 )
                 .await?;
@@ -1906,7 +1956,7 @@ impl SessionStore for PostgresSessionStore {
                 Some(seq) => {
                     scoped
                         .query(
-                            "SELECT seq, message_id, role, content, tool_data, ts, tokens, desk
+                            "SELECT seq, message_id, role, content, tool_data, ts, tokens, desk, external_id
                              FROM session_archive
                              WHERE session_id = $1 AND seq < $2 AND tenant_id = $4
                              ORDER BY seq DESC LIMIT $3",
@@ -1917,7 +1967,7 @@ impl SessionStore for PostgresSessionStore {
                 None => {
                     scoped
                         .query(
-                            "SELECT seq, message_id, role, content, tool_data, ts, tokens, desk
+                            "SELECT seq, message_id, role, content, tool_data, ts, tokens, desk, external_id
                              FROM session_archive
                              WHERE session_id = $1 AND tenant_id = $3
                              ORDER BY seq DESC LIMIT $2",
@@ -2006,7 +2056,8 @@ impl SessionStore for PostgresSessionStore {
             let scoped = self.scope(&mut conn).await?;
             let row = scoped
                 .query_opt(
-                    "SELECT a.seq, a.message_id, a.role, a.content, a.tool_data, a.ts, a.tokens, a.desk
+                    "SELECT a.seq, a.message_id, a.role, a.content, a.tool_data, a.ts, a.tokens, a.desk,
+                            a.external_id
                      FROM session_archive a
                      JOIN sessions s ON s.id = a.session_id AND s.tenant_id = a.tenant_id
                      WHERE a.session_id = $1 AND a.message_id = $2
@@ -2278,6 +2329,7 @@ impl PostgresSessionStore {
                      SELECT seq, role, content,
                             row_number() OVER (ORDER BY seq) AS rn
                      FROM session_archive WHERE session_id = $1 AND tenant_id = $4
+                       AND NOT COALESCE((desk->>'failed')::boolean, false)
                  ),
                  hit AS (SELECT rn FROM ordered WHERE seq = $2)
                  SELECT o.seq, o.role, o.content
@@ -2314,7 +2366,7 @@ fn archive_row_to_entry(session_id: &str, r: &tokio_postgres::Row) -> Transcript
         tool_data: r.get(4),
         timestamp: r.get(5),
         tokens: r.get::<_, i32>(6) as u32,
-        external_id: None,
+        external_id: r.get(8),
         attachments: None,
         trust_level: None,
         actor: None,
@@ -2322,12 +2374,60 @@ fn archive_row_to_entry(session_id: &str, r: &tokio_postgres::Row) -> Transcript
             .get::<_, Option<serde_json::Value>>(7)
             .and_then(|mark| serde_json::from_value(mark).ok()),
     };
-    message_to_transcript_entry(session_id, &msg)
+    TranscriptEntry {
+        seq: Some(r.get(0)),
+        ..message_to_transcript_entry(session_id, &msg)
+    }
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// A migration that times out on a lock is tried again until it runs;
+    /// anything else fails at once, and so does one still locked out once
+    /// the budget is spent.
+    #[tokio::test]
+    async fn migrations_locked_out_are_tried_again_within_the_budget() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        const BUDGET: std::time::Duration = std::time::Duration::from_millis(400);
+        const FIRST: std::time::Duration = std::time::Duration::from_millis(10);
+        let tries = AtomicU32::new(0);
+        retry_lock_timeouts(BUDGET, FIRST, || async {
+            match tries.fetch_add(1, Ordering::SeqCst) {
+                0 | 1 => Err(workforce_postgres::PostgresError::LockNotAvailable(
+                    "canceling statement due to lock timeout".into(),
+                )
+                .into()),
+                _ => Ok(()),
+            }
+        })
+        .await
+        .expect("runs once the lock is free");
+        assert_eq!(tries.load(Ordering::SeqCst), 3);
+
+        let other = AtomicU32::new(0);
+        let failed = retry_lock_timeouts(BUDGET, FIRST, || async {
+            other.fetch_add(1, Ordering::SeqCst);
+            Err(eyre::eyre!("lock timeout, said in words only"))
+        })
+        .await;
+        assert!(failed.is_err());
+        assert_eq!(other.load(Ordering::SeqCst), 1, "not a lock: no retry");
+
+        let started = tokio::time::Instant::now();
+        let stuck = retry_lock_timeouts(BUDGET, FIRST, || async {
+            Err(workforce_postgres::PostgresError::LockNotAvailable("locked".into()).into())
+        })
+        .await;
+        assert!(stuck.is_err());
+        assert!(started.elapsed() <= BUDGET, "{:?}", started.elapsed());
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(150),
+            "{:?}",
+            started.elapsed()
+        );
+    }
     use workforce_postgres::test_support::{now_micros, with_test_pool};
 
     pub(crate) async fn with_embedded_pg_pool<F, Fut>(test: F)

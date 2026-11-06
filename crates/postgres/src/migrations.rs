@@ -177,6 +177,44 @@ mod pg_tests {
         }
     }
 
+    /// A statement that gives up on a lock someone else holds is reported
+    /// as that by its state, not its words, so a caller (a migration's
+    /// retry) can tell it apart.
+    #[tokio::test]
+    async fn a_statement_locked_out_reports_the_lock() {
+        with_test_pool(PostgresPool::from_config, |pool| async move {
+            let mut holder = pool.get().await.expect("pool connection");
+            holder
+                .batch_execute("CREATE TABLE IF NOT EXISTS public.lock_probe (id int)")
+                .await
+                .unwrap();
+            let held = holder.transaction().await.unwrap();
+            held.batch_execute("LOCK TABLE public.lock_probe IN ACCESS EXCLUSIVE MODE")
+                .await
+                .unwrap();
+            let waiter = pool.get().await.expect("pool connection");
+            let failed = waiter
+                .batch_execute(
+                    "SET lock_timeout = '100ms'; \
+                     ALTER TABLE public.lock_probe ADD COLUMN IF NOT EXISTS x int",
+                )
+                .await
+                .expect_err("the table is locked");
+            let failed = PostgresError::from(failed);
+            assert!(failed.is_lock_not_available(), "{failed}");
+            waiter.batch_execute("RESET lock_timeout").await.unwrap();
+            held.rollback().await.unwrap();
+            let other = PostgresError::from(
+                waiter
+                    .batch_execute("SELECT * FROM public.no_such_table")
+                    .await
+                    .expect_err("no such table"),
+            );
+            assert!(!other.is_lock_not_available(), "{other}");
+        })
+        .await;
+    }
+
     /// Two instances booting at once must not race `CREATE TABLE` / refinery
     /// history: the advisory lock serialises them, so both succeed and the
     /// migration applies exactly once.

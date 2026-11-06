@@ -697,6 +697,7 @@ impl ChatTool {
                 Some(crate::serve::TurnInbox {
                     rx: inject_rx,
                     self_serve: workforce_agent::tools::approval::SelfServe::Answerable,
+                    heard: None,
                 }),
                 None,
                 None,

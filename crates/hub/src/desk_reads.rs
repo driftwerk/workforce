@@ -103,6 +103,8 @@ mod tests {
                 ..DeskMark::default()
             }),
             attachments: Vec::new(),
+            client_id: None,
+            seq: None,
         }
     }
 

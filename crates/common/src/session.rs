@@ -434,6 +434,24 @@ pub struct TranscriptEntry {
     /// [`SessionMessage::desk`] has it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub desk: Option<crate::channels::desk::DeskMark>,
+    /// The client's own id for the message ([`SessionMessage::external_id`]),
+    /// where the store keeps it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_id: Option<String>,
+    /// Where the message is in the archive's order: higher was archived
+    /// later, across every session of a thread. A store that keeps no such
+    /// order, or an entry read from the live transcript, has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seq: Option<i64>,
+}
+
+impl TranscriptEntry {
+    /// Whether this is a Desk turn's failure ([`crate::channels::desk::DeskMark::failed`]):
+    /// kept for the conversation to show where it failed, never anyone's
+    /// words, so nothing that reads what was said takes it as the agent's.
+    pub fn is_failure(&self) -> bool {
+        self.desk.as_ref().is_some_and(|mark| mark.failed)
+    }
 }
 
 /// Metadata about a tool invocation.
@@ -4780,6 +4798,9 @@ impl SessionStore for JsonlSessionStore {
                 if single_term && scored.len() >= limit {
                     break;
                 }
+                if msg.desk.as_ref().is_some_and(|mark| mark.failed) {
+                    continue;
+                }
                 let score = coordination_score(&msg.content.to_lowercase(), &terms);
                 if score > 0 {
                     scored.push((
@@ -5055,6 +5076,8 @@ pub fn message_to_transcript_entry(session_id: &str, msg: &SessionMessage) -> Tr
         tool_metadata,
         token_usage,
         desk: msg.desk.clone(),
+        external_id: msg.external_id.clone(),
+        seq: None,
     }
 }
 
@@ -6939,6 +6962,37 @@ mod tests {
         assert_eq!(page.messages.last().unwrap().desk.as_ref(), Some(&mark));
     }
 
+    /// A Desk turn's failure is kept for the conversation, never found as
+    /// something said.
+    #[test]
+    fn search_sessions_never_finds_a_turn_s_failure() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = JsonlSessionStore::new(dir.path()).expect("store");
+        let s = store.get_or_create("desk", "u", "agent").expect("create");
+        let mut failure = SessionMessage::tool(
+            "x",
+            &serde_json::json!({}),
+            &serde_json::json!(""),
+            false,
+            0,
+            None,
+        );
+        failure.role = MessageRole::Assistant;
+        failure.tool_data = None;
+        failure.content = "Agent error: platypus timeout".into();
+        failure.desk = Some(crate::channels::desk::DeskMark {
+            failed: true,
+            ..Default::default()
+        });
+        store.append_to_archive(&s.id, &failure).expect("archive");
+        assert!(store
+            .search_sessions("platypus", 10)
+            .expect("search")
+            .is_empty());
+        let page = store.read_archive_page(&s.id, None, 10).unwrap();
+        assert!(page.messages[0].is_failure());
+    }
+
     #[test]
     fn search_sessions_finds_archived_detail_compacted_out_of_live() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -8415,6 +8469,8 @@ mod tests {
                 tool_metadata: None,
                 token_usage: None,
                 desk: None,
+                external_id: None,
+                seq: None,
             })
             .collect();
 
@@ -8437,6 +8493,8 @@ mod tests {
                 tool_metadata: None,
                 token_usage: None,
                 desk: None,
+                external_id: None,
+                seq: None,
             })
             .collect();
 
@@ -8459,6 +8517,8 @@ mod tests {
                 tool_metadata: None,
                 token_usage: None,
                 desk: None,
+                external_id: None,
+                seq: None,
             })
             .collect();
 
@@ -8481,6 +8541,8 @@ mod tests {
                 tool_metadata: None,
                 token_usage: None,
                 desk: None,
+                external_id: None,
+                seq: None,
             })
             .collect();
 

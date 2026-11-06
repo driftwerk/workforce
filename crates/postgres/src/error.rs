@@ -14,6 +14,33 @@ pub enum PostgresError {
     Pool(String),
     Query(String),
     Migration(String),
+    /// A statement (a query or a migration's) gave up waiting for a lock,
+    /// under `lock_timeout`: `55P03`, `lock_not_available`.
+    LockNotAvailable(String),
+}
+
+impl PostgresError {
+    /// Whether this is Postgres giving up on a lock: worth trying again once
+    /// whatever held it is done.
+    pub fn is_lock_not_available(&self) -> bool {
+        matches!(self, Self::LockNotAvailable(_))
+    }
+}
+
+/// Whether `err`, or anything it was caused by, is Postgres giving up on a
+/// lock.
+fn locked_out(err: &(dyn std::error::Error + 'static)) -> bool {
+    let mut cause = Some(err);
+    while let Some(e) = cause {
+        if e.downcast_ref::<tokio_postgres::Error>()
+            .and_then(tokio_postgres::Error::code)
+            == Some(&tokio_postgres::error::SqlState::LOCK_NOT_AVAILABLE)
+        {
+            return true;
+        }
+        cause = e.source();
+    }
+    false
 }
 
 impl fmt::Display for PostgresError {
@@ -23,6 +50,7 @@ impl fmt::Display for PostgresError {
             Self::Pool(m) => write!(f, "postgres pool error: {m}"),
             Self::Query(m) => write!(f, "postgres query error: {m}"),
             Self::Migration(m) => write!(f, "postgres migration error: {m}"),
+            Self::LockNotAvailable(m) => write!(f, "postgres lock not available: {m}"),
         }
     }
 }
@@ -31,7 +59,10 @@ impl std::error::Error for PostgresError {}
 
 impl From<tokio_postgres::Error> for PostgresError {
     fn from(err: tokio_postgres::Error) -> Self {
-        Self::Query(err.to_string())
+        match locked_out(&err) {
+            true => Self::LockNotAvailable(err.to_string()),
+            false => Self::Query(err.to_string()),
+        }
     }
 }
 
@@ -49,6 +80,9 @@ impl From<deadpool_postgres::CreatePoolError> for PostgresError {
 
 impl From<refinery::Error> for PostgresError {
     fn from(err: refinery::Error) -> Self {
-        Self::Migration(err.to_string())
+        match locked_out(&err) {
+            true => Self::LockNotAvailable(err.to_string()),
+            false => Self::Migration(err.to_string()),
+        }
     }
 }

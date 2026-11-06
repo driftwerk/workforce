@@ -378,3 +378,197 @@ pub(crate) fn record_observed_usage(
     }
     session.record_observed_input_tokens(observed);
 }
+
+/// Adds the person's follow-ups a live turn took in (`heard`) to `session`,
+/// as they arrived: each under the client's id for it, stamped when it came
+/// rather than when the turn saved, and in the turn's Desk place, said by
+/// the person.
+pub(crate) fn keep_heard(
+    session: &mut Session,
+    heard: Vec<crate::hub_core::live_turns::Heard>,
+    trust_level: Option<workforce_common::trust::TrustLevel>,
+    desk: Option<&workforce_common::channels::desk::DeskTurnContext>,
+) {
+    for follow_up in heard {
+        session.add_user_message_with_trust(
+            &follow_up.text,
+            follow_up.external_id.as_deref(),
+            None,
+            trust_level,
+        );
+        if let Some(said) = session.messages.last_mut() {
+            said.timestamp = follow_up.at;
+            said.desk = desk.map(|desk| workforce_common::channels::desk::DeskMark {
+                speaker: Some(workforce_common::channels::desk::DeskSpeaker::Person),
+                ..desk.turn.place.mark()
+            });
+        }
+    }
+}
+
+/// The follow-ups `heard` that the run read (`absorbed`), and those it never
+/// did, each in the order it arrived. One the client named is known by its
+/// id; one it didn't, by who said what.
+pub(crate) fn read_by_run(
+    heard: Vec<crate::hub_core::live_turns::Heard>,
+    absorbed: &[workforce_agent::runner::InjectedUserMessage],
+) -> (
+    Vec<crate::hub_core::live_turns::Heard>,
+    Vec<crate::hub_core::live_turns::Heard>,
+) {
+    let mut left: Vec<&workforce_agent::runner::InjectedUserMessage> = absorbed.iter().collect();
+    heard.into_iter().partition(|h| {
+        let found = left.iter().position(|a| match &h.external_id {
+            Some(id) => a.external_id.as_deref() == Some(id.as_str()),
+            None => a.external_id.is_none() && a.text == h.text && a.user == h.user,
+        });
+        found.map(|at| left.remove(at)).is_some()
+    })
+}
+
+/// Once `over` (the turn's task has ended, however), keeps the follow-ups
+/// still in `heard`: those of a turn stopped or cut short, which no end path
+/// took. They are added to the session's transcript and its archive as they
+/// arrived.
+pub(crate) async fn keep_heard_left(
+    over: tokio_util::sync::CancellationToken,
+    heard: crate::hub_core::live_turns::HeardLog,
+    sessions: Arc<dyn workforce_common::session::SessionStore>,
+    session_id: String,
+    trust_level: Option<workforce_common::trust::TrustLevel>,
+    desk: Option<workforce_common::channels::desk::DeskTurnContext>,
+) {
+    over.cancelled().await;
+    let left = heard.take();
+    if left.is_empty() {
+        heard.kept();
+        return;
+    }
+    let kept = tokio::task::spawn_blocking(move || -> eyre::Result<()> {
+        let Some(mut session) = sessions.get(&session_id)? else {
+            return Ok(());
+        };
+        let from = session.messages.len();
+        keep_heard(&mut session, left, trust_level, desk.as_ref());
+        sessions.save_refreshing(&mut session)?;
+        for msg in session.messages.get(from..).unwrap_or_default() {
+            sessions.append_to_archive(&session.id, msg)?;
+        }
+        Ok(())
+    })
+    .await;
+    match kept {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => tracing::warn!(error = %e, "Failed to keep a stopped turn's follow-ups"),
+        Err(e) => tracing::warn!(error = %e, "Keeping a stopped turn's follow-ups panicked"),
+    }
+    heard.kept();
+}
+
+/// What a turn that failed leaves to keep: where its messages start in the
+/// session, the follow-ups it took in, and what it failed with after
+/// running which tools.
+pub(crate) struct FailedTurn<'a> {
+    pub archive_base: usize,
+    /// Where the messages not archived yet start: the question went before
+    /// the run.
+    pub archived_upto: usize,
+    pub heard: Vec<crate::hub_core::live_turns::Heard>,
+    pub trust_level: Option<workforce_common::trust::TrustLevel>,
+    pub desk: Option<&'a workforce_common::channels::desk::DeskTurnContext>,
+    /// Who asked, in a shared session.
+    pub asker: Option<&'a str>,
+    /// What the client was told the turn failed with.
+    pub error: &'a str,
+    /// The tool rows the turn's journal holds.
+    pub ran: &'a [workforce_common::session::SessionMessage],
+}
+
+/// Keeps what a failed turn was asked: its prompt is saved and archived
+/// already, and the follow-ups it took in go to the transcript and the
+/// archive, so the conversation still reads them after a restart. A DM
+/// turn's failure is archived too, as the agent's row marked failed,
+/// pointing at the message the turn was asked with and carrying the tools it
+/// ran. That row is for the person's DM alone: it never enters the
+/// transcript the model replays, and a room's turn leaves none, since what a
+/// room's conversation keeps is posted to the room as the agent's reply.
+pub(crate) fn keep_failed_turn(
+    sessions: &Arc<dyn workforce_common::session::SessionStore>,
+    session: &mut Session,
+    turn: FailedTurn<'_>,
+) {
+    if !turn.heard.is_empty() {
+        keep_heard(session, turn.heard, turn.trust_level, turn.desk);
+        if let Some(asker) = turn.asker {
+            session.attribute_messages_from(turn.archive_base, asker);
+        }
+        if let Err(e) = sessions.save_refreshing(session) {
+            tracing::warn!(error = %e, "Failed to save a failed turn's follow-ups");
+        }
+    }
+    for msg in session
+        .messages
+        .get(turn.archived_upto..)
+        .unwrap_or_default()
+        .iter()
+        .filter(|m| m.role == workforce_common::session::MessageRole::User)
+    {
+        if let Err(e) = sessions.append_to_archive(&session.id, msg) {
+            tracing::warn!(error = %e, "Failed to archive a failed turn's message");
+        }
+    }
+    let Some(desk) = turn.desk.filter(|desk| {
+        matches!(
+            desk.turn.place,
+            workforce_common::channels::desk::DeskPlace::Dm
+        )
+    }) else {
+        return;
+    };
+    let failure = failure_row(desk, turn.error, turn.ran);
+    if let Err(e) = sessions.append_to_archive(&session.id, &failure) {
+        tracing::warn!(error = %e, "Failed to archive a turn's failure");
+    }
+}
+
+/// The archive row a Desk turn's failure is: the agent's, saying what the
+/// client was told, marked failed and pointing at the message the turn was
+/// asked with, with the tools the turn ran as its steps.
+pub(crate) fn failure_row(
+    desk: &workforce_common::channels::desk::DeskTurnContext,
+    error: &str,
+    ran: &[workforce_common::session::SessionMessage],
+) -> workforce_common::session::SessionMessage {
+    let steps = ran
+        .iter()
+        .filter_map(|row| {
+            workforce_common::session::message_to_transcript_entry("", row).tool_metadata
+        })
+        .take(workforce_common::channels::desk::MAX_STEPS)
+        .map(|tool| {
+            workforce_common::channels::desk::DeskStep::of(
+                &tool.name,
+                tool.success,
+                tool.duration_ms,
+            )
+        })
+        .collect();
+    workforce_common::session::SessionMessage {
+        id: uuid::Uuid::new_v4().to_string(),
+        role: workforce_common::session::MessageRole::Assistant,
+        content: workforce_common::redact::redact_secrets(error),
+        tool_data: None,
+        timestamp: chrono::Utc::now(),
+        tokens: 0,
+        external_id: None,
+        attachments: None,
+        trust_level: None,
+        actor: None,
+        desk: Some(workforce_common::channels::desk::DeskMark {
+            in_reply_to: desk.turn.message,
+            steps,
+            failed: true,
+            ..desk.turn.place.mark()
+        }),
+    }
+}

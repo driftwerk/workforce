@@ -92,6 +92,9 @@ where
         )
         .await;
     }
+    // Follow-ups a stopped turn leaves are saved before its claim goes, so
+    // no next turn's question lands ahead of them.
+    turn.follow_ups_kept().await;
     if let Some(claim_id) = turn_claim_id {
         crate::session_turn_claim::release_claim(&svc.sessions, &session_id, &claim_id).await;
     }
