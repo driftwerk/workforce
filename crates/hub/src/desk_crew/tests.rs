@@ -4249,6 +4249,54 @@ mod board {
         .await;
     }
 
+    /// The ticket a suggestion shows is the one it acts on: an id the
+    /// model brings of its own is dropped, and a stored id is only good for
+    /// the key it was made with.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_ticket_id_the_model_brings_never_changes_which_ticket_is_acted_on() {
+        use super::super::actions::Action;
+        with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let (overseer, crew, d, _llm) =
+                overseeing(dir.path(), pool, "ok", ACT, &[]).await;
+            let b = acme(&d).await;
+            let first = ticket(&d, b, "Add the date picker", TicketState::Todo, &[]).await;
+            let other = ticket(&d, b, "Fix the flaky test", TicketState::Todo, &[]).await;
+            eventually("the overseer's tools", async || {
+                overseer.tools.has("crew.move_ticket").then_some(())
+            })
+            .await;
+            let r = overseer
+                .tools
+                .get("crew.move_ticket")
+                .unwrap()
+                .execute(json!({
+                    "ticket": "acm-1", "ticket_id": other.ticket.id.to_string(),
+                    "state": "dropped", "reason": "Not needed."
+                }))
+                .await
+                .unwrap();
+            assert_eq!(r.output["suggested"], "Move ACM-1 to Dropped", "{r:?}");
+            let kept = d.store().suggestions(10).await.unwrap().remove(0);
+            assert_eq!(kept.action["input"]["ticket"], "ACM-1");
+            assert_eq!(kept.action["input"]["ticket_id"], first.ticket.id.to_string());
+            crew.accept(&kept).await.unwrap();
+            assert_eq!(state_of(&d, "ACM-1").await.0, TicketState::Dropped);
+            assert_eq!(state_of(&d, "ACM-2").await.0, TicketState::Todo, "the other is untouched");
+
+            // A stored id for another ticket than the key says is refused.
+            let wrong = Action::from_suggestion(&json!({
+                "tool": "crew.move_ticket",
+                "input": {"ticket": "ACM-2", "ticket_id": first.ticket.id.to_string(), "state": "done"}
+            }))
+            .unwrap();
+            let r = crew.perform(&wrong, By::you()).await.unwrap_err();
+            assert!(r.starts_with("That was about ACM-2, which isn’t that ticket"), "{r}");
+            assert_eq!(state_of(&d, "ACM-2").await.0, TicketState::Todo);
+        })
+        .await;
+    }
+
     /// A ticket that became ready with no one on it wakes the overseer once,
     /// and only where it may hand out work.
     #[tokio::test(flavor = "multi_thread")]

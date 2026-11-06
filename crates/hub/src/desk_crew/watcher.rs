@@ -735,7 +735,9 @@ pub(super) async fn wake_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
                 // while events wait would let the channel lag and lose
                 // the wakes among them.
                 Ok(DeskEvent::Ticket { .. }) => ready_dirty = true,
-                Ok(_) | Err(RecvError::Lagged(_)) => {}
+                // Events were lost: the boards may have changed in them.
+                Err(RecvError::Lagged(_)) => ready_dirty = true,
+                Ok(_) => {}
                 Err(RecvError::Closed) => return,
             },
             _ = tick.tick() => {

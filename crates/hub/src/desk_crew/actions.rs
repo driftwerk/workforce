@@ -337,6 +337,14 @@ impl Action {
         })
     }
 
+    /// The key of the ticket it is about.
+    pub(crate) fn ticket_key(&self) -> Option<&str> {
+        match self {
+            Self::AssignTicket { ticket, .. } | Self::MoveTicket { ticket, .. } => Some(ticket),
+            _ => None,
+        }
+    }
+
     /// The id of the ticket it is about, once resolved.
     pub(crate) fn ticket_id(&self) -> Option<Uuid> {
         match self {
@@ -1243,11 +1251,18 @@ impl CrewHub {
         key: &str,
         id: Option<Uuid>,
     ) -> Result<workforce_desk::TicketView, String> {
-        match id {
+        let t = match id {
             Some(id) => self.desk.ticket(id).await,
             None => self.desk.ticket_by_key(key).await,
         }
-        .map_err(board_plain)
+        .map_err(board_plain)?;
+        // A suggestion's id is only good for the ticket it was made about.
+        if id.is_some() && t.key.as_deref() != Some(key) {
+            return Err(format!(
+                "That was about {key}, which isn’t that ticket any more; look at the board again."
+            ));
+        }
+        Ok(t)
     }
 
     /// Fills in the ticket `action` is about, before it is gated: its id
@@ -1260,6 +1275,9 @@ impl CrewHub {
             } => {
                 let t = self.ticket_named(ticket, *id).await?;
                 *id = Some(t.ticket.id);
+                if let Some(key) = &t.key {
+                    ticket.clone_from(key);
+                }
                 *text = format!("{}\n{}", t.ticket.title, t.ticket.body);
             }
             Action::MoveTicket {
@@ -1271,6 +1289,9 @@ impl CrewHub {
             } => {
                 let t = self.ticket_named(ticket, *id).await?;
                 *id = Some(t.ticket.id);
+                if let Some(key) = &t.key {
+                    ticket.clone_from(key);
+                }
                 *was = Some(t.ticket.state);
                 *off_external = workforce_desk::board::unassigns(*state)
                     && t.ticket

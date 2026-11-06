@@ -335,13 +335,24 @@ impl CrewTool {
             .map(str::trim)
             .filter(|r| !r.is_empty())
             .ok_or("Give the reason: the person reads it in Activity.")?;
-        let mut action = Action::parse(self.name, input)?;
-        // A ticket is read before the gate looks at what is said of it, and
-        // a suggestion keeps its id, so it is that ticket that is acted on.
-        crew.resolve_ticket(&mut action).await?;
+        // Only the id Desk writes below is ever trusted: one the model
+        // brings is dropped, so the key it names is the ticket acted on.
         let mut kept = input.clone();
-        if let (Some(id), Some(o)) = (action.ticket_id(), kept.as_object_mut()) {
+        if let Some(o) = kept.as_object_mut() {
+            o.remove("ticket_id");
+        }
+        let mut action = Action::parse(self.name, &kept)?;
+        // A ticket is read before the gate looks at what is said of it, and
+        // a suggestion keeps its id and its key, so it is that ticket that
+        // is shown and acted on.
+        crew.resolve_ticket(&mut action).await?;
+        if let (Some(id), Some(key), Some(o)) = (
+            action.ticket_id(),
+            action.ticket_key(),
+            kept.as_object_mut(),
+        ) {
             o.insert("ticket_id".into(), json!(id.to_string()));
+            o.insert("ticket".into(), json!(key));
         }
         let input = &kept;
         let (_, oversight) = crew
