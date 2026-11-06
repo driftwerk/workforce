@@ -4594,6 +4594,19 @@ pub(crate) async fn stream_admitted(
         &service.sessions,
         &current_session_id,
     )?;
+    // A question the conversation holds already, unanswered, under the id
+    // this turn names (one the hub runs as the next turn, after the turn it
+    // was sent into never read it): the turn answers it where it is. A turn
+    // the hub runs for a follow-up answers it there or not at all, before it
+    // does anything else: never one it would save a second time (the person
+    // asked again meanwhile, or a rollover left it behind).
+    let room_message = desk.and_then(|d| d.turn.message).map(|id| id.to_string());
+    let held = room_message
+        .as_deref()
+        .and_then(|id| unanswered_question(&session, id));
+    if held.is_none() && next_turn::held_only() {
+        return Err(next_turn::NothingHeld.into());
+    }
 
     // Classify the session's context once (DM vs shared channel/thread) so
     // relationship capture (DM-only) and per-type reset policies have a
@@ -4772,10 +4785,8 @@ pub(crate) async fn stream_admitted(
     let archive_base = session.messages.len();
 
     let store_content = display_content.unwrap_or(message);
-    let room_message = desk.and_then(|d| d.turn.message).map(|id| id.to_string());
-    // A question the conversation holds already, unanswered, under the id
-    // this turn names (one the hub runs as the next turn, after the turn it
-    // was sent into never read it): the turn answers it where it is.
+    // Where the held question is now, past whatever opening the journal
+    // added to the transcript.
     let held = room_message
         .as_deref()
         .and_then(|id| unanswered_question(&session, id));

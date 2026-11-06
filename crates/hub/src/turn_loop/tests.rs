@@ -1986,3 +1986,145 @@ fn a_room_s_unread_follow_up_is_saved_as_before() {
     assert!(unread.after.is_empty());
     assert!(crate::turn_loop::next_turn::next_of(&desk, &unread.after).is_none());
 }
+
+/// The session as a turn that never read follow-up `steered` left it: the
+/// question, its answer, then the follow-up kept after it.
+fn left_with_follow_up(
+    service: &AgentService,
+    asked: uuid::Uuid,
+    steered: uuid::Uuid,
+) -> workforce_common::session::Session {
+    let mut session = service
+        .sessions
+        .get_or_create(
+            workforce_common::channels::desk::DESK_CHANNEL,
+            "identity-1",
+            service.agent_id.as_str(),
+        )
+        .unwrap();
+    session.add_user_message("what was that research called?", Some(&asked.to_string()));
+    session.add_assistant_message("NCM", 3);
+    let unread = crate::turn_loop::next_turn::unread_plan(
+        Some(&dm_turn(asked)),
+        vec![heard_now("and who wrote it?", Some(&steered.to_string()))],
+    );
+    crate::turn_loop::records::keep_heard(&mut session, unread.after, None, Some(&dm_turn(asked)));
+    service.sessions.save(&session).unwrap();
+    session
+}
+
+fn next_for(
+    session_id: &str,
+    asked: uuid::Uuid,
+    steered: uuid::Uuid,
+) -> crate::turn_loop::next_turn::NextTurn {
+    let (desk, prompt) = crate::turn_loop::next_turn::next_of(
+        &dm_turn(asked),
+        &[heard_now("and who wrote it?", Some(&steered.to_string()))],
+    )
+    .unwrap();
+    crate::turn_loop::next_turn::NextTurn {
+        session_id: session_id.to_string(),
+        channel: workforce_common::channels::desk::DESK_CHANNEL.into(),
+        user: "identity-1".into(),
+        run_as: "identity-1".into(),
+        trust_level: None,
+        desk,
+        prompt,
+    }
+}
+
+/// The person asks again before the hub's next turn starts, and that turn
+/// answers both: the hub's then finds nothing waiting and runs nothing, so
+/// the follow-up is neither saved twice nor answered twice.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_follow_up_answered_meanwhile_is_not_run_again() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (service, server) = crate::serve::testing::service_on_mock_llm_with(tmp.path(), |config| {
+        config.desk.enabled = true;
+    })
+    .await;
+    let (asked, steered) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+    let mut session = left_with_follow_up(&service, asked, steered);
+    session.add_user_message(
+        "hello? anyone there?",
+        Some(&uuid::Uuid::new_v4().to_string()),
+    );
+    session.add_assistant_message("Yes: Ada wrote it.", 4);
+    service.sessions.save(&session).unwrap();
+    let before = session.messages.len();
+    let asked_before = completions(&server).await;
+
+    crate::turn_loop::next_turn::answer_left(
+        std::sync::Arc::clone(&service),
+        next_for(&session.id, asked, steered),
+    )
+    .await;
+
+    let after = service.sessions.get(&session.id).unwrap().unwrap();
+    assert_eq!(after.messages.len(), before, "nothing was added");
+    let steered = steered.to_string();
+    assert_eq!(
+        after
+            .messages
+            .iter()
+            .filter(|m| m.external_id.as_deref() == Some(steered.as_str()))
+            .count(),
+        1
+    );
+    assert_eq!(
+        completions(&server).await,
+        asked_before,
+        "no model was asked"
+    );
+}
+
+/// A rollover between the turns leaves the follow-up in the sealed
+/// predecessor: the hub's next turn runs nothing in the successor.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_follow_up_left_behind_a_rollover_is_not_run() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (service, server) = crate::serve::testing::service_on_mock_llm_with(tmp.path(), |config| {
+        config.desk.enabled = true;
+    })
+    .await;
+    let (asked, steered) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+    let mut session = left_with_follow_up(&service, asked, steered);
+    let successor =
+        workforce_agent::rollover::seal_and_mint(service.sessions.as_ref(), &mut session, 0)
+            .unwrap();
+    let asked_before = completions(&server).await;
+
+    crate::turn_loop::next_turn::answer_left(
+        std::sync::Arc::clone(&service),
+        next_for(&session.id, asked, steered),
+    )
+    .await;
+
+    let next = service.sessions.get(&successor.id).unwrap().unwrap();
+    assert!(
+        next.messages
+            .iter()
+            .all(|m| m.role == workforce_common::session::MessageRole::System
+                || m.content
+                    .starts_with(workforce_agent::rollover::CARRYOVER_PREFIX)),
+        "the successor holds nothing of the follow-up: {:?}",
+        next.messages.iter().map(|m| &m.content).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        completions(&server).await,
+        asked_before,
+        "no model was asked"
+    );
+}
+
+/// How many times the model at `server` was asked for an answer.
+async fn completions(server: &wiremock::MockServer) -> usize {
+    server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|r| r.url.path() == "/v1/chat/completions")
+        .count()
+}

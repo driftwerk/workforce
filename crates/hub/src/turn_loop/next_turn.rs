@@ -78,6 +78,32 @@ pub(crate) fn next_of(
     ))
 }
 
+tokio::task_local! {
+    /// Set around a turn [`answer_left`] runs: it answers the question the
+    /// conversation holds under its id, or nothing.
+    static HELD_ONLY: ();
+}
+
+/// Whether the turn being set up may answer only a question the
+/// conversation already holds, never one it adds.
+pub(crate) fn held_only() -> bool {
+    HELD_ONLY.try_with(|_| ()).is_ok()
+}
+
+/// What a turn [`answer_left`] runs comes to when the question it was to
+/// answer is no longer held: answered since (the person asked again), or
+/// left behind in a session a rollover sealed.
+#[derive(Debug)]
+pub(crate) struct NothingHeld;
+
+impl std::fmt::Display for NothingHeld {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the follow-up is no longer waiting for an answer")
+    }
+}
+
+impl std::error::Error for NothingHeld {}
+
 /// Who asks, and where, for [`answer_left`].
 pub(crate) struct NextTurn {
     pub session_id: String,
@@ -101,45 +127,52 @@ pub(crate) async fn answer_left(service: Arc<AgentService>, next: NextTurn) {
                 return;
             }
             Err(e) if held(&e) => tokio::time::sleep(APART).await,
+            Err(e) if e.downcast_ref::<NothingHeld>().is_some() => {
+                tracing::info!(session = %next.session_id, "a follow-up its turn never read was answered meanwhile; nothing to run");
+                return;
+            }
             Err(e) => {
                 tracing::warn!(session = %next.session_id, error = %e, "answering a follow-up its turn never read failed");
                 return;
             }
         }
     }
-    tracing::warn!(session = %next.session_id, "a follow-up its turn never read is left unanswered: the session stayed held");
+    tracing::info!(session = %next.session_id, tries = TRIES, "a follow-up its turn never read is left unanswered: the session stayed held");
 }
 
 async fn attempt(service: &Arc<AgentService>, next: &NextTurn) -> eyre::Result<String> {
     let (mut live, inbox) = service
         .begin_live_turn(&next.session_id, SelfServe::Unanswerable, Some(&next.desk))
         .await?;
-    let progress = service
-        .process_message_with_progress(
-            &next.channel,
-            &next.user,
-            Some(&next.run_as),
-            &next.prompt,
-            None,
-            Some(&next.session_id),
-            None,
-            None,
-            None,
-            None,
-            Some(inbox),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            next.trust_level,
-            Some(live.cancel_token()),
-            None,
-            Some(&next.desk),
+    let progress = HELD_ONLY
+        .scope(
+            (),
+            service.process_message_with_progress(
+                &next.channel,
+                &next.user,
+                Some(&next.run_as),
+                &next.prompt,
+                None,
+                Some(&next.session_id),
+                None,
+                None,
+                None,
+                None,
+                Some(inbox),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                next.trust_level,
+                Some(live.cancel_token()),
+                None,
+                Some(&next.desk),
+            ),
         )
         .await?;
     let conducted = crate::live_turns::conduct(&mut live, service, progress, |mut rx| async move {

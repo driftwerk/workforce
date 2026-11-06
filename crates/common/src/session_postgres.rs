@@ -340,10 +340,14 @@ where
     }
 }
 
-/// Whether `error` is Postgres giving up on a lock (`lock_timeout`).
+/// Whether `error` is Postgres giving up on a lock (`lock_timeout`,
+/// `55P03`), as the shared runner reports it.
 fn lock_timed_out(error: &eyre::Report) -> bool {
-    let said = format!("{error:#}");
-    said.contains("lock timeout") || said.contains("55P03")
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<workforce_postgres::PostgresError>()
+            .is_some_and(workforce_postgres::PostgresError::is_lock_not_available)
+    })
 }
 
 struct EmbeddedSessionMigrations;
@@ -2391,9 +2395,10 @@ pub(crate) mod tests {
         let tries = AtomicU32::new(0);
         retry_lock_timeouts(BUDGET, FIRST, || async {
             match tries.fetch_add(1, Ordering::SeqCst) {
-                0 | 1 => Err(eyre::eyre!(
-                    "db error: ERROR: canceling statement due to lock timeout"
-                )),
+                0 | 1 => Err(workforce_postgres::PostgresError::LockNotAvailable(
+                    "canceling statement due to lock timeout".into(),
+                )
+                .into()),
                 _ => Ok(()),
             }
         })
@@ -2404,7 +2409,7 @@ pub(crate) mod tests {
         let other = AtomicU32::new(0);
         let failed = retry_lock_timeouts(BUDGET, FIRST, || async {
             other.fetch_add(1, Ordering::SeqCst);
-            Err(eyre::eyre!("syntax error"))
+            Err(eyre::eyre!("lock timeout, said in words only"))
         })
         .await;
         assert!(failed.is_err());
@@ -2412,7 +2417,7 @@ pub(crate) mod tests {
 
         let started = tokio::time::Instant::now();
         let stuck = retry_lock_timeouts(BUDGET, FIRST, || async {
-            Err(eyre::eyre!("canceling statement due to lock timeout"))
+            Err(workforce_postgres::PostgresError::LockNotAvailable("locked".into()).into())
         })
         .await;
         assert!(stuck.is_err());
