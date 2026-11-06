@@ -48,6 +48,33 @@ pub enum Added {
     },
 }
 
+/// An account's sign-in as handed to Desk to copy to another computer
+/// ([`Desk::hand_over_account`]): its token is written only into the
+/// answer's body, and its `Debug` says nothing of it.
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HandOver {
+    pub engine: Engine,
+    pub name: String,
+    pub is_default: bool,
+    #[serde(serialize_with = "exposed")]
+    pub token: AccountToken,
+}
+
+impl std::fmt::Debug for HandOver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HandOver")
+            .field("engine", &self.engine)
+            .field("name", &self.name)
+            .field("is_default", &self.is_default)
+            .finish_non_exhaustive()
+    }
+}
+
+fn exposed<S: serde::Serializer>(t: &AccountToken, s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_str(t.expose())
+}
+
 /// A sign-in running: the engine's command, read until it gives a token.
 pub(super) struct SignInRun {
     view: SignInView,
@@ -264,6 +291,36 @@ impl Desk {
             .find(|a| a.id == id)
             .cloned()
             .ok_or_else(|| DeskError::Invalid("there is no such account".into()))
+    }
+
+    /// Account `id`'s sign-in, handed to Desk to copy to another computer
+    /// of the person's (one of their machines, over Desk's SSH connection
+    /// to it), as `claude setup-token` says its token may be: set wherever
+    /// the person wants to sign in. It is never refreshed, so a copy never
+    /// goes stale, nor makes this one stale. Only the admin route gives it,
+    /// and only Desk's native side asks it (never its page); it is never
+    /// logged, announced or kept anywhere else here.
+    pub async fn hand_over_account(&self, id: Uuid) -> Result<HandOver, DeskError> {
+        let a = self.account(id)?;
+        let keys = Arc::clone(self.keys()?);
+        let token = tokio::task::spawn_blocking(move || keys.get(id))
+            .await
+            .map_err(|e| DeskError::Internal(e.into()))?
+            .map_err(DeskError::Internal)?
+            .ok_or_else(|| {
+                DeskError::Conflict(format!(
+                    "{}'s sign-in is no longer in {}: add the account again",
+                    a.name,
+                    self.accounts_store().unwrap_or("the store")
+                ))
+            })?;
+        tracing::warn!(account = %id, engine = a.engine.as_str(), "an engine account's sign-in was handed to Desk to copy to another computer");
+        Ok(HandOver {
+            engine: a.engine,
+            name: a.name,
+            is_default: a.is_default,
+            token,
+        })
     }
 
     /// The account `wanted` names for a new session of `engine`: absent,
@@ -885,20 +942,24 @@ impl Desk {
             .delete_account(id, to)
             .await
             .map_err(DeskError::Internal)?;
-        let deleted = match self.keys().map(Arc::clone) {
+        let store = self.accounts_store().unwrap_or("the store");
+        // Why its sign-in couldn't be deleted, if it couldn't.
+        let not_deleted: Option<String> = match self.keys().map(Arc::clone) {
             Ok(keys) => match tokio::task::spawn_blocking(move || keys.delete(id)).await {
-                Ok(Ok(())) => true,
+                Ok(Ok(())) => None,
                 Ok(Err(e)) => {
-                    tracing::warn!(account = %id, error = %format!("{e:#}"), "couldn't remove an engine account's sign-in");
-                    false
+                    let why = format!("{e:#}");
+                    tracing::warn!(account = %id, error = %why, "couldn't remove an engine account's sign-in");
+                    Some(why)
                 }
                 Err(e) => {
                     tracing::warn!(account = %id, error = %e, "couldn't remove an engine account's sign-in");
-                    false
+                    Some(e.to_string())
                 }
             },
-            Err(_) => true,
+            Err(_) => None,
         };
+        let deleted = not_deleted.is_none();
         let (running, stopped): (Vec<Uuid>, Vec<Uuid>) = {
             let mut st = self.0.state.lock();
             st.accounts.retain(|o| o.id != id);
@@ -936,7 +997,12 @@ impl Desk {
                 }
             });
         }
-        Ok(())
+        match not_deleted {
+            None => Ok(()),
+            Some(why) => Err(DeskError::Conflict(format!(
+                "The account was removed, but its sign-in couldn't be deleted from {store}: {why}"
+            ))),
+        }
     }
 
     fn announce_sessions_on(&self, account: Uuid) {

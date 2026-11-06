@@ -22,6 +22,10 @@ impl Authorize for Bearer {
             _ => Err(StatusCode::UNAUTHORIZED),
         }
     }
+
+    fn is_hub_token(&self, h: &HeaderMap) -> bool {
+        h.get("authorization").and_then(|v| v.to_str().ok()) == Some("Bearer hub-token")
+    }
 }
 
 /// Holds no voice keys.
@@ -57,11 +61,22 @@ impl Authorize for Fixed {
     ) -> Result<Option<String>, StatusCode> {
         self.0.clone()
     }
+
+    /// Everyone let in without a name stands for the hub's own token.
+    fn is_hub_token(&self, _: &HeaderMap) -> bool {
+        matches!(self.0, Ok(None))
+    }
 }
 
 /// Lets everyone in.
 pub(crate) fn allow_all() -> std::sync::Arc<dyn Authorize> {
     std::sync::Arc::new(Fixed(Ok(None)))
+}
+
+/// Lets in as the person `name`, a signed-in administrator (not the hub's
+/// own token).
+pub(crate) fn identified(name: &str) -> std::sync::Arc<dyn Authorize> {
+    std::sync::Arc::new(Fixed(Ok(Some(name.to_string()))))
 }
 
 /// Lets no one in.

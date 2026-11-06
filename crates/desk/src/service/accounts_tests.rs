@@ -1168,3 +1168,159 @@ async fn switch_all_and_auto_switch_never_pick_an_account_whose_sign_in_cant_be_
     })
     .await;
 }
+
+#[tokio::test]
+async fn an_accounts_sign_in_is_handed_over_whole_and_said_nowhere_else() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = Arc::new(MemoryKeys::default());
+        let d = desk(pool.clone(), account_options(dir.path(), keys.clone())).await;
+        let work = paste(&d, "Work", GOOD, true).await;
+        let personal = paste(&d, "Personal", OTHER, false).await;
+
+        let handed = d.hand_over_account(work).await.unwrap();
+        assert_eq!(handed.token.expose(), GOOD);
+        assert_eq!((handed.name.as_str(), handed.is_default), ("Work", true));
+        // Its wire shape carries the token; its Debug never does.
+        let wire = serde_json::to_value(&handed).unwrap();
+        assert_eq!(wire["token"], GOOD);
+        assert_eq!(wire["engine"], "claude");
+        assert_eq!(wire["isDefault"], true);
+        assert!(!format!("{handed:?}").contains("sk-ant"), "{handed:?}");
+        let other = d.hand_over_account(personal).await.unwrap();
+        assert_eq!((other.token.expose(), other.is_default), (OTHER, false));
+
+        // Handing over moves nothing: the account and its token stay here.
+        assert_eq!(keys.get(work).unwrap().unwrap().expose(), GOOD);
+        assert!(d.accounts().iter().any(|a| a.id == work && a.signed_in));
+
+        // Gone from the store: said, never an empty token.
+        keys.delete(personal).unwrap();
+        let gone = d.hand_over_account(personal).await.unwrap_err();
+        assert!(gone.to_string().contains("add the account again"), "{gone}");
+        // No such account.
+        assert!(d.hand_over_account(Uuid::new_v4()).await.is_err());
+    })
+    .await;
+}
+
+/// Keys that keep tokens but refuse to delete them.
+#[derive(Default)]
+struct StuckKeys(MemoryKeys);
+
+impl Keys for StuckKeys {
+    fn get(&self, account: Uuid) -> eyre::Result<Option<crate::engine_accounts::AccountToken>> {
+        self.0.get(account)
+    }
+    fn set(&self, account: Uuid, token: &crate::engine_accounts::AccountToken) -> eyre::Result<()> {
+        self.0.set(account, token)
+    }
+    fn delete(&self, _: Uuid) -> eyre::Result<()> {
+        Err(eyre::eyre!("the keychain is locked"))
+    }
+    fn name(&self) -> &'static str {
+        "the keychain"
+    }
+}
+
+#[tokio::test]
+async fn removing_an_account_says_so_when_its_sign_in_could_not_be_deleted() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let mut o = account_options(dir.path(), Arc::new(MemoryKeys::default()));
+        o.account_keys = Some(Arc::new(StuckKeys::default()));
+        let d = desk(pool.clone(), o).await;
+        let work = paste(&d, "Work", GOOD, true).await;
+        let err = d.remove_account(work).await.unwrap_err();
+        let said = err.to_string();
+        assert!(
+            said.contains("removed, but its sign-in couldn't be deleted from the keychain")
+                && said.contains("the keychain is locked"),
+            "{said}"
+        );
+        // Not a 2xx over the API, and the account itself is gone.
+        let app = crate::api::sessions_router(d.clone(), crate::testing::allow_all());
+        assert!(d.accounts().iter().all(|a| a.id != work));
+        let again = paste(&d, "Again", OTHER, false).await;
+        let (code, body) = api(&app, "DELETE", &format!("/api/desk/accounts/{again}"), None).await;
+        assert_eq!(code, 409, "{body}");
+        assert!(
+            body["error"].as_str().unwrap().contains("keychain"),
+            "{body}"
+        );
+    })
+    .await;
+}
+
+async fn api(
+    app: &axum::Router,
+    method: &str,
+    uri: &str,
+    _: Option<()>,
+) -> (u16, serde_json::Value) {
+    use tower::ServiceExt;
+    let response = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("authorization", "Bearer hub-token")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status().as_u16();
+    let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+    )
+}
+
+#[tokio::test]
+async fn only_the_hubs_own_token_is_handed_a_sign_in_and_only_once_a_minute() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = Arc::new(MemoryKeys::default());
+        let d = desk(pool.clone(), account_options(dir.path(), keys)).await;
+        let work = paste(&d, "Work", GOOD, true).await;
+        let uri = format!("/api/desk/accounts/{work}/hand-over");
+
+        // A signed-in administrator (a system-admin JWT) is refused, and
+        // being refused uses up nothing.
+        let admin =
+            crate::api::sessions_router(d.clone(), crate::testing::identified("acme-admin"));
+        let (code, body) = api(&admin, "POST", &uri, None).await;
+        assert_eq!(code, 403, "{body}");
+        assert!(body.get("token").is_none(), "{body}");
+
+        // The hub's own token is handed it, once.
+        let gateway = crate::api::sessions_router(d.clone(), crate::testing::allow_all());
+        let (code, body) = api(&gateway, "POST", &uri, None).await;
+        assert_eq!(code, 200, "{body}");
+        assert_eq!(body["token"], GOOD);
+        let (code, body) = api(&gateway, "POST", &uri, None).await;
+        assert_eq!(code, 429, "{body}");
+        assert!(
+            body["error"].as_str().unwrap().contains("a minute"),
+            "{body}"
+        );
+        assert!(body.get("token").is_none(), "{body}");
+
+        // Another account has its own minute.
+        let personal = paste(&d, "Personal", OTHER, false).await;
+        let (code, _) = api(
+            &gateway,
+            "POST",
+            &format!("/api/desk/accounts/{personal}/hand-over"),
+            None,
+        )
+        .await;
+        assert_eq!(code, 200);
+    })
+    .await;
+}
