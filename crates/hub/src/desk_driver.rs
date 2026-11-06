@@ -94,6 +94,20 @@ impl Authorize for SystemAdmins {
             _ => Err(StatusCode::UNAUTHORIZED),
         }
     }
+
+    fn is_hub_token(&self, headers: &HeaderMap) -> bool {
+        bearer_is(headers, &self.0.auth_token)
+    }
+}
+
+/// Whether `headers` carry exactly `token` as their bearer, compared in
+/// constant time; an empty token is never anyone's.
+fn bearer_is(headers: &HeaderMap, token: &str) -> bool {
+    headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .is_some_and(|given| crate::auth::constant_time_token_eq(given, token))
 }
 
 /// Voice keys from the vault alone: the provider's speech key at
@@ -731,6 +745,26 @@ pub async fn mount(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_the_hubs_own_token_itself_is_the_hub_token() {
+        let with = |v: &str| {
+            let mut h = axum::http::HeaderMap::new();
+            h.insert(axum::http::header::AUTHORIZATION, v.parse().unwrap());
+            h
+        };
+        assert!(super::bearer_is(&with("Bearer gw-secret"), "gw-secret"));
+        assert!(!super::bearer_is(&with("Bearer gw-secre"), "gw-secret"));
+        assert!(!super::bearer_is(
+            &with("Bearer eyJhbGciOi.jwt.admin"),
+            "gw-secret"
+        ));
+        assert!(!super::bearer_is(&with("gw-secret"), "gw-secret"));
+        assert!(!super::bearer_is(&with("Bearer "), ""));
+        assert!(!super::bearer_is(
+            &axum::http::HeaderMap::new(),
+            "gw-secret"
+        ));
+    }
 
     #[cfg(unix)]
     #[test]

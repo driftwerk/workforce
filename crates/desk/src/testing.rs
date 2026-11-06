@@ -22,6 +22,10 @@ impl Authorize for Bearer {
             _ => Err(StatusCode::UNAUTHORIZED),
         }
     }
+
+    fn is_hub_token(&self, h: &HeaderMap) -> bool {
+        h.get("authorization").and_then(|v| v.to_str().ok()) == Some("Bearer hub-token")
+    }
 }
 
 /// Holds no voice keys.
@@ -56,6 +60,11 @@ impl Authorize for Fixed {
         _: Option<&str>,
     ) -> Result<Option<String>, StatusCode> {
         self.0.clone()
+    }
+
+    /// Everyone let in without a name stands for the hub's own token.
+    fn is_hub_token(&self, _: &HeaderMap) -> bool {
+        matches!(self.0, Ok(None))
     }
 }
 

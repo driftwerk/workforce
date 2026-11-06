@@ -40,6 +40,14 @@ pub trait Authorize: Send + Sync {
         headers: &HeaderMap,
         query_token: Option<&str>,
     ) -> Result<Option<String>, StatusCode>;
+
+    /// Whether the request's bearer is the hub's own gateway token itself,
+    /// compared in constant time: what an account's sign-in is handed to,
+    /// and nothing else (not a system administrator's sign-in).
+    fn is_hub_token(&self, headers: &HeaderMap) -> bool {
+        let _ = headers;
+        false
+    }
 }
 
 struct ApiState {
@@ -412,18 +420,12 @@ async fn hand_over_account(
         )
             .into_response();
     }
-    match s.auth.authorize(&h, None).await {
-        Ok(None) => {}
-        Ok(Some(_)) => {
-            return (
-                StatusCode::FORBIDDEN,
-                Json(json!({"error": "a sign-in is handed over only to the hub's own token"})),
-            )
-                .into_response();
-        }
-        Err(status) => {
-            return (status, Json(json!({ "error": "not allowed" }))).into_response();
-        }
+    if !s.auth.is_hub_token(&h) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "a sign-in is handed over only to the hub's own token"})),
+        )
+            .into_response();
     }
     {
         let now = std::time::Instant::now();
