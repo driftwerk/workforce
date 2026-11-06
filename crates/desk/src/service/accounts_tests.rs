@@ -1168,3 +1168,38 @@ async fn switch_all_and_auto_switch_never_pick_an_account_whose_sign_in_cant_be_
     })
     .await;
 }
+
+#[tokio::test]
+async fn an_accounts_sign_in_is_handed_over_whole_and_said_nowhere_else() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = Arc::new(MemoryKeys::default());
+        let d = desk(pool.clone(), account_options(dir.path(), keys.clone())).await;
+        let work = paste(&d, "Work", GOOD, true).await;
+        let personal = paste(&d, "Personal", OTHER, false).await;
+
+        let handed = d.hand_over_account(work).await.unwrap();
+        assert_eq!(handed.token.expose(), GOOD);
+        assert_eq!((handed.name.as_str(), handed.is_default), ("Work", true));
+        // Its wire shape carries the token; its Debug never does.
+        let wire = serde_json::to_value(&handed).unwrap();
+        assert_eq!(wire["token"], GOOD);
+        assert_eq!(wire["engine"], "claude");
+        assert_eq!(wire["isDefault"], true);
+        assert!(!format!("{handed:?}").contains("sk-ant"), "{handed:?}");
+        let other = d.hand_over_account(personal).await.unwrap();
+        assert_eq!((other.token.expose(), other.is_default), (OTHER, false));
+
+        // Handing over moves nothing: the account and its token stay here.
+        assert_eq!(keys.get(work).unwrap().unwrap().expose(), GOOD);
+        assert!(d.accounts().iter().any(|a| a.id == work && a.signed_in));
+
+        // Gone from the store: said, never an empty token.
+        keys.delete(personal).unwrap();
+        let gone = d.hand_over_account(personal).await.unwrap_err();
+        assert!(gone.to_string().contains("add the account again"), "{gone}");
+        // No such account.
+        assert!(d.hand_over_account(Uuid::new_v4()).await.is_err());
+    })
+    .await;
+}

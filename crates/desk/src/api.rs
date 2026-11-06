@@ -387,6 +387,38 @@ async fn remove_account(State(s): S, h: HeaderMap, Query(q): Q, Path(id): Path<U
         .into_response()
 }
 
+/// An account's sign-in, for Desk's native side to copy to one of the
+/// person's machines over its SSH connection: admin only, from the
+/// `Authorization` header alone (never a token in the address, which logs
+/// keep), and never kept by anything between (`no-store`). Desk's page
+/// can't ask it: it isn't on the broker's list.
+async fn hand_over_account(
+    State(s): S,
+    h: HeaderMap,
+    Query(q): Q,
+    Path(id): Path<Uuid>,
+) -> Response {
+    if q.token.is_some() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "a sign-in is handed over only to a token in the Authorization header"})),
+        )
+            .into_response();
+    }
+    guarded!(s, h, q);
+    match s.desk.hand_over_account(id).await {
+        Ok(handed) => (
+            [
+                (axum::http::header::CACHE_CONTROL, "no-store"),
+                (axum::http::header::PRAGMA, "no-cache"),
+            ],
+            Json(handed),
+        )
+            .into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
 /// "OK" on a sign-in problem the person has dealt with.
 async fn dismiss_problem(State(s): S, h: HeaderMap, Query(q): Q, Path(id): Path<Uuid>) -> Response {
     guarded!(s, h, q);
@@ -1293,6 +1325,7 @@ pub fn sessions_router(desk: Desk, auth: Arc<dyn Authorize>) -> Router {
             "/api/desk/accounts/{id}",
             patch(update_account).delete(remove_account),
         )
+        .route("/api/desk/accounts/{id}/hand-over", post(hand_over_account))
         .route("/api/desk/accounts/sign-ins/{id}/code", post(sign_in_code))
         .route(
             "/api/desk/accounts/sign-ins/{id}/direct",
@@ -1818,6 +1851,91 @@ mod tests {
             status,
             serde_json::from_slice(&bytes).unwrap_or(Value::Null),
         )
+    }
+
+    #[tokio::test]
+    async fn an_accounts_sign_in_is_handed_over_to_the_admin_alone_and_never_kept() {
+        use std::os::unix::fs::PermissionsExt;
+        with_test_pool(build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            // A Claude Code that signs in by a "good" token.
+            let cli = dir.path().join("claude");
+            std::fs::write(
+                &cli,
+                "#!/bin/sh\ncase \"$1 $2\" in\n'--version ') echo '2.1.300 (Claude Code)' ;;\n\
+                 'auth status') t=$(cat <&3 2>/dev/null); case \"$t\" in sk-ant-oat01-good*) echo '{\"loggedIn\":true,\"authMethod\":\"oauth_token\"}' ;; *) echo '{\"loggedIn\":false}' ;; esac ;;\nesac\n",
+            )
+            .unwrap();
+            std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+            DeskStore::migrate(&pool).await.unwrap();
+            let mut opts = options(dir.path());
+            opts.programs.insert(crate::engine::Engine::Claude, cli);
+            opts.account_keys = Some(std::sync::Arc::new(
+                crate::engine_accounts::MemoryKeys::default(),
+            ));
+            let desk = crate::Desk::start(
+                DeskStore::from_pool(pool),
+                opts,
+                Default::default(),
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            let token = "sk-ant-oat01-good-0123456789abcdefghijklmnopqrstuvwxyz";
+            let id = match desk
+                .add_account(crate::engine_accounts::NewAccount {
+                    engine: crate::engine::Engine::Claude,
+                    name: "Work".into(),
+                    token: Some(token.into()),
+                    make_default: true,
+                    remote: false,
+                })
+                .await
+                .unwrap()
+            {
+                crate::service::Added::Account { account } => account.id,
+                crate::service::Added::SignIn { .. } => unreachable!(),
+            };
+            let path = format!("/api/desk/accounts/{id}/hand-over");
+
+            // Not the admin: refused.
+            let denied = super::sessions_router(desk.clone(), crate::testing::deny_all());
+            let (status, body) = call(&denied, "POST", &path, None).await;
+            assert!(status == 401 || status == 403, "{status}");
+            assert!(!body.to_string().contains("sk-ant"), "{body}");
+
+            let app = super::sessions_router(desk.clone(), allow_all());
+            // A token in the address (which logs keep) is never answered.
+            let (status, body) = call(&app, "POST", &format!("{path}?token=x"), None).await;
+            assert_eq!(status, 400, "{body}");
+            assert!(!body.to_string().contains("sk-ant"), "{body}");
+            // Only POST.
+            let (status, _) = call(&app, "GET", &path, None).await;
+            assert_eq!(status, 405);
+
+            // The admin: the whole token, never kept on the way.
+            use tower::ServiceExt;
+            let res = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri(&path)
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(res.status().as_u16(), 200);
+            assert_eq!(res.headers()["cache-control"], "no-store");
+            let bytes = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+            let body: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body, json!({"engine": "claude", "name": "Work", "isDefault": true, "token": token}));
+            // The list still never says it.
+            let (_, listed) = call(&app, "GET", "/api/desk/accounts", None).await;
+            assert!(!listed.to_string().contains("sk-ant"), "{listed}");
+        })
+        .await;
     }
 
     #[tokio::test]
