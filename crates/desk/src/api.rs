@@ -1104,13 +1104,18 @@ async fn rooms(State(s): S, h: HeaderMap, Query(q): Q) -> Response {
 
 async fn create_room(State(s): S, h: HeaderMap, Query(q): Q, Json(new): Json<NewRoom>) -> Response {
     guarded!(s, h, q);
-    let asks = s.desk.room_asks(None, &new.members, &new.share_with);
+    let asks = s.desk.room_asks(
+        None,
+        Some(new.group.as_deref()),
+        &new.members,
+        &new.share_with,
+    );
     room_saved(s.desk.create_room(new).await, asks)
 }
 
-/// A room saved, or why not: a room whose conversation would go to a hub
-/// the person hasn't agreed to is a `409` naming those hubs, for Desk to
-/// ask about once.
+/// A room saved, or why not: a room of a group with a boss whose
+/// conversation would go to a hub the person hasn't agreed to is a `409`
+/// naming those hubs, for Desk to ask about once.
 fn room_saved(saved: Result<crate::rooms::Room, DeskError>, asks: Vec<String>) -> Response {
     match saved {
         Err(DeskError::Conflict(why)) if !asks.is_empty() => (
@@ -1131,7 +1136,12 @@ async fn update_room(
 ) -> Response {
     guarded!(s, h, q);
     let asks = match &p.members {
-        Some(members) => s.desk.room_asks(Some(id), members, &p.share_with),
+        Some(members) => s.desk.room_asks(
+            Some(id),
+            p.group.as_ref().map(|g| g.as_deref()),
+            members,
+            &p.share_with,
+        ),
         None => Vec::new(),
     };
     room_saved(s.desk.update_room(id, p).await, asks)

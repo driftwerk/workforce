@@ -45,9 +45,14 @@ fn bosses() -> Vec<Boss> {
 /// Acme and Atlas, each with a boss; Infra with none.
 async fn groups(d: &Desk) {
     d.change_layout(|l| {
-        l.create("acme", "Acme", &["agent:local/scout".into()], None)?
-            .create("atlas", "Atlas", &["agent:atlas-hub/ada".into()], None)?
-            .create("infra", "Infra", &["agent:local/infra-bot".into()], None)
+        l.create(
+            "acme",
+            "Acme",
+            &["agent:local/scout".into(), "agent:acme-hub/zed".into()],
+            None,
+        )?
+        .create("atlas", "Atlas", &["agent:atlas-hub/ada".into()], None)?
+        .create("infra", "Infra", &["agent:local/infra-bot".into()], None)
     })
     .await
     .unwrap();
@@ -228,7 +233,8 @@ fn member(hub: &str, agent: &str) -> Member {
 }
 
 #[tokio::test]
-async fn a_room_keeps_to_its_group_and_asks_once_before_its_talk_goes_to_a_new_hub() {
+async fn a_room_keeps_to_its_group_and_a_bossed_groups_room_asks_once_before_its_talk_goes_to_a_new_hub(
+) {
     with_test_pool(build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
         let d = desk(pool, dir.path()).await;
@@ -301,55 +307,70 @@ async fn a_room_keeps_to_its_group_and_asks_once_before_its_talk_goes_to_a_new_h
             .await,
             Err(DeskError::Invalid(_))
         ));
-        // An agent of another hub: asked about once.
-        let mixed = vec![member("local", "infra-bot"), member("other-hub", "zed")];
-        assert_eq!(d.room_asks(Some(open.id), &mixed, &[]), ["other-hub"]);
+        // An ungrouped room mixes hubs as before: nothing is asked.
+        let mixed = vec![member("local", "infra-bot"), member("other-hub", "x")];
+        assert!(d.room_asks(Some(open.id), None, &mixed, &[]).is_empty());
+        d.update_room(
+            open.id,
+            RoomPatch {
+                members: Some(mixed.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        d.create_room(NewRoom {
+            name: "Mixed from the start".into(),
+            members: mixed,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        // A bossed group's room: a new hub of its own agents is asked about once.
+        let acme_mixed = vec![member("local", "scout"), member("acme-hub", "zed")];
+        assert_eq!(
+            d.room_asks(Some(acme_room.id), None, &acme_mixed, &[]),
+            ["acme-hub"]
+        );
         match d
             .update_room(
-                open.id,
+                acme_room.id,
                 RoomPatch {
-                    members: Some(mixed.clone()),
+                    members: Some(acme_mixed.clone()),
                     ..Default::default()
                 },
             )
             .await
         {
-            Err(DeskError::Conflict(why)) => assert!(why.contains("other-hub"), "{why}"),
+            Err(DeskError::Conflict(why)) => assert!(why.contains("acme-hub"), "{why}"),
             other => panic!("{other:?}"),
         }
         let shared = d
             .update_room(
-                open.id,
+                acme_room.id,
                 RoomPatch {
-                    members: Some(mixed.clone()),
-                    share_with: vec!["other-hub".into()],
+                    members: Some(acme_mixed.clone()),
+                    share_with: vec!["acme-hub".into()],
                     ..Default::default()
                 },
             )
             .await
             .unwrap();
-        assert_eq!(shared.shared_with, ["local", "other-hub"]);
+        assert_eq!(shared.shared_with, ["acme-hub", "local"]);
         // Gone and back again: not asked again.
-        d.update_room(
-            open.id,
-            RoomPatch {
-                members: Some(vec![member("local", "infra-bot")]),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
-        d.update_room(
-            open.id,
-            RoomPatch {
-                members: Some(mixed),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
-        let kept = d.store().room(open.id).await.unwrap().unwrap();
-        assert_eq!(kept.shared_with, ["local", "other-hub"]);
+        for members in [vec![member("local", "scout")], acme_mixed] {
+            d.update_room(
+                acme_room.id,
+                RoomPatch {
+                    members: Some(members),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        }
+        let kept = d.store().room(acme_room.id).await.unwrap().unwrap();
+        assert_eq!(kept.shared_with, ["acme-hub", "local"]);
         assert!(matches!(
             d.update_room(
                 open.id,

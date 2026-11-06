@@ -2940,10 +2940,12 @@ impl Desk {
     /// `room` as it may be saved, its members having been `before`: its
     /// group is one of the sidebar's, everyone in it may join a room of
     /// that group (a bossed group's room takes only its own agents, and a
-    /// bossed group's agents join only its rooms), and the person agreed to
-    /// every hub its conversation goes to that it didn't go to before, by
-    /// `share_with` now or once before. Refused with a conflict naming the
-    /// hubs to ask about.
+    /// bossed group's agents join only its rooms), and, for a room of a
+    /// group with a boss, the person agreed to every hub its conversation
+    /// goes to that it didn't go to before, by `share_with` now or once
+    /// before (refused with a conflict naming the hubs to ask about). Any
+    /// other room mixes hubs as before: asking about them everywhere waits
+    /// for Desk to ask (BD9).
     fn room_bounded(
         &self,
         mut room: Room,
@@ -2971,7 +2973,11 @@ impl Desk {
         }
         let mut shared = room.shared_with.clone();
         shared.extend(share_with.iter().cloned());
-        let asks = crate::scope::unshared_hubs(before, &room.members, &shared);
+        let bossed_room = room.group.as_ref().is_some_and(|g| bossed.contains(g));
+        let asks = match bossed_room {
+            true => crate::scope::unshared_hubs(before, &room.members, &shared),
+            false => Vec::new(),
+        };
         if !asks.is_empty() {
             return Err(DeskError::Conflict(room_shares(&asks)));
         }
@@ -2982,18 +2988,25 @@ impl Desk {
         Ok(room)
     }
 
-    /// The hubs a room with `members`, having had `before`, would go to that
-    /// the person hasn't agreed to: what the `409` asks about.
+    /// The hubs a room of `group` (`None`: the room's own, or none) with
+    /// `members` would go to that the person hasn't agreed to: what the
+    /// `409` asks about. Only a room of a group with a boss asks.
     pub fn room_asks(
         &self,
         id: Option<Uuid>,
+        group: Option<Option<&str>>,
         members: &[Member],
         share_with: &[String],
     ) -> Vec<String> {
-        let (before, mut shared) = id
-            .and_then(|id| self.room(id))
-            .map(|r| (r.members, r.shared_with))
-            .unwrap_or_default();
+        let room = id.and_then(|id| self.room(id));
+        let group = match group {
+            Some(g) => g.map(str::to_string),
+            None => room.as_ref().and_then(|r| r.group.clone()),
+        };
+        if !group.is_some_and(|g| self.bossed().contains(&g)) {
+            return Vec::new();
+        }
+        let (before, mut shared) = room.map(|r| (r.members, r.shared_with)).unwrap_or_default();
         shared.extend(share_with.iter().cloned());
         crate::scope::unshared_hubs(&before, members, &shared)
     }
