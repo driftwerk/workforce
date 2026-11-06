@@ -12913,7 +12913,9 @@ mod tests {
             })
             .collect();
         assert!(
-            retried.iter().any(|t| t.contains("we talked about it previously")),
+            retried
+                .iter()
+                .any(|t| t.contains("we talked about it previously")),
             "the follow-up is in the retried call: {retried:?}"
         );
         assert_eq!(

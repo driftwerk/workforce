@@ -12259,7 +12259,10 @@ oauth_system_prefix = ""
         let absent: WorkforceConfig = toml::from_str("").unwrap();
         assert!(absent.llm.retry.is_none());
         let defaults = RetryConfig::default();
-        assert_eq!(defaults.first_token_timeout_secs, None, "the provider's default");
+        assert_eq!(
+            defaults.first_token_timeout_secs, None,
+            "the provider's default"
+        );
         assert_eq!(defaults.stall_timeout_secs, 180);
         assert_eq!(defaults.request_timeout_secs, 300);
         assert!(defaults.model_timeouts.is_empty());

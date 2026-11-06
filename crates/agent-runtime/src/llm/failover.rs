@@ -234,7 +234,11 @@ impl LlmTimeouts {
     /// Resolved streaming watchdog windows for `model` on `provider`. The
     /// first token: the model's override, the provider's, the global value,
     /// else the provider's default.
-    pub fn stream_timeouts_on(&self, provider: Option<ProviderKind>, model: &str) -> StreamTimeouts {
+    pub fn stream_timeouts_on(
+        &self,
+        provider: Option<ProviderKind>,
+        model: &str,
+    ) -> StreamTimeouts {
         let first = self
             .window(provider, model, |o| o.first_token_timeout_secs)
             .or(self.first_token_timeout_secs)
@@ -4037,7 +4041,9 @@ mod tests {
     fn first_token_waits_by_model_then_provider_then_global_then_the_plan() {
         let plain = LlmTimeouts::default();
         assert_eq!(
-            plain.stream_timeouts_on(Some(ProviderKind::ChatGpt), "gpt-6.1-sol").first_token,
+            plain
+                .stream_timeouts_on(Some(ProviderKind::ChatGpt), "gpt-6.1-sol")
+                .first_token,
             Duration::from_secs(SUBSCRIPTION_FIRST_TOKEN_SECS)
         );
         assert_eq!(
@@ -4050,7 +4056,9 @@ mod tests {
             "the pool's provider applies to every model it is asked for"
         );
         assert_eq!(
-            plain.stream_timeouts_on(Some(ProviderKind::Anthropic), "claude-sonnet-5").first_token,
+            plain
+                .stream_timeouts_on(Some(ProviderKind::Anthropic), "claude-sonnet-5")
+                .first_token,
             Duration::from_secs(default_first_token_timeout_secs())
         );
         let global = LlmTimeouts {
@@ -4058,7 +4066,9 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            global.stream_timeouts_on(Some(ProviderKind::ChatGpt), "gpt-6.1-sol").first_token,
+            global
+                .stream_timeouts_on(Some(ProviderKind::ChatGpt), "gpt-6.1-sol")
+                .first_token,
             Duration::from_secs(30),
             "a global value someone set applies to every provider"
         );
