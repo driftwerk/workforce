@@ -28,16 +28,19 @@ fn bosses() -> Vec<Boss> {
             agent: "desk".into(),
             name: "Desk".into(),
             scope: Scope::Ungrouped,
+            level: "act".into(),
         },
         Boss {
             agent: "sarah".into(),
             name: "Sarah".into(),
             scope: acme(),
+            level: "act".into(),
         },
         Boss {
             agent: "mia".into(),
             name: "Mia".into(),
             scope: Scope::Group("atlas".into()),
+            level: "act".into(),
         },
     ]
 }

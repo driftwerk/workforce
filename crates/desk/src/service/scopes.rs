@@ -21,6 +21,8 @@ pub struct Boss {
     pub agent: String,
     pub name: String,
     pub scope: Scope,
+    /// `watch`, `suggest` or `act`.
+    pub level: String,
 }
 
 #[derive(Debug, Default)]
@@ -126,6 +128,11 @@ impl Desk {
             .unwrap_or_default();
     }
 
+    /// Keeps the boundaries as they are now, for the next start.
+    pub async fn keep_boundaries(&self) {
+        self.scopes_keep().await;
+    }
+
     async fn scopes_keep(&self) {
         let (bounded, opened) = {
             let s = self.0.scopes.lock();
@@ -196,6 +203,7 @@ impl Desk {
                 agent: o.id,
                 name: o.name,
                 scope: Scope::Ungrouped,
+                level: o.level,
             })
             .into_iter()
             .collect()
@@ -213,6 +221,12 @@ impl Desk {
                 )
             })
             .collect()
+    }
+
+    /// The group the agent `id` counts in: an overseer's scope's, wherever
+    /// it sits; another agent's sidebar group's.
+    pub fn group_of_agent(&self, id: &str) -> Option<String> {
+        self.0.scopes.lock().party_group(&Party::agent(id, id))
     }
 
     /// The boss of `scope`, when it has one.

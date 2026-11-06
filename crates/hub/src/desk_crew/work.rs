@@ -10,7 +10,6 @@
 //! can as it appears, but never one the person released; and the sessions
 //! a boss that no longer oversees ran pass to the one that does.
 
-use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use uuid::Uuid;
@@ -19,6 +18,7 @@ use workforce_desk::charge::{self, Wheel};
 use workforce_desk::crew::{By, Event, Kind, Party, PartyKind};
 
 use super::{name_of, CrewHub};
+use crate::serve::AgentService;
 
 /// What a work turn's prompt starts with: the person never typed it.
 pub const WORK: &str = "[Desk work]";
@@ -62,7 +62,8 @@ impl CrewHub {
             return None;
         }
         let session: Uuid = subject.id.parse().ok()?;
-        let (service, o) = self.overseer_service()?;
+        // Only the overseer of its scope runs it.
+        let (service, o) = self.overseer_of_session(session)?;
         if o.level == Level::Watch || !self.runs(session, service.agent_id.as_str()) {
             return None;
         }
@@ -100,22 +101,26 @@ impl CrewHub {
     /// it and has its wheel (it may have been let go, or the person taken
     /// over, while its turn's end waited).
     pub(crate) fn still_works(&self, session: Uuid) -> bool {
-        self.overseer_service().is_some_and(|(s, o)| {
+        self.overseer_of_session(session).is_some_and(|(s, o)| {
             o.level != Level::Watch
                 && self.runs(session, s.agent_id.as_str())
                 && self.desk.wheel_of(session) == Some(Wheel::Boss)
         })
     }
 
-    /// Spends one of the hour's work turns if there is one left. When none
+    /// Spends one of the hour's work turns of the overseer that runs
+    /// `session` if it has one left: each overseer's are its own. When none
     /// is, the person is told once that the overseer is pacing itself.
-    pub(crate) fn spend_work_turn(&self) -> bool {
-        let Some((service, o)) = self.overseer_service() else {
+    pub(crate) fn spend_work_turn(&self, session: Uuid) -> bool {
+        let Some((service, o)) = self.overseer_of_session(session) else {
             return false;
         };
         let max = o.work.max_turns_per_hour;
         let hour = self.timing.minute * 60;
-        let mut run = self.work.lock();
+        let mut runs = self.work.lock();
+        let run = runs
+            .entry(service.agent_id.as_str().to_string())
+            .or_default();
         if spend(&mut run.turns, Instant::now(), hour, max) {
             run.told = false;
             return true;
@@ -151,47 +156,85 @@ impl CrewHub {
         )
     }
 
-    /// Takes on every session it can, when the overseer is set to and may
-    /// act; and passes the sessions a boss no longer overseeing ran to the
-    /// one that does, or lets them go where they can't be run any more.
-    /// Nothing, until Desk knows which sessions bosses run.
+    /// Takes on every session it can, for each overseer set to and that
+    /// may act, each in its own scope; and passes the sessions a boss no
+    /// longer overseeing ran to the overseer of their scope now, or lets
+    /// them go where they can't be run any more. (A session moved out of its
+    /// boss's scope is let go as it moves.) Nothing, until Desk knows which
+    /// sessions bosses run.
     pub(crate) async fn take_on_all(&self) {
-        let Some((service, o)) = self.overseer_service() else {
-            return;
-        };
-        // Watching only, it runs nothing.
-        if o.level == Level::Watch || !self.desk.charges_loaded() {
+        if !self.desk.charges_loaded() {
             return;
         }
-        let boss = Party::manager(service.agent_id.as_str(), &name_of(&service));
-        let none = HashSet::new();
-        let by = |why: &str| By::manager(&boss.id, &boss.name, why);
-        for c in self
-            .desk
-            .charges()
-            .into_iter()
-            .filter(|c| c.boss != boss.id)
-        {
-            let by = by("Its boss no longer oversees.");
-            if let Err(e) = self.desk.pass_charge(c.session, &boss, &none, &by).await {
-                tracing::info!(session = %c.session, error = %e, "a session wasn't passed on");
-            }
-        }
-        if o.level != Level::Act || o.work.take_on != TakeOn::All {
-            return;
-        }
-        for s in self.desk.list() {
-            let existing = self.desk.charge_of(s.id);
-            if !charge::takes_automatically(true, &s, existing.as_ref(), &none) {
+        let overseers = self.overseers();
+        let bossed = self.desk.bossed();
+        let party = |s: &AgentService| Party::manager(s.agent_id.as_str(), &name_of(s));
+        for c in self.desk.charges() {
+            let group = self
+                .desk
+                .view(c.session)
+                .ok()
+                .and_then(|v| v.group.map(|g| g.id));
+            let its = overseers
+                .iter()
+                .find(|(_, o)| workforce_desk::scope::sees(&o.scope, group.as_deref(), &bossed));
+            let boss_of_its_scope = its.is_some_and(|(s, _)| s.agent_id.as_str() == c.boss);
+            if boss_of_its_scope {
                 continue;
             }
-            let by = by("The person lets me take on every session.");
-            if let Err(e) = self
-                .desk
-                .take_on(s.id, &boss, charge::How::Taken, &none, &by)
-                .await
-            {
-                tracing::info!(session = %s.id, error = %e, "a session wasn't taken on");
+            // In a group that has become another boss's boundary: its boss
+            // lets it go. (One not in a group yet is being placed.)
+            let boss_scope = overseers
+                .iter()
+                .find(|(s, _)| s.agent_id.as_str() == c.boss)
+                .map(|(_, o)| o.scope.clone());
+            if let (Some(g), Some(scope)) = (group.as_deref(), &boss_scope) {
+                if bossed.contains(g) && scope.group() != Some(g) {
+                    let by = By::manager(
+                        &c.boss,
+                        &c.boss_name,
+                        "Its group has a boss of its own now.",
+                    );
+                    if let Err(e) = self.desk.release(c.session, &by).await {
+                        tracing::info!(session = %c.session, error = %e, "a session wasn't let go");
+                    }
+                    continue;
+                }
+            }
+            let still_boss = overseers.iter().any(|(s, _)| s.agent_id.as_str() == c.boss);
+            // Its boss no longer oversees: passed on, within its scope, by
+            // an overseer that acts.
+            if let Some((s, o)) = its.filter(|(_, o)| !still_boss && o.level != Level::Watch) {
+                let boss = party(s);
+                let by = By::manager(&boss.id, &boss.name, "Its boss no longer oversees.");
+                if let Err(e) = self.desk.pass_charge(c.session, &boss, &o.scope, &by).await {
+                    tracing::info!(session = %c.session, error = %e, "a session wasn't passed on");
+                }
+            }
+        }
+        for (service, o) in &overseers {
+            // Watching only, it runs nothing.
+            if o.level != Level::Act || o.work.take_on != TakeOn::All {
+                continue;
+            }
+            let boss = party(service);
+            for s in self.desk.list() {
+                let existing = self.desk.charge_of(s.id);
+                if !charge::takes_automatically(true, &s, existing.as_ref(), &o.scope, &bossed) {
+                    continue;
+                }
+                let by = By::manager(
+                    &boss.id,
+                    &boss.name,
+                    "The person lets me take on every session.",
+                );
+                if let Err(e) = self
+                    .desk
+                    .take_on(s.id, &boss, charge::How::Taken, &o.scope, &by)
+                    .await
+                {
+                    tracing::info!(session = %s.id, error = %e, "a session wasn't taken on");
+                }
             }
         }
     }

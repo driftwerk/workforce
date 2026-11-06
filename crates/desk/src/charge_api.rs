@@ -1,7 +1,6 @@
 //! Charges over HTTP, for the person: which boss runs which session,
 //! handing one to the boss and taking it back, and the wheel.
 
-use std::collections::HashSet;
 use std::sync::Arc;
 
 use axum::extract::{Path, Query, State};
@@ -63,7 +62,9 @@ async fn hand(
 ) -> Response {
     guarded!(s, h, q);
     let Json(b) = body.unwrap_or_default();
-    let Some(boss) = s.desk.boss() else {
+    // Its scope's boss runs it, and no other.
+    let group = s.desk.view(id).ok().and_then(|v| v.group.map(|g| g.id));
+    let Some(boss) = s.desk.boss_of(&s.desk.scope_of_group(group.as_deref())) else {
         return DeskError::Conflict("No agent oversees the crew to hand it to.".into())
             .into_response();
     };
@@ -74,16 +75,16 @@ async fn hand(
         ))
         .into_response();
     }
-    if b.boss.as_deref().is_some_and(|wanted| wanted != boss.id) {
+    if b.boss.as_deref().is_some_and(|wanted| wanted != boss.agent) {
         return DeskError::Conflict(format!(
-            "{} runs the sessions on this Desk; hand it to them.",
+            "{} runs the sessions here; hand it to them.",
             boss.name
         ))
         .into_response();
     }
-    let party = Party::manager(&boss.id, &boss.name);
+    let party = Party::manager(&boss.agent, &boss.name);
     s.desk
-        .take_on(id, &party, How::Handed, &HashSet::new(), &By::you())
+        .take_on(id, &party, How::Handed, &boss.scope, &By::you())
         .await
         .map(Json)
         .into_response()

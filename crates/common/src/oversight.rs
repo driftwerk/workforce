@@ -5,6 +5,7 @@
 //! ```toml
 //! [oversight]
 //! enabled = true
+//! group = "g-acme" # absent: everything ungrouped
 //! level = "watch" # watch | suggest | act
 //! track = { crew = true, desk_sessions = true, external_sessions = true, workspaces = false }
 //! wake = { waiting_minutes = 5, quiet_minutes = 30, remind_minutes = 120, on_finish = true, on_failure = true, on_message = true }
@@ -14,6 +15,11 @@
 //! act = { nudge = true, resume_restart = true, read_only_approvals = false, hand_out_work = false, interrupt = false, message_agents = false, message_terminal_sessions = false, answer_sessions = true }
 //! work = { prefer_sessions = true, parallel = 4, take_on = "handed", engine = "claude", max_turns_per_hour = 60 }
 //! ```
+//!
+//! `group` is the sidebar group it oversees, as that group's boss: it sees
+//! only that group, and the main overseer (no `group`) sees nothing inside
+//! it. One agent oversees each scope; Desk checks the group is one of the
+//! sidebar's.
 //!
 //! `[oversight.work]` is how it runs sessions for the person: the sessions
 //! in its charge (handed to it, or every one with `take_on = "all"`) wake
@@ -45,6 +51,7 @@
 
 use serde::Serialize;
 use toml::Value;
+pub use workforce_core::scope::Scope;
 
 /// How much an overseer does on its own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
@@ -166,6 +173,8 @@ pub const MAX_WORK_TURNS_PER_HOUR: i64 = 600;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Oversight {
     pub enabled: bool,
+    /// What it oversees: everything ungrouped, or one sidebar group.
+    pub scope: Scope,
     pub level: Level,
     pub track: Track,
     pub wake: Wake,
@@ -178,6 +187,9 @@ pub struct Oversight {
     pub work: Work,
 }
 
+/// What the group it oversees is said wrongly as.
+pub const NOT_A_GROUP: &str = "The group it oversees must be one of your sidebar's groups.";
+
 /// The longest a minute threshold may be: a day.
 pub const MAX_MINUTES: i64 = 1440;
 /// The most check-ins a day may allow.
@@ -189,6 +201,7 @@ impl Default for Oversight {
     fn default() -> Self {
         Self {
             enabled: false,
+            scope: Scope::Ungrouped,
             level: Level::Watch,
             track: Track {
                 crew: true,
@@ -318,6 +331,14 @@ impl Oversight {
                 )
             }
         };
+        let scope = match root.and_then(|t| t.get("group")) {
+            None => Scope::Ungrouped,
+            Some(Value::String(g)) if g.trim() == "ungrouped" => Scope::Ungrouped,
+            Some(Value::String(g)) if !g.trim().is_empty() && g.trim().len() <= 100 => {
+                Scope::Group(g.trim().to_string())
+            }
+            Some(_) => return Err(NOT_A_GROUP.into()),
+        };
         let track = table(root.and_then(|t| t.get("track")), "what it keeps an eye on")?;
         let wake = table(root.and_then(|t| t.get("wake")), "when it speaks up")?;
         let summaries = table(root.and_then(|t| t.get("summaries")), "the summaries")?;
@@ -366,6 +387,7 @@ impl Oversight {
         };
         Ok(Self {
             enabled: switch(root, "enabled", d.enabled, "overseeing the crew")?,
+            scope,
             level,
             track: Track {
                 crew: switch(track, "crew", d.track.crew, "watching your agents")?,
@@ -549,6 +571,29 @@ mod tests {
             parse("[oversight]\nwake = { on_message = 1 }\n").unwrap_err(),
             "Whether answering when a session asks it something is on or off must be true or false."
         );
+    }
+
+    #[test]
+    fn the_group_it_oversees_is_one_groups_id_or_everything_ungrouped() {
+        assert_eq!(
+            parse("[oversight]\nenabled = true\n").unwrap().scope,
+            Scope::Ungrouped
+        );
+        assert_eq!(
+            parse("[oversight]\ngroup = \" g-acme \"\n").unwrap().scope,
+            Scope::Group("g-acme".into())
+        );
+        assert_eq!(
+            parse("[oversight]\ngroup = \"ungrouped\"\n").unwrap().scope,
+            Scope::Ungrouped
+        );
+        for bad in ["group = \"\"", "group = 3", "group = [\"g-acme\"]"] {
+            assert_eq!(
+                parse(&format!("[oversight]\n{bad}\n")).unwrap_err(),
+                NOT_A_GROUP,
+                "{bad}"
+            );
+        }
     }
 
     #[test]

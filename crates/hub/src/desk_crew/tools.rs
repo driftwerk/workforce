@@ -1,8 +1,10 @@
-//! `crew.*`: the overseer's tools, registered for the overseeing agent
-//! alone. It reads the crew at every level; what it may do is gated by its
-//! level and `[oversight.act]` (see [`super::actions`]): at `suggest`, and
-//! for anything not allowed, an action becomes a suggestion the person
-//! accepts or dismisses in Desk.
+//! `crew.*`: the overseer's tools, registered for each overseeing agent
+//! alone, bound to the scope it oversees. It reads its scope at every
+//! level, and nothing outside it: every read is filtered by what its scope
+//! sees, and an action on an id outside it is refused before the gate.
+//! What it may do inside is gated by its level and `[oversight.act]` (see
+//! [`super::actions`]): at `suggest`, and for anything not allowed, an
+//! action becomes a suggestion the person accepts or dismisses in Desk.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Weak};
@@ -12,8 +14,12 @@ use async_trait::async_trait;
 use eyre::Result;
 use serde_json::{json, Value};
 use workforce_agent::tools::{Tool, ToolResult};
+use workforce_common::oversight::{Oversight, Scope};
 use workforce_desk::charge::Wheel;
-use workforce_desk::crew::{self, Filter, Item, ItemState};
+use workforce_desk::crew::{self, Item, ItemState};
+use workforce_desk::scope::Seen;
+
+use crate::serve::AgentService;
 
 use super::actions::{Action, Gate};
 use super::watcher::reported;
@@ -47,20 +53,44 @@ pub const ACT: [&str; 14] = [
 pub struct CrewTool {
     name: &'static str,
     crew: Weak<CrewHub>,
+    /// The overseer it is registered for.
+    agent: String,
+    /// The scope that overseer oversees: all it reads and acts on.
+    scope: Scope,
 }
 
 impl CrewTool {
-    /// The tools an overseer at `level` has: the reading ones, and the
-    /// acting ones unless it only watches.
-    pub fn for_level(crew: &Arc<CrewHub>, watch_only: bool) -> Vec<Self> {
+    /// The tools the overseer `agent` of `scope` has at its level: the
+    /// reading ones, and the acting ones unless it only watches.
+    pub fn for_level(
+        crew: &Arc<CrewHub>,
+        agent: &str,
+        scope: &Scope,
+        watch_only: bool,
+    ) -> Vec<Self> {
         READ.iter()
             .chain(if watch_only { [].iter() } else { ACT.iter() })
             .map(|name| Self {
                 name,
                 crew: Arc::downgrade(crew),
+                agent: agent.to_string(),
+                scope: scope.clone(),
             })
             .collect()
     }
+
+    /// The scope it is bound to.
+    #[cfg(test)]
+    pub fn scope(&self) -> &Scope {
+        &self.scope
+    }
+}
+
+/// The overseer a tool runs for, and what its scope sees now.
+pub(super) struct Bound {
+    pub service: Arc<AgentService>,
+    pub oversight: Oversight,
+    pub seen: Seen,
 }
 
 fn reason_schema() -> Value {
@@ -193,22 +223,23 @@ fn table(items: &[Item], groups: &[String], charged: &Charged) -> String {
 }
 
 impl CrewTool {
-    async fn read(&self, crew: &Arc<CrewHub>, input: &Value) -> Result<Value, String> {
+    async fn read(&self, crew: &Arc<CrewHub>, b: &Bound, input: &Value) -> Result<Value, String> {
         let internal = |e: eyre::Report| {
             tracing::warn!(error = %e, "a crew tool failed");
             "The crew could not be read just now.".to_string()
         };
+        let seen = &b.seen;
         match self.name {
             "crew.overview" => {
                 let o = crew
                     .desk
-                    .overview(crew.as_ref(), None)
+                    .overview_for(crew.as_ref(), None, Some(seen))
                     .await
                     .map_err(internal)?;
-                let (boss, parallel) = crew
-                    .overseer_service()
-                    .map(|(s, o)| (s.agent_id.as_str().to_string(), o.work.parallel))
-                    .unwrap_or_default();
+                let (boss, parallel) = (
+                    b.service.agent_id.as_str().to_string(),
+                    b.oversight.work.parallel,
+                );
                 let charged: Charged = crew
                     .desk
                     .charges()
@@ -225,28 +256,24 @@ impl CrewTool {
             "crew.activity" => {
                 let limit = input["limit"].as_i64().unwrap_or(30).clamp(1, 100);
                 let subject = input["subject_id"].as_str().filter(|s| !s.is_empty());
-                let page = match subject {
-                    Some(id) => crew
-                        .desk
-                        .store()
-                        .events_since(
-                            chrono::Utc::now() - chrono::Duration::days(7),
-                            &[id.to_string()],
-                            limit,
-                            None,
-                        )
-                        .await
-                        .map(|mut e| {
-                            e.reverse();
-                            e
-                        }),
-                    None => crew
-                        .desk
-                        .activity(Filter::All, None, limit)
-                        .await
-                        .map(|p| p.events),
+                if let Some(id) = subject {
+                    crew.subject_seen(id, seen)?;
                 }
-                .map_err(internal)?;
+                let since = match subject {
+                    Some(_) => chrono::Utc::now() - chrono::Duration::days(7),
+                    None => chrono::Utc::now() - chrono::Duration::days(30),
+                };
+                let ids: Vec<String> = subject.map(str::to_string).into_iter().collect();
+                let page = crew
+                    .desk
+                    .store()
+                    .events_since(since, &ids, limit, Some(seen))
+                    .await
+                    .map(|mut e| {
+                        e.reverse();
+                        e
+                    })
+                    .map_err(internal)?;
                 let lines: Vec<String> = page
                     .iter()
                     .map(|e| {
@@ -279,10 +306,8 @@ impl CrewTool {
                     let id: uuid::Uuid = session
                         .parse()
                         .map_err(|_| "That isn’t a session id from crew.overview.".to_string())?;
-                    let v = crew
-                        .desk
-                        .view(id)
-                        .map_err(|_| "That session isn’t there any more.".to_string())?;
+                    crew.session_seen(id, seen)?;
+                    let v = crew.desk.view(id).map_err(|_| crew.not_ours(&self.scope))?;
                     let terminal = crew.desk.terminal_text(id, 3000).ok();
                     let said = json!({
                         "name": v.label(), "hub_name": v.name, "group": v.group.map(|g| g.name),
@@ -298,11 +323,7 @@ impl CrewTool {
                 let agent = input["agent_id"]
                     .as_str()
                     .ok_or("Say which agent or session.")?;
-                let service = crew
-                    .state
-                    .registry
-                    .get(agent)
-                    .ok_or_else(|| format!("There’s no agent called {agent} on this Mac."))?;
+                let service = crew.agent_seen(agent, seen)?;
                 let Some(owner) = crew.person(Some(&service)) else {
                     return Ok(json!({ "messages": [] }));
                 };
@@ -324,13 +345,13 @@ impl CrewTool {
                     "messages": reported(&messages.to_string(), &format!("{agent}'s Desk DM")),
                 }))
             }
-            super::spend::NAME => crew.spend(input).await,
-            super::board::NAME => crew.board().await,
+            super::spend::NAME => crew.spend(input, seen).await,
+            super::board::NAME => crew.board(seen).await,
             _ => Err("not a reading tool".into()),
         }
     }
 
-    async fn act(&self, crew: &Arc<CrewHub>, input: &Value) -> Result<Value, String> {
+    async fn act(&self, crew: &Arc<CrewHub>, b: &Bound, input: &Value) -> Result<Value, String> {
         let reason = input["reason"]
             .as_str()
             .map(str::trim)
@@ -343,10 +364,14 @@ impl CrewTool {
             o.remove("ticket_id");
         }
         let mut action = Action::parse(self.name, &kept)?;
+        // Nothing outside its scope is looked into, before anything is said
+        // of it or the gate weighs it.
+        crew.in_scope(&action, &b.seen).await?;
         // A ticket is read before the gate looks at what is said of it, and
         // a suggestion keeps its id and its key, so it is that ticket that
-        // is shown and acted on.
-        crew.resolve_ticket(&mut action).await?;
+        // is shown and acted on. One on another scope's board is refused
+        // as one that isn't there.
+        crew.resolve_ticket(&mut action, Some(&b.seen)).await?;
         if let (Some(id), Some(key), Some(o)) = (
             action.ticket_id(),
             action.ticket_key(),
@@ -356,14 +381,10 @@ impl CrewTool {
             o.insert("ticket".into(), json!(key));
         }
         let input = &kept;
-        let (_, oversight) = crew
-            .overseer_service()
-            .ok_or("You don’t oversee the crew any more.")?;
-        let by = crew
-            .by_overseer(reason)
-            .ok_or("You don’t oversee the crew any more.")?;
+        let oversight = &b.oversight;
+        let by = crew.by_boss(&b.service, reason);
         crew.know_question(&action).await;
-        match crew.gate(&action, &oversight) {
+        match crew.gate(&action, oversight) {
             Gate::Refuse => {
                 Err("You only watch the crew: tell the person what you would do instead.".into())
             }
@@ -373,7 +394,7 @@ impl CrewTool {
             }
             Gate::Suggest(why) => {
                 if action.starts_session() {
-                    crew.start_suggestable(&by, &oversight).await?;
+                    crew.start_suggestable(&by, oversight).await?;
                 }
                 let s = crew.suggest(self.name, input, &action, &by).await?;
                 // An answer it may not send is a draft the person sends.
@@ -545,10 +566,25 @@ impl Tool for CrewTool {
                 ms(),
             ));
         };
+        // Only while it still oversees this scope.
+        let Some((service, oversight)) = crew
+            .overseer_named(&self.agent)
+            .filter(|(_, o)| o.scope == self.scope)
+        else {
+            return Ok(ToolResult::failure(
+                "You don’t oversee the crew any more.".to_string(),
+                ms(),
+            ));
+        };
+        let bound = Bound {
+            service,
+            oversight,
+            seen: crew.desk.seen_by(&self.scope),
+        };
         let result = if READ.contains(&self.name) {
-            self.read(&crew, &input).await
+            self.read(&crew, &bound, &input).await
         } else {
-            self.act(&crew, &input).await
+            self.act(&crew, &bound, &input).await
         };
         Ok(match result {
             Ok(v) => ToolResult::success(v, ms()),

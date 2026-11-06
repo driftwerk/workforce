@@ -52,7 +52,7 @@ async fn a_persons_prompt_holds_the_bosss_queued_tell_and_hand_back_delivers_it(
         let s = new_session(&d, dir.path()).await;
         idle(&d, s.id).await;
         let c = d
-            .take_on(s.id, &sarah(), How::Handed, &HashSet::new(), &By::you())
+            .take_on(s.id, &sarah(), How::Handed, &Default::default(), &By::you())
             .await
             .unwrap();
         assert_eq!((c.boss_name.as_str(), c.wheel), ("Sarah", Wheel::Boss));
@@ -171,7 +171,7 @@ async fn ill_drive_keeps_the_wheel_and_a_release_keeps_the_row() {
         let d = desk(pool, dir.path()).await;
         let s = new_session(&d, dir.path()).await;
         idle(&d, s.id).await;
-        d.take_on(s.id, &sarah(), How::Taken, &HashSet::new(), &By::you())
+        d.take_on(s.id, &sarah(), How::Taken, &Default::default(), &By::you())
             .await
             .unwrap();
         assert_eq!(d.charges().len(), 1);
@@ -181,14 +181,14 @@ async fn ill_drive_keeps_the_wheel_and_a_release_keeps_the_row() {
         // Passed to another boss, the person keeps driving.
         let mia = Party::manager("mia", "Mia");
         let passed = d
-            .take_on(s.id, &mia, How::Taken, &HashSet::new(), &By::you())
+            .take_on(s.id, &mia, How::Taken, &Default::default(), &By::you())
             .await
             .unwrap();
         assert_eq!(
             (passed.boss.as_str(), passed.wheel),
             ("mia", Wheel::PersonPinned)
         );
-        d.take_on(s.id, &sarah(), How::Taken, &HashSet::new(), &By::you())
+        d.take_on(s.id, &sarah(), How::Taken, &Default::default(), &By::you())
             .await
             .unwrap();
 
@@ -210,11 +210,12 @@ async fn ill_drive_keeps_the_wheel_and_a_release_keeps_the_row() {
             true,
             &d.view(s.id).unwrap(),
             Some(&kept),
-            &HashSet::new()
+            &Default::default(),
+            &std::collections::HashSet::new()
         ));
         // Handed to it again by the person, it is the boss's again.
         let again = d
-            .take_on(s.id, &sarah(), How::Handed, &HashSet::new(), &By::you())
+            .take_on(s.id, &sarah(), How::Handed, &Default::default(), &By::you())
             .await
             .unwrap();
         assert!(again.released_at.is_none());
@@ -231,7 +232,7 @@ async fn an_ended_session_cant_be_taken_on_and_says_why() {
         let s = new_session(&d, dir.path()).await;
         d.0.state.lock().records.get_mut(&s.id).unwrap().state = SessionState::Closed;
         match d
-            .take_on(s.id, &sarah(), How::Handed, &HashSet::new(), &By::you())
+            .take_on(s.id, &sarah(), How::Handed, &Default::default(), &By::you())
             .await
         {
             Err(DeskError::Conflict(why)) => assert_eq!(why, "It has ended."),
@@ -384,7 +385,7 @@ async fn a_boss_is_called_by_its_name_after_a_restart_and_never_by_its_id() {
         let d = desk(pool, dir.path()).await;
         let s = new_session(&d, dir.path()).await;
         idle(&d, s.id).await;
-        d.take_on(s.id, &sarah(), How::Handed, &HashSet::new(), &By::you())
+        d.take_on(s.id, &sarah(), How::Handed, &Default::default(), &By::you())
             .await
             .unwrap();
         let name = |d: &Desk| d.charges()[0].boss_name.clone();
@@ -470,7 +471,7 @@ async fn a_release_withdraws_what_the_boss_said_and_starts_no_turn() {
         let d = desk(pool, dir.path()).await;
         let s = new_session(&d, dir.path()).await;
         idle(&d, s.id).await;
-        d.take_on(s.id, &sarah(), How::Handed, &HashSet::new(), &By::you())
+        d.take_on(s.id, &sarah(), How::Handed, &Default::default(), &By::you())
             .await
             .unwrap();
         d.person_drove(s.id);
@@ -511,7 +512,7 @@ async fn a_handed_message_that_comes_back_after_a_release_is_withdrawn() {
         let d = desk(pool, dir.path()).await;
         let s = new_session(&d, dir.path()).await;
         idle(&d, s.id).await;
-        d.take_on(s.id, &sarah(), How::Handed, &HashSet::new(), &By::you())
+        d.take_on(s.id, &sarah(), How::Handed, &Default::default(), &By::you())
             .await
             .unwrap();
         let by = By::manager("sarah", "Sarah", "Next.");
@@ -550,13 +551,13 @@ async fn a_handed_message_that_comes_back_after_a_release_is_withdrawn() {
 
         // Stale, after the session passed to another boss.
         let mia = Party::manager("mia", "Mia");
-        d.take_on(s.id, &sarah(), How::Handed, &HashSet::new(), &By::you())
+        d.take_on(s.id, &sarah(), How::Handed, &Default::default(), &By::you())
             .await
             .unwrap();
         let stale = send("Carry on.", s.id).await;
         let next = d.line_next(s.id, Duration::from_secs(1)).await.unwrap();
         assert_eq!(next["id"], json!(stale.id));
-        d.take_on(s.id, &mia, How::Handed, &HashSet::new(), &By::you())
+        d.take_on(s.id, &mia, How::Handed, &Default::default(), &By::you())
             .await
             .unwrap();
         let back =
@@ -594,7 +595,7 @@ async fn the_persons_message_goes_ahead_of_the_bosss_waiting_one() {
         let d = desk(pool, dir.path()).await;
         let s = new_session(&d, dir.path()).await;
         idle(&d, s.id).await;
-        d.take_on(s.id, &sarah(), How::Handed, &HashSet::new(), &By::you())
+        d.take_on(s.id, &sarah(), How::Handed, &Default::default(), &By::you())
             .await
             .unwrap();
         let by = By::manager("sarah", "Sarah", "Next.");
@@ -627,7 +628,7 @@ async fn not_knowing_who_runs_what_holds_the_bosss_messages_and_a_restart_keeps_
         let d = desk(pool, dir.path()).await;
         let s = new_session(&d, dir.path()).await;
         idle(&d, s.id).await;
-        d.take_on(s.id, &sarah(), How::Handed, &HashSet::new(), &By::you())
+        d.take_on(s.id, &sarah(), How::Handed, &Default::default(), &By::you())
             .await
             .unwrap();
         let other = new_session(&d, dir.path()).await;
@@ -644,8 +645,14 @@ async fn not_knowing_who_runs_what_holds_the_bosss_messages_and_a_restart_keeps_
             .is_none());
         assert!(row_waits(&d, held.id).await);
         assert!(matches!(
-            d.take_on(other.id, &sarah(), How::Handed, &HashSet::new(), &By::you())
-                .await,
+            d.take_on(
+                other.id,
+                &sarah(),
+                How::Handed,
+                &Default::default(),
+                &By::you()
+            )
+            .await,
             Err(DeskError::Conflict(_))
         ));
 
@@ -682,7 +689,7 @@ async fn a_session_passes_to_the_new_boss_or_is_let_go_once_ended() {
             new_session(&d, dir.path()).await,
         );
         for s in [&a, &b] {
-            d.take_on(s.id, &sarah(), How::Handed, &HashSet::new(), &By::you())
+            d.take_on(s.id, &sarah(), How::Handed, &Default::default(), &By::you())
                 .await
                 .unwrap();
         }
@@ -690,12 +697,12 @@ async fn a_session_passes_to_the_new_boss_or_is_let_go_once_ended() {
         let mia = Party::manager("mia", "Mia");
         let by = By::manager("mia", "Mia", "Its boss no longer oversees.");
         let passed = d
-            .pass_charge(a.id, &mia, &HashSet::new(), &by)
+            .pass_charge(a.id, &mia, &Default::default(), &by)
             .await
             .unwrap();
         assert_eq!((passed.boss.as_str(), passed.how), ("mia", How::Handed));
         let ended = d
-            .pass_charge(b.id, &mia, &HashSet::new(), &by)
+            .pass_charge(b.id, &mia, &Default::default(), &by)
             .await
             .unwrap();
         assert!(ended.released_at.is_some());
@@ -734,7 +741,7 @@ async fn desk_holds_a_boss_to_what_it_may_answer_for_its_session() {
         let d = desk(pool, dir.path()).await;
         let s = new_session(&d, dir.path()).await;
         idle(&d, s.id).await;
-        d.take_on(s.id, &sarah(), How::Handed, &HashSet::new(), &By::you())
+        d.take_on(s.id, &sarah(), How::Handed, &Default::default(), &By::you())
             .await
             .unwrap();
         let sarah_by = By::manager("sarah", "Sarah", "It's the plan.");
@@ -855,7 +862,7 @@ async fn a_push_is_judged_by_the_repository_it_runs_in() {
         let d = desk(pool, dir.path()).await;
         let s = new_session(&d, &own).await;
         idle(&d, s.id).await;
-        d.take_on(s.id, &sarah(), How::Handed, &HashSet::new(), &By::you())
+        d.take_on(s.id, &sarah(), How::Handed, &Default::default(), &By::you())
             .await
             .unwrap();
         d.boss_bounds_with(crate::charge::Bounds {

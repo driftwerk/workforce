@@ -12,6 +12,7 @@ use uuid::Uuid;
 use workforce_common::oversight::{Level, Oversight};
 use workforce_desk::board::TicketState;
 use workforce_desk::crew::{self, PartyKind};
+use workforce_desk::scope::Seen;
 use workforce_desk::{TicketQuery, TicketView};
 
 use super::tools::cell;
@@ -107,20 +108,33 @@ fn table(views: &[&TicketView], waits: &HashMap<Uuid, String>) -> String {
 }
 
 impl CrewHub {
-    /// `crew.board`: what is ready, being done and blocked, board by board.
-    pub(super) async fn board(&self) -> Result<Value, String> {
+    /// `crew.board`: what is ready, being done and blocked, board by board,
+    /// of the boards `seen` sees. What a ticket waits on is named only when
+    /// it is on one of those boards too.
+    pub(super) async fn board(&self, seen: &Seen) -> Result<Value, String> {
         let internal = |e: workforce_desk::DeskError| {
             tracing::warn!(error = %e, "reading the board for crew.board failed");
             "The board could not be read just now.".to_string()
         };
         let mut counts: HashMap<Column, usize> = HashMap::new();
         let mut out = String::new();
+        let mut boards = Vec::new();
         for b in self.desk.boards().await.map_err(internal)? {
+            if !seen.sees(b.group.as_deref()) {
+                continue;
+            }
             let views = self
                 .desk
                 .tickets(b.id, &TicketQuery::default())
                 .await
                 .map_err(internal)?;
+            boards.push((b, views));
+        }
+        let visible: HashSet<Uuid> = boards
+            .iter()
+            .flat_map(|(_, views)| views.iter().map(|v| v.ticket.id))
+            .collect();
+        for (b, views) in &boards {
             let on: Vec<&TicketView> = views.iter().filter(|v| column(v).is_some()).collect();
             if on.is_empty() {
                 continue;
@@ -130,7 +144,11 @@ impl CrewHub {
                     *counts.entry(c).or_default() += 1;
                 }
             }
-            let blockers: Vec<Uuid> = on.iter().flat_map(|v| v.blockers.clone()).collect();
+            let blockers: Vec<Uuid> = on
+                .iter()
+                .flat_map(|v| v.blockers.clone())
+                .filter(|b| visible.contains(b))
+                .collect();
             let waits = match blockers.is_empty() {
                 true => HashMap::new(),
                 false => self
@@ -174,15 +192,16 @@ impl CrewHub {
     }
 
     /// The tickets that became ready with no one on them since `seen` last
-    /// looked, as wakes when the overseer may hand work out. `seen` keeps,
-    /// for each board, the ready tickets nobody has, so that each is said
-    /// once as it becomes so; it is kept up to date whether or not the
-    /// overseer may hand work out, so that switching that on doesn't wake it
-    /// for what has long been waiting.
+    /// looked, as wakes when their board's overseer may hand work out
+    /// (`oversight_of` its board's group). `seen` keeps, for each board, the
+    /// ready tickets nobody has, so that each is said once as it becomes
+    /// so; it is kept up to date whether or not the overseer may hand work
+    /// out, so that switching that on doesn't wake it for what has long been
+    /// waiting. Each wake carries its board's group.
     pub(super) async fn ready_unhanded(
         &self,
         seen: &mut HashMap<Uuid, HashSet<Uuid>>,
-        o: &Oversight,
+        oversight_of: impl Fn(Option<&str>) -> Option<Oversight>,
     ) -> Vec<Trigger> {
         let Ok(boards) = self.desk.boards().await else {
             return Vec::new();
@@ -203,6 +222,9 @@ impl CrewHub {
                 .copied()
                 .collect();
             *known = unhanded.iter().map(|v| v.ticket.id).collect();
+            let Some(o) = oversight_of(b.group.as_deref()) else {
+                continue;
+            };
             if o.level == Level::Watch || !o.act.hand_out_work {
                 continue;
             }
@@ -215,6 +237,7 @@ impl CrewHub {
                 approvals: Vec::new(),
                 hop: 0,
                 about: None,
+                group: b.group.clone(),
             }));
         }
         out

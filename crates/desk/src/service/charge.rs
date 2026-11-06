@@ -10,7 +10,7 @@
 //! moment they type. A loop of its own writes each change of hands down and
 //! lets what waited go once the wheel is back.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -23,6 +23,7 @@ use crate::charge::{self, Charge, How, NotChargeable, Wheel};
 use crate::crew::{self, By, Kind, Party, PartyKind};
 use crate::line::{Delivery, LineKind, LineMessage};
 use crate::model::{DeskEvent, SessionState};
+use crate::scope::Scope;
 
 /// What the desk keeps of charges in memory: every row, and when the
 /// person last gave each session input Desk doesn't see in its terminal.
@@ -92,17 +93,6 @@ impl Desk {
     /// Whether Desk knows which sessions bosses run.
     pub fn charges_loaded(&self) -> bool {
         self.0.state.lock().charges.loaded
-    }
-
-    /// The boss there is now: the overseer of the hub's crew.
-    pub fn boss(&self) -> Option<crew::Overseer> {
-        let crew = self
-            .0
-            .line_crew
-            .lock()
-            .as_ref()
-            .and_then(std::sync::Weak::upgrade)?;
-        crew.overseer()
     }
 
     /// What the boss `id` is called: as the hub's roster says now, which
@@ -400,16 +390,16 @@ impl Desk {
         }
     }
 
-    /// `boss` takes `id` on (`how`), as `by`: the boss itself, or the
-    /// person handing it over. `bossed` are the groups with a boss of their
-    /// own, which this one doesn't run. Taking on one already the boss's
-    /// changes nothing.
+    /// `boss`, the boss of `scope`, takes `id` on (`how`), as `by`: the
+    /// boss itself, or the person handing it over. Only a session in its
+    /// scope can be; the charge is that scope's. Taking on one already the
+    /// boss's changes nothing.
     pub async fn take_on(
         &self,
         id: Uuid,
         boss: &Party,
         how: How,
-        bossed: &HashSet<String>,
+        scope: &Scope,
         by: &By,
     ) -> Result<ChargeView, DeskError> {
         let view = self.view(id)?;
@@ -418,7 +408,7 @@ impl Desk {
                 "Desk can't read which sessions bosses run just now; try again shortly.".into(),
             ));
         }
-        charge::chargeable(&view, bossed)
+        charge::chargeable(&view, scope, &self.bossed())
             .map_err(|e: NotChargeable| DeskError::Conflict(e.to_string()))?;
         let existing = self.charge_of(id).filter(Charge::live);
         if let Some(c) = existing.as_ref().filter(|c| c.boss == boss.id) {
@@ -431,7 +421,7 @@ impl Desk {
             .charges
             .names
             .insert(boss.id.clone(), boss.name.clone());
-        let mut c = Charge::new(id, &boss.id, how, view.group.as_ref().map(|g| g.id.clone()));
+        let mut c = Charge::new(id, &boss.id, how, scope.group().map(str::to_string));
         // From another boss: the person driving it keeps driving.
         let wheel = match existing {
             Some(_) => self.wheel_of(id).unwrap_or(Wheel::Boss),
@@ -506,14 +496,14 @@ impl Desk {
         &self,
         id: Uuid,
         boss: &Party,
-        bossed: &HashSet<String>,
+        scope: &Scope,
         by: &By,
     ) -> Result<ChargeView, DeskError> {
         let view = self.view(id)?;
-        match charge::chargeable(&view, bossed) {
+        match charge::chargeable(&view, scope, &self.bossed()) {
             Ok(()) => {
                 let how = self.charge_of(id).map_or(How::Taken, |c| c.how);
-                self.take_on(id, boss, how, bossed, by).await
+                self.take_on(id, boss, how, scope, by).await
             }
             Err(_) => self.release(id, by).await,
         }

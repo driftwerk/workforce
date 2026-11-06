@@ -196,6 +196,11 @@ impl Desk {
         self.0.store.boards().await.map_err(internal)
     }
 
+    /// The sidebar group the board `id` is in (none: ungrouped).
+    pub async fn group_of_board(&self, id: Uuid) -> Result<Option<String>, DeskError> {
+        Ok(self.board_of(id).await?.group)
+    }
+
     async fn board_of(&self, id: Uuid) -> Result<Board, DeskError> {
         self.0
             .store
@@ -1248,7 +1253,12 @@ impl Desk {
     /// Whether the session `caller` may read and write tickets on `b`.
     fn reaches_board(&self, caller: Uuid, b: &Board) -> bool {
         let group = self.view(caller).ok().and_then(|v| v.group.map(|g| g.id));
-        board::board_reachable(self.line_reach(), group.as_deref(), b.group.as_deref())
+        board::board_reachable(
+            self.line_reach(),
+            group.as_deref(),
+            b.group.as_deref(),
+            &self.bossed(),
+        )
     }
 
     /// What a session reads of a ticket.

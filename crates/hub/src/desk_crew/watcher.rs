@@ -1,5 +1,6 @@
-//! Keeping the overseer in step with its config (its tools, its summary
-//! jobs, one overseer at a time), and waking it: what happened on the crew
+//! Keeping the overseers in step with their configs (their tools, bound to
+//! each one's scope, their summary jobs, one overseer per scope), and
+//! waking each: what happened in its scope, and nothing outside it,
 //! becomes a turn in its Desk DM — something waiting on the person too
 //! long, work gone quiet, work finished or failed — gathered for a minute
 //! into one check-in, never about its own doing, and held to the rooms'
@@ -15,7 +16,7 @@ use std::time::Instant;
 use chrono::{DateTime, Utc};
 use tokio::sync::broadcast::error::RecvError;
 use tokio_util::sync::CancellationToken;
-use workforce_common::oversight::{Level, Oversight};
+use workforce_common::oversight::{Level, Oversight, Scope};
 use workforce_desk::crew::Crew as _;
 use workforce_desk::crew::{
     self, Event, ItemKind, ItemState, Kind, MentionedApproval, Party, PartyKind,
@@ -28,15 +29,10 @@ use super::{name_of, CrewHub, CHECK_IN, MAX_HOPS};
 use crate::scheduler::{JobPayload, Schedule};
 use crate::serve::AgentService;
 
-/// The `desk.*` tools that act on sessions: the overseer acts through its
-/// gated `crew.*` tools instead.
-const DESK_ACTIONS: [&str; 5] = [
-    "desk.start",
-    "desk.prompt",
-    "desk.approve",
-    "desk.stop",
-    "desk.interrupt",
-];
+/// The `desk.*` tools an overseer doesn't have: it acts through its gated
+/// `crew.*` tools instead, and reads through them too, since they keep to
+/// its scope and `desk.*` reads every session.
+const DESK_TOOLS: [&str; 9] = crate::desk_tools::NAMES;
 
 const MORNING_JOB: &str = "crew-summary-morning";
 const EVENING_JOB: &str = "crew-summary-evening";
@@ -58,6 +54,9 @@ pub(super) struct Trigger {
     /// The open question it is about (a session's question, an approval,
     /// something waiting on the person), the same however it is noticed.
     pub about: Option<String>,
+    /// The sidebar group of what it is about: the overseer whose scope sees
+    /// that is the one it wakes.
+    pub group: Option<String>,
 }
 
 /// What the overseer may spend on check-ins now.
@@ -176,54 +175,75 @@ fn who(p: &Party) -> String {
 }
 
 impl CrewHub {
-    /// Keeps tools, summaries and the one-overseer rule in step with the
-    /// agents' configs.
+    /// Keeps tools, summaries and the one-overseer-per-scope rule in step
+    /// with the agents' configs.
     pub(super) async fn sync(&self) {
-        let enabled: Vec<Arc<AgentService>> = self
-            .services()
-            .into_iter()
-            .filter(|s| self.oversight_of(s).enabled)
-            .collect();
-        let current = self.overseer_service();
-        if enabled.len() > 1 {
-            if let Some((keep, _)) = &current {
-                crate::agent_config_write::one_overseer(keep, self.state.def_store.as_deref())
-                    .await;
-                self.read.lock().clear();
+        let mut scopes: HashMap<Scope, usize> = HashMap::new();
+        for s in self.services() {
+            let o = self.oversight_of(&s);
+            if o.enabled {
+                *scopes.entry(o.scope).or_default() += 1;
             }
         }
-        let current = self.overseer_service();
-        let want = current.as_ref().map(|(s, o)| {
-            (
-                s.agent_id.as_str().to_string(),
-                o.level.as_str().to_string(),
-            )
-        });
+        let current = self.overseers();
+        let mut switched = false;
+        for (keep, o) in &current {
+            if scopes.get(&o.scope).is_some_and(|n| *n > 1) {
+                crate::agent_config_write::one_overseer(keep, self.state.def_store.as_deref())
+                    .await;
+                switched = true;
+            }
+        }
+        if switched {
+            self.read.lock().clear();
+        }
+        let current = self.overseers();
+        let want: HashMap<String, (Scope, String)> = current
+            .iter()
+            .map(|(s, o)| {
+                (
+                    s.agent_id.as_str().to_string(),
+                    (o.scope.clone(), o.level.as_str().to_string()),
+                )
+            })
+            .collect();
         let had = self.tooled.lock().clone();
         if want != had {
             for s in self.services() {
                 for name in READ.iter().chain(ACT.iter()) {
                     s.tools.unregister(name);
                 }
-                crate::desk_driver::register_tools(&s);
+                // `desk.*` only on agents that oversee nothing.
+                match want.contains_key(s.agent_id.as_str()) {
+                    true => crate::connector_pins::pin(&s),
+                    false => crate::desk_driver::register_tools(&s),
+                }
             }
-            if let Some((s, o)) = &current {
-                for name in DESK_ACTIONS {
+            for (s, o) in &current {
+                for name in DESK_TOOLS {
                     s.tools.unregister(name);
                 }
-                for tool in CrewTool::for_level(&self.me(), o.level == Level::Watch) {
+                let id = s.agent_id.as_str();
+                for tool in CrewTool::for_level(&self.me(), id, &o.scope, o.level == Level::Watch) {
                     s.tools.register(Arc::new(tool));
                 }
-                tracing::info!(agent_id = %s.agent_id, level = o.level.as_str(), "Oversees the crew");
+                tracing::info!(agent_id = %s.agent_id, group = o.scope.group().unwrap_or("ungrouped"), level = o.level.as_str(), "Oversees the crew");
             }
             *self.tooled.lock() = want;
         }
         for s in self.services() {
             let o = current
-                .as_ref()
-                .filter(|(c, _)| c.agent_id == s.agent_id)
+                .iter()
+                .find(|(c, _)| c.agent_id == s.agent_id)
                 .map(|(_, o)| o.clone());
             self.sync_summaries(&s, o.as_ref()).await;
+            // An overseer recalls only its own memories while groups have
+            // bosses of their own.
+            let now = (*s.resolved.snapshot()).clone();
+            let kept = super::recall_kept_apart(&s, now.clone());
+            if kept.memory.agent_recall_scope != now.memory.agent_recall_scope {
+                s.resolved.store(kept);
+            }
         }
     }
 
@@ -320,6 +340,7 @@ impl CrewHub {
             approvals: Vec::new(),
             hop: event.hop,
             about,
+            group: event.group.clone(),
         })
     }
 
@@ -334,7 +355,8 @@ impl CrewHub {
         o: &Oversight,
         noted: &mut HashSet<String>,
     ) -> Vec<Trigger> {
-        let Ok(overview) = self.desk.overview(self, None).await else {
+        let seen = self.desk.seen_by(&o.scope);
+        let Ok(overview) = self.desk.overview_for(self, None, Some(&seen)).await else {
             return Vec::new();
         };
         let now = Utc::now();
@@ -398,6 +420,7 @@ impl CrewHub {
                             approvals,
                             hop: 0,
                             about: Some(about),
+                            group: item.group_id.clone(),
                         },
                     )
                 }
@@ -429,6 +452,7 @@ impl CrewHub {
                             approvals: vec![],
                             hop: 0,
                             about: None,
+                            group: item.group_id.clone(),
                         },
                     )
                 }
@@ -451,11 +475,14 @@ impl CrewHub {
         }
     }
 
-    /// Wakes the overseer with `triggers`, as one check-in.
-    pub(super) async fn wake(&self, triggers: Vec<Trigger>) {
-        let Some((service, o)) = self.overseer_service() else {
-            return;
-        };
+    /// Wakes the overseer `service` with `triggers`, as one check-in: each
+    /// in its scope, as it was routed.
+    pub(super) async fn wake(
+        &self,
+        service: Arc<AgentService>,
+        o: Oversight,
+        triggers: Vec<Trigger>,
+    ) {
         let Some(owner) = self.person(Some(&service)) else {
             tracing::info!("the overseer has no Desk conversation to check in on yet");
             return;
@@ -517,11 +544,12 @@ impl CrewHub {
         if let Err(e) = self.desk.store().put_check_in(&record).await {
             tracing::warn!(error = %e, "recording a check-in failed");
         }
-        *self.wake_hop.lock() = Some(hop);
+        let id = service.agent_id.as_str().to_string();
+        self.wake_hop.lock().insert(id.clone(), hop);
         let ran = self
             .run_dm_turn(service, owner, prompt, hop, listed, None)
             .await;
-        *self.wake_hop.lock() = None;
+        self.wake_hop.lock().remove(&id);
         match ran {
             Ok((_, reply)) => {
                 record.reply = Some(reply.clone());
@@ -543,12 +571,10 @@ impl CrewHub {
         service: &Arc<AgentService>,
         evening: bool,
     ) -> Result<String, String> {
-        let (overseer, o) = self
-            .overseer_service()
-            .ok_or("no agent oversees the crew")?;
-        if overseer.agent_id != service.agent_id {
-            return Err("this agent no longer oversees the crew".into());
-        }
+        let (_, o) = self
+            .overseer_named(service.agent_id.as_str())
+            .ok_or("this agent no longer oversees the crew")?;
+        let seen = self.desk.seen_by(&o.scope);
         let owner = self
             .person(Some(service))
             .ok_or("no one has a Desk conversation with the overseer yet")?;
@@ -561,7 +587,7 @@ impl CrewHub {
         let events = self
             .desk
             .store()
-            .events_since(since, &[], 150, None)
+            .events_since(since, &[], 150, Some(&seen))
             .await
             .map_err(|e| e.to_string())?;
         let lines: Vec<String> = events
@@ -699,36 +725,45 @@ pub(super) async fn sync_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
     }
 }
 
-/// Turns what happens into the overseer's check-ins.
+/// One overseer's check-ins as they gather: what waits for the next, since
+/// when, what of its scope it has noted, the one firing, and until when its
+/// check-ins are spent (and the pause the person was told of).
+#[derive(Default)]
+struct Waking {
+    pending: Vec<Trigger>,
+    window: Option<Instant>,
+    noted: HashSet<String>,
+    firing: Option<tokio::task::JoinHandle<()>>,
+    held_until: Option<DateTime<Utc>>,
+    told: Option<DateTime<Utc>>,
+}
+
+/// Turns what happens into the overseers' check-ins: each event, and each
+/// threshold passed, goes to the overseer whose scope sees its group, and
+/// no other; each overseer's check-ins are gathered and spent apart.
 pub(super) async fn wake_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
     let (_, mut events) = crew.desk.subscribe();
     let mut tick = tokio::time::interval(crew.timing.tick.min(crew.timing.coalesce));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut pending: Vec<Trigger> = Vec::new();
-    let mut window: Option<Instant> = None;
-    let mut noted: HashSet<String> = HashSet::new();
-    let mut firing: Option<tokio::task::JoinHandle<()>> = None;
+    let mut waking: HashMap<String, Waking> = HashMap::new();
     let mut raised = crew.raised().await;
     // The ready tickets nobody has, so that one that becomes so wakes it.
     let mut ready_seen = HashMap::new();
     let mut ready_dirty = false;
-    crew.ready_unhanded(&mut ready_seen, &Oversight::default())
-        .await;
-    // Until when check-ins are spent, and the pause the person was told of.
-    let mut held_until: Option<DateTime<Utc>> = None;
-    let mut told: Option<DateTime<Utc>> = None;
+    crew.ready_unhanded(&mut ready_seen, |_| None).await;
     loop {
-        let mut found = Vec::new();
+        // What was found, by the overseer it is for.
+        let mut found: Vec<(String, Trigger)> = Vec::new();
         tokio::select! {
             () = cancel.cancelled() => return,
             received = events.recv() => match received {
                 Ok(DeskEvent::Activity { event }) => {
-                    if let Some((s, o)) = crew.overseer_service() {
+                    if let Some((s, o)) = crew.overseer_of_group(event.group.as_deref()) {
                         if let Some(mut t) = crew.trigger_for(&event, s.agent_id.as_str(), &o) {
                             if let Some(session) = finished_session(&event) {
                                 t.line = crew.with_doing(session, t.line).await;
                             }
-                            found.push(t);
+                            found.push((s.agent_id.as_str().to_string(), t));
                         }
                     }
                 }
@@ -742,77 +777,108 @@ pub(super) async fn wake_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
                 Err(RecvError::Closed) => return,
             },
             _ = tick.tick() => {
+                let overseers = crew.overseers();
                 // Kept up to date with no overseer too, so that one set up
                 // later isn't woken for what has long been ready.
                 if std::mem::take(&mut ready_dirty) {
-                    let o = crew.overseer_service().map(|(_, o)| o).unwrap_or_default();
-                    found.extend(crew.ready_unhanded(&mut ready_seen, &o).await);
+                    let of = |g: Option<&str>| crew.overseer_of_group(g);
+                    for t in crew.ready_unhanded(&mut ready_seen, |g| of(g).map(|(_, o)| o)).await {
+                        if let Some((s, _)) = of(t.group.as_deref()) {
+                            found.push((s.agent_id.as_str().to_string(), t));
+                        }
+                    }
                 }
-                if let Some((s, o)) = crew.overseer_service() {
-                    found.extend(crew.thresholds(s.agent_id.as_str(), &o, &mut noted).await);
+                for (s, o) in &overseers {
+                    let id = s.agent_id.as_str().to_string();
+                    let w = waking.entry(id.clone()).or_default();
+                    let mut noted = std::mem::take(&mut w.noted);
+                    let at = crew.thresholds(&id, o, &mut noted).await;
+                    waking.entry(id.clone()).or_default().noted = noted;
+                    found.extend(at.into_iter().map(|t| (id.clone(), t)));
                 }
+                // An overseer gone has nothing waiting.
+                waking.retain(|id, _| overseers.iter().any(|(s, _)| s.agent_id.as_str() == id));
             }
         }
-        if !found.is_empty() {
-            if let Some((_, o)) = crew.overseer_service() {
-                let remind = (o.wake.remind_minutes > 0).then(|| {
-                    chrono::Duration::from_std(crew.timing.minute * o.wake.remind_minutes)
-                        .unwrap_or(RAISED_FOR)
-                });
-                let now = Utc::now();
-                found.retain_mut(|t| fresh(t, &raised, remind, now));
-            }
-        }
-        if !found.is_empty() {
-            window.get_or_insert_with(Instant::now);
-            hold(&mut pending, found);
-        }
-        if firing.as_ref().is_some_and(|f| f.is_finished()) {
-            firing = None;
-        }
-        let due = window.is_some_and(|w| w.elapsed() >= crew.timing.coalesce);
-        if !due || firing.is_some() || pending.is_empty() {
-            continue;
-        }
-        if held_until.is_some_and(|until| Utc::now() < until) {
-            continue;
-        }
-        let Some((service, o)) = crew.overseer_service() else {
-            window = None;
-            pending.clear();
-            continue;
-        };
-        match crew.budget(service.agent_id.as_str(), &o).await {
-            Ok(Budget::Open) => held_until = None,
-            Ok(Budget::Spent { until, daily }) => {
-                held_until = Some(until);
-                if told != Some(until) {
-                    told = Some(until);
-                    crew.paused(&service, until, daily);
-                }
-                continue;
-            }
-            Err(e) => {
-                tracing::warn!(error = %format!("{e:#}"), "counting the overseer's check-ins failed");
-                held_until = chrono::Duration::from_std(crew.timing.coalesce)
-                    .ok()
-                    .map(|d| Utc::now() + d);
-                continue;
-            }
-        }
-        window = None;
-        let triggers = std::mem::take(&mut pending);
         let now = Utc::now();
-        raised.retain(|_, at| now - *at < RAISED_FOR);
-        let asked: Vec<&String> = triggers.iter().filter_map(|t| t.about.as_ref()).collect();
-        if !asked.is_empty() {
-            for key in asked {
-                raised.insert(key.clone(), now);
+        for (id, mut t) in found {
+            let Some((_, o)) = crew.overseer_named(&id) else {
+                continue;
+            };
+            let remind = (o.wake.remind_minutes > 0).then(|| {
+                chrono::Duration::from_std(crew.timing.minute * o.wake.remind_minutes)
+                    .unwrap_or(RAISED_FOR)
+            });
+            if fresh(&mut t, &raised, remind, now) {
+                let w = waking.entry(id).or_default();
+                w.window.get_or_insert_with(Instant::now);
+                hold(&mut w.pending, vec![t]);
             }
-            crew.keep_raised(&raised).await;
         }
-        let crew = Arc::clone(&crew);
-        firing = Some(tokio::spawn(async move { crew.wake(triggers).await }));
+        let ids: Vec<String> = waking.keys().cloned().collect();
+        for id in ids {
+            let Some(w) = waking.get_mut(&id) else {
+                continue;
+            };
+            if w.firing.as_ref().is_some_and(|f| f.is_finished()) {
+                w.firing = None;
+            }
+            let due = w
+                .window
+                .is_some_and(|at| at.elapsed() >= crew.timing.coalesce);
+            if !due || w.firing.is_some() || w.pending.is_empty() {
+                continue;
+            }
+            if w.held_until.is_some_and(|until| Utc::now() < until) {
+                continue;
+            }
+            let Some((service, o)) = crew.overseer_named(&id) else {
+                w.window = None;
+                w.pending.clear();
+                continue;
+            };
+            // What it gathered of a group that has since become another's
+            // boundary is not its any more.
+            let seen = crew.desk.seen_by(&o.scope);
+            w.pending.retain(|t| seen.sees(t.group.as_deref()));
+            if w.pending.is_empty() {
+                w.window = None;
+                continue;
+            }
+            match crew.budget(&id, &o).await {
+                Ok(Budget::Open) => w.held_until = None,
+                Ok(Budget::Spent { until, daily }) => {
+                    w.held_until = Some(until);
+                    if w.told != Some(until) {
+                        w.told = Some(until);
+                        crew.paused(&service, until, daily);
+                    }
+                    continue;
+                }
+                Err(e) => {
+                    tracing::warn!(error = %format!("{e:#}"), "counting the overseer's check-ins failed");
+                    w.held_until = chrono::Duration::from_std(crew.timing.coalesce)
+                        .ok()
+                        .map(|d| Utc::now() + d);
+                    continue;
+                }
+            }
+            w.window = None;
+            let triggers = std::mem::take(&mut w.pending);
+            let now = Utc::now();
+            raised.retain(|_, at| now - *at < RAISED_FOR);
+            let asked: Vec<&String> = triggers.iter().filter_map(|t| t.about.as_ref()).collect();
+            if !asked.is_empty() {
+                for key in asked {
+                    raised.insert(key.clone(), now);
+                }
+                crew.keep_raised(&raised).await;
+            }
+            let crew = Arc::clone(&crew);
+            w.firing = Some(tokio::spawn(async move {
+                crew.wake(service, o, triggers).await
+            }));
+        }
     }
 }
 
@@ -877,6 +943,7 @@ mod budget_tests {
             approvals: vec![],
             hop: 0,
             about: Some(about.into()),
+            group: None,
         }
     }
 

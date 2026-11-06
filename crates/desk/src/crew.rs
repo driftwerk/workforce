@@ -604,9 +604,10 @@ pub trait Crew: Send + Sync {
         None
     }
     /// Whether a session's last reply asks the person to decide, answer,
-    /// approve or do something, as a cheap model reads it; `None` where the
-    /// hub has no model to ask, or it couldn't say.
-    async fn asks(&self, _reply: &str) -> Option<bool> {
+    /// approve or do something, as a cheap model reads it: the model of the
+    /// overseer whose scope the session's `group` is in, so no other scope's
+    /// model reads its words. `None` where there is none, or it couldn't say.
+    async fn asks(&self, _reply: &str, _group: Option<&str>) -> Option<bool> {
         None
     }
     /// Whether the overseer answers what sessions ask it on Desk's line;

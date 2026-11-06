@@ -1774,6 +1774,8 @@ async fn an_unprompted_answer_reaches_a_dm_left_open_for_days() {
 
 /// The floor over this hub: what needs the person, from the turns its
 /// agents and Desk sessions log, and answering it in place.
+mod groups;
+
 mod floor {
     use workforce_common::settings::WorkforceConfig;
     use workforce_desk::floor::{Answer, NeedKind, Place, Scope, TurnLog};
@@ -2500,7 +2502,7 @@ async fn a_reply_the_rules_cant_tell_is_read_by_the_overseers_cheap_model() {
             );
             let state = hub(std::slice::from_ref(&overseer));
             let crew = CrewHub::start(state, d.clone(), FAST, CancellationToken::new());
-            assert_eq!(crew.asks(reply).await, read, "{says}");
+            assert_eq!(crew.asks(reply, None).await, read, "{says}");
         }
     })
     .await;
@@ -2931,7 +2933,7 @@ async fn a_session_the_overseer_runs_wakes_it_on_its_line_when_its_turn_ends() {
         )
         .await
         .unwrap();
-        let overview = super::tools::CrewTool::for_level(&crew, false)
+        let overview = super::tools::CrewTool::for_level(&crew, "desk", &Default::default(), false)
             .into_iter()
             .find(|t| workforce_agent::tools::Tool::name(t) == "crew.overview")
             .unwrap();
@@ -3814,12 +3816,12 @@ mod board {
             assert_eq!(d.list().len(), 1);
             assert_eq!(state_of(&d, "ACM-2").await, (TicketState::Todo, None));
 
-            // A session that is gone is said so.
+            // A session that is gone is refused as one outside its scope is.
             let r = assign
                 .execute(json!({"ticket": "ACM-2", "to": {"session": uuid::Uuid::new_v4().to_string()}, "reason": "It is next."}))
                 .await
                 .unwrap();
-            assert_eq!(r.error.as_deref(), Some("That session isn’t there any more."));
+            assert_eq!(r.error.as_deref(), Some("That isn't one of yours."));
 
             // A session that is already there takes it, slots or not.
             let mine = new_session(&d, dir.path(), "acme-api").await;
@@ -4196,7 +4198,7 @@ mod board {
                 let input = json!({"ticket": key, "state": state, "reason": "Back on."});
                 async move {
                     let mut a = Action::parse("crew.move_ticket", &input).unwrap();
-                    crew.resolve_ticket(&mut a).await.unwrap();
+                    crew.resolve_ticket(&mut a, None).await.unwrap();
                     a
                 }
             };
@@ -4325,20 +4327,20 @@ mod board {
 
             let first = ticket(&d, b, "Add the date picker", TicketState::Todo, &[]).await;
             assert_eq!(
-                lines(crew.ready_unhanded(&mut seen, &on).await),
+                lines(crew.ready_unhanded(&mut seen, |_| Some(on.clone())).await),
                 ["ACM-1 “Add the date picker” is ready on the board and has no one on it yet"]
             );
-            assert!(crew.ready_unhanded(&mut seen, &on).await.is_empty(), "said once");
+            assert!(crew.ready_unhanded(&mut seen, |_| Some(on.clone())).await.is_empty(), "said once");
 
             // Not ready, or already someone's: not a wake.
             let waits = ticket(&d, b, "Wire the picker to checkout", TicketState::Todo, &[first.ticket.id]).await;
             ticket(&d, b, "Someday the dark mode", TicketState::Backlog, &[]).await;
-            assert!(crew.ready_unhanded(&mut seen, &on).await.is_empty());
+            assert!(crew.ready_unhanded(&mut seen, |_| Some(on.clone())).await.is_empty());
             let s = new_session(&d, dir.path(), "acme-web").await;
             d.assign_ticket(first.ticket.id, Some(AssignTo::Session(s.id)), &By::you())
                 .await
                 .unwrap();
-            assert!(crew.ready_unhanded(&mut seen, &on).await.is_empty());
+            assert!(crew.ready_unhanded(&mut seen, |_| Some(on.clone())).await.is_empty());
 
             // Its need done, it becomes ready: a wake.
             d.move_ticket(
@@ -4349,7 +4351,7 @@ mod board {
             .await
             .unwrap();
             assert_eq!(
-                lines(crew.ready_unhanded(&mut seen, &on).await),
+                lines(crew.ready_unhanded(&mut seen, |_| Some(on.clone())).await),
                 ["ACM-2 “Wire the picker to checkout” is ready on the board and has no one on it yet"]
             );
             assert_eq!(waits.key.as_deref(), Some("ACM-2"));
@@ -4357,12 +4359,12 @@ mod board {
             // With hand_out_work off it is no wake, and what waited then is
             // not one when it is switched on.
             ticket(&d, b, "Fix the flaky test", TicketState::Todo, &[]).await;
-            assert!(crew.ready_unhanded(&mut seen, &off).await.is_empty());
-            assert!(crew.ready_unhanded(&mut seen, &on).await.is_empty());
+            assert!(crew.ready_unhanded(&mut seen, |_| Some(off.clone())).await.is_empty());
+            assert!(crew.ready_unhanded(&mut seen, |_| Some(on.clone())).await.is_empty());
             let mut watching = on.clone();
             watching.level = workforce_common::oversight::Level::Watch;
             ticket(&d, b, "Tidy the footer", TicketState::Todo, &[]).await;
-            assert!(crew.ready_unhanded(&mut seen, &watching).await.is_empty());
+            assert!(crew.ready_unhanded(&mut seen, |_| Some(watching.clone())).await.is_empty());
         })
         .await;
     }

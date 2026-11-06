@@ -13,6 +13,7 @@ use workforce_common::usage::{account_key, LoginRef, PlanKind, Reading, Window};
 use workforce_desk::engine::{Engine, SignIn};
 use workforce_desk::ledger::{Period, SpendBy, SpendRow, SpendView, Totals};
 use workforce_desk::ledger_store::Filter;
+use workforce_desk::scope::Seen;
 use workforce_desk::SpendQuery;
 
 use super::CrewHub;
@@ -29,7 +30,7 @@ my tokens?\"); never suggest an outside tool for it.";
 
 pub fn schema() -> Value {
     json!({ "type": "object", "properties": {
-        "by": { "type": "string", "enum": ["session", "project", "day", "engine", "account"],
+        "by": { "type": "string", "enum": ["session", "project", "day", "engine", "account", "group"],
                 "description": "How to group it (default session)" },
         "since": { "type": "string", "description": "five_hours, today (default), week, month, or a date or time (2026-10-30, 2026-10-30T09:00:00Z)" },
         "limit": { "type": "integer", "minimum": 1, "maximum": 50, "description": "Rows at most (default 10)" }
@@ -195,13 +196,16 @@ fn claude_account(sign_in: &SignIn) -> Option<(String, String)> {
 }
 
 impl CrewHub {
-    pub(super) async fn spend(&self, input: &Value) -> Result<Value, String> {
+    /// `crew.spend` as an overseer that sees `seen` reads it: the calls of
+    /// its scope's sessions alone, by the group each was kept in.
+    pub(super) async fn spend(&self, input: &Value, seen: &Seen) -> Result<Value, String> {
         let internal = |e: workforce_desk::DeskError| {
             tracing::warn!(error = %e, "reading the ledger for crew.spend failed");
             "Spend couldn't be read just now.".to_string()
         };
-        let by = SpendBy::parse(input["by"].as_str().unwrap_or("session"))
-            .map_err(|_| "Say by as session, project, day, engine or account.".to_string())?;
+        let by = SpendBy::parse(input["by"].as_str().unwrap_or("session")).map_err(|_| {
+            "Say by as session, project, day, engine, account or group.".to_string()
+        })?;
         let now = Utc::now();
         let from = since_of(input["since"].as_str().unwrap_or("today"), |p| {
             self.desk.period_start(p, now)
@@ -214,12 +218,19 @@ impl CrewHub {
                 from,
                 to: now,
                 limit,
-                filter: Filter::default(),
+                filter: Filter {
+                    seen: Some(seen.clone()),
+                    ..Filter::default()
+                },
             })
             .await
             .map_err(internal)?;
+        // A plan's reading counts every group's use of it: read only while
+        // no group has a boss of its own.
         let (plan, windows) = match by {
-            SpendBy::Session => self.claude_windows(now).await.map_err(internal)?,
+            SpendBy::Session if seen.bossed.is_empty() => {
+                self.claude_windows(now, seen).await.map_err(internal)?
+            }
             _ => (None, Vec::new()),
         };
         Ok(answer(&view, &windows, plan.as_ref()))
@@ -231,6 +242,7 @@ impl CrewHub {
     async fn claude_windows(
         &self,
         now: DateTime<Utc>,
+        seen: &Seen,
     ) -> Result<(Option<Reading>, Vec<WindowSpend>), workforce_desk::DeskError> {
         let Some((label, key)) = claude_account(self.desk.sign_ins().of(Engine::Claude)) else {
             return Ok((None, Vec::new()));
@@ -271,7 +283,7 @@ impl CrewHub {
                         engine: Some(Engine::Claude),
                         account: Some(label.clone()),
                         session: None,
-                        seen: None,
+                        seen: Some(seen.clone()),
                     },
                 })
                 .await?;

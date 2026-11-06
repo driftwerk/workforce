@@ -65,9 +65,7 @@ impl CrewHub {
             return None;
         }
         let agent_id = service.agent_id.as_str().to_string();
-        let overseer = self
-            .overseer_service()
-            .is_some_and(|(s, _)| s.agent_id == service.agent_id);
+        let overseer = self.overseer_named(service.agent_id.as_str()).is_some();
         let party = Party::agent(&agent_id, &super::name_of(service));
         let hop = session_id
             .and_then(|sid| self.hops.lock().remove(sid))
