@@ -418,11 +418,12 @@ impl Desk {
 
     /// What a session of `engine` on no account (`None`: the CLI's own
     /// sign-in) runs on instead when this computer's CLI has no sign-in of
-    /// its own: the first of its accounts, in the order a switch takes them
-    /// (the default first, then oldest first), whose sign-in reads, with
-    /// that sign-in. A session there never starts at the CLI's login
-    /// prompt. `None` when the CLI is signed in here, or there are no
-    /// accounts to start on (as before accounts, the CLI's own login).
+    /// its own (it says it isn't logged in): the first of its accounts, in
+    /// the order a switch takes them (the default first, then oldest
+    /// first), whose sign-in reads, with that sign-in. A session there
+    /// never starts at the CLI's login prompt. `None` when the CLI may be
+    /// signed in here, or there are no accounts to start on (as before
+    /// accounts, the CLI's own login).
     pub(super) async fn instead_of_own(
         &self,
         engine: Engine,
@@ -457,13 +458,14 @@ impl Desk {
         )))
     }
 
-    /// Whether `engine`'s CLI is signed in on this computer by itself (to a
-    /// plan or with a key). Not yet read, or unreadable: read again now.
+    /// Whether `engine`'s CLI may be signed in on this computer by itself:
+    /// false only once it says it isn't. Not yet read: read now. Still
+    /// unreadable: left to it, as before accounts.
     async fn own_sign_in_works(&self, engine: Engine) -> bool {
         if *self.sign_ins().of(engine) == engine::SignIn::Unknown {
             self.read_engine_now(engine).await;
         }
-        matches!(self.sign_ins().of(engine), engine::SignIn::In { .. })
+        *self.sign_ins().of(engine) != engine::SignIn::Out
     }
 
     /// `a`'s token from the store, off the runtime's threads and never under
