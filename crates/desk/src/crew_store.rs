@@ -234,21 +234,27 @@ impl DeskStore {
         seen: Option<&Seen>,
     ) -> Result<Vec<Event>> {
         let client = self.pool().get().await?;
-        let (group, open) = (
-            seen.and_then(Seen::group_param),
-            seen.map(Seen::open_param).unwrap_or_default(),
-        );
+        let p = seen.map(Seen::params).unwrap_or_default();
         let sql = format!(
             "SELECT * FROM (SELECT * FROM activity WHERE at >= $1 \
              AND (cardinality($2::text[]) = 0 OR subject ->> 'id' = ANY($2)) \
-             AND ($6::bool OR {}) \
+             AND ($8::bool OR {}) \
              ORDER BY at DESC, id DESC LIMIT $3) recent ORDER BY at, id",
-            seen_sql("group_id", 4, 5)
+            seen_sql("group_id", "at", 4)
         );
         let rows = client
             .query(
                 &sql,
-                &[&since, &ids, &limit, &group, &open, &seen.is_none()],
+                &[
+                    &since,
+                    &ids,
+                    &limit,
+                    &p.group,
+                    &p.open,
+                    &p.groups,
+                    &p.since,
+                    &seen.is_none(),
+                ],
             )
             .await?;
         rows.iter().map(event).collect()

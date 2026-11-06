@@ -7,6 +7,8 @@
 
 use std::collections::{HashMap, HashSet};
 
+use chrono::{DateTime, Utc};
+
 use crate::crew::{Event, Party, PartyKind};
 use crate::scope::{self, Scope, Seen};
 
@@ -30,7 +32,19 @@ pub(crate) struct Scopes {
     /// None until the hub says: then the crew's one overseer is the main
     /// one, and no group has a boss.
     bosses: Option<Vec<Boss>>,
+    /// Groups that stay boundaries whether or not their boss oversees now
+    /// (its config doesn't load, is switched off, or its agent is gone):
+    /// until the person takes the boss off them, their rows are the
+    /// person's alone. Kept across restarts.
+    pub(crate) bounded: HashSet<String>,
+    /// When each group that was a boundary stopped being one: the main
+    /// overseer sees its rows from then on, never its past. Kept too.
+    opened: HashMap<String, DateTime<Utc>>,
 }
+
+/// Where the boundaries are kept across restarts.
+const BOUNDED: &str = "desk.groups.bounded";
+const OPENED: &str = "desk.groups.opened";
 
 impl Scopes {
     fn party_group(&self, p: &Party) -> Option<String> {
@@ -47,10 +61,15 @@ impl Scopes {
                     .ok()
                     .and_then(|id| self.members.get(&session_item(id)).cloned())
             }
-            // A boss's own doing is its scope's, wherever its agent sits.
-            PartyKind::Agent => {
-                boss().unwrap_or_else(|| self.members.get(&local_agent_item(&p.id)).cloned())
-            }
+            // A boss's own doing is its scope's, wherever its agent sits; an
+            // agent of another hub is known as `hub/agent`.
+            PartyKind::Agent => boss().unwrap_or_else(|| {
+                let item = match p.id.contains('/') {
+                    true => format!("agent:{}", p.id),
+                    false => local_agent_item(&p.id),
+                };
+                self.members.get(&item).cloned()
+            }),
             PartyKind::Manager => boss().flatten(),
             PartyKind::You | PartyKind::Desk => None,
         }
@@ -61,6 +80,7 @@ impl Scopes {
             .iter()
             .flatten()
             .filter_map(|b| b.scope.group().map(str::to_string))
+            .chain(self.bounded.iter().cloned())
             .collect()
     }
 }
@@ -79,6 +99,78 @@ impl Desk {
             .iter()
             .map(|g| (g.id.clone(), g.name.clone()))
             .collect();
+    }
+
+    /// Reads the boundaries kept across restarts.
+    pub(super) async fn scopes_load(&self) {
+        let read = |key: &'static str| async move {
+            self.0
+                .store
+                .state(key)
+                .await
+                .inspect_err(
+                    |e| tracing::warn!(error = %e, "reading the groups' boundaries failed"),
+                )
+                .ok()
+                .flatten()
+                .map(|e| e.value)
+        };
+        let bounded = read(BOUNDED).await;
+        let opened = read(OPENED).await;
+        let mut s = self.0.scopes.lock();
+        s.bounded = bounded
+            .and_then(|v| serde_json::from_value(v).ok())
+            .unwrap_or_default();
+        s.opened = opened
+            .and_then(|v| serde_json::from_value(v).ok())
+            .unwrap_or_default();
+    }
+
+    async fn scopes_keep(&self) {
+        let (bounded, opened) = {
+            let s = self.0.scopes.lock();
+            (serde_json::json!(s.bounded), serde_json::json!(s.opened))
+        };
+        for (key, value) in [(BOUNDED, bounded), (OPENED, opened)] {
+            if let Err(e) = self.0.store.put_state(key, &value).await {
+                tracing::error!(error = %e, "keeping the groups' boundaries failed");
+            }
+        }
+    }
+
+    /// Makes `groups` boundaries, as any agent's `[oversight]` names them:
+    /// they stay so until the person takes the boss off them.
+    pub async fn bound_groups(&self, groups: impl IntoIterator<Item = String>) {
+        if self.bound_groups_now(groups) {
+            self.scopes_keep().await;
+        }
+    }
+
+    /// [`Self::bound_groups`] at once, in memory: whether any is new, and so
+    /// is to be kept.
+    pub fn bound_groups_now(&self, groups: impl IntoIterator<Item = String>) -> bool {
+        let mut s = self.0.scopes.lock();
+        let mut added = false;
+        for g in groups {
+            added |= s.bounded.insert(g);
+        }
+        added
+    }
+
+    /// The person took the boss off `group`: the main overseer sees it from
+    /// now on, never what it held before.
+    pub async fn unbound_group(&self, group: &str) {
+        let removed = {
+            let mut s = self.0.scopes.lock();
+            let removed = s.bounded.remove(group);
+            if removed {
+                s.opened.insert(group.to_string(), Utc::now());
+            }
+            removed
+        };
+        if removed {
+            self.scopes_keep().await;
+        }
     }
 
     /// The overseers there are now, each with its scope: the hub says, each
@@ -106,6 +198,20 @@ impl Desk {
                 scope: Scope::Ungrouped,
             })
             .into_iter()
+            .collect()
+    }
+
+    /// Each overseer as a room member (`local/<agent>`), with its scope's
+    /// group.
+    pub(crate) fn boss_members(&self) -> HashMap<String, Option<String>> {
+        self.bosses()
+            .into_iter()
+            .map(|b| {
+                (
+                    format!("{}/{}", crate::rooms::LOCAL_HUB, b.agent),
+                    b.scope.group().map(str::to_string),
+                )
+            })
             .collect()
     }
 
@@ -137,7 +243,8 @@ impl Desk {
             .is_some_and(|b| scope::sees(&b.scope, group, &bossed))
     }
 
-    /// The groups no overseer but their own sees: those with a boss.
+    /// The groups no overseer but their own sees: those with a boss, and
+    /// those whose boss isn't overseeing now but was never taken off.
     pub fn bossed(&self) -> HashSet<String> {
         self.0.scopes.lock().bossed()
     }
@@ -152,7 +259,9 @@ impl Desk {
             .filter(|g| !bossed.contains(*g))
             .cloned()
             .collect();
-        Seen::new(scope.clone(), bossed, open)
+        let mut seen = Seen::new(scope.clone(), bossed, open);
+        seen.opened = s.opened.clone();
+        seen
     }
 
     /// The scope a row of `group` is in now.

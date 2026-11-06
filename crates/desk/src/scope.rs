@@ -15,7 +15,9 @@
 //! through another Desk hub, would sit in a group by its own `session:` key
 //! and be stamped and scoped as any other.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+
+use chrono::{DateTime, Utc};
 
 pub use workforce_core::scope::Scope;
 
@@ -42,14 +44,18 @@ pub fn sees(scope: &Scope, group: Option<&str>, bossed: &HashSet<String>) -> boo
 }
 
 /// What one overseer sees, as things stood when it was read: its scope,
-/// the groups with a boss of their own, and the sidebar's groups with none
-/// (`open`), which are the main overseer's. A group in neither is no
-/// longer in the sidebar: no overseer sees its rows.
+/// the groups that are boundaries (a boss of their own, or one named for
+/// them that isn't overseeing now), the sidebar's groups that aren't
+/// (`open`), which are the main overseer's, and when each group that once
+/// was a boundary stopped being one (`opened`): the main overseer sees its
+/// rows from then on, never its past. A group in neither set is no longer in
+/// the sidebar: no overseer sees its rows.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Seen {
     pub scope: Scope,
     pub bossed: HashSet<String>,
     pub open: HashSet<String>,
+    pub opened: HashMap<String, DateTime<Utc>>,
 }
 
 impl Seen {
@@ -58,36 +64,60 @@ impl Seen {
             scope,
             bossed,
             open,
+            opened: HashMap::new(),
         }
     }
 
-    /// Whether it sees a row stamped with `group`: [`sees`], and never a
-    /// group that is no longer in the sidebar.
+    /// Whether it sees what is in `group` now: [`sees`], and never a group
+    /// that is no longer in the sidebar.
     pub fn sees(&self, group: Option<&str>) -> bool {
         let gone = group.is_some_and(|g| !self.bossed.contains(g) && !self.open.contains(g));
         !gone && sees(&self.scope, group, &self.bossed)
     }
 
-    /// The scope's group, a query's first parameter for [`seen_sql`].
-    pub fn group_param(&self) -> Option<&str> {
-        self.scope.group()
+    /// Whether it sees a row stamped with `group` at `at`: as [`Self::sees`],
+    /// and for the main overseer, of a group that was a boundary, only a row
+    /// written after it stopped being one.
+    pub fn sees_row(&self, group: Option<&str>, at: DateTime<Utc>) -> bool {
+        let before = group
+            .and_then(|g| self.opened.get(g))
+            .is_some_and(|since| at < *since);
+        self.sees(group) && !(self.scope == Scope::Ungrouped && before)
     }
 
-    /// The groups with no boss, a query's second parameter for [`seen_sql`].
-    pub fn open_param(&self) -> Vec<String> {
-        let mut o: Vec<String> = self.open.iter().cloned().collect();
-        o.sort();
-        o
+    /// The parameters [`seen_sql`] takes, in order.
+    pub fn params(&self) -> SeenParams {
+        let mut open: Vec<String> = self.open.iter().cloned().collect();
+        open.sort();
+        let (groups, since): (Vec<String>, Vec<DateTime<Utc>>) =
+            self.opened.iter().map(|(g, at)| (g.clone(), *at)).unzip();
+        SeenParams {
+            group: self.scope.group().map(str::to_string),
+            open,
+            groups,
+            since,
+        }
     }
 }
 
-/// [`Seen::sees`] in SQL, over `column`, with the scope's group as
-/// parameter `$group` (null: ungrouped) and the groups with no boss as
-/// `$open`.
-pub fn seen_sql(column: &str, group: usize, open: usize) -> String {
+/// [`Seen::sees_row`]'s parameters for SQL.
+#[derive(Debug, Clone, Default)]
+pub struct SeenParams {
+    pub group: Option<String>,
+    pub open: Vec<String>,
+    pub groups: Vec<String>,
+    pub since: Vec<DateTime<Utc>>,
+}
+
+/// [`Seen::sees_row`] in SQL, over `column` and the row's time `at`, with
+/// [`SeenParams`] as parameters `$first` to `$first + 3`.
+pub fn seen_sql(column: &str, at: &str, first: usize) -> String {
+    let (g, open, og, ot) = (first, first + 1, first + 2, first + 3);
     format!(
-        "(CASE WHEN ${group}::text IS NOT NULL THEN {column} = ${group}::text \
-         ELSE ({column} IS NULL OR {column} = ANY(${open}::text[])) END)"
+        "(CASE WHEN ${g}::text IS NOT NULL THEN {column} = ${g}::text \
+         ELSE ({column} IS NULL OR ({column} = ANY(${open}::text[]) AND NOT EXISTS ( \
+           SELECT 1 FROM unnest(${og}::text[], ${ot}::timestamptz[]) AS o(g, t) \
+           WHERE o.g = {column} AND {at} < o.t))) END)"
     )
 }
 
@@ -97,7 +127,7 @@ pub fn seen_sql(column: &str, group: usize, open: usize) -> String {
 pub fn not_ours(group_name: Option<&str>) -> String {
     match group_name {
         Some(name) => format!("That isn't one of {name}'s."),
-        None => "That isn't one of yours: it is in a group with a boss of its own.".into(),
+        None => "That isn't one of yours.".into(),
     }
 }
 
@@ -107,23 +137,30 @@ pub fn member_item(member: &crate::rooms::Member) -> String {
 }
 
 /// Whether `member` may be in a room of `room_group` (none: ungrouped),
-/// given the layout and the groups with a boss of their own. A bossed
-/// group's room takes that group's agents, and local agents of no other
-/// bossed group; any other room takes agents of any hub that are in no
-/// bossed group, because a bossed group's agents join only their group's
-/// rooms.
+/// given the layout, the groups with a boss of their own, and the
+/// overseers (`bosses`: each one's member key, `local/<agent>`, and its
+/// scope's group). A bossed group's room takes that group's agents, its
+/// boss, and local agents of no other bossed group that oversee nothing;
+/// any other room takes agents of any hub that are in no bossed group, and
+/// the main overseer, because a bossed group's agents and its boss join
+/// only their group's rooms.
 pub fn allowed_member(
     room_group: Option<&str>,
     member: &crate::rooms::Member,
     layout: &Layout,
     bossed: &HashSet<String>,
+    bosses: &HashMap<String, Option<String>>,
 ) -> bool {
     let item = member_item(member);
-    let theirs = group_of(&item, layout).filter(|g| bossed.contains(*g));
+    let boss = bosses.get(&member.key());
+    let theirs = match boss {
+        Some(g) => g.as_deref(),
+        None => group_of(&item, layout).filter(|g| bossed.contains(*g)),
+    };
     match room_group.filter(|g| bossed.contains(*g)) {
         Some(room) => match theirs {
             Some(g) => g == room,
-            None => member.hub == crate::rooms::LOCAL_HUB,
+            None => boss.is_none() && member.hub == crate::rooms::LOCAL_HUB,
         },
         None => theirs.is_none(),
     }
@@ -228,23 +265,54 @@ mod tests {
     #[test]
     fn a_rooms_members_keep_to_its_boundary() {
         let (l, b) = (layout(), bossed());
+        let bosses: HashMap<String, Option<String>> = [
+            ("local/desk".to_string(), None),
+            ("local/sarah-boss".to_string(), Some("acme".to_string())),
+            ("local/mia-boss".to_string(), Some("atlas".to_string())),
+        ]
+        .into();
+        let allowed_member_ = |room: Option<&str>, m: &Member, l: &Layout, b: &HashSet<String>| {
+            allowed_member(room, m, l, b, &bosses)
+        };
         let m = |hub: &str, agent: &str| Member {
             hub: hub.into(),
             agent: agent.into(),
         };
         // Acme's room: its own agents, and local ones of no other bossed group.
-        assert!(allowed_member(Some("acme"), &m("local", "sarah"), &l, &b));
-        assert!(allowed_member(Some("acme"), &m("atlas-hub", "ada"), &l, &b));
-        assert!(allowed_member(Some("acme"), &m("local", "scout"), &l, &b));
-        assert!(allowed_member(Some("acme"), &m("local", "free"), &l, &b));
-        assert!(!allowed_member(Some("acme"), &m("local", "mia"), &l, &b));
-        assert!(!allowed_member(Some("acme"), &m("other", "zed"), &l, &b));
+        assert!(allowed_member_(Some("acme"), &m("local", "sarah"), &l, &b));
+        assert!(allowed_member_(
+            Some("acme"),
+            &m("atlas-hub", "ada"),
+            &l,
+            &b
+        ));
+        assert!(allowed_member_(Some("acme"), &m("local", "scout"), &l, &b));
+        assert!(allowed_member_(Some("acme"), &m("local", "free"), &l, &b));
+        assert!(!allowed_member_(Some("acme"), &m("local", "mia"), &l, &b));
+        assert!(!allowed_member_(Some("acme"), &m("other", "zed"), &l, &b));
+        // A boss joins only its own group's rooms; the main overseer none of
+        // a bossed group's.
+        assert!(allowed_member_(
+            Some("acme"),
+            &m("local", "sarah-boss"),
+            &l,
+            &b
+        ));
+        assert!(!allowed_member_(
+            Some("acme"),
+            &m("local", "mia-boss"),
+            &l,
+            &b
+        ));
+        assert!(!allowed_member_(Some("acme"), &m("local", "desk"), &l, &b));
+        assert!(allowed_member_(None, &m("local", "desk"), &l, &b));
+        assert!(!allowed_member_(None, &m("local", "sarah-boss"), &l, &b));
         // An ungrouped room (or one of a group with no boss): no bossed agent.
         for room in [None, Some("infra")] {
-            assert!(allowed_member(room, &m("other", "zed"), &l, &b));
-            assert!(allowed_member(room, &m("local", "scout"), &l, &b));
-            assert!(!allowed_member(room, &m("local", "sarah"), &l, &b));
-            assert!(!allowed_member(room, &m("atlas-hub", "ada"), &l, &b));
+            assert!(allowed_member_(room, &m("other", "zed"), &l, &b));
+            assert!(allowed_member_(room, &m("local", "scout"), &l, &b));
+            assert!(!allowed_member_(room, &m("local", "sarah"), &l, &b));
+            assert!(!allowed_member_(room, &m("atlas-hub", "ada"), &l, &b));
         }
     }
 
@@ -273,12 +341,13 @@ mod tests {
     #[test]
     fn the_refusal_names_the_scope_and_never_what_is_outside_it() {
         assert_eq!(not_ours(Some("Acme")), "That isn't one of Acme's.");
-        assert!(not_ours(None).contains("boss of its own"));
-        let sql = seen_sql("group_id", 2, 3);
+        assert_eq!(not_ours(None), "That isn't one of yours.");
+        let sql = seen_sql("group_id", "at", 2);
         assert!(
             sql.contains("$2::text") && sql.contains("$3::text[]"),
             "{sql}"
         );
+        assert!(sql.contains("$4::text[], $5::timestamptz[]"), "{sql}");
     }
 
     #[test]
@@ -289,5 +358,19 @@ mod tests {
         assert!(!main.sees(Some("acme")) && !main.sees(Some("deleted")));
         let acme = Seen::new(Scope::Group("acme".into()), bossed(), open);
         assert!(acme.sees(Some("acme")) && !acme.sees(Some("deleted")));
+    }
+
+    #[test]
+    fn a_group_that_was_a_boundary_opens_to_the_main_overseer_from_then_on_not_its_past() {
+        let now = Utc::now();
+        let mut main = Seen::new(
+            Scope::Ungrouped,
+            HashSet::new(),
+            ["acme".to_string()].into(),
+        );
+        main.opened.insert("acme".into(), now);
+        assert!(!main.sees_row(Some("acme"), now - chrono::Duration::seconds(1)));
+        assert!(main.sees_row(Some("acme"), now));
+        assert!(main.sees_row(None, now - chrono::Duration::days(1)));
     }
 }

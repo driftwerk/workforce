@@ -6,7 +6,8 @@
 -- which is no group: it is null in every stamp here.
 
 -- The group an event was about when it was recorded: a ticket's board's,
--- else its subject's (a session or this hub's agent, `agent:local/<id>`).
+-- else its subject's (a session, this hub's agent `agent:local/<id>`, or a
+-- room's agent of another hub, `agent:<hub>/<agent>`).
 ALTER TABLE activity ADD COLUMN group_id TEXT;
 UPDATE activity a SET group_id = b.group_id
   FROM tickets t JOIN boards b ON b.id = t.board
@@ -16,7 +17,9 @@ UPDATE activity a SET group_id = m.group_id
  WHERE a.group_id IS NULL AND m.group_id <> 'ungrouped' AND a.subject IS NOT NULL
    AND m.item = CASE a.subject ->> 'kind'
                   WHEN 'session' THEN 'session:' || (a.subject ->> 'id')
-                  WHEN 'agent' THEN 'agent:local/' || (a.subject ->> 'id')
+                  WHEN 'agent' THEN CASE WHEN position('/' IN a.subject ->> 'id') > 0
+                                         THEN 'agent:' || (a.subject ->> 'id')
+                                         ELSE 'agent:local/' || (a.subject ->> 'id') END
                 END;
 CREATE INDEX activity_group ON activity (group_id, at DESC);
 

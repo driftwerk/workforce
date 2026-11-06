@@ -11,7 +11,7 @@ use uuid::Uuid;
 use crate::engine::Engine;
 use crate::ledger::{Billing, Cell, Priced, Spend, Tokens};
 use crate::model::SessionRecord;
-use crate::scope::{seen_sql, Seen};
+use crate::scope::{seen_sql, Seen, SeenParams};
 use crate::store::DeskStore;
 
 /// How far one of a session's records has been read.
@@ -45,10 +45,10 @@ pub struct Filter {
 impl Filter {
     /// The scope's group and the groups with no boss, which [`seen_sql`] takes,
     /// and whether every row is read (there is no scope to keep to).
-    fn seen_params(&self) -> (Option<&str>, Vec<String>, bool) {
+    fn seen_params(&self) -> (SeenParams, bool) {
         match &self.seen {
-            Some(s) => (s.group_param(), s.open_param(), false),
-            None => (None, Vec::new(), true),
+            Some(s) => (s.params(), false),
+            None => (SeenParams::default(), true),
         }
     }
 }
@@ -250,7 +250,7 @@ impl DeskStore {
         filter: &Filter,
     ) -> Result<Vec<Cell>> {
         let client = self.pool().get().await?;
-        let (group, open, all) = filter.seen_params();
+        let (p, all) = filter.seen_params();
         let sql = format!(
             "SELECT session, engine, model, account, billing, \
                (at AT TIME ZONE $3)::date AS day, \
@@ -262,9 +262,9 @@ impl DeskStore {
                AND ($4::text IS NULL OR engine = $4) \
                AND ($5::text IS NULL OR account = $5) \
                AND ($6::uuid IS NULL OR session = $6) \
-               AND ($9::bool OR {}) \
+               AND ($11::bool OR {}) \
              GROUP BY 1, 2, 3, 4, 5, 6, 15",
-            seen_sql("group_id", 7, 8)
+            seen_sql("group_id", "at", 7)
         );
         let rows = client
             .query(
@@ -276,8 +276,10 @@ impl DeskStore {
                     &filter.engine.map(Engine::as_str),
                     &filter.account,
                     &filter.session,
-                    &group,
-                    &open,
+                    &p.group,
+                    &p.open,
+                    &p.groups,
+                    &p.since,
                     &all,
                 ],
             )
@@ -312,7 +314,7 @@ impl DeskStore {
         after: Option<&After>,
     ) -> Result<Vec<LedgerRow>> {
         let client = self.pool().get().await?;
-        let (group, open, all) = filter.seen_params();
+        let (p, all) = filter.seen_params();
         let sql = format!(
             "SELECT session, key, at, engine, model, input, output, cache_read, \
                cache_write, reasoning, usd, priced, billing, account, ticket, group_id \
@@ -321,9 +323,9 @@ impl DeskStore {
                AND ($4::text IS NULL OR account = $4) \
                AND ($5::uuid IS NULL OR session = $5) \
                AND ($6::timestamptz IS NULL OR (at, engine, key) < ($6, $7, $8)) \
-               AND ($12::bool OR {}) \
+               AND ($14::bool OR {}) \
              ORDER BY at DESC, engine DESC, key DESC LIMIT $9",
-            seen_sql("group_id", 10, 11)
+            seen_sql("group_id", "at", 10)
         );
         let rows = client
             .query(
@@ -338,8 +340,10 @@ impl DeskStore {
                     &after.map(|a| a.engine.as_str()),
                     &after.map(|a| a.key.as_str()),
                     &PAGE,
-                    &group,
-                    &open,
+                    &p.group,
+                    &p.open,
+                    &p.groups,
+                    &p.since,
                     &all,
                 ],
             )

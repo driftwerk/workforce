@@ -423,3 +423,65 @@ async fn a_group_deleted_takes_its_rows_out_of_every_overseers_sight() {
     })
     .await;
 }
+
+#[tokio::test]
+async fn a_group_stays_a_boundary_until_its_boss_is_taken_off_and_then_opens_from_then_on() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        groups(&d).await;
+        // No boss oversees Acme now (its config didn't load), but one is
+        // named for it: Acme's rows are the person's alone.
+        d.set_bosses(vec![]);
+        d.bound_groups(["acme".to_string()]).await;
+        let scout = Party::agent("scout", "Scout");
+        d.note(Event::new(
+            Kind::Started,
+            scout.clone(),
+            Some(scout.clone()),
+            "started “before”",
+        ));
+        // A room agent of another hub is stamped by its own sidebar key.
+        let ada = Party::agent("atlas-hub/ada", "Ada");
+        d.note(Event::new(
+            Kind::Started,
+            ada.clone(),
+            Some(ada),
+            "started “ada's”",
+        ));
+        let bot = Party::agent("infra-bot", "Infra bot");
+        d.note(Event::new(
+            Kind::Started,
+            bot.clone(),
+            Some(bot.clone()),
+            "started “marker”",
+        ));
+        let main = seen_events(&d, &Scope::Ungrouped, 1).await;
+        assert!(
+            main.iter().all(|e| e.text != "started “before”"),
+            "{main:?}"
+        );
+        assert!(main
+            .iter()
+            .any(|e| e.text == "started “ada's”" && e.group.as_deref() == Some("atlas")));
+
+        // Kept across a restart.
+        d.0.scopes.lock().bounded.clear();
+        d.scopes_load().await;
+        assert!(d.bossed().contains("acme"));
+
+        // The person takes the boss off: from now on, not its past.
+        d.unbound_group("acme").await;
+        d.note(Event::new(
+            Kind::Started,
+            scout.clone(),
+            Some(scout),
+            "started “after”",
+        ));
+        let main = seen_events(&d, &Scope::Ungrouped, 3).await;
+        let texts: Vec<&str> = main.iter().map(|e| e.text.as_str()).collect();
+        assert!(texts.contains(&"started “after”"), "{texts:?}");
+        assert!(!texts.contains(&"started “before”"), "{texts:?}");
+    })
+    .await;
+}

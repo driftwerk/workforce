@@ -465,6 +465,12 @@ pub fn reach(
     let Some(them) = sessions.iter().find(|s| s.id == id) else {
         return Err(Refusal::NoSuchSession(id.to_string()));
     };
+    // Another scope's session is refused as one that isn't there: nothing
+    // of it, its name included, is said.
+    let scope = |s: &SessionView| scope_of(s.group.as_ref().map(|g| g.id.as_str()), bossed);
+    if scope(from) != scope(them) {
+        return Err(Refusal::NoSuchSession(id.to_string()));
+    }
     let name = them.label().to_string();
     if them.id == from.id {
         return Err(Refusal::Unreachable(name, "that is you"));
@@ -477,13 +483,6 @@ pub fn reach(
     }
     if them.caps.line == Deliver::None {
         return Err(Refusal::Unreachable(name, "its engine can't take messages"));
-    }
-    let scope = |s: &SessionView| scope_of(s.group.as_ref().map(|g| g.id.as_str()), bossed);
-    if scope(from) != scope(them) {
-        return Err(Refusal::Unreachable(
-            name,
-            "it is in another client's group",
-        ));
     }
     match policy {
         Reach::All => {}
@@ -959,10 +958,7 @@ mod tests {
         assert!(to(&a, &b).is_ok(), "within one bossed group");
         for (from, them) in [(&a, &c), (&c, &a), (&a, &e), (&e, &a), (&a, &d), (&d, &c)] {
             assert!(
-                matches!(
-                    to(from, them),
-                    Err(Refusal::Unreachable(_, "it is in another client's group"))
-                ),
+                to(from, them) == Err(Refusal::NoSuchSession(them.id.to_string())),
                 "{} to {}",
                 from.name,
                 them.name

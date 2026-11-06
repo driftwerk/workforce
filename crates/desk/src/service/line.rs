@@ -369,6 +369,15 @@ impl Desk {
                 let recipient = match to {
                     Target::Session(id) => {
                         let them = find(id).ok_or(DeskError::NotFound)?;
+                        // A boss writes only to its own scope's sessions:
+                        // another's is refused as one that isn't there, before
+                        // anything is said of it.
+                        if let Sender::Overseer(by) = &from {
+                            let group = them.group.as_ref().map(|g| g.id.as_str());
+                            if !self.boss_reaches(&by.party.id, group) {
+                                return Err(Refusal::NoSuchSession(id.to_string()).into());
+                            }
+                        }
                         if them.state == SessionState::Closed {
                             return Err(Refusal::Gone(them.label().into()).into());
                         }
@@ -379,23 +388,20 @@ impl Desk {
                             )
                             .into());
                         }
-                        // A boss writes only to its own scope's sessions.
-                        if let Sender::Overseer(by) = &from {
-                            let group = them.group.as_ref().map(|g| g.id.as_str());
-                            if !self.boss_reaches(&by.party.id, group) {
-                                return Err(Refusal::Unreachable(
-                                    them.label().into(),
-                                    "it is in another client's group",
-                                )
-                                .into());
-                            }
-                        }
                         Party::session(them)
                     }
                     Target::Person if party.kind == PartyKind::You => {
                         return Err(Refusal::Unreachable("You".into(), "that is you").into())
                     }
                     Target::Person => Party::you(),
+                    // An overseer never messages another.
+                    Target::Overseer if matches!(from, Sender::Overseer(_)) => {
+                        return Err(Refusal::Unreachable(
+                            "Desk".into(),
+                            "message a session or the person",
+                        )
+                        .into())
+                    }
                     Target::Overseer => match self.line_overseer(None) {
                         Some(o) if o.id != party.id => o,
                         _ => {

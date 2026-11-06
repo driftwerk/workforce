@@ -1061,6 +1061,7 @@ impl Desk {
             scopes: Mutex::default(),
         }));
         desk.scopes_follow(&desk.layout());
+        desk.scopes_load().await;
         tokio::spawn(persist_loop(store, floor.turns, persist_rx));
         tokio::spawn(desk.clone().read_engines());
         tokio::spawn(desk.clone().look_for_sign_ins());
@@ -2961,11 +2962,10 @@ impl Desk {
         }
         let layout = self.layout();
         let bossed = self.bossed();
-        if let Some(m) = room
-            .members
-            .iter()
-            .find(|m| !crate::scope::allowed_member(room.group.as_deref(), m, &layout, &bossed))
-        {
+        let bosses = self.boss_members();
+        if let Some(m) = room.members.iter().find(|m| {
+            !crate::scope::allowed_member(room.group.as_deref(), m, &layout, &bossed, &bosses)
+        }) {
             return Err(DeskError::Invalid(format!(
                 "{} is in another client's group, so it can't be in this room",
                 m.key()
@@ -3122,8 +3122,8 @@ impl Desk {
         // Whoever posts, a bossed group's agent stays within its rooms and
         // a bossed group's room takes only its agents, a delivery too.
         if let Some(m) = is_agent.then(|| Member::parse(&new.author)).flatten() {
-            let (layout, bossed) = (self.layout(), self.bossed());
-            if !crate::scope::allowed_member(room.group.as_deref(), &m, &layout, &bossed) {
+            let (layout, bossed, bosses) = (self.layout(), self.bossed(), self.boss_members());
+            if !crate::scope::allowed_member(room.group.as_deref(), &m, &layout, &bossed, &bosses) {
                 return Err(DeskError::Invalid(format!(
                     "{} is in another client's group, so it can't post in this room",
                     new.author
