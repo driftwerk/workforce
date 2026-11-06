@@ -4473,3 +4473,56 @@ async fn a_served_rounds_plan_reading_is_kept_as_its_logins() {
         seen.0.lock()
     );
 }
+
+/// A silent ChatGPT plan with a Claude route after it: the turn moves to
+/// Claude after one first-token window, without trying the silent model
+/// again first.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_silent_model_with_a_fallback_route_is_left_after_one_window() {
+    use wiremock::matchers::{method, path};
+    let hub = hub(|config| {
+        config.llm.provider = "chatgpt".into();
+        config.llm.default_model = "gpt-6.1-sol".into();
+        config.llm.failover = vec!["claude-code:sonnet".into()];
+        let mut retry = workforce_common::settings::RetryConfig::default();
+        retry.provider_timeouts.insert(
+            "chatgpt".into(),
+            workforce_common::settings::ModelTimeoutOverride {
+                first_token_timeout_secs: Some(1),
+                ..Default::default()
+            },
+        );
+        config.llm.retry = Some(retry);
+    })
+    .await;
+    store_chatgpt_login(&hub.service, ALICE);
+    wiremock::Mock::given(method("POST"))
+        .and(path("/responses"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_delay(Duration::from_secs(8)))
+        .mount(&hub.server)
+        .await;
+    hub.claude_login(ALICE);
+    hub.claude.reply(None, &answer("Claude answers."));
+
+    let started = std::time::Instant::now();
+    let (events, served) = hub.stream(ALICE, "hello there", None, None).await;
+
+    let served = served.expect("the fallback route answers");
+    assert_eq!(served.response, "Claude answers.");
+    assert_eq!(
+        hub.chatgpt_requests().await,
+        1,
+        "the silent model is asked once"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, ProgressEvent::SlowModelRetry { .. })),
+        "no retry is announced while a route follows"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(6),
+        "{:?}",
+        started.elapsed()
+    );
+}

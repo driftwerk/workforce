@@ -3306,6 +3306,11 @@ pub(crate) async fn forward_local_progress(
                 "slow_model_failover",
                 slow_model_line(&model, elapsed_secs),
             )),
+            ProgressEvent::SlowModelRetry { model } => Some(BroadcastMessage::new(
+                sid.clone(),
+                SLOW_MODEL_RETRY,
+                slow_model_retry_line(&model),
+            )),
             ProgressEvent::SubActivity { source, detail } => Some(BroadcastMessage::silent(
                 sid.clone(),
                 "tool_start",
@@ -3717,6 +3722,14 @@ fn followup_injection(
     }
 }
 
+/// The frame saying a silent model is asked once more.
+const SLOW_MODEL_RETRY: &str = "slow_model_retry";
+
+/// What a client shows while a silent model is asked once more.
+fn slow_model_retry_line(model: &str) -> String {
+    format!("{model} is slow to answer, trying again")
+}
+
 /// The agent a frame addresses: its own `agent_id`, else the agent the
 /// connection was opened for, else the default.
 fn frame_agent<'a>(
@@ -3977,6 +3990,11 @@ pub(crate) fn chat_progress_to_broadcast(
             session_id,
             "slow_model_failover",
             slow_model_line(&model, elapsed_secs),
+        )),
+        ChatProgress::SlowModelRetry { model } => Some(BroadcastMessage::new(
+            session_id,
+            SLOW_MODEL_RETRY,
+            slow_model_retry_line(&model),
         )),
         ChatProgress::Snapshot(snapshot) => {
             Some(BroadcastMessage::turn_snapshot(session_id, snapshot))

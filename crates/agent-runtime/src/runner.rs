@@ -1393,6 +1393,9 @@ pub enum ProgressEvent {
     },
     /// Mid-run message(s) were absorbed from the user.
     InjectedMessage { count: u32 },
+    /// The model sent nothing in its first-token window and, with no other
+    /// route to take the turn, is asked once more.
+    SlowModelRetry { model: String },
     /// A tool call requires human approval before execution.
     ApprovalRequired {
         request_id: String,
@@ -2858,9 +2861,21 @@ pub struct AgentRunner {
     tool_access: Arc<dyn ToolAccess>,
     image_sink: Option<Arc<dyn crate::tools::image_gen::ImageSink>>,
     image_view_sink: Option<Arc<dyn crate::tools::image_view::ImageViewSink>>,
+    /// Whether a model call with no first token is tried once more before
+    /// the run fails: off where another route would take the turn.
+    silent_retry: bool,
 }
 
 impl AgentRunner {
+    /// This runner, failing a call that never sent a first token at once:
+    /// for a route another one follows, which takes the turn instead.
+    pub fn without_silent_retry(self) -> Self {
+        Self {
+            silent_retry: false,
+            ..self
+        }
+    }
+
     pub fn new(
         config: RunnerConfig,
         llm: Arc<dyn LlmProvider>,
@@ -2882,6 +2897,7 @@ impl AgentRunner {
             tool_access: access::noop(),
             image_sink: None,
             image_view_sink: None,
+            silent_retry: true,
         }
     }
 
@@ -5300,8 +5316,9 @@ impl AgentRunner {
                                     cached_prefix,
                                 )
                                 .await?
-                            } else if classify_error(&error_str)
-                                == crate::llm::failover::ErrorKind::FirstTokenTimeout
+                            } else if self.silent_retry
+                                && classify_error(&error_str)
+                                    == crate::llm::failover::ErrorKind::FirstTokenTimeout
                             {
                                 // Nothing streamed, and nothing was left to
                                 // fail over to: a slow model gets one more
@@ -5312,6 +5329,11 @@ impl AgentRunner {
                                     round = rounds,
                                     "No first token from the model — retrying the call once"
                                 );
+                                let _ = progress_tx
+                                    .send(ProgressEvent::SlowModelRetry {
+                                        model: run_model.clone(),
+                                    })
+                                    .await;
                                 self.absorb_injected_followups(
                                     &mut fwd_inject_rx,
                                     &mut messages,
@@ -10616,6 +10638,7 @@ mod tests {
                 ProgressEvent::CompactEnd => "compact_end",
                 ProgressEvent::ContextUpdate { .. } => "context_update",
                 ProgressEvent::InjectedMessage { .. } => "injected_message",
+                ProgressEvent::SlowModelRetry { .. } => "slow_model_retry",
                 ProgressEvent::ApprovalRequired { .. } => "approval_required",
                 ProgressEvent::ApprovalResolved { .. } => "approval_resolved",
                 ProgressEvent::RateLimited { .. } => "rate_limited",
@@ -12873,7 +12896,7 @@ mod tests {
             release: Arc::new(tokio::sync::Semaphore::new(0)),
         });
         let runner = make_runner(provider.clone());
-        let (progress_tx, _progress_rx) = mpsc::channel(64);
+        let (progress_tx, mut progress_rx) = mpsc::channel(256);
         let (inject_tx, inject_rx) = mpsc::channel(8);
         let run = tokio::spawn(async move {
             runner
@@ -12901,6 +12924,14 @@ mod tests {
 
         let result = run.await.unwrap().expect("the retry answers");
         assert_eq!(result.response, "it was NCM");
+        let mut announced = false;
+        while let Ok(event) = progress_rx.try_recv() {
+            announced |= matches!(event, ProgressEvent::SlowModelRetry { .. });
+        }
+        assert!(
+            announced,
+            "the person is told the model is slow and asked again"
+        );
         assert_eq!(result.rounds, 1, "the retry is the same round's call");
         let calls = provider.calls.lock().unwrap();
         assert_eq!(calls.len(), 2, "tried once more, no more");
@@ -12926,6 +12957,33 @@ mod tests {
                 external_id: Some("c-2".into()),
             }]
         );
+    }
+
+    /// A runner some other route follows fails a silent call at once, and
+    /// says nothing of a retry: the next route takes the turn.
+    #[tokio::test]
+    async fn a_runner_another_route_follows_does_not_retry_a_silent_model() {
+        let provider = Arc::new(SilentOnce {
+            calls: std::sync::Mutex::new(Vec::new()),
+            started: Arc::new(tokio::sync::Semaphore::new(0)),
+            release: Arc::new(tokio::sync::Semaphore::new(1)),
+        });
+        let runner = make_runner(provider.clone()).without_silent_retry();
+        let (progress_tx, mut progress_rx) = mpsc::channel(64);
+        let _failed = runner
+            .run_with_progress_and_history(
+                vec![ContentBlock::Text { text: "hi".into() }],
+                Vec::new(),
+                progress_tx,
+                None,
+                None,
+            )
+            .await
+            .expect_err("silent, with no retry");
+        assert_eq!(provider.calls.lock().unwrap().len(), 1);
+        while let Ok(event) = progress_rx.try_recv() {
+            assert!(!matches!(event, ProgressEvent::SlowModelRetry { .. }));
+        }
     }
 
     /// A model silent twice fails the turn: one retry, not a loop.

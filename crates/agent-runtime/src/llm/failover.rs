@@ -271,10 +271,25 @@ impl From<&workforce_common::settings::RetryConfig> for LlmTimeouts {
             stall_timeout_secs: r.stall_timeout_secs,
             request_timeout_secs: r.request_timeout_secs,
             model_timeouts: overrides(&r.model_timeouts),
-            provider_timeouts: overrides(&r.provider_timeouts),
+            provider_timeouts: {
+                for key in unknown_providers(r.provider_timeouts.keys()) {
+                    warn!(
+                        provider = key,
+                        "[llm.retry.provider_timeouts] names no provider; its override never applies"
+                    );
+                }
+                overrides(&r.provider_timeouts)
+            },
             provider: None,
         }
     }
+}
+
+/// The keys of `[llm.retry.provider_timeouts]` that name no provider.
+fn unknown_providers<'a>(keys: impl Iterator<Item = &'a String>) -> Vec<&'a str> {
+    keys.filter(|key| ProviderKind::from_str_loose(key).is_none())
+        .map(String::as_str)
+        .collect()
 }
 
 /// The wire's overrides, by the same keys.
@@ -4105,6 +4120,16 @@ mod tests {
                 .first_token,
             Duration::from_secs(30)
         );
+    }
+
+    #[test]
+    fn a_provider_override_naming_no_provider_is_called_out() {
+        let keys = [
+            "chatgpt".to_string(),
+            "claude".to_string(),
+            "chat-gpt".to_string(),
+        ];
+        assert_eq!(unknown_providers(keys.iter()), ["chat-gpt"]);
     }
 
     #[test]
