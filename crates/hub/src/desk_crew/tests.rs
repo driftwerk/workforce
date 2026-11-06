@@ -3782,12 +3782,15 @@ mod board {
             let r = assign.execute(new("ACM-1")).await.unwrap();
             assert!(r.success, "{r:?}");
             let done = r.output["done"].as_str().unwrap();
-            assert!(done.starts_with("gave ACM-1 to ACM-1, a session started for it"), "{done}");
             let started = d
                 .list()
                 .into_iter()
                 .find(|v| v.name == "ACM-1")
                 .expect("a session named for the ticket");
+            assert!(
+                done.starts_with(&format!("started ACM-1 ({}) for ACM-1; you run it", started.id)),
+                "{done}"
+            );
             assert_eq!(started.goal, "ACM-1 · Add the date picker");
             assert_eq!(started.group.as_ref().map(|g| g.id.as_str()), Some("g-acme"));
             let c = d.charge_of(started.id).unwrap();
@@ -3824,6 +3827,13 @@ mod board {
                 Some("ACM-3 waits on ACM-1, which isn't done; hand it out once it is.")
             );
 
+            // A session that is gone is said so.
+            let r = assign
+                .execute(json!({"ticket": "ACM-2", "to": {"session": uuid::Uuid::new_v4().to_string()}, "reason": "It is next."}))
+                .await
+                .unwrap();
+            assert_eq!(r.error.as_deref(), Some("That session isn’t there any more."));
+
             // A ticket that is done is not handed out again.
             d.move_ticket(
                 first.ticket.id,
@@ -3837,6 +3847,68 @@ mod board {
                 r.error.as_deref(),
                 Some("ACM-1 is done already; there is nothing to hand out.")
             );
+        })
+        .await;
+    }
+
+    /// At suggest, a ticket handed to a new session holds a slot as any
+    /// start does, whether it waits as that or as a start of its own.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_overseer_suggests_no_more_ticket_starts_than_it_has_free_slots() {
+        with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let (overseer, _crew, d, _llm) = overseeing(
+                dir.path(),
+                pool,
+                "ok",
+                "[oversight]\nenabled = true\nlevel = \"suggest\"\n[oversight.work]\nparallel = 2\n",
+                &[],
+            )
+            .await;
+            let b = acme(&d).await;
+            for title in ["Add the date picker", "Fix the flaky test", "Tidy the footer"] {
+                ticket(&d, b, title, TicketState::Todo, &[]).await;
+            }
+            eventually("the overseer's tools", async || {
+                overseer.tools.has("crew.assign_ticket").then_some(())
+            })
+            .await;
+            let folder = dir.path().to_string_lossy().into_owned();
+            let assign = overseer.tools.get("crew.assign_ticket").unwrap();
+            let start = overseer.tools.get("crew.start_session").unwrap();
+            let new = |key: &str| {
+                json!({"ticket": key, "to": {"newSession": {"folder": folder}}, "reason": "It is next."})
+            };
+            let r = assign.execute(new("ACM-1")).await.unwrap();
+            assert_eq!(
+                r.output["suggested"],
+                format!("Start a session in {folder} for ACM-1")
+            );
+            // A start of its own holds the second slot.
+            let r = start
+                .execute(json!({"folder": folder, "goal": "Fix bug", "reason": "Sam asked"}))
+                .await
+                .unwrap();
+            assert!(r.output["suggestion_id"].is_string(), "{r:?}");
+            for r in [
+                assign.execute(new("ACM-2")).await.unwrap(),
+                start
+                    .execute(json!({"folder": folder, "goal": "Fix another", "reason": "Sam asked"}))
+                    .await
+                    .unwrap(),
+            ] {
+                assert_eq!(
+                    r.error.as_deref(),
+                    Some("You already run or have suggested 2 sessions, the most you may run at once (2). Wait for one to finish, or for the person to answer the starts you suggested.")
+                );
+            }
+            // Handing it to a session already there takes no slot.
+            let s = new_session(&d, dir.path(), "acme-web").await;
+            let r = assign
+                .execute(json!({"ticket": "ACM-3", "to": {"session": s.id.to_string()}, "reason": "It is next."}))
+                .await
+                .unwrap();
+            assert!(r.output["suggested"].is_string(), "{r:?}");
         })
         .await;
     }

@@ -1195,10 +1195,14 @@ impl CrewHub {
         }
         let id = t.ticket.id;
         let given = match to {
-            Handout::Session(s) => d
-                .assign_ticket(id, Some(AssignTo::Session(*s)), &by)
-                .await
-                .map_err(board_plain)?,
+            Handout::Session(s) => {
+                if d.view(*s).is_err() {
+                    return Err("That session isn’t there any more.".into());
+                }
+                d.assign_ticket(id, Some(AssignTo::Session(*s)), &by)
+                    .await
+                    .map_err(board_plain)?
+            }
             Handout::Agent(a) => d
                 .assign_ticket(id, Some(AssignTo::Agent(a.clone())), &by)
                 .await
@@ -1225,28 +1229,26 @@ impl CrewHub {
                     .map_err(board_plain)?
             }
         };
-        let who = given
-            .ticket
-            .assignee
-            .map(|a| a.name)
-            .unwrap_or_else(|| "no one".into());
-        Ok(match to {
-            Handout::NewSession { .. } => format!(
-                "gave {key} to {who}, a session started for it; you run it, and the person can watch it, type into it and take it over"
+        let who = given.ticket.assignee;
+        let name = who.as_ref().map_or("no one", |a| a.name.as_str());
+        Ok(match (to, who.as_ref()) {
+            (Handout::NewSession { .. }, Some(a)) => format!(
+                "started {name} ({}) for {key}; you run it, and the person can watch it, type into it and take it over",
+                a.id
             ),
-            _ => format!("gave {key} to {who}"),
+            _ => format!("gave {key} to {name}"),
         })
     }
 
     /// Whether the overseer (`by`) may suggest one more start: the sessions
     /// it runs that are starting or working, and the starts it suggested
-    /// that the person hasn't answered, are fewer than its limit.
+    /// that the person hasn't answered (a ticket handed to a new session is a start), are fewer than its limit.
     pub(crate) async fn start_suggestable(&self, by: &By, o: &Oversight) -> Result<(), String> {
         let busy = self.desk.charges_busy(&by.party.id);
         let open = self
             .desk
             .store()
-            .open_suggestions(&by.party.id, "crew.start_session")
+            .open_start_suggestions(&by.party.id)
             .await
             .map_err(|e| {
                 tracing::warn!(error = %e, "couldn't count the starts the overseer suggested");

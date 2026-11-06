@@ -340,6 +340,24 @@ impl DeskStore {
         Ok(row.get(0))
     }
 
+    /// How many of `agent_id`'s suggestions to start a session are still
+    /// open: a start of its own, or a ticket handed to a session started
+    /// for it.
+    pub async fn open_start_suggestions(&self, agent_id: &str) -> Result<i64> {
+        let client = self.pool().get().await?;
+        let row = client
+            .query_one(
+                "SELECT count(*) FROM suggestions WHERE agent_id = $1 AND state = 'open' \
+                 AND (action ->> 'tool' = 'crew.start_session' \
+                  OR (action ->> 'tool' = 'crew.assign_ticket' \
+                      AND (action #> '{input,to,newSession}' IS NOT NULL \
+                           OR action #> '{input,to,new_session}' IS NOT NULL)))",
+                &[&agent_id],
+            )
+            .await?;
+        Ok(row.get(0))
+    }
+
     /// Suggestions `agent_id` made since `since`, oldest first.
     pub async fn suggestions_since(
         &self,
