@@ -710,6 +710,7 @@ pub(super) async fn wake_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
     let mut raised = crew.raised().await;
     // The ready tickets nobody has, so that one that becomes so wakes it.
     let mut ready_seen = HashMap::new();
+    let mut ready_dirty = false;
     crew.ready_unhanded(&mut ready_seen, &Oversight::default())
         .await;
     // Until when check-ins are spent, and the pause the person was told of.
@@ -730,15 +731,20 @@ pub(super) async fn wake_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
                         }
                     }
                 }
-                Ok(DeskEvent::Ticket { .. }) => {
-                    if let Some((_, o)) = crew.overseer_service() {
-                        found.extend(crew.ready_unhanded(&mut ready_seen, &o).await);
-                    }
-                }
+                // Looked at on the next tick, not here: reading the boards
+                // while events wait would let the channel lag and lose
+                // the wakes among them.
+                Ok(DeskEvent::Ticket { .. }) => ready_dirty = true,
                 Ok(_) | Err(RecvError::Lagged(_)) => {}
                 Err(RecvError::Closed) => return,
             },
             _ = tick.tick() => {
+                // Kept up to date with no overseer too, so that one set up
+                // later isn't woken for what has long been ready.
+                if std::mem::take(&mut ready_dirty) {
+                    let o = crew.overseer_service().map(|(_, o)| o).unwrap_or_default();
+                    found.extend(crew.ready_unhanded(&mut ready_seen, &o).await);
+                }
                 if let Some((s, o)) = crew.overseer_service() {
                     found.extend(crew.thresholds(s.agent_id.as_str(), &o, &mut noted).await);
                 }

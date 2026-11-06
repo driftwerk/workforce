@@ -99,12 +99,25 @@ pub(crate) enum Action {
     /// session started for it.
     AssignTicket {
         ticket: String,
+        /// The ticket's id, once it is resolved ([`CrewHub::resolve_ticket`]):
+        /// a suggestion keeps it, so that it is that ticket that is acted
+        /// on, whatever the key means by then.
+        id: Option<Uuid>,
+        /// Its title and body as resolved, which the hand-out says to
+        /// whoever gets it.
+        text: String,
         to: Handout,
     },
     /// Move a ticket on the board (by its key) to a column.
     MoveTicket {
         ticket: String,
+        id: Option<Uuid>,
         state: TicketState,
+        /// The column it is in as resolved.
+        was: Option<TicketState>,
+        /// Whether the move takes it off a session started in another
+        /// terminal, which is then told.
+        off_external: bool,
     },
     /// Run a session for the person: it wakes the overseer at each turn's
     /// end, and waits for it while the person isn't driving.
@@ -134,6 +147,7 @@ struct Input {
     worktree: Option<String>,
     task: Option<String>,
     ticket: Option<String>,
+    ticket_id: Option<String>,
     to: Option<Value>,
     state: Option<TicketState>,
     reply_to: Option<String>,
@@ -163,6 +177,16 @@ fn ticket_key(raw: Option<String>) -> Result<String, String> {
     workforce_desk::board::parse_key(&key)
         .map(|(prefix, n)| format!("{prefix}-{n}"))
         .ok_or_else(|| format!("{key:?} isn’t a ticket’s key, like ACM-12."))
+}
+
+/// The id a resolved ticket is kept by in a suggestion.
+fn ticket_id(raw: Option<String>) -> Result<Option<Uuid>, String> {
+    raw.map(|r| {
+        r.trim()
+            .parse()
+            .map_err(|_| "That isn’t a ticket id.".to_string())
+    })
+    .transpose()
 }
 
 /// Who `to` hands a ticket to: `{ "session": id }`, `{ "agent": id }` or
@@ -290,13 +314,18 @@ impl Action {
             },
             "crew.assign_ticket" => Self::AssignTicket {
                 ticket: ticket_key(i.ticket)?,
+                id: ticket_id(i.ticket_id)?,
+                text: String::new(),
                 to: handout(i.to)?,
             },
             "crew.move_ticket" => Self::MoveTicket {
                 ticket: ticket_key(i.ticket)?,
+                id: ticket_id(i.ticket_id)?,
                 state: i
                     .state
                     .ok_or("Say which column: backlog, todo, doing, review, done or dropped.")?,
+                was: None,
+                off_external: false,
             },
             "crew.take_on" => Self::TakeOn {
                 session: session()?,
@@ -306,6 +335,14 @@ impl Action {
             },
             other => return Err(format!("{other} is not something the overseer can do")),
         })
+    }
+
+    /// The id of the ticket it is about, once resolved.
+    pub(crate) fn ticket_id(&self) -> Option<Uuid> {
+        match self {
+            Self::AssignTicket { id, .. } | Self::MoveTicket { id, .. } => *id,
+            _ => None,
+        }
     }
 
     /// Whether it starts a session.
@@ -480,19 +517,32 @@ impl CrewHub {
             } => self.questions.lock().get(ask).is_none_or(|q| outward(q)),
             _ => false,
         };
-        if action.outward() || asked_outward {
+        if action.outward() || asked_outward || self.ticket_outward(action) {
             return Gate::Suggest(
                 "anything that pushes, deletes or reaches outside Desk is the person's call".into(),
             );
         }
         // Letting go of a ticket for good is the person's, whatever else
-        // they let it hand out.
+        // they let it hand out; so is bringing back one they dropped.
+        if let Action::MoveTicket { state, was, .. } = action {
+            if *state == TicketState::Dropped {
+                return Gate::Suggest("dropping a ticket is the person's call".into());
+            }
+            if *was == Some(TicketState::Dropped) {
+                return Gate::Suggest(
+                    "the person dropped this ticket; bringing it back is their call".into(),
+                );
+            }
+        }
         if let Action::MoveTicket {
-            state: TicketState::Dropped,
-            ..
+            off_external: true, ..
         } = action
         {
-            return Gate::Suggest("dropping a ticket is the person's call".into());
+            if !o.act.message_terminal_sessions {
+                return Gate::Suggest(
+                    "moving it tells a session in another terminal, which the person hasn't let you message without asking".into(),
+                );
+            }
         }
         let allowed = match action {
             Action::Nudge {
@@ -542,6 +592,25 @@ impl CrewHub {
         } else {
             Gate::Suggest("the person hasn't let you do that without asking".into())
         }
+    }
+
+    /// Whether the ticket `action` hands out says something reaching
+    /// outside Desk, as `crew.assign` and `crew.start_session` are judged by
+    /// what they say: to an agent, to a session started for it, and to a
+    /// session in another terminal (one Desk started waits on its
+    /// approvals).
+    fn ticket_outward(&self, action: &Action) -> bool {
+        let Action::AssignTicket { to, text, .. } = action else {
+            return false;
+        };
+        let says = match to {
+            Handout::Agent(_) | Handout::NewSession { .. } => true,
+            Handout::Session(s) => self
+                .desk
+                .view(*s)
+                .is_ok_and(|v| v.origin == Origin::External),
+        };
+        says && outward(text)
     }
 
     /// The session `action` is done to, when it is one.
@@ -848,14 +917,14 @@ impl CrewHub {
                     crew::clip(task, 200)
                 )
             }
-            Action::AssignTicket { ticket, to } => match to {
+            Action::AssignTicket { ticket, to, .. } => match to {
                 Handout::Session(s) => format!("Give {ticket} to {}", self.session_name(*s)),
                 Handout::Agent(a) => format!("Give {ticket} to {}", self.agent_name(a)),
                 Handout::NewSession { folder, .. } => {
                     format!("Start a session in {folder} for {ticket}")
                 }
             },
-            Action::MoveTicket { ticket, state } => {
+            Action::MoveTicket { ticket, state, .. } => {
                 format!("Move {ticket} to {}", state.title())
             }
             Action::TakeOn { session } => {
@@ -1020,8 +1089,10 @@ impl CrewHub {
             }
             Action::StartSession { .. } => self.start_session(action, by).await,
             Action::AssignTicket { .. } => self.assign_ticket(action, by).await,
-            Action::MoveTicket { ticket, state } => {
-                let t = d.ticket_by_key(ticket).await.map_err(board_plain)?;
+            Action::MoveTicket {
+                ticket, id, state, ..
+            } => {
+                let t = self.ticket_named(ticket, *id).await?;
                 let mv = Move {
                     state: *state,
                     before: None,
@@ -1165,20 +1236,89 @@ impl CrewHub {
         Ok(())
     }
 
+    /// The ticket by its id when it has one (a suggestion's), else by its
+    /// key.
+    async fn ticket_named(
+        &self,
+        key: &str,
+        id: Option<Uuid>,
+    ) -> Result<workforce_desk::TicketView, String> {
+        match id {
+            Some(id) => self.desk.ticket(id).await,
+            None => self.desk.ticket_by_key(key).await,
+        }
+        .map_err(board_plain)
+    }
+
+    /// Fills in the ticket `action` is about, before it is gated: its id
+    /// (the suggestion keeps that, not the key), its words, and where it
+    /// stands. Other actions are left as they are.
+    pub(crate) async fn resolve_ticket(&self, action: &mut Action) -> Result<(), String> {
+        match action {
+            Action::AssignTicket {
+                ticket, id, text, ..
+            } => {
+                let t = self.ticket_named(ticket, *id).await?;
+                *id = Some(t.ticket.id);
+                *text = format!("{}\n{}", t.ticket.title, t.ticket.body);
+            }
+            Action::MoveTicket {
+                ticket,
+                id,
+                state,
+                was,
+                off_external,
+            } => {
+                let t = self.ticket_named(ticket, *id).await?;
+                *id = Some(t.ticket.id);
+                *was = Some(t.ticket.state);
+                *off_external = workforce_desk::board::unassigns(*state)
+                    && t.ticket
+                        .session()
+                        .and_then(|s| self.desk.view(s).ok())
+                        .is_some_and(|v| v.origin == Origin::External);
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
     /// Hands the ticket `action` names to a session, an agent, or a session
     /// started for it, as `by`. One that is started is the overseer's to
     /// run from the start: it counts against `[oversight.work] parallel`
     /// as any start does, and is in the overseer's charge and group.
     async fn assign_ticket(&self, action: &Action, by: By) -> Result<String, String> {
-        let Action::AssignTicket { ticket: key, to } = action else {
+        let Action::AssignTicket {
+            ticket: key,
+            id,
+            to,
+            ..
+        } = action
+        else {
             return Err("That isn't a ticket to hand out.".into());
         };
         let d = &self.desk;
-        let t = d.ticket_by_key(key).await.map_err(board_plain)?;
+        // One hand-out at a time, and the ticket read after waiting for
+        // its turn: a hand-out made meanwhile, or a suggestion accepted
+        // after one, finds it taken.
+        let _one = self.starting.lock().await;
+        let t = self.ticket_named(key, *id).await?;
         if matches!(t.ticket.state, TicketState::Done | TicketState::Dropped) {
             return Err(format!(
                 "{key} is {} already; there is nothing to hand out.",
                 t.ticket.state.title().to_lowercase()
+            ));
+        }
+        if let Some(has) = &t.ticket.assignee {
+            return Err(format!(
+                "{key} is already with {}; it can't be handed out again.",
+                has.name
+            ));
+        }
+        if t.ticket.state != TicketState::Todo {
+            return Err(format!(
+                "{key} is in {}, not To do; only a ready ticket can be handed out.",
+                t.ticket.state.title()
             ));
         }
         if !t.blockers.is_empty() {
@@ -1214,7 +1354,6 @@ impl CrewHub {
                 let boss = Party::manager(service.agent_id.as_str(), &super::name_of(&service));
                 let engine = self.engine_or_default(*engine, &o)?;
                 self.startable(engine, None)?;
-                let _one = self.starting.lock().await;
                 self.slot_free(&boss, &o, &by)?;
                 let charged = ChargedTo {
                     group: self.boss_group(&boss.id),

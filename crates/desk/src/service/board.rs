@@ -839,8 +839,17 @@ impl Desk {
                 // Its prompt is the ticket: no message on its line too. The
                 // ticket is read again: it may have changed while the
                 // session started, and is never started for twice.
-                let t = self.ticket_of(id).await?;
-                self.assign_session(t, &key, view, by, false).await
+                let name = view.label().to_string();
+                let started = view.id;
+                let given = match self.ticket_of(id).await {
+                    Ok(t) => self.assign_session(t, &key, view, by, false).await,
+                    Err(e) => Err(e),
+                };
+                given.map_err(|e| {
+                    DeskError::Conflict(format!(
+                        "The session {name} ({started}) did start for {key}, but the ticket couldn't be given to it ({e}). It is running: don't start another."
+                    ))
+                })
             }
             Some(AssignTo::Agent(agent)) => self.assign_agent(t, &key, &agent, by).await,
         }
@@ -1015,7 +1024,7 @@ impl Desk {
         // Saved first: the agent is handed only what the board says is its.
         let needs = self.need_keys(&t).await?;
         if let Err(e) = crew
-            .assign(agent, &board::handed_text(key, &t, &needs))
+            .assign_as(agent, &board::handed_text(key, &t, &needs), by)
             .await
         {
             let mut back = t.clone();

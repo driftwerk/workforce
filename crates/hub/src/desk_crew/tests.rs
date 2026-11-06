@@ -3811,6 +3811,13 @@ mod board {
             assert_eq!(d.list().len(), 1);
             assert_eq!(state_of(&d, "ACM-2").await, (TicketState::Todo, None));
 
+            // A session that is gone is said so.
+            let r = assign
+                .execute(json!({"ticket": "ACM-2", "to": {"session": uuid::Uuid::new_v4().to_string()}, "reason": "It is next."}))
+                .await
+                .unwrap();
+            assert_eq!(r.error.as_deref(), Some("That session isn’t there any more."));
+
             // A session that is already there takes it, slots or not.
             let mine = new_session(&d, dir.path(), "acme-api").await;
             let r = assign
@@ -3826,13 +3833,6 @@ mod board {
                 r.error.as_deref(),
                 Some("ACM-3 waits on ACM-1, which isn't done; hand it out once it is.")
             );
-
-            // A session that is gone is said so.
-            let r = assign
-                .execute(json!({"ticket": "ACM-2", "to": {"session": uuid::Uuid::new_v4().to_string()}, "reason": "It is next."}))
-                .await
-                .unwrap();
-            assert_eq!(r.error.as_deref(), Some("That session isn’t there any more."));
 
             // A ticket that is done is not handed out again.
             d.move_ticket(
@@ -3909,6 +3909,342 @@ mod board {
                 .await
                 .unwrap();
             assert!(r.output["suggested"].is_string(), "{r:?}");
+        })
+        .await;
+    }
+
+    /// A session started in another terminal, put in the store before Desk
+    /// starts.
+    async fn elsewhere(pool: workforce_postgres::PostgresPool, dir: &Path) -> uuid::Uuid {
+        let now = chrono::Utc::now();
+        let terminal = workforce_desk::model::SessionRecord {
+            id: uuid::Uuid::new_v4(),
+            engine: Engine::Claude,
+            engine_version: None,
+            approve_for_me: false,
+            account: None,
+            view: workforce_desk::model::View::Terminal,
+            name: "elsewhere".into(),
+            goal: String::new(),
+            cwd: dir.to_string_lossy().into_owned(),
+            branch: None,
+            origin: workforce_desk::model::Origin::External,
+            state: workforce_desk::model::SessionState::Idle,
+            approvals: workforce_desk::model::Approvals::Desk,
+            cli_session_id: Some("cli-elsewhere".into()),
+            transcript: None,
+            last_prompt: None,
+            last_reply: None,
+            external_pid: None,
+            restore_offer: false,
+            terminal_id: None,
+            display_name: None,
+            asked: None,
+            created_at: now,
+            updated_at: now,
+        };
+        DeskStore::with_pool(pool)
+            .await
+            .unwrap()
+            .put(&terminal)
+            .await
+            .unwrap();
+        terminal.id
+    }
+
+    /// A ticket handed to an agent goes to it as the overseer, not as the
+    /// person: in the overseer's name, as its doing, and counted against
+    /// the loop guards.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_ticket_handed_to_an_agent_is_the_overseers_message_within_the_loop_guard() {
+        with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let (scout, _s) = agent(dir.path(), "scout", "On it.").await;
+            let dm = scout
+                .sessions
+                .get_or_create(DESK_CHANNEL, PERSON, "scout")
+                .unwrap();
+            scout.sessions.save(&dm).unwrap();
+            let (overseer, crew, d, _llm) = overseeing(
+                dir.path(),
+                pool,
+                "ok",
+                "[oversight]\nenabled = true\nlevel = \"act\"\n[oversight.act]\nhand_out_work = true\nmessage_agents = true\n",
+                &[Arc::clone(&scout)],
+            )
+            .await;
+            let b = acme(&d).await;
+            for title in ["Check the date picker build", "Fix the flaky test"] {
+                ticket(&d, b, title, TicketState::Todo, &[]).await;
+            }
+            eventually("the overseer's tools", async || {
+                overseer.tools.has("crew.assign_ticket").then_some(())
+            })
+            .await;
+            let assign = overseer.tools.get("crew.assign_ticket").unwrap();
+            let to_scout = |key: &str| json!({"ticket": key, "to": {"agent": "scout"}, "reason": "Next up."});
+            let mut frames = crew.state.broadcast_tx.subscribe();
+            let r = assign.execute(to_scout("ACM-1")).await.unwrap();
+            assert_eq!(r.output["done"], "gave ACM-1 to Scout", "{r:?}");
+            let (said, _) = relayed_frame(&mut frames, &dm.id).await;
+            assert!(said.content.starts_with("Desk has a task for you: ACM-1 is yours"), "{}", said.content);
+            assert_eq!(
+                said.author,
+                Some(json!({"kind": "overseer", "id": "desk", "name": "Desk"}))
+            );
+            let events = d.activity(Filter::All, None, 50).await.unwrap().events;
+            let gave = events.iter().find(|e| e.kind == Kind::Assigned).expect("an assigned event");
+            assert_eq!(gave.actor.kind, PartyKind::Manager);
+            assert_eq!(gave.reason.as_deref(), Some("Next up."));
+            assert_eq!(crew.sent.lock().len(), 1, "counted against the turn budget");
+
+            // At its budget it is held, and the ticket is not left with an
+            // agent that was never told.
+            while crew.sent.lock().len() < super::super::TURN_BUDGET {
+                crew.sent.lock().push(chrono::Utc::now());
+            }
+            let r = assign.execute(to_scout("ACM-2")).await.unwrap();
+            assert!(r.error.as_deref().is_some_and(|e| e.contains("Loop guard")), "{r:?}");
+            assert_eq!(state_of(&d, "ACM-2").await, (TicketState::Todo, None));
+        })
+        .await;
+    }
+
+    /// What a ticket says is judged as `crew.assign` judges its task: words
+    /// that push, deploy or send make a hand-out the person's call.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_ticket_that_says_to_deploy_is_handed_out_as_a_suggestion() {
+        with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let terminal = elsewhere(pool.clone(), dir.path()).await;
+            let (scout, _s) = agent(dir.path(), "scout", "On it.").await;
+            let dm = scout.sessions.get_or_create(DESK_CHANNEL, PERSON, "scout").unwrap();
+            scout.sessions.save(&dm).unwrap();
+            let (overseer, _crew, d, _llm) = overseeing(
+                dir.path(),
+                pool,
+                "ok",
+                "[oversight]\nenabled = true\nlevel = \"act\"\n[oversight.act]\nhand_out_work = true\nmessage_agents = true\nmessage_terminal_sessions = true\n",
+                &[Arc::clone(&scout)],
+            )
+            .await;
+            let b = acme(&d).await;
+            d.create_ticket(
+                NewTicket {
+                    board: b,
+                    title: "Roll the picker out".into(),
+                    body: "Deploy it to production when the tests pass.".into(),
+                    state: Some(TicketState::Todo),
+                    needs: vec![],
+                },
+                &By::you(),
+            )
+            .await
+            .unwrap();
+            ticket(&d, b, "Fix the flaky test", TicketState::Todo, &[]).await;
+            eventually("the overseer's tools", async || {
+                overseer.tools.has("crew.assign_ticket").then_some(())
+            })
+            .await;
+            let assign = overseer.tools.get("crew.assign_ticket").unwrap();
+            let to = |key: &str, to: Value| json!({"ticket": key, "to": to, "reason": "Next up."});
+            let r = assign.execute(to("ACM-1", json!({"agent": "scout"}))).await.unwrap();
+            assert!(r.output["suggested"].is_string(), "{r:?}");
+            let r = assign
+                .execute(to("ACM-1", json!({"session": terminal.to_string()})))
+                .await
+                .unwrap();
+            assert!(r.output["suggested"].is_string(), "another terminal: {r:?}");
+            assert_eq!(state_of(&d, "ACM-1").await, (TicketState::Todo, None));
+            // Plain words go to the same agent at once.
+            let r = assign.execute(to("ACM-2", json!({"agent": "scout"}))).await.unwrap();
+            assert_eq!(r.output["done"], "gave ACM-2 to Scout", "{r:?}");
+        })
+        .await;
+    }
+
+    /// Only a ready ticket nobody has is handed out, and the ticket is read
+    /// again when it is its turn: a stale suggestion finds it taken.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn only_a_ready_ticket_nobody_has_is_handed_out_even_from_a_stale_suggestion() {
+        with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let (overseer, crew, d, _llm) =
+                overseeing(dir.path(), pool, "ok", ACT, &[]).await;
+            let b = acme(&d).await;
+            ticket(&d, b, "Add the date picker", TicketState::Todo, &[]).await;
+            ticket(&d, b, "Someday the dark mode", TicketState::Backlog, &[]).await;
+            let web = new_session(&d, dir.path(), "acme-web").await;
+            let api = new_session(&d, dir.path(), "acme-api").await;
+            eventually("the overseer's tools", async || {
+                overseer.tools.has("crew.assign_ticket").then_some(())
+            })
+            .await;
+            let assign = overseer.tools.get("crew.assign_ticket").unwrap();
+            let to = |key: &str, s: uuid::Uuid| json!({"ticket": key, "to": {"session": s.to_string()}, "reason": "Next up."});
+
+            // hand_out_work is off: a suggestion that keeps the ticket's id.
+            let r = assign.execute(to("ACM-1", web.id)).await.unwrap();
+            assert!(r.output["suggested"].is_string(), "{r:?}");
+            let kept = d.store().suggestions(10).await.unwrap().remove(0);
+            let id = d.ticket_by_key("ACM-1").await.unwrap().ticket.id;
+            assert_eq!(kept.action["input"]["ticket_id"], id.to_string());
+
+            // The person gives it to another session meanwhile.
+            d.assign_ticket(id, Some(AssignTo::Session(api.id)), &By::you())
+                .await
+                .unwrap();
+            let r = crew.accept(&kept).await.unwrap_err();
+            assert_eq!(r, "ACM-1 is already with acme-api; it can't be handed out again.");
+            assert_eq!(
+                state_of(&d, "ACM-1").await,
+                (TicketState::Doing, Some("acme-api".into()))
+            );
+
+            // Not in To do: refused, as it is.
+            let backlog = crew
+                .perform(
+                    &super::super::actions::Action::parse(
+                        "crew.assign_ticket",
+                        &json!({"ticket": "ACM-2", "to": {"session": web.id.to_string()}}),
+                    )
+                    .unwrap(),
+                    crew.by_overseer("Next up.").unwrap(),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(backlog, "ACM-2 is in Backlog, not To do; only a ready ticket can be handed out.");
+        })
+        .await;
+    }
+
+    /// Two hand-outs of one ticket to new sessions at once start one session.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn two_hand_outs_at_once_start_one_session() {
+        with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let (overseer, _llm) = agent(dir.path(), "desk", "ok").await;
+            write_config(
+                &overseer,
+                "[oversight]\nenabled = true\nlevel = \"act\"\n[oversight.act]\nhand_out_work = true\n[oversight.work]\nparallel = 4\n",
+            );
+            let state = hub(std::slice::from_ref(&overseer));
+            let d = desk_running(
+                pool,
+                dir.path(),
+                Default::default(),
+                installed_cli(dir.path()),
+                not_installed(dir.path()),
+            )
+            .await;
+            let _crew = CrewHub::start(state, d.clone(), FAST, CancellationToken::new());
+            let b = acme(&d).await;
+            ticket(&d, b, "Add the date picker", TicketState::Todo, &[]).await;
+            eventually("the overseer's tools and engines", async || {
+                let installed = d
+                    .engines()
+                    .iter()
+                    .find(|v| v.engine == Engine::Claude)
+                    .and_then(|v| v.installed);
+                (overseer.tools.has("crew.assign_ticket") && installed == Some(true)).then_some(())
+            })
+            .await;
+            let assign = overseer.tools.get("crew.assign_ticket").unwrap();
+            let new = json!({"ticket": "ACM-1", "to": {"newSession": {"folder": dir.path().to_string_lossy()}}, "reason": "Next up."});
+            let (one, two) = tokio::join!(assign.execute(new.clone()), assign.execute(new.clone()));
+            let results = [one.unwrap(), two.unwrap()];
+            assert_eq!(results.iter().filter(|r| r.success).count(), 1, "{results:?}");
+            let refused = results.iter().find(|r| !r.success).unwrap();
+            assert!(
+                refused.error.as_deref().is_some_and(|e| e.contains("is already with")),
+                "{refused:?}"
+            );
+            assert_eq!(d.list().len(), 1);
+        })
+        .await;
+    }
+
+    /// Bringing back a ticket the person dropped, or moving one off a
+    /// session in another terminal, is theirs unless they let the overseer
+    /// message such sessions.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn moving_a_dropped_ticket_or_one_off_another_terminal_is_a_suggestion() {
+        use super::super::actions::{Action, Gate};
+        with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let terminal = elsewhere(pool.clone(), dir.path()).await;
+            let (_overseer, crew, d, _llm) = overseeing(
+                dir.path(),
+                pool,
+                "ok",
+                "[oversight]\nenabled = true\nlevel = \"act\"\n[oversight.act]\nhand_out_work = true\n",
+                &[],
+            )
+            .await;
+            let b = acme(&d).await;
+            ticket(&d, b, "Add the date picker", TicketState::Dropped, &[]).await;
+            let held = ticket(&d, b, "Fix the flaky test", TicketState::Todo, &[]).await;
+            d.assign_ticket(held.ticket.id, Some(AssignTo::Session(terminal)), &By::you())
+                .await
+                .unwrap();
+            let (_, mut o) = crew.overseer_service().unwrap();
+            let resolved = |key: &str, state: &str| {
+                let crew = Arc::clone(&crew);
+                let input = json!({"ticket": key, "state": state, "reason": "Back on."});
+                async move {
+                    let mut a = Action::parse("crew.move_ticket", &input).unwrap();
+                    crew.resolve_ticket(&mut a).await.unwrap();
+                    a
+                }
+            };
+            let revive = resolved("ACM-1", "todo").await;
+            assert!(matches!(crew.gate(&revive, &o), Gate::Suggest(_)));
+            // The same move of a ticket that wasn't dropped runs.
+            let plain = resolved("ACM-2", "review").await;
+            assert_eq!(crew.gate(&plain, &o), Gate::Run);
+            let off = resolved("ACM-2", "todo").await;
+            assert!(matches!(crew.gate(&off, &o), Gate::Suggest(_)), "off another terminal");
+            o.act.message_terminal_sessions = true;
+            assert_eq!(crew.gate(&off, &o), Gate::Run);
+            assert!(matches!(crew.gate(&revive, &o), Gate::Suggest(_)), "still theirs");
+        })
+        .await;
+    }
+
+    /// A ticket that was waiting before an overseer was set up is not news
+    /// to it; one that becomes ready afterwards is.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tickets_ready_before_an_overseer_exists_do_not_wake_the_one_set_up_later() {
+        with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let (overseer, _crew, d, _llm) = overseeing(
+                dir.path(),
+                pool,
+                "I will hand it out.",
+                "[oversight]\nenabled = false\n",
+                &[],
+            )
+            .await;
+            let b = acme(&d).await;
+            ticket(&d, b, "Add the date picker", TicketState::Todo, &[]).await;
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            write_config(
+                &overseer,
+                "[oversight]\nenabled = true\nlevel = \"act\"\n[oversight.act]\nhand_out_work = true\n",
+            );
+            super::super::config_saved(&overseer);
+            eventually("the overseer's tools", async || {
+                overseer.tools.has("crew.assign_ticket").then_some(())
+            })
+            .await;
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            ticket(&d, b, "Fix the flaky test", TicketState::Todo, &[]).await;
+            let woke = eventually("a check-in about the new ticket", async || {
+                d.store().latest_check_in("desk").await.unwrap()
+            })
+            .await;
+            assert!(woke.prompt.contains("ACM-2 “Fix the flaky test” is ready"), "{}", woke.prompt);
+            assert!(!woke.prompt.contains("ACM-1"), "{}", woke.prompt);
         })
         .await;
     }

@@ -609,6 +609,12 @@ pub trait Crew: Send + Sync {
     async fn assign(&self, _agent: &str, _task: &str) -> Result<String, String> {
         Err("There are no agents here to give it to.".into())
     }
+
+    /// `assign`, as `by`: the overseer handing out a ticket is the overseer
+    /// that the agent reads, and is held to its loop guards.
+    async fn assign_as(&self, agent: &str, task: &str, _by: &By) -> Result<String, String> {
+        self.assign(agent, task).await
+    }
 }
 
 // ── Words ────────────────────────────────────────────────────────────────

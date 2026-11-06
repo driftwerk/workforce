@@ -280,6 +280,8 @@ impl DeskStore {
             return Ok(None);
         };
         let mut t = vec![ticket(&row)?];
+        // Not held while its needs and links are read on another.
+        drop(client);
         self.fill(&mut t).await?;
         Ok(t.pop())
     }
@@ -294,6 +296,9 @@ impl DeskStore {
             .await?
             .map(|r| r.try_get(0))
             .transpose()?;
+        // Not held while the ticket is read on another: two of these at
+        // once on a small pool would each wait for the other's.
+        drop(client);
         match id {
             Some(id) => self.ticket(id).await,
             None => Ok(None),
@@ -349,6 +354,7 @@ impl DeskStore {
             .await
             .context("searching tickets")?;
         let mut out = rows.iter().map(ticket).collect::<Result<Vec<_>>>()?;
+        drop(client);
         self.fill(&mut out).await?;
         Ok(out)
     }
@@ -366,6 +372,7 @@ impl DeskStore {
             )
             .await?;
         let mut out = rows.iter().map(ticket).collect::<Result<Vec<_>>>()?;
+        drop(client);
         self.fill(&mut out).await?;
         Ok(out)
     }

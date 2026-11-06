@@ -335,7 +335,15 @@ impl CrewTool {
             .map(str::trim)
             .filter(|r| !r.is_empty())
             .ok_or("Give the reason: the person reads it in Activity.")?;
-        let action = Action::parse(self.name, input)?;
+        let mut action = Action::parse(self.name, input)?;
+        // A ticket is read before the gate looks at what is said of it, and
+        // a suggestion keeps its id, so it is that ticket that is acted on.
+        crew.resolve_ticket(&mut action).await?;
+        let mut kept = input.clone();
+        if let (Some(id), Some(o)) = (action.ticket_id(), kept.as_object_mut()) {
+            o.insert("ticket_id".into(), json!(id.to_string()));
+        }
+        let input = &kept;
         let (_, oversight) = crew
             .overseer_service()
             .ok_or("You don’t oversee the crew any more.")?;
