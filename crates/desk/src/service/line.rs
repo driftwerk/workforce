@@ -192,17 +192,28 @@ impl Desk {
         *self.0.line_crew.lock() = Some(Arc::downgrade(crew));
     }
 
-    fn line_overseer(&self) -> Option<Party> {
+    /// The boss a session in `group` reaches as "desk": its scope's, so a
+    /// session in a group with a boss of its own never reaches another.
+    fn line_overseer(&self, group: Option<&str>) -> Option<Party> {
         let crew = self
             .0
             .line_crew
             .lock()
             .as_ref()
             .and_then(std::sync::Weak::upgrade)?;
-        crew.answers_lines()
-            .then(|| crew.overseer())
-            .flatten()
-            .map(|o| Party::manager(&o.id, &o.name))
+        if !crew.answers_lines() {
+            return None;
+        }
+        self.boss_of(&self.scope_of_group(group))
+            .map(|b| Party::manager(&b.agent, &b.name))
+    }
+
+    /// The group a line message is its session's: its sender's when that
+    /// is a session, else its recipient's.
+    fn line_group(&self, m: &LineMessage) -> Option<String> {
+        m.from_session()
+            .or_else(|| m.to_session())
+            .and_then(|id| self.group_of_member(&super::session_item(id)))
     }
 
     fn line_run(&self, id: Uuid) -> LineRun {
@@ -319,7 +330,7 @@ impl Desk {
             return Err(Refusal::Missing("what to say").into());
         }
         let sessions = self.line_sessions();
-        let overseer = self.line_overseer();
+        let bossed = self.bossed();
         let find = |id: Uuid| sessions.iter().find(|s| s.id == id);
         let (party, hop, group, recipient) = match &from {
             Sender::Session(id) => {
@@ -333,8 +344,15 @@ impl Desk {
                     Target::Overseer | Target::Session(_) => hop,
                 };
                 line::guard(checked, run.sent)?;
-                let recipient =
-                    line::reach(me, &to, &sessions, overseer.as_ref(), self.line_reach())?;
+                let overseer = self.line_overseer(me.group.as_ref().map(|g| g.id.as_str()));
+                let recipient = line::reach(
+                    me,
+                    &to,
+                    &sessions,
+                    overseer.as_ref(),
+                    self.line_reach(),
+                    &bossed,
+                )?;
                 (
                     Party::session(me),
                     hop,
@@ -361,13 +379,24 @@ impl Desk {
                             )
                             .into());
                         }
+                        // A boss writes only to its own scope's sessions.
+                        if let Sender::Overseer(by) = &from {
+                            let group = them.group.as_ref().map(|g| g.id.as_str());
+                            if !self.boss_reaches(&by.party.id, group) {
+                                return Err(Refusal::Unreachable(
+                                    them.label().into(),
+                                    "it is in another client's group",
+                                )
+                                .into());
+                            }
+                        }
                         Party::session(them)
                     }
                     Target::Person if party.kind == PartyKind::You => {
                         return Err(Refusal::Unreachable("You".into(), "that is you").into())
                     }
                     Target::Person => Party::you(),
-                    Target::Overseer => match overseer {
+                    Target::Overseer => match self.line_overseer(None) {
                         Some(o) if o.id != party.id => o,
                         _ => {
                             return Err(Refusal::Unreachable(
@@ -382,7 +411,8 @@ impl Desk {
             }
         };
         let mut m = LineMessage::new(party, recipient, kind, text, hop);
-        m.group = group;
+        // The person's and the overseer's to a session are its group's.
+        m.group = group.or_else(|| self.line_group(&m));
         if let Send::Ask { chose, parts, .. } = &hop_send {
             let clean = |v: &Option<String>| {
                 v.as_deref()
@@ -552,7 +582,9 @@ impl Desk {
                 Party::session(&self.view(*id)?)
             }
             Sender::Overseer(b)
-                if question.to.kind == PartyKind::Manager && question.to.id == b.party.id =>
+                if question.to.kind == PartyKind::Manager
+                    && question.to.id == b.party.id
+                    && self.boss_reaches(&b.party.id, question.group.as_deref()) =>
             {
                 if let Some(asker) = question.from_session() {
                     self.boss_holds(asker, Some(b))?;
@@ -570,6 +602,7 @@ impl Desk {
             question.hop,
         );
         a.in_reply_to = Some(question.id);
+        a.group = question.group.clone().or_else(|| self.line_group(&a));
         let asker = question.from_session().and_then(|id| self.view(id).ok());
         match &asker {
             Some(v) if !v.live => a.delivery = Delivery::Held,
@@ -798,19 +831,20 @@ impl Desk {
                     .iter()
                     .find(|s| s.id == caller)
                     .ok_or_else(|| "Desk doesn't know this session.".to_string())?;
-                let peers: Vec<Value> = line::peers(me, &sessions, self.line_reach())
-                    .into_iter()
-                    .map(|s| {
-                        json!({
-                            "id": s.id,
-                            "name": s.label(),
-                            "engine": s.engine.title(),
-                            "folder": s.cwd,
-                            "state": s.state,
+                let peers: Vec<Value> =
+                    line::peers(me, &sessions, self.line_reach(), &self.bossed())
+                        .into_iter()
+                        .map(|s| {
+                            json!({
+                                "id": s.id,
+                                "name": s.label(),
+                                "engine": s.engine.title(),
+                                "folder": s.cwd,
+                                "state": s.state,
+                            })
                         })
-                    })
-                    .collect();
-                let desk = match self.line_overseer() {
+                        .collect();
+                let desk = match self.line_overseer(me.group.as_ref().map(|g| g.id.as_str())) {
                     Some(o) => format!("{}, the person's overseer: to \"desk\"", o.name),
                     None => "No overseer answers here: \"desk\" reaches the person".into(),
                 };
@@ -1330,6 +1364,7 @@ impl Desk {
                 ),
                 ask.hop,
             );
+            note.group = ask.group.clone().or_else(|| self.line_group(&note));
             if !self.view(asker).is_ok_and(|v| v.live) {
                 note.delivery = Delivery::Held;
             }

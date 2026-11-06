@@ -271,6 +271,7 @@ impl CrewHub {
                         engine: Some(Engine::Claude),
                         account: Some(label.clone()),
                         session: None,
+                        seen: None,
                     },
                 })
                 .await?;
@@ -326,6 +327,7 @@ mod tests {
                     engine: Some(Engine::Claude),
                     folder: Some(format!("/Users/allan/dev/{name}")),
                     totals: totals(*usd, 3_000),
+                    agents: None,
                 })
                 .collect(),
             more: 0,

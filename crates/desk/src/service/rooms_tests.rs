@@ -21,6 +21,8 @@ async fn release(d: &Desk) -> Room {
             },
         ],
         default_member: None,
+        share_with: vec!["dw".into(), "local".into()],
+        ..Default::default()
     })
     .await
     .unwrap()
@@ -45,6 +47,7 @@ async fn a_post_answers_a_message_of_its_own_room_and_steps_go_on_an_agents_answ
                 name: "acme-web".into(),
                 members: vec![],
                 default_member: None,
+                ..Default::default()
             })
             .await
             .unwrap();

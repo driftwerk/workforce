@@ -3,6 +3,7 @@
 //! (`line_messages`) delivered once, when its recipient can take it. This
 //! module decides; [`crate::service`]'s `line` submodule stores and delivers.
 
+use std::collections::HashSet;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -14,6 +15,7 @@ use crate::crew::{Party, PartyKind};
 use crate::engine::{Deliver, Steer};
 use crate::model::{text_enum, Origin, SessionState, SessionView};
 use crate::rooms::{MAX_HOPS, TURN_BUDGET};
+use crate::scope::scope_of;
 
 text_enum!(LineKind {
     Ask => "ask",
@@ -442,15 +444,18 @@ pub fn target_of(to: &str, sessions: &[SessionView]) -> Result<Target, Refusal> 
     }
 }
 
-/// Who a message from `from` to `to` reaches, under `policy`: the overseer
-/// (or the person, when there is none), the person, or a session among
-/// `sessions` that can take messages.
+/// Who a message from `from` to `to` reaches, under `policy`: `overseer`,
+/// the boss of `from`'s scope (or the person, when there is none), the
+/// person, or a session among `sessions` that can take messages. A session
+/// in another scope is never reached, whatever `policy` says: two clients'
+/// groups with bosses of their own (`bossed`) don't talk.
 pub fn reach(
     from: &SessionView,
     to: &Target,
     sessions: &[SessionView],
     overseer: Option<&Party>,
     policy: Reach,
+    bossed: &HashSet<String>,
 ) -> Result<Party, Refusal> {
     let id = match to {
         Target::Overseer => return Ok(overseer.cloned().unwrap_or_else(Party::you)),
@@ -472,6 +477,13 @@ pub fn reach(
     }
     if them.caps.line == Deliver::None {
         return Err(Refusal::Unreachable(name, "its engine can't take messages"));
+    }
+    let scope = |s: &SessionView| scope_of(s.group.as_ref().map(|g| g.id.as_str()), bossed);
+    if scope(from) != scope(them) {
+        return Err(Refusal::Unreachable(
+            name,
+            "it is in another client's group",
+        ));
     }
     match policy {
         Reach::All => {}
@@ -496,10 +508,11 @@ pub fn peers<'a>(
     from: &SessionView,
     sessions: &'a [SessionView],
     policy: Reach,
+    bossed: &HashSet<String>,
 ) -> Vec<&'a SessionView> {
     sessions
         .iter()
-        .filter(|s| reach(from, &Target::Session(s.id), sessions, None, policy).is_ok())
+        .filter(|s| reach(from, &Target::Session(s.id), sessions, None, policy, bossed).is_ok())
         .collect()
 }
 
@@ -920,6 +933,54 @@ mod tests {
         SessionView::new(&r, true, None, None)
     }
 
+    fn none() -> HashSet<String> {
+        HashSet::new()
+    }
+
+    #[test]
+    fn a_line_across_bossed_groups_is_refused_whatever_the_reach() {
+        let a = grouped(session("acme-web", Engine::Claude), "g-acme");
+        let b = grouped(session("acme-api", Engine::Claude), "g-acme");
+        let c = grouped(session("atlas-web", Engine::Claude), "g-atlas");
+        let d = grouped(session("infra", Engine::Claude), "g-infra");
+        let e = session("loose", Engine::Claude);
+        let all = [a.clone(), b.clone(), c.clone(), d.clone(), e.clone()];
+        let bossed: HashSet<String> = ["g-acme".to_string(), "g-atlas".to_string()].into();
+        let to = |from: &SessionView, s: &SessionView| {
+            reach(
+                from,
+                &Target::Session(s.id),
+                &all,
+                None,
+                Reach::All,
+                &bossed,
+            )
+        };
+        assert!(to(&a, &b).is_ok(), "within one bossed group");
+        for (from, them) in [(&a, &c), (&c, &a), (&a, &e), (&e, &a), (&a, &d), (&d, &c)] {
+            assert!(
+                matches!(
+                    to(from, them),
+                    Err(Refusal::Unreachable(_, "it is in another client's group"))
+                ),
+                "{} to {}",
+                from.name,
+                them.name
+            );
+        }
+        assert!(
+            to(&d, &e).is_ok(),
+            "a group with no boss is the main overseer's"
+        );
+        assert_eq!(
+            peers(&a, &all, Reach::All, &bossed)
+                .iter()
+                .map(|s| s.id)
+                .collect::<Vec<_>>(),
+            vec![b.id]
+        );
+    }
+
     fn grouped(mut s: SessionView, group: &str) -> SessionView {
         s.group = Some(GroupRef {
             id: group.into(),
@@ -934,15 +995,22 @@ mod tests {
         let sarah = Party::manager("sarah", "Sarah");
         let all = [a.clone()];
         assert_eq!(
-            reach(&a, &Target::Overseer, &all, Some(&sarah), Reach::Group),
+            reach(
+                &a,
+                &Target::Overseer,
+                &all,
+                Some(&sarah),
+                Reach::Group,
+                &none()
+            ),
             Ok(sarah)
         );
         assert_eq!(
-            reach(&a, &Target::Overseer, &all, None, Reach::Group).map(|p| p.kind),
+            reach(&a, &Target::Overseer, &all, None, Reach::Group, &none()).map(|p| p.kind),
             Ok(PartyKind::You)
         );
         assert_eq!(
-            reach(&a, &Target::Person, &all, None, Reach::Overseer).map(|p| p.kind),
+            reach(&a, &Target::Person, &all, None, Reach::Overseer, &none()).map(|p| p.kind),
             Ok(PartyKind::You)
         );
     }
@@ -953,7 +1021,9 @@ mod tests {
         let b = grouped(session("acme-api", Engine::Codex), "g-acme");
         let c = grouped(session("atlas-web", Engine::Claude), "g-atlas");
         let all = [a.clone(), b.clone(), c.clone()];
-        let to = |s: &SessionView, policy| reach(&a, &Target::Session(s.id), &all, None, policy);
+        let to = |s: &SessionView, policy| {
+            reach(&a, &Target::Session(s.id), &all, None, policy, &none())
+        };
         assert!(to(&b, Reach::Group).is_ok());
         assert!(matches!(
             to(&c, Reach::Group),
@@ -967,9 +1037,17 @@ mod tests {
         // Two sessions in no group are in the same (none).
         let (x, y) = (session("x", Engine::Claude), session("y", Engine::Claude));
         let loose = [x.clone(), y.clone()];
-        assert!(reach(&x, &Target::Session(y.id), &loose, None, Reach::Group).is_ok());
+        assert!(reach(
+            &x,
+            &Target::Session(y.id),
+            &loose,
+            None,
+            Reach::Group,
+            &none()
+        )
+        .is_ok());
         assert_eq!(
-            peers(&a, &all, Reach::Group)
+            peers(&a, &all, Reach::Group, &none())
                 .iter()
                 .map(|s| s.id)
                 .collect::<Vec<_>>(),
@@ -987,7 +1065,8 @@ mod tests {
         let mut old = session("old", Engine::Claude);
         old.caps.line = Deliver::None;
         let all = [a.clone(), external.clone(), ended.clone(), old.clone()];
-        let to = |s: &SessionView| reach(&a, &Target::Session(s.id), &all, None, Reach::All);
+        let to =
+            |s: &SessionView| reach(&a, &Target::Session(s.id), &all, None, Reach::All, &none());
         assert!(matches!(
             to(&a),
             Err(Refusal::Unreachable(_, "that is you"))
@@ -999,7 +1078,14 @@ mod tests {
         assert_eq!(to(&ended), Err(Refusal::Gone("ended".into())));
         assert!(matches!(to(&old), Err(Refusal::Unreachable(..))));
         assert!(matches!(
-            reach(&a, &Target::Session(Uuid::new_v4()), &all, None, Reach::All),
+            reach(
+                &a,
+                &Target::Session(Uuid::new_v4()),
+                &all,
+                None,
+                Reach::All,
+                &none()
+            ),
             Err(Refusal::NoSuchSession(_))
         ));
     }

@@ -85,6 +85,13 @@ pub struct Room {
     pub channel: String,
     pub members: Vec<Member>,
     pub default_member: Option<String>,
+    /// The sidebar group it belongs to: one with a boss of its own takes
+    /// only that group's agents.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+    /// The hubs the person agreed its conversation goes to.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub shared_with: Vec<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -312,13 +319,18 @@ pub struct Posted {
     pub created: bool,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NewRoom {
     pub name: String,
     #[serde(default)]
     pub members: Vec<Member>,
     pub default_member: Option<String>,
+    #[serde(default)]
+    pub group: Option<String>,
+    /// The hubs the person agreed its conversation may go to.
+    #[serde(default)]
+    pub share_with: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -328,6 +340,13 @@ pub struct RoomPatch {
     pub members: Option<Vec<Member>>,
     #[serde(default, with = "double_option")]
     pub default_member: Option<Option<String>>,
+    /// The group it belongs to; `null` makes it ungrouped.
+    #[serde(default, with = "double_option")]
+    pub group: Option<Option<String>>,
+    /// The hubs the person agreed, in answer to being asked, its
+    /// conversation may go to now.
+    #[serde(default)]
+    pub share_with: Vec<String>,
 }
 
 /// `null` clears the field; absent leaves it.
@@ -550,6 +569,8 @@ fn room(row: &Row) -> Result<Room> {
         channel: row.try_get("channel")?,
         members: serde_json::from_value(row.try_get("members")?)?,
         default_member: row.try_get("default_member")?,
+        group: row.try_get("group_id")?,
+        shared_with: serde_json::from_value(row.try_get("shared_with")?)?,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
     })
@@ -667,10 +688,11 @@ impl DeskStore {
         let client = self.pool().get().await?;
         client
             .execute(
-                "INSERT INTO rooms \
-                 (id, slug, name, members, default_member, created_at, updated_at, channel) \
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (id) DO UPDATE SET slug = $2, \
-                 name = $3, members = $4, default_member = $5, updated_at = $7",
+                "INSERT INTO rooms (id, slug, name, members, default_member, created_at, \
+                 updated_at, channel, group_id, shared_with) \
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT (id) DO UPDATE SET slug = $2, \
+                 name = $3, members = $4, default_member = $5, updated_at = $7, group_id = $9, \
+                 shared_with = $10",
                 &[
                     &r.id,
                     &r.slug,
@@ -680,6 +702,8 @@ impl DeskStore {
                     &r.created_at,
                     &r.updated_at,
                     &r.channel,
+                    &r.group,
+                    &serde_json::to_value(&r.shared_with)?,
                 ],
             )
             .await
@@ -1041,6 +1065,8 @@ pub(crate) mod tests {
                 },
             ],
             default_member: Some("dw/allan".into()),
+            group: None,
+            shared_with: vec!["dw".into(), "local".into()],
             created_at: now,
             updated_at: now,
         }

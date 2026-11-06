@@ -561,7 +561,7 @@ impl CrewHub {
         let events = self
             .desk
             .store()
-            .events_since(since, &[], 150)
+            .events_since(since, &[], 150, None)
             .await
             .map_err(|e| e.to_string())?;
         let lines: Vec<String> = events
@@ -621,14 +621,15 @@ impl CrewHub {
             )
     }
 
-    /// What the overseer may spend on check-ins now.
-    pub(super) async fn budget(&self, o: &Oversight) -> eyre::Result<Budget> {
+    /// What the overseer `agent` may spend on check-ins now: each
+    /// overseer's are its own.
+    pub(super) async fn budget(&self, agent: &str, o: &Oversight) -> eyre::Result<Budget> {
         let now = Utc::now();
         let midnight = self.midnight();
         let wakes = self
             .desk
             .store()
-            .wakes_since(midnight.min(now - self.hour()))
+            .wakes_since(agent, midnight.min(now - self.hour()))
             .await?;
         Ok(budget(
             o,
@@ -781,7 +782,7 @@ pub(super) async fn wake_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
             pending.clear();
             continue;
         };
-        match crew.budget(&o).await {
+        match crew.budget(service.agent_id.as_str(), &o).await {
             Ok(Budget::Open) => held_until = None,
             Ok(Budget::Spent { until, daily }) => {
                 held_until = Some(until);

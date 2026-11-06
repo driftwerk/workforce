@@ -571,6 +571,7 @@ mod tests {
                     name: "Release".into(),
                     members: Vec::new(),
                     default_member: None,
+                    ..Default::default()
                 })
                 .await
                 .unwrap();

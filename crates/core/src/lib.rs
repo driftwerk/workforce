@@ -6,6 +6,7 @@ pub mod desk;
 pub mod message;
 pub mod participant;
 pub mod policy;
+pub mod scope;
 pub mod subscription;
 pub mod task;
 mod text_enum;

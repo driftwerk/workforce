@@ -67,6 +67,10 @@ mod ledger;
 mod lifecycle_tests;
 #[cfg(test)]
 mod rooms_tests;
+mod scopes;
+pub use scopes::Boss;
+#[cfg(test)]
+mod scopes_tests;
 mod terminals;
 mod transition;
 mod unread;
@@ -533,6 +537,9 @@ struct Inner {
     /// Where a boss's answers for its sessions are judged; none until the
     /// hub says, and until then no boss answers a request.
     boss_bounds: Mutex<Option<crate::charge::Bounds>>,
+    /// Whose scope each row is: members' groups and the bosses there are.
+    /// Nothing is held under it, so events are stamped wherever noted.
+    scopes: Mutex<scopes::Scopes>,
 }
 
 #[derive(Clone)]
@@ -1051,7 +1058,9 @@ impl Desk {
             line_mcp: std::sync::OnceLock::new(),
             line_crew: Mutex::new(None),
             boss_bounds: Mutex::new(None),
+            scopes: Mutex::default(),
         }));
+        desk.scopes_follow(&desk.layout());
         tokio::spawn(persist_loop(store, floor.turns, persist_rx));
         tokio::spawn(desk.clone().read_engines());
         tokio::spawn(desk.clone().look_for_sign_ins());
@@ -1693,7 +1702,8 @@ impl Desk {
     }
 
     /// Records `event` in Activity and tells every Desk watching.
-    pub fn note(&self, event: Event) {
+    pub fn note(&self, mut event: Event) {
+        self.stamp(&mut event);
         let _ = self.0.persist.send(Persist::Event(Box::new(event.clone())));
         let _ = self.0.events.send(DeskEvent::Activity {
             event: Box::new(event),
@@ -2881,7 +2891,7 @@ impl Desk {
         let now = Utc::now();
         let members = dedup(new.members);
         let id = Uuid::new_v4();
-        self.save_room(Room {
+        let room = Room {
             id,
             channel: channel_for(id),
             slug: slug_for(&new.name),
@@ -2890,14 +2900,18 @@ impl Desk {
                 .default_member
                 .or_else(|| (members.len() == 1).then(|| members[0].key())),
             members,
+            group: new.group,
+            shared_with: Vec::new(),
             created_at: now,
             updated_at: now,
-        })
-        .await
+        };
+        let room = self.room_bounded(room, &[], &new.share_with)?;
+        self.save_room(room).await
     }
 
     pub async fn update_room(&self, id: Uuid, patch: RoomPatch) -> Result<Room, DeskError> {
         let mut room = self.room_of(id)?;
+        let before = room.members.clone();
         if let Some(name) = patch.name {
             room.slug = slug_for(&name);
             room.name = name.trim().to_string();
@@ -2915,8 +2929,73 @@ impl Desk {
         if let Some(d) = patch.default_member {
             room.default_member = d;
         }
+        if let Some(g) = patch.group {
+            room.group = g;
+        }
         room.updated_at = Utc::now();
+        let room = self.room_bounded(room, &before, &patch.share_with)?;
         self.save_room(room).await
+    }
+
+    /// `room` as it may be saved, its members having been `before`: its
+    /// group is one of the sidebar's, everyone in it may join a room of
+    /// that group (a bossed group's room takes only its own agents, and a
+    /// bossed group's agents join only its rooms), and the person agreed to
+    /// every hub its conversation goes to that it didn't go to before, by
+    /// `share_with` now or once before. Refused with a conflict naming the
+    /// hubs to ask about.
+    fn room_bounded(
+        &self,
+        mut room: Room,
+        before: &[Member],
+        share_with: &[String],
+    ) -> Result<Room, DeskError> {
+        if let Some(g) = room.group.as_deref() {
+            if !self.is_group(g) {
+                return Err(DeskError::Invalid(format!(
+                    "there's no group {g} in the sidebar"
+                )));
+            }
+        }
+        let layout = self.layout();
+        let bossed = self.bossed();
+        if let Some(m) = room
+            .members
+            .iter()
+            .find(|m| !crate::scope::allowed_member(room.group.as_deref(), m, &layout, &bossed))
+        {
+            return Err(DeskError::Invalid(format!(
+                "{} is in another client's group, so it can't be in this room",
+                m.key()
+            )));
+        }
+        let mut shared = room.shared_with.clone();
+        shared.extend(share_with.iter().cloned());
+        let asks = crate::scope::unshared_hubs(before, &room.members, &shared);
+        if !asks.is_empty() {
+            return Err(DeskError::Conflict(room_shares(&asks)));
+        }
+        shared.extend(room.members.iter().map(|m| m.hub.clone()));
+        shared.sort();
+        shared.dedup();
+        room.shared_with = shared;
+        Ok(room)
+    }
+
+    /// The hubs a room with `members`, having had `before`, would go to that
+    /// the person hasn't agreed to: what the `409` asks about.
+    pub fn room_asks(
+        &self,
+        id: Option<Uuid>,
+        members: &[Member],
+        share_with: &[String],
+    ) -> Vec<String> {
+        let (before, mut shared) = id
+            .and_then(|id| self.room(id))
+            .map(|r| (r.members, r.shared_with))
+            .unwrap_or_default();
+        shared.extend(share_with.iter().cloned());
+        crate::scope::unshared_hubs(&before, members, &shared)
     }
 
     pub async fn delete_room(&self, id: Uuid) -> Result<(), DeskError> {
@@ -3026,6 +3105,17 @@ impl Desk {
                 "a delivery comes from an agent, as hub/agent, not {}",
                 new.author
             )));
+        }
+        // Whoever posts, a bossed group's agent stays within its rooms and
+        // a bossed group's room takes only its agents, a delivery too.
+        if let Some(m) = is_agent.then(|| Member::parse(&new.author)).flatten() {
+            let (layout, bossed) = (self.layout(), self.bossed());
+            if !crate::scope::allowed_member(room.group.as_deref(), &m, &layout, &bossed) {
+                return Err(DeskError::Invalid(format!(
+                    "{} is in another client's group, so it can't post in this room",
+                    new.author
+                )));
+            }
         }
         if is_agent && !delivered && !room.members.iter().any(|m| m.key() == new.author) {
             return Err(DeskError::Invalid(format!(
@@ -4570,6 +4660,25 @@ async fn hook_listener(port: Option<u16>) -> Result<tokio::net::TcpListener> {
     Ok(tokio::net::TcpListener::bind("127.0.0.1:0").await?)
 }
 
+/// What the person is asked before a room's conversation goes to `hubs`
+/// it didn't go to before.
+fn room_shares(hubs: &[String]) -> String {
+    let named = match hubs {
+        [] => String::new(),
+        [one] => one.clone(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    };
+    format!(
+        "Agents on {named} will see this room's conversation: its thread context goes to {}. \
+         Say it may, with shareWith.",
+        if hubs.len() == 1 {
+            "that hub"
+        } else {
+            "those hubs"
+        }
+    )
+}
+
 fn dedup(members: Vec<Member>) -> Vec<Member> {
     let mut seen = HashSet::new();
     members
@@ -5942,6 +6051,8 @@ mod tests {
                     name: "Release".into(),
                     members: vec![allan.clone(), scout.clone(), allan.clone()],
                     default_member: None,
+                    share_with: vec!["dw".into(), "local".into()],
+                    ..Default::default()
                 })
                 .await
                 .unwrap();
@@ -5950,7 +6061,8 @@ mod tests {
                 .create_room(NewRoom {
                     name: "release".into(),
                     members: vec![],
-                    default_member: None
+                    default_member: None,
+                    ..Default::default()
                 })
                 .await
                 .is_err());
@@ -6073,6 +6185,7 @@ mod tests {
                     name: "Release".into(),
                     members: vec![scout.clone()],
                     default_member: None,
+                    ..Default::default()
                 })
                 .await
                 .unwrap();

@@ -321,6 +321,7 @@ text_enum!(SpendBy {
     Day => "day",
     Engine => "engine",
     Account => "account",
+    Group => "group",
 });
 
 /// The ledger summed by everything a view groups by: what the store
@@ -328,6 +329,8 @@ text_enum!(SpendBy {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Cell {
     pub session: Uuid,
+    /// The sidebar group the session was in when its calls were kept.
+    pub group: Option<String>,
     pub engine: Engine,
     pub model: Option<String>,
     pub account: Option<String>,
@@ -388,6 +391,18 @@ pub struct SpendRow {
     /// The session's folder, or the project's.
     pub folder: Option<String>,
     pub totals: Totals,
+    /// By group: what the group's agents spent, at the hub's prices, which
+    /// `totals.usd` counts too.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agents: Option<AgentsSpent>,
+}
+
+/// What agents spent, by the hub's own records.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentsSpent {
+    pub tokens: u64,
+    pub usd: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -406,6 +421,8 @@ pub struct SpendView {
 pub const FORGOTTEN: &str = "A session since forgotten";
 /// What Desk calls the calls it can't say the account of.
 pub const UNKNOWN_ACCOUNT: &str = "Account not known";
+/// What Desk calls the spend of what is in no group.
+pub const UNGROUPED_SPEND: &str = "Ungrouped";
 
 /// `cells` grouped `by`, the costliest first (by day: the latest first),
 /// at most `limit` rows. `label` names a session, if Desk still has it.
@@ -433,6 +450,7 @@ pub fn fold(
                     engine: Some(c.engine),
                     folder: l.as_ref().map(|l| l.cwd.clone()),
                     totals: Totals::default(),
+                    agents: None,
                 },
             ),
             SpendBy::Project => {
@@ -454,6 +472,7 @@ pub fn fold(
                         engine: None,
                         folder,
                         totals: Totals::default(),
+                        agents: None,
                     },
                 )
             }
@@ -468,6 +487,7 @@ pub fn fold(
                         engine: None,
                         folder: None,
                         totals: Totals::default(),
+                        agents: None,
                     },
                 )
             }
@@ -480,6 +500,7 @@ pub fn fold(
                     engine: Some(c.engine),
                     folder: None,
                     totals: Totals::default(),
+                    agents: None,
                 },
             ),
             SpendBy::Account => {
@@ -493,6 +514,23 @@ pub fn fold(
                         engine: None,
                         folder: None,
                         totals: Totals::default(),
+                        agents: None,
+                    },
+                )
+            }
+            // Named by the caller, who knows the groups: here by id.
+            SpendBy::Group => {
+                let key = c.group.clone().unwrap_or_default();
+                (
+                    key.clone(),
+                    SpendRow {
+                        label: c.group.clone().unwrap_or_else(|| UNGROUPED_SPEND.into()),
+                        key,
+                        session: None,
+                        engine: None,
+                        folder: None,
+                        totals: Totals::default(),
+                        agents: None,
                     },
                 )
             }
@@ -703,6 +741,7 @@ mod tests {
     fn cell(session: Uuid, model: &str, usd: f64, unpriced: u64) -> Cell {
         Cell {
             session,
+            group: None,
             engine: Engine::Claude,
             model: Some(model.into()),
             account: Some("allan@example.com".into()),
