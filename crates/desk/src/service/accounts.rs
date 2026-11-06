@@ -314,7 +314,7 @@ impl Desk {
                     self.accounts_store().unwrap_or("the store")
                 ))
             })?;
-        tracing::info!(account = %id, engine = a.engine.as_str(), "an engine account's sign-in was handed to Desk to copy to another computer");
+        tracing::warn!(account = %id, engine = a.engine.as_str(), "an engine account's sign-in was handed to Desk to copy to another computer");
         Ok(HandOver {
             engine: a.engine,
             name: a.name,
@@ -942,20 +942,24 @@ impl Desk {
             .delete_account(id, to)
             .await
             .map_err(DeskError::Internal)?;
-        let deleted = match self.keys().map(Arc::clone) {
+        let store = self.accounts_store().unwrap_or("the store");
+        // Why its sign-in couldn't be deleted, if it couldn't.
+        let not_deleted: Option<String> = match self.keys().map(Arc::clone) {
             Ok(keys) => match tokio::task::spawn_blocking(move || keys.delete(id)).await {
-                Ok(Ok(())) => true,
+                Ok(Ok(())) => None,
                 Ok(Err(e)) => {
-                    tracing::warn!(account = %id, error = %format!("{e:#}"), "couldn't remove an engine account's sign-in");
-                    false
+                    let why = format!("{e:#}");
+                    tracing::warn!(account = %id, error = %why, "couldn't remove an engine account's sign-in");
+                    Some(why)
                 }
                 Err(e) => {
                     tracing::warn!(account = %id, error = %e, "couldn't remove an engine account's sign-in");
-                    false
+                    Some(e.to_string())
                 }
             },
-            Err(_) => true,
+            Err(_) => None,
         };
+        let deleted = not_deleted.is_none();
         let (running, stopped): (Vec<Uuid>, Vec<Uuid>) = {
             let mut st = self.0.state.lock();
             st.accounts.retain(|o| o.id != id);
@@ -993,7 +997,12 @@ impl Desk {
                 }
             });
         }
-        Ok(())
+        match not_deleted {
+            None => Ok(()),
+            Some(why) => Err(DeskError::Conflict(format!(
+                "The account was removed, but its sign-in couldn't be deleted from {store}: {why}"
+            ))),
+        }
     }
 
     fn announce_sessions_on(&self, account: Uuid) {

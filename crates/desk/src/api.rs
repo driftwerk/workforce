@@ -45,7 +45,12 @@ pub trait Authorize: Send + Sync {
 struct ApiState {
     desk: Desk,
     auth: Arc<dyn Authorize>,
+    /// When each account's sign-in was last asked for by a hand-over.
+    handed: parking_lot::Mutex<std::collections::HashMap<Uuid, std::time::Instant>>,
 }
+
+/// One hand-over of an account's sign-in per this long.
+const HAND_OVER_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
 
 #[derive(Deserialize)]
 struct TokenQuery {
@@ -388,10 +393,12 @@ async fn remove_account(State(s): S, h: HeaderMap, Query(q): Q, Path(id): Path<U
 }
 
 /// An account's sign-in, for Desk's native side to copy to one of the
-/// person's machines over its SSH connection: admin only, from the
-/// `Authorization` header alone (never a token in the address, which logs
-/// keep), and never kept by anything between (`no-store`). Desk's page
-/// can't ask it: it isn't on the broker's list.
+/// person's machines over its SSH connection: the hub's own (gateway)
+/// token only, never a signed-in person's, an administrator's included;
+/// from the `Authorization` header alone (never a token in the address,
+/// which logs keep); once a minute per account; and never kept by anything
+/// between (`no-store`). Desk's page can't ask it: it isn't on the broker's
+/// list.
 async fn hand_over_account(
     State(s): S,
     h: HeaderMap,
@@ -405,7 +412,32 @@ async fn hand_over_account(
         )
             .into_response();
     }
-    guarded!(s, h, q);
+    match s.auth.authorize(&h, None).await {
+        Ok(None) => {}
+        Ok(Some(_)) => {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(json!({"error": "a sign-in is handed over only to the hub's own token"})),
+            )
+                .into_response();
+        }
+        Err(status) => {
+            return (status, Json(json!({ "error": "not allowed" }))).into_response();
+        }
+    }
+    {
+        let now = std::time::Instant::now();
+        let mut handed = s.handed.lock();
+        handed.retain(|_, at| now.duration_since(*at) < HAND_OVER_EVERY);
+        if handed.contains_key(&id) {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(json!({"error": "that sign-in was handed over a moment ago: try again in a minute"})),
+            )
+                .into_response();
+        }
+        handed.insert(id, now);
+    }
     match s.desk.hand_over_account(id).await {
         Ok(handed) => (
             [
@@ -1423,6 +1455,7 @@ pub fn sessions_router(desk: Desk, auth: Arc<dyn Authorize>) -> Router {
         .with_state(Arc::new(ApiState {
             desk: desk.clone(),
             auth: Arc::clone(&auth),
+            handed: Default::default(),
         }))
         .merge(crate::line_api::api_routes(desk.clone(), Arc::clone(&auth)))
         .merge(crate::charge_api::api_routes(
