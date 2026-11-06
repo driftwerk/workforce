@@ -6174,6 +6174,15 @@ async fn create_agent(
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     let caller = require_admin_action(&state, &headers, query.token.as_deref()).await?;
 
+    if !state.registry.serves_agents() {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "this hub runs Desk's sessions only and serves no agents ([desk] agents = false)"
+            })),
+        ));
+    }
+
     // Validate ID format (alphanumeric + hyphens + underscores)
     if body.id.is_empty()
         || !body
@@ -8270,7 +8279,8 @@ async fn pair_device_request_unauthenticated(
 /// to; failing that, the host the device reached the hub at.
 fn pair_approve_url(state: &GatewayState, headers: &axum::http::HeaderMap, code: &str) -> String {
     let configured = state
-        .default_service()
+        .registry
+        .host()
         .and_then(|service| service.config.hub.public_url.clone())
         .filter(|url| !url.trim().is_empty());
     #[cfg(feature = "oidc")]

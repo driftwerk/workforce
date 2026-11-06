@@ -1927,11 +1927,16 @@ impl Setup {
             .map(|a| AgentId::new(&a.id))
             .unwrap_or_else(|| AgentId::new("default"));
 
-        let workspace = crate::hub_core::layout::agent_workspace(
-            std::path::Path::new(&config.hub.data_dir),
-            agent_id.as_str(),
-            agent_config.and_then(|a| a.workspace.as_deref()),
-        );
+        let data_dir = std::path::Path::new(&config.hub.data_dir);
+        let workspace = match agent_config {
+            // A hub that serves no agents: its own plumbing, which is none.
+            None if !config.serves_agents() => crate::hub_core::layout::host_workspace(data_dir),
+            _ => crate::hub_core::layout::agent_workspace(
+                data_dir,
+                agent_id.as_str(),
+                agent_config.and_then(|a| a.workspace.as_deref()),
+            ),
+        };
         // Create the agent workspace as a shared, group-writable+setgid tree so
         // the dispatched agent runner (git/cargo) can write the files the hub
         // created here, and vice versa (audit F7). setgid makes descendants

@@ -52,6 +52,69 @@ pub async fn build_session_store(
     }
 }
 
+/// On a hub that serves no agents, forget the agents it served before that
+/// its `[desk] forget_agents` names (a machine's old Desk agent): each one's
+/// chat sessions ([`PostgresSessionStore::forget_agent`]) and its Floor
+/// rows (`floor.turns` and `floor.gists` of subject `agent:<id>`), and
+/// nothing else. Once each: a marker in `done` says it was, and a later
+/// start leaves it be. Only sessions kept in Postgres. The agents forgotten
+/// now, with their sessions' count.
+pub async fn forget_retired_agents(
+    config: &WorkforceConfig,
+    done: &Path,
+) -> eyre::Result<Vec<(String, u64)>> {
+    let mut forgotten = Vec::new();
+    if config.serves_agents() || config.sessions.backend != "postgres" {
+        return Ok(forgotten);
+    }
+    for agent in &config.desk.forget_agents {
+        let marker = done.join(format!("forgotten-agent-{agent}"));
+        if agent.is_empty()
+            || !agent
+                .chars()
+                .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+            || marker.exists()
+        {
+            continue;
+        }
+        #[cfg(feature = "postgres")]
+        {
+            let pool = shared_sessions_pool(config).await?;
+            let sessions = PostgresSessionStore::forget_agent(&pool, agent).await?;
+            forget_floor_rows(&pool, agent).await?;
+            std::fs::create_dir_all(done)?;
+            std::fs::write(&marker, "")?;
+            forgotten.push((agent.clone(), sessions));
+        }
+    }
+    Ok(forgotten)
+}
+
+/// `agent`'s rows on the Floor: its turns and its gist, by its subject key,
+/// named in the Floor's schema. None where this hub has kept no Floor yet.
+#[cfg(feature = "postgres")]
+async fn forget_floor_rows(pool: &PostgresPool, agent: &str) -> eyre::Result<()> {
+    // The Floor's subject key of an agent (`SubjectKey::agent`).
+    let subject = format!("agent:{agent}");
+    let mut conn = pool.get().await?;
+    let tx = conn.transaction().await?;
+    for table in ["floor.gists", "floor.turns"] {
+        let kept: bool = tx
+            .query_one("SELECT to_regclass($1) IS NOT NULL", &[&table])
+            .await?
+            .get(0);
+        if kept {
+            tx.execute(
+                &format!("DELETE FROM {table} WHERE subject = $1"),
+                &[&subject],
+            )
+            .await?;
+        }
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
 /// Whether this hub's sessions are in Postgres, beside which a person's
 /// Desk read points are kept.
 pub(crate) fn keeps_desk_reads() -> bool {

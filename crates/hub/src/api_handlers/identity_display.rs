@@ -176,7 +176,7 @@ where
 {
     let distinct: BTreeSet<String> = payers.into_iter().map(|s| s.as_ref().to_string()).collect();
     let teams = registry
-        .default_agent()
+        .host()
         .and_then(|service| service.team_store.read().clone());
     distinct
         .into_iter()

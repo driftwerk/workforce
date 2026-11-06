@@ -76,7 +76,12 @@ pub(crate) async fn wire(
         id: own_id,
     };
 
-    let mon_def_store = crate::workflow_runtime::shared_workflow_store(config).await;
+    // A hub that serves no agents (a machine's) watches nothing: no monitor
+    // runs there on anyone's plan.
+    let mon_def_store = match config.serves_agents() {
+        true => crate::workflow_runtime::shared_workflow_store(config).await,
+        false => None,
+    };
     let mut durable: Option<Arc<super::MonitorEngine>> = None;
     if let (Some(def_store), Some(wf_runtime)) =
         (mon_def_store, service.workflow_runtime().cloned())

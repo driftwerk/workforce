@@ -460,7 +460,7 @@ impl SlotReader<'_> {
 fn chatgpt_direct(state: &GatewayState) -> bool {
     state
         .registry
-        .default_agent()
+        .host()
         .is_some_and(|service| service.config.subscription.chatgpt_direct)
 }
 
@@ -729,7 +729,7 @@ pub async fn remove_login(
 fn device_logins(state: &GatewayState) -> Result<DeviceLogins, ApiError> {
     state
         .registry
-        .default_agent()
+        .host()
         .map(|service| service.subscriptions().device_logins().clone())
         .ok_or_else(|| err(StatusCode::SERVICE_UNAVAILABLE, "no agents on this hub"))
 }

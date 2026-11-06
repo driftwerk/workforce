@@ -21,7 +21,7 @@ impl HubPricer {
         Self {
             tracker: Box::new(move || {
                 registry
-                    .default_agent()
+                    .host()
                     .map(|service| Arc::clone(&service.cost_tracker))
             }),
         }

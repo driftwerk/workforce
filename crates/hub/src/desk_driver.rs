@@ -695,7 +695,7 @@ pub async fn mount(
     let telemetry = state.telemetry_store.clone().or_else(|| {
         state
             .registry
-            .default_agent()
+            .host()
             .map(|s| Arc::clone(&s.telemetry_store))
     });
     if let Some(telemetry) = telemetry {

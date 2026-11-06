@@ -35,6 +35,12 @@ pub struct AgentRegistry {
     /// every service, present or spawned later, is attached to them.
     gates: std::sync::OnceLock<Gates>,
     routed: std::sync::OnceLock<tokio::sync::mpsc::Sender<crate::hosts::RoutedApproval>>,
+    /// On a hub that serves no agents (`[desk] agents = false`), the hub's
+    /// own plumbing: the service the default agent would be, held off the
+    /// roster. Nobody chats with it, it oversees nothing, and no heartbeat,
+    /// learning or scheduler runs for it; it only lends its model, sign-ins
+    /// and price table to what the hub does itself ([`Self::host`]).
+    host: std::sync::OnceLock<Arc<AgentService>>,
 }
 
 #[derive(Clone)]
@@ -268,6 +274,29 @@ impl AgentRegistry {
         self.agents.read().get(&self.default_id).cloned()
     }
 
+    /// The service the hub's own work runs on (a Floor line's model, a
+    /// sign-in, a price): the default agent, else, on a hub that serves no
+    /// agents, its plumbing. Never for anything an agent does: that is
+    /// [`Self::default_agent`], which such a hub has none of.
+    pub fn host(&self) -> Option<Arc<AgentService>> {
+        self.default_agent().or_else(|| self.host.get().cloned())
+    }
+
+    /// Whether this hub serves agents: every hub but one whose plumbing is
+    /// held off the roster ([`Self::set_host`]).
+    pub fn serves_agents(&self) -> bool {
+        self.host.get().is_none()
+    }
+
+    /// Hold `service` as the hub's plumbing on a hub that serves no agents:
+    /// off the roster. Once; a second call is ignored.
+    pub fn set_host(&self, service: Arc<AgentService>) {
+        if let Some(gates) = self.gates.get() {
+            attach_gates(&service, gates);
+        }
+        let _ = self.host.set(service);
+    }
+
     /// Get the default agent ID.
     pub fn default_id(&self) -> &str {
         &self.default_id
@@ -457,6 +486,7 @@ impl AgentRegistry {
             default_id,
             gates: std::sync::OnceLock::new(),
             routed: std::sync::OnceLock::new(),
+            host: std::sync::OnceLock::new(),
         }
     }
 
@@ -465,7 +495,11 @@ impl AgentRegistry {
     /// overlay agent is filtered the same as one from the config file.
     pub fn install_gates(&self, gates: Gates) {
         let gates = self.gates.get_or_init(|| gates);
-        for service in self.all_services() {
+        for service in self
+            .all_services()
+            .into_iter()
+            .chain(self.host.get().cloned())
+        {
             attach_gates(&service, gates);
         }
     }
@@ -654,6 +688,45 @@ mod tests {
             id: id.into(),
             ..Default::default()
         }
+    }
+
+    /// A hub that serves no agents (`[desk] agents = false`, a machine's)
+    /// keeps its plumbing in its own folder, never under `agents/`, and off
+    /// the roster: no agent to chat with, list or oversee, while the hub's
+    /// own work still finds it. Every other hub's plumbing is its default
+    /// agent.
+    #[tokio::test]
+    async fn a_hub_with_no_agents_holds_its_plumbing_off_the_roster() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = WorkforceConfig::default();
+        config.hub.data_dir = tmp.path().to_string_lossy().to_string();
+        config.memory.db_path = tmp.path().join("memory.db").to_string_lossy().into_owned();
+        config.llm.api_key = Some("test-key".into());
+        config.desk.enabled = true;
+        config.desk.agents = false;
+        assert!(!config.serves_agents());
+        let host = AgentService::from_config(config, None).await.unwrap();
+        assert_eq!(
+            host.workspace,
+            tmp.path().join("host").canonicalize().unwrap()
+        );
+        assert!(!tmp.path().join("agents").exists(), "no agent's folder");
+
+        let registry = AgentRegistry::from_parts(HashMap::new(), "default".into());
+        assert!(registry.serves_agents());
+        registry.set_host(Arc::clone(&host));
+        assert!(!registry.serves_agents());
+        assert!(registry.default_agent().is_none());
+        assert!(registry.resolve(None).is_none());
+        assert!(registry.resolve(Some("default")).is_none());
+        assert!(registry.all_services().is_empty());
+        assert!(registry.agent_ids().is_empty());
+        assert!(Arc::ptr_eq(&registry.host().unwrap(), &host));
+
+        let agent = scoped_service("desk", "p").await;
+        let desktop = AgentRegistry::single(Arc::clone(&agent));
+        assert!(desktop.serves_agents());
+        assert!(Arc::ptr_eq(&desktop.host().unwrap(), &agent));
     }
 
     #[tokio::test]
