@@ -943,10 +943,33 @@ async fn layout(State(s): S, h: HeaderMap, Query(q): Q) -> Response {
     Json(s.desk.layout()).into_response()
 }
 
-async fn replace_layout(State(s): S, h: HeaderMap, Query(q): Q, Json(l): Json<Layout>) -> Response {
+/// `PUT /api/desk/layout`: the whole layout, and, optionally, the layout it
+/// was made from. When that's given and the hub's has changed since (an
+/// agent grouped something, a session was placed or forgotten), nothing is
+/// written and it answers 409, so a write made meanwhile is never reverted:
+/// the caller reads the layout again and makes its change to that.
+#[derive(Deserialize)]
+struct ReplaceLayout {
+    #[serde(flatten)]
+    layout: Layout,
+    #[serde(default)]
+    expected: Option<Layout>,
+}
+
+async fn replace_layout(
+    State(s): S,
+    h: HeaderMap,
+    Query(q): Q,
+    Json(r): Json<ReplaceLayout>,
+) -> Response {
     guarded!(s, h, q);
     s.desk
-        .change_layout(|_| Ok(l))
+        .change_layout(|before| match &r.expected {
+            Some(expected) if expected != before => Err(DeskError::Conflict(
+                "The layout changed since it was read: read it again.".into(),
+            )),
+            _ => Ok(r.layout),
+        })
         .await
         .map(Json)
         .into_response()
@@ -1958,6 +1981,22 @@ mod tests {
             assert_eq!(status, 400);
             let (_, got) = call(&app, "GET", "/api/desk/layout", None).await;
             assert_eq!(got["groups"].as_array().unwrap().len(), 1);
+            // Made from a layout that has changed since: refused, nothing written.
+            let stale = json!({ "groups": [], "ungrouped": { "collapsed": false, "items": [] } });
+            let (status, _) = call(&app, "PUT", "/api/desk/layout", Some(json!({ "groups": [], "ungrouped": { "collapsed": false, "items": [] }, "expected": stale }))).await;
+            assert_eq!(status, 409);
+            let (_, still) = call(&app, "GET", "/api/desk/layout", None).await;
+            assert_eq!(still, got);
+            // Made from the one it has: written.
+            let (status, l) = call(&app, "PUT", "/api/desk/layout", Some(json!({ "groups": [], "ungrouped": { "collapsed": false, "items": [] }, "expected": got }))).await;
+            assert_eq!((status, l["groups"].as_array().unwrap().len()), (200, 0));
+            // A machine's session has a place through the wildcard route, by Desk's key for it.
+            call(&app, "POST", "/api/desk/groups", Some(json!({ "id": "dev", "name": "Devbox" }))).await;
+            let devbox = format!("session:devbox/{}", uuid::Uuid::from_u128(77));
+            let (status, l) = call(&app, "PUT", &format!("/api/desk/groups/dev/items/{devbox}"), Some(json!({ "before": null }))).await;
+            assert_eq!((status, &l["groups"][0]["items"]), (200, &json!([devbox])));
+            let (status, _) = call(&app, "PUT", "/api/desk/groups/dev/items/session:devbox/nonsense", Some(json!({ "before": null }))).await;
+            assert_eq!(status, 400);
             let (status, l) = call(&app, "PUT", "/api/desk/layout", Some(json!({ "groups": [], "ungrouped": { "collapsed": false, "items": [] } }))).await;
             assert_eq!((status, l["groups"].as_array().unwrap().len()), (200, 0));
             let (status, i) = call(&app, "POST", "/api/desk/layout/import", Some(json!({
