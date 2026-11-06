@@ -1323,6 +1323,13 @@ impl Desk {
         }
     }
 
+    /// `id` runs now: what its line held for it is delivered, soon.
+    pub(super) fn line_went_live(&self, id: Uuid) {
+        if self.0.state.lock().lines.pending.contains(&id) {
+            self.line_pump_later(id);
+        }
+    }
+
     /// Delivers what waits for `id`, soon.
     fn line_pump_later(&self, id: Uuid) {
         let desk = self.clone();

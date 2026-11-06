@@ -21,6 +21,7 @@ use crate::claude::{self, Hook};
 use crate::codex::{self, AppServer, CodexEvent, Seen};
 use crate::crew::{self, By, Event, Kind, Party};
 use crate::engine::{self, Installed, SignIns, View};
+use crate::first_run;
 use crate::floor::{Outcome, Scope, Subject, SubjectKey, Turn, TurnLog, TurnOp};
 use crate::holder::{Held, Holder};
 use crate::model::{
@@ -3326,6 +3327,7 @@ impl Desk {
                 env.remove(k);
             }
         }
+        self.settle_first_run(r.engine, cwd, &env).await;
         let (spec, codex) = match r.engine {
             Engine::Claude => {
                 let session_id = r.cli_session_id.as_deref().unwrap_or_default();
@@ -3445,11 +3447,71 @@ impl Desk {
             },
         );
         tokio::spawn(self.clone().on_exit(r.id, exit));
+        // What its line held while it wasn't running is looked at again now
+        // it is: its state said Starting before it was (settling its CLI's
+        // first run waits on a file), and a pump then still found it stopped.
+        self.line_went_live(r.id);
         let version = self.version_of(r.engine);
         if version.is_some() && version != r.engine_version {
             self.change(r.id, |r, _| r.engine_version = version);
         }
         Ok(())
+    }
+
+    /// Settles what `engine` asks on its first run before a session in
+    /// `cwd` works (see [`first_run`]): the CLI may never have run where
+    /// the hub is (a machine, a fresh Mac), and `cwd` is a folder the person
+    /// chose, or Desk's worktree of one. A config that can't be settled is
+    /// said and the session starts anyway: its CLI asks in the terminal.
+    async fn settle_first_run(&self, engine: Engine, cwd: &Path, env: &BTreeMap<String, String>) {
+        let configs: Vec<PathBuf> = match engine {
+            Engine::Claude => first_run::claude_config(env).into_iter().collect(),
+            // Its TUI asks, and its app-server (in the hub's environment)
+            // keeps the answer.
+            Engine::Codex => {
+                let mut c: Vec<PathBuf> = [env, &self.0.env]
+                    .into_iter()
+                    .filter_map(first_run::codex_config)
+                    .collect();
+                c.dedup();
+                c
+            }
+            _ => return,
+        };
+        let version = self.version_of(engine);
+        let folder = cwd.to_path_buf();
+        let settled = tokio::task::spawn_blocking(move || {
+            configs
+                .iter()
+                .map(|config| {
+                    let done = match engine {
+                        Engine::Claude => {
+                            first_run::ready_claude(config, &folder, version.as_deref())
+                        }
+                        _ => first_run::trust_codex(config, &folder),
+                    };
+                    (config.clone(), done)
+                })
+                .collect::<Vec<_>>()
+        })
+        .await;
+        for (config, done) in settled.unwrap_or_default() {
+            match done {
+                Ok(true) => tracing::info!(
+                    engine = engine.title(),
+                    config = %config.display(),
+                    folder = %cwd.display(),
+                    "settled the CLI's first run for a session"
+                ),
+                Ok(false) => {}
+                Err(e) => tracing::warn!(
+                    engine = engine.title(),
+                    config = %config.display(),
+                    error = %e,
+                    "couldn't settle the CLI's first run; it may ask in the terminal"
+                ),
+            }
+        }
     }
 
     /// `engine`'s version as last read, as a session records it.
@@ -5175,6 +5237,89 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(100)).await;
             assert!(h.list().await.unwrap().is_empty());
             holder_cancel.cancel();
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_session_finds_claude_code_set_up_and_its_folder_trusted() {
+        with_test_pool(build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let home = dir.path().join("home");
+            std::fs::create_dir(&home).unwrap();
+            let config = home.join(".claude.json");
+            std::fs::write(&config, r#"{"userID":"u1","theme":"light"}"#).unwrap();
+            let mut opts = options(dir.path());
+            opts.env
+                .insert("HOME".into(), home.to_string_lossy().into_owned());
+            DeskStore::migrate(&pool).await.unwrap();
+            let d = Desk::start(
+                DeskStore::from_pool(pool),
+                opts,
+                Floor {
+                    turns: None,
+                    plans: None,
+                    pricer: None,
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            let repo = dir.path().join("acme-api");
+            std::fs::create_dir(&repo).unwrap();
+            for args in [
+                &["init", "-q", "-b", "main"][..],
+                &[
+                    "-c",
+                    "user.email=d@e",
+                    "-c",
+                    "user.name=d",
+                    "commit",
+                    "-q",
+                    "--allow-empty",
+                    "-m",
+                    "init",
+                ],
+            ] {
+                let ok = std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(&repo)
+                    .args(args)
+                    .status()
+                    .unwrap();
+                assert!(ok.success());
+            }
+            let plain = new_session(&d, &repo).await;
+            let new = |worktree: &str| NewSession {
+                engine: Engine::Claude,
+                view: None,
+                name: "login-race".into(),
+                cwd: repo.to_string_lossy().into_owned(),
+                goal: String::new(),
+                worktree: Some(worktree.into()),
+                prompt: None,
+                approvals: None,
+                approve_for_me: false,
+                account: None,
+                env: Default::default(),
+                group: None,
+            };
+            let in_worktree = d.create(new("desk/login-race"), None).await.unwrap();
+            let doc: Value =
+                serde_json::from_str(&std::fs::read_to_string(&config).unwrap()).unwrap();
+            assert_eq!(doc["hasCompletedOnboarding"], Value::Bool(true));
+            assert_eq!(doc["theme"], "light", "the person's theme is kept");
+            assert_eq!(doc["userID"], "u1");
+            for s in [&plain, &in_worktree] {
+                let real = std::fs::canonicalize(&s.cwd).unwrap();
+                assert_eq!(
+                    doc["projects"][real.to_str().unwrap()]["hasTrustDialogAccepted"],
+                    Value::Bool(true),
+                    "{} is trusted",
+                    s.cwd
+                );
+            }
+            assert!(in_worktree.cwd.contains("/.worktrees/"));
         })
         .await;
     }
