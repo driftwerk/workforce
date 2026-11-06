@@ -113,9 +113,10 @@ impl Default for RetryConfig {
 pub struct LlmTimeouts {
     /// Max seconds to wait for the first stream event after dispatching a
     /// streaming request. Firing before any event is forwarded, this is
-    /// failover-safe: the chain silently moves to the next model.
-    #[serde(default = "default_first_token_timeout_secs")]
-    pub first_token_timeout_secs: u64,
+    /// failover-safe: the chain silently moves to the next model. Unset, it
+    /// is the provider's own default ([`default_first_token_secs`]).
+    #[serde(default)]
+    pub first_token_timeout_secs: Option<u64>,
     /// Max seconds between stream events once streaming has begun. Firing
     /// after partial content was surfaced, the chain retracts it and moves to
     /// the next model.
@@ -130,7 +131,30 @@ pub struct LlmTimeouts {
     /// keys match, the longest wins.
     #[serde(default)]
     pub model_timeouts: HashMap<String, TimeoutOverride>,
+    /// Per-provider overrides, keyed by provider name (`chatgpt`, `codex`,
+    /// `claude-code`, `anthropic`, …, or an alias of one). A model override
+    /// beats these; these beat the global values.
+    #[serde(default)]
+    pub provider_timeouts: HashMap<String, TimeoutOverride>,
+    /// The provider the agent's own calls go to, when the builder says: its
+    /// override and default apply to every model it is asked for.
+    #[serde(skip)]
+    pub provider: Option<ProviderKind>,
 }
+
+/// Seconds a provider's first token is waited for when nothing configures
+/// it: a subscription plan's models (ChatGPT, Claude, Codex logins) think
+/// for long before they say anything, so they are given longer than a
+/// metered API's.
+pub fn default_first_token_secs(provider: Option<ProviderKind>) -> u64 {
+    match provider {
+        Some(p) if p.is_subscription() => SUBSCRIPTION_FIRST_TOKEN_SECS,
+        _ => default_first_token_timeout_secs(),
+    }
+}
+
+/// [`default_first_token_secs`] for a subscription provider.
+pub const SUBSCRIPTION_FIRST_TOKEN_SECS: u64 = 120;
 
 /// Per-model override entry for [`LlmTimeouts`]; unset fields inherit the
 /// global value.
@@ -147,10 +171,12 @@ pub struct TimeoutOverride {
 impl Default for LlmTimeouts {
     fn default() -> Self {
         Self {
-            first_token_timeout_secs: default_first_token_timeout_secs(),
+            first_token_timeout_secs: None,
             stall_timeout_secs: default_stall_timeout_secs(),
             request_timeout_secs: default_request_timeout_secs(),
             model_timeouts: HashMap::new(),
+            provider_timeouts: HashMap::new(),
+            provider: None,
         }
     }
 }
@@ -169,14 +195,52 @@ impl LlmTimeouts {
         })
     }
 
-    /// Resolved streaming watchdog windows for `model`.
+    /// These windows for calls to `provider`'s models.
+    pub fn for_provider(self, provider: ProviderKind) -> Self {
+        Self {
+            provider: Some(provider),
+            ..self
+        }
+    }
+
+    /// The configured override for `provider`, keyed by any of its names.
+    fn provider_override(&self, provider: Option<ProviderKind>) -> Option<&TimeoutOverride> {
+        let provider = provider?;
+        self.provider_timeouts
+            .iter()
+            .find(|(key, _)| ProviderKind::from_str_loose(key) == Some(provider))
+            .map(|(_, v)| v)
+    }
+
+    /// One window for `model` on `provider`: the model's override, else the
+    /// provider's, else the global value.
+    fn window(
+        &self,
+        provider: Option<ProviderKind>,
+        model: &str,
+        field: impl Fn(&TimeoutOverride) -> Option<u64>,
+    ) -> Option<u64> {
+        self.override_for(model)
+            .and_then(&field)
+            .or_else(|| self.provider_override(provider).and_then(&field))
+    }
+
+    /// Resolved streaming watchdog windows for `model` on the agent's own
+    /// provider.
     pub fn stream_timeouts_for(&self, model: &str) -> StreamTimeouts {
-        let over = self.override_for(model);
-        let first = over
-            .and_then(|o| o.first_token_timeout_secs)
-            .unwrap_or(self.first_token_timeout_secs);
-        let stall = over
-            .and_then(|o| o.stall_timeout_secs)
+        self.stream_timeouts_on(self.provider, model)
+    }
+
+    /// Resolved streaming watchdog windows for `model` on `provider`. The
+    /// first token: the model's override, the provider's, the global value,
+    /// else the provider's default.
+    pub fn stream_timeouts_on(&self, provider: Option<ProviderKind>, model: &str) -> StreamTimeouts {
+        let first = self
+            .window(provider, model, |o| o.first_token_timeout_secs)
+            .or(self.first_token_timeout_secs)
+            .unwrap_or_else(|| default_first_token_secs(provider));
+        let stall = self
+            .window(provider, model, |o| o.stall_timeout_secs)
             .unwrap_or(self.stall_timeout_secs);
         StreamTimeouts {
             first_token: Duration::from_secs(first),
@@ -187,8 +251,7 @@ impl LlmTimeouts {
     /// Resolved non-streaming request cap for `model`; `None` = disabled.
     pub fn request_timeout_for(&self, model: &str) -> Option<Duration> {
         let secs = self
-            .override_for(model)
-            .and_then(|o| o.request_timeout_secs)
+            .window(self.provider, model, |o| o.request_timeout_secs)
             .unwrap_or(self.request_timeout_secs);
         (secs > 0).then(|| Duration::from_secs(secs))
     }
@@ -203,22 +266,29 @@ impl From<&workforce_common::settings::RetryConfig> for LlmTimeouts {
             first_token_timeout_secs: r.first_token_timeout_secs,
             stall_timeout_secs: r.stall_timeout_secs,
             request_timeout_secs: r.request_timeout_secs,
-            model_timeouts: r
-                .model_timeouts
-                .iter()
-                .map(|(model, o)| {
-                    (
-                        model.clone(),
-                        TimeoutOverride {
-                            first_token_timeout_secs: o.first_token_timeout_secs,
-                            stall_timeout_secs: o.stall_timeout_secs,
-                            request_timeout_secs: o.request_timeout_secs,
-                        },
-                    )
-                })
-                .collect(),
+            model_timeouts: overrides(&r.model_timeouts),
+            provider_timeouts: overrides(&r.provider_timeouts),
+            provider: None,
         }
     }
+}
+
+/// The wire's overrides, by the same keys.
+fn overrides(
+    wire: &HashMap<String, workforce_common::settings::ModelTimeoutOverride>,
+) -> HashMap<String, TimeoutOverride> {
+    wire.iter()
+        .map(|(key, o)| {
+            (
+                key.clone(),
+                TimeoutOverride {
+                    first_token_timeout_secs: o.first_token_timeout_secs,
+                    stall_timeout_secs: o.stall_timeout_secs,
+                    request_timeout_secs: o.request_timeout_secs,
+                },
+            )
+        })
+        .collect()
 }
 
 fn default_max_retries() -> u32 {
@@ -1490,7 +1560,13 @@ impl FailoverProvider {
                     return Ok(());
                 }
                 let provider = &provider;
-                let timeouts = retry_config.timeouts.stream_timeouts_for(&entry.model);
+                let timeouts = retry_config.timeouts.stream_timeouts_on(
+                    entry
+                        .provider_key
+                        .as_deref()
+                        .and_then(ProviderKind::from_str_loose),
+                    &entry.model,
+                );
                 let (result, forwarded) = relay_stream(&tx, |attempt_tx| async move {
                     // Externals bypass the pool's liveness watchdog — wrap here.
                     if is_external {
@@ -1624,7 +1700,13 @@ impl FailoverProvider {
                                 if kind == ErrorKind::FirstTokenTimeout && !is_last {
                                     let elapsed_secs = retry_config
                                         .timeouts
-                                        .stream_timeouts_for(&entry.model)
+                                        .stream_timeouts_on(
+                                            entry
+                                                .provider_key
+                                                .as_deref()
+                                                .and_then(ProviderKind::from_str_loose),
+                                            &entry.model,
+                                        )
                                         .first_token
                                         .as_secs();
                                     let _ = tx
@@ -2793,7 +2875,7 @@ mod tests {
             retry_rate_limited: true,
             max_rate_limit_wait_secs: 45,
             timeouts: LlmTimeouts {
-                first_token_timeout_secs: 5,
+                first_token_timeout_secs: Some(5),
                 ..Default::default()
             },
         };
@@ -3945,6 +4027,73 @@ mod tests {
         assert_eq!(
             miss.first_token,
             Duration::from_secs(default_first_token_timeout_secs())
+        );
+    }
+
+    /// A subscription plan's models are waited on longer for their first
+    /// token when nothing configures it; a provider's override beats the
+    /// global value, and a model's beats both.
+    #[test]
+    fn first_token_waits_by_model_then_provider_then_global_then_the_plan() {
+        let plain = LlmTimeouts::default();
+        assert_eq!(
+            plain.stream_timeouts_on(Some(ProviderKind::ChatGpt), "gpt-6.1-sol").first_token,
+            Duration::from_secs(SUBSCRIPTION_FIRST_TOKEN_SECS)
+        );
+        assert_eq!(
+            plain
+                .clone()
+                .for_provider(ProviderKind::ChatGpt)
+                .stream_timeouts_for("gpt-6.1-sol")
+                .first_token,
+            Duration::from_secs(SUBSCRIPTION_FIRST_TOKEN_SECS),
+            "the pool's provider applies to every model it is asked for"
+        );
+        assert_eq!(
+            plain.stream_timeouts_on(Some(ProviderKind::Anthropic), "claude-sonnet-5").first_token,
+            Duration::from_secs(default_first_token_timeout_secs())
+        );
+        let global = LlmTimeouts {
+            first_token_timeout_secs: Some(30),
+            ..Default::default()
+        };
+        assert_eq!(
+            global.stream_timeouts_on(Some(ProviderKind::ChatGpt), "gpt-6.1-sol").first_token,
+            Duration::from_secs(30),
+            "a global value someone set applies to every provider"
+        );
+        let configured = LlmTimeouts {
+            first_token_timeout_secs: Some(30),
+            provider_timeouts: HashMap::from([(
+                "chatgpt".to_string(),
+                TimeoutOverride {
+                    first_token_timeout_secs: Some(240),
+                    ..Default::default()
+                },
+            )]),
+            model_timeouts: HashMap::from([(
+                "gpt-6.1-mini".to_string(),
+                TimeoutOverride {
+                    first_token_timeout_secs: Some(20),
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        }
+        .for_provider(ProviderKind::ChatGpt);
+        assert_eq!(
+            configured.stream_timeouts_for("gpt-6.1-sol").first_token,
+            Duration::from_secs(240)
+        );
+        assert_eq!(
+            configured.stream_timeouts_for("gpt-6.1-mini").first_token,
+            Duration::from_secs(20)
+        );
+        assert_eq!(
+            configured
+                .stream_timeouts_on(Some(ProviderKind::Anthropic), "claude-sonnet-5")
+                .first_token,
+            Duration::from_secs(30)
         );
     }
 

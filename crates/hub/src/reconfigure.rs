@@ -173,7 +173,8 @@ pub(crate) async fn apply_config(service: &AgentService) -> eyre::Result<Vec<Str
                 .retry
                 .as_ref()
                 .map(workforce_agent::llm::failover::LlmTimeouts::from)
-                .unwrap_or_default(),
+                .unwrap_or_default()
+                .for_provider(*service.provider_kind.read()),
         );
     }
 

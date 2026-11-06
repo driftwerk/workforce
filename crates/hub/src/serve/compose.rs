@@ -2204,7 +2204,8 @@ impl LlmStack {
                 .retry
                 .as_ref()
                 .map(workforce_agent::llm::failover::LlmTimeouts::from)
-                .unwrap_or_default(),
+                .unwrap_or_default()
+                .for_provider(provider_kind_val),
         );
         {
             let default_provider = providers

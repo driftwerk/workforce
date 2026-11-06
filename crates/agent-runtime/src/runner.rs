@@ -5300,6 +5300,35 @@ impl AgentRunner {
                                     cached_prefix,
                                 )
                                 .await?
+                            } else if classify_error(&error_str)
+                                == crate::llm::failover::ErrorKind::FirstTokenTimeout
+                            {
+                                // Nothing streamed, and nothing was left to
+                                // fail over to: a slow model gets one more
+                                // try before the turn fails. A follow-up
+                                // sent while it was silent joins the retry.
+                                warn!(
+                                    agent = %self.config.agent_id,
+                                    round = rounds,
+                                    "No first token from the model — retrying the call once"
+                                );
+                                self.absorb_injected_followups(
+                                    &mut fwd_inject_rx,
+                                    &mut messages,
+                                    &mut absorbed_followups,
+                                    &mut stop_after_next_round,
+                                    &progress_tx,
+                                    rounds,
+                                )
+                                .await;
+                                self.call_llm_streaming(
+                                    &messages,
+                                    &offered,
+                                    &progress_tx,
+                                    tel,
+                                    cached_prefix,
+                                )
+                                .await?
                             } else if classify_error(&error_str).needs_compaction() {
                                 warn!("Context overflow — attempting emergency compaction");
                                 let _ = progress_tx.send(ProgressEvent::CompactStart).await;
@@ -12784,6 +12813,158 @@ mod tests {
             draft_pos < follow_pos,
             "follow-up must read as a reply to the draft"
         );
+    }
+
+    /// A model that says nothing within the first-token window on its first
+    /// call, held open until the test releases it, then answers.
+    struct SilentOnce {
+        calls: std::sync::Mutex<Vec<Vec<LlmMessage>>>,
+        started: Arc<tokio::sync::Semaphore>,
+        release: Arc<tokio::sync::Semaphore>,
+    }
+
+    #[async_trait]
+    impl LlmProvider for SilentOnce {
+        async fn create_message(
+            &self,
+            _system_prompt: Option<&str>,
+            messages: &[LlmMessage],
+            _tools: &[LlmToolDef],
+            _model: Option<&str>,
+            _max_tokens: Option<u32>,
+            _enable_cache: bool,
+        ) -> Result<LlmResponse> {
+            let first = {
+                let mut calls = self.calls.lock().unwrap();
+                calls.push(messages.to_vec());
+                calls.len() == 1
+            };
+            if first {
+                self.started.add_permits(1);
+                self.release.acquire().await.expect("release").forget();
+                return Err(eyre::eyre!(
+                    "{}: no first token after 45s (model gpt-6.1-sol)",
+                    crate::llm::streaming::FIRST_TOKEN_TIMEOUT_MARKER
+                ));
+            }
+            Ok(LlmResponse {
+                content: vec![ContentBlock::Text {
+                    text: "it was NCM".into(),
+                }],
+                stop_reason: StopReason::EndTurn,
+                usage: TokenUsage {
+                    input_tokens: 5,
+                    output_tokens: 5,
+                    ..Default::default()
+                },
+                model: "mock-silent-once".to_string(),
+            })
+        }
+    }
+
+    /// A first-token timeout with nothing left to fail over to is tried once
+    /// more before the turn fails, and a follow-up sent while the model was
+    /// silent is in the retried call and in what the run reports it took in.
+    #[tokio::test]
+    async fn a_silent_model_is_retried_once_with_the_follow_up_sent_meanwhile() {
+        let provider = Arc::new(SilentOnce {
+            calls: std::sync::Mutex::new(Vec::new()),
+            started: Arc::new(tokio::sync::Semaphore::new(0)),
+            release: Arc::new(tokio::sync::Semaphore::new(0)),
+        });
+        let runner = make_runner(provider.clone());
+        let (progress_tx, _progress_rx) = mpsc::channel(64);
+        let (inject_tx, inject_rx) = mpsc::channel(8);
+        let run = tokio::spawn(async move {
+            runner
+                .run_with_progress_and_history(
+                    vec![ContentBlock::Text {
+                        text: "what was that research called?".into(),
+                    }],
+                    Vec::new(),
+                    progress_tx,
+                    None,
+                    Some(inject_rx),
+                )
+                .await
+        });
+        provider.started.acquire().await.unwrap().forget();
+        inject_tx
+            .send(InjectedMessage::UserMessage {
+                text: "we talked about it previously".into(),
+                user: "u1".into(),
+                external_id: Some("c-2".into()),
+            })
+            .await
+            .unwrap();
+        provider.release.add_permits(1);
+
+        let result = run.await.unwrap().expect("the retry answers");
+        assert_eq!(result.response, "it was NCM");
+        assert_eq!(result.rounds, 1, "the retry is the same round's call");
+        let calls = provider.calls.lock().unwrap();
+        assert_eq!(calls.len(), 2, "tried once more, no more");
+        let retried: Vec<&str> = calls[1]
+            .iter()
+            .flat_map(|m| &m.content)
+            .filter_map(|b| match b {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            retried.iter().any(|t| t.contains("we talked about it previously")),
+            "the follow-up is in the retried call: {retried:?}"
+        );
+        assert_eq!(
+            result.injected_user_messages,
+            vec![InjectedUserMessage {
+                user: "u1".into(),
+                text: "we talked about it previously".into(),
+                external_id: Some("c-2".into()),
+            }]
+        );
+    }
+
+    /// A model silent twice fails the turn: one retry, not a loop.
+    #[tokio::test]
+    async fn a_model_silent_twice_fails_the_turn() {
+        struct Silent(std::sync::atomic::AtomicU32);
+        #[async_trait]
+        impl LlmProvider for Silent {
+            async fn create_message(
+                &self,
+                _system_prompt: Option<&str>,
+                _messages: &[LlmMessage],
+                _tools: &[LlmToolDef],
+                _model: Option<&str>,
+                _max_tokens: Option<u32>,
+                _enable_cache: bool,
+            ) -> Result<LlmResponse> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Err(eyre::eyre!(
+                    "{}: no first token after 45s (model m)",
+                    crate::llm::streaming::FIRST_TOKEN_TIMEOUT_MARKER
+                ))
+            }
+        }
+        let provider = Arc::new(Silent(std::sync::atomic::AtomicU32::new(0)));
+        let runner = make_runner(provider.clone());
+        let (progress_tx, _progress_rx) = mpsc::channel(64);
+        let failed = runner
+            .run_with_progress_and_history(
+                vec![ContentBlock::Text { text: "hi".into() }],
+                Vec::new(),
+                progress_tx,
+                None,
+                None,
+            )
+            .await
+            .expect_err("silent twice");
+        assert!(failed
+            .to_string()
+            .contains(crate::llm::streaming::FIRST_TOKEN_TIMEOUT_MARKER));
+        assert_eq!(provider.0.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     #[test]
