@@ -739,6 +739,15 @@ pub struct DeskConfig {
     /// own sign-in on this computer.
     #[serde(default)]
     pub accounts: DeskAccounts,
+    /// Whether this hub serves agents of its own. Off on a machine Desk on
+    /// another computer drives over SSH: its hub runs the sessions placed
+    /// there and nothing else. No `[[agents]]` is served, none can be added,
+    /// so there is no overseer and a session's questions go to the person;
+    /// the hub's own plumbing (the model its Floor lines are written on,
+    /// sign-ins, prices) is kept off the roster, and every agent's sessions
+    /// left from before are forgotten when it starts. Default: on.
+    #[serde(default = "default_true")]
+    pub agents: bool,
 }
 
 /// Where the sign-ins of the person's engine accounts (a second Claude
@@ -805,6 +814,7 @@ impl Default for DeskConfig {
             attachment_retention_days: default_desk_attachment_retention_days(),
             github_client_id: None,
             accounts: DeskAccounts::default(),
+            agents: true,
         }
     }
 }
@@ -11371,6 +11381,12 @@ impl WorkforceConfig {
             .or_else(|| self.agents.first())
     }
 
+    /// Whether this hub serves agents: always, except a Desk hub whose
+    /// `[desk] agents` is off (a machine's: [`DeskConfig::agents`]).
+    pub fn serves_agents(&self) -> bool {
+        !self.desk.enabled || self.desk.agents
+    }
+
     /// Look up an agent config by ID.
     pub fn agent_by_id(&self, id: &str) -> Option<&AgentConfig> {
         self.agents.iter().find(|a| a.id == id)
@@ -11527,6 +11543,7 @@ default = true
 # restore = "ask"              # "ask", "auto" or "off"
 # approval_timeout_secs = 3600 # Then the terminal asks instead
 # adopt_interval_secs = 5      # Look for sessions in other terminals (0 = off)
+# agents = true                # false: run Desk's sessions only, no agents (a machine's)
 
 # Heartbeat — periodic agent check-ins.
 # [heartbeat]
@@ -11631,6 +11648,22 @@ mod tests {
     /// Only the base file's few secret fields expand from the inherited
     /// secrets. Anything an agent or a tool can write (the overlay: agents,
     /// their prompts) never does, nor do the base's other fields.
+    /// Every hub serves agents unless it is a Desk hub whose `[desk]
+    /// agents` is off: a machine's.
+    #[test]
+    fn only_a_desk_hub_told_so_serves_no_agents() {
+        let parse = |toml: &str| toml::from_str::<WorkforceConfig>(toml).unwrap();
+        assert!(parse("").serves_agents());
+        assert!(parse("[desk]\nenabled = true\n").serves_agents());
+        assert!(
+            parse("[desk]\nagents = false\n").serves_agents(),
+            "no Desk: off is moot"
+        );
+        let machine = parse("[desk]\nenabled = true\nagents = false\n");
+        assert!(!machine.serves_agents());
+        assert!(DeskConfig::default().agents);
+    }
+
     #[test]
     fn agent_written_config_never_expands_to_an_inherited_secret() {
         crate::inherited_secrets::install_test_fixture();

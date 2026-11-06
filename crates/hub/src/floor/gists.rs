@@ -846,7 +846,9 @@ fn floor_model(
 
 /// The hub's own model: an agent's turn's gist on that agent's cheap
 /// model, a Desk session's and the floor's paragraph on the hub's default
-/// agent's, each call costed to the person it is for.
+/// agent's (on a hub that serves no agents, its plumbing's: the same plan,
+/// [`crate::agent_registry::AgentRegistry::host`]), each call costed to the
+/// person it is for.
 pub(crate) struct HubModel {
     pub state: Arc<crate::gateway::GatewayState>,
     /// `[floor] fallback_providers`: whether a person's line may be written
@@ -1091,7 +1093,7 @@ impl Model for HubModel {
             Some(Subject::Agent { agent_id, .. }) => registry.get(agent_id),
             _ => None,
         }
-        .or_else(|| registry.default_agent())
+        .or_else(|| registry.host())
         .ok_or_else(|| eyre::eyre!("no agent to write with"))?;
         let others = match self.fallback {
             true => registry.all_services(),

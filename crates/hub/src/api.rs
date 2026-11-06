@@ -1674,7 +1674,7 @@ async fn definitions_seen_by(
     let teams = crate::team_reach::TeamReach::new(
         state
             .agent_registry()
-            .and_then(|registry| registry.default_agent())
+            .and_then(|registry| registry.host())
             .and_then(|service| service.team_store.read().clone()),
         reader.identity_id.clone(),
     );

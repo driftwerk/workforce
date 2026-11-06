@@ -599,8 +599,10 @@ impl Crew for CrewHub {
     }
 
     fn timezone(&self) -> chrono_tz::Tz {
-        self.services()
-            .first()
+        // The hub's: on a hub that serves no agents, its plumbing's config.
+        self.state
+            .registry
+            .host()
             .map_or(chrono_tz::UTC, |s| s.config.user_timezone())
     }
 

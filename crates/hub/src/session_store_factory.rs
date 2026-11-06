@@ -52,6 +52,27 @@ pub async fn build_session_store(
     }
 }
 
+/// On a hub that serves no agents, forget every agent's sessions but its
+/// plumbing's (`keep`): an agent it served before, a machine's Desk agent
+/// say, leaves nothing behind. Only sessions kept in Postgres; none in
+/// JSONL, whose files are each agent's own workspace's. The sessions
+/// forgotten.
+pub async fn forget_unserved_agents(config: &WorkforceConfig, keep: &str) -> eyre::Result<u64> {
+    if config.serves_agents() || config.sessions.backend != "postgres" {
+        return Ok(0);
+    }
+    #[cfg(feature = "postgres")]
+    {
+        let pool = shared_sessions_pool(config).await?;
+        PostgresSessionStore::forget_agents_but(&pool, keep).await
+    }
+    #[cfg(not(feature = "postgres"))]
+    {
+        let _ = keep;
+        Ok(0)
+    }
+}
+
 /// Whether this hub's sessions are in Postgres, beside which a person's
 /// Desk read points are kept.
 pub(crate) fn keeps_desk_reads() -> bool {

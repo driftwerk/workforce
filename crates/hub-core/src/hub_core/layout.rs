@@ -160,6 +160,13 @@ pub fn agent_workspace(data_dir: &Path, agent_id: &str, configured: Option<&str>
     configured.map_or_else(|| agent_root(data_dir, agent_id), PathBuf::from)
 }
 
+/// Where the hub's own plumbing keeps its files on a hub that serves no
+/// agents (`[desk] agents = false`): beside the agents' folder, never in it,
+/// so nothing that reads `agents/` takes it for one.
+pub fn host_workspace(data_dir: &Path) -> PathBuf {
+    data_dir.join("host")
+}
+
 pub fn projects_root(data_dir: &Path, agent_id: &str) -> PathBuf {
     agent_root(data_dir, agent_id).join("projects")
 }

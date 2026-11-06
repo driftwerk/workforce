@@ -3786,7 +3786,7 @@ rules:
             use workforce_common::settings::WorkforceConfig;
 
             let config_path = config.clone();
-            let wf_config = if config.exists() {
+            let mut wf_config = if config.exists() {
                 WorkforceConfig::load(&config)?
             } else {
                 eprintln!(
@@ -3796,6 +3796,16 @@ rules:
                 );
                 WorkforceConfig::default()
             };
+            // A hub that serves no agents (`[desk] agents = false`, a
+            // machine's) runs none of those its config names.
+            let serves_agents = wf_config.serves_agents();
+            if !serves_agents && !wf_config.agents.is_empty() {
+                tracing::warn!(
+                    agents = wf_config.agents.len(),
+                    "[desk] agents = false: this hub serves none of the [[agents]] its config names"
+                );
+                wf_config.agents.clear();
+            }
 
             eprintln!("{} Starting Workforce Agent Service", style("🚀").bold(),);
             eprintln!(
@@ -3907,7 +3917,7 @@ rules:
             // survive the upgrade (a missing legacy file — fresh install — is a
             // no-op; agent workspaces aren't symlinked, so the relative path
             // resolves to the same file the scheduler loads).
-            {
+            if serves_agents {
                 let default_ws = wf_config
                     .default_agent()
                     .map(|a| {
@@ -4218,7 +4228,11 @@ rules:
             // Share the default service's local_agents and knowledge service with all agents
             let shared_local_agents = default_service.local_agents.clone();
             let shared_knowledge = default_service.knowledge_service().cloned();
-            agent_map.insert(default_id.clone(), Arc::clone(&default_service));
+            // On a hub that serves no agents the default service is only its
+            // plumbing, held off the roster below.
+            if serves_agents {
+                agent_map.insert(default_id.clone(), Arc::clone(&default_service));
+            }
 
             // Readiness is deferred to the "all surfaces registered" point
             // below, alongside the default's: a scheduler made ready here can
@@ -4270,6 +4284,30 @@ rules:
             let registry = Arc::new(workforce_hub::agent_registry::AgentRegistry::from_parts(
                 agent_map, default_id,
             ));
+            if !serves_agents {
+                registry.set_host(Arc::clone(&default_service));
+                eprintln!(
+                    "  Agents:    {} (this hub runs Desk's sessions only)",
+                    style("none").dim()
+                );
+                // Whatever agent it served before leaves no sessions behind.
+                match workforce_hub::session_store_factory::forget_unserved_agents(
+                    &wf_config,
+                    default_service.agent_id.as_str(),
+                )
+                .await
+                {
+                    Ok(0) => {}
+                    Ok(sessions) => tracing::info!(
+                        sessions,
+                        "forgot the sessions of the agents this hub no longer serves"
+                    ),
+                    Err(e) => tracing::warn!(
+                        error = %format!("{e:#}"),
+                        "the sessions of the agents this hub no longer serves could not be forgotten; tried again on the next start"
+                    ),
+                }
+            }
             let every_agent_loaded = failed_agents.is_empty();
             for (agent_config, reason) in failed_agents {
                 registry.load_failed(&agent_config, reason);
@@ -4543,30 +4581,33 @@ rules:
                 parking_lot::RwLock<Option<Arc<dyn workforce_agent::runner::CapabilityGate>>>,
             > = Arc::new(parking_lot::RwLock::new(None));
             let slack_slot = workforce_hub::slack_onboarding::SlackSlot::default();
-            spawn_overlay_agent_watcher(OverlayWatcherCtx {
-                registry: Arc::clone(&registry),
-                config_path: config_path.clone(),
-                data_dir: std::path::PathBuf::from(&wf_config.hub.data_dir),
-                lock_manager: Arc::clone(&lock_manager_for_agents),
-                shared_knowledge: shared_knowledge.clone(),
-                shared_local_agents: shared_local_agents.clone(),
-                global_vault: global_vault.clone(),
-                subscriptions: subscriptions.clone(),
-                engagement_overrides: Arc::clone(&engagement_overrides),
-                project_store: Arc::clone(&project_store),
-                mcp_store: Arc::clone(&mcp_store),
-                oauth_state: Arc::clone(&oauth_state),
-                mcp_http: Arc::clone(&mcp_http),
-                mcp_managers: Arc::clone(&mcp_managers),
-                broadcast_tx: broadcast_tx.clone(),
-                voice_announcer: Arc::clone(&voice_announcer),
-                leader_flag: leader_flag.clone(),
-                nats: nats_for_gateway.clone(),
-                identity_store: Arc::clone(&watcher_identity_store),
-                capability_gate: Arc::clone(&watcher_capability_gate),
-                slack: Arc::clone(&slack_slot),
-                kick: Arc::clone(&overlay_kick),
-            });
+            // A hub that serves no agents gains none from its overlay either.
+            if serves_agents {
+                spawn_overlay_agent_watcher(OverlayWatcherCtx {
+                    registry: Arc::clone(&registry),
+                    config_path: config_path.clone(),
+                    data_dir: std::path::PathBuf::from(&wf_config.hub.data_dir),
+                    lock_manager: Arc::clone(&lock_manager_for_agents),
+                    shared_knowledge: shared_knowledge.clone(),
+                    shared_local_agents: shared_local_agents.clone(),
+                    global_vault: global_vault.clone(),
+                    subscriptions: subscriptions.clone(),
+                    engagement_overrides: Arc::clone(&engagement_overrides),
+                    project_store: Arc::clone(&project_store),
+                    mcp_store: Arc::clone(&mcp_store),
+                    oauth_state: Arc::clone(&oauth_state),
+                    mcp_http: Arc::clone(&mcp_http),
+                    mcp_managers: Arc::clone(&mcp_managers),
+                    broadcast_tx: broadcast_tx.clone(),
+                    voice_announcer: Arc::clone(&voice_announcer),
+                    leader_flag: leader_flag.clone(),
+                    nats: nats_for_gateway.clone(),
+                    identity_store: Arc::clone(&watcher_identity_store),
+                    capability_gate: Arc::clone(&watcher_capability_gate),
+                    slack: Arc::clone(&slack_slot),
+                    kick: Arc::clone(&overlay_kick),
+                });
+            }
 
             let channel_pairing = {
                 // Only create the service if any platform uses non-Open policy
