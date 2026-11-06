@@ -136,6 +136,47 @@ pub fn not_ours(group_name: Option<&str>) -> String {
     }
 }
 
+/// What moving a session between groups does, beyond the sidebar.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Effect {
+    /// Its ticket on the old scope's board is taken off it, back to To do.
+    Unassign { ticket: uuid::Uuid },
+    /// Its open questions to the old boss are withdrawn.
+    WithdrawAsks,
+    /// The old boss stops running it.
+    Release,
+    /// It is told, on its line, what changed.
+    Tell,
+}
+
+/// What moving a session from group `from` to group `to` does: nothing but
+/// the sidebar within one scope; across a boss boundary, its `tickets` on
+/// the old scope's boards are unassigned, its open questions to the old
+/// boss withdrawn, the old boss lets it go when it ran it (`charged`), and
+/// it is told. What it wrote stays the old group's; what it writes next is
+/// the new one's.
+pub fn move_effects(
+    from: Option<&str>,
+    to: Option<&str>,
+    tickets: &[uuid::Uuid],
+    charged: bool,
+    bossed: &HashSet<String>,
+) -> Vec<Effect> {
+    if scope_of(from, bossed) == scope_of(to, bossed) {
+        return Vec::new();
+    }
+    let mut out: Vec<Effect> = tickets
+        .iter()
+        .map(|t| Effect::Unassign { ticket: *t })
+        .collect();
+    out.push(Effect::WithdrawAsks);
+    if charged {
+        out.push(Effect::Release);
+    }
+    out.push(Effect::Tell);
+    out
+}
+
 /// The sidebar key of a room member (`hub/agent`).
 pub fn member_item(member: &crate::rooms::Member) -> String {
     format!("agent:{}", member.key())
@@ -353,6 +394,41 @@ mod tests {
             "{sql}"
         );
         assert!(sql.contains("$4::text[], $5::timestamptz[]"), "{sql}");
+    }
+
+    #[test]
+    fn a_move_across_a_boss_boundary_unassigns_withdraws_and_lets_go_and_within_one_changes_nothing(
+    ) {
+        let b = bossed();
+        let t = uuid::Uuid::from_u128(7);
+        assert!(
+            move_effects(None, Some("infra"), &[t], true, &b).is_empty(),
+            "one scope"
+        );
+        assert!(move_effects(Some("acme"), Some("acme"), &[t], true, &b).is_empty());
+        assert_eq!(
+            move_effects(Some("acme"), Some("atlas"), &[t], true, &b),
+            [
+                Effect::Unassign { ticket: t },
+                Effect::WithdrawAsks,
+                Effect::Release,
+                Effect::Tell
+            ]
+        );
+        assert_eq!(
+            move_effects(None, Some("acme"), &[], false, &b),
+            [Effect::WithdrawAsks, Effect::Tell],
+            "into a bossed group, with no ticket, not run"
+        );
+        assert_eq!(
+            move_effects(Some("atlas"), Some("infra"), &[t], false, &b),
+            [
+                Effect::Unassign { ticket: t },
+                Effect::WithdrawAsks,
+                Effect::Tell
+            ],
+            "out to the main overseer"
+        );
     }
 
     #[test]

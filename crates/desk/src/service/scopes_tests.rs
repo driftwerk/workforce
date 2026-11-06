@@ -488,3 +488,99 @@ async fn a_group_stays_a_boundary_until_its_boss_is_taken_off_and_then_opens_fro
     })
     .await;
 }
+
+#[tokio::test]
+async fn a_session_moved_across_bosses_leaves_its_ticket_questions_and_boss_behind() {
+    use crate::board::TicketState;
+    use crate::line::{Asked, Delivery, LineKind, LineMessage};
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        groups(&d).await;
+        let s = super::tests::new_session(&d, dir.path()).await;
+        d.change_layout(|l| l.put(&session_item(s.id), "acme", None))
+            .await
+            .unwrap();
+        let board = d
+            .create_board(NewBoard {
+                name: "Acme".into(),
+                group: Some("acme".into()),
+                prefix: Some("ACM".into()),
+            })
+            .await
+            .unwrap();
+        let t = d
+            .create_ticket(
+                NewTicket {
+                    board: board.id,
+                    title: "Fix the checkout".into(),
+                    body: String::new(),
+                    state: Some(TicketState::Todo),
+                    needs: vec![],
+                },
+                &By::you(),
+            )
+            .await
+            .unwrap();
+        d.assign_ticket(t.ticket.id, Some(AssignTo::Session(s.id)), &By::you())
+            .await
+            .unwrap();
+        let mut ask = LineMessage::new(
+            Party::session(&d.view(s.id).unwrap()),
+            Party::manager("sarah", "Sarah"),
+            LineKind::Ask,
+            "Which port?".into(),
+            1,
+        );
+        ask.asked = Some(Asked::Open);
+        d.store().put_line(&ask).await.unwrap();
+        let sarah = Party::manager("sarah", "Sarah");
+        for _ in 0..200 {
+            if d.charges_loaded() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        d.take_on(
+            s.id,
+            &sarah,
+            crate::charge::How::Handed,
+            &acme(),
+            &By::you(),
+        )
+        .await
+        .unwrap();
+
+        // Within Acme nothing but the sidebar changes; to Atlas, it all goes.
+        d.change_layout(|l| l.put(&session_item(s.id), "atlas", None))
+            .await
+            .unwrap();
+        let after = d.ticket(t.ticket.id).await.unwrap().ticket;
+        assert_eq!((after.state, after.assignee), (TicketState::Todo, None));
+        let asked = d.store().line_message(ask.id).await.unwrap().unwrap();
+        assert_eq!(asked.asked, Some(Asked::Withdrawn));
+        assert!(
+            !d.charge_of(s.id).unwrap().live(),
+            "Sarah no longer runs it"
+        );
+        let thread = d.line_thread(s.id, None, None).await.unwrap();
+        let told = thread
+            .iter()
+            .find(|m| m.text.starts_with("You were moved to Atlas"))
+            .expect("the session is told");
+        assert!(told.text.contains("back in To do"), "{}", told.text);
+        assert_ne!(told.delivery, Delivery::Refused);
+        // It can't be taken on by Acme's boss any more.
+        assert!(d
+            .take_on(
+                s.id,
+                &sarah,
+                crate::charge::How::Handed,
+                &acme(),
+                &By::you()
+            )
+            .await
+            .is_err());
+    })
+    .await;
+}

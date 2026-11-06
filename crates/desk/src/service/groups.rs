@@ -498,13 +498,22 @@ impl Desk {
             layout: after.clone(),
         });
         let ids: Vec<Uuid> = self.0.state.lock().records.keys().copied().collect();
+        let mut crossed = Vec::new();
         for id in ids {
             let item = session_item(id);
             let moved = before.group_of(&item).map(|g| (&g.id, &g.name))
                 != after.group_of(&item).map(|g| (&g.id, &g.name));
             if moved {
                 self.publish(id);
+                let group = |l: &Layout| l.group_of(&item).map(|g| g.id.clone());
+                crossed.push((id, group(&before), group(&after)));
             }
+        }
+        drop(_one);
+        // Boxed: what a move undoes (a ticket's hand-out) can itself start
+        // a session, which goes into the sidebar.
+        for (id, from, to) in crossed {
+            Box::pin(self.moved_across(id, from.as_deref(), to.as_deref())).await;
         }
         Ok(after)
     }
