@@ -81,12 +81,15 @@ fn cursor_path(workspace: &Path) -> PathBuf {
     workspace.join(".sessions-redaction-cursor")
 }
 
+/// Where the sweep resumes; the start of 1970 before any sweep ran. Not
+/// `MIN_UTC`: Postgres can't store a time that early, so a store there
+/// failed every sweep and never moved the cursor.
 fn read_cursor(workspace: &Path) -> DateTime<Utc> {
     std::fs::read_to_string(cursor_path(workspace))
         .ok()
         .and_then(|raw| DateTime::parse_from_rfc3339(raw.trim()).ok())
         .map(|dt| dt.with_timezone(&Utc))
-        .unwrap_or(DateTime::<Utc>::MIN_UTC)
+        .unwrap_or(DateTime::<Utc>::UNIX_EPOCH)
 }
 
 fn write_cursor(workspace: &Path, at: DateTime<Utc>) {
@@ -181,6 +184,13 @@ mod tests {
         assert!(!store.get(&id).unwrap().unwrap().messages[0]
             .content
             .contains("ABCDEFGHIJKLMNOPQRSTUVWXYZ"));
+    }
+
+    #[test]
+    fn a_first_sweep_starts_at_a_time_postgres_can_store() {
+        let ws = tempfile::tempdir().unwrap();
+        // Postgres' timestamptz goes back to 4713 BC.
+        assert_eq!(read_cursor(ws.path()), DateTime::<Utc>::UNIX_EPOCH);
     }
 
     #[test]
