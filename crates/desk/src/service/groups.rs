@@ -29,7 +29,8 @@ pub struct Group {
     pub name: String,
     #[serde(default)]
     pub collapsed: bool,
-    /// `session:<id>` or `agent:<hub>/<agent>`, in order.
+    /// `session:<id>`, `session:<machine>/<id>` or `agent:<hub>/<agent>`,
+    /// in order.
     #[serde(default)]
     pub items: Vec<String>,
 }
@@ -67,9 +68,21 @@ fn bad(why: impl Into<String>) -> DeskError {
     DeskError::Invalid(why.into())
 }
 
+/// A session's key as Desk keeps it: its id on this computer, or
+/// `<machine>/<id>` for one on a machine of the person's, which this hub
+/// only keeps a place for (it never prunes it: it doesn't know it).
+fn session_key_ok(key: &str) -> bool {
+    match key.split_once('/') {
+        Some((machine, id)) => {
+            !machine.is_empty() && machine != "local" && Uuid::parse_str(id).is_ok()
+        }
+        None => Uuid::parse_str(key).is_ok(),
+    }
+}
+
 fn check_item(item: &str) -> Result<(), DeskError> {
     let ok = match (item.strip_prefix("session:"), item.strip_prefix("agent:")) {
-        (Some(id), _) => Uuid::parse_str(id).is_ok(),
+        (Some(key), _) => session_key_ok(key),
         (_, Some(key)) => key
             .split_once('/')
             .is_some_and(|(hub, agent)| !hub.is_empty() && !agent.is_empty()),
@@ -79,7 +92,7 @@ fn check_item(item: &str) -> Result<(), DeskError> {
         Ok(())
     } else {
         Err(bad(format!(
-            "{item:?} is not session:<id> or agent:<hub>/<agent>"
+            "{item:?} is not session:<id>, session:<machine>/<id> or agent:<hub>/<agent>"
         )))
     }
 }
@@ -723,6 +736,33 @@ mod tests {
         let l = l.order_ungrouped(&[s(8), s(9), s(9)]).unwrap();
         assert_eq!(l.ungrouped.items, [s(8), s(9), s(7)]);
         assert!(l.order_ungrouped(&["nonsense".into()]).is_err());
+    }
+
+    /// A machine's session is kept by its key on Desk, `<machine>/<id>`,
+    /// in any group; this hub never forgets it, as it doesn't know it.
+    #[test]
+    fn a_machines_session_has_a_place_and_is_never_forgotten_here() {
+        let devbox = format!("session:devbox/{}", Uuid::from_u128(5));
+        let l = Layout::default()
+            .create("g", "Acme", &[s(1)], None)
+            .unwrap()
+            .put(&devbox, "g", None)
+            .unwrap()
+            .checked()
+            .unwrap();
+        assert_eq!(l.groups[0].items, [s(1), devbox.clone()]);
+        let l = l.order_ungrouped(std::slice::from_ref(&devbox)).unwrap();
+        assert_eq!(l.ungrouped.items, std::slice::from_ref(&devbox));
+        let l = l.without_sessions(|id| id == Uuid::from_u128(5));
+        assert_eq!(l.ungrouped.items, std::slice::from_ref(&devbox));
+        for bad in [
+            "session:devbox/nonsense".to_string(),
+            format!("session:/{}", Uuid::from_u128(5)),
+            format!("session:local/{}", Uuid::from_u128(5)),
+            format!("session:a/b/{}", Uuid::from_u128(5)),
+        ] {
+            assert!(l.put(&bad, "g", None).is_err(), "{bad}");
+        }
     }
 
     #[test]
