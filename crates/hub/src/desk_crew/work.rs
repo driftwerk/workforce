@@ -162,6 +162,8 @@ impl CrewHub {
     /// them go where they can't be run any more. (A session moved out of its
     /// boss's scope is let go as it moves.) Nothing, until Desk knows which
     /// sessions bosses run.
+    /// A hub that serves no agents has no overseers: every session a boss
+    /// ran there (its old Desk agent) is let go.
     pub(crate) async fn take_on_all(&self) {
         if !self.desk.charges_loaded() {
             return;
@@ -202,14 +204,32 @@ impl CrewHub {
                 }
             }
             let still_boss = overseers.iter().any(|(s, _)| s.agent_id.as_str() == c.boss);
+            if still_boss {
+                continue;
+            }
             // Its boss no longer oversees: passed on, within its scope, by
-            // an overseer that acts.
-            if let Some((s, o)) = its.filter(|(_, o)| !still_boss && o.level != Level::Watch) {
-                let boss = party(s);
-                let by = By::manager(&boss.id, &boss.name, "Its boss no longer oversees.");
-                if let Err(e) = self.desk.pass_charge(c.session, &boss, &o.scope, &by).await {
-                    tracing::info!(session = %c.session, error = %e, "a session wasn't passed on");
+            // an overseer that acts; let go where none can run it (on a hub
+            // that serves no agents, a machine's, none ever can). Never while
+            // its boss is only starting or failed to load: it may yet serve.
+            match its.filter(|(_, o)| o.level != Level::Watch) {
+                Some((s, o)) => {
+                    let boss = party(s);
+                    let by = By::manager(&boss.id, &boss.name, "Its boss no longer oversees.");
+                    if let Err(e) = self.desk.pass_charge(c.session, &boss, &o.scope, &by).await {
+                        tracing::info!(session = %c.session, error = %e, "a session wasn't passed on");
+                    }
                 }
+                None if self.state.registry.not_serving(&c.boss).is_none() => {
+                    let by = By::manager(
+                        &c.boss,
+                        &c.boss_name,
+                        "Its boss no longer oversees, and no boss can run it.",
+                    );
+                    if let Err(e) = self.desk.release(c.session, &by).await {
+                        tracing::info!(session = %c.session, error = %e, "a session wasn't let go");
+                    }
+                }
+                None => {}
             }
         }
         for (service, o) in &overseers {

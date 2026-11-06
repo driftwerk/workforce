@@ -215,16 +215,19 @@ impl PostgresSessionStore {
         })
     }
 
-    /// Forget every agent's sessions in the hub's rows (the untenanted
-    /// ones) but `keep`'s: their transcripts and archives, turn claims and
-    /// journals, and the Desk read points kept on them. A person's read
-    /// floor, which names no agent, stays. For a hub that serves no agents,
-    /// whose own plumbing is `keep`: nothing else's sessions are its to keep.
-    /// Every table is named in this store's schema ([`Self::SCHEMA`]), so
-    /// Desk's own records (its `desk` schema's sessions, terminals, rooms,
-    /// lines) are never reached whatever the connection's search path.
-    /// In one transaction; the sessions forgotten.
-    pub async fn forget_agents_but(pool: &PostgresPool, keep: &str) -> Result<u64> {
+    /// Forget agent `agent`'s sessions in the hub's rows (the untenanted
+    /// ones): their transcripts and archives, turn claims and journals, and
+    /// the Desk read points kept on them. Nobody else's: no other agent's
+    /// row, and no person's read floor (which names no agent). For an agent
+    /// a hub no longer serves, a machine's old Desk agent. Every table is
+    /// named in this store's schema ([`Self::SCHEMA`]), so Desk's own
+    /// records (its `desk` schema's sessions, terminals, rooms, lines) are
+    /// never reached whatever the connection's search path. In one
+    /// transaction; the sessions forgotten.
+    pub async fn forget_agent(pool: &PostgresPool, agent: &str) -> Result<u64> {
+        if agent.is_empty() {
+            eyre::bail!("no agent named to forget");
+        }
         let mut conn = pool.get().await?;
         let tx = conn.transaction().await?;
         let tenant = DEFAULT_TENANT;
@@ -232,27 +235,21 @@ impl PostgresSessionStore {
             "DELETE FROM sessions.session_archive
               WHERE tenant_id = $1
                 AND session_id IN
-                    (SELECT id FROM sessions.sessions WHERE tenant_id = $1 AND agent_id <> $2)",
-            &[&tenant, &keep],
+                    (SELECT id FROM sessions.sessions WHERE tenant_id = $1 AND agent_id = $2)",
+            &[&tenant, &agent],
         )
         .await?;
-        for table in ["turn_claims", "turn_journal"] {
+        for table in ["turn_claims", "turn_journal", "desk_reads"] {
             tx.execute(
-                &format!("DELETE FROM sessions.{table} WHERE tenant_id = $1 AND agent_id <> $2"),
-                &[&tenant, &keep],
+                &format!("DELETE FROM sessions.{table} WHERE tenant_id = $1 AND agent_id = $2"),
+                &[&tenant, &agent],
             )
             .await?;
         }
-        tx.execute(
-            "DELETE FROM sessions.desk_reads
-              WHERE tenant_id = $1 AND agent_id <> '' AND agent_id <> $2",
-            &[&tenant, &keep],
-        )
-        .await?;
         let forgotten = tx
             .execute(
-                "DELETE FROM sessions.sessions WHERE tenant_id = $1 AND agent_id <> $2",
-                &[&tenant, &keep],
+                "DELETE FROM sessions.sessions WHERE tenant_id = $1 AND agent_id = $2",
+                &[&tenant, &agent],
             )
             .await?;
         tx.commit().await?;
@@ -2552,14 +2549,14 @@ pub(crate) mod tests {
         .await;
     }
 
-    /// A hub that serves no agents forgets every other agent's sessions,
-    /// their archives and read points, and keeps its plumbing's and a
-    /// person's read floor; Desk's own records, in its `desk` schema beside
-    /// (a `sessions` table there too, with an agent column), are never
-    /// touched, whatever the search path; a second time there is nothing
-    /// left to forget.
+    /// Forgetting an agent a hub no longer serves takes its sessions, their
+    /// archives and read points, and nobody else's: another agent's and a
+    /// person's read floor stay; Desk's own records, in its `desk` schema
+    /// beside (a `sessions` table there too, with an agent column), are
+    /// never touched, whatever the search path; a second time there is
+    /// nothing left to forget.
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_hub_with_no_agents_forgets_every_other_agents_sessions_once() {
+    async fn forgetting_an_agent_takes_only_its_own_sessions() {
         with_embedded_pg_pool(|pool| async move {
             let gone: Arc<dyn SessionStore> = PostgresSessionStore::with_pool(pool.clone(), "desk")
                 .await
@@ -2609,7 +2606,7 @@ pub(crate) mod tests {
             let own_id: Uuid = own.id.parse().unwrap();
             assert!(archived(&conn, old_id).await > 0, "saved with its archive");
 
-            let forgotten = PostgresSessionStore::forget_agents_but(&pool, "default")
+            let forgotten = PostgresSessionStore::forget_agent(&pool, "desk")
                 .await
                 .unwrap();
             assert_eq!(forgotten, 1);
@@ -2634,10 +2631,11 @@ pub(crate) mod tests {
                 assert_eq!(left, 1, "Desk's own {table} is untouched");
             }
 
-            let again = PostgresSessionStore::forget_agents_but(&pool, "default")
+            let again = PostgresSessionStore::forget_agent(&pool, "desk")
                 .await
                 .unwrap();
             assert_eq!(again, 0);
+            assert!(PostgresSessionStore::forget_agent(&pool, "").await.is_err());
         })
         .await;
     }

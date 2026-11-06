@@ -748,6 +748,12 @@ pub struct DeskConfig {
     /// left from before are forgotten when it starts. Default: on.
     #[serde(default = "default_true")]
     pub agents: bool,
+    /// Agents this hub served before and serves no more, whose chat
+    /// sessions and Floor rows it forgets, once each, when it starts with
+    /// `agents` off: a machine's old Desk agent (`["desk"]`). Never any other
+    /// agent's, and never Desk's own sessions or terminals. Default: none.
+    #[serde(default)]
+    pub forget_agents: Vec<String>,
 }
 
 /// Where the sign-ins of the person's engine accounts (a second Claude
@@ -815,6 +821,7 @@ impl Default for DeskConfig {
             github_client_id: None,
             accounts: DeskAccounts::default(),
             agents: true,
+            forget_agents: Vec::new(),
         }
     }
 }

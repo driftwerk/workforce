@@ -4290,18 +4290,24 @@ rules:
                     "  Agents:    {} (this hub runs Desk's sessions only)",
                     style("none").dim()
                 );
-                // Whatever agent it served before leaves no sessions behind.
-                match workforce_hub::session_store_factory::forget_unserved_agents(
+                // The agents it served before and names to forget (a
+                // machine's old Desk agent) leave no chat sessions or Floor
+                // rows behind; once each.
+                match workforce_hub::session_store_factory::forget_retired_agents(
                     &wf_config,
-                    default_service.agent_id.as_str(),
+                    &default_service.workspace,
                 )
                 .await
                 {
-                    Ok(0) => {}
-                    Ok(sessions) => tracing::info!(
-                        sessions,
-                        "forgot the sessions of the agents this hub no longer serves"
-                    ),
+                    Ok(forgotten) => {
+                        for (agent, sessions) in forgotten {
+                            tracing::info!(
+                                agent,
+                                sessions,
+                                "forgot the sessions of an agent this hub no longer serves"
+                            );
+                        }
+                    }
                     Err(e) => tracing::warn!(
                         error = %format!("{e:#}"),
                         "the sessions of the agents this hub no longer serves could not be forgotten; tried again on the next start"
@@ -4402,7 +4408,9 @@ rules:
             // can never fire against a runtime that cannot resolve its agent.
             // (Belt: no scheduler is `set_ready` until the surfaces block
             // below, so nothing can fire before this point either way.)
-            if let Some(wf_runtime) = default_service.workflow_runtime() {
+            // A hub that serves no agents (a machine's) arms none: nothing
+            // scheduled runs there on the person's plan.
+            if let Some(wf_runtime) = default_service.workflow_runtime().filter(|_| serves_agents) {
                 match wf_runtime.sync_schedule_triggers().await {
                     Ok(count) => tracing::info!(count, "Armed workflow schedule triggers"),
                     Err(e) => {
@@ -5969,7 +5977,11 @@ rules:
             // runtime has its agent registry: readying one earlier reopens
             // the boot window where a persisted cron fires a declared-agent
             // step that cannot resolve.
-            scheduler.set_ready();
+            // A hub that serves no agents (a machine's) never readies its
+            // plumbing's scheduler: no job, consolidation or sweep fires.
+            if serves_agents {
+                scheduler.set_ready();
+            }
             for agent_scheduler in &agent_schedulers {
                 agent_scheduler.set_ready();
             }
