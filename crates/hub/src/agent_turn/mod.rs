@@ -447,7 +447,8 @@ impl TurnChain {
             continuity,
         };
         let mut misses = Vec::new();
-        for route in &self.routes {
+        let last = self.routes.len().saturating_sub(1);
+        for (at, route) in self.routes.iter().enumerate() {
             if cancel.is_cancelled() {
                 eyre::bail!("turn cancelled");
             }
@@ -470,6 +471,12 @@ impl TurnChain {
                         },
                         &tools,
                     );
+                    // A silent model is tried again only when no route
+                    // follows to take the turn instead.
+                    let runner = match at == last {
+                        true => runner,
+                        false => runner.without_silent_retry(),
+                    };
                     match Box::pin(run_runner(
                         &runner,
                         task.clone(),

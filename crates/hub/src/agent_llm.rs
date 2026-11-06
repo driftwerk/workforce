@@ -297,6 +297,8 @@ impl AgentProviders {
         if let Some(pool) = pool {
             pool.remove("default").await;
             pool.add("default", provider).await;
+            // The new provider's own first-token default applies from now.
+            pool.set_llm_timeouts(pool.llm_timeouts().for_provider(kind));
         }
         if let Some(failover) = failover {
             self.register_externals(

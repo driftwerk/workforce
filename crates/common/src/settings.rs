@@ -5977,9 +5977,12 @@ pub struct RetryConfig {
     pub max_rate_limit_wait_secs: u64,
     /// Max seconds to wait for the first stream event of a streaming call.
     /// Fires before anything was surfaced, so the failover chain silently
-    /// moves to the next model. `0` disables.
-    #[serde(default = "default_first_token_timeout_secs")]
-    pub first_token_timeout_secs: u64,
+    /// moves to the next model, and with none left the call is tried once
+    /// more before the turn fails. `0` disables. Unset, it is 45, or 120 on
+    /// a subscription plan (`chatgpt`, `codex`, `claude-code`), whose models
+    /// think for long before they say anything.
+    #[serde(default)]
+    pub first_token_timeout_secs: Option<u64>,
     /// Max seconds between stream events once streaming has begun. Fires
     /// after partial content was surfaced, so the turn aborts with a clear
     /// error instead of failing over. `0` disables.
@@ -5994,10 +5997,15 @@ pub struct RetryConfig {
     /// substring keys match, the longest wins.
     #[serde(default)]
     pub model_timeouts: HashMap<String, ModelTimeoutOverride>,
+    /// Per-provider timeout overrides, keyed by provider name (`chatgpt`,
+    /// `anthropic`, …): `[llm.retry.provider_timeouts.chatgpt]`. A model's
+    /// override beats its provider's, which beats the global values.
+    #[serde(default)]
+    pub provider_timeouts: HashMap<String, ModelTimeoutOverride>,
 }
 
-/// Per-model override entry for the `[llm.retry]` watchdog timeouts; unset
-/// fields inherit the global value.
+/// Per-model (or per-provider) override entry for the `[llm.retry]`
+/// watchdog timeouts; unset fields inherit the global value.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ModelTimeoutOverride {
     #[serde(default)]
@@ -6018,10 +6026,11 @@ impl Default for RetryConfig {
             retry_overloaded: default_retry_overloaded(),
             retry_rate_limited: default_retry_rate_limited(),
             max_rate_limit_wait_secs: default_max_rate_limit_wait_secs(),
-            first_token_timeout_secs: default_first_token_timeout_secs(),
+            first_token_timeout_secs: None,
             stall_timeout_secs: default_stall_timeout_secs(),
             request_timeout_secs: default_request_timeout_secs(),
             model_timeouts: HashMap::new(),
+            provider_timeouts: HashMap::new(),
         }
     }
 }
@@ -6046,9 +6055,6 @@ fn default_retry_rate_limited() -> bool {
 }
 fn default_max_rate_limit_wait_secs() -> u64 {
     70
-}
-fn default_first_token_timeout_secs() -> u64 {
-    45
 }
 fn default_stall_timeout_secs() -> u64 {
     180
@@ -12253,7 +12259,10 @@ oauth_system_prefix = ""
         let absent: WorkforceConfig = toml::from_str("").unwrap();
         assert!(absent.llm.retry.is_none());
         let defaults = RetryConfig::default();
-        assert_eq!(defaults.first_token_timeout_secs, 45);
+        assert_eq!(
+            defaults.first_token_timeout_secs, None,
+            "the provider's default"
+        );
         assert_eq!(defaults.stall_timeout_secs, 180);
         assert_eq!(defaults.request_timeout_secs, 300);
         assert!(defaults.model_timeouts.is_empty());
@@ -12267,11 +12276,18 @@ stall_timeout_secs = 120
 
 [llm.retry.model_timeouts."gemini-3.1"]
 first_token_timeout_secs = 10
+
+[llm.retry.provider_timeouts.chatgpt]
+first_token_timeout_secs = 300
 "#,
         )
         .unwrap();
         let retry = cfg.llm.retry.expect("retry block parses");
-        assert_eq!(retry.first_token_timeout_secs, 30);
+        assert_eq!(retry.first_token_timeout_secs, Some(30));
+        assert_eq!(
+            retry.provider_timeouts["chatgpt"].first_token_timeout_secs,
+            Some(300)
+        );
         assert_eq!(retry.stall_timeout_secs, 120);
         // Omitted field keeps its default.
         assert_eq!(retry.request_timeout_secs, 300);

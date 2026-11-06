@@ -393,6 +393,9 @@ fn chat_progress(
             model,
             elapsed_secs,
         }),
+        ProgressEvent::SlowModelRetry { model } => {
+            desk.then_some(ChatProgress::SlowModelRetry { model })
+        }
         ProgressEvent::Snapshot(snapshot) => desk.then_some(ChatProgress::Snapshot(snapshot)),
         ProgressEvent::File(file) => desk.then_some(ChatProgress::File(file)),
         ProgressEvent::SecretConsumed { .. } => None,

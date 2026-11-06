@@ -3597,6 +3597,11 @@ mod tests {
         assert!(result.success, "{result:?}");
         assert_eq!(ctx.provider_kind(), ProviderKind::ClaudeCode);
         assert_eq!(ctx.tier_key(), "claude-code");
+        assert_eq!(
+            ctx.pool.llm_timeouts().provider,
+            Some(ProviderKind::ClaudeCode),
+            "the pool waits on the new provider's first token as that provider's"
+        );
         let persisted = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
         assert!(persisted.contains("claude-code"), "{persisted}");
     }

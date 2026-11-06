@@ -377,6 +377,11 @@ impl PooledProvider {
         *self.timeouts.write() = timeouts;
     }
 
+    /// The watchdog windows the pool enforces now.
+    pub fn llm_timeouts(&self) -> LlmTimeouts {
+        self.timeouts.read().clone()
+    }
+
     /// Admit a request of `estimate` tokens against the entry's rolling
     /// window. `Proceed`/`Wait` record the reservation (paced requests are
     /// stamped at their future send time so concurrent admissions see
