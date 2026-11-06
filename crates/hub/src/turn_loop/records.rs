@@ -441,6 +441,7 @@ pub(crate) async fn keep_heard_left(
     over.cancelled().await;
     let left = heard.take();
     if left.is_empty() {
+        heard.kept();
         return;
     }
     let kept = tokio::task::spawn_blocking(move || -> eyre::Result<()> {
@@ -461,6 +462,7 @@ pub(crate) async fn keep_heard_left(
         Ok(Err(e)) => tracing::warn!(error = %e, "Failed to keep a stopped turn's follow-ups"),
         Err(e) => tracing::warn!(error = %e, "Keeping a stopped turn's follow-ups panicked"),
     }
+    heard.kept();
 }
 
 /// What a turn that failed leaves to keep: where its messages start in the

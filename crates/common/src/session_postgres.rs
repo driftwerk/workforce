@@ -292,15 +292,58 @@ impl PostgresSessionStore {
 
 /// Apply the embedded sessions migration set (V001..) against a pool.
 /// Idempotent — refinery records applied versions and skips them.
+///
+/// A migration that gives up waiting for its table's lock (V014 bounds its
+/// wait to 5s, so it never queues behind long reads) is tried again with
+/// backoff for [`LOCK_RETRY_FOR`] before the boot fails: two replicas
+/// booting together, or a long read, only delay it.
 pub async fn run_session_migrations(pool: &PostgresPool) -> Result<()> {
-    let set = MigrationSet::new(
-        PostgresSessionStore::SCHEMA,
-        Box::new(EmbeddedSessionMigrations) as Box<dyn MigrationRun>,
-    );
-    MigrationRunner::run(pool, &[set])
-        .await
-        .context("running session migrations")?;
-    Ok(())
+    retry_lock_timeouts(LOCK_RETRY_FOR, LOCK_RETRY_FIRST, || async {
+        let set = MigrationSet::new(
+            PostgresSessionStore::SCHEMA,
+            Box::new(EmbeddedSessionMigrations) as Box<dyn MigrationRun>,
+        );
+        MigrationRunner::run(pool, &[set])
+            .await
+            .context("running session migrations")
+    })
+    .await
+}
+
+/// How long session migrations are retried while they time out on a lock.
+pub const LOCK_RETRY_FOR: std::time::Duration = std::time::Duration::from_secs(120);
+/// The first wait between them; each later one doubles, up to 15s.
+const LOCK_RETRY_FIRST: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Runs `attempt` until it succeeds, fails other than by a lock timeout, or
+/// `budget` is spent waiting `first` and then twice as long each time.
+pub(crate) async fn retry_lock_timeouts<F, Fut>(
+    budget: std::time::Duration,
+    first: std::time::Duration,
+    mut attempt: F,
+) -> Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    let started = tokio::time::Instant::now();
+    let mut wait = first;
+    loop {
+        match attempt().await {
+            Err(e) if lock_timed_out(&e) && started.elapsed() + wait <= budget => {
+                tracing::warn!(error = %format!("{e:#}"), wait_secs = wait.as_secs_f32(), "a session migration waited too long for a lock; trying again");
+                tokio::time::sleep(wait).await;
+                wait = (wait * 2).min(std::time::Duration::from_secs(15));
+            }
+            done => return done,
+        }
+    }
+}
+
+/// Whether `error` is Postgres giving up on a lock (`lock_timeout`).
+fn lock_timed_out(error: &eyre::Report) -> bool {
+    let said = format!("{error:#}");
+    said.contains("lock timeout") || said.contains("55P03")
 }
 
 struct EmbeddedSessionMigrations;
@@ -2336,6 +2379,50 @@ fn archive_row_to_entry(session_id: &str, r: &tokio_postgres::Row) -> Transcript
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// A migration that times out on a lock is tried again until it runs;
+    /// anything else fails at once, and so does one still locked out once
+    /// the budget is spent.
+    #[tokio::test]
+    async fn migrations_locked_out_are_tried_again_within_the_budget() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        const BUDGET: std::time::Duration = std::time::Duration::from_millis(400);
+        const FIRST: std::time::Duration = std::time::Duration::from_millis(10);
+        let tries = AtomicU32::new(0);
+        retry_lock_timeouts(BUDGET, FIRST, || async {
+            match tries.fetch_add(1, Ordering::SeqCst) {
+                0 | 1 => Err(eyre::eyre!(
+                    "db error: ERROR: canceling statement due to lock timeout"
+                )),
+                _ => Ok(()),
+            }
+        })
+        .await
+        .expect("runs once the lock is free");
+        assert_eq!(tries.load(Ordering::SeqCst), 3);
+
+        let other = AtomicU32::new(0);
+        let failed = retry_lock_timeouts(BUDGET, FIRST, || async {
+            other.fetch_add(1, Ordering::SeqCst);
+            Err(eyre::eyre!("syntax error"))
+        })
+        .await;
+        assert!(failed.is_err());
+        assert_eq!(other.load(Ordering::SeqCst), 1, "not a lock: no retry");
+
+        let started = tokio::time::Instant::now();
+        let stuck = retry_lock_timeouts(BUDGET, FIRST, || async {
+            Err(eyre::eyre!("canceling statement due to lock timeout"))
+        })
+        .await;
+        assert!(stuck.is_err());
+        assert!(started.elapsed() <= BUDGET, "{:?}", started.elapsed());
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(150),
+            "{:?}",
+            started.elapsed()
+        );
+    }
     use workforce_postgres::test_support::{now_micros, with_test_pool};
 
     pub(crate) async fn with_embedded_pg_pool<F, Fut>(test: F)

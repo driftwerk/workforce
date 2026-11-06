@@ -1393,9 +1393,6 @@ pub enum ProgressEvent {
     },
     /// Mid-run message(s) were absorbed from the user.
     InjectedMessage { count: u32 },
-    /// A follow-up the turn took in that its run never read, sent back under
-    /// the client's id `id` to be asked again once the turn ends.
-    Requeued { id: String, text: String },
     /// A tool call requires human approval before execution.
     ApprovalRequired {
         request_id: String,
@@ -10590,7 +10587,6 @@ mod tests {
                 ProgressEvent::CompactEnd => "compact_end",
                 ProgressEvent::ContextUpdate { .. } => "context_update",
                 ProgressEvent::InjectedMessage { .. } => "injected_message",
-                ProgressEvent::Requeued { .. } => "requeued",
                 ProgressEvent::ApprovalRequired { .. } => "approval_required",
                 ProgressEvent::ApprovalResolved { .. } => "approval_resolved",
                 ProgressEvent::RateLimited { .. } => "rate_limited",

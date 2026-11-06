@@ -25,6 +25,7 @@ use workforce_common::text::truncate_with_ellipsis;
 pub(crate) mod citations;
 pub(crate) mod extraction;
 pub(crate) mod grounding;
+pub(crate) mod next_turn;
 pub(crate) mod prompt;
 pub(crate) mod recall;
 pub(crate) mod records;
@@ -809,6 +810,19 @@ pub(crate) async fn assemble_code_context(
 
 /// Save a turn no route served with the notice its person was given as
 /// its answer; nothing is billed, reviewed or learnt from it.
+/// Where in `session` the person's message kept under the client's id `id`
+/// is, when nothing has answered it yet.
+pub(crate) fn unanswered_question(session: &Session, id: &str) -> Option<usize> {
+    let at = session.messages.iter().rposition(|m| {
+        m.role == workforce_common::session::MessageRole::User
+            && m.external_id.as_deref() == Some(id)
+    })?;
+    session.messages[at + 1..]
+        .iter()
+        .all(|m| m.role != workforce_common::session::MessageRole::Assistant)
+        .then_some(at)
+}
+
 /// Where the turn's question `asked` is in `session`, which may have been
 /// compacted since it was added at `added`: found by its id, else where it
 /// was added, held to the transcript.
@@ -4759,13 +4773,22 @@ pub(crate) async fn stream_admitted(
 
     let store_content = display_content.unwrap_or(message);
     let room_message = desk.and_then(|d| d.turn.message).map(|id| id.to_string());
-    session.add_user_message_with_trust(
-        store_content,
-        external_id.or(room_message.as_deref()),
-        attachments.clone(),
-        trust_level,
-    );
-    if let Some(desk) = desk {
+    // A question the conversation holds already, unanswered, under the id
+    // this turn names (one the hub runs as the next turn, after the turn it
+    // was sent into never read it): the turn answers it where it is.
+    let held = room_message
+        .as_deref()
+        .and_then(|id| unanswered_question(&session, id));
+    let archive_base = held.unwrap_or(archive_base);
+    if held.is_none() {
+        session.add_user_message_with_trust(
+            store_content,
+            external_id.or(room_message.as_deref()),
+            attachments.clone(),
+            trust_level,
+        );
+    }
+    if let Some(desk) = desk.filter(|_| held.is_none()) {
         let files = crate::desk_attachments::carried(
             Arc::clone(&service.sessions),
             service.agent_id.as_str(),
@@ -4782,16 +4805,6 @@ pub(crate) async fn stream_admitted(
     }
     // The message this turn answers, for the resume sweep.
     let turn_message_id = session.messages.get(archive_base).map(|m| m.id.clone());
-    // The question goes to the archive now, before anything can rewrite the
-    // transcript (an urgent compaction shortens it): the conversation reads
-    // it whether the turn answers, fails or is stopped (which ends the task
-    // before anything after the run), numbered ahead of whatever is
-    // delivered while the turn runs.
-    for msg in session.messages.get(archive_base..).unwrap_or_default() {
-        if let Err(e) = service.sessions.append_to_archive(&session.id, msg) {
-            warn!(error = %e, "Failed to archive the turn's question");
-        }
-    }
 
     turn_claim.unless_cancelled(&cancel_token).await?;
     stamp_tool_whitelist(&mut session);
@@ -4979,9 +4992,24 @@ pub(crate) async fn stream_admitted(
     // turn's own metadata (lessons, round-cap continuation) at the stored
     // version.
     service.sessions.save_refreshing(&mut session)?;
-    // What the turn adds from here on is archived when it ends; the
-    // question already is.
+    // The question goes to the archive now that the transcript holds it and
+    // the turn holds the session, not when the turn ends: the conversation
+    // reads it whether the turn answers, fails or is stopped (which ends the
+    // task before anything after the run), numbered ahead of whatever is
+    // delivered while the turn runs. One the conversation held already was
+    // archived when it was saved.
     let archived_upto = session.messages.len();
+    if held.is_none() {
+        for msg in session
+            .messages
+            .get(archive_base..archived_upto)
+            .unwrap_or_default()
+        {
+            if let Err(e) = service.sessions.append_to_archive(&session.id, msg) {
+                warn!(error = %e, "Failed to archive the turn's question");
+            }
+        }
+    }
 
     // Open the turn record only once the message it answers is durable: a
     // crash between the two loses the recovery, never the transcript, and
@@ -5119,6 +5147,7 @@ pub(crate) async fn stream_admitted(
     let heard_for_task = heard;
     let kh_question = message.to_string();
     let session_key_for_task = channel.to_string();
+    let session_key_for_next = channel.to_string();
     let session_id_for_task = current_session_id.clone();
     let user_id_for_task = principal.to_string();
     // Separate owned copy for shared-session attribution: `user_id_for_task`
@@ -5166,6 +5195,7 @@ pub(crate) async fn stream_admitted(
     // person's: kept, as said, once it is over.
     let turn_over = tokio_util::sync::CancellationToken::new();
     if let Some(log) = heard_for_task.clone() {
+        log.arm();
         tokio::spawn(records::keep_heard_left(
             turn_over.clone(),
             log,
@@ -5175,6 +5205,9 @@ pub(crate) async fn stream_admitted(
             desk.cloned(),
         ));
     }
+    // Made here and moved in, so a task aborted before it first runs still
+    // drops it.
+    let turn_over = turn_over.drop_guard();
     let handle = tokio::spawn(workforce_agent::runner::with_desk(desk_scope_for_task, CURRENT_BILLING_IDENTITY.scope(
         billing_identity_for_task.unwrap_or_default(),
         CURRENT_VOICE_CHANNEL.scope(
@@ -5195,7 +5228,7 @@ pub(crate) async fn stream_admitted(
                 // Hold (and background-renew) the fleet-wide turn claim
                 // until every exit path of this task has run.
                 let _turn_claim = turn_claim;
-                let _turn_over = turn_over.drop_guard();
+                let _turn_over = turn_over;
                 let started_at = chrono::Utc::now();
                 // Cloned before the run consumes the runner's sender: the
                 // answer streams during the run, so the grounding block (nag
@@ -5425,23 +5458,18 @@ pub(crate) async fn stream_admitted(
                 // the runner absorbed. System injections (job results) are
                 // tool-derived: never promote them into user-authored history.
                 // One the run never read (taken in after its last look) is
-                // not answered: a Desk asks it again, under its id, once this
-                // turn ends.
+                // not answered: in the person's DM it is kept after the
+                // answer and is the conversation's next turn, which the hub
+                // runs; anywhere else it is kept as it always was.
+                let mut next_up = Vec::new();
                 match heard_for_task.as_ref() {
                     Some(log) => {
                         let (read, unread) =
                             records::read_by_run(log.take(), &result.injected_user_messages);
                         records::keep_heard(&mut session, read, trust_level, desk_for_task.as_ref());
-                        for follow_up in unread {
-                            match (desk_for_task.is_some(), follow_up.external_id.clone()) {
-                                (true, Some(id)) => {
-                                    let _ = grounding_progress
-                                        .send(ProgressEvent::Requeued { id, text: follow_up.text })
-                                        .await;
-                                }
-                                _ => records::keep_heard(&mut session, vec![follow_up], trust_level, desk_for_task.as_ref()),
-                            }
-                        }
+                        let unread = next_turn::unread_plan(desk_for_task.as_ref(), unread);
+                        records::keep_heard(&mut session, unread.now, trust_level, desk_for_task.as_ref());
+                        next_up = unread.after;
                     }
                     None => {
                         for follow_up in result
@@ -5460,6 +5488,7 @@ pub(crate) async fn stream_admitted(
                 }
                 let telemetry_provider = settle_served(&mut session, &result, route, reserved, desk_for_task.as_ref())
                     .map_or(telemetry_provider, str::to_string);
+                records::keep_heard(&mut session, next_up.clone(), trust_level, desk_for_task.as_ref());
                 // Attribute this turn's tool messages to the asker so a shared
                 // session's later replay drops them for every other speaker.
                 if session.is_shared_conversation() {
@@ -5483,6 +5512,23 @@ pub(crate) async fn stream_admitted(
                     if let Err(e) = sessions.append_to_archive(&session.id, msg) {
                         warn!(error = %e, "Failed to append to session archive");
                     }
+                }
+                if let Some((desk, prompt)) = desk_for_task
+                    .as_ref()
+                    .and_then(|desk| next_turn::next_of(desk, &next_up))
+                {
+                    tokio::spawn(next_turn::answer_left(
+                        Arc::clone(&me),
+                        next_turn::NextTurn {
+                            session_id: session.id.clone(),
+                            channel: session_key_for_next.clone(),
+                            user: user_id_for_attr.clone(),
+                            run_as: principal_for_task.clone(),
+                            trust_level,
+                            desk,
+                            prompt,
+                        },
+                    ));
                 }
 
                 // Infer semantic task type from prompt + tool usage

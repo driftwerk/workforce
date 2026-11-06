@@ -1847,3 +1847,142 @@ fn follow_ups_split_by_what_the_run_read() {
         [Some("a"), None]
     );
 }
+
+fn heard_now(text: &str, id: Option<&str>) -> crate::hub_core::live_turns::Heard {
+    crate::hub_core::live_turns::Heard {
+        text: text.into(),
+        user: "identity-1".into(),
+        external_id: id.map(str::to_string),
+        at: Utc::now(),
+    }
+}
+
+/// A follow-up a DM turn's run never read is answered by the hub as the
+/// conversation's next turn, with no client there: its message is kept
+/// once, under the client's id, and the answer names it.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unread_dm_follow_up_runs_as_the_next_turn_with_no_client() {
+    use workforce_common::channels::desk::DESK_CHANNEL;
+    use workforce_common::session::MessageRole;
+    let tmp = tempfile::tempdir().unwrap();
+    let (service, _server) =
+        crate::serve::testing::service_on_mock_llm_with(tmp.path(), |config| {
+            config.desk.enabled = true;
+        })
+        .await;
+    let (asked, steered) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+    let mut session = service
+        .sessions
+        .get_or_create(DESK_CHANNEL, "identity-1", service.agent_id.as_str())
+        .unwrap();
+    session.add_user_message("what was that research called?", Some(&asked.to_string()));
+    session.add_assistant_message("NCM", 3);
+    let unread = crate::turn_loop::next_turn::unread_plan(
+        Some(&dm_turn(asked)),
+        vec![heard_now("and who wrote it?", Some(&steered.to_string()))],
+    );
+    crate::turn_loop::records::keep_heard(
+        &mut session,
+        unread.after.clone(),
+        None,
+        Some(&dm_turn(asked)),
+    );
+    service.sessions.save(&session).unwrap();
+    for msg in &session.messages {
+        service
+            .sessions
+            .append_to_archive(&session.id, msg)
+            .unwrap();
+    }
+    let (desk, prompt) =
+        crate::turn_loop::next_turn::next_of(&dm_turn(asked), &unread.after).expect("a next turn");
+    assert_eq!(desk.turn.message, Some(steered));
+    crate::turn_loop::next_turn::answer_left(
+        std::sync::Arc::clone(&service),
+        crate::turn_loop::next_turn::NextTurn {
+            session_id: session.id.clone(),
+            channel: DESK_CHANNEL.into(),
+            user: "identity-1".into(),
+            run_as: "identity-1".into(),
+            trust_level: None,
+            desk,
+            prompt,
+        },
+    )
+    .await;
+    let after = service.sessions.get(&session.id).unwrap().unwrap();
+    let said: Vec<(MessageRole, &str)> = after
+        .messages
+        .iter()
+        .filter(|m| matches!(m.role, MessageRole::User | MessageRole::Assistant))
+        .map(|m| (m.role.clone(), m.content.as_str()))
+        .collect();
+    assert_eq!(
+        said,
+        [
+            (MessageRole::User, "what was that research called?"),
+            (MessageRole::Assistant, "NCM"),
+            (MessageRole::User, "and who wrote it?"),
+            (MessageRole::Assistant, "done"),
+        ],
+        "the follow-up is answered where it is, once"
+    );
+    let read = read_back(&service, "identity-1");
+    assert_eq!(
+        read.last().unwrap(),
+        &("done".to_string(), None, false, Some(steered))
+    );
+    assert_eq!(read[2].1.as_deref(), Some(steered.to_string().as_str()));
+}
+
+/// A Desk that names no id for its follow-ups (an older one) still has an
+/// unread one answered as the next turn, under an id the hub gives it.
+#[test]
+fn an_older_desk_s_unread_follow_up_gets_an_id_for_its_next_turn() {
+    let asked = uuid::Uuid::new_v4();
+    let unread = crate::turn_loop::next_turn::unread_plan(
+        Some(&dm_turn(asked)),
+        vec![heard_now("and who wrote it?", None)],
+    );
+    assert!(unread.now.is_empty());
+    let id = unread.after[0]
+        .external_id
+        .clone()
+        .expect("an id of the hub's");
+    let (desk, prompt) =
+        crate::turn_loop::next_turn::next_of(&dm_turn(asked), &unread.after).unwrap();
+    assert_eq!(desk.turn.message.map(|m| m.to_string()), Some(id));
+    assert_eq!(
+        (prompt.as_str(), desk.turn_ref.as_deref()),
+        ("and who wrote it?", None)
+    );
+}
+
+/// In a room an unread follow-up is saved as it always was, not run.
+#[test]
+fn a_room_s_unread_follow_up_is_saved_as_before() {
+    use workforce_common::channels::desk::{DeskPlace, DeskSpeaker, DeskTurn, DeskTurnContext};
+    let room = uuid::Uuid::new_v4();
+    let turn = DeskTurn {
+        place: DeskPlace::Room {
+            room,
+            name: "Atlas".into(),
+            thread: None,
+        },
+        speaker: DeskSpeaker::Person,
+        hop: 0,
+        context: Vec::new(),
+        message: Some(uuid::Uuid::new_v4()),
+        spoken: false,
+        voice: None,
+    };
+    let desk = DeskTurnContext::new(turn, &format!("desk:{room}"), None, false, None, "r".into());
+    let unread = crate::turn_loop::next_turn::unread_plan(
+        Some(&desk),
+        vec![heard_now("and the date?", Some("c-1"))],
+    );
+    assert_eq!(unread.now.len(), 1);
+    assert_eq!(unread.now[0].external_id.as_deref(), Some("c-1"));
+    assert!(unread.after.is_empty());
+    assert!(crate::turn_loop::next_turn::next_of(&desk, &unread.after).is_none());
+}

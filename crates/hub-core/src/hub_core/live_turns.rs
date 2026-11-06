@@ -167,7 +167,19 @@ pub struct Heard {
 /// that arrives after the run last looked was still told to the person as
 /// taken in.
 #[derive(Debug, Clone, Default)]
-pub struct HeardLog(Arc<Mutex<Vec<Heard>>>);
+pub struct HeardLog {
+    heard: Arc<Mutex<Vec<Heard>>>,
+    kept: Arc<Kept>,
+}
+
+/// Whether what a turn leaves of its follow-ups has been kept, once
+/// something has undertaken to keep it.
+#[derive(Debug, Default)]
+struct Kept {
+    armed: AtomicBool,
+    done: AtomicBool,
+    notify: tokio::sync::Notify,
+}
 
 impl HeardLog {
     /// Notes `message` if it is something a person said: an approval answer
@@ -181,7 +193,7 @@ impl HeardLog {
         } = message
         {
             if user != "system" {
-                self.0.lock().push(Heard {
+                self.heard.lock().push(Heard {
                     text: text.clone(),
                     user: user.clone(),
                     external_id: external_id.clone(),
@@ -193,7 +205,40 @@ impl HeardLog {
 
     /// What has arrived so far, taken out of the log.
     pub fn take(&self) -> Vec<Heard> {
-        std::mem::take(&mut *self.0.lock())
+        std::mem::take(&mut *self.heard.lock())
+    }
+
+    /// Undertakes to keep what the turn leaves: [`Self::settled`] waits for
+    /// [`Self::kept`] from here on.
+    pub fn arm(&self) {
+        self.kept.armed.store(true, Ordering::Release);
+    }
+
+    /// What the turn left is kept.
+    pub fn kept(&self) {
+        self.kept.done.store(true, Ordering::Release);
+        self.kept.notify.notify_waiters();
+    }
+
+    /// Waits, up to `within`, for what the turn left to be kept, when
+    /// something undertook to: until then the session's next turn must not
+    /// start, or its question could be saved ahead of them.
+    pub async fn settled(&self, within: Duration) {
+        if !self.kept.armed.load(Ordering::Acquire) {
+            return;
+        }
+        let done = async {
+            loop {
+                let notified = self.kept.notify.notified();
+                if self.kept.done.load(Ordering::Acquire) {
+                    return;
+                }
+                notified.await;
+            }
+        };
+        if tokio::time::timeout(within, done).await.is_err() {
+            warn!("a stopped turn's follow-ups were not kept in time");
+        }
     }
 }
 
@@ -484,6 +529,12 @@ pub struct LiveTurn {
 }
 
 impl LiveTurn {
+    /// Waits, a little at most, for what the turn left of its follow-ups to
+    /// be kept: the session's turn is held until then.
+    pub async fn follow_ups_kept(&self) {
+        self.entry.heard.settled(SETTLE_WAIT).await;
+    }
+
     pub fn cancel_token(&self) -> CancellationToken {
         self.entry.cancel.clone()
     }
@@ -799,6 +850,26 @@ mod tests {
         );
         assert!(taken[0].at >= before && taken[0].at <= chrono::Utc::now());
         assert!(heard.take().is_empty(), "taken once");
+    }
+
+    /// The session's turn is held until what a turn left of its follow-ups
+    /// is kept, once something undertook to keep it; otherwise not at all.
+    #[tokio::test]
+    async fn the_turn_waits_for_its_left_follow_ups_to_be_kept() {
+        let log = HeardLog::default();
+        tokio::time::timeout(Duration::from_millis(50), log.settled(SETTLE_WAIT))
+            .await
+            .expect("nothing undertook to keep them: no wait");
+        log.arm();
+        let keeper = log.clone();
+        let started = tokio::time::Instant::now();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            keeper.kept();
+        });
+        log.settled(SETTLE_WAIT).await;
+        assert!(started.elapsed() >= Duration::from_millis(100));
+        assert!(started.elapsed() < SETTLE_WAIT);
     }
 
     #[tokio::test]
