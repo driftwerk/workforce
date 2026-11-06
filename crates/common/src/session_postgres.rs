@@ -220,33 +220,38 @@ impl PostgresSessionStore {
     /// journals, and the Desk read points kept on them. A person's read
     /// floor, which names no agent, stays. For a hub that serves no agents,
     /// whose own plumbing is `keep`: nothing else's sessions are its to keep.
+    /// Every table is named in this store's schema ([`Self::SCHEMA`]), so
+    /// Desk's own records (its `desk` schema's sessions, terminals, rooms,
+    /// lines) are never reached whatever the connection's search path.
     /// In one transaction; the sessions forgotten.
     pub async fn forget_agents_but(pool: &PostgresPool, keep: &str) -> Result<u64> {
         let mut conn = pool.get().await?;
         let tx = conn.transaction().await?;
         let tenant = DEFAULT_TENANT;
         tx.execute(
-            "DELETE FROM session_archive
+            "DELETE FROM sessions.session_archive
               WHERE tenant_id = $1
-                AND session_id IN (SELECT id FROM sessions WHERE tenant_id = $1 AND agent_id <> $2)",
+                AND session_id IN
+                    (SELECT id FROM sessions.sessions WHERE tenant_id = $1 AND agent_id <> $2)",
             &[&tenant, &keep],
         )
         .await?;
         for table in ["turn_claims", "turn_journal"] {
             tx.execute(
-                &format!("DELETE FROM {table} WHERE tenant_id = $1 AND agent_id <> $2"),
+                &format!("DELETE FROM sessions.{table} WHERE tenant_id = $1 AND agent_id <> $2"),
                 &[&tenant, &keep],
             )
             .await?;
         }
         tx.execute(
-            "DELETE FROM desk_reads WHERE tenant_id = $1 AND agent_id <> '' AND agent_id <> $2",
+            "DELETE FROM sessions.desk_reads
+              WHERE tenant_id = $1 AND agent_id <> '' AND agent_id <> $2",
             &[&tenant, &keep],
         )
         .await?;
         let forgotten = tx
             .execute(
-                "DELETE FROM sessions WHERE tenant_id = $1 AND agent_id <> $2",
+                "DELETE FROM sessions.sessions WHERE tenant_id = $1 AND agent_id <> $2",
                 &[&tenant, &keep],
             )
             .await?;
@@ -2549,7 +2554,10 @@ pub(crate) mod tests {
 
     /// A hub that serves no agents forgets every other agent's sessions,
     /// their archives and read points, and keeps its plumbing's and a
-    /// person's read floor; a second time there is nothing left to forget.
+    /// person's read floor; Desk's own records, in its `desk` schema beside
+    /// (a `sessions` table there too, with an agent column), are never
+    /// touched, whatever the search path; a second time there is nothing
+    /// left to forget.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_hub_with_no_agents_forgets_every_other_agents_sessions_once() {
         with_embedded_pg_pool(|pool| async move {
@@ -2585,6 +2593,18 @@ pub(crate) mod tests {
                 .unwrap()
                 .get(0)
             }
+            // Desk's own records, as its store keeps them: a terminal session
+            // and a terminal, in a schema of its own, found first on the path.
+            conn.batch_execute(
+                "CREATE SCHEMA desk;
+                 CREATE TABLE desk.sessions (id UUID PRIMARY KEY, agent_id TEXT, tenant_id TEXT);
+                 CREATE TABLE desk.terminals (id UUID PRIMARY KEY, agent_id TEXT, tenant_id TEXT);
+                 INSERT INTO desk.sessions VALUES (gen_random_uuid(), 'desk', 'default');
+                 INSERT INTO desk.terminals VALUES (gen_random_uuid(), 'desk', 'default');
+                 SET search_path TO desk, sessions, public;",
+            )
+            .await
+            .unwrap();
             let old_id: Uuid = old.id.parse().unwrap();
             let own_id: Uuid = own.id.parse().unwrap();
             assert!(archived(&conn, old_id).await > 0, "saved with its archive");
@@ -2598,13 +2618,21 @@ pub(crate) mod tests {
             assert_eq!(kept.get(&own.id).unwrap().unwrap().messages.len(), 1);
             assert!(archived(&conn, own_id).await > 0);
             let reads: Vec<String> = conn
-                .query("SELECT agent_id FROM desk_reads", &[])
+                .query("SELECT agent_id FROM sessions.desk_reads", &[])
                 .await
                 .unwrap()
                 .iter()
                 .map(|r| r.get(0))
                 .collect();
             assert_eq!(reads, vec![String::new()], "the person's floor stays");
+            for table in ["desk.sessions", "desk.terminals"] {
+                let left: i64 = conn
+                    .query_one(&format!("SELECT count(*) FROM {table}"), &[])
+                    .await
+                    .unwrap()
+                    .get(0);
+                assert_eq!(left, 1, "Desk's own {table} is untouched");
+            }
 
             let again = PostgresSessionStore::forget_agents_but(&pool, "default")
                 .await
