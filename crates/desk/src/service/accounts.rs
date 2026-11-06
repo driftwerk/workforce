@@ -324,7 +324,9 @@ impl Desk {
     }
 
     /// The account `wanted` names for a new session of `engine`: absent,
-    /// its default; `null`, the CLI's own sign-in.
+    /// its default; `null`, the CLI's own sign-in (which, on a computer
+    /// where the CLI has none, is an account at launch:
+    /// [`Desk::instead_of_own`]).
     pub(super) fn account_for(
         &self,
         engine: Engine,
@@ -412,6 +414,64 @@ impl Desk {
             }
         }
         self.read_token(&a).await.map(Some)
+    }
+
+    /// What a session of `engine` on no account (`None`: the CLI's own
+    /// sign-in) runs on instead when this computer's CLI has no sign-in of
+    /// its own (it says it isn't logged in): the first of its accounts, in
+    /// the order a switch takes them (the default first, then oldest
+    /// first), whose sign-in reads, with that sign-in. A session there
+    /// never starts at the CLI's login prompt. `None` when the CLI may be
+    /// signed in here, or there are no accounts to start on (as before
+    /// accounts, the CLI's own login).
+    pub(super) async fn instead_of_own(
+        &self,
+        engine: Engine,
+    ) -> Result<Option<(Uuid, AccountToken)>, DeskError> {
+        if engine::caps(engine, View::Terminal).accounts != AccountsVia::Token
+            || self.0.opts.account_keys.is_none()
+        {
+            return Ok(None);
+        }
+        let mut ordered: Vec<Account> = {
+            let st = self.0.state.lock();
+            st.accounts
+                .iter()
+                .filter(|a| a.engine == engine)
+                .cloned()
+                .collect()
+        };
+        if ordered.is_empty() || self.own_sign_in_works(engine).await {
+            return Ok(None);
+        }
+        ordered.sort_by_key(|a| !a.is_default);
+        for a in &ordered {
+            if let Ok(token) = self.read_token(a).await {
+                tracing::info!(account = %a.id, engine = engine.as_str(), "a session runs on an account: the CLI has no sign-in of its own on this computer");
+                return Ok(Some((a.id, token)));
+            }
+        }
+        Err(DeskError::Conflict(format!(
+            "{} isn't signed in on this computer, and none of its accounts here can sign in \
+             just now: add one again in Settings → Engines",
+            engine.title()
+        )))
+    }
+
+    /// Whether `engine`'s CLI may be signed in on this computer by itself:
+    /// false only once it says it isn't. A "logged out" read before is read
+    /// again (a login since is honoured at once), as is one never read; one
+    /// that can't be read is left to the CLI, as before accounts, and isn't
+    /// asked again for each session.
+    async fn own_sign_in_works(&self, engine: Engine) -> bool {
+        match self.engine_read(engine) {
+            Some(engine::SignIn::In { .. } | engine::SignIn::Unknown) => return true,
+            Some(engine::SignIn::Out) | None => {}
+        }
+        self.read_engine_since(engine, self.read_asked(), super::Since::Ended)
+            .await;
+        self.spend_signed_in();
+        self.engine_read(engine) != Some(engine::SignIn::Out)
     }
 
     /// `a`'s token from the store, off the runtime's threads and never under
@@ -929,7 +989,8 @@ impl Desk {
     }
 
     /// Removes an account and its sign-in. The sessions on it move to the
-    /// default account (or the CLI's own sign-in) at their next start;
+    /// default account (or the CLI's own sign-in, or with none here the
+    /// first account that signs in) at their next start;
     /// running ones carry on as they are until then.
     pub async fn remove_account(&self, id: Uuid) -> Result<(), DeskError> {
         let a = self.account(id)?;

@@ -472,6 +472,22 @@ const READ_LATER: Duration = Duration::from_secs(45);
 /// How often sessions' background work is looked at.
 const LOOK_EVERY: Duration = Duration::from_secs(10);
 
+/// When an engine was last read.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct EngineRead {
+    began: std::time::Instant,
+    ended: std::time::Instant,
+}
+
+/// Which read since a moment serves a caller: one that began after it
+/// (what changed just before is in it), or one that ended after it (a read
+/// under way when it asked is shared).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Since {
+    Began,
+    Ended,
+}
+
 /// How often the engines' versions and sign-ins are read again.
 const ENGINES_EVERY: Duration = Duration::from_secs(60 * 60);
 /// How long a CLI may take to say its version or who it is signed in as.
@@ -513,6 +529,11 @@ struct Inner {
     /// What each engine's program said of its version and sign-in, as
     /// last read.
     engines: Mutex<BTreeMap<Engine, Installed>>,
+    /// Each engine's reads, one at a time: when the last began and ended.
+    engine_reads: BTreeMap<Engine, Arc<tokio::sync::Mutex<Option<EngineRead>>>>,
+    /// While the sessions running at the last stop are restored: since
+    /// when a read of an engine serves them all.
+    restoring_since: Mutex<Option<std::time::Instant>>,
     ledger: ledger::LedgerRun,
     /// Reads a turn's last reply where the rules can't tell whether it
     /// asks: the hub's crew, once its routes are mounted.
@@ -949,6 +970,7 @@ impl Desk {
         floor: Floor,
         cancel: CancellationToken,
     ) -> Result<Self> {
+        let restoring_since = (opts.restore == RestorePolicy::Auto).then(std::time::Instant::now);
         let store = Arc::new(store);
         forget_hub_internal(&store, &opts.hub_internal, floor.turns.as_deref()).await;
         let layout = store.layout().await?;
@@ -1047,6 +1069,11 @@ impl Desk {
             layout_write: tokio::sync::Mutex::new(()),
             plans: floor.plans,
             engines: Mutex::new(BTreeMap::new()),
+            engine_reads: Engine::ALL
+                .into_iter()
+                .map(|e| (e, Arc::default()))
+                .collect(),
+            restoring_since: Mutex::new(restoring_since),
             ledger,
             reader: Mutex::new(None),
             read_wait: Mutex::new(READ_LATER),
@@ -1100,6 +1127,7 @@ impl Desk {
                 .collect::<Vec<_>>();
             desk.restore(&ids, None).await;
         }
+        *desk.0.restoring_since.lock() = None;
         tokio::spawn({
             let desk = desk.clone();
             async move {
@@ -1462,29 +1490,72 @@ impl Desk {
                 _ = self.0.cancel.cancelled() => return,
                 _ = tick.tick() => {}
             }
+            let asked = std::time::Instant::now();
             let reads = Engine::ALL
                 .into_iter()
-                .filter_map(|e| Some((e, self.program(e)?.to_path_buf())))
-                .map(|(e, program)| {
-                    let desk = self.clone();
-                    async move { (e, desk.read_engine(e, &program).await) }
-                });
-            let read: BTreeMap<Engine, Installed> =
-                futures::future::join_all(reads).await.into_iter().collect();
-            *self.0.engines.lock() = read;
+                .map(|e| self.read_engine_since(e, asked, Since::Ended));
+            futures::future::join_all(reads).await;
             self.spend_signed_in();
         }
     }
 
     /// Reads `engine` again now, rather than at the next look: its sign-in
-    /// has just changed.
+    /// has just changed, so only a read begun from now on says it.
     async fn read_engine_now(&self, engine: Engine) {
+        self.read_engine_since(engine, std::time::Instant::now(), Since::Began)
+            .await;
+        self.spend_signed_in();
+    }
+
+    /// Reads `engine` and keeps what it said, unless a read since `asked`
+    /// already did ([`Since`]). One read of an engine at a time: a caller
+    /// that comes while one is under way waits for it.
+    pub(super) async fn read_engine_since(
+        &self,
+        engine: Engine,
+        asked: std::time::Instant,
+        since: Since,
+    ) {
         let Some(program) = self.program(engine).map(Path::to_path_buf) else {
             return;
         };
+        let Some(gate) = self.0.engine_reads.get(&engine).map(Arc::clone) else {
+            return;
+        };
+        let mut last = gate.lock().await;
+        let fresh = last.is_some_and(|r| match since {
+            Since::Began => r.began >= asked,
+            Since::Ended => r.ended >= asked,
+        });
+        if fresh {
+            return;
+        }
+        let began = std::time::Instant::now();
         let read = self.read_engine(engine, &program).await;
         self.0.engines.lock().insert(engine, read);
-        self.spend_signed_in();
+        *last = Some(EngineRead {
+            began,
+            ended: std::time::Instant::now(),
+        });
+    }
+
+    /// Whether `engine`'s sign-in was ever read here (unreadable is read).
+    pub(super) fn engine_read(&self, engine: Engine) -> Option<engine::SignIn> {
+        self.0
+            .engines
+            .lock()
+            .get(&engine)
+            .map(|i| i.sign_in.clone())
+    }
+
+    /// Since when a read of an engine serves a session starting now: while
+    /// the last stop's sessions are restored, any since the hub started;
+    /// else one that ends after now (one under way is shared).
+    pub(super) fn read_asked(&self) -> std::time::Instant {
+        self.0
+            .restoring_since
+            .lock()
+            .unwrap_or_else(std::time::Instant::now)
     }
 
     /// What `engine`'s `program` says of its version and its sign-in.
@@ -3238,7 +3309,18 @@ impl Desk {
         let mut env = self.with_added(&self.0.state.lock().session_env.clone());
         // Read only now; it reaches the CLI on a descriptor, never in an
         // environment ([`crate::token_pipe`]).
-        let account_token = self.account_token(r.engine, r.account).await?;
+        let account_token = match r.account {
+            Some(_) => self.account_token(r.engine, r.account).await?,
+            // No sign-in of the CLI's own here: on an account, kept as the
+            // session's so its plan readings and switches are that account's.
+            None => match self.instead_of_own(r.engine).await? {
+                Some((account, token)) => {
+                    self.change(r.id, |r, _| r.account = Some(account));
+                    Some(token)
+                }
+                None => None,
+            },
+        };
         if account_token.is_some() {
             for k in crate::engine_accounts::OUTRANKS_CLAUDE_TOKEN {
                 env.remove(k);
