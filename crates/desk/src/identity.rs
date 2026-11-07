@@ -299,10 +299,4 @@ mod tests {
         let kept: Prints = serde_json::from_value(serde_json::to_value(&work).unwrap()).unwrap();
         assert_eq!(kept, work);
     }
-
-    #[test]
-    fn real_resets_are_not_on_the_hour() {
-        // As Claude Code 2.1.319 wrote them: "resets 2:20pm" (13:20 UTC).
-        assert_eq!(1_791_811_200 % 3600, 1200);
-    }
 }

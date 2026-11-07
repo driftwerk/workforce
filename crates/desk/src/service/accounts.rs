@@ -1358,9 +1358,11 @@ impl Desk {
             .values()
             .filter(|r| r.engine == Engine::Claude && st.live.contains_key(&r.id))
         {
-            on.entry(Self::side_of_session(&st, r.id))
-                .or_default()
-                .push(r.id);
+            // A session still on a sign-in the CLI no longer has counts for
+            // nobody now.
+            if let Some(side) = Self::side_of_session(&st, r.id) {
+                on.entry(side).or_default().push(r.id);
+            }
         }
         accounts::needs(
             Engine::Claude,
@@ -1409,6 +1411,7 @@ impl Desk {
         &self,
         raw: &super::identities::Raw,
         windows: Vec<crate::usage::LimitWindow>,
+        at: chrono::DateTime<Utc>,
     ) {
         if windows.is_empty() {
             return;
@@ -1417,7 +1420,7 @@ impl Desk {
             let mut st = self.0.state.lock();
             let s = Self::standing_mut(&mut st, raw);
             s.windows = windows;
-            s.read_at = Some(Utc::now());
+            s.read_at = Some(at);
         }
         let desk = self.clone();
         tokio::spawn(async move { desk.accounts_moved().await });
@@ -1494,7 +1497,7 @@ impl Desk {
                 .values()
                 .filter(|r| {
                     r.engine == engine
-                        && Self::side_of_session(&st, r.id) == from
+                        && Self::side_of_session(&st, r.id) == Some(from)
                         && r.state != SessionState::Closed
                 })
                 .map(|r| {

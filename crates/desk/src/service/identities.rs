@@ -54,18 +54,19 @@ impl Desk {
     /// when the read said nothing (it is kept as it was). Its readings held
     /// until now are filed.
     pub(super) fn own_identity_read(&self, own: Option<Option<Identity>>) {
-        let Some(own) = own else {
-            return;
-        };
+        // Read, whatever it said: what was held is filed now, under the
+        // identity said, or (it said nothing) under none, as before.
         let (changed, waiting) = {
             let mut st = self.0.state.lock();
-            let changed = st.own_identity != own;
-            st.own_identity = own;
+            let changed = own.as_ref().is_some_and(|o| st.own_identity != *o);
+            if let Some(own) = own {
+                st.own_identity = own;
+            }
             st.own_read = true;
             (changed, std::mem::take(&mut st.own_waiting))
         };
-        for (limits, session) in waiting {
-            self.report_usage(limits, session);
+        for (limits, session, at) in waiting {
+            self.report_usage_at(limits, session, at);
         }
         if changed {
             self.announce_accounts();
@@ -154,9 +155,10 @@ impl Desk {
         }
     }
 
-    /// The side session `id` counts on now.
-    pub(super) fn side_of_session(st: &State, id: Uuid) -> Option<Uuid> {
-        Self::side_of_raw(st, &Self::raw_running(st, id)).unwrap_or(None)
+    /// The side session `id` counts on now: `None` while it runs on a
+    /// sign-in the CLI no longer has, which counts for nobody.
+    pub(super) fn side_of_session(st: &State, id: Uuid) -> Option<Option<Uuid>> {
+        Self::side_of_raw(st, &Self::raw_running(st, id))
     }
 
     /// The standing kept for `raw` alone, to write to.
@@ -242,8 +244,13 @@ impl Desk {
     /// disagrees unlinks an account linked so. A manual link, or the
     /// person's "none of these", is never changed. A reading of a CLI
     /// sign-in the CLI no longer has says nothing of it.
-    pub(super) fn observe_print(&self, raw: &Raw, windows: &[crate::usage::LimitWindow]) {
-        let Some(print) = Print::of(windows, Utc::now()) else {
+    pub(super) fn observe_print(
+        &self,
+        raw: &Raw,
+        windows: &[crate::usage::LimitWindow],
+        at: DateTime<Utc>,
+    ) {
+        let Some(print) = Print::of(windows, at) else {
             return;
         };
         let mut changed: Vec<(Uuid, Option<Link>)> = Vec::new();
@@ -294,6 +301,7 @@ impl Desk {
                     prints.agreed.clear();
                     if linked_here {
                         tracing::info!(%account, "an account's usage no longer matches this computer's sign-in: unlinked");
+                        st.links.remove(&account);
                         changed.push((account, None));
                     }
                 } else if agrees && link.is_none() && !answered {
@@ -304,22 +312,16 @@ impl Desk {
                         .any(|(id, l)| *id != account && l.identity.key == own.key);
                     if !taken {
                         tracing::info!(%account, "an account's usage matches this computer's sign-in: linked");
-                        changed.push((
-                            account,
-                            Some(Link {
-                                identity: own.clone(),
-                                by: LinkedBy::Usage,
-                                at: Utc::now(),
-                            }),
-                        ));
+                        let link = Link {
+                            identity: own.clone(),
+                            by: LinkedBy::Usage,
+                            at: Utc::now(),
+                        };
+                        // Seen by the next account in this pass: never two.
+                        st.links.insert(account, link.clone());
+                        changed.push((account, Some(link)));
                     }
                 }
-            }
-            for (account, link) in &changed {
-                match link {
-                    Some(l) => st.links.insert(*account, l.clone()),
-                    None => st.links.remove(account),
-                };
             }
         }
         self.keep_prints();

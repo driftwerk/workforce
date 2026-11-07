@@ -604,7 +604,7 @@ struct State {
     /// Whether the CLI's own sign-in was read yet: until it is, its
     /// readings wait, never filed as nobody's.
     own_read: bool,
-    own_waiting: Vec<(Value, Option<Uuid>)>,
+    own_waiting: Vec<(Value, Option<Uuid>, DateTime<Utc>)>,
     /// The last `/login` each session's transcript showed.
     logins_seen: HashMap<Uuid, String>,
     /// Account needs the person put off.
@@ -626,6 +626,9 @@ struct State {
     /// Which boss runs which session, and the person's input to each.
     charges: charge::Charges,
 }
+
+/// The most readings of the CLI's own sign-in held until it is first read.
+const OWN_WAITING_MAX: usize = 64;
 
 /// How often a busy session's tool is recorded as `working`.
 const WORKING_EVERY: Duration = Duration::from_secs(60);
@@ -1571,6 +1574,11 @@ impl Desk {
             return;
         }
         st.records.insert(r.id, r.clone());
+        // Closed: whatever it was signed in to inside is over.
+        if r.state == SessionState::Closed && st.relogged.remove(&r.id) {
+            let ids: Vec<Uuid> = st.relogged.iter().copied().collect();
+            self.keep_state(identities::RELOGGED, serde_json::json!(ids));
+        }
         let view = Self::view_of(st, &r);
         if before.as_ref().is_none_or(|b| b.state != view.state) {
             st.state_since.insert(r.id, view.updated_at);
@@ -1868,6 +1876,11 @@ impl Desk {
     /// reported to the hub: of its account when it runs on one, else of the
     /// CLI's own sign-in.
     fn report_usage(&self, limits: Value, session: Option<Uuid>) {
+        self.report_usage_at(limits, session, Utc::now());
+    }
+
+    /// [`Self::report_usage`], of a reading taken at `at`.
+    pub(super) fn report_usage_at(&self, limits: Value, session: Option<Uuid>, at: DateTime<Utc>) {
         let Some(plans) = &self.0.plans else {
             return;
         };
@@ -1882,7 +1895,10 @@ impl Desk {
             };
             // The CLI's own sign-in, not read yet: held until it is.
             if matches!(raw, identities::Raw::Own(_)) && !st.own_read {
-                st.own_waiting.push((limits, session));
+                if st.own_waiting.len() >= OWN_WAITING_MAX {
+                    st.own_waiting.remove(0);
+                }
+                st.own_waiting.push((limits, session, at));
                 return;
             }
             let ids = Self::plan_ids(&st, &raw);
@@ -1898,9 +1914,9 @@ impl Desk {
             None => own.unwrap_or_default(),
         };
         let windows = plans.windows(LocalPlan::Claude, &limits);
-        plans.local(LocalPlan::Claude, limits, account);
-        self.observe_print(&raw, &windows);
-        self.plan_read(&raw, windows);
+        plans.local_at(LocalPlan::Claude, limits, account, at);
+        self.observe_print(&raw, &windows, at);
+        self.plan_read(&raw, windows, at);
     }
 
     /// The process a session's own background work runs under: its
@@ -4620,9 +4636,8 @@ impl Desk {
         }
         let st = self.0.state.lock();
         let now = Utc::now();
-        let side = Self::side_of_session(&st, id);
-        let full = Some(Self::standing_of(&st, side))
-            .filter(|_| st.records.contains_key(&id))
+        let full = Self::side_of_session(&st, id)
+            .map(|side| Self::standing_of(&st, side))
             .and_then(|s| {
                 s.windows
                     .iter()

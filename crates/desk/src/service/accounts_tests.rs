@@ -2305,3 +2305,53 @@ async fn only_the_current_keys_name_this_computers_cards() {
     })
     .await;
 }
+
+#[tokio::test]
+async fn a_sign_in_claude_code_says_nothing_of_still_files_its_readings_with_their_time() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        DeskStore::migrate(&pool).await.unwrap();
+        let plans = Arc::new(Plans::default());
+        let o = signed_out_options(dir.path(), Arc::new(MemoryKeys::default()));
+        std::fs::write(dir.path().join("signed-out"), "garbled").unwrap();
+        let d = Desk::start(
+            DeskStore::from_pool(pool),
+            o,
+            super::Floor {
+                plans: Some(plans.clone()),
+                ..Default::default()
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        d.0.state.lock().own_read = false;
+        for _ in 0..(super::OWN_WAITING_MAX + 10) {
+            d.report_usage(both(10.0, 20.0, (3600, 86_400)), None);
+        }
+        assert_eq!(
+            d.0.state.lock().own_waiting.len(),
+            super::OWN_WAITING_MAX,
+            "held, but never without end"
+        );
+        let first = d.0.state.lock().own_waiting[0].2;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        // Claude Code says nothing readable: filed all the same, under no
+        // identity, at the time each came.
+        d.read_engine_now(Engine::Claude).await;
+        assert!(d.0.state.lock().own_read);
+        assert!(d.0.state.lock().own_waiting.is_empty());
+        assert_eq!(plans.0.lock().len(), super::OWN_WAITING_MAX);
+        assert_eq!(
+            d.0.state.lock().own_standing[""]
+                .read_at
+                .map(|t| t >= first),
+            Some(true)
+        );
+        assert!(
+            d.0.state.lock().own_standing[""].read_at
+                < Some(chrono::Utc::now() - chrono::Duration::milliseconds(15))
+        );
+    })
+    .await;
+}
