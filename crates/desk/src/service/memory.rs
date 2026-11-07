@@ -71,6 +71,36 @@ pub struct SessionMemory {
     pub remembering: bool,
     /// Why not, in plain words.
     pub why: Option<String>,
+    /// What else the person should know of it, in plain words: that its
+    /// oldest exchanges are past what the search index holds.
+    pub notice: Option<String>,
+}
+
+/// What the panel says of a session past its cap.
+fn past_cap_notice(counts: &MemoryCounts) -> Option<String> {
+    (counts.past_cap > 0).then(|| {
+        format!(
+            "Desk searches only this session's latest {} exchanges by meaning; its {} older ones are found by keyword.",
+            thousands(crate::memory_store::SESSION_CAP as i64),
+            thousands(counts.past_cap)
+        )
+    })
+}
+
+/// `n` with a space between each three digits, as Desk writes numbers.
+fn thousands(n: i64) -> String {
+    let digits = n.unsigned_abs().to_string();
+    let mut out = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(' ');
+        }
+        out.push(c);
+    }
+    match n < 0 {
+        true => format!("-{out}"),
+        false => out,
+    }
 }
 
 impl Desk {
@@ -104,6 +134,9 @@ impl Desk {
         }
         if self.0.ledger.redactor.is_none() {
             return Err(Why::Hold(crate::memory::NO_REDACTOR.into()));
+        }
+        if self.memory_full() {
+            return Err(Why::Hold(crate::memory::FULL.into()));
         }
         if !matches!(r.engine, Engine::Claude | Engine::Codex) {
             return Err(Why::Skip(crate::memory::NO_RECORD.into()));
@@ -186,8 +219,17 @@ impl Desk {
             .sweep_memory(self.0.opts.memory.retain_days)
             .await
         {
-            Ok(0) => {}
-            Ok(gone) => tracing::info!(gone, "swept conversations past their keeping"),
+            Ok(swept) if swept == Default::default() => {}
+            Ok(swept) => {
+                tracing::info!(
+                    gone = swept.gone,
+                    capped = swept.capped,
+                    purges = swept.purges,
+                    "swept conversations past their keeping"
+                );
+                self.memory_index_poke();
+                self.measure_memory().await;
+            }
             Err(e) => tracing::warn!(error = format!("{e:#}"), "couldn't sweep old conversations"),
         }
     }
@@ -269,6 +311,7 @@ impl Desk {
             }
             return Ok(SessionMemory {
                 exchanges,
+                notice: past_cap_notice(&counts),
                 counts,
                 remembering: false,
                 why: Some(crate::memory::CLEARED.into()),
@@ -291,6 +334,7 @@ impl Desk {
         };
         Ok(SessionMemory {
             exchanges,
+            notice: past_cap_notice(&counts),
             counts,
             remembering: why.is_none(),
             why,
@@ -302,7 +346,11 @@ impl Desk {
     /// conversation, records and exchanges are never harvested again.
     pub async fn forget_memory(&self, id: Uuid) -> Result<(), DeskError> {
         match self.0.store.forget_memory(id).await? {
-            true => Ok(()),
+            true => {
+                self.memory_index_poke();
+                self.measure_memory().await;
+                Ok(())
+            }
             false => Err(DeskError::NotFound),
         }
     }

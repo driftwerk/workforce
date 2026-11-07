@@ -112,6 +112,8 @@ pub(crate) mod desk_line_mcp;
 #[cfg(feature = "postgres")]
 pub mod desk_memory;
 #[cfg(feature = "postgres")]
+pub mod desk_memory_index;
+#[cfg(feature = "postgres")]
 pub(crate) mod desk_pool;
 pub(crate) mod desk_reads;
 pub(crate) mod desk_surface;
