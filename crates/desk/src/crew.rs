@@ -443,12 +443,27 @@ pub struct Overview {
     pub groups: Vec<String>,
 }
 
-/// The overseer, as `GET /api/desk/manager` says.
+/// The overseer, as `GET /api/desk/manager` says, and each sidebar group's
+/// boss.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ManagerView {
     pub agent_id: Option<String>,
     pub level: Option<String>,
+    /// Each sidebar group's boss, one per group; the main overseer is
+    /// `agent_id` and never among them.
+    pub bosses: Vec<GroupBoss>,
+}
+
+/// A sidebar group's boss, as Desk shows it on the group and its row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GroupBoss {
+    pub agent_id: String,
+    pub name: String,
+    pub group: String,
+    /// `watch`, `suggest` or `act`.
+    pub level: String,
 }
 
 /// The overseer as the desk needs it.
