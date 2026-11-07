@@ -60,16 +60,18 @@ Agents support multiple LLM providers, each with different authentication method
 
 ### Model tier system
 Driftwerk uses three capability tiers for easier configuration:
-- **`powerful`** – Highest capability models (e.g., Claude Opus, Gemini 2.5 Pro).
+- **`powerful`** – Highest capability models (e.g., Claude Opus, Gemini Pro).
 - **`standard`** – Balanced models (e.g., Claude Sonnet, Gemini Flash).
-- **`cheap`** – Cost-effective models (e.g., Claude Haiku, Gemini Nano).
+- **`cheap`** – Cost-effective models (e.g., Claude Haiku, Gemini Flash-Lite).
 
 You can specify tiers directly in configuration:
 ```toml
+[[agents]]
+id = "assistant"
 model = "anthropic:powerful"  # Resolves to Claude Opus
-model = "openrouter:deepseek:standard"  # Routes through OpenRouter
-model = "gemini:cheap"  # Resolves to Gemini Flash
 ```
+
+Other examples of the same form: `openrouter:deepseek:standard` (a DeepSeek model through OpenRouter) and `gemini:cheap` (a Gemini Flash-Lite model).
 
 Tier mappings are defined in `default_tiers.toml` but can be overridden in your workspace root.
 
