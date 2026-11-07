@@ -110,7 +110,7 @@ async fn save_over(
     #[cfg(feature = "postgres")]
     if saved.is_err() {
         if let Some(g) = &closed {
-            crate::desk_crew::not_closed(service, g);
+            crate::desk_crew::not_closed(service, g).await;
         }
     }
     let saved = saved?;
@@ -235,6 +235,83 @@ pub(crate) async fn one_overseer(keep: &AgentService, store: Option<&WorkflowSto
             Err(e) => tracing::warn!(agent_id = %id, error = %e, "Could not switch oversight off"),
         }
     }
+    // An agent the hub doesn't serve now, whose config still names the
+    // group, would keep it closed to everyone: its name goes too.
+    if let workforce_common::oversight::Scope::Group(g) = &mine {
+        let served: Vec<std::path::PathBuf> = registry
+            .all_services()
+            .iter()
+            .map(|s| s.workspace.clone())
+            .collect();
+        for workspace in unserved_beside(&served) {
+            if let Err(e) = unname_unserved(&workspace, store, g).await {
+                tracing::warn!(workspace = %workspace.display(), error = %e, "Could not take a group off an agent's config");
+            }
+        }
+    }
+}
+
+/// Every agent workspace beside the `served` ones (the folders they sit in,
+/// as Desk's crew scans for the groups named for a boss), the served ones
+/// left out.
+pub(crate) fn unserved_beside(served: &[std::path::PathBuf]) -> Vec<std::path::PathBuf> {
+    let mut dirs: Vec<&Path> = served.iter().filter_map(|w| w.parent()).collect();
+    dirs.sort();
+    dirs.dedup();
+    let mut out = Vec::new();
+    for dir in dirs {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            let path = e.path();
+            if path.is_dir() && !served.contains(&path) {
+                out.push(path);
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// The config at `workspace`, of an agent the hub doesn't serve, switched off
+/// and naming no group when it names `group`: written as a revision, under
+/// the workspace's lock, only over what was read.
+pub(crate) async fn unname_unserved(
+    workspace: &Path,
+    store: Option<&WorkflowStore>,
+    group: &str,
+) -> Result<bool, String> {
+    use workforce_common::settings::AgentWorkspaceConfig;
+    let path = workspace.join(config_files::WORKSPACE_CONFIG);
+    let Some(current) = config_files::read(&path).map_err(|e| e.to_string())? else {
+        return Ok(false);
+    };
+    if named_in(&current).as_deref() != Some(group) {
+        return Ok(false);
+    }
+    let off = oversight_off(&current).ok_or("its settings file has a mistake in it")?;
+    let ref_id = workspace
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    record_revision(
+        store,
+        KIND_AGENT_CONFIG,
+        &ref_id,
+        &path,
+        &off,
+        EditContext::new("oversight", None),
+    )
+    .await?;
+    AgentWorkspaceConfig::locked(workspace, || {
+        if config_files::read(&path).ok().flatten().as_deref() != Some(current.as_str()) {
+            return Err("it changed meanwhile".to_string());
+        }
+        config_files::replace_over(&path, off.as_bytes(), Over::Ours).map_err(|e| e.to_string())
+    })?;
+    tracing::info!(workspace = %workspace.display(), group, "A group's name taken off an agent the hub doesn't serve");
+    Ok(true)
 }
 
 async fn save_one(
