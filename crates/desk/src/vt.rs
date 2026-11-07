@@ -65,21 +65,28 @@ impl Colors {
         Ok(())
     }
 
-    /// Its background's ground, by WCAG relative luminance, as Desk tells
-    /// a light terminal from a dark one.
+    /// Its background's ground as Desk tells it (`isDarkGround`): dark when
+    /// Desk's light text (`#F1F2EC`) reads better on it, by WCAG contrast,
+    /// than its dark text (`#161714`) does.
     pub fn ground(&self) -> Ground {
-        let [r, g, b] = rgb(&self.background).unwrap_or_default().map(|v| {
-            let c = f64::from(v) / 255.0;
-            if c <= 0.03928 {
-                c / 12.92
-            } else {
-                ((c + 0.055) / 1.055).powf(2.4)
-            }
-        });
-        if 0.2126 * r + 0.7152 * g + 0.0722 * b >= 0.2 {
-            Ground::Light
-        } else {
+        let luminance = |c: [u8; 3]| {
+            let [r, g, b] = c.map(|v| {
+                let c = f64::from(v) / 255.0;
+                if c <= 0.03928 {
+                    c / 12.92
+                } else {
+                    ((c + 0.055) / 1.055).powf(2.4)
+                }
+            });
+            0.2126 * r + 0.7152 * g + 0.0722 * b
+        };
+        let contrast = |a: f64, b: f64| (a.max(b) + 0.05) / (a.min(b) + 0.05);
+        let bg = luminance(rgb(&self.background).unwrap_or_default());
+        let (paper, ink) = (luminance([0xF1, 0xF2, 0xEC]), luminance([0x16, 0x17, 0x14]));
+        if contrast(bg, paper) > contrast(bg, ink) {
             Ground::Dark
+        } else {
+            Ground::Light
         }
     }
 
@@ -587,6 +594,18 @@ mod tests {
             ..day()
         };
         assert_eq!((night.ground(), night.colorfgbg()), (Ground::Dark, "15;0"));
+        // A mid grey goes with the text that reads better on it, as in Desk.
+        let mid = |bg: &str| {
+            Colors {
+                background: bg.into(),
+                ..day()
+            }
+            .ground()
+        };
+        assert_eq!(
+            (mid("#757575"), mid("#777777")),
+            (Ground::Dark, Ground::Light)
+        );
         assert!(light.check().is_ok());
         assert!(Colors {
             ansi: vec![],
