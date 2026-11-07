@@ -238,6 +238,19 @@ mod tests {
     }
 
     #[test]
+    fn a_weekly_window_alone_is_never_a_print_to_link_by() {
+        // As Claude Code reports a plan now: the weekly window alone,
+        // resetting on the hour, as two plans' often do.
+        let weekly = vec![LimitWindow {
+            used_percent: 26.0,
+            resets_at: Some(at(1_794_596_400)),
+            minutes: 10_080,
+        }];
+        assert_eq!(Print::of(&weekly, at(0)), None);
+        assert!(Print::of(&windows((10.0, 3600), (26.0, 86_400)), at(0)).is_some());
+    }
+
+    #[test]
     fn an_identity_is_its_organization_and_email_never_either() {
         let a = Identity::of("org-1", "Kim@Example.com").unwrap();
         assert_eq!(

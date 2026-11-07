@@ -102,9 +102,15 @@ fn per_user(login: &Login) -> Option<String> {
 impl PlanUsage for Plans {
     fn observe(&self, login: &Login, plan: Option<&str>, windows: Vec<Window>) {
         let kind = plan_kind(login.kind);
+        // Whose account it is, where that can be told: a ChatGPT sign-in
+        // says; one of the person's own Claude accounts (a pooled call) is
+        // known by the key Desk keeps its readings under, so it is that
+        // account's card. A Claude token says nothing of its account.
         let account = match &login.credential {
             Credential::ChatGpt(auth) => auth.account_id().and_then(|id| account_key(kind, &[id])),
-            Credential::Token(_) | Credential::Pooled(_) => None,
+            Credential::Pooled(id) => crate::hub_core::logins::install_pool::of(&login.slot.vault)
+                .and_then(|pool| pool.plan_key(id)),
+            Credential::Token(_) => None,
         };
         // A login is its credential in its slot: one credential two people
         // keep, a shared Team account's say, is two plans' readings.
@@ -215,6 +221,69 @@ mod tests {
             worth_writing(Some(&old), &[window(40.0, 100)]),
             "a minute on"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_call_on_one_of_the_persons_own_accounts_is_that_accounts_reading() {
+        use crate::hub_core::logins::install_pool::{self, InstallPool, PoolAccount};
+        use crate::hub_core::logins::resolve::{Credential, LoginKey, VaultSlot};
+        use workforce_postgres::test_support::with_test_pool;
+        struct Pool;
+        impl InstallPool for Pool {
+            fn claude_accounts(&self) -> Vec<PoolAccount> {
+                Vec::new()
+            }
+            fn token(&self, _: &str) -> Option<String> {
+                None
+            }
+            fn serves(&self, _: uuid::Uuid) -> bool {
+                true
+            }
+            fn cooling(&self, _: &str, _: chrono::DateTime<Utc>) {}
+            fn plan_key(&self, id: &str) -> Option<String> {
+                (id == "starmoire").then(|| "planofstarmoire".to_string())
+            }
+        }
+        with_test_pool(PgFloorStore::build_pool, |pool| async move {
+            let store = Arc::new(PgFloorStore::with_pool(pool).await.unwrap());
+            let plans = Plans::new(Arc::clone(&store), crate::floor::signal::Signals::start());
+            let dir = tempfile::tempdir().unwrap();
+            let vault = Arc::new(
+                crate::vault::Vault::open(&dir.path().join("logins.enc"), "test-key").unwrap(),
+            );
+            install_pool::set(&vault, Some(Arc::new(Pool)));
+            let pooled = |id: &str| {
+                let credential = Credential::Pooled(id.into());
+                Login {
+                    tier: CredentialTier::SystemShared,
+                    owner: LoginOwner::Install,
+                    key: LoginKey::of(&credential).unwrap(),
+                    credential,
+                    slot: VaultSlot {
+                        vault: Arc::clone(&vault),
+                        key: SubscriptionKind::Claude.vault_key().to_string(),
+                    },
+                    ..crate::hub_core::logins::test_support::claude_login("unused")
+                }
+            };
+            plans.observe(&pooled("starmoire"), None, vec![window(100.0, 100)]);
+            plans.observe(&pooled("gone"), None, vec![window(5.0, 100)]);
+            let kept = loop {
+                let kept = store.readings().await.unwrap();
+                if kept.len() == 2 {
+                    break kept;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            };
+            let accounts: Vec<_> = kept.iter().map(|r| r.account.clone()).collect();
+            assert!(
+                accounts.contains(&Some("planofstarmoire".into())),
+                "the account's own card: {accounts:?}"
+            );
+            assert!(accounts.contains(&None), "one Desk no longer has: nobody's");
+            install_pool::set(&vault, None);
+        })
+        .await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
