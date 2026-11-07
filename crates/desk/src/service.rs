@@ -3496,7 +3496,7 @@ impl Desk {
         };
         let version = self.version_of(engine);
         let folder = cwd.to_path_buf();
-        let home = env.get("HOME").filter(|h| !h.is_empty()).map(PathBuf::from);
+        let home = first_run::home_of(env, std::env::var_os("HOME").map(PathBuf::from));
         let chosen = r.folder_chosen;
         let settled = tokio::task::spawn_blocking(move || {
             let s = first_run::Settle {
@@ -4680,7 +4680,7 @@ impl Desk {
                             r.state = state;
                             r.external_pid = ext.pid;
                             r.restore_offer = false;
-                            r.cwd = ext.cwd.clone();
+                            r.moved_to(ext.cwd.clone());
                             r.transcript = transcript.clone().or(r.transcript.take());
                             if let Some(t) = tail {
                                 r.last_prompt = t.last_prompt.or(r.last_prompt.take());

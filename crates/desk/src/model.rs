@@ -88,6 +88,15 @@ pub struct SessionRecord {
 }
 
 impl SessionRecord {
+    /// It runs in `cwd` now: a folder other than the one it had isn't the
+    /// one the person chose, so its CLI isn't to trust it on their word.
+    pub fn moved_to(&mut self, cwd: String) {
+        if cwd != self.cwd {
+            self.folder_chosen = false;
+            self.cwd = cwd;
+        }
+    }
+
     /// What Desk can do with this session: its engine's [`crate::engine::caps`]
     /// for the version it runs and where it runs. One adopted from another
     /// terminal has no environment of Desk's, so no line.
@@ -457,6 +466,20 @@ pub enum Decision {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_session_moved_to_another_folder_loses_the_persons_choice() {
+        let mut r = SessionRecord {
+            folder_chosen: true,
+            cwd: "/dev/acme-api".into(),
+            ..crate::store::tests::record_fixture("claude")
+        };
+        r.moved_to("/dev/acme-api".into());
+        assert!(r.folder_chosen, "the same folder is still theirs");
+        r.moved_to("/dev/elsewhere".into());
+        assert!(!r.folder_chosen);
+        assert_eq!(r.cwd, "/dev/elsewhere");
+    }
 
     #[test]
     fn running_states_become_interrupted_or_stopped_when_lost() {
