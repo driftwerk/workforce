@@ -90,15 +90,18 @@ pub trait MemoryIndex: Send + Sync {
     ) -> eyre::Result<KeyPage>;
 
     /// The passages of `collection` that best match `q`, by meaning and by
-    /// words, best first; one hit per exchange.
-    async fn search(&self, collection: &str, q: &IndexQuery) -> eyre::Result<Vec<IndexHit>>;
+    /// words, best first; one hit per exchange. None when the index has no
+    /// such collection: for a group whose rows Postgres says it holds, the
+    /// index lost it.
+    async fn search(&self, collection: &str, q: &IndexQuery)
+        -> eyre::Result<Option<Vec<IndexHit>>>;
 }
 
 /// An index in memory, for tests: what the hub's vellev index does, without
 /// a node. It can be told to fail.
 #[cfg(test)]
 pub mod fake {
-    use std::collections::{BTreeMap, HashMap};
+    use std::collections::{BTreeMap, HashMap, HashSet};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use parking_lot::Mutex;
@@ -113,6 +116,12 @@ pub mod fake {
         pub down: AtomicBool,
         /// How many writes were asked for.
         pub writes: AtomicUsize,
+        /// A write holding a passage of one of these fails.
+        pub poison: Mutex<HashSet<Uuid>>,
+        /// Every deletion fails while set, the rest answering.
+        pub purges_fail: AtomicBool,
+        /// Reconcile's comparisons fail while set, the rest answering.
+        pub differing_fails: AtomicBool,
     }
 
     impl FakeIndex {
@@ -159,6 +168,9 @@ pub mod fake {
         async fn write(&self, collection: &str, passages: &[Passage]) -> eyre::Result<()> {
             self.up()?;
             self.writes.fetch_add(1, Ordering::SeqCst);
+            if passages.iter().any(|p| self.poison.lock().contains(&p.of)) {
+                eyre::bail!("the index refused a passage");
+            }
             let mut held = self.held.lock();
             let c = held.entry(collection.to_string()).or_default();
             let mut counts: HashMap<Uuid, u32> = HashMap::new();
@@ -173,6 +185,9 @@ pub mod fake {
 
         async fn purge(&self, collection: &str, purge: &Purge) -> eyre::Result<u64> {
             self.up()?;
+            if self.purges_fail.load(Ordering::SeqCst) {
+                eyre::bail!("the index refused a deletion");
+            }
             let mut held = self.held.lock();
             if let Purge::All = purge {
                 return Ok(held.remove(collection).map(|c| c.len() as u64).unwrap_or(0));
@@ -200,6 +215,9 @@ pub mod fake {
             page: &[(String, String)],
         ) -> eyre::Result<Differing> {
             self.up()?;
+            if self.differing_fails.load(Ordering::SeqCst) {
+                eyre::bail!("the index couldn't compare");
+            }
             let held = self.held.lock();
             let c = held.get(collection);
             let mut out = Differing::default();
@@ -254,12 +272,16 @@ pub mod fake {
 
         /// By words alone: a passage matches by how many of the query's
         /// words it holds.
-        async fn search(&self, collection: &str, q: &IndexQuery) -> eyre::Result<Vec<IndexHit>> {
+        async fn search(
+            &self,
+            collection: &str,
+            q: &IndexQuery,
+        ) -> eyre::Result<Option<Vec<IndexHit>>> {
             self.up()?;
             let words: Vec<String> = q.text.split_whitespace().map(str::to_lowercase).collect();
             let held = self.held.lock();
             let Some(c) = held.get(collection) else {
-                return Ok(Vec::new());
+                return Ok(None);
             };
             let mut best: HashMap<Uuid, f32> = HashMap::new();
             for p in c.values() {
@@ -284,7 +306,7 @@ pub mod fake {
                 .collect();
             hits.sort_by(|a, b| b.relevance.total_cmp(&a.relevance).then(a.of.cmp(&b.of)));
             hits.truncate(q.limit);
-            Ok(hits)
+            Ok(Some(hits))
         }
     }
 }

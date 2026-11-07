@@ -67,6 +67,8 @@ pub const DISABLED: &str = "Remembering conversations is turned off for this Des
 pub const CLEARED: &str = "Desk no longer has this session; this is what it remembered of it.";
 /// What the person reads while Desk Memory is out of room.
 pub const FULL: &str = "Desk Memory is full, so Desk isn't remembering new conversations. Forget some sessions or raise max_disk_mb, and it carries on where it stopped.";
+/// What the Floor says while deletions from the search index are set aside.
+pub const PURGES_SET_ASIDE: &str = "Desk couldn't take some conversations you asked it to forget out of its search, though they're gone from everything else. Rebuild the search in Settings → Memory to clear them.";
 /// What the Floor says as Desk Memory nears its limit.
 pub const NEARLY_FULL: &str = "Desk Memory is nearly full. When it is, Desk stops remembering new conversations until you forget some sessions or raise max_disk_mb.";
 /// What a search says while some of what it covers isn't in the index yet.

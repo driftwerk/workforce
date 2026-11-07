@@ -229,6 +229,7 @@ impl Desk {
                     "swept conversations past their keeping"
                 );
                 self.memory_index_poke();
+                self.measure_memory().await;
             }
             Err(e) => tracing::warn!(error = format!("{e:#}"), "couldn't sweep old conversations"),
         }
@@ -367,6 +368,7 @@ impl Desk {
         match self.0.store.forget_memory(id).await? {
             true => {
                 self.memory_index_poke();
+                self.measure_memory().await;
                 Ok(())
             }
             false => Err(DeskError::NotFound),

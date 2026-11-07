@@ -44,6 +44,10 @@ const RECONCILE_PAGE: i64 = 200;
 const KEYS_PAGE: usize = 1000;
 /// How often session memory's disk use is measured.
 pub(super) const MEASURE_EVERY: Duration = Duration::from_secs(10 * 60);
+/// What one passage takes in the index's store, as estimated: its 768
+/// floats (3 KiB), its text (at most 1 600 chars) and its properties and
+/// index entries.
+pub(super) const PASSAGE_BYTES: u64 = 6 * 1024;
 /// How full Desk Memory is when the Floor says so, in percent.
 const NEARLY_FULL_AT: u64 = 90;
 
@@ -56,7 +60,7 @@ pub(super) struct IndexRun {
     /// Held while a batch is written or the index reconciled, and while a
     /// rebuild resets it: a batch read before a rebuild is never marked
     /// written after it.
-    work: tokio::sync::Mutex<()>,
+    pub(super) work: tokio::sync::Mutex<()>,
     state: Mutex<IndexState>,
     /// Session memory's disk use in Postgres as last measured, and since
     /// when it has been nearly full.
@@ -71,11 +75,15 @@ struct IndexState {
     caught_up: Option<DateTime<Utc>>,
     /// When it was last reconciled.
     reconciled: Option<DateTime<Utc>>,
+    /// Deletions set aside, and since when.
+    purges_set_aside: (i64, Option<DateTime<Utc>>),
 }
 
 #[derive(Debug, Default, Clone, Copy)]
 pub(super) struct Disk {
     pub(super) bytes: Option<u64>,
+    /// The index's store, as last estimated.
+    index_bytes: u64,
     nearly_full_since: Option<DateTime<Utc>>,
 }
 
@@ -105,8 +113,12 @@ pub struct IndexStatus {
     pub failing: Option<String>,
     pub caught_up: Option<DateTime<Utc>>,
     pub reconciled: Option<DateTime<Utc>>,
-    /// Session memory's disk use in Postgres, in MB, as last measured;
-    /// the index's own isn't counted.
+    /// Exchanges the index kept refusing, set aside: found by keyword.
+    pub set_aside: i64,
+    /// Deletions the index kept refusing, set aside until a rebuild.
+    pub purges_set_aside: i64,
+    /// Session memory's disk use as last measured, in MB: its live data in
+    /// Postgres, and the index's estimated from how many passages it holds.
     pub disk_mb: Option<u64>,
     pub max_disk_mb: u64,
 }
@@ -149,6 +161,14 @@ impl Budget {
 }
 
 impl Desk {
+    /// After memory was forgotten: the index worker has deletions to run,
+    /// and the room freed is measured, so a hold on the harvest lifts.
+    pub(super) fn memory_forgotten(&self) {
+        self.memory_index_poke();
+        let desk = self.clone();
+        tokio::spawn(async move { desk.measure_memory().await });
+    }
+
     /// Tells the index worker there may be work.
     pub(super) fn memory_index_poke(&self) {
         self.0.index.poke.notify_one();
@@ -166,19 +186,31 @@ impl Desk {
             spent: 0,
         };
         let mut reconcile_at = Instant::now();
+        let mut reconcile_failures = 0u32;
         let mut failures = 0u32;
         loop {
             if self.0.cancel.is_cancelled() {
                 return;
             }
-            let did = match reconcile_at <= Instant::now() {
-                true => self.reconcile(&*index).await.map(|()| {
-                    reconcile_at = Instant::now() + RECONCILE_EVERY;
-                    Did::Work
-                }),
-                false => self.index_step(&*index, &mut budget).await,
-            };
-            let wait = match did {
+            if reconcile_at <= Instant::now() {
+                // A reconcile that fails is tried again later; the outbox
+                // and the deletions go on meanwhile.
+                match self.reconcile(&*index).await {
+                    Ok(()) => {
+                        reconcile_failures = 0;
+                        reconcile_at = Instant::now() + RECONCILE_EVERY;
+                    }
+                    Err(e) => {
+                        reconcile_failures += 1;
+                        tracing::warn!(
+                            error = format!("{e:#}"),
+                            "couldn't reconcile Desk Memory's search index; trying again later"
+                        );
+                        reconcile_at = Instant::now() + backoff(reconcile_failures);
+                    }
+                }
+            }
+            let wait = match self.index_step(&*index, &mut budget).await {
                 Ok(did) => {
                     if failures > 0 {
                         tracing::info!("Desk Memory's search index is answering again");
@@ -204,6 +236,11 @@ impl Desk {
                     backoff(failures)
                 }
             };
+            let wait = wait.min(
+                reconcile_at
+                    .saturating_duration_since(Instant::now())
+                    .max(Duration::from_millis(10)),
+            );
             tokio::select! {
                 _ = self.0.cancel.cancelled() => return,
                 _ = self.0.index.poke.notified(), if failures == 0 => {}
@@ -212,8 +249,17 @@ impl Desk {
         }
     }
 
+    /// Whether the index answers at all: what tells a request it refused
+    /// (to be tried a few more times, then set aside) from an index that
+    /// is down (to be waited for).
+    async fn answering(index: &dyn MemoryIndex) -> bool {
+        index.collections().await.is_ok()
+    }
+
     /// Runs the deletions waiting, or else writes one batch of the outbox.
+    /// Both under the work lock, so a rebuild comes wholly before or after.
     async fn index_step(&self, index: &dyn MemoryIndex, budget: &mut Budget) -> eyre::Result<Did> {
+        let _work = self.0.index.work.lock().await;
         let purges = self.0.store.purges_pending(PURGES).await?;
         if !purges.is_empty() {
             for p in purges {
@@ -226,7 +272,6 @@ impl Desk {
             Ok(left) => left,
             Err(wait) => return Ok(Did::Throttled(wait)),
         };
-        let _work = self.0.index.work.lock().await;
         let pending = self
             .0
             .store
@@ -256,18 +301,69 @@ impl Desk {
                     );
                 }
             }
-            let passages: Vec<Passage> = rows.iter().flat_map(|p| passages_of(&p.row)).collect();
-            if !passages.is_empty() {
-                index.write(&collection, &passages).await?;
-            }
-            budget.spent = budget
-                .spent
-                .saturating_add(u32::try_from(passages.len()).unwrap_or(u32::MAX));
-            let written: Vec<(Uuid, String)> =
-                rows.iter().map(|p| (p.row.id, p.version.clone())).collect();
+            let written = match self.write_rows(index, &collection, &rows, budget).await {
+                Ok(()) => rows.clone(),
+                Err(e) if !Self::answering(index).await => return Err(e),
+                // The index answers, but refused this batch: write each on
+                // its own, so one it refuses can't hold up the rest.
+                Err(_) => {
+                    let mut ok = Vec::new();
+                    let mut refused = Vec::new();
+                    for row in &rows {
+                        match self.write_rows(index, &collection, &[*row], budget).await {
+                            Ok(()) => ok.push(*row),
+                            Err(e) if !Self::answering(index).await => return Err(e),
+                            Err(e) => {
+                                tracing::warn!(exchange = %row.row.id, error = format!("{e:#}"), "Desk Memory's search index refused an exchange");
+                                refused.push(row.row.id);
+                            }
+                        }
+                    }
+                    for id in self.0.store.index_tried(&refused).await? {
+                        tracing::warn!(exchange = %id, "an exchange the search index keeps refusing is set aside; it is found by keyword");
+                    }
+                    ok
+                }
+            };
+            let written: Vec<(Uuid, String)> = written
+                .iter()
+                .map(|p| (p.row.id, p.version.clone()))
+                .collect();
             self.0.store.index_written(&written).await?;
         }
         Ok(Did::Work)
+    }
+
+    /// Writes `rows`' passages to `collection`; what it held of an exchange
+    /// whose text is now empty goes.
+    async fn write_rows(
+        &self,
+        index: &dyn MemoryIndex,
+        collection: &str,
+        rows: &[&Pending],
+        budget: &mut Budget,
+    ) -> eyre::Result<()> {
+        let mut passages: Vec<Passage> = Vec::new();
+        let mut emptied = Vec::new();
+        for p in rows {
+            let of = passages_of(&p.row);
+            if of.is_empty() {
+                emptied.push(p.row.id);
+            }
+            passages.extend(of);
+        }
+        if !passages.is_empty() {
+            index.write(collection, &passages).await?;
+        }
+        if !emptied.is_empty() {
+            index
+                .purge(collection, &Purge::Refs { refs: emptied })
+                .await?;
+        }
+        budget.spent = budget
+            .spent
+            .saturating_add(u32::try_from(passages.len()).unwrap_or(u32::MAX));
+        Ok(())
     }
 
     async fn run_purge(
@@ -283,9 +379,16 @@ impl Desk {
         };
         match index.purge(collection, purge).await {
             Ok(_) => self.0.store.purge_done(id).await,
+            Err(e) if !Self::answering(index).await => Err(e),
+            // Refused while the index answers otherwise: tried again a few
+            // times, then set aside and said on the Floor.
             Err(e) => {
-                let _ = self.0.store.purge_tried(id).await;
-                Err(e)
+                tracing::warn!(%id, collection, error = format!("{e:#}"), "Desk Memory's search index refused a deletion");
+                if self.0.store.purge_tried(id).await? {
+                    tracing::error!(%id, collection, "a deletion the search index keeps refusing is set aside until the index is rebuilt");
+                    self.purges_set_aside_read().await;
+                }
+                Ok(())
             }
         }
     }
@@ -294,9 +397,9 @@ impl Desk {
     /// lacks or holds with another text is queued to be written again, and
     /// what Postgres no longer has (or never had) is queued to be deleted.
     /// A collection of session memory with no group left in Postgres is
-    /// dropped.
+    /// dropped. The work lock is held a page at a time, so a rebuild needn't
+    /// wait for the whole pass.
     async fn reconcile(&self, index: &dyn MemoryIndex) -> eyre::Result<()> {
-        let _work = self.0.index.work.lock().await;
         let listed: HashSet<String> = index.collections().await?.into_iter().collect();
         let groups = self.0.store.memory_groups().await?;
         let mut wanted = HashSet::new();
@@ -305,12 +408,18 @@ impl Desk {
             let collection = collection_of(group.as_deref());
             wanted.insert(collection.clone());
             if !listed.contains(&collection) {
+                let _work = self.0.index.work.lock().await;
                 again += self.0.store.index_requeue_group(group.as_deref()).await?;
                 continue;
             }
+            // Exchanges still to be written before this pass: the index may
+            // hold part of each already.
+            let unwritten =
+                u64::try_from(self.0.store.index_unwritten(group.as_deref()).await?).unwrap_or(0);
             let mut held = 0u64;
             let mut after = None;
             loop {
+                let _work = self.0.index.work.lock().await;
                 let page = self
                     .0
                     .store
@@ -335,9 +444,10 @@ impl Desk {
                     again += self.0.store.index_requeue(&refs).await?;
                 }
             }
-            // It holds more than Postgres says it should: find what of it
-            // Postgres no longer has.
-            if index.count(&collection).await? > held {
+            // It holds more than Postgres says it should, even counting a
+            // passage for each exchange still to be written: find what of
+            // it Postgres no longer has.
+            if index.count(&collection).await? > held + unwritten {
                 orphans += self.orphans(index, &collection, group.as_deref()).await?;
             }
         }
@@ -424,6 +534,7 @@ impl Desk {
         collections.sort();
         let queued = self.0.store.rebuild_index(&collections).await?;
         drop(_work);
+        self.purges_set_aside_read().await;
         self.memory_index_poke();
         Ok(queued)
     }
@@ -441,6 +552,8 @@ impl Desk {
             failing,
             caught_up,
             reconciled,
+            set_aside: self.0.store.index_set_aside().await?,
+            purges_set_aside: self.0.index.state.lock().purges_set_aside.0,
             disk_mb: self.0.index.disk.lock().bytes.map(|b| b / (1024 * 1024)),
             max_disk_mb: self.0.opts.memory.max_disk_mb,
         })
@@ -464,19 +577,60 @@ impl Desk {
         self.memory_index_poke();
     }
 
-    /// Measures session memory's disk use.
+    /// Measures session memory's disk use: its live data in Postgres, and
+    /// the index's store estimated from how many passages it holds
+    /// ([`PASSAGE_BYTES`] each; the vellev client doesn't say a store's
+    /// size, and the node's folder isn't the hub's to read). While the
+    /// index doesn't answer, its last estimate stands.
     pub(super) async fn measure_memory(&self) {
-        match self.0.store.memory_disk_bytes().await {
-            Ok(bytes) => self.disk_measured(bytes),
-            Err(e) => tracing::warn!(
-                error = format!("{e:#}"),
-                "couldn't measure Desk Memory's disk use"
-            ),
+        let postgres = match self.0.store.memory_disk_bytes().await {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                tracing::warn!(
+                    error = format!("{e:#}"),
+                    "couldn't measure Desk Memory's disk use"
+                );
+                return;
+            }
+        };
+        if let Some(index) = self.0.index.index.clone() {
+            let mut passages = 0u64;
+            let counted: eyre::Result<()> = async {
+                for c in index.collections().await? {
+                    passages += index.count(&c).await?;
+                }
+                Ok(())
+            }
+            .await;
+            if counted.is_ok() {
+                self.0.index.disk.lock().index_bytes = passages.saturating_mul(PASSAGE_BYTES);
+            }
+        }
+        let index_bytes = self.0.index.disk.lock().index_bytes;
+        self.disk_measured(postgres.saturating_add(index_bytes));
+        self.purges_set_aside_read().await;
+    }
+
+    /// Reads how many deletions are set aside, for the Floor.
+    async fn purges_set_aside_read(&self) {
+        if let Ok(n) = self.0.store.purges_set_aside().await {
+            self.0.index.state.lock().purges_set_aside = n;
         }
     }
 
     pub(super) fn disk_measured(&self, bytes: u64) {
         let limit = self.0.opts.memory.max_disk_mb.saturating_mul(1024 * 1024);
+        let was_full = self.memory_full();
+        if was_full && bytes < limit {
+            // The hold lifts: every record is read again from where its
+            // harvest held.
+            let desk = self.clone();
+            tokio::spawn(async move {
+                if let Ok(all) = desk.0.store.every_session().await {
+                    all.iter().for_each(|r| desk.spend_read(r.id));
+                }
+            });
+        }
         let mut d = self.0.index.disk.lock();
         let nearly = bytes.saturating_mul(100) >= limit.saturating_mul(NEARLY_FULL_AT);
         d.bytes = Some(bytes);
@@ -496,29 +650,47 @@ impl Desk {
     /// The Floor's need while Desk Memory is nearly or quite full: the
     /// person frees room, or raises the limit. Nothing answers it but that.
     pub fn memory_needs(&self) -> Vec<Need> {
+        let mut needs = Vec::new();
+        if let (n, Some(since)) = self.0.index.state.lock().purges_set_aside {
+            if n > 0 {
+                needs.push(desk_memory_need(
+                    "memory:purges",
+                    crate::memory::PURGES_SET_ASIDE,
+                    since,
+                ));
+            }
+        }
         let Some(since) = self.0.index.disk.lock().nearly_full_since else {
-            return Vec::new();
+            return needs;
         };
-        vec![Need {
-            id: "memory:disk".into(),
-            kind: NeedKind::Question,
-            who: Who {
-                kind: crate::crew::PartyKind::Desk,
-                id: "memory".into(),
-                name: "Desk Memory".into(),
-                engine: None,
-            },
-            ask: match self.memory_full() {
-                true => crate::memory::FULL.into(),
-                false => crate::memory::NEARLY_FULL.into(),
-            },
-            why: None,
-            options: None,
-            chose: None,
-            since,
-            place: Place::Elsewhere,
-            answer: Answer::Reply,
-        }]
+        let ask = match self.memory_full() {
+            true => crate::memory::FULL,
+            false => crate::memory::NEARLY_FULL,
+        };
+        needs.push(desk_memory_need("memory:disk", ask, since));
+        needs
+    }
+}
+
+/// A need of Desk Memory's own: said, with nothing to click but what the
+/// words say to do.
+fn desk_memory_need(id: &str, ask: &str, since: DateTime<Utc>) -> Need {
+    Need {
+        id: id.into(),
+        kind: NeedKind::Question,
+        who: Who {
+            kind: crate::crew::PartyKind::Desk,
+            id: "memory".into(),
+            name: "Desk Memory".into(),
+            engine: None,
+        },
+        ask: ask.into(),
+        why: None,
+        options: None,
+        chose: None,
+        since,
+        place: Place::Elsewhere,
+        answer: Answer::Reply,
     }
 }
 

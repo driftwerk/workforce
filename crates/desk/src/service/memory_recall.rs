@@ -58,6 +58,11 @@ impl Desk {
         let b = bound(reader, self.session_reach().await, r.reach, &known)
             .narrowed(r.group.as_ref().map(|g| g.as_deref()), r.session);
         if b.is_empty() {
+            tracing::info!(
+                reader = %reader.label(),
+                tool = r.tool,
+                "a memory search asked for nothing its reader may read; nothing was searched"
+            );
             return Ok(Recalled {
                 hits: Vec::new(),
                 keyword_only: self.memory_index_up().is_none(),
@@ -173,9 +178,27 @@ impl Desk {
             limit: wanted,
         };
         let mut found = HashMap::new();
-        for collection in &b.collections {
+        for (collection, group) in b.collections.iter().zip(&b.groups) {
             match index.search(collection, &query).await {
-                Ok(hits) => {
+                // The index has no collection where Postgres says it holds
+                // this group's rows: it lost it. Searched by keyword, and
+                // the group written again.
+                Ok(None) => match self.0.store.index_holds_any(group.as_deref()).await {
+                    Ok(false) => {}
+                    Ok(true) | Err(_) => {
+                        let lost = eyre::eyre!("the search index lost the collection {collection}");
+                        if let Err(e) = self.0.store.index_requeue_group(group.as_deref()).await {
+                            tracing::warn!(
+                                error = format!("{e:#}"),
+                                collection,
+                                "couldn't queue a lost collection to be written again"
+                            );
+                        }
+                        self.memory_index_failed(&lost);
+                        return None;
+                    }
+                },
+                Ok(Some(hits)) => {
                     for h in hits {
                         let e = found.entry(h.of).or_insert(h.relevance);
                         *e = e.max(h.relevance);
