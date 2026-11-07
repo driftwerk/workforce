@@ -119,6 +119,7 @@ async fn manager(State(s): S, h: HeaderMap, Query(q): Query<TokenQuery>) -> Resp
         agent_id: o.as_ref().map(|o| o.id.clone()),
         level: o.map(|o| o.level),
         bosses,
+        sealed: s.desk.sealed(),
     })
     .into_response()
 }
@@ -430,7 +431,7 @@ mod tests {
             let (_, m) = call(&app, "GET", "/api/desk/manager").await;
             assert_eq!(
                 m,
-                json!({"agentId": "desk", "level": "suggest", "bosses": []})
+                json!({"agentId": "desk", "level": "suggest", "bosses": [], "sealed": []})
             );
 
             let made = |text: &str| Suggestion {
@@ -523,9 +524,19 @@ mod tests {
                     level: "act".into(),
                 },
             ]);
+            // Globex is named for a boss that oversees nothing now: sealed.
+            d.change_layout(|l| {
+                l.create("g-acme", "Acme", &[], None)?
+                    .create("g-globex", "Globex", &[], None)
+            })
+            .await
+            .unwrap();
+            d.bound_groups(["g-acme".to_string(), "g-globex".to_string()])
+                .await;
             let (status, m) = call(&app, "GET", "/api/desk/manager").await;
             assert_eq!(status, StatusCode::OK);
             assert_eq!(m["agentId"], "desk");
+            assert_eq!(m["sealed"], json!(["g-globex"]));
             assert_eq!(
                 m["bosses"],
                 json!([{"agentId": "sarah", "name": "Sarah", "group": "g-acme", "level": "act"}])

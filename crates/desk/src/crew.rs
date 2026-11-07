@@ -453,6 +453,9 @@ pub struct ManagerView {
     /// Each sidebar group's boss, one per group; the main overseer is
     /// `agent_id` and never among them.
     pub bosses: Vec<GroupBoss>,
+    /// Groups closed to everyone but the person: named for a boss that
+    /// oversees nothing now, so neither it nor the main overseer sees them.
+    pub sealed: Vec<String>,
 }
 
 /// A sidebar group's boss, as Desk shows it on the group and its row.
@@ -635,6 +638,13 @@ pub trait Crew: Send + Sync {
     /// words.
     async fn assign(&self, _agent: &str, _task: &str) -> Result<String, String> {
         Err("There are no agents here to give it to.".into())
+    }
+
+    /// Takes the boss off the group `group`, before it is deleted: every
+    /// agent whose config names it is switched off and names it no more.
+    /// What went wrong, in plain words.
+    async fn release_group(&self, _group: &str) -> Result<(), String> {
+        Ok(())
     }
 
     /// `assign`, as `by`: the overseer handing out a ticket is the overseer
