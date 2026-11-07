@@ -397,6 +397,10 @@ impl Desk {
         env.insert("DESK_HOOK_BASE".into(), self.0.hook_base.clone());
         env.insert(claude::USAGE_URL.into(), hook_url.clone());
         env.insert("DESK_HOOK_URL".into(), hook_url);
+        // Light or dark, for programs that read it rather than ask.
+        if let Some(c) = crate::vt::colors() {
+            env.insert("COLORFGBG".into(), c.colorfgbg().into());
+        }
         Spawn {
             program: PathBuf::from(&r.shell),
             args: vec!["-l".into()],
@@ -656,6 +660,7 @@ impl Desk {
             stopping: false,
             _codex: None,
             terminal: Some(terminal),
+            fixed_ground: None,
             background: Default::default(),
             baseline: Default::default(),
             prompts: 0,
@@ -785,6 +790,7 @@ impl Desk {
                             stopping: false,
                             _codex: None,
                             terminal: Some(terminal),
+                            fixed_ground: None,
                             background: Default::default(),
                             baseline: Default::default(),
                             prompts: 0,

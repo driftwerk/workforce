@@ -170,6 +170,9 @@ pub(crate) struct Live {
     /// The Desk terminal it runs in: its PTY is the terminal's, which
     /// outlives it.
     terminal: Option<Uuid>,
+    /// The terminal ground its CLI took its colours from at its start, when
+    /// it can't follow the terminal while it runs ([`SessionView::fixed_ground`]).
+    fixed_ground: Option<crate::vt::Ground>,
     /// What it started that still runs.
     background: Background,
     /// What already ran under its Codex app-server when its turn began.
@@ -766,6 +769,8 @@ const PLUGIN_DIRS: &str = "CLAUDE_CODE_PLUGIN_DIRS";
 /// Where what Desk last asked its sessions' environment to add is kept, so
 /// a session the hub starts or resumes after a restart still has it.
 const SESSION_ENV: &str = "hub.sessions.env";
+/// The colours Desk last said its terminals are drawn in.
+const TERMINAL_COLORS: &str = "hub.terminal.colors";
 /// Most variables Desk may add to a CLI's environment.
 const MAX_ENV: usize = 64;
 const MAX_ENV_VALUE: usize = 32 * 1024;
@@ -1167,6 +1172,18 @@ impl Desk {
         forget_hub_internal(&store, &opts.hub_internal, floor.turns.as_deref()).await;
         let layout = store.layout().await?;
         let session_env = kept_session_env(&store).await;
+        // What a session restored before Desk connects answers with.
+        match store.state(TERMINAL_COLORS).await {
+            Ok(Some(kept)) => {
+                if let Ok(c) = serde_json::from_value::<crate::vt::Colors>(kept.value) {
+                    if c.check().is_ok() {
+                        crate::vt::set_colors(c);
+                    }
+                }
+            }
+            Ok(None) => {}
+            Err(e) => tracing::warn!(error = %e, "couldn't read the terminals' colours"),
+        }
         let engine_accounts = store.accounts().await?;
         let auto_switch = match store.state(accounts::AUTO_SWITCH).await {
             Ok(kept) => kept.is_some_and(|e| e.value == serde_json::json!(true)),
@@ -1446,6 +1463,7 @@ impl Desk {
                     stopping: false,
                     _codex: codex,
                     terminal: None,
+                    fixed_ground: None,
                     background: Default::default(),
                     baseline: Default::default(),
                     prompts: 0,
@@ -1502,6 +1520,7 @@ impl Desk {
         view.group = Self::group_ref(&state.layout, &groups::session_item(r.id));
         (view.account, view.switching_to) = Self::account_refs(state, r);
         view.background = live.and_then(|l| l.background.view());
+        view.fixed_ground = live.and_then(|l| l.fixed_ground);
         view.interrupted = live.is_some_and(|l| l.interrupted);
         view.reading = live.is_some_and(|l| l.reading.is_some());
         view.prompts = live.map_or(0, |l| l.prompts);
@@ -2604,6 +2623,38 @@ impl Desk {
         Ok(view)
     }
 
+    /// Takes the colours Desk draws its terminals in: programs asking (OSC
+    /// 4, 10, 11, 12) are answered with them while no pane is there to, the
+    /// CLIs started next read their light or dark from them, and when the
+    /// background changed every program that asked to be told (mode 2031) is
+    /// told, so it asks again. Kept for the hub's next start.
+    pub fn set_terminal_colors(&self, colors: crate::vt::Colors) -> Result<(), DeskError> {
+        colors.check().map_err(DeskError::Invalid)?;
+        let ground = colors.ground();
+        let kept = serde_json::json!(colors);
+        if crate::vt::set_colors(colors) {
+            let ptys: Vec<Arc<Pty>> = {
+                let st = self.0.state.lock();
+                st.live
+                    .values()
+                    .filter(|l| l.terminal.is_none())
+                    .map(|l| Arc::clone(&l.pty))
+                    .chain(st.terminal_ptys.values().cloned())
+                    .collect()
+            };
+            for pty in ptys {
+                pty.tell_ground(ground);
+            }
+        }
+        let store = Arc::clone(&self.0.store);
+        tokio::spawn(async move {
+            if let Err(e) = store.put_state(TERMINAL_COLORS, &kept).await {
+                tracing::warn!(error = %e, "couldn't keep the terminals' colours");
+            }
+        });
+        Ok(())
+    }
+
     /// Stops a running session (if it runs) and resumes its conversation,
     /// with `prompt` if given: one `restarted` event by `by`.
     pub async fn restart(
@@ -3542,8 +3593,18 @@ impl Desk {
             }
         }
         self.settle_first_run(r, cwd, &env).await;
+        // The colours Desk draws its terminals in, as it last said them: the
+        // CLI reads its light or dark from them ([`crate::vt::Colors`]).
+        let colors = crate::vt::colors();
+        if let Some(c) = &colors {
+            env.insert("COLORFGBG".into(), c.colorfgbg().into());
+        }
+        let mut fixed_ground = None;
         let (spec, codex) = match r.engine {
             Engine::Claude => {
+                let theme =
+                    first_run::claude_config(&env).and_then(|c| first_run::claude_theme(&c));
+                let theme = claude::theme_for(theme.as_deref());
                 let session_id = r.cli_session_id.as_deref().unwrap_or_default();
                 let hook_url = format!("{}/hook/{}/{token}", self.0.hook_base, r.id);
                 let spec = claude::spawn(&claude::ClaudeSpawn {
@@ -3559,6 +3620,7 @@ impl Desk {
                     hook_url: &hook_url,
                     approval_timeout_secs: self.0.opts.approval_timeout.as_secs(),
                     env: &env,
+                    theme,
                 });
                 (spec, None)
             }
@@ -3585,6 +3647,8 @@ impl Desk {
                 });
                 let link =
                     self.observe_codex(r.id, server, socket, thread.map(str::to_string), false);
+                // Codex asks the terminal's colours once, at its start.
+                fixed_ground = colors.as_ref().map(|c| c.ground());
                 (spec, Some(link))
             }
             Engine::Gemini
@@ -3642,6 +3706,7 @@ impl Desk {
                 stopping: false,
                 _codex: codex,
                 terminal: None,
+                fixed_ground,
                 background: Default::default(),
                 baseline: Default::default(),
                 prompts: 0,
@@ -5910,6 +5975,96 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(100)).await;
             assert!(h.list().await.unwrap().is_empty());
             holder_cancel.cancel();
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn claude_code_follows_desks_terminal_unless_the_person_set_a_theme() {
+        with_test_pool(build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let home = dir.path().join("home");
+            std::fs::create_dir(&home).unwrap();
+            // Records its arguments and what it reads light or dark from.
+            let cli = dir.path().join("recording-cli");
+            let out = dir.path().join("launched");
+            std::fs::write(
+                &cli,
+                format!(
+                    "#!/bin/sh\nprintf '%s\\n' \"$COLORFGBG\" \"$@\" > '{}'\nexec sleep 60\n",
+                    out.display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let mut opts = options(dir.path());
+            opts.programs = crate::testing::programs(cli, fake_cli(dir.path()));
+            opts.env
+                .insert("HOME".into(), home.to_string_lossy().into_owned());
+            DeskStore::migrate(&pool).await.unwrap();
+            let d = Desk::start(
+                DeskStore::from_pool(pool.clone()),
+                opts,
+                Default::default(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            let day = crate::vt::Colors {
+                foreground: "#24251F".into(),
+                background: "#FFFFFF".into(),
+                cursor: "#3F5A06".into(),
+                ansi: vec!["#1B1C18".into(); 16],
+            };
+            assert!(matches!(
+                d.set_terminal_colors(crate::vt::Colors {
+                    ansi: vec![],
+                    ..day.clone()
+                }),
+                Err(DeskError::Invalid(_))
+            ));
+            d.set_terminal_colors(day).unwrap();
+            let launched = || async {
+                for _ in 0..100 {
+                    if let Ok(text) = std::fs::read_to_string(&out) {
+                        if text.contains("--settings") {
+                            std::fs::remove_file(&out).unwrap();
+                            return text;
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(30)).await;
+                }
+                panic!("the CLI never started");
+            };
+            let settings = |text: &str| -> Value {
+                let lines: Vec<&str> = text.lines().collect();
+                let at = lines.iter().position(|l| *l == "--settings").unwrap();
+                serde_json::from_str(lines[at + 1]).unwrap()
+            };
+
+            // No theme of the person's: it follows the terminal.
+            let s = new_session(&d, dir.path()).await;
+            let text = launched().await;
+            assert_eq!(text.lines().next(), Some("0;15"), "COLORFGBG says light");
+            assert_eq!(settings(&text)["theme"], "auto");
+            assert_eq!(s.fixed_ground, None, "it follows the terminal as it runs");
+            let config: Value =
+                serde_json::from_str(&std::fs::read_to_string(home.join(".claude.json")).unwrap())
+                    .unwrap();
+            assert_eq!(
+                config["theme"], "auto",
+                "its onboarding is settled to follow too"
+            );
+
+            // One the person set is theirs.
+            std::fs::write(
+                home.join(".claude.json"),
+                r#"{"hasCompletedOnboarding":true,"theme":"dark-daltonized"}"#,
+            )
+            .unwrap();
+            new_session(&d, dir.path()).await;
+            let text = launched().await;
+            assert!(settings(&text).get("theme").is_none());
         })
         .await;
     }

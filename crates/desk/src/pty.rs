@@ -265,6 +265,20 @@ impl Pty {
         )
     }
 
+    /// Tells the program the terminal turned light or dark (`CSI ? 997 ; 1
+    /// n` dark, `2` light), when it asked to be told (mode 2031): it asks for
+    /// the colours again. Whether it was told.
+    pub fn tell_ground(&self, ground: crate::vt::Ground) -> bool {
+        if !self.screen.core.lock().term.color_scheme_events() {
+            return false;
+        }
+        let n = match ground {
+            crate::vt::Ground::Dark => 1,
+            crate::vt::Ground::Light => 2,
+        };
+        self.io.write(format!("\x1b[?997;{n}n").as_bytes()).is_ok()
+    }
+
     /// Types `input` whoever is active (the hub's own writes: prompts from
     /// agents, a holder's client).
     pub fn write(&self, input: &[u8]) -> Result<()> {
@@ -657,6 +671,22 @@ pub(crate) mod tests {
                 _ => None,
             })
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_program_that_asked_is_told_the_terminal_turned_light() {
+        let (quiet, _q) = spawn("stty raw -echo; printf 'ready'; sleep 5");
+        wait_for(&quiet, "ready").await;
+        assert!(
+            !quiet.tell_ground(crate::vt::Ground::Light),
+            "a program that didn't ask is sent nothing: its shell would echo it"
+        );
+        let (pty, _exit) = spawn(
+            "stty raw -echo; printf '\\033[?2031hready\\r\\n'; head -c 9 | od -An -c | tr -d ' '; sleep 5",
+        );
+        wait_for(&pty, "ready").await;
+        assert!(pty.tell_ground(crate::vt::Ground::Light));
+        wait_for(&pty, "033[?997;2n").await;
     }
 
     #[tokio::test]

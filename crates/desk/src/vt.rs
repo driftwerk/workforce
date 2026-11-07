@@ -7,11 +7,132 @@
 //! events, colour-scheme notifications, the kitty keyboard flags,
 //! modifyOtherKeys); they are tracked here and put back in every snapshot.
 //! Queries a terminal must answer are answered as Desk's xterm.js 6 does,
-//! for when no viewer is there to answer them.
+//! for when no viewer is there to answer them: the colour queries (OSC 4,
+//! 10, 11 and 12) with the colours Desk draws its terminals in, once Desk
+//! has said them ([`set_colors`]).
 
 use std::num::NonZeroU16;
+use std::sync::Arc;
 
+use parking_lot::RwLock;
+use serde::{Deserialize, Serialize};
 use vt100::{Callbacks, MouseProtocolEncoding, MouseProtocolMode, Screen};
+
+/// The colours Desk draws its terminals in, from its theme: what a program
+/// is told when it asks (OSC 10, 11, 12 and 4), each `#RRGGBB`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Colors {
+    pub foreground: String,
+    pub background: String,
+    pub cursor: String,
+    /// The 16 ANSI colours, by index.
+    pub ansi: Vec<String>,
+}
+
+/// Light or dark: which a terminal's background is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Ground {
+    Light,
+    Dark,
+}
+
+fn rgb(hex: &str) -> Option<[u8; 3]> {
+    let h = hex.strip_prefix('#').filter(|h| h.len() == 6)?;
+    let at = |i: usize| u8::from_str_radix(h.get(i..i + 2)?, 16).ok();
+    Some([at(0)?, at(2)?, at(4)?])
+}
+
+impl Colors {
+    /// Whether every colour is `#RRGGBB` and there are 16 ANSI ones.
+    pub fn check(&self) -> Result<(), String> {
+        for (name, c) in [
+            ("foreground", &self.foreground),
+            ("background", &self.background),
+            ("cursor", &self.cursor),
+        ]
+        .into_iter()
+        .chain(self.ansi.iter().map(|c| ("an ANSI colour", c)))
+        {
+            if rgb(c).is_none() {
+                return Err(format!("{name} must be a colour like #112233"));
+            }
+        }
+        if self.ansi.len() != 16 {
+            return Err("there must be 16 ANSI colours".into());
+        }
+        Ok(())
+    }
+
+    /// Its background's ground, by WCAG relative luminance, as Desk tells
+    /// a light terminal from a dark one.
+    pub fn ground(&self) -> Ground {
+        let [r, g, b] = rgb(&self.background).unwrap_or_default().map(|v| {
+            let c = f64::from(v) / 255.0;
+            if c <= 0.03928 {
+                c / 12.92
+            } else {
+                ((c + 0.055) / 1.055).powf(2.4)
+            }
+        });
+        if 0.2126 * r + 0.7152 * g + 0.0722 * b >= 0.2 {
+            Ground::Light
+        } else {
+            Ground::Dark
+        }
+    }
+
+    /// `COLORFGBG` for it, as terminals set it: foreground;background as
+    /// ANSI indexes, which programs read light or dark from.
+    pub fn colorfgbg(&self) -> &'static str {
+        match self.ground() {
+            Ground::Light => "0;15",
+            Ground::Dark => "15;0",
+        }
+    }
+
+    /// Colour `index` of the 256 (OSC 4): the 16 Desk's, the rest xterm's
+    /// own cube and greys, as xterm.js has them.
+    fn indexed(&self, index: u16) -> Option<[u8; 3]> {
+        match index {
+            0..=15 => rgb(self.ansi.get(usize::from(index))?),
+            16..=231 => {
+                let i = index - 16;
+                let level = |v: u16| if v == 0 { 0 } else { (v * 40 + 55) as u8 };
+                Some([level(i / 36), level(i / 6 % 6), level(i % 6)])
+            }
+            232..=255 => {
+                let v = ((index - 232) * 10 + 8) as u8;
+                Some([v, v, v])
+            }
+            _ => None,
+        }
+    }
+}
+
+/// What Desk last said its terminals look like; none until it has.
+static COLORS: RwLock<Option<Arc<Colors>>> = RwLock::new(None);
+
+/// Sets the colours terminals answer with. Whether the ground changed (or
+/// they were first set), for programs to be told ([`Term::color_scheme_events`]).
+pub fn set_colors(colors: Colors) -> bool {
+    let mut current = COLORS.write();
+    let changed = current.as_ref().map(|c| c.background.as_str()) != Some(&colors.background);
+    *current = Some(Arc::new(colors));
+    changed
+}
+
+/// The colours terminals answer with, once Desk has said them.
+pub fn colors() -> Option<Arc<Colors>> {
+    COLORS.read().clone()
+}
+
+/// A colour as xterm.js reports it: `rgb:rrrr/gggg/bbbb`.
+fn report(c: [u8; 3]) -> String {
+    let [r, g, b] = c;
+    format!("rgb:{r:02x}{r:02x}/{g:02x}{g:02x}/{b:02x}{b:02x}")
+}
 
 /// Most kitty keyboard flag pushes remembered.
 const KITTY_DEPTH: usize = 16;
@@ -29,6 +150,54 @@ struct Tracker {
     modify_other_keys: Option<u16>,
     title: Option<Vec<u8>>,
     cwd: Option<String>,
+    /// Colours this terminal answers with instead of Desk's (tests).
+    colors: Option<Arc<Colors>>,
+}
+
+impl Tracker {
+    /// Answers OSC 10, 11 and 12 (each `?` after the first asking for the
+    /// next of them) and OSC 4 (`index;?` pairs), one reply each, as
+    /// xterm.js does; nothing while Desk hasn't said its colours.
+    fn colour_queries(&mut self, params: &[&[u8]]) {
+        let Some(colors) = self.colors.clone().or_else(colors) else {
+            return;
+        };
+        let num = |p: &[u8]| std::str::from_utf8(p).ok()?.parse::<u16>().ok();
+        let Some((&code, rest)) = params.split_first() else {
+            return;
+        };
+        match num(code) {
+            Some(4) => {
+                for pair in rest.chunks(2) {
+                    if let [index, b"?"] = pair {
+                        if let Some((i, c)) = num(index).and_then(|i| Some((i, colors.indexed(i)?)))
+                        {
+                            self.replies
+                                .extend(format!("\x1b]4;{i};{}\x1b\\", report(c)).bytes());
+                        }
+                    }
+                }
+            }
+            Some(first @ 10..=12) => {
+                for (offset, p) in rest.iter().enumerate() {
+                    let code = first + offset as u16;
+                    let colour = match code {
+                        10 => &colors.foreground,
+                        11 => &colors.background,
+                        12 => &colors.cursor,
+                        _ => break,
+                    };
+                    if *p == b"?" {
+                        if let Some(c) = rgb(colour) {
+                            self.replies
+                                .extend(format!("\x1b]{code};{}\x1b\\", report(c)).bytes());
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 fn first(params: &[&[u16]], i: usize) -> Option<u16> {
@@ -165,6 +334,7 @@ impl Callbacks for Tracker {
                 self.cwd = Some(path);
             }
         }
+        self.colour_queries(params);
     }
 }
 
@@ -213,6 +383,20 @@ impl Term {
                 Tracker::default(),
             ),
         }
+    }
+
+    /// A terminal that answers with `colors`, not Desk's.
+    #[cfg(test)]
+    fn with_colors(cols: u16, rows: u16, colors: Colors) -> Self {
+        let mut t = Self::new(cols, rows, 0);
+        t.parser.callbacks_mut().colors = Some(Arc::new(colors));
+        t
+    }
+
+    /// Whether the program asked to be told when the terminal turns light
+    /// or dark (mode 2031).
+    pub fn color_scheme_events(&self) -> bool {
+        self.parser.callbacks().color_scheme_events
     }
 
     /// Parses `bytes`; returns the replies owed to queries in them, in order.
@@ -327,6 +511,97 @@ mod tests {
             vt100::Parser::new_with_callbacks(nz(rows), nz(cols), 100, Tracker::default());
         viewer.process(&t.snapshot(history));
         viewer
+    }
+
+    /// Desk's Day terminal, as its theme gives it.
+    fn day() -> Colors {
+        Colors {
+            foreground: "#24251F".into(),
+            background: "#FFFFFF".into(),
+            cursor: "#3F5A06".into(),
+            ansi: [
+                "#1B1C18", "#B3261E", "#2F6A12", "#8A5A00", "#1D58C0", "#7240C4", "#0A6B84",
+                "#5E6157", "#62655B", "#8E231C", "#295614", "#6E4A06", "#1C4AA0", "#5E37A1",
+                "#0D586C", "#1B1C18",
+            ]
+            .map(String::from)
+            .to_vec(),
+        }
+    }
+
+    #[test]
+    fn colour_queries_are_answered_with_desks_colours_as_xterm_js_answers_them() {
+        let mut t = Term::with_colors(80, 24, day());
+        // ST- and BEL-terminated, as Codex and Claude Code send them.
+        assert_eq!(
+            t.feed(b"\x1b]10;?\x1b\\\x1b]11;?\x07"),
+            b"\x1b]10;rgb:2424/2525/1f1f\x1b\\\x1b]11;rgb:ffff/ffff/ffff\x1b\\"
+        );
+        assert_eq!(
+            t.feed(b"\x1b]12;?\x07"),
+            b"\x1b]12;rgb:3f3f/5a5a/0606\x1b\\"
+        );
+        // One OSC 10 asking for the colours after it too.
+        assert_eq!(
+            t.feed(b"\x1b]10;?;?\x07"),
+            b"\x1b]10;rgb:2424/2525/1f1f\x1b\\\x1b]11;rgb:ffff/ffff/ffff\x1b\\"
+        );
+        // OSC 4: one reply per index; past the 16, xterm's own cube.
+        assert_eq!(
+            t.feed(b"\x1b]4;5;?;13;?;196;?\x1b\\"),
+            b"\x1b]4;5;rgb:7272/4040/c4c4\x1b\\\x1b]4;13;rgb:5e5e/3737/a1a1\x1b\\\x1b]4;196;rgb:ffff/0000/0000\x1b\\"
+                .as_slice()
+        );
+        assert_eq!(
+            t.feed(b"\x1b]4;244;?\x07"),
+            b"\x1b]4;244;rgb:8080/8080/8080\x1b\\"
+        );
+        // Setting a colour, or one past 255, is not a query.
+        assert!(t
+            .feed(b"\x1b]11;#000000\x07\x1b]4;300;?\x07\x1b]4;1;rgb:00/00/00\x07")
+            .is_empty());
+    }
+
+    #[test]
+    fn colour_queries_go_unanswered_until_desk_says_its_colours() {
+        let mut t = Term::new(80, 24, 0);
+        if colors().is_none() {
+            assert!(t.feed(b"\x1b]11;?\x07").is_empty());
+        }
+    }
+
+    #[test]
+    fn a_ground_is_light_or_dark_by_its_background() {
+        let light = day();
+        assert_eq!((light.ground(), light.colorfgbg()), (Ground::Light, "0;15"));
+        let night = Colors {
+            background: "#0C0D0B".into(),
+            ..day()
+        };
+        assert_eq!((night.ground(), night.colorfgbg()), (Ground::Dark, "15;0"));
+        assert!(light.check().is_ok());
+        assert!(Colors {
+            ansi: vec![],
+            ..day()
+        }
+        .check()
+        .is_err());
+        assert!(Colors {
+            background: "white".into(),
+            ..day()
+        }
+        .check()
+        .is_err());
+    }
+
+    #[test]
+    fn a_program_asking_for_colour_scheme_changes_is_known() {
+        let mut t = Term::new(80, 24, 0);
+        assert!(!t.color_scheme_events());
+        t.feed(b"\x1b[?2031h");
+        assert!(t.color_scheme_events());
+        t.feed(b"\x1b[?2031l");
+        assert!(!t.color_scheme_events());
     }
 
     /// Claude Code's startup: modes, then its queries ending in DA1.

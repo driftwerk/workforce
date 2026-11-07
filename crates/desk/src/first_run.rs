@@ -95,8 +95,17 @@ pub fn home_of(env: &BTreeMap<String, String>, hub: Option<PathBuf>) -> Option<P
         .or(hub.filter(|h| !h.as_os_str().is_empty()))
 }
 
-/// The theme Claude Code is given when Desk completes its onboarding.
-pub const CLAUDE_THEME: &str = "dark";
+/// The theme Claude Code is given when Desk completes its onboarding:
+/// `auto`, which follows the terminal's background, Desk's or another's
+/// (see [`crate::claude::theme_for`]). Not its default, so it is kept.
+pub const CLAUDE_THEME: &str = "auto";
+
+/// The theme Claude Code's `config` keeps, if one is set.
+pub fn claude_theme(config: &Config) -> Option<String> {
+    let text = fs::read_to_string(&config.path).ok()?;
+    let doc: Value = serde_json::from_str(&text).ok()?;
+    doc.get("theme")?.as_str().map(str::to_string)
+}
 
 /// What a session's start may settle.
 #[derive(Debug, Clone, Copy)]
@@ -771,6 +780,20 @@ mod tests {
     }
 
     #[test]
+    fn the_theme_claude_code_keeps_is_read() {
+        let home = tempfile::tempdir().unwrap();
+        let config = Config {
+            path: home.path().join(".claude.json"),
+            make_folder: false,
+        };
+        assert_eq!(claude_theme(&config), None, "no file");
+        fs::write(&config.path, r#"{"numStartups": 3}"#).unwrap();
+        assert_eq!(claude_theme(&config), None);
+        fs::write(&config.path, r#"{"theme": "light-daltonized"}"#).unwrap();
+        assert_eq!(claude_theme(&config).as_deref(), Some("light-daltonized"));
+    }
+
+    #[test]
     fn without_a_home_of_its_own_a_session_has_the_hubs() {
         let hub = Some(PathBuf::from("/home/hub"));
         let env = |h: &str| BTreeMap::from([("HOME".to_string(), h.to_string())]);
@@ -792,7 +815,7 @@ mod tests {
         assert!(ready_claude(&claude(&config), &chosen(&folder, home.path())).unwrap());
         let doc = json_of(&config);
         assert_eq!(doc["hasCompletedOnboarding"], json!(true));
-        assert_eq!(doc["theme"], json!("dark"));
+        assert_eq!(doc["theme"], json!("auto"));
         assert_eq!(doc["lastOnboardingVersion"], json!("2.1.318"));
         assert_eq!(
             doc["projects"][real(&folder)]["hasTrustDialogAccepted"],

@@ -29,6 +29,17 @@ pub struct ClaudeSpawn<'a> {
     pub hook_url: &'a str,
     pub approval_timeout_secs: u64,
     pub env: &'a BTreeMap<String, String>,
+    /// Its theme for this session only ([`theme_for`]); none keeps its own.
+    pub theme: Option<&'a str>,
+}
+
+/// The theme a session of Claude Code is given, from the one its config
+/// keeps (`person`): with none set, `auto`, which reads the terminal's
+/// background (OSC 11) at its start and again whenever the terminal says it
+/// turned light or dark (mode 2031), so it follows Desk's theme as it runs.
+/// One the person set (other than `auto`) is theirs, and kept.
+pub fn theme_for(person: Option<&str>) -> Option<&'static str> {
+    matches!(person, None | Some("auto")).then_some("auto")
 }
 
 const TOOL_EVENTS: [&str; 5] = [
@@ -92,11 +103,15 @@ pub fn spawn(s: &ClaudeSpawn<'_>) -> Spawn {
         Launch::New { session_id } => vec!["--session-id".to_string(), session_id.to_string()],
         Launch::Resume { session_id } => vec!["--resume".to_string(), session_id.to_string()],
     };
+    let mut settings = hook_settings(s.hook_url, s.approval_timeout_secs);
+    if let Some(theme) = s.theme {
+        settings["theme"] = Value::String(theme.into());
+    }
     args.extend([
         "-n".to_string(),
         s.name.to_string(),
         "--settings".to_string(),
-        hook_settings(s.hook_url, s.approval_timeout_secs).to_string(),
+        settings.to_string(),
     ]);
     args.extend(s.prompt.map(str::to_string));
     let mut env = s.env.clone();
@@ -578,6 +593,7 @@ pub(crate) mod tests {
             hook_url: "http://h",
             approval_timeout_secs: 60,
             env: &env,
+            theme: None,
         };
         let new = spawn(&base(Launch::New { session_id: "abc" }));
         assert_eq!(&new.args[..4], ["--session-id", "abc", "-n", "auth-fix"]);
@@ -589,6 +605,35 @@ pub(crate) mod tests {
         assert_eq!(new.args.last().unwrap(), "continue");
         let resumed = spawn(&base(Launch::Resume { session_id: "abc" }));
         assert_eq!(&resumed.args[..2], ["--resume", "abc"]);
+    }
+
+    #[test]
+    fn a_session_follows_the_terminal_unless_the_person_set_a_theme() {
+        assert_eq!(theme_for(None), Some("auto"));
+        assert_eq!(theme_for(Some("auto")), Some("auto"));
+        for theirs in ["dark", "light-daltonized", "custom:mine"] {
+            assert_eq!(theme_for(Some(theirs)), None, "{theirs} is kept");
+        }
+        let env = BTreeMap::new();
+        let settings = |theme| {
+            let s = spawn(&ClaudeSpawn {
+                program: Path::new("/usr/local/bin/claude"),
+                cwd: Path::new("/repo"),
+                name: "n",
+                launch: Launch::New { session_id: "abc" },
+                prompt: None,
+                hook_url: "http://h",
+                approval_timeout_secs: 60,
+                env: &env,
+                theme,
+            });
+            let at = s.args.iter().position(|a| a == "--settings").unwrap();
+            serde_json::from_str::<Value>(&s.args[at + 1]).unwrap()
+        };
+        let auto = settings(Some("auto"));
+        assert_eq!(auto["theme"], "auto");
+        assert!(auto["hooks"]["SessionStart"].is_array(), "the hooks stay");
+        assert!(settings(None).get("theme").is_none());
     }
 
     #[test]

@@ -709,6 +709,31 @@ async fn resume(
         .into_response()
 }
 
+/// Stops it and resumes its conversation: what a CLI that read the
+/// terminal's colours only at its start needs to take new ones.
+async fn restart(State(s): S, h: HeaderMap, Query(q): Q, Path(id): Path<Uuid>) -> Response {
+    guarded!(s, h, q);
+    s.desk
+        .restart(id, None, By::you())
+        .await
+        .map(Json)
+        .into_response()
+}
+
+/// The colours Desk draws its terminals in ([`crate::vt::Colors`]).
+async fn terminal_colors(
+    State(s): S,
+    h: HeaderMap,
+    Query(q): Q,
+    Json(colors): Json<crate::vt::Colors>,
+) -> Response {
+    guarded!(s, h, q);
+    s.desk
+        .set_terminal_colors(colors)
+        .map(|()| StatusCode::NO_CONTENT)
+        .into_response()
+}
+
 #[derive(Deserialize)]
 struct DecideBody {
     decision: Decision,
@@ -1401,6 +1426,11 @@ pub fn sessions_router(desk: Desk, auth: Arc<dyn Authorize>) -> Router {
         .route("/api/desk/sessions/{id}/asked/allow", post(allow_asked))
         .route("/api/desk/sessions/{id}/asked/dismiss", post(dismiss_asked))
         .route("/api/desk/sessions/{id}/resume", post(resume))
+        .route("/api/desk/sessions/{id}/restart", post(restart))
+        .route(
+            "/api/desk/terminal/colors",
+            axum::routing::put(terminal_colors),
+        )
         .route("/api/desk/sessions/{id}/approvals/{approval}", post(decide))
         .route("/api/desk/sessions/{id}/pty", get(pty))
         .route(
