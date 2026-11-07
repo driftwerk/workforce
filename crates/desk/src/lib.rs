@@ -44,6 +44,8 @@ pub mod memory;
 pub mod memory_store;
 pub mod model;
 pub mod overview;
+pub mod plan;
+pub mod plan_store;
 mod procs;
 pub mod providers;
 mod pty;
