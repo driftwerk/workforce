@@ -85,6 +85,16 @@ pub fn codex_config(env: &BTreeMap<String, String>) -> Option<Config> {
     }
 }
 
+/// The session's home folder, for never trusting it: its environment's
+/// `HOME`, else the hub's own (`hub`), so a session without one still
+/// doesn't trust the home it runs in.
+pub fn home_of(env: &BTreeMap<String, String>, hub: Option<PathBuf>) -> Option<PathBuf> {
+    env.get("HOME")
+        .filter(|h| !h.is_empty())
+        .map(PathBuf::from)
+        .or(hub.filter(|h| !h.as_os_str().is_empty()))
+}
+
 /// The theme Claude Code is given when Desk completes its onboarding.
 pub const CLAUDE_THEME: &str = "dark";
 
@@ -128,11 +138,33 @@ fn trust_of(s: &Settle<'_>) -> (String, MayTrust) {
         MayTrust::Chosen
     } else {
         match crate::worktree::project_of(&key) {
-            repo if repo != key => MayTrust::WorktreeOf(repo.to_string()),
+            repo if repo != key && is_worktree_of(&real, Path::new(repo)) => {
+                MayTrust::WorktreeOf(repo.to_string())
+            }
             _ => MayTrust::No,
         }
     };
     (key, may)
+}
+
+/// `folder` is a git worktree of `repo`, as git keeps one: its `.git` file
+/// names a folder under the repo's `.git/worktrees`, which names it back.
+/// Not only a folder where Desk would put one.
+fn is_worktree_of(folder: &Path, repo: &Path) -> bool {
+    let check = || -> Option<bool> {
+        let dot_git = folder.join(".git");
+        let text = fs::read_to_string(&dot_git).ok()?;
+        let named = text.trim().strip_prefix("gitdir:")?.trim();
+        let admin = fs::canonicalize(folder.join(named)).ok()?;
+        let worktrees = fs::canonicalize(repo.join(".git").join("worktrees")).ok()?;
+        if admin.parent()? != worktrees {
+            return Some(false);
+        }
+        let back = fs::read_to_string(admin.join("gitdir")).ok()?;
+        let back = admin.join(back.trim());
+        Some(fs::canonicalize(back).ok()? == fs::canonicalize(&dot_git).ok()?)
+    };
+    check().unwrap_or(false)
 }
 
 /// Completes Claude Code's onboarding in `config`, and trusts the folder as
@@ -189,7 +221,9 @@ enum Node {
 
 impl Ordered {
     fn get(&self, key: &str) -> Option<&Node> {
-        self.0.iter().find(|(k, _)| k == key).map(|(_, v)| v)
+        // The last of a key said twice, as JSON readers (Claude Code's too)
+        // take it.
+        self.0.iter().rev().find(|(k, _)| k == key).map(|(_, v)| v)
     }
 
     /// `key`'s value read as JSON.
@@ -202,7 +236,7 @@ impl Ordered {
 
     fn set(&mut self, key: &str, value: &Value) -> Result<()> {
         let raw = RawValue::from_string(serde_json::to_string(value)?)?;
-        match self.0.iter_mut().find(|(k, _)| k == key) {
+        match self.0.iter_mut().rev().find(|(k, _)| k == key) {
             Some((_, v)) => *v = Node::Raw(raw),
             None => self.0.push((key.to_string(), Node::Raw(raw))),
         }
@@ -211,7 +245,7 @@ impl Ordered {
 
     /// `key`'s object, opened up for changing (made when missing).
     fn map(&mut self, key: &str, what: &str) -> Result<&mut Ordered> {
-        let at = match self.0.iter().position(|(k, _)| k == key) {
+        let at = match self.0.iter().rposition(|(k, _)| k == key) {
             Some(at) => at,
             None => {
                 self.0
@@ -560,8 +594,8 @@ impl Lock {
         loop {
             match fs::create_dir(&path) {
                 Ok(()) => {
-                    let made = fs::symlink_metadata(&path).ok().map(|m| made(&m))?;
-                    return Some(Self { path, made });
+                    let read = fs::symlink_metadata(&path);
+                    return Self::made(path, read);
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                     let held = fs::symlink_metadata(&path).ok();
@@ -589,6 +623,25 @@ impl Lock {
                     tracing::warn!(lock = %path.display(), error = %e, "couldn't lock a CLI's config; Desk left it alone");
                     return None;
                 }
+            }
+        }
+    }
+}
+
+impl Lock {
+    /// The lock Desk just made at `path`, known by what `read` says of it;
+    /// when that can't be read, it can't be known as Desk's later, so it is
+    /// removed now rather than left held.
+    fn made(path: PathBuf, read: std::io::Result<fs::Metadata>) -> Option<Self> {
+        match read {
+            Ok(m) => Some(Self {
+                path,
+                made: made(&m),
+            }),
+            Err(e) => {
+                let _ = fs::remove_dir(&path);
+                tracing::warn!(lock = %path.display(), error = %e, "couldn't read the lock Desk made; Desk left the config alone");
+                None
             }
         }
     }
@@ -634,6 +687,36 @@ mod tests {
 
     fn real(p: &Path) -> String {
         fs::canonicalize(p).unwrap().to_string_lossy().into_owned()
+    }
+
+    /// A git worktree `<repo>/.worktrees/<name>` as Desk makes one (the
+    /// repo made first when it isn't there).
+    fn git_worktree(repo: &Path, name: &str) -> PathBuf {
+        let git = |dir: &Path, args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(["-c", "user.email=d@e", "-c", "user.name=d"])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                ok.status.success(),
+                "{}",
+                String::from_utf8_lossy(&ok.stderr)
+            );
+        };
+        if !repo.join(".git").exists() {
+            fs::create_dir_all(repo).unwrap();
+            git(repo, &["init", "-q", "-b", "main"]);
+            git(repo, &["commit", "-q", "--allow-empty", "-m", "init"]);
+        }
+        let wt = repo.join(".worktrees").join(name);
+        git(
+            repo,
+            &["worktree", "add", "-q", "-b", name, &wt.to_string_lossy()],
+        );
+        wt
     }
 
     /// Takes `<file>.lock` as Claude Code's lockfile does (`mkdir`, retried
@@ -685,6 +768,19 @@ mod tests {
             Some((PathBuf::from("/cx/config.toml"), false))
         );
         assert_eq!(at(codex_config(&env(&[]))), None);
+    }
+
+    #[test]
+    fn without_a_home_of_its_own_a_session_has_the_hubs() {
+        let hub = Some(PathBuf::from("/home/hub"));
+        let env = |h: &str| BTreeMap::from([("HOME".to_string(), h.to_string())]);
+        assert_eq!(
+            home_of(&env("/home/dev"), hub.clone()),
+            Some("/home/dev".into())
+        );
+        assert_eq!(home_of(&BTreeMap::new(), hub.clone()), hub);
+        assert_eq!(home_of(&env(""), hub.clone()), hub);
+        assert_eq!(home_of(&BTreeMap::new(), None), None);
     }
 
     #[test]
@@ -800,10 +896,12 @@ mod tests {
     fn a_start_the_person_didnt_choose_trusts_only_a_worktree_of_a_trusted_repo() {
         let home = tempfile::tempdir().unwrap();
         let repo = home.path().join("acme-api");
-        let wt = repo.join(".worktrees/login-race");
+        let wt = git_worktree(&repo, "login-race");
         let other = home.path().join("elsewhere");
-        fs::create_dir_all(&wt).unwrap();
         fs::create_dir_all(&other).unwrap();
+        // Where Desk puts one, but no worktree: never trusted as one.
+        let shaped = repo.join(".worktrees/not-one");
+        fs::create_dir_all(&shaped).unwrap();
         let config = home.path().join(".claude.json");
         let agent = |folder| Settle {
             folder,
@@ -836,10 +934,16 @@ mod tests {
             json!(true),
             "Desk's worktree of a trusted repo"
         );
+        assert!(!ready_claude(&claude(&config), &agent(&shaped)).unwrap());
+        assert_eq!(json_of(&config)["projects"].get(real(&shaped)), None);
+        // Another repo's worktree, put in this repo's folder.
+        let elsewhere = git_worktree(&home.path().join("acme-web"), "x");
+        let moved = repo.join(".worktrees/x");
+        fs::rename(&elsewhere, &moved).unwrap();
+        assert!(!ready_claude(&claude(&config), &agent(&moved)).unwrap());
 
         // A `false` stays for a start the person didn't choose.
-        let wt2 = repo.join(".worktrees/other");
-        fs::create_dir_all(&wt2).unwrap();
+        let wt2 = git_worktree(&repo, "other");
         let mut doc = json_of(&config);
         doc["projects"][real(&wt2)] = json!({ "hasTrustDialogAccepted": false });
         fs::write(&config, doc.to_string()).unwrap();
@@ -1153,8 +1257,7 @@ mod tests {
     fn codex_for_a_start_the_person_didnt_choose() {
         let home = tempfile::tempdir().unwrap();
         let repo = home.path().join("acme-api");
-        let wt = repo.join(".worktrees/x");
-        fs::create_dir_all(&wt).unwrap();
+        let wt = git_worktree(&repo, "x");
         let config = Config {
             path: home.path().join("config.toml"),
             make_folder: false,
@@ -1185,5 +1288,53 @@ mod tests {
             doc["projects"][&real(&wt)]["trust_level"].as_str(),
             Some("trusted")
         );
+    }
+
+    #[test]
+    fn a_key_said_twice_is_read_as_its_last() {
+        let home = tempfile::tempdir().unwrap();
+        let folder = home.path().join("p");
+        fs::create_dir(&folder).unwrap();
+        let config = home.path().join(".claude.json");
+        let key = real(&folder);
+        let text = format!(
+            "{{\"hasCompletedOnboarding\": false, \"hasCompletedOnboarding\": true, \
+             \"projects\": {{\"{key}\": {{\"hasTrustDialogAccepted\": false}}}}, \
+             \"projects\": {{\"{key}\": {{\"hasTrustDialogAccepted\": true}}}}}}"
+        );
+        fs::write(&config, &text).unwrap();
+        assert!(
+            !ready_claude(&claude(&config), &chosen(&folder, home.path())).unwrap(),
+            "settled already, by the last of each"
+        );
+        assert_eq!(fs::read_to_string(&config).unwrap(), text);
+
+        let text = r#"{"theme": "light", "hasCompletedOnboarding": true, "hasCompletedOnboarding": false}"#;
+        fs::write(&config, text).unwrap();
+        let other = home.path().join("q");
+        fs::create_dir(&other).unwrap();
+        let s = Settle {
+            folder: &other,
+            home: Some(home.path()),
+            chosen: false,
+            version: None,
+        };
+        assert!(ready_claude(&claude(&config), &s).unwrap());
+        let after: Value = serde_json::from_str(&fs::read_to_string(&config).unwrap()).unwrap();
+        assert_eq!(
+            after["hasCompletedOnboarding"],
+            json!(true),
+            "the last one is set"
+        );
+    }
+
+    #[test]
+    fn a_lock_whose_folder_cant_be_read_isnt_left_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join(".claude.json.lock");
+        fs::create_dir(&lock).unwrap();
+        let unread = Err(std::io::Error::other("can't be read"));
+        assert!(Lock::made(lock.clone(), unread).is_none());
+        assert!(!lock.exists(), "removed, not left held");
     }
 }

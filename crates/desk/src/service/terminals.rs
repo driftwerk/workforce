@@ -686,7 +686,7 @@ impl Desk {
                 r.restore_offer = false;
                 r.state = SessionState::Starting;
                 if let Some(cwd) = cwd {
-                    r.cwd = cwd;
+                    r.moved_to(cwd);
                 }
             }),
             None => {
