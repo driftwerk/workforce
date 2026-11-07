@@ -497,29 +497,37 @@ async fn a_session_never_recalls_another_groups_memory_whatever_it_asks() {
         for r in [&acme, &globex] {
             store.put(r).await.unwrap();
         }
-        let index = Arc::new(FakeIndex::default());
-        index.down.store(true, Ordering::SeqCst);
-        let (d, _cancel) = start(&pool, dir.path(), &index).await;
-        harvested(&d, &store, acme.id, 6).await;
-        harvested(&d, &store, globex.id, 6).await;
+        // Each in its client's group, as the sidebar keeps them.
         {
             let client = store.pool().get().await.unwrap();
-            for (id, g) in [(acme.id, "g-acme"), (globex.id, "g-globex")] {
+            for (i, (id, g)) in [(acme.id, "g-acme"), (globex.id, "g-globex")].into_iter().enumerate() {
+                let position = i32::try_from(i).unwrap();
                 client
                     .execute(
-                        "UPDATE memory_exchanges SET group_id = $2 WHERE session = $1",
-                        &[&id, &g],
+                        "INSERT INTO groups (id, name, position, updated_at) VALUES ($1, $1, $2, now())",
+                        &[&g, &position],
+                    )
+                    .await
+                    .unwrap();
+                client
+                    .execute(
+                        "INSERT INTO group_members (item, group_id, position) VALUES ($1, $2, 0)",
+                        &[&format!("session:{id}"), &g],
                     )
                     .await
                     .unwrap();
             }
         }
-        index.down.store(false, Ordering::SeqCst);
+        let index = Arc::new(FakeIndex::default());
+        let (d, _cancel) = start(&pool, dir.path(), &index).await;
+        harvested(&d, &store, acme.id, 6).await;
+        harvested(&d, &store, globex.id, 6).await;
         until(&d, "indexed", async || {
             let s = d.memory_index_status().await.unwrap();
             s.backlog == 0 && s.failing.is_none()
         })
         .await;
+        assert_eq!(index.refs(&collection_of(Some("g-globex"))), closed(&store, globex.id).await);
         let reader = Reader::Session {
             id: acme.id,
             group: Some("g-acme".into()),
