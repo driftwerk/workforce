@@ -2934,3 +2934,49 @@ async fn a_sign_in_claude_code_says_nothing_of_still_files_its_readings_with_the
     })
     .await;
 }
+
+#[tokio::test]
+async fn the_hubs_own_calls_are_offered_the_accounts_default_first_and_tell_desk_of_a_limit() {
+    use crate::engine_accounts::AccountNeed;
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(
+            pool,
+            key_options(dir.path(), Arc::new(MemoryKeys::default())),
+        )
+        .await;
+        let (work, personal, _, _) = two_on_work(&d, dir.path()).await;
+        let offered = d.pool_accounts();
+        assert_eq!(
+            offered,
+            vec![(work, None), (personal, None)],
+            "the default first, no token"
+        );
+        assert_eq!(
+            d.pool_token(personal).map(|t| t.expose().to_string()),
+            Some(OTHER.to_string())
+        );
+        assert_eq!(d.pool_token(Uuid::new_v4()), None);
+        // A call of the hub's own refused on Work: full for Desk too, and
+        // offered as such from then on.
+        let until = chrono::Utc::now() + chrono::Duration::days(2);
+        d.hub_cooling(work, until);
+        let need = until_need(&d).await;
+        assert!(
+            matches!(&need, AccountNeed::Limit { from, .. } if from.id == Some(work)),
+            "{need:?}"
+        );
+        assert_eq!(d.pool_accounts()[0].1, Some(until));
+        // Told again, nothing new.
+        d.hub_cooling(work, until - chrono::Duration::hours(1));
+        assert_eq!(
+            d.0.state.lock().standing[&Some(work)].hit_until,
+            Some(until)
+        );
+    })
+    .await;
+}
+
+async fn until_need(d: &Desk) -> crate::engine_accounts::AccountNeed {
+    until(|| d.account_needs().into_iter().next()).await
+}

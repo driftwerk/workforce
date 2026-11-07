@@ -6,6 +6,7 @@ pub mod chatgpt_backend;
 pub mod cooldown;
 pub mod device_login;
 pub mod errors;
+pub mod install_pool;
 pub mod limits;
 pub mod plan_usage;
 pub mod resolve;

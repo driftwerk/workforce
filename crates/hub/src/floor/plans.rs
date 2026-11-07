@@ -104,7 +104,7 @@ impl PlanUsage for Plans {
         let kind = plan_kind(login.kind);
         let account = match &login.credential {
             Credential::ChatGpt(auth) => auth.account_id().and_then(|id| account_key(kind, &[id])),
-            Credential::Token(_) => None,
+            Credential::Token(_) | Credential::Pooled(_) => None,
         };
         // A login is its credential in its slot: one credential two people
         // keep, a shared Team account's say, is two plans' readings.

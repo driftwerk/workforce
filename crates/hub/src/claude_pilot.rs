@@ -311,7 +311,7 @@ pub async fn run_pilot(
 ) -> Result<PilotResult> {
     let paid = Paid {
         login,
-        auth: ResolvedAuth::resolve(&ClaudeAuth::Resolved(login.clone()))?,
+        auth: ResolvedAuth::resolve(&ClaudeAuth::Resolved(login.clone())).await?,
         caller: &config.agent_id,
     };
 

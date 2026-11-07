@@ -889,7 +889,15 @@ async fn written_on<F: std::future::Future>(
 ) -> Option<F::Output> {
     let work = service.in_background(principal, crate::serve::Route::Model(Some(model)), call);
     match quiet {
-        true => crate::subscription::unowned_by_design(work).await,
+        // A personal hub's Desk: the hub's own work for its person, which
+        // may run on their accounts when the install's login is at its
+        // limit.
+        true => {
+            crate::hub_core::logins::install_pool::hub_own_work(
+                crate::subscription::unowned_by_design(work),
+            )
+            .await
+        }
         false => work.await,
     }
 }

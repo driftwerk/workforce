@@ -814,8 +814,8 @@ mod tests {
             .is_some_and(|t| t.contains("[image removed")));
     }
 
-    #[test]
-    fn claude_completion_command_is_contained() {
+    #[tokio::test]
+    async fn claude_completion_command_is_contained() {
         let (hub, token) = Hub::with_login();
         hub.vault.set("skills/github/token", "ghp-hub").unwrap();
         let completion = CliCompletion::new(hub.plans(), CliKind::ClaudeCode, None, Some(0));
@@ -831,7 +831,7 @@ mod tests {
         .unwrap();
         let input = render(ROUTE, &[LlmMessage::user("hi")]).unwrap();
         let config = completion.config(&login, &workdir, input, "haiku", COMPLETION_TIMEOUT);
-        let auth = ResolvedAuth::resolve(&config.auth).unwrap();
+        let auth = ResolvedAuth::resolve(&config.auth).await.unwrap();
         let command = |config: &ClaudeCodeConfig| {
             claude_code::command(config, &auth, None, Some(&hub.vault), Some(&hub.vault))
         };

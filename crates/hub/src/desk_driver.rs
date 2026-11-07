@@ -690,6 +690,10 @@ pub async fn mount(
     if DESK.set(desk.clone()).is_err() {
         eyre::bail!("desk sessions started twice");
     }
+    // The hub's own Claude calls fail over across the person's accounts.
+    if let Some(vault) = state.vault.as_ref() {
+        crate::desk_pool::install(vault, &desk, state.identity_store.as_ref()).await;
+    }
     // The person's budgets reach agents through the cost governor, and
     // agents' use counts toward Desk's totals: only on a hub running Desk.
     let telemetry = state.telemetry_store.clone().or_else(|| {
