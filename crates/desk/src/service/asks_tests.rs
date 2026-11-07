@@ -525,3 +525,121 @@ async fn a_background_sub_agents_ask_ends_with_its_own_call() {
     })
     .await;
 }
+
+#[tokio::test]
+async fn an_ask_turned_down_in_the_terminal_ends_when_the_turn_goes_on() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (d, logged) = logged_desk(pool, dir.path(), fake_cli(dir.path())).await;
+        let s = asking_session(&d, dir.path()).await;
+        let transcript = dir.path().join("t.jsonl");
+        std::fs::write(&transcript, "").unwrap();
+        post(&d, s.id, json!({"hook_event_name": "SessionStart", "session_id": "cc-1",
+            "transcript_path": transcript.to_string_lossy()})).await;
+        prompted(&d, s.id, "clean up").await;
+        asked(&d, s.id, "toolu_A", "rm -rf build").await;
+        assert!(lists(&logged, 1).await);
+        // A call started beside it, before its dialog is answered: it waits.
+        post(&d, s.id, start("toolu_B", "Read", json!({"file_path": "/etc/hosts"}))).await;
+        assert_eq!(d.view(s.id).unwrap().state, SessionState::Blocked);
+        // "No, and tell Claude what to do differently": no hook says so,
+        // the transcript has its result, and the turn goes on.
+        std::fs::write(
+            &transcript,
+            concat!(
+                r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_A","is_error":true,"content":"The user doesn't want to proceed with this tool use."}]}}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        post(&d, s.id, start("toolu_C", "Bash", json!({"command": "ls build"}))).await;
+        let v = d.view(s.id).unwrap();
+        assert_eq!((v.state, v.pending), (SessionState::Working, None));
+        assert!(lists(&logged, 0).await, "{:?}", needs(&d, &logged));
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_running_sub_agents_ask_outlives_the_main_turn() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (d, logged) = logged_desk(pool, dir.path(), fake_cli(dir.path())).await;
+        let s = asking_session(&d, dir.path()).await;
+        prompted(&d, s.id, "ship it").await;
+        asked(&d, s.id, "toolu_A", "make deploy").await;
+        // A sub-agent in the background asks too, behind it.
+        post(&d, s.id, json!({"hook_event_name": "SubagentStart", "agent_id": "a1"})).await;
+        post(&d, s.id, json!({"hook_event_name": "PreToolUse", "agent_id": "a1", "tool_name": "Bash",
+            "tool_use_id": "toolu_s1", "tool_input": {"command": "git push"}})).await;
+        post(&d, s.id, json!({"hook_event_name": "PermissionRequest", "agent_id": "a1", "tool_name": "Bash",
+            "tool_input": {"command": "git push"}})).await;
+        assert_eq!(d.view(s.id).unwrap().pending.unwrap().call.as_deref(), Some("toolu_A"));
+        // The main turn ends, the sub-agent runs on: its ask shows.
+        post(&d, s.id, json!({"hook_event_name": "Stop", "last_assistant_message": "Deploying in the background.",
+            "background_tasks": [{"id": "a1", "type": "agent", "status": "running"}]})).await;
+        let v = d.view(s.id).unwrap();
+        assert_eq!(v.state, SessionState::Blocked);
+        let p = v.pending.unwrap();
+        assert_eq!((p.call.as_deref(), p.agent.as_deref()), (Some("toolu_s1"), Some("a1")));
+        assert!(
+            logs(&logged, |ops| {
+                let needs = floor::open_needs(&ops.iter().fold(Vec::new(), floor::apply));
+                needs.len() == 1 && needs[0].id.ends_with(&p.id.to_string())
+            })
+            .await,
+            "{:?}",
+            needs(&d, &logged)
+        );
+        // A sub-agent that ended doesn't keep its ask past the turn.
+        post(&d, s.id, json!({"hook_event_name": "SubagentStop", "agent_id": "a1"})).await;
+        assert_eq!(d.view(s.id).unwrap().pending, None);
+        assert!(lists(&logged, 0).await, "{:?}", needs(&d, &logged));
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn another_threads_call_never_ends_a_sub_agents_ask_whose_call_isnt_known() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (d, logged) = logged_desk(pool, dir.path(), fake_cli(dir.path())).await;
+        let s = asking_session(&d, dir.path()).await;
+        prompted(&d, s.id, "tidy").await;
+        post(
+            &d,
+            s.id,
+            json!({"hook_event_name": "SubagentStart", "agent_id": "a1"}),
+        )
+        .await;
+        // Its call came without an id: which it asks about isn't known, and
+        // it has nothing known running.
+        post(
+            &d,
+            s.id,
+            json!({"hook_event_name": "PreToolUse", "agent_id": "a1", "tool_name": "Bash",
+            "tool_input": {"command": "rm -rf tmp"}}),
+        )
+        .await;
+        post(
+            &d,
+            s.id,
+            json!({"hook_event_name": "PermissionRequest", "agent_id": "a1", "tool_name": "Bash",
+            "tool_input": {"command": "rm -rf tmp"}}),
+        )
+        .await;
+        assert_eq!(d.view(s.id).unwrap().pending.unwrap().call, None);
+        assert!(lists(&logged, 1).await);
+        // The main thread's call runs and ends.
+        post(
+            &d,
+            s.id,
+            start("toolu_M", "Read", json!({"file_path": "/etc/hosts"})),
+        )
+        .await;
+        post(&d, s.id, ended("toolu_M", "Read")).await;
+        assert_eq!(d.view(s.id).unwrap().state, SessionState::Blocked);
+        assert_eq!(needs(&d, &logged).len(), 1);
+    })
+    .await;
+}
