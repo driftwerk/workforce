@@ -3,21 +3,24 @@
 use serde_json::Value;
 
 use super::{asker_of, one_line, time};
-use crate::memory::record::{Asker, Part};
+use crate::memory::record::Part;
 
 /// The parts one transcript line holds, keyed by the line's `uuid`:
 /// - a `user` line's words are an Ask, and its `tool_result` blocks are
 ///   Results;
 /// - an `assistant` line's `text` blocks are Text and its `tool_use`
 ///   blocks Calls (its `thinking` is never read), and a message that
-///   stopped at the end of its turn (`stop_reason: "end_turn"`) is an End;
+///   stopped for good (any `stop_reason` but `tool_use` and `pause_turn`:
+///   the turn's end, a stop sequence, its token limit, a refusal) is an End;
+/// - the person stopping it (`[Request interrupted by user…]`) is an End,
+///   never an Ask;
 /// - the summary Claude Code writes at a compaction (`isCompactSummary`)
 ///   is Compacted.
 ///
 /// A sub-agent's lines (`isSidechain`) are its parent's step: the parent's
 /// call's result holds what it found. Claude Code's own messages
-/// (`isMeta`, `<command-…>` and `<local-command-…>` lines, `<synthetic>`
-/// replies) are no one's words.
+/// (`isMeta`, the tags it writes for slash and shell commands, `<synthetic>`
+/// replies) are no one's words; any other prompt, `<` or not, is.
 pub fn claude_part(v: &Value) -> Vec<Part> {
     if v.get("isSidechain").and_then(Value::as_bool) == Some(true) {
         return Vec::new();
@@ -69,8 +72,12 @@ pub fn claude_part(v: &Value) -> Vec<Part> {
                     failed: b["is_error"] == true,
                 })
                 .collect();
+            if text.trim_start().starts_with(INTERRUPTED) {
+                parts.push(Part::End { at });
+                return parts;
+            }
             let asker = asker_of(&text);
-            let own = text.trim_start().starts_with('<') && asker != Asker::Unknown;
+            let own = CLAUDE_TAGS.iter().any(|t| text.trim_start().starts_with(t));
             if !text.trim().is_empty() && !own {
                 parts.insert(
                     0,
@@ -98,7 +105,8 @@ pub fn claude_part(v: &Value) -> Vec<Part> {
                     _ => None,
                 })
                 .collect();
-            if v.pointer("/message/stop_reason").and_then(Value::as_str) == Some("end_turn") {
+            let stopped = v.pointer("/message/stop_reason").and_then(Value::as_str);
+            if stopped.is_some_and(|r| !matches!(r, "tool_use" | "pause_turn")) {
                 parts.push(Part::End { at });
             }
             parts
@@ -106,6 +114,22 @@ pub fn claude_part(v: &Value) -> Vec<Part> {
         _ => Vec::new(),
     }
 }
+
+/// What Claude Code writes when the person stops a turn: the turn's end.
+const INTERRUPTED: &str = "[Request interrupted by user";
+
+/// The tags Claude Code wraps its own lines in: a slash command, its
+/// output, and a `!` shell command and what it printed.
+const CLAUDE_TAGS: [&str; 8] = [
+    "<command-name>",
+    "<command-message>",
+    "<command-args>",
+    "<local-command-stdout>",
+    "<local-command-stderr>",
+    "<bash-input>",
+    "<bash-stdout>",
+    "<bash-stderr>",
+];
 
 /// A `tool_use` block as a call: its files from `file_path` (and a
 /// notebook's path), its command from a shell's `command`.

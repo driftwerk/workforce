@@ -160,13 +160,24 @@ fn item(
     }
 }
 
-/// What Codex sends as the user's but the person didn't write.
+/// What Codex sends as the user's but the person didn't write: its context
+/// blocks (`<environment_context>`, `<user_instructions>`,
+/// `<recommended_plugins>` and the like, each one whole `<snake_case>`
+/// block), and AGENTS.md.
 fn codex_context(text: &str) -> bool {
-    let t = text.trim_start();
-    t.is_empty()
-        || t.starts_with("<environment_context>")
-        || t.starts_with("<user_instructions>")
-        || t.starts_with("# AGENTS.md instructions")
+    let t = text.trim();
+    if t.is_empty() || t.starts_with("# AGENTS.md instructions") {
+        return true;
+    }
+    let Some(rest) = t.strip_prefix('<') else {
+        return false;
+    };
+    let Some((tag, _)) = rest.split_once('>') else {
+        return false;
+    };
+    !tag.is_empty()
+        && tag.chars().all(|c| c.is_ascii_lowercase() || c == '_')
+        && t.ends_with(&format!("</{tag}>"))
 }
 
 /// A shell call's command: `["bash", "-lc", "cargo test"]` as `cargo test`,
