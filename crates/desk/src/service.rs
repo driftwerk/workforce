@@ -624,6 +624,16 @@ struct State {
     own_waiting: Vec<(Value, Option<Uuid>, DateTime<Utc>)>,
     /// The last `/login` each session's transcript showed.
     logins_seen: HashMap<Uuid, String>,
+    /// Who wrote each credential's standing as it is now: its last reading,
+    /// its last stop on the limit. Only what a session wrote itself is taken
+    /// back when it turns out to have run on another sign-in.
+    written_by: HashMap<identities::Raw, identities::WrittenBy>,
+    /// Sessions taken back on an account whose transcript is still being
+    /// read for a `/login` inside them: what they report waits until it is
+    /// known which sign-in they run on.
+    scan_pending: HashSet<Uuid>,
+    /// What those sessions reported meanwhile, as it came.
+    scan_waiting: Vec<identities::Waiting>,
     /// The stop on a limit each session's last turn marked, on which side
     /// and when: a refusal later read as not the plan's undoes only that,
     /// never another session's stop on the same account.
@@ -652,6 +662,10 @@ struct State {
 
 /// The most readings of the CLI's own sign-in held until it is first read.
 const OWN_WAITING_MAX: usize = 64;
+
+/// How long a held session's transcript is read for a `/login` before what
+/// it reported meanwhile is filed as it was.
+const LOGIN_SCAN_WAIT: Duration = Duration::from_secs(60);
 
 /// The stop on a limit a session's turn marked: on which side, when, and
 /// what the side's standing said of its last stop before, to go back to.
@@ -1275,7 +1289,8 @@ impl Desk {
                 Default::default()
             }
         };
-        let (standing, own_standing, moved_off, limit_marks) = kept_standing.clone().into_state();
+        let (standing, own_standing, moved_off, limit_marks, written_by) =
+            kept_standing.clone().into_state();
         let auto_switch = match store.state(accounts::AUTO_SWITCH).await {
             Ok(kept) => kept.is_some_and(|e| e.value == serde_json::json!(true)),
             Err(e) => {
@@ -1383,6 +1398,7 @@ impl Desk {
                 own_standing,
                 moved_off,
                 limit_marks,
+                written_by,
                 auto_switch,
                 ..State::default()
             }),
@@ -1521,21 +1537,39 @@ impl Desk {
         Ok(Pty::spawn_with(spec, cols, rows, history, palette)?)
     }
 
-    /// When a held session's process started: as the hub kept it at its
+    /// When each held session's process started: as the hub kept it at its
     /// start, else (one started before that was kept) as the system says,
-    /// else now.
-    async fn held_since(h: &crate::holder::Held) -> DateTime<Utc> {
-        let kept = h
-            .meta
-            .get("startedAt")
-            .and_then(|v| serde_json::from_value::<DateTime<Utc>>(v.clone()).ok());
-        if let Some(at) = kept {
-            return at;
-        }
-        match h.pid {
-            Some(pid) => procs::started_at(pid).await.unwrap_or_else(Utc::now),
-            None => Utc::now(),
-        }
+    /// all asked at once, else now, said.
+    async fn held_since(held: &HashMap<Uuid, Held>) -> HashMap<Uuid, DateTime<Utc>> {
+        let kept = |h: &Held| {
+            h.meta
+                .get("startedAt")
+                .and_then(|v| serde_json::from_value::<DateTime<Utc>>(v.clone()).ok())
+        };
+        let asked = held
+            .iter()
+            .filter(|(_, h)| kept(h).is_none())
+            .map(|(id, h)| {
+                let pid = h.pid;
+                async move {
+                    let at = match pid {
+                        Some(pid) => procs::started_at(pid).await,
+                        None => None,
+                    };
+                    (*id, at)
+                }
+            });
+        let os: HashMap<Uuid, Option<DateTime<Utc>>> =
+            futures::future::join_all(asked).await.into_iter().collect();
+        held.iter()
+            .map(|(id, h)| {
+                let at = kept(h).or_else(|| os.get(id).copied().flatten()).unwrap_or_else(|| {
+                    tracing::warn!(session = %id, "couldn't tell when a held session's process started: a /login inside it before now isn't looked for");
+                    Utc::now()
+                });
+                (*id, at)
+            })
+            .collect()
     }
 
     /// Takes back the sessions whose processes the holder kept while the
@@ -1550,6 +1584,7 @@ impl Desk {
             return;
         };
         let history = crate::pty::history_rows(self.0.opts.scrollback_bytes);
+        let since = Self::held_since(&held.sessions).await;
         for (id, h) in std::mem::take(&mut held.sessions) {
             let known = self.0.state.lock().records.get(&id).cloned();
             let Some(record) = known else {
@@ -1557,7 +1592,7 @@ impl Desk {
                 continue;
             };
             let (pty, exit) = holder.adopt(&h, history, Some(self.0.palette.clone()));
-            let started_at = Self::held_since(&h).await;
+            let started_at = since.get(&id).copied().unwrap_or_else(Utc::now);
             let codex = match held.servers.remove(&id) {
                 Some(server) if record.engine == Engine::Codex => {
                     let socket = server.meta["socket"].as_str().map(PathBuf::from);
@@ -1572,7 +1607,22 @@ impl Desk {
                     None
                 }
             };
-            self.0.state.lock().live.insert(
+            // On an account, its transcript changed since its process
+            // started: read for a `/login` inside it before what it reports
+            // is filed.
+            let scan = match (record.engine, &record.transcript, record.account) {
+                (Engine::Claude, Some(path), Some(_)) => std::fs::metadata(path)
+                    .and_then(|m| m.modified())
+                    .is_ok_and(|m| DateTime::<Utc>::from(m) >= started_at)
+                    .then(|| PathBuf::from(path)),
+                _ => None,
+            };
+            let mut st = self.0.state.lock();
+            let scan = scan.filter(|_| !st.relogged.contains(&id));
+            if scan.is_some() {
+                st.scan_pending.insert(id);
+            }
+            st.live.insert(
                 id,
                 Live {
                     pty: Arc::new(pty),
@@ -1609,6 +1659,7 @@ impl Desk {
                     breaker: Default::default(),
                 },
             );
+            drop(st);
             tokio::spawn(self.clone().on_exit(id, exit));
             if !record.state.is_running() {
                 self.change(id, |r, _| r.state = SessionState::Idle);
@@ -1618,20 +1669,28 @@ impl Desk {
             tracing::info!(%id, "desk session taken back from the PTY holder");
             // A `/login` inside it while the hub was away, or before this hub
             // could tell: it runs on that sign-in.
-            if let (Engine::Claude, Some(path)) = (record.engine, record.transcript.clone()) {
+            if let Some(path) = scan {
                 let desk = self.clone();
                 tokio::spawn(async move {
-                    let found = tokio::task::spawn_blocking(move || {
-                        transcript::last_login_since(Path::new(&path), started_at)
-                            .ok()
-                            .flatten()
-                    })
-                    .await
-                    .ok()
-                    .flatten();
-                    if let Some(found) = found {
-                        desk.login_found(id, found).await;
-                    }
+                    let read = tokio::task::spawn_blocking(move || {
+                        transcript::last_login_since(&path, started_at)
+                    });
+                    let found = match tokio::time::timeout(LOGIN_SCAN_WAIT, read).await {
+                        Ok(Ok(Ok(found))) => found,
+                        Ok(Ok(Err(e))) => {
+                            tracing::warn!(session = %id, error = %e, "couldn't read a session's transcript for a /login inside it");
+                            None
+                        }
+                        Ok(Err(e)) => {
+                            tracing::warn!(session = %id, error = %e, "reading a session's transcript for a /login failed");
+                            None
+                        }
+                        Err(_) => {
+                            tracing::warn!(session = %id, "reading a session's transcript for a /login took too long: what it reports is filed as before");
+                            None
+                        }
+                    };
+                    desk.login_scan_done(id, found).await;
                 });
             }
         }
@@ -1740,7 +1799,13 @@ impl Desk {
             // When Claude Code said it resets; else what a reading says. The
             // account it stopped on, whichever credential of it it ran on.
             let raw = Self::raw_running(st, id);
-            Self::mark_hit(st, &raw, view.failure.as_ref().and_then(|f| f.limit()));
+            Self::mark_hit(
+                st,
+                id,
+                &raw,
+                view.failure.as_ref().and_then(|f| f.limit()),
+                Utc::now(),
+            );
             let desk = self.clone();
             tokio::spawn(async move { desk.accounts_moved().await });
         }
@@ -2012,6 +2077,16 @@ impl Desk {
         // is: one card per account, whichever credential of it reported.
         let (raw, ids) = {
             let mut st = self.0.state.lock();
+            // Its transcript still being read for a `/login` inside it: kept
+            // until it is known which sign-in it runs on.
+            if let Some(id) = session.filter(|id| st.scan_pending.contains(id)) {
+                if st.scan_waiting.len() >= OWN_WAITING_MAX {
+                    st.scan_waiting.remove(0);
+                }
+                st.scan_waiting
+                    .push(identities::Waiting::Usage(limits, id, at));
+                return;
+            }
             let raw = match session {
                 Some(id) => Self::raw_running(&st, id),
                 None => Self::raw_of(&st, None),
@@ -2039,7 +2114,11 @@ impl Desk {
         let windows = plans.windows(LocalPlan::Claude, &limits);
         plans.local_at(LocalPlan::Claude, limits, account, at);
         self.observe_print(&raw, &windows, at);
-        self.plan_read(&raw, windows, at);
+        let by = session.map_or(
+            identities::Writer::Unattributed,
+            identities::Writer::Session,
+        );
+        self.plan_read(&raw, windows, at, by);
     }
 
     /// The process a session's own background work runs under: its
@@ -4870,19 +4949,33 @@ impl Desk {
 
     /// `account` stopped on its plan's limit now: full until `hit` says it
     /// resets, else until a reading says it has room.
+    ///
+    /// Session `id` stopped it: while its transcript is still read for a
+    /// `/login` inside it, the stop waits (`None`) to be marked on the
+    /// sign-in it ran on.
     fn mark_hit(
         st: &mut State,
+        id: Uuid,
         raw: &identities::Raw,
         hit: Option<&crate::limit::LimitHit>,
-    ) -> DateTime<Utc> {
-        let now = Utc::now();
+        now: DateTime<Utc>,
+    ) -> Option<DateTime<Utc>> {
+        if st.scan_pending.contains(&id) {
+            if st.scan_waiting.len() >= OWN_WAITING_MAX {
+                st.scan_waiting.remove(0);
+            }
+            st.scan_waiting
+                .push(identities::Waiting::Hit(id, hit.cloned(), now));
+            return None;
+        }
         let standing = Self::standing_mut(st, raw);
         standing.hit_at = Some(now);
         standing.hit_until = hit
             .and_then(|h| h.resets_at)
             .or(standing.hit_until.filter(|u| *u > now));
         standing.hit_window = hit.and_then(|h| h.minutes());
-        now
+        Self::wrote_hit(st, raw, identities::Writer::Session(id));
+        Some(now)
     }
 
     /// Session `id`'s turn stopped `account` on its limit now; kept as the
@@ -4893,9 +4986,22 @@ impl Desk {
         raw: &identities::Raw,
         hit: Option<&crate::limit::LimitHit>,
     ) {
+        Self::mark_session_hit_at(st, id, raw, hit, Utc::now());
+    }
+
+    /// [`Self::mark_session_hit`], of a stop at `now`.
+    fn mark_session_hit_at(
+        st: &mut State,
+        id: Uuid,
+        raw: &identities::Raw,
+        hit: Option<&crate::limit::LimitHit>,
+        now: DateTime<Utc>,
+    ) {
         let s = Self::standing_mut(st, raw);
         let before = (s.hit_at, s.hit_until, s.hit_window);
-        let at = Self::mark_hit(st, raw, hit);
+        let Some(at) = Self::mark_hit(st, id, raw, hit, now) else {
+            return;
+        };
         st.limit_marks.insert(
             id,
             LimitMark {
@@ -5008,6 +5114,9 @@ impl Desk {
                         if s.hit_at == Some(mark.at) {
                             // Back to what the last stop before it said.
                             (s.hit_at, s.hit_until, s.hit_window) = mark.before;
+                            if let Some(by) = st.written_by.get_mut(&mark.side) {
+                                by.hit = None;
+                            }
                         }
                     }
                     st.turn_failures.insert(id, TurnFailure::Failed(error));
@@ -6219,7 +6328,11 @@ mod tests {
             ));
             std::fs::write(&transcript, lines.join("\n")).unwrap();
             let path = transcript.to_string_lossy().into_owned();
-            first.change(s.id, |r, _| r.transcript = Some(path));
+            // On an account: only then is it read for one.
+            first.change(s.id, |r, _| {
+                r.transcript = Some(path);
+                r.account = Some(Uuid::new_v4());
+            });
             tokio::time::sleep(Duration::from_millis(200)).await;
             first_cancel.cancel();
             tokio::time::sleep(Duration::from_millis(300)).await;
@@ -6239,19 +6352,23 @@ mod tests {
                 began,
                 "its process started when it did, not when it was taken back"
             );
-            let mut seen = None;
-            for _ in 0..200 {
-                seen = second.0.state.lock().logins_seen.get(&s.id).cloned();
-                if seen.is_some() {
+            // Once the CLI's sign-in is read (the stand-in CLI never says:
+            // its read gives up after a while).
+            for _ in 0..1600 {
+                if second.0.state.lock().relogged.contains(&s.id) {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(25)).await;
             }
-            assert_eq!(
-                seen.as_deref(),
-                Some("in-1"),
-                "the login inside it is found however far back"
-            );
+            {
+                let st = second.0.state.lock();
+                assert!(
+                    st.relogged.contains(&s.id),
+                    "the login inside it is found however far back"
+                );
+                assert_eq!(st.logins_seen.get(&s.id).map(String::as_str), Some("in-1"));
+                assert!(st.scan_pending.is_empty(), "what it reports is filed again");
+            }
             assert_eq!(v.state, SessionState::Working, "not interrupted");
             assert!(second.restore_offer().is_empty(), "nothing to restore");
             assert_eq!(

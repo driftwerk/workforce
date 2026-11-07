@@ -142,22 +142,53 @@ fn absorb(mut tail: Tail, v: &Value) -> Tail {
     tail
 }
 
-/// A `/login` Claude Code confirmed in a session, and the plan limit its
-/// turn stopped on last before it: on the credential it ran on until then.
+/// The `/login`s Claude Code confirmed in a session since its process
+/// started, and the plan limit its turn stopped on last before the first:
+/// on the credential it ran on until then.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SignedInAgain {
-    /// Its line's id.
-    pub id: String,
-    pub at: chrono::DateTime<chrono::Utc>,
-    /// When its turn last stopped on the plan's limit before the `/login`
-    /// (since `since`), and the limit it stopped on.
+    /// The first one since: from then on it ran on another sign-in.
+    pub first_at: chrono::DateTime<chrono::Utc>,
+    /// The last one's line id and when: the one a later read of the tail
+    /// sees, so it is never taken for a new one.
+    pub last_id: String,
+    pub last_at: chrono::DateTime<chrono::Utc>,
+    /// When its turn last stopped on the plan's limit before the first
+    /// (since the process started), and the limit it stopped on.
     pub hit_before: Option<(chrono::DateTime<chrono::Utc>, crate::limit::LimitHit)>,
 }
 
-/// The last `/login` Claude Code confirmed in the whole transcript at or
-/// after `since` (when its process started), however far back it is: a
-/// long turn since buries it far past the tail. Only the lines that could
-/// say one are read.
+/// One transcript line, as far as a `/login` scan reads it: borrowed where
+/// it can be, its content only when it is text.
+#[derive(serde::Deserialize)]
+struct LoginLine<'a> {
+    #[serde(rename = "type", borrow)]
+    kind: Option<std::borrow::Cow<'a, str>>,
+    #[serde(borrow)]
+    uuid: Option<std::borrow::Cow<'a, str>>,
+    #[serde(borrow)]
+    timestamp: Option<std::borrow::Cow<'a, str>>,
+    #[serde(borrow)]
+    message: Option<LoginMessage<'a>>,
+}
+
+#[derive(serde::Deserialize)]
+struct LoginMessage<'a> {
+    #[serde(borrow)]
+    content: Option<LoginContent<'a>>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum LoginContent<'a> {
+    Text(#[serde(borrow)] std::borrow::Cow<'a, str>),
+    Other(serde::de::IgnoredAny),
+}
+
+/// The `/login`s Claude Code confirmed in the whole transcript at or after
+/// `since` (when its process started), however far back they are: a long
+/// turn since buries them far past the tail. Only the lines that could say
+/// one are read, and only those that do are parsed whole.
 pub fn last_login_since(
     path: &Path,
     since: chrono::DateTime<chrono::Utc>,
@@ -167,35 +198,40 @@ pub fn last_login_since(
     let mut raw = Vec::new();
     let mut pending: Option<(String, chrono::DateTime<chrono::Utc>)> = None;
     let mut hit: Option<(chrono::DateTime<chrono::Utc>, crate::limit::LimitHit)> = None;
-    let mut found = None;
+    let mut found: Option<SignedInAgain> = None;
     loop {
         raw.clear();
         if reader.read_until(b'\n', &mut raw)? == 0 {
             return Ok(found);
         }
         let line = String::from_utf8_lossy(&raw);
-        if !(line.contains("/login</command-name>")
-            || line.contains("<local-command-stdout>")
-            || line.contains("\"isApiErrorMessage\""))
+        let error = line.contains("\"isApiErrorMessage\"");
+        if !(error
+            || line.contains("/login</command-name>")
+            || line.contains("<local-command-stdout>"))
         {
             continue;
         }
-        let Ok(v) = serde_json::from_str::<Value>(&line) else {
+        let Ok(l) = serde_json::from_str::<LoginLine<'_>>(&line) else {
             continue;
         };
-        let at = v
-            .get("timestamp")
-            .and_then(Value::as_str)
+        // A line with no time can't be placed against the process's start:
+        // never one inside it (Claude Code stamps every line it writes).
+        let Some(at) = l
+            .timestamp
+            .as_deref()
             .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
-            .map(|t| t.to_utc());
-        match v.get("type").and_then(Value::as_str) {
+            .map(|t| t.to_utc())
+        else {
+            continue;
+        };
+        match l.kind.as_deref() {
             Some("user") => {
-                let Some(text) = v.pointer("/message/content").and_then(Value::as_str) else {
+                let Some(LoginContent::Text(text)) = l.message.and_then(|m| m.content) else {
                     continue;
                 };
                 if text.starts_with("<command-name>/login</command-name>") {
-                    let id = v.get("uuid").and_then(Value::as_str).map(str::to_string);
-                    pending = id.zip(at);
+                    pending = l.uuid.map(|id| (id.into_owned(), at));
                 } else if text.starts_with("<local-command-stdout>") {
                     let Some((id, at)) = pending.take() else {
                         continue;
@@ -203,23 +239,35 @@ pub fn last_login_since(
                     if !text.starts_with("<local-command-stdout>Login successful") {
                         continue;
                     }
-                    // On another sign-in from here: a limit before it was
-                    // the last one's.
-                    let before = hit.take();
-                    if at >= since {
-                        found = Some(SignedInAgain {
-                            id,
-                            at,
-                            hit_before: before,
-                        });
+                    if at < since {
+                        // Before its process started: a limit before it
+                        // was another sign-in's.
+                        hit = None;
+                        continue;
+                    }
+                    match &mut found {
+                        // The first: what it stopped on before is the
+                        // credential's it ran on until then.
+                        None => {
+                            found = Some(SignedInAgain {
+                                first_at: at,
+                                last_id: id,
+                                last_at: at,
+                                hit_before: hit.take(),
+                            })
+                        }
+                        Some(f) => {
+                            f.last_id = id;
+                            f.last_at = at;
+                        }
                     }
                 }
             }
-            Some("assistant") => {
-                if let (Some(at), Some(crate::limit::TurnFailure::Limit(h))) =
-                    (at, crate::limit::in_transcript_line(&v))
-                {
-                    if at >= since {
+            Some("assistant") if error && at >= since && found.is_none() => {
+                if let Ok(v) = serde_json::from_str::<Value>(&line) {
+                    if let Some(crate::limit::TurnFailure::Limit(h)) =
+                        crate::limit::in_transcript_line(&v)
+                    {
                         hit = Some((at, h));
                     }
                 }
@@ -379,8 +427,12 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(
-            (found.id.as_str(), found.at),
-            ("late", at("2026-11-07T07:53:27Z"))
+            (found.first_at, found.last_id.as_str(), found.last_at),
+            (
+                at("2026-11-07T07:53:27Z"),
+                "late",
+                at("2026-11-07T07:53:27Z")
+            )
         );
         let (hit_at, hit) = found.hit_before.unwrap();
         assert_eq!(hit_at, at("2026-11-07T07:52:29Z"));
@@ -393,13 +445,48 @@ mod tests {
             last_login_since(f.path(), at("2026-11-07T08:00:00Z")).unwrap(),
             None
         );
-        // Started before both: the last one, and only the limit since the
-        // one before it.
+        // Started before both: from the first, with the limit before it.
         let found = last_login_since(f.path(), at("2026-11-01T00:00:00Z"))
             .unwrap()
             .unwrap();
-        assert_eq!(found.id, "late");
-        assert_eq!(found.hit_before.unwrap().0, at("2026-11-07T07:52:29Z"));
+        assert_eq!(
+            (found.first_at, found.last_id.as_str()),
+            (at("2026-11-05T08:46:05Z"), "late")
+        );
+        assert_eq!(found.hit_before.unwrap().0, at("2026-11-05T07:32:30Z"));
+    }
+
+    #[test]
+    fn two_logins_inside_a_process_take_it_off_its_account_at_the_first() {
+        let at = |s: &str| chrono::DateTime::parse_from_rfc3339(s).unwrap().to_utc();
+        let lines = [
+            r#"{"type":"assistant","timestamp":"2026-11-07T07:00:00Z","isApiErrorMessage":true,"apiError":"usage_limit_reached","apiErrorParams":{"rate_limit_info":{"status":"rejected","resetsAt":1794466800,"rateLimitType":"seven_day"}},"message":{"content":[]}}"#,
+            r#"{"type":"user","uuid":"one","timestamp":"2026-11-07T07:10:00Z","message":{"role":"user","content":"<command-name>/login</command-name>"}}"#,
+            r#"{"type":"user","uuid":"one-s","timestamp":"2026-11-07T07:10:00Z","message":{"role":"user","content":"<local-command-stdout>Login successful</local-command-stdout>"}}"#,
+            // Its new sign-in's own limit: never the account's.
+            r#"{"type":"assistant","timestamp":"2026-11-07T08:00:00Z","isApiErrorMessage":true,"apiError":"usage_limit_reached","apiErrorParams":{"rate_limit_info":{"status":"rejected","resetsAt":1794596400,"rateLimitType":"seven_day"}},"message":{"content":[]}}"#,
+            r#"{"type":"user","uuid":"two","timestamp":"2026-11-07T08:10:00Z","message":{"role":"user","content":"<command-name>/login</command-name>"}}"#,
+            r#"{"type":"user","uuid":"two-s","timestamp":"2026-11-07T08:10:00Z","message":{"role":"user","content":"<local-command-stdout>Login successful</local-command-stdout>"}}"#,
+            // No time: never placed against the start.
+            r#"{"type":"user","uuid":"three","message":{"role":"user","content":"<command-name>/login</command-name>"}}"#,
+        ];
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        for line in lines {
+            writeln!(f, "{line}").unwrap();
+        }
+        let found = last_login_since(f.path(), at("2026-11-07T06:00:00Z"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.first_at, at("2026-11-07T07:10:00Z"));
+        assert_eq!(
+            (found.last_id.as_str(), found.last_at),
+            ("two", at("2026-11-07T08:10:00Z"))
+        );
+        let (hit_at, hit) = found.hit_before.unwrap();
+        assert_eq!(
+            (hit_at, hit.resets_at),
+            (at("2026-11-07T07:00:00Z"), Some(at("2026-11-12T07:00:00Z")))
+        );
     }
 
     #[test]

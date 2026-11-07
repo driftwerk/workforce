@@ -26,11 +26,91 @@ const REWRITE_EVERY: Duration = Duration::from_secs(60);
 const MOVED: f64 = 1.0;
 
 /// Keeps readings in the floor's store, each login's no more often than it
-/// says something new, telling whose plan it is when one is kept.
+/// says something new, telling whose plan it is when one is kept. Every
+/// write goes through one writer, in the order it was asked for: a reading
+/// forgotten is never one kept after it.
 pub struct Plans {
+    written: Mutex<HashMap<String, (Vec<Window>, Instant)>>,
+    writes: tokio::sync::mpsc::UnboundedSender<Write>,
+}
+
+/// One write to the floor's plan readings.
+enum Write {
+    Keep(Reading),
+    /// Forget the login's reading taken at `exact` (if it is still the one
+    /// kept), then keep `instead`.
+    Forget {
+        login: String,
+        exact: Option<chrono::DateTime<Utc>>,
+        instead: Option<Reading>,
+    },
+}
+
+/// How often forgetting a reading is tried before it is given up on.
+const FORGET_TRIES: u32 = 4;
+
+/// Carries out `writes` one after the other.
+async fn write(
     store: Arc<PgFloorStore>,
     signals: Signals,
-    written: Mutex<HashMap<String, (Vec<Window>, Instant)>>,
+    mut writes: tokio::sync::mpsc::UnboundedReceiver<Write>,
+) {
+    let kept = |r: Reading| {
+        let (store, signals) = (Arc::clone(&store), signals.clone());
+        async move {
+            match store.record(&r).await {
+                Ok(true) => {
+                    signals.send(DeskSignal::Usage, r.login.owner());
+                    true
+                }
+                Ok(false) => false,
+                Err(e) => {
+                    tracing::warn!(target: "floor", error = %format!("{e:#}"), "keeping a plan reading failed");
+                    false
+                }
+            }
+        }
+    };
+    while let Some(w) = writes.recv().await {
+        match w {
+            Write::Keep(r) => {
+                kept(r).await;
+            }
+            Write::Forget {
+                login,
+                exact,
+                instead,
+            } => {
+                let mut forgot = false;
+                if let Some(exact) = exact {
+                    let mut wait = Duration::from_millis(500);
+                    for attempt in 1..=FORGET_TRIES {
+                        match store.forget_reading(&login, exact).await {
+                            Ok(gone) => {
+                                forgot = gone;
+                                break;
+                            }
+                            Err(e) if attempt < FORGET_TRIES => {
+                                tracing::warn!(target: "floor", error = %format!("{e:#}"), attempt, "forgetting a plan reading failed: trying again");
+                                tokio::time::sleep(wait).await;
+                                wait *= 2;
+                            }
+                            Err(e) => {
+                                tracing::warn!(target: "floor", error = %format!("{e:#}"), "forgetting a plan reading failed: given up");
+                            }
+                        }
+                    }
+                }
+                let kept = match instead {
+                    Some(r) => kept(r).await,
+                    None => false,
+                };
+                if forgot && !kept {
+                    signals.send(DeskSignal::Usage, None);
+                }
+            }
+        }
+    }
 }
 
 /// Whether `windows` say something the reading last written didn't: a
@@ -51,10 +131,11 @@ fn worth_writing(last: Option<&(Vec<Window>, Instant)>, windows: &[Window]) -> b
 
 impl Plans {
     pub fn new(store: Arc<PgFloorStore>, signals: Signals) -> Arc<Self> {
+        let (writes, rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(write(store, signals, rx));
         Arc::new(Self {
-            store,
-            signals,
             written: Mutex::new(HashMap::new()),
+            writes,
         })
     }
 
@@ -67,17 +148,7 @@ impl Plans {
             }
             written.insert(key, (reading.windows.clone(), Instant::now()));
         }
-        let store = Arc::clone(&self.store);
-        let signals = self.signals.clone();
-        tokio::spawn(async move {
-            match store.record(&reading).await {
-                Ok(true) => signals.send(DeskSignal::Usage, reading.login.owner()),
-                Ok(false) => {}
-                Err(e) => {
-                    tracing::warn!(target: "floor", error = %format!("{e:#}"), "keeping a plan reading failed")
-                }
-            }
-        });
+        let _ = self.writes.send(Write::Keep(reading));
     }
 }
 
@@ -187,7 +258,7 @@ impl PlanSink for Plans {
         &self,
         plan: LocalPlan,
         account: LocalAccount,
-        since: chrono::DateTime<Utc>,
+        exact: Option<chrono::DateTime<Utc>>,
         instead: Option<(Value, chrono::DateTime<Utc>)>,
     ) {
         let (kind, windows): (_, fn(&Value) -> Vec<Window>) = match plan {
@@ -208,30 +279,13 @@ impl PlanSink for Plans {
         let instead = instead
             .map(|(payload, at)| reading(windows(&payload), at))
             .filter(|r| !r.windows.is_empty());
-        let login = super::postgres::login_key(&reading(Vec::new(), since));
-        // Written again whatever was last: the one kept is gone.
+        let login = super::postgres::login_key(&reading(Vec::new(), Utc::now()));
+        // Written again whatever was last: the one kept may be gone.
         self.written.lock().remove(&login);
-        let store = Arc::clone(&self.store);
-        let signals = self.signals.clone();
-        tokio::spawn(async move {
-            // Forgotten first, then its own kept: one after the other.
-            let forgot = match store.forget_reading(&login, since).await {
-                Ok(forgot) => forgot,
-                Err(e) => {
-                    tracing::warn!(target: "floor", error = %format!("{e:#}"), "forgetting a plan reading failed");
-                    return;
-                }
-            };
-            let kept = match &instead {
-                Some(r) => store.record(r).await.unwrap_or_else(|e| {
-                    tracing::warn!(target: "floor", error = %format!("{e:#}"), "keeping a plan reading failed");
-                    false
-                }),
-                None => false,
-            };
-            if forgot || kept {
-                signals.send(DeskSignal::Usage, None);
-            }
+        let _ = self.writes.send(Write::Forget {
+            login,
+            exact,
+            instead,
         });
     }
 }
@@ -270,7 +324,8 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_reading_another_sign_in_made_is_forgotten_and_the_accounts_own_kept_instead() {
+    async fn a_reading_another_sign_in_made_is_forgotten_in_order_and_only_while_it_is_the_one_kept(
+    ) {
         use workforce_postgres::test_support::with_test_pool;
         with_test_pool(PgFloorStore::build_pool, |pool| async move {
             let store = Arc::new(PgFloorStore::with_pool(pool).await.unwrap());
@@ -283,54 +338,51 @@ mod tests {
             let now = chrono::DateTime::from_timestamp(Utc::now().timestamp(), 0).unwrap();
             let at = |mins: i64| now - chrono::Duration::minutes(mins);
             let resets = chrono::DateTime::from_timestamp(now.timestamp() + 86_400, 0).unwrap();
-            // Another sign-in's plan, filed as this account's after the
-            // login ten minutes ago.
-            plans.local_at(
-                LocalPlan::Claude,
-                serde_json::json!([{"kind": "seven_day", "percentUsed": 26, "resetsAt": "2026-11-13T19:00:00Z"}]),
-                account(),
-                at(5),
-            );
-            let kept = || async { store.readings().await.unwrap() };
-            for _ in 0..200 {
-                if !kept().await.is_empty() {
-                    break;
+            let weekly = |used: u32, resets: &str| {
+                serde_json::json!([{"kind": "seven_day", "percentUsed": used, "resetsAt": resets}])
+            };
+            let full = || Some((weekly(100, &resets.to_rfc3339()), at(11)));
+            let (p, st) = (&plans, &store);
+            let settled = |used: u32| async move {
+                // Every write before this one is done: the writer is in order.
+                let marker = LocalAccount {
+                    ids: vec!["marker".into()],
+                    plan: None,
+                };
+                // Its own time, later each call: kept over the last one.
+                let n = now + chrono::Duration::seconds(i64::from(used));
+                p.local_at(LocalPlan::Claude, weekly(used, "2026-11-13T19:00:00Z"), marker, n);
+                loop {
+                    let kept = st.readings().await.unwrap();
+                    if kept.iter().any(|r| r.account == account_key(PlanKind::Claude, &["marker".into()]) && r.observed_at == n) {
+                        return kept
+                            .into_iter()
+                            .filter(|r| r.account == account_key(PlanKind::Claude, &["desk-account:star".into()]))
+                            .collect::<Vec<_>>();
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
                 }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-            plans.forget_local(
-                LocalPlan::Claude,
-                account(),
-                at(10),
-                Some((
-                    serde_json::json!([{"kind": "seven_day", "percentUsed": 100, "resetsAt": resets.to_rfc3339()}]),
-                    at(11),
-                )),
-            );
-            let mut now_kept = Vec::new();
-            for _ in 0..200 {
-                now_kept = kept().await;
-                if now_kept.first().is_some_and(|r| r.observed_at == at(11)) {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-            assert_eq!(now_kept.len(), 1);
-            let r = &now_kept[0];
-            assert_eq!(r.login, LoginRef::Mac);
+            };
+            // Another sign-in's plan, filed as this account's, and forgotten
+            // at once: in order, never before it was kept.
+            plans.local_at(LocalPlan::Claude, weekly(26, "2026-11-13T19:00:00Z"), account(), at(5));
+            plans.forget_local(LocalPlan::Claude, account(), Some(at(5)), full());
+            let kept = settled(1).await;
+            assert_eq!(kept.len(), 1);
             assert_eq!(
-                r.account,
-                account_key(PlanKind::Claude, &["desk-account:star".into()])
-            );
-            assert_eq!(
-                (r.windows[0].used_percent, r.windows[0].resets_at, r.observed_at),
+                (kept[0].windows[0].used_percent, kept[0].windows[0].resets_at, kept[0].observed_at),
                 (100.0, Some(resets), at(11)),
                 "the account's own limit, as it stopped on it"
             );
-            // One before the login stands.
-            plans.forget_local(LocalPlan::Claude, account(), at(1), None);
-            tokio::time::sleep(Duration::from_millis(200)).await;
-            assert_eq!(kept().await.len(), 1);
+            // A later reading, someone else's, stands: only the one taken
+            // then is forgotten, and the limit is never kept over it.
+            plans.local_at(LocalPlan::Claude, weekly(40, "2026-11-13T19:00:00Z"), account(), at(2));
+            plans.forget_local(LocalPlan::Claude, account(), Some(at(5)), full());
+            let kept = settled(9).await;
+            assert_eq!(
+                (kept[0].windows[0].used_percent, kept[0].observed_at),
+                (40.0, at(2))
+            );
         })
         .await;
     }

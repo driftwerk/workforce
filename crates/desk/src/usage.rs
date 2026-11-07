@@ -52,14 +52,17 @@ pub trait PlanSink: Send + Sync {
         None
     }
 
-    /// What this computer reported as `account`'s since `since` was another
-    /// sign-in's: forgotten, and `instead` (a reading of the account's own,
-    /// as `plan`'s CLI reports one, taken at its time) kept in its place.
+    /// The reading this computer reported as `account`'s at `exact` was
+    /// another sign-in's: forgotten, only if it is still the one kept (a
+    /// later one, someone else's, stands). `instead` (a reading of the
+    /// account's own, as `plan`'s CLI reports one, taken at its time) is
+    /// kept as any reading is: only over an older one. In order with every
+    /// reading kept before it.
     fn forget_local(
         &self,
         _plan: LocalPlan,
         _account: LocalAccount,
-        _since: chrono::DateTime<chrono::Utc>,
+        _exact: Option<chrono::DateTime<chrono::Utc>>,
         _instead: Option<(Value, chrono::DateTime<chrono::Utc>)>,
     ) {
     }

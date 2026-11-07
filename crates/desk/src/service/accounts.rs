@@ -218,12 +218,14 @@ impl Desk {
                 }),
                 // As last seen: the store is never read under this lock.
                 signed_in: keys.is_some() && st.signed_in_accounts.contains(&a.id),
-                // On it now: not one signed in again inside since.
+                // On it now, by the credential each runs on: one signed in
+                // again inside counts on the account its sign-in is.
                 sessions: st
                     .records
                     .values()
                     .filter(|r| {
-                        st.live.contains_key(&r.id) && Self::running_on(&st, r.id) == Some(a.id)
+                        st.live.contains_key(&r.id)
+                            && Self::side_of_session(&st, r.id) == Some(Some(a.id))
                     })
                     .map(|r| r.id)
                     .collect(),
@@ -529,10 +531,12 @@ impl Desk {
                 return;
             }
             // Kept as the account's own: the call ran on its token.
-            let standing = Self::standing_mut(&mut st, &super::identities::Raw::Account(account));
+            let raw = super::identities::Raw::Account(account);
+            let standing = Self::standing_mut(&mut st, &raw);
             standing.hit_at = Some(now);
             standing.hit_until = Some(until);
             standing.hit_window = None;
+            Self::wrote_hit(&mut st, &raw, super::identities::Writer::Pool);
         }
         tracing::info!(%account, %until, "the hub's own call found an account at its limit");
         // Told from wherever a login is resolved, which may have no runtime.
@@ -1478,6 +1482,8 @@ pub(super) struct KeptStanding {
     pub own: std::collections::BTreeMap<String, accounts::Standing>,
     pub moves: Vec<super::identities::RawMove>,
     pub marks: Vec<(Uuid, super::LimitMark)>,
+    /// Who wrote each credential's standing as it is.
+    pub by: Vec<(super::identities::Raw, super::identities::WrittenBy)>,
 }
 
 type KeptState = (
@@ -1485,6 +1491,7 @@ type KeptState = (
     std::collections::HashMap<String, accounts::Standing>,
     Vec<super::identities::RawMove>,
     std::collections::HashMap<Uuid, super::LimitMark>,
+    std::collections::HashMap<super::identities::Raw, super::identities::WrittenBy>,
 );
 
 impl KeptStanding {
@@ -1506,6 +1513,11 @@ impl KeptStanding {
                 .iter()
                 .map(|(id, m)| (*id, m.clone()))
                 .collect(),
+            by: st
+                .written_by
+                .iter()
+                .map(|(r, b)| (r.clone(), b.clone()))
+                .collect(),
         }
     }
 
@@ -1521,6 +1533,7 @@ impl KeptStanding {
             self.own.into_iter().collect(),
             self.moves,
             self.marks.into_iter().collect(),
+            self.by.into_iter().collect(),
         )
     }
 }
@@ -1763,7 +1776,18 @@ impl Desk {
                 let Some(id) = id else {
                     continue;
                 };
-                if st.standing.entry(Some(id)).or_default().learn(&standing) {
+                let s = st.standing.entry(Some(id)).or_default();
+                let before = (s.read_at, s.hit_at);
+                if s.learn(&standing) {
+                    // Another computer's: none of this one's sessions wrote it.
+                    let after = (s.read_at, s.hit_at);
+                    let raw = super::identities::Raw::Account(id);
+                    if after.0 != before.0 {
+                        Self::wrote_read(&mut st, &raw, super::identities::Writer::Elsewhere);
+                    }
+                    if after.1 != before.1 {
+                        Self::wrote_hit(&mut st, &raw, super::identities::Writer::Elsewhere);
+                    }
                     learnt += 1;
                 }
             }
@@ -1807,6 +1831,7 @@ impl Desk {
         raw: &super::identities::Raw,
         windows: Vec<crate::usage::LimitWindow>,
         at: chrono::DateTime<Utc>,
+        by: super::identities::Writer,
     ) {
         if windows.is_empty() {
             return;
@@ -1816,6 +1841,7 @@ impl Desk {
             let s = Self::standing_mut(&mut st, raw);
             s.windows = windows;
             s.read_at = Some(at);
+            Self::wrote_read(&mut st, raw, by);
         }
         let desk = self.clone();
         tokio::spawn(async move { desk.accounts_moved().await });
