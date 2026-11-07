@@ -1471,6 +1471,17 @@ async fn session_memory(State(s): S, h: HeaderMap, Query(q): Q, Path(id): Path<U
     s.desk.session_memory(id).await.map(Json).into_response()
 }
 
+/// Forgets what Desk remembers of one session, whether or not Desk still
+/// has it.
+async fn forget_memory(State(s): S, h: HeaderMap, Query(q): Q, Path(id): Path<Uuid>) -> Response {
+    guarded!(s, h, q);
+    s.desk
+        .forget_memory(id)
+        .await
+        .map(|()| StatusCode::NO_CONTENT)
+        .into_response()
+}
+
 /// The sessions' and rooms' routes and the events socket alone.
 pub fn sessions_router(desk: Desk, auth: Arc<dyn Authorize>) -> Router {
     Router::new()
@@ -1518,7 +1529,10 @@ pub fn sessions_router(desk: Desk, auth: Arc<dyn Authorize>) -> Router {
         .route("/api/desk/spend", get(spend))
         .route("/api/desk/ledger", get(ledger))
         .route("/api/desk/memory/search", get(memory_search))
-        .route("/api/desk/sessions/{id}/memory", get(session_memory))
+        .route(
+            "/api/desk/sessions/{id}/memory",
+            get(session_memory).delete(forget_memory),
+        )
         .route("/api/desk/budgets", get(budgets).post(put_budget))
         .route(
             "/api/desk/budgets/{id}",

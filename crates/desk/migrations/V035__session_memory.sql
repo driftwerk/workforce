@@ -33,6 +33,18 @@ CREATE INDEX memory_exchanges_scope ON memory_exchanges (group_id, project, at);
 CREATE INDEX memory_exchanges_tsv ON memory_exchanges USING GIN (tsv);
 CREATE INDEX memory_exchanges_outbox ON memory_exchanges (at) WHERE indexed_at IS NULL AND ended IS NOT NULL;
 
+-- Whose each session's memory is, as it was when last harvested: its name,
+-- engine and records, so what it remembered can still be named, read and
+-- forgotten once the session itself is cleared away.
+CREATE TABLE memory_sessions (
+    session        UUID        PRIMARY KEY,
+    engine         TEXT        NOT NULL,
+    name           TEXT        NOT NULL,
+    cli_session_id TEXT,
+    sources        TEXT[]      NOT NULL DEFAULT '{}',
+    updated_at     TIMESTAMPTZ NOT NULL
+);
+
 -- What Desk noted from a session: decisions, facts and todos, each citing
 -- its exchanges.
 CREATE TABLE memory_items (

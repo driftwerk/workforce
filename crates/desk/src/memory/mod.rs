@@ -48,6 +48,8 @@ pub const NO_REDACTOR: &str =
     "Desk can't hide secrets in conversations here, so it isn't remembering them.";
 /// What the person reads when the install turned session memory off.
 pub const DISABLED: &str = "Remembering conversations is turned off for this Desk.";
+/// What the person reads of a session Desk no longer has.
+pub const CLEARED: &str = "Desk no longer has this session; this is what it remembered of it.";
 /// What a keyword search says of itself until the search index is ready.
 pub const KEYWORD_ONLY: &str = "Searching by keyword only until Desk Memory is ready.";
 

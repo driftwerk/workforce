@@ -388,3 +388,67 @@ async fn no_planted_secret_reaches_any_column_of_session_memory() {
     })
     .await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cleared_sessions_memory_is_still_named_read_and_forgotten() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = dir.path().join("web.jsonl");
+        std::fs::write(&transcript, CLAUDE).unwrap();
+        DeskStore::migrate(&pool).await.unwrap();
+        let web = session("acme-web", dir.path(), &transcript);
+        let store = DeskStore::with_pool(pool.clone()).await.unwrap();
+        store.put(&web).await.unwrap();
+        let (_, cancel, addr) = start(&pool, dir.path()).await;
+        memory_until(addr, web.id, |m| m["counts"]["exchanges"] == 6).await;
+        cancel.cancel();
+
+        // Cleared away: the card goes, what Desk remembers of it stays.
+        store
+            .remove_sessions(
+                &[web.id],
+                &[],
+                "you",
+                workforce_desk::memory_store::Memory::Keep,
+            )
+            .await
+            .unwrap();
+        let (_, _cancel, addr) = start(&pool, dir.path()).await;
+        let memory = memory_until(addr, web.id, |m| m["counts"]["exchanges"] == 6).await;
+        assert_eq!(memory["remembering"], false);
+        let (_, found) = get(addr, "/api/desk/memory/search?q=cookie").await;
+        assert_eq!(found["hits"][0]["name"], "acme-web", "{found}");
+
+        let client = reqwest::Client::new();
+        let path = format!("http://{addr}/api/desk/sessions/{}/memory", web.id);
+        assert_eq!(client.delete(&path).send().await.unwrap().status(), 204);
+        assert_eq!(
+            get(addr, &format!("/api/desk/sessions/{}/memory", web.id))
+                .await
+                .0,
+            404
+        );
+        assert_eq!(
+            count(
+                &pool,
+                "SELECT COUNT(*) FROM memory_exchanges WHERE session = $1",
+                web.id
+            )
+            .await,
+            0
+        );
+        assert_eq!(
+            client.delete(&path).send().await.unwrap().status(),
+            404,
+            "nothing left to forget"
+        );
+
+        // The same conversation found again is never remembered.
+        let again = session("acme-web again", dir.path(), &transcript);
+        store.put(&again).await.unwrap();
+        let (_, _cancel, addr) = start(&pool, dir.path()).await;
+        let memory = memory_until(addr, again.id, |m| m["remembering"] == false).await;
+        assert_eq!(memory["counts"]["exchanges"], 0);
+    })
+    .await;
+}

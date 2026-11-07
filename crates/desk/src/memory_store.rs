@@ -38,6 +38,10 @@ pub struct RecordWrite<'a> {
     /// The session's project and folder, stamped on its exchanges.
     pub project: &'a str,
     pub folder: &'a str,
+    /// What the session is called, and its conversation's id, kept with its
+    /// memory.
+    pub name: &'a str,
+    pub cli_session_id: Option<&'a str>,
 }
 
 /// What the harvest checks a session against, from the store.
@@ -141,6 +145,26 @@ impl DeskStore {
             )
             .await?
             .is_some();
+        if held && (!w.closed.is_empty() || w.open.is_some()) {
+            tx.execute(
+                "INSERT INTO memory_sessions (session, engine, name, cli_session_id, sources, \
+                   updated_at) VALUES ($1, $2, $3, $4, ARRAY[$5], now()) \
+                 ON CONFLICT (session) DO UPDATE SET name = $3, \
+                   cli_session_id = COALESCE($4, memory_sessions.cli_session_id), \
+                   sources = CASE WHEN $5 = ANY(memory_sessions.sources) \
+                     THEN memory_sessions.sources ELSE memory_sessions.sources || $5 END, \
+                   updated_at = now()",
+                &[
+                    &w.session,
+                    &w.engine.as_str(),
+                    &w.name,
+                    &w.cli_session_id,
+                    &w.source,
+                ],
+            )
+            .await
+            .context("naming a session's memory")?;
+        }
         if held {
             let base: i32 = tx
                 .query_one(
@@ -218,6 +242,40 @@ impl DeskStore {
         }
         tx.commit().await?;
         Ok(changed)
+    }
+
+    /// Forgets what Desk remembers of `session`, whether or not the registry
+    /// still has it: as forgetting the session does, with the same
+    /// tombstones. Whether there was anything of it to forget.
+    pub async fn forget_memory(&self, session: Uuid) -> Result<bool> {
+        let mut client = self.pool().get().await?;
+        let tx = client.transaction().await?;
+        let known = tx
+            .query_opt(
+                "SELECT 1 FROM sessions WHERE id = $1 \
+                 UNION ALL SELECT 1 FROM memory_sessions WHERE session = $1 \
+                 UNION ALL SELECT 1 FROM memory_exchanges WHERE session = $1 LIMIT 1",
+                &[&session],
+            )
+            .await?
+            .is_some();
+        forget_memory_in(&tx, &[session]).await?;
+        tx.commit().await?;
+        Ok(known)
+    }
+
+    /// What a session whose memory is kept was called, and its engine.
+    pub async fn memory_names(&self, ids: &[Uuid]) -> Result<Vec<(Uuid, String, Engine)>> {
+        let client = self.pool().get().await?;
+        client
+            .query(
+                "SELECT session, name, engine FROM memory_sessions WHERE session = ANY($1)",
+                &[&ids],
+            )
+            .await?
+            .iter()
+            .map(|r| Ok((r.try_get(0)?, r.try_get(1)?, Engine::parse(r.try_get(2)?)?)))
+            .collect()
     }
 
     /// What the harvest of `session` is checked against: its switch, which
@@ -449,7 +507,9 @@ pub(crate) async fn forget_memory_in(
            SELECT engine, cli_session_id AS ref FROM sessions WHERE id = ANY($1) \
            UNION SELECT engine, transcript FROM sessions WHERE id = ANY($1) \
            UNION SELECT s.engine, c.source FROM ledger_cursors c \
-             JOIN sessions s ON s.id = c.session WHERE c.session = ANY($1)) r \
+             JOIN sessions s ON s.id = c.session WHERE c.session = ANY($1) \
+           UNION SELECT engine, cli_session_id FROM memory_sessions WHERE session = ANY($1) \
+           UNION SELECT engine, unnest(sources) FROM memory_sessions WHERE session = ANY($1)) r \
          WHERE ref IS NOT NULL AND ref <> '' ON CONFLICT DO NOTHING",
         &[&ids],
     )
@@ -461,7 +521,20 @@ pub(crate) async fn forget_memory_in(
         &[&readers],
     )
     .await?;
-    for table in ["memory_exchanges", "memory_items", "memory_derive"] {
+    // A session that stays keeps reading its records for the ledger, but
+    // no harvest text of it is kept.
+    tx.execute(
+        "UPDATE ledger_cursors SET harvest = '{\"decided\": true}', harvested_to = read_to \
+         WHERE session = ANY($1)",
+        &[&ids],
+    )
+    .await?;
+    for table in [
+        "memory_exchanges",
+        "memory_items",
+        "memory_derive",
+        "memory_sessions",
+    ] {
         tx.execute(
             &format!("DELETE FROM {table} WHERE session = ANY($1)"),
             &[&ids],
@@ -514,6 +587,8 @@ mod tests {
                 open,
                 project: "/dev/acme-web",
                 folder: "/dev/acme-web",
+                name: "acme-web",
+                cli_session_id: Some("5b1f0c2e"),
             })
             .await
             .unwrap();
@@ -637,6 +712,21 @@ mod tests {
                 .await,
                 0
             );
+
+            // A cleared session's memory is still named, and can be forgotten.
+            assert_eq!(
+                store.memory_names(&[cleared.id]).await.unwrap(),
+                [(cleared.id, "acme-web".to_string(), Engine::Claude)]
+            );
+            assert!(store.forget_memory(cleared.id).await.unwrap());
+            assert_eq!(n(&store, "SELECT COUNT(*) FROM memory_exchanges WHERE session = $1", cleared.id).await, 0);
+            assert_eq!(n(&store, "SELECT COUNT(*) FROM memory_sessions WHERE session = $1", cleared.id).await, 0);
+            assert_eq!(
+                n(&store, "SELECT COUNT(*) FROM memory_forgotten WHERE ref IN ('5b1f0c2e', '/records/t.jsonl', 'key:x-c') AND $1::uuid IS NOT NULL", cleared.id).await,
+                3,
+                "its conversation, record and exchange are tombstoned"
+            );
+            assert!(!store.forget_memory(Uuid::new_v4()).await.unwrap(), "nothing to forget");
 
             // A fork that copied the forgotten lines can't keep them again.
             write(

@@ -224,6 +224,10 @@ impl Desk {
             .filter(|id| !named.contains_key(id))
             .collect();
         if !missing.is_empty() {
+            // A session cleared away is named as its memory remembers it.
+            for (id, name, engine) in self.0.store.memory_names(&missing).await? {
+                named.insert(id, (name, engine));
+            }
             for r in self.0.store.sessions_of(&missing).await? {
                 named.insert(
                     r.id,
@@ -257,10 +261,19 @@ impl Desk {
     /// What Desk remembers of session `id`: its latest exchanges, its
     /// counts, and whether it is remembering now.
     pub async fn session_memory(&self, id: Uuid) -> Result<SessionMemory, DeskError> {
-        let r = self
-            .session_record_any(id)
-            .await
-            .ok_or(DeskError::NotFound)?;
+        let Some(r) = self.session_record_any(id).await else {
+            // Cleared away: what it remembered stays, to read or forget.
+            let (exchanges, counts) = self.0.store.session_memory(id, LIST_MAX).await?;
+            if self.0.store.memory_names(&[id]).await?.is_empty() && counts.exchanges == 0 {
+                return Err(DeskError::NotFound);
+            }
+            return Ok(SessionMemory {
+                exchanges,
+                counts,
+                remembering: false,
+                why: Some(crate::memory::CLEARED.into()),
+            });
+        };
         let (exchanges, counts) = self.0.store.session_memory(id, LIST_MAX).await?;
         let why = if self.0.opts.hub_internal.holds(Path::new(&r.cwd))
             || crate::ledger::agent_turn(&r.cwd, &r.name)
@@ -282,6 +295,16 @@ impl Desk {
             remembering: why.is_none(),
             why,
         })
+    }
+
+    /// Forgets what Desk remembers of session `id`, whether or not Desk
+    /// still has the session: its exchanges and notes go, and its
+    /// conversation, records and exchanges are never harvested again.
+    pub async fn forget_memory(&self, id: Uuid) -> Result<(), DeskError> {
+        match self.0.store.forget_memory(id).await? {
+            true => Ok(()),
+            false => Err(DeskError::NotFound),
+        }
     }
 
     /// The registry's record of `id`, closed sessions too.

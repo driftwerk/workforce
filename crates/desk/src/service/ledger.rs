@@ -614,6 +614,8 @@ impl Desk {
                     open: open.as_ref(),
                     project,
                     folder: &r.cwd,
+                    name: r.display_name.as_deref().unwrap_or(&r.name),
+                    cli_session_id: r.cli_session_id.as_deref(),
                 })
                 .await?;
             if changed > 0 {
