@@ -94,3 +94,7 @@ mod node_routes;
 #[cfg(feature = "postgres")]
 #[path = "api/desk_floor_routes.rs"]
 mod desk_floor_routes;
+
+#[cfg(feature = "postgres")]
+#[path = "api/desk_memory_routes.rs"]
+mod desk_memory_routes;

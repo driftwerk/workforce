@@ -70,6 +70,7 @@ mod codex_asks_tests;
 mod ledger;
 #[cfg(test)]
 mod lifecycle_tests;
+mod memory;
 #[cfg(test)]
 mod rooms_tests;
 mod scopes;
@@ -92,6 +93,7 @@ pub use breaker::{
 };
 pub use ledger::{LedgerPage, SpendQuery};
 pub use line::{LineError, Sender, SessionMcp};
+pub use memory::{MemoryHitView, MemorySearch, SessionMemory};
 pub use terminals::{NewTerminal, TerminalPatch, TerminalRecord, TerminalState, TerminalView};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,6 +130,8 @@ pub struct Options {
     pub account_keys: Option<Arc<dyn crate::engine_accounts::Keys>>,
     /// Which sessions may message each other on Desk's line.
     pub line_reach: crate::line::Reach,
+    /// What session memory keeps, from `[desk.memory]`.
+    pub memory: crate::memory::MemoryOptions,
 }
 
 #[cfg(test)]
@@ -4543,6 +4547,9 @@ impl Desk {
                 self.turn_ended(id, transcript, reply, background, Some(failure))
                     .await
             }
+            // Its record is kept before Claude Code compacts it; the hook is
+            // answered at once.
+            Hook::PreCompact => self.spend_read_soon(id),
             Hook::SessionEnd => {
                 // Nothing it asked stands once it has ended.
                 self.change(id, |_, l| {
@@ -5933,6 +5940,7 @@ mod tests {
             hub_internal: HubInternal::default(),
             account_keys: None,
             line_reach: crate::line::Reach::Group,
+            memory: Default::default(),
         }
     }
 
@@ -7858,6 +7866,7 @@ mod tests {
                     hub_internal: HubInternal::new([PathBuf::from("/data")], None),
                     account_keys: None,
                     line_reach: crate::line::Reach::Group,
+                    memory: Default::default(),
                     ..options(dir.path())
                 },
                 Default::default(),
@@ -7900,6 +7909,7 @@ mod tests {
                     hub_internal: HubInternal::default().started_by(std::process::id()),
                     account_keys: None,
                     line_reach: crate::line::Reach::Group,
+                    memory: Default::default(),
                     ..options(dir.path())
                 },
                 Default::default(),
@@ -7977,6 +7987,7 @@ mod tests {
                     hub_internal: HubInternal::new([PathBuf::from("/data")], None),
                     account_keys: None,
                     line_reach: crate::line::Reach::Group,
+                    memory: Default::default(),
                     ..options(dir.path())
                 },
                 Floor {
@@ -8037,6 +8048,7 @@ mod tests {
                     hub_internal: HubInternal::new([PathBuf::from("/data")], None),
                     account_keys: None,
                     line_reach: crate::line::Reach::Group,
+                    memory: Default::default(),
                     ..options(dir.path())
                 },
                 Floor {

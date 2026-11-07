@@ -208,6 +208,9 @@ pub(crate) async fn forget_in(
     ids: &[Uuid],
     owner: &str,
 ) -> Result<u64> {
+    // What session memory holds of them, while their records are still
+    // known to tombstone.
+    crate::memory_store::forget_memory_in(tx, ids).await?;
     let places: Vec<String> = ids
         .iter()
         .map(|id| ReadPlace::Session(*id).to_string())

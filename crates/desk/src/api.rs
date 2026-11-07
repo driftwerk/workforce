@@ -1411,6 +1411,66 @@ async fn search(
     s.desk.search(&filters).await.map(Json).into_response()
 }
 
+/// A search of what Desk remembers (`?q=&group=&session=&kind=`).
+#[derive(Debug, serde::Deserialize)]
+struct MemoryParams {
+    q: String,
+    /// A group's id, or `ungrouped`.
+    group: Option<String>,
+    session: Option<Uuid>,
+    /// `exchanges` or `all`; decisions, todos and facts are noted once Desk
+    /// writes them, and none are kept yet.
+    kind: Option<String>,
+    limit: Option<i64>,
+}
+
+/// The person's keyword search of what Desk remembers of its sessions.
+async fn memory_search(
+    State(s): S,
+    h: HeaderMap,
+    Query(q): Q,
+    p: Result<Query<MemoryParams>, QueryRejection>,
+) -> Response {
+    guarded!(s, h, q);
+    let Query(p) = match p {
+        Ok(p) => p,
+        Err(e) => return DeskError::Invalid(e.body_text()).into_response(),
+    };
+    let run = async {
+        let exchanges = match p.kind.as_deref().unwrap_or("all") {
+            "all" | "exchanges" => true,
+            "decisions" | "todos" | "facts" => false,
+            _ => {
+                return Err(DeskError::Invalid(
+                    "kind is decisions, todos, facts, exchanges or all".into(),
+                ))
+            }
+        };
+        let mut found = s
+            .desk
+            .memory_search(&crate::memory_store::MemoryQuery {
+                q: p.q,
+                group: p
+                    .group
+                    .map(|g| Some(g).filter(|g| g != crate::service::UNGROUPED)),
+                session: p.session,
+                limit: p.limit.unwrap_or(20),
+            })
+            .await?;
+        if !exchanges {
+            found.hits.clear();
+        }
+        Ok(found)
+    };
+    run.await.map(Json).into_response()
+}
+
+/// What Desk remembers of one session.
+async fn session_memory(State(s): S, h: HeaderMap, Query(q): Q, Path(id): Path<Uuid>) -> Response {
+    guarded!(s, h, q);
+    s.desk.session_memory(id).await.map(Json).into_response()
+}
+
 /// The sessions' and rooms' routes and the events socket alone.
 pub fn sessions_router(desk: Desk, auth: Arc<dyn Authorize>) -> Router {
     Router::new()
@@ -1457,6 +1517,8 @@ pub fn sessions_router(desk: Desk, auth: Arc<dyn Authorize>) -> Router {
         .route("/api/desk/sessions/{id}/account", post(switch_account))
         .route("/api/desk/spend", get(spend))
         .route("/api/desk/ledger", get(ledger))
+        .route("/api/desk/memory/search", get(memory_search))
+        .route("/api/desk/sessions/{id}/memory", get(session_memory))
         .route("/api/desk/budgets", get(budgets).post(put_budget))
         .route(
             "/api/desk/budgets/{id}",

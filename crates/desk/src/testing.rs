@@ -98,6 +98,7 @@ pub(crate) fn options(dir: &std::path::Path) -> crate::service::Options {
         hub_internal: Default::default(),
         account_keys: None,
         line_reach: crate::line::Reach::Group,
+        memory: Default::default(),
     }
 }
 
