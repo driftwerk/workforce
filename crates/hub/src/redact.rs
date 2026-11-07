@@ -81,6 +81,11 @@ fn patterns() -> &'static [Pattern] {
     })
 }
 
+/// The patterns with their labels, the most specific first.
+pub(crate) fn labelled_patterns() -> impl Iterator<Item = (&'static str, &'static Regex)> {
+    patterns().iter().map(|p| (p.label, &p.regex))
+}
+
 /// Return a copy of `text` with any matched secret patterns replaced by
 /// `[REDACTED <LABEL>]`. When nothing matches the input is returned unchanged.
 ///

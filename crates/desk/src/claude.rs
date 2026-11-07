@@ -156,7 +156,7 @@ struct BackgroundTask {
 
 /// The prompts Claude Code submits itself when background work it started
 /// ends: not the person's words.
-const ENGINE_PROMPTS: [&str; 2] = ["<task-notification>", "<agent-message from="];
+pub(crate) const ENGINE_PROMPTS: [&str; 2] = ["<task-notification>", "<agent-message from="];
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Hook {

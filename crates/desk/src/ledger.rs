@@ -12,6 +12,7 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::engine::Engine;
+use crate::memory::record::Read;
 use crate::model::text_enum;
 
 /// A call's tokens. `input` is the fresh (uncached) part; cache reads and
@@ -107,13 +108,33 @@ fn time(v: &Value, pointer: &str) -> Option<DateTime<Utc>> {
 /// `cache_read_input_tokens`, `cache_creation_input_tokens`; thinking is
 /// within output), keyed by `message.id`. A message whose content blocks
 /// each repeat its usage is one call. Claude Code's own `<synthetic>`
-/// messages cost nothing.
+/// messages cost nothing. The ledger's view of [`claude_read`].
 pub fn claude_line(line: &[u8]) -> Option<Spend> {
-    // Most lines aren't calls; skip them before parsing.
-    if !contains(line, b"\"usage\"") {
-        return None;
+    claude_read(line, true, false).spend
+}
+
+/// One line of a Claude Code transcript, read once for each consumer that
+/// wants it: the call it records (`spend`), and the conversation it holds
+/// (`parts`, for session memory).
+pub fn claude_read(line: &[u8], spend: bool, parts: bool) -> Read {
+    // Most lines aren't calls; the ledger alone skips them before parsing.
+    let spend = spend && contains(line, b"\"usage\"");
+    if !spend && !parts {
+        return Read::default();
     }
-    let v: Value = serde_json::from_slice(line).ok()?;
+    let Ok(v) = serde_json::from_slice::<Value>(line) else {
+        return Read::default();
+    };
+    Read {
+        spend: spend.then(|| claude_spend(&v)).flatten(),
+        parts: match parts {
+            true => crate::memory::harvest::claude_part(&v),
+            false => Vec::new(),
+        },
+    }
+}
+
+fn claude_spend(v: &Value) -> Option<Spend> {
     if v.get("type").and_then(Value::as_str) != Some("assistant") {
         return None;
     }
@@ -133,7 +154,7 @@ pub fn claude_line(line: &[u8]) -> Option<Spend> {
         .filter(|k| !k.is_empty())?;
     Some(Spend {
         key: key.to_string(),
-        at: time(&v, "/timestamp")?,
+        at: time(v, "/timestamp")?,
         model: model.map(str::to_string),
         tokens: Tokens {
             input: number(usage, "/input_tokens"),
@@ -194,10 +215,38 @@ fn codex_key(turn: &str, thread_total: u64) -> String {
 /// `task_started` name the turn and model; `token_usage_record` and
 /// `event_msg` `token_count` (verified on CLI 0.164; both appear for one
 /// call, with the same numbers) are the call.
+/// The ledger's view of [`codex_read`].
 pub fn codex_line(line: &[u8], state: &mut CodexState) -> Option<Spend> {
-    let v: Value = serde_json::from_slice(line).ok()?;
+    codex_read(line, Some(state), None).spend
+}
+
+/// One line of a Codex rollout, read once for each consumer that wants it:
+/// the call it records, with the ledger's `spend` state, and the
+/// conversation it holds, with the harvest's `parts` state. A consumer
+/// that doesn't want the line (it has read past it already) passes no
+/// state, which leaves its own untouched.
+pub fn codex_read(
+    line: &[u8],
+    spend: Option<&mut CodexState>,
+    parts: Option<&mut crate::memory::harvest::CodexParts>,
+) -> Read {
+    if spend.is_none() && parts.is_none() {
+        return Read::default();
+    }
+    let Ok(v) = serde_json::from_slice::<Value>(line) else {
+        return Read::default();
+    };
+    Read {
+        spend: spend.and_then(|state| codex_spend_of(&v, state)),
+        parts: parts
+            .map(|state| crate::memory::harvest::codex_part(&v, state))
+            .unwrap_or_default(),
+    }
+}
+
+fn codex_spend_of(v: &Value, state: &mut CodexState) -> Option<Spend> {
     let p = v.get("payload")?;
-    let at = time(&v, "/timestamp");
+    let at = time(v, "/timestamp");
     let text = |v: &Value, k: &str| v.get(k).and_then(Value::as_str).map(str::to_string);
     let spend = |key: String, tokens: Tokens, state: &CodexState| {
         Some(Spend {
