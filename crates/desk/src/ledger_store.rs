@@ -14,12 +14,18 @@ use crate::model::SessionRecord;
 use crate::scope::{seen_sql, Seen, SeenParams};
 use crate::store::DeskStore;
 
-/// How far one of a session's records has been read.
+/// How far one of a session's records has been read: by the ledger, and
+/// by the harvest of its conversation, each from its own offset.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Cursor {
     pub read_to: u64,
     /// What its reader carries from line to line.
     pub seen: Value,
+    /// How far its conversation has been harvested.
+    pub harvested_to: u64,
+    /// What the harvest carries from line to line (a
+    /// [`Harvested`](crate::memory::record::Harvested)).
+    pub harvest: Value,
 }
 
 /// A call as the ledger keeps it: priced, and stamped with how it was paid
@@ -137,6 +143,7 @@ impl DeskStore {
             Ok(Cursor {
                 read_to: u64::try_from(r.try_get::<_, i64>(0)?).unwrap_or(0),
                 seen: r.try_get(1)?,
+                ..Cursor::default()
             })
         })
         .transpose()

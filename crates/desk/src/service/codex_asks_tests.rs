@@ -111,6 +111,7 @@ async fn codex_asks_are_answered_from_desk_and_go_when_answered_anywhere() {
                 turns: Some(logged.clone()),
                 plans: None,
                 pricer: None,
+                redactor: None,
             },
             CancellationToken::new(),
         )
@@ -267,6 +268,7 @@ async fn a_codex_question_shows_its_words_until_the_terminal_answers_it() {
                 turns: Some(logged.clone()),
                 plans: None,
                 pricer: None,
+                redactor: None,
             },
             CancellationToken::new(),
         )

@@ -215,6 +215,19 @@ static SUSPICIOUS_CONTEXT: Lazy<Regex> = Lazy::new(|| {
     .expect("invalid suspicious-context regex")
 });
 
+/// Every catalogued pattern with its label, the most specific first, for a
+/// redactor that writes each match in a form of its own (session memory
+/// replaces it whole, keeping no part of it).
+pub fn labelled_patterns() -> impl Iterator<Item = (&'static str, &'static Regex)> {
+    LABELLED_PATTERNS.iter().map(|p| (p.label, &p.regex))
+}
+
+/// Whether `matched` is public by design (a Stripe publishable key): never
+/// a secret, whatever pattern caught it.
+pub fn is_public(matched: &str) -> bool {
+    is_allowlisted(matched)
+}
+
 /// Backwards-compatible accessor for the legacy unlabeled API.
 static SECRET_PATTERNS: Lazy<Vec<&'static Regex>> =
     Lazy::new(|| LABELLED_PATTERNS.iter().map(|p| &p.regex).collect());
