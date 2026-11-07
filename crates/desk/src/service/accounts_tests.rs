@@ -852,13 +852,33 @@ async fn an_account_at_its_limit_asks_to_switch_all_and_asks_back_once_it_resets
             d.change(id, |r, _| r.state = SessionState::Idle);
         }
 
-        // Work reads with room again: asked back, never switched back alone.
+        // Long since, nothing read of Work: not known to have reset, so
+        // nobody is asked back.
         d.0.state
             .lock()
             .standing
             .get_mut(&Some(work))
             .unwrap()
             .hit_at = Some(chrono::Utc::now() - chrono::Duration::hours(6));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(d.account_needs().is_empty(), "{:?}", d.account_needs());
+        // Work reads with room again: asked back, never switched back alone.
+        d.0.state
+            .lock()
+            .standing
+            .get_mut(&Some(work))
+            .unwrap()
+            .read_at = Some(chrono::Utc::now());
+        d.0.state
+            .lock()
+            .standing
+            .get_mut(&Some(work))
+            .unwrap()
+            .windows = vec![crate::usage::LimitWindow {
+            used_percent: 10.0,
+            resets_at: Some(chrono::Utc::now() + chrono::Duration::hours(3)),
+            minutes: 300,
+        }];
         let need = until(|| d.account_needs().into_iter().next()).await;
         assert!(
             matches!(&need, AccountNeed::Reset { account, from, sessions, .. }
@@ -2144,6 +2164,445 @@ async fn an_account_whose_usage_matches_the_sign_in_is_linked_until_it_doesnt_an
     .await;
 }
 
+#[tokio::test]
+async fn a_reading_of_another_account_never_ends_one_being_full_and_a_move_off_is_asked_back_once()
+{
+    use crate::engine_accounts::AccountNeed;
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let plans = Arc::new(Plans::default());
+        let d = signed_in_as_gmail(pool, dir.path(), plans).await;
+        let (work, personal, a, b) = two_on_work(&d, dir.path()).await;
+        // Work stops on its weekly limit, resetting in two days.
+        let resets = chrono::Utc::now() + chrono::Duration::days(2);
+        stops_on_its_limit(&d, a);
+        {
+            let mut st = d.0.state.lock();
+            let s = st.standing.get_mut(&Some(work)).unwrap();
+            s.hit_until = Some(resets);
+            s.hit_window = Some(10_080);
+        }
+        // Moved off it, twice over: one move, one need.
+        for _ in 0..2 {
+            d.switch_all(Engine::Claude, Some(work), Some(personal))
+                .await
+                .unwrap();
+        }
+        assert_eq!(d.0.state.lock().moved_off.len(), 1);
+        until(|| d.view(a).ok().filter(|v| v.live).map(drop)).await;
+        until(|| d.view(b).ok().filter(|v| v.live).map(drop)).await;
+
+        // Room on Personal, and on this computer's sign-in (signed in again
+        // inside one of them): neither is Work's, so Work is still full and
+        // nobody is asked back.
+        d.report_usage(both(5.0, 10.0, (3600, 86_400)), Some(b));
+        d.apply_hook(a, crate::claude::Hook::SignedIn, None).await;
+        d.report_usage(both(1.0, 2.0, (7200, 90_000)), Some(a));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            d.0.state.lock().standing[&Some(work)].full(chrono::Utc::now()),
+            Some(Some(resets))
+        );
+        assert!(
+            !d.account_needs()
+                .iter()
+                .any(|n| matches!(n, AccountNeed::Reset { .. })),
+            "{:?}",
+            d.account_needs()
+        );
+        // Work's own reading, its weekly window begun again: asked back,
+        // once.
+        {
+            let mut st = d.0.state.lock();
+            let s = st.standing.get_mut(&Some(work)).unwrap();
+            s.read_at = Some(chrono::Utc::now());
+            s.windows = vec![crate::usage::LimitWindow {
+                used_percent: 3.0,
+                resets_at: Some(resets + chrono::Duration::days(7)),
+                minutes: 10_080,
+            }];
+        }
+        let needs = until(|| {
+            let n = d.account_needs();
+            n.iter()
+                .any(|n| matches!(n, AccountNeed::Reset { .. }))
+                .then_some(n)
+        })
+        .await;
+        let resets_asked = needs
+            .iter()
+            .filter(|n| matches!(n, AccountNeed::Reset { .. }))
+            .count();
+        assert_eq!(resets_asked, 1, "{needs:?}");
+        let mut ids: Vec<&str> = needs.iter().map(|n| n.id()).collect();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), needs.len());
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn standing_and_moves_off_outlive_a_restart() {
+    use crate::engine_accounts::AccountNeed;
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let o = || account_options(dir.path(), Arc::new(MemoryKeys::default()));
+        let d = desk(pool.clone(), o()).await;
+        let (work, personal, a, _) = two_on_work(&d, dir.path()).await;
+        stops_on_its_limit(&d, a);
+        until(|| d.account_needs().into_iter().next()).await;
+        d.switch_all(Engine::Claude, Some(work), Some(personal))
+            .await
+            .unwrap();
+        let kept = d.0.state.lock().standing[&Some(work)].clone();
+        // Written once it changes.
+        let mut written = false;
+        for _ in 0..200 {
+            d.keep_standing();
+            let e = d.0.store.state(super::accounts::STANDING).await.unwrap();
+            if e.is_some_and(|e| e.value["moves"].as_array().is_some_and(|m| m.len() == 1)) {
+                written = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(written);
+        drop(d);
+
+        let back = desk(pool, o()).await;
+        assert_eq!(back.0.state.lock().standing.get(&Some(work)), Some(&kept));
+        assert_eq!(back.0.state.lock().moved_off.len(), 1);
+        assert!(kept.full(chrono::Utc::now()).is_some());
+        let _ = AccountNeed::AllFull {
+            id: String::new(),
+            engine: Engine::Claude,
+            resets: vec![],
+        };
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_session_in_a_terminal_of_its_own_on_a_full_plan_has_its_own_need() {
+    use crate::engine_accounts::AccountNeed;
+    use crate::model::{Approvals, Origin, SessionRecord, View};
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(
+            pool,
+            account_options(dir.path(), Arc::new(MemoryKeys::default())),
+        )
+        .await;
+        paste(&d, "Work", GOOD, true).await;
+        let now = chrono::Utc::now();
+        let id = Uuid::new_v4();
+        d.save(SessionRecord {
+            id,
+            engine: Engine::Claude,
+            view: View::Terminal,
+            engine_version: None,
+            approve_for_me: false,
+            account: None,
+            name: "api-fix".into(),
+            goal: String::new(),
+            cwd: dir.path().to_string_lossy().into_owned(),
+            branch: None,
+            origin: Origin::External,
+            state: SessionState::Working,
+            approvals: Approvals::Desk,
+            cli_session_id: Some("ext-1".into()),
+            transcript: None,
+            last_prompt: Some("fix it".into()),
+            last_reply: None,
+            external_pid: Some(1),
+            restore_offer: false,
+            terminal_id: None,
+            display_name: None,
+            asked: None,
+            folder_chosen: Default::default(),
+            created_at: now,
+            updated_at: now,
+        });
+        assert!(d.account_needs().is_empty());
+        // Its transcript ends on the plan's limit: its turn is over on it.
+        d.0.state.lock().turn_failures.insert(
+            id,
+            crate::limit::TurnFailure::Limit(crate::limit::LimitHit {
+                window: Some("five_hour".into()),
+                resets_at: Some(now + chrono::Duration::hours(2)),
+            }),
+        );
+        d.change(id, |r, _| {
+            r.state = SessionState::Idle;
+            r.last_reply = Some("You've hit your session limit · resets 9am".into());
+        });
+        let need = until(|| {
+            d.account_needs()
+                .into_iter()
+                .find(|n| matches!(n, AccountNeed::InTerminal { .. }))
+        })
+        .await;
+        let AccountNeed::InTerminal {
+            session,
+            name,
+            account,
+            resets_at,
+            ..
+        } = need
+        else {
+            unreachable!()
+        };
+        assert_eq!((session, name.as_str(), account.id), (id, "api-fix", None));
+        assert!(resets_at.is_some());
+        // Closed there: no longer anyone's need.
+        d.change(id, |r, _| r.state = SessionState::Closed);
+        assert!(!d
+            .account_needs()
+            .iter()
+            .any(|n| matches!(n, AccountNeed::InTerminal { .. })));
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn which_account_this_computer_is_signed_in_to_is_asked_before_any_switch_depends_on_it() {
+    use crate::engine_accounts::AccountNeed;
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = signed_in_as_gmail(pool, dir.path(), Arc::new(Plans::default())).await;
+        let (work, personal, _, _) = two_on_work(&d, dir.path()).await;
+        d.set_auto_switch(true).await.unwrap();
+        let own = d.create(session(dir.path(), Some(None)), None).await.unwrap();
+        started(dir.path(), own.id, 0).await;
+        d.change(own.id, |r, _| r.state = SessionState::Idle);
+        // The sign-in's session at its limit, the sign-in unlinked: asked,
+        // and nothing moves on a guess.
+        stops_on_its_limit(&d, own.id);
+        let need = until(|| d.account_needs().into_iter().next()).await;
+        assert!(
+            matches!(&need, AccountNeed::WhichSignIn { email: Some(e), .. } if e == "kim@example.com"),
+            "{need:?}"
+        );
+        assert!(!d.account_needs().iter().any(|n| matches!(n, AccountNeed::Limit { from, .. } if from.id.is_none())));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(d.view(own.id).unwrap().account, None);
+        // Answered: it is Personal. Its limit is Personal's now, and Desk
+        // moves everything on it to Work.
+        d.link_own_sign_in(Some(personal)).await.unwrap();
+        // What the sign-in reported is Personal's now, with nothing copied.
+        assert!(Desk::standing_of(&d.0.state.lock(), Some(personal))
+            .full(chrono::Utc::now())
+            .is_some());
+        d.accounts_moved().await;
+        assert!(!d
+            .account_needs()
+            .iter()
+            .any(|n| matches!(n, AccountNeed::WhichSignIn { .. })));
+        let (env, _) = started(dir.path(), own.id, 1).await;
+        assert_eq!(env["TOKEN_ON_FD"], GOOD);
+        assert_eq!(d.view(own.id).unwrap().account.map(|x| x.id), Some(work));
+    })
+    .await;
+}
+
+/// What Desk passes a machine's hub of this Mac's accounts, read from the
+/// Mac's view of them as Desk reads it.
+fn standing_of(d: &Desk) -> Vec<crate::engine_accounts::StandingElsewhere> {
+    let wire = serde_json::to_value(d.accounts()).unwrap();
+    wire.as_array()
+        .unwrap()
+        .iter()
+        .filter(|a| !a["standing"].is_null())
+        .map(|a| {
+            serde_json::from_value(serde_json::json!({
+                "engine": a["engine"],
+                "name": a["name"],
+                "standing": a["standing"],
+            }))
+            .unwrap()
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn a_machine_told_an_account_is_full_starts_new_sessions_on_the_next_and_says_when_all_are() {
+    with_test_pool(build_pool, |mac_pool| async move {
+        with_test_pool(build_pool, |machine_pool| async move {
+            let mac_dir = tempfile::tempdir().unwrap();
+            let machine_dir = tempfile::tempdir().unwrap();
+            let mac = desk(
+                mac_pool,
+                account_options(mac_dir.path(), Arc::new(MemoryKeys::default())),
+            )
+            .await;
+            // A machine never logged in to Claude Code, with this Mac's two
+            // accounts copied to it.
+            let machine = desk(
+                machine_pool,
+                signed_out_options(machine_dir.path(), Arc::new(MemoryKeys::default())),
+            )
+            .await;
+            let (_, _, a, _) = two_on_work(&mac, mac_dir.path()).await;
+            paste(&machine, "Work", GOOD, true).await;
+            let personal = paste(&machine, "Personal", OTHER, false).await;
+
+            // Work is full on the Mac; the machine is told.
+            stops_on_its_limit(&mac, a);
+            until(|| {
+                mac.0
+                    .state
+                    .lock()
+                    .standing
+                    .values()
+                    .any(|s| s.hit_at.is_some())
+                    .then_some(())
+            })
+            .await;
+            machine
+                .learn_standing(standing_of(&mac), Some(chrono::Utc::now()))
+                .await;
+            let s = machine
+                .create(session(machine_dir.path(), None), None)
+                .await
+                .unwrap();
+            assert_eq!(s.account.map(|x| x.id), Some(personal));
+            let (env, _) = started(machine_dir.path(), s.id, 0).await;
+            assert_eq!(env["TOKEN_ON_FD"], OTHER);
+            // Told again: nothing new, nothing changes.
+            assert_eq!(
+                machine
+                    .learn_standing(standing_of(&mac), Some(chrono::Utc::now()))
+                    .await,
+                0
+            );
+
+            // Both full: said plainly, and nothing starts.
+            {
+                let mut st = machine.0.state.lock();
+                let work = st
+                    .standing
+                    .iter()
+                    .find(|(_, s)| s.hit_at.is_some())
+                    .unwrap()
+                    .1
+                    .clone();
+                st.standing.insert(Some(personal), work);
+            }
+            let refused = machine
+                .create(session(machine_dir.path(), None), None)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(
+                refused.contains("every Claude Code account here is at its limit")
+                    && refused.contains("Work")
+                    && refused.contains("Personal"),
+                "{refused}"
+            );
+        })
+        .await;
+    })
+    .await;
+}
+
+/// How many times session `id` was started.
+fn starts(dir: &Path, id: Uuid) -> usize {
+    let hook = format!("/hook/{id}/");
+    std::fs::read_dir(dir)
+        .unwrap()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with("env-"))
+        .filter(|e| std::fs::read_to_string(e.path()).is_ok_and(|env| env.contains(&hook)))
+        .count()
+}
+
+#[tokio::test]
+async fn a_switch_waiting_on_a_rate_limit_waits_for_its_transcript_and_carries_on_at_the_limit() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(
+            pool,
+            key_options(dir.path(), Arc::new(MemoryKeys::default())),
+        )
+        .await;
+        let (_, personal, a, _) = two_on_work(&d, dir.path()).await;
+        d.apply_hook(a, crate::claude::Hook::Prompt("go".into()), None)
+            .await;
+        d.switch_account(a, Some(personal), None).await.unwrap();
+        let transcript = dir.path().join("a.jsonl");
+        std::fs::write(&transcript, "").unwrap();
+        // Words that don't say the plan's: not moved on them alone.
+        d.apply_hook(
+            a,
+            stop_failure(
+                &transcript,
+                "API Error: Request rejected (429) · rate limited",
+            ),
+            None,
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(
+            starts(dir.path(), a),
+            1,
+            "it waits for the transcript's word"
+        );
+        // The transcript says the plan's limit: moved, and carries on.
+        std::fs::write(&transcript, error_line(true)).unwrap();
+        let (env, args) = started(dir.path(), a, 1).await;
+        assert_eq!(env["TOKEN_ON_FD"], OTHER);
+        assert!(args.trim_end().ends_with("Continue"), "{args}");
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_refusal_read_as_not_the_plans_undoes_only_its_own_sessions_stop() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(
+            pool,
+            account_options(dir.path(), Arc::new(MemoryKeys::default())),
+        )
+        .await;
+        let (work, _, a, b) = two_on_work(&d, dir.path()).await;
+        let full = |d: &Desk| {
+            d.0.state
+                .lock()
+                .standing
+                .get(&Some(work))
+                .is_some_and(|s| s.full(chrono::Utc::now()).is_some())
+        };
+        // B truly stops on Work's limit.
+        stops_on_its_limit(&d, b);
+        until(|| full(&d).then_some(())).await;
+        let genuine = d.0.state.lock().standing[&Some(work)].hit_at;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        // A's words read as the limit; its transcript then says otherwise.
+        let transcript = dir.path().join("a.jsonl");
+        std::fs::write(&transcript, "").unwrap();
+        d.apply_hook(a, crate::claude::Hook::Prompt("go".into()), None)
+            .await;
+        d.apply_hook(a, stop_failure(&transcript, "You've hit your limit"), None)
+            .await;
+        assert_ne!(d.0.state.lock().standing[&Some(work)].hit_at, genuine);
+        std::fs::write(&transcript, error_line(false)).unwrap();
+        until(|| {
+            matches!(
+                d.view(a).ok()?.failure,
+                Some(crate::limit::TurnFailure::Failed(_))
+            )
+            .then_some(())
+        })
+        .await;
+        // B's stop stands: Work is still full, as B left it.
+        assert!(full(&d));
+        assert_eq!(d.0.state.lock().standing[&Some(work)].hit_at, genuine);
+    })
+    .await;
+}
+
 /// This computer's Claude Code signs in as `who` now (`gmail`, `star`).
 async fn cli_signs_in_as(d: &Desk, dir: &Path, who: &str) {
     std::fs::write(dir.join("signed-out"), who).unwrap();
@@ -2302,6 +2761,126 @@ async fn only_the_current_keys_name_this_computers_cards() {
         assert!(!d
             .current_plan_keys()
             .contains(&format!("key:desk-account:{personal}")));
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_machine_takes_standing_by_identity_else_name_and_only_times_that_can_be_right() {
+    use crate::engine_accounts::{Standing, StandingElsewhere};
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let machine = desk(
+            pool,
+            account_options(dir.path(), Arc::new(MemoryKeys::default())),
+        )
+        .await;
+        let work = paste(&machine, "Work", GOOD, true).await;
+        let personal = paste(&machine, "Personal", OTHER, false).await;
+        let now = chrono::Utc::now();
+        let full = |hit_at| Standing {
+            hit_at: Some(hit_at),
+            hit_until: Some(hit_at + chrono::Duration::days(30)),
+            ..Default::default()
+        };
+        let told = |name: &str, identity: Option<&str>, standing: Standing| StandingElsewhere {
+            engine: Engine::Claude,
+            name: name.into(),
+            identity: identity.map(str::to_string),
+            standing,
+        };
+        // The Mac knows Work's identity, the machine doesn't: by name, its
+        // reset bounded to a week, and the sender's clock (an hour behind)
+        // read as this one.
+        let sent = now - chrono::Duration::hours(1);
+        assert_eq!(
+            machine
+                .learn_standing(vec![told(" work ", Some("k-work"), full(sent))], Some(sent))
+                .await,
+            1
+        );
+        let kept = machine.0.state.lock().standing[&Some(work)].clone();
+        let hit = kept.hit_at.unwrap();
+        assert!((hit - now).num_seconds().abs() < 5, "read on this clock");
+        assert_eq!(kept.hit_until, Some(hit + chrono::Duration::days(7)));
+        // Known there as another identity: never onto it.
+        machine.0.state.lock().links.insert(
+            personal,
+            crate::identity::Link {
+                identity: crate::identity::Identity {
+                    key: "k-other".into(),
+                    email: None,
+                },
+                by: crate::identity::LinkedBy::Manual,
+                at: now,
+            },
+        );
+        assert_eq!(
+            machine
+                .learn_standing(vec![told("Personal", Some("k-work"), full(now))], Some(now))
+                .await,
+            0
+        );
+        // From the future: refused.
+        assert_eq!(
+            machine
+                .learn_standing(
+                    vec![told(
+                        "Personal",
+                        Some("k-other"),
+                        full(now + chrono::Duration::hours(1))
+                    )],
+                    Some(now)
+                )
+                .await,
+            0
+        );
+        assert!(machine
+            .0
+            .state
+            .lock()
+            .standing
+            .get(&Some(personal))
+            .is_none_or(|s| s.hit_at.is_none()));
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn none_of_these_is_never_asked_again_and_the_sign_in_is_a_plan_of_its_own() {
+    use crate::engine_accounts::AccountNeed;
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = signed_in_as_gmail(pool, dir.path(), Arc::new(Plans::default())).await;
+        let (work, personal, _, _) = two_on_work(&d, dir.path()).await;
+        let own = d.create(session(dir.path(), Some(None)), None).await.unwrap();
+        started(dir.path(), own.id, 0).await;
+        d.change(own.id, |r, _| r.state = SessionState::Idle);
+        d.link_own_sign_in(None).await.unwrap();
+        stops_on_its_limit(&d, own.id);
+        let need = until(|| d.account_needs().into_iter().next()).await;
+        assert!(
+            matches!(&need, AccountNeed::Limit { from, to, .. } if from.id.is_none() && to.id == Some(work)),
+            "{need:?}"
+        );
+        assert!(!d
+            .account_needs()
+            .iter()
+            .any(|n| matches!(n, AccountNeed::WhichSignIn { .. })));
+        // Both accounts full, the sign-in with room again: a new session
+        // naming none starts on it.
+        let later = chrono::Utc::now() + chrono::Duration::days(1);
+        {
+            let mut st = d.0.state.lock();
+            for id in [work, personal] {
+                let s = st.standing.entry(Some(id)).or_default();
+                s.hit_at = Some(chrono::Utc::now());
+                s.hit_until = Some(later);
+            }
+            st.own_standing.clear();
+        }
+        let s = d.create(session(dir.path(), None), None).await.unwrap();
+        assert_eq!(s.account, None, "on this computer's own sign-in, another plan with room");
     })
     .await;
 }

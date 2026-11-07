@@ -43,6 +43,17 @@ pub enum TurnFailure {
     Failed(String),
 }
 
+impl LimitHit {
+    /// Its window's length in minutes, as the plan readings say it.
+    pub fn minutes(&self) -> Option<u32> {
+        match self.window.as_deref()? {
+            "five_hour" => Some(300),
+            w if w.starts_with("seven_day") => Some(10_080),
+            _ => None,
+        }
+    }
+}
+
 impl TurnFailure {
     pub fn limit(&self) -> Option<&LimitHit> {
         match self {

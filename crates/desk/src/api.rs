@@ -498,6 +498,28 @@ async fn put_off_need(State(s): S, h: HeaderMap, Query(q): Q, Path(id): Path<Str
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StandingBody {
+    accounts: Vec<crate::engine_accounts::StandingElsewhere>,
+    /// The sender's clock as it sent this: what its times are shifted by.
+    #[serde(default)]
+    sent_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// What the person's other computers know of their accounts' plans, passed
+/// on by Desk.
+async fn learn_standing(
+    State(s): S,
+    h: HeaderMap,
+    Query(q): Q,
+    Json(b): Json<StandingBody>,
+) -> Response {
+    guarded!(s, h, q);
+    s.desk.learn_standing(b.accounts, b.sent_at).await;
+    StatusCode::NO_CONTENT.into_response()
+}
+
+#[derive(Deserialize)]
 struct OwnSignInBody {
     /// The account this computer's Claude Code is signed in to; none: none
     /// of the person's accounts.
@@ -1388,6 +1410,10 @@ pub fn sessions_router(desk: Desk, auth: Arc<dyn Authorize>) -> Router {
         .route(
             "/api/desk/accounts/own-sign-in",
             axum::routing::put(own_sign_in),
+        )
+        .route(
+            "/api/desk/accounts/standing",
+            axum::routing::put(learn_standing),
         )
         .route("/api/desk/accounts/needs/{id}/put-off", post(put_off_need))
         .route(

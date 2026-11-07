@@ -621,6 +621,12 @@ struct State {
     own_waiting: Vec<(Value, Option<Uuid>, DateTime<Utc>)>,
     /// The last `/login` each session's transcript showed.
     logins_seen: HashMap<Uuid, String>,
+    /// The stop on a limit each session's last turn marked, on which side
+    /// and when: a refusal later read as not the plan's undoes only that,
+    /// never another session's stop on the same account.
+    limit_marks: HashMap<Uuid, LimitMark>,
+    /// Sessions whose rate limit's transcript line is still to be read.
+    verdict_pending: HashSet<Uuid>,
     /// Account needs the person put off.
     put_off: HashSet<String>,
     /// Desk moves sessions off an account at its limit by itself.
@@ -643,6 +649,15 @@ struct State {
 
 /// The most readings of the CLI's own sign-in held until it is first read.
 const OWN_WAITING_MAX: usize = 64;
+
+/// The stop on a limit a session's turn marked: on which side, when, and
+/// what the side's standing said of its last stop before, to go back to.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(super) struct LimitMark {
+    side: identities::Raw,
+    at: DateTime<Utc>,
+    before: (Option<DateTime<Utc>>, Option<DateTime<Utc>>, Option<u32>),
+}
 
 /// How often a busy session's tool is recorded as `working`.
 const WORKING_EVERY: Duration = Duration::from_secs(60);
@@ -754,6 +769,8 @@ struct Inner {
     read_wait: Mutex<Duration>,
     /// Held while the accounts' needs are acted on.
     accounts_moving: tokio::sync::Mutex<()>,
+    /// The accounts' standing as last written ([`accounts::STANDING`]).
+    standing_kept: Mutex<Option<accounts::KeptStanding>>,
     /// The budgets and every subject's breaker.
     breakers: Mutex<breaker::BreakerRun>,
     /// Reads the local agents' spend for budgets: the hub's telemetry.
@@ -1225,6 +1242,17 @@ impl Desk {
             .unwrap_or_default()
             .into_iter()
             .collect();
+        // "Full until 9am" and "switch back?" outlive a restart.
+        let kept_standing: accounts::KeptStanding = match store.state(accounts::STANDING).await {
+            Ok(kept) => kept
+                .and_then(|e| serde_json::from_value(e.value).ok())
+                .unwrap_or_default(),
+            Err(e) => {
+                tracing::warn!(error = %e, "couldn't read accounts' standing");
+                Default::default()
+            }
+        };
+        let (standing, own_standing, moved_off, limit_marks) = kept_standing.clone().into_state();
         let auto_switch = match store.state(accounts::AUTO_SWITCH).await {
             Ok(kept) => kept.is_some_and(|e| e.value == serde_json::json!(true)),
             Err(e) => {
@@ -1326,6 +1354,10 @@ impl Desk {
                 own_none,
                 relogged,
                 prints,
+                standing,
+                own_standing,
+                moved_off,
+                limit_marks,
                 auto_switch,
                 ..State::default()
             }),
@@ -1347,6 +1379,7 @@ impl Desk {
             reader: Mutex::new(None),
             read_wait: Mutex::new(READ_LATER),
             accounts_moving: tokio::sync::Mutex::new(()),
+            standing_kept: Mutex::new(Some(kept_standing.clone())),
             breakers: Mutex::new(breaker::BreakerRun::default()),
             agent_spend: Mutex::new(None),
             budget_tz: Mutex::new(None),
@@ -1626,7 +1659,11 @@ impl Desk {
                     | Transition::Interrupted
             )
         });
+        // A session running here whose turn an API error ended: how it
+        // ended is turn_ended's and its transcript's to say.
+        let reported = st.live.contains_key(&id) && view.failure.is_some();
         let hit_limit = view.engine == Engine::Claude
+            && !reported
             && transitions.iter().any(|t| match t {
                 Transition::Finished { reply } => {
                     transition::finished(reply, &view).0 == crate::floor::Outcome::Limit
@@ -1641,8 +1678,14 @@ impl Desk {
             let desk = self.clone();
             tokio::spawn(async move { desk.accounts_moved().await });
         }
+        // A rate limit whose transcript hasn't said yet whether it was the
+        // plan's: its switch waits for that (the limit carries on with
+        // "Continue").
+        let verdict_pending = reported
+            && matches!(&view.failure, Some(crate::limit::TurnFailure::Failed(e)) if e == "rate_limit")
+            && st.verdict_pending.contains(&id);
         // Carried out by the one driver of this session's switches.
-        if turn_over && st.switches.contains_key(&id) {
+        if turn_over && !verdict_pending && st.switches.contains_key(&id) {
             let desk = self.clone();
             tokio::spawn(async move {
                 if let Err(e) = desk.drive_switch(id, None).await {
@@ -4574,8 +4617,17 @@ impl Desk {
             Some(crate::limit::TurnFailure::Failed(e)) => e == "rate_limit",
             None => false,
         };
+        let background_known = background.as_ref().is_some_and(|b| !b.is_empty());
+        let pending_verdict = matches!(&failure, Some(crate::limit::TurnFailure::Failed(e)) if e == "rate_limit")
+            && path.is_some();
         {
             let mut st = self.0.state.lock();
+            st.limit_marks.remove(&id);
+            if pending_verdict {
+                st.verdict_pending.insert(id);
+            } else {
+                st.verdict_pending.remove(&id);
+            }
             match failure {
                 Some(f) => st.turn_failures.insert(id, f),
                 None => st.turn_failures.remove(&id),
@@ -4651,12 +4703,16 @@ impl Desk {
                 // On its limit: the account is full now, whatever it left
                 // running (a turn waiting on background work isn't over to
                 // the Floor, but it is to its account).
-                Self::mark_hit(&mut self.0.state.lock(), &on, Some(hit));
+                Self::mark_session_hit(&mut self.0.state.lock(), id, &on, Some(hit));
                 let desk = self.clone();
                 tokio::spawn(async move { desk.accounts_moved().await });
             }
-            if failed {
-                // A switch that waited for its turn: it is over.
+            // A switch that waited for its turn: over on the limit, whatever
+            // still runs; over on another failure once nothing does. A rate
+            // limit waits for its transcript's word ([`Self::failure_known`]).
+            let waiting = background_known || self.view(id).is_ok_and(|v| v.waiting_on() > 0);
+            let other_failure = failed && !rate_limit && !waiting;
+            if limit.is_some() || other_failure {
                 self.drive_waiting_switch(id);
             }
             if let (true, Some(p)) = (rate_limit, path) {
@@ -4683,13 +4739,40 @@ impl Desk {
 
     /// `account` stopped on its plan's limit now: full until `hit` says it
     /// resets, else until a reading says it has room.
-    fn mark_hit(st: &mut State, raw: &identities::Raw, hit: Option<&crate::limit::LimitHit>) {
+    fn mark_hit(
+        st: &mut State,
+        raw: &identities::Raw,
+        hit: Option<&crate::limit::LimitHit>,
+    ) -> DateTime<Utc> {
         let now = Utc::now();
         let standing = Self::standing_mut(st, raw);
         standing.hit_at = Some(now);
         standing.hit_until = hit
             .and_then(|h| h.resets_at)
             .or(standing.hit_until.filter(|u| *u > now));
+        standing.hit_window = hit.and_then(|h| h.minutes());
+        now
+    }
+
+    /// Session `id`'s turn stopped `account` on its limit now; kept as the
+    /// session's own mark.
+    fn mark_session_hit(
+        st: &mut State,
+        id: Uuid,
+        raw: &identities::Raw,
+        hit: Option<&crate::limit::LimitHit>,
+    ) {
+        let s = Self::standing_mut(st, raw);
+        let before = (s.hit_at, s.hit_until, s.hit_window);
+        let at = Self::mark_hit(st, raw, hit);
+        st.limit_marks.insert(
+            id,
+            LimitMark {
+                side: raw.clone(),
+                at,
+                before,
+            },
+        );
     }
 
     /// A refusal of `error` "rate_limit" whose words weren't the plan's, on
@@ -4747,6 +4830,10 @@ impl Desk {
                 desk.failure_known(id, account.clone(), said);
                 return;
             }
+            // Nothing said: as the hook said it.
+            if desk.0.state.lock().verdict_pending.remove(&id) {
+                desk.drive_waiting_switch(id);
+            }
         });
     }
 
@@ -4761,8 +4848,9 @@ impl Desk {
         said: crate::limit::TurnFailure,
     ) {
         use crate::limit::TurnFailure;
-        let upgraded = {
+        let settled = {
             let mut st = self.0.state.lock();
+            let pending = st.verdict_pending.remove(&id);
             // Asked again since: the turn it was is behind it, though the
             // account's standing still learns when it resets.
             let current = st.turn_failures.get(&id).cloned();
@@ -4770,34 +4858,52 @@ impl Desk {
                 (Some(TurnFailure::Limit(_)), TurnFailure::Limit(hit)) => {
                     let standing = Self::standing_mut(&mut st, &account);
                     standing.hit_until = hit.resets_at.or(standing.hit_until);
+                    standing.hit_window = hit.minutes().or(standing.hit_window);
                     st.turn_failures.insert(id, TurnFailure::Limit(hit));
                     false
                 }
                 (Some(TurnFailure::Failed(_)), TurnFailure::Limit(hit)) => {
                     tracing::info!(session = %id, "its transcript says the plan's limit ended its turn");
-                    Self::mark_hit(&mut st, &account, Some(&hit));
+                    Self::mark_session_hit(&mut st, id, &account, Some(&hit));
                     st.turn_failures.insert(id, TurnFailure::Limit(hit));
                     true
                 }
                 (Some(TurnFailure::Limit(_)), TurnFailure::Failed(error)) => {
                     tracing::info!(session = %id, "its transcript says a refusal that isn't the plan's ended its turn");
-                    let s = Self::standing_mut(&mut st, &account);
-                    s.hit_at = None;
-                    s.hit_until = None;
+                    // Only the stop this session marked: another session's
+                    // stop on the same account since stands.
+                    if let Some(mark) = st.limit_marks.remove(&id) {
+                        let s = Self::standing_mut(&mut st, &mark.side);
+                        if s.hit_at == Some(mark.at) {
+                            // Back to what the last stop before it said.
+                            (s.hit_at, s.hit_until, s.hit_window) = mark.before;
+                        }
+                    }
                     st.turn_failures.insert(id, TurnFailure::Failed(error));
-                    false
+                    true
                 }
                 (None, TurnFailure::Limit(hit)) => {
                     let standing = Self::standing_mut(&mut st, &account);
                     if standing.hit_at.is_some() {
                         standing.hit_until = hit.resets_at.or(standing.hit_until);
+                        standing.hit_window = hit.minutes().or(standing.hit_window);
                     }
                     false
                 }
-                (Some(TurnFailure::Failed(_)) | None, TurnFailure::Failed(_)) => false,
+                // A rate limit that wasn't the plan's: its turn is over.
+                (Some(TurnFailure::Failed(_)), TurnFailure::Failed(_)) => pending,
+                (None, TurnFailure::Failed(_)) => false,
             }
         };
-        if upgraded {
+        // Its turn's end is settled: a switch that waited for it goes on
+        // (on the limit, with "Continue"), unless work it left still runs
+        // and it isn't the limit.
+        let limit = matches!(
+            self.0.state.lock().turn_failures.get(&id),
+            Some(TurnFailure::Limit(_))
+        );
+        let waiting = self.view(id).is_ok_and(|v| v.waiting_on() > 0);
+        if settled && (limit || !waiting) {
             self.drive_waiting_switch(id);
         }
         let desk = self.clone();

@@ -190,6 +190,7 @@ impl Desk {
     /// Every account, as Settings shows them.
     pub fn accounts(&self) -> Vec<AccountView> {
         let st = self.0.state.lock();
+        let effective = Self::effective_standing(&st);
         let keys = self.0.opts.account_keys.as_ref();
         st.accounts
             .iter()
@@ -203,6 +204,9 @@ impl Desk {
                         .unwrap_or_default();
                     p.account_key(crate::usage::LocalPlan::Claude, &ids)
                 }),
+                // As it reads now: with what the CLI sign-in reported while it
+                // was this account.
+                standing: effective.get(&Some(a.id)).cloned(),
                 identity: st.links.get(&a.id).map(|l| accounts::IdentityView {
                     key: l.identity.key.clone(),
                     email: l.identity.email.clone(),
@@ -374,7 +378,7 @@ impl Desk {
         let has_accounts = engine::caps(engine, View::Terminal).accounts == AccountsVia::Token;
         match wanted {
             None if !has_accounts || self.0.opts.account_keys.is_none() => Ok(None),
-            None => Ok(accounts::default_of(&self.0.state.lock().accounts, engine)),
+            None => Self::with_room(&self.0.state.lock(), engine),
             Some(None) => Ok(None),
             Some(Some(_)) if !has_accounts => Err(DeskError::Invalid(format!(
                 "{} sessions run on its own sign-in here",
@@ -393,6 +397,59 @@ impl Desk {
                 Ok(Some(id))
             }
         }
+    }
+
+    /// When `side` is known to be full now, and until when.
+    fn full_now(st: &super::State, side: Option<Uuid>) -> Option<Option<chrono::DateTime<Utc>>> {
+        Self::standing_of(st, Self::canonical(st, side)).full(Utc::now())
+    }
+
+    /// What a new session of `engine` naming no account starts on: the
+    /// default (else the CLI's own sign-in), unless it is known to be full,
+    /// then the next account with room, in the order a switch takes them.
+    /// Every one full: said plainly, and nothing starts.
+    fn with_room(st: &super::State, engine: Engine) -> Result<Option<Uuid>, DeskError> {
+        let mut ordered: Vec<&Account> =
+            st.accounts.iter().filter(|a| a.engine == engine).collect();
+        ordered.sort_by_key(|a| !a.is_default);
+        let first: Option<Uuid> = accounts::default_of(&st.accounts, engine);
+        let mut sides: Vec<Option<Uuid>> = vec![first];
+        sides.extend(ordered.iter().map(|a| Some(a.id)).filter(|id| *id != first));
+        // The CLI's own sign-in, when it is another account than all of
+        // these: a plan to start on too.
+        if st.own_identity.is_some() && Self::own_account(st).is_none() && !sides.contains(&None) {
+            sides.push(None);
+        }
+        if let Some(side) = sides.iter().find(|s| Self::full_now(st, **s).is_none()) {
+            if *side != first {
+                tracing::info!(
+                    engine = engine.as_str(),
+                    "a new session starts on the next account: the first is at its limit"
+                );
+            }
+            return Ok(*side);
+        }
+        Err(Self::all_full(st, engine, &sides))
+    }
+
+    /// "Every Claude account here is at its limit: Work until 12 Nov 09:00
+    /// UTC, Personal until …".
+    fn all_full(st: &super::State, engine: Engine, sides: &[Option<Uuid>]) -> DeskError {
+        let until: Vec<String> = sides
+            .iter()
+            .map(|s| {
+                let name = accounts::Side::of(&st.accounts, *s).name;
+                match Self::full_now(st, *s).flatten() {
+                    Some(at) => format!("{name} until {}", at.format("%-d %b %H:%M UTC")),
+                    None => format!("{name} (no reset time yet)"),
+                }
+            })
+            .collect();
+        DeskError::Conflict(format!(
+            "every {} account here is at its limit: {}",
+            engine.title(),
+            until.join(", ")
+        ))
     }
 
     /// An account by the name the person or an agent gave it.
@@ -484,7 +541,19 @@ impl Desk {
             return Ok(None);
         }
         ordered.sort_by_key(|a| !a.is_default);
-        for a in &ordered {
+        // One known to be full is passed over for the next with room.
+        let (room, full): (Vec<Account>, Vec<Account>) = {
+            let st = self.0.state.lock();
+            ordered
+                .into_iter()
+                .partition(|a| Self::full_now(&st, Some(a.id)).is_none())
+        };
+        if room.is_empty() {
+            let st = self.0.state.lock();
+            let sides: Vec<Option<Uuid>> = full.iter().map(|a| Some(a.id)).collect();
+            return Err(Self::all_full(&st, engine, &sides));
+        }
+        for a in &room {
             if let Ok(token) = self.read_token(a).await {
                 tracing::info!(account = %a.id, engine = engine.as_str(), "a session runs on an account: the CLI has no sign-in of its own on this computer");
                 return Ok(Some((a.id, token)));
@@ -1303,6 +1372,96 @@ impl Desk {
 
 /// Where the person's "switch automatically" choice is kept.
 pub(super) const AUTO_SWITCH: &str = "accounts.autoSwitch";
+/// Where each account's standing and the moves off a full one are kept, so
+/// "full until 9am" and "switch back?" outlive a restart.
+pub(super) const STANDING: &str = "accounts.standing";
+
+/// Each credential's standing, the moves off full ones, and the stops each
+/// session marked, as kept: never merged ([`super::identities::Raw`]).
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub(super) struct KeptStanding {
+    /// Each account's, by its id. An `own` entry an earlier Desk kept here
+    /// can't be told whose it was, so it is dropped.
+    pub standing: std::collections::BTreeMap<String, accounts::Standing>,
+    /// The CLI sign-in's, by the identity it was signed in as.
+    pub own: std::collections::BTreeMap<String, accounts::Standing>,
+    pub moves: Vec<super::identities::RawMove>,
+    pub marks: Vec<(Uuid, super::LimitMark)>,
+}
+
+type KeptState = (
+    std::collections::HashMap<Option<Uuid>, accounts::Standing>,
+    std::collections::HashMap<String, accounts::Standing>,
+    Vec<super::identities::RawMove>,
+    std::collections::HashMap<Uuid, super::LimitMark>,
+);
+
+impl KeptStanding {
+    pub(super) fn of(st: &super::State) -> Self {
+        Self {
+            standing: st
+                .standing
+                .iter()
+                .filter_map(|(side, s)| Some((side.as_ref()?.to_string(), s.clone())))
+                .collect(),
+            own: st
+                .own_standing
+                .iter()
+                .map(|(k, s)| (k.clone(), s.clone()))
+                .collect(),
+            moves: st.moved_off.clone(),
+            marks: st
+                .limit_marks
+                .iter()
+                .map(|(id, m)| (*id, m.clone()))
+                .collect(),
+        }
+    }
+
+    /// As the state keeps it: entries whose key doesn't read are dropped.
+    pub(super) fn into_state(self) -> KeptState {
+        let standing = self
+            .standing
+            .into_iter()
+            .filter_map(|(k, s)| Uuid::parse_str(&k).ok().map(|id| (Some(id), s)))
+            .collect();
+        (
+            standing,
+            self.own.into_iter().collect(),
+            self.moves,
+            self.marks.into_iter().collect(),
+        )
+    }
+}
+
+impl Desk {
+    /// Writes each account's standing and the moves off full ones, when
+    /// they changed since last written.
+    pub(super) fn keep_standing(&self) {
+        let kept = KeptStanding::of(&self.0.state.lock());
+        {
+            let mut last = self.0.standing_kept.lock();
+            if last.as_ref() == Some(&kept) {
+                return;
+            }
+            *last = Some(kept.clone());
+        }
+        let store = Arc::clone(&self.0.store);
+        tokio::spawn(async move {
+            let value = match serde_json::to_value(&kept) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(error = %e, "couldn't write accounts' standing");
+                    return;
+                }
+            };
+            if let Err(e) = store.put_state(STANDING, &value).await {
+                tracing::warn!(error = %format!("{e:#}"), "couldn't keep accounts' standing");
+            }
+        });
+    }
+}
 
 /// Each sign-in problem as a Floor need.
 fn sign_in_needs(st: &super::State) -> Vec<accounts::AccountNeed> {
@@ -1364,7 +1523,7 @@ impl Desk {
                 on.entry(side).or_default().push(r.id);
             }
         }
-        accounts::needs(
+        let needs = accounts::needs(
             Engine::Claude,
             &st.accounts,
             &standing,
@@ -1377,11 +1536,157 @@ impl Desk {
                 .copied()
                 .collect(),
             Utc::now(),
-        )
-        .into_iter()
-        .chain(sign_in_needs(&st))
-        .filter(|n| !st.put_off.contains(n.id()))
-        .collect()
+        );
+        let needs = Self::ask_which_sign_in(&st, own_on_plan, needs);
+        let mut seen = std::collections::HashSet::new();
+        needs
+            .into_iter()
+            .chain(Self::in_terminal_needs(&st))
+            .chain(sign_in_needs(&st))
+            .filter(|n| !st.put_off.contains(n.id()))
+            // One of each, whatever raised it twice.
+            .filter(|n| seen.insert(n.id().to_string()))
+            .collect()
+    }
+
+    /// While which account this computer's sign-in is isn't known, a need
+    /// that would switch to or from it is a question instead: never a
+    /// guess behind a switch.
+    fn ask_which_sign_in(
+        st: &super::State,
+        own_on_plan: bool,
+        needs: Vec<accounts::AccountNeed>,
+    ) -> Vec<accounts::AccountNeed> {
+        use accounts::AccountNeed as N;
+        let has_accounts = st.accounts.iter().any(|a| a.engine == Engine::Claude);
+        let Some(own) = st.own_identity.as_ref() else {
+            return needs;
+        };
+        // Answered already: one of them, or (kept) none of them.
+        if !own_on_plan || !has_accounts || Self::own_account(st).is_some() || Self::own_is_none(st)
+        {
+            return needs;
+        }
+        let on_own = |n: &N| match n {
+            N::Limit { from, to, .. } => from.id.is_none() || to.id.is_none(),
+            N::Reset { account, from, .. } => account.id.is_none() || from.id.is_none(),
+            _ => false,
+        };
+        let own_full = st
+            .standing
+            .get(&None)
+            .is_some_and(|s| s.full(Utc::now()).is_some());
+        if !own_full && !needs.iter().any(on_own) {
+            return needs;
+        }
+        let mut kept: Vec<N> = needs.into_iter().filter(|n| !on_own(n)).collect();
+        kept.insert(
+            0,
+            N::WhichSignIn {
+                id: "which-sign-in".into(),
+                engine: Engine::Claude,
+                email: own.email.clone(),
+            },
+        );
+        kept
+    }
+
+    /// A Claude Code session in a terminal Desk can't restart (the person's
+    /// own, or one of Desk's grids) on a full plan: its own need.
+    fn in_terminal_needs(st: &super::State) -> Vec<accounts::AccountNeed> {
+        let now = Utc::now();
+        let mut out: Vec<accounts::AccountNeed> = st
+            .records
+            .values()
+            .filter(|r| r.engine == Engine::Claude)
+            // Running: in the person's own terminal (as last seen), or in one
+            // of Desk's grids while its process is.
+            .filter(|r| match (r.origin, r.terminal_id) {
+                (crate::model::Origin::External, _) => !matches!(
+                    r.state,
+                    SessionState::Stopped | SessionState::Closed | SessionState::Interrupted
+                ),
+                (_, Some(_)) => st.live.contains_key(&r.id),
+                (_, None) => false,
+            })
+            .filter_map(|r| {
+                let side = Self::side_of_session(st, r.id)?;
+                let resets_at = Self::standing_of(st, side).full(now)?;
+                Some(accounts::AccountNeed::InTerminal {
+                    id: format!("terminal:{}", r.id.simple()),
+                    engine: Engine::Claude,
+                    session: r.id,
+                    name: r.display_name.clone().unwrap_or_else(|| r.name.clone()),
+                    account: accounts::Side::of(&st.accounts, side),
+                    resets_at,
+                })
+            })
+            .collect();
+        out.sort_by(|a, b| a.id().cmp(b.id()));
+        out
+    }
+
+    /// What the person's other computers know of their accounts' plans
+    /// (Desk passes it on): kept where it is newer than this hub's, by the
+    /// account of the same identity, else of the same name. A machine with
+    /// copied accounts so never starts a session on one known to be full.
+    pub async fn learn_standing(
+        &self,
+        elsewhere: Vec<accounts::StandingElsewhere>,
+        sent_at: Option<chrono::DateTime<Utc>>,
+    ) -> usize {
+        let now = Utc::now();
+        // The sender's clock, as far from this one as its sending time is
+        // (a few seconds' difference is the trip, not the clock).
+        let skew = sent_at
+            .map(|sent| now - sent)
+            .filter(|d| d.num_seconds().abs() >= 5)
+            .unwrap_or_else(chrono::Duration::zero);
+        let learnt = {
+            let mut st = self.0.state.lock();
+            let mut learnt = 0;
+            for e in elsewhere {
+                let Some(standing) = e.standing.as_seen(skew, now) else {
+                    tracing::info!(account = %e.name.trim(), "standing from another computer refused: its times can't be right");
+                    continue;
+                };
+                let mine = |a: &&Account| {
+                    a.engine == e.engine && a.name.trim().eq_ignore_ascii_case(e.name.trim())
+                };
+                let by_identity = e
+                    .identity
+                    .as_deref()
+                    .and_then(|key| Self::account_of_identity(&st, key));
+                let by_name = st.accounts.iter().find(mine).map(|a| a.id);
+                // By identity when both know it; never onto an account known
+                // as another; else by name, as Desk copies them.
+                let id = match (by_identity, e.identity.as_deref(), by_name) {
+                    (Some(id), _, _) => Some(id),
+                    (None, Some(key), Some(id)) => st
+                        .links
+                        .get(&id)
+                        .is_none_or(|l| l.identity.key == key)
+                        .then_some(id),
+                    (None, None, Some(id)) => Some(id),
+                    (None, _, None) => None,
+                };
+                let Some(id) = id else {
+                    continue;
+                };
+                if st.standing.entry(Some(id)).or_default().learn(&standing) {
+                    learnt += 1;
+                }
+            }
+            learnt
+        };
+        if learnt > 0 {
+            tracing::info!(
+                learnt,
+                "accounts' standing learnt from another of the person's computers"
+            );
+            self.accounts_moved().await;
+        }
+        learnt
     }
 
     /// Whether Desk moves sessions off an account at its limit by itself.
@@ -1436,6 +1741,8 @@ impl Desk {
         // One at a time: two reports close together never move the same
         // sessions twice.
         let Ok(_one) = self.0.accounts_moving.try_lock() else {
+            // Another is acting on the needs; what changed is kept all the same.
+            self.keep_standing();
             return;
         };
         let needs = self.account_needs_all();
@@ -1443,6 +1750,7 @@ impl Desk {
             let mut st = self.0.state.lock();
             st.put_off.retain(|id| needs.iter().any(|n| n.id() == id));
         }
+        self.keep_standing();
         if self.auto_switch() {
             for n in &needs {
                 if let accounts::AccountNeed::Limit {

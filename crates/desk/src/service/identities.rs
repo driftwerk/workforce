@@ -100,9 +100,28 @@ impl Desk {
         found.first().map(|(id, _)| **id)
     }
 
+    /// The account known as the identity `key`.
+    pub(super) fn account_of_identity(st: &State, key: &str) -> Option<Uuid> {
+        Self::account_of(st, key)
+    }
+
     /// The account this computer's own CLI sign-in is, when that is known.
     pub(super) fn own_account(st: &State) -> Option<Uuid> {
         Self::account_of(st, &Self::own_key(st))
+    }
+
+    /// The side a need counts the CLI sign-in on now: the account it is
+    /// known to be.
+    pub(super) fn canonical(st: &State, side: Option<Uuid>) -> Option<Uuid> {
+        side.or_else(|| Self::own_account(st))
+    }
+
+    /// Whether the person said this computer's sign-in is none of their
+    /// accounts.
+    pub(super) fn own_is_none(st: &State) -> bool {
+        st.own_identity
+            .as_ref()
+            .is_some_and(|o| st.own_none.contains(&o.key))
     }
 
     /// The credential `side` is as kept: an account, or the CLI sign-in as

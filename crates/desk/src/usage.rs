@@ -54,7 +54,8 @@ pub trait PlanSink: Send + Sync {
 }
 
 /// One of a plan's windows as a CLI reported it.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct LimitWindow {
     pub used_percent: f64,
     pub resets_at: Option<chrono::DateTime<chrono::Utc>>,
