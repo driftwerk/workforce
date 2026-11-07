@@ -473,6 +473,15 @@ fn breaker_needs(sources: &Sources, caller: &FloorCaller) -> Vec<Need> {
     }
 }
 
+/// The bosses' plans, and changes to them, waiting on the person who holds
+/// the Desk: only they approve one.
+fn plan_needs(sources: &Sources, caller: &FloorCaller) -> Vec<Need> {
+    match (sources.desk)() {
+        Some(desk) if caller.personal => desk.plan_needs(),
+        _ => Vec::new(),
+    }
+}
+
 /// The questions sessions asked on the Desk's lines that wait on the
 /// person who holds it.
 fn line_needs(sources: &Sources, caller: &FloorCaller) -> Vec<Need> {
@@ -508,6 +517,7 @@ fn needs_of(
             .chain(routed_needs(state, caller, now)?)
             .chain(config_needs(state, caller))
             .chain(breaker_needs(sources, caller))
+            .chain(plan_needs(sources, caller))
             .chain(line_needs(sources, caller))
             .collect(),
     ))
@@ -800,6 +810,29 @@ pub(crate) async fn answer(
                 Err(DeskError::NotFound) => Ok(Err(Unanswered::Unknown)),
                 Err(DeskError::Conflict(_)) => Ok(Err(Unanswered::AlreadyAnswered)),
                 Err(e) => Err(e.into()),
+            }
+        }
+        DecideRef::Plan { plan, revision } => {
+            // The person's alone: a boss proposes, never approves.
+            if !caller.personal {
+                return Ok(Err(Unanswered::NotYours));
+            }
+            let Some(desk) = (sources.desk)() else {
+                return Ok(Err(Unanswered::Unknown));
+            };
+            match choice {
+                Choice::Allow => match desk.approve_plan(*plan, *revision, &By::you()).await {
+                    Ok(_) => Ok(Ok(())),
+                    Err(DeskError::NotFound) => Ok(Err(Unanswered::Unknown)),
+                    // A newer revision came, or it ended: it is asked again
+                    // as it is now.
+                    Err(DeskError::Conflict(_)) => Ok(Err(Unanswered::AlreadyAnswered)),
+                    Err(DeskError::Invalid(_)) => Ok(Err(Unanswered::NotOffered)),
+                    Err(e) => Err(e.into()),
+                },
+                // It stays as proposed: Desk opens its card to edit or drop.
+                Choice::Deny => Ok(Ok(())),
+                Choice::AllowForSession | Choice::Cancel => Ok(Err(Unanswered::NotOffered)),
             }
         }
         DecideRef::Config { agent_id, hash } => {

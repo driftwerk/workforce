@@ -107,6 +107,9 @@ pub(crate) enum Action {
         /// whoever gets it.
         text: String,
         to: Handout,
+        /// It is a ticket of a plan the person approved, which is the
+        /// authority for handing it out.
+        planned: bool,
     },
     /// Move a ticket on the board (by its key) to a column.
     MoveTicket {
@@ -118,6 +121,8 @@ pub(crate) enum Action {
         /// Whether the move takes it off a session started in another
         /// terminal, which is then told.
         off_external: bool,
+        /// It is a ticket of a plan the person approved.
+        planned: bool,
     },
     /// Run a session for the person: it wakes the overseer at each turn's
     /// end, and waits for it while the person isn't driving.
@@ -317,6 +322,7 @@ impl Action {
                 id: ticket_id(i.ticket_id)?,
                 text: String::new(),
                 to: handout(i.to)?,
+                planned: false,
             },
             "crew.move_ticket" => Self::MoveTicket {
                 ticket: ticket_key(i.ticket)?,
@@ -326,6 +332,7 @@ impl Action {
                     .ok_or("Say which column: backlog, todo, doing, review, done or dropped.")?,
                 was: None,
                 off_external: false,
+                planned: false,
             },
             "crew.take_on" => Self::TakeOn {
                 session: session()?,
@@ -562,8 +569,11 @@ impl CrewHub {
             Action::Assign { .. } => true,
             Action::Resume { .. } | Action::Restart { .. } => o.act.resume_restart,
             Action::StartSession { .. } => o.act.hand_out_work,
-            Action::AssignTicket { .. } => o.act.hand_out_work,
-            Action::MoveTicket { .. } => o.act.hand_out_work,
+            // The person's approval of its plan is the authority for its
+            // tickets, whatever `hand_out_work` says.
+            Action::AssignTicket { planned, .. } | Action::MoveTicket { planned, .. } => {
+                *planned || o.act.hand_out_work
+            }
             Action::Approve { session, approval } => {
                 // Codex's requests are to leave its sandbox, and what it says
                 // of them isn't what runs: the person's alone.
@@ -1291,9 +1301,14 @@ impl CrewHub {
     ) -> Result<(), String> {
         match action {
             Action::AssignTicket {
-                ticket, id, text, ..
+                ticket,
+                id,
+                text,
+                planned,
+                ..
             } => {
                 let t = self.ticket_named(ticket, *id, seen).await?;
+                *planned = self.in_approved_plan(t.ticket.id).await;
                 *id = Some(t.ticket.id);
                 if let Some(key) = &t.key {
                     ticket.clone_from(key);
@@ -1306,8 +1321,10 @@ impl CrewHub {
                 state,
                 was,
                 off_external,
+                planned,
             } => {
                 let t = self.ticket_named(ticket, *id, seen).await?;
+                *planned = self.in_approved_plan(t.ticket.id).await;
                 *id = Some(t.ticket.id);
                 if let Some(key) = &t.key {
                     ticket.clone_from(key);
@@ -1322,6 +1339,27 @@ impl CrewHub {
             _ => {}
         }
         Ok(())
+    }
+
+    /// Whether `ticket` is in a plan the person approved that hasn't ended.
+    async fn in_approved_plan(&self, ticket: Uuid) -> bool {
+        let Ok(Some(plan)) = self.desk.store().plan_of_ticket(ticket).await else {
+            return false;
+        };
+        self.desk
+            .store()
+            .plan(plan)
+            .await
+            .ok()
+            .flatten()
+            .is_some_and(|p| {
+                p.approved_revision.is_some()
+                    && matches!(
+                        p.state,
+                        workforce_desk::plan::PlanState::Running
+                            | workforce_desk::plan::PlanState::Paused
+                    )
+            })
     }
 
     /// Hands the ticket `action` names to a session, an agent, or a session
@@ -1449,7 +1487,11 @@ impl CrewHub {
     /// its scope's group for a group's boss; for the main overseer, the
     /// group its agent sits in when that group has no boss of its own
     /// (which is still its scope), else none.
-    fn boss_group(&self, service: &crate::serve::AgentService, o: &Oversight) -> Option<String> {
+    pub(crate) fn boss_group(
+        &self,
+        service: &crate::serve::AgentService,
+        o: &Oversight,
+    ) -> Option<String> {
         if let Some(g) = o.scope.group() {
             return Some(g.to_string());
         }

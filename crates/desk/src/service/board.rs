@@ -186,7 +186,7 @@ impl Desk {
 
     /// Writes `t` as changed from what was read of it; a change made
     /// meanwhile by anyone else is never overwritten.
-    async fn save_ticket(&self, t: &mut Ticket) -> Result<(), DeskError> {
+    pub(super) async fn save_ticket(&self, t: &mut Ticket) -> Result<(), DeskError> {
         self.0.store.put_ticket(t).await.map_err(stale)
     }
 
@@ -201,7 +201,7 @@ impl Desk {
         Ok(self.board_of(id).await?.group)
     }
 
-    async fn board_of(&self, id: Uuid) -> Result<Board, DeskError> {
+    pub(super) async fn board_of(&self, id: Uuid) -> Result<Board, DeskError> {
         self.0
             .store
             .board(id)
@@ -325,7 +325,7 @@ impl Desk {
     // ── Reading tickets ──────────────────────────────────────────────────
 
     /// `tickets` as Desk shows them, with what the board computes of each.
-    async fn views(&self, tickets: Vec<Ticket>) -> Result<Vec<TicketView>, DeskError> {
+    pub(super) async fn views(&self, tickets: Vec<Ticket>) -> Result<Vec<TicketView>, DeskError> {
         let mut states: HashMap<Uuid, TicketState> =
             tickets.iter().map(|t| (t.id, t.state)).collect();
         let missing: Vec<Uuid> = tickets
@@ -363,11 +363,11 @@ impl Desk {
             .collect())
     }
 
-    async fn view_ticket(&self, t: Ticket) -> Result<TicketView, DeskError> {
+    pub(super) async fn view_ticket(&self, t: Ticket) -> Result<TicketView, DeskError> {
         Ok(self.views(vec![t]).await?.remove(0))
     }
 
-    async fn ticket_of(&self, id: Uuid) -> Result<Ticket, DeskError> {
+    pub(super) async fn ticket_of(&self, id: Uuid) -> Result<Ticket, DeskError> {
         self.0
             .store
             .ticket(id)
@@ -481,7 +481,7 @@ impl Desk {
     // ── Changing tickets ─────────────────────────────────────────────────
 
     /// Records `kind` by `by` on `t`, about `subject`, and announces `t`.
-    async fn ticket_changed(
+    pub(super) async fn ticket_changed(
         &self,
         t: Ticket,
         by: &By,
@@ -501,13 +501,18 @@ impl Desk {
         Ok(v)
     }
 
-    async fn key_of(&self, t: &Ticket) -> Result<String, DeskError> {
+    pub(super) async fn key_of(&self, t: &Ticket) -> Result<String, DeskError> {
         let b = self.board_of(t.board).await?;
         Ok(t.key(&b).unwrap_or_else(|| "a ticket".into()))
     }
 
     /// The rank of a card dropped at the end of `state` on `board`.
-    async fn end_rank(&self, board: Uuid, state: TicketState, not: Uuid) -> Result<f64, DeskError> {
+    pub(super) async fn end_rank(
+        &self,
+        board: Uuid,
+        state: TicketState,
+        not: Uuid,
+    ) -> Result<f64, DeskError> {
         let tickets = self.0.store.board_tickets(board).await.map_err(internal)?;
         let last = tickets
             .iter()
@@ -518,7 +523,7 @@ impl Desk {
     }
 
     /// `t` moved to the end of `to`, when it isn't in `to` already.
-    async fn to_column(
+    pub(super) async fn to_column(
         &self,
         t: &mut Ticket,
         to: TicketState,
@@ -639,7 +644,12 @@ impl Desk {
     /// Moves `t` as it was read: a change made to it since is never undone.
     /// Anyone but a session dropping it or putting it back in the queue
     /// takes it off whoever had it, and that session is told.
-    async fn move_read(&self, mut t: Ticket, mv: Move, by: &By) -> Result<TicketView, DeskError> {
+    pub(super) async fn move_read(
+        &self,
+        mut t: Ticket,
+        mv: Move,
+        by: &By,
+    ) -> Result<TicketView, DeskError> {
         let rank = self.drop_rank(&t, &mv).await?;
         let from = t.state;
         set_state(&mut t, mv.state, now());
@@ -906,7 +916,10 @@ impl Desk {
     }
 
     /// The keys and states of what `t` needs.
-    async fn need_keys(&self, t: &Ticket) -> Result<Vec<(String, TicketState)>, DeskError> {
+    pub(super) async fn need_keys(
+        &self,
+        t: &Ticket,
+    ) -> Result<Vec<(String, TicketState)>, DeskError> {
         if t.needs.is_empty() {
             return Ok(vec![]);
         }
@@ -934,7 +947,7 @@ impl Desk {
             .await
     }
 
-    async fn assign_session(
+    pub(super) async fn assign_session(
         &self,
         mut t: Ticket,
         key: &str,
@@ -1070,7 +1083,7 @@ impl Desk {
 
     /// Tells `session` on its line, from `by`; what can't be sent is
     /// only logged.
-    async fn tell_session(&self, session: Uuid, text: String, by: &By) {
+    pub(super) async fn tell_session(&self, session: Uuid, text: String, by: &By) {
         let said = self
             .line_send(
                 sender_of(by),

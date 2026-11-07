@@ -68,6 +68,8 @@ mod breaker_tests;
 #[cfg(test)]
 mod codex_asks_tests;
 mod ledger;
+mod plans;
+pub use plans::{Changed, NewPlan, OnDrop, PlanDetail, PlanEdit, PlanSummary, PlanTicketView};
 #[cfg(test)]
 mod lifecycle_tests;
 mod memory;
@@ -821,6 +823,8 @@ struct Inner {
     /// Whose scope each row is: members' groups and the bosses there are.
     /// Nothing is held under it, so events are stamped wherever noted.
     scopes: Mutex<scopes::Scopes>,
+    /// The plans waiting on the person.
+    boss_plans: Mutex<plans::Plans>,
 }
 
 #[derive(Clone)]
@@ -1442,6 +1446,7 @@ impl Desk {
             line_crew: Mutex::new(None),
             boss_bounds: Mutex::new(None),
             scopes: Mutex::default(),
+            boss_plans: Mutex::default(),
         }));
         desk.scopes_follow(&desk.layout());
         desk.scopes_load().await;
@@ -1453,6 +1458,7 @@ impl Desk {
         tokio::spawn(desk.clone().breaker_loop());
         desk.charge_load().await;
         tokio::spawn(desk.clone().charge_loop());
+        desk.plans_load().await;
         desk.boards_ungrouped(&ungrouped_boards).await;
         tokio::spawn(desk.clone().watch_background());
         tokio::spawn(desk.clone().line_loop());
@@ -2542,14 +2548,15 @@ impl Desk {
     /// Starts a session; `by` is who asked (none: the session's own
     /// `started` is recorded).
     pub async fn create(&self, new: NewSession, by: Option<By>) -> Result<SessionView, DeskError> {
-        self.start_session(new, None, by, false).await
+        self.start_session(new, None, None, by, false).await
     }
 
     /// Starts a session the person asked for in Desk, in a folder they
     /// chose: the one start whose CLI may trust its folder (see
     /// [`SessionRecord::folder_chosen`]).
     pub async fn create_chosen(&self, new: NewSession) -> Result<SessionView, DeskError> {
-        self.start_session(new, None, Some(By::you()), true).await
+        self.start_session(new, None, None, Some(By::you()), true)
+            .await
     }
 
     /// Starts a session for `boss`, which runs it from the start: it is in
@@ -2562,12 +2569,29 @@ impl Desk {
         boss: &Party,
         by: By,
     ) -> Result<SessionView, DeskError> {
-        self.start_session(new, Some(boss), Some(by), false).await
+        self.start_session(new, None, Some(boss), Some(by), false)
+            .await
+    }
+
+    /// [`Self::create_for`], as the session `id`: a plan's runner names its
+    /// session before it starts, so a start cut off between the two starts
+    /// that same session, and never another. An `id` Desk already has is
+    /// refused: it started.
+    pub(super) async fn create_for_as(
+        &self,
+        id: Uuid,
+        new: NewSession,
+        boss: &Party,
+        by: By,
+    ) -> Result<SessionView, DeskError> {
+        self.start_session(new, Some(id), Some(boss), Some(by), false)
+            .await
     }
 
     async fn start_session(
         &self,
         new: NewSession,
+        id: Option<Uuid>,
         boss: Option<&Party>,
         by: Option<By>,
         folder_chosen: bool,
@@ -2576,6 +2600,15 @@ impl Desk {
         if name.is_empty() {
             return Err(DeskError::Invalid("a session needs a name".into()));
         }
+        let id = match id {
+            Some(id) if self.0.state.lock().records.contains_key(&id) => {
+                return Err(DeskError::Conflict(format!(
+                    "the session {id} has started already"
+                )))
+            }
+            Some(id) => id,
+            None => Uuid::new_v4(),
+        };
         self.breaker_refuses_start(by.as_ref())?;
         let group = new
             .group
@@ -2657,7 +2690,6 @@ impl Desk {
             None => (cwd, None),
         };
         let now = Utc::now();
-        let id = Uuid::new_v4();
         let caps = engine::caps(new.engine, view);
         let record = SessionRecord {
             id,

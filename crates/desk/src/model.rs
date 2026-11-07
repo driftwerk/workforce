@@ -413,6 +413,11 @@ pub enum DeskEvent {
     Charge {
         charge: Box<crate::service::ChargeView>,
     },
+    /// A boss's plan was made or changed: proposed, approved, edited,
+    /// paused, dropped or done.
+    Plan {
+        plan: Box<crate::service::PlanSummary>,
+    },
     /// A board's ticket was made or changed.
     Ticket {
         ticket: Box<crate::service::TicketView>,

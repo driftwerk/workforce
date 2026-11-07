@@ -35,6 +35,10 @@ mod desk_folders_routes;
 mod desk_line_routes;
 
 #[cfg(feature = "postgres")]
+#[path = "api/desk_plan_routes.rs"]
+mod desk_plan_routes;
+
+#[cfg(feature = "postgres")]
 #[path = "api/desk_conversation_routes.rs"]
 mod desk_conversation_routes;
 

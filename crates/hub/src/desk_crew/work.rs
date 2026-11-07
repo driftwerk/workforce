@@ -46,6 +46,17 @@ pub(crate) fn spend(turns: &mut Vec<Instant>, now: Instant, hour: Duration, max:
     true
 }
 
+/// Spends one work turn of `run`'s hour, when one fits.
+pub(crate) fn spend_run(run: &mut WorkRun, now: Instant, hour: Duration, max: u32) -> bool {
+    match spend(&mut run.turns, now, hour, max) {
+        true => {
+            run.told = false;
+            true
+        }
+        false => false,
+    }
+}
+
 impl CrewHub {
     /// Whether `boss` runs `session` now.
     pub(crate) fn runs(&self, session: Uuid, boss: &str) -> bool {

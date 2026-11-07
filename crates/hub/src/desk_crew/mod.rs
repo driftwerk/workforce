@@ -33,6 +33,7 @@ mod deliver;
 mod extras;
 mod line;
 mod observe;
+mod plan;
 mod read_only;
 mod reading;
 mod scope;
@@ -46,6 +47,7 @@ pub(crate) mod tests;
 
 pub(crate) use extras::mentions_for;
 pub use observe::Observed;
+pub use plan::{plan_channel, PLAN};
 
 /// What a check-in's prompt starts with: the person never typed it, so the
 /// DM's history leaves it out.
@@ -128,6 +130,11 @@ pub struct CrewHub {
     /// Held while the overseer starts a session: counting its busy
     /// sessions and starting one more are one step.
     starting: tokio::sync::Mutex<()>,
+    /// The plan tickets whose session failed to start, and when: each is
+    /// tried again only after a minute.
+    plan_failed: Mutex<HashMap<uuid::Uuid, std::time::Instant>>,
+    /// What failed to start, for its plan's next turn.
+    plan_failures: Mutex<Vec<(uuid::Uuid, String)>>,
 }
 
 static CREWS: Mutex<Vec<Weak<CrewHub>>> = Mutex::new(Vec::new());
@@ -330,6 +337,8 @@ impl CrewHub {
             questions: Mutex::default(),
             work: Mutex::default(),
             starting: tokio::sync::Mutex::new(()),
+            plan_failed: Mutex::default(),
+            plan_failures: Mutex::default(),
         });
         {
             let mut crews = CREWS.lock();
@@ -343,6 +352,7 @@ impl CrewHub {
             .answer_lines_with(&(Arc::clone(&crew) as Arc<dyn Crew>));
         tokio::spawn(watcher::sync_loop(Arc::clone(&crew), cancel.clone()));
         tokio::spawn(watcher::wake_loop(Arc::clone(&crew), cancel.clone()));
+        tokio::spawn(plan::plan_loop(Arc::clone(&crew), cancel.clone()));
         tokio::spawn(line::line_loop(Arc::clone(&crew), cancel));
         crew
     }

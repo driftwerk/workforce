@@ -462,6 +462,15 @@ impl Desk {
             .names
             .insert(boss.id.clone(), boss.name.clone());
         let c = Charge::new(id, &boss.id, How::Started, group.map(str::to_string));
+        // Known as the boss's before it is written, so a boss that takes on
+        // every session never takes this one on as it starts; one that
+        // fails to be written is forgotten with the start.
+        self.0
+            .state
+            .lock()
+            .charges
+            .rows
+            .insert(c.session, c.clone());
         self.put_charge(c, Wheel::Boss).await.map(drop)
     }
 

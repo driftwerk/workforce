@@ -152,6 +152,12 @@ kinds! {
     TicketEdited => "ticket_edited",
     TicketCommented => "ticket_commented",
     TicketDeleted => "ticket_deleted",
+    Planned => "planned",
+    PlanApproved => "plan_approved",
+    PlanChanged => "plan_changed",
+    PlanPaused => "plan_paused",
+    PlanDropped => "plan_dropped",
+    PlanDone => "plan_done",
 }
 
 /// One thing that happened on the crew.
@@ -532,12 +538,26 @@ pub struct Extras {
     /// person, answered in place.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub questions: Vec<MentionedQuestion>,
+    /// The plan a plan card shows, as of the revision it was posted for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<MentionedPlan>,
 }
 
 impl Extras {
     pub fn is_empty(&self) -> bool {
-        self.approvals.is_empty() && self.suggestions.is_empty() && self.questions.is_empty()
+        self.approvals.is_empty()
+            && self.suggestions.is_empty()
+            && self.questions.is_empty()
+            && self.plan.is_none()
     }
+}
+
+/// A plan, as a card in its boss's DM names it: Desk reads the plan, and
+/// says when a newer revision has come since.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MentionedPlan {
+    pub id: uuid::Uuid,
+    pub revision: i32,
 }
 
 /// A question on a session's line, as the overseer's DM shows it.

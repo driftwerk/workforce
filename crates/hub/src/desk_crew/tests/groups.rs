@@ -266,6 +266,18 @@ fn pointed_at(name: &str, other: &Client, dir: &Path) -> Vec<(Value, bool)> {
             json!({ "ticket": other.ticket, "state": "done", "reason": r }),
             true,
         )],
+        "crew.plan" => vec![(
+            json!({
+                "goal": "Ship it",
+                "board": other.ticket.split('-').next().unwrap_or_default(),
+                "tickets": [{ "title": "Look around", "folder": dir.to_string_lossy() }],
+            }),
+            true,
+        )],
+        "crew.plan_update" => vec![(
+            json!({ "plan_id": uuid::Uuid::new_v4().to_string(), "goal": "Ship it", "why": r }),
+            true,
+        )],
         other => {
             panic!("{other} is a crew tool with no case here: say how it is kept to its scope")
         }

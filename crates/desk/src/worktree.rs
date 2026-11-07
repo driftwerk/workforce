@@ -73,6 +73,23 @@ pub async fn create(cwd: &Path, branch: &str) -> Result<PathBuf> {
     Ok(path)
 }
 
+/// Whether `cwd` is in a git repository: only one can have a worktree.
+pub async fn in_repo(cwd: &Path) -> bool {
+    git(cwd, &["rev-parse", "--show-toplevel"]).await.is_ok()
+}
+
+/// The worktree [`create`] made for `branch` in `cwd`'s repo, when there
+/// is one: what a start cut off after making it starts in.
+pub async fn existing(cwd: &Path, branch: &str) -> Option<PathBuf> {
+    let name = slug(branch);
+    if name.is_empty() {
+        return None;
+    }
+    let root = PathBuf::from(git(cwd, &["rev-parse", "--show-toplevel"]).await.ok()?);
+    let path = root.join(".worktrees").join(&name);
+    path.is_dir().then_some(path)
+}
+
 /// The project a session's folder belongs to: the repo for one of Desk's
 /// own worktrees (`<repo>/.worktrees/<slug>`, as [`create`] makes them),
 /// else the folder itself.
