@@ -167,6 +167,8 @@ pub enum Hook {
     ToolStart {
         tool: String,
         call: Call,
+        /// The call's id (`tool_use_id`), when the CLI says.
+        id: Option<String>,
     },
     /// A tool that waits on the person until they answer it in the
     /// terminal: a question it asks, its plan to approve. Its call's id,
@@ -175,8 +177,11 @@ pub enum Hook {
         id: Option<String>,
         question: Question,
     },
-    /// Auto mode refused a tool call.
-    Denied(Denied),
+    /// Auto mode refused a tool call: the call's id, when the CLI says.
+    Denied {
+        denied: Denied,
+        id: Option<String>,
+    },
     Permission {
         tool: String,
         detail: String,
@@ -264,12 +269,16 @@ pub fn parse_hook(body: &[u8]) -> eyre::Result<Hook> {
                 p.tool_name.as_deref().unwrap_or("tool"),
                 p.tool_input.as_ref(),
             ),
+            id: p.tool_use_id.clone(),
         },
-        "PermissionDenied" => Hook::Denied(Denied::from_hook(
-            p.tool_name.as_deref().unwrap_or("tool"),
-            p.tool_input.as_ref(),
-            p.reason.as_deref().unwrap_or_default(),
-        )),
+        "PermissionDenied" => Hook::Denied {
+            denied: Denied::from_hook(
+                p.tool_name.as_deref().unwrap_or("tool"),
+                p.tool_input.as_ref(),
+                p.reason.as_deref().unwrap_or_default(),
+            ),
+            id: p.tool_use_id.clone(),
+        },
         "PermissionRequest" => {
             let (tool, detail) = tool();
             Hook::Permission {
@@ -690,14 +699,16 @@ pub(crate) mod tests {
                 call: Call {
                     tool: "Bash".into(),
                     input: Some("sleep 20".into())
-                }
+                },
+                id: None,
             }
         );
         // As Claude Code 2.1.314 sends it in auto mode.
         let refused = br#"{"session_id":"s1","permission_mode":"auto","hook_event_name":"PermissionDenied","tool_name":"Bash","tool_input":{"command":"security find-generic-password -s deploy -w","description":"Read the password"},"tool_use_id":"toolu_01","reason":"[Credential Exploration]"}"#;
-        let Hook::Denied(d) = parse_hook(refused).unwrap() else {
+        let Hook::Denied { denied: d, id } = parse_hook(refused).unwrap() else {
             panic!("not a refusal")
         };
+        assert_eq!(id.as_deref(), Some("toolu_01"));
         assert_eq!(
             (d.tool.as_str(), d.reason.as_str(), d.allowable),
             (

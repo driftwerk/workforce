@@ -288,19 +288,22 @@ pub(crate) async fn turns(
         .map(|t| t.id)
         .collect();
     let desk = (sources.desk)();
-    Ok(named(
-        floor::settle(logged, &live),
-        |subject| match subject {
-            Subject::Agent { agent_id, .. } => state
-                .registry
-                .get(agent_id)
-                .map(|s| crate::desk_crew::name_of(&s)),
-            Subject::Session { id, .. } => desk
-                .as_ref()
-                .and_then(|d| d.view(*id).ok())
-                .map(|v| v.label().to_string()),
-        },
-    ))
+    let settled = floor::settle(logged, &live);
+    // A session's wait stands only while the session asks it.
+    let settled = match &desk {
+        Some(d) => floor::backed(settled, &d.ask_keys()),
+        None => settled,
+    };
+    Ok(named(settled, |subject| match subject {
+        Subject::Agent { agent_id, .. } => state
+            .registry
+            .get(agent_id)
+            .map(|s| crate::desk_crew::name_of(&s)),
+        Subject::Session { id, .. } => desk
+            .as_ref()
+            .and_then(|d| d.view(*id).ok())
+            .map(|v| v.label().to_string()),
+    }))
 }
 
 /// A routed approval waiting on its approver, as a need: the call it asks

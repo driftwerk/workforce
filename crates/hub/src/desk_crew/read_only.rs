@@ -467,6 +467,9 @@ mod tests {
             why: None,
             options: None,
             request: None,
+            call: None,
+            agent: None,
+            cli_session: None,
         }
     }
 

@@ -142,6 +142,27 @@ pub struct PendingApproval {
     /// wire; none when Desk wasn't sent it whole.
     #[serde(skip)]
     pub request: Option<Request>,
+    /// The engine's id for the tool call it asks about (Claude Code's
+    /// `tool_use_id`), when it says: what the call's end, refusal, or the
+    /// next call of its thread is matched by.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call: Option<String>,
+    /// The sub-agent that asked it (Claude Code's `agent_id`), when one did:
+    /// that sub-agent's end ends it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    /// The engine's own id for the conversation that asked it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cli_session: Option<String>,
+}
+
+impl PendingApproval {
+    /// The key of the wait it makes on the floor: its own id, which it
+    /// keeps however often it is shown, a hub restart included (Desk keeps
+    /// it, with the call it is about).
+    pub fn key(&self) -> String {
+        self.id.to_string()
+    }
 }
 
 /// A session's request in full, as its engine sent it.

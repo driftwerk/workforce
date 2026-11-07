@@ -335,7 +335,7 @@ pub(super) fn turn_ops(
                 if let Some(turn) = open {
                     ops.push(TurnOp::Unwait {
                         turn,
-                        key: pending.id.to_string(),
+                        key: pending.key(),
                         at,
                     });
                 }
@@ -423,9 +423,9 @@ pub(super) fn asking_outcome(
 }
 
 /// A pending request as the wait it makes.
-fn wait_of(session: Uuid, p: &PendingApproval) -> Wait {
+pub(super) fn wait_of(session: Uuid, p: &PendingApproval) -> Wait {
     Wait {
-        key: p.id.to_string(),
+        key: p.key(),
         from: p.since,
         to: None,
         ask: match &p.why {
@@ -507,6 +507,9 @@ mod tests {
             why: None,
             options: None,
             request: None,
+            call: None,
+            agent: None,
+            cli_session: None,
         }
     }
 
@@ -1137,6 +1140,9 @@ mod tests {
             why: None,
             options: None,
             request: None,
+            call: None,
+            agent: None,
+            cli_session: None,
         };
         for t in [
             Transition::Finished { reply: "" },
