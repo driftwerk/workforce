@@ -73,20 +73,75 @@ pub(crate) enum Waiting {
     Hit(Uuid, Option<crate::limit::LimitHit>, DateTime<Utc>),
 }
 
+/// The most a session's waiting readings are kept; its stops on the limit
+/// are all kept.
+pub(super) const WAITING_MAX: usize = 64;
+
 impl Waiting {
     fn session(&self) -> Uuid {
         match self {
             Waiting::Usage(_, id, _) | Waiting::Hit(id, _, _) => *id,
         }
     }
+
+    /// Waits in `st`: a session's readings beyond [`WAITING_MAX`] drop its
+    /// oldest reading, never a stop on the limit, nor another session's.
+    pub(super) fn wait(self, st: &mut State) {
+        let id = self.session();
+        if matches!(self, Waiting::Usage(..)) {
+            let readings = st
+                .scan_waiting
+                .iter()
+                .filter(|w| w.session() == id && matches!(w, Waiting::Usage(..)))
+                .count();
+            if readings >= WAITING_MAX {
+                if let Some(oldest) = st
+                    .scan_waiting
+                    .iter()
+                    .position(|w| w.session() == id && matches!(w, Waiting::Usage(..)))
+                {
+                    st.scan_waiting.remove(oldest);
+                }
+            }
+        }
+        st.scan_waiting.push(self);
+    }
+}
+
+/// Releases a session's scan when dropped, however it ended: what waited
+/// on it is filed as it is known now (on its account, unless a sign-in
+/// inside was found).
+pub(super) struct ScanRelease {
+    desk: Desk,
+    id: Uuid,
+}
+
+impl ScanRelease {
+    pub(super) fn new(desk: Desk, id: Uuid) -> Self {
+        Self { desk, id }
+    }
+}
+
+impl Drop for ScanRelease {
+    fn drop(&mut self) {
+        let waiting = {
+            let mut st = self.desk.0.state.lock();
+            if !st.scan_pending.contains(&self.id) {
+                return;
+            }
+            Desk::scan_released(&mut st, self.id)
+        };
+        self.desk.replay(waiting);
+    }
 }
 
 /// What a session that turned out to run on another sign-in takes back
-/// from its account: this computer's plan reading of it taken at `exact`,
+/// from its account: this computer's plan reading of it taken in `taken`
+/// (from the `/login` to its last report),
 /// with `instead` (the account's own stop on its limit, as a reading) kept.
 struct TakenBack {
     ids: Option<Vec<String>>,
-    exact: Option<DateTime<Utc>>,
+    taken: Option<(DateTime<Utc>, DateTime<Utc>)>,
     instead: Option<(serde_json::Value, DateTime<Utc>)>,
 }
 
@@ -616,8 +671,11 @@ impl Desk {
         }
         if hit {
             self.keep_standing();
-            let desk = self.clone();
-            tokio::spawn(async move { desk.accounts_moved().await });
+            // Filed from a release that may come as the runtime stops.
+            if let Ok(rt) = tokio::runtime::Handle::try_current() {
+                let desk = self.clone();
+                rt.spawn(async move { desk.accounts_moved().await });
+            }
         }
     }
 
@@ -686,13 +744,13 @@ impl Desk {
             self.keep_relogged();
         }
         if let Some((Some(account), t)) = taken {
-            tracing::info!(session = %id, %account, forgot = t.exact.is_some(), "a session ran on this computer's sign-in since a /login inside it: what it reported since is no longer its account's");
+            tracing::info!(session = %id, %account, forgot = t.taken.is_some(), "a session ran on this computer's sign-in since a /login inside it: what it reported since is no longer its account's");
             if let (Some(plans), Some(ids)) = (&self.0.plans, t.ids) {
-                if t.exact.is_some() || t.instead.is_some() {
+                if t.taken.is_some() || t.instead.is_some() {
                     plans.forget_local(
                         crate::usage::LocalPlan::Claude,
                         crate::usage::LocalAccount { ids, plan: None },
-                        t.exact,
+                        t.taken,
                         t.instead,
                     );
                 }
@@ -791,7 +849,7 @@ impl Desk {
         }
         TakenBack {
             ids: Self::plan_ids(st, &raw),
-            exact,
+            taken: exact.map(|last| (since, last)),
             instead,
         }
     }

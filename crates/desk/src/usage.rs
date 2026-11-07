@@ -52,9 +52,10 @@ pub trait PlanSink: Send + Sync {
         None
     }
 
-    /// The reading this computer reported as `account`'s at `exact` was
-    /// another sign-in's: forgotten, only if it is still the one kept (a
-    /// later one, someone else's, stands). `instead` (a reading of the
+    /// What this computer reported as `account`'s from `taken.0` to
+    /// `taken.1` (the last it reported, which may not have been written as
+    /// it said nothing new) was another sign-in's: the reading kept from
+    /// then is forgotten; a later one, someone else's, stands. `instead` (a reading of the
     /// account's own, as `plan`'s CLI reports one, taken at its time) is
     /// kept as any reading is: only over an older one. In order with every
     /// reading kept before it.
@@ -62,7 +63,7 @@ pub trait PlanSink: Send + Sync {
         &self,
         _plan: LocalPlan,
         _account: LocalAccount,
-        _exact: Option<chrono::DateTime<chrono::Utc>>,
+        _taken: Option<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)>,
         _instead: Option<(Value, chrono::DateTime<chrono::Utc>)>,
     ) {
     }

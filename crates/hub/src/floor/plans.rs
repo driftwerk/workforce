@@ -37,14 +37,18 @@ pub struct Plans {
 /// One write to the floor's plan readings.
 enum Write {
     Keep(Reading),
-    /// Forget the login's reading taken at `exact` (if it is still the one
+    /// Forget the login's reading taken in `taken` (if it is still the one
     /// kept), then keep `instead`.
     Forget {
         login: String,
-        exact: Option<chrono::DateTime<Utc>>,
+        taken: Option<(chrono::DateTime<Utc>, chrono::DateTime<Utc>)>,
         instead: Option<Reading>,
     },
 }
+
+/// How long one write may wait on the store: one stuck never holds up the
+/// rest for long.
+const STORE_WAIT: Duration = Duration::from_secs(10);
 
 /// How often forgetting a reading is tried before it is given up on.
 const FORGET_TRIES: u32 = 4;
@@ -58,7 +62,10 @@ async fn write(
     let kept = |r: Reading| {
         let (store, signals) = (Arc::clone(&store), signals.clone());
         async move {
-            match store.record(&r).await {
+            let kept = tokio::time::timeout(STORE_WAIT, store.record(&r))
+                .await
+                .unwrap_or_else(|_| Err(eyre::eyre!("the store took too long")));
+            match kept {
                 Ok(true) => {
                     signals.send(DeskSignal::Usage, r.login.owner());
                     true
@@ -78,14 +85,20 @@ async fn write(
             }
             Write::Forget {
                 login,
-                exact,
+                taken,
                 instead,
             } => {
                 let mut forgot = false;
-                if let Some(exact) = exact {
+                if let Some((since, last)) = taken {
                     let mut wait = Duration::from_millis(500);
                     for attempt in 1..=FORGET_TRIES {
-                        match store.forget_reading(&login, exact).await {
+                        let tried = tokio::time::timeout(
+                            STORE_WAIT,
+                            store.forget_reading(&login, since, last),
+                        )
+                        .await
+                        .unwrap_or_else(|_| Err(eyre::eyre!("the store took too long")));
+                        match tried {
                             Ok(gone) => {
                                 forgot = gone;
                                 break;
@@ -258,7 +271,7 @@ impl PlanSink for Plans {
         &self,
         plan: LocalPlan,
         account: LocalAccount,
-        exact: Option<chrono::DateTime<Utc>>,
+        taken: Option<(chrono::DateTime<Utc>, chrono::DateTime<Utc>)>,
         instead: Option<(Value, chrono::DateTime<Utc>)>,
     ) {
         let (kind, windows): (_, fn(&Value) -> Vec<Window>) = match plan {
@@ -284,7 +297,7 @@ impl PlanSink for Plans {
         self.written.lock().remove(&login);
         let _ = self.writes.send(Write::Forget {
             login,
-            exact,
+            taken,
             instead,
         });
     }
@@ -366,7 +379,7 @@ mod tests {
             // Another sign-in's plan, filed as this account's, and forgotten
             // at once: in order, never before it was kept.
             plans.local_at(LocalPlan::Claude, weekly(26, "2026-11-13T19:00:00Z"), account(), at(5));
-            plans.forget_local(LocalPlan::Claude, account(), Some(at(5)), full());
+            plans.forget_local(LocalPlan::Claude, account(), Some((at(10), at(5))), full());
             let kept = settled(1).await;
             assert_eq!(kept.len(), 1);
             assert_eq!(
@@ -374,10 +387,25 @@ mod tests {
                 (100.0, Some(resets), at(11)),
                 "the account's own limit, as it stopped on it"
             );
+            // Reported again unchanged ten seconds on: not written again,
+            // so the one kept is older than the last report, and still
+            // forgotten.
+            plans.local_at(LocalPlan::Claude, weekly(26, "2026-11-13T19:00:00Z"), account(), at(4));
+            let steady = at(4) + chrono::Duration::seconds(10);
+            plans.local_at(LocalPlan::Claude, weekly(26, "2026-11-13T19:00:00Z"), account(), steady);
+            let kept = settled(5).await;
+            assert_eq!(kept[0].observed_at, at(4), "the second was never written");
+            plans.forget_local(LocalPlan::Claude, account(), Some((at(10), steady)), full());
+            let kept = settled(6).await;
+            assert_eq!(
+                (kept[0].windows[0].used_percent, kept[0].observed_at),
+                (100.0, at(11)),
+                "forgotten though its time is before the last report's"
+            );
             // A later reading, someone else's, stands: only the one taken
             // then is forgotten, and the limit is never kept over it.
             plans.local_at(LocalPlan::Claude, weekly(40, "2026-11-13T19:00:00Z"), account(), at(2));
-            plans.forget_local(LocalPlan::Claude, account(), Some(at(5)), full());
+            plans.forget_local(LocalPlan::Claude, account(), Some((at(10), at(5))), full());
             let kept = settled(9).await;
             assert_eq!(
                 (kept[0].windows[0].used_percent, kept[0].observed_at),

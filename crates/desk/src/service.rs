@@ -1672,25 +1672,29 @@ impl Desk {
             if let Some(path) = scan {
                 let desk = self.clone();
                 tokio::spawn(async move {
-                    let read = tokio::task::spawn_blocking(move || {
-                        transcript::last_login_since(&path, started_at)
-                    });
-                    let found = match tokio::time::timeout(LOGIN_SCAN_WAIT, read).await {
-                        Ok(Ok(Ok(found))) => found,
-                        Ok(Ok(Err(e))) => {
-                            tracing::warn!(session = %id, error = %e, "couldn't read a session's transcript for a /login inside it");
-                            None
-                        }
-                        Ok(Err(e)) => {
-                            tracing::warn!(session = %id, error = %e, "reading a session's transcript for a /login failed");
-                            None
-                        }
-                        Err(_) => {
-                            tracing::warn!(session = %id, "reading a session's transcript for a /login took too long: what it reports is filed as before");
-                            None
-                        }
+                    // Whatever ends it (done, too long, a panic): what waited
+                    // is filed.
+                    let _release = identities::ScanRelease::new(desk.clone(), id);
+                    let scan = async {
+                        let read = tokio::task::spawn_blocking(move || {
+                            transcript::last_login_since(&path, started_at)
+                        });
+                        let found = match read.await {
+                            Ok(Ok(found)) => found,
+                            Ok(Err(e)) => {
+                                tracing::warn!(session = %id, error = %e, "couldn't read a session's transcript for a /login inside it");
+                                None
+                            }
+                            Err(e) => {
+                                tracing::warn!(session = %id, error = %e, "reading a session's transcript for a /login failed");
+                                None
+                            }
+                        };
+                        desk.login_scan_done(id, found).await;
                     };
-                    desk.login_scan_done(id, found).await;
+                    if tokio::time::timeout(LOGIN_SCAN_WAIT, scan).await.is_err() {
+                        tracing::warn!(session = %id, "reading a session's transcript for a /login took too long: what it reports is filed as before");
+                    }
                 });
             }
         }
@@ -2080,11 +2084,7 @@ impl Desk {
             // Its transcript still being read for a `/login` inside it: kept
             // until it is known which sign-in it runs on.
             if let Some(id) = session.filter(|id| st.scan_pending.contains(id)) {
-                if st.scan_waiting.len() >= OWN_WAITING_MAX {
-                    st.scan_waiting.remove(0);
-                }
-                st.scan_waiting
-                    .push(identities::Waiting::Usage(limits, id, at));
+                identities::Waiting::Usage(limits, id, at).wait(&mut st);
                 return;
             }
             let raw = match session {
@@ -4961,11 +4961,7 @@ impl Desk {
         now: DateTime<Utc>,
     ) -> Option<DateTime<Utc>> {
         if st.scan_pending.contains(&id) {
-            if st.scan_waiting.len() >= OWN_WAITING_MAX {
-                st.scan_waiting.remove(0);
-            }
-            st.scan_waiting
-                .push(identities::Waiting::Hit(id, hit.cloned(), now));
+            identities::Waiting::Hit(id, hit.cloned(), now).wait(st);
             return None;
         }
         let standing = Self::standing_mut(st, raw);

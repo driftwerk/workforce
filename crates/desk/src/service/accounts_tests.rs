@@ -1264,12 +1264,14 @@ impl crate::usage::PlanSink for Plans {
         &self,
         _: crate::usage::LocalPlan,
         account: crate::usage::LocalAccount,
-        exact: Option<chrono::DateTime<chrono::Utc>>,
+        taken: Option<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)>,
         instead: Option<(serde_json::Value, chrono::DateTime<chrono::Utc>)>,
     ) {
-        self.1
-            .lock()
-            .push((account.ids, exact, instead.map(|(_, at)| at)));
+        self.1.lock().push((
+            account.ids,
+            taken.map(|(_, last)| last),
+            instead.map(|(_, at)| at),
+        ));
     }
 }
 
@@ -3344,4 +3346,64 @@ async fn what_waited_on_a_scan_that_found_nothing_is_filed_as_it_was() {
         assert!(!d.0.state.lock().relogged.contains(&a));
     })
     .await;
+}
+
+#[tokio::test]
+async fn a_scan_that_ends_however_it_ends_files_what_waited_on_it() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let plans = Arc::new(Plans::default());
+        let d = signed_in_as_gmail(pool, dir.path(), plans.clone()).await;
+        let (work, _, a, _) = one_on_work_started_an_hour_ago(&d, dir.path()).await;
+        d.0.state.lock().scan_pending.insert(a);
+        d.report_usage(weekly(26.0, in_secs(6 * 86_400)), Some(a));
+        // Its scan's task gone (timed out, or a panic): dropped, released.
+        let task = tokio::spawn({
+            let d = d.clone();
+            async move {
+                let _release = super::identities::ScanRelease::new(d, a);
+                panic!("the scan failed");
+            }
+        });
+        assert!(task.await.is_err());
+        assert!(d.0.state.lock().scan_pending.is_empty());
+        assert_eq!(
+            plans.0.lock().last().unwrap().ids,
+            vec![format!("desk-account:{work}")],
+            "filed as it was"
+        );
+    })
+    .await;
+}
+
+#[test]
+fn a_sessions_waiting_drops_only_its_own_oldest_readings_never_a_stop() {
+    use super::identities::{Waiting, WAITING_MAX};
+    let mut st = super::State::default();
+    let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+    let at = |n: i64| chrono::DateTime::from_timestamp(1_794_000_000 + n, 0).unwrap();
+    Waiting::Hit(a, None, at(0)).wait(&mut st);
+    for n in 0..WAITING_MAX as i64 {
+        Waiting::Usage(serde_json::Value::Null, b, at(n)).wait(&mut st);
+    }
+    for n in 1..=(WAITING_MAX as i64 + 5) {
+        Waiting::Usage(serde_json::Value::Null, a, at(n)).wait(&mut st);
+    }
+    let of = |id: Uuid, hit: bool| {
+        st.scan_waiting
+            .iter()
+            .filter(|w| match w {
+                Waiting::Usage(_, s, _) => !hit && *s == id,
+                Waiting::Hit(s, _, _) => hit && *s == id,
+            })
+            .count()
+    };
+    assert_eq!(of(a, true), 1, "its stop is kept");
+    assert_eq!(of(a, false), WAITING_MAX);
+    assert_eq!(of(b, false), WAITING_MAX, "another session's untouched");
+    let oldest_a = st.scan_waiting.iter().find_map(|w| match w {
+        Waiting::Usage(_, s, t) if *s == a => Some(*t),
+        _ => None,
+    });
+    assert_eq!(oldest_a, Some(at(6)), "its oldest dropped first");
 }
