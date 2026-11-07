@@ -47,6 +47,10 @@ impl InstallPool for DeskPool {
             self.desk.hub_cooling(id, until);
         }
     }
+
+    fn plan_key(&self, id: &str) -> Option<String> {
+        self.desk.account_plan_key(Uuid::parse_str(id).ok()?)
+    }
 }
 
 /// Makes `desk`'s Claude accounts the install tier's pool on the hub whose

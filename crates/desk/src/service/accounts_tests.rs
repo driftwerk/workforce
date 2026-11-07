@@ -2660,7 +2660,14 @@ async fn another_sign_ins_reading_never_stands_for_this_ones_and_linking_loses_n
         cli_signs_in_as(&d, dir.path(), "star").await;
         assert_eq!(Desk::own_key(&d.0.state.lock()), star().key);
         assert!(!full(&d, None), "another sign-in's limit");
-        assert!(d.account_needs().is_empty(), "{:?}", d.account_needs());
+        // Nothing but which account the new sign-in is.
+        assert!(
+            d.account_needs()
+                .iter()
+                .all(|n| matches!(n, crate::engine_accounts::AccountNeed::WhichSignIn { .. })),
+            "{:?}",
+            d.account_needs()
+        );
         // Back on Gmail: full again, as it was.
         cli_signs_in_as(&d, dir.path(), "gmail").await;
         assert!(full(&d, None));
@@ -2777,13 +2784,14 @@ async fn only_the_current_keys_name_this_computers_cards() {
         let dir = tempfile::tempdir().unwrap();
         let d = signed_in_as_gmail(pool, dir.path(), Arc::new(Plans::default())).await;
         let (work, personal, _, _) = two_on_work(&d, dir.path()).await;
-        let keys = d.current_plan_keys();
+        let keys = d.current_plan_keys().unwrap();
         assert!(keys.contains(&format!("key:desk-account:{work}")));
         assert!(keys.contains(&format!("key:{}", gmail().plan_id())));
         assert_eq!(d.own_plan_key(), Some(format!("key:{}", gmail().plan_id())));
         d.remove_account(personal).await.unwrap();
         assert!(!d
             .current_plan_keys()
+            .unwrap()
             .contains(&format!("key:desk-account:{personal}")));
     })
     .await;
@@ -3406,4 +3414,133 @@ fn a_sessions_waiting_drops_only_its_own_oldest_readings_never_a_stop() {
         _ => None,
     });
     assert_eq!(oldest_a, Some(at(6)), "its oldest dropped first");
+}
+
+#[tokio::test]
+async fn which_account_this_computers_sign_in_is_is_asked_while_unknown_with_no_switch_waiting() {
+    use crate::engine_accounts::AccountNeed;
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = signed_in_as_gmail(pool, dir.path(), Arc::new(Plans::default())).await;
+        assert!(
+            d.account_needs().is_empty(),
+            "no account to be: nothing to ask"
+        );
+        let gmail_account = paste(&d, "Kingsley Gmail", GOOD, true).await;
+        let need = until(|| d.account_needs().into_iter().next()).await;
+        assert!(
+            matches!(&need, AccountNeed::WhichSignIn { email: Some(e), .. } if e == "kim@example.com"),
+            "{need:?}"
+        );
+        assert_eq!(
+            need.id(),
+            format!("which-sign-in:{}", gmail().key),
+            "asked of this sign-in"
+        );
+        d.link_own_sign_in(Some(gmail_account)).await.unwrap();
+        assert!(d.account_needs().is_empty(), "answered");
+        assert_eq!(
+            d.own_plan_key(),
+            d.account_plan_key(gmail_account),
+            "this computer's card is the account's"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn not_now_for_which_account_the_sign_in_is_outlives_a_restart_and_holds_for_that_sign_in_alone(
+) {
+    use crate::engine_accounts::AccountNeed;
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = signed_in_as_gmail(pool.clone(), dir.path(), Arc::new(Plans::default())).await;
+        paste(&d, "Kingsley Gmail", GOOD, true).await;
+        let need = until(|| d.account_needs().into_iter().next()).await;
+        d.put_off(need.id());
+        assert!(d.account_needs().is_empty());
+        let mut kept = false;
+        for _ in 0..200 {
+            let e = d.0.store.state(super::accounts::PUT_OFF).await.unwrap();
+            if e.is_some_and(|e| e.value.as_array().is_some_and(|v| v.len() == 1)) {
+                kept = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(kept, "kept for the hub's next start");
+        drop(d);
+        let again = signed_in_as_gmail(pool, dir.path(), Arc::new(Plans::default())).await;
+        again.accounts_moved().await;
+        assert!(
+            !again
+                .account_needs()
+                .iter()
+                .any(|n| matches!(n, AccountNeed::WhichSignIn { .. })),
+            "not asked again after a restart"
+        );
+        // Signed in as another: asked of that one, and the last one's "Not
+        // now" is gone with it.
+        cli_signs_in_as(&again, dir.path(), "star").await;
+        again.accounts_moved().await;
+        assert!(
+            !again
+                .0
+                .state
+                .lock()
+                .put_off
+                .contains(&format!("which-sign-in:{}", gmail().key)),
+            "a sign-in no longer had keeps no answer"
+        );
+        let need = until(|| {
+            again
+                .account_needs()
+                .into_iter()
+                .find(|n| matches!(n, AccountNeed::WhichSignIn { .. }))
+        })
+        .await;
+        assert_eq!(need.id(), format!("which-sign-in:{}", star().key));
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn no_key_is_current_until_this_computers_sign_in_is_read() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = signed_in_as_gmail(pool, dir.path(), Arc::new(Plans::default())).await;
+        assert!(d.current_plan_keys().is_some());
+        d.0.state.lock().own_read = false;
+        assert_eq!(
+            d.current_plan_keys(),
+            None,
+            "not yet known: nothing dropped"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn with_no_claude_code_here_its_sign_in_is_read_as_none_and_keys_are_current() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        DeskStore::migrate(&pool).await.unwrap();
+        let mut o = signed_out_options(dir.path(), Arc::new(MemoryKeys::default()));
+        o.programs.remove(&Engine::Claude);
+        let d = Desk::start(
+            DeskStore::from_pool(pool),
+            o,
+            super::Floor {
+                plans: Some(Arc::new(Plans::default())),
+                ..Default::default()
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        d.read_engine_now(Engine::Claude).await;
+        assert!(d.0.state.lock().own_read);
+        assert!(d.current_plan_keys().is_some(), "the filter is on");
+    })
+    .await;
 }

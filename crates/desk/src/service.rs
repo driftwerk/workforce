@@ -1281,6 +1281,8 @@ impl Desk {
             serde_json::from_value(kept(identities::OWN_NONE).await).unwrap_or_default();
         let relogged: HashSet<Uuid> =
             serde_json::from_value(kept(identities::RELOGGED).await).unwrap_or_default();
+        let put_off: HashSet<String> =
+            serde_json::from_value(kept(accounts::PUT_OFF).await).unwrap_or_default();
         let prints: HashMap<identities::Raw, crate::identity::Prints> =
             serde_json::from_value::<Vec<(identities::Raw, crate::identity::Prints)>>(
                 kept(identities::PRINTS).await,
@@ -1410,6 +1412,7 @@ impl Desk {
                 limit_marks,
                 written_by,
                 auto_switch,
+                put_off,
                 ..State::default()
             }),
             events: broadcast::channel(256).0,
@@ -1979,6 +1982,11 @@ impl Desk {
         since: Since,
     ) {
         let Some(program) = self.program(engine).map(Path::to_path_buf) else {
+            // No Claude Code here: its sign-in is read, as none, so what
+            // waited on it is filed and nothing waits on it again.
+            if engine == Engine::Claude && !self.0.state.lock().own_read {
+                self.own_identity_read(None);
+            }
             return;
         };
         let Some(gate) = self.0.engine_reads.get(&engine).map(Arc::clone) else {
