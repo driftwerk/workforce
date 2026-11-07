@@ -212,10 +212,29 @@ pub(crate) struct Live {
     /// an MCP server's request), by its request's id: only the terminal
     /// answers it.
     codex_question: Option<(Value, PendingApproval)>,
-    /// The id of the call each thread (the main thread's, `None`, or a
-    /// sub-agent's) last started: what a permission it then asks for is
-    /// about, as Claude Code's `PermissionRequest` doesn't say.
-    last_call: HashMap<Option<String>, String>,
+    /// The calls each thread (the main thread's, `None`, or a sub-agent's)
+    /// started that haven't ended, oldest first: Claude Code runs some side
+    /// by side, and a permission request names none of them.
+    flights: HashMap<Option<String>, Vec<Flight>>,
+    /// Asks raised while another showed, oldest first: each shows once
+    /// those in front of it end, and none of them is lost meanwhile.
+    behind: Vec<Behind>,
+}
+
+/// A call a thread started that hasn't ended.
+#[derive(Debug, Clone)]
+pub(crate) struct Flight {
+    id: String,
+    tool: String,
+    input: Value,
+}
+
+/// An ask waiting behind the one shown: what it asks, who raised it, and
+/// Desk's way to answer it, while Desk holds its hook open.
+pub(crate) struct Behind {
+    pending: PendingApproval,
+    raised: Raised,
+    answer: Option<Answer>,
 }
 
 /// What raised a Claude Code session's pending wait (the one with `pending`'s
@@ -246,9 +265,11 @@ impl Live {
     }
 
     /// Whether a hook from `inside` (a sub-agent, or the main thread) about
-    /// the call `call` leaves its pending wait be: a sub-agent's tools don't
-    /// end what another thread waits on, and an ask raised by a call waits
-    /// for that call's own end, not another's run beside it.
+    /// the call `call`, which ended, leaves its pending wait be: a
+    /// sub-agent's tools don't end what another thread waits on; an ask
+    /// raised by a call waits for that call's own end, not another's run
+    /// beside it; and one whose call isn't known waits while its thread
+    /// still has a call running, which may be its own.
     fn holds_against(&self, inside: Option<&str>, call: Option<&str>) -> bool {
         if self.pending.is_none() {
             return false;
@@ -259,33 +280,110 @@ impl Live {
                 return true;
             }
         }
-        call.is_some() && held.is_some_and(|h| h.call.is_some() && h.call.as_deref() != call)
+        held.is_some_and(|h| match (h.call.as_deref(), call) {
+            (Some(asked), Some(ended)) => asked != ended,
+            (None, Some(_)) => self.flights.get(&h.agent).is_some_and(|f| !f.is_empty()),
+            _ => false,
+        })
     }
 
-    /// What `thread` (the main thread, `None`, or a sub-agent) asked before
-    /// it started the call `call` is over, as nothing goes on in a thread
-    /// while it waits on the person: but an ask whose hook Desk still holds
-    /// open, which is plainly waiting yet. Whether one ended.
+    /// `thread` started the call `id`, `tool` on `input`.
+    fn started(&mut self, thread: Option<String>, id: String, tool: &str, input: Value) {
+        let flights = self.flights.entry(thread).or_default();
+        if flights.iter().all(|f| f.id != id) {
+            flights.push(Flight {
+                id,
+                tool: tool.to_string(),
+                input,
+            });
+        }
+    }
+
+    /// The call `id` ended (or was refused): it runs no more, and an ask
+    /// of it waiting behind the one shown goes. Whether one did.
+    fn landed(&mut self, id: &str) -> bool {
+        self.flights
+            .values_mut()
+            .for_each(|f| f.retain(|f| f.id != id));
+        let before = self.behind.len();
+        self.behind.retain(|b| b.raised.call.as_deref() != Some(id));
+        before != self.behind.len()
+    }
+
+    /// The call a permission `thread` asks for, `tool` on `input`, is
+    /// about: the one of its calls running that matches it, or, with no
+    /// match, the only one it has running. Two alike, or several and none
+    /// alike, and which isn't known.
+    fn call_asked(&self, thread: &Option<String>, tool: &str, input: &Value) -> Option<String> {
+        let flights = self.flights.get(thread)?;
+        let alike: Vec<&Flight> = flights
+            .iter()
+            .filter(|f| f.tool == tool && f.input == *input)
+            .collect();
+        match (alike.as_slice(), flights.as_slice()) {
+            ([one], _) => Some(one.id.clone()),
+            ([], [only]) => Some(only.id.clone()),
+            _ => None,
+        }
+    }
+
+    /// `thread` went on to the call `call`: what it asked of a call that
+    /// has since ended is over. Not an ask whose call still runs (one run
+    /// beside it may start meanwhile), nor one whose call isn't known, nor
+    /// one whose hook Desk still holds open. Whether one ended.
     fn went_past(&mut self, thread: Option<&str>, call: Option<&str>) -> bool {
-        let stale = self.holder().is_some_and(|h| {
-            h.agent.as_deref() == thread && (call.is_none() || h.call.as_deref() != call)
-        }) && self.answer.is_none();
+        let stale = self.answer.is_none()
+            && self.holder().is_some_and(|h| {
+                h.agent.as_deref() == thread
+                    && h.call.as_deref().is_some_and(|asked| {
+                        Some(asked) != call
+                            && !self
+                                .flights
+                                .get(&h.agent)
+                                .is_some_and(|f| f.iter().any(|f| f.id == asked))
+                    })
+            });
         if stale {
             self.ask_ended();
         }
         stale
     }
 
-    /// Its pending ask is over: the main thread's question, while it is
-    /// open behind it, shows again.
+    /// Its pending ask is over: the oldest waiting behind it shows next,
+    /// else the main thread's question, while it is open behind it.
     fn ask_ended(&mut self) {
         self.pending = None;
         self.held = None;
         self.answer = None;
-        if let Some((question, raised)) = self.open_question.clone() {
+        if !self.behind.is_empty() {
+            let next = self.behind.remove(0);
+            self.pending = Some(next.pending);
+            self.held = Some(next.raised);
+            self.answer = next.answer;
+        } else if let Some((question, raised)) = self.open_question.clone() {
             self.pending = Some(question);
             self.held = Some(raised);
         }
+    }
+
+    /// What `agent` (a sub-agent) asked and ran is over with it.
+    fn agent_ended(&mut self, agent: &str) {
+        self.flights.remove(&Some(agent.to_string()));
+        self.behind
+            .retain(|b| b.raised.agent.as_deref() != Some(agent));
+        if self
+            .holder()
+            .is_some_and(|h| h.agent.as_deref() == Some(agent))
+        {
+            self.ask_ended();
+        }
+    }
+
+    /// The main thread's turn is over: nothing it ran runs, and nothing
+    /// asked in it waits.
+    fn turn_over(&mut self) {
+        self.flights.remove(&None);
+        self.behind.clear();
     }
 
     /// Every ask it has open now, each once: what Desk keeps of them, and
@@ -306,8 +404,13 @@ impl Live {
             .map(|a| &a.pending)
             .chain(self.codex_question.iter().map(|(_, p)| p))
             .map(|p| asks::KeptAsk::of(p, None, false));
+        let behind = self
+            .behind
+            .iter()
+            .map(|b| asks::KeptAsk::of(&b.pending, Some(&b.raised), false));
         let mut seen = HashSet::new();
         shown
+            .chain(behind)
             .chain(question)
             .chain(codex)
             .filter(|a| seen.insert(a.key.clone()))
@@ -1110,6 +1213,11 @@ impl Desk {
                 HashMap::new()
             }
         };
+        let transcripts = records
+            .values()
+            .filter_map(|r| Some((r.id, r.transcript.clone()?)))
+            .collect();
+        let kept_asks = asks::not_ended(kept_asks, transcripts).await;
         let state_since = store.state_times().await?;
         let mut attention = store.attention_times().await?;
         // One lost while it worked failed: worth your attention, as one
@@ -1339,7 +1447,8 @@ impl Desk {
                     held: None,
                     open_question: None,
                     codex_question: None,
-                    last_call: HashMap::new(),
+                    flights: HashMap::new(),
+                    behind: Vec::new(),
                     breaker: Default::default(),
                 },
             );
@@ -2685,7 +2794,8 @@ impl Desk {
                     }
                 }
                 Decision::Allow | Decision::Deny | Decision::AllowForSession | Decision::Cancel => {
-                    live.pending = None;
+                    // Answered: what waits behind it shows next.
+                    live.ask_ended();
                     st.decided.insert(approval);
                 }
             }
@@ -3533,7 +3643,8 @@ impl Desk {
                 held: None,
                 open_question: None,
                 codex_question: None,
-                last_call: HashMap::new(),
+                flights: HashMap::new(),
+                behind: Vec::new(),
                 breaker: Default::default(),
             },
         );
@@ -3755,18 +3866,38 @@ impl Desk {
     /// its background work, not the session working.
     async fn apply_hook(&self, id: Uuid, hook: Hook, inside: Option<String>) -> Value {
         let empty = || Value::Object(Default::default());
-        // The call each thread started last, whatever comes of its hook
-        // below: what a permission it then asks for is about.
-        let started = match &hook {
-            Hook::ToolStart { id: Some(call), .. } | Hook::Question { id: Some(call), .. } => {
-                Some(call.clone())
+        // The calls each thread has running, whatever comes of its hook
+        // below: what a permission it then asks for is matched to, and
+        // what keeps an ask of a call running from being taken as over.
+        let unqueued = {
+            let mut st = self.0.state.lock();
+            match (st.live.get_mut(&id), &hook) {
+                (
+                    Some(l),
+                    Hook::ToolStart {
+                        id: Some(call),
+                        call: c,
+                        input,
+                        ..
+                    },
+                ) => {
+                    l.started(inside.clone(), call.clone(), &c.tool, input.clone());
+                    false
+                }
+                (Some(l), Hook::Question { id: Some(call), .. }) => {
+                    l.started(inside.clone(), call.clone(), "", Value::Null);
+                    false
+                }
+                (
+                    Some(l),
+                    Hook::ToolEnd { id: Some(call), .. } | Hook::Denied { id: Some(call), .. },
+                ) => l.landed(call),
+                _ => false,
             }
-            _ => None,
         };
-        if let Some(call) = started {
-            if let Some(l) = self.0.state.lock().live.get_mut(&id) {
-                l.last_call.insert(inside.clone(), call);
-            }
+        // An ask waiting behind the one shown went with its call.
+        if unqueued {
+            self.change(id, |_, _| {});
         }
         if let Hook::ToolStart { call, .. } = &hook {
             let cd = call.tool == "Bash"
@@ -3896,9 +4027,9 @@ impl Desk {
                     if inside.is_none() {
                         l.end_question();
                     }
-                    // The main thread's question, shown again behind what
-                    // a sub-agent asked, waits on.
-                    if past && l.pending.is_some() {
+                    // What still asks (a call run beside this one, or
+                    // the main thread's question shown again) waits on.
+                    if (past || l.holder().is_some()) && l.pending.is_some() {
                         r.state = SessionState::Blocked;
                     }
                 }
@@ -3998,24 +4129,25 @@ impl Desk {
                     };
                     if let Some(l) = l {
                         l.current_tool = None;
-                        l.pending = None;
-                        l.answer = None;
                         // A tool ran: the turn got past what it was refused.
                         if inside.is_none() {
                             asking::went_on(&mut l.denials, true);
                         }
+                        let esc = interrupt && inside.is_none();
                         let ends_question = inside.is_none()
                             && l.open_question.as_ref().is_some_and(|(_, h)| {
                                 call.is_none() || h.call.is_none() || h.call == call
                             });
-                        if ends_question || (interrupt && inside.is_none()) {
+                        if ends_question || esc {
                             l.open_question = None;
                         }
-                        // What else showed in front of the main thread's
-                        // question ended: the question shows again.
-                        if let Some((question, raised)) = l.open_question.clone() {
-                            l.pending = Some(question);
-                            l.held = Some(raised);
+                        if esc {
+                            l.turn_over();
+                        }
+                        // What showed ended: what waits behind it (another
+                        // ask, the main thread's question) shows next.
+                        l.ask_ended();
+                        if l.pending.is_some() {
                             r.state = SessionState::Blocked;
                         }
                     }
@@ -4058,16 +4190,8 @@ impl Desk {
             // Back at its prompt, nothing on screen: a question it asked was
             // turned down (Esc fires no hook of its own).
             Hook::AtPrompt => self.change(id, |r, l| {
-                let Some(l) = l else { return };
-                let asked = l.open_question.is_some()
-                    // Nothing on screen: no dialog of the main thread's
-                    // asks (one Desk holds open doesn't show in it).
-                    || (l.answer.is_none() && l.holder().is_some_and(|h| h.agent.is_none()));
-                if asked {
+                if let Some(l) = l.filter(|l| l.open_question.is_some()) {
                     l.end_question();
-                    if l.answer.is_none() && l.holder().is_some_and(|h| h.agent.is_none()) {
-                        l.ask_ended();
-                    }
                     if l.pending.is_none() && r.state == SessionState::Blocked {
                         r.state = SessionState::Done;
                     }
@@ -4090,6 +4214,7 @@ impl Desk {
                     if let Some(l) = l {
                         l.pending = None;
                         l.open_question = None;
+                        l.turn_over();
                         l.denials.clear();
                         l.reading = None;
                         r.asked = None;
@@ -4107,11 +4232,10 @@ impl Desk {
             }),
             Hook::SubagentStop(agent) => self.change(id, |r, l| {
                 if let Some(l) = l {
-                    // What it asked is over with it.
-                    if l.holder()
-                        .is_some_and(|h| h.agent.as_deref() == Some(agent.as_str()))
-                    {
-                        l.ask_ended();
+                    // What it asked and ran is over with it.
+                    let asked = l.pending.is_some();
+                    l.agent_ended(&agent);
+                    if asked {
                         r.state = match l.pending {
                             Some(_) => SessionState::Blocked,
                             None if r.state == SessionState::Blocked => SessionState::Working,
@@ -4160,6 +4284,8 @@ impl Desk {
                         l.held = None;
                         l.answer = None;
                         l.open_question = None;
+                        l.behind.clear();
+                        l.flights.clear();
                     }
                 });
                 self.spend_read(id);
@@ -4191,6 +4317,7 @@ impl Desk {
                 l.pending = None;
                 l.held = None;
                 l.open_question = None;
+                l.turn_over();
                 if person {
                     l.prompts += 1;
                 }
@@ -4308,6 +4435,7 @@ impl Desk {
                 l.held = None;
                 l.open_question = None;
                 l.answer = None;
+                l.turn_over();
                 l.denials.clear();
                 let now = Utc::now();
                 l.background = match (failed, background) {
@@ -4530,14 +4658,15 @@ impl Desk {
         let desk_answers = self
             .record(id)
             .is_ok_and(|r| r.approvals == Approvals::Desk);
-        // What it asks about is the call its thread last started: Claude
-        // Code's permission request doesn't say.
+        // Which call it asks about, as Claude Code's permission request
+        // doesn't say: the one of its thread's running calls it matches.
         let (call, cli_session) = {
             let st = self.0.state.lock();
             (
-                st.live
-                    .get(&id)
-                    .and_then(|l| l.last_call.get(&inside).cloned()),
+                st.live.get(&id).and_then(|l| {
+                    let r = request.as_ref()?;
+                    l.call_asked(&inside, &r.tool, &r.input)
+                }),
                 st.records.get(&id).and_then(|r| r.cli_session_id.clone()),
             )
         };
@@ -4559,14 +4688,31 @@ impl Desk {
         self.change(id, |r, l| {
             r.state = SessionState::Blocked;
             if let Some(l) = l {
-                l.pending = Some(pending.clone());
-                l.held = Some(Raised {
+                let raised = Raised {
                     pending: pending.id,
                     agent: inside,
                     question: false,
                     call,
-                });
-                l.answer = desk_answers.then_some(tx);
+                };
+                let answer = desk_answers.then_some(tx);
+                // Another ask shows (not the main thread's question, which
+                // a permission shows in front of): this one waits behind
+                // it, as the terminal shows one dialog at a time.
+                let shown_question = l
+                    .open_question
+                    .as_ref()
+                    .is_some_and(|(q, _)| l.pending.as_ref().is_some_and(|p| p.id == q.id));
+                if l.pending.is_some() && !shown_question {
+                    l.behind.push(Behind {
+                        pending: pending.clone(),
+                        raised,
+                        answer,
+                    });
+                } else {
+                    l.pending = Some(pending.clone());
+                    l.held = Some(raised);
+                    l.answer = answer;
+                }
             }
         });
         if !desk_answers {
@@ -4594,8 +4740,12 @@ impl Desk {
                     if let Some(l) = l {
                         if let Some(p) = l.pending.as_mut().filter(|p| p.id == pending.id) {
                             p.answerable = false;
+                            l.answer = None;
                         }
-                        l.answer = None;
+                        if let Some(b) = l.behind.iter_mut().find(|b| b.pending.id == pending.id) {
+                            b.pending.answerable = false;
+                            b.answer = None;
+                        }
                     }
                 });
                 claude::ask_in_terminal()
@@ -5303,9 +5453,21 @@ async fn persist_loop(
     turns: Option<Arc<dyn TurnLog>>,
     mut rx: mpsc::UnboundedReceiver<Persist>,
 ) {
+    // What a session asks that couldn't be written: written again with the
+    // next save, until it is (or a newer write of it is).
+    let mut unwritten: HashMap<Uuid, Vec<asks::KeptAsk>> = HashMap::new();
     while let Some(op) = rx.recv().await {
         let result = match op {
-            Persist::Put(r) => store.put(&r).await,
+            Persist::Put(r) => {
+                let put = store.put(&r).await;
+                for (session, asks) in std::mem::take(&mut unwritten) {
+                    if let Err(e) = store.put_open_asks(session, &asks).await {
+                        tracing::warn!(%session, error = format!("{e:#}"), "couldn't keep what a session asks; trying again");
+                        unwritten.insert(session, asks);
+                    }
+                }
+                put
+            }
             Persist::Attention(id, at) => store.set_attention(id, at).await,
             Persist::Forget { ids, hidden, done } => {
                 let result = store.remove_sessions(&ids, &hidden, YOU).await;
@@ -5324,7 +5486,14 @@ async fn persist_loop(
                 }
                 Ok(())
             }
-            Persist::Asks(session, asks) => store.put_open_asks(session, &asks).await,
+            Persist::Asks(session, asks) => {
+                let put = store.put_open_asks(session, &asks).await;
+                match put {
+                    Ok(()) => unwritten.remove(&session),
+                    Err(_) => unwritten.insert(session, asks),
+                };
+                put
+            }
         };
         if let Err(e) = result {
             // The whole chain: the outermost context alone ("saving desk

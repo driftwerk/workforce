@@ -169,6 +169,9 @@ pub enum Hook {
         call: Call,
         /// The call's id (`tool_use_id`), when the CLI says.
         id: Option<String>,
+        /// Its input whole: what its permission request, which names no
+        /// call, is matched to it by.
+        input: Value,
     },
     /// A tool that waits on the person until they answer it in the
     /// terminal: a question it asks, its plan to approve. Its call's id,
@@ -270,6 +273,7 @@ pub fn parse_hook(body: &[u8]) -> eyre::Result<Hook> {
                 p.tool_input.as_ref(),
             ),
             id: p.tool_use_id.clone(),
+            input: p.tool_input.clone().unwrap_or(Value::Null),
         },
         "PermissionDenied" => Hook::Denied {
             denied: Denied::from_hook(
@@ -701,6 +705,7 @@ pub(crate) mod tests {
                     input: Some("sleep 20".into())
                 },
                 id: None,
+                input: json!({"command": "sleep 20"}),
             }
         );
         // As Claude Code 2.1.314 sends it in auto mode.

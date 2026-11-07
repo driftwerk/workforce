@@ -171,58 +171,133 @@ async fn an_ask_is_its_call_and_ends_with_that_calls_end() {
     .await;
 }
 
+fn start(id: &str, tool: &str, input: Value) -> Value {
+    json!({"hook_event_name": "PreToolUse", "tool_name": tool, "tool_use_id": id, "tool_input": input})
+}
+
+fn ended(id: &str, tool: &str) -> Value {
+    json!({"hook_event_name": "PostToolUse", "tool_name": tool, "tool_use_id": id})
+}
+
+fn asks_for(tool: &str, input: Value) -> Value {
+    json!({"hook_event_name": "PermissionRequest", "tool_name": tool, "tool_input": input})
+}
+
 #[tokio::test]
-async fn a_newer_call_on_the_same_thread_ends_what_it_asked_before() {
+async fn calls_run_beside_an_ask_never_end_it() {
     with_test_pool(build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
         let (d, logged) = logged_desk(pool, dir.path(), fake_cli(dir.path())).await;
         let s = asking_session(&d, dir.path()).await;
-        prompted(&d, s.id, "deploy it").await;
-        // A sub-agent's ask: the main thread's calls don't end it.
+        prompted(&d, s.id, "read up on it").await;
+        // Run side by side: a fetch that needs permission, a read that
+        // doesn't, started after it.
+        let fetch = json!({"url": "https://example.com/a"});
+        post(&d, s.id, start("toolu_A", "WebFetch", fetch.clone())).await;
         post(
             &d,
             s.id,
-            json!({"hook_event_name": "SubagentStart", "agent_id": "a1"}),
+            start("toolu_B", "Read", json!({"file_path": "/etc/hosts"})),
         )
         .await;
-        post(
-            &d,
-            s.id,
-            json!({"hook_event_name": "PreToolUse", "agent_id": "a1", "tool_name": "Bash",
-            "tool_use_id": "toolu_s1", "tool_input": {"command": "rm -rf build"}}),
-        )
-        .await;
-        post(
-            &d,
-            s.id,
-            json!({"hook_event_name": "PermissionRequest", "agent_id": "a1", "tool_name": "Bash",
-            "tool_input": {"command": "rm -rf build"}}),
-        )
-        .await;
+        post(&d, s.id, asks_for("WebFetch", fetch)).await;
+        let p = d.view(s.id).unwrap().pending.unwrap();
         assert_eq!(
-            d.view(s.id).unwrap().pending.unwrap().agent.as_deref(),
-            Some("a1")
+            p.call.as_deref(),
+            Some("toolu_A"),
+            "its own call, not the last started"
         );
         assert!(lists(&logged, 1).await);
-        // Turned down in the terminal, which says nothing: the sub-agent
-        // goes on to its next call.
+        // Another starts beside it, and the read ends: its dialog is up yet.
         post(
             &d,
             s.id,
-            json!({"hook_event_name": "PreToolUse", "agent_id": "a1", "tool_name": "Bash",
-            "tool_use_id": "toolu_s2", "tool_input": {"command": "ls"}}),
+            start(
+                "toolu_C",
+                "WebFetch",
+                json!({"url": "https://example.com/c"}),
+            ),
         )
         .await;
+        post(&d, s.id, ended("toolu_B", "Read")).await;
+        post(&d, s.id, ended("toolu_C", "WebFetch")).await;
+        let v = d.view(s.id).unwrap();
+        assert_eq!(v.state, SessionState::Blocked);
+        assert_eq!(v.pending.map(|p| p.id), Some(p.id));
+        assert_eq!(listed(&d, &logged), std::slice::from_ref(&p.id.to_string()));
+        // Its own end ends it.
+        post(&d, s.id, ended("toolu_A", "WebFetch")).await;
         assert_eq!(d.view(s.id).unwrap().pending, None);
         assert!(lists(&logged, 0).await, "{:?}", needs(&d, &logged));
+    })
+    .await;
+}
 
-        // The main thread's ask, the same way.
-        asked(&d, s.id, "toolu_1", "make deploy").await;
+#[tokio::test]
+async fn an_ask_whose_call_cant_be_told_waits_while_its_thread_runs_any() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (d, logged) = logged_desk(pool, dir.path(), fake_cli(dir.path())).await;
+        let s = asking_session(&d, dir.path()).await;
+        prompted(&d, s.id, "look twice").await;
+        // Two alike side by side: which one asks isn't known.
+        let ls = json!({"command": "ls /srv"});
+        post(&d, s.id, start("toolu_A", "Bash", ls.clone())).await;
+        post(&d, s.id, start("toolu_B", "Bash", ls.clone())).await;
+        post(&d, s.id, asks_for("Bash", ls)).await;
+        assert_eq!(d.view(s.id).unwrap().pending.unwrap().call, None);
         assert!(lists(&logged, 1).await);
-        post(&d, s.id, bash("toolu_2", "make status")).await;
-        let v = d.view(s.id).unwrap();
-        assert_eq!((v.state, v.pending), (SessionState::Working, None));
+        post(&d, s.id, ended("toolu_B", "Bash")).await;
+        assert_eq!(
+            d.view(s.id).unwrap().state,
+            SessionState::Blocked,
+            "the other may be it"
+        );
+        post(&d, s.id, ended("toolu_A", "Bash")).await;
+        assert_eq!(d.view(s.id).unwrap().pending, None);
         assert!(lists(&logged, 0).await, "{:?}", needs(&d, &logged));
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_second_ask_waits_behind_the_first_and_shows_when_it_ends() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (d, logged) = logged_desk(pool, dir.path(), fake_cli(dir.path())).await;
+        let s = asking_session(&d, dir.path()).await;
+        prompted(&d, s.id, "fetch both").await;
+        let (a, b) = (
+            json!({"url": "https://example.com/a"}),
+            json!({"url": "https://example.com/b"}),
+        );
+        post(&d, s.id, start("toolu_A", "WebFetch", a.clone())).await;
+        post(&d, s.id, start("toolu_B", "WebFetch", b.clone())).await;
+        post(&d, s.id, asks_for("WebFetch", a)).await;
+        post(&d, s.id, asks_for("WebFetch", b)).await;
+        let first = d.view(s.id).unwrap().pending.unwrap();
+        assert_eq!(
+            first.call.as_deref(),
+            Some("toolu_A"),
+            "the first still shows"
+        );
+        assert!(lists(&logged, 1).await);
+        assert_eq!(d.ask_keys()[&s.id].len(), 2, "and the second is kept");
+        post(&d, s.id, ended("toolu_A", "WebFetch")).await;
+        let second = d.view(s.id).unwrap().pending.unwrap();
+        assert_eq!(second.call.as_deref(), Some("toolu_B"));
+        assert!(
+            logs(&logged, |ops| {
+                let needs = floor::open_needs(&ops.iter().fold(Vec::new(), floor::apply));
+                needs.len() == 1 && needs[0].id.ends_with(&second.id.to_string())
+            })
+            .await,
+            "{:?}",
+            needs(&d, &logged)
+        );
+        post(&d, s.id, ended("toolu_B", "WebFetch")).await;
+        assert_eq!(d.view(s.id).unwrap().pending, None);
+        assert!(lists(&logged, 0).await);
     })
     .await;
 }
@@ -271,6 +346,12 @@ async fn a_sub_agents_ask_ends_when_it_does() {
         .await;
         let v = d.view(s.id).unwrap();
         assert_eq!((v.state, v.pending), (SessionState::Working, None));
+        assert!(
+            !d.0.state.lock().live[&s.id]
+                .flights
+                .contains_key(&Some("a1".to_string())),
+            "nor does it run anything"
+        );
         assert!(lists(&logged, 0).await, "{:?}", needs(&d, &logged));
     })
     .await;

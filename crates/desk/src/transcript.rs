@@ -55,6 +55,38 @@ pub fn denials(path: &Path) -> std::io::Result<Vec<Denied>> {
     Ok(crate::asking::denials_in(tail_lines(path)?.lines()))
 }
 
+/// Which of the calls `ids` (`tool_use_id`s) the transcript's tail has a
+/// result for: they ended, however the hooks that would have said so went.
+pub fn results_among(
+    path: &Path,
+    ids: &std::collections::HashSet<String>,
+) -> std::io::Result<std::collections::HashSet<String>> {
+    Ok(results_in(tail_lines(path)?.lines(), ids))
+}
+
+fn results_in<'a>(
+    lines: impl Iterator<Item = &'a str>,
+    ids: &std::collections::HashSet<String>,
+) -> std::collections::HashSet<String> {
+    lines
+        .filter(|l| l.contains("tool_result"))
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .flat_map(|v| {
+            v.pointer("/message/content")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default()
+        })
+        .filter(|b| b.get("type").and_then(Value::as_str) == Some("tool_result"))
+        .filter_map(|b| {
+            b.get("tool_use_id")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .filter(|id| ids.contains(id))
+        .collect()
+}
+
 fn absorb(mut tail: Tail, v: &Value) -> Tail {
     let str_at = |k: &str| v.get(k).and_then(Value::as_str).map(str::to_string);
     match v.get("type").and_then(Value::as_str) {
@@ -235,5 +267,22 @@ mod tests {
     #[test]
     fn a_missing_transcript_is_an_error() {
         assert!(read_tail(Path::new("/nonexistent/x.jsonl")).is_err());
+    }
+
+    #[test]
+    fn a_calls_result_in_the_transcript_says_it_ended() {
+        let lines = [
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_A","name":"Bash","input":{}}]}}"#,
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_A","content":"ok"}]}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_B","name":"Bash","input":{}}]}}"#,
+        ];
+        let ids = ["toolu_A", "toolu_B"]
+            .map(String::from)
+            .into_iter()
+            .collect();
+        assert_eq!(
+            results_in(lines.into_iter(), &ids),
+            ["toolu_A".to_string()].into_iter().collect()
+        );
     }
 }

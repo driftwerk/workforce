@@ -13,7 +13,9 @@ use eyre::Result;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use super::{Desk, Live, OpenTurn, Persist, Raised, State};
+use serde_json::Value;
+
+use super::{Behind, Desk, Live, OpenTurn, Persist, Raised, State};
 use crate::floor::{Answer, Subject, Turn, TurnOp, Wait};
 use crate::model::{Engine, PendingApproval, SessionState};
 use crate::store::DeskStore;
@@ -143,6 +145,48 @@ fn restore(l: &mut Live, kept: &[KeptAsk]) {
         .iter()
         .find(|k| k.main_question)
         .map(|k| (k.pending(), k.raised()));
+    l.behind = kept
+        .iter()
+        .skip(1)
+        .filter(|k| !k.main_question)
+        .map(|k| Behind {
+            pending: k.pending(),
+            raised: k.raised(),
+            answer: None,
+        })
+        .collect();
+    // An ask's call runs until it ends: one started beside it after the
+    // restart doesn't end it.
+    for k in kept {
+        if let Some(call) = &k.call {
+            l.started(k.agent.clone(), call.clone(), &k.tool, Value::Null);
+        }
+    }
+}
+
+/// `kept` without the asks whose call the session's transcript already has
+/// a result for: answered (or refused) while no hub heard its end.
+pub(super) async fn not_ended(
+    mut kept: HashMap<Uuid, Vec<KeptAsk>>,
+    transcripts: HashMap<Uuid, String>,
+) -> HashMap<Uuid, Vec<KeptAsk>> {
+    for (id, asks) in kept.iter_mut() {
+        let Some(path) = transcripts.get(id).cloned() else {
+            continue;
+        };
+        let calls: HashSet<String> = asks.iter().filter_map(|a| a.call.clone()).collect();
+        if calls.is_empty() {
+            continue;
+        }
+        let ended = tokio::task::spawn_blocking(move || {
+            crate::transcript::results_among(std::path::Path::new(&path), &calls)
+                .unwrap_or_default()
+        })
+        .await
+        .unwrap_or_default();
+        asks.retain(|a| a.call.as_ref().is_none_or(|c| !ended.contains(c)));
+    }
+    kept
 }
 
 impl State {
@@ -162,6 +206,13 @@ impl Desk {
     /// open in, however it ended: the one place a session's asks are
     /// written down, so none is left open by a change no transition reads
     /// (a turn that ends while its background work runs, say).
+    ///
+    /// The order of writes: the kept asks go on the persist queue before the
+    /// floor's ops for this change (`saved` logs those after), and both
+    /// leave in queue order. A hub that stops between them is put right by
+    /// the next start either way: an ask kept whose wait wasn't written yet
+    /// is written there (`carry_asks`), and a wait whose ask is no longer
+    /// kept is closed there.
     pub(super) fn keep_asks(
         &self,
         st: &mut State,
@@ -234,15 +285,20 @@ impl Desk {
                     r.cli_session_id.clone(),
                 );
                 let turn = st.turns.get(&id).map(|o| o.id);
+                // One asking already (a Codex request seen again) keeps
+                // what it asks; it is kept below with the rest.
                 let Some(l) = st.live.get_mut(&id).filter(|l| l.pending.is_none()) else {
+                    kept.remove(&id);
                     continue;
                 };
                 // A Codex request was the old hub's connection's: it went.
-                let asks = kept
-                    .remove(&id)
-                    .filter(|_| engine == Engine::Claude)
-                    .unwrap_or_default();
-                if !asks.is_empty() {
+                // Kept, but each one's call has ended since: it asks nothing.
+                let kept_here = kept.remove(&id).filter(|_| engine == Engine::Claude);
+                let answered = kept_here.as_ref().is_some_and(Vec::is_empty);
+                let asks = kept_here.unwrap_or_default();
+                if answered {
+                    Some((Vec::new(), SessionState::Working))
+                } else if !asks.is_empty() {
                     restore(l, &asks);
                     let ops = turn.map_or_else(Vec::new, |turn| {
                         asks.iter()
@@ -252,7 +308,7 @@ impl Desk {
                             })
                             .collect()
                     });
-                    Some(ops)
+                    Some((ops, SessionState::Blocked))
                 } else if blocked {
                     // Asked before Desk kept what it asks (or the floor
                     // has no wait for it): its terminal shows it, as the
@@ -298,17 +354,37 @@ impl Desk {
                         call,
                     });
                     l.pending = Some(pending);
-                    Some(turn.map_or_else(Vec::new, |turn| vec![TurnOp::Wait { turn, wait }]))
+                    let ops = turn.map_or_else(Vec::new, |turn| vec![TurnOp::Wait { turn, wait }]);
+                    Some((ops, SessionState::Blocked))
                 } else {
                     None
                 }
             };
-            if let Some(ops) = reshown {
+            if let Some((ops, state)) = reshown {
                 self.log_turns(ops);
-                self.change(id, |r, _| r.state = SessionState::Blocked);
+                self.change(id, |r, _| match state {
+                    SessionState::Blocked => r.state = state,
+                    // What it was kept asking was answered while no hub ran.
+                    _ if r.state == SessionState::Blocked => r.state = state,
+                    _ => {}
+                });
             }
         }
-        // Nothing runs to ask what the rest kept.
+        // Every running session's asks, as they stand now, are what is
+        // kept and what backs the floor; nothing runs to ask the rest.
+        {
+            let mut st = self.0.state.lock();
+            let running: Vec<(Uuid, Vec<KeptAsk>)> =
+                st.live.iter().map(|(id, l)| (*id, l.open_asks())).collect();
+            for (id, asks) in running {
+                kept.remove(&id);
+                match asks.is_empty() {
+                    true => st.asks.remove(&id),
+                    false => st.asks.insert(id, asks.clone()),
+                };
+                let _ = self.0.persist.send(Persist::Asks(id, asks));
+            }
+        }
         for id in kept.into_keys() {
             let _ = self.0.persist.send(Persist::Asks(id, Vec::new()));
         }

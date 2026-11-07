@@ -671,7 +671,8 @@ impl Desk {
             held: None,
             open_question: None,
             codex_question: None,
-            last_call: HashMap::new(),
+            flights: HashMap::new(),
+            behind: Vec::new(),
             breaker: Default::default(),
         };
         if existing.is_some_and(|id| self.0.state.lock().live.contains_key(&id)) {
@@ -799,7 +800,8 @@ impl Desk {
                             held: None,
                             open_question: None,
                             codex_question: None,
-                            last_call: HashMap::new(),
+                            flights: HashMap::new(),
+                            behind: Vec::new(),
                             breaker: Default::default(),
                         },
                     );
@@ -1518,7 +1520,18 @@ mod tests {
             .unwrap();
             let (tid, token) = open(&d, dir.path()).await;
             let say = |event: &'static str, extra: serde_json::Value| hook(event, "cc-8", extra);
-            d.terminal_hook(tid, &token, &say("SessionStart", serde_json::json!({}))).await.unwrap();
+            let transcript = dir.path().join("cc-8.jsonl");
+            std::fs::write(&transcript, "").unwrap();
+            d.terminal_hook(
+                tid,
+                &token,
+                &say(
+                    "SessionStart",
+                    serde_json::json!({ "transcript_path": transcript.to_string_lossy() }),
+                ),
+            )
+            .await
+            .unwrap();
             d.terminal_hook(tid, &token, &say("UserPromptSubmit", serde_json::json!({ "prompt": "deploy" })))
                 .await
                 .unwrap();
@@ -1577,8 +1590,8 @@ mod tests {
                 "nor does the log keep it open"
             );
 
-            // Asked again, and answered while the hub is away: the session
-            // has gone on by the time it is back.
+            // Asked again, and answered while the hub is away: its call's
+            // result is in the transcript by the time the hub is back.
             let mut start = serde_json::json!({ "tool_name": "Bash", "tool_input": { "command": "make clean" } });
             start["tool_use_id"] = "toolu_P2".into();
             d.terminal_hook(tid, &token, &say("PreToolUse", start)).await.unwrap();
@@ -1594,6 +1607,16 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(300)).await;
             cancel.cancel();
             tokio::time::sleep(Duration::from_millis(300)).await;
+            std::fs::write(
+                &transcript,
+                concat!(
+                    r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_P2","name":"Bash","input":{}}]}}"#,
+                    "\n",
+                    r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_P2","content":"done"}]}}"#,
+                    "\n"
+                ),
+            )
+            .unwrap();
             let d = Desk::start(
                 crate::store::DeskStore::from_pool(pool),
                 opts,
@@ -1602,10 +1625,7 @@ mod tests {
             )
             .await
             .unwrap();
-            let mut next = serde_json::json!({ "tool_name": "Bash", "tool_input": { "command": "ls" } });
-            next["tool_use_id"] = "toolu_P3".into();
-            d.terminal_hook(tid, &token, &say("PreToolUse", next)).await.unwrap();
-            assert_eq!(d.view(s.id).unwrap().pending, None);
+            assert_eq!(d.view(s.id).unwrap().pending, None, "not shown again");
             assert!(needs(&d).is_empty(), "{:?}", needs(&d));
             assert!(
                 super::super::tests::logs(&logged, |ops| {
