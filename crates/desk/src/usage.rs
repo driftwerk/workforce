@@ -51,6 +51,22 @@ pub trait PlanSink: Send + Sync {
     fn account_key(&self, _plan: LocalPlan, _ids: &[String]) -> Option<String> {
         None
     }
+
+    /// What this computer reported as `account`'s from `taken.0` to
+    /// `taken.1` (the last it reported, which may not have been written as
+    /// it said nothing new) was another sign-in's: the reading kept from
+    /// then is forgotten; a later one, someone else's, stands. `instead` (a reading of the
+    /// account's own, as `plan`'s CLI reports one, taken at its time) is
+    /// kept as any reading is: only over an older one. In order with every
+    /// reading kept before it.
+    fn forget_local(
+        &self,
+        _plan: LocalPlan,
+        _account: LocalAccount,
+        _taken: Option<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)>,
+        _instead: Option<(Value, chrono::DateTime<chrono::Utc>)>,
+    ) {
+    }
 }
 
 /// One of a plan's windows as a CLI reported it.

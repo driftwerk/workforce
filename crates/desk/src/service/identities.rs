@@ -44,6 +44,107 @@ pub(crate) struct RawMove {
     pub to: Raw,
 }
 
+/// Who wrote a credential's standing: a session of this computer's, the
+/// hub's own call on the account, another computer, or a report no session
+/// made (a terminal's own Claude Code).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "id", rename_all = "camelCase")]
+pub(crate) enum Writer {
+    Session(Uuid),
+    Pool,
+    Elsewhere,
+    Unattributed,
+}
+
+/// Who wrote a standing's last reading and its last stop on the limit
+/// (`None`: not known, as kept before this was).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub(crate) struct WrittenBy {
+    pub read: Option<Writer>,
+    pub hit: Option<Writer>,
+}
+
+/// What a session reported while its transcript was read for a `/login`
+/// inside it: filed once that is known, as it came.
+#[derive(Debug, Clone)]
+pub(crate) enum Waiting {
+    Usage(serde_json::Value, Uuid, DateTime<Utc>),
+    Hit(Uuid, Option<crate::limit::LimitHit>, DateTime<Utc>),
+}
+
+/// The most a session's waiting readings are kept; its stops on the limit
+/// are all kept.
+pub(super) const WAITING_MAX: usize = 64;
+
+impl Waiting {
+    fn session(&self) -> Uuid {
+        match self {
+            Waiting::Usage(_, id, _) | Waiting::Hit(id, _, _) => *id,
+        }
+    }
+
+    /// Waits in `st`: a session's readings beyond [`WAITING_MAX`] drop its
+    /// oldest reading, never a stop on the limit, nor another session's.
+    pub(super) fn wait(self, st: &mut State) {
+        let id = self.session();
+        if matches!(self, Waiting::Usage(..)) {
+            let readings = st
+                .scan_waiting
+                .iter()
+                .filter(|w| w.session() == id && matches!(w, Waiting::Usage(..)))
+                .count();
+            if readings >= WAITING_MAX {
+                if let Some(oldest) = st
+                    .scan_waiting
+                    .iter()
+                    .position(|w| w.session() == id && matches!(w, Waiting::Usage(..)))
+                {
+                    st.scan_waiting.remove(oldest);
+                }
+            }
+        }
+        st.scan_waiting.push(self);
+    }
+}
+
+/// Releases a session's scan when dropped, however it ended: what waited
+/// on it is filed as it is known now (on its account, unless a sign-in
+/// inside was found).
+pub(super) struct ScanRelease {
+    desk: Desk,
+    id: Uuid,
+}
+
+impl ScanRelease {
+    pub(super) fn new(desk: Desk, id: Uuid) -> Self {
+        Self { desk, id }
+    }
+}
+
+impl Drop for ScanRelease {
+    fn drop(&mut self) {
+        let waiting = {
+            let mut st = self.desk.0.state.lock();
+            if !st.scan_pending.contains(&self.id) {
+                return;
+            }
+            Desk::scan_released(&mut st, self.id)
+        };
+        self.desk.replay(waiting);
+    }
+}
+
+/// What a session that turned out to run on another sign-in takes back
+/// from its account: this computer's plan reading of it taken in `taken`
+/// (from the `/login` to its last report),
+/// with `instead` (the account's own stop on its limit, as a reading) kept.
+struct TakenBack {
+    ids: Option<Vec<String>>,
+    taken: Option<(DateTime<Utc>, DateTime<Utc>)>,
+    instead: Option<(serde_json::Value, DateTime<Utc>)>,
+}
+
 /// Where the person's answers and the prints are kept, across restarts.
 pub(super) const OWN_NONE: &str = "accounts.ownNone";
 pub(super) const RELOGGED: &str = "accounts.relogged";
@@ -500,6 +601,16 @@ impl Desk {
         self.keep_state(RELOGGED, serde_json::json!(ids));
     }
 
+    /// Who wrote `raw`'s last reading.
+    pub(super) fn wrote_read(st: &mut State, raw: &Raw, by: Writer) {
+        st.written_by.entry(raw.clone()).or_default().read = Some(by);
+    }
+
+    /// Who wrote `raw`'s last stop on its limit.
+    pub(super) fn wrote_hit(st: &mut State, raw: &Raw, by: Writer) {
+        st.written_by.entry(raw.clone()).or_default().hit = Some(by);
+    }
+
     /// What a session's transcript said of its last confirmed `/login`: one
     /// not seen before, since its process started here, is a sign-in inside
     /// it.
@@ -511,17 +622,235 @@ impl Desk {
         let Some((login, at)) = last_login else {
             return;
         };
+        self.login_seen(id, login, at, None, false).await;
+    }
+
+    /// The whole transcript of a session taken back was read for a `/login`
+    /// since its process started (`None`: none, or it couldn't be read):
+    /// what it reported meanwhile is filed now, on the sign-in it runs on.
+    pub(super) async fn login_scan_done(
+        &self,
+        id: Uuid,
+        found: Option<crate::transcript::SignedInAgain>,
+    ) {
+        match found {
+            Some(f) => {
+                self.login_seen(id, f.last_id, f.first_at, f.hit_before, true)
+                    .await
+            }
+            None => {
+                let waiting = Self::scan_released(&mut self.0.state.lock(), id);
+                self.replay(waiting);
+            }
+        }
+    }
+
+    /// The scan of session `id` is over: what waited on it.
+    fn scan_released(st: &mut State, id: Uuid) -> Vec<Waiting> {
+        st.scan_pending.remove(&id);
+        let (mine, others) = std::mem::take(&mut st.scan_waiting)
+            .into_iter()
+            .partition(|w| w.session() == id);
+        st.scan_waiting = others;
+        mine
+    }
+
+    /// Files what waited, as it came.
+    fn replay(&self, waiting: Vec<Waiting>) {
+        let mut hit = false;
+        for w in waiting {
+            match w {
+                Waiting::Usage(limits, id, at) => self.report_usage_at(limits, Some(id), at),
+                Waiting::Hit(id, limit, at) => {
+                    let mut st = self.0.state.lock();
+                    let raw = Self::raw_running(&st, id);
+                    Self::mark_session_hit_at(&mut st, id, &raw, limit.as_ref(), at);
+                    hit = true;
+                }
+            }
+        }
+        if hit {
+            self.keep_standing();
+            // Filed from a release that may come as the runtime stops.
+            if let Ok(rt) = tokio::runtime::Handle::try_current() {
+                let desk = self.clone();
+                rt.spawn(async move { desk.accounts_moved().await });
+            }
+        }
+    }
+
+    /// A `/login` in session `id`, the last `last` and the first since its
+    /// process started at `since`: a new one is a sign-in inside it. From
+    /// `since` it ran on the sign-in made there, so what it reported as its
+    /// account's since is taken back (unless it signed in to that account
+    /// again), and the limit it stopped on before (`hit_before`) is the
+    /// account's. `release`: the scan it waited on is over.
+    async fn login_seen(
+        &self,
+        id: Uuid,
+        last: String,
+        since: DateTime<Utc>,
+        hit_before: Option<(DateTime<Utc>, crate::limit::LimitHit)>,
+        release: bool,
+    ) {
         let new = {
             let mut st = self.0.state.lock();
             let started = st.live.get(&id).map(|l| l.started_at);
-            let before = st.logins_seen.insert(id, login.clone());
+            let before = st.logins_seen.insert(id, last.clone());
             match before {
-                Some(seen) => seen != login,
-                None => started.is_some_and(|s| at >= s),
+                Some(seen) => seen != last,
+                None => started.is_some_and(|s| since >= s),
             }
         };
-        if new {
-            self.signed_in_inside(id).await;
+        if !new {
+            if release {
+                let waiting = Self::scan_released(&mut self.0.state.lock(), id);
+                self.replay(waiting);
+            }
+            return;
+        }
+        // Which account it signed in to there, as the CLI says now. One
+        // found as the hub took it back was before this hub started: the
+        // read the hub starts with (or one since) says it.
+        if release {
+            self.read_engine_since(Engine::Claude, self.read_asked(), super::Since::Ended)
+                .await;
+        } else {
+            self.read_engine_now(Engine::Claude).await;
+        }
+        // Taken back, moved to the sign-in and what waited filed in one go:
+        // nothing it reports in between is filed on the account.
+        let (moved, taken, waiting) = {
+            let mut guard = self.0.state.lock();
+            let st = &mut *guard;
+            let was_on = Self::running_on(st, id);
+            let moved = was_on.is_some() && st.relogged.insert(id);
+            let key = Self::own_key(st);
+            if let Some(l) = st.live.get_mut(&id) {
+                l.own_key = Some(key);
+            }
+            let taken = was_on
+                .filter(|account| Self::own_account(st) != Some(*account))
+                .map(|account| Self::take_back_locked(st, id, account, since, hit_before));
+            let waiting = if release {
+                Self::scan_released(st, id)
+            } else {
+                Vec::new()
+            };
+            (moved, taken.map(|t| (was_on, t)), waiting)
+        };
+        if moved {
+            tracing::info!(session = %id, "a session signed in again inside: it runs on this computer's sign-in now");
+            self.keep_relogged();
+        }
+        if let Some((Some(account), t)) = taken {
+            tracing::info!(session = %id, %account, forgot = t.taken.is_some(), "a session ran on this computer's sign-in since a /login inside it: what it reported since is no longer its account's");
+            if let (Some(plans), Some(ids)) = (&self.0.plans, t.ids) {
+                if t.taken.is_some() || t.instead.is_some() {
+                    plans.forget_local(
+                        crate::usage::LocalPlan::Claude,
+                        crate::usage::LocalAccount { ids, plan: None },
+                        t.taken,
+                        t.instead,
+                    );
+                }
+            }
+            self.keep_standing();
+            self.keep_prints();
+        }
+        self.replay(waiting);
+        self.announce_accounts();
+        let desk = self.clone();
+        tokio::spawn(async move { desk.accounts_moved().await });
+    }
+
+    /// Session `id` ran on another sign-in from `since`, though it was filed
+    /// on `account`: what it wrote of the account since is taken back (its
+    /// last reading, its last stop, its prints), never what another session,
+    /// the hub's own call or another computer wrote. Kept from before this
+    /// was known, an unknown writer is taken for it only while no other
+    /// session runs on the account. The limit it stopped on before `since`
+    /// is the account's.
+    fn take_back_locked(
+        st: &mut State,
+        id: Uuid,
+        account: Uuid,
+        since: DateTime<Utc>,
+        hit_before: Option<(DateTime<Utc>, crate::limit::LimitHit)>,
+    ) -> TakenBack {
+        let raw = Raw::Account(account);
+        let others = st.records.values().any(|r| {
+            r.id != id && st.live.contains_key(&r.id) && Self::running_on(st, r.id) == Some(account)
+        });
+        let by = st.written_by.get(&raw).cloned().unwrap_or_default();
+        let its = |w: Option<Writer>| match w {
+            Some(Writer::Session(s)) => s == id,
+            None => !others,
+            Some(_) => false,
+        };
+        let hit_before = hit_before.filter(|(at, _)| *at < since);
+        let s = st.standing.entry(Some(account)).or_default();
+        let mut exact = None;
+        if s.read_at.is_some_and(|r| r >= since) && its(by.read) {
+            exact = s.read_at.take();
+            s.windows.clear();
+        }
+        let mut hit_by = by.hit;
+        if s.hit_at.is_some_and(|h| h >= since) && its(by.hit) {
+            s.hit_at = None;
+            s.hit_until = None;
+            s.hit_window = None;
+            hit_by = None;
+        }
+        if let Some((at, hit)) = &hit_before {
+            if s.hit_at.is_none_or(|h| h < *at) {
+                s.hit_at = Some(*at);
+                s.hit_until = hit.resets_at;
+                s.hit_window = hit.minutes();
+                hit_by = Some(Writer::Session(id));
+            }
+        }
+        // The limit it stopped on, as a reading of the account's own: the
+        // window full until it resets. Said by the scan, else by the stop
+        // the account's standing keeps from before; never from a model's
+        // own limit, which isn't the plan's window.
+        let instead = match &hit_before {
+            Some((at, hit)) => hit.minutes().zip(hit.resets_at).map(|w| (w, *at)),
+            None => s
+                .hit_window
+                .zip(s.hit_until)
+                .zip(s.hit_at)
+                .filter(|&((_, until), at)| at < since && until > since),
+        }
+        .and_then(|((minutes, resets), at)| {
+            let kind = match minutes {
+                300 => "five_hour",
+                10_080 => "seven_day",
+                _ => return None,
+            };
+            Some((
+                serde_json::json!([{ "kind": kind, "percentUsed": 100, "resetsAt": resets.to_rfc3339() }]),
+                at,
+            ))
+        });
+        let read_by = if exact.is_some() { None } else { by.read };
+        st.written_by.insert(
+            raw.clone(),
+            WrittenBy {
+                read: read_by,
+                hit: hit_by,
+            },
+        );
+        if exact.is_some() {
+            if let Some(p) = st.prints.get_mut(&raw) {
+                p.recent.retain(|p| p.at < since);
+                p.agreed.retain(|(_, mine)| *mine < since);
+            }
+        }
+        TakenBack {
+            ids: Self::plan_ids(st, &raw),
+            taken: exact.map(|last| (since, last)),
+            instead,
         }
     }
 }

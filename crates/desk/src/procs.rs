@@ -107,9 +107,88 @@ pub async fn table() -> Option<Vec<Proc>> {
         .then(|| parse(&String::from_utf8_lossy(&out.stdout)))
 }
 
+/// How long `ps` is waited on for one process's start.
+#[cfg(not(target_os = "linux"))]
+const PS_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// When process `pid` started, to the second: what a process kept running
+/// across a restart of the hub began at, not when it was taken back. On
+/// Linux from `/proc`, elsewhere as `ps` says. `None` when neither can say.
+pub async fn started_at(pid: u32) -> Option<chrono::DateTime<chrono::Utc>> {
+    #[cfg(target_os = "linux")]
+    {
+        tokio::task::spawn_blocking(move || proc_started_at(pid))
+            .await
+            .ok()
+            .flatten()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let run = tokio::process::Command::new("ps")
+            .args(["-o", "etime=", "-p", &pid.to_string()])
+            .kill_on_drop(true)
+            .output();
+        let out = tokio::time::timeout(PS_WAIT, run).await.ok()?.ok()?;
+        let ran = crate::codex_session::parse_etime(&String::from_utf8_lossy(&out.stdout))
+            .filter(|_| out.status.success())?;
+        Some(chrono::Utc::now() - chrono::Duration::seconds(i64::try_from(ran).ok()?))
+    }
+}
+
+/// When `pid` started, from `/proc/<pid>/stat`'s start time (in clock ticks
+/// since boot) and the boot time `/proc/stat` says.
+#[cfg(target_os = "linux")]
+fn proc_started_at(pid: u32) -> Option<chrono::DateTime<chrono::Utc>> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let boot = std::fs::read_to_string("/proc/stat").ok()?;
+    // SAFETY: sysconf reads a constant of the system; it has no other effect.
+    let ticks = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    start_of(&stat, &boot, u64::try_from(ticks).ok()?)
+}
+
+/// A process's start from its `stat` line, the system's `stat` and its clock
+/// ticks a second. Its name may hold spaces and parentheses: the fields are
+/// counted after its last `)`.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn start_of(stat: &str, boot: &str, ticks: u64) -> Option<chrono::DateTime<chrono::Utc>> {
+    let fields: Vec<&str> = stat
+        .get(stat.rfind(')')? + 1..)?
+        .split_whitespace()
+        .collect();
+    // Field 22 of the line, the 20th after the name.
+    let since_boot: u64 = fields.get(19)?.parse().ok()?;
+    let btime: i64 = boot
+        .lines()
+        .find_map(|l| l.strip_prefix("btime "))?
+        .trim()
+        .parse()
+        .ok()?;
+    let secs = i64::try_from(since_boot / ticks.max(1)).ok()?;
+    chrono::DateTime::from_timestamp(btime + secs, 0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_processs_start_is_read_from_its_stat_whatever_its_name() {
+        let stat = "4242 (claude (2.1)) S 1 4242 4242 0 -1 4194560 100 0 0 0 5 2 0 0 20 0 9 0 360000 1000 200";
+        let boot = "cpu  1 2 3\nbtime 1794000000\nprocesses 9\n";
+        assert_eq!(
+            start_of(stat, boot, 100),
+            chrono::DateTime::from_timestamp(1_794_000_000 + 3600, 0)
+        );
+        assert_eq!(start_of("4242 (x) S 1", boot, 100), None);
+        assert_eq!(start_of(stat, "cpu 1\n", 100), None);
+    }
+
+    #[tokio::test]
+    async fn this_process_started_before_now() {
+        let started = started_at(std::process::id()).await.unwrap();
+        assert!(started <= chrono::Utc::now());
+        assert!(started_at(u32::MAX - 1).await.is_none());
+    }
 
     #[test]
     fn what_runs_under_a_process_is_found_however_deep() {

@@ -218,10 +218,15 @@ impl Desk {
                 }),
                 // As last seen: the store is never read under this lock.
                 signed_in: keys.is_some() && st.signed_in_accounts.contains(&a.id),
+                // On it now, by the credential each runs on: one signed in
+                // again inside counts on the account its sign-in is.
                 sessions: st
                     .records
                     .values()
-                    .filter(|r| r.account == Some(a.id) && st.live.contains_key(&r.id))
+                    .filter(|r| {
+                        st.live.contains_key(&r.id)
+                            && Self::side_of_session(&st, r.id) == Some(Some(a.id))
+                    })
                     .map(|r| r.id)
                     .collect(),
                 created_at: a.created_at,
@@ -244,18 +249,23 @@ impl Desk {
     /// each account's and the CLI sign-in's. A reading kept under another
     /// (an account removed, a sign-in gone, an identity learnt since) is
     /// nobody's card.
-    pub fn current_plan_keys(&self) -> Vec<String> {
-        let Some(plans) = self.0.plans.as_ref() else {
-            return Vec::new();
-        };
+    ///
+    /// `None` until this computer's sign-in has been read: until then which
+    /// keys are current can't be told, and nothing is anyone's but none.
+    pub fn current_plan_keys(&self) -> Option<Vec<String>> {
+        let plans = self.0.plans.as_ref()?;
         let st = self.0.state.lock();
+        if !st.own_read {
+            return None;
+        }
         st.accounts
             .iter()
             .filter(|a| a.engine == Engine::Claude)
             .filter_map(|a| Self::plan_ids(&st, &super::identities::Raw::Account(a.id)))
             .chain(Self::own_plan_ids(&st))
             .filter_map(|ids| plans.account_key(crate::usage::LocalPlan::Claude, &ids))
-            .collect()
+            .collect::<Vec<_>>()
+            .into()
     }
 
     /// The store the accounts' sign-ins are kept in, as the person calls it;
@@ -484,6 +494,16 @@ impl Desk {
             .collect()
     }
 
+    /// The key account `id`'s plan readings are kept under, as the Floor
+    /// names its card: what a call of the hub's own on it reports is its.
+    pub fn account_plan_key(&self, id: Uuid) -> Option<String> {
+        let plans = self.0.plans.as_ref()?;
+        let st = self.0.state.lock();
+        st.accounts.iter().find(|a| a.id == id)?;
+        let ids = Self::plan_ids(&st, &super::identities::Raw::Account(id))?;
+        plans.account_key(crate::usage::LocalPlan::Claude, &ids)
+    }
+
     /// Account `id`'s token, read from the store now for the one call of
     /// the hub's own it serves; never kept. The store may block, so never
     /// under the state lock.
@@ -526,10 +546,12 @@ impl Desk {
                 return;
             }
             // Kept as the account's own: the call ran on its token.
-            let standing = Self::standing_mut(&mut st, &super::identities::Raw::Account(account));
+            let raw = super::identities::Raw::Account(account);
+            let standing = Self::standing_mut(&mut st, &raw);
             standing.hit_at = Some(now);
             standing.hit_until = Some(until);
             standing.hit_window = None;
+            Self::wrote_hit(&mut st, &raw, super::identities::Writer::Pool);
         }
         tracing::info!(%account, %until, "the hub's own call found an account at its limit");
         // Told from wherever a login is resolved, which may have no runtime.
@@ -1457,6 +1479,11 @@ impl Desk {
     }
 }
 
+/// Where the needs the person put off are kept.
+pub(super) const PUT_OFF: &str = "accounts.putOff";
+/// The start of the id of the need that asks which account a sign-in is.
+const WHICH_SIGN_IN: &str = "which-sign-in:";
+
 /// Where the person's "switch automatically" choice is kept.
 pub(super) const AUTO_SWITCH: &str = "accounts.autoSwitch";
 /// Where each account's standing and the moves off a full one are kept, so
@@ -1475,6 +1502,8 @@ pub(super) struct KeptStanding {
     pub own: std::collections::BTreeMap<String, accounts::Standing>,
     pub moves: Vec<super::identities::RawMove>,
     pub marks: Vec<(Uuid, super::LimitMark)>,
+    /// Who wrote each credential's standing as it is.
+    pub by: Vec<(super::identities::Raw, super::identities::WrittenBy)>,
 }
 
 type KeptState = (
@@ -1482,6 +1511,7 @@ type KeptState = (
     std::collections::HashMap<String, accounts::Standing>,
     Vec<super::identities::RawMove>,
     std::collections::HashMap<Uuid, super::LimitMark>,
+    std::collections::HashMap<super::identities::Raw, super::identities::WrittenBy>,
 );
 
 impl KeptStanding {
@@ -1503,6 +1533,11 @@ impl KeptStanding {
                 .iter()
                 .map(|(id, m)| (*id, m.clone()))
                 .collect(),
+            by: st
+                .written_by
+                .iter()
+                .map(|(r, b)| (r.clone(), b.clone()))
+                .collect(),
         }
     }
 
@@ -1518,6 +1553,7 @@ impl KeptStanding {
             self.own.into_iter().collect(),
             self.moves,
             self.marks.into_iter().collect(),
+            self.by.into_iter().collect(),
         )
     }
 }
@@ -1636,9 +1672,9 @@ impl Desk {
             .collect()
     }
 
-    /// While which account this computer's sign-in is isn't known, a need
-    /// that would switch to or from it is a question instead: never a
-    /// guess behind a switch.
+    /// While which account this computer's sign-in is isn't known, Desk
+    /// asks; a need that would switch to or from it is that question
+    /// instead: never a guess behind a switch.
     fn ask_which_sign_in(
         st: &super::State,
         own_on_plan: bool,
@@ -1659,18 +1695,16 @@ impl Desk {
             N::Reset { account, from, .. } => account.id.is_none() || from.id.is_none(),
             _ => false,
         };
-        let own_full = st
-            .standing
-            .get(&None)
-            .is_some_and(|s| s.full(Utc::now()).is_some());
-        if !own_full && !needs.iter().any(on_own) {
-            return needs;
-        }
+        // Asked whenever it isn't known, not only once a switch depends on
+        // it: until then its plan is a card of its own, beside the account
+        // it is, and no reading can tell them apart (they reset on the hour
+        // now).
         let mut kept: Vec<N> = needs.into_iter().filter(|n| !on_own(n)).collect();
         kept.insert(
             0,
             N::WhichSignIn {
-                id: "which-sign-in".into(),
+                // Per sign-in: "Not now" for this one is never for the next.
+                id: format!("which-sign-in:{}", own.key),
                 engine: Engine::Claude,
                 email: own.email.clone(),
             },
@@ -1760,7 +1794,18 @@ impl Desk {
                 let Some(id) = id else {
                     continue;
                 };
-                if st.standing.entry(Some(id)).or_default().learn(&standing) {
+                let s = st.standing.entry(Some(id)).or_default();
+                let before = (s.read_at, s.hit_at);
+                if s.learn(&standing) {
+                    // Another computer's: none of this one's sessions wrote it.
+                    let after = (s.read_at, s.hit_at);
+                    let raw = super::identities::Raw::Account(id);
+                    if after.0 != before.0 {
+                        Self::wrote_read(&mut st, &raw, super::identities::Writer::Elsewhere);
+                    }
+                    if after.1 != before.1 {
+                        Self::wrote_hit(&mut st, &raw, super::identities::Writer::Elsewhere);
+                    }
                     learnt += 1;
                 }
             }
@@ -1795,7 +1840,14 @@ impl Desk {
     /// Puts a need off until what it says changes.
     pub fn put_off(&self, need: &str) {
         self.0.state.lock().put_off.insert(need.to_string());
+        self.keep_put_off();
         self.announce_accounts();
+    }
+
+    /// Writes what the person put off, so "Not now" outlives a restart.
+    fn keep_put_off(&self) {
+        let ids: Vec<String> = self.0.state.lock().put_off.iter().cloned().collect();
+        self.keep_state(PUT_OFF, serde_json::json!(ids));
     }
 
     /// What a session on `account` reported of its plan's windows.
@@ -1804,6 +1856,7 @@ impl Desk {
         raw: &super::identities::Raw,
         windows: Vec<crate::usage::LimitWindow>,
         at: chrono::DateTime<Utc>,
+        by: super::identities::Writer,
     ) {
         if windows.is_empty() {
             return;
@@ -1813,6 +1866,7 @@ impl Desk {
             let s = Self::standing_mut(&mut st, raw);
             s.windows = windows;
             s.read_at = Some(at);
+            Self::wrote_read(&mut st, raw, by);
         }
         let desk = self.clone();
         tokio::spawn(async move { desk.accounts_moved().await });
@@ -1833,9 +1887,25 @@ impl Desk {
             return;
         };
         let needs = self.account_needs_all();
-        {
+        let forgot = {
             let mut st = self.0.state.lock();
-            st.put_off.retain(|id| needs.iter().any(|n| n.id() == id));
+            let before = st.put_off.len();
+            // A sign-in's question stands for that sign-in, raised or not
+            // (it isn't while the CLI is still being read), until the CLI is
+            // signed in as another: then it is forgotten.
+            let own = st
+                .own_identity
+                .as_ref()
+                .map(|o| format!("{WHICH_SIGN_IN}{}", o.key));
+            st.put_off
+                .retain(|id| match id.strip_prefix(WHICH_SIGN_IN) {
+                    Some(_) => own.as_ref().is_none_or(|own| own == id),
+                    None => needs.iter().any(|n| n.id() == id),
+                });
+            st.put_off.len() != before
+        };
+        if forgot {
+            self.keep_put_off();
         }
         self.keep_standing();
         if self.auto_switch() {

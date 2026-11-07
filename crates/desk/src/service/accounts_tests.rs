@@ -1216,7 +1216,18 @@ async fn a_session_elsewhere_whose_transcript_ends_on_a_429_that_isnt_the_plans_
 /// The hub's plan readings, as a test sees them: what each report was
 /// kept as, and a window parser that takes `[{used, resets}]`.
 #[derive(Default)]
-struct Plans(parking_lot::Mutex<Vec<crate::usage::LocalAccount>>);
+struct Plans(
+    parking_lot::Mutex<Vec<crate::usage::LocalAccount>>,
+    /// What was forgotten: the account's ids, the reading's time, and when
+    /// what was kept instead was taken.
+    parking_lot::Mutex<Forgot>,
+);
+
+type Forgot = Vec<(
+    Vec<String>,
+    Option<chrono::DateTime<chrono::Utc>>,
+    Option<chrono::DateTime<chrono::Utc>>,
+)>;
 
 impl crate::usage::PlanSink for Plans {
     fn local(
@@ -1248,6 +1259,19 @@ impl crate::usage::PlanSink for Plans {
     }
     fn account_key(&self, _: crate::usage::LocalPlan, ids: &[String]) -> Option<String> {
         Some(format!("key:{}", ids.join(",")))
+    }
+    fn forget_local(
+        &self,
+        _: crate::usage::LocalPlan,
+        account: crate::usage::LocalAccount,
+        taken: Option<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)>,
+        instead: Option<(serde_json::Value, chrono::DateTime<chrono::Utc>)>,
+    ) {
+        self.1.lock().push((
+            account.ids,
+            taken.map(|(_, last)| last),
+            instead.map(|(_, at)| at),
+        ));
     }
 }
 
@@ -2636,7 +2660,14 @@ async fn another_sign_ins_reading_never_stands_for_this_ones_and_linking_loses_n
         cli_signs_in_as(&d, dir.path(), "star").await;
         assert_eq!(Desk::own_key(&d.0.state.lock()), star().key);
         assert!(!full(&d, None), "another sign-in's limit");
-        assert!(d.account_needs().is_empty(), "{:?}", d.account_needs());
+        // Nothing but which account the new sign-in is.
+        assert!(
+            d.account_needs()
+                .iter()
+                .all(|n| matches!(n, crate::engine_accounts::AccountNeed::WhichSignIn { .. })),
+            "{:?}",
+            d.account_needs()
+        );
         // Back on Gmail: full again, as it was.
         cli_signs_in_as(&d, dir.path(), "gmail").await;
         assert!(full(&d, None));
@@ -2753,13 +2784,14 @@ async fn only_the_current_keys_name_this_computers_cards() {
         let dir = tempfile::tempdir().unwrap();
         let d = signed_in_as_gmail(pool, dir.path(), Arc::new(Plans::default())).await;
         let (work, personal, _, _) = two_on_work(&d, dir.path()).await;
-        let keys = d.current_plan_keys();
+        let keys = d.current_plan_keys().unwrap();
         assert!(keys.contains(&format!("key:desk-account:{work}")));
         assert!(keys.contains(&format!("key:{}", gmail().plan_id())));
         assert_eq!(d.own_plan_key(), Some(format!("key:{}", gmail().plan_id())));
         d.remove_account(personal).await.unwrap();
         assert!(!d
             .current_plan_keys()
+            .unwrap()
             .contains(&format!("key:desk-account:{personal}")));
     })
     .await;
@@ -2979,4 +3011,536 @@ async fn the_hubs_own_calls_are_offered_the_accounts_default_first_and_tell_desk
 
 async fn until_need(d: &Desk) -> crate::engine_accounts::AccountNeed {
     until(|| d.account_needs().into_iter().next()).await
+}
+
+/// A weekly window only, as Claude Code reports a plan now: `used`,
+/// resetting at `resets`.
+fn weekly(used: f64, resets: chrono::DateTime<chrono::Utc>) -> serde_json::Value {
+    serde_json::json!([{ "used": used, "resets": resets.to_rfc3339(), "minutes": 10_080 }])
+}
+
+/// `secs` from now, to the second.
+fn in_secs(secs: i64) -> chrono::DateTime<chrono::Utc> {
+    chrono::DateTime::from_timestamp(chrono::Utc::now().timestamp() + secs, 0).unwrap()
+}
+
+/// Work's session `a` (the only one on Work: `b` is on Personal), its
+/// process started an hour ago and taken back since.
+async fn one_on_work_started_an_hour_ago(d: &Desk, dir: &Path) -> (Uuid, Uuid, Uuid, Uuid) {
+    let (work, personal, a, b) = two_on_work(d, dir).await;
+    d.change(b, |r, _| r.account = Some(personal));
+    d.0.state.lock().live.get_mut(&a).unwrap().started_at =
+        chrono::Utc::now() - chrono::Duration::hours(1);
+    (work, personal, a, b)
+}
+
+/// A `/login` in a session's whole transcript at `first`, and the weekly
+/// limit it stopped on a minute before, resetting at `resets`.
+fn login_at(
+    first: chrono::DateTime<chrono::Utc>,
+    resets: Option<chrono::DateTime<chrono::Utc>>,
+) -> crate::transcript::SignedInAgain {
+    crate::transcript::SignedInAgain {
+        first_at: first,
+        last_id: format!("login-{}", first.timestamp()),
+        last_at: first,
+        hit_before: resets.map(|r| {
+            (
+                first - chrono::Duration::minutes(1),
+                crate::limit::LimitHit {
+                    window: Some("seven_day".into()),
+                    resets_at: Some(r),
+                },
+            )
+        }),
+    }
+}
+
+fn work_standing(d: &Desk, work: Uuid) -> crate::engine_accounts::Standing {
+    Desk::standing_of(&d.0.state.lock(), Some(work))
+}
+
+#[tokio::test]
+async fn a_login_found_after_the_fact_takes_back_what_was_filed_as_its_account_and_keeps_its_limit()
+{
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let plans = Arc::new(Plans::default());
+        let d = signed_in_as_gmail(pool, dir.path(), plans.clone()).await;
+        let (work, _, a, _) = one_on_work_started_an_hour_ago(&d, dir.path()).await;
+        let now = chrono::Utc::now();
+        let login = now - chrono::Duration::minutes(10);
+        let work_resets = in_secs(4 * 86_400);
+        // Signed in again inside ten minutes ago, unheard: what it reported
+        // since, the sign-in's plan, was filed as Work's.
+        d.report_usage(weekly(26.0, in_secs(6 * 86_400)), Some(a));
+        let read_at = work_standing(&d, work).read_at.unwrap();
+        assert_eq!(
+            plans.0.lock().last().unwrap().ids,
+            vec![format!("desk-account:{work}")]
+        );
+        assert!(d
+            .accounts()
+            .iter()
+            .any(|x| x.id == work && x.sessions == vec![a]));
+        // Found as the hub takes it back: Work stopped on its weekly limit
+        // just before.
+        d.login_scan_done(a, Some(login_at(login, Some(work_resets))))
+            .await;
+        assert!(
+            d.0.state.lock().relogged.contains(&a),
+            "it runs on the sign-in"
+        );
+        let s = work_standing(&d, work);
+        assert!(
+            s.windows.is_empty(),
+            "the sign-in's reading is no longer Work's"
+        );
+        assert_eq!(
+            s.full(now),
+            Some(Some(work_resets)),
+            "Work is full until it resets"
+        );
+        assert_eq!(
+            plans.1.lock().clone(),
+            vec![(
+                vec![format!("desk-account:{work}")],
+                Some(read_at),
+                Some(login - chrono::Duration::minutes(1))
+            )],
+            "only the reading it filed is forgotten, its limit kept instead"
+        );
+        assert!(
+            d.accounts()
+                .iter()
+                .any(|x| x.id == work && x.sessions.is_empty()),
+            "not on Work any more"
+        );
+        // Seen once: found again, nothing more is taken back.
+        d.login_scan_done(a, Some(login_at(login, None))).await;
+        assert_eq!(plans.1.lock().len(), 1);
+        // What it reports now is the sign-in's.
+        d.report_usage(weekly(27.0, in_secs(6 * 86_400)), Some(a));
+        assert_eq!(plans.0.lock().last().unwrap().ids, vec![gmail().plan_id()]);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_login_from_before_its_process_started_is_not_one_inside_it() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let plans = Arc::new(Plans::default());
+        let d = signed_in_as_gmail(pool, dir.path(), plans.clone()).await;
+        let (work, _, a, _) = one_on_work_started_an_hour_ago(&d, dir.path()).await;
+        d.report_usage(weekly(40.0, in_secs(86_400)), Some(a));
+        d.login_scan_done(
+            a,
+            Some(login_at(
+                chrono::Utc::now() - chrono::Duration::hours(2),
+                None,
+            )),
+        )
+        .await;
+        assert!(!d.0.state.lock().relogged.contains(&a));
+        assert_eq!(
+            work_standing(&d, work).windows.len(),
+            1,
+            "Work's reading stands"
+        );
+        assert!(plans.1.lock().is_empty());
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn only_what_the_session_itself_wrote_of_its_account_is_taken_back() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let plans = Arc::new(Plans::default());
+        let d = signed_in_as_gmail(pool, dir.path(), plans.clone()).await;
+        let (work, _, a, b) = one_on_work_started_an_hour_ago(&d, dir.path()).await;
+        let login = chrono::Utc::now() - chrono::Duration::minutes(10);
+        // Another session on Work too, running: it reports Work's own plan
+        // last, then the pool finds Work at its limit.
+        d.change(b, |r, _| r.account = Some(work));
+        d.report_usage(weekly(26.0, in_secs(6 * 86_400)), Some(a));
+        d.report_usage(weekly(55.0, in_secs(2 * 86_400)), Some(b));
+        let pool_until = in_secs(3600);
+        d.hub_cooling(work, pool_until);
+        d.login_scan_done(a, Some(login_at(login, None))).await;
+        assert!(d.0.state.lock().relogged.contains(&a));
+        let s = work_standing(&d, work);
+        assert_eq!(s.windows[0].used_percent, 55.0, "b's reading stands");
+        assert_eq!(s.hit_until, Some(pool_until), "the pool's stop stands");
+        assert!(plans.1.lock().iter().all(|(_, exact, _)| exact.is_none()));
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn what_the_session_wrote_last_is_taken_back_though_another_runs_on_the_account() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let plans = Arc::new(Plans::default());
+        let d = signed_in_as_gmail(pool, dir.path(), plans.clone()).await;
+        let (work, _, a, b) = one_on_work_started_an_hour_ago(&d, dir.path()).await;
+        d.change(b, |r, _| r.account = Some(work));
+        d.report_usage(weekly(55.0, in_secs(2 * 86_400)), Some(b));
+        d.report_usage(weekly(26.0, in_secs(6 * 86_400)), Some(a));
+        let read_at = work_standing(&d, work).read_at;
+        d.login_scan_done(
+            a,
+            Some(login_at(
+                chrono::Utc::now() - chrono::Duration::minutes(10),
+                None,
+            )),
+        )
+        .await;
+        assert!(work_standing(&d, work).windows.is_empty());
+        assert_eq!(plans.1.lock()[0].1, read_at);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_closed_sessions_reading_since_the_login_is_never_taken_back() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let plans = Arc::new(Plans::default());
+        let d = signed_in_as_gmail(pool, dir.path(), plans.clone()).await;
+        let (work, _, a, b) = one_on_work_started_an_hour_ago(&d, dir.path()).await;
+        d.change(b, |r, _| r.account = Some(work));
+        d.report_usage(weekly(55.0, in_secs(2 * 86_400)), Some(b));
+        // b is gone since: what it wrote is still its own.
+        d.0.state.lock().live.remove(&b);
+        d.login_scan_done(
+            a,
+            Some(login_at(
+                chrono::Utc::now() - chrono::Duration::minutes(10),
+                None,
+            )),
+        )
+        .await;
+        assert_eq!(work_standing(&d, work).windows[0].used_percent, 55.0);
+        assert!(plans.1.lock().is_empty());
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_login_to_the_same_account_takes_nothing_back() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let plans = Arc::new(Plans::default());
+        let d = signed_in_as_gmail(pool, dir.path(), plans.clone()).await;
+        let (work, _, a, _) = one_on_work_started_an_hour_ago(&d, dir.path()).await;
+        // This computer's sign-in is Work: a /login to it again is Work still.
+        d.link_own_sign_in(Some(work)).await.unwrap();
+        d.report_usage(weekly(26.0, in_secs(6 * 86_400)), Some(a));
+        d.login_scan_done(
+            a,
+            Some(login_at(
+                chrono::Utc::now() - chrono::Duration::minutes(10),
+                None,
+            )),
+        )
+        .await;
+        assert_eq!(work_standing(&d, work).windows.len(), 1);
+        assert!(plans.1.lock().is_empty());
+        assert!(
+            d.accounts()
+                .iter()
+                .any(|x| x.id == work && x.sessions == vec![a]),
+            "it counts on Work, the account its sign-in is"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_login_seen_in_the_tail_keeps_the_stop_its_account_had_before_as_its_reading() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let plans = Arc::new(Plans::default());
+        let d = signed_in_as_gmail(pool, dir.path(), plans.clone()).await;
+        let (work, _, a, _) = one_on_work_started_an_hour_ago(&d, dir.path()).await;
+        let resets = in_secs(86_400);
+        let hit_at = chrono::Utc::now() - chrono::Duration::minutes(20);
+        {
+            let mut st = d.0.state.lock();
+            let raw = super::identities::Raw::Account(work);
+            Desk::mark_session_hit_at(
+                &mut st,
+                a,
+                &raw,
+                Some(&crate::limit::LimitHit {
+                    window: Some("seven_day".into()),
+                    resets_at: Some(resets),
+                }),
+                hit_at,
+            );
+        }
+        d.report_usage(weekly(26.0, in_secs(6 * 86_400)), Some(a));
+        let login = chrono::Utc::now() - chrono::Duration::minutes(10);
+        d.login_in_transcript(a, Some(("tail-login".into(), login)))
+            .await;
+        assert_eq!(
+            work_standing(&d, work).full(chrono::Utc::now()),
+            Some(Some(resets))
+        );
+        assert_eq!(
+            plans.1.lock()[0].2,
+            Some(hit_at),
+            "at its limit, never \"no reading yet\""
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn what_a_session_reports_while_its_transcript_is_read_waits_and_is_filed_as_its_sign_ins() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let plans = Arc::new(Plans::default());
+        let d = signed_in_as_gmail(pool, dir.path(), plans.clone()).await;
+        let (work, _, a, _) = one_on_work_started_an_hour_ago(&d, dir.path()).await;
+        d.0.state.lock().scan_pending.insert(a);
+        let reported = plans.0.lock().len();
+        d.report_usage(weekly(26.0, in_secs(6 * 86_400)), Some(a));
+        stops_on_its_limit(&d, a);
+        assert_eq!(plans.0.lock().len(), reported, "waits");
+        assert!(
+            work_standing(&d, work).hit_at.is_none(),
+            "its stop waits too"
+        );
+        d.login_scan_done(
+            a,
+            Some(login_at(
+                chrono::Utc::now() - chrono::Duration::minutes(10),
+                None,
+            )),
+        )
+        .await;
+        assert!(d.0.state.lock().scan_pending.is_empty());
+        assert_eq!(plans.0.lock().last().unwrap().ids, vec![gmail().plan_id()]);
+        let st = d.0.state.lock();
+        assert!(st
+            .standing
+            .get(&Some(work))
+            .is_none_or(|s| s.read_at.is_none() && s.hit_at.is_none()));
+        assert!(st
+            .own_standing
+            .get(&gmail().key)
+            .is_some_and(|s| s.hit_at.is_some() && s.read_at.is_some()));
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn what_waited_on_a_scan_that_found_nothing_is_filed_as_it_was() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let plans = Arc::new(Plans::default());
+        let d = signed_in_as_gmail(pool, dir.path(), plans.clone()).await;
+        let (work, _, a, _) = one_on_work_started_an_hour_ago(&d, dir.path()).await;
+        d.0.state.lock().scan_pending.insert(a);
+        d.report_usage(weekly(26.0, in_secs(6 * 86_400)), Some(a));
+        d.login_scan_done(a, None).await;
+        assert_eq!(
+            plans.0.lock().last().unwrap().ids,
+            vec![format!("desk-account:{work}")]
+        );
+        assert!(!d.0.state.lock().relogged.contains(&a));
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_scan_that_ends_however_it_ends_files_what_waited_on_it() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let plans = Arc::new(Plans::default());
+        let d = signed_in_as_gmail(pool, dir.path(), plans.clone()).await;
+        let (work, _, a, _) = one_on_work_started_an_hour_ago(&d, dir.path()).await;
+        d.0.state.lock().scan_pending.insert(a);
+        d.report_usage(weekly(26.0, in_secs(6 * 86_400)), Some(a));
+        // Its scan's task gone (timed out, or a panic): dropped, released.
+        let task = tokio::spawn({
+            let d = d.clone();
+            async move {
+                let _release = super::identities::ScanRelease::new(d, a);
+                panic!("the scan failed");
+            }
+        });
+        assert!(task.await.is_err());
+        assert!(d.0.state.lock().scan_pending.is_empty());
+        assert_eq!(
+            plans.0.lock().last().unwrap().ids,
+            vec![format!("desk-account:{work}")],
+            "filed as it was"
+        );
+    })
+    .await;
+}
+
+#[test]
+fn a_sessions_waiting_drops_only_its_own_oldest_readings_never_a_stop() {
+    use super::identities::{Waiting, WAITING_MAX};
+    let mut st = super::State::default();
+    let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+    let at = |n: i64| chrono::DateTime::from_timestamp(1_794_000_000 + n, 0).unwrap();
+    Waiting::Hit(a, None, at(0)).wait(&mut st);
+    for n in 0..WAITING_MAX as i64 {
+        Waiting::Usage(serde_json::Value::Null, b, at(n)).wait(&mut st);
+    }
+    for n in 1..=(WAITING_MAX as i64 + 5) {
+        Waiting::Usage(serde_json::Value::Null, a, at(n)).wait(&mut st);
+    }
+    let of = |id: Uuid, hit: bool| {
+        st.scan_waiting
+            .iter()
+            .filter(|w| match w {
+                Waiting::Usage(_, s, _) => !hit && *s == id,
+                Waiting::Hit(s, _, _) => hit && *s == id,
+            })
+            .count()
+    };
+    assert_eq!(of(a, true), 1, "its stop is kept");
+    assert_eq!(of(a, false), WAITING_MAX);
+    assert_eq!(of(b, false), WAITING_MAX, "another session's untouched");
+    let oldest_a = st.scan_waiting.iter().find_map(|w| match w {
+        Waiting::Usage(_, s, t) if *s == a => Some(*t),
+        _ => None,
+    });
+    assert_eq!(oldest_a, Some(at(6)), "its oldest dropped first");
+}
+
+#[tokio::test]
+async fn which_account_this_computers_sign_in_is_is_asked_while_unknown_with_no_switch_waiting() {
+    use crate::engine_accounts::AccountNeed;
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = signed_in_as_gmail(pool, dir.path(), Arc::new(Plans::default())).await;
+        assert!(
+            d.account_needs().is_empty(),
+            "no account to be: nothing to ask"
+        );
+        let gmail_account = paste(&d, "Kingsley Gmail", GOOD, true).await;
+        let need = until(|| d.account_needs().into_iter().next()).await;
+        assert!(
+            matches!(&need, AccountNeed::WhichSignIn { email: Some(e), .. } if e == "kim@example.com"),
+            "{need:?}"
+        );
+        assert_eq!(
+            need.id(),
+            format!("which-sign-in:{}", gmail().key),
+            "asked of this sign-in"
+        );
+        d.link_own_sign_in(Some(gmail_account)).await.unwrap();
+        assert!(d.account_needs().is_empty(), "answered");
+        assert_eq!(
+            d.own_plan_key(),
+            d.account_plan_key(gmail_account),
+            "this computer's card is the account's"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn not_now_for_which_account_the_sign_in_is_outlives_a_restart_and_holds_for_that_sign_in_alone(
+) {
+    use crate::engine_accounts::AccountNeed;
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = signed_in_as_gmail(pool.clone(), dir.path(), Arc::new(Plans::default())).await;
+        paste(&d, "Kingsley Gmail", GOOD, true).await;
+        let need = until(|| d.account_needs().into_iter().next()).await;
+        d.put_off(need.id());
+        assert!(d.account_needs().is_empty());
+        let mut kept = false;
+        for _ in 0..200 {
+            let e = d.0.store.state(super::accounts::PUT_OFF).await.unwrap();
+            if e.is_some_and(|e| e.value.as_array().is_some_and(|v| v.len() == 1)) {
+                kept = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(kept, "kept for the hub's next start");
+        drop(d);
+        let again = signed_in_as_gmail(pool, dir.path(), Arc::new(Plans::default())).await;
+        again.accounts_moved().await;
+        assert!(
+            !again
+                .account_needs()
+                .iter()
+                .any(|n| matches!(n, AccountNeed::WhichSignIn { .. })),
+            "not asked again after a restart"
+        );
+        // Signed in as another: asked of that one, and the last one's "Not
+        // now" is gone with it.
+        cli_signs_in_as(&again, dir.path(), "star").await;
+        again.accounts_moved().await;
+        assert!(
+            !again
+                .0
+                .state
+                .lock()
+                .put_off
+                .contains(&format!("which-sign-in:{}", gmail().key)),
+            "a sign-in no longer had keeps no answer"
+        );
+        let need = until(|| {
+            again
+                .account_needs()
+                .into_iter()
+                .find(|n| matches!(n, AccountNeed::WhichSignIn { .. }))
+        })
+        .await;
+        assert_eq!(need.id(), format!("which-sign-in:{}", star().key));
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn no_key_is_current_until_this_computers_sign_in_is_read() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = signed_in_as_gmail(pool, dir.path(), Arc::new(Plans::default())).await;
+        assert!(d.current_plan_keys().is_some());
+        d.0.state.lock().own_read = false;
+        assert_eq!(
+            d.current_plan_keys(),
+            None,
+            "not yet known: nothing dropped"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn with_no_claude_code_here_its_sign_in_is_read_as_none_and_keys_are_current() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        DeskStore::migrate(&pool).await.unwrap();
+        let mut o = signed_out_options(dir.path(), Arc::new(MemoryKeys::default()));
+        o.programs.remove(&Engine::Claude);
+        let d = Desk::start(
+            DeskStore::from_pool(pool),
+            o,
+            super::Floor {
+                plans: Some(Arc::new(Plans::default())),
+                ..Default::default()
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        d.read_engine_now(Engine::Claude).await;
+        assert!(d.0.state.lock().own_read);
+        assert!(d.current_plan_keys().is_some(), "the filter is on");
+    })
+    .await;
 }
