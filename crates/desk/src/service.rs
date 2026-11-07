@@ -74,6 +74,7 @@ mod memory;
 mod memory_index;
 #[cfg(test)]
 mod memory_index_tests;
+mod memory_recall;
 #[cfg(test)]
 mod rooms_tests;
 mod scopes;

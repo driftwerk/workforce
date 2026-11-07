@@ -546,6 +546,8 @@ fn options(config: &WorkforceConfig) -> Options {
             exclude: desk.memory.exclude.clone(),
             max_disk_mb: desk.memory.max_disk_mb,
             index_per_minute: desk.memory.index_per_minute,
+            session_reach: workforce_desk::memory::reach::Reach::parse(&desk.memory.session_reach)
+                .unwrap_or(workforce_desk::memory::reach::Reach::Project),
         },
     }
 }

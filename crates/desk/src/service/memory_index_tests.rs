@@ -368,3 +368,206 @@ async fn a_full_memory_holds_the_harvest_and_the_floor_says_so_first() {
     })
     .await;
 }
+
+async fn reads(store: &DeskStore, reader: &str) -> i64 {
+    q::<i64>(
+        store,
+        "SELECT COUNT(*) FROM memory_reads WHERE reader = $1",
+        &[&reader],
+    )
+    .await
+}
+
+fn query(q: &str) -> crate::memory_store::MemoryQuery {
+    crate::memory_store::MemoryQuery {
+        q: q.into(),
+        limit: 10,
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn the_person_searches_the_index_and_keywords_stand_in_when_it_is_down() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        DeskStore::migrate(&pool).await.unwrap();
+        let store = DeskStore::from_pool(pool.clone());
+        let web = session(dir.path(), "acme-web");
+        store.put(&web).await.unwrap();
+        let index = Arc::new(FakeIndex::default());
+        index.down.store(true, Ordering::SeqCst);
+        let (d, _cancel) = start(&pool, dir.path(), &index).await;
+        harvested(&d, &store, web.id, 6).await;
+
+        // Not written yet, and the index down: by keyword, and said so.
+        until(&d, "the outage is said", async || {
+            d.memory_index_status().await.unwrap().failing.is_some()
+        })
+        .await;
+        let found = d.memory_search(&query("cookie")).await.unwrap();
+        assert!(found.keyword_only);
+        assert_eq!(found.notice, Some(crate::memory::KEYWORD_ONLY));
+        assert!(found.hits.iter().any(|h| h.hit.answer.contains("HttpOnly")));
+        assert_eq!(reads(&store, "person").await, 1, "every search is a read");
+
+        index.down.store(false, Ordering::SeqCst);
+        until(&d, "indexed", async || {
+            d.memory_index_status().await.unwrap().backlog == 0
+                && d.memory_index_status().await.unwrap().failing.is_none()
+        })
+        .await;
+        let found = d.memory_search(&query("cookie HttpOnly")).await.unwrap();
+        assert!(!found.keyword_only);
+        assert_eq!(found.notice, None);
+        assert!(
+            found.hits[0].hit.answer.contains("HttpOnly"),
+            "{:?}",
+            found.hits
+        );
+        assert_eq!(found.hits[0].name.as_deref(), Some("acme-web"));
+
+        // A row Postgres no longer has, its deletion not yet run in the
+        // index, is never returned.
+        index.down.store(true, Ordering::SeqCst);
+        {
+            let client = store.pool().get().await.unwrap();
+            client
+                .execute(
+                    "DELETE FROM memory_exchanges WHERE answer LIKE '%HttpOnly%'",
+                    &[],
+                )
+                .await
+                .unwrap();
+        }
+        index.down.store(false, Ordering::SeqCst);
+        let found = d.memory_search(&query("cookie HttpOnly")).await.unwrap();
+        assert!(found
+            .hits
+            .iter()
+            .all(|h| !h.hit.answer.contains("HttpOnly")));
+
+        // Something new, not yet in the index, is found by its words.
+        index.down.store(true, Ordering::SeqCst);
+        {
+            let client = store.pool().get().await.unwrap();
+            client
+                .execute(
+                    "INSERT INTO memory_exchanges (id, engine, key, session, project, folder, seq, \
+                       at, ended, asker, ask, answer, steps) VALUES (gen_random_uuid(), 'claude', \
+                       'k-new', $1, '/dev/acme', '/dev/acme', 99, now(), now(), 'person', \
+                       'rotate the signing keys', 'Rotated.', '[]')",
+                    &[&web.id],
+                )
+                .await
+                .unwrap();
+        }
+        index.down.store(false, Ordering::SeqCst);
+        let found = d.memory_search(&query("signing keys")).await.unwrap();
+        if !found.keyword_only {
+            assert_eq!(found.notice, Some(crate::memory::CATCHING_UP));
+        }
+        assert_eq!(found.hits.len(), 1);
+        assert_eq!(found.hits[0].hit.ask, "rotate the signing keys");
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_session_never_recalls_another_groups_memory_whatever_it_asks() {
+    use super::memory_recall::Recall;
+    use crate::memory::reach::{Reach, Reader};
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        DeskStore::migrate(&pool).await.unwrap();
+        let store = DeskStore::from_pool(pool.clone());
+        let (acme, globex) = (
+            session(dir.path(), "acme-web"),
+            session(dir.path(), "globex-web"),
+        );
+        for r in [&acme, &globex] {
+            store.put(r).await.unwrap();
+        }
+        let index = Arc::new(FakeIndex::default());
+        index.down.store(true, Ordering::SeqCst);
+        let (d, _cancel) = start(&pool, dir.path(), &index).await;
+        harvested(&d, &store, acme.id, 6).await;
+        harvested(&d, &store, globex.id, 6).await;
+        {
+            let client = store.pool().get().await.unwrap();
+            for (id, g) in [(acme.id, "g-acme"), (globex.id, "g-globex")] {
+                client
+                    .execute(
+                        "UPDATE memory_exchanges SET group_id = $2 WHERE session = $1",
+                        &[&id, &g],
+                    )
+                    .await
+                    .unwrap();
+            }
+        }
+        index.down.store(false, Ordering::SeqCst);
+        until(&d, "indexed", async || {
+            let s = d.memory_index_status().await.unwrap();
+            s.backlog == 0 && s.failing.is_none()
+        })
+        .await;
+        let reader = Reader::Session {
+            id: acme.id,
+            group: Some("g-acme".into()),
+            project: dir.path().to_string_lossy().into_owned(),
+            work: Vec::new(),
+        };
+        for down in [false, true] {
+            index.down.store(down, Ordering::SeqCst);
+            for (reach, group, session) in [
+                (None, None, None),
+                (Some(Reach::Group), None, None),
+                (Some(Reach::Group), Some(Some("g-globex".to_string())), None),
+                (Some(Reach::Group), None, Some(globex.id)),
+            ] {
+                let got = d
+                    .memory_recall(
+                        &reader,
+                        &Recall {
+                            q: "cookie HttpOnly".into(),
+                            reach,
+                            group,
+                            session,
+                            limit: 10,
+                            tool: "recall",
+                        },
+                    )
+                    .await
+                    .unwrap();
+                assert!(
+                    got.hits
+                        .iter()
+                        .all(|(r, _)| r.session == acme.id && r.group.as_deref() == Some("g-acme")),
+                    "down: {down}, {reach:?}"
+                );
+            }
+        }
+        index.down.store(false, Ordering::SeqCst);
+        // Its own are found; the person finds both.
+        let own = d
+            .memory_recall(
+                &reader,
+                &Recall {
+                    q: "HttpOnly".into(),
+                    limit: 10,
+                    tool: "recall",
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(!own.hits.is_empty());
+        let all = d.memory_search(&query("HttpOnly")).await.unwrap();
+        let sessions: std::collections::HashSet<Uuid> =
+            all.hits.iter().map(|h| h.hit.session).collect();
+        assert_eq!(sessions.len(), 2);
+        // Every search is a read, but one asking only for another group's
+        // has nothing to search.
+        assert_eq!(reads(&store, &format!("session:{}", acme.id)).await, 7);
+    })
+    .await;
+}

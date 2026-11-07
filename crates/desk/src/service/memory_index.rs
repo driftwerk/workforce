@@ -446,6 +446,24 @@ impl Desk {
         })
     }
 
+    /// The index, when there is one and its last try didn't fail: what a
+    /// search asks before it falls back to keywords.
+    pub(super) fn memory_index_up(&self) -> Option<Arc<dyn MemoryIndex>> {
+        let index = self.0.index.index.clone()?;
+        self.0.index.state.lock().failing.is_none().then_some(index)
+    }
+
+    /// Notes that the index failed a search: until it answers the worker
+    /// again, searches are by keyword.
+    pub(super) fn memory_index_failed(&self, e: &eyre::Report) {
+        tracing::warn!(
+            error = format!("{e:#}"),
+            "Desk Memory's search index failed a search; searching by keyword"
+        );
+        self.0.index.state.lock().failing = Some(format!("{e:#}"));
+        self.memory_index_poke();
+    }
+
     /// Measures session memory's disk use.
     pub(super) async fn measure_memory(&self) {
         match self.0.store.memory_disk_bytes().await {

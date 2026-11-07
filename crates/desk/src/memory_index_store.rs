@@ -9,6 +9,7 @@ use eyre::{Context, Result};
 use uuid::Uuid;
 
 use crate::memory::passage::{IndexRow, Purge};
+use crate::memory::reach::Bound;
 use crate::memory_store::queue_purge_of;
 use crate::store::DeskStore;
 
@@ -309,6 +310,130 @@ impl DeskStore {
             .await?
             .try_get(0)?;
         Ok(u64::try_from(bytes).unwrap_or(0))
+    }
+}
+
+/// An exchange a recall found, read back from Postgres by its ref.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RecallRow {
+    pub id: Uuid,
+    pub session: Uuid,
+    pub group: Option<String>,
+    pub project: String,
+    pub at: chrono::DateTime<chrono::Utc>,
+    pub asker: crate::memory::record::Asker,
+    pub ask: String,
+    pub answer: String,
+    pub compaction: bool,
+    /// It has tool steps.
+    pub stepped: bool,
+    pub flagged: bool,
+}
+
+/// [`Bound`]'s parts as SQL parameters: the groups named, whether
+/// ungrouped is among them, and the sessions and projects it keeps to.
+fn bound_params(b: &Bound) -> (Vec<String>, bool, Option<Vec<Uuid>>, Option<Vec<String>>) {
+    (
+        b.groups.iter().flatten().cloned().collect(),
+        b.groups.iter().any(Option::is_none),
+        b.sessions.clone(),
+        b.projects.clone(),
+    )
+}
+
+/// The SQL of [`Bound`] over `memory_exchanges`, parameters `$first` on.
+fn bound_sql(first: usize) -> String {
+    let (g, u, s, p) = (first, first + 1, first + 2, first + 3);
+    format!(
+        "(group_id = ANY(${g}) OR (${u} AND group_id IS NULL)) \
+         AND (${s}::uuid[] IS NULL OR session = ANY(${s})) \
+         AND (${p}::text[] IS NULL OR project = ANY(${p}))"
+    )
+}
+
+impl DeskStore {
+    /// The exchanges `ids` names that still exist.
+    pub async fn recall_rows(&self, ids: &[Uuid]) -> Result<Vec<RecallRow>> {
+        let client = self.pool().get().await?;
+        client
+            .query(
+                "SELECT id, session, group_id, project, at, asker, ask, answer, compaction, \
+                   jsonb_array_length(steps) > 0, cardinality(flagged) > 0 \
+                 FROM memory_exchanges WHERE id = ANY($1)",
+                &[&ids],
+            )
+            .await
+            .context("reading recalled exchanges")?
+            .iter()
+            .map(|r| {
+                Ok(RecallRow {
+                    id: r.try_get(0)?,
+                    session: r.try_get(1)?,
+                    group: r.try_get(2)?,
+                    project: r.try_get(3)?,
+                    at: r.try_get(4)?,
+                    asker: crate::memory::record::Asker::parse(r.try_get(5)?)?,
+                    ask: r.try_get(6)?,
+                    answer: r.try_get(7)?,
+                    compaction: r.try_get(8)?,
+                    stepped: r.try_get(9)?,
+                    flagged: r.try_get(10)?,
+                })
+            })
+            .collect()
+    }
+
+    /// The exchanges within `bound` whose words match `q`, best first, each
+    /// with its rank from 0 to 1: every one, or (`unindexed`) only those
+    /// the search index doesn't hold yet, or ever will (past the cap).
+    pub async fn memory_keyword(
+        &self,
+        q: &str,
+        bound: &Bound,
+        unindexed: bool,
+        limit: i64,
+    ) -> Result<Vec<(Uuid, f32)>> {
+        let client = self.pool().get().await?;
+        let (named, ungrouped, sessions, projects) = bound_params(bound);
+        client
+            .query(
+                &format!(
+                    "SELECT id, ts_rank_cd(tsv, query, 32) FROM memory_exchanges, \
+                       websearch_to_tsquery('simple', $1) query \
+                     WHERE tsv @@ query AND (NOT $2 OR indexed_at IS NULL OR past_cap) AND {} \
+                     ORDER BY ts_rank_cd(tsv, query, 32) DESC, at DESC LIMIT $3",
+                    bound_sql(4)
+                ),
+                &[
+                    &q, &unindexed, &limit, &named, &ungrouped, &sessions, &projects,
+                ],
+            )
+            .await
+            .context("searching session memory by keyword")?
+            .iter()
+            .map(|r| Ok((r.try_get(0)?, r.try_get(1)?)))
+            .collect()
+    }
+
+    /// Keeps who read what: `hits` found by `reader` with `tool`.
+    pub async fn memory_read(
+        &self,
+        reader: &str,
+        tool: &str,
+        query: Option<&str>,
+        hits: &[Uuid],
+        group: Option<&str>,
+    ) -> Result<()> {
+        let client = self.pool().get().await?;
+        client
+            .execute(
+                "INSERT INTO memory_reads (id, at, reader, tool, query, hits, group_id) \
+                 VALUES (gen_random_uuid(), now(), $1, $2, $3, $4, $5)",
+                &[&reader, &tool, &query, &hits, &group],
+            )
+            .await
+            .context("noting a read of session memory")?;
+        Ok(())
     }
 }
 
