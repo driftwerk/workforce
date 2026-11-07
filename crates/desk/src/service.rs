@@ -638,9 +638,9 @@ const OWN_WAITING_MAX: usize = 64;
 
 /// The stop on a limit a session's turn marked: on which side, when, and
 /// what the side's standing said of its last stop before, to go back to.
-#[derive(Debug, Clone)]
-struct LimitMark {
-    side: Option<Uuid>,
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(super) struct LimitMark {
+    side: identities::Raw,
     at: DateTime<Utc>,
     before: (Option<DateTime<Utc>>, Option<DateTime<Utc>>, Option<u32>),
 }
@@ -1238,7 +1238,7 @@ impl Desk {
                 Default::default()
             }
         };
-        let (standing, moved_off) = kept_standing.clone().into_state();
+        let (standing, own_standing, moved_off, limit_marks) = kept_standing.clone().into_state();
         let auto_switch = match store.state(accounts::AUTO_SWITCH).await {
             Ok(kept) => kept.is_some_and(|e| e.value == serde_json::json!(true)),
             Err(e) => {
@@ -1341,7 +1341,9 @@ impl Desk {
                 relogged,
                 prints,
                 standing,
+                own_standing,
                 moved_off,
+                limit_marks,
                 auto_switch,
                 ..State::default()
             }),
@@ -4685,17 +4687,16 @@ impl Desk {
     fn mark_session_hit(
         st: &mut State,
         id: Uuid,
-        account: Option<Uuid>,
+        raw: &identities::Raw,
         hit: Option<&crate::limit::LimitHit>,
     ) {
-        let before = st.standing.get(&account).map_or((None, None, None), |s| {
-            (s.hit_at, s.hit_until, s.hit_window)
-        });
-        let at = Self::mark_hit(st, account, hit);
+        let s = Self::standing_mut(st, raw);
+        let before = (s.hit_at, s.hit_until, s.hit_window);
+        let at = Self::mark_hit(st, raw, hit);
         st.limit_marks.insert(
             id,
             LimitMark {
-                side: account,
+                side: raw.clone(),
                 at,
                 before,
             },

@@ -724,6 +724,29 @@ pub struct StandingElsewhere {
 }
 
 impl Standing {
+    /// What another computer's clock said, as this one reads it: shifted by
+    /// `skew` (this clock less the sender's). `None` when its times can't be
+    /// right (later than now, by more than a moment); a reset is never more
+    /// than a week after the stop.
+    pub fn as_seen(&self, skew: chrono::Duration, now: DateTime<Utc>) -> Option<Standing> {
+        let shift = |t: Option<DateTime<Utc>>| t.map(|t| t + skew);
+        let mut s = self.clone();
+        s.read_at = shift(s.read_at);
+        s.hit_at = shift(s.hit_at);
+        s.hit_until = shift(s.hit_until);
+        for w in &mut s.windows {
+            w.resets_at = shift(w.resets_at);
+        }
+        let soon = now + chrono::Duration::minutes(2);
+        if s.read_at.is_some_and(|t| t > soon) || s.hit_at.is_some_and(|t| t > soon) {
+            return None;
+        }
+        if let (Some(hit), Some(until)) = (s.hit_at, s.hit_until) {
+            s.hit_until = Some(until.min(hit + chrono::Duration::days(7)));
+        }
+        Some(s)
+    }
+
     /// What another computer knew, taken where it is newer: a later stop
     /// on the limit, a later reading. Whether anything changed.
     pub fn learn(&mut self, other: &Standing) -> bool {
