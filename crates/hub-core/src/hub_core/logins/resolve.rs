@@ -83,6 +83,7 @@ impl LoginKey {
                 kind: SubscriptionKind::Claude,
                 fingerprint: credential.fingerprint(),
             }),
+            Credential::Pooled(id) => Some(super::install_pool::login_key(id)),
             Credential::ChatGpt(auth) => Self::of_chatgpt(auth),
         }
     }
@@ -103,6 +104,10 @@ pub enum Credential {
     Token(String),
     /// A ChatGPT sign-in, as `codex login` writes it.
     ChatGpt(AuthJson),
+    /// One of the person's own Claude accounts in the hub's install pool,
+    /// by its id: its token is read from where Desk keeps it only as the
+    /// call's CLI starts ([`super::install_pool::token_of`]).
+    Pooled(String),
 }
 
 impl Credential {
@@ -111,6 +116,7 @@ impl Credential {
         match self {
             Self::Token(token) => hex::encode(&Sha256::digest(token.as_bytes())[..8]),
             Self::ChatGpt(auth) => auth.fingerprint(),
+            Self::Pooled(id) => super::install_pool::slot_key(id),
         }
     }
 }
@@ -157,7 +163,7 @@ impl Login {
     pub fn auth(&self) -> Option<&AuthJson> {
         match &self.credential {
             Credential::ChatGpt(auth) => Some(auth),
-            Credential::Token(_) => None,
+            Credential::Token(_) | Credential::Pooled(_) => None,
         }
     }
 
@@ -342,6 +348,16 @@ pub fn resolve(
         } else {
             Err(Miss::NotServed(policy.shared_serves))
         };
+        // The install tier of the person's own hub: its vault login, else
+        // the next of the person's accounts with room ([`install_pool`]).
+        let found = match found {
+            Err(miss)
+                if tier == CredentialTier::SystemShared && kind == SubscriptionKind::Claude =>
+            {
+                pooled(vaults, &miss, payer, owner, cooldowns, now).unwrap_or(Err(miss))
+            }
+            found => found,
+        };
         match found {
             Ok(login) => return Ok(login),
             Err(miss) => misses.push((tier, miss)),
@@ -352,6 +368,102 @@ pub fn resolve(
         payer: payer.clone(),
         misses,
     })
+}
+
+/// The first of the person's accounts in the hub's install pool that is
+/// usable at `now`: not known to be full by Desk, not cooling here, not
+/// refused for good. `None` when the hub has no pool, or the pool may not
+/// serve this call ([`pool_serves`]). Its token is not read here: only as
+/// the call's CLI starts. An account Desk knows is full cools here until
+/// its reset; one cooling here is told to Desk.
+fn pooled(
+    vaults: &Vaults<'_>,
+    miss: &Miss,
+    payer: &Payer,
+    owner: &AgentOwner,
+    cooldowns: &CooldownStore,
+    now: DateTime<Utc>,
+) -> Option<Result<Login, Miss>> {
+    let vault = vaults.of(CredentialTier::SystemShared)?;
+    let pool = super::install_pool::of(vault)?;
+    if !pool_serves(pool.as_ref(), miss, payer, owner) {
+        return None;
+    }
+    let mut soonest: Option<DateTime<Utc>> = None;
+    let mut refused = false;
+    for account in pool.claude_accounts() {
+        let credential = Credential::Pooled(account.id.clone());
+        let key = super::install_pool::login_key(&account.id);
+        let slot = VaultSlot {
+            vault: Arc::clone(vault),
+            key: super::install_pool::slot_key(&account.id),
+        };
+        if let Some(full) = account.full_until.filter(|u| *u > now) {
+            cooldowns.note(
+                &key,
+                &LimitSignal {
+                    status: LimitStatus::Rejected,
+                    resets_at: Some(full),
+                    window: None,
+                },
+                now,
+            );
+        }
+        if cooldowns.is_dead(&slot, &credential.fingerprint()) {
+            refused = true;
+            continue;
+        }
+        if let Some(until) = cooldowns.until(&key, now) {
+            if account.full_until.is_none_or(|f| f < until) {
+                pool.cooling(&account.id, until);
+            }
+            soonest = Some(soonest.map_or(until, |s| s.min(until)));
+            continue;
+        }
+        return Some(Ok(Login {
+            kind: SubscriptionKind::Claude,
+            tier: CredentialTier::SystemShared,
+            // Whose plan it is, on its cost row: the person's own.
+            owner: match payer {
+                Payer::Person(person) => LoginOwner::Person(*person),
+                _ => LoginOwner::Install,
+            },
+            credential,
+            slot,
+            key,
+        }));
+    }
+    match (soonest, refused) {
+        (Some(until), _) => Some(Err(Miss::Cooling { until })),
+        (None, true) => Some(Err(Miss::Invalid)),
+        (None, false) => None,
+    }
+}
+
+/// Whether the person's own accounts may pay for this call: only for the
+/// person themself ([`super::install_pool::InstallPool::serves`]) or the
+/// hub's own background work marked so ([`super::install_pool::hub_own_work`]),
+/// on an agent no one else owns, and only where the install tier's own
+/// login is missing, cooling or refused, never where the policy refused the
+/// payer. Never for an outside caller.
+fn pool_serves(
+    pool: &dyn super::install_pool::InstallPool,
+    miss: &Miss,
+    payer: &Payer,
+    owner: &AgentOwner,
+) -> bool {
+    let missing = matches!(miss, Miss::Absent | Miss::Cooling { .. } | Miss::Invalid);
+    let theirs = match owner {
+        AgentOwner::Unowned => true,
+        AgentOwner::User(user) => pool.serves(*user),
+        AgentOwner::Team { .. } => false,
+    };
+    let for_them = match payer {
+        Payer::Person(person) => pool.serves(*person),
+        Payer::Background(_) | Payer::Unset => super::install_pool::in_hub_own_work(),
+        Payer::External(_) | Payer::Unidentified(_) => false,
+    };
+    missing && theirs && for_them
 }
 
 /// The login `tier` holds for `person` (whom it may serve aside): usable, or
@@ -512,6 +624,7 @@ mod tests {
     fn token(login: &Login) -> &str {
         match &login.credential {
             Credential::Token(token) => token,
+            Credential::Pooled(id) => id,
             Credential::ChatGpt(_) => panic!("a ChatGPT login"),
         }
     }
@@ -1066,5 +1179,269 @@ mod tests {
             err.misses[2],
             (CredentialTier::AgentShared, Miss::Malformed(_))
         ));
+    }
+
+    /// The person's accounts as Desk would offer them, whose calls they
+    /// serve, and what each was told back and asked for.
+    struct Pool {
+        accounts: Vec<(&'static str, &'static str, Option<DateTime<Utc>>)>,
+        person: Uuid,
+        told: parking_lot::Mutex<Vec<(String, DateTime<Utc>)>>,
+        /// Whose tokens were read.
+        read: parking_lot::Mutex<Vec<String>>,
+    }
+
+    impl Pool {
+        fn of(accounts: Vec<(&'static str, &'static str, Option<DateTime<Utc>>)>) -> Arc<Self> {
+            Arc::new(Self {
+                accounts,
+                person: Uuid::parse_str(ALICE).unwrap(),
+                told: parking_lot::Mutex::new(Vec::new()),
+                read: parking_lot::Mutex::new(Vec::new()),
+            })
+        }
+    }
+
+    impl super::super::install_pool::InstallPool for Pool {
+        fn claude_accounts(&self) -> Vec<super::super::install_pool::PoolAccount> {
+            self.accounts
+                .iter()
+                .map(
+                    |(id, _, full_until)| super::super::install_pool::PoolAccount {
+                        id: (*id).into(),
+                        full_until: *full_until,
+                    },
+                )
+                .collect()
+        }
+        fn token(&self, id: &str) -> Option<String> {
+            self.read.lock().push(id.to_string());
+            self.accounts
+                .iter()
+                .find(|(i, _, _)| *i == id)
+                .map(|(_, t, _)| (*t).to_string())
+        }
+        fn serves(&self, person: Uuid) -> bool {
+            person == self.person
+        }
+        fn cooling(&self, id: &str, until: DateTime<Utc>) {
+            self.told.lock().push((id.into(), until));
+        }
+    }
+
+    fn install_policy() -> LoginPolicy {
+        LoginPolicy {
+            tiers: vec![CredentialTier::GlobalUser, CredentialTier::SystemShared],
+            shared_serves: SharedServes::Anyone,
+        }
+    }
+
+    /// A call for `payer` on an agent `owner` owns, with `pool` registered
+    /// on the fixture's hub.
+    fn pooled_for(
+        f: &Fixture,
+        pool: &Arc<Pool>,
+        payer: &Payer,
+        owner: &AgentOwner,
+        policy: &LoginPolicy,
+        cooldowns: &CooldownStore,
+    ) -> Result<Login, NoLogin> {
+        super::super::install_pool::set(
+            &f.global,
+            Some(Arc::clone(pool) as Arc<dyn super::super::install_pool::InstallPool>),
+        );
+        f.resolve_with(SubscriptionKind::Claude, payer, owner, policy, cooldowns)
+    }
+
+    fn alice() -> Payer {
+        Payer::Person(Uuid::parse_str(ALICE).unwrap())
+    }
+
+    #[test]
+    fn the_persons_own_calls_move_to_the_next_of_their_accounts_at_a_limit() {
+        let f = Fixture::new();
+        let cooldowns = CooldownStore::default();
+        let pool = Pool::of(vec![
+            ("starmoire", "sk-ant-oat01-starmoire", None),
+            ("gmail", "sk-ant-oat01-gmail", None),
+        ]);
+        let call = |pool: &Arc<Pool>| {
+            pooled_for(
+                &f,
+                pool,
+                &alice(),
+                &AgentOwner::Unowned,
+                &install_policy(),
+                &cooldowns,
+            )
+        };
+        // No vault login: the default account first, named by its id alone.
+        let first = call(&pool).unwrap();
+        assert!(matches!(&first.credential, Credential::Pooled(id) if id == "starmoire"));
+        assert_eq!(first.tier, CredentialTier::SystemShared);
+        assert_eq!(
+            first.owner,
+            LoginOwner::Person(Uuid::parse_str(ALICE).unwrap()),
+            "the person's plan, on its cost row"
+        );
+        assert!(
+            pool.read.lock().is_empty(),
+            "no token is read to resolve a login"
+        );
+        // Refused at its limit: the next account serves, and Desk is told.
+        let reset = Utc::now() + chrono::Duration::days(3);
+        cooldowns.note(
+            &first.key,
+            &LimitSignal {
+                status: LimitStatus::Rejected,
+                resets_at: Some(reset),
+                window: None,
+            },
+            Utc::now(),
+        );
+        let next = call(&pool).unwrap();
+        assert!(matches!(&next.credential, Credential::Pooled(id) if id == "gmail"));
+        assert_eq!(
+            pool.told.lock().clone(),
+            vec![("starmoire".to_string(), reset)]
+        );
+        // A vault login of the install's own serves before the pool.
+        f.global.set(CLAUDE, "sk-ant-oat01-install").unwrap();
+        assert_eq!(token(&call(&pool).unwrap()), "sk-ant-oat01-install");
+        super::super::install_pool::set(&f.global, None);
+    }
+
+    #[test]
+    fn an_account_desk_knows_is_full_is_skipped_and_all_full_says_when_one_frees() {
+        let f = Fixture::new();
+        let cooldowns = CooldownStore::default();
+        let soon = Utc::now() + chrono::Duration::hours(2);
+        let later = Utc::now() + chrono::Duration::days(4);
+        let call = |pool: &Arc<Pool>| {
+            pooled_for(
+                &f,
+                pool,
+                &alice(),
+                &AgentOwner::Unowned,
+                &install_policy(),
+                &cooldowns,
+            )
+        };
+        let pool = Pool::of(vec![
+            ("starmoire", "sk-ant-oat01-starmoire", Some(later)),
+            ("gmail", "sk-ant-oat01-gmail", None),
+        ]);
+        assert!(
+            matches!(&call(&pool).unwrap().credential, Credential::Pooled(id) if id == "gmail")
+        );
+        assert!(pool.told.lock().is_empty(), "Desk already knew");
+        let full = Pool::of(vec![
+            ("starmoire", "sk-ant-oat01-starmoire", Some(later)),
+            ("gmail", "sk-ant-oat01-gmail", Some(soon)),
+        ]);
+        assert_eq!(call(&full).unwrap_err().cooling_until(), Some(soon));
+        super::super::install_pool::set(&f.global, None);
+    }
+
+    #[test]
+    fn the_persons_accounts_never_pay_for_anyone_else() {
+        let f = Fixture::new();
+        let cooldowns = CooldownStore::default();
+        let pool = Pool::of(vec![("gmail", "sk-ant-oat01-gmail", None)]);
+        let bob = Uuid::parse_str(BOB).unwrap();
+        let refused = |payer: Payer, owner: AgentOwner, policy: LoginPolicy| {
+            pooled_for(&f, &pool, &payer, &owner, &policy, &cooldowns).is_err()
+        };
+        // Someone else on the hub, an outside caller, an unidentified one.
+        assert!(refused(
+            Payer::Person(bob),
+            AgentOwner::Unowned,
+            install_policy()
+        ));
+        assert!(refused(
+            Payer::External("ext:acme".into()),
+            AgentOwner::Unowned,
+            install_policy()
+        ));
+        assert!(refused(
+            Payer::Unidentified("U123".into()),
+            AgentOwner::Unowned,
+            install_policy()
+        ));
+        // Background work not marked the hub's own: never.
+        assert!(refused(
+            Payer::Background("heartbeat".into()),
+            AgentOwner::Unowned,
+            install_policy()
+        ));
+        assert!(refused(Payer::Unset, AgentOwner::Unowned, install_policy()));
+        // The person, on an agent someone else or a team owns.
+        assert!(refused(alice(), AgentOwner::User(bob), install_policy()));
+        let team = AgentOwner::Team {
+            id: Uuid::new_v4(),
+            members: [Uuid::parse_str(ALICE).unwrap()].into_iter().collect(),
+        };
+        assert!(refused(alice(), team, install_policy()));
+        // A policy that refuses the payer the shared tiers is never overruled.
+        assert!(refused(
+            alice(),
+            AgentOwner::Unowned,
+            LoginPolicy {
+                tiers: vec![CredentialTier::SystemShared],
+                shared_serves: SharedServes::Owner,
+            }
+        ));
+        // The person on their own agent: served.
+        assert!(!refused(
+            alice(),
+            AgentOwner::User(Uuid::parse_str(ALICE).unwrap()),
+            install_policy()
+        ));
+        // Another hub's vault never reaches this hub's pool.
+        let other = Fixture::new();
+        assert!(other
+            .resolve_with(
+                SubscriptionKind::Claude,
+                &alice(),
+                &AgentOwner::Unowned,
+                &install_policy(),
+                &cooldowns
+            )
+            .is_err());
+        assert!(pool.read.lock().is_empty());
+        super::super::install_pool::set(&f.global, None);
+    }
+
+    #[tokio::test]
+    async fn the_hubs_own_work_for_its_person_runs_on_their_accounts_and_reads_a_token_only_to_run()
+    {
+        let f = Fixture::new();
+        let cooldowns = CooldownStore::default();
+        let pool = Pool::of(vec![("gmail", "sk-ant-oat01-gmail", None)]);
+        let background = || {
+            pooled_for(
+                &f,
+                &pool,
+                &Payer::Background("system".into()),
+                &AgentOwner::Unowned,
+                &install_policy(),
+                &cooldowns,
+            )
+        };
+        assert!(background().is_err(), "not marked the hub's own");
+        let login = super::super::install_pool::hub_own_work(async { background() })
+            .await
+            .unwrap();
+        assert_eq!(login.owner, LoginOwner::Install);
+        assert!(pool.read.lock().is_empty());
+        // Its token, only as the call's CLI starts.
+        assert_eq!(
+            super::super::install_pool::token_of(&f.global, "gmail")
+                .await
+                .as_deref(),
+            Some("sk-ant-oat01-gmail")
+        );
+        assert_eq!(pool.read.lock().clone(), vec!["gmail".to_string()]);
+        super::super::install_pool::set(&f.global, None);
     }
 }

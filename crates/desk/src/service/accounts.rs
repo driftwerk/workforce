@@ -452,6 +452,88 @@ impl Desk {
         ))
     }
 
+    /// The person's Claude accounts for the hub's own model calls (the
+    /// overseer, the Floor's gists), in the order a switch takes them (the
+    /// default first), and when each is known to be full. Never their
+    /// tokens ([`Desk::pool_token`]); one whose sign-in can't be used is
+    /// left out.
+    pub fn pool_accounts(&self) -> Vec<(Uuid, Option<chrono::DateTime<Utc>>)> {
+        if self.0.opts.account_keys.is_none() {
+            return Vec::new();
+        }
+        let st = self.0.state.lock();
+        let mut accounts: Vec<&Account> = st
+            .accounts
+            .iter()
+            .filter(|a| {
+                a.engine == Engine::Claude
+                    && st.signed_in_accounts.contains(&a.id)
+                    && !st.sign_in_problems.contains_key(&a.id)
+            })
+            .collect();
+        accounts.sort_by_key(|a| !a.is_default);
+        accounts
+            .into_iter()
+            .map(|a| {
+                // Full with no reset known: looked at again shortly.
+                let full = Self::full_now(&st, Some(a.id)).map(|until| {
+                    until.unwrap_or_else(|| Utc::now() + chrono::Duration::minutes(15))
+                });
+                (a.id, full)
+            })
+            .collect()
+    }
+
+    /// Account `id`'s token, read from the store now for the one call of
+    /// the hub's own it serves; never kept. The store may block, so never
+    /// under the state lock.
+    pub fn pool_token(&self, id: Uuid) -> Option<AccountToken> {
+        let is_claude = self
+            .0
+            .state
+            .lock()
+            .accounts
+            .iter()
+            .any(|a| a.id == id && a.engine == Engine::Claude);
+        if !is_claude {
+            return None;
+        }
+        let keys = Arc::clone(self.keys().ok()?);
+        match keys.get(id) {
+            Ok(token) => token,
+            Err(e) => {
+                tracing::warn!(account = %id, error = %format!("{e:#}"), "couldn't read an account's sign-in for the hub's own call");
+                None
+            }
+        }
+    }
+
+    /// A call of the hub's own on `account` was refused at its limit: it is
+    /// full until `until` for Desk too.
+    pub fn hub_cooling(&self, account: Uuid, until: chrono::DateTime<Utc>) {
+        let now = Utc::now();
+        {
+            let mut st = self.0.state.lock();
+            if !st.accounts.iter().any(|a| a.id == account) {
+                return;
+            }
+            let side = Self::canonical(&st, Some(account));
+            let standing = st.standing.entry(side).or_default();
+            if standing.full(now).flatten().is_some_and(|t| t >= until) {
+                return;
+            }
+            standing.hit_at = Some(now);
+            standing.hit_until = Some(until);
+            standing.hit_window = None;
+        }
+        tracing::info!(%account, %until, "the hub's own call found an account at its limit");
+        // Told from wherever a login is resolved, which may have no runtime.
+        if let Ok(rt) = tokio::runtime::Handle::try_current() {
+            let desk = self.clone();
+            rt.spawn(async move { desk.accounts_moved().await });
+        }
+    }
+
     /// An account by the name the person or an agent gave it.
     pub fn account_named(&self, engine: Engine, name: &str) -> Result<Uuid, DeskError> {
         let st = self.0.state.lock();

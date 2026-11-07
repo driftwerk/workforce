@@ -1221,11 +1221,21 @@ pub(crate) enum ResolvedAuth {
 }
 
 impl ResolvedAuth {
-    pub(crate) fn resolve(auth: &ClaudeAuth) -> Result<Self> {
+    pub(crate) async fn resolve(auth: &ClaudeAuth) -> Result<Self> {
         match auth {
             ClaudeAuth::Resolved(login) => match &login.credential {
                 crate::subscription::Credential::Token(token) => {
                     Ok(Self::Subscription(token.clone()))
+                }
+                // One of the person's own accounts: its token read now, for
+                // this round's CLI alone.
+                crate::subscription::Credential::Pooled(id) => {
+                    crate::hub_core::logins::install_pool::token_of(&login.slot.vault, id)
+                        .await
+                        .map(Self::Subscription)
+                        .ok_or_else(|| {
+                            eyre!("the sign-in of one of your Claude accounts couldn't be read just now")
+                        })
                 }
                 crate::subscription::Credential::ChatGpt(_) => Err(eyre!(
                     "Claude Code runs on a Claude login, not a {} one",
@@ -1480,7 +1490,7 @@ pub async fn run(
     cancel: Option<CancellationToken>,
     progress_tx: Option<tokio::sync::mpsc::Sender<workforce_agent::runner::ProgressEvent>>,
 ) -> Result<ClaudeCodeResult> {
-    let auth = ResolvedAuth::resolve(&config.auth)?;
+    let auth = ResolvedAuth::resolve(&config.auth).await?;
 
     let start = Instant::now();
 

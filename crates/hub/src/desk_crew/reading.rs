@@ -48,14 +48,18 @@ impl CrewHub {
         let skip = reply.chars().count().saturating_sub(READ_CHARS);
         let tail: String = reply.chars().skip(skip).collect();
         let model = crate::turn_loop::cheap_model(&service);
-        let (response, served) = with_served_log(service.llm.create_message(
-            Some(SYSTEM),
-            &[LlmMessage::user(tail)],
-            &[],
-            Some(&model),
-            Some(8),
-            true,
-        ))
+        // The hub's own work for the person whose Desk this is: it may run
+        // on their accounts when the install's login is at its limit.
+        let (response, served) = crate::hub_core::logins::install_pool::hub_own_work(
+            with_served_log(service.llm.create_message(
+                Some(SYSTEM),
+                &[LlmMessage::user(tail)],
+                &[],
+                Some(&model),
+                Some(8),
+                true,
+            )),
+        )
         .await;
         let response = response
             .inspect_err(|e| tracing::info!(error = %e, "reading a session's reply failed"))
