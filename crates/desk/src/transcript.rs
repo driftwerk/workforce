@@ -20,6 +20,9 @@ pub struct Tail {
     /// The last reply whole, for reading whether it asks the person
     /// something.
     pub said: Option<String>,
+    /// The plan's limit, when the transcript ends on Claude Code's refusal
+    /// at it: which window, and when it resets.
+    pub limit: Option<crate::limit::LimitHit>,
 }
 
 /// The whole lines of the end of a transcript.
@@ -60,10 +63,14 @@ fn absorb(mut tail: Tail, v: &Value) -> Tail {
             if let Some(text) = v.pointer("/message/content").and_then(Value::as_str) {
                 if !text.starts_with('<') {
                     tail.last_prompt = Some(text.to_string());
+                    // Asked again: what stopped the last turn is behind it.
+                    tail.limit = None;
                 }
             }
         }
         Some("assistant") => {
+            // Only the turn it ends on: a later reply or error clears it.
+            tail.limit = crate::limit::in_transcript_line(v);
             let text: Vec<&str> = v
                 .pointer("/message/content")
                 .and_then(Value::as_array)
@@ -154,8 +161,48 @@ mod tests {
                 last_prompt: Some("now open a PR".into()),
                 last_reply: Some("Done, tests pass.".into()),
                 said: Some("Done, tests pass.".into()),
+                limit: None,
             }
         );
+    }
+
+    #[test]
+    fn a_transcript_that_ends_on_the_plans_limit_says_when_it_resets() {
+        let refused = r#"{"type":"assistant","isApiErrorMessage":true,"apiError":"usage_limit_reached","apiErrorParams":{"rate_limit_info":{"status":"rejected","resetsAt":1792137600,"rateLimitType":"seven_day"}},"quotaLimits":{"status":"rejected","resetsAt":1792137600,"rateLimitType":"seven_day"},"error":"rate_limit","message":{"content":[{"type":"text","text":"You've hit your weekly limit · resets Fri 9am"}]}}"#;
+        let write = |lines: &[&str]| {
+            let mut f = tempfile::NamedTempFile::new().unwrap();
+            for line in lines {
+                writeln!(f, "{line}").unwrap();
+            }
+            f
+        };
+        let f = write(&[
+            r#"{"type":"user","message":{"role":"user","content":"fix it"}}"#,
+            refused,
+        ]);
+        let t = read_tail(f.path()).unwrap();
+        assert_eq!(
+            t.limit,
+            Some(crate::limit::LimitHit {
+                window: Some("seven_day".into()),
+                resets_at: chrono::DateTime::from_timestamp(1_792_137_600, 0),
+            })
+        );
+        assert_eq!(
+            t.last_reply.as_deref(),
+            Some("You've hit your weekly limit · resets Fri 9am")
+        );
+        // Asked again, or answered since: no longer on it.
+        let f = write(&[
+            refused,
+            r#"{"type":"user","message":{"role":"user","content":"Continue"}}"#,
+        ]);
+        assert_eq!(read_tail(f.path()).unwrap().limit, None);
+        let f = write(&[
+            refused,
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Done."}]}}"#,
+        ]);
+        assert_eq!(read_tail(f.path()).unwrap().limit, None);
     }
 
     #[test]

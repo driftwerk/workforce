@@ -1186,10 +1186,16 @@ impl Desk {
             let (live, hit_limit) = {
                 let st = self.0.state.lock();
                 let live = st.live.contains_key(&id);
+                // What Claude Code said of how its turn ended comes first;
+                // the reply's words only when it said nothing.
                 let hit_limit = matches!(r.state, SessionState::Done | SessionState::Idle)
-                    && r.last_reply
-                        .as_deref()
-                        .is_some_and(|reply| crew::outcome_of(Ok(reply)).0 == Outcome::Limit);
+                    && match st.turn_failures.get(&id) {
+                        Some(f) => f.limit().is_some(),
+                        None => r
+                            .last_reply
+                            .as_deref()
+                            .is_some_and(|reply| crew::outcome_of(Ok(reply)).0 == Outcome::Limit),
+                    };
                 (live, hit_limit)
             };
             if r.account == to && !hit_limit {

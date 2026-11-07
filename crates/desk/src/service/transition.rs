@@ -383,13 +383,21 @@ pub(super) fn turn_ops(
 const TASK_CHARS: usize = 120;
 
 /// How a turn that ended on `reply` without asking the person ended:
-/// finished, or on its usage limit. A session in another terminal, whose
-/// turns Desk reads from its transcript and not its hooks, is read for an
-/// ask here, by the rules alone.
+/// finished, failed, or on its usage limit. What Claude Code said of an API
+/// error that ended it (`StopFailure`, the transcript) comes first; the
+/// reply's words only when it said nothing. A session in another terminal,
+/// whose turns Desk reads from its transcript and not its hooks, is read
+/// for an ask here, by the rules alone.
 pub(super) fn finished(
     reply: &str,
     now: &SessionView,
 ) -> (Outcome, Option<String>, Option<ItemQuestion>) {
+    let line = || crew::outcome_of(Ok(reply)).1;
+    match &now.failure {
+        Some(crate::limit::TurnFailure::Limit(_)) => return (Outcome::Limit, line(), None),
+        Some(crate::limit::TurnFailure::Failed(_)) => return (Outcome::Failed, line(), None),
+        None => {}
+    }
     match (asking::read(reply), crew::outcome_of(Ok(reply))) {
         (_, (Outcome::Limit, line, _)) => (Outcome::Limit, line, None),
         (Reading::Asks(asked), _) if now.state == SessionState::Idle => {

@@ -826,18 +826,21 @@ fn either_or(question: &str) -> Option<Vec<String>> {
     (fine(&a) && fine(&b) && a != b).then(|| vec![a, b])
 }
 
-/// Whether a reply says the work stopped on a usage or rate limit.
+/// Whether a reply says the work stopped on a usage or rate limit. The
+/// last resort: a Claude Code session's limit is read from its
+/// `StopFailure` and transcript ([`crate::limit`]) first.
 pub fn hit_limit(reply: &str) -> bool {
     let r = reply.to_lowercase();
-    [
-        "usage limit",
-        "limit reached",
-        "rate limit",
-        "limit will reset",
-        "out of extra usage",
-    ]
-    .iter()
-    .any(|p| r.contains(p))
+    crate::limit::says_plan_limit(reply)
+        || [
+            "usage limit",
+            "limit reached",
+            "rate limit",
+            "limit will reset",
+            "out of extra usage",
+        ]
+        .iter()
+        .any(|p| r.contains(p))
 }
 
 /// How long an answer's line is kept.
@@ -1006,6 +1009,14 @@ mod tests {
             outcome_of(Err("rate limit reached, try later")).0,
             Outcome::Limit
         );
+        // As Claude Code 2.1.31x says its plan's own limits.
+        for said in [
+            "You've hit your weekly limit · resets Fri 9am",
+            "You've hit your session limit · resets 9am (Europe/London)",
+            "You've hit your 5-hour limit · resets 2:20pm",
+        ] {
+            assert_eq!(outcome_of(Ok(said)).0, Outcome::Limit, "{said}");
+        }
         assert_eq!(
             outcome_of(Err("connection refused")),
             (Outcome::Failed, Some("connection refused".into()), None)

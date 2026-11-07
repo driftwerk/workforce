@@ -42,10 +42,13 @@ const TOOL_EVENTS: [&str; 5] = [
     // Auto mode refused a tool: the turn may end stuck on it.
     "PermissionDenied",
 ];
-const PLAIN_EVENTS: [&str; 6] = [
+const PLAIN_EVENTS: [&str; 7] = [
     "UserPromptSubmit",
     "Notification",
     "Stop",
+    // A turn an API error ended (its plan's limit, a refused sign-in): it
+    // fires instead of Stop, verified on 2.1.319 ([`crate::limit`]).
+    "StopFailure",
     "SubagentStart",
     "SubagentStop",
     "SessionEnd",
@@ -128,6 +131,7 @@ struct Payload {
     reason: Option<String>,
     background_tasks: Option<Vec<BackgroundTask>>,
     error: Option<String>,
+    error_details: Option<String>,
     cwd: Option<String>,
 }
 
@@ -195,6 +199,15 @@ pub enum Hook {
         reply: Option<String>,
         /// What it left running, when the CLI says.
         background: Option<Vec<(String, TaskKind)>>,
+    },
+    /// Its turn ended on an API error (`StopFailure`): the plan's limit,
+    /// or another failure, as [`crate::limit::of_stop_failure`] reads it.
+    StopFailure {
+        transcript: Option<String>,
+        /// What Claude Code said of it: "You've hit your 5-hour limit ·
+        /// resets 9am".
+        reply: Option<String>,
+        failure: crate::limit::TurnFailure,
     },
     /// Claude Code went on by itself: background work it started ended.
     Woken,
@@ -308,6 +321,20 @@ pub fn parse_hook(body: &[u8]) -> eyre::Result<Hook> {
                     .collect()
             }),
         },
+        "StopFailure" => {
+            let reply = p
+                .last_assistant_message
+                .filter(|m| !m.trim().is_empty())
+                .or(p.error_details.filter(|m| !m.trim().is_empty()));
+            Hook::StopFailure {
+                transcript: p.transcript_path,
+                failure: crate::limit::of_stop_failure(
+                    p.error.as_deref().unwrap_or("unknown"),
+                    reply.as_deref(),
+                ),
+                reply,
+            }
+        }
         "SubagentStart" => p.agent_id.map_or(Hook::Other, Hook::SubagentStart),
         "SubagentStop" => p.agent_id.map_or(Hook::Other, Hook::SubagentStop),
         "SessionEnd" => Hook::SessionEnd,
@@ -601,6 +628,28 @@ pub(crate) mod tests {
                 ])
             }
         );
+        // As Claude Code 2.1.319 posted them, on a subscription at its limit
+        // and on a 429 that isn't the plan's.
+        let full = r#"{"session_id":"a3d6","transcript_path":"/t.jsonl","cwd":"/w","prompt_id":"1d6a","effort":{"level":"medium"},"hook_event_name":"StopFailure","error":"rate_limit","last_assistant_message":"You've hit your 5-hour limit · resets 9am (Europe/London)"}"#;
+        assert_eq!(
+            parse_hook(full.as_bytes()).unwrap(),
+            Hook::StopFailure {
+                transcript: Some("/t.jsonl".into()),
+                reply: Some("You've hit your 5-hour limit · resets 9am (Europe/London)".into()),
+                failure: crate::limit::TurnFailure::Limit(crate::limit::LimitHit {
+                    window: None,
+                    resets_at: None
+                }),
+            }
+        );
+        let refused = r#"{"session_id":"338b","transcript_path":"/t.jsonl","hook_event_name":"StopFailure","error":"rate_limit","last_assistant_message":"API Error: Request rejected (429) · This request would exceed your account's rate limit."}"#;
+        assert!(matches!(
+            parse_hook(refused.as_bytes()).unwrap(),
+            Hook::StopFailure {
+                failure: crate::limit::TurnFailure::Failed(e),
+                ..
+            } if e == "rate_limit"
+        ));
         let woken = br#"{"hook_event_name":"UserPromptSubmit","prompt":"<task-notification>\n<task-id>baoj</task-id>\n<status>completed</status>\n</task-notification>"}"#;
         assert_eq!(
             parse_hook(woken).unwrap(),

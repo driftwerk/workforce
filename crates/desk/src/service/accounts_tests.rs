@@ -915,6 +915,103 @@ async fn with_switch_automatically_on_desk_moves_them_itself_and_never_when_all_
     .await;
 }
 
+/// Claude Code's `StopFailure`, as 2.1.319 posts it: `said` is the error
+/// as its terminal shows it.
+fn stop_failure(transcript: &Path, said: &str) -> crate::claude::Hook {
+    crate::claude::parse_hook(
+        serde_json::json!({
+            "session_id": "s1",
+            "transcript_path": transcript,
+            "cwd": "/w",
+            "hook_event_name": "StopFailure",
+            "error": "rate_limit",
+            "last_assistant_message": said,
+        })
+        .to_string()
+        .as_bytes(),
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn a_turn_stopped_by_its_plans_limit_moves_at_once_and_carries_on() {
+    use crate::floor::Outcome;
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(
+            pool,
+            key_options(dir.path(), Arc::new(MemoryKeys::default())),
+        )
+        .await;
+        let (work, personal, a, b) = two_on_work(&d, dir.path()).await;
+        d.set_auto_switch(true).await.unwrap();
+
+        // A 429 that isn't the plan's: the turn failed, nothing is full.
+        let transcript = dir.path().join("a.jsonl");
+        std::fs::write(&transcript, "").unwrap();
+        d.apply_hook(a, crate::claude::Hook::Prompt("fix it".into()), None)
+            .await;
+        d.apply_hook(
+            a,
+            stop_failure(
+                &transcript,
+                "API Error: Request rejected (429) · This request would exceed your account's rate limit.",
+            ),
+            None,
+        )
+        .await;
+        let v = d.view(a).unwrap();
+        assert_eq!(v.state, SessionState::Done);
+        assert_eq!(
+            super::transition::finished(v.last_reply.as_deref().unwrap_or_default(), &v).0,
+            Outcome::Failed
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(d.account_needs().is_empty());
+        assert_eq!(d.view(a).unwrap().account.map(|x| x.id), Some(work));
+
+        // The plan's own limit, mid-turn: no Stop comes, yet the turn is over
+        // on its limit, and Desk moves both at once, this one told to carry
+        // on.
+        d.apply_hook(a, crate::claude::Hook::Prompt("fix it".into()), None)
+            .await;
+        assert_eq!(d.view(a).unwrap().failure, None, "asked again");
+        assert_eq!(d.view(a).unwrap().state, SessionState::Working);
+        // Claude Code writes the error to the transcript after the hook.
+        d.apply_hook(
+            a,
+            stop_failure(&transcript, "You've hit your 5-hour limit · resets 9am (Europe/London)"),
+            None,
+        )
+        .await;
+        std::fs::write(
+            &transcript,
+            r#"{"type":"assistant","isApiErrorMessage":true,"apiError":"usage_limit_reached","apiErrorParams":{"rate_limit_info":{"status":"rejected","resetsAt":1792137600,"rateLimitType":"five_hour"}},"quotaLimits":{"status":"rejected","resetsAt":1792137600,"rateLimitType":"five_hour"},"error":"rate_limit","message":{"content":[{"type":"text","text":"You've hit your 5-hour limit · resets 9am (Europe/London)"}]}}
+"#,
+        )
+        .unwrap();
+        let (env, args) = started(dir.path(), a, 1).await;
+        assert_eq!(env["TOKEN_ON_FD"], OTHER);
+        assert!(args.trim_end().ends_with("Continue"), "{args}");
+        let (env, args) = started(dir.path(), b, 1).await;
+        assert_eq!(env["TOKEN_ON_FD"], OTHER);
+        assert!(!args.contains("Continue"), "{args}");
+        assert_eq!(d.view(a).unwrap().account.map(|x| x.id), Some(personal));
+        // And Work is full until the moment Claude Code said.
+        let reset = chrono::DateTime::from_timestamp(1_792_137_600, 0);
+        until(|| {
+            d.0.state
+                .lock()
+                .standing
+                .get(&Some(work))
+                .and_then(|s| s.hit_until)
+                .filter(|at| Some(*at) == reset)
+        })
+        .await;
+    })
+    .await;
+}
+
 /// The hub's plan readings, as a test sees them: what each report was
 /// kept as, and a window parser that takes `[{used, resets}]`.
 #[derive(Default)]
