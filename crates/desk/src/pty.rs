@@ -79,6 +79,8 @@ pub(crate) trait Io: Send + Sync {
 
 struct Core {
     term: Term,
+    /// What its colour queries are answered from, kept across a reset.
+    palette: Option<crate::vt::Palette>,
     active: Option<u64>,
     /// Attached viewers, oldest first, with the size each last asked for.
     viewers: Vec<(u64, Option<(u16, u16)>)>,
@@ -109,10 +111,16 @@ pub(crate) struct Screen {
 }
 
 impl Screen {
-    pub(crate) fn new(cols: u16, rows: u16, history: usize) -> Arc<Self> {
+    pub(crate) fn new(
+        cols: u16,
+        rows: u16,
+        history: usize,
+        palette: Option<crate::vt::Palette>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             core: Mutex::new(Core {
-                term: Term::new(cols, rows, history),
+                term: Term::with_palette(cols, rows, history, palette.clone()),
+                palette,
                 active: None,
                 viewers: Vec::new(),
                 next_viewer: 1,
@@ -135,7 +143,7 @@ impl Screen {
     /// hub reconnected or fell behind it); viewers are resynced.
     pub(crate) fn reset(&self, cols: u16, rows: u16, history: usize, snapshot: &[u8]) {
         let mut core = self.core.lock();
-        let mut term = Term::new(cols, rows, history);
+        let mut term = Term::with_palette(cols, rows, history, core.palette.clone());
         term.feed(snapshot);
         core.term = term;
         let _ = self.tx.send(Frame::Size { cols, rows });
@@ -222,7 +230,18 @@ impl Pty {
         rows: u16,
         history: usize,
     ) -> Result<(Self, oneshot::Receiver<Exit>)> {
-        let (local, screen, exit) = Local::spawn(spec, cols, rows, history)?;
+        Self::spawn_with(spec, cols, rows, history, None)
+    }
+
+    /// [`Self::spawn`], answering colour queries from `palette`.
+    pub fn spawn_with(
+        spec: &Spawn,
+        cols: u16,
+        rows: u16,
+        history: usize,
+        palette: Option<crate::vt::Palette>,
+    ) -> Result<(Self, oneshot::Receiver<Exit>)> {
+        let (local, screen, exit) = Local::spawn(spec, cols, rows, history, palette)?;
         let pid = local.pid;
         Ok((Self::from_parts(screen, Box::new(local), pid), exit))
     }
@@ -263,6 +282,26 @@ impl Pty {
             frames,
             rx,
         )
+    }
+
+    /// Tells the program the terminal turned light or dark (`CSI ? 997 ; 1
+    /// n` dark, `2` light), when it asked to be told (mode 2031): it asks for
+    /// the colours again. Whether it was told.
+    pub fn tell_ground(&self, ground: crate::vt::Ground) -> bool {
+        if !self.screen.core.lock().term.color_scheme_events() {
+            return false;
+        }
+        let n = match ground {
+            crate::vt::Ground::Dark => 1,
+            crate::vt::Ground::Light => 2,
+        };
+        self.io.write(format!("\x1b[?997;{n}n").as_bytes()).is_ok()
+    }
+
+    /// Forgets that its program asked to be told of colour scheme changes:
+    /// the program that asked has ended, and its shell must never be sent one.
+    pub fn forget_color_scheme_events(&self) {
+        self.screen.core.lock().term.forget_color_scheme_events();
     }
 
     /// Types `input` whoever is active (the hub's own writes: prompts from
@@ -426,6 +465,7 @@ impl Local {
         cols: u16,
         rows: u16,
         history: usize,
+        palette: Option<crate::vt::Palette>,
     ) -> Result<(Self, Arc<Screen>, oneshot::Receiver<Exit>)> {
         let (cols, rows) = (cols.max(2), rows.max(2));
         let pair = native_pty_system()
@@ -468,7 +508,7 @@ impl Local {
                 }
             })
             .context("starting the terminal writer")?;
-        let screen = Screen::new(cols, rows, history);
+        let screen = Screen::new(cols, rows, history, palette);
 
         let (sink, answer) = (Arc::clone(&screen), input.clone());
         // Dropped when the reader has taken the last of the output, so the
@@ -660,6 +700,22 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn a_program_that_asked_is_told_the_terminal_turned_light() {
+        let (quiet, _q) = spawn("stty raw -echo; printf 'ready'; sleep 5");
+        wait_for(&quiet, "ready").await;
+        assert!(
+            !quiet.tell_ground(crate::vt::Ground::Light),
+            "a program that didn't ask is sent nothing: its shell would echo it"
+        );
+        let (pty, _exit) = spawn(
+            "stty raw -echo; printf '\\033[?2031hready\\r\\n'; head -c 9 | od -An -c | tr -d ' '; sleep 5",
+        );
+        wait_for(&pty, "ready").await;
+        assert!(pty.tell_ground(crate::vt::Ground::Light));
+        wait_for(&pty, "033[?997;2n").await;
+    }
+
+    #[tokio::test]
     async fn output_lands_on_the_screen_and_exit_code_is_reported() {
         let (pty, exit) = spawn("printf 'hello desk\\n'; exit 3");
         wait_for(&pty, "hello desk").await;
@@ -775,7 +831,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn a_viewer_that_falls_behind_is_resynced_with_the_screen() {
-        let screen = Screen::new(40, 10, 100);
+        let screen = Screen::new(40, 10, 100, None);
         let pty = Arc::new(Pty::from_parts(Arc::clone(&screen), Box::new(Null), None));
         screen.push(b"row 0\r\n");
         let (viewer, _, mut rx) = pty.attach();

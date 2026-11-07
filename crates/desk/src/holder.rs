@@ -807,6 +807,7 @@ impl Holder {
         rows: u16,
         history: usize,
         meta: Value,
+        palette: Option<crate::vt::Palette>,
     ) -> Result<(Pty, oneshot::Receiver<Exit>)> {
         let id = Uuid::new_v4();
         let answer = self
@@ -821,15 +822,21 @@ impl Holder {
             })
             .await?;
         match answer {
-            Msg::Spawned { pid, .. } => Ok(self.attach(id, pid, cols, rows, history)),
+            Msg::Spawned { pid, .. } => Ok(self.attach(id, pid, cols, rows, history, palette)),
             Msg::Failed { error, .. } => eyre::bail!("{error}"),
             other => eyre::bail!("unexpected answer {other:?}"),
         }
     }
 
     /// Takes back a terminal the holder kept: its screen comes with it.
-    pub fn adopt(&self, held: &Held, history: usize) -> (Pty, oneshot::Receiver<Exit>) {
-        self.attach(held.id, held.pid, held.cols, held.rows, history)
+    /// Its colour queries are answered from `palette`.
+    pub fn adopt(
+        &self,
+        held: &Held,
+        history: usize,
+        palette: Option<crate::vt::Palette>,
+    ) -> (Pty, oneshot::Receiver<Exit>) {
+        self.attach(held.id, held.pid, held.cols, held.rows, history, palette)
     }
 
     fn attach(
@@ -839,8 +846,9 @@ impl Holder {
         cols: u16,
         rows: u16,
         history: usize,
+        palette: Option<crate::vt::Palette>,
     ) -> (Pty, oneshot::Receiver<Exit>) {
-        let screen = Screen::new(cols, rows, history);
+        let screen = Screen::new(cols, rows, history, palette);
         let (tx, rx) = oneshot::channel();
         self.0.attached.lock().insert(
             id,
@@ -953,7 +961,7 @@ pub(crate) mod tests {
         let mut spec = sh("env; echo env-done");
         spec.env.insert("ASKED_FOR".into(), "yes".into());
         let (pty, _exit) = client
-            .spawn(&spec, 200, 50, 100, json!({ "kind": "terminal" }))
+            .spawn(&spec, 200, 50, 100, json!({ "kind": "terminal" }), None)
             .await
             .unwrap();
         let text = wait_for(&pty, "env-done").await;
@@ -987,6 +995,7 @@ pub(crate) mod tests {
                 24,
                 100,
                 json!({ "kind": "terminal", "terminal": "t1" }),
+                None,
             )
             .await
             .unwrap();
@@ -1005,7 +1014,7 @@ pub(crate) mod tests {
             (held[0].pid, &held[0].meta["terminal"], held[0].exited),
             (pid, &json!("t1"), false)
         );
-        let (pty, exit) = second.adopt(&held[0], 100);
+        let (pty, exit) = second.adopt(&held[0], 100, None);
         let pty = Arc::new(pty);
         let text = wait_for(&pty, "got:one").await;
         assert!(text.contains("ready"));
@@ -1034,7 +1043,7 @@ pub(crate) mod tests {
         let (_dir, socket, cancel) = holder().await;
         let client = Holder::connect(&socket, TOKEN).await.unwrap();
         let (pty, _exit) = client
-            .spawn(&sh("sleep 1; exit 7"), 80, 24, 10, json!({}))
+            .spawn(&sh("sleep 1; exit 7"), 80, 24, 10, json!({}), None)
             .await
             .unwrap();
         let id_pid = pty.pid();
@@ -1059,7 +1068,7 @@ pub(crate) mod tests {
         let client = Holder::connect(&socket, TOKEN).await.unwrap();
         let script = "stty raw -echo; sleep 1; printf '\\033[c'; dd bs=1 count=7 2>/dev/null | od -An -c; sleep 30";
         let (pty, _exit) = client
-            .spawn(&sh(script), 80, 24, 10, json!({}))
+            .spawn(&sh(script), 80, 24, 10, json!({}), None)
             .await
             .unwrap();
         let held = client.list().await.unwrap();
@@ -1067,7 +1076,7 @@ pub(crate) mod tests {
         drop(pty);
         tokio::time::sleep(Duration::from_millis(1500)).await;
         let client = Holder::connect(&socket, TOKEN).await.unwrap();
-        let (pty, _exit) = client.adopt(&held[0], 10);
+        let (pty, _exit) = client.adopt(&held[0], 10, None);
         wait_for(&pty, "?   1   ;   2   c").await;
         cancel.cancel();
     }
@@ -1077,7 +1086,7 @@ pub(crate) mod tests {
         let (_dir, socket, cancel) = holder().await;
         let client = Holder::connect(&socket, TOKEN).await.unwrap();
         let (_pty, exit) = client
-            .spawn(&sh("sleep 30"), 80, 24, 10, json!({}))
+            .spawn(&sh("sleep 30"), 80, 24, 10, json!({}), None)
             .await
             .unwrap();
         cancel.cancel();

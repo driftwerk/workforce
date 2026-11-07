@@ -95,8 +95,93 @@ pub fn home_of(env: &BTreeMap<String, String>, hub: Option<PathBuf>) -> Option<P
         .or(hub.filter(|h| !h.as_os_str().is_empty()))
 }
 
-/// The theme Claude Code is given when Desk completes its onboarding.
-pub const CLAUDE_THEME: &str = "dark";
+/// The theme Claude Code is given when Desk completes its onboarding:
+/// `auto`, which follows the terminal's background, Desk's or another's.
+/// Not its default, so it is kept.
+pub const CLAUDE_THEME: &str = "auto";
+
+/// Where Claude Code's settings may set its theme, as it reads them: the
+/// managed settings, the user's (`$CLAUDE_CONFIG_DIR` or `~/.claude`), the
+/// folder's and the folder's local ones. `/theme` writes the user's.
+fn claude_settings_files(env: &BTreeMap<String, String>, cwd: &Path) -> Vec<PathBuf> {
+    let set = |k: &str| env.get(k).filter(|v| !v.is_empty()).map(PathBuf::from);
+    let managed = if cfg!(target_os = "macos") {
+        "/Library/Application Support/ClaudeCode/managed-settings.json"
+    } else {
+        "/etc/claude-code/managed-settings.json"
+    };
+    let user = set("CLAUDE_CONFIG_DIR").or_else(|| set("HOME").map(|h| h.join(".claude")));
+    [
+        Some(PathBuf::from(managed)),
+        user.map(|d| d.join("settings.json")),
+    ]
+    .into_iter()
+    .flatten()
+    .chain([
+        cwd.join(".claude").join("settings.json"),
+        cwd.join(".claude").join("settings.local.json"),
+    ])
+    .collect()
+}
+
+/// The `theme` a JSON file sets, if it is one and sets one.
+fn theme_in(path: &Path) -> Option<String> {
+    let doc: Value = serde_json::from_str(&fs::read_to_string(path).ok()?).ok()?;
+    doc.get("theme")?.as_str().map(str::to_string)
+}
+
+/// Whether a Claude Code session in `cwd` with `env` may follow the
+/// terminal's light or dark (theme `auto`): when nothing the person set
+/// says otherwise. Any of its settings files setting a theme is theirs; so
+/// is a theme in its config (`.claude.json`, its older place), but for
+/// `dark`, its default, which it never keeps there of its own accord, and
+/// `auto`. When it may, the config is set to `auto` too ([`follow_terminal`]),
+/// so Claude Code started by hand in a Desk terminal follows as well. Reads
+/// and writes files: call off the async runtime.
+pub fn claude_follows_terminal(env: &BTreeMap<String, String>, cwd: &Path) -> bool {
+    if claude_settings_files(env, cwd)
+        .iter()
+        .any(|f| theme_in(f).is_some())
+    {
+        return false;
+    }
+    let config = claude_config(env);
+    let legacy = config.as_ref().and_then(|c| theme_in(&c.path));
+    if legacy
+        .as_deref()
+        .is_some_and(|t| t != "dark" && t != "auto")
+    {
+        return false;
+    }
+    if let Some(c) = &config {
+        if let Err(e) = follow_terminal(c) {
+            tracing::warn!(config = %c.path.display(), error = %e, "Claude Code's config wasn't set to follow the terminal");
+        }
+    }
+    true
+}
+
+/// Sets an existing Claude Code config's theme to `auto` where it has
+/// none, or `dark`, its default: under its lock, read again, replaced
+/// whole. Whether the file changed.
+pub fn follow_terminal(config: &Config) -> Result<bool> {
+    update(config, |text| {
+        let Some(text) = text.filter(|t| !t.trim().is_empty()) else {
+            return Ok(None);
+        };
+        let mut top: Ordered =
+            serde_json::from_str(text).context("Claude Code's config isn't a JSON object")?;
+        match top.value("theme") {
+            None => {}
+            Some(Value::String(t)) if t == "dark" => {}
+            Some(_) => return Ok(None),
+        }
+        top.set("theme", &Value::String(CLAUDE_THEME.into()))?;
+        let mut out = serde_json::to_string_pretty(&top)?;
+        out.push('\n');
+        Ok(Some(out))
+    })
+}
 
 /// What a session's start may settle.
 #[derive(Debug, Clone, Copy)]
@@ -771,6 +856,63 @@ mod tests {
     }
 
     #[test]
+    fn claude_code_follows_the_terminal_unless_the_person_set_a_theme() {
+        let home = tempfile::tempdir().unwrap();
+        let folder = home.path().join("repo");
+        fs::create_dir_all(folder.join(".claude")).unwrap();
+        let env = BTreeMap::from([(
+            "HOME".to_string(),
+            home.path().to_string_lossy().into_owned(),
+        )]);
+        let config = home.path().join(".claude.json");
+        let theme = || theme_in(&config);
+
+        // No config yet: it follows, and none is made.
+        assert!(claude_follows_terminal(&env, &folder));
+        assert!(!config.exists());
+        // None set, or its default `dark`: it follows, and the config says so.
+        for kept in [
+            r#"{"numStartups": 3}"#,
+            r#"{"theme": "dark", "numStartups": 3}"#,
+        ] {
+            fs::write(&config, kept).unwrap();
+            assert!(claude_follows_terminal(&env, &folder));
+            assert_eq!(theme().as_deref(), Some("auto"));
+            let doc: Value = serde_json::from_str(&fs::read_to_string(&config).unwrap()).unwrap();
+            assert_eq!(doc["numStartups"], 3, "the rest is kept");
+        }
+        // One of its own in the config is theirs.
+        fs::write(&config, r#"{"theme": "light-daltonized"}"#).unwrap();
+        assert!(!claude_follows_terminal(&env, &folder));
+        assert_eq!(theme().as_deref(), Some("light-daltonized"));
+        // `/theme` writes the user's settings, which win over the config.
+        fs::write(&config, r#"{"theme": "dark"}"#).unwrap();
+        let settings = home.path().join(".claude").join("settings.json");
+        fs::create_dir_all(settings.parent().unwrap()).unwrap();
+        fs::write(&settings, r#"{"theme": "dark"}"#).unwrap();
+        assert!(!claude_follows_terminal(&env, &folder));
+        assert_eq!(theme().as_deref(), Some("dark"), "the config is left alone");
+        fs::remove_file(&settings).unwrap();
+        // So do the folder's settings, and its local ones.
+        for name in ["settings.json", "settings.local.json"] {
+            let f = folder.join(".claude").join(name);
+            fs::write(&f, r#"{"theme": "light"}"#).unwrap();
+            assert!(!claude_follows_terminal(&env, &folder), "{name}");
+            fs::remove_file(&f).unwrap();
+        }
+        // CLAUDE_CONFIG_DIR moves both the settings and the config.
+        let dir = home.path().join("cfg");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("settings.json"), r#"{"theme": "light"}"#).unwrap();
+        let mut moved = env.clone();
+        moved.insert(
+            "CLAUDE_CONFIG_DIR".into(),
+            dir.to_string_lossy().into_owned(),
+        );
+        assert!(!claude_follows_terminal(&moved, &folder));
+    }
+
+    #[test]
     fn without_a_home_of_its_own_a_session_has_the_hubs() {
         let hub = Some(PathBuf::from("/home/hub"));
         let env = |h: &str| BTreeMap::from([("HOME".to_string(), h.to_string())]);
@@ -792,7 +934,7 @@ mod tests {
         assert!(ready_claude(&claude(&config), &chosen(&folder, home.path())).unwrap());
         let doc = json_of(&config);
         assert_eq!(doc["hasCompletedOnboarding"], json!(true));
-        assert_eq!(doc["theme"], json!("dark"));
+        assert_eq!(doc["theme"], json!("auto"));
         assert_eq!(doc["lastOnboardingVersion"], json!("2.1.318"));
         assert_eq!(
             doc["projects"][real(&folder)]["hasTrustDialogAccepted"],

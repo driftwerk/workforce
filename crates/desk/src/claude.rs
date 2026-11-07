@@ -29,6 +29,10 @@ pub struct ClaudeSpawn<'a> {
     pub hook_url: &'a str,
     pub approval_timeout_secs: u64,
     pub env: &'a BTreeMap<String, String>,
+    /// Its theme for this session only (`auto` when it may follow the
+    /// terminal, [`crate::first_run::claude_follows_terminal`]); none keeps
+    /// the person's.
+    pub theme: Option<&'a str>,
 }
 
 const TOOL_EVENTS: [&str; 5] = [
@@ -92,11 +96,15 @@ pub fn spawn(s: &ClaudeSpawn<'_>) -> Spawn {
         Launch::New { session_id } => vec!["--session-id".to_string(), session_id.to_string()],
         Launch::Resume { session_id } => vec!["--resume".to_string(), session_id.to_string()],
     };
+    let mut settings = hook_settings(s.hook_url, s.approval_timeout_secs);
+    if let Some(theme) = s.theme {
+        settings["theme"] = Value::String(theme.into());
+    }
     args.extend([
         "-n".to_string(),
         s.name.to_string(),
         "--settings".to_string(),
-        hook_settings(s.hook_url, s.approval_timeout_secs).to_string(),
+        settings.to_string(),
     ]);
     args.extend(s.prompt.map(str::to_string));
     let mut env = s.env.clone();
@@ -583,6 +591,7 @@ pub(crate) mod tests {
             hook_url: "http://h",
             approval_timeout_secs: 60,
             env: &env,
+            theme: None,
         };
         let new = spawn(&base(Launch::New { session_id: "abc" }));
         assert_eq!(&new.args[..4], ["--session-id", "abc", "-n", "auth-fix"]);
@@ -594,6 +603,30 @@ pub(crate) mod tests {
         assert_eq!(new.args.last().unwrap(), "continue");
         let resumed = spawn(&base(Launch::Resume { session_id: "abc" }));
         assert_eq!(&resumed.args[..2], ["--resume", "abc"]);
+    }
+
+    #[test]
+    fn a_session_given_a_theme_has_it_in_its_settings_with_the_hooks() {
+        let env = BTreeMap::new();
+        let settings = |theme| {
+            let s = spawn(&ClaudeSpawn {
+                program: Path::new("/usr/local/bin/claude"),
+                cwd: Path::new("/repo"),
+                name: "n",
+                launch: Launch::New { session_id: "abc" },
+                prompt: None,
+                hook_url: "http://h",
+                approval_timeout_secs: 60,
+                env: &env,
+                theme,
+            });
+            let at = s.args.iter().position(|a| a == "--settings").unwrap();
+            serde_json::from_str::<Value>(&s.args[at + 1]).unwrap()
+        };
+        let auto = settings(Some("auto"));
+        assert_eq!(auto["theme"], "auto");
+        assert!(auto["hooks"]["SessionStart"].is_array(), "the hooks stay");
+        assert!(settings(None).get("theme").is_none());
     }
 
     #[test]
