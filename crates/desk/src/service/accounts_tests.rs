@@ -47,6 +47,7 @@ fn claude(dir: &Path) -> PathBuf {
                  garbled) echo 'Something went wrong' ;;\n\
                  key) echo '{{\"loggedIn\":true,\"authMethod\":\"api_key\"}}' ;;\n\
                  gmail) echo '{{\"loggedIn\":true,\"authMethod\":\"claude.ai\",\"orgId\":\"org-gmail\",\"email\":\"kim@example.com\",\"subscriptionType\":\"max\"}}' ;;\n\
+                 star) echo '{{\"loggedIn\":true,\"authMethod\":\"claude.ai\",\"orgId\":\"org-star\",\"email\":\"kim@star.example\",\"subscriptionType\":\"max\"}}' ;;\n\
                  *) echo '{{\"loggedIn\":true,\"authMethod\":\"claude.ai\"}}' ;;\n\
                esac ;;\n\
                *) echo '{{\"loggedIn\":false}}' ;;\n\
@@ -758,6 +759,7 @@ fn accounts_and_sign_ins_reach_desk_in_its_wire_shape() {
         needs: vec![],
         auto_switch: true,
         problems: vec![],
+        own_plan_key: None,
     })
     .unwrap();
     assert_eq!(accounts["type"], "accounts");
@@ -2010,7 +2012,10 @@ async fn a_login_inside_a_session_files_what_it_reports_as_the_sign_in_it_runs_o
         stops_on_its_limit(&d, a);
         {
             let st = d.0.state.lock();
-            assert!(st.standing.get(&None).is_some_and(|s| s.hit_at.is_some()));
+            assert!(st
+                .own_standing
+                .get(&gmail().key)
+                .is_some_and(|s| s.hit_at.is_some()));
             assert!(st
                 .standing
                 .get(&Some(work))
@@ -2135,6 +2140,168 @@ async fn an_account_whose_usage_matches_the_sign_in_is_linked_until_it_doesnt_an
             back.0.state.lock().links.get(&personal).map(|l| l.by),
             Some(crate::identity::LinkedBy::Manual)
         );
+    })
+    .await;
+}
+
+/// This computer's Claude Code signs in as `who` now (`gmail`, `star`).
+async fn cli_signs_in_as(d: &Desk, dir: &Path, who: &str) {
+    std::fs::write(dir.join("signed-out"), who).unwrap();
+    d.read_engine_now(Engine::Claude).await;
+}
+
+fn star() -> crate::identity::Identity {
+    crate::identity::Identity::of("org-star", "kim@star.example").unwrap()
+}
+
+#[tokio::test]
+async fn another_sign_ins_reading_never_stands_for_this_ones_and_linking_loses_nothing() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = signed_in_as_gmail(pool, dir.path(), Arc::new(Plans::default())).await;
+        let (work, _, _, _) = two_on_work(&d, dir.path()).await;
+        let own = d
+            .create(session(dir.path(), Some(None)), None)
+            .await
+            .unwrap();
+        started(dir.path(), own.id, 0).await;
+        let full = |d: &Desk, side: Option<Uuid>| {
+            Desk::standing_of(&d.0.state.lock(), side)
+                .full(chrono::Utc::now())
+                .is_some()
+        };
+        // Gmail, the CLI's sign-in, stops on its limit.
+        stops_on_its_limit(&d, own.id);
+        assert!(full(&d, None));
+        // The CLI signs in to another account: Gmail's stop isn't its.
+        cli_signs_in_as(&d, dir.path(), "star").await;
+        assert_eq!(Desk::own_key(&d.0.state.lock()), star().key);
+        assert!(!full(&d, None), "another sign-in's limit");
+        assert!(d.account_needs().is_empty(), "{:?}", d.account_needs());
+        // Back on Gmail: full again, as it was.
+        cli_signs_in_as(&d, dir.path(), "gmail").await;
+        assert!(full(&d, None));
+        // Linked to Work: Work reads full, from what the sign-in said; the
+        // sign-in is no side of its own.
+        d.link_own_sign_in(Some(work)).await.unwrap();
+        assert!(full(&d, Some(work)));
+        assert!(!Desk::effective_standing(&d.0.state.lock()).contains_key(&None));
+        // Unlinked ("none of these"): Work is as it was alone, and the
+        // sign-in keeps its own stop.
+        d.link_own_sign_in(None).await.unwrap();
+        assert!(!full(&d, Some(work)));
+        assert!(full(&d, None));
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn none_of_these_holds_across_a_restart_and_usage_never_overrules_it() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let plans = Arc::new(Plans::default());
+        let d = signed_in_as_gmail(pool.clone(), dir.path(), plans.clone()).await;
+        let (work, _, a, _) = two_on_work(&d, dir.path()).await;
+        let own = d
+            .create(session(dir.path(), Some(None)), None)
+            .await
+            .unwrap();
+        started(dir.path(), own.id, 0).await;
+        d.link_own_sign_in(None).await.unwrap();
+        let mut kept = false;
+        for _ in 0..200 {
+            let e = d.0.store.state(super::identities::OWN_NONE).await.unwrap();
+            if e.is_some_and(|e| e.value.as_array().is_some_and(|v| !v.is_empty())) {
+                kept = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(kept);
+        drop(d);
+        let d = signed_in_as_gmail(pool, dir.path(), plans).await;
+        assert!(d.0.state.lock().own_none.contains(&gmail().key));
+        // Readings that agree, again and again: still not linked.
+        for (n, used) in [(1, 12.5), (2, 13.5), (3, 14.5)] {
+            d.report_usage(both(used, 30.0, (3600, 86_400)), Some(a));
+            d.report_usage(both(used, 30.0, (3600, 86_400)), Some(own.id));
+            let _ = n;
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(!d.0.state.lock().links.contains_key(&work));
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_reading_before_the_sign_in_is_read_waits_and_is_filed_as_whose_it_is() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        DeskStore::migrate(&pool).await.unwrap();
+        let plans = Arc::new(Plans::default());
+        let o = signed_out_options(dir.path(), Arc::new(MemoryKeys::default()));
+        std::fs::write(dir.path().join("signed-out"), "gmail").unwrap();
+        let d = Desk::start(
+            DeskStore::from_pool(pool),
+            o,
+            super::Floor {
+                plans: Some(plans.clone()),
+                ..Default::default()
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        // Read before Desk asked Claude Code who it is: held.
+        d.0.state.lock().own_read = false;
+        d.report_usage(both(10.0, 20.0, (3600, 86_400)), None);
+        assert!(plans.0.lock().is_empty());
+        d.read_engine_now(Engine::Claude).await;
+        d.own_identity_read(Some(Some(gmail())));
+        assert_eq!(plans.0.lock().last().unwrap().ids, vec![gmail().plan_id()]);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_sign_in_inside_a_session_holds_across_a_restart_until_it_starts_afresh() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let plans = Arc::new(Plans::default());
+        let d = signed_in_as_gmail(pool.clone(), dir.path(), plans.clone()).await;
+        let (_, _, a, _) = two_on_work(&d, dir.path()).await;
+        d.apply_hook(a, crate::claude::Hook::SignedIn, None).await;
+        let mut kept = false;
+        for _ in 0..200 {
+            let e = d.0.store.state(super::identities::RELOGGED).await.unwrap();
+            if e.is_some_and(|e| e.value.as_array().is_some_and(|v| v.len() == 1)) {
+                kept = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(kept, "kept for the hub's next start");
+        // Started afresh (on its account again): no longer.
+        d.started_afresh(a);
+        assert!(!d.0.state.lock().relogged.contains(&a));
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn only_the_current_keys_name_this_computers_cards() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = signed_in_as_gmail(pool, dir.path(), Arc::new(Plans::default())).await;
+        let (work, personal, _, _) = two_on_work(&d, dir.path()).await;
+        let keys = d.current_plan_keys();
+        assert!(keys.contains(&format!("key:desk-account:{work}")));
+        assert!(keys.contains(&format!("key:{}", gmail().plan_id())));
+        assert_eq!(d.own_plan_key(), Some(format!("key:{}", gmail().plan_id())));
+        d.remove_account(personal).await.unwrap();
+        assert!(!d
+            .current_plan_keys()
+            .contains(&format!("key:desk-account:{personal}")));
     })
     .await;
 }

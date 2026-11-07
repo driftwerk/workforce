@@ -91,17 +91,20 @@ pub struct Link {
 
 /// How far apart two readings may be and still be read as one moment.
 const TOGETHER: Duration = Duration::minutes(2);
-/// How many readings that agree it takes to link an account by its usage.
+/// How many distinct readings on each side must agree to link an account
+/// by its usage.
 pub const AGREEING: usize = 2;
 /// How many of a side's readings are kept to compare.
 const KEPT: usize = 8;
 
 /// A reading's windows as compared: the 5-hour and the weekly window's
-/// reset to the second, and how far each is used, in whole points.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// reset to the second, and how far each is used, as precisely as the
+/// reading said. Resets are not on the hour (a real one reset at 13:20
+/// UTC), so two plans rarely share both by chance.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Print {
-    five_hour: (i64, i64),
-    weekly: (i64, i64),
+    five_hour: (i64, f64),
+    weekly: (i64, f64),
     pub at: DateTime<Utc>,
 }
 
@@ -111,7 +114,7 @@ impl Print {
     pub fn of(windows: &[LimitWindow], at: DateTime<Utc>) -> Option<Self> {
         let window = |minutes: u32| {
             let w = windows.iter().find(|w| w.minutes == minutes)?;
-            Some((w.resets_at?.timestamp(), w.used_percent.round() as i64))
+            Some((w.resets_at?.timestamp(), w.used_percent))
         };
         Some(Self {
             five_hour: window(300)?,
@@ -120,16 +123,19 @@ impl Print {
         })
     }
 
-    /// Anything used in it: two empty plans look alike.
-    fn used(&self) -> bool {
-        self.five_hour.1 > 0 || self.weekly.1 > 0
+    /// Something to tell plans apart by: a window part used. Empty plans
+    /// and full ones all look alike.
+    fn telling(&self) -> bool {
+        [self.five_hour.1, self.weekly.1]
+            .iter()
+            .any(|u| *u > 0.0 && *u < 100.0)
     }
 }
 
 /// What two prints read together say of their plans.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verdict {
-    /// One plan: the same resets to the second, used as far.
+    /// One plan: the same resets to the second, used exactly as far.
     Same,
     /// Two plans: a window resets at another moment.
     Different,
@@ -145,20 +151,21 @@ pub fn compare(a: &Print, b: &Print) -> Verdict {
     if a.five_hour.0 != b.five_hour.0 || a.weekly.0 != b.weekly.0 {
         return Verdict::Different;
     }
-    if a.five_hour == b.five_hour && a.weekly == b.weekly {
+    let same = |x: f64, y: f64| (x - y).abs() < 1e-9;
+    if same(a.five_hour.1, b.five_hour.1) && same(a.weekly.1, b.weekly.1) {
         Verdict::Same
     } else {
         Verdict::Unsure
     }
 }
 
-/// One side's recent prints, and the moments its readings agreed with the
-/// CLI sign-in's.
-#[derive(Debug, Clone, Default)]
+/// One side's recent prints, and the pairs of readings (the CLI sign-in's,
+/// this side's) that agreed. Kept across restarts.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Prints {
     pub recent: VecDeque<Print>,
-    /// The CLI sign-in's readings each agreeing one matched, once each.
-    pub agreed: Vec<DateTime<Utc>>,
+    /// Each agreeing pair, once: the CLI's reading's time, this side's.
+    pub agreed: Vec<(DateTime<Utc>, DateTime<Utc>)>,
 }
 
 impl Prints {
@@ -170,27 +177,40 @@ impl Prints {
     }
 
     /// `own`, the CLI sign-in's print, against this side's: whether they
-    /// are the same plan now, two, or nothing can be said. A match is
-    /// counted once per reading of the CLI's, and only when something was
-    /// used.
+    /// are the same plan now, two, or nothing can be said. An agreeing pair
+    /// counts only when one of them has a window part used.
     pub fn against(&mut self, own: &Print) -> Verdict {
         let mut verdict = Verdict::Unsure;
+        let mut agreeing = Vec::new();
         for mine in &self.recent {
             match compare(own, mine) {
                 Verdict::Different => return Verdict::Different,
-                Verdict::Same => verdict = Verdict::Same,
+                Verdict::Same => {
+                    verdict = Verdict::Same;
+                    if own.telling() || mine.telling() {
+                        agreeing.push((own.at, mine.at));
+                    }
+                }
                 Verdict::Unsure => {}
             }
         }
-        if verdict == Verdict::Same && own.used() && !self.agreed.contains(&own.at) {
-            self.agreed.push(own.at);
+        for pair in agreeing {
+            if !self.agreed.contains(&pair) {
+                self.agreed.push(pair);
+            }
         }
         verdict
     }
 
-    /// Whether enough readings agreed to link it.
+    /// Whether enough distinct readings on each side agreed to link it.
     pub fn agrees(&self) -> bool {
-        self.agreed.len() >= AGREEING
+        let distinct = |of: fn(&(DateTime<Utc>, DateTime<Utc>)) -> DateTime<Utc>| {
+            let mut times: Vec<DateTime<Utc>> = self.agreed.iter().map(of).collect();
+            times.sort();
+            times.dedup();
+            times.len()
+        };
+        distinct(|p| p.0) >= AGREEING && distinct(|p| p.1) >= AGREEING
     }
 }
 
@@ -236,15 +256,16 @@ mod tests {
     #[test]
     fn two_readings_of_one_plan_agree_and_another_plans_never_do() {
         let own = Print::of(&windows((12.0, 1000), (40.0, 9000)), at(100)).unwrap();
-        let same = Print::of(&windows((12.2, 1000), (40.0, 9000)), at(160)).unwrap();
+        let same = Print::of(&windows((12.0, 1000), (40.0, 9000)), at(160)).unwrap();
         assert_eq!(compare(&own, &same), Verdict::Same);
         // Another plan resets at another moment.
         let other = Print::of(&windows((12.0, 1000), (40.0, 9600)), at(160)).unwrap();
         assert_eq!(compare(&own, &other), Verdict::Different);
-        // Too far apart, or used differently: nothing to go by.
+        // Too far apart, or used differently, even by a fraction: nothing
+        // to go by.
         let later = Print::of(&windows((12.0, 1000), (40.0, 9000)), at(400)).unwrap();
         assert_eq!(compare(&own, &later), Verdict::Unsure);
-        let moved = Print::of(&windows((14.0, 1000), (40.0, 9000)), at(160)).unwrap();
+        let moved = Print::of(&windows((12.2, 1000), (40.0, 9000)), at(160)).unwrap();
         assert_eq!(compare(&own, &moved), Verdict::Unsure);
         // Only a reading with both windows and their resets is one.
         assert_eq!(
@@ -254,20 +275,34 @@ mod tests {
     }
 
     #[test]
-    fn it_takes_two_used_readings_to_agree() {
+    fn it_takes_two_distinct_readings_each_side_with_a_window_part_used() {
         let mut work = Prints::default();
-        work.keep(Print::of(&windows((0.0, 1000), (0.0, 9000)), at(100)).unwrap());
-        // Two empty plans look alike: not counted.
-        let empty = Print::of(&windows((0.0, 1000), (0.0, 9000)), at(110)).unwrap();
-        assert_eq!(work.against(&empty), Verdict::Same);
+        // Empty plans and full ones look alike: never counted.
+        for (used, t) in [(0.0, 100), (100.0, 200)] {
+            work.keep(Print::of(&windows((used, 1000), (used, 9000)), at(t)).unwrap());
+            let own = Print::of(&windows((used, 1000), (used, 9000)), at(t + 10)).unwrap();
+            assert_eq!(work.against(&own), Verdict::Same);
+        }
         assert!(work.agreed.is_empty());
-        work.keep(Print::of(&windows((5.0, 1000), (2.0, 9000)), at(200)).unwrap());
-        let own = Print::of(&windows((5.0, 1000), (2.0, 9000)), at(210)).unwrap();
-        work.against(&own);
-        work.against(&own);
-        assert!(!work.agrees(), "one reading of the CLI's counts once");
+        // One reading of Work's against two of the CLI's: not enough.
+        work.keep(Print::of(&windows((5.0, 1000), (2.0, 9000)), at(300)).unwrap());
+        work.against(&Print::of(&windows((5.0, 1000), (2.0, 9000)), at(310)).unwrap());
+        work.against(&Print::of(&windows((5.0, 1000), (2.0, 9000)), at(320)).unwrap());
+        assert!(
+            !work.agrees(),
+            "one of Work's readings, however often matched"
+        );
         work.keep(Print::of(&windows((6.0, 1000), (2.0, 9000)), at(600)).unwrap());
         work.against(&Print::of(&windows((6.0, 1000), (2.0, 9000)), at(620)).unwrap());
         assert!(work.agrees());
+        // Kept as it was across a restart.
+        let kept: Prints = serde_json::from_value(serde_json::to_value(&work).unwrap()).unwrap();
+        assert_eq!(kept, work);
+    }
+
+    #[test]
+    fn real_resets_are_not_on_the_hour() {
+        // As Claude Code 2.1.319 wrote them: "resets 2:20pm" (13:20 UTC).
+        assert_eq!(1_791_811_200 % 3600, 1200);
     }
 }

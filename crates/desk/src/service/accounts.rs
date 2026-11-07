@@ -199,10 +199,12 @@ impl Desk {
                 name: a.name.clone(),
                 is_default: a.is_default,
                 plan_key: self.0.plans.as_ref().and_then(|p| {
-                    let ids = Self::plan_ids(&st, Some(a.id)).unwrap_or_default();
+                    let ids = Self::plan_ids(&st, &super::identities::Raw::Account(a.id))
+                        .unwrap_or_default();
                     p.account_key(crate::usage::LocalPlan::Claude, &ids)
                 }),
                 identity: st.links.get(&a.id).map(|l| accounts::IdentityView {
+                    key: l.identity.key.clone(),
                     email: l.identity.email.clone(),
                     linked_by: l.by,
                     this_computer: st
@@ -220,6 +222,35 @@ impl Desk {
                     .collect(),
                 created_at: a.created_at,
             })
+            .collect()
+    }
+
+    /// The key this computer's CLI sign-in's plan card has on the Floor, when
+    /// its identity is known: the card that is named by its email while it
+    /// is none of the accounts.
+    pub fn own_plan_key(&self) -> Option<String> {
+        let ids = Self::own_plan_ids(&self.0.state.lock())?;
+        self.0
+            .plans
+            .as_ref()?
+            .account_key(crate::usage::LocalPlan::Claude, &ids)
+    }
+
+    /// The keys this computer's Claude plan readings are kept under now:
+    /// each account's and the CLI sign-in's. A reading kept under another
+    /// (an account removed, a sign-in gone, an identity learnt since) is
+    /// nobody's card.
+    pub fn current_plan_keys(&self) -> Vec<String> {
+        let Some(plans) = self.0.plans.as_ref() else {
+            return Vec::new();
+        };
+        let st = self.0.state.lock();
+        st.accounts
+            .iter()
+            .filter(|a| a.engine == Engine::Claude)
+            .filter_map(|a| Self::plan_ids(&st, &super::identities::Raw::Account(a.id)))
+            .chain(Self::own_plan_ids(&st))
+            .filter_map(|ids| plans.account_key(crate::usage::LocalPlan::Claude, &ids))
             .collect()
     }
 
@@ -285,6 +316,7 @@ impl Desk {
             needs: self.account_needs(),
             auto_switch: self.auto_switch(),
             problems: self.sign_in_problems(),
+            own_plan_key: self.own_plan_key(),
         });
     }
 
@@ -1032,7 +1064,11 @@ impl Desk {
             let mut st = self.0.state.lock();
             st.accounts.retain(|o| o.id != id);
             st.links.remove(&id);
-            st.prints.remove(&Some(id));
+            // Nothing of it is anyone's now.
+            st.prints.remove(&super::identities::Raw::Account(id));
+            st.standing.remove(&Some(id));
+            let gone = super::identities::Raw::Account(id);
+            st.moved_off.retain(|m| m.from != gone && m.to != gone);
             st.signed_in_accounts.remove(&id);
             st.switches.retain(|_, to| *to != Some(id));
             st.sign_in_problems.remove(&id);
@@ -1314,6 +1350,8 @@ impl Desk {
         // The CLI's own sign-in, known to be one of the accounts, is that
         // account: never one more side.
         let own_signed_in = own_on_plan && Self::own_account(&st).is_none();
+        let standing = Self::effective_standing(&st);
+        let moved_off = Self::effective_moves(&st);
         let mut on: std::collections::HashMap<Option<Uuid>, Vec<Uuid>> = Default::default();
         for r in st
             .records
@@ -1327,9 +1365,9 @@ impl Desk {
         accounts::needs(
             Engine::Claude,
             &st.accounts,
-            &st.standing,
+            &standing,
             &on,
-            &st.moved_off,
+            &moved_off,
             own_signed_in,
             &st.signed_in_accounts
                 .iter()
@@ -1367,14 +1405,17 @@ impl Desk {
     }
 
     /// What a session on `account` reported of its plan's windows.
-    pub(super) fn plan_read(&self, account: Option<Uuid>, windows: Vec<crate::usage::LimitWindow>) {
+    pub(super) fn plan_read(
+        &self,
+        raw: &super::identities::Raw,
+        windows: Vec<crate::usage::LimitWindow>,
+    ) {
         if windows.is_empty() {
             return;
         }
         {
             let mut st = self.0.state.lock();
-            let side = Self::canonical(&st, account);
-            let s = st.standing.entry(side).or_default();
+            let s = Self::standing_mut(&mut st, raw);
             s.windows = windows;
             s.read_at = Some(Utc::now());
         }
@@ -1464,10 +1505,7 @@ impl Desk {
                     )
                 })
                 .collect();
-            let full = st
-                .standing
-                .get(&from)
-                .is_some_and(|s| s.full(Utc::now()).is_some());
+            let full = Self::standing_of(&st, from).full(Utc::now()).is_some();
             (ids, full)
         };
         let mut done = SwitchedAll::default();
@@ -1489,10 +1527,30 @@ impl Desk {
             let mut st = self.0.state.lock();
             // Moving back settles it; moving off a full account is kept
             // until it resets and the person is asked back.
-            st.moved_off
-                .retain(|m| !(m.engine == engine && (m.from == to || m.to == from)));
+            let st = &mut *st;
+            let settled: Vec<bool> = st
+                .moved_off
+                .iter()
+                .map(|m| {
+                    m.engine == engine
+                        && (Self::side_of_raw(st, &m.from) == Some(to)
+                            || Self::side_of_raw(st, &m.to) == Some(from))
+                })
+                .collect();
+            let mut at = 0;
+            st.moved_off.retain(|_| {
+                at += 1;
+                !settled[at - 1]
+            });
             if full {
-                st.moved_off.push(accounts::MovedOff { engine, from, to });
+                let moved = super::identities::RawMove {
+                    engine,
+                    from: Self::raw_of(st, from),
+                    to: Self::raw_of(st, to),
+                };
+                if !st.moved_off.contains(&moved) {
+                    st.moved_off.push(moved);
+                }
             }
         }
         self.announce_accounts();

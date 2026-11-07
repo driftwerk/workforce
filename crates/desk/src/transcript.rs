@@ -24,9 +24,13 @@ pub struct Tail {
     /// API error: the plan's limit (which window, and when it resets), or
     /// another failure.
     pub failure: Option<crate::limit::TurnFailure>,
-    /// The last `/login` run in it: its line's id and when. It signs the
-    /// CLI in again, so the session runs on that sign-in from then on.
+    /// The last `/login` run in it that Claude Code said succeeded ("Login
+    /// successful"): its line's id and when. It signs the CLI in again, so
+    /// the session runs on that sign-in from then on. One cancelled or
+    /// failed is not.
     pub last_login: Option<(String, chrono::DateTime<chrono::Utc>)>,
+    /// A `/login` whose outcome is still to come.
+    pending_login: Option<(String, chrono::DateTime<chrono::Utc>)>,
 }
 
 /// The whole lines of the end of a transcript.
@@ -101,8 +105,12 @@ fn absorb(mut tail: Tail, v: &Value) -> Tail {
                     let at = str_at("timestamp")
                         .and_then(|t| chrono::DateTime::parse_from_rfc3339(&t).ok())
                         .map(|t| t.to_utc());
-                    if let (Some(id), Some(at)) = (str_at("uuid"), at) {
-                        tail.last_login = Some((id, at));
+                    tail.pending_login = str_at("uuid").zip(at);
+                } else if text.starts_with("<local-command-stdout>") {
+                    // What the command said: only a success signs it in.
+                    let pending = tail.pending_login.take();
+                    if text.starts_with("<local-command-stdout>Login successful") {
+                        tail.last_login = pending.or(tail.last_login.take());
                     }
                 }
                 if !text.starts_with('<') {
@@ -207,6 +215,7 @@ mod tests {
                 said: Some("Done, tests pass.".into()),
                 failure: None,
                 last_login: None,
+                pending_login: None,
             }
         );
     }
@@ -217,7 +226,14 @@ mod tests {
         for line in [
             r#"{"type":"user","uuid":"u1","timestamp":"2026-11-07T08:00:00.000Z","message":{"role":"user","content":"<command-name>/login</command-name>\n            <command-message>login</command-message>\n            <command-args></command-args>"}}"#,
             r#"{"type":"user","uuid":"u2","timestamp":"2026-11-07T08:05:00.000Z","message":{"role":"user","content":"fix it"}}"#,
+            r#"{"type":"user","uuid":"u1s","timestamp":"2026-11-07T08:00:05.000Z","message":{"role":"user","content":"<local-command-stdout>Login successful</local-command-stdout>"}}"#,
             r#"{"type":"user","uuid":"u3","timestamp":"2026-11-07T09:00:00.000Z","message":{"role":"user","content":"<command-name>/login</command-name>"}}"#,
+            r#"{"type":"user","uuid":"u3s","timestamp":"2026-11-07T09:00:09.000Z","message":{"role":"user","content":"<local-command-stdout>Login successful</local-command-stdout>"}}"#,
+            // Cancelled: not a sign-in.
+            r#"{"type":"user","uuid":"u4","timestamp":"2026-11-07T10:00:00.000Z","message":{"role":"user","content":"<command-name>/login</command-name>"}}"#,
+            r#"{"type":"user","uuid":"u4s","timestamp":"2026-11-07T10:00:03.000Z","message":{"role":"user","content":"<local-command-stdout>Login interrupted</local-command-stdout>"}}"#,
+            // Still under way: not yet.
+            r#"{"type":"user","uuid":"u5","timestamp":"2026-11-07T11:00:00.000Z","message":{"role":"user","content":"<command-name>/login</command-name>"}}"#,
         ] {
             writeln!(f, "{line}").unwrap();
         }

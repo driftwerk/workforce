@@ -10,3 +10,5 @@ CREATE TABLE engine_account_identities (
     linked_by  TEXT        NOT NULL,
     linked_at  TIMESTAMPTZ NOT NULL
 );
+-- One account per identity: the CLI sign-in is never two of them.
+CREATE UNIQUE INDEX engine_account_identities_identity ON engine_account_identities (identity);

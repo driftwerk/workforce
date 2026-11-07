@@ -983,11 +983,24 @@ async fn usage(State(r): S, headers: HeaderMap, Query(q): Query<TokenQuery>) -> 
         .iter()
         .flat_map(|v| v.list(None))
         .collect::<Vec<_>>();
-    let mac = caller
-        .personal
-        .then(|| (sources.desk)())
-        .flatten()
-        .map(|d| d.sign_ins());
+    let desk = caller.personal.then(|| (sources.desk)()).flatten();
+    let mac = desk.as_ref().map(|d| d.sign_ins());
+    // This computer's Claude readings under a key no account or sign-in
+    // has now (one removed, a sign-in gone): nobody's card.
+    let current: Option<HashSet<String>> = desk
+        .as_ref()
+        .map(|d| d.current_plan_keys().into_iter().collect());
+    let readings = readings
+        .into_iter()
+        .filter(|r| {
+            !(r.login == LoginRef::Mac
+                && r.kind == PlanKind::Claude
+                && current
+                    .as_ref()
+                    .zip(r.account.as_ref())
+                    .is_some_and(|(keys, key)| !keys.contains(key)))
+        })
+        .collect();
     Json(usage_of(
         readings,
         &signed_in(keys, &caller),

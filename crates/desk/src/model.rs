@@ -377,6 +377,9 @@ pub enum DeskEvent {
         #[serde(rename = "autoSwitch")]
         auto_switch: bool,
         problems: Vec<crate::engine_accounts::ProblemView>,
+        /// The key this computer's CLI sign-in's plan card has.
+        #[serde(rename = "ownPlanKey")]
+        own_plan_key: Option<String>,
     },
     /// Signing in to an account through its engine's own command moved on.
     AccountSignIn {

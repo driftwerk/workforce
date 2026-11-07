@@ -312,6 +312,9 @@ pub struct AccountView {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IdentityView {
+    /// Its identity's key: a hash, never its organization or email. What
+    /// the person's other computers match the account by.
+    pub key: String,
     pub email: Option<String>,
     /// The person said so, or its usage matched this computer's sign-in.
     pub linked_by: crate::identity::LinkedBy,
@@ -642,6 +645,22 @@ pub struct Standing {
     /// When the limit it last stopped on resets, as Claude Code said
     /// ([`crate::limit`]).
     pub hit_until: Option<DateTime<Utc>>,
+}
+
+impl Standing {
+    /// `self` with what `other` knows that is newer: a later stop on the
+    /// limit (with its reset), a later reading (with its windows).
+    pub fn merged(mut self, other: &Standing) -> Standing {
+        if other.hit_at > self.hit_at {
+            self.hit_at = other.hit_at;
+            self.hit_until = other.hit_until;
+        }
+        if other.read_at > self.read_at && !other.windows.is_empty() {
+            self.read_at = other.read_at;
+            self.windows = other.windows.clone();
+        }
+        self
+    }
 }
 
 /// How long a stop on the limit counts when no window says when it resets.

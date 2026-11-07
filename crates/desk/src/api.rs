@@ -356,6 +356,7 @@ async fn accounts(State(s): S, h: HeaderMap, Query(q): Q) -> Response {
         "needs": s.desk.account_needs(),
         "autoSwitch": s.desk.auto_switch(),
         "problems": s.desk.sign_in_problems(),
+        "ownPlanKey": s.desk.own_plan_key(),
     }))
     .into_response()
 }
