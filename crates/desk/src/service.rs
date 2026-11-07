@@ -2789,16 +2789,22 @@ impl Desk {
         let kept = serde_json::json!(colors);
         let saving = self.0.palette_save.lock().await;
         if self.0.palette.set(colors) {
-            let ptys: Vec<Arc<Pty>> = self
+            // A session in a Desk terminal shares it with the terminal's shell.
+            let ptys: Vec<(Arc<Pty>, bool)> = self
                 .0
                 .state
                 .lock()
                 .live
                 .values()
-                .map(|l| Arc::clone(&l.pty))
+                .map(|l| (Arc::clone(&l.pty), l.terminal.is_some()))
                 .collect();
-            for pty in ptys {
-                pty.tell_ground(ground);
+            let told = tokio::task::spawn_blocking(move || {
+                for (pty, shell) in ptys {
+                    pty.tell_ground(ground, shell);
+                }
+            });
+            if let Err(e) = told.await {
+                tracing::warn!(error = %e, "programs weren't told the terminal's ground");
             }
         }
         if let Err(e) = self.0.store.put_state(TERMINAL_COLORS, &kept).await {
