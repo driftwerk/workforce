@@ -1216,7 +1216,18 @@ async fn a_session_elsewhere_whose_transcript_ends_on_a_429_that_isnt_the_plans_
 /// The hub's plan readings, as a test sees them: what each report was
 /// kept as, and a window parser that takes `[{used, resets}]`.
 #[derive(Default)]
-struct Plans(parking_lot::Mutex<Vec<crate::usage::LocalAccount>>);
+struct Plans(
+    parking_lot::Mutex<Vec<crate::usage::LocalAccount>>,
+    /// What was forgotten: the account's ids, since when, and when what
+    /// was kept instead was taken.
+    parking_lot::Mutex<Forgot>,
+);
+
+type Forgot = Vec<(
+    Vec<String>,
+    chrono::DateTime<chrono::Utc>,
+    Option<chrono::DateTime<chrono::Utc>>,
+)>;
 
 impl crate::usage::PlanSink for Plans {
     fn local(
@@ -1248,6 +1259,17 @@ impl crate::usage::PlanSink for Plans {
     }
     fn account_key(&self, _: crate::usage::LocalPlan, ids: &[String]) -> Option<String> {
         Some(format!("key:{}", ids.join(",")))
+    }
+    fn forget_local(
+        &self,
+        _: crate::usage::LocalPlan,
+        account: crate::usage::LocalAccount,
+        since: chrono::DateTime<chrono::Utc>,
+        instead: Option<(serde_json::Value, chrono::DateTime<chrono::Utc>)>,
+    ) {
+        self.1
+            .lock()
+            .push((account.ids, since, instead.map(|(_, at)| at)));
     }
 }
 
@@ -2979,4 +3001,141 @@ async fn the_hubs_own_calls_are_offered_the_accounts_default_first_and_tell_desk
 
 async fn until_need(d: &Desk) -> crate::engine_accounts::AccountNeed {
     until(|| d.account_needs().into_iter().next()).await
+}
+
+/// A weekly window only, as Claude Code reports a plan now: `used`,
+/// resetting at `resets`.
+fn weekly(used: f64, resets: chrono::DateTime<chrono::Utc>) -> serde_json::Value {
+    serde_json::json!([{ "used": used, "resets": resets.to_rfc3339(), "minutes": 10_080 }])
+}
+
+/// Work's session `a` (the only one on Work: `b` is on Personal), its
+/// process started an hour ago and taken back since.
+async fn one_on_work_started_an_hour_ago(d: &Desk, dir: &Path) -> (Uuid, Uuid, Uuid) {
+    let (work, personal, a, b) = two_on_work(d, dir).await;
+    d.change(b, |r, _| r.account = Some(personal));
+    d.0.state.lock().live.get_mut(&a).unwrap().started_at =
+        chrono::Utc::now() - chrono::Duration::hours(1);
+    (work, personal, a)
+}
+
+#[tokio::test]
+async fn a_login_found_after_the_fact_takes_back_what_was_filed_as_its_account_and_keeps_its_limit()
+{
+    use crate::limit::LimitHit;
+    use crate::transcript::SignedInAgain;
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let plans = Arc::new(Plans::default());
+        let d = signed_in_as_gmail(pool, dir.path(), plans.clone()).await;
+        let (work, _, a) = one_on_work_started_an_hour_ago(&d, dir.path()).await;
+        let now = chrono::Utc::now();
+        let login_at = now - chrono::Duration::minutes(10);
+        let hit_at = login_at - chrono::Duration::minutes(1);
+        let work_resets =
+            chrono::DateTime::from_timestamp(now.timestamp() + 4 * 86_400, 0).unwrap();
+        // It was signed in again inside ten minutes ago, unheard: what it
+        // reported since, the sign-in's plan, was filed as Work's.
+        let gmail_resets =
+            chrono::DateTime::from_timestamp(now.timestamp() + 6 * 86_400, 0).unwrap();
+        d.report_usage(weekly(26.0, gmail_resets), Some(a));
+        assert_eq!(
+            plans.0.lock().last().unwrap().ids,
+            vec![format!("desk-account:{work}")]
+        );
+        assert!(d
+            .accounts()
+            .iter()
+            .any(|x| x.id == work && x.sessions == vec![a]));
+        // Found as the hub takes it back: Work stopped on its weekly limit
+        // just before.
+        d.login_found(
+            a,
+            SignedInAgain {
+                id: "login-1".into(),
+                at: login_at,
+                hit_before: Some((
+                    hit_at,
+                    LimitHit {
+                        window: Some("seven_day".into()),
+                        resets_at: Some(work_resets),
+                    },
+                )),
+            },
+        )
+        .await;
+        assert!(
+            d.0.state.lock().relogged.contains(&a),
+            "it runs on the sign-in"
+        );
+        let s = Desk::standing_of(&d.0.state.lock(), Some(work));
+        assert!(
+            s.windows.is_empty(),
+            "the sign-in's reading is no longer Work's"
+        );
+        assert_eq!(
+            s.full(now),
+            Some(Some(work_resets)),
+            "Work is full until it resets"
+        );
+        assert_eq!(
+            plans.1.lock().clone(),
+            vec![(vec![format!("desk-account:{work}")], login_at, Some(hit_at))],
+            "this computer's reading of Work is forgotten, its limit kept instead"
+        );
+        assert!(
+            d.accounts()
+                .iter()
+                .any(|x| x.id == work && x.sessions.is_empty()),
+            "not on Work any more"
+        );
+        // Seen once: found again, nothing more is taken back.
+        d.login_found(
+            a,
+            SignedInAgain {
+                id: "login-1".into(),
+                at: login_at,
+                hit_before: None,
+            },
+        )
+        .await;
+        assert_eq!(plans.1.lock().len(), 1);
+        // What it reports now is the sign-in's.
+        d.report_usage(weekly(27.0, gmail_resets), Some(a));
+        assert_eq!(plans.0.lock().last().unwrap().ids, vec![gmail().plan_id()]);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_login_from_before_its_process_started_is_not_one_inside_it() {
+    use crate::transcript::SignedInAgain;
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let plans = Arc::new(Plans::default());
+        let d = signed_in_as_gmail(pool, dir.path(), plans.clone()).await;
+        let (work, _, a) = one_on_work_started_an_hour_ago(&d, dir.path()).await;
+        let now = chrono::Utc::now();
+        let resets = chrono::DateTime::from_timestamp(now.timestamp() + 86_400, 0).unwrap();
+        d.report_usage(weekly(40.0, resets), Some(a));
+        d.login_found(
+            a,
+            SignedInAgain {
+                id: "login-0".into(),
+                at: now - chrono::Duration::hours(2),
+                hit_before: None,
+            },
+        )
+        .await;
+        assert!(!d.0.state.lock().relogged.contains(&a));
+        assert_eq!(
+            Desk::standing_of(&d.0.state.lock(), Some(work))
+                .windows
+                .len(),
+            1,
+            "Work's reading stands"
+        );
+        assert!(plans.1.lock().is_empty());
+    })
+    .await;
 }

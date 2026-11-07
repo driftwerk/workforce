@@ -511,17 +511,124 @@ impl Desk {
         let Some((login, at)) = last_login else {
             return;
         };
-        let new = {
+        self.login_seen(id, login, at, None).await;
+    }
+
+    /// A `/login` its whole transcript shows since its process started, read
+    /// as the hub took it back: one before this hub could tell, or buried
+    /// past the tail since.
+    pub(super) async fn login_found(&self, id: Uuid, found: crate::transcript::SignedInAgain) {
+        self.login_seen(id, found.id, found.at, found.hit_before)
+            .await;
+    }
+
+    /// The `/login` `login` at `at` in session `id`: a new one since its
+    /// process started is a sign-in inside it. What it reported since as its
+    /// account's was the sign-in's, and is taken back from the account; the
+    /// limit it stopped on just before (`hit_before`) was the account's.
+    async fn login_seen(
+        &self,
+        id: Uuid,
+        login: String,
+        at: DateTime<Utc>,
+        hit_before: Option<(DateTime<Utc>, crate::limit::LimitHit)>,
+    ) {
+        let (new, was_on) = {
             let mut st = self.0.state.lock();
             let started = st.live.get(&id).map(|l| l.started_at);
             let before = st.logins_seen.insert(id, login.clone());
-            match before {
+            let new = match before {
                 Some(seen) => seen != login,
                 None => started.is_some_and(|s| at >= s),
-            }
+            };
+            (new, Self::running_on(&st, id))
         };
-        if new {
-            self.signed_in_inside(id).await;
+        if !new {
+            return;
         }
+        if let Some(account) = was_on {
+            self.take_back_since(id, account, at, hit_before);
+        }
+        self.signed_in_inside(id).await;
+    }
+
+    /// Session `id` ran on the CLI's sign-in from `since`, though it was
+    /// filed on `account`: what it reported since is taken back from the
+    /// account (its standing, its prints, this computer's plan reading of
+    /// it), unless another session runs on the account still, and the limit
+    /// it stopped on before then is kept as the account's, with its reset.
+    fn take_back_since(
+        &self,
+        id: Uuid,
+        account: Uuid,
+        since: DateTime<Utc>,
+        hit_before: Option<(DateTime<Utc>, crate::limit::LimitHit)>,
+    ) {
+        let hit_before = hit_before.filter(|(at, _)| *at < since);
+        let (forgot, ids) = {
+            let mut guard = self.0.state.lock();
+            let st = &mut *guard;
+            let others = st.records.values().any(|r| {
+                r.id != id
+                    && st.live.contains_key(&r.id)
+                    && Self::running_on(st, r.id) == Some(account)
+            });
+            let s = st.standing.entry(Some(account)).or_default();
+            let mut forgot = false;
+            if !others {
+                if s.read_at.is_some_and(|r| r >= since) {
+                    s.windows.clear();
+                    s.read_at = None;
+                    forgot = true;
+                }
+                if s.hit_at.is_some_and(|h| h >= since) {
+                    s.hit_at = None;
+                    s.hit_until = None;
+                    s.hit_window = None;
+                }
+            }
+            if let Some((at, hit)) = &hit_before {
+                if s.hit_at.is_none_or(|h| h < *at) {
+                    s.hit_at = Some(*at);
+                    s.hit_until = hit.resets_at;
+                    s.hit_window = hit.minutes();
+                }
+            }
+            if !others {
+                if let Some(p) = st.prints.get_mut(&Raw::Account(account)) {
+                    p.recent.retain(|p| p.at < since);
+                    p.agreed.retain(|(_, mine)| *mine < since);
+                }
+            }
+            (forgot, Self::plan_ids(st, &Raw::Account(account)))
+        };
+        tracing::info!(session = %id, %account, forgot, "a session ran on this computer's sign-in since a /login inside it: its readings since are no longer its account's");
+        // The limit it stopped on, as a reading of its own: the window full
+        // until it resets.
+        let instead = hit_before.and_then(|(at, hit)| {
+            let kind = match hit.minutes()? {
+                300 => "five_hour",
+                _ => "seven_day",
+            };
+            let resets = hit.resets_at?;
+            Some((
+                serde_json::json!([{ "kind": kind, "percentUsed": 100, "resetsAt": resets.to_rfc3339() }]),
+                at,
+            ))
+        });
+        if let (Some(plans), Some(ids)) = (&self.0.plans, ids) {
+            if forgot || instead.is_some() {
+                plans.forget_local(
+                    crate::usage::LocalPlan::Claude,
+                    crate::usage::LocalAccount { ids, plan: None },
+                    since,
+                    instead,
+                );
+            }
+        }
+        self.keep_standing();
+        self.keep_prints();
+        let desk = self.clone();
+        tokio::spawn(async move { desk.accounts_moved().await });
     }
 }

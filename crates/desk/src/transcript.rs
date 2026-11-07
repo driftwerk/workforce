@@ -142,6 +142,93 @@ fn absorb(mut tail: Tail, v: &Value) -> Tail {
     tail
 }
 
+/// A `/login` Claude Code confirmed in a session, and the plan limit its
+/// turn stopped on last before it: on the credential it ran on until then.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SignedInAgain {
+    /// Its line's id.
+    pub id: String,
+    pub at: chrono::DateTime<chrono::Utc>,
+    /// When its turn last stopped on the plan's limit before the `/login`
+    /// (since `since`), and the limit it stopped on.
+    pub hit_before: Option<(chrono::DateTime<chrono::Utc>, crate::limit::LimitHit)>,
+}
+
+/// The last `/login` Claude Code confirmed in the whole transcript at or
+/// after `since` (when its process started), however far back it is: a
+/// long turn since buries it far past the tail. Only the lines that could
+/// say one are read.
+pub fn last_login_since(
+    path: &Path,
+    since: chrono::DateTime<chrono::Utc>,
+) -> std::io::Result<Option<SignedInAgain>> {
+    use std::io::BufRead;
+    let mut reader = std::io::BufReader::new(std::fs::File::open(path)?);
+    let mut raw = Vec::new();
+    let mut pending: Option<(String, chrono::DateTime<chrono::Utc>)> = None;
+    let mut hit: Option<(chrono::DateTime<chrono::Utc>, crate::limit::LimitHit)> = None;
+    let mut found = None;
+    loop {
+        raw.clear();
+        if reader.read_until(b'\n', &mut raw)? == 0 {
+            return Ok(found);
+        }
+        let line = String::from_utf8_lossy(&raw);
+        if !(line.contains("/login</command-name>")
+            || line.contains("<local-command-stdout>")
+            || line.contains("\"isApiErrorMessage\""))
+        {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        let at = v
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+            .map(|t| t.to_utc());
+        match v.get("type").and_then(Value::as_str) {
+            Some("user") => {
+                let Some(text) = v.pointer("/message/content").and_then(Value::as_str) else {
+                    continue;
+                };
+                if text.starts_with("<command-name>/login</command-name>") {
+                    let id = v.get("uuid").and_then(Value::as_str).map(str::to_string);
+                    pending = id.zip(at);
+                } else if text.starts_with("<local-command-stdout>") {
+                    let Some((id, at)) = pending.take() else {
+                        continue;
+                    };
+                    if !text.starts_with("<local-command-stdout>Login successful") {
+                        continue;
+                    }
+                    // On another sign-in from here: a limit before it was
+                    // the last one's.
+                    let before = hit.take();
+                    if at >= since {
+                        found = Some(SignedInAgain {
+                            id,
+                            at,
+                            hit_before: before,
+                        });
+                    }
+                }
+            }
+            Some("assistant") => {
+                if let (Some(at), Some(crate::limit::TurnFailure::Limit(h))) =
+                    (at, crate::limit::in_transcript_line(&v))
+                {
+                    if at >= since {
+                        hit = Some((at, h));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 /// The same for a Codex rollout: the last prompt the person typed and the
 /// last thing Codex said when a turn completed.
 pub fn read_codex_tail(path: &Path) -> std::io::Result<Tail> {
@@ -248,6 +335,71 @@ mod tests {
             ))
         );
         assert_eq!(t.last_prompt.as_deref(), Some("fix it"));
+    }
+
+    #[test]
+    fn a_login_buried_past_the_tail_is_found_since_the_process_started_with_the_limit_before_it() {
+        let at = |s: &str| chrono::DateTime::parse_from_rfc3339(s).unwrap().to_utc();
+        let login = |id: &str, t: &str| {
+            [
+                format!(
+                    r#"{{"type":"user","uuid":"{id}","timestamp":"{t}","message":{{"role":"user","content":"<command-name>/login</command-name>\n<command-message>login</command-message>"}}}}"#
+                ),
+                format!(
+                    r#"{{"type":"user","uuid":"{id}s","timestamp":"{t}","message":{{"role":"user","content":"<local-command-stdout>Login successful</local-command-stdout>"}}}}"#
+                ),
+            ]
+        };
+        let full = |t: &str| {
+            format!(
+                r#"{{"type":"assistant","timestamp":"{t}","isApiErrorMessage":true,"apiError":"usage_limit_reached","apiErrorParams":{{"rate_limit_info":{{"status":"rejected","resetsAt":1794466800,"rateLimitType":"seven_day"}}}},"error":"rate_limit","message":{{"content":[{{"type":"text","text":"You've hit your weekly limit"}}]}}}}"#
+            )
+        };
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        let mut lines = vec![full("2026-11-05T07:32:30Z")];
+        lines.extend(login("early", "2026-11-05T08:46:05Z"));
+        lines.push(full("2026-11-07T07:52:29Z"));
+        lines.extend(login("late", "2026-11-07T07:53:27Z"));
+        // A turn's worth of tool output since: the login is long past the tail.
+        let filler = format!(
+            r#"{{"type":"user","timestamp":"2026-11-07T08:00:00Z","message":{{"role":"user","content":[{{"type":"tool_result","content":"{}"}}]}}}}"#,
+            "x".repeat(4096)
+        );
+        lines.extend(std::iter::repeat_n(filler, 200));
+        for line in &lines {
+            writeln!(f, "{line}").unwrap();
+        }
+        assert!(
+            read_tail(f.path()).unwrap().last_login.is_none(),
+            "the tail alone never sees it"
+        );
+        // The process started on 11-05 at 09:28: the later login is inside
+        // it, with the limit it stopped on just before.
+        let found = last_login_since(f.path(), at("2026-11-05T09:28:42Z"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (found.id.as_str(), found.at),
+            ("late", at("2026-11-07T07:53:27Z"))
+        );
+        let (hit_at, hit) = found.hit_before.unwrap();
+        assert_eq!(hit_at, at("2026-11-07T07:52:29Z"));
+        assert_eq!(
+            (hit.window.as_deref(), hit.resets_at),
+            (Some("seven_day"), Some(at("2026-11-12T07:00:00Z")))
+        );
+        // Started after it: no login inside this process.
+        assert_eq!(
+            last_login_since(f.path(), at("2026-11-07T08:00:00Z")).unwrap(),
+            None
+        );
+        // Started before both: the last one, and only the limit since the
+        // one before it.
+        let found = last_login_since(f.path(), at("2026-11-01T00:00:00Z"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.id, "late");
+        assert_eq!(found.hit_before.unwrap().0, at("2026-11-07T07:52:29Z"));
     }
 
     #[test]

@@ -419,6 +419,19 @@ impl PgFloorStore {
         Ok(kept == 1)
     }
 
+    /// Forgets `login`'s reading when it was taken at `since` or later:
+    /// another sign-in's, filed as this one's. Whether one was.
+    pub async fn forget_reading(&self, login: &str, since: DateTime<Utc>) -> Result<bool> {
+        let conn = self.pool.get().await?;
+        let gone = conn
+            .execute(
+                "DELETE FROM plan_readings WHERE login = $1 AND observed_at >= $2",
+                &[&login, &since],
+            )
+            .await?;
+        Ok(gone > 0)
+    }
+
     /// Every login's latest reading.
     pub async fn readings(&self) -> Result<Vec<Reading>> {
         let conn = self.pool.get().await?;

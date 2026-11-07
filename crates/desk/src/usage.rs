@@ -51,6 +51,18 @@ pub trait PlanSink: Send + Sync {
     fn account_key(&self, _plan: LocalPlan, _ids: &[String]) -> Option<String> {
         None
     }
+
+    /// What this computer reported as `account`'s since `since` was another
+    /// sign-in's: forgotten, and `instead` (a reading of the account's own,
+    /// as `plan`'s CLI reports one, taken at its time) kept in its place.
+    fn forget_local(
+        &self,
+        _plan: LocalPlan,
+        _account: LocalAccount,
+        _since: chrono::DateTime<chrono::Utc>,
+        _instead: Option<(Value, chrono::DateTime<chrono::Utc>)>,
+    ) {
+    }
 }
 
 /// One of a plan's windows as a CLI reported it.

@@ -107,9 +107,60 @@ pub async fn table() -> Option<Vec<Proc>> {
         .then(|| parse(&String::from_utf8_lossy(&out.stdout)))
 }
 
+/// How long a process has run, from `ps`'s `etime` (`[[dd-]hh:]mm:ss`), in
+/// seconds.
+pub fn elapsed(etime: &str) -> Option<i64> {
+    let etime = etime.trim();
+    let (days, clock) = match etime.split_once('-') {
+        Some((d, rest)) => (d.parse::<i64>().ok()?, rest),
+        None => (0, etime),
+    };
+    let parts: Vec<i64> = clock
+        .split(':')
+        .map(|p| p.parse::<i64>().ok())
+        .collect::<Option<_>>()?;
+    let (h, m, s) = match parts[..] {
+        [m, s] => (0, m, s),
+        [h, m, s] => (h, m, s),
+        _ => return None,
+    };
+    Some(((days * 24 + h) * 60 + m) * 60 + s)
+}
+
+/// When process `pid` started, as `ps` says, to the second: what a process
+/// kept running across a restart of the hub began at, not when it was
+/// taken back.
+pub async fn started_at(pid: u32) -> Option<chrono::DateTime<chrono::Utc>> {
+    let out = tokio::process::Command::new("ps")
+        .args(["-o", "etime=", "-p", &pid.to_string()])
+        .kill_on_drop(true)
+        .output()
+        .await
+        .ok()?;
+    let ran = elapsed(&String::from_utf8_lossy(&out.stdout)).filter(|_| out.status.success())?;
+    Some(chrono::Utc::now() - chrono::Duration::seconds(ran))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn how_long_a_process_has_run_is_read_from_ps() {
+        assert_eq!(elapsed("   00:07"), Some(7));
+        assert_eq!(elapsed("12:34"), Some(12 * 60 + 34));
+        assert_eq!(elapsed("01:02:03"), Some(3723));
+        assert_eq!(elapsed("2-07:24:00"), Some(2 * 86_400 + 7 * 3600 + 24 * 60));
+        assert_eq!(elapsed(""), None);
+        assert_eq!(elapsed("ELAPSED"), None);
+    }
+
+    #[tokio::test]
+    async fn this_process_started_before_now() {
+        let started = started_at(std::process::id()).await.unwrap();
+        assert!(started <= chrono::Utc::now());
+        assert!(started_at(u32::MAX - 1).await.is_none());
+    }
 
     #[test]
     fn what_runs_under_a_process_is_found_however_deep() {

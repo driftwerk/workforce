@@ -182,6 +182,58 @@ impl PlanSink for Plans {
             observed_at: at,
         });
     }
+
+    fn forget_local(
+        &self,
+        plan: LocalPlan,
+        account: LocalAccount,
+        since: chrono::DateTime<Utc>,
+        instead: Option<(Value, chrono::DateTime<Utc>)>,
+    ) {
+        let (kind, windows): (_, fn(&Value) -> Vec<Window>) = match plan {
+            LocalPlan::Claude => (PlanKind::Claude, claude_mod_usage),
+            LocalPlan::Codex => (PlanKind::Chatgpt, codex_usage),
+        };
+        let Some(key) = account_key(kind, &account.ids) else {
+            return;
+        };
+        let reading = |windows: Vec<Window>, observed_at| Reading {
+            kind,
+            login: LoginRef::Mac,
+            account: Some(key.clone()),
+            plan: account.plan.clone(),
+            windows,
+            observed_at,
+        };
+        let instead = instead
+            .map(|(payload, at)| reading(windows(&payload), at))
+            .filter(|r| !r.windows.is_empty());
+        let login = super::postgres::login_key(&reading(Vec::new(), since));
+        // Written again whatever was last: the one kept is gone.
+        self.written.lock().remove(&login);
+        let store = Arc::clone(&self.store);
+        let signals = self.signals.clone();
+        tokio::spawn(async move {
+            // Forgotten first, then its own kept: one after the other.
+            let forgot = match store.forget_reading(&login, since).await {
+                Ok(forgot) => forgot,
+                Err(e) => {
+                    tracing::warn!(target: "floor", error = %format!("{e:#}"), "forgetting a plan reading failed");
+                    return;
+                }
+            };
+            let kept = match &instead {
+                Some(r) => store.record(r).await.unwrap_or_else(|e| {
+                    tracing::warn!(target: "floor", error = %format!("{e:#}"), "keeping a plan reading failed");
+                    false
+                }),
+                None => false,
+            };
+            if forgot || kept {
+                signals.send(DeskSignal::Usage, None);
+            }
+        });
+    }
 }
 
 #[cfg(test)]
@@ -215,6 +267,72 @@ mod tests {
             worth_writing(Some(&old), &[window(40.0, 100)]),
             "a minute on"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reading_another_sign_in_made_is_forgotten_and_the_accounts_own_kept_instead() {
+        use workforce_postgres::test_support::with_test_pool;
+        with_test_pool(PgFloorStore::build_pool, |pool| async move {
+            let store = Arc::new(PgFloorStore::with_pool(pool).await.unwrap());
+            let plans = Plans::new(Arc::clone(&store), crate::floor::signal::Signals::start());
+            let account = || LocalAccount {
+                ids: vec!["desk-account:star".into()],
+                plan: None,
+            };
+            // To the second, as the store gives times back.
+            let now = chrono::DateTime::from_timestamp(Utc::now().timestamp(), 0).unwrap();
+            let at = |mins: i64| now - chrono::Duration::minutes(mins);
+            let resets = chrono::DateTime::from_timestamp(now.timestamp() + 86_400, 0).unwrap();
+            // Another sign-in's plan, filed as this account's after the
+            // login ten minutes ago.
+            plans.local_at(
+                LocalPlan::Claude,
+                serde_json::json!([{"kind": "seven_day", "percentUsed": 26, "resetsAt": "2026-11-13T19:00:00Z"}]),
+                account(),
+                at(5),
+            );
+            let kept = || async { store.readings().await.unwrap() };
+            for _ in 0..200 {
+                if !kept().await.is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            plans.forget_local(
+                LocalPlan::Claude,
+                account(),
+                at(10),
+                Some((
+                    serde_json::json!([{"kind": "seven_day", "percentUsed": 100, "resetsAt": resets.to_rfc3339()}]),
+                    at(11),
+                )),
+            );
+            let mut now_kept = Vec::new();
+            for _ in 0..200 {
+                now_kept = kept().await;
+                if now_kept.first().is_some_and(|r| r.observed_at == at(11)) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert_eq!(now_kept.len(), 1);
+            let r = &now_kept[0];
+            assert_eq!(r.login, LoginRef::Mac);
+            assert_eq!(
+                r.account,
+                account_key(PlanKind::Claude, &["desk-account:star".into()])
+            );
+            assert_eq!(
+                (r.windows[0].used_percent, r.windows[0].resets_at, r.observed_at),
+                (100.0, Some(resets), at(11)),
+                "the account's own limit, as it stopped on it"
+            );
+            // One before the login stands.
+            plans.forget_local(LocalPlan::Claude, account(), at(1), None);
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            assert_eq!(kept().await.len(), 1);
+        })
+        .await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
