@@ -815,6 +815,9 @@ mod tests {
                 cwd: cwd.map(str::to_string),
                 read_only: false,
             }),
+            call: None,
+            agent: None,
+            cli_session: None,
         }
     }
 

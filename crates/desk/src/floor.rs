@@ -661,6 +661,27 @@ pub fn settle(turns: Vec<Turn>, live: &HashSet<Uuid>) -> Vec<Turn> {
         .collect()
 }
 
+/// `turns` with every open wait of a session's open turn that nothing asks
+/// now (`asks`: what each running session asks, by its waits' keys) closed
+/// where its turn was last heard from: a session's wait stands only while
+/// an ask of it stands. An agent's waits are its own hub's to keep.
+pub fn backed(turns: Vec<Turn>, asks: &HashMap<Uuid, HashSet<String>>) -> Vec<Turn> {
+    turns
+        .into_iter()
+        .map(|mut t| {
+            if let (Subject::Session { id, .. }, None) = (&t.subject, t.ended_at) {
+                let keys = asks.get(id);
+                let at = t.heard_at;
+                t.waits
+                    .iter_mut()
+                    .filter(|w| w.to.is_none() && keys.is_none_or(|k| !k.contains(&w.key)))
+                    .for_each(|w| w.to = Some(at.max(w.from)));
+            }
+            t
+        })
+        .collect()
+}
+
 /// What still needs the person, longest waiting first: every open wait of
 /// an open turn, and every question not yet settled.
 pub fn open_needs(turns: &[Turn]) -> Vec<Need> {
@@ -1144,6 +1165,42 @@ mod tests {
         assert_eq!(needs[0].ask, "Ship it?");
         assert_eq!(needs[0].since, at("2026-10-29T08:30:00Z"));
         assert_eq!(needs, open_needs(&turns), "ids are stable");
+    }
+
+    #[test]
+    fn the_floor_never_lists_a_sessions_wait_that_nothing_asks() {
+        let session = Uuid::new_v4();
+        let mut asking = turn(
+            Subject::Session {
+                id: session,
+                engine: Engine::Claude,
+            },
+            None,
+            "2026-10-29T09:00:00Z",
+        );
+        asking.heard_at = at("2026-10-29T09:20:00Z");
+        asking.waits = vec![
+            wait("toolu_live", "2026-10-29T09:10:00Z", None, Answer::Terminal),
+            // Raised before a restart that took its ask with it.
+            wait("toolu_gone", "2026-10-29T09:09:00Z", None, Answer::Terminal),
+        ];
+        let mut agents = turn(agent("scout", "s1"), None, "2026-10-29T09:00:00Z");
+        agents.waits = vec![wait("r1", "2026-10-29T09:05:00Z", None, decide())];
+        let asks = HashMap::from([(session, HashSet::from(["toolu_live".to_string()]))]);
+        let shown = backed(vec![asking.clone(), agents.clone()], &asks);
+        let ids: Vec<String> = open_needs(&shown).into_iter().map(|n| n.id).collect();
+        assert_eq!(
+            ids,
+            [
+                format!("wait:{}:r1", agents.id),
+                format!("wait:{}:toolu_live", asking.id),
+            ],
+            "an agent's wait is its own hub's; a session's stands only while it is asked"
+        );
+        assert_eq!(shown[0].waits[1].to, Some(at("2026-10-29T09:20:00Z")));
+        // A session that asks nothing lists nothing.
+        let none = backed(vec![asking], &HashMap::new());
+        assert!(open_needs(&none).is_empty());
     }
 
     #[test]

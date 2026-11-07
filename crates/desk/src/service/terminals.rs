@@ -671,6 +671,8 @@ impl Desk {
             held: None,
             open_question: None,
             codex_question: None,
+            flights: HashMap::new(),
+            behind: Vec::new(),
             breaker: Default::default(),
         };
         if existing.is_some_and(|id| self.0.state.lock().live.contains_key(&id)) {
@@ -798,6 +800,8 @@ impl Desk {
                             held: None,
                             open_question: None,
                             codex_question: None,
+                            flights: HashMap::new(),
+                            behind: Vec::new(),
                             breaker: Default::default(),
                         },
                     );
@@ -1464,6 +1468,174 @@ mod tests {
             d.reconcile_external(found).await;
             assert_eq!(d.view(early.id).unwrap().origin, Origin::Desk);
             assert_eq!(d.list().len(), 1);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn an_ask_pending_across_a_hub_restart_is_shown_again_and_never_left_open() {
+        with_test_pool(build_pool, |pool| async move {
+            let (_hdir, socket, holder_cancel) = crate::holder::tests::holder().await;
+            let dir = tempfile::tempdir().unwrap();
+            let mut opts = options(dir.path());
+            opts.env = BTreeMap::from([
+                ("PATH".into(), "/usr/bin:/bin".into()),
+                ("SHELL".into(), "/bin/sh".into()),
+            ]);
+            opts.holder = Some(super::super::HolderOptions {
+                socket,
+                token: crate::holder::tests::TOKEN.into(),
+            });
+            crate::store::DeskStore::migrate(&pool).await.unwrap();
+            let logged = Arc::new(super::super::tests::Logged::default());
+            let floor = || super::super::Floor {
+                turns: Some(logged.clone()),
+                ..Default::default()
+            };
+            // What the hub's floor lists: only what a session still asks.
+            let needs = |d: &Desk| {
+                let turns = logged.0.lock().iter().fold(Vec::new(), crate::floor::apply);
+                crate::floor::open_needs(&crate::floor::backed(turns, &d.ask_keys()))
+            };
+            // Until the log has caught up with `n` open waits of its own.
+            let kept_open = |n: usize| {
+                let logged = logged.clone();
+                async move {
+                    super::super::tests::logs(&logged, |ops| {
+                        crate::floor::open_needs(&ops.iter().fold(Vec::new(), crate::floor::apply))
+                            .len()
+                            == n
+                    })
+                    .await
+                }
+            };
+            let cancel = CancellationToken::new();
+            let d = Desk::start(
+                crate::store::DeskStore::from_pool(pool.clone()),
+                opts.clone(),
+                floor(),
+                cancel.clone(),
+            )
+            .await
+            .unwrap();
+            let (tid, token) = open(&d, dir.path()).await;
+            let say = |event: &'static str, extra: serde_json::Value| hook(event, "cc-8", extra);
+            let transcript = dir.path().join("cc-8.jsonl");
+            std::fs::write(&transcript, "").unwrap();
+            d.terminal_hook(
+                tid,
+                &token,
+                &say(
+                    "SessionStart",
+                    serde_json::json!({ "transcript_path": transcript.to_string_lossy() }),
+                ),
+            )
+            .await
+            .unwrap();
+            d.terminal_hook(tid, &token, &say("UserPromptSubmit", serde_json::json!({ "prompt": "deploy" })))
+                .await
+                .unwrap();
+            let bash = serde_json::json!({ "tool_name": "Bash", "tool_input": { "command": "make deploy" } });
+            let mut start = bash.clone();
+            start["tool_use_id"] = "toolu_P1".into();
+            d.terminal_hook(tid, &token, &say("PreToolUse", start)).await.unwrap();
+            d.terminal_hook(tid, &token, &say("PermissionRequest", bash)).await.unwrap();
+            let s = d.list().into_iter().find(|s| s.terminal_id == Some(tid)).unwrap();
+            let asked = d.view(s.id).unwrap().pending.unwrap();
+            assert_eq!(asked.call.as_deref(), Some("toolu_P1"));
+            assert!(kept_open(1).await);
+            let [need] = &needs(&d)[..] else { panic!("{:?}", needs(&d)) };
+            assert!(need.id.ends_with(&format!(":{}", asked.id)));
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            cancel.cancel();
+            tokio::time::sleep(Duration::from_millis(300)).await;
+
+            // The hub comes back: the terminal still shows the dialog.
+            let cancel = CancellationToken::new();
+            let d = Desk::start(
+                crate::store::DeskStore::from_pool(pool.clone()),
+                opts.clone(),
+                floor(),
+                cancel.clone(),
+            )
+            .await
+            .unwrap();
+            let v = d.view(s.id).unwrap();
+            assert_eq!(v.state, SessionState::Blocked);
+            assert!(
+                super::super::tests::logs(&logged, |ops| ops.iter().any(|op| matches!(
+                    op,
+                    TurnOp::Wait { wait, .. }
+                        if wait.key == asked.id.to_string() && wait.answer == crate::floor::Answer::Terminal
+                )))
+                .await
+            );
+            let again = v.pending.unwrap();
+            assert_eq!((again.id, again.call.as_deref(), again.answerable), (asked.id, Some("toolu_P1"), false));
+            let [need] = &needs(&d)[..] else { panic!("{:?}", needs(&d)) };
+            assert!(need.id.ends_with(&format!(":{}", asked.id)), "under the same key");
+            assert_eq!(need.answer, crate::floor::Answer::Terminal, "the terminal's to answer now");
+
+            // Answered there: its call runs and ends, and so does its wait.
+            let mut end = serde_json::json!({ "tool_name": "Bash" });
+            end["tool_use_id"] = "toolu_P1".into();
+            d.terminal_hook(tid, &token, &say("PostToolUse", end)).await.unwrap();
+            assert_eq!(d.view(s.id).unwrap().pending, None);
+            assert!(needs(&d).is_empty());
+            assert!(
+                super::super::tests::logs(&logged, |ops| {
+                    crate::floor::open_needs(&ops.iter().fold(Vec::new(), crate::floor::apply)).is_empty()
+                })
+                .await,
+                "nor does the log keep it open"
+            );
+
+            // Asked again, and answered while the hub is away: its call's
+            // result is in the transcript by the time the hub is back.
+            let mut start = serde_json::json!({ "tool_name": "Bash", "tool_input": { "command": "make clean" } });
+            start["tool_use_id"] = "toolu_P2".into();
+            d.terminal_hook(tid, &token, &say("PreToolUse", start)).await.unwrap();
+            d.terminal_hook(
+                tid,
+                &token,
+                &say("PermissionRequest", serde_json::json!({ "tool_name": "Bash", "tool_input": { "command": "make clean" } })),
+            )
+            .await
+            .unwrap();
+            assert!(kept_open(1).await);
+            assert_eq!(needs(&d).len(), 1);
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            cancel.cancel();
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            std::fs::write(
+                &transcript,
+                concat!(
+                    r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_P2","name":"Bash","input":{}}]}}"#,
+                    "\n",
+                    r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_P2","content":"done"}]}}"#,
+                    "\n"
+                ),
+            )
+            .unwrap();
+            let d = Desk::start(
+                crate::store::DeskStore::from_pool(pool),
+                opts,
+                floor(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(d.view(s.id).unwrap().pending, None, "not shown again");
+            assert!(needs(&d).is_empty(), "{:?}", needs(&d));
+            assert!(
+                super::super::tests::logs(&logged, |ops| {
+                    crate::floor::open_needs(&ops.iter().fold(Vec::new(), crate::floor::apply)).is_empty()
+                })
+                .await,
+                "no wait is left open"
+            );
+            d.close_terminal(tid).unwrap();
+            holder_cancel.cancel();
         })
         .await;
     }
