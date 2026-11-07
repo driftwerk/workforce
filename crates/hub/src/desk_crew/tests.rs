@@ -1912,6 +1912,7 @@ mod floor {
                         plans: None,
                         pricer: None,
                         redactor: None,
+                        index: None,
                     },
                 )
                 .await;
@@ -2028,6 +2029,7 @@ mod floor {
                         plans: None,
                         pricer: None,
                         redactor: None,
+                        index: None,
                     },
                 )
                 .await;
@@ -2353,6 +2355,7 @@ mod floor {
                         plans: None,
                         pricer: None,
                         redactor: None,
+                        index: None,
                     },
                 )
                 .await;

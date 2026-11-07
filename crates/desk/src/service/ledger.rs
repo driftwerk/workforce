@@ -412,6 +412,7 @@ impl Desk {
         }
         let mut tell = tokio::time::interval(TELL_EVERY);
         let mut sweep = tokio::time::interval(super::memory::SWEEP_EVERY);
+        let mut measure = tokio::time::interval(super::memory_index::MEASURE_EVERY);
         loop {
             tokio::select! {
                 biased;
@@ -419,6 +420,7 @@ impl Desk {
                 Some(id) = soon.recv() => self.read_spend(id).await,
                 _ = tell.tick() => self.tell_spend(),
                 _ = sweep.tick() => self.sweep_memory().await,
+                _ = measure.tick() => self.measure_memory().await,
                 job = jobs.recv() => match job {
                     None => return,
                     Some(Job::Read(id)) => {

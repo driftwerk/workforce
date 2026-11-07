@@ -36,6 +36,9 @@ pub use markers::{
 };
 pub use matching::{unmatched, Unmatched};
 pub use shape::{checked, mismatches, Refused};
+/// What the stores filter by, for those that don't depend on the index
+/// crate themselves.
+pub use vellev_index::filter::Filter;
 
 /// The model a collection the node embeds for runs.
 pub const LOCAL_MODEL: &str = "BAAI/bge-base-en-v1.5";

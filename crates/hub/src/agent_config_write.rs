@@ -100,8 +100,20 @@ async fn save_over(
     {
         return Err(Refused::Unloadable(ConfigRefusal::Said(why)));
     }
+    // A group getting a boss is closed to the main overseer before the file
+    // is written, so nothing reaches it in between; opened again if the
+    // write doesn't happen and no file names it.
+    #[cfg(feature = "postgres")]
+    let closed = crate::desk_crew::closing(service, body);
     let before = crate::connector_pins::binding_in(&service.workspace);
-    let saved = save_one(service, ref_id, store, body, edit, expects, over).await?;
+    let saved = save_one(service, ref_id, store, body, edit, expects, over).await;
+    #[cfg(feature = "postgres")]
+    if saved.is_err() {
+        if let Some(g) = &closed {
+            crate::desk_crew::not_closed(service, g);
+        }
+    }
+    let saved = saved?;
     if service.config.desk.enabled {
         let after = crate::connector_pins::binding_in(&service.workspace);
         crate::connector_pins::rebind(service, &before, &after).await;
@@ -112,6 +124,9 @@ async fn save_over(
     #[cfg(feature = "postgres")]
     {
         crate::desk_crew::oversight_saved(service, was.as_deref(), body).await;
+        if closed.is_some() {
+            crate::desk_crew::keep_closed(service).await;
+        }
         crate::desk_crew::config_saved(service);
     }
     #[cfg(not(feature = "postgres"))]
@@ -133,21 +148,32 @@ pub(crate) fn overseen(body: &str) -> Option<workforce_common::oversight::Scope>
         .map(|o| o.scope)
 }
 
-/// `body` with its `[oversight]` switched off and everything else as it was,
-/// the table itself kept (an absent one reads as never set, which Desk's hub
-/// would turn back on for its own agent). `None` when it doesn't parse.
+/// `body` with its `[oversight]` switched off, naming no group, and
+/// everything else as it was, the table itself kept (an absent one reads as
+/// never set, which Desk's hub would turn back on for its own agent). A
+/// group any config names stays closed to everyone, so one switched off
+/// names none. `None` when it doesn't parse.
 pub(crate) fn oversight_off(body: &str) -> Option<String> {
     let mut doc: toml_edit::DocumentMut = body.parse().ok()?;
     match doc.get_mut("oversight")? {
         toml_edit::Item::Table(t) => {
             t.insert("enabled", toml_edit::value(false));
+            t.remove("group");
         }
         toml_edit::Item::Value(toml_edit::Value::InlineTable(t)) => {
             t.insert("enabled", false.into());
+            t.remove("group");
         }
         _ => return None,
     }
     Some(doc.to_string())
+}
+
+/// The group `body` names in `[oversight] group`, switched on or not.
+fn named_in(body: &str) -> Option<String> {
+    let doc: toml::Table = toml::from_str(body).ok()?;
+    let g = doc.get("oversight")?.get("group")?.as_str()?.trim();
+    (!g.is_empty()).then(|| g.to_string())
 }
 
 /// Switches every agent but `keep` that oversees what `keep` oversees off,
@@ -178,7 +204,12 @@ pub(crate) async fn one_overseer(keep: &AgentService, store: Option<&WorkflowSto
         let Ok(Some(current)) = workforce_common::config_files::read(&path) else {
             continue;
         };
-        if overseen(&current).as_ref() != Some(&mine) {
+        // Another that oversees the same, or is switched off but still
+        // names the same group (which keeps it closed to everyone).
+        let same = overseen(&current).as_ref() == Some(&mine)
+            || matches!(&mine, workforce_common::oversight::Scope::Group(g)
+                if named_in(&current).as_deref() == Some(g.as_str()));
+        if !same {
             continue;
         }
         let Some(off) = oversight_off(&current) else {
@@ -720,6 +751,17 @@ mod tests {
         assert!(!oversees(&off));
         assert!(off.contains("level = \"act\""));
         assert!(off.contains("[oversight.wake]\nquiet_minutes = 0"));
+
+        let boss = "[oversight]\nenabled = true\ngroup = \"acme\"\nlevel = \"act\"\n";
+        let off = oversight_off(boss).unwrap();
+        assert!(!oversees(&off));
+        assert!(
+            !off.contains("group"),
+            "a boss switched off names no group: {off}"
+        );
+        assert!(off.contains("level = \"act\""));
+        let off = oversight_off("oversight = { enabled = true, group = \"acme\" }\n").unwrap();
+        assert!(!off.contains("group"), "{off}");
 
         let inline = "oversight = { enabled = true, level = \"watch\" }\n";
         assert!(oversees(inline));

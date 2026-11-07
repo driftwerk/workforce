@@ -392,8 +392,13 @@ impl Desk {
             true => Some(HashSet::new()),
             false => None,
         };
-        self.remove_as(id, elsewhere.as_ref(), Memory::Forget, |_, _| Ok(()))
-            .await
+        let removed = self
+            .remove_as(id, elsewhere.as_ref(), Memory::Forget, |_, _| Ok(()))
+            .await;
+        if removed.is_ok() {
+            self.memory_forgotten();
+        }
+        removed
     }
 
     /// [`Self::remove`], deleting its transcript when `elsewhere` (what

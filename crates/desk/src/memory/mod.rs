@@ -5,7 +5,12 @@
 //! searches.
 
 pub mod harvest;
+pub mod index;
+pub mod passage;
+pub mod rank;
+pub mod reach;
 pub mod record;
+pub mod render;
 
 use std::borrow::Cow;
 use std::collections::HashSet;
@@ -26,6 +31,13 @@ pub struct MemoryOptions {
     pub retain_days: u32,
     /// Folders never harvested.
     pub exclude: Vec<String>,
+    /// The most disk session memory may take, in MB: at 90 % the Floor
+    /// says so, and at 100 % the harvest holds until there is room.
+    pub max_disk_mb: u64,
+    /// The most passages written to the search index a minute.
+    pub index_per_minute: u32,
+    /// The most a session's recall may cover within its group.
+    pub session_reach: reach::Reach,
 }
 
 impl Default for MemoryOptions {
@@ -35,6 +47,9 @@ impl Default for MemoryOptions {
             backfill_days: 30,
             retain_days: 180,
             exclude: Vec::new(),
+            max_disk_mb: 4096,
+            index_per_minute: 600,
+            session_reach: reach::Reach::Project,
         }
     }
 }
@@ -50,6 +65,14 @@ pub const NO_REDACTOR: &str =
 pub const DISABLED: &str = "Remembering conversations is turned off for this Desk.";
 /// What the person reads of a session Desk no longer has.
 pub const CLEARED: &str = "Desk no longer has this session; this is what it remembered of it.";
+/// What the person reads while Desk Memory is out of room.
+pub const FULL: &str = "Desk Memory is full, so Desk isn't remembering new conversations. Forget some sessions or raise max_disk_mb, and it carries on where it stopped.";
+/// What the Floor says while deletions from the search index are set aside.
+pub const PURGES_SET_ASIDE: &str = "Desk couldn't take some conversations you asked it to forget out of its search, though they're gone from everything else. Rebuild the search in Settings → Memory to clear them.";
+/// What the Floor says as Desk Memory nears its limit.
+pub const NEARLY_FULL: &str = "Desk Memory is nearly full. When it is, Desk stops remembering new conversations until you forget some sessions or raise max_disk_mb.";
+/// What a search says while some of what it covers isn't in the index yet.
+pub const CATCHING_UP: &str = "Desk is still adding some conversations to its search; until it has, those are found by keyword.";
 /// What a keyword search says of itself until the search index is ready.
 pub const KEYWORD_ONLY: &str = "Searching by keyword only until Desk Memory is ready.";
 

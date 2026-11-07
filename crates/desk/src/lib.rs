@@ -41,6 +41,7 @@ mod line_api;
 pub mod line_store;
 pub mod local;
 pub mod memory;
+pub mod memory_index_store;
 pub mod memory_store;
 pub mod model;
 pub mod overview;

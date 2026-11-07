@@ -45,6 +45,7 @@ pub struct MemorySearch {
     pub hits: Vec<MemoryHitView>,
     /// Only keywords were matched: the search index isn't ready.
     pub keyword_only: bool,
+    /// What the person should know of the search, in plain words.
     pub notice: Option<&'static str>,
 }
 
@@ -71,6 +72,36 @@ pub struct SessionMemory {
     pub remembering: bool,
     /// Why not, in plain words.
     pub why: Option<String>,
+    /// What else the person should know of it, in plain words: that its
+    /// oldest exchanges are past what the search index holds.
+    pub notice: Option<String>,
+}
+
+/// What the panel says of a session past its cap.
+fn past_cap_notice(counts: &MemoryCounts) -> Option<String> {
+    (counts.past_cap > 0).then(|| {
+        format!(
+            "Desk searches only this session's latest {} exchanges by meaning; its {} older ones are found by keyword.",
+            thousands(crate::memory_store::SESSION_CAP as i64),
+            thousands(counts.past_cap)
+        )
+    })
+}
+
+/// `n` with a space between each three digits, as Desk writes numbers.
+fn thousands(n: i64) -> String {
+    let digits = n.unsigned_abs().to_string();
+    let mut out = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(' ');
+        }
+        out.push(c);
+    }
+    match n < 0 {
+        true => format!("-{out}"),
+        false => out,
+    }
 }
 
 impl Desk {
@@ -104,6 +135,9 @@ impl Desk {
         }
         if self.0.ledger.redactor.is_none() {
             return Err(Why::Hold(crate::memory::NO_REDACTOR.into()));
+        }
+        if self.memory_full() {
+            return Err(Why::Hold(crate::memory::FULL.into()));
         }
         if !matches!(r.engine, Engine::Claude | Engine::Codex) {
             return Err(Why::Skip(crate::memory::NO_RECORD.into()));
@@ -186,24 +220,52 @@ impl Desk {
             .sweep_memory(self.0.opts.memory.retain_days)
             .await
         {
-            Ok(0) => {}
-            Ok(gone) => tracing::info!(gone, "swept conversations past their keeping"),
+            Ok(swept) if swept == Default::default() => {}
+            Ok(swept) => {
+                tracing::info!(
+                    gone = swept.gone,
+                    capped = swept.capped,
+                    purges = swept.purges,
+                    "swept conversations past their keeping"
+                );
+                self.memory_index_poke();
+                self.measure_memory().await;
+            }
             Err(e) => tracing::warn!(error = format!("{e:#}"), "couldn't sweep old conversations"),
         }
     }
 
-    /// The person's keyword search of what Desk remembers: every session's,
-    /// or one group's or one session's. Until the search index is ready,
-    /// only keywords are matched, and the answer says so.
+    /// The person's search of what Desk remembers: every session's, or one
+    /// group's or one session's. By meaning and words once the search
+    /// index is ready; until then by keyword only, and the answer says so.
     pub async fn memory_search(&self, q: &MemoryQuery) -> Result<MemorySearch, DeskError> {
-        if q.q.trim().is_empty() {
-            return Err(DeskError::Invalid("Say what to search for.".into()));
-        }
-        let q = MemoryQuery {
-            limit: q.limit.clamp(1, SEARCH_MAX),
-            ..q.clone()
-        };
-        let hits = self.0.store.memory_search(&q).await?;
+        let found = self
+            .memory_recall(
+                &crate::memory::reach::Reader::Person,
+                &super::memory_recall::Recall {
+                    q: q.q.clone(),
+                    group: q.group.clone(),
+                    session: q.session,
+                    limit: usize::try_from(q.limit.clamp(1, SEARCH_MAX)).unwrap_or(1),
+                    tool: "search",
+                    ..Default::default()
+                },
+            )
+            .await?;
+        let hits: Vec<MemoryHit> = found
+            .hits
+            .into_iter()
+            .map(|(r, _)| MemoryHit {
+                session: r.session,
+                group: r.group,
+                project: r.project,
+                at: r.at,
+                asker: r.asker,
+                ask: r.ask,
+                answer: r.answer,
+                compaction: r.compaction,
+            })
+            .collect();
         let ids: Vec<Uuid> = hits
             .iter()
             .map(|h| h.session)
@@ -253,8 +315,8 @@ impl Desk {
                     }
                 })
                 .collect(),
-            keyword_only: true,
-            notice: Some(crate::memory::KEYWORD_ONLY),
+            keyword_only: found.keyword_only,
+            notice: found.notice,
         })
     }
 
@@ -269,6 +331,7 @@ impl Desk {
             }
             return Ok(SessionMemory {
                 exchanges,
+                notice: past_cap_notice(&counts),
                 counts,
                 remembering: false,
                 why: Some(crate::memory::CLEARED.into()),
@@ -291,6 +354,7 @@ impl Desk {
         };
         Ok(SessionMemory {
             exchanges,
+            notice: past_cap_notice(&counts),
             counts,
             remembering: why.is_none(),
             why,
@@ -302,7 +366,11 @@ impl Desk {
     /// conversation, records and exchanges are never harvested again.
     pub async fn forget_memory(&self, id: Uuid) -> Result<(), DeskError> {
         match self.0.store.forget_memory(id).await? {
-            true => Ok(()),
+            true => {
+                self.memory_index_poke();
+                self.measure_memory().await;
+                Ok(())
+            }
             false => Err(DeskError::NotFound),
         }
     }

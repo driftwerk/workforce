@@ -3,7 +3,7 @@
 //! record's offsets; what is never to be read again; the person's switches;
 //! and the keyword search over what is kept.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
 use eyre::{Context, Result};
@@ -13,6 +13,7 @@ use uuid::Uuid;
 
 use crate::engine::Engine;
 use crate::ledger_store::{Cursor, Kept};
+use crate::memory::passage::{collection_of, Purge};
 use crate::memory::record::{Asker, Exchange, Step};
 use crate::store::DeskStore;
 
@@ -109,6 +110,9 @@ pub struct MemoryCounts {
     pub compactions: i64,
     /// Secrets hidden in what was kept.
     pub secrets_hidden: i64,
+    /// Older exchanges past the session's cap: kept, but found by keyword
+    /// only.
+    pub past_cap: i64,
 }
 
 fn count(n: u64) -> i64 {
@@ -118,6 +122,21 @@ fn count(n: u64) -> i64 {
 /// The setting key of a group's memory switches.
 pub fn group_key(group: &str) -> String {
     format!("memory.group.{group}")
+}
+
+/// The most exchanges of one session the search index holds: older ones
+/// stay in Postgres, found by keyword.
+pub const SESSION_CAP: usize = 20_000;
+
+/// What a sweep did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Swept {
+    /// Exchanges past their keeping, deleted.
+    pub gone: usize,
+    /// Exchanges past their session's cap, taken out of the index.
+    pub capped: usize,
+    /// Index deletions queued.
+    pub purges: usize,
 }
 
 /// The setting key of the pause.
@@ -166,6 +185,20 @@ impl DeskStore {
             .context("naming a session's memory")?;
         }
         if held {
+            // What this step rewrites is locked in id order, as every write
+            // of many exchanges locks them.
+            let keys: Vec<&str> = w
+                .closed
+                .iter()
+                .chain(w.open)
+                .map(|x| x.key.as_str())
+                .collect();
+            tx.execute(
+                "SELECT 1 FROM memory_exchanges WHERE engine = $1 AND key = ANY($2) \
+                 ORDER BY id FOR UPDATE",
+                &[&w.engine.as_str(), &keys],
+            )
+            .await?;
             let base: i32 = tx
                 .query_one(
                     "SELECT COALESCE(MAX(seq), 0) FROM memory_exchanges WHERE session = $1",
@@ -192,7 +225,13 @@ impl DeskStore {
                        ask = EXCLUDED.ask, answer = EXCLUDED.answer, steps = EXCLUDED.steps, \
                        files = EXCLUDED.files, commands = EXCLUDED.commands, \
                        errors = EXCLUDED.errors, redacted = EXCLUDED.redacted, \
-                       flagged = EXCLUDED.flagged \
+                       flagged = EXCLUDED.flagged, \
+                       indexed_at = CASE WHEN (memory_exchanges.ask, memory_exchanges.answer, \
+                         memory_exchanges.steps) IS DISTINCT FROM (EXCLUDED.ask, EXCLUDED.answer, \
+                         EXCLUDED.steps) THEN NULL ELSE memory_exchanges.indexed_at END, \
+                       index_tries = CASE WHEN (memory_exchanges.ask, memory_exchanges.answer, \
+                         memory_exchanges.steps) IS DISTINCT FROM (EXCLUDED.ask, EXCLUDED.answer, \
+                         EXCLUDED.steps) THEN 0 ELSE memory_exchanges.index_tries END \
                      WHERE memory_exchanges.session = EXCLUDED.session",
                     &[
                         &w.engine.as_str(),
@@ -365,25 +404,89 @@ impl DeskStore {
     }
 
     /// Deletes conversations that ended more than `retain_days` ago, and
-    /// reads older than 90 days. How many exchanges went.
-    pub async fn sweep_memory(&self, retain_days: u32) -> Result<u64> {
-        let client = self.pool().get().await?;
+    /// reads older than 90 days, and takes each session's exchanges past
+    /// the newest [`SESSION_CAP`] out of the search index. What the index
+    /// held of them is queued to be deleted from it in the same
+    /// transaction.
+    pub async fn sweep_memory(&self, retain_days: u32) -> Result<Swept> {
+        let mut client = self.pool().get().await?;
+        let tx = client.transaction().await?;
         let days = i32::try_from(retain_days).unwrap_or(i32::MAX);
-        // One never ended (its session stopped mid-turn) goes by when it began.
-        let gone = client
-            .execute(
-                "DELETE FROM memory_exchanges \
+        let cap = i64::try_from(SESSION_CAP).unwrap_or(i64::MAX);
+        // What goes, and what is past its session's cap, are found first,
+        // with nothing locked; then only those rows are locked, all in one
+        // id order, as every write of many exchanges locks them. One never
+        // ended (its session stopped mid-turn) goes by when it began.
+        let old: Vec<Uuid> = tx
+            .query(
+                "SELECT id FROM memory_exchanges \
                  WHERE COALESCE(ended, at) < now() - make_interval(days => $1)",
                 &[&days],
             )
+            .await?
+            .iter()
+            .map(|r| r.try_get(0))
+            .collect::<Result<_, _>>()?;
+        let over: Vec<Uuid> = tx
+            .query(
+                "SELECT id FROM ( \
+                   SELECT id, row_number() OVER (PARTITION BY session ORDER BY seq DESC) AS newer \
+                   FROM memory_exchanges WHERE NOT past_cap AND session IN ( \
+                     SELECT session FROM memory_exchanges WHERE NOT past_cap \
+                     GROUP BY session HAVING COUNT(*) > $1)) x \
+                 WHERE newer > $1",
+                &[&cap],
+            )
+            .await
+            .context("finding sessions' exchanges past their cap")?
+            .iter()
+            .map(|r| r.try_get(0))
+            .collect::<Result<_, _>>()?;
+        let both: Vec<Uuid> = old.iter().chain(over.iter()).copied().collect();
+        tx.execute(crate::memory_index_store::LOCKED_IDS, &[&both])
             .await?;
-        client
-            .execute(
-                "DELETE FROM memory_reads WHERE at < now() - interval '90 days'",
-                &[],
+        let gone = tx
+            .query(
+                "DELETE FROM memory_exchanges WHERE id = ANY($1) \
+                   AND COALESCE(ended, at) < now() - make_interval(days => $2) \
+                 RETURNING id, group_id",
+                &[&old, &days],
             )
             .await?;
-        Ok(gone)
+        let gone = refs_by_group(&gone)?;
+        let capped = tx
+            .query(
+                "UPDATE memory_exchanges SET past_cap = true WHERE id = ANY($1) AND NOT past_cap \
+                 RETURNING id, group_id",
+                &[&over],
+            )
+            .await
+            .context("capping sessions' indexed exchanges")?;
+        let capped = refs_by_group(&capped)?;
+        let mut purged = 0;
+        for (group, refs) in gone.iter().chain(capped.iter()) {
+            for purge in crate::memory::passage::ref_purges(refs) {
+                queue_purge(&tx, group.as_deref(), &purge).await?;
+                purged += 1;
+            }
+        }
+        tx.execute(
+            "DELETE FROM memory_reads WHERE at < now() - interval '90 days'",
+            &[],
+        )
+        .await?;
+        tx.execute(
+            "DELETE FROM memory_purges WHERE done_at < now() - interval '7 days'",
+            &[],
+        )
+        .await?;
+        tx.commit().await?;
+        let count = |m: &HashMap<Option<String>, Vec<Uuid>>| m.values().map(Vec::len).sum();
+        Ok(Swept {
+            gone: count(&gone),
+            capped: count(&capped),
+            purges: purged,
+        })
     }
 
     /// The exchanges a keyword search of `q` finds, the best first: Postgres's
@@ -459,7 +562,8 @@ impl DeskStore {
         let c = client
             .query_one(
                 "SELECT COUNT(*), COUNT(*) FILTER (WHERE ended IS NULL), \
-                   COUNT(*) FILTER (WHERE compaction), COALESCE(SUM(redacted), 0)::int8 \
+                   COUNT(*) FILTER (WHERE compaction), COALESCE(SUM(redacted), 0)::int8, \
+                   COUNT(*) FILTER (WHERE past_cap) \
                  FROM memory_exchanges WHERE session = $1",
                 &[&session],
             )
@@ -471,9 +575,44 @@ impl DeskStore {
                 open: c.try_get(1)?,
                 compactions: c.try_get(2)?,
                 secrets_hidden: c.try_get(3)?,
+                past_cap: c.try_get(4)?,
             },
         ))
     }
+}
+
+/// Queues `purge` of `group`'s collection, to run once `tx` commits.
+pub(crate) async fn queue_purge(
+    tx: &tokio_postgres::Transaction<'_>,
+    group: Option<&str>,
+    purge: &Purge,
+) -> Result<()> {
+    queue_purge_of(tx, &collection_of(group), purge).await
+}
+
+/// Queues `purge` of `collection`, to run once `tx` commits.
+pub(crate) async fn queue_purge_of(
+    tx: &tokio_postgres::Transaction<'_>,
+    collection: &str,
+    purge: &Purge,
+) -> Result<()> {
+    tx.execute(
+        "INSERT INTO memory_purges (id, collection, filter, created_at) \
+         VALUES (gen_random_uuid(), $1, $2, clock_timestamp())",
+        &[&collection, &serde_json::to_value(purge)?],
+    )
+    .await
+    .context("queueing an index deletion")?;
+    Ok(())
+}
+
+/// Rows' ids (column 0) by their group (column 1).
+fn refs_by_group(rows: &[tokio_postgres::Row]) -> Result<HashMap<Option<String>, Vec<Uuid>>> {
+    let mut by: HashMap<Option<String>, Vec<Uuid>> = HashMap::new();
+    for r in rows {
+        by.entry(r.try_get(1)?).or_default().push(r.try_get(0)?);
+    }
+    Ok(by)
 }
 
 /// Forgets what session memory holds of `ids` within `tx`, which forgets
@@ -488,6 +627,13 @@ pub(crate) async fn forget_memory_in(
 ) -> Result<()> {
     tx.execute(
         "SELECT 1 FROM sessions WHERE id = ANY($1) FOR UPDATE",
+        &[&ids],
+    )
+    .await?;
+    // Their exchanges are locked in id order, as every write of many
+    // exchanges locks them.
+    tx.execute(
+        "SELECT 1 FROM memory_exchanges WHERE session = ANY($1) ORDER BY id FOR UPDATE",
         &[&ids],
     )
     .await?;
@@ -515,6 +661,20 @@ pub(crate) async fn forget_memory_in(
     )
     .await
     .context("tombstoning forgotten records")?;
+    // What the index holds of them goes too: one purge per session for
+    // each collection its rows are in (a session moved between groups has
+    // rows in more than one).
+    for row in tx
+        .query(
+            "SELECT DISTINCT session, group_id FROM memory_exchanges WHERE session = ANY($1) \
+             UNION SELECT DISTINCT session, group_id FROM memory_items WHERE session = ANY($1)",
+            &[&ids],
+        )
+        .await?
+    {
+        let (session, group): (Uuid, Option<String>) = (row.try_get(0)?, row.try_get(1)?);
+        queue_purge(tx, group.as_deref(), &Purge::Session { session }).await?;
+    }
     let readers: Vec<String> = ids.iter().map(|id| format!("session:{id}")).collect();
     tx.execute(
         "DELETE FROM memory_reads WHERE reader = ANY($1)",
@@ -610,7 +770,7 @@ mod tests {
             let mut never = exchange("x-never", "stopped mid-turn", None);
             never.at = old;
             write(&store, s.id, &[exchange("x-old", "long ago", Some(old)), exchange("x-new", "today", Some(Utc::now()))], Some(&never)).await;
-            assert_eq!(store.sweep_memory(180).await.unwrap(), 2);
+            assert_eq!(store.sweep_memory(180).await.unwrap().gone, 2);
             let (kept, _) = store.session_memory(s.id, 10).await.unwrap();
             assert_eq!(kept.iter().map(|x| x.ask.as_str()).collect::<Vec<_>>(), ["today"]);
             assert_eq!(n(&store, "SELECT COUNT(*) FROM memory_exchanges WHERE session = $1 AND cardinality(flagged) = 1", s.id).await, 1, "what was flagged is kept with it");

@@ -14,7 +14,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::api::Authorize;
-use crate::crew::{By, Crew, Filter, Kind, ManagerView, SuggestionState};
+use crate::crew::{By, Crew, Filter, GroupBoss, Kind, ManagerView, SuggestionState};
 use crate::reads::{AllScope, Read, ReadPut};
 use crate::rooms::YOU;
 use crate::service::{Desk, DeskError};
@@ -102,9 +102,24 @@ async fn manager(State(s): S, h: HeaderMap, Query(q): Query<TokenQuery>) -> Resp
         return r;
     }
     let o = s.crew.overseer();
+    let bosses = s
+        .desk
+        .bosses()
+        .into_iter()
+        .filter_map(|b| {
+            Some(GroupBoss {
+                group: b.scope.group()?.to_string(),
+                agent_id: b.agent,
+                name: b.name,
+                level: b.level,
+            })
+        })
+        .collect();
     Json(ManagerView {
         agent_id: o.as_ref().map(|o| o.id.clone()),
         level: o.map(|o| o.level),
+        bosses,
+        sealed: s.desk.sealed(),
     })
     .into_response()
 }
@@ -414,7 +429,10 @@ mod tests {
             assert_eq!(o["brief"], Value::Null);
 
             let (_, m) = call(&app, "GET", "/api/desk/manager").await;
-            assert_eq!(m, json!({"agentId": "desk", "level": "suggest"}));
+            assert_eq!(
+                m,
+                json!({"agentId": "desk", "level": "suggest", "bosses": [], "sealed": []})
+            );
 
             let made = |text: &str| Suggestion {
                 id: crate::crew::new_id(),
@@ -482,6 +500,47 @@ mod tests {
             assert_eq!(dismissed["text"], "dismissed the suggestion about Scout");
             let (status, _) = call(&app, "POST", "/api/desk/suggestions/nope/dismiss").await;
             assert_eq!(status, StatusCode::NOT_FOUND);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn the_manager_route_says_each_groups_boss_and_the_main_overseer_apart() {
+        with_test_pool(build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let d = desk(pool, dir.path()).await;
+            let app = crew_router(d.clone(), Arc::new(Bearer), Arc::new(Hub::default()));
+            d.set_bosses(vec![
+                crate::Boss {
+                    agent: "desk".into(),
+                    name: "Desk".into(),
+                    scope: crate::scope::Scope::Ungrouped,
+                    level: "suggest".into(),
+                },
+                crate::Boss {
+                    agent: "sarah".into(),
+                    name: "Sarah".into(),
+                    scope: crate::scope::Scope::Group("g-acme".into()),
+                    level: "act".into(),
+                },
+            ]);
+            // Globex is named for a boss that oversees nothing now: sealed.
+            d.change_layout(|l| {
+                l.create("g-acme", "Acme", &[], None)?
+                    .create("g-globex", "Globex", &[], None)
+            })
+            .await
+            .unwrap();
+            d.bound_groups(["g-acme".to_string(), "g-globex".to_string()])
+                .await;
+            let (status, m) = call(&app, "GET", "/api/desk/manager").await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(m["agentId"], "desk");
+            assert_eq!(m["sealed"], json!(["g-globex"]));
+            assert_eq!(
+                m["bosses"],
+                json!([{"agentId": "sarah", "name": "Sarah", "group": "g-acme", "level": "act"}])
+            );
         })
         .await;
     }

@@ -544,6 +544,10 @@ fn options(config: &WorkforceConfig) -> Options {
             backfill_days: desk.memory.backfill_days,
             retain_days: desk.memory.retain_days,
             exclude: desk.memory.exclude.clone(),
+            max_disk_mb: desk.memory.max_disk_mb,
+            index_per_minute: desk.memory.index_per_minute,
+            session_reach: workforce_desk::memory::reach::Reach::parse(&desk.memory.session_reach)
+                .unwrap_or(workforce_desk::memory::reach::Reach::Project),
         },
     }
 }
@@ -687,6 +691,8 @@ pub async fn mount(
             &state.registry,
         )))),
         redactor: Some(Arc::new(crate::desk_memory::HubRedactor)),
+        index: crate::desk_memory_index::VellevDeskIndex::installed(config)
+            .map(|i| i as Arc<dyn workforce_desk::memory::index::MemoryIndex>),
         ..crate::floor::desk_floor()
     };
     let desk = Desk::start(store, options(config), floor, cancel)
