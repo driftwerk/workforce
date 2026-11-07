@@ -587,6 +587,7 @@ mod tests {
             restore_offer: false,
             terminal_id: None,
             display_name: None,
+            folder_chosen: false,
             asked: None,
             created_at: now,
             updated_at: now,

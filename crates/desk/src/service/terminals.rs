@@ -717,6 +717,7 @@ impl Desk {
                     restore_offer: false,
                     terminal_id: Some(terminal),
                     display_name: None,
+                    folder_chosen: false,
                     asked: None,
                     created_at: now,
                     updated_at: now,
