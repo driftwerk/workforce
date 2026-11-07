@@ -14,6 +14,43 @@ use std::path::Path;
 use crate::adopt::HubInternal;
 use crate::engine::Engine;
 
+/// What session memory keeps, as the install's `[desk.memory]` says.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryOptions {
+    /// Harvest sessions' conversations at all.
+    pub enabled: bool,
+    /// How far back a record not harvested before is read, by when its
+    /// engine last wrote it.
+    pub backfill_days: u32,
+    /// How long a conversation is kept after it ended.
+    pub retain_days: u32,
+    /// Folders never harvested.
+    pub exclude: Vec<String>,
+}
+
+impl Default for MemoryOptions {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            backfill_days: 30,
+            retain_days: 180,
+            exclude: Vec::new(),
+        }
+    }
+}
+
+/// What the person reads when a session's engine keeps no record Desk can
+/// read.
+pub const NO_RECORD: &str =
+    "Desk can't read this session's conversation, so it remembers only what it's for.";
+/// What the person reads when the hub can't hide secrets.
+pub const NO_REDACTOR: &str =
+    "Desk can't hide secrets in conversations here, so it isn't remembering them.";
+/// What the person reads when the install turned session memory off.
+pub const DISABLED: &str = "Remembering conversations is turned off for this Desk.";
+/// What a keyword search says of itself until the search index is ready.
+pub const KEYWORD_ONLY: &str = "Searching by keyword only until Desk Memory is ready.";
+
 /// Text as it may be kept: every secret in it replaced whole, and how many
 /// were. Text with none is the text itself, uncopied.
 #[derive(Debug, Clone, PartialEq, Eq)]

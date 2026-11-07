@@ -543,7 +543,7 @@ async fn a_session_finished_again_lately_is_not_cleared_by_when_it_first_finishe
         // Nor is one that runs, when its state says it finished.
         let s = new_session(&d, dir.path()).await;
         assert!(matches!(
-            d.remove_as(s.id, None, |st, r| {
+            d.remove_as(s.id, None, crate::memory_store::Memory::Forget, |st, r| {
                 if super::lifecycle::finished_before(st, r, Utc::now()) {
                     Ok(())
                 } else {

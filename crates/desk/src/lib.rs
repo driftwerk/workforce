@@ -41,6 +41,7 @@ mod line_api;
 pub mod line_store;
 pub mod local;
 pub mod memory;
+pub mod memory_store;
 pub mod model;
 pub mod overview;
 mod procs;
@@ -77,9 +78,9 @@ pub use service::{
 };
 pub use service::{
     local_agent_item, session_item, Clearing, Desk, DeskError, Floor, Group, Hidden, HolderOptions,
-    Import, Imported, Layout, LedgerPage, LineError, NewTerminal, Options, Removal, Removed,
-    RestorePolicy, Sender as LineSender, SessionMcp, SpendQuery, TerminalPatch, TerminalState,
-    TerminalView, Ungrouped, UNGROUPED,
+    Import, Imported, Layout, LedgerPage, LineError, MemoryHitView, MemorySearch, NewTerminal,
+    Options, Removal, Removed, RestorePolicy, Sender as LineSender, SessionMcp, SessionMemory,
+    SpendQuery, TerminalPatch, TerminalState, TerminalView, Ungrouped, UNGROUPED,
 };
 pub use service::{
     AssignTo, BoardPatch, ChargedTo, Move, NewBoard, NewSessionFor, NewTicket, TicketPatch,

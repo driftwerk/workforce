@@ -237,6 +237,9 @@ pub enum Hook {
     SubagentStart(String),
     SubagentStop(String),
     SessionEnd,
+    /// Claude Code is about to compact the conversation: its record is
+    /// read now, ahead of everything else, so a flush never waits.
+    PreCompact,
     /// Desk's plugin reporting the plan's rate limits (`DeskUsage`).
     Usage(Value),
     Other,
@@ -362,6 +365,7 @@ pub fn parse_hook(body: &[u8]) -> eyre::Result<Hook> {
         "SubagentStart" => p.agent_id.map_or(Hook::Other, Hook::SubagentStart),
         "SubagentStop" => p.agent_id.map_or(Hook::Other, Hook::SubagentStop),
         "SessionEnd" => Hook::SessionEnd,
+        "PreCompact" => Hook::PreCompact,
         "DeskUsage" => Hook::Usage(p.rate_limits.unwrap_or(Value::Null)),
         _ => Hook::Other,
     })
@@ -667,6 +671,10 @@ pub(crate) mod tests {
             Some(&json!({"notebook_path": "/etc/n.ipynb"})),
         );
         assert_eq!(detail, "/etc/n.ipynb");
+        assert_eq!(
+            parse_hook(br#"{"hook_event_name":"PreCompact","trigger":"auto","transcript_path":"/t.jsonl"}"#).unwrap(),
+            Hook::PreCompact
+        );
         let stop = br#"{"hook_event_name":"Stop","transcript_path":"/t.jsonl","last_assistant_message":"desk-e2e-dir"}"#;
         assert_eq!(
             parse_hook(stop).unwrap(),

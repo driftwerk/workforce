@@ -135,7 +135,8 @@ impl DeskStore {
         let client = self.pool().get().await?;
         let row = client
             .query_opt(
-                "SELECT read_to, seen FROM ledger_cursors WHERE session = $1 AND source = $2",
+                "SELECT read_to, seen, harvested_to, harvest FROM ledger_cursors \
+                 WHERE session = $1 AND source = $2",
                 &[&session, &source],
             )
             .await?;
@@ -143,7 +144,8 @@ impl DeskStore {
             Ok(Cursor {
                 read_to: u64::try_from(r.try_get::<_, i64>(0)?).unwrap_or(0),
                 seen: r.try_get(1)?,
-                ..Cursor::default()
+                harvested_to: u64::try_from(r.try_get::<_, i64>(2)?).unwrap_or(0),
+                harvest: r.try_get(3)?,
             })
         })
         .transpose()
@@ -168,71 +170,7 @@ impl DeskStore {
     ) -> Result<u64> {
         let mut client = self.pool().get().await?;
         let tx = client.transaction().await?;
-        let mut changed = 0;
-        if !rows.is_empty() {
-            let col = |f: &dyn Fn(&Kept) -> i64| rows.iter().map(f).collect::<Vec<i64>>();
-            let keys: Vec<&str> = rows.iter().map(|r| r.spend.key.as_str()).collect();
-            let ats: Vec<DateTime<Utc>> = rows.iter().map(|r| r.spend.at).collect();
-            let models: Vec<Option<&str>> = rows.iter().map(|r| r.spend.model.as_deref()).collect();
-            let usds: Vec<Option<f64>> = rows.iter().map(|r| r.spend.usd).collect();
-            let priced: Vec<&str> = rows.iter().map(|r| r.spend.priced.as_str()).collect();
-            let billing: Vec<&str> = rows.iter().map(|r| r.billing.as_str()).collect();
-            let accounts: Vec<Option<&str>> = rows.iter().map(|r| r.account.as_deref()).collect();
-            changed = tx
-                .execute(
-                    "INSERT INTO ledger (engine, key, session, at, model, input, output, \
-                     cache_read, cache_write, reasoning, usd, priced, billing, account, ticket, \
-                     group_id) \
-                     SELECT $1, k, $2, a, m, i, o, cr, cw, r, u, p, b, acc, ( \
-                       SELECT w.ticket FROM ticket_assignments w \
-                       WHERE w.session = $2::uuid AND w.from_at <= a \
-                         AND (w.until_at IS NULL OR a < w.until_at) \
-                       ORDER BY w.from_at DESC LIMIT 1), ( \
-                       SELECT NULLIF(g.group_id, 'ungrouped') FROM group_members g \
-                       WHERE g.item = 'session:' || $2::uuid::text) FROM UNNEST( \
-                       $3::text[], $4::timestamptz[], $5::text[], $6::int8[], $7::int8[], \
-                       $8::int8[], $9::int8[], $10::int8[], $11::float8[], $12::text[], \
-                       $13::text[], $14::text[]) AS t(k, a, m, i, o, cr, cw, r, u, p, b, acc) \
-                     ON CONFLICT (engine, key) DO UPDATE SET \
-                       model = COALESCE(EXCLUDED.model, ledger.model), \
-                       input = GREATEST(ledger.input, EXCLUDED.input), \
-                       output = GREATEST(ledger.output, EXCLUDED.output), \
-                       cache_read = GREATEST(ledger.cache_read, EXCLUDED.cache_read), \
-                       cache_write = GREATEST(ledger.cache_write, EXCLUDED.cache_write), \
-                       reasoning = GREATEST(ledger.reasoning, EXCLUDED.reasoning), \
-                       usd = COALESCE(EXCLUDED.usd, ledger.usd), \
-                       priced = CASE WHEN EXCLUDED.usd IS NULL THEN ledger.priced \
-                                ELSE EXCLUDED.priced END, \
-                       billing = CASE WHEN ledger.billing = 'unknown' THEN EXCLUDED.billing \
-                                 ELSE ledger.billing END, \
-                       account = COALESCE(ledger.account, EXCLUDED.account) \
-                     WHERE (ledger.model IS NULL AND EXCLUDED.model IS NOT NULL) \
-                        OR (ledger.usd IS NULL AND EXCLUDED.usd IS NOT NULL) \
-                        OR EXCLUDED.input > ledger.input OR EXCLUDED.output > ledger.output \
-                        OR EXCLUDED.cache_read > ledger.cache_read \
-                        OR EXCLUDED.cache_write > ledger.cache_write \
-                        OR (ledger.billing = 'unknown' AND EXCLUDED.billing <> 'unknown') \
-                        OR (ledger.account IS NULL AND EXCLUDED.account IS NOT NULL)",
-                    &[
-                        &engine.as_str(),
-                        &session,
-                        &keys,
-                        &ats,
-                        &models,
-                        &col(&|r| count(r.spend.tokens.input)),
-                        &col(&|r| count(r.spend.tokens.output)),
-                        &col(&|r| count(r.spend.tokens.cache_read)),
-                        &col(&|r| count(r.spend.tokens.cache_write)),
-                        &col(&|r| count(r.spend.tokens.reasoning)),
-                        &usds,
-                        &priced,
-                        &billing,
-                        &accounts,
-                    ],
-                )
-                .await
-                .context("keeping ledger rows")?;
-        }
+        let changed = ledger_write_in(&tx, session, engine, rows).await?;
         if let Some((source, cursor)) = source {
             tx.execute(
                 "INSERT INTO ledger_cursors (session, source, read_to, seen, updated_at) \
@@ -394,4 +332,80 @@ impl DeskStore {
             .await?;
         rows.iter().map(crate::store::record).collect()
     }
+}
+
+/// [`DeskStore::ledger_write`]'s rows within `tx`: how many were added or
+/// completed.
+pub(crate) async fn ledger_write_in(
+    tx: &tokio_postgres::Transaction<'_>,
+    session: Uuid,
+    engine: Engine,
+    rows: &[Kept],
+) -> Result<u64> {
+    let mut changed = 0;
+    if !rows.is_empty() {
+        let col = |f: &dyn Fn(&Kept) -> i64| rows.iter().map(f).collect::<Vec<i64>>();
+        let keys: Vec<&str> = rows.iter().map(|r| r.spend.key.as_str()).collect();
+        let ats: Vec<DateTime<Utc>> = rows.iter().map(|r| r.spend.at).collect();
+        let models: Vec<Option<&str>> = rows.iter().map(|r| r.spend.model.as_deref()).collect();
+        let usds: Vec<Option<f64>> = rows.iter().map(|r| r.spend.usd).collect();
+        let priced: Vec<&str> = rows.iter().map(|r| r.spend.priced.as_str()).collect();
+        let billing: Vec<&str> = rows.iter().map(|r| r.billing.as_str()).collect();
+        let accounts: Vec<Option<&str>> = rows.iter().map(|r| r.account.as_deref()).collect();
+        changed = tx
+            .execute(
+                "INSERT INTO ledger (engine, key, session, at, model, input, output, \
+                     cache_read, cache_write, reasoning, usd, priced, billing, account, ticket, \
+                     group_id) \
+                     SELECT $1, k, $2, a, m, i, o, cr, cw, r, u, p, b, acc, ( \
+                       SELECT w.ticket FROM ticket_assignments w \
+                       WHERE w.session = $2::uuid AND w.from_at <= a \
+                         AND (w.until_at IS NULL OR a < w.until_at) \
+                       ORDER BY w.from_at DESC LIMIT 1), ( \
+                       SELECT NULLIF(g.group_id, 'ungrouped') FROM group_members g \
+                       WHERE g.item = 'session:' || $2::uuid::text) FROM UNNEST( \
+                       $3::text[], $4::timestamptz[], $5::text[], $6::int8[], $7::int8[], \
+                       $8::int8[], $9::int8[], $10::int8[], $11::float8[], $12::text[], \
+                       $13::text[], $14::text[]) AS t(k, a, m, i, o, cr, cw, r, u, p, b, acc) \
+                     ON CONFLICT (engine, key) DO UPDATE SET \
+                       model = COALESCE(EXCLUDED.model, ledger.model), \
+                       input = GREATEST(ledger.input, EXCLUDED.input), \
+                       output = GREATEST(ledger.output, EXCLUDED.output), \
+                       cache_read = GREATEST(ledger.cache_read, EXCLUDED.cache_read), \
+                       cache_write = GREATEST(ledger.cache_write, EXCLUDED.cache_write), \
+                       reasoning = GREATEST(ledger.reasoning, EXCLUDED.reasoning), \
+                       usd = COALESCE(EXCLUDED.usd, ledger.usd), \
+                       priced = CASE WHEN EXCLUDED.usd IS NULL THEN ledger.priced \
+                                ELSE EXCLUDED.priced END, \
+                       billing = CASE WHEN ledger.billing = 'unknown' THEN EXCLUDED.billing \
+                                 ELSE ledger.billing END, \
+                       account = COALESCE(ledger.account, EXCLUDED.account) \
+                     WHERE (ledger.model IS NULL AND EXCLUDED.model IS NOT NULL) \
+                        OR (ledger.usd IS NULL AND EXCLUDED.usd IS NOT NULL) \
+                        OR EXCLUDED.input > ledger.input OR EXCLUDED.output > ledger.output \
+                        OR EXCLUDED.cache_read > ledger.cache_read \
+                        OR EXCLUDED.cache_write > ledger.cache_write \
+                        OR (ledger.billing = 'unknown' AND EXCLUDED.billing <> 'unknown') \
+                        OR (ledger.account IS NULL AND EXCLUDED.account IS NOT NULL)",
+                &[
+                    &engine.as_str(),
+                    &session,
+                    &keys,
+                    &ats,
+                    &models,
+                    &col(&|r| count(r.spend.tokens.input)),
+                    &col(&|r| count(r.spend.tokens.output)),
+                    &col(&|r| count(r.spend.tokens.cache_read)),
+                    &col(&|r| count(r.spend.tokens.cache_write)),
+                    &col(&|r| count(r.spend.tokens.reasoning)),
+                    &usds,
+                    &priced,
+                    &billing,
+                    &accounts,
+                ],
+            )
+            .await
+            .context("keeping ledger rows")?;
+    }
+    Ok(changed)
 }

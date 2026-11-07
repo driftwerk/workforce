@@ -754,6 +754,144 @@ pub struct DeskConfig {
     /// agent's, and never Desk's own sessions or terminals. Default: none.
     #[serde(default)]
     pub forget_agents: Vec<String>,
+    /// Session memory (`[desk.memory]`): what Desk keeps of its sessions'
+    /// conversations, and its limits.
+    #[serde(default)]
+    pub memory: DeskMemoryConfig,
+}
+
+/// `[desk.memory]`: the install's defaults and limits for session memory.
+/// The person's own switches (pause, per group) are Desk's settings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeskMemoryConfig {
+    /// Harvest sessions' conversations at all. Default: on.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Who writes decisions, facts and todos: the hub's cheap model
+    /// (`cheap`), or no one (`off`).
+    #[serde(default = "default_desk_memory_derive")]
+    pub derive: String,
+    /// How far back an upgrade reads sessions' history, in days.
+    #[serde(default = "default_desk_memory_backfill_days")]
+    pub backfill_days: u32,
+    /// How long a conversation is kept after it ended, in days; notes stay
+    /// until forgotten.
+    #[serde(default = "default_desk_memory_retain_days")]
+    pub retain_days: u32,
+    /// The most disk session memory may use, in MB.
+    #[serde(default = "default_desk_memory_max_disk_mb")]
+    pub max_disk_mb: u64,
+    /// The most passages written to the search index a minute.
+    #[serde(default = "default_desk_memory_index_per_minute")]
+    pub index_per_minute: u32,
+    /// The most calls the cheap model makes a day to note decisions.
+    #[serde(default = "default_desk_memory_derive_calls_per_day")]
+    pub derive_calls_per_day: u32,
+    /// The most a session's recall may cover: `work`, `project` or `group`.
+    #[serde(default = "default_desk_memory_session_reach")]
+    pub session_reach: String,
+    /// The largest brief a handoff gives, in tokens.
+    #[serde(default = "default_desk_memory_brief_max_tokens")]
+    pub brief_max_tokens: u32,
+    /// Folders never harvested (`~/clients/secret-x/**`).
+    #[serde(default)]
+    pub exclude: Vec<String>,
+}
+
+impl Default for DeskMemoryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            derive: default_desk_memory_derive(),
+            backfill_days: default_desk_memory_backfill_days(),
+            retain_days: default_desk_memory_retain_days(),
+            max_disk_mb: default_desk_memory_max_disk_mb(),
+            index_per_minute: default_desk_memory_index_per_minute(),
+            derive_calls_per_day: default_desk_memory_derive_calls_per_day(),
+            session_reach: default_desk_memory_session_reach(),
+            brief_max_tokens: default_desk_memory_brief_max_tokens(),
+            exclude: Vec::new(),
+        }
+    }
+}
+
+impl DeskMemoryConfig {
+    /// Refuses a setting that can't work, saying so in plain words.
+    pub fn validate(&self) -> eyre::Result<()> {
+        let fail = |why: String| Err(eyre::eyre!("[desk.memory] {why}"));
+        if !["cheap", "off"].contains(&self.derive.as_str()) {
+            return fail(format!(
+                "derive must be \"cheap\" or \"off\", not \"{}\"",
+                self.derive
+            ));
+        }
+        if !["work", "project", "group"].contains(&self.session_reach.as_str()) {
+            return fail(format!(
+                "session_reach must be \"work\", \"project\" or \"group\", not \"{}\"",
+                self.session_reach
+            ));
+        }
+        if self.retain_days < 7 {
+            return fail("retain_days must be at least 7.".into());
+        }
+        if self.backfill_days > self.retain_days {
+            return fail(format!(
+                "backfill_days must be no more than retain_days ({}): history older than that would be read only to be deleted.",
+                self.retain_days
+            ));
+        }
+        if self.max_disk_mb < 64 {
+            return fail("max_disk_mb must be at least 64.".into());
+        }
+        if self.index_per_minute == 0 {
+            return fail("index_per_minute must be at least 1.".into());
+        }
+        if self.brief_max_tokens < 4000 {
+            return fail("brief_max_tokens must be at least 4000.".into());
+        }
+        if let Some(bad) = self.exclude.iter().find(|f| {
+            let f = f.trim();
+            f.is_empty() || !(f.starts_with('/') || f == "~" || f.starts_with("~/"))
+        }) {
+            return fail(format!(
+                "exclude names folders from the root (/…) or the home folder (~/…), not \"{bad}\"."
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn default_desk_memory_derive() -> String {
+    "cheap".into()
+}
+
+fn default_desk_memory_backfill_days() -> u32 {
+    30
+}
+
+fn default_desk_memory_retain_days() -> u32 {
+    180
+}
+
+fn default_desk_memory_max_disk_mb() -> u64 {
+    4096
+}
+
+fn default_desk_memory_index_per_minute() -> u32 {
+    600
+}
+
+fn default_desk_memory_derive_calls_per_day() -> u32 {
+    200
+}
+
+fn default_desk_memory_session_reach() -> String {
+    "project".into()
+}
+
+fn default_desk_memory_brief_max_tokens() -> u32 {
+    20000
 }
 
 /// Where the sign-ins of the person's engine accounts (a second Claude
@@ -822,6 +960,7 @@ impl Default for DeskConfig {
             accounts: DeskAccounts::default(),
             agents: true,
             forget_agents: Vec::new(),
+            memory: DeskMemoryConfig::default(),
         }
     }
 }
@@ -11206,6 +11345,7 @@ impl WorkforceConfig {
 
     /// Validate the configuration.
     pub fn validate(&self) -> eyre::Result<()> {
+        self.desk.memory.validate()?;
         if self.nats.url.as_deref().is_some_and(str::is_empty) {
             return Err(eyre::eyre!("NATS URL cannot be empty"));
         }
@@ -13392,6 +13532,39 @@ role = "dev"
             shown.contains("<redacted>") && !shown.contains("very-secret"),
             "{shown}"
         );
+    }
+
+    #[test]
+    fn desk_memory_settings_are_read_and_refused_in_plain_words() {
+        let config = WorkforceConfig::from_toml(
+            "[desk.memory]\nretain_days = 90\nexclude = [\"~/clients/globex/**\"]\n",
+        )
+        .unwrap();
+        assert!(config.validate().is_ok());
+        assert_eq!(config.desk.memory.retain_days, 90);
+        assert_eq!(config.desk.memory.backfill_days, 30);
+        assert!(config.desk.memory.enabled);
+        for (toml, said) in [
+            (
+                "retain_days = 3",
+                "[desk.memory] retain_days must be at least 7.",
+            ),
+            ("derive = \"local\"", "derive must be \"cheap\" or \"off\""),
+            ("session_reach = \"everything\"", "session_reach must be"),
+            (
+                "backfill_days = 400",
+                "backfill_days must be no more than retain_days",
+            ),
+            (
+                "exclude = [\"clients\"]",
+                "exclude names folders from the root",
+            ),
+        ] {
+            let config = WorkforceConfig::from_toml(&format!("[desk.memory]\n{toml}\n")).unwrap();
+            let e = config.validate().unwrap_err().to_string();
+            assert!(e.contains(said), "{toml}: {e}");
+        }
+        assert!(WorkforceConfig::from_toml("[desk.memory]\nretain = 9\n").is_err());
     }
 
     #[test]

@@ -219,6 +219,7 @@ async fn desk_running(
             hub_internal: Default::default(),
             account_keys: None,
             line_reach: workforce_desk::line::Reach::Group,
+            memory: Default::default(),
         },
         floor,
         CancellationToken::new(),

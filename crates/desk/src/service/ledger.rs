@@ -15,6 +15,7 @@ use parking_lot::Mutex;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
+use super::memory::Harvest;
 use super::{Desk, DeskError};
 use crate::engine::{Engine, SignIn, Via};
 use crate::ledger::{
@@ -43,9 +44,17 @@ pub(super) enum Job {
     Live { session: Uuid, spend: Spend },
 }
 
+/// What the worker is given: jobs in order, and reads to make before any
+/// of them (a session about to compact, whose record must be kept first).
+pub(super) struct Jobs {
+    jobs: mpsc::UnboundedReceiver<Job>,
+    soon: mpsc::UnboundedReceiver<Uuid>,
+}
+
 /// The ledger's share of the desk.
 pub(super) struct LedgerRun {
     jobs: mpsc::UnboundedSender<Job>,
+    soon: mpsc::UnboundedSender<Uuid>,
     /// Sessions waiting to be read: a session asked for twice is read once.
     waiting: Mutex<HashSet<Uuid>>,
     /// When each working session was last read on a tool call.
@@ -57,27 +66,38 @@ pub(super) struct LedgerRun {
     signed: Mutex<BTreeMap<Engine, (SignIn, DateTime<Utc>)>>,
     pricer: Option<Arc<dyn Pricer>>,
     /// Hides secrets in what the harvest keeps; none, nothing is harvested.
-    #[allow(dead_code)] // The harvest's store reads it (SM1's storage PR).
-    redactor: Option<Arc<dyn Redactor>>,
+    pub(super) redactor: Option<Arc<dyn Redactor>>,
+    /// Sessions whose turn or run ended: their next read closes the
+    /// exchange they leave open.
+    ending: Mutex<HashSet<Uuid>>,
+    /// Each session's project, found once.
+    projects: Mutex<HashMap<Uuid, String>>,
 }
 
 impl LedgerRun {
     pub(super) fn new(
         pricer: Option<Arc<dyn Pricer>>,
         redactor: Option<Arc<dyn Redactor>>,
-    ) -> (Self, mpsc::UnboundedReceiver<Job>) {
+    ) -> (Self, Jobs) {
         let (jobs, rx) = mpsc::unbounded_channel();
+        let (soon, soon_rx) = mpsc::unbounded_channel();
         (
             Self {
                 jobs,
+                soon,
                 waiting: Mutex::default(),
                 read_at: Mutex::default(),
                 untold: Mutex::default(),
                 signed: Mutex::default(),
                 pricer,
                 redactor,
+                ending: Mutex::default(),
+                projects: Mutex::default(),
             },
-            rx,
+            Jobs {
+                jobs: rx,
+                soon: soon_rx,
+            },
         )
     }
 
@@ -188,7 +208,6 @@ fn next_line(r: &mut impl BufRead, buf: &mut Vec<u8>) -> std::io::Result<Line> {
 struct Step {
     spends: Vec<Spend>,
     /// What of the conversation its lines hold, past the harvest's offset.
-    #[allow(dead_code)] // The harvest's store reads it (SM1's storage PR).
     parts: Vec<Part>,
     cursor: Cursor,
     /// The record has nothing more to read now.
@@ -334,6 +353,19 @@ impl Desk {
         }
     }
 
+    /// Reads `id`'s records once its turn or its run has ended: the
+    /// exchange it leaves open is closed.
+    pub(super) fn spend_read_ending(&self, id: Uuid) {
+        self.0.ledger.ending.lock().insert(id);
+        self.spend_read(id);
+    }
+
+    /// Reads `id`'s records before anything else the worker has waiting:
+    /// it is about to compact, and what it said is kept first. Never waits.
+    pub(super) fn spend_read_soon(&self, id: Uuid) {
+        let _ = self.0.ledger.soon.send(id);
+    }
+
     /// Reads a working session's records on its tool calls, at most every
     /// [`WHILE_WORKING`].
     pub(super) fn spend_read_while_working(&self, id: Uuid) {
@@ -369,7 +401,8 @@ impl Desk {
     /// ones too, oldest first, so a forked conversation's copied calls stay
     /// with the session that made them), then what comes. Until the desk
     /// stops.
-    pub(super) async fn ledger_loop(self, mut jobs: mpsc::UnboundedReceiver<Job>) {
+    pub(super) async fn ledger_loop(self, jobs: Jobs) {
+        let Jobs { mut jobs, mut soon } = jobs;
         match self.0.store.every_session().await {
             Ok(all) => all.iter().for_each(|r| self.spend_read(r.id)),
             Err(e) => tracing::warn!(
@@ -378,10 +411,14 @@ impl Desk {
             ),
         }
         let mut tell = tokio::time::interval(TELL_EVERY);
+        let mut sweep = tokio::time::interval(super::memory::SWEEP_EVERY);
         loop {
             tokio::select! {
+                biased;
                 _ = self.0.cancel.cancelled() => return,
+                Some(id) = soon.recv() => self.read_spend(id).await,
                 _ = tell.tick() => self.tell_spend(),
+                _ = sweep.tick() => self.sweep_memory().await,
                 job = jobs.recv() => match job {
                     None => return,
                     Some(Job::Read(id)) => {
@@ -438,7 +475,7 @@ impl Desk {
 
     /// Where `r`'s engine keeps what it did: found from its id when the
     /// registry doesn't say.
-    fn records_of(&self, r: &SessionRecord) -> Vec<PathBuf> {
+    pub(super) fn records_of(&self, r: &SessionRecord) -> Vec<PathBuf> {
         let home = self.0.env.get("HOME").map(PathBuf::from);
         let known = r
             .transcript
@@ -469,7 +506,8 @@ impl Desk {
         }
     }
 
-    /// Reads each of `id`'s records from its cursor to its end.
+    /// Reads each of `id`'s records from its cursor to its end, for the
+    /// ledger and, where it may be, for session memory.
     async fn read_spend(&self, id: Uuid) {
         let Some(r) = self.session_record(id).await else {
             return;
@@ -480,35 +518,81 @@ impl Desk {
         {
             return;
         }
-        let records = {
+        let known = self.0.ledger.projects.lock().get(&id).cloned();
+        let (records, project) = {
             let desk = self.clone();
             let r = r.clone();
-            tokio::task::spawn_blocking(move || desk.records_of(&r))
-                .await
-                .unwrap_or_default()
+            let cwd = r.cwd.clone();
+            tokio::task::spawn_blocking(move || {
+                let project = known.unwrap_or_else(|| crate::worktree::git_project(&r.cwd));
+                (desk.records_of(&r), project)
+            })
+            .await
+            .unwrap_or_else(|_| (Vec::new(), cwd))
         };
-        for path in records {
-            if let Err(e) = self.read_record(&r, &path).await {
-                tracing::warn!(session = %id, error = %e, "couldn't read a session's spend");
+        self.0.ledger.projects.lock().insert(id, project.clone());
+        let ending = self.0.ledger.ending.lock().remove(&id);
+        let modes = self.harvest_modes(&r, &records).await;
+        for (path, mode) in records.iter().zip(modes) {
+            if let Err(e) = self.read_record(&r, path, mode, ending, &project).await {
+                tracing::warn!(session = %id, error = %e, "couldn't read a session's record");
             }
         }
     }
 
-    async fn read_record(&self, r: &SessionRecord, path: &Path) -> eyre::Result<()> {
+    /// Reads `path`, one of `r`'s records, from its cursor to its end.
+    /// `ending`: its session's turn or run ended, so the exchange it leaves
+    /// open is closed. The reading, folding and redacting are done off the
+    /// async runtime.
+    async fn read_record(
+        &self,
+        r: &SessionRecord,
+        path: &Path,
+        mode: Harvest,
+        ending: bool,
+        project: &str,
+    ) -> eyre::Result<()> {
         let source = path.to_string_lossy().into_owned();
         loop {
-            let cursor = self
+            let loaded = self
                 .0
                 .store
                 .ledger_cursor(r.id, &source)
                 .await?
                 .unwrap_or_default();
-            let step = {
-                let (engine, path, cursor) = (r.engine, path.to_path_buf(), cursor.clone());
-                tokio::task::spawn_blocking(move || read_step(engine, &path, &cursor, false))
-                    .await??
+            let cursor = self.harvest_begins(&loaded, path, mode);
+            let redactor = self.0.ledger.redactor.clone();
+            let (step, next, open, closed) = {
+                let (engine, path) = (r.engine, path.to_path_buf());
+                tokio::task::spawn_blocking(move || {
+                    let on = mode == Harvest::On;
+                    let mut step = read_step(engine, &path, &cursor, on)?;
+                    let mut next = std::mem::take(&mut step.cursor);
+                    if mode == Harvest::Skip {
+                        // Never to be remembered: the harvest goes on with
+                        // the ledger.
+                        next.harvested_to = next.read_to;
+                    }
+                    let (mut open, mut closed) = (None, Vec::new());
+                    if let (Harvest::On, Some(redactor)) = (mode, redactor.as_deref()) {
+                        let mut h = Harvested::of(&next.harvest);
+                        let parts = std::mem::take(&mut step.parts);
+                        (open, closed) =
+                            crate::memory::record::fold(h.open.take(), parts, redactor);
+                        if ending && step.done {
+                            if let Some(mut x) = open.take() {
+                                x.ended = Some(Utc::now());
+                                closed.push(x);
+                            }
+                        }
+                        h.open = open.clone();
+                        next.harvest = h.value();
+                    }
+                    Ok::<_, std::io::Error>((step, next, open, closed))
+                })
+                .await??
             };
-            if step.cursor == cursor && step.spends.is_empty() {
+            if next == loaded && step.spends.is_empty() {
                 return Ok(());
             }
             let on = self.account_name(r.account);
@@ -520,7 +604,17 @@ impl Desk {
             let changed = self
                 .0
                 .store
-                .ledger_write(r.id, r.engine, Some((&source, &step.cursor)), &kept)
+                .record_write(&crate::memory_store::RecordWrite {
+                    session: r.id,
+                    engine: r.engine,
+                    source: &source,
+                    cursor: &next,
+                    rows: &kept,
+                    closed: &closed,
+                    open: open.as_ref(),
+                    project,
+                    folder: &r.cwd,
+                })
                 .await?;
             if changed > 0 {
                 self.0.ledger.untold.lock().insert(r.id);
