@@ -196,7 +196,7 @@ impl DeskStore {
     pub async fn forget_sessions(&self, ids: &[Uuid], owner: &str) -> Result<u64> {
         let mut client = self.pool.get().await?;
         let tx = client.transaction().await?;
-        let gone = forget_in(&tx, ids, owner).await?;
+        let gone = forget_in(&tx, ids, owner, crate::memory_store::Memory::Forget).await?;
         tx.commit().await?;
         Ok(gone)
     }
@@ -207,10 +207,13 @@ pub(crate) async fn forget_in(
     tx: &tokio_postgres::Transaction<'_>,
     ids: &[Uuid],
     owner: &str,
+    memory: crate::memory_store::Memory,
 ) -> Result<u64> {
     // What session memory holds of them, while their records are still
-    // known to tombstone.
-    crate::memory_store::forget_memory_in(tx, ids).await?;
+    // known to tombstone; a session only cleared away keeps it.
+    if memory == crate::memory_store::Memory::Forget {
+        crate::memory_store::forget_memory_in(tx, ids).await?;
+    }
     let places: Vec<String> = ids
         .iter()
         .map(|id| ReadPlace::Session(*id).to_string())

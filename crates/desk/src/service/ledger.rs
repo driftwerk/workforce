@@ -67,6 +67,11 @@ pub(super) struct LedgerRun {
     pricer: Option<Arc<dyn Pricer>>,
     /// Hides secrets in what the harvest keeps; none, nothing is harvested.
     pub(super) redactor: Option<Arc<dyn Redactor>>,
+    /// Sessions whose turn or run ended: their next read closes the
+    /// exchange they leave open.
+    ending: Mutex<HashSet<Uuid>>,
+    /// Each session's project, found once.
+    projects: Mutex<HashMap<Uuid, String>>,
 }
 
 impl LedgerRun {
@@ -86,6 +91,8 @@ impl LedgerRun {
                 signed: Mutex::default(),
                 pricer,
                 redactor,
+                ending: Mutex::default(),
+                projects: Mutex::default(),
             },
             Jobs {
                 jobs: rx,
@@ -346,6 +353,13 @@ impl Desk {
         }
     }
 
+    /// Reads `id`'s records once its turn or its run has ended: the
+    /// exchange it leaves open is closed.
+    pub(super) fn spend_read_ending(&self, id: Uuid) {
+        self.0.ledger.ending.lock().insert(id);
+        self.spend_read(id);
+    }
+
     /// Reads `id`'s records before anything else the worker has waiting:
     /// it is about to compact, and what it said is kept first. Never waits.
     pub(super) fn spend_read_soon(&self, id: Uuid) {
@@ -504,22 +518,40 @@ impl Desk {
         {
             return;
         }
-        let records = {
+        let known = self.0.ledger.projects.lock().get(&id).cloned();
+        let (records, project) = {
             let desk = self.clone();
             let r = r.clone();
-            tokio::task::spawn_blocking(move || desk.records_of(&r))
-                .await
-                .unwrap_or_default()
+            let cwd = r.cwd.clone();
+            tokio::task::spawn_blocking(move || {
+                let project = known.unwrap_or_else(|| crate::worktree::git_project(&r.cwd));
+                (desk.records_of(&r), project)
+            })
+            .await
+            .unwrap_or_else(|_| (Vec::new(), cwd))
         };
+        self.0.ledger.projects.lock().insert(id, project.clone());
+        let ending = self.0.ledger.ending.lock().remove(&id);
         let modes = self.harvest_modes(&r, &records).await;
         for (path, mode) in records.iter().zip(modes) {
-            if let Err(e) = self.read_record(&r, path, mode).await {
+            if let Err(e) = self.read_record(&r, path, mode, ending, &project).await {
                 tracing::warn!(session = %id, error = %e, "couldn't read a session's record");
             }
         }
     }
 
-    async fn read_record(&self, r: &SessionRecord, path: &Path, mode: Harvest) -> eyre::Result<()> {
+    /// Reads `path`, one of `r`'s records, from its cursor to its end.
+    /// `ending`: its session's turn or run ended, so the exchange it leaves
+    /// open is closed. The reading, folding and redacting are done off the
+    /// async runtime.
+    async fn read_record(
+        &self,
+        r: &SessionRecord,
+        path: &Path,
+        mode: Harvest,
+        ending: bool,
+        project: &str,
+    ) -> eyre::Result<()> {
         let source = path.to_string_lossy().into_owned();
         loop {
             let loaded = self
@@ -529,26 +561,36 @@ impl Desk {
                 .await?
                 .unwrap_or_default();
             let cursor = self.harvest_begins(&loaded, path, mode);
-            let step = {
-                let (engine, path, cursor) = (r.engine, path.to_path_buf(), cursor.clone());
-                let on = mode == Harvest::On;
-                tokio::task::spawn_blocking(move || read_step(engine, &path, &cursor, on)).await??
-            };
-            let mut next = step.cursor;
-            if mode == Harvest::Skip {
-                // Never to be remembered: the harvest goes on with the ledger.
-                next.harvested_to = next.read_to;
-            }
-            let (open, closed) = match (mode, self.0.ledger.redactor.as_deref()) {
-                (Harvest::On, Some(redactor)) => {
-                    let mut h = Harvested::of(&next.harvest);
-                    let (open, closed) =
-                        crate::memory::record::fold(h.open.take(), step.parts, redactor);
-                    h.open = open.clone();
-                    next.harvest = h.value();
-                    (open, closed)
-                }
-                _ => (None, Vec::new()),
+            let redactor = self.0.ledger.redactor.clone();
+            let (step, next, open, closed) = {
+                let (engine, path) = (r.engine, path.to_path_buf());
+                tokio::task::spawn_blocking(move || {
+                    let on = mode == Harvest::On;
+                    let mut step = read_step(engine, &path, &cursor, on)?;
+                    let mut next = std::mem::take(&mut step.cursor);
+                    if mode == Harvest::Skip {
+                        // Never to be remembered: the harvest goes on with
+                        // the ledger.
+                        next.harvested_to = next.read_to;
+                    }
+                    let (mut open, mut closed) = (None, Vec::new());
+                    if let (Harvest::On, Some(redactor)) = (mode, redactor.as_deref()) {
+                        let mut h = Harvested::of(&next.harvest);
+                        let parts = std::mem::take(&mut step.parts);
+                        (open, closed) =
+                            crate::memory::record::fold(h.open.take(), parts, redactor);
+                        if ending && step.done {
+                            if let Some(mut x) = open.take() {
+                                x.ended = Some(Utc::now());
+                                closed.push(x);
+                            }
+                        }
+                        h.open = open.clone();
+                        next.harvest = h.value();
+                    }
+                    Ok::<_, std::io::Error>((step, next, open, closed))
+                })
+                .await??
             };
             if next == loaded && step.spends.is_empty() {
                 return Ok(());
@@ -570,7 +612,7 @@ impl Desk {
                     rows: &kept,
                     closed: &closed,
                     open: open.as_ref(),
-                    project: crate::worktree::project_of(&r.cwd),
+                    project,
                     folder: &r.cwd,
                 })
                 .await?;

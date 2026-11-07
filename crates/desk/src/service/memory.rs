@@ -29,10 +29,12 @@ const LIST_MAX: i64 = 200;
 pub(super) enum Harvest {
     /// Harvest it from its own offset.
     On,
-    /// Keep its offset where it is, so nothing is lost: no redactor,
-    /// harvesting turned off for the install, or paused.
+    /// Keep its offset where it is, so nothing is lost: there is no
+    /// redactor yet to keep it safely.
     Hold,
-    /// Never remember it: its offset follows the ledger's.
+    /// Never remember it: its offset follows the ledger's. Remembering
+    /// turned off (for the install, the person's pause, the session, its
+    /// group, its folder) means nothing said meanwhile is ever kept.
     Skip,
 }
 
@@ -98,7 +100,7 @@ impl Desk {
     /// Whether `r`'s conversation is harvested now, and if not, why.
     async fn why_not(&self, r: &SessionRecord, records: &[PathBuf]) -> Result<(), Why> {
         if !self.0.opts.memory.enabled {
-            return Err(Why::Hold(crate::memory::DISABLED.into()));
+            return Err(Why::Skip(crate::memory::DISABLED.into()));
         }
         if self.0.ledger.redactor.is_none() {
             return Err(Why::Hold(crate::memory::NO_REDACTOR.into()));
@@ -138,7 +140,6 @@ impl Desk {
             engine: r.engine,
             cwd: &r.cwd,
             name: &r.name,
-            pid: r.external_pid,
             cli_session_id: r.cli_session_id.as_deref(),
             source: &source,
             memory_on: facts.memory_on,
@@ -150,13 +151,9 @@ impl Desk {
             exclude: &self.0.opts.memory.exclude,
             home: home.as_deref(),
             forgotten: &facts.forgotten,
-            procs: &[],
         };
-        match harvestable(&subject, &self.0.opts.hub_internal, &switches) {
-            Ok(()) => Ok(()),
-            Err(Skip::Paused) => Err(Why::Hold(Skip::Paused.plain().into())),
-            Err(skip) => Err(Why::Skip(skip.plain().into())),
-        }
+        harvestable(&subject, &self.0.opts.hub_internal, &switches)
+            .map_err(|skip| Why::Skip(skip.plain().into()))
     }
 
     /// `cursor` with its harvest's beginning decided, the first time it is
@@ -352,7 +349,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn without_a_redactor_or_while_paused_nothing_is_harvested_and_nothing_lost() {
+    async fn without_a_redactor_nothing_is_lost_and_while_paused_nothing_is_kept() {
         with_test_pool(build_pool, |pool| async move {
             let dir = tempfile::tempdir().unwrap();
             DeskStore::migrate(&pool).await.unwrap();
@@ -372,7 +369,7 @@ mod tests {
                 r.state = crate::model::SessionState::Closed;
                 r
             };
-            let (bare, paused) = (put("acme-bare"), put("acme-paused"));
+            let bare = put("acme-bare");
             // An old record: its engine last wrote it before the backfill.
             let old = put("acme-old");
             std::fs::File::options()
@@ -381,20 +378,44 @@ mod tests {
                 .unwrap()
                 .set_modified(std::time::SystemTime::now() - Duration::from_secs(90 * 24 * 3600))
                 .unwrap();
-            for r in [&bare, &paused, &old] {
+            for r in [&bare, &old] {
                 store.put(r).await.unwrap();
             }
+            let start = |floor: super::super::Floor| {
+                let cancel = tokio_util::sync::CancellationToken::new();
+                let pool = pool.clone();
+                let dir = dir.path().to_path_buf();
+                async move {
+                    let d = Desk::start(
+                        DeskStore::from_pool(pool),
+                        crate::testing::options(&dir),
+                        floor,
+                        cancel.clone(),
+                    )
+                    .await
+                    .unwrap();
+                    (d, cancel)
+                }
+            };
+            let floor = || super::super::Floor {
+                redactor: Some(Arc::new(Plain)),
+                ..Default::default()
+            };
+            let until_harvested = |d: Desk, id: Uuid| async move {
+                for _ in 0..400 {
+                    let c = cursor_of(&d, id).await;
+                    if c.as_ref()
+                        .is_some_and(|c| c.harvested_to > 0 && c.harvested_to == c.read_to)
+                    {
+                        return c.unwrap();
+                    }
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+                panic!("the harvest never caught up");
+            };
 
             // No redactor: the ledger reads on, the harvest holds.
-            let cancel = tokio_util::sync::CancellationToken::new();
-            let d = Desk::start(
-                DeskStore::from_pool(pool.clone()),
-                crate::testing::options(dir.path()),
-                Default::default(),
-                cancel.clone(),
-            )
-            .await
-            .unwrap();
+            let (d, cancel) = start(Default::default()).await;
             let c = read_through(&d, bare.id).await;
             assert_eq!(c.harvested_to, 0);
             let m = d.session_memory(bare.id).await.unwrap();
@@ -404,74 +425,98 @@ mod tests {
             );
             cancel.cancel();
 
-            // Paused: still held.
-            store
-                .put_setting(crate::memory_store::PAUSED, &serde_json::json!(true))
-                .await
-                .unwrap();
-            let floor = || super::super::Floor {
-                redactor: Some(Arc::new(Plain)),
-                ..Default::default()
-            };
-            let cancel = tokio_util::sync::CancellationToken::new();
-            let d = Desk::start(
-                DeskStore::from_pool(pool.clone()),
-                crate::testing::options(dir.path()),
-                floor(),
-                cancel.clone(),
-            )
-            .await
-            .unwrap();
-            d.spend_read(paused.id);
-            tokio::time::sleep(Duration::from_millis(300)).await;
-            assert_eq!(read_through(&d, paused.id).await.harvested_to, 0);
-            assert!(d
-                .session_memory(paused.id)
-                .await
-                .unwrap()
-                .exchanges
-                .is_empty());
-            cancel.cancel();
-
-            // Unpaused, with a redactor: what was held is harvested now, and
-            // the old record's history never is.
-            store
-                .put_setting(crate::memory_store::PAUSED, &serde_json::json!(false))
-                .await
-                .unwrap();
-            let d = Desk::start(
-                DeskStore::from_pool(pool.clone()),
-                crate::testing::options(dir.path()),
-                floor(),
-                Default::default(),
-            )
-            .await
-            .unwrap();
-            for _ in 0..400 {
-                if d.session_memory(paused.id).await.unwrap().counts.exchanges == 5 {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(25)).await;
-            }
-            let m = d.session_memory(paused.id).await.unwrap();
-            assert_eq!(m.counts.exchanges, 5, "nothing said while paused was lost");
+            // With one, what was held is harvested; the old record's history
+            // never is.
+            let (d, cancel) = start(floor()).await;
+            until_harvested(d.clone(), bare.id).await;
+            let m = d.session_memory(bare.id).await.unwrap();
+            assert_eq!(
+                m.counts.exchanges, 6,
+                "nothing held for a redactor was lost"
+            );
             assert!(m.remembering);
-            let c = read_through(&d, old.id).await;
-            for _ in 0..400 {
-                if cursor_of(&d, old.id)
-                    .await
-                    .is_some_and(|c| c.harvested_to > 0)
-                {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(25)).await;
-            }
-            assert_eq!(cursor_of(&d, old.id).await.unwrap().harvested_to, c.read_to);
+            let c = until_harvested(d.clone(), old.id).await;
+            assert_eq!(c.harvested_to, c.read_to);
             assert_eq!(
                 d.session_memory(old.id).await.unwrap().counts.exchanges,
                 0,
                 "older than backfill_days"
             );
+            cancel.cancel();
+
+            // Paused: the harvest goes on with the ledger, and nothing said
+            // meanwhile is kept, then or after.
+            store
+                .put_setting(crate::memory_store::PAUSED, &serde_json::json!(true))
+                .await
+                .unwrap();
+            let paused = put("acme-paused");
+            store.put(&paused).await.unwrap();
+            let (d, cancel) = start(floor()).await;
+            until_harvested(d.clone(), paused.id).await;
+            let m = d.session_memory(paused.id).await.unwrap();
+            assert_eq!(
+                (m.counts.exchanges, m.why.as_deref()),
+                (0, Some(Skip::Paused.plain()))
+            );
+            cancel.cancel();
+            store
+                .put_setting(crate::memory_store::PAUSED, &serde_json::json!(false))
+                .await
+                .unwrap();
+            let (d, _cancel) = start(floor()).await;
+            d.spend_read(paused.id);
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let m = d.session_memory(paused.id).await.unwrap();
+            assert_eq!(m.counts.exchanges, 0, "nothing said while paused is kept");
+            assert!(m.remembering);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_turns_end_closes_the_exchange_it_left_open() {
+        with_test_pool(build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            DeskStore::migrate(&pool).await.unwrap();
+            let store = DeskStore::from_pool(pool.clone());
+            let t = dir.path().join("web.jsonl");
+            // It ends on a reply its record never says stopped.
+            std::fs::write(&t, &CLAUDE[..CLAUDE.find("\"uuid\":\"u-11\"").unwrap() - 1]).unwrap();
+            let mut r = record_fixture("acme-web");
+            r.cwd = dir.path().to_string_lossy().into_owned();
+            r.transcript = Some(t.to_string_lossy().into_owned());
+            r.state = crate::model::SessionState::Closed;
+            store.put(&r).await.unwrap();
+            let d = Desk::start(
+                DeskStore::from_pool(pool.clone()),
+                crate::testing::options(dir.path()),
+                super::super::Floor {
+                    redactor: Some(Arc::new(Plain)),
+                    ..Default::default()
+                },
+                Default::default(),
+            )
+            .await
+            .unwrap();
+            let counts = |d: Desk| async move { d.session_memory(r.id).await.unwrap().counts };
+            for _ in 0..400 {
+                if counts(d.clone()).await.open == 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            assert_eq!(counts(d.clone()).await.open, 1);
+            d.spend_read_ending(r.id);
+            for _ in 0..400 {
+                if counts(d.clone()).await.open == 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            let m = d.session_memory(r.id).await.unwrap();
+            assert_eq!((m.counts.open, m.counts.exchanges), (0, 5));
+            assert!(m.exchanges.last().unwrap().ended.is_some());
         })
         .await;
     }
