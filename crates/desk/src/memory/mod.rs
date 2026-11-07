@@ -7,6 +7,7 @@
 pub mod harvest;
 pub mod record;
 
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::path::Path;
 
@@ -51,10 +52,10 @@ pub const DISABLED: &str = "Remembering conversations is turned off for this Des
 pub const KEYWORD_ONLY: &str = "Searching by keyword only until Desk Memory is ready.";
 
 /// Text as it may be kept: every secret in it replaced whole, and how many
-/// were.
+/// were. Text with none is the text itself, uncopied.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Redacted {
-    pub text: String,
+pub struct Redacted<'a> {
+    pub text: Cow<'a, str>,
     pub count: u32,
 }
 
@@ -62,14 +63,21 @@ pub struct Redacted {
 /// read them. Each secret is replaced in full by its label, with no part of
 /// it kept.
 pub trait Redactor: Send + Sync {
-    fn stored(&self, text: &str) -> Redacted;
+    fn stored<'a>(&self, text: &'a str) -> Redacted<'a>;
+
+    /// What in `text`, already redacted, reads as instructions to a model:
+    /// the hub's injection scan's categories. None without a scan.
+    fn flags(&self, text: &str) -> Vec<String> {
+        let _ = text;
+        Vec::new()
+    }
 }
 
 /// Why a record isn't harvested.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Skip {
-    /// A run the hub made itself: its CLI completions, an agent's turn, or a
-    /// process it started.
+    /// A run the hub made itself: one in its folders (its CLI completions),
+    /// or an agent's turn.
     HubInternal,
     /// The person turned memory off for this session.
     SessionOff,
@@ -104,8 +112,6 @@ pub struct Subject<'a> {
     pub engine: Engine,
     pub cwd: &'a str,
     pub name: &'a str,
-    /// The process of a session found in another terminal.
-    pub pid: Option<i32>,
     pub cli_session_id: Option<&'a str>,
     /// The record's path.
     pub source: &'a str,
@@ -128,17 +134,14 @@ pub struct Switches<'a> {
     /// The refs tombstoned for the subject's engine: conversation ids and
     /// record paths.
     pub forgotten: &'a HashSet<String>,
-    /// The process table, when it was read; empty otherwise.
-    pub procs: &'a [crate::procs::Proc],
 }
 
 /// Whether `r` may be harvested, checked before anything of it is parsed;
 /// the first reason it may not, if any.
 pub fn harvestable(r: &Subject, hub: &HubInternal, s: &Switches) -> Result<(), Skip> {
-    if hub.holds(Path::new(r.cwd))
-        || crate::ledger::agent_turn(r.cwd, r.name)
-        || r.pid.is_some_and(|pid| hub.started(s.procs, pid))
-    {
+    // A process the hub started is never adopted, so it has no record
+    // here to check: its folder and its name are what tell.
+    if hub.holds(Path::new(r.cwd)) || crate::ledger::agent_turn(r.cwd, r.name) {
         return Err(Skip::HubInternal);
     }
     if r.cli_session_id.is_some_and(|id| s.forgotten.contains(id)) || s.forgotten.contains(r.source)
@@ -219,7 +222,6 @@ mod tests {
             engine: Engine::Claude,
             cwd,
             name: "acme-web",
-            pid: None,
             cli_session_id: Some("5b1f0c2e"),
             source: "/Users/allan/.claude/projects/acme/5b1f0c2e.jsonl",
             memory_on: true,
@@ -229,22 +231,19 @@ mod tests {
 
     #[test]
     fn every_reason_not_to_harvest_is_told_apart() {
-        let hub =
-            HubInternal::new([PathBuf::from("/data")], Some(Path::new("/nohome/k"))).started_by(50);
+        let hub = HubInternal::new([PathBuf::from("/data")], Some(Path::new("/nohome/k")));
         let none = HashSet::new();
         let off: HashSet<String> = ["acme".to_string()].into();
         let tomb: HashSet<String> = ["5b1f0c2e".to_string()].into();
         let tomb_path: HashSet<String> =
             ["/Users/allan/.claude/projects/acme/5b1f0c2e.jsonl".to_string()].into();
         let exclude = ["~/clients/secret-x/**".to_string()];
-        let procs = crate::procs::parse("  1 0 launchd\n 50 1 hub\n 51 50 claude -p\n");
         let open = Switches {
             paused: false,
             groups_off: &none,
             exclude: &exclude,
             home: Some("/nohome/k"),
             forgotten: &none,
-            procs: &procs,
         };
         let check = |r: Subject, s: Switches| harvestable(&r, &hub, &s);
 
@@ -261,17 +260,6 @@ mod tests {
             ),
             Err(Skip::HubInternal),
             "an agent's turn"
-        );
-        assert_eq!(
-            check(
-                Subject {
-                    pid: Some(51),
-                    ..subject("/nohome/k/dev/acme-web")
-                },
-                open
-            ),
-            Err(Skip::HubInternal),
-            "a process the hub started"
         );
         assert_eq!(
             check(

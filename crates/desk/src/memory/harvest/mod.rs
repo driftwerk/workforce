@@ -103,7 +103,7 @@ mod tests {
         let lines: Vec<&str> = CLAUDE.lines().collect();
         let (open, closed) = fold(None, claude(&lines), &Plain);
         let keys: Vec<&str> = closed.iter().map(|x| x.key.as_str()).collect();
-        assert_eq!(keys, ["u-01", "u-03", "u-07", "u-08"]);
+        assert_eq!(keys, ["u-01", "u-03", "u-07", "u-08", "u-09", "u-12"]);
 
         let race = &closed[0];
         assert_eq!(race.ask, "Fix the login race in acme-web");
@@ -141,12 +141,28 @@ mod tests {
 
         assert_eq!(closed[2].asker, Asker::Session);
         assert!(closed[3].compaction && closed[3].answer.contains("cookie is HttpOnly"));
-        let open = open.unwrap();
+        let pr = &closed[4];
         assert_eq!(
-            (open.ask.as_str(), open.answer.as_str()),
+            (pr.ask.as_str(), pr.answer.as_str()),
             ("Open the PR", "Opening it now.")
         );
-        assert_eq!(open.ended, None, "still being written");
+        assert_eq!(
+            pr.ended.unwrap().to_rfc3339(),
+            "2026-10-31T09:11:30+00:00",
+            "the person stopping it ends it, and isn't asked"
+        );
+        let banner = &closed[5];
+        assert!(
+            banner.ask.starts_with("<div"),
+            "a prompt opening with a tag is still the person's"
+        );
+        assert_eq!(banner.asker, Asker::Person);
+        assert_eq!(
+            banner.steps[0].result, "step 1\u{FFFD}step 2",
+            "a NUL can't be stored"
+        );
+        assert!(banner.ended.is_some(), "its token limit ended the turn");
+        assert!(open.is_none());
     }
 
     #[test]
@@ -194,13 +210,13 @@ mod tests {
         let open = open.unwrap();
         assert_eq!(
             (open.key.as_str(), open.commands.as_slice()),
-            ("turn-3:1", &["git log -1".to_string()][..])
+            ("turn-3:2", &["git log -1".to_string()][..])
         );
         assert_eq!(
             state,
             CodexParts {
                 turn: Some("turn-3".into()),
-                item: 2
+                item: 3
             }
         );
 
