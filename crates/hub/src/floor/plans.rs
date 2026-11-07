@@ -192,10 +192,8 @@ impl PlanUsage for Plans {
         // account's card. A Claude token says nothing of its account.
         let account = match &login.credential {
             Credential::ChatGpt(auth) => auth.account_id().and_then(|id| account_key(kind, &[id])),
-            Credential::Pooled(id) => {
-                crate::hub_core::logins::install_pool::of(&login.slot.vault)
-                    .and_then(|pool| pool.plan_key(id))
-            }
+            Credential::Pooled(id) => crate::hub_core::logins::install_pool::of(&login.slot.vault)
+                .and_then(|pool| pool.plan_key(id)),
             Credential::Token(_) => None,
         };
         // A login is its credential in its slot: one credential two people

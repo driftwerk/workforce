@@ -1272,6 +1272,8 @@ impl Desk {
             serde_json::from_value(kept(identities::OWN_NONE).await).unwrap_or_default();
         let relogged: HashSet<Uuid> =
             serde_json::from_value(kept(identities::RELOGGED).await).unwrap_or_default();
+        let put_off: HashSet<String> =
+            serde_json::from_value(kept(accounts::PUT_OFF).await).unwrap_or_default();
         let prints: HashMap<identities::Raw, crate::identity::Prints> =
             serde_json::from_value::<Vec<(identities::Raw, crate::identity::Prints)>>(
                 kept(identities::PRINTS).await,
@@ -1400,6 +1402,7 @@ impl Desk {
                 limit_marks,
                 written_by,
                 auto_switch,
+                put_off,
                 ..State::default()
             }),
             events: broadcast::channel(256).0,

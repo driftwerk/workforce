@@ -883,6 +883,9 @@ struct ReadingView {
     #[serde(rename = "where")]
     at: Where,
     account: Option<String>,
+    /// Which of the hub's logins made it, by its key (a hash, never its
+    /// credential): one card a login, never several mixed.
+    login: Option<String>,
     plan: Option<String>,
     windows: Vec<Window>,
     observed_at: DateTime<Utc>,
@@ -961,6 +964,10 @@ fn usage_of(
                     LoginRef::Mac => Where::Mac,
                     LoginRef::Hub { .. } => Where::Hub,
                 },
+                login: match r.login {
+                    LoginRef::Mac => None,
+                    LoginRef::Hub { login, .. } => Some(login),
+                },
                 account: r.account,
                 plan: r.plan,
                 windows: r.windows,
@@ -1003,7 +1010,8 @@ async fn usage(State(r): S, headers: HeaderMap, Query(q): Query<TokenQuery>) -> 
     let mac = desk.as_ref().map(|d| d.sign_ins());
     let current: Option<HashSet<String>> = desk
         .as_ref()
-        .map(|d| d.current_plan_keys().into_iter().collect());
+        .and_then(|d| d.current_plan_keys())
+        .map(|keys| keys.into_iter().collect());
     let readings = current_readings(readings, current.as_ref());
     Json(usage_of(
         readings,
@@ -1497,8 +1505,16 @@ mod tests {
             observed_at: at,
             ..reading(LoginRef::Mac)
         };
+        let hub = Reading {
+            account: None,
+            observed_at: at,
+            ..reading(LoginRef::Hub {
+                login: "a659".into(),
+                owner: None,
+            })
+        };
         let view = usage_of(
-            vec![mac],
+            vec![mac, hub],
             &HashSet::from([PlanKind::Claude]),
             Some(&SignIns {
                 by_engine: [(
@@ -1526,8 +1542,13 @@ mod tests {
                     {"kind": "chatgpt", "where": "mac", "signedIn": false}
                 ],
                 "readings": [{
-                    "kind": "claude", "where": "mac", "account": "3f1c", "plan": "max",
+                    "kind": "claude", "where": "mac", "account": "3f1c", "login": null, "plan": "max",
                     "windows": [{"usedPercent": 62.0, "resetsAt": "2026-10-29T16:42:00Z", "minutes": 300}],
+                    "observedAt": "2026-10-29T16:42:00Z"
+                }, {
+                    // The hub's own login, by its key: one card a login.
+                    "kind": "claude", "where": "hub", "account": null, "login": "a659", "plan": null,
+                    "windows": [],
                     "observedAt": "2026-10-29T16:42:00Z"
                 }]
             })

@@ -249,18 +249,23 @@ impl Desk {
     /// each account's and the CLI sign-in's. A reading kept under another
     /// (an account removed, a sign-in gone, an identity learnt since) is
     /// nobody's card.
-    pub fn current_plan_keys(&self) -> Vec<String> {
-        let Some(plans) = self.0.plans.as_ref() else {
-            return Vec::new();
-        };
+    ///
+    /// `None` until this computer's sign-in has been read: until then which
+    /// keys are current can't be told, and nothing is anyone's but none.
+    pub fn current_plan_keys(&self) -> Option<Vec<String>> {
+        let plans = self.0.plans.as_ref()?;
         let st = self.0.state.lock();
+        if !st.own_read {
+            return None;
+        }
         st.accounts
             .iter()
             .filter(|a| a.engine == Engine::Claude)
             .filter_map(|a| Self::plan_ids(&st, &super::identities::Raw::Account(a.id)))
             .chain(Self::own_plan_ids(&st))
             .filter_map(|ids| plans.account_key(crate::usage::LocalPlan::Claude, &ids))
-            .collect()
+            .collect::<Vec<_>>()
+            .into()
     }
 
     /// The store the accounts' sign-ins are kept in, as the person calls it;
@@ -1474,6 +1479,11 @@ impl Desk {
     }
 }
 
+/// Where the needs the person put off are kept.
+pub(super) const PUT_OFF: &str = "accounts.putOff";
+/// The start of the id of the need that asks which account a sign-in is.
+const WHICH_SIGN_IN: &str = "which-sign-in:";
+
 /// Where the person's "switch automatically" choice is kept.
 pub(super) const AUTO_SWITCH: &str = "accounts.autoSwitch";
 /// Where each account's standing and the moves off a full one are kept, so
@@ -1693,7 +1703,8 @@ impl Desk {
         kept.insert(
             0,
             N::WhichSignIn {
-                id: "which-sign-in".into(),
+                // Per sign-in: "Not now" for this one is never for the next.
+                id: format!("which-sign-in:{}", own.key),
                 engine: Engine::Claude,
                 email: own.email.clone(),
             },
@@ -1829,7 +1840,14 @@ impl Desk {
     /// Puts a need off until what it says changes.
     pub fn put_off(&self, need: &str) {
         self.0.state.lock().put_off.insert(need.to_string());
+        self.keep_put_off();
         self.announce_accounts();
+    }
+
+    /// Writes what the person put off, so "Not now" outlives a restart.
+    fn keep_put_off(&self) {
+        let ids: Vec<String> = self.0.state.lock().put_off.iter().cloned().collect();
+        self.keep_state(PUT_OFF, serde_json::json!(ids));
     }
 
     /// What a session on `account` reported of its plan's windows.
@@ -1869,9 +1887,17 @@ impl Desk {
             return;
         };
         let needs = self.account_needs_all();
-        {
+        let forgot = {
             let mut st = self.0.state.lock();
-            st.put_off.retain(|id| needs.iter().any(|n| n.id() == id));
+            let before = st.put_off.len();
+            // A sign-in's question stands for that sign-in, raised or not
+            // (it isn't while the CLI is still being read).
+            st.put_off
+                .retain(|id| id.starts_with(WHICH_SIGN_IN) || needs.iter().any(|n| n.id() == id));
+            st.put_off.len() != before
+        };
+        if forgot {
+            self.keep_put_off();
         }
         self.keep_standing();
         if self.auto_switch() {
