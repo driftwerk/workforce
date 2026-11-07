@@ -62,6 +62,9 @@ The Claude login is stored under `claude_code/oauth_token` and the ChatGPT login
 By default every tier is tried and a shared login serves anyone. `[llm.logins]` narrows that, globally in `[llm]` or for one agent:
 
 ```toml
+[[agents]]
+id = "allan"
+
 [agents.llm.logins]
 tiers = ["agent_user", "global_user", "agent_shared"]   # never the hub's own login
 shared_serves = "owner"                                 # owner | agent_users | anyone
@@ -116,7 +119,7 @@ When a plan reaches its usage limit, its login is skipped until the limit resets
 ```toml
 [subscription]
 chatgpt_direct = false            # allow the chatgpt provider
-operator = "<identity uuid>"      # whose plan pays for the hub's own work
+operator = "6f1c1c3e-2a51-4a8e-9a57-0d6b1c9f2b11"  # an identity's UUID; whose plan pays for the hub's own work
 max_concurrent_cli_turns = 4      # claude-code / codex agent turns generating at once; 0 = unbounded
 max_concurrent_completions = 4    # one-shot CLI calls at once; 0 = unbounded
 ```
