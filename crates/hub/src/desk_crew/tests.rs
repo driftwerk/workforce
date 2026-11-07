@@ -1910,6 +1910,7 @@ mod floor {
                         turns: Some(Arc::clone(&installed.log)),
                         plans: None,
                         pricer: None,
+                        redactor: None,
                     },
                 )
                 .await;
@@ -2025,6 +2026,7 @@ mod floor {
                         turns: Some(Arc::clone(&installed.log)),
                         plans: None,
                         pricer: None,
+                        redactor: None,
                     },
                 )
                 .await;
@@ -2349,6 +2351,7 @@ mod floor {
                         turns: Some(Arc::clone(&installed.log)),
                         plans: None,
                         pricer: None,
+                        redactor: None,
                     },
                 )
                 .await;

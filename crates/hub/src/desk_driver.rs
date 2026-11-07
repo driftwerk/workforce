@@ -680,6 +680,7 @@ pub async fn mount(
         pricer: Some(Arc::new(crate::desk_ledger::HubPricer::new(Arc::clone(
             &state.registry,
         )))),
+        redactor: Some(Arc::new(crate::desk_memory::HubRedactor)),
         ..crate::floor::desk_floor()
     };
     let desk = Desk::start(store, options(config), floor, cancel)

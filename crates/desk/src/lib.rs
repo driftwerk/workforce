@@ -40,6 +40,7 @@ pub mod line;
 mod line_api;
 pub mod line_store;
 pub mod local;
+pub mod memory;
 pub mod model;
 pub mod overview;
 mod procs;

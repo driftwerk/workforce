@@ -21,6 +21,8 @@ use crate::ledger::{
     self, Billing, CodexState, Label, Period, Priced, Pricer, Spend, SpendBy, SpendRow, SpendView,
 };
 use crate::ledger_store::{After, Cursor, Filter, Kept, LedgerRow, PAGE};
+use crate::memory::record::{Harvested, Part, Read};
+use crate::memory::Redactor;
 use crate::model::{DeskEvent, SessionRecord};
 
 /// How much of a record one step reads before keeping what it found.
@@ -54,10 +56,16 @@ pub(super) struct LedgerRun {
     /// before then is of an account Desk can't name.
     signed: Mutex<BTreeMap<Engine, (SignIn, DateTime<Utc>)>>,
     pricer: Option<Arc<dyn Pricer>>,
+    /// Hides secrets in what the harvest keeps; none, nothing is harvested.
+    #[allow(dead_code)] // The harvest's store reads it (SM1's storage PR).
+    redactor: Option<Arc<dyn Redactor>>,
 }
 
 impl LedgerRun {
-    pub(super) fn new(pricer: Option<Arc<dyn Pricer>>) -> (Self, mpsc::UnboundedReceiver<Job>) {
+    pub(super) fn new(
+        pricer: Option<Arc<dyn Pricer>>,
+        redactor: Option<Arc<dyn Redactor>>,
+    ) -> (Self, mpsc::UnboundedReceiver<Job>) {
         let (jobs, rx) = mpsc::unbounded_channel();
         (
             Self {
@@ -67,6 +75,7 @@ impl LedgerRun {
                 untold: Mutex::default(),
                 signed: Mutex::default(),
                 pricer,
+                redactor,
             },
             rx,
         )
@@ -178,47 +187,75 @@ fn next_line(r: &mut impl BufRead, buf: &mut Vec<u8>) -> std::io::Result<Line> {
 /// What one step of reading a record found.
 struct Step {
     spends: Vec<Spend>,
+    /// What of the conversation its lines hold, past the harvest's offset.
+    #[allow(dead_code)] // The harvest's store reads it (SM1's storage PR).
+    parts: Vec<Part>,
     cursor: Cursor,
     /// The record has nothing more to read now.
     done: bool,
 }
 
 /// Reads one step of `engine`'s record at `path` from `cursor`: whole lines
-/// only, so a line still being written is read next time. A record
-/// shorter than its cursor was replaced, and is read again from its start.
-fn read_step(engine: Engine, path: &Path, cursor: &Cursor) -> std::io::Result<Step> {
+/// only, so a line still being written is read next time. Each line is
+/// read once for every consumer whose offset it is past: the ledger's
+/// (`read_to`) for its call, and, when `harvest`, the harvest's
+/// (`harvested_to`) for its conversation. Each offset only moves on, so a
+/// harvest catching up never counts a call twice. Without `harvest` the
+/// harvest's offset stays where it is. A record shorter than its cursor
+/// was replaced, and both are read again from its start.
+fn read_step(engine: Engine, path: &Path, cursor: &Cursor, harvest: bool) -> std::io::Result<Step> {
     let mut file = std::fs::File::open(path)?;
     let len = file.metadata()?.len();
-    let (start, mut codex) = match len < cursor.read_to {
-        true => (0, CodexState::default()),
+    let replaced = len < cursor.read_to || (harvest && len < cursor.harvested_to);
+    let (read_to, harvested_to, mut codex, mut harvested) = match replaced {
+        true => (
+            0,
+            0,
+            CodexState::default(),
+            Harvested {
+                decided: Harvested::of(&cursor.harvest).decided,
+                ..Harvested::default()
+            },
+        ),
         false => (
             cursor.read_to,
+            cursor.harvested_to,
             serde_json::from_value(cursor.seen.clone()).unwrap_or_default(),
+            Harvested::of(&cursor.harvest),
         ),
+    };
+    let start = match harvest {
+        true => read_to.min(harvested_to),
+        false => read_to,
     };
     file.seek(SeekFrom::Start(start))?;
     let mut r = BufReader::with_capacity(256 * 1024, file);
     let mut buf = Vec::new();
     let mut at = start;
-    let mut spends = Vec::new();
+    let mut reads: Vec<Read> = Vec::new();
     let done = loop {
         if at - start >= STEP_BYTES {
             break at >= len;
         }
         match next_line(&mut r, &mut buf)? {
             Line::Whole(n) => {
+                let (spend, parts) = (at >= read_to, harvest && at >= harvested_to);
                 at += n;
-                let spend = match engine {
-                    Engine::Claude => ledger::claude_line(&buf),
-                    Engine::Codex => ledger::codex_line(&buf, &mut codex),
+                let read = match engine {
+                    Engine::Claude => ledger::claude_read(&buf, spend, parts),
+                    Engine::Codex => ledger::codex_read(
+                        &buf,
+                        spend.then_some(&mut codex),
+                        parts.then_some(&mut harvested.codex),
+                    ),
                     Engine::Gemini
                     | Engine::Copilot
                     | Engine::OpenCode
                     | Engine::Cursor
                     | Engine::Devin
-                    | Engine::Custom => None,
+                    | Engine::Custom => Read::default(),
                 };
-                spends.extend(spend);
+                reads.push(read);
             }
             Line::Skipped(n) => at += n,
             Line::Partial | Line::End => break true,
@@ -228,9 +265,26 @@ fn read_step(engine: Engine, path: &Path, cursor: &Cursor) -> std::io::Result<St
         Engine::Codex => serde_json::to_value(&codex).unwrap_or_default(),
         _ => serde_json::json!({}),
     };
+    let (mut spends, mut parts) = (Vec::new(), Vec::new());
+    for read in reads {
+        spends.extend(read.spend);
+        parts.extend(read.parts);
+    }
     Ok(Step {
         spends: ledger::once_each(spends),
-        cursor: Cursor { read_to: at, seen },
+        parts,
+        cursor: Cursor {
+            read_to: read_to.max(at),
+            seen,
+            harvested_to: match harvest {
+                true => harvested_to.max(at),
+                false => harvested_to,
+            },
+            harvest: match harvest || replaced {
+                true => harvested.value(),
+                false => cursor.harvest.clone(),
+            },
+        },
         done,
     })
 }
@@ -451,7 +505,8 @@ impl Desk {
                 .unwrap_or_default();
             let step = {
                 let (engine, path, cursor) = (r.engine, path.to_path_buf(), cursor.clone());
-                tokio::task::spawn_blocking(move || read_step(engine, &path, &cursor)).await??
+                tokio::task::spawn_blocking(move || read_step(engine, &path, &cursor, false))
+                    .await??
             };
             if step.cursor == cursor && step.spends.is_empty() {
                 return Ok(());
@@ -676,7 +731,7 @@ mod tests {
         let fixture = include_str!("../../fixtures/ledger/claude.jsonl");
         let (head, tail) = fixture.split_at(fixture.find("msg_02").unwrap());
         std::fs::write(&path, head).unwrap();
-        let first = read_step(Engine::Claude, &path, &Cursor::default()).unwrap();
+        let first = read_step(Engine::Claude, &path, &Cursor::default(), false).unwrap();
         assert_eq!(
             first.spends.len(),
             1,
@@ -688,20 +743,117 @@ mod tests {
             .open(&path)
             .unwrap();
         f.write_all(tail.as_bytes()).unwrap();
-        let second = read_step(Engine::Claude, &path, &first.cursor).unwrap();
+        let second = read_step(Engine::Claude, &path, &first.cursor, false).unwrap();
         let keys: Vec<&str> = second.spends.iter().map(|s| s.key.as_str()).collect();
         assert_eq!(keys, ["msg_02"]);
         assert_eq!(second.cursor.read_to, fixture.len() as u64);
-        let again = read_step(Engine::Claude, &path, &second.cursor).unwrap();
+        let again = read_step(Engine::Claude, &path, &second.cursor, false).unwrap();
         assert!(again.spends.is_empty() && again.cursor == second.cursor);
 
         std::fs::write(&path, head).unwrap();
-        let replaced = read_step(Engine::Claude, &path, &second.cursor).unwrap();
+        let replaced = read_step(Engine::Claude, &path, &second.cursor, false).unwrap();
         assert_eq!(
             replaced.spends.len(),
             1,
             "a shorter record is read from its start"
         );
+    }
+
+    const CLAUDE_MORE: &str = concat!(
+        include_str!("../../fixtures/ledger/claude.jsonl"),
+        include_str!("../../fixtures/memory/claude-more.jsonl")
+    );
+    const CODEX_MORE: &str = concat!(
+        include_str!("../../fixtures/ledger/codex-rollout.jsonl"),
+        include_str!("../../fixtures/memory/codex-more.jsonl")
+    );
+
+    #[test]
+    fn the_ledger_and_the_harvest_read_from_their_own_offsets() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.jsonl");
+        std::fs::write(&path, CLAUDE_MORE).unwrap();
+        let len = CLAUDE_MORE.len() as u64;
+        let ledger = read_step(Engine::Claude, &path, &Cursor::default(), false).unwrap();
+        assert!(ledger.parts.is_empty(), "no harvest, no parts");
+        assert_eq!(
+            (ledger.cursor.read_to, ledger.cursor.harvested_to),
+            (len, 0)
+        );
+        let calls = ledger.spends.len();
+        assert!(calls > 2);
+
+        // The ledger at the end, the harvest at 0: read once more, for the
+        // harvest alone.
+        let harvest = read_step(Engine::Claude, &path, &ledger.cursor, true).unwrap();
+        assert!(harvest.spends.is_empty(), "no call is counted twice");
+        assert!(!harvest.parts.is_empty());
+        assert_eq!(
+            (harvest.cursor.read_to, harvest.cursor.harvested_to),
+            (len, len)
+        );
+        let again = read_step(Engine::Claude, &path, &harvest.cursor, true).unwrap();
+        assert!(again.spends.is_empty() && again.parts.is_empty());
+        assert_eq!(again.cursor, harvest.cursor);
+
+        // Both at once from the start find what each did alone.
+        let both = read_step(Engine::Claude, &path, &Cursor::default(), true).unwrap();
+        assert_eq!(both.spends, ledger.spends);
+        assert_eq!(both.parts, harvest.parts);
+
+        // The harvest held back (no redactor) stays where it was while the
+        // ledger reads on.
+        let head = &CLAUDE_MORE[..CLAUDE_MORE.find("msg_03").unwrap()];
+        let head = &head[..=head.rfind('\n').unwrap()];
+        std::fs::write(&path, head).unwrap();
+        let first = read_step(Engine::Claude, &path, &Cursor::default(), true).unwrap();
+        std::fs::write(&path, CLAUDE_MORE).unwrap();
+        let held = read_step(Engine::Claude, &path, &first.cursor, false).unwrap();
+        assert_eq!(
+            (held.cursor.read_to, held.cursor.harvested_to),
+            (len, head.len() as u64)
+        );
+        let caught_up = read_step(Engine::Claude, &path, &held.cursor, true).unwrap();
+        assert!(caught_up.spends.is_empty());
+        let mut parts = first.parts.clone();
+        parts.extend(caught_up.parts);
+        assert_eq!(
+            parts, both.parts,
+            "the harvest catches up where it was left"
+        );
+
+        // A record shorter than either offset was replaced: both read again.
+        std::fs::write(&path, head).unwrap();
+        let replaced = read_step(Engine::Claude, &path, &caught_up.cursor, true).unwrap();
+        assert_eq!(replaced.parts, first.parts);
+        assert_eq!(replaced.spends.len(), first.spends.len());
+        let ledger_alone = read_step(Engine::Claude, &path, &caught_up.cursor, false).unwrap();
+        assert_eq!(
+            (
+                ledger_alone.cursor.read_to,
+                ledger_alone.cursor.harvested_to
+            ),
+            (head.len() as u64, 0),
+            "a replaced record resets the harvest's offset too"
+        );
+    }
+
+    #[test]
+    fn a_harvest_catching_up_never_moves_the_ledgers_codex_state_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout.jsonl");
+        std::fs::write(&path, CODEX_MORE).unwrap();
+        let ledger = read_step(Engine::Codex, &path, &Cursor::default(), false).unwrap();
+        let harvest = read_step(Engine::Codex, &path, &ledger.cursor, true).unwrap();
+        assert_eq!(harvest.cursor.seen, ledger.cursor.seen);
+        let kept = Harvested::of(&harvest.cursor.harvest);
+        assert_eq!(kept.codex.turn.as_deref(), Some("turn-3"));
+        let asks = harvest
+            .parts
+            .iter()
+            .filter(|p| matches!(p, Part::Ask { .. }))
+            .count();
+        assert_eq!(asks, 2);
     }
 
     #[test]
@@ -730,10 +882,10 @@ mod tests {
         let fixture = include_str!("../../fixtures/ledger/codex-rollout.jsonl");
         let lines: Vec<&str> = fixture.lines().collect();
         std::fs::write(&path, format!("{}\n", lines[..5].join("\n"))).unwrap();
-        let first = read_step(Engine::Codex, &path, &Cursor::default()).unwrap();
+        let first = read_step(Engine::Codex, &path, &Cursor::default(), false).unwrap();
         assert_eq!(first.spends.len(), 1);
         std::fs::write(&path, fixture).unwrap();
-        let second = read_step(Engine::Codex, &path, &first.cursor).unwrap();
+        let second = read_step(Engine::Codex, &path, &first.cursor, false).unwrap();
         assert_eq!(second.spends.len(), 1);
         assert_eq!(second.spends[0].model.as_deref(), Some("gpt-5.6-sol"));
         assert_eq!(second.spends[0].billing, Some(Billing::Plan));
@@ -910,7 +1062,7 @@ mod tests {
 
     #[test]
     fn a_call_is_stamped_with_the_sign_in_seen_when_it_was_made_and_priced_from_the_table() {
-        let (run, _rx) = LedgerRun::new(Some(Arc::new(Table)));
+        let (run, _rx) = LedgerRun::new(Some(Arc::new(Table)), None);
         let since = DateTime::parse_from_rfc3339("2026-10-31T09:00:00Z")
             .unwrap()
             .to_utc();

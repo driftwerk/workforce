@@ -689,6 +689,9 @@ pub struct Floor {
     pub plans: Option<Arc<dyn PlanSink>>,
     /// Prices the ledger's calls: the hub's price table.
     pub pricer: Option<Arc<dyn crate::ledger::Pricer>>,
+    /// Hides secrets in what session memory keeps: the hub's patterns.
+    /// Without one, nothing is harvested.
+    pub redactor: Option<Arc<dyn crate::memory::Redactor>>,
 }
 
 /// How long the hub's model may take to read whether a turn's reply asks
@@ -1357,7 +1360,8 @@ impl Desk {
         let hook_base = format!("http://127.0.0.1:{hook_port}");
         let (persist, persist_rx) = mpsc::unbounded_channel();
         let env = cli_env(&opts.env);
-        let (ledger, ledger_jobs) = ledger::LedgerRun::new(floor.pricer.clone());
+        let (ledger, ledger_jobs) =
+            ledger::LedgerRun::new(floor.pricer.clone(), floor.redactor.clone());
         let desk = Self(Arc::new(Inner {
             palette,
             palette_save: Default::default(),
@@ -6363,6 +6367,7 @@ mod tests {
                     turns: None,
                     plans: None,
                     pricer: None,
+                    redactor: None,
                 },
                 CancellationToken::new(),
             )
@@ -6521,6 +6526,7 @@ mod tests {
                     turns: None,
                     plans: Some(readings.clone()),
                     pricer: None,
+                    redactor: None,
                 },
                 CancellationToken::new(),
             )
@@ -6647,6 +6653,7 @@ mod tests {
                 turns: None,
                 plans: None,
                 pricer: None,
+                redactor: None,
             };
             let d = Desk::start(
                 DeskStore::from_pool(pool.clone()),
@@ -6759,6 +6766,7 @@ mod tests {
                     turns: Some(logged.clone()),
                     plans: None,
                     pricer: None,
+                    redactor: None,
                 },
                 CancellationToken::new(),
             )
@@ -6881,6 +6889,7 @@ mod tests {
                     turns: Some(logged.clone()),
                     plans: None,
                     pricer: None,
+                    redactor: None,
                 },
                 CancellationToken::new(),
             )
@@ -7194,6 +7203,7 @@ mod tests {
                     turns: Some(logged.clone()),
                     plans: None,
                     pricer: None,
+                    redactor: None,
                 },
                 CancellationToken::new(),
             )
@@ -7973,6 +7983,7 @@ mod tests {
                     turns: Some(logged.clone()),
                     plans: None,
                     pricer: None,
+                    redactor: None,
                 },
                 CancellationToken::new(),
             )
@@ -8032,6 +8043,7 @@ mod tests {
                     turns: Some(logged.clone()),
                     plans: None,
                     pricer: None,
+                    redactor: None,
                 },
                 CancellationToken::new(),
             )
@@ -8097,6 +8109,7 @@ mod tests {
                 turns: Some(logged.clone()),
                 plans: None,
                 pricer: None,
+                redactor: None,
             },
             CancellationToken::new(),
         )
