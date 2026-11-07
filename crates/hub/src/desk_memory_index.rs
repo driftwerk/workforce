@@ -314,13 +314,13 @@ impl MemoryIndex for VellevDeskIndex {
         })
     }
 
-    async fn search(&self, name: &str, q: &IndexQuery) -> Result<Vec<IndexHit>> {
-        if q.text.trim().is_empty() {
-            return Ok(Vec::new());
-        }
+    async fn search(&self, name: &str, q: &IndexQuery) -> Result<Option<Vec<IndexHit>>> {
         let Some(ensured) = self.existing(name).await? else {
-            return Ok(Vec::new());
+            return Ok(None);
         };
+        if q.text.trim().is_empty() {
+            return Ok(Some(Vec::new()));
+        }
         let e = &*ensured;
         let mut all = Vec::new();
         if let Some(sessions) = &q.sessions {
@@ -385,7 +385,7 @@ impl MemoryIndex for VellevDeskIndex {
             .collect();
         hits.sort_by(|a, b| b.relevance.total_cmp(&a.relevance).then(a.of.cmp(&b.of)));
         hits.truncate(q.limit);
-        Ok(hits)
+        Ok(Some(hits))
     }
 }
 
@@ -473,7 +473,8 @@ mod tests {
         let found = index
             .search(&acme, &q("storing auth tokens in the browser"))
             .await
-            .unwrap();
+            .unwrap()
+            .expect("the collection is there");
         assert_eq!(found[0].of, cookie.id, "{found:?}");
         assert!(
             found.iter().all(|h| h.of != secret.id),
@@ -492,6 +493,7 @@ mod tests {
         assert!(index
             .search(&acme, &only_api)
             .await
+            .unwrap()
             .unwrap()
             .iter()
             .all(|h| h.of == lunch.id));
@@ -554,11 +556,11 @@ mod tests {
             0,
             "nothing to drop"
         );
-        assert!(index
-            .search(&globex, &q("session token"))
-            .await
-            .unwrap()
-            .is_empty());
+        assert_eq!(
+            index.search(&globex, &q("session token")).await.unwrap(),
+            None,
+            "a collection that isn't there is said so, not found empty"
+        );
         assert!(
             index.ensure(&globex).await.unwrap(),
             "made afresh after a drop"

@@ -185,6 +185,20 @@ impl DeskStore {
             .context("naming a session's memory")?;
         }
         if held {
+            // What this step rewrites is locked in id order, as every write
+            // of many exchanges locks them.
+            let keys: Vec<&str> = w
+                .closed
+                .iter()
+                .chain(w.open)
+                .map(|x| x.key.as_str())
+                .collect();
+            tx.execute(
+                "SELECT 1 FROM memory_exchanges WHERE engine = $1 AND key = ANY($2) \
+                 ORDER BY id FOR UPDATE",
+                &[&w.engine.as_str(), &keys],
+            )
+            .await?;
             let base: i32 = tx
                 .query_one(
                     "SELECT COALESCE(MAX(seq), 0) FROM memory_exchanges WHERE session = $1",
@@ -214,7 +228,10 @@ impl DeskStore {
                        flagged = EXCLUDED.flagged, \
                        indexed_at = CASE WHEN (memory_exchanges.ask, memory_exchanges.answer, \
                          memory_exchanges.steps) IS DISTINCT FROM (EXCLUDED.ask, EXCLUDED.answer, \
-                         EXCLUDED.steps) THEN NULL ELSE memory_exchanges.indexed_at END \
+                         EXCLUDED.steps) THEN NULL ELSE memory_exchanges.indexed_at END, \
+                       index_tries = CASE WHEN (memory_exchanges.ask, memory_exchanges.answer, \
+                         memory_exchanges.steps) IS DISTINCT FROM (EXCLUDED.ask, EXCLUDED.answer, \
+                         EXCLUDED.steps) THEN 0 ELSE memory_exchanges.index_tries END \
                      WHERE memory_exchanges.session = EXCLUDED.session",
                     &[
                         &w.engine.as_str(),
@@ -398,8 +415,10 @@ impl DeskStore {
         // One never ended (its session stopped mid-turn) goes by when it began.
         let gone = tx
             .query(
-                "DELETE FROM memory_exchanges \
-                 WHERE COALESCE(ended, at) < now() - make_interval(days => $1) \
+                "DELETE FROM memory_exchanges WHERE id IN ( \
+                   SELECT id FROM memory_exchanges \
+                   WHERE COALESCE(ended, at) < now() - make_interval(days => $1) \
+                   ORDER BY id FOR UPDATE) \
                  RETURNING id, group_id",
                 &[&days],
             )
@@ -415,6 +434,7 @@ impl DeskStore {
                        SELECT session FROM memory_exchanges WHERE NOT past_cap \
                        GROUP BY session HAVING COUNT(*) > $1)) x \
                    WHERE newer > $1) \
+                   AND id IN (SELECT id FROM memory_exchanges WHERE NOT past_cap ORDER BY id FOR UPDATE) \
                  RETURNING id, group_id",
                 &[&cap],
             )
@@ -585,6 +605,13 @@ pub(crate) async fn forget_memory_in(
 ) -> Result<()> {
     tx.execute(
         "SELECT 1 FROM sessions WHERE id = ANY($1) FOR UPDATE",
+        &[&ids],
+    )
+    .await?;
+    // Their exchanges are locked in id order, as every write of many
+    // exchanges locks them.
+    tx.execute(
+        "SELECT 1 FROM memory_exchanges WHERE session = ANY($1) ORDER BY id FOR UPDATE",
         &[&ids],
     )
     .await?;

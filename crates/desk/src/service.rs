@@ -2916,9 +2916,14 @@ impl Desk {
     /// the floor, and takes it out of the sidebar's layout. Its engine's
     /// transcript is the engine's, and stays.
     pub async fn forget(&self, id: Uuid) -> Result<(), DeskError> {
-        self.forget_as(id, None, crate::memory_store::Memory::Forget, |_, _| Ok(()))
+        let forgot = self
+            .forget_as(id, None, crate::memory_store::Memory::Forget, |_, _| Ok(()))
             .await
-            .map(drop)
+            .map(drop);
+        if forgot.is_ok() {
+            self.memory_forgotten();
+        }
+        forgot
     }
 
     /// [`Self::forget`], once `may` agrees under the lock it is forgotten
