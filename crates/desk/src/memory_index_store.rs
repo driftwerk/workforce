@@ -230,6 +230,21 @@ impl DeskStore {
             .collect()
     }
 
+    /// Gives every exchange set aside its tries again. How many.
+    pub async fn index_retry_set_aside(&self) -> Result<u64> {
+        let client = self.pool().get().await?;
+        Ok(client
+            .execute(
+                &format!(
+                    "UPDATE memory_exchanges SET index_tries = 0 WHERE id IN ( \
+                       SELECT id FROM memory_exchanges WHERE indexed_at IS NULL AND {BELONGS} \
+                       AND index_tries >= $1 ORDER BY id FOR UPDATE)"
+                ),
+                &[&INDEX_TRIES],
+            )
+            .await?)
+    }
+
     /// How many exchanges are set aside, failing on their own.
     pub async fn index_set_aside(&self) -> Result<i64> {
         let client = self.pool().get().await?;
@@ -826,6 +841,38 @@ mod tests {
                 .unwrap()
                 .get(0);
             assert_eq!(redundant, 0, "V038 dropped V035's outbox index");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn the_sweep_locks_only_the_rows_it_takes() {
+        with_test_pool(build_pool, |pool| async move {
+            DeskStore::migrate(&pool).await.unwrap();
+            let store = DeskStore::from_pool(pool);
+            let s = record_fixture("acme-web");
+            store.put(&s).await.unwrap();
+            let mut old = exchange("x-old", "long ago");
+            old.at = chrono::Utc::now() - chrono::Duration::days(400);
+            old.ended = Some(old.at);
+            write(&store, s.id, &old).await;
+            write(&store, s.id, &exchange("x-new", "today")).await;
+            // Another writer holds today's exchange.
+            let mut other = store.pool().get().await.unwrap();
+            let held = other.transaction().await.unwrap();
+            held.execute(
+                "SELECT 1 FROM memory_exchanges WHERE key = 'x-new' FOR UPDATE",
+                &[],
+            )
+            .await
+            .unwrap();
+            let swept =
+                tokio::time::timeout(std::time::Duration::from_secs(5), store.sweep_memory(180))
+                    .await
+                    .expect("the sweep doesn't wait on a row it doesn't take")
+                    .unwrap();
+            assert_eq!(swept.gone, 1);
+            held.rollback().await.unwrap();
         })
         .await;
     }

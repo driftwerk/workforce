@@ -412,31 +412,53 @@ impl DeskStore {
         let mut client = self.pool().get().await?;
         let tx = client.transaction().await?;
         let days = i32::try_from(retain_days).unwrap_or(i32::MAX);
-        // One never ended (its session stopped mid-turn) goes by when it began.
+        let cap = i64::try_from(SESSION_CAP).unwrap_or(i64::MAX);
+        // What goes, and what is past its session's cap, are found first,
+        // with nothing locked; then only those rows are locked, all in one
+        // id order, as every write of many exchanges locks them. One never
+        // ended (its session stopped mid-turn) goes by when it began.
+        let old: Vec<Uuid> = tx
+            .query(
+                "SELECT id FROM memory_exchanges \
+                 WHERE COALESCE(ended, at) < now() - make_interval(days => $1)",
+                &[&days],
+            )
+            .await?
+            .iter()
+            .map(|r| r.try_get(0))
+            .collect::<Result<_, _>>()?;
+        let over: Vec<Uuid> = tx
+            .query(
+                "SELECT id FROM ( \
+                   SELECT id, row_number() OVER (PARTITION BY session ORDER BY seq DESC) AS newer \
+                   FROM memory_exchanges WHERE NOT past_cap AND session IN ( \
+                     SELECT session FROM memory_exchanges WHERE NOT past_cap \
+                     GROUP BY session HAVING COUNT(*) > $1)) x \
+                 WHERE newer > $1",
+                &[&cap],
+            )
+            .await
+            .context("finding sessions' exchanges past their cap")?
+            .iter()
+            .map(|r| r.try_get(0))
+            .collect::<Result<_, _>>()?;
+        let both: Vec<Uuid> = old.iter().chain(over.iter()).copied().collect();
+        tx.execute(crate::memory_index_store::LOCKED_IDS, &[&both])
+            .await?;
         let gone = tx
             .query(
-                "DELETE FROM memory_exchanges WHERE id IN ( \
-                   SELECT id FROM memory_exchanges \
-                   WHERE COALESCE(ended, at) < now() - make_interval(days => $1) \
-                   ORDER BY id FOR UPDATE) \
+                "DELETE FROM memory_exchanges WHERE id = ANY($1) \
+                   AND COALESCE(ended, at) < now() - make_interval(days => $2) \
                  RETURNING id, group_id",
-                &[&days],
+                &[&old, &days],
             )
             .await?;
         let gone = refs_by_group(&gone)?;
-        let cap = i64::try_from(SESSION_CAP).unwrap_or(i64::MAX);
         let capped = tx
             .query(
-                "UPDATE memory_exchanges SET past_cap = true WHERE id IN ( \
-                   SELECT id FROM ( \
-                     SELECT id, row_number() OVER (PARTITION BY session ORDER BY seq DESC) AS newer \
-                     FROM memory_exchanges WHERE NOT past_cap AND session IN ( \
-                       SELECT session FROM memory_exchanges WHERE NOT past_cap \
-                       GROUP BY session HAVING COUNT(*) > $1)) x \
-                   WHERE newer > $1) \
-                   AND id IN (SELECT id FROM memory_exchanges WHERE NOT past_cap ORDER BY id FOR UPDATE) \
+                "UPDATE memory_exchanges SET past_cap = true WHERE id = ANY($1) AND NOT past_cap \
                  RETURNING id, group_id",
-                &[&cap],
+                &[&over],
             )
             .await
             .context("capping sessions' indexed exchanges")?;
