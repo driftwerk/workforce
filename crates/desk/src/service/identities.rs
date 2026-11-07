@@ -100,6 +100,11 @@ impl Desk {
         found.first().map(|(id, _)| **id)
     }
 
+    /// The account known as the identity `key`.
+    pub(super) fn account_of_identity(st: &State, key: &str) -> Option<Uuid> {
+        Self::account_of(st, key)
+    }
+
     /// The account this computer's own CLI sign-in is, when that is known.
     pub(super) fn own_account(st: &State) -> Option<Uuid> {
         Self::account_of(st, &Self::own_key(st))

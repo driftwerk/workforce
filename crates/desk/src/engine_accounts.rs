@@ -290,7 +290,7 @@ pub struct Account {
 }
 
 /// An account as Desk shows it: never its token.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AccountView {
     pub id: Uuid,
@@ -303,6 +303,9 @@ pub struct AccountView {
     pub plan_key: Option<String>,
     /// Which Anthropic account it is, when known ([`crate::identity`]).
     pub identity: Option<IdentityView>,
+    /// What this hub knows of its plan: Desk passes it to the person's
+    /// other computers' hubs, which have the same account.
+    pub standing: Option<Standing>,
     /// The sessions running on it now.
     pub sessions: Vec<Uuid>,
     pub created_at: DateTime<Utc>,
@@ -636,8 +639,9 @@ impl Side {
 }
 
 /// What Desk last read of one account's plan: its windows, and when one of
-/// its sessions last stopped on its limit.
-#[derive(Debug, Clone, Default, PartialEq)]
+/// its sessions last stopped on its limit. Kept across restarts.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
 pub struct Standing {
     pub windows: Vec<crate::usage::LimitWindow>,
     pub read_at: Option<DateTime<Utc>>,
@@ -645,6 +649,8 @@ pub struct Standing {
     /// When the limit it last stopped on resets, as Claude Code said
     /// ([`crate::limit`]).
     pub hit_until: Option<DateTime<Utc>>,
+    /// The length of the window it stopped on, in minutes, when said.
+    pub hit_window: Option<u32>,
 }
 
 impl Standing {
@@ -678,10 +684,16 @@ impl Standing {
         if let Some(w) = full_window {
             return Some(w.resets_at);
         }
-        // Claude Code said when: full until then.
-        let until = self.hit_until.filter(|_| self.hit_at.is_some());
-        if let Some(until) = until {
-            return (until > now).then_some(Some(until));
+        // Claude Code said when: full until then, unless a reading of this
+        // account since shows that window begun again with room.
+        if let (Some(hit), Some(until)) = (self.hit_at, self.hit_until) {
+            let began_again = self.read_at.is_some_and(|r| r > hit)
+                && self.windows.iter().any(|w| {
+                    self.hit_window == Some(w.minutes)
+                        && w.used_percent < 100.0
+                        && w.resets_at.is_some_and(|r| r > until)
+                });
+            return (until > now && !began_again).then_some(Some(until));
         }
         let hit = self.hit_at.filter(|at| now - *at < HIT_FOR)?;
         // A reading after the stop that shows room: it has reset.
@@ -695,6 +707,55 @@ impl Standing {
                 .filter(|r| *r > now)
                 .min(),
         )
+    }
+}
+
+/// One account's standing as another of the person's computers knew it:
+/// by its name (the same on each, as Desk copies them) and, when known,
+/// its identity.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StandingElsewhere {
+    pub engine: Engine,
+    pub name: String,
+    #[serde(default)]
+    pub identity: Option<String>,
+    pub standing: Standing,
+}
+
+impl Standing {
+    /// What another computer knew, taken where it is newer: a later stop
+    /// on the limit, a later reading. Whether anything changed.
+    pub fn learn(&mut self, other: &Standing) -> bool {
+        let before = self.clone();
+        if other.hit_at > self.hit_at {
+            self.hit_at = other.hit_at;
+            self.hit_until = other.hit_until;
+            self.hit_window = other.hit_window;
+        }
+        if other.read_at > self.read_at && !other.windows.is_empty() {
+            self.read_at = other.read_at;
+            self.windows = other.windows.clone();
+        }
+        *self != before
+    }
+
+    /// Whether the account is known to have room again since it was last
+    /// full: the reset Claude Code said has passed, or a reading of this
+    /// same account since the stop shows room. A stop that only aged out,
+    /// with nothing read since, is not.
+    pub fn reset_confirmed(&self, now: DateTime<Utc>) -> bool {
+        if self.full(now).is_some() {
+            return false;
+        }
+        match (self.hit_at, self.hit_until) {
+            // Not full by then: the time passed, or a reading of it showed
+            // its window begun again.
+            (Some(_), Some(_)) => true,
+            (Some(hit), None) => self.read_at.is_some_and(|r| r > hit) && !self.windows.is_empty(),
+            // Only readings said it was full, and they say it isn't now.
+            (None, _) => true,
+        }
     }
 }
 
@@ -739,6 +800,27 @@ pub enum AccountNeed {
         from: Side,
         sessions: Vec<Uuid>,
     },
+    /// A session in a terminal of the person's own sits on a full plan:
+    /// Desk can't move it. "Run /login there, or start it in Desk."
+    #[serde(rename_all = "camelCase")]
+    InTerminal {
+        id: String,
+        engine: Engine,
+        session: Uuid,
+        name: String,
+        account: Side,
+        resets_at: Option<DateTime<Utc>>,
+    },
+    /// Which of the person's accounts this computer's Claude Code is
+    /// signed in to isn't known, and a switch depends on it: asked, never
+    /// guessed.
+    #[serde(rename_all = "camelCase")]
+    WhichSignIn {
+        id: String,
+        engine: Engine,
+        /// Who Claude Code says it is signed in as.
+        email: Option<String>,
+    },
 }
 
 impl AccountNeed {
@@ -747,20 +829,24 @@ impl AccountNeed {
             AccountNeed::Limit { id, .. }
             | AccountNeed::AllFull { id, .. }
             | AccountNeed::SignIn { id, .. }
-            | AccountNeed::Reset { id, .. } => id,
+            | AccountNeed::Reset { id, .. }
+            | AccountNeed::InTerminal { id, .. }
+            | AccountNeed::WhichSignIn { id, .. } => id,
         }
     }
 }
 
-/// Sessions were moved off `from` onto `to` because `from` was full.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Sessions were moved off `from` onto `to` because `from` was full. Kept
+/// once per pair, across restarts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct MovedOff {
     pub engine: Engine,
     pub from: Option<Uuid>,
     pub to: Option<Uuid>,
 }
 
-fn side_key(id: Option<Uuid>) -> String {
+pub fn side_key(id: Option<Uuid>) -> String {
     id.map_or_else(|| "own".to_string(), |id| id.simple().to_string())
 }
 
@@ -829,11 +915,14 @@ pub fn needs(
         }
     }
     for m in moved_off.iter().filter(|m| m.engine == engine) {
-        let back = full(&m.from).is_none() && sides.contains(&m.from) && takes(&m.from);
+        // Only once it has truly reset: never on another account's room.
+        let reset = standing.get(&m.from).is_none_or(|s| s.reset_confirmed(now));
+        let back = reset && sides.contains(&m.from) && takes(&m.from);
         let sessions = on.get(&m.to).cloned().unwrap_or_default();
-        if back && !sessions.is_empty() {
+        let id = format!("reset:{}:{}", side_key(m.from), side_key(m.to));
+        if back && !sessions.is_empty() && !out.iter().any(|n| n.id() == id) {
             out.push(AccountNeed::Reset {
-                id: format!("reset:{}:{}", side_key(m.from), side_key(m.to)),
+                id,
                 engine,
                 account: Side::of(accounts, m.from),
                 from: Side::of(accounts, m.to),
@@ -1100,6 +1189,7 @@ mod tests {
             read_at: Some(at(read_at)),
             hit_at: hit_at.map(at),
             hit_until: None,
+            hit_window: None,
         }
     }
 
@@ -1113,6 +1203,14 @@ mod tests {
         assert_eq!(s.full(at(60)), Some(Some(at(600))));
         assert_eq!(s.full(at(599)), Some(Some(at(600))));
         assert_eq!(s.full(at(601)), None);
+        // A reading of it since, its window begun again with room: reset.
+        s.hit_window = Some(10_080);
+        s.read_at = Some(at(70));
+        s.windows[0].resets_at = Some(at(20_000));
+        assert_eq!(s.full(at(80)), None);
+        // The other window begun again says nothing of this one.
+        s.hit_window = Some(300);
+        assert_eq!(s.full(at(80)), Some(Some(at(600))));
     }
 
     #[test]
