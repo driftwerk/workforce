@@ -730,6 +730,7 @@ async fn terminal_colors(
     guarded!(s, h, q);
     s.desk
         .set_terminal_colors(colors)
+        .await
         .map(|()| StatusCode::NO_CONTENT)
         .into_response()
 }
@@ -1429,7 +1430,8 @@ pub fn sessions_router(desk: Desk, auth: Arc<dyn Authorize>) -> Router {
         .route("/api/desk/sessions/{id}/restart", post(restart))
         .route(
             "/api/desk/terminal/colors",
-            axum::routing::put(terminal_colors),
+            // 20 colours: a few hundred bytes.
+            axum::routing::put(terminal_colors).layer(axum::extract::DefaultBodyLimit::max(4096)),
         )
         .route("/api/desk/sessions/{id}/approvals/{approval}", post(decide))
         .route("/api/desk/sessions/{id}/pty", get(pty))

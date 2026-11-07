@@ -209,10 +209,12 @@ pub struct SessionView {
     pub switching_to: Option<crate::engine_accounts::AccountRef>,
     /// The Desk terminal it runs in, when it was started in one.
     pub terminal_id: Option<Uuid>,
-    /// The terminal ground its CLI took its colours from at its start, when
-    /// it can't follow the terminal while it runs (Codex reads them once):
-    /// a change of ground shows once it restarts. None while it follows the
-    /// terminal, or keeps a theme of the person's own.
+    /// The terminal ground its CLI took its colours from at its start, for a
+    /// CLI that reads them only then (Codex): a change of ground shows once
+    /// it restarts. None for one that follows the terminal as it runs
+    /// (Claude Code, whose own theme, when the person set one, no restart
+    /// changes), one started before Desk said its colours, and one taken
+    /// back after the hub restarted.
     pub fixed_ground: Option<crate::vt::Ground>,
     /// What the person calls it in Desk (`name` is the hub's own).
     pub display_name: Option<String>,

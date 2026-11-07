@@ -398,7 +398,7 @@ impl Desk {
         env.insert(claude::USAGE_URL.into(), hook_url.clone());
         env.insert("DESK_HOOK_URL".into(), hook_url);
         // Light or dark, for programs that read it rather than ask.
-        if let Some(c) = crate::vt::colors() {
+        if let Some(c) = self.0.palette.get() {
             env.insert("COLORFGBG".into(), c.colorfgbg().into());
         }
         Spawn {
@@ -411,6 +411,13 @@ impl Desk {
 
     async fn open_terminal(&self, r: TerminalRecord) -> Result<TerminalView, DeskError> {
         let spec = self.terminal_spawn(&r);
+        // Claude Code started here by hand reads its theme from its config:
+        // set to follow the terminal's light or dark, unless the person set one.
+        let (env, cwd) = (spec.env.clone(), spec.cwd.clone());
+        let _ = tokio::task::spawn_blocking(move || {
+            crate::first_run::claude_follows_terminal(&env, &cwd)
+        })
+        .await;
         let meta = serde_json::json!({
             "kind": "terminal",
             "terminal": r.id,
@@ -481,7 +488,7 @@ impl Desk {
             match (kept, holder) {
                 (Some(i), Some(holder)) => {
                     let (_, h) = held.swap_remove(i);
-                    let (pty, exit) = holder.adopt(&h, history);
+                    let (pty, exit) = holder.adopt(&h, history, Some(self.0.palette.clone()));
                     self.0
                         .state
                         .lock()
@@ -512,7 +519,7 @@ impl Desk {
         }
         if let Some(holder) = holder {
             for (_, stray) in held {
-                holder.adopt(&stray, 0).0.kill();
+                holder.adopt(&stray, 0, None).0.kill();
             }
         }
         self.relink_terminal_sessions();
@@ -738,10 +745,11 @@ impl Desk {
     /// A session in a terminal is no longer running: it ended there
     /// (`clean`), or the terminal itself went.
     pub(super) fn end_terminal_session(&self, id: Uuid, clean: bool) {
-        let live = self.0.state.lock().live.remove(&id);
-        if live.is_none() {
+        let Some(live) = self.0.state.lock().live.remove(&id) else {
             return;
-        }
+        };
+        // Back at its shell, which must never be sent a colour scheme notice.
+        live.pty.forget_color_scheme_events();
         drop(live);
         self.change(id, |r, _| {
             r.state = if clean {
@@ -814,6 +822,15 @@ impl Desk {
                     self.publish(id);
                 }
                 None => self.change(id, |r, _| r.state = r.state.after_loss()),
+            }
+        }
+        // A terminal no session runs in now is its shell's: a colour scheme
+        // request its snapshot brought back was a session's that has gone.
+        let st = self.0.state.lock();
+        let hosting: HashSet<Uuid> = st.live.values().filter_map(|l| l.terminal).collect();
+        for (id, pty) in &st.terminal_ptys {
+            if !hosting.contains(id) {
+                pty.forget_color_scheme_events();
             }
         }
     }

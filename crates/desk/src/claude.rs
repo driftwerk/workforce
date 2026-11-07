@@ -29,17 +29,10 @@ pub struct ClaudeSpawn<'a> {
     pub hook_url: &'a str,
     pub approval_timeout_secs: u64,
     pub env: &'a BTreeMap<String, String>,
-    /// Its theme for this session only ([`theme_for`]); none keeps its own.
+    /// Its theme for this session only (`auto` when it may follow the
+    /// terminal, [`crate::first_run::claude_follows_terminal`]); none keeps
+    /// the person's.
     pub theme: Option<&'a str>,
-}
-
-/// The theme a session of Claude Code is given, from the one its config
-/// keeps (`person`): with none set, `auto`, which reads the terminal's
-/// background (OSC 11) at its start and again whenever the terminal says it
-/// turned light or dark (mode 2031), so it follows Desk's theme as it runs.
-/// One the person set (other than `auto`) is theirs, and kept.
-pub fn theme_for(person: Option<&str>) -> Option<&'static str> {
-    matches!(person, None | Some("auto")).then_some("auto")
 }
 
 const TOOL_EVENTS: [&str; 5] = [
@@ -608,12 +601,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_session_follows_the_terminal_unless_the_person_set_a_theme() {
-        assert_eq!(theme_for(None), Some("auto"));
-        assert_eq!(theme_for(Some("auto")), Some("auto"));
-        for theirs in ["dark", "light-daltonized", "custom:mine"] {
-            assert_eq!(theme_for(Some(theirs)), None, "{theirs} is kept");
-        }
+    fn a_session_given_a_theme_has_it_in_its_settings_with_the_hooks() {
         let env = BTreeMap::new();
         let settings = |theme| {
             let s = spawn(&ClaudeSpawn {
