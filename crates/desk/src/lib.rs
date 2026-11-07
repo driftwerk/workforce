@@ -32,6 +32,7 @@ pub mod floor;
 pub mod folders;
 pub mod gist;
 pub mod holder;
+pub mod identity;
 pub mod ledger;
 pub mod ledger_store;
 pub mod limit;

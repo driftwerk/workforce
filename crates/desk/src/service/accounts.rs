@@ -198,11 +198,18 @@ impl Desk {
                 engine: a.engine,
                 name: a.name.clone(),
                 is_default: a.is_default,
-                plan_key: self
-                    .0
-                    .plans
-                    .as_ref()
-                    .and_then(|p| p.account_key(crate::usage::LocalPlan::Claude, &[plan_id(a.id)])),
+                plan_key: self.0.plans.as_ref().and_then(|p| {
+                    let ids = Self::plan_ids(&st, Some(a.id)).unwrap_or_default();
+                    p.account_key(crate::usage::LocalPlan::Claude, &ids)
+                }),
+                identity: st.links.get(&a.id).map(|l| accounts::IdentityView {
+                    email: l.identity.email.clone(),
+                    linked_by: l.by,
+                    this_computer: st
+                        .own_identity
+                        .as_ref()
+                        .is_some_and(|o| o.key == l.identity.key),
+                }),
                 // As last seen: the store is never read under this lock.
                 signed_in: keys.is_some() && st.signed_in_accounts.contains(&a.id),
                 sessions: st
@@ -1024,6 +1031,8 @@ impl Desk {
         let (running, stopped): (Vec<Uuid>, Vec<Uuid>) = {
             let mut st = self.0.state.lock();
             st.accounts.retain(|o| o.id != id);
+            st.links.remove(&id);
+            st.prints.remove(&Some(id));
             st.signed_in_accounts.remove(&id);
             st.switches.retain(|_, to| *to != Some(id));
             st.sign_in_problems.remove(&id);
@@ -1300,15 +1309,20 @@ pub struct SwitchedAll {
 impl Desk {
     /// The account needs the Floor shows, less those the person put off.
     pub fn account_needs(&self) -> Vec<accounts::AccountNeed> {
-        let own_signed_in = self.sign_ins().of(Engine::Claude).on_plan();
+        let own_on_plan = self.sign_ins().of(Engine::Claude).on_plan();
         let st = self.0.state.lock();
+        // The CLI's own sign-in, known to be one of the accounts, is that
+        // account: never one more side.
+        let own_signed_in = own_on_plan && Self::own_account(&st).is_none();
         let mut on: std::collections::HashMap<Option<Uuid>, Vec<Uuid>> = Default::default();
         for r in st
             .records
             .values()
             .filter(|r| r.engine == Engine::Claude && st.live.contains_key(&r.id))
         {
-            on.entry(r.account).or_default().push(r.id);
+            on.entry(Self::side_of_session(&st, r.id))
+                .or_default()
+                .push(r.id);
         }
         accounts::needs(
             Engine::Claude,
@@ -1359,7 +1373,8 @@ impl Desk {
         }
         {
             let mut st = self.0.state.lock();
-            let s = st.standing.entry(account).or_default();
+            let side = Self::canonical(&st, account);
+            let s = st.standing.entry(side).or_default();
             s.windows = windows;
             s.read_at = Some(Utc::now());
         }
@@ -1437,7 +1452,9 @@ impl Desk {
                 .records
                 .values()
                 .filter(|r| {
-                    r.engine == engine && r.account == from && r.state != SessionState::Closed
+                    r.engine == engine
+                        && Self::side_of_session(&st, r.id) == from
+                        && r.state != SessionState::Closed
                 })
                 .map(|r| {
                     (

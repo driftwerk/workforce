@@ -43,6 +43,7 @@ use crate::worktree;
 mod accounts;
 mod asks;
 mod engine_sign_ins;
+mod identities;
 pub use accounts::Added;
 mod board;
 pub use board::{
@@ -219,6 +220,9 @@ pub(crate) struct Live {
     /// Asks raised while another showed, oldest first: each shows once
     /// those in front of it end, and none of them is lost meanwhile.
     behind: Vec<Behind>,
+    /// It was signed in again inside (`/login`): it runs on the CLI's own
+    /// sign-in, not its account's, until it starts again.
+    relogged: bool,
 }
 
 /// A call a thread started that hasn't ended.
@@ -577,6 +581,16 @@ struct State {
     /// How each session's last turn ended when an API error ended it, until
     /// it is asked again ([`crate::limit`]).
     turn_failures: HashMap<Uuid, crate::limit::TurnFailure>,
+    /// Which Anthropic account each of the person's accounts is, when known
+    /// ([`crate::identity`]).
+    links: HashMap<Uuid, crate::identity::Link>,
+    /// Which one this computer's own Claude Code sign-in is, as last read.
+    own_identity: Option<crate::identity::Identity>,
+    /// Each side's recent plan readings, to tell which account the CLI's
+    /// own sign-in is by its usage (`None`: the CLI's own).
+    prints: HashMap<Option<Uuid>, crate::identity::Prints>,
+    /// The last `/login` each session's transcript showed.
+    logins_seen: HashMap<Uuid, String>,
     /// Account needs the person put off.
     put_off: HashSet<String>,
     /// Desk moves sessions off an account at its limit by itself.
@@ -1154,6 +1168,7 @@ impl Desk {
         let layout = store.layout().await?;
         let session_env = kept_session_env(&store).await;
         let engine_accounts = store.accounts().await?;
+        let account_links = store.account_links().await?;
         let auto_switch = match store.state(accounts::AUTO_SWITCH).await {
             Ok(kept) => kept.is_some_and(|e| e.value == serde_json::json!(true)),
             Err(e) => {
@@ -1251,6 +1266,7 @@ impl Desk {
                 hidden,
                 turns,
                 accounts: engine_accounts,
+                links: account_links,
                 auto_switch,
                 ..State::default()
             }),
@@ -1449,6 +1465,7 @@ impl Desk {
                     codex_question: None,
                     flights: HashMap::new(),
                     behind: Vec::new(),
+                    relogged: false,
                     breaker: Default::default(),
                 },
             );
@@ -1532,7 +1549,6 @@ impl Desk {
         let mut ops = Self::turn_ops(st, &transitions, &view);
         self.keep_asks(st, r.id, open_turn, &mut ops);
         let id = r.id;
-        let r_account = r.account;
         // A switch of account that waited for its turn to end.
         let turn_over = transitions.iter().any(|t| {
             matches!(
@@ -1553,8 +1569,10 @@ impl Desk {
                 _ => false,
             });
         if hit_limit {
-            // When Claude Code said it resets; else what a reading says.
-            Self::mark_hit(st, r_account, view.failure.as_ref().and_then(|f| f.limit()));
+            // When Claude Code said it resets; else what a reading says. The
+            // account it stopped on, whichever credential of it it ran on.
+            let side = Self::side_of_session(st, id);
+            Self::mark_hit(st, side, view.failure.as_ref().and_then(|f| f.limit()));
             let desk = self.clone();
             tokio::spawn(async move { desk.accounts_moved().await });
         }
@@ -1723,6 +1741,13 @@ impl Desk {
         }
         let began = std::time::Instant::now();
         let read = self.read_engine(engine, &program).await;
+        if engine == Engine::Claude {
+            let own = match &read.sign_in {
+                engine::SignIn::Unknown => None,
+                said => Some(said.claude_identity()),
+            };
+            self.own_identity_read(own);
+        }
         self.0.engines.lock().insert(engine, read);
         *last = Some(EngineRead {
             began,
@@ -1803,20 +1828,25 @@ impl Desk {
         let Some(plans) = &self.0.plans else {
             return;
         };
-        let on = session.and_then(|id| self.0.state.lock().records.get(&id)?.account);
-        let account = match on {
-            Some(id) => crate::usage::LocalAccount {
-                ids: vec![accounts::plan_id(id)],
-                plan: None,
+        // Filed by the credential the session runs on now (a `/login`
+        // inside moves it to the CLI's own sign-in), under the account that
+        // is: one card per account, whichever credential of it reported.
+        let (on, ids) = {
+            let st = self.0.state.lock();
+            let on = session.and_then(|id| Self::running_on(&st, id));
+            (on, Self::plan_ids(&st, Self::canonical(&st, on)))
+        };
+        let own = self.sign_ins().of(Engine::Claude).plan_account();
+        let account = match ids {
+            Some(ids) => crate::usage::LocalAccount {
+                ids,
+                plan: own.and_then(|o| o.plan).filter(|_| on.is_none()),
             },
-            None => self
-                .sign_ins()
-                .of(Engine::Claude)
-                .plan_account()
-                .unwrap_or_default(),
+            None => own.unwrap_or_default(),
         };
         let windows = plans.windows(LocalPlan::Claude, &limits);
         plans.local(LocalPlan::Claude, limits, account);
+        self.observe_print(on, &windows);
         self.plan_read(on, windows);
     }
 
@@ -3645,6 +3675,7 @@ impl Desk {
                 codex_question: None,
                 flights: HashMap::new(),
                 behind: Vec::new(),
+                relogged: false,
                 breaker: Default::default(),
             },
         );
@@ -4300,6 +4331,7 @@ impl Desk {
                     .await
             }
             Hook::Usage(limits) => self.report_usage(limits, Some(id)),
+            Hook::SignedIn => self.signed_in_inside(id).await,
             Hook::Other => {}
         }
         answer()
@@ -4417,8 +4449,11 @@ impl Desk {
                 Some(_) => SessionState::Asking,
                 None => SessionState::Done,
             };
-            // The account it stopped on, before any switch moves it.
-            on = Some(r.account);
+            // The credential it stopped on, before any switch moves it.
+            on = Some(match l.as_deref() {
+                Some(l) if l.relogged => None,
+                _ => r.account,
+            });
             if let Some(l) = l.as_deref_mut() {
                 l.ends += 1;
                 l.reading = reader.as_ref().map(|_| l.ends);
@@ -4450,12 +4485,30 @@ impl Desk {
         if let (Some(reader), Some(end), Some(reply)) = (reader, read, said_whole) {
             self.read_later(id, end, reader, reply);
         }
+        // A `/login` inside it whose `auth_success` went unheard.
+        if let Some(p) = path.clone() {
+            let desk = self.clone();
+            tokio::spawn(async move {
+                let login = tokio::task::spawn_blocking(move || {
+                    transcript::read_tail(Path::new(&p))
+                        .ok()
+                        .and_then(|t| t.last_login)
+                })
+                .await
+                .ok()
+                .flatten();
+                desk.login_in_transcript(id, login).await;
+            });
+        }
         if let Some(on) = on {
             if let Some(hit) = &limit {
                 // On its limit: the account is full now, whatever it left
                 // running (a turn waiting on background work isn't over to
                 // the Floor, but it is to its account).
-                Self::mark_hit(&mut self.0.state.lock(), on, Some(hit));
+                let mut st = self.0.state.lock();
+                let side = Self::canonical(&st, on);
+                Self::mark_hit(&mut st, side, Some(hit));
+                drop(st);
                 let desk = self.clone();
                 tokio::spawn(async move { desk.accounts_moved().await });
             }
@@ -4569,6 +4622,8 @@ impl Desk {
         use crate::limit::TurnFailure;
         let upgraded = {
             let mut st = self.0.state.lock();
+            // The account it is, whichever credential of it stopped.
+            let account = Self::canonical(&st, account);
             // Asked again since: the turn it was is behind it, though the
             // account's standing still learns when it resets.
             let current = st.turn_failures.get(&id).cloned();
@@ -5218,6 +5273,9 @@ impl Desk {
                             && r.external_pid == ext.pid
                             && tail.is_none()
                     });
+                    if let Some(t) = &tail {
+                        self.login_in_transcript(id, t.last_login.clone()).await;
+                    }
                     if !unchanged {
                         // Its transcript says when its turn ended on an API
                         // error: the plan's limit (and when it resets), or

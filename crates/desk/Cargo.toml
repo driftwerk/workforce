@@ -17,6 +17,7 @@ chrono-tz = "0.10"
 deadpool-postgres = { workspace = true }
 eyre = { workspace = true }
 futures = { workspace = true }
+hex = "0.4"
 parking_lot = { workspace = true }
 libc = "0.2"
 nix = { version = "0.31", features = ["user"] }
@@ -25,6 +26,7 @@ refinery = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true, features = ["raw_value"] }
+sha2 = "0.10"
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-postgres = { workspace = true }

@@ -301,9 +301,22 @@ pub struct AccountView {
     pub signed_in: bool,
     /// The key its plan readings have on the Floor's plan cards.
     pub plan_key: Option<String>,
+    /// Which Anthropic account it is, when known ([`crate::identity`]).
+    pub identity: Option<IdentityView>,
     /// The sessions running on it now.
     pub sessions: Vec<Uuid>,
     pub created_at: DateTime<Utc>,
+}
+
+/// Which Anthropic account a Desk account is, as Settings shows it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IdentityView {
+    pub email: Option<String>,
+    /// The person said so, or its usage matched this computer's sign-in.
+    pub linked_by: crate::identity::LinkedBy,
+    /// This computer's own Claude Code is signed in to it.
+    pub this_computer: bool,
 }
 
 /// What is wrong with an account's sign-in in the store.
@@ -1348,6 +1361,66 @@ impl crate::store::DeskStore {
         tx.execute("DELETE FROM engine_accounts WHERE id = $1", &[&id])
             .await?;
         tx.commit().await.context("removing an engine account")
+    }
+}
+
+impl crate::store::DeskStore {
+    /// Which identity each account is known as.
+    pub async fn account_links(
+        &self,
+    ) -> Result<std::collections::HashMap<Uuid, crate::identity::Link>> {
+        let client = self.pool().get().await?;
+        let rows = client
+            .query(
+                "SELECT account, identity, email, linked_by, linked_at FROM engine_account_identities",
+                &[],
+            )
+            .await?;
+        Ok(rows
+            .iter()
+            .filter_map(|row| {
+                let by = crate::identity::LinkedBy::parse(row.get("linked_by"))?;
+                Some((
+                    row.get("account"),
+                    crate::identity::Link {
+                        identity: crate::identity::Identity {
+                            key: row.get("identity"),
+                            email: row.get("email"),
+                        },
+                        by,
+                        at: row.get("linked_at"),
+                    },
+                ))
+            })
+            .collect())
+    }
+
+    /// Keeps `account` known as `link`, or (none) as no identity.
+    pub async fn put_account_link(
+        &self,
+        account: Uuid,
+        link: Option<&crate::identity::Link>,
+    ) -> Result<()> {
+        let client = self.pool().get().await?;
+        match link {
+            Some(l) => client
+                .execute(
+                    "INSERT INTO engine_account_identities (account, identity, email, linked_by, linked_at) \
+                     VALUES ($1, $2, $3, $4, $5) \
+                     ON CONFLICT (account) DO UPDATE SET identity = $2, email = $3, linked_by = $4, linked_at = $5",
+                    &[&account, &l.identity.key, &l.identity.email, &l.by.as_str(), &l.at],
+                )
+                .await
+                .context("keeping an account's identity")?,
+            None => client
+                .execute(
+                    "DELETE FROM engine_account_identities WHERE account = $1",
+                    &[&account],
+                )
+                .await
+                .context("forgetting an account's identity")?,
+        };
+        Ok(())
     }
 }
 

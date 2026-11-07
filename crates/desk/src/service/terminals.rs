@@ -673,6 +673,7 @@ impl Desk {
             codex_question: None,
             flights: HashMap::new(),
             behind: Vec::new(),
+            relogged: false,
             breaker: Default::default(),
         };
         if existing.is_some_and(|id| self.0.state.lock().live.contains_key(&id)) {
@@ -802,6 +803,7 @@ impl Desk {
                             codex_question: None,
                             flights: HashMap::new(),
                             behind: Vec::new(),
+                            relogged: false,
                             breaker: Default::default(),
                         },
                     );
