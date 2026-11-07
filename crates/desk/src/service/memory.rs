@@ -45,6 +45,7 @@ pub struct MemorySearch {
     pub hits: Vec<MemoryHitView>,
     /// Only keywords were matched: the search index isn't ready.
     pub keyword_only: bool,
+    /// What the person should know of the search, in plain words.
     pub notice: Option<&'static str>,
 }
 
@@ -234,18 +235,37 @@ impl Desk {
         }
     }
 
-    /// The person's keyword search of what Desk remembers: every session's,
-    /// or one group's or one session's. Until the search index is ready,
-    /// only keywords are matched, and the answer says so.
+    /// The person's search of what Desk remembers: every session's, or one
+    /// group's or one session's. By meaning and words once the search
+    /// index is ready; until then by keyword only, and the answer says so.
     pub async fn memory_search(&self, q: &MemoryQuery) -> Result<MemorySearch, DeskError> {
-        if q.q.trim().is_empty() {
-            return Err(DeskError::Invalid("Say what to search for.".into()));
-        }
-        let q = MemoryQuery {
-            limit: q.limit.clamp(1, SEARCH_MAX),
-            ..q.clone()
-        };
-        let hits = self.0.store.memory_search(&q).await?;
+        let found = self
+            .memory_recall(
+                &crate::memory::reach::Reader::Person,
+                &super::memory_recall::Recall {
+                    q: q.q.clone(),
+                    group: q.group.clone(),
+                    session: q.session,
+                    limit: usize::try_from(q.limit.clamp(1, SEARCH_MAX)).unwrap_or(1),
+                    tool: "search",
+                    ..Default::default()
+                },
+            )
+            .await?;
+        let hits: Vec<MemoryHit> = found
+            .hits
+            .into_iter()
+            .map(|(r, _)| MemoryHit {
+                session: r.session,
+                group: r.group,
+                project: r.project,
+                at: r.at,
+                asker: r.asker,
+                ask: r.ask,
+                answer: r.answer,
+                compaction: r.compaction,
+            })
+            .collect();
         let ids: Vec<Uuid> = hits
             .iter()
             .map(|h| h.session)
@@ -295,8 +315,8 @@ impl Desk {
                     }
                 })
                 .collect(),
-            keyword_only: true,
-            notice: Some(crate::memory::KEYWORD_ONLY),
+            keyword_only: found.keyword_only,
+            notice: found.notice,
         })
     }
 
