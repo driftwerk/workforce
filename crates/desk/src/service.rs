@@ -6065,6 +6065,8 @@ mod tests {
             new_session(&d, dir.path()).await;
             let text = launched().await;
             assert!(settings(&text).get("theme").is_none());
+            // The colours are the process's: the next test starts without.
+            crate::vt::clear_colors();
         })
         .await;
     }

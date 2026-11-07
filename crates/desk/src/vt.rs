@@ -123,6 +123,12 @@ pub fn set_colors(colors: Colors) -> bool {
     changed
 }
 
+/// Forgets the colours Desk said (tests that set them).
+#[cfg(test)]
+pub(crate) fn clear_colors() {
+    *COLORS.write() = None;
+}
+
 /// The colours terminals answer with, once Desk has said them.
 pub fn colors() -> Option<Arc<Colors>> {
     COLORS.read().clone()
@@ -150,8 +156,9 @@ struct Tracker {
     modify_other_keys: Option<u16>,
     title: Option<Vec<u8>>,
     cwd: Option<String>,
-    /// Colours this terminal answers with instead of Desk's (tests).
-    colors: Option<Arc<Colors>>,
+    /// Colours this terminal answers with instead of Desk's, or none at
+    /// all (tests).
+    colors: Option<Option<Arc<Colors>>>,
 }
 
 impl Tracker {
@@ -159,7 +166,7 @@ impl Tracker {
     /// next of them) and OSC 4 (`index;?` pairs), one reply each, as
     /// xterm.js does; nothing while Desk hasn't said its colours.
     fn colour_queries(&mut self, params: &[&[u8]]) {
-        let Some(colors) = self.colors.clone().or_else(colors) else {
+        let Some(colors) = self.colors.clone().unwrap_or_else(colors) else {
             return;
         };
         let num = |p: &[u8]| std::str::from_utf8(p).ok()?.parse::<u16>().ok();
@@ -385,11 +392,12 @@ impl Term {
         }
     }
 
-    /// A terminal that answers with `colors`, not Desk's.
+    /// A terminal that answers with `colors` (none: Desk hasn't said
+    /// them), not with Desk's as they are now.
     #[cfg(test)]
-    fn with_colors(cols: u16, rows: u16, colors: Colors) -> Self {
+    fn with_colors(cols: u16, rows: u16, colors: Option<Colors>) -> Self {
         let mut t = Self::new(cols, rows, 0);
-        t.parser.callbacks_mut().colors = Some(Arc::new(colors));
+        t.parser.callbacks_mut().colors = Some(colors.map(Arc::new));
         t
     }
 
@@ -531,7 +539,7 @@ mod tests {
 
     #[test]
     fn colour_queries_are_answered_with_desks_colours_as_xterm_js_answers_them() {
-        let mut t = Term::with_colors(80, 24, day());
+        let mut t = Term::with_colors(80, 24, Some(day()));
         // ST- and BEL-terminated, as Codex and Claude Code send them.
         assert_eq!(
             t.feed(b"\x1b]10;?\x1b\\\x1b]11;?\x07"),
@@ -564,10 +572,10 @@ mod tests {
 
     #[test]
     fn colour_queries_go_unanswered_until_desk_says_its_colours() {
-        let mut t = Term::new(80, 24, 0);
-        if colors().is_none() {
-            assert!(t.feed(b"\x1b]11;?\x07").is_empty());
-        }
+        let mut t = Term::with_colors(80, 24, None);
+        assert!(t
+            .feed(b"\x1b]11;?\x07\x1b]10;?\x07\x1b]4;1;?\x07")
+            .is_empty());
     }
 
     #[test]
