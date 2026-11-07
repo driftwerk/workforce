@@ -12,5 +12,6 @@
 {"timestamp":"2026-10-31T10:06:00.000Z","type":"compacted","payload":{"message":"Summary: the auth test was fixed by retrying once.","replacement_history":[]}}
 {"timestamp":"2026-10-31T10:07:00.000Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-3","model_context_window":272000}}
 {"timestamp":"2026-10-31T10:07:00.100Z","type":"turn_context","payload":{"turn_id":"turn-3","cwd":"/Users/allan/dev/atlas","model":"gpt-5.6-sol","approval_policy":"on-request"}}
+{"timestamp":"2026-10-31T10:07:00.150Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<recommended_plugins>\n- changelog-helper\n</recommended_plugins>"}]}}
 {"timestamp":"2026-10-31T10:07:00.200Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Now update the changelog"}]}}
 {"timestamp":"2026-10-31T10:07:02.000Z","type":"response_item","payload":{"type":"local_shell_call","call_id":"call_3","status":"completed","action":{"type":"exec","command":["git","log","-1"]}}}
