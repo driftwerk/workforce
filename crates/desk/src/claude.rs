@@ -131,7 +131,9 @@ struct Payload {
     reason: Option<String>,
     background_tasks: Option<Vec<BackgroundTask>>,
     error: Option<String>,
-    error_details: Option<String>,
+    /// `StopFailure`'s, said in the hooks reference as text; read as any
+    /// value, so a shape it changes to never loses the whole hook.
+    error_details: Option<Value>,
     cwd: Option<String>,
 }
 
@@ -208,6 +210,8 @@ pub enum Hook {
         /// resets 9am".
         reply: Option<String>,
         failure: crate::limit::TurnFailure,
+        /// What it left running, when the CLI says (2.1.319's doesn't).
+        background: Option<Vec<(String, TaskKind)>>,
     },
     /// Claude Code went on by itself: background work it started ended.
     Woken,
@@ -307,25 +311,18 @@ pub fn parse_hook(body: &[u8]) -> eyre::Result<Hook> {
         "Stop" => Hook::Stop {
             transcript: p.transcript_path,
             reply: p.last_assistant_message.filter(|m| !m.trim().is_empty()),
-            background: p.background_tasks.map(|tasks| {
-                tasks
-                    .into_iter()
-                    .filter(|t| t.status == "running")
-                    .map(|t| {
-                        let kind = match t.kind.as_str() {
-                            "shell" => TaskKind::Shell,
-                            _ => TaskKind::Agent,
-                        };
-                        (t.id, kind)
-                    })
-                    .collect()
-            }),
+            background: p.background_tasks.map(running_tasks),
         },
         "StopFailure" => {
+            let details = p
+                .error_details
+                .as_ref()
+                .and_then(Value::as_str)
+                .map(str::to_string);
             let reply = p
                 .last_assistant_message
                 .filter(|m| !m.trim().is_empty())
-                .or(p.error_details.filter(|m| !m.trim().is_empty()));
+                .or(details.filter(|m| !m.trim().is_empty()));
             Hook::StopFailure {
                 transcript: p.transcript_path,
                 failure: crate::limit::of_stop_failure(
@@ -333,6 +330,7 @@ pub fn parse_hook(body: &[u8]) -> eyre::Result<Hook> {
                     reply.as_deref(),
                 ),
                 reply,
+                background: p.background_tasks.map(running_tasks),
             }
         }
         "SubagentStart" => p.agent_id.map_or(Hook::Other, Hook::SubagentStart),
@@ -341,6 +339,21 @@ pub fn parse_hook(body: &[u8]) -> eyre::Result<Hook> {
         "DeskUsage" => Hook::Usage(p.rate_limits.unwrap_or(Value::Null)),
         _ => Hook::Other,
     })
+}
+
+/// The tasks of a turn's end that still run.
+fn running_tasks(tasks: Vec<BackgroundTask>) -> Vec<(String, TaskKind)> {
+    tasks
+        .into_iter()
+        .filter(|t| t.status == "running")
+        .map(|t| {
+            let kind = match t.kind.as_str() {
+                "shell" => TaskKind::Shell,
+                _ => TaskKind::Agent,
+            };
+            (t.id, kind)
+        })
+        .collect()
 }
 
 /// The `Notification` kinds that mean a dialog waits on the person, as
@@ -640,8 +653,14 @@ pub(crate) mod tests {
                     window: None,
                     resets_at: None
                 }),
+                background: None,
             }
         );
+        // Details in another shape never lose the hook.
+        assert!(matches!(
+            parse_hook(br#"{"hook_event_name":"StopFailure","error":"server_error","error_details":{"status":500}}"#).unwrap(),
+            Hook::StopFailure { failure: crate::limit::TurnFailure::Failed(e), .. } if e == "server_error"
+        ));
         let refused = r#"{"session_id":"338b","transcript_path":"/t.jsonl","hook_event_name":"StopFailure","error":"rate_limit","last_assistant_message":"API Error: Request rejected (429) · This request would exceed your account's rate limit."}"#;
         assert!(matches!(
             parse_hook(refused.as_bytes()).unwrap(),

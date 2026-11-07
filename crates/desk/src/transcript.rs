@@ -20,9 +20,10 @@ pub struct Tail {
     /// The last reply whole, for reading whether it asks the person
     /// something.
     pub said: Option<String>,
-    /// The plan's limit, when the transcript ends on Claude Code's refusal
-    /// at it: which window, and when it resets.
-    pub limit: Option<crate::limit::LimitHit>,
+    /// How its last turn failed, when the transcript ends on Claude Code's
+    /// API error: the plan's limit (which window, and when it resets), or
+    /// another failure.
+    pub failure: Option<crate::limit::TurnFailure>,
 }
 
 /// The whole lines of the end of a transcript.
@@ -64,13 +65,13 @@ fn absorb(mut tail: Tail, v: &Value) -> Tail {
                 if !text.starts_with('<') {
                     tail.last_prompt = Some(text.to_string());
                     // Asked again: what stopped the last turn is behind it.
-                    tail.limit = None;
+                    tail.failure = None;
                 }
             }
         }
         Some("assistant") => {
             // Only the turn it ends on: a later reply or error clears it.
-            tail.limit = crate::limit::in_transcript_line(v);
+            tail.failure = crate::limit::in_transcript_line(v);
             let text: Vec<&str> = v
                 .pointer("/message/content")
                 .and_then(Value::as_array)
@@ -161,7 +162,7 @@ mod tests {
                 last_prompt: Some("now open a PR".into()),
                 last_reply: Some("Done, tests pass.".into()),
                 said: Some("Done, tests pass.".into()),
-                limit: None,
+                failure: None,
             }
         );
     }
@@ -182,11 +183,11 @@ mod tests {
         ]);
         let t = read_tail(f.path()).unwrap();
         assert_eq!(
-            t.limit,
-            Some(crate::limit::LimitHit {
+            t.failure,
+            Some(crate::limit::TurnFailure::Limit(crate::limit::LimitHit {
                 window: Some("seven_day".into()),
                 resets_at: chrono::DateTime::from_timestamp(1_792_137_600, 0),
-            })
+            }))
         );
         assert_eq!(
             t.last_reply.as_deref(),
@@ -197,12 +198,21 @@ mod tests {
             refused,
             r#"{"type":"user","message":{"role":"user","content":"Continue"}}"#,
         ]);
-        assert_eq!(read_tail(f.path()).unwrap().limit, None);
+        assert_eq!(read_tail(f.path()).unwrap().failure, None);
         let f = write(&[
             refused,
             r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Done."}]}}"#,
         ]);
-        assert_eq!(read_tail(f.path()).unwrap().limit, None);
+        assert_eq!(read_tail(f.path()).unwrap().failure, None);
+        // A 429 that isn't the plan's: a failed turn.
+        let f = write(&[
+            r#"{"type":"user","message":{"role":"user","content":"fix it"}}"#,
+            r#"{"type":"assistant","isApiErrorMessage":true,"apiError":null,"quotaLimits":null,"error":"rate_limit","apiErrorStatus":429,"message":{"content":[{"type":"text","text":"API Error: Request rejected (429) · This request would exceed your account's rate limit."}]}}"#,
+        ]);
+        assert_eq!(
+            read_tail(f.path()).unwrap().failure,
+            Some(crate::limit::TurnFailure::Failed("rate_limit".into()))
+        );
     }
 
     #[test]

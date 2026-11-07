@@ -74,11 +74,17 @@ pub fn says_plan_limit(said: &str) -> bool {
         || s.starts_with("you have hit your")
         || s.contains("usage limit reached")
         || s.contains("limit · resets")
+        // Older wordings: "5-hour limit reached ∙ resets 3pm".
+        || s.contains("limit reached ∙ resets")
+        || s.contains("out of extra usage")
 }
 
-/// The plan's limit as one transcript line says it: an API error line with
-/// `apiError: "usage_limit_reached"`, or a `quotaLimits` refusal.
-pub fn in_transcript_line(v: &Value) -> Option<LimitHit> {
+/// How a turn ended as one transcript line says, when the line is Claude
+/// Code's API error: the plan's own limit (`apiError: "usage_limit_reached"`,
+/// or a `quotaLimits` refusal), with its window and reset; else a failed
+/// turn, whatever its words say (an organization's or a passing 429 reads
+/// "rate limit" too). None for any other line.
+pub fn in_transcript_line(v: &Value) -> Option<TurnFailure> {
     if v.get("isApiErrorMessage").and_then(Value::as_bool) != Some(true) {
         return None;
     }
@@ -87,17 +93,18 @@ pub fn in_transcript_line(v: &Value) -> Option<LimitHit> {
     let plan = v.get("apiError").and_then(Value::as_str) == Some("usage_limit_reached")
         || quota.is_some_and(|q| q.get("status").and_then(Value::as_str) == Some("rejected"));
     if !plan {
-        return None;
+        let error = v.get("error").and_then(Value::as_str).unwrap_or("unknown");
+        return Some(TurnFailure::Failed(error.to_string()));
     }
     let field = |k: &str| [info, quota].into_iter().flatten().find_map(|o| o.get(k));
-    Some(LimitHit {
+    Some(TurnFailure::Limit(LimitHit {
         window: field("rateLimitType")
             .and_then(Value::as_str)
             .map(str::to_string),
         resets_at: field("resetsAt")
             .and_then(Value::as_i64)
             .and_then(|s| DateTime::from_timestamp(s, 0)),
-    })
+    }))
 }
 
 #[cfg(test)]
@@ -163,18 +170,23 @@ mod tests {
         .unwrap();
         assert_eq!(
             in_transcript_line(&line),
-            Some(LimitHit {
+            Some(TurnFailure::Limit(LimitHit {
                 window: Some("five_hour".into()),
                 resets_at: DateTime::from_timestamp(1_792_137_600, 0),
-            })
+            }))
         );
-        // An API key's 429: no plan limit in it.
+        // An API key's 429, as 2.1.319 wrote it: a failed turn, never the
+        // plan's limit, whatever its words.
         let key: Value = serde_json::from_str(
             r#"{"type":"assistant","isApiErrorMessage":true,"apiError":null,
-            "apiErrorParams":null,"quotaLimits":null,"error":"rate_limit","apiErrorStatus":429}"#,
+            "apiErrorParams":null,"quotaLimits":null,"error":"rate_limit","apiErrorStatus":429,
+            "message":{"content":[{"type":"text","text":"API Error: Request rejected (429) · This request would exceed your account's rate limit."}]}}"#,
         )
         .unwrap();
-        assert_eq!(in_transcript_line(&key), None);
+        assert_eq!(
+            in_transcript_line(&key),
+            Some(TurnFailure::Failed("rate_limit".into()))
+        );
         // A reply, not an error.
         let reply: Value = serde_json::from_str(
             r#"{"type":"assistant","message":{"content":[{"type":"text","text":"You've hit your usage limit"}]}}"#,

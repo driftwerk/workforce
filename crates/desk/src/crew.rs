@@ -835,7 +835,6 @@ pub fn hit_limit(reply: &str) -> bool {
         || [
             "usage limit",
             "limit reached",
-            "rate limit",
             "limit will reset",
             "out of extra usage",
         ]
@@ -1008,6 +1007,11 @@ mod tests {
         assert_eq!(
             outcome_of(Err("rate limit reached, try later")).0,
             Outcome::Limit
+        );
+        // A 429 that isn't the plan's says "rate limit" too: not a limit.
+        assert_eq!(
+            outcome_of(Err("API Error: Request rejected (429) · This request would exceed your account's rate limit.")).0,
+            Outcome::Failed
         );
         // As Claude Code 2.1.31x says its plan's own limits.
         for said in [

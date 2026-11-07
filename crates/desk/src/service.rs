@@ -1367,14 +1367,8 @@ impl Desk {
                 _ => false,
             });
         if hit_limit {
-            let standing = st.standing.entry(r_account).or_default();
-            standing.hit_at = Some(Utc::now());
             // When Claude Code said it resets; else what a reading says.
-            standing.hit_until = view
-                .failure
-                .as_ref()
-                .and_then(|f| f.limit())
-                .and_then(|l| l.resets_at);
+            Self::mark_hit(st, r_account, view.failure.as_ref().and_then(|f| f.limit()));
             let desk = self.clone();
             tokio::spawn(async move { desk.accounts_moved().await });
         }
@@ -3924,8 +3918,9 @@ impl Desk {
                 transcript,
                 reply,
                 failure,
+                background,
             } => {
-                self.turn_ended(id, transcript, reply, None, Some(failure))
+                self.turn_ended(id, transcript, reply, background, Some(failure))
                     .await
             }
             Hook::SessionEnd => {
@@ -4034,7 +4029,16 @@ impl Desk {
         let said_whole = said.clone().filter(|_| unsure);
         let reader = unsure.then(|| self.reader()).flatten();
         let running = self.running_now(id).await;
-        let limit = failure.as_ref().is_some_and(|f| f.limit().is_some());
+        // A refusal whose words aren't the plan's, on an account whose
+        // readings show a window full: the plan's limit after all.
+        let failure = failure.map(|f| self.cross_checked(id, f));
+        let limit = failure.as_ref().and_then(|f| f.limit()).cloned();
+        // A rate limit's transcript line decides what it was.
+        let rate_limit = match &failure {
+            Some(crate::limit::TurnFailure::Limit(_)) => true,
+            Some(crate::limit::TurnFailure::Failed(e)) => e == "rate_limit",
+            None => false,
+        };
         {
             let mut st = self.0.state.lock();
             match failure {
@@ -4043,6 +4047,7 @@ impl Desk {
             };
         }
         let mut read = None;
+        let mut on = None;
         self.change(id, |r, mut l| {
             // The person spoke while it was read: that answers it.
             let asked = asked.filter(|_| l.as_ref().is_some_and(|l| l.prompts == prompts));
@@ -4050,6 +4055,8 @@ impl Desk {
                 Some(_) => SessionState::Asking,
                 None => SessionState::Done,
             };
+            // The account it stopped on, before any switch moves it.
+            on = Some(r.account);
             if let Some(l) = l.as_deref_mut() {
                 l.ends += 1;
                 l.reading = reader.as_ref().map(|_| l.ends);
@@ -4067,18 +4074,34 @@ impl Desk {
                 l.open_question = None;
                 l.answer = None;
                 l.denials.clear();
-                l.background = std::mem::take(&mut l.background)
-                    .reported(background, Utc::now())
-                    .looked_if(running, Utc::now());
+                let now = Utc::now();
+                l.background = match (failed, background) {
+                    // A failure says nothing of what it left running: what
+                    // was known is kept, and looked at again.
+                    (true, None) => std::mem::take(&mut l.background),
+                    (_, background) => std::mem::take(&mut l.background).reported(background, now),
+                }
+                .looked_if(running, now);
             }
         });
         if let (Some(reader), Some(end), Some(reply)) = (reader, read, said_whole) {
             self.read_later(id, end, reader, reply);
         }
-        if let (true, Some(p)) = (limit, path) {
-            // The account it stopped on, before any switch moves it.
-            if let Ok(r) = self.record(id) {
-                self.limit_read_later(id, r.account, PathBuf::from(p));
+        if let Some(on) = on {
+            if let Some(hit) = &limit {
+                // On its limit: the account is full now, whatever it left
+                // running (a turn waiting on background work isn't over to
+                // the Floor, but it is to its account).
+                Self::mark_hit(&mut self.0.state.lock(), on, Some(hit));
+                let desk = self.clone();
+                tokio::spawn(async move { desk.accounts_moved().await });
+            }
+            if failed {
+                // A switch that waited for its turn: it is over.
+                self.drive_waiting_switch(id);
+            }
+            if let (true, Some(p)) = (rate_limit, path) {
+                self.failure_read_later(id, on, PathBuf::from(p));
             }
         }
         // The turn's calls are in its transcript now.
@@ -4086,45 +4109,140 @@ impl Desk {
         self.breaker_settled(id);
     }
 
-    /// The exact window and reset of the limit a turn just stopped on:
-    /// Claude Code writes them to the transcript only after its
-    /// `StopFailure`, so it is read again a little later.
-    fn limit_read_later(&self, id: Uuid, account: Option<Uuid>, path: PathBuf) {
+    /// A switch of account session `id` waits on, carried out now.
+    fn drive_waiting_switch(&self, id: Uuid) {
+        if !self.0.state.lock().switches.contains_key(&id) {
+            return;
+        }
+        let desk = self.clone();
+        tokio::spawn(async move {
+            if let Err(e) = desk.drive_switch(id, None).await {
+                tracing::warn!(session = %id, error = %e, "couldn't move a session to its account");
+            }
+        });
+    }
+
+    /// `account` stopped on its plan's limit now: full until `hit` says it
+    /// resets, else until a reading says it has room.
+    fn mark_hit(st: &mut State, account: Option<Uuid>, hit: Option<&crate::limit::LimitHit>) {
+        let now = Utc::now();
+        let standing = st.standing.entry(account).or_default();
+        standing.hit_at = Some(now);
+        standing.hit_until = hit
+            .and_then(|h| h.resets_at)
+            .or(standing.hit_until.filter(|u| *u > now));
+    }
+
+    /// A refusal of `error` "rate_limit" whose words weren't the plan's, on
+    /// an account whose last reading has a window full: its limit.
+    fn cross_checked(
+        &self,
+        id: Uuid,
+        failure: crate::limit::TurnFailure,
+    ) -> crate::limit::TurnFailure {
+        use crate::limit::{LimitHit, TurnFailure};
+        let TurnFailure::Failed(error) = &failure else {
+            return failure;
+        };
+        if error != "rate_limit" {
+            return failure;
+        }
+        let st = self.0.state.lock();
+        let now = Utc::now();
+        let full = st
+            .records
+            .get(&id)
+            .and_then(|r| st.standing.get(&r.account))
+            .and_then(|s| {
+                s.windows
+                    .iter()
+                    .filter(|w| w.used_percent >= 100.0 && w.resets_at.is_some_and(|r| r > now))
+                    .filter_map(|w| w.resets_at)
+                    .max()
+            });
+        match full {
+            Some(resets_at) => TurnFailure::Limit(LimitHit {
+                window: None,
+                resets_at: Some(resets_at),
+            }),
+            None => failure,
+        }
+    }
+
+    /// What a rate limit really was, and, for the plan's own, which window
+    /// and when it resets: Claude Code writes that line to the transcript
+    /// only after its `StopFailure`, so it is read again a little later.
+    fn failure_read_later(&self, id: Uuid, account: Option<Uuid>, path: PathBuf) {
         let desk = self.clone();
         tokio::spawn(async move {
             for wait in [250, 1000, 3000, 8000] {
                 tokio::time::sleep(Duration::from_millis(wait)).await;
                 let p = path.clone();
-                let hit = tokio::task::spawn_blocking(move || {
-                    transcript::read_tail(&p).ok().and_then(|t| t.limit)
+                let said = tokio::task::spawn_blocking(move || {
+                    transcript::read_tail(&p).ok().and_then(|t| t.failure)
                 })
                 .await
                 .ok()
                 .flatten();
-                let Some(hit) = hit else {
+                let Some(said) = said else {
                     continue;
                 };
-                desk.limit_known(id, account, hit);
+                desk.failure_known(id, account, said);
                 return;
             }
         });
     }
 
-    /// What Claude Code said of the limit session `id` stopped on, on
-    /// `account`: the account's standing is told when it resets, and the
-    /// session keeps it while that is still how its last turn ended.
-    pub(super) fn limit_known(&self, id: Uuid, account: Option<Uuid>, hit: crate::limit::LimitHit) {
-        {
+    /// What the transcript said of the API error session `id`'s turn ended
+    /// on, on `account`; it decides over the hook's words. The plan's limit
+    /// makes the account full until its reset, though the words didn't say
+    /// so; a refusal that isn't the plan's undoes a limit read from words.
+    pub(super) fn failure_known(
+        &self,
+        id: Uuid,
+        account: Option<Uuid>,
+        said: crate::limit::TurnFailure,
+    ) {
+        use crate::limit::TurnFailure;
+        let upgraded = {
             let mut st = self.0.state.lock();
-            if let Some(at) = hit.resets_at {
-                let standing = st.standing.entry(account).or_default();
-                if standing.hit_at.is_some() {
-                    standing.hit_until = Some(at);
+            // Asked again since: the turn it was is behind it, though the
+            // account's standing still learns when it resets.
+            let current = st.turn_failures.get(&id).cloned();
+            match (current, said) {
+                (Some(TurnFailure::Limit(_)), TurnFailure::Limit(hit)) => {
+                    let standing = st.standing.entry(account).or_default();
+                    standing.hit_until = hit.resets_at.or(standing.hit_until);
+                    st.turn_failures.insert(id, TurnFailure::Limit(hit));
+                    false
                 }
+                (Some(TurnFailure::Failed(_)), TurnFailure::Limit(hit)) => {
+                    tracing::info!(session = %id, "its transcript says the plan's limit ended its turn");
+                    Self::mark_hit(&mut st, account, Some(&hit));
+                    st.turn_failures.insert(id, TurnFailure::Limit(hit));
+                    true
+                }
+                (Some(TurnFailure::Limit(_)), TurnFailure::Failed(error)) => {
+                    tracing::info!(session = %id, "its transcript says a refusal that isn't the plan's ended its turn");
+                    if let Some(s) = st.standing.get_mut(&account) {
+                        s.hit_at = None;
+                        s.hit_until = None;
+                    }
+                    st.turn_failures.insert(id, TurnFailure::Failed(error));
+                    false
+                }
+                (None, TurnFailure::Limit(hit)) => {
+                    let standing = st.standing.entry(account).or_default();
+                    if standing.hit_at.is_some() {
+                        standing.hit_until = hit.resets_at.or(standing.hit_until);
+                    }
+                    false
+                }
+                (Some(TurnFailure::Failed(_)) | None, TurnFailure::Failed(_)) => false,
             }
-            if let Some(crate::limit::TurnFailure::Limit(old)) = st.turn_failures.get_mut(&id) {
-                *old = hit;
-            }
+        };
+        if upgraded {
+            self.drive_waiting_switch(id);
         }
         let desk = self.clone();
         tokio::spawn(async move { desk.accounts_moved().await });
@@ -4699,14 +4817,13 @@ impl Desk {
                             && tail.is_none()
                     });
                     if !unchanged {
-                        // Its transcript says when its turn ended on the
-                        // plan's limit, and when that resets.
+                        // Its transcript says when its turn ended on an API
+                        // error: the plan's limit (and when it resets), or
+                        // another failure, never read from its words.
                         if let Some(t) = &tail {
                             let mut st = self.0.state.lock();
-                            match t.limit.clone() {
-                                Some(hit) => st
-                                    .turn_failures
-                                    .insert(id, crate::limit::TurnFailure::Limit(hit)),
+                            match t.failure.clone() {
+                                Some(f) => st.turn_failures.insert(id, f),
                                 None => st.turn_failures.remove(&id),
                             };
                         }
@@ -4727,7 +4844,7 @@ impl Desk {
                 None => {
                     let now = Utc::now();
                     let mut tail = tail.unwrap_or_default();
-                    let limit = tail.limit.take();
+                    let failure = tail.failure.take();
                     let r = SessionRecord {
                         id: Uuid::new_v4(),
                         engine: Engine::Claude,
@@ -4759,12 +4876,8 @@ impl Desk {
                         updated_at: now,
                     };
                     present.insert(r.id);
-                    if let Some(hit) = limit {
-                        self.0
-                            .state
-                            .lock()
-                            .turn_failures
-                            .insert(r.id, crate::limit::TurnFailure::Limit(hit));
+                    if let Some(f) = failure {
+                        self.0.state.lock().turn_failures.insert(r.id, f);
                     }
                     self.save(r);
                 }

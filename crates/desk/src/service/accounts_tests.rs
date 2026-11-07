@@ -984,12 +984,7 @@ async fn a_turn_stopped_by_its_plans_limit_moves_at_once_and_carries_on() {
             None,
         )
         .await;
-        std::fs::write(
-            &transcript,
-            r#"{"type":"assistant","isApiErrorMessage":true,"apiError":"usage_limit_reached","apiErrorParams":{"rate_limit_info":{"status":"rejected","resetsAt":1792137600,"rateLimitType":"five_hour"}},"quotaLimits":{"status":"rejected","resetsAt":1792137600,"rateLimitType":"five_hour"},"error":"rate_limit","message":{"content":[{"type":"text","text":"You've hit your 5-hour limit · resets 9am (Europe/London)"}]}}
-"#,
-        )
-        .unwrap();
+        std::fs::write(&transcript, error_line(true)).unwrap();
         let (env, args) = started(dir.path(), a, 1).await;
         assert_eq!(env["TOKEN_ON_FD"], OTHER);
         assert!(args.trim_end().ends_with("Continue"), "{args}");
@@ -998,7 +993,7 @@ async fn a_turn_stopped_by_its_plans_limit_moves_at_once_and_carries_on() {
         assert!(!args.contains("Continue"), "{args}");
         assert_eq!(d.view(a).unwrap().account.map(|x| x.id), Some(personal));
         // And Work is full until the moment Claude Code said.
-        let reset = chrono::DateTime::from_timestamp(1_792_137_600, 0);
+        let reset = Some(resets_in_two_days());
         until(|| {
             d.0.state
                 .lock()
@@ -1008,6 +1003,189 @@ async fn a_turn_stopped_by_its_plans_limit_moves_at_once_and_carries_on() {
                 .filter(|at| Some(*at) == reset)
         })
         .await;
+    })
+    .await;
+}
+
+/// Claude Code's API error line for a refused turn, as 2.1.319 writes it
+/// after its StopFailure: the plan's own limit, or (`plan` false) a 429
+/// that isn't.
+fn error_line(plan: bool) -> String {
+    if plan {
+        r#"{"type":"assistant","isApiErrorMessage":true,"apiError":"usage_limit_reached","apiErrorParams":{"rate_limit_info":{"status":"rejected","resetsAt":RESETS,"rateLimitType":"seven_day"}},"quotaLimits":{"status":"rejected","resetsAt":RESETS,"rateLimitType":"seven_day"},"error":"rate_limit","message":{"content":[{"type":"text","text":"Request rejected (429)"}]}}"#.replace("RESETS", &resets_in_two_days().timestamp().to_string()) + "\n"
+    } else {
+        r#"{"type":"assistant","isApiErrorMessage":true,"apiError":null,"apiErrorParams":null,"quotaLimits":null,"error":"rate_limit","apiErrorStatus":429,"message":{"content":[{"type":"text","text":"API Error: Request rejected (429) · This request would exceed your account's rate limit."}]}}"#.to_string() + "\n"
+    }
+}
+
+/// Two days from now, to the hour, as Claude Code's resets are.
+fn resets_in_two_days() -> chrono::DateTime<chrono::Utc> {
+    let at = chrono::Utc::now().timestamp() + 2 * 86_400;
+    chrono::DateTime::from_timestamp(at - at % 3600, 0).unwrap()
+}
+
+#[tokio::test]
+async fn a_limit_hit_while_background_work_runs_still_moves_the_session_at_once() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(
+            pool,
+            key_options(dir.path(), Arc::new(MemoryKeys::default())),
+        )
+        .await;
+        let (_, personal, a, _) = two_on_work(&d, dir.path()).await;
+        // Asked to move while it works: it waits for the turn to end.
+        d.apply_hook(
+            a,
+            crate::claude::Hook::Prompt("start the dev server".into()),
+            None,
+        )
+        .await;
+        d.apply_hook(a, crate::claude::Hook::SubagentStart("a471".into()), None)
+            .await;
+        let v = d.switch_account(a, Some(personal), None).await.unwrap();
+        assert!(v.switching_to.is_some());
+        let transcript = dir.path().join("a.jsonl");
+        std::fs::write(&transcript, "").unwrap();
+        // The plan's limit ends the turn with a sub-agent still running:
+        // the Floor waits on it, the switch doesn't.
+        d.apply_hook(
+            a,
+            stop_failure(&transcript, "You've hit your weekly limit · resets Fri 9am"),
+            None,
+        )
+        .await;
+        assert_eq!(
+            d.view(a).unwrap().waiting_on(),
+            1,
+            "its work is still known"
+        );
+        let (env, args) = started(dir.path(), a, 1).await;
+        assert_eq!(env["TOKEN_ON_FD"], OTHER);
+        assert!(args.trim_end().ends_with("Continue"), "{args}");
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn the_transcript_decides_what_a_rate_limit_was() {
+    use crate::floor::Outcome;
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(
+            pool,
+            key_options(dir.path(), Arc::new(MemoryKeys::default())),
+        )
+        .await;
+        let (work, personal, a, b) = two_on_work(&d, dir.path()).await;
+        let transcript = dir.path().join("a.jsonl");
+        let full = |d: &Desk| {
+            d.0.state
+                .lock()
+                .standing
+                .get(&Some(work))
+                .is_some_and(|s| s.full(chrono::Utc::now()).is_some())
+        };
+
+        // Words that read as the plan's, a line that says it wasn't: the
+        // turn failed, and Work isn't full.
+        std::fs::write(&transcript, "").unwrap();
+        d.apply_hook(a, crate::claude::Hook::Prompt("go".into()), None)
+            .await;
+        d.apply_hook(a, stop_failure(&transcript, "You've hit your limit"), None)
+            .await;
+        assert!(full(&d));
+        std::fs::write(&transcript, error_line(false)).unwrap();
+        until(|| (!full(&d)).then_some(())).await;
+        assert_eq!(
+            d.view(a).unwrap().failure,
+            Some(crate::limit::TurnFailure::Failed("rate_limit".into()))
+        );
+
+        // Words that don't, a line that says it was the plan's weekly
+        // limit: full until its reset, and Desk moves them.
+        std::fs::write(&transcript, "").unwrap();
+        d.set_auto_switch(true).await.unwrap();
+        d.apply_hook(a, crate::claude::Hook::Prompt("go".into()), None)
+            .await;
+        d.apply_hook(
+            a,
+            stop_failure(
+                &transcript,
+                "API Error: Request rejected (429) · rate limited",
+            ),
+            None,
+        )
+        .await;
+        let v = d.view(a).unwrap();
+        assert_eq!(
+            super::transition::finished(v.last_reply.as_deref().unwrap_or_default(), &v).0,
+            Outcome::Failed
+        );
+        assert!(!full(&d));
+        std::fs::write(&transcript, error_line(true)).unwrap();
+        until(|| full(&d).then_some(())).await;
+        assert!(d
+            .view(a)
+            .unwrap()
+            .failure
+            .is_some_and(|f| f.limit().is_some()));
+        let (env, args) = started(dir.path(), a, 1).await;
+        assert_eq!(env["TOKEN_ON_FD"], OTHER);
+        assert!(args.trim_end().ends_with("Continue"), "{args}");
+        started(dir.path(), b, 1).await;
+        assert_eq!(d.view(b).unwrap().account.map(|x| x.id), Some(personal));
+        assert_eq!(
+            d.0.state.lock().standing[&Some(work)].hit_until,
+            Some(resets_in_two_days())
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_session_elsewhere_whose_transcript_ends_on_a_429_that_isnt_the_plans_failed_and_fills_nothing(
+) {
+    use crate::floor::Outcome;
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(
+            pool,
+            account_options(dir.path(), Arc::new(MemoryKeys::default())),
+        )
+        .await;
+        let (work, _, a, _) = two_on_work(&d, dir.path()).await;
+        // As the scan of another terminal's transcript keeps it.
+        let f = dir.path().join("t.jsonl");
+        std::fs::write(&f, error_line(false)).unwrap();
+        let failure = crate::transcript::read_tail(&f).unwrap().failure;
+        assert_eq!(
+            failure,
+            Some(crate::limit::TurnFailure::Failed("rate_limit".into()))
+        );
+        d.change(a, |r, _| r.state = SessionState::Working);
+        d.0.state.lock().turn_failures.insert(a, failure.unwrap());
+        d.change(a, |r, _| {
+            r.state = SessionState::Done;
+            r.last_reply = Some(
+                "API Error: Request rejected (429) · This request would exceed your account's rate limit."
+                    .into(),
+            );
+        });
+        let v = d.view(a).unwrap();
+        assert_eq!(
+            super::transition::finished(v.last_reply.as_deref().unwrap_or_default(), &v).0,
+            Outcome::Failed
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(d.account_needs().is_empty());
+        assert!(d
+            .0
+            .state
+            .lock()
+            .standing
+            .get(&Some(work))
+            .is_none_or(|s| s.hit_at.is_none()));
     })
     .await;
 }
