@@ -1105,7 +1105,19 @@ async fn prune_layout(
     layout: Layout,
     records: &HashMap<Uuid, SessionRecord>,
 ) -> (Layout, Vec<Uuid>) {
-    let pruned = layout.without_sessions(|id| !records.contains_key(&id));
+    // A closed session is still the registry's: it keeps its group, which
+    // what is harvested of it and its ledger rows are stamped with.
+    let closed: HashSet<Uuid> = match store.every_session().await {
+        Ok(all) => all.into_iter().map(|r| r.id).collect(),
+        Err(e) => {
+            tracing::warn!(
+                error = format!("{e:#}"),
+                "couldn't read the closed sessions; the sidebar's layout is left as it is"
+            );
+            return (layout, vec![]);
+        }
+    };
+    let pruned = layout.without_sessions(|id| !records.contains_key(&id) && !closed.contains(&id));
     if pruned == layout {
         return (layout, vec![]);
     }
