@@ -42,10 +42,13 @@ const TOOL_EVENTS: [&str; 5] = [
     // Auto mode refused a tool: the turn may end stuck on it.
     "PermissionDenied",
 ];
-const PLAIN_EVENTS: [&str; 6] = [
+const PLAIN_EVENTS: [&str; 7] = [
     "UserPromptSubmit",
     "Notification",
     "Stop",
+    // A turn an API error ended (its plan's limit, a refused sign-in): it
+    // fires instead of Stop, verified on 2.1.319 ([`crate::limit`]).
+    "StopFailure",
     "SubagentStart",
     "SubagentStop",
     "SessionEnd",
@@ -128,6 +131,9 @@ struct Payload {
     reason: Option<String>,
     background_tasks: Option<Vec<BackgroundTask>>,
     error: Option<String>,
+    /// `StopFailure`'s, said in the hooks reference as text; read as any
+    /// value, so a shape it changes to never loses the whole hook.
+    error_details: Option<Value>,
     cwd: Option<String>,
 }
 
@@ -194,6 +200,17 @@ pub enum Hook {
         transcript: Option<String>,
         reply: Option<String>,
         /// What it left running, when the CLI says.
+        background: Option<Vec<(String, TaskKind)>>,
+    },
+    /// Its turn ended on an API error (`StopFailure`): the plan's limit,
+    /// or another failure, as [`crate::limit::of_stop_failure`] reads it.
+    StopFailure {
+        transcript: Option<String>,
+        /// What Claude Code said of it: "You've hit your 5-hour limit ·
+        /// resets 9am".
+        reply: Option<String>,
+        failure: crate::limit::TurnFailure,
+        /// What it left running, when the CLI says (2.1.319's doesn't).
         background: Option<Vec<(String, TaskKind)>>,
     },
     /// Claude Code went on by itself: background work it started ended.
@@ -294,26 +311,49 @@ pub fn parse_hook(body: &[u8]) -> eyre::Result<Hook> {
         "Stop" => Hook::Stop {
             transcript: p.transcript_path,
             reply: p.last_assistant_message.filter(|m| !m.trim().is_empty()),
-            background: p.background_tasks.map(|tasks| {
-                tasks
-                    .into_iter()
-                    .filter(|t| t.status == "running")
-                    .map(|t| {
-                        let kind = match t.kind.as_str() {
-                            "shell" => TaskKind::Shell,
-                            _ => TaskKind::Agent,
-                        };
-                        (t.id, kind)
-                    })
-                    .collect()
-            }),
+            background: p.background_tasks.map(running_tasks),
         },
+        "StopFailure" => {
+            let details = p
+                .error_details
+                .as_ref()
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let reply = p
+                .last_assistant_message
+                .filter(|m| !m.trim().is_empty())
+                .or(details.filter(|m| !m.trim().is_empty()));
+            Hook::StopFailure {
+                transcript: p.transcript_path,
+                failure: crate::limit::of_stop_failure(
+                    p.error.as_deref().unwrap_or("unknown"),
+                    reply.as_deref(),
+                ),
+                reply,
+                background: p.background_tasks.map(running_tasks),
+            }
+        }
         "SubagentStart" => p.agent_id.map_or(Hook::Other, Hook::SubagentStart),
         "SubagentStop" => p.agent_id.map_or(Hook::Other, Hook::SubagentStop),
         "SessionEnd" => Hook::SessionEnd,
         "DeskUsage" => Hook::Usage(p.rate_limits.unwrap_or(Value::Null)),
         _ => Hook::Other,
     })
+}
+
+/// The tasks of a turn's end that still run.
+fn running_tasks(tasks: Vec<BackgroundTask>) -> Vec<(String, TaskKind)> {
+    tasks
+        .into_iter()
+        .filter(|t| t.status == "running")
+        .map(|t| {
+            let kind = match t.kind.as_str() {
+                "shell" => TaskKind::Shell,
+                _ => TaskKind::Agent,
+            };
+            (t.id, kind)
+        })
+        .collect()
 }
 
 /// The `Notification` kinds that mean a dialog waits on the person, as
@@ -601,6 +641,34 @@ pub(crate) mod tests {
                 ])
             }
         );
+        // As Claude Code 2.1.319 posted them, on a subscription at its limit
+        // and on a 429 that isn't the plan's.
+        let full = r#"{"session_id":"a3d6","transcript_path":"/t.jsonl","cwd":"/w","prompt_id":"1d6a","effort":{"level":"medium"},"hook_event_name":"StopFailure","error":"rate_limit","last_assistant_message":"You've hit your 5-hour limit · resets 9am (Europe/London)"}"#;
+        assert_eq!(
+            parse_hook(full.as_bytes()).unwrap(),
+            Hook::StopFailure {
+                transcript: Some("/t.jsonl".into()),
+                reply: Some("You've hit your 5-hour limit · resets 9am (Europe/London)".into()),
+                failure: crate::limit::TurnFailure::Limit(crate::limit::LimitHit {
+                    window: None,
+                    resets_at: None
+                }),
+                background: None,
+            }
+        );
+        // Details in another shape never lose the hook.
+        assert!(matches!(
+            parse_hook(br#"{"hook_event_name":"StopFailure","error":"server_error","error_details":{"status":500}}"#).unwrap(),
+            Hook::StopFailure { failure: crate::limit::TurnFailure::Failed(e), .. } if e == "server_error"
+        ));
+        let refused = r#"{"session_id":"338b","transcript_path":"/t.jsonl","hook_event_name":"StopFailure","error":"rate_limit","last_assistant_message":"API Error: Request rejected (429) · This request would exceed your account's rate limit."}"#;
+        assert!(matches!(
+            parse_hook(refused.as_bytes()).unwrap(),
+            Hook::StopFailure {
+                failure: crate::limit::TurnFailure::Failed(e),
+                ..
+            } if e == "rate_limit"
+        ));
         let woken = br#"{"hook_event_name":"UserPromptSubmit","prompt":"<task-notification>\n<task-id>baoj</task-id>\n<status>completed</status>\n</task-notification>"}"#;
         assert_eq!(
             parse_hook(woken).unwrap(),

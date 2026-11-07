@@ -626,6 +626,9 @@ pub struct Standing {
     pub windows: Vec<crate::usage::LimitWindow>,
     pub read_at: Option<DateTime<Utc>>,
     pub hit_at: Option<DateTime<Utc>>,
+    /// When the limit it last stopped on resets, as Claude Code said
+    /// ([`crate::limit`]).
+    pub hit_until: Option<DateTime<Utc>>,
 }
 
 /// How long a stop on the limit counts when no window says when it resets.
@@ -642,6 +645,11 @@ impl Standing {
             .max_by_key(|w| w.resets_at);
         if let Some(w) = full_window {
             return Some(w.resets_at);
+        }
+        // Claude Code said when: full until then.
+        let until = self.hit_until.filter(|_| self.hit_at.is_some());
+        if let Some(until) = until {
+            return (until > now).then_some(Some(until));
         }
         let hit = self.hit_at.filter(|at| now - *at < HIT_FOR)?;
         // A reading after the stop that shows room: it has reset.
@@ -1059,7 +1067,20 @@ mod tests {
                 .collect(),
             read_at: Some(at(read_at)),
             hit_at: hit_at.map(at),
+            hit_until: None,
         }
+    }
+
+    #[test]
+    fn a_reset_claude_code_said_holds_until_it_passes() {
+        let at = |m: i64| chrono::DateTime::from_timestamp(m * 60, 0).unwrap();
+        // Stopped at minute 10, resetting at 600 by Claude Code's word: a
+        // later reading with room doesn't end it, its time does.
+        let mut s = standing(&[(20.0, Some(700))], 50, Some(10));
+        s.hit_until = Some(at(600));
+        assert_eq!(s.full(at(60)), Some(Some(at(600))));
+        assert_eq!(s.full(at(599)), Some(Some(at(600))));
+        assert_eq!(s.full(at(601)), None);
     }
 
     #[test]

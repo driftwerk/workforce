@@ -415,6 +415,9 @@ struct State {
     /// Accounts sessions were moved off at their limit, until they reset
     /// and the person is asked back.
     moved_off: Vec<crate::engine_accounts::MovedOff>,
+    /// How each session's last turn ended when an API error ended it, until
+    /// it is asked again ([`crate::limit`]).
+    turn_failures: HashMap<Uuid, crate::limit::TurnFailure>,
     /// Account needs the person put off.
     put_off: HashSet<String>,
     /// Desk moves sessions off an account at its limit by itself.
@@ -1305,6 +1308,7 @@ impl Desk {
         view.interrupted = live.is_some_and(|l| l.interrupted);
         view.reading = live.is_some_and(|l| l.reading.is_some());
         view.prompts = live.map_or(0, |l| l.prompts);
+        view.failure = state.turn_failures.get(&r.id).cloned();
         view
     }
 
@@ -1364,7 +1368,8 @@ impl Desk {
                 _ => false,
             });
         if hit_limit {
-            st.standing.entry(r_account).or_default().hit_at = Some(Utc::now());
+            // When Claude Code said it resets; else what a reading says.
+            Self::mark_hit(st, r_account, view.failure.as_ref().and_then(|f| f.limit()));
             let desk = self.clone();
             tokio::spawn(async move { desk.accounts_moved().await });
         }
@@ -3750,6 +3755,9 @@ impl Desk {
                 transcript,
                 ..
             } => {
+                // Started again (on another account, maybe): its last
+                // turn's failure was the run before's.
+                self.0.state.lock().turn_failures.remove(&id);
                 self.change(id, |r, _| {
                     r.cli_session_id = session_id.or(r.cli_session_id.take());
                     r.transcript = transcript.or(r.transcript.take());
@@ -3943,6 +3951,7 @@ impl Desk {
             }),
             Hook::Woken => {
                 self.breaker_turn(id, false);
+                self.0.state.lock().turn_failures.remove(&id);
                 self.change(id, |r, l| {
                     r.state = SessionState::Working;
                     if let Some(l) = l {
@@ -3983,76 +3992,20 @@ impl Desk {
                 reply,
                 background,
             } => {
-                let path = transcript.or_else(|| self.record(id).ok().and_then(|r| r.transcript));
-                // The hook fires before the transcript has the reply, so the
-                // transcript is only a fallback for older CLIs.
-                let said = match (reply, path.clone()) {
-                    (Some(r), _) => Some(r),
-                    (None, Some(p)) => tokio::task::spawn_blocking(move || {
-                        transcript::read_tail(Path::new(&p))
-                            .ok()
-                            .and_then(|t| t.said)
-                    })
+                self.turn_ended(id, transcript, reply, background, None)
                     .await
-                    .ok()
-                    .flatten(),
-                    (None, None) => None,
-                };
-                let (heard, prompts) = {
-                    let st = self.0.state.lock();
-                    st.live
-                        .get(&id)
-                        .map_or((Vec::new(), 0), |l| (l.denials.clone(), l.prompts))
-                };
-                // The refusals its hooks didn't report (an older plugin, an
-                // older CLI) are in the transcript.
-                let denials = match (heard.is_empty(), path.clone()) {
-                    (true, Some(p)) => tokio::task::spawn_blocking(move || {
-                        transcript::denials(Path::new(&p)).unwrap_or_default()
-                    })
+            }
+            // A sub-agent's own failure isn't its session's turn ending: the
+            // main thread's StopFailure follows if it ends the turn.
+            Hook::StopFailure { .. } if inside.is_some() => {}
+            Hook::StopFailure {
+                transcript,
+                reply,
+                failure,
+                background,
+            } => {
+                self.turn_ended(id, transcript, reply, background, Some(failure))
                     .await
-                    .unwrap_or_default(),
-                    _ => heard,
-                };
-                let (asked, unsure) = asked_at_end(&denials, said.as_deref());
-                let said_whole = said.clone().filter(|_| unsure);
-                let reader = unsure.then(|| self.reader()).flatten();
-                let running = self.running_now(id).await;
-                let mut read = None;
-                self.change(id, |r, mut l| {
-                    // The person spoke while it was read: that answers it.
-                    let asked = asked.filter(|_| l.as_ref().is_some_and(|l| l.prompts == prompts));
-                    r.state = match asked {
-                        Some(_) => SessionState::Asking,
-                        None => SessionState::Done,
-                    };
-                    if let Some(l) = l.as_deref_mut() {
-                        l.ends += 1;
-                        l.reading = reader.as_ref().map(|_| l.ends);
-                        read = l.reading;
-                    }
-                    r.transcript = path.or(r.transcript.take());
-                    if let Some(reply) = said {
-                        r.last_reply = Some(transcript::clip(&reply));
-                    }
-                    r.asked = asked;
-                    if let Some(l) = l {
-                        l.current_tool = None;
-                        l.pending = None;
-                        l.open_question = None;
-                        l.answer = None;
-                        l.denials.clear();
-                        l.background = std::mem::take(&mut l.background)
-                            .reported(background, Utc::now())
-                            .looked_if(running, Utc::now());
-                    }
-                });
-                if let (Some(reader), Some(end), Some(reply)) = (reader, read, said_whole) {
-                    self.read_later(id, end, reader, reply);
-                }
-                // The turn's calls are in its transcript now.
-                self.spend_read(id);
-                self.breaker_settled(id);
             }
             Hook::SessionEnd => {
                 if let Some(l) = self.0.state.lock().live.get_mut(&id) {
@@ -4077,6 +4030,8 @@ impl Desk {
 
     /// A turn started on `p`: the person's own words when `person`.
     fn prompted(&self, id: Uuid, p: String, person: bool) {
+        // Asked again: how its last turn failed is behind it.
+        self.0.state.lock().turn_failures.remove(&id);
         self.change(id, |r, l| {
             r.state = SessionState::Working;
             r.last_prompt = Some(p);
@@ -4106,6 +4061,277 @@ impl Desk {
     /// session to asking, if it is still done on that turn (nobody has
     /// spoken, and it hasn't worked or ended again since); anything else
     /// leaves it done.
+    /// A Claude Code session's turn ended: by itself (`Stop`), or on an API
+    /// error (`StopFailure`, with how it failed). Either way it is done and
+    /// nothing it waited on still waits; a turn that failed asks nothing.
+    async fn turn_ended(
+        &self,
+        id: Uuid,
+        transcript: Option<String>,
+        reply: Option<String>,
+        background: Option<Vec<(String, TaskKind)>>,
+        failure: Option<crate::limit::TurnFailure>,
+    ) {
+        let failed = failure.is_some();
+        let path = transcript.or_else(|| self.record(id).ok().and_then(|r| r.transcript));
+        // The hook fires before the transcript has the reply, so the
+        // transcript is only a fallback for older CLIs. A failure's words
+        // are its hook's: the transcript's last reply is an older turn's.
+        let said = match (reply, path.clone()) {
+            (Some(r), _) => Some(r),
+            (None, _) if failed => None,
+            (None, Some(p)) => tokio::task::spawn_blocking(move || {
+                transcript::read_tail(Path::new(&p))
+                    .ok()
+                    .and_then(|t| t.said)
+            })
+            .await
+            .ok()
+            .flatten(),
+            (None, None) => None,
+        };
+        let (heard, prompts) = {
+            let st = self.0.state.lock();
+            st.live
+                .get(&id)
+                .map_or((Vec::new(), 0), |l| (l.denials.clone(), l.prompts))
+        };
+        // The refusals its hooks didn't report (an older plugin, an older
+        // CLI) are in the transcript.
+        let denials = match (heard.is_empty() && !failed, path.clone()) {
+            (true, Some(p)) => tokio::task::spawn_blocking(move || {
+                transcript::denials(Path::new(&p)).unwrap_or_default()
+            })
+            .await
+            .unwrap_or_default(),
+            _ => heard,
+        };
+        let (asked, unsure) = match failed {
+            true => (None, false),
+            false => asked_at_end(&denials, said.as_deref()),
+        };
+        let said_whole = said.clone().filter(|_| unsure);
+        let reader = unsure.then(|| self.reader()).flatten();
+        let running = self.running_now(id).await;
+        // A refusal whose words aren't the plan's, on an account whose
+        // readings show a window full: the plan's limit after all.
+        let failure = failure.map(|f| self.cross_checked(id, f));
+        let limit = failure.as_ref().and_then(|f| f.limit()).cloned();
+        // A rate limit's transcript line decides what it was.
+        let rate_limit = match &failure {
+            Some(crate::limit::TurnFailure::Limit(_)) => true,
+            Some(crate::limit::TurnFailure::Failed(e)) => e == "rate_limit",
+            None => false,
+        };
+        {
+            let mut st = self.0.state.lock();
+            match failure {
+                Some(f) => st.turn_failures.insert(id, f),
+                None => st.turn_failures.remove(&id),
+            };
+        }
+        let mut read = None;
+        let mut on = None;
+        self.change(id, |r, mut l| {
+            // The person spoke while it was read: that answers it.
+            let asked = asked.filter(|_| l.as_ref().is_some_and(|l| l.prompts == prompts));
+            r.state = match asked {
+                Some(_) => SessionState::Asking,
+                None => SessionState::Done,
+            };
+            // The account it stopped on, before any switch moves it.
+            on = Some(r.account);
+            if let Some(l) = l.as_deref_mut() {
+                l.ends += 1;
+                l.reading = reader.as_ref().map(|_| l.ends);
+                read = l.reading;
+            }
+            r.transcript = path.clone().or(r.transcript.take());
+            if let Some(reply) = said {
+                r.last_reply = Some(transcript::clip(&reply));
+            }
+            r.asked = asked;
+            if let Some(l) = l {
+                l.current_tool = None;
+                l.pending = None;
+                l.held = None;
+                l.open_question = None;
+                l.answer = None;
+                l.denials.clear();
+                let now = Utc::now();
+                l.background = match (failed, background) {
+                    // A failure says nothing of what it left running: what
+                    // was known is kept, and looked at again.
+                    (true, None) => std::mem::take(&mut l.background),
+                    (_, background) => std::mem::take(&mut l.background).reported(background, now),
+                }
+                .looked_if(running, now);
+            }
+        });
+        if let (Some(reader), Some(end), Some(reply)) = (reader, read, said_whole) {
+            self.read_later(id, end, reader, reply);
+        }
+        if let Some(on) = on {
+            if let Some(hit) = &limit {
+                // On its limit: the account is full now, whatever it left
+                // running (a turn waiting on background work isn't over to
+                // the Floor, but it is to its account).
+                Self::mark_hit(&mut self.0.state.lock(), on, Some(hit));
+                let desk = self.clone();
+                tokio::spawn(async move { desk.accounts_moved().await });
+            }
+            if failed {
+                // A switch that waited for its turn: it is over.
+                self.drive_waiting_switch(id);
+            }
+            if let (true, Some(p)) = (rate_limit, path) {
+                self.failure_read_later(id, on, PathBuf::from(p));
+            }
+        }
+        // The turn's calls are in its transcript now.
+        self.spend_read(id);
+        self.breaker_settled(id);
+    }
+
+    /// A switch of account session `id` waits on, carried out now.
+    fn drive_waiting_switch(&self, id: Uuid) {
+        if !self.0.state.lock().switches.contains_key(&id) {
+            return;
+        }
+        let desk = self.clone();
+        tokio::spawn(async move {
+            if let Err(e) = desk.drive_switch(id, None).await {
+                tracing::warn!(session = %id, error = %e, "couldn't move a session to its account");
+            }
+        });
+    }
+
+    /// `account` stopped on its plan's limit now: full until `hit` says it
+    /// resets, else until a reading says it has room.
+    fn mark_hit(st: &mut State, account: Option<Uuid>, hit: Option<&crate::limit::LimitHit>) {
+        let now = Utc::now();
+        let standing = st.standing.entry(account).or_default();
+        standing.hit_at = Some(now);
+        standing.hit_until = hit
+            .and_then(|h| h.resets_at)
+            .or(standing.hit_until.filter(|u| *u > now));
+    }
+
+    /// A refusal of `error` "rate_limit" whose words weren't the plan's, on
+    /// an account whose last reading has a window full: its limit.
+    fn cross_checked(
+        &self,
+        id: Uuid,
+        failure: crate::limit::TurnFailure,
+    ) -> crate::limit::TurnFailure {
+        use crate::limit::{LimitHit, TurnFailure};
+        let TurnFailure::Failed(error) = &failure else {
+            return failure;
+        };
+        if error != "rate_limit" {
+            return failure;
+        }
+        let st = self.0.state.lock();
+        let now = Utc::now();
+        let full = st
+            .records
+            .get(&id)
+            .and_then(|r| st.standing.get(&r.account))
+            .and_then(|s| {
+                s.windows
+                    .iter()
+                    .filter(|w| w.used_percent >= 100.0 && w.resets_at.is_some_and(|r| r > now))
+                    .filter_map(|w| w.resets_at)
+                    .max()
+            });
+        match full {
+            Some(resets_at) => TurnFailure::Limit(LimitHit {
+                window: None,
+                resets_at: Some(resets_at),
+            }),
+            None => failure,
+        }
+    }
+
+    /// What a rate limit really was, and, for the plan's own, which window
+    /// and when it resets: Claude Code writes that line to the transcript
+    /// only after its `StopFailure`, so it is read again a little later.
+    fn failure_read_later(&self, id: Uuid, account: Option<Uuid>, path: PathBuf) {
+        let desk = self.clone();
+        tokio::spawn(async move {
+            for wait in [250, 1000, 3000, 8000] {
+                tokio::time::sleep(Duration::from_millis(wait)).await;
+                let p = path.clone();
+                let said = tokio::task::spawn_blocking(move || {
+                    transcript::read_tail(&p).ok().and_then(|t| t.failure)
+                })
+                .await
+                .ok()
+                .flatten();
+                let Some(said) = said else {
+                    continue;
+                };
+                desk.failure_known(id, account, said);
+                return;
+            }
+        });
+    }
+
+    /// What the transcript said of the API error session `id`'s turn ended
+    /// on, on `account`; it decides over the hook's words. The plan's limit
+    /// makes the account full until its reset, though the words didn't say
+    /// so; a refusal that isn't the plan's undoes a limit read from words.
+    pub(super) fn failure_known(
+        &self,
+        id: Uuid,
+        account: Option<Uuid>,
+        said: crate::limit::TurnFailure,
+    ) {
+        use crate::limit::TurnFailure;
+        let upgraded = {
+            let mut st = self.0.state.lock();
+            // Asked again since: the turn it was is behind it, though the
+            // account's standing still learns when it resets.
+            let current = st.turn_failures.get(&id).cloned();
+            match (current, said) {
+                (Some(TurnFailure::Limit(_)), TurnFailure::Limit(hit)) => {
+                    let standing = st.standing.entry(account).or_default();
+                    standing.hit_until = hit.resets_at.or(standing.hit_until);
+                    st.turn_failures.insert(id, TurnFailure::Limit(hit));
+                    false
+                }
+                (Some(TurnFailure::Failed(_)), TurnFailure::Limit(hit)) => {
+                    tracing::info!(session = %id, "its transcript says the plan's limit ended its turn");
+                    Self::mark_hit(&mut st, account, Some(&hit));
+                    st.turn_failures.insert(id, TurnFailure::Limit(hit));
+                    true
+                }
+                (Some(TurnFailure::Limit(_)), TurnFailure::Failed(error)) => {
+                    tracing::info!(session = %id, "its transcript says a refusal that isn't the plan's ended its turn");
+                    if let Some(s) = st.standing.get_mut(&account) {
+                        s.hit_at = None;
+                        s.hit_until = None;
+                    }
+                    st.turn_failures.insert(id, TurnFailure::Failed(error));
+                    false
+                }
+                (None, TurnFailure::Limit(hit)) => {
+                    let standing = st.standing.entry(account).or_default();
+                    if standing.hit_at.is_some() {
+                        standing.hit_until = hit.resets_at.or(standing.hit_until);
+                    }
+                    false
+                }
+                (Some(TurnFailure::Failed(_)) | None, TurnFailure::Failed(_)) => false,
+            }
+        };
+        if upgraded {
+            self.drive_waiting_switch(id);
+        }
+        let desk = self.clone();
+        tokio::spawn(async move { desk.accounts_moved().await });
+    }
+
     fn read_later(&self, id: Uuid, end: u64, reader: Arc<dyn crew::Crew>, reply: String) {
         let desk = self.clone();
         let wait = *self.0.read_wait.lock();
@@ -4675,6 +4901,16 @@ impl Desk {
                             && tail.is_none()
                     });
                     if !unchanged {
+                        // Its transcript says when its turn ended on an API
+                        // error: the plan's limit (and when it resets), or
+                        // another failure, never read from its words.
+                        if let Some(t) = &tail {
+                            let mut st = self.0.state.lock();
+                            match t.failure.clone() {
+                                Some(f) => st.turn_failures.insert(id, f),
+                                None => st.turn_failures.remove(&id),
+                            };
+                        }
                         self.change(id, |r, _| {
                             r.origin = Origin::External;
                             r.state = state;
@@ -4691,7 +4927,8 @@ impl Desk {
                 }
                 None => {
                     let now = Utc::now();
-                    let tail = tail.unwrap_or_default();
+                    let mut tail = tail.unwrap_or_default();
+                    let failure = tail.failure.take();
                     let r = SessionRecord {
                         id: Uuid::new_v4(),
                         engine: Engine::Claude,
@@ -4724,6 +4961,9 @@ impl Desk {
                         updated_at: now,
                     };
                     present.insert(r.id);
+                    if let Some(f) = failure {
+                        self.0.state.lock().turn_failures.insert(r.id, f);
+                    }
                     self.save(r);
                 }
             }

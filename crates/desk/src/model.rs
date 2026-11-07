@@ -207,6 +207,11 @@ pub struct SessionView {
     /// the turn isn't over until it says.
     #[serde(skip)]
     pub reading: bool,
+    /// How its last turn ended when an API error ended it: the plan's
+    /// limit, or another failure ([`crate::limit`]). Cleared once it is
+    /// asked again.
+    #[serde(skip)]
+    pub failure: Option<crate::limit::TurnFailure>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -289,6 +294,7 @@ impl SessionView {
             prompts: 0,
             interrupted: false,
             reading: false,
+            failure: None,
             created_at: r.created_at,
             updated_at: r.updated_at,
         }
