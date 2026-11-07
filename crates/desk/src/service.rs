@@ -1521,6 +1521,23 @@ impl Desk {
         Ok(Pty::spawn_with(spec, cols, rows, history, palette)?)
     }
 
+    /// When a held session's process started: as the hub kept it at its
+    /// start, else (one started before that was kept) as the system says,
+    /// else now.
+    async fn held_since(h: &crate::holder::Held) -> DateTime<Utc> {
+        let kept = h
+            .meta
+            .get("startedAt")
+            .and_then(|v| serde_json::from_value::<DateTime<Utc>>(v.clone()).ok());
+        if let Some(at) = kept {
+            return at;
+        }
+        match h.pid {
+            Some(pid) => procs::started_at(pid).await.unwrap_or_else(Utc::now),
+            None => Utc::now(),
+        }
+    }
+
     /// Takes back the sessions whose processes the holder kept while the
     /// hub was away, as they were: same processes, same hook tokens.
     async fn adopt_held(&self, mut held: HeldSet) {
@@ -1540,6 +1557,7 @@ impl Desk {
                 continue;
             };
             let (pty, exit) = holder.adopt(&h, history, Some(self.0.palette.clone()));
+            let started_at = Self::held_since(&h).await;
             let codex = match held.servers.remove(&id) {
                 Some(server) if record.engine == Engine::Codex => {
                     let socket = server.meta["socket"].as_str().map(PathBuf::from);
@@ -1587,7 +1605,7 @@ impl Desk {
                     flights: HashMap::new(),
                     behind: Vec::new(),
                     own_key: None,
-                    started_at: Utc::now(),
+                    started_at,
                     breaker: Default::default(),
                 },
             );
@@ -1598,6 +1616,24 @@ impl Desk {
                 self.publish(id);
             }
             tracing::info!(%id, "desk session taken back from the PTY holder");
+            // A `/login` inside it while the hub was away, or before this hub
+            // could tell: it runs on that sign-in.
+            if let (Engine::Claude, Some(path)) = (record.engine, record.transcript.clone()) {
+                let desk = self.clone();
+                tokio::spawn(async move {
+                    let found = tokio::task::spawn_blocking(move || {
+                        transcript::last_login_since(Path::new(&path), started_at)
+                            .ok()
+                            .flatten()
+                    })
+                    .await
+                    .ok()
+                    .flatten();
+                    if let Some(found) = found {
+                        desk.login_found(id, found).await;
+                    }
+                });
+            }
         }
         held.strays.extend(held.servers.into_values());
         for stray in held.strays {
@@ -3831,11 +3867,15 @@ impl Desk {
                 )))
             }
         };
+        // When its process started, kept with it in the holder: a `/login`
+        // inside it after this is one, whenever the hub takes it back.
+        let started_at = Utc::now();
         let meta = serde_json::json!({
             "kind": "session",
             "session": r.id,
             "token": token,
             "hookPort": self.0.hook_port,
+            "startedAt": started_at,
         });
         let spec = match account_token {
             Some(account_token) => {
@@ -3893,7 +3933,7 @@ impl Desk {
                 flights: HashMap::new(),
                 behind: Vec::new(),
                 own_key: None,
-                started_at: Utc::now(),
+                started_at,
                 breaker: Default::default(),
             },
         );
@@ -6165,6 +6205,21 @@ mod tests {
             let port = first.0.hook_port;
             let turns = first.open_turns();
             assert_eq!(turns.len(), 1, "its prompt began a turn");
+            // Signed in again inside it, its transcript run on long since.
+            let began = first.0.state.lock().live[&s.id].started_at;
+            let transcript = dir.path().join("held.jsonl");
+            let at = (Utc::now() + chrono::Duration::seconds(1)).to_rfc3339();
+            let mut lines = vec![
+                format!(r#"{{"type":"user","uuid":"in-1","timestamp":"{at}","message":{{"role":"user","content":"<command-name>/login</command-name>"}}}}"#),
+                format!(r#"{{"type":"user","uuid":"in-1s","timestamp":"{at}","message":{{"role":"user","content":"<local-command-stdout>Login successful</local-command-stdout>"}}}}"#),
+            ];
+            lines.extend(std::iter::repeat_n(
+                format!(r#"{{"type":"user","message":{{"role":"user","content":"{}"}}}}"#, "x".repeat(8192)),
+                100,
+            ));
+            std::fs::write(&transcript, lines.join("\n")).unwrap();
+            let path = transcript.to_string_lossy().into_owned();
+            first.change(s.id, |r, _| r.transcript = Some(path));
             tokio::time::sleep(Duration::from_millis(200)).await;
             first_cancel.cancel();
             tokio::time::sleep(Duration::from_millis(300)).await;
@@ -6179,6 +6234,24 @@ mod tests {
             .unwrap();
             let v = second.view(s.id).unwrap();
             assert!(v.live, "taken back");
+            assert_eq!(
+                second.0.state.lock().live[&s.id].started_at,
+                began,
+                "its process started when it did, not when it was taken back"
+            );
+            let mut seen = None;
+            for _ in 0..200 {
+                seen = second.0.state.lock().logins_seen.get(&s.id).cloned();
+                if seen.is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            assert_eq!(
+                seen.as_deref(),
+                Some("in-1"),
+                "the login inside it is found however far back"
+            );
             assert_eq!(v.state, SessionState::Working, "not interrupted");
             assert!(second.restore_offer().is_empty(), "nothing to restore");
             assert_eq!(

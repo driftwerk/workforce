@@ -218,10 +218,13 @@ impl Desk {
                 }),
                 // As last seen: the store is never read under this lock.
                 signed_in: keys.is_some() && st.signed_in_accounts.contains(&a.id),
+                // On it now: not one signed in again inside since.
                 sessions: st
                     .records
                     .values()
-                    .filter(|r| r.account == Some(a.id) && st.live.contains_key(&r.id))
+                    .filter(|r| {
+                        st.live.contains_key(&r.id) && Self::running_on(&st, r.id) == Some(a.id)
+                    })
                     .map(|r| r.id)
                     .collect(),
                 created_at: a.created_at,
