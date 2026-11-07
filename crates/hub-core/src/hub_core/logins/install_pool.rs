@@ -51,6 +51,12 @@ pub trait InstallPool: Send + Sync {
 
     /// Account `id` is at its limit until `until`, as a call here found.
     fn cooling(&self, id: &str, until: DateTime<Utc>);
+
+    /// The key account `id`'s plan readings are kept under, as the Floor
+    /// names its card: a call's reading on it is the account's.
+    fn plan_key(&self, _id: &str) -> Option<String> {
+        None
+    }
 }
 
 /// The key a pool account cools under: its id, as its token is never read

@@ -2660,7 +2660,14 @@ async fn another_sign_ins_reading_never_stands_for_this_ones_and_linking_loses_n
         cli_signs_in_as(&d, dir.path(), "star").await;
         assert_eq!(Desk::own_key(&d.0.state.lock()), star().key);
         assert!(!full(&d, None), "another sign-in's limit");
-        assert!(d.account_needs().is_empty(), "{:?}", d.account_needs());
+        // Nothing but which account the new sign-in is.
+        assert!(
+            d.account_needs()
+                .iter()
+                .all(|n| matches!(n, crate::engine_accounts::AccountNeed::WhichSignIn { .. })),
+            "{:?}",
+            d.account_needs()
+        );
         // Back on Gmail: full again, as it was.
         cli_signs_in_as(&d, dir.path(), "gmail").await;
         assert!(full(&d, None));
@@ -3406,4 +3413,31 @@ fn a_sessions_waiting_drops_only_its_own_oldest_readings_never_a_stop() {
         _ => None,
     });
     assert_eq!(oldest_a, Some(at(6)), "its oldest dropped first");
+}
+
+#[tokio::test]
+async fn which_account_this_computers_sign_in_is_is_asked_while_unknown_with_no_switch_waiting() {
+    use crate::engine_accounts::AccountNeed;
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = signed_in_as_gmail(pool, dir.path(), Arc::new(Plans::default())).await;
+        assert!(
+            d.account_needs().is_empty(),
+            "no account to be: nothing to ask"
+        );
+        let gmail_account = paste(&d, "Kingsley Gmail", GOOD, true).await;
+        let need = until(|| d.account_needs().into_iter().next()).await;
+        assert!(
+            matches!(&need, AccountNeed::WhichSignIn { email: Some(e), .. } if e == "kim@example.com"),
+            "{need:?}"
+        );
+        d.link_own_sign_in(Some(gmail_account)).await.unwrap();
+        assert!(d.account_needs().is_empty(), "answered");
+        assert_eq!(
+            d.own_plan_key(),
+            d.account_plan_key(gmail_account),
+            "this computer's card is the account's"
+        );
+    })
+    .await;
 }

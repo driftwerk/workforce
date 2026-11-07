@@ -489,6 +489,16 @@ impl Desk {
             .collect()
     }
 
+    /// The key account `id`'s plan readings are kept under, as the Floor
+    /// names its card: what a call of the hub's own on it reports is its.
+    pub fn account_plan_key(&self, id: Uuid) -> Option<String> {
+        let plans = self.0.plans.as_ref()?;
+        let st = self.0.state.lock();
+        st.accounts.iter().find(|a| a.id == id)?;
+        let ids = Self::plan_ids(&st, &super::identities::Raw::Account(id))?;
+        plans.account_key(crate::usage::LocalPlan::Claude, &ids)
+    }
+
     /// Account `id`'s token, read from the store now for the one call of
     /// the hub's own it serves; never kept. The store may block, so never
     /// under the state lock.
@@ -1652,9 +1662,9 @@ impl Desk {
             .collect()
     }
 
-    /// While which account this computer's sign-in is isn't known, a need
-    /// that would switch to or from it is a question instead: never a
-    /// guess behind a switch.
+    /// While which account this computer's sign-in is isn't known, Desk
+    /// asks; a need that would switch to or from it is that question
+    /// instead: never a guess behind a switch.
     fn ask_which_sign_in(
         st: &super::State,
         own_on_plan: bool,
@@ -1675,13 +1685,10 @@ impl Desk {
             N::Reset { account, from, .. } => account.id.is_none() || from.id.is_none(),
             _ => false,
         };
-        let own_full = st
-            .standing
-            .get(&None)
-            .is_some_and(|s| s.full(Utc::now()).is_some());
-        if !own_full && !needs.iter().any(on_own) {
-            return needs;
-        }
+        // Asked whenever it isn't known, not only once a switch depends on
+        // it: until then its plan is a card of its own, beside the account
+        // it is, and no reading can tell them apart (they reset on the hour
+        // now).
         let mut kept: Vec<N> = needs.into_iter().filter(|n| !on_own(n)).collect();
         kept.insert(
             0,
