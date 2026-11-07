@@ -970,6 +970,22 @@ fn usage_of(
     }
 }
 
+/// The readings that are someone's card now. A Claude reading kept under
+/// an account key no account or sign-in has now (one removed, a sign-in
+/// gone, an account known as its identity since) is nobody's: this Mac's,
+/// and a call the hub made on one of the person's accounts alike.
+fn current_readings(readings: Vec<Reading>, current: Option<&HashSet<String>>) -> Vec<Reading> {
+    readings
+        .into_iter()
+        .filter(|r| {
+            !(r.kind == PlanKind::Claude
+                && current
+                    .zip(r.account.as_ref())
+                    .is_some_and(|(keys, key)| !keys.contains(key)))
+        })
+        .collect()
+}
+
 async fn usage(State(r): S, headers: HeaderMap, Query(q): Query<TokenQuery>) -> Response {
     let (caller, sources) = match reader(&r, &headers, q.token.as_deref()).await {
         Ok(found) => found,
@@ -985,22 +1001,10 @@ async fn usage(State(r): S, headers: HeaderMap, Query(q): Query<TokenQuery>) -> 
         .collect::<Vec<_>>();
     let desk = caller.personal.then(|| (sources.desk)()).flatten();
     let mac = desk.as_ref().map(|d| d.sign_ins());
-    // This computer's Claude readings under a key no account or sign-in
-    // has now (one removed, a sign-in gone): nobody's card.
     let current: Option<HashSet<String>> = desk
         .as_ref()
         .map(|d| d.current_plan_keys().into_iter().collect());
-    let readings = readings
-        .into_iter()
-        .filter(|r| {
-            !(r.login == LoginRef::Mac
-                && r.kind == PlanKind::Claude
-                && current
-                    .as_ref()
-                    .zip(r.account.as_ref())
-                    .is_some_and(|(keys, key)| !keys.contains(key)))
-        })
-        .collect();
+    let readings = current_readings(readings, current.as_ref());
     Json(usage_of(
         readings,
         &signed_in(keys, &caller),
@@ -1026,6 +1030,45 @@ mod tests {
             desk: None,
             answers_to: None,
         }
+    }
+
+    #[test]
+    fn a_claude_reading_under_a_key_no_account_has_now_is_nobodys_card() {
+        let reading = |login: LoginRef, kind: PlanKind, account: Option<&str>| Reading {
+            kind,
+            login,
+            account: account.map(str::to_string),
+            plan: None,
+            windows: Vec::new(),
+            observed_at: Utc::now(),
+        };
+        let hub = || LoginRef::Hub {
+            login: "pooled".into(),
+            owner: None,
+        };
+        let readings = vec![
+            reading(LoginRef::Mac, PlanKind::Claude, Some("identity-key")),
+            // A call on an account before it was known as its identity.
+            reading(hub(), PlanKind::Claude, Some("old-account-key")),
+            reading(LoginRef::Mac, PlanKind::Claude, Some("old-account-key")),
+            reading(hub(), PlanKind::Claude, None),
+            reading(hub(), PlanKind::Chatgpt, Some("chatgpt-account")),
+        ];
+        let current: HashSet<String> = ["identity-key".to_string()].into();
+        let kept: Vec<(PlanKind, Option<String>)> =
+            current_readings(readings.clone(), Some(&current))
+                .into_iter()
+                .map(|r| (r.kind, r.account))
+                .collect();
+        assert_eq!(
+            kept,
+            vec![
+                (PlanKind::Claude, Some("identity-key".into())),
+                (PlanKind::Claude, None),
+                (PlanKind::Chatgpt, Some("chatgpt-account".into())),
+            ]
+        );
+        assert_eq!(current_readings(readings, None).len(), 5, "no Desk: all");
     }
 
     #[test]
