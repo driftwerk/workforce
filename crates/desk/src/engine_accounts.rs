@@ -724,19 +724,18 @@ pub struct StandingElsewhere {
 }
 
 impl Standing {
-    /// What another computer's clock said, as this one reads it: shifted by
-    /// `skew` (this clock less the sender's). `None` when its times can't be
+    /// What another computer's clock said, as this one reads it: its own
+    /// times (when it read, when it stopped) shifted by `skew` (this clock
+    /// less the sender's); the resets, the server's, as they are. `None`
+    /// when its times can't be
     /// right (later than now, by more than a moment); a reset is never more
     /// than a week after the stop.
     pub fn as_seen(&self, skew: chrono::Duration, now: DateTime<Utc>) -> Option<Standing> {
+        // Only the sender's own times: resets are the server's, on its clock.
         let shift = |t: Option<DateTime<Utc>>| t.map(|t| t + skew);
         let mut s = self.clone();
         s.read_at = shift(s.read_at);
         s.hit_at = shift(s.hit_at);
-        s.hit_until = shift(s.hit_until);
-        for w in &mut s.windows {
-            w.resets_at = shift(w.resets_at);
-        }
         let soon = now + chrono::Duration::minutes(2);
         if s.read_at.is_some_and(|t| t > soon) || s.hit_at.is_some_and(|t| t > soon) {
             return None;
@@ -1214,6 +1213,22 @@ mod tests {
             hit_until: None,
             hit_window: None,
         }
+    }
+
+    #[test]
+    fn another_clocks_times_are_shifted_but_the_servers_resets_never_are() {
+        let at = |m: i64| chrono::DateTime::from_timestamp(m * 60, 0).unwrap();
+        let mut s = standing(&[(20.0, Some(700))], 50, Some(10));
+        s.hit_until = Some(at(600));
+        let seen = s.as_seen(chrono::Duration::minutes(5), at(100)).unwrap();
+        assert_eq!((seen.read_at, seen.hit_at), (Some(at(55)), Some(at(15))));
+        assert_eq!(seen.hit_until, Some(at(600)));
+        assert_eq!(seen.windows[0].resets_at, Some(at(700)));
+        assert_eq!(
+            s.as_seen(chrono::Duration::zero(), at(20)),
+            None,
+            "read in the future"
+        );
     }
 
     #[test]

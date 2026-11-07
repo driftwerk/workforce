@@ -1610,7 +1610,7 @@ impl Desk {
                 (_, None) => false,
             })
             .filter_map(|r| {
-                let side = Self::side_of_session(st, r.id);
+                let side = Self::side_of_session(st, r.id)?;
                 let resets_at = Self::standing_of(st, side).full(now)?;
                 Some(accounts::AccountNeed::InTerminal {
                     id: format!("terminal:{}", r.id.simple()),
