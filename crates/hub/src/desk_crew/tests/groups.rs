@@ -986,3 +986,174 @@ async fn a_session_a_boss_starts_is_its_groups_from_its_first_row() {
     })
     .await;
 }
+
+/// Saves `body` as `service`'s config, as the person does from Desk.
+async fn person_saves(
+    service: &Arc<AgentService>,
+    body: &str,
+) -> Result<crate::agent_config_write::Saved, crate::agent_config_write::Refused> {
+    crate::agent_config_write::save(
+        service,
+        service.agent_id.as_str(),
+        None,
+        body,
+        workforce_orchestrator::workflow_store::EditContext::new("web", None),
+        |_| true,
+    )
+    .await
+}
+
+/// What the main overseer's overview says, now.
+async fn main_overview(c: &Clients) -> String {
+    let t = c.desk.tools.get("crew.overview").unwrap();
+    t.execute(json!({})).await.unwrap().output.to_string()
+}
+
+/// A boss replaced names its group no more, so when the new boss is taken
+/// off, the group opens to the main overseer: no file is left naming it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_boss_replaced_and_then_its_successor_taken_off_leaves_the_group_open() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let c = clients(dir.path(), pool).await;
+        // Mia replaces Sarah over Acme.
+        person_saves(
+            &c.mia,
+            &format!("[oversight]\nenabled = true\ngroup = \"acme\"\n{ACTS}"),
+        )
+        .await
+        .unwrap();
+        let sarahs = std::fs::read_to_string(c.sarah.workspace.join("config.toml")).unwrap();
+        assert!(sarahs.contains("enabled = false"), "{sarahs}");
+        assert_eq!(super::super::group_named_in(&sarahs), None, "{sarahs}");
+        assert!(!main_overview(&c).await.contains("acme-web"));
+
+        // The person takes Mia off: Acme is the main overseer's from now on.
+        person_saves(&c.mia, &format!("[oversight]\nenabled = false\n{ACTS}"))
+            .await
+            .unwrap();
+        eventually("Acme open to the main overseer", async || {
+            main_overview(&c).await.contains("acme-web").then_some(())
+        })
+        .await;
+        assert!(!c.d.bossed().contains("acme"));
+        assert!(c.d.sealed().is_empty(), "{:?}", c.d.sealed());
+    })
+    .await;
+}
+
+/// A group getting a boss is closed before its config is written, and
+/// opened again, past and all, when the write doesn't happen.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_group_is_closed_before_its_boss_is_written_and_reopened_if_it_isnt() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let c = clients(dir.path(), pool).await;
+        assert!(!c.d.bossed().contains("infra"));
+        let closed_while_writing = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen = Arc::clone(&closed_while_writing);
+        let d = c.d.clone();
+        // The file changed meanwhile: the write is refused.
+        let refused = crate::agent_config_write::save(
+            &c.mia,
+            "mia",
+            None,
+            &format!("[oversight]\nenabled = true\ngroup = \"infra\"\n{ACTS}"),
+            workforce_orchestrator::workflow_store::EditContext::new("web", None),
+            move |_| {
+                seen.store(
+                    d.bossed().contains("infra"),
+                    std::sync::atomic::Ordering::SeqCst,
+                );
+                false
+            },
+        )
+        .await;
+        assert!(refused.is_err());
+        assert!(
+            closed_while_writing.load(std::sync::atomic::Ordering::SeqCst),
+            "closed before the write"
+        );
+        assert!(!c.d.bossed().contains("infra"), "opened again");
+        assert!(
+            main_overview(&c).await.contains("infra-web"),
+            "past and all"
+        );
+
+        // Written, it stays closed.
+        person_saves(
+            &c.mia,
+            &format!("[oversight]\nenabled = true\ngroup = \"infra\"\n{ACTS}"),
+        )
+        .await
+        .unwrap();
+        assert!(c.d.bossed().contains("infra"));
+    })
+    .await;
+}
+
+/// Deleting a group takes its boss off first, through the crew: the boss
+/// names the group no more, and nothing is left closed.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_group_deleted_takes_its_boss_off_first() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let c = clients(dir.path(), pool).await;
+        c.d.release_group("atlas").await.unwrap();
+        let mias = std::fs::read_to_string(c.mia.workspace.join("config.toml")).unwrap();
+        assert!(mias.contains("enabled = false"), "{mias}");
+        assert_eq!(super::super::group_named_in(&mias), None, "{mias}");
+        let sarahs = std::fs::read_to_string(c.sarah.workspace.join("config.toml")).unwrap();
+        assert!(
+            sarahs.contains("group = \"acme\""),
+            "another group's boss stays"
+        );
+        c.d.change_layout(|l| l.delete("atlas")).await.unwrap();
+        assert!(!c.d.bossed().contains("atlas"));
+        eventually("Mia to stop overseeing", async || {
+            c.crew.overseer_named("mia").is_none().then_some(())
+        })
+        .await;
+    })
+    .await;
+}
+
+/// A group named for a boss whose config is switched off (by hand, so it
+/// still names it) is sealed: closed to everyone but the person.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_group_whose_boss_is_off_but_still_named_is_sealed() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let c = clients(dir.path(), pool).await;
+        assert!(c.d.sealed().is_empty());
+        write_config(
+            &c.mia,
+            &format!("[oversight]\nenabled = false\ngroup = \"atlas\"\n{ACTS}"),
+        );
+        super::super::config_saved(&c.mia);
+        eventually("Atlas sealed", async || {
+            (c.d.sealed() == ["atlas".to_string()]).then_some(())
+        })
+        .await;
+        // Sarah takes Atlas on: the stale name goes with it, so taking her
+        // off leaves Atlas open, not sealed.
+        person_saves(
+            &c.sarah,
+            &format!("[oversight]\nenabled = true\ngroup = \"atlas\"\n{ACTS}"),
+        )
+        .await
+        .unwrap();
+        let mias = std::fs::read_to_string(c.mia.workspace.join("config.toml")).unwrap();
+        assert_eq!(super::super::group_named_in(&mias), None, "{mias}");
+        assert!(c.d.sealed().is_empty());
+        person_saves(&c.sarah, &format!("[oversight]\nenabled = false\n{ACTS}"))
+            .await
+            .unwrap();
+        eventually("Atlas open to the main overseer", async || {
+            main_overview(&c).await.contains("atlas-web").then_some(())
+        })
+        .await;
+        assert!(c.d.sealed().is_empty());
+    })
+    .await;
+}

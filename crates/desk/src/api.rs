@@ -1158,6 +1158,10 @@ async fn update_group(
 
 async fn delete_group(State(s): S, h: HeaderMap, Query(q): Q, Path(id): Path<String>) -> Response {
     guarded!(s, h, q);
+    // Its boss is taken off first, so the group is no one's when it goes.
+    if let Err(why) = s.desk.release_group(&id).await {
+        return DeskError::Conflict(why).into_response();
+    }
     s.desk
         .change_layout(|l| l.delete(&id))
         .await
