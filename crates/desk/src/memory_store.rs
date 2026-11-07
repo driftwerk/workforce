@@ -16,6 +16,15 @@ use crate::ledger_store::{Cursor, Kept};
 use crate::memory::record::{Asker, Exchange, Step};
 use crate::store::DeskStore;
 
+/// Whether forgetting sessions forgets what Desk remembers of them: an
+/// explicit forget or removal does; clearing finished sessions away only
+/// tidies their cards.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Memory {
+    Keep,
+    Forget,
+}
+
 /// One step of a record, as [`DeskStore::record_write`] keeps it.
 pub struct RecordWrite<'a> {
     pub session: Uuid,
@@ -144,18 +153,22 @@ impl DeskStore {
                 let seq = base + i32::try_from(i).unwrap_or(i32::MAX - base) + 1;
                 let steps = serde_json::to_value(&x.steps)?;
                 let files: Vec<&str> = x.files.iter().map(String::as_str).collect();
+                let flagged: Vec<&str> = x.flagged.iter().map(String::as_str).collect();
                 tx.execute(
                     "INSERT INTO memory_exchanges (id, engine, key, session, group_id, project, \
                        folder, seq, at, ended, asker, ask, answer, steps, files, commands, \
-                       errors, compaction, redacted) \
-                     VALUES (gen_random_uuid(), $1, $2, $3, ( \
+                       errors, compaction, redacted, flagged) \
+                     SELECT gen_random_uuid(), $1, $2, $3, ( \
                        SELECT NULLIF(g.group_id, 'ungrouped') FROM group_members g \
                        WHERE g.item = 'session:' || $3::uuid::text), $4, $5, $6, $7, $8, $9, \
-                       $10, $11, $12, $13, $14, $15, $16, $17) \
+                       $10, $11, $12, $13, $14, $15, $16, $17, $18 \
+                     WHERE NOT EXISTS (SELECT 1 FROM memory_forgotten f \
+                       WHERE f.engine = $1 AND f.ref = 'key:' || $2) \
                      ON CONFLICT (engine, key) DO UPDATE SET ended = EXCLUDED.ended, \
                        ask = EXCLUDED.ask, answer = EXCLUDED.answer, steps = EXCLUDED.steps, \
                        files = EXCLUDED.files, commands = EXCLUDED.commands, \
-                       errors = EXCLUDED.errors, redacted = EXCLUDED.redacted \
+                       errors = EXCLUDED.errors, redacted = EXCLUDED.redacted, \
+                       flagged = EXCLUDED.flagged \
                      WHERE memory_exchanges.session = EXCLUDED.session",
                     &[
                         &w.engine.as_str(),
@@ -175,29 +188,34 @@ impl DeskStore {
                         &x.errors,
                         &x.compaction,
                         &i32::try_from(x.redacted).unwrap_or(i32::MAX),
+                        &flagged,
                     ],
                 )
                 .await
                 .context("keeping an exchange")?;
             }
         }
-        let c = w.cursor;
-        tx.execute(
-            "INSERT INTO ledger_cursors (session, source, read_to, seen, harvested_to, harvest, \
-               updated_at) VALUES ($1, $2, $3, $4, $5, $6, now()) \
-             ON CONFLICT (session, source) DO UPDATE SET read_to = $3, seen = $4, \
-               harvested_to = $5, harvest = $6, updated_at = now()",
-            &[
-                &w.session,
-                &w.source,
-                &count(c.read_to),
-                &c.seen,
-                &count(c.harvested_to),
-                &c.harvest,
-            ],
-        )
-        .await
-        .context("moving a record's cursor")?;
+        // A session forgotten meanwhile keeps no cursor: its harvest's state
+        // holds what it said.
+        if held {
+            let c = w.cursor;
+            tx.execute(
+                "INSERT INTO ledger_cursors (session, source, read_to, seen, harvested_to, harvest, \
+                   updated_at) VALUES ($1, $2, $3, $4, $5, $6, now()) \
+                 ON CONFLICT (session, source) DO UPDATE SET read_to = $3, seen = $4, \
+                   harvested_to = $5, harvest = $6, updated_at = now()",
+                &[
+                    &w.session,
+                    &w.source,
+                    &count(c.read_to),
+                    &c.seen,
+                    &count(c.harvested_to),
+                    &c.harvest,
+                ],
+            )
+            .await
+            .context("moving a record's cursor")?;
+        }
         tx.commit().await?;
         Ok(changed)
     }
@@ -292,10 +310,12 @@ impl DeskStore {
     /// reads older than 90 days. How many exchanges went.
     pub async fn sweep_memory(&self, retain_days: u32) -> Result<u64> {
         let client = self.pool().get().await?;
-        let days = f64::from(retain_days);
+        let days = i32::try_from(retain_days).unwrap_or(i32::MAX);
+        // One never ended (its session stopped mid-turn) goes by when it began.
         let gone = client
             .execute(
-                "DELETE FROM memory_exchanges WHERE ended < now() - make_interval(days => $1)",
+                "DELETE FROM memory_exchanges \
+                 WHERE COALESCE(ended, at) < now() - make_interval(days => $1)",
                 &[&days],
             )
             .await?;
@@ -413,6 +433,16 @@ pub(crate) async fn forget_memory_in(
         &[&ids],
     )
     .await?;
+    // The exchanges' own keys too: a fork that copied them can't keep them
+    // again.
+    tx.execute(
+        "INSERT INTO memory_forgotten (engine, ref, at) \
+         SELECT engine, 'key:' || key, now() FROM memory_exchanges WHERE session = ANY($1) \
+         ON CONFLICT DO NOTHING",
+        &[&ids],
+    )
+    .await
+    .context("tombstoning forgotten exchanges")?;
     tx.execute(
         "INSERT INTO memory_forgotten (engine, ref, at) \
          SELECT engine, ref, now() FROM ( \
@@ -440,4 +470,192 @@ pub(crate) async fn forget_memory_in(
         .with_context(|| format!("forgetting {table}"))?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::{build_pool, tests::record_fixture};
+    use workforce_postgres::test_support::with_test_pool;
+
+    fn exchange(key: &str, ask: &str, ended: Option<DateTime<Utc>>) -> Exchange {
+        Exchange {
+            key: key.into(),
+            at: ended.unwrap_or_else(Utc::now) - chrono::Duration::minutes(1),
+            ended,
+            asker: Asker::Person,
+            ask: ask.into(),
+            answer: "done".into(),
+            steps: Vec::new(),
+            files: Default::default(),
+            commands: Vec::new(),
+            errors: Vec::new(),
+            compaction: false,
+            redacted: 0,
+            flagged: ["instruction_override".to_string()].into(),
+        }
+    }
+
+    async fn write(store: &DeskStore, session: Uuid, closed: &[Exchange], open: Option<&Exchange>) {
+        let cursor = Cursor {
+            read_to: 10,
+            harvested_to: 10,
+            harvest: serde_json::json!({"open": {"ask": "what it said"}}),
+            ..Cursor::default()
+        };
+        store
+            .record_write(&RecordWrite {
+                session,
+                engine: Engine::Claude,
+                source: "/records/t.jsonl",
+                cursor: &cursor,
+                rows: &[],
+                closed,
+                open,
+                project: "/dev/acme-web",
+                folder: "/dev/acme-web",
+            })
+            .await
+            .unwrap();
+    }
+
+    async fn n(store: &DeskStore, sql: &str, id: Uuid) -> i64 {
+        let client = store.pool().get().await.unwrap();
+        client.query_one(sql, &[&id]).await.unwrap().get(0)
+    }
+
+    #[tokio::test]
+    async fn the_sweep_deletes_what_is_past_its_keeping_ended_or_not() {
+        with_test_pool(build_pool, |pool| async move {
+            DeskStore::migrate(&pool).await.unwrap();
+            let store = DeskStore::from_pool(pool);
+            let s = record_fixture("acme-web");
+            store.put(&s).await.unwrap();
+            let old = Utc::now() - chrono::Duration::days(200);
+            let mut never = exchange("x-never", "stopped mid-turn", None);
+            never.at = old;
+            write(&store, s.id, &[exchange("x-old", "long ago", Some(old)), exchange("x-new", "today", Some(Utc::now()))], Some(&never)).await;
+            assert_eq!(store.sweep_memory(180).await.unwrap(), 2);
+            let (kept, _) = store.session_memory(s.id, 10).await.unwrap();
+            assert_eq!(kept.iter().map(|x| x.ask.as_str()).collect::<Vec<_>>(), ["today"]);
+            assert_eq!(n(&store, "SELECT COUNT(*) FROM memory_exchanges WHERE session = $1 AND cardinality(flagged) = 1", s.id).await, 1, "what was flagged is kept with it");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_session_forgotten_while_its_step_was_read_keeps_no_cursor_and_no_text() {
+        with_test_pool(build_pool, |pool| async move {
+            DeskStore::migrate(&pool).await.unwrap();
+            let store = DeskStore::from_pool(pool);
+            let gone = Uuid::new_v4();
+            write(
+                &store,
+                gone,
+                &[exchange("x-1", "fix it", Some(Utc::now()))],
+                None,
+            )
+            .await;
+            assert_eq!(
+                n(
+                    &store,
+                    "SELECT COUNT(*) FROM ledger_cursors WHERE session = $1",
+                    gone
+                )
+                .await,
+                0
+            );
+            assert_eq!(
+                n(
+                    &store,
+                    "SELECT COUNT(*) FROM memory_exchanges WHERE session = $1",
+                    gone
+                )
+                .await,
+                0
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn clearing_keeps_memory_and_forgetting_tombstones_even_a_forks_copy() {
+        with_test_pool(build_pool, |pool| async move {
+            DeskStore::migrate(&pool).await.unwrap();
+            let store = DeskStore::from_pool(pool);
+            let (cleared, forgotten, fork) = (
+                record_fixture("acme-old"),
+                record_fixture("acme-web"),
+                record_fixture("acme-fork"),
+            );
+            for s in [&cleared, &forgotten, &fork] {
+                store.put(s).await.unwrap();
+            }
+            write(
+                &store,
+                cleared.id,
+                &[exchange("x-c", "the cookie flag", Some(Utc::now()))],
+                None,
+            )
+            .await;
+            write(
+                &store,
+                forgotten.id,
+                &[exchange("x-f", "the vault path", Some(Utc::now()))],
+                None,
+            )
+            .await;
+            store
+                .remove_sessions(&[cleared.id], &[], "you", Memory::Keep)
+                .await
+                .unwrap();
+            store
+                .remove_sessions(&[forgotten.id], &[], "you", Memory::Forget)
+                .await
+                .unwrap();
+
+            let found = store
+                .memory_search(&MemoryQuery {
+                    q: "cookie".into(),
+                    limit: 10,
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                found.len(),
+                1,
+                "a cleared session's memory is still searched"
+            );
+            assert_eq!(found[0].session, cleared.id);
+            assert_eq!(
+                n(
+                    &store,
+                    "SELECT COUNT(*) FROM memory_exchanges WHERE session = $1",
+                    forgotten.id
+                )
+                .await,
+                0
+            );
+
+            // A fork that copied the forgotten lines can't keep them again.
+            write(
+                &store,
+                fork.id,
+                &[exchange("x-f", "the vault path", Some(Utc::now()))],
+                None,
+            )
+            .await;
+            assert_eq!(
+                n(
+                    &store,
+                    "SELECT COUNT(*) FROM memory_exchanges WHERE session = $1",
+                    fork.id
+                )
+                .await,
+                0
+            );
+        })
+        .await;
+    }
 }
