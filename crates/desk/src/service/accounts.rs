@@ -517,11 +517,16 @@ impl Desk {
             if !st.accounts.iter().any(|a| a.id == account) {
                 return;
             }
-            let side = Self::canonical(&st, Some(account));
-            let standing = st.standing.entry(side).or_default();
-            if standing.full(now).flatten().is_some_and(|t| t >= until) {
+            // Already full until then as it reads now: nothing new.
+            if Self::standing_of(&st, Some(account))
+                .full(now)
+                .flatten()
+                .is_some_and(|t| t >= until)
+            {
                 return;
             }
+            // Kept as the account's own: the call ran on its token.
+            let standing = Self::standing_mut(&mut st, &super::identities::Raw::Account(account));
             standing.hit_at = Some(now);
             standing.hit_until = Some(until);
             standing.hit_window = None;

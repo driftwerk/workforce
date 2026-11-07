@@ -2930,7 +2930,12 @@ async fn a_sign_in_claude_code_says_nothing_of_still_files_its_readings_with_the
         assert!(
             d.0.state.lock().own_standing[""].read_at
                 < Some(chrono::Utc::now() - chrono::Duration::milliseconds(15))
+        );
+    })
+    .await;
+}
 
+#[tokio::test]
 async fn the_hubs_own_calls_are_offered_the_accounts_default_first_and_tell_desk_of_a_limit() {
     use crate::engine_accounts::AccountNeed;
     with_test_pool(build_pool, |pool| async move {
@@ -2971,7 +2976,6 @@ async fn the_hubs_own_calls_are_offered_the_accounts_default_first_and_tell_desk
     })
     .await;
 }
-
 
 async fn until_need(d: &Desk) -> crate::engine_accounts::AccountNeed {
     until(|| d.account_needs().into_iter().next()).await
