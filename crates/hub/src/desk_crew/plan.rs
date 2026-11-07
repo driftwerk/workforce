@@ -26,7 +26,7 @@ use uuid::Uuid;
 use workforce_common::channels::desk::{DeliveryKind, DeskPlace, DeskTarget};
 use workforce_common::channels::DESK_CHANNEL;
 use workforce_common::oversight::{Level, Oversight};
-use workforce_core::budget::{self, BudgetScope, Status};
+use workforce_core::budget::Status;
 use workforce_desk::board::TicketState;
 use workforce_desk::crew::{self, By, Extras, Kind, MentionedPlan, Party, PartyKind};
 use workforce_desk::model::{DeskEvent, Engine, SessionState};
@@ -434,22 +434,6 @@ impl CrewHub {
             .filter(|(_, o)| self.desk.seen_by(&o.scope).sees(p.group.as_deref()))
     }
 
-    /// Where `p`'s group's spend stands: the tightest of its group's
-    /// budgets, none for a plan in no group.
-    async fn group_standing(&self, p: &Plan) -> Option<Status> {
-        let g = p.group.as_deref()?;
-        let view = self.desk.budgets_view().await.ok()?;
-        budget::tightest(
-            view.budgets
-                .into_iter()
-                .filter(|b| {
-                    b.budget.scope == BudgetScope::Desk && b.budget.group.as_deref() == Some(g)
-                })
-                .filter_map(|b| b.standing),
-        )
-        .map(|s| s.status)
-    }
-
     async fn run_plan(&self, p: Plan) {
         let Some((service, o)) = self.boss_of_plan(&p) else {
             // Its boss is gone from the hub: nothing runs unsupervised.
@@ -464,7 +448,9 @@ impl CrewHub {
         if o.level == Level::Watch {
             return;
         }
-        let standing = self.group_standing(&p).await;
+        // What a group's warning holds back, and its Continue, are the
+        // budgets' own to add; Desk's breaker already holds what is over.
+        let standing = None;
         let boss = Party::manager(service.agent_id.as_str(), &name_of(&service));
         let by = By::manager(
             &boss.id,
@@ -891,7 +877,9 @@ pub(super) async fn plan_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
     let mut running: HashMap<Uuid, tokio::task::JoinHandle<()>> = HashMap::new();
     let mut pass: Option<tokio::task::JoinHandle<()>> = None;
     let mut dirty = true;
-    let mut last = Instant::now();
+    let mut last = Instant::now()
+        .checked_sub(Duration::from_secs(60))
+        .unwrap_or_else(Instant::now);
     let mut tick = tokio::time::interval(Duration::from_millis(250));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
@@ -936,7 +924,9 @@ pub(super) async fn plan_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
         if last.elapsed() >= crew.timing.tick {
             dirty = true;
         }
-        if dirty && pass.as_ref().is_none_or(|h| h.is_finished()) {
+        // Not more often than a gap apart, however busy the sessions are.
+        let gap = crew.timing.tick.min(Duration::from_secs(1));
+        if dirty && last.elapsed() >= gap && pass.as_ref().is_none_or(|h| h.is_finished()) {
             dirty = false;
             last = Instant::now();
             let c = Arc::clone(&crew);
@@ -959,5 +949,20 @@ pub(super) async fn plan_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
                 tokio::spawn(async move { c.plan_turn(plan, g.lines).await }),
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_plan_has_a_channel_of_its_own_that_is_no_desk_room() {
+        let id = Uuid::new_v4();
+        let channel = plan_channel(id);
+        assert_eq!(channel, format!("desk:plan:{id}"));
+        assert!(!workforce_common::channels::is_desk_room(&channel));
+        assert!(!workforce_common::channels::is_desk_conversation(&channel));
+        assert_ne!(channel, super::super::line::line_channel(id));
     }
 }

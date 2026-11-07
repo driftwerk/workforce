@@ -452,6 +452,7 @@ impl Desk {
         boss: &Party,
         by: &By,
     ) -> Result<PlanDetail, DeskError> {
+        let _write = self.0.plan_write.lock().await;
         let s =
             plan::snapshot_of(&new.draft, None, new.engine, &mut Uuid::new_v4).map_err(problems)?;
         plan::validate(&s, &self.engines(), &|f| Path::new(f).is_dir()).map_err(problems)?;
@@ -747,6 +748,7 @@ impl Desk {
         asks: bool,
         by: &By,
     ) -> Result<Changed, DeskError> {
+        let _write = self.0.plan_write.lock().await;
         let mut p = self.plan_of(id).await?;
         if matches!(p.state, PlanState::Done | PlanState::Dropped) {
             return Err(DeskError::Conflict(format!(
@@ -860,6 +862,7 @@ impl Desk {
         revision: i32,
         by: &By,
     ) -> Result<PlanDetail, DeskError> {
+        let _write = self.0.plan_write.lock().await;
         if by.party.kind != PartyKind::You {
             return Err(DeskError::Invalid(
                 "Only the person approves a plan.".into(),
@@ -935,6 +938,7 @@ impl Desk {
         why: Paused,
         by: &By,
     ) -> Result<PlanDetail, DeskError> {
+        let _write = self.0.plan_write.lock().await;
         let mut p = self.plan_of(id).await?;
         if !matches!(p.state, PlanState::Running | PlanState::Paused) {
             return Err(DeskError::Conflict(
@@ -964,6 +968,7 @@ impl Desk {
         why: &[Paused],
         by: &By,
     ) -> Result<PlanDetail, DeskError> {
+        let _write = self.0.plan_write.lock().await;
         let mut p = self.plan_of(id).await?;
         let Some(was) = p.paused.filter(|w| why.contains(w)) else {
             return match p.paused {
@@ -990,6 +995,7 @@ impl Desk {
     /// working on the rest are stopped, or left running as the person's
     /// own (`on`).
     pub async fn drop_plan(&self, id: Uuid, on: OnDrop, by: &By) -> Result<PlanDetail, DeskError> {
+        let _write = self.0.plan_write.lock().await;
         let mut p = self.plan_of(id).await?;
         if p.state == PlanState::Dropped {
             return self.plan_detail(p).await;
@@ -1046,6 +1052,7 @@ impl Desk {
 
     /// Plan `id` is done: every ticket of it is Done or Dropped.
     pub async fn finish_plan(&self, id: Uuid, by: &By) -> Result<PlanDetail, DeskError> {
+        let _write = self.0.plan_write.lock().await;
         let mut p = self.plan_of(id).await?;
         if p.state == PlanState::Done {
             return self.plan_detail(p).await;

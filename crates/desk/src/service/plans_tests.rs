@@ -878,3 +878,79 @@ async fn the_persons_plan_routes_read_edit_approve_and_drop_and_refuse_a_stale_r
     })
     .await;
 }
+
+#[tokio::test]
+async fn two_approvals_at_once_run_the_plan_once_and_an_approval_racing_a_change_keeps_every_revision(
+) {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let p = d
+            .propose_plan(
+                new_plan(dir.path(), &[("a", &[]), ("b", &[])]),
+                &sarah(),
+                &by_sarah(),
+            )
+            .await
+            .unwrap();
+        let id = p.summary.plan.id;
+        // From the Floor and from the DM at once.
+        let you = By::you();
+        let (one, two) = tokio::join!(d.approve_plan(id, 1, &you), d.approve_plan(id, 1, &you));
+        assert!(one.is_ok() && two.is_ok());
+        let ran = d.plan(id).await.unwrap();
+        assert_eq!(ran.summary.plan.state, PlanState::Running);
+        assert_eq!(states(&ran), vec![TicketState::Todo; 2]);
+        let todo: HashSet<i64> = ran
+            .tickets
+            .iter()
+            .map(|t| t.ticket.ticket.rank as i64)
+            .collect();
+        assert_eq!(todo.len(), 2, "each moved once, to a place of its own");
+
+        // The person approves as the boss adds a ticket: whichever lands
+        // first, the plan's revision is its newest one kept.
+        let q = d
+            .propose_plan(new_plan(dir.path(), &[("c", &[])]), &sarah(), &by_sarah())
+            .await
+            .unwrap();
+        let qid = q.summary.plan.id;
+        let mut more = kept(&q);
+        more.push(DraftTicket {
+            title: "d".into(),
+            folder: dir.path().to_string_lossy().into_owned(),
+            ..Default::default()
+        });
+        let edit = PlanEdit {
+            revision: Some(1),
+            tickets: Some(more),
+            ..Default::default()
+        };
+        let boss = by_sarah();
+        let (approved, changed) = tokio::join!(
+            d.approve_plan(qid, 1, &you),
+            d.change_plan(qid, edit, Engine::Claude, false, &boss)
+        );
+        let now = d.plan(qid).await.unwrap();
+        let newest = now.revisions.iter().map(|r| r.revision).max().unwrap();
+        assert_eq!(now.summary.plan.revision, newest);
+        match (approved.is_ok(), changed.is_ok()) {
+            // Approved first: the change waits for the person.
+            (true, true) => {
+                assert_eq!(now.summary.plan.approved_revision, Some(1));
+                assert_eq!(now.summary.plan.revision, 2);
+                assert_eq!(d.plan_needs().len(), 1);
+            }
+            // Changed first: the approval of what was read is refused.
+            (false, true) => {
+                assert_eq!(now.summary.plan.approved_revision, None);
+                assert_eq!(now.summary.plan.revision, 2);
+            }
+            other => panic!("{other:?}: {approved:?} {changed:?}"),
+        }
+        // Either way the person can approve the newest.
+        d.approve_plan(qid, newest, &you).await.unwrap();
+        assert_eq!(d.plan(qid).await.unwrap().tickets.len(), 2);
+    })
+    .await;
+}

@@ -825,6 +825,9 @@ struct Inner {
     scopes: Mutex<scopes::Scopes>,
     /// The plans waiting on the person.
     boss_plans: Mutex<plans::Plans>,
+    /// Held from reading a plan to writing it back: a plan is written
+    /// whole, so two changes at once would undo one another.
+    plan_write: tokio::sync::Mutex<()>,
 }
 
 #[derive(Clone)]
@@ -1447,6 +1450,7 @@ impl Desk {
             boss_bounds: Mutex::new(None),
             scopes: Mutex::default(),
             boss_plans: Mutex::default(),
+            plan_write: tokio::sync::Mutex::new(()),
         }));
         desk.scopes_follow(&desk.layout());
         desk.scopes_load().await;
