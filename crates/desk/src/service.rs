@@ -6149,9 +6149,19 @@ mod tests {
 
             let limits = json!([{"kind": "five_hour", "percentUsed": 62, "resetsAt": "2026-10-29T19:10:00Z"}]);
             post(&d, s.id, json!({"hook_event_name": "DeskUsage", "rate_limits": limits})).await;
+            // Kept by the account the sign-in is (its identity), whichever
+            // credential of it reports.
+            let identity = crate::identity::Identity::of("org-1", "person@example.com").unwrap();
             assert_eq!(
                 readings.0.lock().clone(),
-                [(LocalPlan::Claude, limits, max)],
+                [(
+                    LocalPlan::Claude,
+                    limits,
+                    crate::usage::LocalAccount {
+                        ids: vec![identity.plan_id()],
+                        plan: Some("max".into()),
+                    }
+                )],
                 "the reading is the session's sign-in's"
             );
             assert_eq!(d.view(s.id).unwrap().state, SessionState::Starting, "and changes nothing of it");
