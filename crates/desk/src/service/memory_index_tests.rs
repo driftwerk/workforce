@@ -955,3 +955,74 @@ async fn a_collection_the_index_lost_is_searched_by_keyword_and_written_again() 
     })
     .await;
 }
+
+#[tokio::test]
+async fn an_index_that_cant_write_is_waited_for_and_sets_nothing_aside() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        DeskStore::migrate(&pool).await.unwrap();
+        let store = DeskStore::from_pool(pool.clone());
+        let web = session(dir.path(), "acme-web");
+        store.put(&web).await.unwrap();
+        let index = Arc::new(FakeIndex::default());
+        // It lists its collections, but its embedder is down.
+        index.writes_down.store(true, Ordering::SeqCst);
+        let (d, _cancel) = start(&pool, dir.path(), &index).await;
+        harvested(&d, &store, web.id, 6).await;
+        until(&d, "said failing", async || {
+            d.memory_index_status().await.unwrap().failing.is_some()
+        })
+        .await;
+        // Long enough for many more passes than a row's tries.
+        tokio::time::sleep(Duration::from_secs(8)).await;
+        assert_eq!(d.memory_index_status().await.unwrap().set_aside, 0);
+        assert_eq!(
+            q::<i64>(
+                &store,
+                "SELECT COALESCE(MAX(index_tries), 0)::int8 FROM memory_exchanges",
+                &[]
+            )
+            .await,
+            0,
+            "no refusal is counted while nothing can be written"
+        );
+        index.writes_down.store(false, Ordering::SeqCst);
+        until(&d, "all written once it can write", async || {
+            let s = d.memory_index_status().await.unwrap();
+            s.backlog == 0 && index.refs(UNGROUPED_COLLECTION).len() == 6
+        })
+        .await;
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn what_was_set_aside_is_tried_again() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        DeskStore::migrate(&pool).await.unwrap();
+        let store = DeskStore::from_pool(pool.clone());
+        let web = session(dir.path(), "acme-web");
+        store.put(&web).await.unwrap();
+        let index = Arc::new(FakeIndex::default());
+        index.down.store(true, Ordering::SeqCst);
+        let (d, _cancel) = start(&pool, dir.path(), &index).await;
+        harvested(&d, &store, web.id, 6).await;
+        let poison = closed(&store, web.id).await[0];
+        index.poison.lock().insert(poison);
+        index.down.store(false, Ordering::SeqCst);
+        until(&d, "set aside", async || {
+            d.memory_index_status().await.unwrap().set_aside == 1
+        })
+        .await;
+        index.poison.lock().clear();
+        // What reconcile does each day.
+        assert_eq!(store.index_retry_set_aside().await.unwrap(), 1);
+        until(&d, "written after all", async || {
+            index.refs(UNGROUPED_COLLECTION).contains(&poison)
+        })
+        .await;
+        assert_eq!(d.memory_index_status().await.unwrap().set_aside, 0);
+    })
+    .await;
+}

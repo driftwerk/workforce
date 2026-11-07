@@ -319,6 +319,13 @@ impl Desk {
                             }
                         }
                     }
+                    // A refusal counts against an exchange only when the
+                    // index can write: another in this pass was written, or
+                    // its own check was. Else the index can't write at all
+                    // (its embedder down) and is waited for.
+                    if !refused.is_empty() && ok.is_empty() {
+                        index.canary().await?;
+                    }
                     for id in self.0.store.index_tried(&refused).await? {
                         tracing::warn!(exchange = %id, "an exchange the search index keeps refusing is set aside; it is found by keyword");
                     }
@@ -382,6 +389,8 @@ impl Desk {
             Err(e) if !Self::answering(index).await => Err(e),
             // Refused while the index answers otherwise: tried again a few
             // times, then set aside and said on the Floor.
+            // It can't write at all: waited for, not counted.
+            Err(e) if index.canary().await.is_err() => Err(e),
             Err(e) => {
                 tracing::warn!(%id, collection, error = format!("{e:#}"), "Desk Memory's search index refused a deletion");
                 if self.0.store.purge_tried(id).await? {
@@ -455,6 +464,14 @@ impl Desk {
         for collection in listed.iter().filter(|c| is_ours(c) && !wanted.contains(*c)) {
             self.0.store.queue_purges(collection, &[Purge::All]).await?;
             dropped += 1;
+        }
+        // What was set aside is tried again once a day.
+        let again_set_aside = self.0.store.index_retry_set_aside().await?;
+        if again_set_aside > 0 {
+            tracing::info!(
+                again_set_aside,
+                "trying again the exchanges the search index refused"
+            );
         }
         self.0.index.state.lock().reconciled = Some(Utc::now());
         if again > 0 || orphans > 0 || dropped > 0 {

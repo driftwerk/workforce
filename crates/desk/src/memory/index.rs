@@ -89,6 +89,11 @@ pub trait MemoryIndex: Send + Sync {
         limit: usize,
     ) -> eyre::Result<KeyPage>;
 
+    /// Writes and deletes a passage of its own, outside every memory
+    /// collection: whether the index can embed and write now, which a
+    /// listing of its collections doesn't show.
+    async fn canary(&self) -> eyre::Result<()>;
+
     /// The passages of `collection` that best match `q`, by meaning and by
     /// words, best first; one hit per exchange. None when the index has no
     /// such collection: for a group whose rows Postgres says it holds, the
@@ -122,6 +127,9 @@ pub mod fake {
         pub purges_fail: AtomicBool,
         /// Reconcile's comparisons fail while set, the rest answering.
         pub differing_fails: AtomicBool,
+        /// Every write fails while set, listings answering: an embedder
+        /// that is down.
+        pub writes_down: AtomicBool,
     }
 
     impl FakeIndex {
@@ -168,6 +176,9 @@ pub mod fake {
         async fn write(&self, collection: &str, passages: &[Passage]) -> eyre::Result<()> {
             self.up()?;
             self.writes.fetch_add(1, Ordering::SeqCst);
+            if self.writes_down.load(Ordering::SeqCst) {
+                eyre::bail!("the index can't embed");
+            }
             if passages.iter().any(|p| self.poison.lock().contains(&p.of)) {
                 eyre::bail!("the index refused a passage");
             }
@@ -202,6 +213,14 @@ pub mod fake {
                 Purge::All => false,
             });
             Ok((before - c.len()) as u64)
+        }
+
+        async fn canary(&self) -> eyre::Result<()> {
+            self.up()?;
+            match self.writes_down.load(Ordering::SeqCst) {
+                true => eyre::bail!("the index can't embed"),
+                false => Ok(()),
+            }
         }
 
         async fn collections(&self) -> eyre::Result<Vec<String>> {
