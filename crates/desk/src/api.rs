@@ -356,6 +356,7 @@ async fn accounts(State(s): S, h: HeaderMap, Query(q): Q) -> Response {
         "needs": s.desk.account_needs(),
         "autoSwitch": s.desk.auto_switch(),
         "problems": s.desk.sign_in_problems(),
+        "ownPlanKey": s.desk.own_plan_key(),
     }))
     .into_response()
 }
@@ -494,6 +495,28 @@ async fn put_off_need(State(s): S, h: HeaderMap, Query(q): Q, Path(id): Path<Str
     guarded!(s, h, q);
     s.desk.put_off(&id);
     StatusCode::NO_CONTENT.into_response()
+}
+
+#[derive(Deserialize)]
+struct OwnSignInBody {
+    /// The account this computer's Claude Code is signed in to; none: none
+    /// of the person's accounts.
+    account: Option<Uuid>,
+}
+
+/// "This computer's sign-in is …": which of the person's accounts it is.
+async fn own_sign_in(
+    State(s): S,
+    h: HeaderMap,
+    Query(q): Q,
+    Json(b): Json<OwnSignInBody>,
+) -> Response {
+    guarded!(s, h, q);
+    s.desk
+        .link_own_sign_in(b.account)
+        .await
+        .map(|()| StatusCode::NO_CONTENT)
+        .into_response()
 }
 
 #[derive(Deserialize)]
@@ -1362,6 +1385,10 @@ pub fn sessions_router(desk: Desk, auth: Arc<dyn Authorize>) -> Router {
             get(sign_in_direct),
         )
         .route("/api/desk/accounts/switch-all", post(switch_all))
+        .route(
+            "/api/desk/accounts/own-sign-in",
+            axum::routing::put(own_sign_in),
+        )
         .route("/api/desk/accounts/needs/{id}/put-off", post(put_off_need))
         .route(
             "/api/desk/accounts/auto-switch",

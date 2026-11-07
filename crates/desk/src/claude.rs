@@ -221,6 +221,9 @@ pub enum Hook {
         /// What it left running, when the CLI says (2.1.319's doesn't).
         background: Option<Vec<(String, TaskKind)>>,
     },
+    /// It was signed in again inside (`/login`, `auth_success`): it runs on
+    /// the CLI's own sign-in from now on.
+    SignedIn,
     /// Claude Code went on by itself: background work it started ended.
     Woken,
     SubagentStart(String),
@@ -317,6 +320,8 @@ pub fn parse_hook(body: &[u8]) -> eyre::Result<Hook> {
             }
             Some(kind) if ANSWERED_NOTICES.contains(&kind) => Hook::InputAnswered,
             Some("idle_prompt") => Hook::AtPrompt,
+            // Signed in again inside it (`/login`): it runs on that sign-in.
+            Some("auth_success") => Hook::SignedIn,
             // Idle at its prompt (the turn's end says that), signed in,
             // finished, and the like: nothing waits.
             Some(_) => Hook::Other,
@@ -682,6 +687,10 @@ pub(crate) mod tests {
                 ..
             } if e == "rate_limit"
         ));
+        assert_eq!(
+            parse_hook(br#"{"hook_event_name":"Notification","notification_type":"auth_success","message":"Login successful"}"#).unwrap(),
+            Hook::SignedIn
+        );
         let woken = br#"{"hook_event_name":"UserPromptSubmit","prompt":"<task-notification>\n<task-id>baoj</task-id>\n<status>completed</status>\n</task-notification>"}"#;
         assert_eq!(
             parse_hook(woken).unwrap(),
@@ -842,10 +851,12 @@ pub(crate) mod tests {
             assert_eq!(notice(kind), Hook::InputAnswered, "{kind}");
         }
         assert_eq!(notice("idle_prompt"), Hook::AtPrompt);
+        // Signed in again inside: it runs on that sign-in now, waiting on
+        // nothing.
+        assert_eq!(notice("auth_success"), Hook::SignedIn);
         for kind in [
             // The agents view's, about other sessions.
             "agent_needs_input",
-            "auth_success",
             "agent_completed",
             "computer_use_enter",
             "computer_use_exit",

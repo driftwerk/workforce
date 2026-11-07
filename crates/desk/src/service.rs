@@ -43,6 +43,7 @@ use crate::worktree;
 mod accounts;
 mod asks;
 mod engine_sign_ins;
+mod identities;
 pub use accounts::Added;
 mod board;
 pub use board::{
@@ -219,6 +220,13 @@ pub(crate) struct Live {
     /// Asks raised while another showed, oldest first: each shows once
     /// those in front of it end, and none of them is lost meanwhile.
     behind: Vec<Behind>,
+    /// On the CLI's own sign-in, the identity key it was signed in as when
+    /// this session started on it (or signed in again inside): a `/login`
+    /// elsewhere since may not have changed it for this process.
+    own_key: Option<String>,
+    /// When its process started here, or the hub took it back: a `/login`
+    /// its transcript shows after this is a sign-in inside it.
+    started_at: DateTime<Utc>,
 }
 
 /// A call a thread started that hasn't ended.
@@ -587,10 +595,32 @@ struct State {
     standing: HashMap<Option<Uuid>, crate::engine_accounts::Standing>,
     /// Accounts sessions were moved off at their limit, until they reset
     /// and the person is asked back.
-    moved_off: Vec<crate::engine_accounts::MovedOff>,
+    moved_off: Vec<identities::RawMove>,
     /// How each session's last turn ended when an API error ended it, until
     /// it is asked again ([`crate::limit`]).
     turn_failures: HashMap<Uuid, crate::limit::TurnFailure>,
+    /// Which Anthropic account each of the person's accounts is, when known
+    /// ([`crate::identity`]).
+    links: HashMap<Uuid, crate::identity::Link>,
+    /// Which one this computer's own Claude Code sign-in is, as last read.
+    own_identity: Option<crate::identity::Identity>,
+    /// Each side's recent plan readings, to tell which account the CLI's
+    /// own sign-in is by its usage (`None`: the CLI's own).
+    prints: HashMap<identities::Raw, crate::identity::Prints>,
+    /// What this computer's CLI sign-in reported, by the identity it was
+    /// signed in as: never another's ([`identities::Raw`]).
+    own_standing: HashMap<String, crate::engine_accounts::Standing>,
+    /// Sessions signed in again inside (`/login`): on the CLI's own
+    /// sign-in until they start afresh.
+    relogged: HashSet<Uuid>,
+    /// The CLI sign-ins the person said are none of their accounts.
+    own_none: HashSet<String>,
+    /// Whether the CLI's own sign-in was read yet: until it is, its
+    /// readings wait, never filed as nobody's.
+    own_read: bool,
+    own_waiting: Vec<(Value, Option<Uuid>, DateTime<Utc>)>,
+    /// The last `/login` each session's transcript showed.
+    logins_seen: HashMap<Uuid, String>,
     /// Account needs the person put off.
     put_off: HashSet<String>,
     /// Desk moves sessions off an account at its limit by itself.
@@ -610,6 +640,9 @@ struct State {
     /// Which boss runs which session, and the person's input to each.
     charges: charge::Charges,
 }
+
+/// The most readings of the CLI's own sign-in held until it is first read.
+const OWN_WAITING_MAX: usize = 64;
 
 /// How often a busy session's tool is recorded as `working`.
 const WORKING_EVERY: Duration = Duration::from_secs(60);
@@ -1168,6 +1201,30 @@ impl Desk {
         let layout = store.layout().await?;
         let session_env = kept_session_env(&store).await;
         let engine_accounts = store.accounts().await?;
+        let account_links = store.account_links().await?;
+        let kept = |key: &'static str| {
+            let store = Arc::clone(&store);
+            async move {
+                store
+                    .state(key)
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|e| e.value)
+                    .unwrap_or(Value::Null)
+            }
+        };
+        let own_none: HashSet<String> =
+            serde_json::from_value(kept(identities::OWN_NONE).await).unwrap_or_default();
+        let relogged: HashSet<Uuid> =
+            serde_json::from_value(kept(identities::RELOGGED).await).unwrap_or_default();
+        let prints: HashMap<identities::Raw, crate::identity::Prints> =
+            serde_json::from_value::<Vec<(identities::Raw, crate::identity::Prints)>>(
+                kept(identities::PRINTS).await,
+            )
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
         let auto_switch = match store.state(accounts::AUTO_SWITCH).await {
             Ok(kept) => kept.is_some_and(|e| e.value == serde_json::json!(true)),
             Err(e) => {
@@ -1265,6 +1322,10 @@ impl Desk {
                 hidden,
                 turns,
                 accounts: engine_accounts,
+                links: account_links,
+                own_none,
+                relogged,
+                prints,
                 auto_switch,
                 ..State::default()
             }),
@@ -1463,6 +1524,8 @@ impl Desk {
                     codex_question: None,
                     flights: HashMap::new(),
                     behind: Vec::new(),
+                    own_key: None,
+                    started_at: Utc::now(),
                     breaker: Default::default(),
                 },
             );
@@ -1525,6 +1588,11 @@ impl Desk {
             return;
         }
         st.records.insert(r.id, r.clone());
+        // Closed: whatever it was signed in to inside is over.
+        if r.state == SessionState::Closed && st.relogged.remove(&r.id) {
+            let ids: Vec<Uuid> = st.relogged.iter().copied().collect();
+            self.keep_state(identities::RELOGGED, serde_json::json!(ids));
+        }
         let view = Self::view_of(st, &r);
         if before.as_ref().is_none_or(|b| b.state != view.state) {
             st.state_since.insert(r.id, view.updated_at);
@@ -1546,7 +1614,6 @@ impl Desk {
         let mut ops = Self::turn_ops(st, &transitions, &view);
         self.keep_asks(st, r.id, open_turn, &mut ops);
         let id = r.id;
-        let r_account = r.account;
         // A switch of account that waited for its turn to end.
         let turn_over = transitions.iter().any(|t| {
             matches!(
@@ -1567,8 +1634,10 @@ impl Desk {
                 _ => false,
             });
         if hit_limit {
-            // When Claude Code said it resets; else what a reading says.
-            Self::mark_hit(st, r_account, view.failure.as_ref().and_then(|f| f.limit()));
+            // When Claude Code said it resets; else what a reading says. The
+            // account it stopped on, whichever credential of it it ran on.
+            let raw = Self::raw_running(st, id);
+            Self::mark_hit(st, &raw, view.failure.as_ref().and_then(|f| f.limit()));
             let desk = self.clone();
             tokio::spawn(async move { desk.accounts_moved().await });
         }
@@ -1737,6 +1806,13 @@ impl Desk {
         }
         let began = std::time::Instant::now();
         let read = self.read_engine(engine, &program).await;
+        if engine == Engine::Claude {
+            let own = match &read.sign_in {
+                engine::SignIn::Unknown => None,
+                said => Some(said.claude_identity()),
+            };
+            self.own_identity_read(own);
+        }
         self.0.engines.lock().insert(engine, read);
         *last = Some(EngineRead {
             began,
@@ -1814,24 +1890,47 @@ impl Desk {
     /// reported to the hub: of its account when it runs on one, else of the
     /// CLI's own sign-in.
     fn report_usage(&self, limits: Value, session: Option<Uuid>) {
+        self.report_usage_at(limits, session, Utc::now());
+    }
+
+    /// [`Self::report_usage`], of a reading taken at `at`.
+    pub(super) fn report_usage_at(&self, limits: Value, session: Option<Uuid>, at: DateTime<Utc>) {
         let Some(plans) = &self.0.plans else {
             return;
         };
-        let on = session.and_then(|id| self.0.state.lock().records.get(&id)?.account);
-        let account = match on {
-            Some(id) => crate::usage::LocalAccount {
-                ids: vec![accounts::plan_id(id)],
-                plan: None,
+        // Filed by the credential the session runs on now (a `/login`
+        // inside moves it to the CLI's own sign-in), under the account that
+        // is: one card per account, whichever credential of it reported.
+        let (raw, ids) = {
+            let mut st = self.0.state.lock();
+            let raw = match session {
+                Some(id) => Self::raw_running(&st, id),
+                None => Self::raw_of(&st, None),
+            };
+            // The CLI's own sign-in, not read yet: held until it is.
+            if matches!(raw, identities::Raw::Own(_)) && !st.own_read {
+                if st.own_waiting.len() >= OWN_WAITING_MAX {
+                    st.own_waiting.remove(0);
+                }
+                st.own_waiting.push((limits, session, at));
+                return;
+            }
+            let ids = Self::plan_ids(&st, &raw);
+            (raw, ids)
+        };
+        let on_own = matches!(raw, identities::Raw::Own(_));
+        let own = self.sign_ins().of(Engine::Claude).plan_account();
+        let account = match ids {
+            Some(ids) => crate::usage::LocalAccount {
+                ids,
+                plan: own.and_then(|o| o.plan).filter(|_| on_own),
             },
-            None => self
-                .sign_ins()
-                .of(Engine::Claude)
-                .plan_account()
-                .unwrap_or_default(),
+            None => own.unwrap_or_default(),
         };
         let windows = plans.windows(LocalPlan::Claude, &limits);
-        plans.local(LocalPlan::Claude, limits, account);
-        self.plan_read(on, windows);
+        plans.local_at(LocalPlan::Claude, limits, account, at);
+        self.observe_print(&raw, &windows, at);
+        self.plan_read(&raw, windows, at);
     }
 
     /// The process a session's own background work runs under: its
@@ -3659,9 +3758,14 @@ impl Desk {
                 codex_question: None,
                 flights: HashMap::new(),
                 behind: Vec::new(),
+                own_key: None,
+                started_at: Utc::now(),
                 breaker: Default::default(),
             },
         );
+        // Started afresh: on its own account again, or on the CLI's sign-in
+        // as it is now.
+        self.started_afresh(r.id);
         tokio::spawn(self.clone().on_exit(r.id, exit));
         // What its line held while it wasn't running is looked at again now
         // it is: its state said Starting before it was (settling its CLI's
@@ -4326,6 +4430,7 @@ impl Desk {
                     .await
             }
             Hook::Usage(limits) => self.report_usage(limits, Some(id)),
+            Hook::SignedIn => self.signed_in_inside(id).await,
             Hook::Other => {}
         }
         answer()
@@ -4477,7 +4582,13 @@ impl Desk {
             };
         }
         let mut read = None;
-        let mut on = None;
+        // The credential it stopped on, before any switch moves it.
+        let on = {
+            let st = self.0.state.lock();
+            st.records
+                .contains_key(&id)
+                .then(|| Self::raw_running(&st, id))
+        };
         self.change(id, |r, mut l| {
             // The person spoke while it was read: that answers it.
             let asked = asked.filter(|_| l.as_ref().is_some_and(|l| l.prompts == prompts));
@@ -4485,8 +4596,6 @@ impl Desk {
                 Some(_) => SessionState::Asking,
                 None => SessionState::Done,
             };
-            // The account it stopped on, before any switch moves it.
-            on = Some(r.account);
             if let Some(l) = l.as_deref_mut() {
                 l.ends += 1;
                 l.reading = reader.as_ref().map(|_| l.ends);
@@ -4522,12 +4631,27 @@ impl Desk {
         if let (Some(reader), Some(end), Some(reply)) = (reader, read, said_whole) {
             self.read_later(id, end, reader, reply);
         }
+        // A `/login` inside it whose `auth_success` went unheard.
+        if let Some(p) = path.clone() {
+            let desk = self.clone();
+            tokio::spawn(async move {
+                let login = tokio::task::spawn_blocking(move || {
+                    transcript::read_tail(Path::new(&p))
+                        .ok()
+                        .and_then(|t| t.last_login)
+                })
+                .await
+                .ok()
+                .flatten();
+                desk.login_in_transcript(id, login).await;
+            });
+        }
         if let Some(on) = on {
             if let Some(hit) = &limit {
                 // On its limit: the account is full now, whatever it left
                 // running (a turn waiting on background work isn't over to
                 // the Floor, but it is to its account).
-                Self::mark_hit(&mut self.0.state.lock(), on, Some(hit));
+                Self::mark_hit(&mut self.0.state.lock(), &on, Some(hit));
                 let desk = self.clone();
                 tokio::spawn(async move { desk.accounts_moved().await });
             }
@@ -4559,9 +4683,9 @@ impl Desk {
 
     /// `account` stopped on its plan's limit now: full until `hit` says it
     /// resets, else until a reading says it has room.
-    fn mark_hit(st: &mut State, account: Option<Uuid>, hit: Option<&crate::limit::LimitHit>) {
+    fn mark_hit(st: &mut State, raw: &identities::Raw, hit: Option<&crate::limit::LimitHit>) {
         let now = Utc::now();
-        let standing = st.standing.entry(account).or_default();
+        let standing = Self::standing_mut(st, raw);
         standing.hit_at = Some(now);
         standing.hit_until = hit
             .and_then(|h| h.resets_at)
@@ -4584,10 +4708,8 @@ impl Desk {
         }
         let st = self.0.state.lock();
         let now = Utc::now();
-        let full = st
-            .records
-            .get(&id)
-            .and_then(|r| st.standing.get(&r.account))
+        let full = Self::side_of_session(&st, id)
+            .map(|side| Self::standing_of(&st, side))
             .and_then(|s| {
                 s.windows
                     .iter()
@@ -4607,7 +4729,7 @@ impl Desk {
     /// What a rate limit really was, and, for the plan's own, which window
     /// and when it resets: Claude Code writes that line to the transcript
     /// only after its `StopFailure`, so it is read again a little later.
-    fn failure_read_later(&self, id: Uuid, account: Option<Uuid>, path: PathBuf) {
+    fn failure_read_later(&self, id: Uuid, account: identities::Raw, path: PathBuf) {
         let desk = self.clone();
         tokio::spawn(async move {
             for wait in [250, 1000, 3000, 8000] {
@@ -4622,7 +4744,7 @@ impl Desk {
                 let Some(said) = said else {
                     continue;
                 };
-                desk.failure_known(id, account, said);
+                desk.failure_known(id, account.clone(), said);
                 return;
             }
         });
@@ -4635,7 +4757,7 @@ impl Desk {
     pub(super) fn failure_known(
         &self,
         id: Uuid,
-        account: Option<Uuid>,
+        account: identities::Raw,
         said: crate::limit::TurnFailure,
     ) {
         use crate::limit::TurnFailure;
@@ -4646,28 +4768,27 @@ impl Desk {
             let current = st.turn_failures.get(&id).cloned();
             match (current, said) {
                 (Some(TurnFailure::Limit(_)), TurnFailure::Limit(hit)) => {
-                    let standing = st.standing.entry(account).or_default();
+                    let standing = Self::standing_mut(&mut st, &account);
                     standing.hit_until = hit.resets_at.or(standing.hit_until);
                     st.turn_failures.insert(id, TurnFailure::Limit(hit));
                     false
                 }
                 (Some(TurnFailure::Failed(_)), TurnFailure::Limit(hit)) => {
                     tracing::info!(session = %id, "its transcript says the plan's limit ended its turn");
-                    Self::mark_hit(&mut st, account, Some(&hit));
+                    Self::mark_hit(&mut st, &account, Some(&hit));
                     st.turn_failures.insert(id, TurnFailure::Limit(hit));
                     true
                 }
                 (Some(TurnFailure::Limit(_)), TurnFailure::Failed(error)) => {
                     tracing::info!(session = %id, "its transcript says a refusal that isn't the plan's ended its turn");
-                    if let Some(s) = st.standing.get_mut(&account) {
-                        s.hit_at = None;
-                        s.hit_until = None;
-                    }
+                    let s = Self::standing_mut(&mut st, &account);
+                    s.hit_at = None;
+                    s.hit_until = None;
                     st.turn_failures.insert(id, TurnFailure::Failed(error));
                     false
                 }
                 (None, TurnFailure::Limit(hit)) => {
-                    let standing = st.standing.entry(account).or_default();
+                    let standing = Self::standing_mut(&mut st, &account);
                     if standing.hit_at.is_some() {
                         standing.hit_until = hit.resets_at.or(standing.hit_until);
                     }
@@ -5290,6 +5411,9 @@ impl Desk {
                             && r.external_pid == ext.pid
                             && tail.is_none()
                     });
+                    if let Some(t) = &tail {
+                        self.login_in_transcript(id, t.last_login.clone()).await;
+                    }
                     if !unchanged {
                         // Its transcript says when its turn ended on an API
                         // error: the plan's limit (and when it resets), or
@@ -6163,9 +6287,19 @@ mod tests {
 
             let limits = json!([{"kind": "five_hour", "percentUsed": 62, "resetsAt": "2026-10-29T19:10:00Z"}]);
             post(&d, s.id, json!({"hook_event_name": "DeskUsage", "rate_limits": limits})).await;
+            // Kept by the account the sign-in is (its identity), whichever
+            // credential of it reports.
+            let identity = crate::identity::Identity::of("org-1", "person@example.com").unwrap();
             assert_eq!(
                 readings.0.lock().clone(),
-                [(LocalPlan::Claude, limits, max)],
+                [(
+                    LocalPlan::Claude,
+                    limits,
+                    crate::usage::LocalAccount {
+                        ids: vec![identity.plan_id()],
+                        plan: Some("max".into()),
+                    }
+                )],
                 "the reading is the session's sign-in's"
             );
             assert_eq!(d.view(s.id).unwrap().state, SessionState::Starting, "and changes nothing of it");

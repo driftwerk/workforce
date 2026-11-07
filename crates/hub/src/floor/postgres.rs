@@ -540,11 +540,14 @@ impl PgFloorStore {
     }
 }
 
-/// The key a reading is kept under: `hub:<login>`, or `mac:<kind>`.
+/// The key a reading is kept under: `hub:<login>`, or this computer's
+/// `mac:<kind>:<account>`, one per account (its identity's, whichever
+/// credential of it reported), and `mac:<kind>` when it names none.
 pub(super) fn login_key(r: &Reading) -> String {
-    match &r.login {
-        LoginRef::Hub { login, .. } => format!("hub:{login}"),
-        LoginRef::Mac => format!("mac:{}", r.kind.as_str()),
+    match (&r.login, &r.account) {
+        (LoginRef::Hub { login, .. }, _) => format!("hub:{login}"),
+        (LoginRef::Mac, Some(account)) => format!("mac:{}:{account}", r.kind.as_str()),
+        (LoginRef::Mac, None) => format!("mac:{}", r.kind.as_str()),
     }
 }
 
@@ -1148,6 +1151,36 @@ mod tests {
             assert_eq!(kept[1], mac);
             assert_eq!(store.prune(at("2026-10-29T16:02:00Z")).await.unwrap(), 1);
             assert_eq!(store.readings().await.unwrap().len(), 1);
+
+            // Two of this computer's accounts: each its own reading, never
+            // one filed as the other's.
+            let of = |account: &str, used: f64, when: &str| Reading {
+                login: LoginRef::Mac,
+                kind: PlanKind::Claude,
+                account: Some(account.into()),
+                ..reading(used, when, None)
+            };
+            store
+                .record(&of("gmail", 30.0, "2026-10-29T17:00:00Z"))
+                .await
+                .unwrap();
+            store
+                .record(&of("work", 90.0, "2026-10-29T17:01:00Z"))
+                .await
+                .unwrap();
+            let mut mine: Vec<(Option<String>, f64)> = store
+                .readings()
+                .await
+                .unwrap()
+                .into_iter()
+                .filter(|r| r.login == LoginRef::Mac)
+                .map(|r| (r.account, r.windows[0].used_percent))
+                .collect();
+            mine.sort_by(|a, b| a.0.cmp(&b.0));
+            assert_eq!(
+                mine,
+                vec![(Some("gmail".into()), 30.0), (Some("work".into()), 90.0)]
+            );
         })
         .await;
     }

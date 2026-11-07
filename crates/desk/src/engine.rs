@@ -417,6 +417,21 @@ impl SignIn {
         }
     }
 
+    /// The Anthropic account a Claude Code sign-in is, when it says: only
+    /// a claude.ai login names its organization and email
+    /// ([`claude_sign_in`]); a long-lived token names neither.
+    pub fn claude_identity(&self) -> Option<crate::identity::Identity> {
+        match self {
+            SignIn::In {
+                via: Via::Plan,
+                who: Some(email),
+                ids,
+                ..
+            } if ids.len() == 2 => crate::identity::Identity::of(&ids[0], email),
+            _ => None,
+        }
+    }
+
     /// Whether it is signed in to a plan.
     pub fn on_plan(&self) -> bool {
         matches!(self, SignIn::In { via: Via::Plan, .. })

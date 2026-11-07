@@ -156,6 +156,16 @@ impl PlanSink for Plans {
     }
 
     fn local(&self, plan: LocalPlan, payload: Value, account: LocalAccount) {
+        self.local_at(plan, payload, account, Utc::now());
+    }
+
+    fn local_at(
+        &self,
+        plan: LocalPlan,
+        payload: Value,
+        account: LocalAccount,
+        at: chrono::DateTime<Utc>,
+    ) {
         let (kind, windows) = match plan {
             LocalPlan::Claude => (PlanKind::Claude, claude_mod_usage(&payload)),
             LocalPlan::Codex => (PlanKind::Chatgpt, codex_usage(&payload)),
@@ -169,7 +179,7 @@ impl PlanSink for Plans {
             account: account_key(kind, &account.ids),
             plan: account.plan,
             windows,
-            observed_at: Utc::now(),
+            observed_at: at,
         });
     }
 }

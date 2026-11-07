@@ -28,6 +28,18 @@ pub trait PlanSink: Send + Sync {
     /// Codex's rate-limit snapshot.
     fn local(&self, plan: LocalPlan, payload: Value, account: LocalAccount);
 
+    /// [`Self::local`], for a reading taken at `at` (one held until the
+    /// CLI's sign-in was read keeps the time it came).
+    fn local_at(
+        &self,
+        plan: LocalPlan,
+        payload: Value,
+        account: LocalAccount,
+        _at: chrono::DateTime<chrono::Utc>,
+    ) {
+        self.local(plan, payload, account);
+    }
+
     /// The windows `payload` says: how full each is and when it resets.
     /// Desk reads them to know when an account has hit its limit.
     fn windows(&self, _plan: LocalPlan, _payload: &Value) -> Vec<LimitWindow> {

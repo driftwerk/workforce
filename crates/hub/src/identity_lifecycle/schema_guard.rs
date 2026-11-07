@@ -184,6 +184,21 @@ const CLAIMS: &[(&str, &str, &str, Claim)] = &[
     ("desk", "connections", "person", By(C::Vault)),
     (
         "desk",
+        "engine_account_identities",
+        "identity",
+        NotPersonal(
+            "a hash naming which Anthropic account one of the Desk's own engine accounts is, \
+             never a hub identity; the row goes with its engine account",
+        ),
+    ),
+    (
+        "desk",
+        "engine_account_identities",
+        "linked_by",
+        NotPersonal("how that was learnt: \"manual\" or \"usage\", never who"),
+    ),
+    (
+        "desk",
         "reads",
         "owner",
         NotPersonal("`you`, the one person of the Desk whose own hub this is"),
