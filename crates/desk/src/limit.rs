@@ -44,11 +44,14 @@ pub enum TurnFailure {
 }
 
 impl LimitHit {
-    /// Its window's length in minutes, as the plan readings say it.
+    /// Its window's length in minutes, as the plan readings say it: the
+    /// plan's own 5-hour and weekly windows only. A model's own weekly
+    /// limit (`seven_day_opus`, `seven_day_sonnet`) isn't the plan's weekly
+    /// window, and has none.
     pub fn minutes(&self) -> Option<u32> {
         match self.window.as_deref()? {
             "five_hour" => Some(300),
-            w if w.starts_with("seven_day") => Some(10_080),
+            "seven_day" => Some(10_080),
             _ => None,
         }
     }
@@ -121,6 +124,18 @@ pub fn in_transcript_line(v: &Value) -> Option<TurnFailure> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_the_plans_own_windows_have_a_length() {
+        let hit = |w: &str| LimitHit {
+            window: Some(w.into()),
+            resets_at: None,
+        };
+        assert_eq!(hit("five_hour").minutes(), Some(300));
+        assert_eq!(hit("seven_day").minutes(), Some(10_080));
+        assert_eq!(hit("seven_day_opus").minutes(), None);
+        assert_eq!(hit("seven_day_sonnet").minutes(), None);
+    }
 
     #[test]
     fn only_the_plans_own_limit_is_a_limit() {

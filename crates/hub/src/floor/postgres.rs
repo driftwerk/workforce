@@ -419,6 +419,28 @@ impl PgFloorStore {
         Ok(kept == 1)
     }
 
+    /// Forgets `login`'s reading when it is still one taken from `since` to
+    /// `last` (to the microsecond the store keeps): another sign-in's, filed
+    /// as this one's. One reported unchanged isn't written again, so the one
+    /// kept may be older than the last report. A later one stands. Whether
+    /// it was forgotten.
+    pub async fn forget_reading(
+        &self,
+        login: &str,
+        since: DateTime<Utc>,
+        last: DateTime<Utc>,
+    ) -> Result<bool> {
+        let micro = chrono::Duration::microseconds(1);
+        let conn = self.pool.get().await?;
+        let gone = conn
+            .execute(
+                "DELETE FROM plan_readings WHERE login = $1 AND observed_at BETWEEN $2 AND $3",
+                &[&login, &(since - micro), &(last + micro)],
+            )
+            .await?;
+        Ok(gone > 0)
+    }
+
     /// Every login's latest reading.
     pub async fn readings(&self) -> Result<Vec<Reading>> {
         let conn = self.pool.get().await?;
