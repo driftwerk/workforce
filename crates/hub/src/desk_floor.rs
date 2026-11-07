@@ -473,6 +473,15 @@ fn breaker_needs(sources: &Sources, caller: &FloorCaller) -> Vec<Need> {
     }
 }
 
+/// Desk Memory nearly or quite out of room, for the person who holds the
+/// Desk: only they free room or raise the limit.
+fn memory_needs(sources: &Sources, caller: &FloorCaller) -> Vec<Need> {
+    match (sources.desk)() {
+        Some(desk) if caller.personal => desk.memory_needs(),
+        _ => Vec::new(),
+    }
+}
+
 /// The questions sessions asked on the Desk's lines that wait on the
 /// person who holds it.
 fn line_needs(sources: &Sources, caller: &FloorCaller) -> Vec<Need> {
@@ -509,6 +518,7 @@ fn needs_of(
             .chain(config_needs(state, caller))
             .chain(breaker_needs(sources, caller))
             .chain(line_needs(sources, caller))
+            .chain(memory_needs(sources, caller))
             .collect(),
     ))
 }

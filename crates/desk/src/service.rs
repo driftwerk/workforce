@@ -71,6 +71,9 @@ mod ledger;
 #[cfg(test)]
 mod lifecycle_tests;
 mod memory;
+mod memory_index;
+#[cfg(test)]
+mod memory_index_tests;
 #[cfg(test)]
 mod rooms_tests;
 mod scopes;
@@ -696,6 +699,9 @@ pub struct Floor {
     /// Hides secrets in what session memory keeps: the hub's patterns.
     /// Without one, nothing is harvested.
     pub redactor: Option<Arc<dyn crate::memory::Redactor>>,
+    /// Session memory's search index: the hub's vellev node. Without one,
+    /// what Desk remembers is searched by keyword only.
+    pub index: Option<Arc<dyn crate::memory::index::MemoryIndex>>,
 }
 
 /// How long the hub's model may take to read whether a turn's reply asks
@@ -779,6 +785,8 @@ struct Inner {
     /// when a read of an engine serves them all.
     restoring_since: Mutex<Option<std::time::Instant>>,
     ledger: ledger::LedgerRun,
+    /// Session memory's search index and its worker.
+    index: memory_index::IndexRun,
     /// Reads a turn's last reply where the rules can't tell whether it
     /// asks: the hub's crew, once its routes are mounted.
     reader: Mutex<Option<Weak<dyn crew::Crew>>>,
@@ -1411,6 +1419,7 @@ impl Desk {
                 .collect(),
             restoring_since: Mutex::new(restoring_since),
             ledger,
+            index: memory_index::IndexRun::new(floor.index.clone()),
             reader: Mutex::new(None),
             read_wait: Mutex::new(READ_LATER),
             accounts_moving: tokio::sync::Mutex::new(()),
@@ -1430,6 +1439,7 @@ impl Desk {
         tokio::spawn(desk.clone().read_engines());
         tokio::spawn(desk.clone().look_for_sign_ins());
         tokio::spawn(desk.clone().ledger_loop(ledger_jobs));
+        tokio::spawn(desk.clone().index_loop());
         desk.breaker_load().await;
         tokio::spawn(desk.clone().breaker_loop());
         desk.charge_load().await;
@@ -6387,6 +6397,7 @@ mod tests {
                     plans: None,
                     pricer: None,
                     redactor: None,
+                    index: None,
                 },
                 CancellationToken::new(),
             )
@@ -6546,6 +6557,7 @@ mod tests {
                     plans: Some(readings.clone()),
                     pricer: None,
                     redactor: None,
+                    index: None,
                 },
                 CancellationToken::new(),
             )
@@ -6673,6 +6685,7 @@ mod tests {
                 plans: None,
                 pricer: None,
                 redactor: None,
+                index: None,
             };
             let d = Desk::start(
                 DeskStore::from_pool(pool.clone()),
@@ -6786,6 +6799,7 @@ mod tests {
                     plans: None,
                     pricer: None,
                     redactor: None,
+                    index: None,
                 },
                 CancellationToken::new(),
             )
@@ -6909,6 +6923,7 @@ mod tests {
                     plans: None,
                     pricer: None,
                     redactor: None,
+                    index: None,
                 },
                 CancellationToken::new(),
             )
@@ -7223,6 +7238,7 @@ mod tests {
                     plans: None,
                     pricer: None,
                     redactor: None,
+                    index: None,
                 },
                 CancellationToken::new(),
             )
@@ -8006,6 +8022,7 @@ mod tests {
                     plans: None,
                     pricer: None,
                     redactor: None,
+                    index: None,
                 },
                 CancellationToken::new(),
             )
@@ -8067,6 +8084,7 @@ mod tests {
                     plans: None,
                     pricer: None,
                     redactor: None,
+                    index: None,
                 },
                 CancellationToken::new(),
             )
@@ -8133,6 +8151,7 @@ mod tests {
                 plans: None,
                 pricer: None,
                 redactor: None,
+                index: None,
             },
             CancellationToken::new(),
         )
