@@ -198,12 +198,14 @@ pub fn may_see(reader: &Reader, bound: &Bound, row: &Row) -> bool {
         }
 }
 
-/// The groups among `rows` (for `memory_reads.group_id`): one when every
-/// row is of the same.
+/// What `memory_reads.group_id` says of the rows a read returned: their
+/// one group, `ungrouped` when every one is ungrouped, and none when they
+/// are of more than one (or there are none).
 pub fn one_group<'a>(groups: impl Iterator<Item = Option<&'a str>>) -> Option<String> {
     let set: HashSet<Option<&str>> = groups.collect();
-    match set.len() {
-        1 => set.into_iter().next().flatten().map(str::to_string),
+    match (set.len(), set.into_iter().next()) {
+        (1, Some(Some(g))) => Some(g.to_string()),
+        (1, Some(None)) => Some(crate::service::UNGROUPED.to_string()),
         _ => None,
     }
 }
@@ -424,6 +426,11 @@ mod tests {
             one_group([Some(ACME), Some(ACME)].into_iter()),
             Some(ACME.into())
         );
-        assert_eq!(one_group([Some(ACME), None].into_iter()), None);
+        assert_eq!(one_group([Some(ACME), None].into_iter()), None, "mixed");
+        assert_eq!(
+            one_group([None, None].into_iter()).as_deref(),
+            Some("ungrouped")
+        );
+        assert_eq!(one_group(std::iter::empty()), None);
     }
 }
