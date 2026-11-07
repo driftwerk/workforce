@@ -3479,8 +3479,19 @@ async fn not_now_for_which_account_the_sign_in_is_outlives_a_restart_and_holds_f
                 .any(|n| matches!(n, AccountNeed::WhichSignIn { .. })),
             "not asked again after a restart"
         );
-        // Signed in as another: asked of that one.
+        // Signed in as another: asked of that one, and the last one's "Not
+        // now" is gone with it.
         cli_signs_in_as(&again, dir.path(), "star").await;
+        again.accounts_moved().await;
+        assert!(
+            !again
+                .0
+                .state
+                .lock()
+                .put_off
+                .contains(&format!("which-sign-in:{}", gmail().key)),
+            "a sign-in no longer had keeps no answer"
+        );
         let need = until(|| {
             again
                 .account_needs()
@@ -3505,6 +3516,31 @@ async fn no_key_is_current_until_this_computers_sign_in_is_read() {
             None,
             "not yet known: nothing dropped"
         );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn with_no_claude_code_here_its_sign_in_is_read_as_none_and_keys_are_current() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        DeskStore::migrate(&pool).await.unwrap();
+        let mut o = signed_out_options(dir.path(), Arc::new(MemoryKeys::default()));
+        o.programs.remove(&Engine::Claude);
+        let d = Desk::start(
+            DeskStore::from_pool(pool),
+            o,
+            super::Floor {
+                plans: Some(Arc::new(Plans::default())),
+                ..Default::default()
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        d.read_engine_now(Engine::Claude).await;
+        assert!(d.0.state.lock().own_read);
+        assert!(d.current_plan_keys().is_some(), "the filter is on");
     })
     .await;
 }

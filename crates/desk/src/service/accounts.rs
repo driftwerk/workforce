@@ -1891,9 +1891,17 @@ impl Desk {
             let mut st = self.0.state.lock();
             let before = st.put_off.len();
             // A sign-in's question stands for that sign-in, raised or not
-            // (it isn't while the CLI is still being read).
+            // (it isn't while the CLI is still being read), until the CLI is
+            // signed in as another: then it is forgotten.
+            let own = st
+                .own_identity
+                .as_ref()
+                .map(|o| format!("{WHICH_SIGN_IN}{}", o.key));
             st.put_off
-                .retain(|id| id.starts_with(WHICH_SIGN_IN) || needs.iter().any(|n| n.id() == id));
+                .retain(|id| match id.strip_prefix(WHICH_SIGN_IN) {
+                    Some(_) => own.as_ref().is_none_or(|own| own == id),
+                    None => needs.iter().any(|n| n.id() == id),
+                });
             st.put_off.len() != before
         };
         if forgot {

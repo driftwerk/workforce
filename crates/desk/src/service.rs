@@ -1972,6 +1972,11 @@ impl Desk {
         since: Since,
     ) {
         let Some(program) = self.program(engine).map(Path::to_path_buf) else {
+            // No Claude Code here: its sign-in is read, as none, so what
+            // waited on it is filed and nothing waits on it again.
+            if engine == Engine::Claude && !self.0.state.lock().own_read {
+                self.own_identity_read(None);
+            }
             return;
         };
         let Some(gate) = self.0.engine_reads.get(&engine).map(Arc::clone) else {
