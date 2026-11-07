@@ -286,9 +286,15 @@ impl Pty {
 
     /// Tells the program the terminal turned light or dark (`CSI ? 997 ; 1
     /// n` dark, `2` light), when it asked to be told (mode 2031): it asks for
-    /// the colours again. Whether it was told.
-    pub fn tell_ground(&self, ground: crate::vt::Ground) -> bool {
+    /// the colours again. In a terminal whose process is its `shell`, only
+    /// while another program is in the foreground: a program that asked and
+    /// then crashed leaves the shell at its prompt, which would take the
+    /// notice as typing. Whether it was told.
+    pub fn tell_ground(&self, ground: crate::vt::Ground, shell: bool) -> bool {
         if !self.screen.core.lock().term.color_scheme_events() {
+            return false;
+        }
+        if shell && !self.shell_in_background() {
             return false;
         }
         let n = match ground {
@@ -296,6 +302,25 @@ impl Pty {
             crate::vt::Ground::Light => 2,
         };
         self.io.write(format!("\x1b[?997;{n}n").as_bytes()).is_ok()
+    }
+
+    /// Whether the terminal's foreground process group is another than its
+    /// process's own (a shell's, running a program). Read with `ps`, which
+    /// works the same for a process the PTY holder keeps; false when it
+    /// can't be told.
+    fn shell_in_background(&self) -> bool {
+        let Some(pid) = self.pid else {
+            return false;
+        };
+        let out = std::process::Command::new("/bin/ps")
+            .args(["-o", "tpgid=", "-p", &pid.to_string()])
+            .output();
+        let foreground = out
+            .ok()
+            .filter(|o| o.status.success())
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .and_then(|t| t.trim().parse::<i64>().ok());
+        foreground.is_some_and(|g| g > 0 && g != i64::from(pid))
     }
 
     /// Forgets that its program asked to be told of colour scheme changes:
@@ -704,14 +729,41 @@ pub(crate) mod tests {
         let (quiet, _q) = spawn("stty raw -echo; printf 'ready'; sleep 5");
         wait_for(&quiet, "ready").await;
         assert!(
-            !quiet.tell_ground(crate::vt::Ground::Light),
+            !quiet.tell_ground(crate::vt::Ground::Light, false),
             "a program that didn't ask is sent nothing: its shell would echo it"
         );
         let (pty, _exit) = spawn(
             "stty raw -echo; printf '\\033[?2031hready\\r\\n'; head -c 9 | od -An -c | tr -d ' '; sleep 5",
         );
         wait_for(&pty, "ready").await;
-        assert!(pty.tell_ground(crate::vt::Ground::Light));
+        assert!(pty.tell_ground(crate::vt::Ground::Light, false));
+        wait_for(&pty, "033[?997;2n").await;
+    }
+
+    #[tokio::test]
+    async fn a_shell_at_its_prompt_is_never_told_though_its_program_asked() {
+        // The program asked, then left the shell in the foreground (it
+        // crashed): the notice would be typed at the prompt.
+        let (shell, _s) = spawn(
+            "stty raw -echo; printf '\\033[?2031hready\\r\\n'; read x; printf 'typed:%s\\r\\n' \"$x\"; sleep 5",
+        );
+        wait_for(&shell, "ready").await;
+        assert!(!shell.tell_ground(crate::vt::Ground::Light, true));
+        // A program in the foreground of it (job control on) is told.
+        let (pty, _exit) = spawn(
+            "set -m; stty raw -echo; printf '\\033[?2031hready\\r\\n'; head -c 9 | od -An -c | tr -d ' '; sleep 5",
+        );
+        wait_for(&pty, "ready").await;
+        let mut told = false;
+        for _ in 0..50 {
+            // Until the pipeline is the foreground job.
+            if pty.tell_ground(crate::vt::Ground::Light, true) {
+                told = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(told);
         wait_for(&pty, "033[?997;2n").await;
     }
 

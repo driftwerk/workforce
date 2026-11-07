@@ -524,7 +524,9 @@ fn update(
         .ok_or_else(|| eyre::eyre!("{} has no folder", target.display()))?;
     if !dir.is_dir() {
         if !config.make_folder {
-            eyre::bail!("{} isn't there; left alone", dir.display());
+            // A folder the environment names that isn't there: nothing to
+            // settle, every start, so nothing said.
+            return Ok(false);
         }
         use std::os::unix::fs::DirBuilderExt;
         fs::DirBuilder::new()
@@ -1151,16 +1153,21 @@ mod tests {
         assert!(trust_codex(&codex, &chosen(&folder, home.path())).is_err());
         assert_eq!(fs::read_to_string(&codex.path).unwrap(), "model = [");
 
-        // A CLAUDE_CONFIG_DIR that isn't there is never made.
+        // A CLAUDE_CONFIG_DIR that isn't there is never made, and quietly.
         let missing = home.path().join("cfg/.claude.json");
-        assert!(ready_claude(&claude(&missing), &chosen(&folder, home.path())).is_err());
+        assert!(!ready_claude(&claude(&missing), &chosen(&folder, home.path())).unwrap());
+        assert!(!follow_terminal(&claude(&missing)).unwrap());
         assert!(!home.path().join("cfg").exists());
         let missing = Config {
             path: home.path().join("cx/config.toml"),
             make_folder: false,
         };
-        assert!(trust_codex(&missing, &chosen(&folder, home.path())).is_err());
+        assert!(!trust_codex(&missing, &chosen(&folder, home.path())).unwrap());
         assert!(!home.path().join("cx").exists());
+        // Nor is a config that isn't there yet.
+        let absent = home.path().join("none.json");
+        assert!(!follow_terminal(&claude(&absent)).unwrap());
+        assert!(!absent.exists());
     }
 
     #[test]
