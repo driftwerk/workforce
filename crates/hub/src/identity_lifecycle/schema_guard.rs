@@ -199,6 +199,12 @@ const CLAIMS: &[(&str, &str, &str, Claim)] = &[
     ),
     (
         "desk",
+        "memory_items",
+        "superseded_by",
+        NotPersonal("the memory item that replaced this one, never who replaced it"),
+    ),
+    (
+        "desk",
         "reads",
         "owner",
         NotPersonal("`you`, the one person of the Desk whose own hub this is"),

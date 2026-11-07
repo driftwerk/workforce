@@ -70,6 +70,7 @@ mod codex_asks_tests;
 mod ledger;
 #[cfg(test)]
 mod lifecycle_tests;
+mod memory;
 #[cfg(test)]
 mod rooms_tests;
 mod scopes;
@@ -92,6 +93,7 @@ pub use breaker::{
 };
 pub use ledger::{LedgerPage, SpendQuery};
 pub use line::{LineError, Sender, SessionMcp};
+pub use memory::{MemoryHitView, MemorySearch, SessionMemory};
 pub use terminals::{NewTerminal, TerminalPatch, TerminalRecord, TerminalState, TerminalView};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,6 +130,8 @@ pub struct Options {
     pub account_keys: Option<Arc<dyn crate::engine_accounts::Keys>>,
     /// Which sessions may message each other on Desk's line.
     pub line_reach: crate::line::Reach,
+    /// What session memory keeps, from `[desk.memory]`.
+    pub memory: crate::memory::MemoryOptions,
 }
 
 #[cfg(test)]
@@ -735,6 +739,8 @@ enum Persist {
     Forget {
         ids: Vec<Uuid>,
         hidden: Vec<lifecycle::Hidden>,
+        /// Whether what Desk remembers of them goes too.
+        memory: crate::memory_store::Memory,
         done: Option<oneshot::Sender<bool>>,
     },
     Unhide(Engine, String),
@@ -2888,7 +2894,9 @@ impl Desk {
     /// the floor, and takes it out of the sidebar's layout. Its engine's
     /// transcript is the engine's, and stays.
     pub async fn forget(&self, id: Uuid) -> Result<(), DeskError> {
-        self.forget_as(id, None, |_, _| Ok(())).await.map(drop)
+        self.forget_as(id, None, crate::memory_store::Memory::Forget, |_, _| Ok(()))
+            .await
+            .map(drop)
     }
 
     /// [`Self::forget`], once `may` agrees under the lock it is forgotten
@@ -2898,6 +2906,7 @@ impl Desk {
         &self,
         id: Uuid,
         hide: Option<lifecycle::Hidden>,
+        memory: crate::memory_store::Memory,
         may: impl FnOnce(&State, &SessionRecord) -> Result<(), DeskError>,
     ) -> Result<oneshot::Receiver<bool>, DeskError> {
         self.load(id).await?;
@@ -2937,6 +2946,7 @@ impl Desk {
         let _ = self.0.persist.send(Persist::Forget {
             ids: vec![id],
             hidden: hide.into_iter().collect(),
+            memory,
             done: Some(done),
         });
         self.log_turns(vec![TurnOp::Forget {
@@ -4081,7 +4091,7 @@ impl Desk {
         let closing = live.closing;
         live.end();
         drop(live);
-        self.spend_read(id);
+        self.spend_read_ending(id);
         self.change(id, |r, _| {
             // Ended from Desk, whether before its exit was seen or since.
             r.state = if closing || r.state == SessionState::Closed {
@@ -4543,6 +4553,9 @@ impl Desk {
                 self.turn_ended(id, transcript, reply, background, Some(failure))
                     .await
             }
+            // Its record is kept before Claude Code compacts it; the hook is
+            // answered at once.
+            Hook::PreCompact => self.spend_read_soon(id),
             Hook::SessionEnd => {
                 // Nothing it asked stands once it has ended.
                 self.change(id, |_, l| {
@@ -4556,7 +4569,7 @@ impl Desk {
                         l.flights.clear();
                     }
                 });
-                self.spend_read(id);
+                self.spend_read_ending(id);
             }
             Hook::Permission {
                 tool,
@@ -4815,7 +4828,7 @@ impl Desk {
             }
         }
         // The turn's calls are in its transcript now.
-        self.spend_read(id);
+        self.spend_read_ending(id);
         self.breaker_settled(id);
     }
 
@@ -5267,7 +5280,7 @@ impl Desk {
             }
             if matches!(event, CodexEvent::Idle) {
                 // Its rollout has the turn's calls, with their model.
-                self.spend_read(id);
+                self.spend_read_ending(id);
                 self.breaker_settled(id);
             }
             match &event {
@@ -5866,8 +5879,13 @@ async fn persist_loop(
                 put
             }
             Persist::Attention(id, at) => store.set_attention(id, at).await,
-            Persist::Forget { ids, hidden, done } => {
-                let result = store.remove_sessions(&ids, &hidden, YOU).await;
+            Persist::Forget {
+                ids,
+                hidden,
+                memory,
+                done,
+            } => {
+                let result = store.remove_sessions(&ids, &hidden, YOU, memory).await;
                 if let Some(done) = done {
                     let _ = done.send(result.is_ok());
                 }
@@ -5933,6 +5951,7 @@ mod tests {
             hub_internal: HubInternal::default(),
             account_keys: None,
             line_reach: crate::line::Reach::Group,
+            memory: Default::default(),
         }
     }
 
@@ -7858,6 +7877,7 @@ mod tests {
                     hub_internal: HubInternal::new([PathBuf::from("/data")], None),
                     account_keys: None,
                     line_reach: crate::line::Reach::Group,
+                    memory: Default::default(),
                     ..options(dir.path())
                 },
                 Default::default(),
@@ -7900,6 +7920,7 @@ mod tests {
                     hub_internal: HubInternal::default().started_by(std::process::id()),
                     account_keys: None,
                     line_reach: crate::line::Reach::Group,
+                    memory: Default::default(),
                     ..options(dir.path())
                 },
                 Default::default(),
@@ -7977,6 +7998,7 @@ mod tests {
                     hub_internal: HubInternal::new([PathBuf::from("/data")], None),
                     account_keys: None,
                     line_reach: crate::line::Reach::Group,
+                    memory: Default::default(),
                     ..options(dir.path())
                 },
                 Floor {
@@ -8037,6 +8059,7 @@ mod tests {
                     hub_internal: HubInternal::new([PathBuf::from("/data")], None),
                     account_keys: None,
                     line_reach: crate::line::Reach::Group,
+                    memory: Default::default(),
                     ..options(dir.path())
                 },
                 Floor {

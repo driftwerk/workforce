@@ -17,6 +17,7 @@ use super::{Desk, DeskError, Persist, State};
 use crate::adopt;
 use crate::codex;
 use crate::crew::{By, Kind, Party};
+use crate::memory_store::Memory;
 use crate::model::{Engine, Origin, SessionRecord, SessionState, SessionView};
 use crate::store::{record, DeskStore};
 
@@ -125,13 +126,14 @@ impl DeskStore {
         ids: &[Uuid],
         hidden: &[Hidden],
         owner: &str,
+        memory: crate::memory_store::Memory,
     ) -> Result<u64> {
         let mut client = self.pool().get().await?;
         let tx = client.transaction().await?;
         for h in hidden {
             hide_in(&*tx, h).await?;
         }
-        let gone = crate::store::forget_in(&tx, ids, owner).await?;
+        let gone = crate::store::forget_in(&tx, ids, owner, memory).await?;
         tx.commit().await?;
         Ok(gone)
     }
@@ -390,7 +392,8 @@ impl Desk {
             true => Some(HashSet::new()),
             false => None,
         };
-        self.remove_as(id, elsewhere.as_ref(), |_, _| Ok(())).await
+        self.remove_as(id, elsewhere.as_ref(), Memory::Forget, |_, _| Ok(()))
+            .await
     }
 
     /// [`Self::remove`], deleting its transcript when `elsewhere` (what
@@ -400,6 +403,7 @@ impl Desk {
         &self,
         id: Uuid,
         elsewhere: Option<&HashSet<String>>,
+        memory: Memory,
         may: impl FnOnce(&State, &SessionRecord) -> Result<(), DeskError>,
     ) -> Result<Removed, DeskError> {
         let r = self.load(id).await?;
@@ -427,7 +431,7 @@ impl Desk {
         });
         let deleting = !files.is_empty();
         let written = self
-            .forget_as(id, hidden, |st, now| {
+            .forget_as(id, hidden, memory, |st, now| {
                 if deleting && st.live.contains_key(&id) {
                     // Started since it was looked at.
                     return Err(DeskError::Conflict(STILL_RUNNING.into()));
@@ -579,7 +583,11 @@ impl Desk {
                     Err(DeskError::Conflict("it started again".into()))
                 }
             };
-            match self.remove_as(id, elsewhere.as_ref(), still).await {
+            // Clearing only tidies the cards: what Desk remembers of them stays.
+            match self
+                .remove_as(id, elsewhere.as_ref(), Memory::Keep, still)
+                .await
+            {
                 Ok(r) => {
                     done.removed += r.removed;
                     done.transcripts += r.transcripts;

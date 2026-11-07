@@ -90,9 +90,69 @@ pub fn project_of(cwd: &str) -> &str {
     }
 }
 
+/// The project a folder belongs to, by git: the root of its repository,
+/// a linked worktree's main repository (through its `.git` file's `gitdir`
+/// and that folder's `commondir`); else [`project_of`]. Reads a few small
+/// files, never runs git.
+pub fn git_project(cwd: &str) -> String {
+    let mut at = Some(std::path::Path::new(cwd));
+    while let Some(dir) = at {
+        let dot = dir.join(".git");
+        if dot.is_dir() {
+            return dir.to_string_lossy().into_owned();
+        }
+        if dot.is_file() {
+            return main_repo(dir, &dot).unwrap_or_else(|| dir.to_string_lossy().into_owned());
+        }
+        at = dir.parent();
+    }
+    project_of(cwd).to_string()
+}
+
+/// A linked worktree's main repository, from its `.git` file.
+fn main_repo(dir: &std::path::Path, dot: &std::path::Path) -> Option<String> {
+    let text = std::fs::read_to_string(dot).ok()?;
+    let gitdir = text.lines().find_map(|l| l.strip_prefix("gitdir:"))?.trim();
+    let gitdir = dir.join(gitdir);
+    let common = std::fs::read_to_string(gitdir.join("commondir")).ok()?;
+    let common = std::fs::canonicalize(gitdir.join(common.trim())).ok()?;
+    let root = match common.file_name().is_some_and(|n| n == ".git") {
+        true => common.parent()?.to_path_buf(),
+        false => common,
+    };
+    Some(root.to_string_lossy().into_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_linked_worktree_is_its_main_repositorys_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = std::fs::canonicalize(dir.path()).unwrap().join("atlas");
+        std::fs::create_dir_all(main.join(".git/worktrees/fix-1")).unwrap();
+        std::fs::create_dir_all(main.join("src/deep")).unwrap();
+        std::fs::write(main.join(".git/worktrees/fix-1/commondir"), "../..\n").unwrap();
+        let tree = dir.path().join("elsewhere/fix-1");
+        std::fs::create_dir_all(tree.join("crates")).unwrap();
+        std::fs::write(
+            tree.join(".git"),
+            format!("gitdir: {}\n", main.join(".git/worktrees/fix-1").display()),
+        )
+        .unwrap();
+        let main_s = main.to_string_lossy().into_owned();
+        assert_eq!(
+            git_project(&main.join("src/deep").to_string_lossy()),
+            main_s
+        );
+        assert_eq!(git_project(&tree.join("crates").to_string_lossy()), main_s);
+        assert_eq!(
+            git_project("/nowhere/at/all"),
+            "/nowhere/at/all",
+            "not in a repository"
+        );
+    }
 
     #[test]
     fn slugs_are_path_safe() {

@@ -539,6 +539,12 @@ fn options(config: &WorkforceConfig) -> Options {
             DeskLineReach::Group => workforce_desk::line::Reach::Group,
             DeskLineReach::All => workforce_desk::line::Reach::All,
         },
+        memory: workforce_desk::memory::MemoryOptions {
+            enabled: desk.memory.enabled,
+            backfill_days: desk.memory.backfill_days,
+            retain_days: desk.memory.retain_days,
+            exclude: desk.memory.exclude.clone(),
+        },
     }
 }
 

@@ -456,6 +456,7 @@ async fn sessions_reach_the_ones_the_reach_setting_lets_them() {
             DeskStore::from_pool(pool),
             Options {
                 line_reach: Reach::Overseer,
+                memory: Default::default(),
                 ..options(dir.path())
             },
             Default::default(),
