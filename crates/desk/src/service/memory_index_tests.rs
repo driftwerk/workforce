@@ -167,29 +167,39 @@ async fn forgetting_and_sweeping_take_out_what_the_index_held() {
         for r in [&web, &api] {
             store.put(r).await.unwrap();
         }
-        let index = Arc::new(FakeIndex::default());
-        index.down.store(true, Ordering::SeqCst);
-        let (d, _cancel) = start(&pool, dir.path(), &index).await;
-        harvested(&d, &store, web.id, 6).await;
-        harvested(&d, &store, api.id, 6).await;
-        // `api`'s rows are Acme's (as its group stamped them): its memory
-        // is in Acme's collection.
+        // `api` is in Acme's group, as the sidebar keeps it: its memory is
+        // stamped Acme's, and kept in Acme's collection.
         {
             let client = store.pool().get().await.unwrap();
             client
                 .execute(
-                    "UPDATE memory_exchanges SET group_id = 'g-acme' WHERE session = $1",
-                    &[&api.id],
+                    "INSERT INTO groups (id, name, position, updated_at) VALUES ('g-acme', 'Acme', 0, now())",
+                    &[],
+                )
+                .await
+                .unwrap();
+            client
+                .execute(
+                    "INSERT INTO group_members (item, group_id, position) VALUES ($1, 'g-acme', 0)",
+                    &[&format!("session:{}", api.id)],
                 )
                 .await
                 .unwrap();
         }
-        index.down.store(false, Ordering::SeqCst);
-        let acme = collection_of(Some("g-acme"));
+        let index = Arc::new(FakeIndex::default());
+        let (d, _cancel) = start(&pool, dir.path(), &index).await;
+        harvested(&d, &store, web.id, 6).await;
+        harvested(&d, &store, api.id, 6).await;
+        assert_eq!(
+            q::<i64>(&store, "SELECT COUNT(*) FROM memory_exchanges WHERE group_id = 'g-acme' AND session = $1", &[&api.id]).await,
+            6,
+            "a closed session keeps its group"
+        );
         until(&d, "both indexed", async || {
             d.memory_index_status().await.unwrap().backlog == 0
         })
         .await;
+        let acme = collection_of(Some("g-acme"));
         assert_eq!(
             (index.refs(&acme), index.refs(UNGROUPED_COLLECTION)),
             (closed(&store, api.id).await, closed(&store, web.id).await)
