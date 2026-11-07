@@ -21,6 +21,7 @@ use crate::claude::{self, Hook};
 use crate::codex::{self, AppServer, CodexEvent, Seen};
 use crate::crew::{self, By, Event, Kind, Party};
 use crate::engine::{self, Installed, SignIns, View};
+use crate::first_run;
 use crate::floor::{Outcome, Scope, Subject, SubjectKey, Turn, TurnLog, TurnOp};
 use crate::holder::{Held, Holder};
 use crate::model::{
@@ -2032,7 +2033,14 @@ impl Desk {
     /// Starts a session; `by` is who asked (none: the session's own
     /// `started` is recorded).
     pub async fn create(&self, new: NewSession, by: Option<By>) -> Result<SessionView, DeskError> {
-        self.start_session(new, None, by).await
+        self.start_session(new, None, by, false).await
+    }
+
+    /// Starts a session the person asked for in Desk, in a folder they
+    /// chose: the one start whose CLI may trust its folder (see
+    /// [`SessionRecord::folder_chosen`]).
+    pub async fn create_chosen(&self, new: NewSession) -> Result<SessionView, DeskError> {
+        self.start_session(new, None, Some(By::you()), true).await
     }
 
     /// Starts a session for `boss`, which runs it from the start: it is in
@@ -2045,7 +2053,7 @@ impl Desk {
         boss: &Party,
         by: By,
     ) -> Result<SessionView, DeskError> {
-        self.start_session(new, Some(boss), Some(by)).await
+        self.start_session(new, Some(boss), Some(by), false).await
     }
 
     async fn start_session(
@@ -2053,6 +2061,7 @@ impl Desk {
         new: NewSession,
         boss: Option<&Party>,
         by: Option<By>,
+        folder_chosen: bool,
     ) -> Result<SessionView, DeskError> {
         let name = new.name.trim();
         if name.is_empty() {
@@ -2167,6 +2176,7 @@ impl Desk {
             restore_offer: false,
             terminal_id: None,
             display_name: None,
+            folder_chosen: folder_chosen && boss.is_none(),
             asked: None,
             created_at: now,
             updated_at: now,
@@ -3326,6 +3336,7 @@ impl Desk {
                 env.remove(k);
             }
         }
+        self.settle_first_run(r, cwd, &env).await;
         let (spec, codex) = match r.engine {
             Engine::Claude => {
                 let session_id = r.cli_session_id.as_deref().unwrap_or_default();
@@ -3445,11 +3456,84 @@ impl Desk {
             },
         );
         tokio::spawn(self.clone().on_exit(r.id, exit));
+        // What its line held while it wasn't running is looked at again now
+        // it is: its state said Starting before it was (settling its CLI's
+        // first run waits on a file), and a pump then still found it stopped.
+        self.line_went_live(r.id);
         let version = self.version_of(r.engine);
         if version.is_some() && version != r.engine_version {
             self.change(r.id, |r, _| r.engine_version = version);
         }
         Ok(())
+    }
+
+    /// Settles what `r`'s CLI asks on its first run before it works in
+    /// `cwd` (see [`first_run`]): the CLI may never have run where the hub
+    /// is (a machine, a fresh Mac). Its onboarding always; its folder's
+    /// trust only as [`SessionRecord::folder_chosen`] and the folder allow.
+    /// A config that can't be settled is said, and the session starts
+    /// anyway: its CLI asks in the terminal.
+    async fn settle_first_run(
+        &self,
+        r: &SessionRecord,
+        cwd: &Path,
+        env: &BTreeMap<String, String>,
+    ) {
+        let engine = r.engine;
+        let configs: Vec<first_run::Config> = match engine {
+            Engine::Claude => first_run::claude_config(env).into_iter().collect(),
+            // Its TUI (in the session's environment) asks, and its
+            // app-server (in the hub's CLI environment) keeps the answer.
+            Engine::Codex => {
+                let mut c: Vec<first_run::Config> = [env, &self.0.env]
+                    .into_iter()
+                    .filter_map(first_run::codex_config)
+                    .collect();
+                c.dedup();
+                c
+            }
+            _ => return,
+        };
+        let version = self.version_of(engine);
+        let folder = cwd.to_path_buf();
+        let home = env.get("HOME").filter(|h| !h.is_empty()).map(PathBuf::from);
+        let chosen = r.folder_chosen;
+        let settled = tokio::task::spawn_blocking(move || {
+            let s = first_run::Settle {
+                folder: &folder,
+                home: home.as_deref(),
+                chosen,
+                version: version.as_deref(),
+            };
+            configs
+                .iter()
+                .map(|config| {
+                    let done = match engine {
+                        Engine::Claude => first_run::ready_claude(config, &s),
+                        _ => first_run::trust_codex(config, &s),
+                    };
+                    (config.path.clone(), done)
+                })
+                .collect::<Vec<_>>()
+        })
+        .await;
+        for (config, done) in settled.unwrap_or_default() {
+            match done {
+                Ok(true) => tracing::info!(
+                    engine = engine.title(),
+                    config = %config.display(),
+                    folder = %cwd.display(),
+                    "settled the CLI's first run for a session"
+                ),
+                Ok(false) => {}
+                Err(e) => tracing::warn!(
+                    engine = engine.title(),
+                    config = %config.display(),
+                    error = %e,
+                    "couldn't settle the CLI's first run; it may ask in the terminal"
+                ),
+            }
+        }
     }
 
     /// `engine`'s version as last read, as a session records it.
@@ -4634,6 +4718,7 @@ impl Desk {
                         restore_offer: false,
                         terminal_id: None,
                         display_name: None,
+                        folder_chosen: false,
                         asked: None,
                         created_at: now,
                         updated_at: now,
@@ -5175,6 +5260,112 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(100)).await;
             assert!(h.list().await.unwrap().is_empty());
             holder_cancel.cancel();
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_session_finds_claude_code_set_up_and_its_folder_trusted_only_when_the_person_chose_it(
+    ) {
+        with_test_pool(build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let home = dir.path().join("home");
+            std::fs::create_dir(&home).unwrap();
+            let config = home.join(".claude.json");
+            std::fs::write(&config, r#"{"userID":"u1","theme":"light"}"#).unwrap();
+            let mut opts = options(dir.path());
+            opts.env
+                .insert("HOME".into(), home.to_string_lossy().into_owned());
+            DeskStore::migrate(&pool).await.unwrap();
+            let d = Desk::start(
+                DeskStore::from_pool(pool.clone()),
+                opts,
+                Floor {
+                    turns: None,
+                    plans: None,
+                    pricer: None,
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            let repo = dir.path().join("acme-api");
+            std::fs::create_dir(&repo).unwrap();
+            for args in [
+                &["init", "-q", "-b", "main"][..],
+                &[
+                    "-c",
+                    "user.email=d@e",
+                    "-c",
+                    "user.name=d",
+                    "commit",
+                    "-q",
+                    "--allow-empty",
+                    "-m",
+                    "init",
+                ],
+            ] {
+                let ok = std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(&repo)
+                    .args(args)
+                    .status()
+                    .unwrap();
+                assert!(ok.success());
+            }
+            let elsewhere = dir.path().join("acme-web");
+            std::fs::create_dir(&elsewhere).unwrap();
+            let new = |cwd: &Path, worktree: Option<&str>| NewSession {
+                engine: Engine::Claude,
+                view: None,
+                name: "login-race".into(),
+                cwd: cwd.to_string_lossy().into_owned(),
+                goal: String::new(),
+                worktree: worktree.map(str::to_string),
+                prompt: None,
+                approvals: None,
+                approve_for_me: false,
+                account: None,
+                env: Default::default(),
+                group: None,
+            };
+            let trusted = |cwd: &str| {
+                let doc: Value =
+                    serde_json::from_str(&std::fs::read_to_string(&config).unwrap()).unwrap();
+                let real = std::fs::canonicalize(cwd).unwrap();
+                doc["projects"][real.to_str().unwrap()]["hasTrustDialogAccepted"].clone()
+            };
+            // An agent's start: onboarding, and no trust it wasn't given.
+            let agent = d
+                .create(
+                    new(&elsewhere, None),
+                    Some(By::manager("scout", "Scout", "")),
+                )
+                .await
+                .unwrap();
+            let doc: Value =
+                serde_json::from_str(&std::fs::read_to_string(&config).unwrap()).unwrap();
+            assert_eq!(doc["hasCompletedOnboarding"], Value::Bool(true));
+            assert_eq!(doc["theme"], "light", "the person's theme is kept");
+            assert_eq!(doc["userID"], "u1");
+            assert_eq!(
+                trusted(&agent.cwd),
+                Value::Null,
+                "an agent's start trusts nothing"
+            );
+
+            let plain = d.create_chosen(new(&repo, None)).await.unwrap();
+            let in_worktree = d
+                .create_chosen(new(&repo, Some("desk/login-race")))
+                .await
+                .unwrap();
+            assert!(in_worktree.cwd.contains("/.worktrees/"));
+            for s in [&plain, &in_worktree] {
+                assert_eq!(trusted(&s.cwd), Value::Bool(true), "{} is trusted", s.cwd);
+            }
+            let kept = DeskStore::from_pool(pool.clone());
+            assert!(kept.get(plain.id).await.unwrap().unwrap().folder_chosen);
+            assert!(!kept.get(agent.id).await.unwrap().unwrap().folder_chosen);
         })
         .await;
     }

@@ -24,12 +24,14 @@ portable-pty = "0.9"
 refinery = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
+serde_json = { workspace = true, features = ["raw_value"] }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-postgres = { workspace = true }
 tokio-tungstenite = { version = "0.28", features = ["native-tls"] }
 tokio-util = { workspace = true }
+toml = { workspace = true }
+toml_edit = { workspace = true }
 tracing = { workspace = true }
 url = { workspace = true }
 uuid = { workspace = true }

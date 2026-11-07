@@ -568,11 +568,7 @@ async fn switch_account(
 
 async fn create(State(s): S, h: HeaderMap, Query(q): Q, Json(new): Json<NewSession>) -> Response {
     guarded!(s, h, q);
-    s.desk
-        .create(new, Some(By::you()))
-        .await
-        .map(Json)
-        .into_response()
+    s.desk.create_chosen(new).await.map(Json).into_response()
 }
 
 async fn update(

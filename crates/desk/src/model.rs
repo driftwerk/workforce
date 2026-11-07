@@ -77,6 +77,12 @@ pub struct SessionRecord {
     pub display_name: Option<String>,
     /// While it is asking: what, and why Desk read it so.
     pub asked: Option<crate::asking::Asked>,
+    /// The person chose its folder themselves when they started it in Desk:
+    /// their consent for its CLI to trust that folder, decided once, when it
+    /// was made, and kept for every start and resume after
+    /// ([`crate::first_run`]). An agent's, a boss's or a board's start never
+    /// has it.
+    pub folder_chosen: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
