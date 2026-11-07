@@ -282,6 +282,9 @@ impl Live {
         }
         held.is_some_and(|h| match (h.call.as_deref(), call) {
             (Some(asked), Some(ended)) => asked != ended,
+            // Not its own thread's call: whichever it asks about, it isn't
+            // this one.
+            (None, Some(_)) if h.agent.as_deref() != inside => true,
             (None, Some(_)) => self.flights.get(&h.agent).is_some_and(|f| !f.is_empty()),
             _ => false,
         })
@@ -380,10 +383,21 @@ impl Live {
     }
 
     /// The main thread's turn is over: nothing it ran runs, and nothing
-    /// asked in it waits.
-    fn turn_over(&mut self) {
+    /// asked in it waits; but what a sub-agent still running asked waits
+    /// on, Desk's way to answer it too, and shows once nothing else does.
+    /// Whether an ask shows.
+    fn turn_over(&mut self) -> bool {
         self.flights.remove(&None);
-        self.behind.clear();
+        let (background, flights) = (&self.background, &self.flights);
+        self.behind.retain(|b| {
+            b.raised.agent.as_deref().is_some_and(|agent| {
+                background.runs(agent) || flights.contains_key(&Some(agent.to_string()))
+            })
+        });
+        if self.pending.is_none() && !self.behind.is_empty() {
+            self.ask_ended();
+        }
+        self.pending.is_some()
     }
 
     /// Every ask it has open now, each once: what Desk keeps of them, and
@@ -3899,6 +3913,14 @@ impl Desk {
         if unqueued {
             self.change(id, |_, _| {});
         }
+        // The session goes on to another call, or asks again: the ask shown
+        // is over if its call has a result already. A "No" with words for
+        // Claude in the terminal's dialog fires no hook, and the turn goes on.
+        match &hook {
+            Hook::ToolStart { id: call, .. } => self.end_if_answered(id, call.as_deref()).await,
+            Hook::Permission { .. } | Hook::Question { .. } => self.end_if_answered(id, None).await,
+            _ => {}
+        }
         if let Hook::ToolStart { call, .. } = &hook {
             let cd = call.tool == "Bash"
                 && call.input.as_deref().is_some_and(|c| {
@@ -4142,7 +4164,8 @@ impl Desk {
                             l.open_question = None;
                         }
                         if esc {
-                            l.turn_over();
+                            // What shows behind is shown below.
+                            let _ = l.turn_over();
                         }
                         // What showed ended: what waits behind it (another
                         // ask, the main thread's question) shows next.
@@ -4214,7 +4237,10 @@ impl Desk {
                     if let Some(l) = l {
                         l.pending = None;
                         l.open_question = None;
-                        l.turn_over();
+                        // A running sub-agent's ask waits on.
+                        if l.turn_over() {
+                            r.state = SessionState::Blocked;
+                        }
                         l.denials.clear();
                         l.reading = None;
                         r.asked = None;
@@ -4305,6 +4331,45 @@ impl Desk {
         answer()
     }
 
+    /// Ends session `id`'s shown ask if the transcript has its call's
+    /// result (it was answered, or turned down, in the terminal), unless
+    /// `next` is that call or Desk holds its hook open.
+    async fn end_if_answered(&self, id: Uuid, next: Option<&str>) {
+        let shown = {
+            let st = self.0.state.lock();
+            let call = st
+                .live
+                .get(&id)
+                .filter(|l| l.answer.is_none())
+                .and_then(|l| l.holder()?.call.clone())
+                .filter(|c| Some(c.as_str()) != next);
+            call.zip(st.records.get(&id).and_then(|r| r.transcript.clone()))
+        };
+        let Some((call, path)) = shown else { return };
+        let calls = HashSet::from([call.clone()]);
+        let ended = tokio::task::spawn_blocking(move || {
+            transcript::results_among(Path::new(&path), &calls).unwrap_or_default()
+        })
+        .await
+        .unwrap_or_default();
+        if !ended.contains(&call) {
+            return;
+        }
+        self.change(id, |r, l| {
+            let Some(l) = l else { return };
+            l.landed(&call);
+            if l.holder()
+                .is_some_and(|h| h.call.as_deref() == Some(call.as_str()))
+            {
+                l.ask_ended();
+                r.state = match l.pending {
+                    Some(_) => SessionState::Blocked,
+                    None => SessionState::Working,
+                };
+            }
+        });
+    }
+
     /// A turn started on `p`: the person's own words when `person`.
     fn prompted(&self, id: Uuid, p: String, person: bool) {
         // Asked again: how its last turn failed is behind it.
@@ -4317,7 +4382,10 @@ impl Desk {
                 l.pending = None;
                 l.held = None;
                 l.open_question = None;
-                l.turn_over();
+                // A running sub-agent's ask waits on.
+                if l.turn_over() {
+                    r.state = SessionState::Blocked;
+                }
                 if person {
                     l.prompts += 1;
                 }
@@ -4435,7 +4503,11 @@ impl Desk {
                 l.held = None;
                 l.open_question = None;
                 l.answer = None;
-                l.turn_over();
+                // A running sub-agent's ask waits on: the turn is over, the
+                // session's wait on the person isn't.
+                if l.turn_over() {
+                    r.state = SessionState::Blocked;
+                }
                 l.denials.clear();
                 let now = Utc::now();
                 l.background = match (failed, background) {

@@ -109,6 +109,11 @@ impl Background {
         self
     }
 
+    /// Whether the piece `id` (a sub-agent, a shell) runs, as last known.
+    pub fn runs(&self, id: &str) -> bool {
+        self.tasks.contains_key(id)
+    }
+
     /// One piece ended.
     pub fn ended(mut self, id: &str, now: DateTime<Utc>) -> Self {
         self.tasks.remove(id);
