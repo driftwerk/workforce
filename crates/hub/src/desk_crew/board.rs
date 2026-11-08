@@ -77,6 +77,9 @@ fn holder(v: &TicketView) -> String {
 
 /// The tickets of one board as a table, in the order of their columns and
 /// then of the board. `waits` names what each blocked ticket waits on.
+/// What a ticket waits on that another scope holds now reads as.
+const ELSEWHERE: &str = "a ticket now in another group";
+
 fn table(views: &[&TicketView], waits: &HashMap<Uuid, String>) -> String {
     let mut rows: Vec<(Column, &TicketView)> = views
         .iter()
@@ -89,12 +92,15 @@ fn table(views: &[&TicketView], waits: &HashMap<Uuid, String>) -> String {
     let mut out =
         String::from("| Key | Title | Column | Has it | Waits on |\n|---|---|---|---|---|\n");
     for (c, v) in rows {
-        let waiting = v
+        // One it waits on that is another scope's now (it moved there) is
+        // said, never named.
+        let mut waiting = v
             .blockers
             .iter()
-            .filter_map(|b| waits.get(b).map(String::as_str))
-            .collect::<Vec<_>>()
-            .join(", ");
+            .map(|b| waits.get(b).map_or(ELSEWHERE, String::as_str))
+            .collect::<Vec<_>>();
+        waiting.dedup();
+        let waiting = waiting.join(", ");
         out.push_str(&format!(
             "| {} | {} | {} | {} | {} |\n",
             v.key.as_deref().unwrap_or("-"),

@@ -30,9 +30,10 @@ struct TokenQuery {
 
 type Q = Query<TokenQuery>;
 
+/// Moves are the person's who holds the hub alone, as deciding a need is.
 macro_rules! guarded {
     ($s:expr, $h:expr, $q:expr) => {
-        if let Err(status) = $s.auth.authorize(&$h, $q.token.as_deref()).await {
+        if let Err(status) = $s.auth.authorize_holder(&$h, $q.token.as_deref()).await {
             return (status, Json(json!({ "error": "not allowed" }))).into_response();
         }
     };

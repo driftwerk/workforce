@@ -260,8 +260,10 @@ impl DeskStore {
     }
 
     /// Moves ticket `id` to board `to` under that board's next number, in
-    /// one step: out of any plan, and with none of its needs either way,
-    /// which were its old board's. Its links, history and assignment stay.
+    /// one step, out of any plan. What it waits on and what waits on it are
+    /// kept, so nothing waiting on it is let go early: each side reads the
+    /// other as a ticket now in another group. Its links, history and
+    /// assignment stay.
     /// `None` when there's no such ticket.
     pub async fn move_ticket_board(&self, id: Uuid, to: Uuid) -> Result<Option<Ticket>> {
         let mut client = self.pool().get().await?;
@@ -285,11 +287,6 @@ impl DeskStore {
         if moved == 0 {
             return Ok(None);
         }
-        tx.execute(
-            "DELETE FROM ticket_needs WHERE ticket = $1 OR needs = $1",
-            &[&id],
-        )
-        .await?;
         tx.commit()
             .await
             .context("moving a ticket to another board")?;

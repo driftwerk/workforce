@@ -858,6 +858,9 @@ struct Inner {
     /// Held from reading a plan to writing it back: a plan is written
     /// whole, so two changes at once would undo one another.
     plan_write: tokio::sync::Mutex<()>,
+    /// Held while a move is made: two previews of one item never both go
+    /// through, the second finding what it does changed.
+    move_write: tokio::sync::Mutex<()>,
     /// Held while a plan's ticket is started, and while a plan is dropped:
     /// a drop never misses a start under way.
     plan_starting: tokio::sync::Mutex<()>,
@@ -1501,6 +1504,7 @@ impl Desk {
             group_counts: std::sync::atomic::AtomicUsize::new(0),
             boss_plans: Mutex::default(),
             plan_write: tokio::sync::Mutex::new(()),
+            move_write: tokio::sync::Mutex::new(()),
             plan_starting: tokio::sync::Mutex::new(()),
         }));
         desk.scopes_follow(&desk.layout());
