@@ -934,6 +934,43 @@ impl MemoryStore for SqliteMemoryStore {
         Ok(())
     }
 
+    async fn add_tag(
+        &self,
+        owner: &AgentId,
+        tag: &str,
+        unless_prefix: &str,
+    ) -> Result<Vec<MemoryId>> {
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|e| eyre::eyre!("Failed to lock database: {}", e))?;
+        let tx = conn.transaction()?;
+        let held: Vec<(String, String)> = {
+            let mut stmt = tx.prepare("SELECT id, tags FROM memories WHERE owner = ?1")?;
+            let rows = stmt
+                .query_map(params![owner.as_str()], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows
+        };
+        let mut tagged = Vec::new();
+        for (id, tags_json) in held {
+            let mut tags: Vec<String> = serde_json::from_str(&tags_json).unwrap_or_default();
+            if tags.iter().any(|t| t.starts_with(unless_prefix)) {
+                continue;
+            }
+            tags.push(tag.to_string());
+            tx.execute(
+                "UPDATE memories SET tags = ?1 WHERE id = ?2",
+                params![serde_json::to_string(&tags)?, id],
+            )?;
+            tagged.push(MemoryId(id));
+        }
+        tx.commit()?;
+        Ok(tagged)
+    }
+
     async fn identity_memories(&self, owner: &AgentId, identity: &str) -> Result<Vec<MemoryId>> {
         let conn = self
             .conn
@@ -1522,6 +1559,11 @@ mod tests {
     #[tokio::test]
     async fn identity_memories_are_reassigned_and_purged_forgotten_ones_included() {
         crate::store::identity_operations_contract(&make_store()).await;
+    }
+
+    #[tokio::test]
+    async fn the_add_tag_contract_holds() {
+        crate::store::add_tag_contract(&make_store()).await;
     }
 
     // ─── Forget (Soft Delete) ────────────────────────────────────────────

@@ -333,6 +333,25 @@ pub trait MemoryStore: Send + Sync {
     /// Update the tags on a memory.
     async fn update_tags(&self, id: &MemoryId, tags: Vec<String>) -> Result<()>;
 
+    /// Add `tag` to every memory `owner` holds, forgotten ones included,
+    /// that carries no tag starting with `unless_prefix`: what a boss's
+    /// memories from before it was fenced in are given once, so they stay
+    /// with the scope they were learned in (boss-gaps W8). A bulk update,
+    /// done in the store, never per memory by its caller. Returns the ids
+    /// it tagged, each once, for a replica to follow.
+    ///
+    /// The default refuses: a store that can't do it must fail the move
+    /// that asked, never leave memories it says it fenced unfenced.
+    async fn add_tag(
+        &self,
+        owner: &AgentId,
+        tag: &str,
+        unless_prefix: &str,
+    ) -> Result<Vec<MemoryId>> {
+        let _ = (owner, tag, unless_prefix);
+        Err(eyre::eyre!("this memory store can't tag memories in bulk"))
+    }
+
     /// Atomically apply `delta` to a memory's `importance`, clamp the result
     /// to `[IMPORTANCE_FLOOR, 1.0]`, and return the new value. Two concurrent
     /// callers — one positive, one negative — must compose to the net delta
@@ -543,6 +562,83 @@ pub(crate) async fn identity_operations_contract(store: &dyn MemoryStore) {
         "an identity that only starts the same is untouched"
     );
     assert_eq!(store.identities(&owner).await.unwrap(), ["bobby"]);
+}
+
+/// What every backend's [`MemoryStore::add_tag`] must do alike: only the
+/// owner's memories with no tag of the prefix, forgotten ones too, each
+/// once; and a second call tags nothing.
+#[cfg(test)]
+pub(crate) async fn add_tag_contract(store: &dyn MemoryStore) {
+    use crate::types::MemoryLayer;
+    let owner = AgentId::new("sarah");
+    let other = AgentId::new("mia");
+    let mem = |content: &str, owner: &AgentId, tags: &[&str]| {
+        let mut m = Memory::new(content, MemoryLayer::Episodic, owner.clone());
+        m.identity_id = Some("sam".into());
+        m.tags = tags.iter().map(|t| t.to_string()).collect();
+        m
+    };
+    let plain = store
+        .remember(mem("acme uses postgres", &owner, &[]))
+        .await
+        .unwrap();
+    let other_tags = store
+        .remember(mem("acme deploys on fridays", &owner, &["topic:deploys"]))
+        .await
+        .unwrap();
+    let forgotten = store
+        .remember(mem("acme's old office", &owner, &[]))
+        .await
+        .unwrap();
+    store.forget(&forgotten).await.unwrap();
+    let fenced = store
+        .remember(mem("atlas uses mysql", &owner, &["desk-group:atlas"]))
+        .await
+        .unwrap();
+    let elsewhere = store
+        .remember(mem("mia's own note", &other, &[]))
+        .await
+        .unwrap();
+
+    let mut tagged = store
+        .add_tag(&owner, "desk-group:acme", "desk-group:")
+        .await
+        .unwrap();
+    tagged.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut expected = vec![plain.clone(), other_tags.clone(), forgotten.clone()];
+    expected.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(
+        tagged, expected,
+        "the owner's unfenced memories, forgotten ones too"
+    );
+
+    let tags_of = |m: Option<Memory>| m.map(|m| m.tags).unwrap_or_default();
+    assert_eq!(
+        tags_of(store.get(&plain).await.unwrap()),
+        ["desk-group:acme"]
+    );
+    assert_eq!(
+        tags_of(store.get(&other_tags).await.unwrap()),
+        ["topic:deploys", "desk-group:acme"],
+        "its own tags are kept"
+    );
+    assert_eq!(
+        tags_of(store.get(&fenced).await.unwrap()),
+        ["desk-group:atlas"],
+        "one fenced already is left as it is"
+    );
+    assert!(
+        tags_of(store.get(&elsewhere).await.unwrap()).is_empty(),
+        "another agent's memories are untouched"
+    );
+    assert!(
+        store
+            .add_tag(&owner, "desk-group:acme", "desk-group:")
+            .await
+            .unwrap()
+            .is_empty(),
+        "a second call tags nothing"
+    );
 }
 
 #[cfg(test)]
