@@ -1661,6 +1661,28 @@ impl Desk {
             .collect()
     }
 
+    /// Whether the holder still runs a process for session `id` that this
+    /// hub doesn't hold: one it couldn't take back as it started (the holder
+    /// out of reach, or its list unread). Resuming it would start a second
+    /// engine on the same conversation.
+    async fn held_untaken(&self, id: Uuid) -> bool {
+        let Some(holder) = self.holder().await else {
+            return false;
+        };
+        let id = id.to_string();
+        match holder.list().await {
+            Ok(all) => all.iter().any(|h| {
+                !h.exited
+                    && h.meta["kind"].as_str() == Some("session")
+                    && h.meta["session"].as_str() == Some(id.as_str())
+            }),
+            Err(e) => {
+                tracing::warn!(session = %id, error = %e, "the PTY holder didn't list its terminals; resuming as if it holds none");
+                false
+            }
+        }
+    }
+
     /// Takes back the sessions whose processes the holder kept while the
     /// hub was away, as they were: same processes, same hook tokens.
     async fn adopt_held(&self, mut held: HeldSet) {
@@ -3011,6 +3033,12 @@ impl Desk {
         if r.origin == Origin::External && r.external_pid.is_some_and(adopt::alive) {
             return Err(DeskError::Conflict(
                 "still running in another terminal — close it there first".into(),
+            ));
+        }
+        if self.held_untaken(id).await {
+            return Err(DeskError::Conflict(
+                "this session is still running in Desk's terminal keeper, which this hub couldn't reach when it started; restart Desk's helper on this computer to take it back"
+                    .into(),
             ));
         }
         if r.cli_session_id.is_none() {
@@ -6502,6 +6530,65 @@ mod tests {
                 .unwrap();
             assert_eq!(saved.state, SessionState::Interrupted);
             assert!(!saved.restore_offer);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_session_the_holder_still_runs_is_never_resumed_a_second_time() {
+        with_test_pool(build_pool, |pool| async move {
+            let (hdir, socket, _holder_cancel) = crate::holder::tests::holder().await;
+            let dir = tempfile::tempdir().unwrap();
+            let mut opts = options(dir.path());
+            opts.holder = Some(HolderOptions {
+                socket: socket.clone(),
+                token: crate::holder::tests::TOKEN.into(),
+            });
+            DeskStore::migrate(&pool).await.unwrap();
+            let first_cancel = CancellationToken::new();
+            let first = Desk::start(
+                DeskStore::from_pool(pool.clone()),
+                opts.clone(),
+                Default::default(),
+                first_cancel.clone(),
+            )
+            .await
+            .unwrap();
+            let s = new_session(&first, dir.path()).await;
+            first.change(s.id, |r, _| r.cli_session_id = Some("cli-1".into()));
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            first_cancel.cancel();
+            tokio::time::sleep(Duration::from_millis(300)).await;
+
+            // The next hub starts while the holder is out of its reach: the
+            // session looks lost to it, though its process runs on.
+            let away = hdir.path().join("away.sock");
+            std::fs::rename(&socket, &away).unwrap();
+            let second = Desk::start(
+                DeskStore::from_pool(pool.clone()),
+                opts.clone(),
+                Default::default(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            assert!(!second.view(s.id).unwrap().live);
+            std::fs::rename(&away, &socket).unwrap();
+
+            let refused = second.resume(s.id, None, None).await.unwrap_err();
+            assert!(refused.to_string().contains("still running"), "{refused}");
+            assert!(!second.view(s.id).unwrap().live, "a second one was started");
+            let holder = Holder::connect(&socket, crate::holder::tests::TOKEN)
+                .await
+                .unwrap();
+            let running = holder
+                .list()
+                .await
+                .unwrap()
+                .into_iter()
+                .filter(|h| !h.exited && h.meta["session"].as_str() == Some(&s.id.to_string()))
+                .count();
+            assert_eq!(running, 1, "one process for the conversation");
         })
         .await;
     }
