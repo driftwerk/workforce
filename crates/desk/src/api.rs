@@ -992,7 +992,9 @@ impl IntoResponse for crate::folders::FolderError {
             E::NotFound => StatusCode::NOT_FOUND,
             E::NotAFolder => StatusCode::BAD_REQUEST,
             E::NoHome => StatusCode::CONFLICT,
-            E::Unreadable => StatusCode::INTERNAL_SERVER_ERROR,
+            E::Unreadable | E::NotMade => StatusCode::INTERNAL_SERVER_ERROR,
+            E::BadName => StatusCode::BAD_REQUEST,
+            E::OutsideHome => StatusCode::FORBIDDEN,
         };
         (status, Json(json!({ "error": self.to_string() }))).into_response()
     }
@@ -1011,6 +1013,32 @@ async fn folders(State(s): S, h: HeaderMap, Query(q): Query<FolderParams>) -> Re
         Ok(Ok(l)) => Json(l).into_response(),
         Ok(Err(e)) => e.into_response(),
         Err(_) => crate::folders::FolderError::Unreadable.into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MakeFolder {
+    path: String,
+}
+
+/// Makes a folder inside the hub user's home for a session to run in (New
+/// session on a machine): the person's, through Desk; `mkdir -p` there.
+async fn make_folder(
+    State(s): S,
+    h: HeaderMap,
+    Query(q): Q,
+    Json(body): Json<MakeFolder>,
+) -> Response {
+    guarded!(s, h, q);
+    let home = s.desk.home_folder();
+    let made =
+        tokio::task::spawn_blocking(move || crate::folders::make(&body.path, home.as_deref()))
+            .await;
+    match made {
+        Ok(Ok(path)) => (StatusCode::CREATED, Json(json!({ "path": path }))).into_response(),
+        Ok(Err(e)) => e.into_response(),
+        Err(_) => crate::folders::FolderError::NotMade.into_response(),
     }
 }
 
@@ -1718,7 +1746,7 @@ pub fn sessions_router(desk: Desk, auth: Arc<dyn Authorize>) -> Router {
             "/api/desk/sessions/{id}/name",
             axum::routing::put(name_session),
         )
-        .route("/api/desk/folders", get(folders))
+        .route("/api/desk/folders", get(folders).post(make_folder))
         .route("/api/desk/layout", get(layout).put(replace_layout))
         .route("/api/desk/layout/import", post(import_layout))
         .route("/api/desk/groups", get(layout).post(create_group))
@@ -2310,6 +2338,37 @@ mod tests {
                     call(&app, "GET", &format!("/api/desk/folders?path={path}"), None).await;
                 assert_eq!(status, 403, "{path}");
             }
+            // Made inside the home, and refused outside it.
+            let (status, made) = call(
+                &app,
+                "POST",
+                "/api/desk/folders",
+                Some(json!({"path": "~/dagr/app"})),
+            )
+            .await;
+            assert_eq!(status, 201, "{made}");
+            assert!(home.join("dagr/app").is_dir());
+            for path in ["/etc/desk-made", "~/../x"] {
+                let (status, _) = call(
+                    &app,
+                    "POST",
+                    "/api/desk/folders",
+                    Some(json!({ "path": path })),
+                )
+                .await;
+                assert!(status == 403 || status == 400, "{path}: {status}");
+            }
+            assert!(!dir.path().join("x").exists());
+            // Only the path: anything else said is refused.
+            let (status, _) = call(
+                &app,
+                "POST",
+                "/api/desk/folders",
+                Some(json!({"path": "~/other", "mode": "777"})),
+            )
+            .await;
+            assert!((400..500).contains(&status), "{status}");
+            assert!(!home.join("other").exists());
         })
         .await;
     }

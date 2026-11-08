@@ -1,8 +1,10 @@
-//! The folders a person may pick for a session: `GET /api/desk/folders`.
+//! The folders a person may pick for a session: `GET /api/desk/folders`,
+//! and one made for it: `POST /api/desk/folders`.
 //!
 //! Folders only, never files, and only inside the hub user's home or a live
 //! session's folder. A path is followed through symlinks before it is
-//! checked, so `..` and a link that leads out are refused alike.
+//! checked, so `..` and a link that leads out are refused alike. A folder is
+//! made only inside the home, from a path with no `.` or `..` in it.
 
 use std::path::{Path, PathBuf};
 
@@ -23,6 +25,86 @@ pub enum FolderError {
     NoHome,
     #[error("the folder could not be read")]
     Unreadable,
+    #[error("a folder's path can't hold . or .., or be empty")]
+    BadName,
+    #[error("only a folder inside the home folder can be made")]
+    OutsideHome,
+    #[error("the folder could not be made")]
+    NotMade,
+}
+
+/// Most folders one make may add below the deepest one already there.
+pub const MAX_MADE: usize = 8;
+
+/// Makes the folder `requested` (`~` and `~/x` are the home; anything else
+/// must be absolute) and any folders above it that aren't there yet, all
+/// inside `home`; one already there is its answer too. What is already
+/// there is followed through symlinks and must be inside the home, so a link
+/// that leads out is never made into. Returns the folder, links resolved.
+pub fn make(requested: &str, home: Option<&Path>) -> Result<String, FolderError> {
+    use std::path::Component;
+    let home = home
+        .and_then(|h| h.canonicalize().ok())
+        // A home that is the whole disk is no home to make folders in.
+        .filter(|h| h.parent().is_some())
+        .ok_or(FolderError::NoHome)?;
+    let r = requested.trim();
+    // As typed: a path drops a `.` inside it as it is read.
+    if r.is_empty() || r.contains('\0') || r.split('/').any(|p| p == "." || p == "..") {
+        return Err(FolderError::BadName);
+    }
+    let wanted = match expand_tilde(r) {
+        Some(rest) if r.starts_with('~') => home.join(rest),
+        Some(abs) if abs.starts_with('/') => PathBuf::from(abs),
+        // `~user`, or a path relative to nothing said.
+        _ => return Err(FolderError::OutsideHome),
+    };
+    if wanted
+        .components()
+        .any(|c| matches!(c, Component::ParentDir | Component::CurDir))
+    {
+        return Err(FolderError::BadName);
+    }
+    // The deepest folder already there, and the names to make below it.
+    let mut there = wanted.clone();
+    let mut names = Vec::new();
+    while std::fs::symlink_metadata(&there).is_err() {
+        let Some(name) = there.file_name().map(|n| n.to_os_string()) else {
+            return Err(FolderError::OutsideHome);
+        };
+        names.push(name);
+        if !there.pop() || names.len() > MAX_MADE {
+            return Err(FolderError::BadName);
+        }
+    }
+    let base = there.canonicalize().map_err(|_| FolderError::Unreadable)?;
+    if !base.starts_with(&home) {
+        return Err(FolderError::OutsideHome);
+    }
+    if !base.is_dir() {
+        return Err(FolderError::NotAFolder);
+    }
+    let mut made = base;
+    for name in names.into_iter().rev() {
+        made.push(name);
+        match std::fs::create_dir(&made) {
+            Ok(()) => {}
+            // Made meanwhile: a folder of its own only (a link is refused).
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                let meta = std::fs::symlink_metadata(&made).map_err(|_| FolderError::NotMade)?;
+                if !meta.is_dir() {
+                    return Err(FolderError::NotAFolder);
+                }
+            }
+            Err(_) => return Err(FolderError::NotMade),
+        }
+    }
+    // What was made, as the disk has it now, is still inside the home.
+    let real = made.canonicalize().map_err(|_| FolderError::NotMade)?;
+    if !real.starts_with(&home) {
+        return Err(FolderError::OutsideHome);
+    }
+    Ok(real.to_string_lossy().into_owned())
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
@@ -134,6 +216,51 @@ pub fn list(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_folder_is_made_in_the_home_and_nowhere_else() {
+        let t = tree();
+        let home = Some(t.home.as_path());
+        // One level, and several: `mkdir -p`, inside the home.
+        let one = make("~/dagr", home).unwrap();
+        assert_eq!(one, t.home.join("dagr").to_string_lossy());
+        assert!(t.home.join("dagr").is_dir());
+        let deep = t.home.join("src/new/app");
+        assert_eq!(
+            make(&deep.to_string_lossy(), home).unwrap(),
+            deep.to_string_lossy()
+        );
+        assert!(deep.is_dir());
+        // There already: its answer, nothing made.
+        assert_eq!(make("~/dagr", home).unwrap(), one);
+        // Never outside the home, nor through `..`, `.`, a link out, or `~user`.
+        let out = t.outside.join("x");
+        assert_eq!(
+            make(&out.to_string_lossy(), home),
+            Err(FolderError::OutsideHome)
+        );
+        assert!(!out.exists());
+        assert_eq!(make("~/../escape", home), Err(FolderError::BadName));
+        assert_eq!(make("~/./a", home), Err(FolderError::BadName));
+        assert_eq!(make("~root/x", home), Err(FolderError::OutsideHome));
+        assert_eq!(make("relative/x", home), Err(FolderError::OutsideHome));
+        assert_eq!(make("  ", home), Err(FolderError::BadName));
+        std::os::unix::fs::symlink(&t.outside, t.home.join("out-link")).unwrap();
+        assert_eq!(make("~/out-link/x", home), Err(FolderError::OutsideHome));
+        assert!(!t.outside.join("x").exists());
+        // Under a file: not a folder.
+        std::fs::write(t.home.join("a-file"), "x").unwrap();
+        assert_eq!(make("~/a-file/x", home), Err(FolderError::NotAFolder));
+        // Too deep at once.
+        assert_eq!(make("~/1/2/3/4/5/6/7/8/9", home), Err(FolderError::BadName));
+        assert_eq!(make("~/x", None), Err(FolderError::NoHome));
+        // A home that resolves to `/`: nothing is made anywhere.
+        assert_eq!(
+            make("/tmp/desk-made-x", Some(Path::new("/"))),
+            Err(FolderError::NoHome)
+        );
+        assert!(!Path::new("/tmp/desk-made-x").exists());
+    }
 
     fn names(l: &Listing) -> Vec<&str> {
         l.folders.iter().map(|f| f.name.as_str()).collect()
