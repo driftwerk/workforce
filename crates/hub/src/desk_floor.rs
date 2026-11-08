@@ -515,7 +515,7 @@ fn line_went_ahead(sources: &Sources, caller: &FloorCaller) -> Vec<floor::WentAh
 
 /// `view` by the person's sidebar, for the person who holds the hub's Desk:
 /// each item stamped with the group it is in now and that group's boss, the
-/// bosses, and the sealed groups. Only this hub's own sessions and agents
+/// bosses, the sealed groups, and the open plans. Only this hub's own sessions and agents
 /// are stamped: another hub's and a machine's are Desk's to place by their
 /// keys in its layout.
 pub(crate) async fn by_group(sources: &Sources, caller: &FloorCaller, view: &mut floor::FloorView) {
@@ -524,7 +524,22 @@ pub(crate) async fn by_group(sources: &Sources, caller: &FloorCaller, view: &mut
     };
     desk.stamp_floor(view);
     view.bosses = desk.floor_bosses(view).await;
+    // Plans never hold up the Floor: none when they can't be read in time.
+    view.plans = match tokio::time::timeout(PLANS_WAIT, desk.floor_plans()).await {
+        Ok(Ok(plans)) => plans,
+        Ok(Err(e)) => {
+            tracing::warn!(target: "floor", error = %e, "reading the plans for the floor failed");
+            Vec::new()
+        }
+        Err(_) => {
+            tracing::debug!(target: "floor", "the plans took too long to read for the floor");
+            Vec::new()
+        }
+    };
 }
+
+/// How long the Floor waits for the plans.
+const PLANS_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// What still needs the person: what their turns wait on and ask, the
 /// routed approvals waiting on them, their agents' settings changed

@@ -439,7 +439,6 @@ impl Desk {
             let _ = self.0.events.send(DeskEvent::Spend { session: *session });
         }
         if !told.is_empty() {
-            self.group_spend_changed();
             let desk = self.clone();
             tokio::spawn(async move { desk.breaker_spend(Some(told)).await });
         }

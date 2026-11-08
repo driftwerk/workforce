@@ -653,6 +653,7 @@ fn floor_of(whos: &[crate::floor::Who]) -> crate::floor::FloorView {
         summary: None,
         bosses: vec![],
         sealed: vec![],
+        plans: vec![],
     }
 }
 
@@ -927,10 +928,13 @@ async fn the_floor_has_no_spend_it_cant_count_and_waits_for_none() {
             "{:?}",
             begun.elapsed()
         );
-        // Kept a moment, so the next read doesn't start another count.
+        // A read while that count runs doesn't wait for it, nor start one.
+        let counts = d.group_counts();
         let begun = std::time::Instant::now();
         assert_eq!(spend_of(&spends(&d).await, "sarah"), None);
         assert!(begun.elapsed() < super::breaker::SPEND_WAIT);
+        assert_eq!(d.group_counts(), counts);
+        tokio::time::sleep(Duration::from_secs(3)).await;
 
         // The ledger can't be read: none.
         d.group_spend_changed();
@@ -946,6 +950,67 @@ async fn the_floor_has_no_spend_it_cant_count_and_waits_for_none() {
             .await
             .unwrap();
         assert_eq!(spend_of(&spends(&d).await, "sarah"), None);
+    })
+    .await;
+}
+
+/// A day budget of `amount` for Acme, set by the person.
+async fn acme_budget_of(d: &Desk, amount: f64) {
+    use workforce_core::budget::{BudgetScope, Period, Unit};
+    d.put_budget(
+        NewBudget {
+            scope: BudgetScope::Desk,
+            group: Some("acme".into()),
+            period: Period::Day,
+            unit: Unit::Usd,
+            amount,
+            warn_at: None,
+            on_exceed: None,
+        },
+        crate::crew::By::you(),
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn reads_at_once_start_one_count_and_a_count_begun_before_the_budgets_changed_isnt_kept() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        groups(&d).await;
+        acme_budget_of(&d, 40.0).await;
+        d.spend_agents_with(std::sync::Arc::new(Spent {
+            wait: Duration::from_secs(1),
+            spent: Some(vec![]),
+        }));
+        d.group_spend_changed();
+        let before = d.group_counts();
+
+        // Eight Floor reads at once under slow telemetry: one count.
+        let reads = futures::future::join_all((0..8).map(|_| spends(&d))).await;
+        assert!(reads.iter().all(|r| spend_of(r, "sarah").is_none()));
+        assert_eq!(d.group_counts() - before, 1);
+        // Once it ends, what it counted is kept.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert_eq!(spend_of(&spends(&d).await, "sarah"), Some((0.0, 40.0)));
+        assert_eq!(d.group_counts() - before, 1);
+
+        // A count runs; the budget changes meanwhile; what it counted is
+        // not kept, and the next read counts the new budget.
+        d.group_spend_changed();
+        let _ = spends(&d).await;
+        assert_eq!(d.group_counts() - before, 2);
+        acme_budget_of(&d, 50.0).await;
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert!(
+            d.0.group_spend.lock().kept().is_none(),
+            "a count begun before the change isn't kept"
+        );
+        let _ = spends(&d).await;
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert_eq!(spend_of(&spends(&d).await, "sarah"), Some((0.0, 50.0)));
+        assert_eq!(d.group_counts() - before, 3);
     })
     .await;
 }

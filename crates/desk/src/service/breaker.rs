@@ -209,6 +209,25 @@ fn sessions_used(
     total
 }
 
+/// The groups' budgets as last counted for the Floor.
+#[derive(Debug, Default)]
+pub(super) struct GroupSpend {
+    /// What was counted, and when.
+    kept: Option<(std::time::Instant, HashMap<String, Standing>)>,
+    /// Whether a count runs now.
+    counting: bool,
+    /// Bumped each time the budgets change: a count begun before is not kept.
+    generation: u64,
+}
+
+impl GroupSpend {
+    /// What was counted, when anything was.
+    #[cfg(test)]
+    pub(super) fn kept(&self) -> Option<&HashMap<String, Standing>> {
+        self.kept.as_ref().map(|(_, k)| k)
+    }
+}
+
 /// How long the Floor waits for the groups' budgets to be counted.
 pub(super) const SPEND_WAIT: Duration = Duration::from_millis(500);
 /// How long what was counted for the Floor is kept.
@@ -1275,29 +1294,76 @@ impl Desk {
 
     /// Each group's own budget, the furthest along, by group id, as the
     /// Floor heads a boss's section: none counted when no group has one,
-    /// and none when they can't be counted within [`SPEND_WAIT`] (Desk
-    /// doesn't know the timezone yet, the ledger can't be read, or reading
-    /// it is slow), so the Floor is never held up by it. What was counted is
-    /// kept for [`SPEND_KEPT`], or until the ledger or the budgets change.
+    /// and none when they can't be counted (Desk doesn't know the timezone
+    /// yet, or the ledger can't be read). What was counted is kept for
+    /// [`SPEND_KEPT`], or until the budgets change. One count runs at a
+    /// time: the read that starts it waits for it up to [`SPEND_WAIT`], and
+    /// a read while it runs takes what was counted last, so the Floor is
+    /// never held up by it. A count begun before the budgets changed is
+    /// not kept.
     pub async fn group_standings(&self) -> HashMap<String, Standing> {
-        if let Some((at, kept)) = self.0.group_spend.lock().as_ref() {
-            if at.elapsed() < SPEND_KEPT {
-                return kept.clone();
+        let (generation, last) = {
+            let mut g = self.0.group_spend.lock();
+            if let Some((at, kept)) = &g.kept {
+                if at.elapsed() < SPEND_KEPT {
+                    return kept.clone();
+                }
             }
+            let last = g.kept.as_ref().map(|(_, k)| k.clone()).unwrap_or_default();
+            if g.counting {
+                return last;
+            }
+            g.counting = true;
+            (g.generation, last)
+        };
+        let done = std::sync::Arc::clone(&self.0.group_counted);
+        let waiting = done.notified();
+        let desk = self.clone();
+        tokio::spawn(async move {
+            /// The count is over however it ends.
+            struct Over(Desk);
+            impl Drop for Over {
+                fn drop(&mut self) {
+                    self.0 .0.group_spend.lock().counting = false;
+                    self.0 .0.group_counted.notify_waiters();
+                }
+            }
+            let over = Over(desk);
+            over.0
+                 .0
+                .group_counts
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let counted = over.0.count_group_standings().await;
+            let mut g = over.0 .0.group_spend.lock();
+            if g.generation == generation {
+                g.kept = Some((std::time::Instant::now(), counted));
+            }
+        });
+        if tokio::time::timeout(SPEND_WAIT, waiting).await.is_err() {
+            tracing::debug!("the groups' budgets are taking long to count");
+            return last;
         }
-        let counted = tokio::time::timeout(SPEND_WAIT, self.count_group_standings())
-            .await
-            .unwrap_or_else(|_| {
-                tracing::debug!("the groups' budgets took too long to count");
-                HashMap::new()
-            });
-        *self.0.group_spend.lock() = Some((std::time::Instant::now(), counted.clone()));
-        counted
+        let g = self.0.group_spend.lock();
+        match &g.kept {
+            Some((_, kept)) if g.generation == generation => kept.clone(),
+            _ => last,
+        }
     }
 
-    /// What the Floor counts for the groups' bosses is to be counted again.
+    /// What the Floor counts for the groups' bosses is to be counted again:
+    /// the budgets changed. A count running now is not kept.
     pub(super) fn group_spend_changed(&self) {
-        *self.0.group_spend.lock() = None;
+        let mut g = self.0.group_spend.lock();
+        g.kept = None;
+        g.generation += 1;
+    }
+
+    /// How many counts of the groups' budgets have begun.
+    #[cfg(test)]
+    pub(super) fn group_counts(&self) -> usize {
+        self.0
+            .group_counts
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     async fn count_group_standings(&self) -> HashMap<String, Standing> {

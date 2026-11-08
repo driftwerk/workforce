@@ -1410,3 +1410,91 @@ async fn only_a_bosss_own_starts_under_way_hold_its_slots() {
     })
     .await;
 }
+
+#[tokio::test]
+async fn a_plan_is_on_the_floor_in_its_own_group_whoever_its_boss_is_now() {
+    use crate::scope::Scope;
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        d.change_layout(|l| {
+            l.create("acme", "Acme", &[], None)?
+                .create("atlas", "Atlas", &[], None)
+        })
+        .await
+        .unwrap();
+        let boss = |agent: &str, name: &str, group: Option<&str>| crate::service::Boss {
+            agent: agent.into(),
+            name: name.into(),
+            scope: Scope::of(group),
+            level: "act".into(),
+        };
+        d.set_bosses(vec![
+            boss("desk", "Desk", None),
+            boss("sarah", "Sarah", Some("acme")),
+        ]);
+        let p = d
+            .propose_plan(
+                NewPlan {
+                    group: Some("acme".into()),
+                    ..new_plan(
+                        dir.path(),
+                        &[("Add the cart API", &[]), ("Wire the form", &[0])],
+                    )
+                },
+                &sarah(),
+                &by_sarah(),
+            )
+            .await
+            .unwrap();
+
+        // The Floor lists it in Acme, with where its tickets stand.
+        let plans = d.floor_plans().await.unwrap();
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].id, p.summary.plan.id);
+        assert_eq!(
+            (plans[0].group.as_deref(), plans[0].boss.as_str()),
+            (Some("acme"), "sarah")
+        );
+        assert_eq!(plans[0].state, PlanState::Proposed);
+        assert_eq!(plans[0].progress.waiting, 2);
+
+        let need_of = |d: &Desk| {
+            let mut v = crate::floor::view(
+                &[],
+                d.plan_needs(),
+                &Default::default(),
+                chrono::Utc::now(),
+                chrono::Utc::now(),
+            );
+            d.stamp_floor(&mut v);
+            let n = v.needs.into_iter().next().unwrap();
+            (n.group, n.boss)
+        };
+        assert_eq!(need_of(&d), (Some("acme".into()), Some("sarah".into())));
+
+        // Sarah moves to oversee Atlas and Mia takes Acme: the plan stays
+        // Acme's, now Mia's to lead.
+        d.set_bosses(vec![
+            boss("desk", "Desk", None),
+            boss("sarah", "Sarah", Some("atlas")),
+            boss("mia", "Mia", Some("acme")),
+        ]);
+        assert_eq!(need_of(&d), (Some("acme".into()), Some("mia".into())));
+
+        // Acme is sealed: still Acme's, and no one's to lead.
+        d.set_bosses(vec![
+            boss("desk", "Desk", None),
+            boss("sarah", "Sarah", Some("atlas")),
+        ]);
+        d.bound_groups(["acme".to_string()]).await;
+        assert_eq!(need_of(&d), (Some("acme".into()), None));
+
+        // A finished plan is off the Floor.
+        d.drop_plan(p.summary.plan.id, OnDrop::Leave, &By::you())
+            .await
+            .unwrap();
+        assert!(d.floor_plans().await.unwrap().is_empty());
+    })
+    .await;
+}

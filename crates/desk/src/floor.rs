@@ -668,6 +668,28 @@ pub struct FloorView {
     /// boss, and are not the main boss's.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sealed: Vec<String>,
+    /// The bosses' plans still open, each in its group, with where its
+    /// tickets stand: for the person who holds the hub's Desk.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub plans: Vec<PlanProgress>,
+}
+
+/// A plan as the Floor shows it in its group's section.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanProgress {
+    pub id: Uuid,
+    pub goal: String,
+    /// Its group, as it was made; none is ungrouped.
+    pub group: Option<String>,
+    /// Its boss's agent id, and what the boss is called.
+    pub boss: String,
+    pub boss_name: String,
+    pub state: crate::plan::PlanState,
+    /// Why it is paused, in the person's words, while it is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paused_why: Option<String>,
+    pub progress: crate::plan::Progress,
 }
 
 /// Whether a boss is in a turn now.
@@ -1022,6 +1044,7 @@ pub fn view(
         summary: None,
         bosses: Vec::new(),
         sealed: Vec::new(),
+        plans: Vec::new(),
     }
 }
 
@@ -1039,7 +1062,18 @@ pub fn stamp(
         (group, boss)
     };
     for n in &mut view.needs {
-        (n.group, n.boss) = place(&n.who);
+        (n.group, n.boss) = match &n.answer {
+            // A plan is its own group's, as it was made, wherever its boss
+            // is now: the group it carries, with that group's boss now.
+            Answer::Decide {
+                at: DecideRef::Plan { .. },
+            } => {
+                let group = n.group.take();
+                let boss = group.as_deref().and_then(&boss_of);
+                (group, boss)
+            }
+            _ => place(&n.who),
+        };
     }
     for w in view.working.iter_mut().chain(view.done.iter_mut()) {
         (w.group, w.boss) = place(&w.who);
@@ -1787,7 +1821,7 @@ mod tests {
     fn a_floor_by_group_is_the_old_shape_with_more_and_an_older_desk_reads_it() {
         let plain = floor_of_two();
         let before = serde_json::to_value(&plain).unwrap();
-        for key in ["bosses", "sealed"] {
+        for key in ["bosses", "sealed", "plans"] {
             assert!(before.get(key).is_none(), "no groups: today's shape");
         }
         assert!(before["needs"][0].get("group").is_none());
