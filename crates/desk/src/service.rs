@@ -2941,13 +2941,16 @@ impl Desk {
     }
 
     /// After Stop's SIGHUP (the PTY's, which a program may handle and
-    /// outlive), SIGTERM and then SIGKILL, each [`STOP_GRACE`] after the
-    /// last, while the hub still holds that same process for the session:
-    /// once it has ended (its exit seen), nothing more is sent, so a number
-    /// used again is never signalled. Sent by the hub itself, so a holder
-    /// started by an older Desk, which only hangs up, ends it too.
+    /// outlive), SIGTERM and then SIGKILL to its process group, each
+    /// [`STOP_GRACE`] after the last, while the hub still holds that same PTY
+    /// for the session and its process is still there. The process is held
+    /// from now ([`crate::leader`]: a pidfd on Linux), so a number used again
+    /// is never signalled. Sent by the hub itself, so a holder started by an
+    /// older Desk, which only hangs up, ends it too.
     fn stop_firmly(&self, id: Uuid, pty: &Arc<Pty>) {
-        let Some(pid) = pty.pid() else { return };
+        let Some(leader) = pty.pid().and_then(crate::leader::Leader::of) else {
+            return;
+        };
         let Ok(rt) = tokio::runtime::Handle::try_current() else {
             return;
         };
@@ -2962,13 +2965,10 @@ impl Desk {
                         _ => false,
                     }
                 };
-                if !still {
+                if !still || !leader.signal_group(signal) {
                     return;
                 }
-                tracing::warn!(%id, pid, signal = name, "a stopped session is still running");
-                // SAFETY: kill has no preconditions; the number is still
-                // this session's process (its exit isn't in).
-                unsafe { libc::kill(pid as libc::pid_t, signal) };
+                tracing::warn!(%id, signal = name, "a stopped session was still running");
             }
         });
     }
@@ -7763,7 +7763,10 @@ mod tests {
             let stubborn = dir.path().join("stubborn-cli");
             std::fs::write(
                 &stubborn,
-                "#!/bin/sh\ntrap '' HUP TERM\nwhile :; do sleep 1; done\n",
+                format!(
+                    "#!/bin/sh\ntrap '' HUP TERM\nsleep 300 &\necho $! > {}\nwhile :; do sleep 1; done\n",
+                    dir.path().join("below").display()
+                ),
             )
             .unwrap();
             std::fs::set_permissions(&stubborn, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -7791,6 +7794,18 @@ mod tests {
             let v = d.view(s.id).unwrap();
             assert!(!v.live, "the session still runs after Stop");
             assert_eq!(v.state, SessionState::Stopped);
+            // What it started, which ignored the hang-up too, went with it.
+            let below: i32 = std::fs::read_to_string(dir.path().join("below"))
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            let gone = (0..100).any(|_| {
+                std::thread::sleep(Duration::from_millis(20));
+                // SAFETY: kill with no signal only asks.
+                (unsafe { libc::kill(below, 0) }) != 0
+            });
+            assert!(gone, "what the session started still runs");
         })
         .await;
     }
