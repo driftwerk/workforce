@@ -765,6 +765,13 @@ pub(super) enum Since {
 const ENGINES_EVERY: Duration = Duration::from_secs(60 * 60);
 /// How long a CLI may take to say its version or who it is signed in as.
 const SIGN_IN_WAIT: Duration = Duration::from_secs(20);
+/// How long a stopped session's process has after each signal before the
+/// next, firmer one: SIGHUP, then SIGTERM, then SIGKILL. Well inside what
+/// Restart waits for it to end (10 s).
+#[cfg(not(test))]
+const STOP_GRACE: Duration = Duration::from_secs(3);
+#[cfg(test)]
+const STOP_GRACE: Duration = Duration::from_millis(150);
 
 enum Persist {
     Terminal(Box<TerminalRecord>),
@@ -2929,6 +2936,7 @@ impl Desk {
             pty
         };
         pty.kill();
+        self.stop_firmly(id, &pty);
         let view = self.view(id)?;
         if let Some(by) = by {
             self.note(by.event(
@@ -2938,6 +2946,39 @@ impl Desk {
             ));
         }
         Ok(view)
+    }
+
+    /// After Stop's SIGHUP (the PTY's, which a program may handle and
+    /// outlive), SIGTERM and then SIGKILL to its process group, each
+    /// [`STOP_GRACE`] after the last, while the hub still holds that same PTY
+    /// for the session and its process is still there. The process is held
+    /// from now ([`crate::leader`]: a pidfd on Linux), so a number used again
+    /// is never signalled. Sent by the hub itself, so a holder started by an
+    /// older Desk, which only hangs up, ends it too.
+    fn stop_firmly(&self, id: Uuid, pty: &Arc<Pty>) {
+        let Some(leader) = pty.pid().and_then(crate::leader::Leader::of) else {
+            return;
+        };
+        let Ok(rt) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let (desk, held) = (self.clone(), Arc::downgrade(pty));
+        rt.spawn(async move {
+            for (signal, name) in [(libc::SIGTERM, "SIGTERM"), (libc::SIGKILL, "SIGKILL")] {
+                tokio::time::sleep(STOP_GRACE).await;
+                let still = {
+                    let st = desk.0.state.lock();
+                    match (st.live.get(&id), held.upgrade()) {
+                        (Some(l), Some(p)) => Arc::ptr_eq(&l.pty, &p),
+                        _ => false,
+                    }
+                };
+                if !still || !leader.signal_group(signal) {
+                    return;
+                }
+                tracing::warn!(%id, signal = name, "a stopped session was still running");
+            }
+        });
     }
 
     pub async fn resume(
@@ -7765,6 +7806,62 @@ mod tests {
             assert!(back.live);
             assert_eq!(back.last_prompt.as_deref(), Some("continue"));
             assert!(d.resume(s.id, None, None).await.is_err());
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn stopping_a_session_that_outlives_a_hang_up_ends_it_all_the_same() {
+        with_test_pool(build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            // As a Claude Code that handles SIGHUP and SIGTERM and never
+            // gets to act on them.
+            let stubborn = dir.path().join("stubborn-cli");
+            std::fs::write(
+                &stubborn,
+                format!(
+                    "#!/bin/sh\ntrap '' HUP TERM\nsleep 300 &\necho $! > {}\nwhile :; do sleep 1; done\n",
+                    dir.path().join("below").display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&stubborn, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let mut opts = options(dir.path());
+            opts.programs = crate::testing::programs(stubborn.clone(), stubborn);
+            DeskStore::migrate(&pool).await.unwrap();
+            let d = Desk::start(
+                DeskStore::from_pool(pool),
+                opts,
+                Default::default(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            let s = new_session(&d, dir.path()).await;
+            // Its shell is up and has set its traps.
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            d.stop(s.id, None).unwrap();
+            for _ in 0..250 {
+                if !d.view(s.id).unwrap().live {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            let v = d.view(s.id).unwrap();
+            assert!(!v.live, "the session still runs after Stop");
+            assert_eq!(v.state, SessionState::Stopped);
+            // What it started, which ignored the hang-up too, went with it.
+            let below: i32 = std::fs::read_to_string(dir.path().join("below"))
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            let gone = (0..100).any(|_| {
+                std::thread::sleep(Duration::from_millis(20));
+                // SAFETY: kill with no signal only asks.
+                (unsafe { libc::kill(below, 0) }) != 0
+            });
+            assert!(gone, "what the session started still runs");
         })
         .await;
     }
