@@ -195,7 +195,8 @@ fn unread(end: &impl std::os::fd::AsRawFd) -> usize {
     }
 }
 
-/// Whether the pipe whose write end is `end` has no reader left (`POLLERR`).
+/// Whether the pipe whose write end is `end` has no reader left: `POLLERR`
+/// (as Linux says it to a writer), or `POLLHUP` (as other systems may).
 fn reader_gone(end: &impl std::os::fd::AsRawFd) -> bool {
     let mut p = libc::pollfd {
         fd: end.as_raw_fd(),
@@ -204,7 +205,12 @@ fn reader_gone(end: &impl std::os::fd::AsRawFd) -> bool {
     };
     // SAFETY: one valid pollfd, and no waiting.
     let ready = unsafe { libc::poll(&mut p, 1, 0) };
-    ready == 1 && p.revents & libc::POLLERR != 0
+    ready == 1 && says_no_reader(p.revents)
+}
+
+/// Whether what `poll` said of a write end means no one is left to read.
+fn says_no_reader(revents: libc::c_short) -> bool {
+    revents & (libc::POLLERR | libc::POLLHUP) != 0
 }
 
 /// What came of waiting for what was written to a pipe to be read.
@@ -397,6 +403,15 @@ mod tests {
                 std::fs::File::from_raw_fd(fds[1]),
             )
         }
+    }
+
+    #[test]
+    fn a_hang_up_or_an_error_on_the_write_end_both_mean_no_reader_is_left() {
+        assert!(says_no_reader(libc::POLLERR));
+        assert!(says_no_reader(libc::POLLHUP));
+        assert!(says_no_reader(libc::POLLHUP | libc::POLLOUT));
+        assert!(!says_no_reader(libc::POLLOUT));
+        assert!(!says_no_reader(0));
     }
 
     #[test]
