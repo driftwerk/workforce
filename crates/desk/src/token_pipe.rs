@@ -15,6 +15,13 @@
 //! named at random). Once Claude Code has read it the pipe is empty: what the
 //! session runs inherits descriptor 3 at its end, and no token.
 //!
+//! Claude Code (2.1.318) doesn't read descriptor 3 itself: it opens
+//! `/proc/self/fd/3` (or `/dev/fd/3`). On Linux that opens the FIFO afresh,
+//! which waits for a writer: one the hub had already closed left Claude
+//! Code waiting there for good, drawing nothing. So the hub keeps its end
+//! open until the pipe is read empty, and only then closes it, which ends
+//! the stream for Claude Code.
+//!
 //! A one-off run (`claude auth status`) gets it the same way through its
 //! standard input, which the shell moves to descriptor 3.
 
@@ -34,6 +41,10 @@ pub const FD_ENV: &str = "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR";
 pub const FD: &str = "3";
 /// How long the hub waits for a session's shell to open its FIFO.
 const OPEN_WITHIN: Duration = Duration::from_secs(30);
+/// How long the hub keeps the token's pipe open for Claude Code to read it.
+const READ_WITHIN: Duration = Duration::from_secs(60);
+/// How often the hub looks whether the token was read.
+const READ_EVERY: Duration = Duration::from_millis(20);
 
 /// Opens the FIFO as descriptor 3, removes it, and runs the command.
 const SESSION: &str = r#"exec 3<"$1" || exit 126; rm -f -- "$1"; shift; exec "$@""#;
@@ -132,7 +143,12 @@ impl TokenFifo {
                 Ok(mut f) => {
                     let mut line = token.expose().as_bytes().to_vec();
                     line.push(b'\n');
-                    break f.write_all(&line).context("handing a session its token");
+                    let wrote = f.write_all(&line).context("handing a session its token");
+                    if wrote.is_ok() {
+                        // Open until read: Claude Code opens the FIFO again.
+                        wait_read(&f, READ_WITHIN);
+                    }
+                    break wrote;
                 }
                 // No reader yet.
                 Err(e) if e.raw_os_error() == Some(libc::ENXIO) => {
@@ -152,6 +168,28 @@ impl TokenFifo {
 impl Drop for TokenFifo {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// How many bytes are still in the pipe `end` is an end of; none when the
+/// system won't say, and the end is closed at once as before (on macOS
+/// `/dev/fd/3` is the same open, so that never waits).
+fn unread(end: &impl std::os::fd::AsRawFd) -> usize {
+    let mut n: libc::c_int = 0;
+    // SAFETY: FIONREAD writes one int through a valid pointer.
+    if unsafe { libc::ioctl(end.as_raw_fd(), libc::FIONREAD, &mut n) } == 0 {
+        n.max(0) as usize
+    } else {
+        0
+    }
+}
+
+/// Waits, at most `within`, until what was written to the pipe `end` is an
+/// end of has all been read. Blocking.
+fn wait_read(end: &impl std::os::fd::AsRawFd, within: Duration) {
+    let started = Instant::now();
+    while unread(end) > 0 && started.elapsed() < within {
+        std::thread::sleep(READ_EVERY);
     }
 }
 
@@ -248,6 +286,86 @@ mod tests {
             ""
         );
         assert!(!folder.exists(), "the FIFO's folder is removed");
+    }
+
+    /// Whether `child` ends within `within`; it is killed when it doesn't.
+    fn ended_within(child: &mut std::process::Child, within: Duration) -> bool {
+        let started = Instant::now();
+        while started.elapsed() < within {
+            if child.try_wait().unwrap().is_some() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // The whole group: what it runs too, not left waiting behind it.
+        // SAFETY: killpg has no preconditions.
+        unsafe { libc::killpg(child.id() as libc::pid_t, libc::SIGKILL) };
+        let _ = child.wait();
+        false
+    }
+
+    #[tokio::test]
+    async fn a_session_that_opens_descriptor_3_again_reads_its_token_and_its_end() {
+        use std::os::unix::process::CommandExt;
+        // As Claude Code 2.1.318 does: `/dev/fd/3` opened afresh, after the
+        // hub has written, which on Linux waits for a writer.
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out");
+        let script = format!("sleep 0.3; cat /dev/fd/3 > {o}", o = out.display());
+        let fifo = TokenFifo::new(&dir.path().join("run")).unwrap();
+        let spec = fifo.wrap(Spawn {
+            program: PathBuf::from("/bin/sh"),
+            args: vec!["-c".into(), script],
+            cwd: dir.path().to_path_buf(),
+            env: BTreeMap::from([("PATH".to_string(), "/usr/bin:/bin".to_string())]),
+        });
+        let token = AccountToken::new("sk-ant-oat01-pipe-0123456789abcdefghij").unwrap();
+        let mut child = std::process::Command::new(&spec.program)
+            .args(&spec.args)
+            .env_clear()
+            .envs(&spec.env)
+            .current_dir(&spec.cwd)
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let t = token.clone();
+        let handed = tokio::task::spawn_blocking(move || fifo.hand(&t));
+        assert!(
+            ended_within(&mut child, Duration::from_secs(10)),
+            "the session waited for good on its token's pipe"
+        );
+        handed.await.unwrap().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&out).unwrap(),
+            format!("{}\n", token.expose())
+        );
+    }
+
+    #[test]
+    fn a_one_off_run_that_opens_descriptor_3_again_reads_its_token_and_its_end() {
+        // A pipe, not a FIFO: opened again, it never waits for a writer, so
+        // its input may close as soon as the token is written.
+        use std::io::Write;
+        use std::os::unix::process::CommandExt;
+        let (program, args) = one_off(Path::new("/bin/sh"), &["-c", "sleep 0.3; cat /dev/fd/3"]);
+        let mut child = std::process::Command::new(program)
+            .args(&args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        stdin.write_all(b"tok\n").unwrap();
+        drop(stdin);
+        let mut stdout = child.stdout.take().unwrap();
+        assert!(
+            ended_within(&mut child, Duration::from_secs(10)),
+            "the run waited for good"
+        );
+        let mut said = String::new();
+        std::io::Read::read_to_string(&mut stdout, &mut said).unwrap();
+        assert_eq!(said, "tok\n");
     }
 
     #[test]
