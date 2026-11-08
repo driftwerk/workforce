@@ -3078,6 +3078,79 @@ async fn the_breakers_steer_of_a_session_a_boss_runs_is_told_to_the_boss() {
     .await;
 }
 
+/// A message to a session isn't outward for the session's own name, nor
+/// for a word it says not to do; what goes ahead and pushes still is.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_message_is_not_outward_for_its_sessions_name_or_a_negated_word() {
+    use super::actions::{Action, Gate, Target};
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, crew, d, _llm) = overseeing(
+            dir.path(),
+            pool,
+            "ok",
+            "[oversight]\nenabled = true\nlevel = \"act\"\n",
+            &[],
+        )
+        .await;
+        let s = new_session(&d, dir.path(), "Acme Migration").await;
+        let deploy = new_session(&d, dir.path(), "Deploy").await;
+        let (_, o) = crew.overseer_service().unwrap();
+        let nudge = |to, message: &str| Action::Nudge {
+            to: Target::Session(to),
+            message: message.into(),
+            reply_to: None,
+        };
+        let status = "Acme Migration: please give me a plain-English status of where \
+            things stand. Make no production changes until the person replies.";
+        assert_eq!(crew.gate(&nudge(s.id, status), &o), Gate::Run);
+        assert_eq!(
+            crew.gate(&nudge(s.id, "Acme Migration, how is it going?"), &o),
+            Gate::Run,
+            "its name, as addressed"
+        );
+        assert!(
+            matches!(
+                crew.gate(&nudge(deploy.id, "Go ahead with Acme Migration"), &o),
+                Gate::Suggest(_)
+            ),
+            "a name with an outward word, not addressed"
+        );
+        for message in [
+            "Go ahead and deploy",
+            "Push it",
+            "Merge the PR",
+            "Delete the branch",
+            "Don't stop deploying",
+        ] {
+            assert!(
+                matches!(crew.gate(&nudge(s.id, message), &o), Gate::Suggest(_)),
+                "{message}"
+            );
+        }
+        assert!(
+            matches!(
+                crew.gate(&nudge(deploy.id, "Deploy now"), &o),
+                Gate::Suggest(_)
+            ),
+            "a name of outward words hides nothing"
+        );
+        // The question answered is read the same way.
+        let ask = uuid::Uuid::new_v4();
+        crew.questions.lock().insert(
+            ask,
+            "Acme Migration: shall I make no production changes for now?".into(),
+        );
+        let answer = Action::Nudge {
+            to: Target::Session(s.id),
+            message: "Yes".into(),
+            reply_to: Some(ask),
+        };
+        assert_eq!(crew.gate(&answer, &o), Gate::Run);
+    })
+    .await;
+}
+
 /// An answer to a session's question runs at `act` with `answer_sessions`
 /// on, unless the question or the answer reads as pushing, deleting or
 /// sending; giving a question to the person always runs.

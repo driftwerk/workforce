@@ -142,6 +142,8 @@ ignore = "0.4"
 lru = "0.18"
 base64 = "0.22.0"
 unicode-normalization = "0.1"
+unicode-properties = "0.1"
+unicode-security = "0.1"
 
 # CLI
 clap = { version = "4.5.27", features = ["derive", "env"] }
