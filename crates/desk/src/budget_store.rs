@@ -192,6 +192,72 @@ impl DeskStore {
             })
             .collect()
     }
+
+    /// What each of `plans` spent from `from` on: every ledger row stamped
+    /// with one of its tickets, and the rows of a session that worked on
+    /// one of them that no ticket was stamped on (its first calls can come
+    /// before it is handed its ticket).
+    pub async fn ledger_used_by_plan(
+        &self,
+        from: DateTime<Utc>,
+        plans: &[Uuid],
+    ) -> Result<HashMap<Uuid, Used>> {
+        if plans.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let client = self.pool().get().await?;
+        let rows = client
+            .query(
+                "WITH ours AS (SELECT id, plan FROM tickets WHERE plan = ANY($2)), \
+                   worked AS (SELECT DISTINCT ON (a.session) a.session, o.plan \
+                     FROM ticket_assignments a JOIN ours o ON o.id = a.ticket \
+                     ORDER BY a.session, a.from_at) \
+                 SELECT plan, SUM(tokens)::int8, COALESCE(SUM(usd), 0)::float8 FROM ( \
+                   SELECT o.plan, l.input + l.output + l.cache_read + l.cache_write AS tokens, \
+                     l.usd FROM ledger l JOIN ours o ON o.id = l.ticket WHERE l.at >= $1 \
+                   UNION ALL \
+                   SELECT w.plan, l.input + l.output + l.cache_read + l.cache_write, l.usd \
+                     FROM ledger l JOIN worked w ON w.session = l.session \
+                     WHERE l.ticket IS NULL AND l.at >= $1 \
+                 ) spent GROUP BY plan",
+                &[&from, &plans],
+            )
+            .await
+            .context("summing the ledger for plans' budgets")?;
+        rows.iter()
+            .map(|r| {
+                Ok((
+                    r.try_get(0)?,
+                    Used {
+                        tokens: u64::try_from(r.try_get::<_, i64>(1)?).unwrap_or(0),
+                        usd: r.try_get(2)?,
+                    },
+                ))
+            })
+            .collect()
+    }
+
+    /// The plan each session works for, of `plans`: the one whose ticket it
+    /// has now, else the one it had last.
+    pub async fn plan_sessions(&self, plans: &[Uuid]) -> Result<HashMap<Uuid, Uuid>> {
+        if plans.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let client = self.pool().get().await?;
+        let rows = client
+            .query(
+                "SELECT DISTINCT ON (a.session) a.session, t.plan \
+                 FROM ticket_assignments a JOIN tickets t ON t.id = a.ticket \
+                 WHERE t.plan = ANY($1) \
+                 ORDER BY a.session, (a.until_at IS NULL) DESC, a.from_at DESC",
+                &[&plans],
+            )
+            .await
+            .context("reading the plans' sessions")?;
+        rows.iter()
+            .map(|r| Ok((r.try_get(0)?, r.try_get(1)?)))
+            .collect()
+    }
 }
 
 #[cfg(test)]

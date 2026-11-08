@@ -15,7 +15,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use workforce_core::budget::{
-    self, Budget, BudgetScope, OnExceed, Period, Pool, Standing, Subject, Unit, WARN_AT,
+    self, Budget, BudgetScope, OnExceed, Period, Pool, Standing, Status, Subject, Unit, WARN_AT,
 };
 
 use super::{session_item, Desk, DeskError, Live};
@@ -49,6 +49,16 @@ pub(super) struct BreakerRun {
     rules: Rules,
     /// What the hub calls its agents, as last told.
     names: HashMap<String, String>,
+    /// The plans with a budget, as last read, for their breakers' words.
+    plans: HashMap<Uuid, PlanFacts>,
+}
+
+/// What a plan's breaker says of it.
+#[derive(Debug, Clone, Default)]
+pub(super) struct PlanFacts {
+    pub(super) goal: String,
+    pub(super) group: Option<String>,
+    pub(super) boss: String,
 }
 
 /// What a running session's breaker has for it in this run.
@@ -78,6 +88,11 @@ pub fn agent_subject(id: &str) -> String {
     format!("agent:{id}")
 }
 
+/// A plan's breaker: what holds its new starts.
+pub fn plan_subject(id: Uuid) -> String {
+    format!("plan:{id}")
+}
+
 pub fn pool_subject(pool: &Pool) -> String {
     match pool {
         Pool::Desk => "pool:desk".into(),
@@ -91,6 +106,8 @@ pub enum BreakerOf {
     Session(Uuid),
     Agent(String),
     Pool(Pool),
+    /// A plan's new starts, by its budget.
+    Plan(Uuid),
 }
 
 impl BreakerOf {
@@ -98,6 +115,7 @@ impl BreakerOf {
         match subject.split_once(':')? {
             ("session", id) => Uuid::parse_str(id).ok().map(Self::Session),
             ("agent", id) if !id.is_empty() => Some(Self::Agent(id.to_string())),
+            ("plan", id) => Uuid::parse_str(id).ok().map(Self::Plan),
             ("pool", "desk") => Some(Self::Pool(Pool::Desk)),
             ("pool", rest) => rest
                 .strip_prefix("group:")
@@ -112,6 +130,7 @@ impl BreakerOf {
             Self::Session(_) => Whose::Session,
             Self::Agent(_) => Whose::Agent,
             Self::Pool(_) => Whose::Pool,
+            Self::Plan(_) => Whose::Plan,
         }
     }
 }
@@ -281,12 +300,21 @@ impl Desk {
             Ok(Some(e)) => serde_json::from_value(e.value).unwrap_or_default(),
             _ => Rules::default(),
         };
+        let plans: Vec<Uuid> = states
+            .keys()
+            .filter_map(|k| match BreakerOf::parse(k) {
+                Some(BreakerOf::Plan(p)) => Some(p),
+                _ => None,
+            })
+            .collect();
         {
             let mut run = self.0.breakers.lock();
             run.budgets = budgets;
             run.states = states;
             run.rules = rules;
         }
+        // What a plan's hold says of it, from the start.
+        self.read_plan_facts(&plans).await;
     }
 
     /// Looks at every breaker again each minute, until the desk stops.
@@ -298,6 +326,11 @@ impl Desk {
                 _ = look.tick() => self.breaker_spend(None).await,
             }
         }
+    }
+
+    /// Counts every budget against what was spent now, as each minute does.
+    pub async fn count_spend_now(&self) {
+        self.breaker_spend(None).await;
     }
 
     /// Counts budgets in `tz`, the person's (the hub's `user_timezone`, as
@@ -330,6 +363,13 @@ impl Desk {
                 crate::crew::shown_name(id, names.names.get(id).map(String::as_str), boss)
             }
             BreakerOf::Pool(Pool::Desk) => "Desk".into(),
+            BreakerOf::Plan(id) => {
+                let run = self.0.breakers.lock();
+                match run.plans.get(id) {
+                    Some(f) => format!("The plan “{}”", crate::crew::one_line(&f.goal, 80)),
+                    None => "A plan".into(),
+                }
+            }
             BreakerOf::Pool(Pool::Group(g)) => {
                 let st = self.0.state.lock();
                 st.layout
@@ -341,10 +381,32 @@ impl Desk {
         }
     }
 
+    /// Who starts the new sessions a pool or a plan holds: its boss, by
+    /// name. None for Desk's own total, which every agent counts toward.
+    fn starter(&self, held: &BreakerOf) -> Option<String> {
+        match held {
+            BreakerOf::Pool(Pool::Group(g)) => self
+                .boss_of(&crate::scope::Scope::Group(g.clone()))
+                .map(|b| b.name),
+            BreakerOf::Plan(id) => {
+                let boss = self
+                    .0
+                    .breakers
+                    .lock()
+                    .plans
+                    .get(id)
+                    .map(|f| f.boss.clone())?;
+                Some(self.plan_boss_named(&boss))
+            }
+            BreakerOf::Pool(Pool::Desk) | BreakerOf::Session(_) | BreakerOf::Agent(_) => None,
+        }
+    }
+
     fn breaker_view(&self, subject: &str, state: &pure::State) -> Option<BreakerView> {
         let held = BreakerOf::parse(subject)?;
         let name = self.subject_name(&held);
-        let said = pure::need_text(&name, held.whose(), &state.level);
+        let starter = self.starter(&held);
+        let said = pure::need_text_for(&name, held.whose(), &state.level, starter.as_deref());
         Some(BreakerView {
             subject: subject.to_string(),
             name,
@@ -403,6 +465,30 @@ impl Desk {
         Some(self.breaker_view(&subject, &state)?.ask.unwrap_or_default())
     }
 
+    /// What holds the agent `id`, in a few words to follow its name: "over
+    /// budget for the day", "held for repeating a tool call". None while
+    /// nothing holds it.
+    pub fn agent_held_why(&self, id: &str) -> Option<String> {
+        let state = self.held(&agent_subject(id))?;
+        let Level::Held { detail, .. } = &state.level else {
+            return None;
+        };
+        Some(match detail {
+            pure::Detail::Budget { standing } => {
+                let how = match standing.status {
+                    Status::Over => "over budget",
+                    Status::Warn | Status::Under => "near its budget",
+                };
+                match standing.period {
+                    Period::Total => how.to_string(),
+                    p => format!("{how} for the {}", p.words()),
+                }
+            }
+            pure::Detail::Repeats { .. } => "held for repeating a tool call".into(),
+            pure::Detail::Failures { .. } => "held for failing tool calls".into(),
+        })
+    }
+
     /// The Floor's needs for what the breaker holds and the person hasn't
     /// said Keep paused to.
     pub fn breaker_needs(&self) -> Vec<Need> {
@@ -441,7 +527,7 @@ impl Desk {
                         },
                         Place::Dm,
                     ),
-                    BreakerOf::Pool(_) => (
+                    BreakerOf::Pool(_) | BreakerOf::Plan(_) => (
                         Who {
                             kind: PartyKind::Desk,
                             id: subject.clone(),
@@ -450,6 +536,17 @@ impl Desk {
                         },
                         Place::Elsewhere,
                     ),
+                };
+                // A plan's is its own group's, as it was made.
+                let group = match &what {
+                    BreakerOf::Plan(id) => self
+                        .0
+                        .breakers
+                        .lock()
+                        .plans
+                        .get(id)
+                        .and_then(|f| f.group.clone()),
+                    _ => None,
                 };
                 Some(Need {
                     id: format!("breaker:{subject}"),
@@ -464,7 +561,7 @@ impl Desk {
                     answer: Answer::Decide {
                         at: DecideRef::Breaker { subject },
                     },
-                    group: None,
+                    group,
                     boss: None,
                 })
             })
@@ -482,7 +579,9 @@ impl Desk {
             let mut run = self.0.breakers.lock();
             let before = run.states.get(subject).cloned().unwrap_or_default();
             let (after, steps) = match held {
-                BreakerOf::Pool(_) => pure::pool_step(before.clone(), signal, now),
+                BreakerOf::Pool(_) | BreakerOf::Plan(_) => {
+                    pure::pool_step(before.clone(), signal, now)
+                }
                 BreakerOf::Session(_) | BreakerOf::Agent(_) => {
                     pure::step(before.clone(), signal, now)
                 }
@@ -538,6 +637,13 @@ impl Desk {
                 engine: None,
                 origin: None,
             },
+            BreakerOf::Plan(id) => Party {
+                kind: PartyKind::Desk,
+                id: plan_subject(*id),
+                name: name.to_string(),
+                engine: None,
+                origin: None,
+            },
         }
     }
 
@@ -571,7 +677,9 @@ impl Desk {
                 }
                 let ask = self.breaker_view(subject, state).and_then(|v| v.ask);
                 let text = match held {
-                    BreakerOf::Pool(_) => format!("held new sessions for {name}"),
+                    BreakerOf::Pool(_) | BreakerOf::Plan(_) => {
+                        format!("held new sessions for {name}")
+                    }
                     BreakerOf::Session(_) => format!("paused {name} from its next turn"),
                     BreakerOf::Agent(_) => format!("paused {name}'s new turns"),
                 };
@@ -802,11 +910,49 @@ impl Desk {
         let Some(tz) = self.budget_tz() else {
             return;
         };
-        let used = match self.used_by_period(&budgets, now, tz).await {
+        // A plan's budget counts over its own sessions' spend, read apart.
+        let (planned, others): (Vec<Budget>, Vec<Budget>) = budgets
+            .iter()
+            .cloned()
+            .partition(|b| matches!(b.scope, BudgetScope::Plan(_)));
+        let used = match self.used_by_period(&others, now, tz).await {
             Some(u) => u,
             None => return,
         };
-        let agents = self.agents_by_period(&budgets, now, tz).await;
+        let agents = self.agents_by_period(&others, now, tz).await;
+        let mut plans: Vec<Uuid> = planned
+            .iter()
+            .filter_map(|b| match b.scope {
+                BudgetScope::Plan(p) => Some(p),
+                _ => None,
+            })
+            .collect();
+        plans.sort();
+        plans.dedup();
+        let Some(plan_used) = self.plan_used_by_period(&planned, &plans, now, tz).await else {
+            return;
+        };
+        let plan_of: HashMap<Uuid, Uuid> = match self.0.store.plan_sessions(&plans).await {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!(
+                    error = format!("{e:#}"),
+                    "couldn't read the plans' sessions"
+                );
+                return;
+            }
+        };
+        // Every plan with a budget, and every plan still holding.
+        let mut plan_subjects = plans.clone();
+        plan_subjects.extend(self.0.breakers.lock().states.keys().filter_map(|k| {
+            match BreakerOf::parse(k) {
+                Some(BreakerOf::Plan(p)) => Some(p),
+                _ => None,
+            }
+        }));
+        plan_subjects.sort();
+        plan_subjects.dedup();
+        self.read_plan_facts(&plan_subjects).await;
         let groups: HashMap<Uuid, Option<String>> = {
             let st = self.0.state.lock();
             st.records
@@ -841,28 +987,41 @@ impl Desk {
                 .collect()
         };
         let ids: Vec<Uuid> = match sessions {
+            // What one of a plan's sessions spent counts toward its others'.
             Some(ids) => ids
                 .into_iter()
                 .chain(held_sessions)
+                .chain(plan_of.keys().copied().filter(|s| groups.contains_key(s)))
                 .collect::<HashSet<_>>()
                 .into_iter()
                 .collect(),
             None => groups.keys().copied().collect(),
+        };
+        let plan_spent = |plan: Uuid, period: Period| {
+            plan_used
+                .get(&period)
+                .and_then(|m| m.get(&plan))
+                .copied()
+                .unwrap_or_default()
         };
         for id in ids {
             let group = groups.get(&id).cloned().flatten();
             let subject = Subject::Session {
                 id,
                 group: group.as_deref(),
+                plan: plan_of.get(&id).copied(),
             };
             let standings: Vec<Standing> = budget::applying(&budgets, &subject)
                 .into_iter()
                 .map(|b| {
-                    let spent = used
-                        .get(&b.period)
-                        .and_then(|m| m.get(&id))
-                        .copied()
-                        .unwrap_or_default();
+                    let spent = match b.scope {
+                        BudgetScope::Plan(p) => plan_spent(p, b.period),
+                        _ => used
+                            .get(&b.period)
+                            .and_then(|m| m.get(&id))
+                            .copied()
+                            .unwrap_or_default(),
+                    };
                     standing(b, spent.of(b.unit))
                 })
                 .collect();
@@ -901,6 +1060,93 @@ impl Desk {
                 .collect();
             self.breaker_signal(&pool_subject(&pool), Signal::Spend(standings), None);
         }
+        // Each plan's new starts, by its own budget.
+        for plan in plan_subjects {
+            let standings: Vec<Standing> = planned
+                .iter()
+                .filter(|b| b.scope == BudgetScope::Plan(plan))
+                .map(|b| standing(b, plan_spent(plan, b.period).of(b.unit)))
+                .collect();
+            self.breaker_signal(&plan_subject(plan), Signal::Spend(standings), None);
+        }
+    }
+
+    /// What each of `plans` spent from the start of every period their
+    /// budgets (`planned`) use: none to read with no plan budget.
+    async fn plan_used_by_period(
+        &self,
+        planned: &[Budget],
+        plans: &[Uuid],
+        now: DateTime<Utc>,
+        tz: chrono_tz::Tz,
+    ) -> Option<HashMap<Period, HashMap<Uuid, Used>>> {
+        let mut periods: Vec<Period> = planned.iter().map(|b| b.period).collect();
+        periods.sort();
+        periods.dedup();
+        let mut out = HashMap::new();
+        for p in periods {
+            match self
+                .0
+                .store
+                .ledger_used_by_plan(budget::window_start(p, now, tz), plans)
+                .await
+            {
+                Ok(u) => {
+                    out.insert(p, u);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = format!("{e:#}"),
+                        "couldn't sum the ledger for plans' budgets"
+                    );
+                    return None;
+                }
+            }
+        }
+        Some(out)
+    }
+
+    /// Reads what the breakers of `plans` say of them: their goals, groups
+    /// and bosses.
+    async fn read_plan_facts(&self, plans: &[Uuid]) {
+        let mut read = HashMap::new();
+        for id in plans {
+            if let Ok(Some(p)) = self.0.store.plan(*id).await {
+                read.insert(
+                    *id,
+                    PlanFacts {
+                        goal: p.goal,
+                        group: p.group,
+                        boss: p.boss,
+                    },
+                );
+            }
+        }
+        let mut run = self.0.breakers.lock();
+        for (id, f) in read {
+            run.plans.insert(id, f);
+        }
+    }
+
+    /// What `plan`'s budget, `b`, stands at now: none before Desk knows the
+    /// timezone or when the ledger can't be read.
+    pub(super) async fn plan_standing(&self, plan: Uuid, b: &Budget) -> Option<Standing> {
+        let tz = self.budget_tz()?;
+        let now = Utc::now();
+        let used = self
+            .plan_used_by_period(std::slice::from_ref(b), &[plan], now, tz)
+            .await?;
+        let spent = used
+            .get(&b.period)
+            .and_then(|m| m.get(&plan))
+            .copied()
+            .unwrap_or_default();
+        Some(budget::standing_of(
+            b,
+            spent.of(b.unit),
+            budget::window_start(b.period, now, tz),
+            budget::window_end(b.period, now, tz),
+        ))
     }
 
     /// What the local agents spent toward `pool` in `period`.
@@ -1091,6 +1337,40 @@ impl Desk {
         })
     }
 
+    /// What holds plan `plan`'s new starts, in `group`: a pool it counts
+    /// toward (Desk's, its group's) or its own budget. Where that budget
+    /// stood when it held, and what the Floor asks; none once the person
+    /// said Continue.
+    pub fn plan_starts_held(&self, group: Option<&str>, plan: Uuid) -> Option<(Status, String)> {
+        budget::pools_of(group)
+            .iter()
+            .map(pool_subject)
+            .chain([plan_subject(plan)])
+            .find_map(|subject| {
+                let state = self.held(&subject)?;
+                let status = match &state.level {
+                    Level::Held {
+                        detail: pure::Detail::Budget { standing },
+                        ..
+                    } => standing.status,
+                    _ => Status::Over,
+                };
+                let ask = self
+                    .breaker_view(&subject, &state)
+                    .and_then(|v| v.ask)
+                    .unwrap_or_default();
+                Some((status, ask))
+            })
+    }
+
+    /// What holds the session `id` now, in the Floor's words, while its
+    /// breaker does.
+    pub fn session_held(&self, id: Uuid) -> Option<String> {
+        let subject = session_subject(id);
+        let state = self.held(&subject)?;
+        Some(self.breaker_view(&subject, &state)?.ask.unwrap_or_default())
+    }
+
     /// Why a start by `by` is refused while a pool it counts toward holds
     /// new starts. The person's own starts are never refused.
     pub(super) fn breaker_refuses_start(&self, by: Option<&By>) -> Result<(), DeskError> {
@@ -1200,8 +1480,13 @@ impl Desk {
     }
 
     /// Every budget with where it stands, the breakers, and the rules.
+    /// A plan's budget is on its plan ([`Desk::plan`]), not here.
     pub async fn budgets_view(&self) -> Result<BudgetsView, DeskError> {
-        let budgets = self.budget_list();
+        let budgets: Vec<Budget> = self
+            .budget_list()
+            .into_iter()
+            .filter(|b| !matches!(b.scope, BudgetScope::Plan(_)))
+            .collect();
         let now = Utc::now();
         let tz = self
             .budget_tz()
@@ -1259,6 +1544,7 @@ impl Desk {
                             let subject = Subject::Session {
                                 id: *id,
                                 group: g.as_deref(),
+                                plan: None,
                             };
                             budget::applying(&budgets, &subject)
                                 .iter()
@@ -1270,6 +1556,8 @@ impl Desk {
                         let u = agent_spent(id);
                         Some(budget::standing_of(b, u.of(b.unit), from, to))
                     }
+                    // Not among these: on its plan.
+                    BudgetScope::Plan(_) => None,
                     BudgetScope::EachAgent => budget::tightest(
                         agents
                             .get(&b.period)
@@ -1443,6 +1731,11 @@ impl Desk {
         };
         self.0.breakers.lock().budgets = budgets.clone();
         self.group_spend_changed();
+        // A plan's is on its plan, not among the person's own.
+        let budgets = budgets
+            .into_iter()
+            .filter(|b| !matches!(b.scope, BudgetScope::Plan(_)))
+            .collect();
         self.announce(DeskEvent::Budgets { budgets });
         self.note(by.event(Kind::Budgeted, None, text));
         self.breaker_spend(None).await;
@@ -1451,6 +1744,9 @@ impl Desk {
     /// Sets a budget, replacing the one for the same group, scope, period
     /// and unit.
     pub async fn put_budget(&self, new: NewBudget, by: By) -> Result<Budget, DeskError> {
+        if matches!(new.scope, BudgetScope::Plan(_)) {
+            return Err(plan_budget_elsewhere());
+        }
         let b = Budget {
             id: Uuid::new_v4(),
             scope: new.scope,
@@ -1485,6 +1781,9 @@ impl Desk {
             .into_iter()
             .find(|b| b.id == id)
             .ok_or(DeskError::NotFound)?;
+        if matches!(b.scope, BudgetScope::Plan(_)) {
+            return Err(plan_budget_elsewhere());
+        }
         b.amount = patch.amount.unwrap_or(b.amount);
         b.warn_at = patch.warn_at.unwrap_or(b.warn_at);
         b.on_exceed = patch.on_exceed.unwrap_or(b.on_exceed);
@@ -1513,6 +1812,9 @@ impl Desk {
             .into_iter()
             .find(|b| b.id == id)
             .ok_or(DeskError::NotFound)?;
+        if matches!(b.scope, BudgetScope::Plan(_)) {
+            return Err(plan_budget_elsewhere());
+        }
         if !self.0.store.delete_budget(id).await? {
             return Err(DeskError::NotFound);
         }
@@ -1537,8 +1839,133 @@ impl Desk {
             (BudgetScope::EachAgent, Some(g)) => format!("each agent in {g}"),
             (BudgetScope::Session(id), _) => self.subject_name(&BreakerOf::Session(*id)),
             (BudgetScope::Agent(id), _) => id.clone(),
+            (BudgetScope::Plan(id), _) => {
+                let name = self.subject_name(&BreakerOf::Plan(*id));
+                let mut c = name.chars();
+                c.next()
+                    .map(|f| f.to_lowercase().chain(c).collect())
+                    .unwrap_or(name)
+            }
         }
     }
+
+    /// Keeps plan `p`'s budget as `want` says, as the revision the person
+    /// approved has it: set, changed or taken off. A change lets go of what
+    /// its breaker held, which is then counted again against the budget as
+    /// it is now.
+    pub(super) async fn keep_plan_budget(
+        &self,
+        p: &crate::plan::Plan,
+        want: Option<&crate::plan::PlanBudget>,
+        by: &By,
+    ) -> Result<(), DeskError> {
+        let scope = BudgetScope::Plan(p.id);
+        self.0.breakers.lock().plans.insert(
+            p.id,
+            PlanFacts {
+                goal: p.goal.clone(),
+                group: p.group.clone(),
+                boss: p.boss.clone(),
+            },
+        );
+        let had: Vec<Budget> = self
+            .budget_list()
+            .into_iter()
+            .filter(|b| b.scope == scope)
+            .collect();
+        let same = |b: &Budget, w: &crate::plan::PlanBudget| {
+            b.period == w.period
+                && b.unit == w.unit
+                && b.amount == w.amount
+                && b.warn_at == w.warn_at
+                && b.on_exceed == w.on_exceed
+                && b.group == p.group
+        };
+        match want {
+            Some(w) if had.len() == 1 && same(&had[0], w) => return Ok(()),
+            None if had.is_empty() => return Ok(()),
+            _ => {}
+        }
+        for b in &had {
+            self.0.store.delete_budget(b.id).await?;
+        }
+        let text = match want {
+            Some(w) => {
+                let b = Budget {
+                    id: Uuid::new_v4(),
+                    scope,
+                    group: p.group.clone(),
+                    period: w.period,
+                    unit: w.unit,
+                    amount: w.amount,
+                    warn_at: w.warn_at,
+                    on_exceed: w.on_exceed,
+                    updated_at: Utc::now(),
+                };
+                budget::check(&b).map_err(DeskError::Invalid)?;
+                let kept = self.0.store.put_budget(&b).await?;
+                format!(
+                    "set {} for {}",
+                    budget_words(&kept),
+                    self.scope_words(&kept)
+                )
+            }
+            None => format!(
+                "took the budget off {}",
+                self.scope_words(&Budget {
+                    id: Uuid::nil(),
+                    scope,
+                    group: None,
+                    period: Period::Total,
+                    unit: Unit::Usd,
+                    amount: 1.0,
+                    warn_at: WARN_AT,
+                    on_exceed: OnExceed::Pause,
+                    updated_at: Utc::now(),
+                })
+            ),
+        };
+        self.breaker_forget(&plan_subject(p.id));
+        self.budgets_changed(by, text).await;
+        Ok(())
+    }
+
+    /// Forgets `subject`'s breaker: what it held, warned and was let go.
+    pub(super) fn breaker_forget(&self, subject: &str) {
+        let was = self.0.breakers.lock().states.remove(subject);
+        if was.is_none() {
+            return;
+        }
+        let store = std::sync::Arc::clone(&self.0.store);
+        let key = subject.to_string();
+        tokio::spawn(async move {
+            if let Err(e) = store.put_breaker(&key, &pure::State::default()).await {
+                tracing::warn!(subject = %key, error = format!("{e:#}"), "couldn't forget a breaker");
+            }
+        });
+        if let Some(view) = self.breaker_view(subject, &pure::State::default()) {
+            self.announce(DeskEvent::Breaker {
+                breaker: Box::new(view),
+            });
+        }
+    }
+
+    /// Plan `p` is over (done or dropped): its budget goes, and with it
+    /// what its breaker held.
+    pub(super) async fn plan_budget_ends(&self, p: &crate::plan::Plan, by: &By) {
+        if let Err(e) = self.keep_plan_budget(p, None, by).await {
+            tracing::warn!(plan = %p.id, error = %e, "an ended plan's budget stays");
+        }
+        self.breaker_forget(&plan_subject(p.id));
+    }
+}
+
+/// A plan's budget is the person's to set on the plan, never as a budget
+/// of its own: the revision they approve says it.
+fn plan_budget_elsewhere() -> DeskError {
+    DeskError::Invalid(
+        "A plan's budget is set on its plan, as part of what the person approves.".into(),
+    )
 }
 
 #[cfg(test)]

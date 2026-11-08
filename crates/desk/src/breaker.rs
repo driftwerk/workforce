@@ -107,6 +107,9 @@ pub struct State {
     pub warned: Vec<(Reason, Status, DateTime<Utc>)>,
     /// Reasons the person let go on, until when.
     pub released: Vec<(Reason, DateTime<Utc>)>,
+    /// Budgets the person let go on at their warning, until when: once
+    /// over, they hold again (a pool's or a plan's new starts).
+    pub released_warned: Vec<(Reason, DateTime<Utc>)>,
 }
 
 impl State {
@@ -120,6 +123,14 @@ impl State {
             .any(|(r, until)| r == reason && *until > now)
     }
 
+    /// Whether the person let `reason` go on at its warning, and it is
+    /// still only that.
+    fn released_warned(&self, reason: &Reason, now: DateTime<Utc>) -> bool {
+        self.released_warned
+            .iter()
+            .any(|(r, until)| r == reason && *until > now)
+    }
+
     fn warned_since(&self, reason: &Reason, status: Status, since: DateTime<Utc>) -> bool {
         self.warned
             .iter()
@@ -128,6 +139,7 @@ impl State {
 
     fn tidy(&mut self, now: DateTime<Utc>) {
         self.released.retain(|(_, until)| *until > now);
+        self.released_warned.retain(|(_, until)| *until > now);
         // A budget's warning counts for its period, at most a month.
         self.warned
             .retain(|(_, _, at)| now - *at < Duration::days(32));
@@ -291,12 +303,22 @@ pub fn step(mut s: State, signal: Signal, now: DateTime<Utc>) -> (State, Vec<Ste
             }
         }
         Signal::Continue => match std::mem::take(&mut s.level) {
-            Level::Held { reason, until, .. } => {
+            Level::Held {
+                reason,
+                until,
+                detail,
+                ..
+            } => {
                 let until = match reason {
                     Reason::Budget(_) => until,
                     Reason::Loop | Reason::Errors => now + RELEASED_FOR,
                 };
-                s.released.push((reason, until));
+                // Let go on at its warning, it holds again once over.
+                let warned = matches!(&detail, Detail::Budget { standing } if standing.status == Status::Warn);
+                match warned {
+                    true => s.released_warned.push((reason, until)),
+                    false => s.released.push((reason, until)),
+                }
                 (s, vec![Step::Release])
             }
             other => {
@@ -397,9 +419,10 @@ fn spend(mut s: State, standings: Vec<Standing>, now: DateTime<Utc>) -> (State, 
     (s, steps)
 }
 
-/// Folds a pool's standings (Desk's, or a group's) into its breaker: at its
-/// warning, or over, new starts are held for the rest of the period, unless
-/// the budget only warns or the person let them go on.
+/// Folds a pool's standings (Desk's, or a group's), or a plan's, into its
+/// breaker: at its warning, or over, new starts are held for the rest of
+/// the period, unless the budget only warns or the person let them go on.
+/// Let go on at the warning, they are held again once it is over.
 pub fn pool_step(mut s: State, signal: Signal, now: DateTime<Utc>) -> (State, Vec<Step>) {
     s.tidy(now);
     match signal {
@@ -413,9 +436,11 @@ pub fn pool_step(mut s: State, signal: Signal, now: DateTime<Utc>) -> (State, Ve
                 return (s, steps);
             }
             let tripped = ordered(standings).into_iter().find(|st| {
+                let reason = Reason::Budget(st.budget);
                 st.status >= Status::Warn
                     && st.on_exceed == OnExceed::Pause
-                    && !s.released(&Reason::Budget(st.budget), now)
+                    && !s.released(&reason, now)
+                    && !(st.status == Status::Warn && s.released_warned(&reason, now))
             });
             if let Some(st) = tripped {
                 let reason = Reason::Budget(st.budget);
@@ -441,30 +466,56 @@ pub enum Whose {
     Session,
     Agent,
     Pool,
+    /// A plan's new starts.
+    Plan,
 }
 
 /// What the Floor says of a hold: the ask, and what each answer does.
 pub fn need_text(name: &str, whose: Whose, level: &Level) -> Option<(String, String)> {
+    need_text_for(name, whose, level, None)
+}
+
+/// [`need_text`], for a pool or a plan whose new sessions `starter`, its
+/// boss, starts: it is the one that has stopped.
+pub fn need_text_for(
+    name: &str,
+    whose: Whose,
+    level: &Level,
+    starter: Option<&str>,
+) -> Option<(String, String)> {
     let Level::Held { detail, .. } = level else {
         return None;
     };
-    let paused = match whose {
-        Whose::Session => "Desk paused it after its turn.",
-        Whose::Agent => "Desk paused its new turns; the one it was on finished.",
-        Whose::Pool => "Agents can't start new sessions for it.",
+    let stopped = starter.map(|b| format!("{b} has stopped starting sessions."));
+    let paused = match (whose, stopped.as_deref()) {
+        (Whose::Session, _) => "Desk paused it after its turn.",
+        (Whose::Agent, _) => "Desk paused its new turns; the one it was on finished.",
+        (Whose::Pool | Whose::Plan, Some(b)) => b,
+        (Whose::Pool, None) => "Agents can't start new sessions for it.",
+        (Whose::Plan, None) => "Desk has stopped starting its sessions.",
     };
     Some(match detail {
         Detail::Budget { standing } => {
+            let rest = match standing.period {
+                workforce_core::budget::Period::Total => "of its run".to_string(),
+                p => format!("of the {}", p.words()),
+            };
+            let until = match standing.status {
+                Status::Warn => ", until it is over",
+                Status::Under | Status::Over => "",
+            };
             let why = match whose {
+                Whose::Plan => format!(
+                    "Its running sessions carry on under their own limits. Continue lets new \
+                     starts go on for the rest {rest}{until}; Keep paused leaves them held."
+                ),
                 Whose::Pool => format!(
                     "Running sessions carry on under their own limits. Continue lets new starts go \
-                     on for the rest of the {}; Keep paused leaves them held.",
-                    standing.period.words()
+                     on for the rest {rest}{until}; Keep paused leaves them held."
                 ),
                 Whose::Session | Whose::Agent => format!(
-                    "Continue lets it go on for the rest of the {}; Keep paused leaves it paused \
-                     until you say.",
-                    standing.period.words()
+                    "Continue lets it go on for the rest {rest}; Keep paused leaves it paused \
+                     until you say."
                 ),
             };
             (
@@ -706,10 +757,30 @@ mod tests {
         let (ask, why) = need_text("Atlas", Whose::Pool, &s.level).unwrap();
         assert_eq!(ask, "Atlas is at 83% of its day budget ($9.13 of $11). Agents can't start new sessions for it.");
         assert!(why.starts_with("Running sessions carry on under their own limits."));
+        assert!(why.contains("until it is over"), "{why}");
+        let (ask, _) =
+            need_text_for("The plan “Ship it”", Whose::Plan, &s.level, Some("Sarah")).unwrap();
+        assert_eq!(ask, "The plan “Ship it” is at 83% of its day budget ($9.13 of $11). Sarah has stopped starting sessions.");
         let (s, steps) = pool_step(s, Signal::Continue, at(1));
         assert_eq!(steps, [Step::Release]);
         let (s, steps) = pool_step(s, warn, at(2));
         assert!(steps.is_empty() && !s.held());
+        // Let go on at its warning, it holds again once over.
+        let over = Signal::Spend(vec![standing(id, 11.2, Status::Over, OnExceed::Pause)]);
+        let (s, steps) = pool_step(s, over.clone(), at(3));
+        assert_eq!(
+            steps,
+            [Step::Hold {
+                reason: Reason::Budget(id)
+            }]
+        );
+        let (_, why) = need_text("Atlas", Whose::Pool, &s.level).unwrap();
+        assert!(!why.contains("until it is over"), "{why}");
+        let (s, _) = pool_step(s, Signal::Continue, at(4));
+        let (s, steps) = pool_step(s, over, at(5));
+        assert!(steps.is_empty() && !s.held(), "over, let go for the day");
+        let back: State = serde_json::from_value(serde_json::to_value(&s).unwrap()).unwrap();
+        assert_eq!(back, s);
         let (_, steps) = pool_step(
             State::default(),
             Signal::Spend(vec![standing(id, 9.13, Status::Warn, OnExceed::Warn)]),

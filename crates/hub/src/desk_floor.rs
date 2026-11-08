@@ -716,6 +716,11 @@ impl Choice {
 struct DecideBody {
     at: DecideRef,
     choice: Choice,
+    /// With a plan's Allow: what it may spend, as the person approves it
+    /// (`null` takes the proposed budget off). Absent keeps what the
+    /// revision says.
+    #[serde(default, deserialize_with = "workforce_desk::model::present")]
+    budget: Option<Option<workforce_desk::plan::PlanBudget>>,
 }
 
 #[derive(Deserialize)]
@@ -744,7 +749,12 @@ pub(crate) async fn answer(
     caller: &FloorCaller,
     at: &DecideRef,
     choice: Choice,
+    budget: Option<Option<workforce_desk::plan::PlanBudget>>,
 ) -> eyre::Result<Result<(), Unanswered>> {
+    // Only a plan's approval takes a budget.
+    if budget.is_some() && !(matches!(at, DecideRef::Plan { .. }) && choice == Choice::Allow) {
+        return Ok(Err(Unanswered::NotOffered));
+    }
     match at {
         DecideRef::Prompt {
             agent_id,
@@ -871,7 +881,10 @@ pub(crate) async fn answer(
                 Choice::Deny => false,
                 Choice::AllowForSession | Choice::Cancel => return Ok(Err(Unanswered::NotOffered)),
             };
-            match desk.decide_plan(*plan, *revision, allow, &By::you()).await {
+            match desk
+                .decide_plan(*plan, *revision, allow, budget, &By::you())
+                .await
+            {
                 Ok(_) => Ok(Ok(())),
                 Err(DeskError::NotFound) => Ok(Err(Unanswered::Unknown)),
                 // A newer revision came, or it ended: it is asked again as
@@ -920,7 +933,16 @@ async fn decide(
         Ok(found) => found,
         Err(refused) => return refused,
     };
-    match answer(&r.state, &sources, &caller, &body.at, body.choice).await {
+    match answer(
+        &r.state,
+        &sources,
+        &caller,
+        &body.at,
+        body.choice,
+        body.budget,
+    )
+    .await
+    {
         // A plan's card reads the plan as it is now.
         Ok(Ok(())) => match (&body.at, (sources.desk)()) {
             (DecideRef::Plan { plan, .. }, Some(desk)) => match desk.plan(*plan).await {

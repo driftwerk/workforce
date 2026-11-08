@@ -17,10 +17,30 @@ pub enum Period {
     Day,
     Week,
     Month,
+    /// Everything ever spent toward it, in no period: a plan's whole run.
+    Total,
+}
+
+/// Where a [`Period::Total`] budget counts from: everything.
+fn ever() -> DateTime<Utc> {
+    DateTime::UNIX_EPOCH
+}
+
+/// Where a [`Period::Total`] budget's period ends: never, in practice.
+fn never() -> DateTime<Utc> {
+    DateTime::parse_from_rfc3339("2200-01-01T00:00:00Z")
+        .map(|t| t.to_utc())
+        .unwrap_or(DateTime::<Utc>::MAX_UTC)
 }
 
 impl Period {
-    pub const ALL: [Period; 4] = [Self::FiveHours, Self::Day, Self::Week, Self::Month];
+    pub const ALL: [Period; 5] = [
+        Self::FiveHours,
+        Self::Day,
+        Self::Week,
+        Self::Month,
+        Self::Total,
+    ];
 
     pub fn as_str(self) -> &'static str {
         match self {
@@ -28,6 +48,7 @@ impl Period {
             Self::Day => "day",
             Self::Week => "week",
             Self::Month => "month",
+            Self::Total => "total",
         }
     }
 
@@ -45,6 +66,7 @@ impl Period {
             Self::Day => "day",
             Self::Week => "week",
             Self::Month => "month",
+            Self::Total => "total",
         }
     }
 }
@@ -69,6 +91,7 @@ pub fn window_start(period: Period, now: DateTime<Utc>, tz: Tz) -> DateTime<Utc>
     let local = now.with_timezone(&tz).date_naive();
     let day = match period {
         Period::FiveHours => return now - Duration::hours(5),
+        Period::Total => return ever(),
         Period::Day => local,
         Period::Week => local - Duration::days(i64::from(local.weekday().num_days_from_monday())),
         Period::Month => local.with_day(1).unwrap_or(local),
@@ -83,6 +106,7 @@ pub fn window_end(period: Period, now: DateTime<Utc>, tz: Tz) -> DateTime<Utc> {
     let local = now.with_timezone(&tz).date_naive();
     let day = match period {
         Period::FiveHours => return now + Duration::hours(5),
+        Period::Total => return never(),
         Period::Day => local + Duration::days(1),
         Period::Week => {
             local + Duration::days(7 - i64::from(local.weekday().num_days_from_monday()))
@@ -108,7 +132,9 @@ fn midnight(day: NaiveDate, tz: Tz) -> Option<DateTime<Utc>> {
 /// agent on Desk together; with a group, that group's together. `Each*` is
 /// the default for each one that has no budget of its own: a group's for
 /// its members, else the ungrouped one. A session's or agent's own budget
-/// is keyed by it, so it goes wherever it is moved.
+/// is keyed by it, so it goes wherever it is moved. A plan's is what the
+/// person approved for it, counted over every session working on its
+/// tickets, on top of whatever else applies to each.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "id", rename_all = "snake_case")]
 pub enum BudgetScope {
@@ -117,6 +143,7 @@ pub enum BudgetScope {
     EachAgent,
     Session(Uuid),
     Agent(String),
+    Plan(Uuid),
 }
 
 impl BudgetScope {
@@ -128,6 +155,7 @@ impl BudgetScope {
             Self::EachAgent => "each_agent".into(),
             Self::Session(id) => format!("session:{id}"),
             Self::Agent(id) => format!("agent:{id}"),
+            Self::Plan(id) => format!("plan:{id}"),
         }
     }
 
@@ -138,6 +166,7 @@ impl BudgetScope {
             "each_agent" => Self::EachAgent,
             other => match other.split_once(':') {
                 Some(("session", id)) => Self::Session(Uuid::parse_str(id)?),
+                Some(("plan", id)) => Self::Plan(Uuid::parse_str(id)?),
                 Some(("agent", id)) if !id.is_empty() => Self::Agent(id.to_string()),
                 _ => eyre::bail!("unknown budget scope {other:?}"),
             },
@@ -182,25 +211,52 @@ pub fn check(b: &Budget) -> Result<(), String> {
     if b.scope.own() && b.group.is_some() {
         return Err("a session's or agent's own budget goes with it, not with a group".into());
     }
+    match (&b.scope, b.period) {
+        (BudgetScope::Plan(_), _) => {}
+        (_, Period::Total) => {
+            return Err("only a plan's budget counts over its whole run".into());
+        }
+        _ => {}
+    }
     if b.unit == Unit::Tokens && b.amount.fract() != 0.0 {
         return Err("a token budget is a whole number of tokens".into());
     }
     Ok(())
 }
 
-/// One session or agent a budget can apply to, with the group it is in now.
+/// One session or agent a budget can apply to, with the group it is in now
+/// and, for a session, the plan whose ticket it works on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Subject<'a> {
-    Session { id: Uuid, group: Option<&'a str> },
-    Agent { id: &'a str, group: Option<&'a str> },
+    Session {
+        id: Uuid,
+        group: Option<&'a str>,
+        plan: Option<Uuid>,
+    },
+    Agent {
+        id: &'a str,
+        group: Option<&'a str>,
+    },
 }
 
 /// The budgets that apply to `subject` alone: its own, else its group's
-/// `each_*` default, else the ungrouped one. Totals (`Desk`) are pools,
-/// read by [`pools`].
+/// `each_*` default, else the ungrouped one; and, on top, for a session
+/// working on a plan's ticket, the plan's (counted over the plan's whole
+/// spend, not the session's). Totals (`Desk`) are pools, read by [`pools`].
 pub fn applying<'a>(all: &'a [Budget], subject: &Subject<'_>) -> Vec<&'a Budget> {
+    let mut out = alone(all, subject);
+    if let Subject::Session { plan: Some(p), .. } = subject {
+        let plan = BudgetScope::Plan(*p);
+        out.extend(all.iter().filter(|b| b.scope == plan));
+    }
+    out
+}
+
+/// The budgets of `subject`'s own: its own, else its group's default, else
+/// the ungrouped one.
+fn alone<'a>(all: &'a [Budget], subject: &Subject<'_>) -> Vec<&'a Budget> {
     let (own, each, group) = match subject {
-        Subject::Session { id, group } => {
+        Subject::Session { id, group, .. } => {
             (BudgetScope::Session(*id), BudgetScope::EachSession, *group)
         }
         Subject::Agent { id, group } => (
@@ -435,6 +491,7 @@ mod tests {
             BudgetScope::EachAgent,
             BudgetScope::Session(id),
             BudgetScope::Agent("atlas".into()),
+            BudgetScope::Plan(id),
         ] {
             assert_eq!(BudgetScope::parse(&s.text()).unwrap(), s);
         }
@@ -460,7 +517,11 @@ mod tests {
         let ids = |v: Vec<&Budget>| v.iter().map(|b| b.id).collect::<Vec<_>>();
 
         let all = vec![each.clone(), acme_each.clone(), total.clone()];
-        let s = |group| Subject::Session { id, group };
+        let s = |group| Subject::Session {
+            id,
+            group,
+            plan: None,
+        };
         assert_eq!(ids(applying(&all, &s(None))), [each.id]);
         assert_eq!(ids(applying(&all, &s(Some("acme")))), [acme_each.id]);
         assert_eq!(ids(applying(&all, &s(Some("atlas")))), [each.id]);
@@ -505,7 +566,11 @@ mod tests {
             desk_wide.clone(),
         ];
         let ids = |v: Vec<&Budget>| v.iter().map(|b| b.id).collect::<Vec<_>>();
-        let in_group = |g| Subject::Session { id, group: g };
+        let in_group = |g| Subject::Session {
+            id,
+            group: g,
+            plan: None,
+        };
         // The group's own rows, else the ungrouped defaults.
         assert_eq!(ids(applying(&all, &in_group(Some("acme")))), [acme_each.id]);
         assert_eq!(ids(applying(&all, &in_group(Some("atlas")))), [each.id]);
@@ -545,6 +610,45 @@ mod tests {
         assert_eq!(t.budget, a.id);
         assert_eq!(standing_of(&a, 9.1, from, to).amounts(), "$9.10 of $10");
         assert!(tightest([]).is_none());
+    }
+
+    #[test]
+    fn a_plans_budget_applies_to_its_sessions_on_top_of_their_own_or_their_default() {
+        let (id, plan, other) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let each = budget(BudgetScope::EachSession, None, 5.0);
+        let own = budget(BudgetScope::Session(id), None, 1.0);
+        let mut capped = budget(BudgetScope::Plan(plan), Some("acme"), 40.0);
+        capped.period = Period::Total;
+        let theirs = budget(BudgetScope::Plan(other), None, 9.0);
+        let all = vec![each.clone(), own.clone(), capped.clone(), theirs];
+        let ids = |v: Vec<&Budget>| v.iter().map(|b| b.id).collect::<Vec<_>>();
+        let on = |id, plan| Subject::Session {
+            id,
+            group: Some("acme"),
+            plan,
+        };
+        assert_eq!(
+            ids(applying(&all, &on(id, Some(plan)))),
+            [own.id, capped.id]
+        );
+        let elsewhere = Uuid::new_v4();
+        assert_eq!(
+            ids(applying(&all, &on(elsewhere, Some(plan)))),
+            [each.id, capped.id]
+        );
+        assert_eq!(ids(applying(&all, &on(elsewhere, None))), [each.id]);
+        assert!(
+            pools(&all, &Pool::Group("acme".into())).is_empty(),
+            "no pool"
+        );
+        assert!(check(&capped).is_ok(), "a plan's counts over its whole run");
+        let mut total = budget(BudgetScope::EachSession, None, 5.0);
+        total.period = Period::Total;
+        assert!(check(&total).is_err(), "nothing else's does");
+        let now = at("2026-11-03T12:00:00Z");
+        let london: Tz = "Europe/London".parse().unwrap();
+        assert!(window_start(Period::Total, now, london) < at("1971-01-01T00:00:00Z"));
+        assert!(window_end(Period::Total, now, london) > at("2199-01-01T00:00:00Z"));
     }
 
     #[test]

@@ -187,6 +187,7 @@ fn a_draft_names_its_needs_by_place_and_gets_ids_and_the_default_engine() {
 fn a_draft_keeps_the_ids_of_the_tickets_it_changes_and_refuses_others() {
     let before = Snapshot {
         parallel: None,
+        budget: None,
         goal: "Ship".into(),
         tickets: vec![planned(7, "Add the cart API", &[])],
     };
@@ -270,6 +271,7 @@ fn a_draft_refuses_a_subagent_an_unknown_engine_and_bad_needs() {
 fn a_plan_that_can_run_here_is_valid() {
     let s = Snapshot {
         parallel: None,
+        budget: None,
         goal: "Ship the new checkout".into(),
         tickets: vec![
             planned(1, "Add the cart API", &[]),
@@ -300,6 +302,7 @@ fn each_thing_that_keeps_a_plan_from_running_is_said() {
     let outside = planned(10, "Outside", &[77]);
     let s = Snapshot {
         parallel: None,
+        budget: None,
         goal: String::new(),
         tickets: vec![
             planned(1, "Fine", &[]),
@@ -362,6 +365,7 @@ fn each_thing_that_keeps_a_plan_from_running_is_said() {
 fn a_cycle_is_refused_naming_the_tickets_in_it() {
     let s = Snapshot {
         parallel: None,
+        budget: None,
         goal: "g".into(),
         tickets: vec![
             planned(1, "a", &[]),
@@ -380,6 +384,7 @@ fn a_cycle_is_refused_naming_the_tickets_in_it() {
 fn a_plan_has_one_to_thirty_tickets_and_a_short_enough_goal() {
     let none = Snapshot {
         parallel: None,
+        budget: None,
         goal: "g".into(),
         tickets: vec![],
     };
@@ -389,6 +394,7 @@ fn a_plan_has_one_to_thirty_tickets_and_a_short_enough_goal() {
     );
     let many = Snapshot {
         parallel: None,
+        budget: None,
         goal: "x".repeat(GOAL_MAX + 1),
         tickets: (1..=31).map(|n| planned(n, "t", &[])).collect(),
     };
@@ -620,6 +626,7 @@ fn base() -> Snapshot {
             planned(3, "Fix the flaky payment test", &[]),
         ],
         parallel: Some(2),
+        budget: None,
     }
 }
 
@@ -669,6 +676,61 @@ fn plan_change_classifies_each_kind_of_edit() {
     for (what, f) in scopes {
         assert_eq!(minor(f), Ok(Some(Change::Scope)), "{what}");
     }
+}
+
+/// A plan's budget is part of what the person approves: setting or
+/// lowering it is within that, raising it or taking it off is theirs again.
+#[test]
+fn a_plans_budget_raised_or_taken_off_is_a_change_of_scope() {
+    let none = HashSet::new();
+    let capped = |amount: f64| Snapshot {
+        budget: Some(PlanBudget::usd(amount)),
+        ..base()
+    };
+    let a = capped(40.0);
+    assert_eq!(
+        plan_change(&base(), &a, &none),
+        Ok(Some(Change::Minor)),
+        "set"
+    );
+    assert_eq!(
+        plan_change(&a, &capped(30.0), &none),
+        Ok(Some(Change::Minor))
+    );
+    assert_eq!(
+        plan_change(&a, &capped(60.0), &none),
+        Ok(Some(Change::Scope))
+    );
+    assert_eq!(plan_change(&a, &base(), &none), Ok(Some(Change::Scope)));
+    let mut later = capped(40.0);
+    later.budget.as_mut().unwrap().warn_at = 0.95;
+    assert_eq!(plan_change(&a, &later, &none), Ok(Some(Change::Scope)));
+    let mut daily = capped(10.0);
+    daily.budget.as_mut().unwrap().period = Period::Day;
+    assert_eq!(
+        plan_change(&a, &daily, &none),
+        Ok(Some(Change::Scope)),
+        "counted another way"
+    );
+    let mut told = capped(40.0);
+    told.budget.as_mut().unwrap().on_exceed = OnExceed::Warn;
+    assert_eq!(plan_change(&a, &told, &none), Ok(Some(Change::Scope)));
+    assert_eq!(describe(&base(), &a), "Capped it at a total budget of $40");
+    assert_eq!(describe(&a, &base()), "Took its budget off");
+    let mut nothing = capped(0.0);
+    nothing.tickets.truncate(1);
+    let problems = validate(&nothing, &[], &|_| true).unwrap_err();
+    assert!(problems.contains(&Problem::Budget(
+        "A plan's budget is more than nothing.".into()
+    )));
+    // Kept in its revision, and read back by an older revision's shape.
+    let back: Snapshot = serde_json::from_value(serde_json::to_value(&a).unwrap()).unwrap();
+    assert_eq!(back, a);
+    let old: Snapshot =
+        serde_json::from_value(serde_json::json!({ "goal": "g", "tickets": [] })).unwrap();
+    assert_eq!(old.budget, None);
+    let said: PlanBudget = serde_json::from_value(serde_json::json!({ "amount": 40 })).unwrap();
+    assert_eq!(said, PlanBudget::usd(40.0));
 }
 
 #[test]
@@ -760,6 +822,7 @@ fn a_draft_keeps_the_limit_of_what_it_changes_and_an_old_snapshot_reads_with_non
         &before,
         &Snapshot {
             parallel: Some(1),
+            budget: None,
             ..base()
         }
     )

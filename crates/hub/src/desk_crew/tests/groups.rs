@@ -114,6 +114,7 @@ async fn client(
                 parallel: None,
                 engine: Engine::Claude,
                 group: Some(group.into()),
+                budget: None,
             },
             &Party::manager(boss, boss),
             &By::manager(boss, boss, "For the test."),

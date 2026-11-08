@@ -1961,20 +1961,27 @@ mod floor {
                     .unwrap()
                     .is_empty());
                 assert_eq!(
-                    answer(&state, &sources, &me(false), &at, Choice::Allow)
+                    answer(&state, &sources, &me(false), &at, Choice::Allow, None)
                         .await
                         .unwrap(),
                     Err(Unanswered::NotYours)
                 );
                 assert_eq!(
-                    answer(&state, &sources, &me(true), &at, Choice::AllowForSession)
-                        .await
-                        .unwrap(),
+                    answer(
+                        &state,
+                        &sources,
+                        &me(true),
+                        &at,
+                        Choice::AllowForSession,
+                        None
+                    )
+                    .await
+                    .unwrap(),
                     Err(Unanswered::NotOffered)
                 );
                 // Keep paused: the need goes; it is still held.
                 assert_eq!(
-                    answer(&state, &sources, &me(true), &at, Choice::Deny)
+                    answer(&state, &sources, &me(true), &at, Choice::Deny, None)
                         .await
                         .unwrap(),
                     Ok(())
@@ -1984,13 +1991,13 @@ mod floor {
                     .unwrap()
                     .is_empty());
                 assert_eq!(
-                    answer(&state, &sources, &me(true), &at, Choice::Allow)
+                    answer(&state, &sources, &me(true), &at, Choice::Allow, None)
                         .await
                         .unwrap(),
                     Ok(())
                 );
                 assert_eq!(
-                    answer(&state, &sources, &me(true), &at, Choice::Allow)
+                    answer(&state, &sources, &me(true), &at, Choice::Allow, None)
                         .await
                         .unwrap(),
                     Err(Unanswered::AlreadyAnswered)
@@ -2162,13 +2169,13 @@ mod floor {
                     "another hub's caller never sees this hub's sessions"
                 );
                 assert_eq!(
-                    answer(&state, &sources, &me(false), &at, Choice::Allow).await.unwrap(),
+                    answer(&state, &sources, &me(false), &at, Choice::Allow, None).await.unwrap(),
                     Err(Unanswered::NotYours)
                 );
-                assert_eq!(answer(&state, &sources, &me(true), &at, Choice::Allow).await.unwrap(), Ok(()));
+                assert_eq!(answer(&state, &sources, &me(true), &at, Choice::Allow, None).await.unwrap(), Ok(()));
                 assert_eq!(behaviour(&asked.await.unwrap()), "allow");
                 assert_eq!(
-                    answer(&state, &sources, &me(true), &at, Choice::Allow).await.unwrap(),
+                    answer(&state, &sources, &me(true), &at, Choice::Allow, None).await.unwrap(),
                     Err(Unanswered::AlreadyAnswered)
                 );
                 eventually("the answered need to go", async || {
@@ -2927,6 +2934,143 @@ async fn watching_only_a_sessions_question_goes_straight_to_the_person() {
             overseer.sessions.find(&channel, PERSON).unwrap().is_none(),
             "no turn"
         );
+    })
+    .await;
+}
+
+/// A boss Desk's breaker holds (over its own budget) takes no turn for a
+/// session's question: it goes straight to the person, saying why.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_held_bosss_sessions_questions_go_straight_to_the_person() {
+    use workforce_core::budget::{OnExceed, Period, Standing, Status, Unit};
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, _crew, d, _llm) = overseeing(
+            dir.path(),
+            pool,
+            "5433",
+            "[oversight]\nenabled = true\nlevel = \"act\"\n",
+            &[],
+        )
+        .await;
+        let now = chrono::Utc::now();
+        let over = Standing {
+            budget: uuid::Uuid::new_v4(),
+            period: Period::Day,
+            unit: Unit::Usd,
+            used: 12.0,
+            of: 11.0,
+            status: Status::Over,
+            on_exceed: OnExceed::Pause,
+            from: now - chrono::Duration::hours(1),
+            to: now + chrono::Duration::hours(10),
+        };
+        d.agent_stand("desk", "Desk", vec![over], false);
+        let s = new_session(&d, dir.path(), "acme-web").await;
+        let r = d
+            .line_call(
+                s.id,
+                "ask",
+                &json!({"to": "desk", "text": "Which port?", "wait_seconds": 60}),
+                Some(std::time::Duration::from_millis(10)),
+            )
+            .await
+            .unwrap();
+        let ask: uuid::Uuid = serde_json::from_value(r["id"].clone()).unwrap();
+        let given = eventually("the question given to the person", async || {
+            d.store()
+                .line_message(ask)
+                .await
+                .unwrap()
+                .filter(|m| m.asked == Some(workforce_desk::line::Asked::Escalated))
+        })
+        .await;
+        assert_eq!(
+            given.escalation.unwrap().why,
+            format!(
+                "{} is over budget for the day, so this came to you.",
+                super::name_of(&overseer)
+            )
+        );
+        let channel = super::line::line_channel(s.id);
+        assert!(
+            overseer.sessions.find(&channel, PERSON).unwrap().is_none(),
+            "no turn"
+        );
+    })
+    .await;
+}
+
+/// What Desk's breaker tells a session a boss runs reaches the boss too, in
+/// its next work turn on that session's line, so it can help.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_breakers_steer_of_a_session_a_boss_runs_is_told_to_the_boss() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, _crew, d, _llm) = overseeing(
+            dir.path(),
+            pool,
+            "I'll tell it to look at the fixture.",
+            "[oversight]\nenabled = true\nlevel = \"act\"\n",
+            &[],
+        )
+        .await;
+        d.set_breaker_rules(workforce_desk::Rules { loops: true })
+            .await
+            .unwrap();
+        let s = new_session(&d, dir.path(), "acme-api").await;
+        let url = hook_url(dir.path(), s.id).await;
+        hook(
+            &url,
+            json!({"hook_event_name": "SessionStart", "session_id": s.id.to_string()}),
+        )
+        .await;
+        hook(
+            &url,
+            json!({"hook_event_name": "UserPromptSubmit", "prompt": "Fix the payment test"}),
+        )
+        .await;
+        let boss = workforce_desk::crew::Party::manager("desk", &super::name_of(&overseer));
+        d.take_on(
+            s.id,
+            &boss,
+            workforce_desk::charge::How::Handed,
+            &Default::default(),
+            &By::you(),
+        )
+        .await
+        .unwrap();
+        for _ in 0..6 {
+            hook(
+                &url,
+                json!({"hook_event_name": "PreToolUse", "tool_name": "Bash",
+                "tool_input": {"command": "cargo test -p acme-api payment"}}),
+            )
+            .await;
+        }
+        let channel = super::line::line_channel(s.id);
+        let woke = eventually("the boss told", async || {
+            let line = overseer.sessions.find(&channel, PERSON).unwrap()?;
+            line.messages
+                .iter()
+                .find(|m| m.content.starts_with(super::work::WORK))
+                .cloned()
+        })
+        .await;
+        assert!(
+            woke.content.contains("Desk's breaker told acme-api"),
+            "{}",
+            woke.content
+        );
+        // Told once: the steer isn't said again.
+        tokio::time::sleep(Duration::from_millis(3500)).await;
+        let line = overseer.sessions.find(&channel, PERSON).unwrap().unwrap();
+        let told = line
+            .messages
+            .iter()
+            .filter(|m| m.content.contains("Desk's breaker told acme-api"))
+            .count();
+        assert_eq!(told, 1);
     })
     .await;
 }

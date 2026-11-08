@@ -78,8 +78,8 @@ pub use crew_store::CheckIn;
 pub use providers::{AccountError, Accounts, Fields, Spec, Standing};
 pub use realtime::{KeySource, Provider, Realtime};
 pub use service::{
-    agent_subject, pool_subject, session_subject, AgentSpend, AgentVerdict, Boss, BreakerOf,
-    BreakerView, BudgetPatch, BudgetView, BudgetsView, ChargeView, NewBudget, Rules,
+    agent_subject, plan_subject, pool_subject, session_subject, AgentSpend, AgentVerdict, Boss,
+    BreakerOf, BreakerView, BudgetPatch, BudgetView, BudgetsView, ChargeView, NewBudget, Rules,
 };
 pub use service::{
     local_agent_item, session_item, Clearing, Desk, DeskError, Floor, Group, Hidden, HolderOptions,

@@ -111,12 +111,35 @@ fn ticket_schema() -> Value {
     }, "required": ["title", "folder"] })
 }
 
+fn budget_schema() -> Value {
+    json!({ "type": ["object", "null"], "properties": {
+        "amount": { "type": "number", "exclusiveMinimum": 0 },
+        "unit": { "type": "string", "enum": ["usd", "tokens"], "description": "usd when not said" },
+        "period": { "type": "string", "enum": ["total", "day", "week", "month", "five_hours"],
+            "description": "total (the plan's whole run) when not said" }
+    }, "required": ["amount"],
+    "description": "What the plan may spend, over every session working on it. The person approves it with the plan; raising it or taking it off waits for them again." })
+}
+
+/// What a tool's input says the plan may spend: absent leaves it, `null`
+/// takes it off.
+fn budget_of(input: &Value) -> Result<Option<Option<plan::PlanBudget>>, String> {
+    match input.get("budget") {
+        None => Ok(None),
+        Some(Value::Null) => Ok(Some(None)),
+        Some(b) => serde_json::from_value(b.clone())
+            .map(|b| Some(Some(b)))
+            .map_err(|e| format!("The budget doesn't read: {e}.")),
+    }
+}
+
 pub fn schema() -> Value {
     json!({ "type": "object", "properties": {
         "goal": { "type": "string", "description": "What the plan achieves, in the person's terms" },
         "board": { "type": "string", "description": "A board's prefix, like ACM; your group's when not said" },
         "parallel": { "type": "integer", "minimum": 1, "maximum": 12,
             "description": "At most this many of its sessions at once, when fewer than your limit" },
+        "budget": budget_schema(),
         "tickets": { "type": "array", "items": ticket_schema(), "minItems": 1, "maxItems": plan::MAX_TICKETS }
     }, "required": ["goal", "tickets"] })
 }
@@ -127,6 +150,7 @@ pub fn update_schema() -> Value {
         "revision": { "type": "integer", "description": "The revision you read; a newer one refuses the change" },
         "goal": { "type": "string" },
         "parallel": { "type": "integer", "minimum": 1, "maximum": 12 },
+        "budget": budget_schema(),
         "tickets": { "type": "array", "items": ticket_schema(), "minItems": 1, "maxItems": plan::MAX_TICKETS },
         "why": { "type": "string", "description": "Why, in a sentence the person reads" }
     }, "required": ["plan_id", "why"] })
@@ -190,6 +214,8 @@ fn plan_out(p: &PlanDetail) -> Value {
         "approved_revision": plan.approved_revision,
         "goal": plan.goal,
         "progress": p.summary.progress,
+        "budget": p.summary.budget,
+        "held": p.summary.held,
         "waves": p.waves.len(),
         "tickets": p.tickets.iter().map(|t| json!({
             "id": t.ticket.ticket.id.to_string(),
@@ -282,6 +308,7 @@ impl CrewHub {
             parallel,
             engine,
             group: board_group,
+            budget: budget_of(input)?.flatten(),
         };
         let boss = Party::manager(b.service.agent_id.as_str(), &name_of(&b.service));
         let by = self.by_boss(&b.service, "It proposed a plan.");
@@ -350,6 +377,7 @@ impl CrewHub {
                 .and_then(Value::as_i64)
                 .map(|n| i16::try_from(n).ok()),
             tickets,
+            budget: budget_of(input)?,
             why: Some(why.to_string()),
         };
         let engine = Engine::parse(o.work.engine.trim()).unwrap_or(Engine::Claude);
@@ -440,11 +468,20 @@ impl CrewHub {
 
     // ── The runner ──────────────────────────────────────────────────────
 
-    /// Starts what may start now in every running plan. Nothing until Desk
-    /// knows which sessions bosses run.
+    /// Starts what may start now in every running plan, after letting go
+    /// on the plans Desk paused for a hold that has lifted. Nothing until
+    /// Desk knows which sessions bosses run.
     pub(crate) async fn run_plans(&self) {
         if !self.desk.charges_loaded() {
             return;
+        }
+        match self.desk.plans(Some(PlanState::Paused), None).await {
+            Ok(paused) => {
+                for s in paused {
+                    self.lift_hold(&s.plan).await;
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "couldn't read the paused plans"),
         }
         let plans = match self.desk.plans(Some(PlanState::Running), None).await {
             Ok(p) => p,
@@ -455,6 +492,29 @@ impl CrewHub {
         };
         for s in plans {
             self.run_plan(s.plan).await;
+        }
+    }
+
+    /// Resumes `p`, which Desk paused because its boss was held or the
+    /// breaker held its new starts, once that is over: the person said
+    /// Continue, or the hold's period ended. Its boss can't: no crew tool
+    /// lets a hold go.
+    async fn lift_hold(&self, p: &Plan) {
+        let lifted = match p.paused {
+            Some(plan::Paused::BossHeld) => self.desk.agent_held(&p.boss).is_none(),
+            Some(plan::Paused::Budget) => self
+                .desk
+                .plan_starts_held(p.group.as_deref(), p.id)
+                .is_none(),
+            _ => false,
+        };
+        if !lifted {
+            return;
+        }
+        let by = By::desk("What held it is over.");
+        let why = [plan::Paused::BossHeld, plan::Paused::Budget];
+        if let Err(e) = self.desk.resume_plan(p.id, &why, &by).await {
+            tracing::info!(plan = %p.id, error = %e, "a plan Desk paused wasn't resumed");
         }
     }
 
@@ -479,14 +539,30 @@ impl CrewHub {
         if o.level == Level::Watch {
             return;
         }
-        // Held by Desk's breaker: the person has that need already, and
-        // the boss isn't told.
-        if self.desk.starts_held(p.group.as_deref()).is_some() {
+        // Its boss is held by Desk's breaker (over its own budget): its
+        // plans pause, and what its sessions ask goes to the person.
+        if self.desk.agent_held(&p.boss).is_some() {
+            let by = By::desk("Its boss is held by Desk's breaker.");
+            if let Err(e) = self
+                .desk
+                .pause_plan(p.id, plan::Paused::BossHeld, &by)
+                .await
+            {
+                tracing::info!(plan = %p.id, error = %e, "a plan whose boss is held wasn't paused");
+            }
             return;
         }
-        // What a group's warning holds back, and its Continue, are the
-        // budgets' own to add; Desk's breaker already holds what is over.
-        let standing = None;
+        // Its own budget, its group's or Desk's at its warning or over, and
+        // the breaker holding new starts for it: the person has the need,
+        // with Continue; the plan pauses until they say, and nothing starts.
+        let held = self.desk.plan_starts_held(p.group.as_deref(), p.id);
+        if held.is_some() {
+            let by = By::desk("Desk's breaker holds its new starts.");
+            if let Err(e) = self.desk.pause_plan(p.id, plan::Paused::Budget, &by).await {
+                tracing::info!(plan = %p.id, error = %e, "a plan the breaker holds wasn't paused");
+            }
+        }
+        let standing = held.map(|(status, _)| status);
         let boss = Party::manager(service.agent_id.as_str(), &name_of(&service));
         let by = By::manager(
             &boss.id,
@@ -804,6 +880,26 @@ impl CrewHub {
                 let plan = event.detail.as_ref()?.get("plan")?.as_str()?.parse().ok()?;
                 Some((plan, format!("The person {}", event.text)))
             }
+            // Desk stopped starting its sessions for a budget: once a hold.
+            Kind::PlanPaused
+                if event.actor.kind == PartyKind::Desk
+                    && event.detail.as_ref()?.get("paused")?.as_str()
+                        == Some(plan::Paused::Budget.as_str()) =>
+            {
+                let plan = event.detail.as_ref()?.get("plan")?.as_str()?.parse().ok()?;
+                Some((
+                    plan,
+                    format!(
+                        "Desk {}: Desk's breaker holds its new starts. Only the person lets them \
+                         go on, on the Floor; its running sessions carry on.",
+                        event.text
+                    ),
+                ))
+            }
+            Kind::Steered | Kind::Paused => {
+                let (_, line, plan) = self.breaker_note(event).await?;
+                Some((plan?, line))
+            }
             Kind::Failed => {
                 let subject = event.subject.as_ref()?;
                 let session: Uuid = subject.id.parse().ok()?;
@@ -843,6 +939,17 @@ impl CrewHub {
         };
         let tickets = self.desk.plan_tickets(id).await.unwrap_or_default();
         let closing = p.state == PlanState::Running && plan::settled(&tickets);
+        // Held by Desk's breaker, its boss takes no turns: a settled plan
+        // is finished without its summary.
+        if self.desk.agent_held(&p.boss).is_some() {
+            if closing {
+                let by = By::desk("Every ticket is settled; its boss is held.");
+                if let Err(e) = self.desk.finish_plan(id, &by).await {
+                    tracing::info!(plan = %id, error = %e, "a settled plan wasn't finished");
+                }
+            }
+            return;
+        }
         if !closing && !self.spend_boss_turn(&service, &o) {
             return;
         }
@@ -1016,7 +1123,13 @@ pub(super) async fn plan_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
                         gathering.entry(plan).or_insert_with(|| Gathered { since: Instant::now(), lines: Vec::new() }).lines.push(line);
                     }
                 }
-                Ok(DeskEvent::Session { .. } | DeskEvent::Charge { .. } | DeskEvent::Removed { .. }) => dirty = true,
+                Ok(
+                    DeskEvent::Session { .. }
+                    | DeskEvent::Charge { .. }
+                    | DeskEvent::Removed { .. }
+                    | DeskEvent::Breaker { .. }
+                    | DeskEvent::Budgets { .. },
+                ) => dirty = true,
                 Ok(_) => {}
                 Err(RecvError::Lagged(_)) => dirty = true,
                 Err(RecvError::Closed) => return,

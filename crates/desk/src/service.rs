@@ -99,8 +99,8 @@ pub use groups::{
 };
 
 pub use breaker::{
-    agent_subject, pool_subject, session_subject, AgentSpend, AgentVerdict, BreakerOf, BreakerView,
-    BudgetPatch, BudgetView, BudgetsView, NewBudget, Rules,
+    agent_subject, plan_subject, pool_subject, session_subject, AgentSpend, AgentVerdict,
+    BreakerOf, BreakerView, BudgetPatch, BudgetView, BudgetsView, NewBudget, Rules,
 };
 pub use ledger::{LedgerPage, SpendQuery};
 pub use line::{LineError, Sender, SessionMcp};

@@ -1062,17 +1062,25 @@ pub fn stamp(
         (group, boss)
     };
     for n in &mut view.needs {
-        (n.group, n.boss) = match &n.answer {
-            // A plan is its own group's, as it was made, wherever its boss
-            // is now: the group it carries, with that group's boss now.
+        let planned = match &n.answer {
             Answer::Decide {
                 at: DecideRef::Plan { .. },
-            } => {
+            } => true,
+            Answer::Decide {
+                at: DecideRef::Breaker { subject },
+            } => subject.starts_with("plan:"),
+            _ => false,
+        };
+        (n.group, n.boss) = match planned {
+            // A plan is its own group's, as it was made, wherever its boss
+            // is now: the group it carries, with that group's boss now. So
+            // is what holds its new starts.
+            true => {
                 let group = n.group.take();
                 let boss = group.as_deref().and_then(&boss_of);
                 (group, boss)
             }
-            _ => place(&n.who),
+            false => place(&n.who),
         };
     }
     for w in view.working.iter_mut().chain(view.done.iter_mut()) {
