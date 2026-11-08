@@ -837,6 +837,9 @@ struct Inner {
     /// Held from reading a plan to writing it back: a plan is written
     /// whole, so two changes at once would undo one another.
     plan_write: tokio::sync::Mutex<()>,
+    /// Held while a plan's ticket is started, and while a plan is dropped:
+    /// a drop never misses a start under way.
+    plan_starting: tokio::sync::Mutex<()>,
 }
 
 #[derive(Clone)]
@@ -1473,6 +1476,7 @@ impl Desk {
             scopes: Mutex::default(),
             boss_plans: Mutex::default(),
             plan_write: tokio::sync::Mutex::new(()),
+            plan_starting: tokio::sync::Mutex::new(()),
         }));
         desk.scopes_follow(&desk.layout());
         desk.scopes_load().await;
@@ -2627,6 +2631,7 @@ impl Desk {
         if name.is_empty() {
             return Err(DeskError::Invalid("a session needs a name".into()));
         }
+        let named = id.is_some();
         let id = match id {
             Some(id) if self.0.state.lock().records.contains_key(&id) => {
                 return Err(DeskError::Conflict(format!(
@@ -2749,9 +2754,22 @@ impl Desk {
             created_at: now,
             updated_at: now,
         };
-        self.0.state.lock().records.insert(id, record.clone());
+        {
+            let mut st = self.0.state.lock();
+            st.records.insert(id, record.clone());
+            if let Some(boss) = boss {
+                Self::reserve_charge(&mut st, id, boss, group.as_deref());
+            }
+        }
         // Where it belongs, before it can do or spend anything.
-        let placed = self.start_placed(id, group.as_deref(), boss).await;
+        let mut placed = self.start_placed(id, group.as_deref(), boss).await;
+        // A session named before it starts (a plan's) is written down
+        // before its process is: after a stop between the two, its id is
+        // known, and the process the holder kept for it is adopted rather
+        // than a second one started, so its first prompt goes in once.
+        if placed.is_ok() && named {
+            placed = self.0.store.put(&record).await.map_err(DeskError::Internal);
+        }
         let launched = match placed {
             Ok(()) => self.launch(&record, false, new.prompt.as_deref()).await,
             Err(e) => Err(e),

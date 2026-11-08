@@ -528,6 +528,7 @@ fn next_starts_never_exceeds_the_limit_never_starts_an_unready_ticket_and_starts
             Paused::BossHeld,
             Paused::Restoring,
             Paused::NoBoss,
+            Paused::StartFailing,
         ] {
             let mut held = p.clone();
             held.state = PlanState::Paused;
@@ -573,6 +574,7 @@ fn paused_reasons_read_back_as_written() {
         Paused::BossHeld,
         Paused::Restoring,
         Paused::NoBoss,
+        Paused::StartFailing,
     ] {
         assert_eq!(Paused::parse(p.as_str()).unwrap(), p);
         let v: Value = serde_json::to_value(p).unwrap();

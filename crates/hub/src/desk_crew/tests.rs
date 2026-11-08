@@ -4305,7 +4305,7 @@ mod board {
                 let input = json!({"ticket": key, "state": state, "reason": "Back on."});
                 async move {
                     let mut a = Action::parse("crew.move_ticket", &input).unwrap();
-                    crew.resolve_ticket(&mut a, None).await.unwrap();
+                    crew.resolve_ticket(&mut a, None, None).await.unwrap();
                     a
                 }
             };

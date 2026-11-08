@@ -163,7 +163,9 @@ async fn an_approved_plan_starts_four_sessions_and_the_fifth_when_one_finishes()
             &json!({ "ticket": key, "state": "review", "reason": "done" }),
         )
         .unwrap();
-        crew.resolve_ticket(&mut mv, None).await.unwrap();
+        crew.resolve_ticket(&mut mv, None, Some("desk"))
+            .await
+            .unwrap();
         assert_eq!(crew.gate(&mv, &o), Gate::Run);
 
         // One finishes its turn: the fifth starts.
@@ -196,7 +198,7 @@ async fn a_start_cut_off_between_its_link_and_its_session_starts_exactly_once_af
         let mut t = d.store().ticket(first).await.unwrap().unwrap();
         let session = uuid::Uuid::new_v4();
         d.store()
-            .begin_start(&mut t, 50_000.0, session, workforce_desk::crew::now())
+            .begin_start(&mut t, id, 50_000.0, session, workforce_desk::crew::now())
             .await
             .unwrap();
         assert!(d.view(session).is_err());
@@ -214,7 +216,10 @@ async fn a_start_cut_off_between_its_link_and_its_session_starts_exactly_once_af
         );
         let ticket = d.ticket(first).await.unwrap();
         assert_eq!(ticket.ticket.session(), Some(session));
-        assert!(d.store().starting().await.unwrap().is_empty());
+        eventually("its link finished", async || {
+            d.store().starting().await.unwrap().is_empty().then_some(())
+        })
+        .await;
         tokio::time::sleep(Duration::from_millis(800)).await;
         assert_eq!(started(&d).len(), 2, "never started twice");
         let named = d
@@ -430,6 +435,254 @@ async fn a_boss_keeps_its_plan_current_and_a_change_of_scope_waits_for_the_perso
         d.approve_plan(id, 3, &By::you()).await.unwrap();
         assert_eq!(d.plan(id).await.unwrap().tickets.len(), 3);
         assert!(d.plan_needs().is_empty());
+    })
+    .await;
+}
+
+/// How many of the boss's model requests say `marker`.
+async fn said(llm: &wiremock::MockServer, marker: &str) -> usize {
+    llm.received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|r| String::from_utf8_lossy(&r.body).contains(marker))
+        .count()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_approval_counts_only_for_a_running_plan_of_the_bosss_own_and_where_it_says_to_run() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        // One at a time, so the second ticket waits in To do.
+        let (_overseer, state, d, _llm) = hub_with(
+            dir.path(),
+            pool,
+            "[oversight]\nenabled = true\nlevel = \"act\"\n[oversight.work]\nparallel = 1\n",
+        )
+        .await;
+        let p = proposed(&d, dir.path(), 2).await;
+        let id = p.summary.plan.id;
+        d.approve_plan(id, 1, &By::you()).await.unwrap();
+        let crew = CrewHub::start(state, d.clone(), FAST, CancellationToken::new());
+        let doing = eventually("the first started", async || {
+            d.plan(id).await.unwrap().tickets.into_iter().find(|t| t.ticket.ticket.state == TicketState::Doing)
+        })
+        .await;
+        let waiting = d
+            .plan(id)
+            .await
+            .unwrap()
+            .tickets
+            .into_iter()
+            .find(|t| t.ticket.ticket.state == TicketState::Todo)
+            .unwrap();
+        let (_, o) = crew.overseer_service().unwrap();
+        assert!(!o.act.hand_out_work);
+        let key = |t: &workforce_desk::PlanTicketView| t.ticket.key.clone().unwrap();
+        let gate_of = |input: Value, tool: &'static str, boss: Option<&'static str>| {
+            let crew = Arc::clone(&crew);
+            let o = o.clone();
+            async move {
+                let mut a = Action::parse(tool, &input)?;
+                crew.resolve_ticket(&mut a, None, boss).await?;
+                Ok::<Gate, String>(crew.gate(&a, &o))
+            }
+        };
+        let review = json!({ "ticket": key(&doing), "state": "review", "reason": "done" });
+        assert_eq!(gate_of(review.clone(), "crew.move_ticket", Some("desk")).await, Ok(Gate::Run));
+        // Another boss's plan is no authority of this one's.
+        assert!(matches!(
+            gate_of(review.clone(), "crew.move_ticket", Some("sarah")).await,
+            Ok(Gate::Suggest(_))
+        ));
+        // A ticket that has run goes back in the queue only by the person.
+        let back = json!({ "ticket": key(&doing), "state": "todo", "reason": "redo" });
+        assert!(matches!(
+            gate_of(back, "crew.move_ticket", Some("desk")).await,
+            Ok(Gate::Suggest(_))
+        ));
+        // A new session for it runs where the plan says, and nowhere else.
+        let other = tempfile::tempdir().unwrap();
+        let elsewhere = json!({ "ticket": key(&waiting), "to": { "newSession": { "folder": other.path().to_string_lossy() } }, "reason": "x" });
+        let refused = gate_of(elsewhere, "crew.assign_ticket", Some("desk")).await.unwrap_err();
+        assert!(refused.contains("as its plan says"), "{refused}");
+        let there = json!({ "ticket": key(&waiting), "to": { "newSession": { "folder": dir.path().to_string_lossy() } }, "reason": "x" });
+        assert_eq!(gate_of(there.clone(), "crew.assign_ticket", Some("desk")).await, Ok(Gate::Run));
+        // To an agent or a session it stays under `hand_out_work`.
+        let to_agent = json!({ "ticket": key(&waiting), "to": { "agent": "desk" }, "reason": "x" });
+        assert!(matches!(
+            gate_of(to_agent, "crew.assign_ticket", Some("desk")).await,
+            Ok(Gate::Suggest(_))
+        ));
+        // Paused, the approval doesn't count.
+        d.pause_plan(id, workforce_desk::plan::Paused::Person, &By::you())
+            .await
+            .unwrap();
+        assert!(matches!(
+            gate_of(there, "crew.assign_ticket", Some("desk")).await,
+            Ok(Gate::Suggest(_))
+        ));
+        assert!(matches!(
+            gate_of(review, "crew.move_ticket", Some("desk")).await,
+            Ok(Gate::Suggest(_))
+        ));
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_ticket_that_keeps_failing_to_start_tells_the_boss_once_and_pauses_its_plan_saying_why() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (_overseer, state, d, llm) = hub_with(dir.path(), pool, ACTS).await;
+        let folder = tempfile::tempdir().unwrap();
+        let p = proposed(&d, folder.path(), 1).await;
+        let id = p.summary.plan.id;
+        d.approve_plan(id, 1, &By::you()).await.unwrap();
+        // Its folder goes before it starts.
+        drop(folder);
+        let _crew = CrewHub::start(state, d.clone(), FAST, CancellationToken::new());
+        let paused = eventually("the plan paused", async || {
+            let p = d.plan(id).await.unwrap();
+            (p.summary.plan.paused == Some(workforce_desk::plan::Paused::StartFailing)).then_some(p)
+        })
+        .await;
+        let why = paused.summary.paused_why.unwrap();
+        assert!(
+            why.starts_with("DES-1 couldn't start 5 times:") && why.contains("not a folder"),
+            "{why}"
+        );
+        assert!(d
+            .plan_needs()
+            .iter()
+            .any(|n| n.ask.contains("couldn't start 5 times")));
+        eventually("the boss told", async || {
+            (said(&llm, "DES-1 didn't start").await >= 1).then_some(())
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(3_500)).await;
+        assert_eq!(
+            said(&llm, "DES-1 didn't start").await,
+            1,
+            "told once for the one reason"
+        );
+        assert!(started(&d).is_empty());
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_start_the_person_dismissed_isnt_suggested_again_until_the_plan_changes() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (_overseer, state, d, _llm) = hub_with(
+            dir.path(),
+            pool,
+            "[oversight]\nenabled = true\nlevel = \"suggest\"\n",
+        )
+        .await;
+        let p = proposed(&d, dir.path(), 1).await;
+        let id = p.summary.plan.id;
+        d.approve_plan(id, 1, &By::you()).await.unwrap();
+        let _crew = CrewHub::start(state, d.clone(), FAST, CancellationToken::new());
+        let mut s = eventually("the start suggested", async || {
+            d.store()
+                .suggestions_for("desk", "crew.assign_ticket")
+                .await
+                .unwrap()
+                .pop()
+        })
+        .await;
+        assert_eq!(s.action["input"]["plan_revision"], 1);
+        s.state = workforce_desk::crew::SuggestionState::Dismissed;
+        d.store().put_suggestion(&s).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+        assert_eq!(
+            d.store()
+                .suggestions_for("desk", "crew.assign_ticket")
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "not again"
+        );
+        // The person changes the plan: it is suggested afresh.
+        d.change_plan(
+            id,
+            workforce_desk::PlanEdit {
+                revision: Some(1),
+                goal: Some("Make the suite green today".into()),
+                ..Default::default()
+            },
+            Engine::Claude,
+            false,
+            &By::you(),
+        )
+        .await
+        .unwrap();
+        eventually("suggested afresh", async || {
+            (d.store()
+                .suggestions_for("desk", "crew.assign_ticket")
+                .await
+                .unwrap()
+                .len()
+                == 2)
+                .then_some(())
+        })
+        .await;
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_boss_is_told_in_plain_words_when_the_person_turns_its_change_down() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (_overseer, state, d, llm) = hub_with(
+            dir.path(),
+            pool,
+            "[oversight]\nenabled = true\nlevel = \"act\"\n[oversight.work]\nparallel = 1\n",
+        )
+        .await;
+        let p = proposed(&d, dir.path(), 1).await;
+        let id = p.summary.plan.id;
+        let p = d.approve_plan(id, 1, &By::you()).await.unwrap();
+        let _crew = CrewHub::start(state, d.clone(), FAST, CancellationToken::new());
+        let mut tickets: Vec<DraftTicket> = p
+            .tickets
+            .iter()
+            .map(|t| DraftTicket {
+                id: Some(t.ticket.ticket.id),
+                title: t.ticket.ticket.title.clone(),
+                folder: dir.path().to_string_lossy().into_owned(),
+                ..Default::default()
+            })
+            .collect();
+        tickets.push(DraftTicket {
+            title: "Update the docs".into(),
+            folder: dir.path().to_string_lossy().into_owned(),
+            ..Default::default()
+        });
+        d.change_plan(
+            id,
+            workforce_desk::PlanEdit {
+                revision: Some(1),
+                tickets: Some(tickets),
+                ..Default::default()
+            },
+            Engine::Claude,
+            false,
+            &By::manager("desk", "Desk", "The docs are stale."),
+        )
+        .await
+        .unwrap();
+        d.reject_plan(id, 2, &By::you()).await.unwrap();
+        eventually("the boss told", async || {
+            (said(&llm, "The person turned down the change to the plan").await >= 1).then_some(())
+        })
+        .await;
+        assert!(d.plan_needs().is_empty());
+        assert_eq!(d.plan(id).await.unwrap().tickets.len(), 1);
     })
     .await;
 }

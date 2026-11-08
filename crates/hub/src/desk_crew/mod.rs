@@ -130,9 +130,9 @@ pub struct CrewHub {
     /// Held while the overseer starts a session: counting its busy
     /// sessions and starting one more are one step.
     starting: tokio::sync::Mutex<()>,
-    /// The plan tickets whose session failed to start, and when: each is
-    /// tried again only after a minute.
-    plan_failed: Mutex<HashMap<uuid::Uuid, std::time::Instant>>,
+    /// The plan tickets whose session failed to start: each is tried again
+    /// after a wait that doubles.
+    plan_failed: Mutex<HashMap<uuid::Uuid, plan::Failed>>,
     /// What failed to start, for its plan's next turn.
     plan_failures: Mutex<Vec<(uuid::Uuid, String)>>,
 }
@@ -668,6 +668,10 @@ impl Crew for CrewHub {
                 }
             })
             .collect()
+    }
+
+    fn default_engine(&self, agent: &str) -> Option<String> {
+        self.overseer_named(agent).map(|(_, o)| o.work.engine)
     }
 
     fn agent_name(&self, id: &str) -> Option<String> {

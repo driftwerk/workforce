@@ -830,19 +830,22 @@ pub(crate) async fn answer(
             let Some(desk) = (sources.desk)() else {
                 return Ok(Err(Unanswered::Unknown));
             };
-            match choice {
-                Choice::Allow => match desk.approve_plan(*plan, *revision, &By::you()).await {
-                    Ok(_) => Ok(Ok(())),
-                    Err(DeskError::NotFound) => Ok(Err(Unanswered::Unknown)),
-                    // A newer revision came, or it ended: it is asked again
-                    // as it is now.
-                    Err(DeskError::Conflict(_)) => Ok(Err(Unanswered::AlreadyAnswered)),
-                    Err(DeskError::Invalid(_)) => Ok(Err(Unanswered::NotOffered)),
-                    Err(e) => Err(e.into()),
-                },
-                // It stays as proposed: Desk opens its card to edit or drop.
-                Choice::Deny => Ok(Ok(())),
-                Choice::AllowForSession | Choice::Cancel => Ok(Err(Unanswered::NotOffered)),
+            // Allow approves (or continues a plan paused for a ticket that
+            // keeps failing to start); Deny turns down a change of a running
+            // plan, and leaves one never approved as proposed for Desk to open.
+            let allow = match choice {
+                Choice::Allow => true,
+                Choice::Deny => false,
+                Choice::AllowForSession | Choice::Cancel => return Ok(Err(Unanswered::NotOffered)),
+            };
+            match desk.decide_plan(*plan, *revision, allow, &By::you()).await {
+                Ok(_) => Ok(Ok(())),
+                Err(DeskError::NotFound) => Ok(Err(Unanswered::Unknown)),
+                // A newer revision came, or it ended: it is asked again as
+                // it is now.
+                Err(DeskError::Conflict(_)) => Ok(Err(Unanswered::AlreadyAnswered)),
+                Err(DeskError::Invalid(_)) => Ok(Err(Unanswered::NotOffered)),
+                Err(e) => Err(e.into()),
             }
         }
         DecideRef::Config { agent_id, hash } => {

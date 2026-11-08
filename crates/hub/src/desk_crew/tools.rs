@@ -374,7 +374,12 @@ impl CrewTool {
         // a suggestion keeps its id and its key, so it is that ticket that
         // is shown and acted on. One on another scope's board is refused
         // as one that isn't there.
-        crew.resolve_ticket(&mut action, Some(&b.seen)).await?;
+        crew.resolve_ticket(
+            &mut action,
+            Some(&b.seen),
+            Some(b.service.agent_id.as_str()),
+        )
+        .await?;
         if let (Some(id), Some(key), Some(o)) = (
             action.ticket_id(),
             action.ticket_key(),

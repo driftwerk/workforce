@@ -439,7 +439,7 @@ async fn a_start_cut_off_before_its_session_starts_that_session_and_no_other() {
         let mut t = d.ticket_of(a).await.unwrap();
         let session = Uuid::new_v4();
         d.0.store
-            .begin_start(&mut t, 9_000.0, session, crew::now())
+            .begin_start(&mut t, id, 9_000.0, session, crew::now())
             .await
             .unwrap();
         assert!(d.view(session).is_err());
@@ -519,7 +519,7 @@ async fn a_start_cut_off_after_its_session_started_only_links_it() {
         let mut t = d.ticket_of(a).await.unwrap();
         let session = Uuid::new_v4();
         d.0.store
-            .begin_start(&mut t, 9_000.0, session, crew::now())
+            .begin_start(&mut t, id, 9_000.0, session, crew::now())
             .await
             .unwrap();
         // Its session started; the runner stopped before linking it.
@@ -570,7 +570,7 @@ async fn a_ticket_the_person_moved_before_a_cut_off_start_is_left_where_they_put
         let mut t = d.ticket_of(a).await.unwrap();
         let session = Uuid::new_v4();
         d.0.store
-            .begin_start(&mut t, 9_000.0, session, crew::now())
+            .begin_start(&mut t, id, 9_000.0, session, crew::now())
             .await
             .unwrap();
         d.move_ticket(
@@ -766,7 +766,17 @@ async fn the_persons_plan_routes_read_edit_approve_and_drop_and_refuse_a_stale_r
                 "{method} {uri}"
             );
         }
-        let app = crate::plan_api::api_routes(d.clone(), crate::testing::allow_all());
+        // The hub's own token reads and edits, but never approves.
+        let hub = crate::plan_api::api_routes(d.clone(), crate::testing::allow_all());
+        let (status, said) = call(
+            &hub,
+            "POST",
+            &format!("/api/desk/plans/{id}/approve"),
+            Some(json!({ "revision": 1 })),
+        )
+        .await;
+        assert_eq!(status, 403, "{said}");
+        let app = crate::plan_api::api_routes(d.clone(), crate::testing::identified("sam"));
         let (status, list) = call(&app, "GET", "/api/desk/plans?state=proposed", None).await;
         assert_eq!(status, 200);
         assert_eq!(list[0]["id"], id.to_string());
@@ -951,6 +961,431 @@ async fn two_approvals_at_once_run_the_plan_once_and_an_approval_racing_a_change
         // Either way the person can approve the newest.
         d.approve_plan(qid, newest, &you).await.unwrap();
         assert_eq!(d.plan(qid).await.unwrap().tickets.len(), 2);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_pause_that_comes_while_a_pass_runs_starts_nothing_and_a_pause_of_the_persons_stays() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let p = d
+            .propose_plan(new_plan(dir.path(), &[("a", &[])]), &sarah(), &by_sarah())
+            .await
+            .unwrap();
+        let id = p.summary.plan.id;
+        let read = d.approve_plan(id, 1, &By::you()).await.unwrap();
+        // The runner read it running; the person pauses it before it starts.
+        let start = plan::next_starts(
+            &read.summary.plan,
+            &d.plan_tickets(id).await.unwrap(),
+            0,
+            4,
+            None,
+        )
+        .remove(0);
+        d.pause_plan(id, Paused::Person, &By::you()).await.unwrap();
+        let refused = d
+            .plan_start(&read.summary.plan, &start, &sarah(), &by_sarah())
+            .await
+            .unwrap_err();
+        assert!(refused.to_string().contains("paused or ended"), "{refused}");
+        assert!(d.list().is_empty(), "nothing started");
+        assert_eq!(
+            d.ticket(start.ticket).await.unwrap().ticket.state,
+            TicketState::Todo
+        );
+        assert!(d.0.store.starting().await.unwrap().is_empty());
+        // Desk's own reasons never replace the person's pause.
+        let kept = d
+            .pause_plan(id, Paused::NoBoss, &By::desk("Its boss is gone."))
+            .await
+            .unwrap();
+        assert_eq!(kept.summary.plan.paused, Some(Paused::Person));
+        assert_eq!(kept.summary.paused_why.as_deref(), Some("You paused it"));
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_drop_racing_a_start_leaves_no_session_working_on_the_dropped_ticket() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let p = d
+            .propose_plan(new_plan(dir.path(), &[("a", &[])]), &sarah(), &by_sarah())
+            .await
+            .unwrap();
+        let id = p.summary.plan.id;
+        let read = d.approve_plan(id, 1, &By::you()).await.unwrap();
+        let start = plan::next_starts(
+            &read.summary.plan,
+            &d.plan_tickets(id).await.unwrap(),
+            0,
+            4,
+            None,
+        )
+        .remove(0);
+        let boss = sarah();
+        let by = by_sarah();
+        let you = By::you();
+        let (started, dropped) = tokio::join!(
+            d.plan_start(&read.summary.plan, &start, &boss, &by),
+            d.drop_plan(id, OnDrop::Stop, &you)
+        );
+        dropped.unwrap();
+        let t = d.ticket(start.ticket).await.unwrap();
+        assert_eq!(t.ticket.state, TicketState::Dropped);
+        assert!(d.0.store.starting().await.unwrap().is_empty());
+        if let Ok(s) = started {
+            // Started first: the drop stopped it.
+            let v = d.view(s.id).unwrap();
+            assert!(
+                !matches!(v.state, SessionState::Starting | SessionState::Working),
+                "{:?}",
+                v.state
+            );
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_raised_limit_waits_for_the_person_a_lowered_one_applies_and_approval_keeps_it() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let mut new = new_plan(dir.path(), &[("a", &[]), ("b", &[])]);
+        new.parallel = Some(2);
+        let p = d.propose_plan(new, &sarah(), &by_sarah()).await.unwrap();
+        let id = p.summary.plan.id;
+        assert_eq!(p.revisions[0].snapshot.parallel, Some(2));
+        d.approve_plan(id, 1, &By::you()).await.unwrap();
+        let edit = |rev: i32, n: Option<i16>| PlanEdit {
+            revision: Some(rev),
+            parallel: Some(n),
+            ..Default::default()
+        };
+        let lower = d
+            .change_plan(id, edit(1, Some(1)), Engine::Claude, false, &by_sarah())
+            .await
+            .unwrap();
+        assert_eq!((lower.change, lower.applied), (Some(Change::Minor), true));
+        assert_eq!(lower.plan.summary.plan.parallel, Some(1));
+        let raise = d
+            .change_plan(id, edit(2, Some(4)), Engine::Claude, false, &by_sarah())
+            .await
+            .unwrap();
+        assert_eq!((raise.change, raise.applied), (Some(Change::Scope), false));
+        assert_eq!(
+            raise.plan.summary.plan.parallel,
+            Some(1),
+            "it runs as approved"
+        );
+        let ran = d.approve_plan(id, 3, &By::you()).await.unwrap();
+        assert_eq!(ran.summary.plan.parallel, Some(4));
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn the_person_turns_down_a_change_or_must_before_editing_and_the_plan_stays_as_approved() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let p = d
+            .propose_plan(new_plan(dir.path(), &[("a", &[])]), &sarah(), &by_sarah())
+            .await
+            .unwrap();
+        let id = p.summary.plan.id;
+        let p = d.approve_plan(id, 1, &By::you()).await.unwrap();
+        let mut more = kept(&p);
+        more.push(DraftTicket {
+            title: "b".into(),
+            folder: dir.path().to_string_lossy().into_owned(),
+            ..Default::default()
+        });
+        let waits = d
+            .change_plan(
+                id,
+                PlanEdit {
+                    revision: Some(1),
+                    tickets: Some(more),
+                    ..Default::default()
+                },
+                Engine::Claude,
+                false,
+                &by_sarah(),
+            )
+            .await
+            .unwrap();
+        assert!(!waits.applied);
+        // The person's own edit doesn't slip the boss's change through.
+        let blocked = d
+            .change_plan(
+                id,
+                PlanEdit {
+                    revision: Some(2),
+                    goal: Some("Ship it all".into()),
+                    ..Default::default()
+                },
+                Engine::Claude,
+                false,
+                &By::you(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            blocked
+                .to_string()
+                .contains("Approve or reject Sarah's change first"),
+            "{blocked}"
+        );
+        // Deny on the Floor turns it down.
+        let kept_plan = d.decide_plan(id, 2, false, &By::you()).await.unwrap();
+        let plan = &kept_plan.summary.plan;
+        assert_eq!((plan.revision, plan.approved_revision), (3, Some(3)));
+        assert_eq!(kept_plan.tickets.len(), 1, "nothing was added");
+        assert!(
+            kept_plan.revisions[2]
+                .summary
+                .starts_with("Kept as approved"),
+            "{}",
+            kept_plan.revisions[2].summary
+        );
+        assert!(d.plan_needs().is_empty());
+        // Nothing waits now: no change to turn down.
+        assert!(d.reject_plan(id, 3, &By::you()).await.is_err());
+
+        // The route does the same, the hub holder alone.
+        let mut again = kept(&kept_plan);
+        again.push(DraftTicket {
+            title: "c".into(),
+            folder: dir.path().to_string_lossy().into_owned(),
+            ..Default::default()
+        });
+        d.change_plan(
+            id,
+            PlanEdit {
+                revision: Some(3),
+                tickets: Some(again),
+                ..Default::default()
+            },
+            Engine::Claude,
+            false,
+            &by_sarah(),
+        )
+        .await
+        .unwrap();
+        let hub = crate::plan_api::api_routes(d.clone(), crate::testing::allow_all());
+        let uri = format!("/api/desk/plans/{id}/changes/4/reject");
+        assert_eq!(call(&hub, "POST", &uri, None).await.0, 403);
+        let app = crate::plan_api::api_routes(d.clone(), crate::testing::identified("sam"));
+        assert_eq!(
+            call(
+                &app,
+                "POST",
+                &format!("/api/desk/plans/{id}/changes/3/reject"),
+                None
+            )
+            .await
+            .0,
+            409,
+            "a stale revision"
+        );
+        let (status, out) = call(&app, "POST", &uri, None).await;
+        assert_eq!(status, 200, "{out}");
+        assert_eq!(out["approvedRevision"], 5);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_plan_paused_for_a_ticket_that_keeps_failing_says_why_and_the_floor_continues_it() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let p = d
+            .propose_plan(new_plan(dir.path(), &[("a", &[])]), &sarah(), &by_sarah())
+            .await
+            .unwrap();
+        let id = p.summary.plan.id;
+        d.approve_plan(id, 1, &By::you()).await.unwrap();
+        let why = "DES-1 couldn't start 5 times: /gone is not a folder";
+        let paused = d
+            .pause_plan_failing(id, why, &By::desk("It keeps failing."))
+            .await
+            .unwrap();
+        assert_eq!(paused.summary.plan.paused, Some(Paused::StartFailing));
+        assert_eq!(paused.summary.paused_why.as_deref(), Some(why));
+        let v = serde_json::to_value(&paused.summary).unwrap();
+        assert_eq!(v["pausedWhy"], why);
+        let needs = d.plan_needs();
+        assert_eq!(needs.len(), 1);
+        assert!(needs[0].ask.contains(why), "{}", needs[0].ask);
+        let back = d.decide_plan(id, 1, true, &By::you()).await.unwrap();
+        assert!(back.summary.plan.runs());
+        assert_eq!(back.summary.paused_why, None);
+        assert!(d.plan_needs().is_empty());
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn the_breaker_holding_the_plans_group_holds_its_starts() {
+    use crate::ledger::{Billing, Priced, Spend, Tokens};
+    use crate::ledger_store::Kept;
+    use workforce_core::budget::{BudgetScope, Period, Unit};
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        d.change_layout(|l| l.create("g-acme", "Acme", &[], None))
+            .await
+            .unwrap();
+        let mut new = new_plan(dir.path(), &[("a", &[])]);
+        new.group = Some("g-acme".into());
+        let p = d.propose_plan(new, &sarah(), &by_sarah()).await.unwrap();
+        let id = p.summary.plan.id;
+        let read = d.approve_plan(id, 1, &By::you()).await.unwrap();
+        // Acme's own budget is held; Sarah sits in no group.
+        d.put_budget(
+            super::super::NewBudget {
+                scope: BudgetScope::Desk,
+                group: Some("g-acme".into()),
+                period: Period::Day,
+                unit: Unit::Usd,
+                amount: 11.0,
+                warn_at: None,
+                on_exceed: None,
+            },
+            By::you(),
+        )
+        .await
+        .unwrap();
+        let spender = d
+            .create(
+                NewSession {
+                    engine: Engine::Claude,
+                    view: None,
+                    name: "acme-web".into(),
+                    cwd: dir.path().to_string_lossy().into_owned(),
+                    goal: String::new(),
+                    worktree: None,
+                    prompt: None,
+                    approvals: None,
+                    approve_for_me: false,
+                    account: None,
+                    env: Default::default(),
+                    group: Some("g-acme".into()),
+                },
+                Some(By::you()),
+            )
+            .await
+            .unwrap();
+        d.0.store
+            .ledger_write(
+                spender.id,
+                Engine::Claude,
+                None,
+                &[Kept {
+                    spend: Spend {
+                        key: Uuid::new_v4().to_string(),
+                        at: chrono::Utc::now(),
+                        model: Some("claude-opus-5-5".into()),
+                        tokens: Tokens {
+                            input: 1000,
+                            ..Default::default()
+                        },
+                        usd: Some(10.5),
+                        priced: Priced::Reported,
+                        billing: None,
+                    },
+                    billing: Billing::Plan,
+                    account: None,
+                }],
+            )
+            .await
+            .unwrap();
+        d.breaker_spend(Some(vec![spender.id])).await;
+        assert!(d.starts_held(Some("g-acme")).is_some());
+        assert!(d.starts_held(None).is_none(), "not Desk's own total");
+        let start = plan::next_starts(
+            &read.summary.plan,
+            &d.plan_tickets(id).await.unwrap(),
+            0,
+            4,
+            None,
+        )
+        .remove(0);
+        let refused = d
+            .plan_start(&read.summary.plan, &start, &sarah(), &by_sarah())
+            .await
+            .unwrap_err();
+        assert!(refused.to_string().contains("breaker"), "{refused}");
+        assert_eq!(d.list().len(), 1, "only the person's");
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_plans_session_is_written_down_before_its_process_starts() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let p = d
+            .propose_plan(new_plan(dir.path(), &[("a", &[])]), &sarah(), &by_sarah())
+            .await
+            .unwrap();
+        let id = p.summary.plan.id;
+        let read = d.approve_plan(id, 1, &By::you()).await.unwrap();
+        let start = plan::next_starts(
+            &read.summary.plan,
+            &d.plan_tickets(id).await.unwrap(),
+            0,
+            4,
+            None,
+        )
+        .remove(0);
+        let s = d
+            .plan_start(&read.summary.plan, &start, &sarah(), &by_sarah())
+            .await
+            .unwrap();
+        // Its row is there as the start returns, not only once written behind.
+        assert!(d.0.store.get(s.id).await.unwrap().is_some());
+        assert_eq!(
+            d.charge_of(s.id).map(|c| c.how),
+            Some(crate::charge::How::Started)
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn only_a_bosss_own_starts_under_way_hold_its_slots() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let mia = Party::manager("mia", "Mia");
+        let by_mia = By::manager("mia", "Mia", "Atlas asked.");
+        let mut links = Vec::new();
+        for (boss, by) in [(sarah(), by_sarah()), (mia, by_mia)] {
+            let p = d
+                .propose_plan(new_plan(dir.path(), &[("a", &[])]), &boss, &by)
+                .await
+                .unwrap();
+            let id = p.summary.plan.id;
+            d.approve_plan(id, 1, &By::you()).await.unwrap();
+            let mut t = d.ticket_of(p.tickets[0].ticket.ticket.id).await.unwrap();
+            d.0.store
+                .begin_start(&mut t, id, 9_000.0, Uuid::new_v4(), crew::now())
+                .await
+                .unwrap();
+            links.push(id);
+        }
+        assert_eq!(d.starts_under_way("sarah").await, 1);
+        assert_eq!(d.starts_under_way("mia").await, 1);
+        assert_eq!(d.starts_under_way("desk").await, 0);
     })
     .await;
 }

@@ -15,7 +15,6 @@ use uuid::Uuid;
 
 use crate::api::Authorize;
 use crate::crew::By;
-use crate::engine::Engine;
 use crate::plan::{Paused, PlanState};
 use crate::service::{Desk, DeskError, OnDrop, PlanEdit};
 
@@ -43,6 +42,20 @@ macro_rules! guarded {
 
 fn bad(why: &str) -> Response {
     (StatusCode::BAD_REQUEST, Json(json!({ "error": why }))).into_response()
+}
+
+/// Only the person who holds the hub, signed in as themselves, approves
+/// or turns down a plan, as on the Floor: never the hub's own token.
+async fn holder(s: &Api, h: &HeaderMap, q: &TokenQuery) -> Result<(), Response> {
+    match s.auth.authorize(h, q.token.as_deref()).await {
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({ "error": "only the person who holds the hub decides a plan" })),
+        )
+            .into_response()),
+        Err(status) => Err((status, Json(json!({ "error": "not allowed" }))).into_response()),
+    }
 }
 
 #[derive(Deserialize)]
@@ -95,13 +108,9 @@ async fn edit(
     if e.revision.is_none() {
         return bad("say the revision the edit was made from");
     }
-    // A ticket the person adds with no engine runs on the plan's first's.
+    // A ticket the person adds with no engine runs on the boss's default.
     let engine = match s.desk.plan(id).await {
-        Ok(p) => p
-            .tickets
-            .iter()
-            .find_map(|t| t.engine)
-            .unwrap_or(Engine::Claude),
+        Ok(p) => s.desk.boss_engine(&p.summary.plan.boss),
         Err(e) => return e.into_response(),
     };
     s.desk
@@ -127,7 +136,9 @@ async fn approve(
     Path(id): Path<Uuid>,
     Json(b): Json<Approve>,
 ) -> Response {
-    guarded!(s, h, q);
+    if let Err(refused) = holder(&s, &h, &q).await {
+        return refused;
+    }
     if b.budget.is_some_and(|v| !v.is_null()) {
         return DeskError::Invalid(
             "A plan can't have a budget of its own yet; set its group's budget instead.".into(),
@@ -136,6 +147,24 @@ async fn approve(
     }
     s.desk
         .approve_plan(id, b.revision, &By::you())
+        .await
+        .map(Json)
+        .into_response()
+}
+
+/// The person turns down the boss's change waiting on them, revision
+/// `rev`: the plan stays on its approved revision, and the boss is told.
+async fn reject(
+    State(s): S,
+    h: HeaderMap,
+    Query(q): Q,
+    Path((id, rev)): Path<(Uuid, i32)>,
+) -> Response {
+    if let Err(refused) = holder(&s, &h, &q).await {
+        return refused;
+    }
+    s.desk
+        .reject_plan(id, rev, &By::you())
         .await
         .map(Json)
         .into_response()
@@ -191,6 +220,7 @@ pub(crate) fn api_routes(desk: Desk, auth: Arc<dyn Authorize>) -> Router {
         .route("/api/desk/plans", get(list))
         .route("/api/desk/plans/{id}", get(read).patch(edit))
         .route("/api/desk/plans/{id}/approve", post(approve))
+        .route("/api/desk/plans/{id}/changes/{rev}/reject", post(reject))
         .route("/api/desk/plans/{id}/pause", post(pause))
         .route("/api/desk/plans/{id}/resume", post(resume))
         .route("/api/desk/plans/{id}/drop", post(drop_plan))

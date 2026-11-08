@@ -292,6 +292,16 @@ pub struct By {
 }
 
 impl By {
+    /// Desk itself, for `reason`: no boss or person did it.
+    pub fn desk(reason: &str) -> Self {
+        Self {
+            party: Party::desk(),
+            reason: Some(reason.to_string()).filter(|r| !r.trim().is_empty()),
+            suggestion_id: None,
+            hop: 0,
+        }
+    }
+
     pub fn you() -> Self {
         Self {
             party: Party::you(),
@@ -626,6 +636,11 @@ pub trait Crew: Send + Sync {
             .find(|a| a.id == id)
             .map(|a| a.name)
             .filter(|n| !n.trim().is_empty() && n != id)
+    }
+    /// The engine the boss `agent` starts sessions on when nothing says
+    /// another (`[oversight.work] engine`), while it oversees.
+    fn default_engine(&self, _agent: &str) -> Option<String> {
+        None
     }
     /// The start of today, in the person's time.
     fn midnight(&self) -> DateTime<Utc>;

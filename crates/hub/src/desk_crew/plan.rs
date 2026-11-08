@@ -45,6 +45,20 @@ pub const PLAN: &str = "[Desk plan]";
 pub const NAME: &str = "crew.plan";
 pub const UPDATE: &str = "crew.plan_update";
 
+/// How many times a ticket fails to start before its plan pauses.
+pub const FAILS_BEFORE_PAUSE: u32 = 5;
+
+/// A plan's ticket that failed to start: how often, why last, and when it
+/// is tried next. Forgotten once it starts or its plan changes.
+#[derive(Debug, Clone)]
+pub(crate) struct Failed {
+    plan: Uuid,
+    revision: i32,
+    count: u32,
+    next: Instant,
+    why: String,
+}
+
 /// How long what happens to a plan is gathered into one turn.
 const GATHER: Duration = Duration::from_secs(3);
 
@@ -438,7 +452,7 @@ impl CrewHub {
         let Some((service, o)) = self.boss_of_plan(&p) else {
             // Its boss is gone from the hub: nothing runs unsupervised.
             if self.state.registry.get(&p.boss).is_none() {
-                let by = By::manager(&p.boss, &p.boss, "Its boss is no longer here.");
+                let by = By::desk("Its boss is no longer here.");
                 if let Err(e) = self.desk.pause_plan(p.id, plan::Paused::NoBoss, &by).await {
                     tracing::info!(plan = %p.id, error = %e, "a plan with no boss wasn't paused");
                 }
@@ -446,6 +460,11 @@ impl CrewHub {
             return;
         };
         if o.level == Level::Watch {
+            return;
+        }
+        // Held by Desk's breaker: the person has that need already, and
+        // the boss isn't told.
+        if self.desk.starts_held(p.group.as_deref()).is_some() {
             return;
         }
         // What a group's warning holds back, and its Continue, are the
@@ -469,35 +488,36 @@ impl CrewHub {
         let limit = o.work.parallel as usize;
         match o.level {
             Level::Act => {
-                // A ticket that just failed to start waits a minute before
-                // it is tried again.
+                // A ticket that failed to start waits longer each time, and
+                // is tried afresh once the plan changes.
                 let mut rows = tickets.clone();
                 {
                     let mut failed = self.plan_failed.lock();
-                    failed.retain(|_, at| at.elapsed() < self.timing.minute);
+                    failed.retain(|_, f| f.revision == p.revision || f.plan != p.id);
                     for t in &mut rows {
-                        if failed.contains_key(&t.id) {
+                        if failed.get(&t.id).is_some_and(|f| Instant::now() < f.next) {
                             t.starting = true;
                         }
                     }
                 }
-                let busy = self.desk.charges_busy(&boss.id) + self.starts_under_way().await;
+                let busy =
+                    self.desk.charges_busy(&boss.id) + self.desk.starts_under_way(&boss.id).await;
                 for s in plan::next_starts(&p, &rows, busy, limit, standing) {
-                    if let Err(e) = self.desk.plan_start(&p, &s, &boss, &by).await {
-                        tracing::info!(plan = %p.id, ticket = %s.ticket, error = %e, "a plan's ticket didn't start");
-                        let first = self
-                            .plan_failed
-                            .lock()
-                            .insert(s.ticket, Instant::now())
-                            .is_none();
-                        if first {
+                    match self.desk.plan_start(&p, &s, &boss, &by).await {
+                        Ok(_) => {
+                            self.plan_failed.lock().remove(&s.ticket);
+                        }
+                        // Read again next pass: a race, the breaker, a pause.
+                        Err(e @ workforce_desk::DeskError::Conflict(_)) => {
+                            tracing::info!(plan = %p.id, ticket = %s.ticket, error = %e, "a plan's ticket didn't start now");
+                        }
+                        Err(e) => {
+                            tracing::info!(plan = %p.id, ticket = %s.ticket, error = %e, "a plan's ticket didn't start");
                             let key = tickets
                                 .iter()
                                 .find(|t| t.id == s.ticket)
                                 .map_or_else(|| "A ticket".to_string(), PlanTicket::name);
-                            self.plan_failures
-                                .lock()
-                                .push((p.id, format!("{key} didn't start: {}", plain(e))));
+                            self.start_failed(&p, s.ticket, &key, &plain(e)).await;
                         }
                     }
                 }
@@ -510,19 +530,47 @@ impl CrewHub {
         }
     }
 
-    /// The starts whose session isn't there yet: they hold a slot too.
-    async fn starts_under_way(&self) -> usize {
-        match self.desk.store().starting().await {
-            Ok(list) => list
-                .iter()
-                .filter(|s| self.desk.view(s.session).is_err())
-                .count(),
-            Err(_) => 0,
+    /// `ticket` of `p` failed to start, saying `why`. Its boss is told once
+    /// for each thing that keeps it from starting; it is tried again after
+    /// a wait that doubles each time; after [`FAILS_BEFORE_PAUSE`] tries the
+    /// plan pauses, and the person reads why on the Floor.
+    async fn start_failed(&self, p: &Plan, ticket: Uuid, key: &str, why: &str) {
+        let (count, tell) = {
+            let mut failed = self.plan_failed.lock();
+            let f = failed.entry(ticket).or_insert_with(|| Failed {
+                plan: p.id,
+                revision: p.revision,
+                count: 0,
+                next: Instant::now(),
+                why: String::new(),
+            });
+            f.count += 1;
+            let wait = self.timing.minute * 2u32.saturating_pow(f.count - 1).min(64);
+            f.next = Instant::now() + wait;
+            let tell = f.why != why;
+            f.why = why.to_string();
+            (f.count, tell)
+        };
+        if tell {
+            self.plan_failures
+                .lock()
+                .push((p.id, format!("{key} didn't start: {why}")));
+        }
+        if count >= FAILS_BEFORE_PAUSE {
+            let said = format!("{key} couldn't start {count} times: {why}");
+            let by = By::desk("A ticket of it keeps failing to start.");
+            if let Err(e) = self.desk.pause_plan_failing(p.id, &said, &by).await {
+                tracing::info!(plan = %p.id, error = %e, "a plan that keeps failing wasn't paused");
+            }
+            self.plan_failed.lock().remove(&ticket);
         }
     }
 
     /// At `suggest`, what the runner would start becomes a suggestion for
-    /// the person, once per ticket, counted with the boss's other starts.
+    /// the person, once per ticket as it is now in the plan as approved:
+    /// one the person dismissed, or that failed, isn't suggested again
+    /// until the plan or the ticket changes. They count with the boss's
+    /// other starts.
     async fn suggest_starts(
         &self,
         p: &Plan,
@@ -532,18 +580,40 @@ impl CrewHub {
         standing: Option<Status>,
     ) {
         let boss = service.agent_id.as_str();
-        let open: Vec<crew::Suggestion> = match self.desk.store().suggestions(500).await {
-            Ok(all) => all
-                .into_iter()
-                .filter(|s| s.agent_id == boss && s.state == crew::SuggestionState::Open)
-                .collect(),
+        let made = match self
+            .desk
+            .store()
+            .suggestions_for(boss, "crew.assign_ticket")
+            .await
+        {
+            Ok(all) => all,
             Err(e) => {
                 tracing::warn!(error = %e, "couldn't read the boss's suggestions");
                 return;
             }
         };
-        let suggested: HashSet<String> = open
+        let Ok(detail) = self.desk.plan(p.id).await else {
+            return;
+        };
+        let at: HashMap<Uuid, String> = detail
+            .tickets
             .iter()
+            .map(|t| (t.ticket.ticket.id, t.ticket.ticket.updated_at.to_rfc3339()))
+            .collect();
+        let revision = p.approved_revision.unwrap_or(p.revision);
+        let suggested: HashSet<String> = made
+            .iter()
+            .filter(|s| {
+                let i = &s.action["input"];
+                s.state == crew::SuggestionState::Open
+                    || (i["plan_id"].as_str() == Some(&p.id.to_string())
+                        && i["plan_revision"].as_i64() == Some(i64::from(revision))
+                        && i["ticket_id"]
+                            .as_str()
+                            .and_then(|t| t.parse::<Uuid>().ok())
+                            .and_then(|t| at.get(&t))
+                            .is_some_and(|now| i["ticket_at"].as_str() == Some(now.as_str())))
+            })
             .filter_map(|s| s.action["input"]["ticket_id"].as_str().map(str::to_string))
             .collect();
         let mut rows = tickets.to_vec();
@@ -583,6 +653,9 @@ impl CrewHub {
                 "ticket": key,
                 "ticket_id": t.id.to_string(),
                 "to": { "newSession": { "folder": s.folder, "engine": s.engine.as_str() } },
+                "plan_id": p.id.to_string(),
+                "plan_revision": revision,
+                "ticket_at": at.get(&t.id),
             });
             if let Err(e) = self
                 .suggest("crew.assign_ticket", &input, &action, &by)
@@ -613,7 +686,8 @@ impl CrewHub {
                     .filter(|(_, o)| o.level == Level::Act);
                 let Some((service, _)) = boss else {
                     // No boss may start it now: the ticket waits in To do.
-                    if let Err(e) = self.desk.plan_restart_start(s, None, &By::you()).await {
+                    let by = By::desk("No boss may start it now.");
+                    if let Err(e) = self.desk.plan_restart_start(s, None, &by).await {
                         tracing::info!(ticket = %s.ticket, error = %e, "a start cut off wasn't put back");
                     }
                     continue;
@@ -659,7 +733,6 @@ impl CrewHub {
                 let ended = matches!(
                     state,
                     SessionState::Done
-                        | SessionState::Idle
                         | SessionState::Interrupted
                         | SessionState::Stopped
                         | SessionState::Closed

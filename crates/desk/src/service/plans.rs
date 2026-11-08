@@ -20,7 +20,6 @@ use uuid::Uuid;
 use super::{Desk, DeskError};
 use super::{Move, NewBoard};
 use crate::board::{self, Board, Link, Ticket, TicketState, RANK_STEP};
-use crate::board_store::TicketWrite;
 use crate::crew::{self, By, Kind, Party, PartyKind};
 use crate::engine::{Engine, View};
 use crate::floor::{Answer, DecideRef, Need, NeedKind, Place, Who};
@@ -29,13 +28,16 @@ use crate::plan::{
     self, Change, Draft, DraftTicket, Paused, Plan, PlanState, PlanTicket, Planned, Problem,
     Progress, Revision, Snapshot, Start,
 };
-use crate::plan_store::{Runs, Starting};
+use crate::plan_store::{BeginStart, Runs, Starting};
 
 /// What the desk keeps of plans in memory: the ones waiting on the person,
 /// for the Floor, which is read without waiting on Postgres.
 #[derive(Default)]
 pub(crate) struct Plans {
     awaiting: HashMap<Uuid, Need>,
+    /// Why each plan paused for a ticket failing to start is, in the
+    /// person's words.
+    failing: HashMap<Uuid, String>,
     /// What each boss that made a plan is called, by agent id: until the
     /// hub's roster says.
     names: HashMap<String, String>,
@@ -48,6 +50,8 @@ pub struct PlanSummary {
     #[serde(flatten)]
     pub plan: Plan,
     pub boss_name: String,
+    /// Why it is paused, in the person's words, while it is.
+    pub paused_why: Option<String>,
     pub progress: Progress,
 }
 
@@ -181,6 +185,37 @@ impl Desk {
         crew::shown_name(&p.boss, plans.names.get(&p.boss).map(String::as_str), true)
     }
 
+    /// The engine `boss` starts a ticket on that names none: its default,
+    /// as the hub says, else Claude Code.
+    pub fn boss_engine(&self, boss: &str) -> Engine {
+        let crew = self
+            .0
+            .line_crew
+            .lock()
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade);
+        crew.and_then(|c| c.default_engine(boss))
+            .and_then(|e| Engine::parse(e.trim()).ok())
+            .unwrap_or(Engine::Claude)
+    }
+
+    /// Why `p` is paused, in the person's words: what keeps a ticket of it
+    /// from starting, as the runner said, or why it was paused.
+    fn paused_why(&self, p: &Plan) -> Option<String> {
+        let why = p.paused?;
+        let said = match why {
+            Paused::StartFailing => self.0.boss_plans.lock().failing.get(&p.id).cloned(),
+            _ => None,
+        };
+        Some(said.unwrap_or_else(|| {
+            let w = why.why();
+            let mut c = w.chars();
+            c.next()
+                .map(|f| f.to_uppercase().chain(c).collect::<String>())
+                .unwrap_or_default()
+        }))
+    }
+
     /// `plan`'s tickets as the runner and the card read them.
     pub async fn plan_tickets(&self, plan: Uuid) -> Result<Vec<PlanTicket>, DeskError> {
         let (tickets, runs, starting) = self.plan_rows(plan).await?;
@@ -222,6 +257,7 @@ impl Desk {
         let tickets = self.plan_tickets(p.id).await?;
         Ok(PlanSummary {
             boss_name: self.plan_boss_name(&p),
+            paused_why: self.paused_why(&p),
             progress: plan::progress(&tickets),
             plan: p,
         })
@@ -293,6 +329,7 @@ impl Desk {
             waves: plan::waves(&rows),
             summary: PlanSummary {
                 boss_name: self.plan_boss_name(&p),
+                paused_why: self.paused_why(&p),
                 progress: plan::progress(&rows),
                 plan: p,
             },
@@ -305,14 +342,17 @@ impl Desk {
     /// its newest while none is.
     async fn applied(&self, p: &Plan) -> Result<Snapshot, DeskError> {
         let n = p.approved_revision.unwrap_or(p.revision);
-        Ok(self
+        let mut s = self
             .0
             .store
             .revision(p.id, n)
             .await
             .map_err(internal)?
             .map(|r| r.snapshot)
-            .unwrap_or_default())
+            .unwrap_or_default();
+        // What runs is the plan's own limit.
+        s.parallel = p.parallel;
+        Ok(s)
     }
 
     async fn newest(&self, p: &Plan) -> Result<Snapshot, DeskError> {
@@ -355,13 +395,22 @@ impl Desk {
 
     /// Keeps the Floor's need for `p` as it is now.
     async fn plan_awaits(&self, p: &Plan) {
-        if !p.awaiting() {
+        let failing = p.paused == Some(Paused::StartFailing);
+        if !p.awaiting() && !failing {
             self.0.boss_plans.lock().awaiting.remove(&p.id);
             return;
         }
         let summary = self.0.store.revision(p.id, p.revision).await.ok().flatten();
         let boss = self.plan_boss_name(p);
+        let failed = self.0.boss_plans.lock().failing.get(&p.id).cloned();
         let (ask, why) = match p.approved_revision {
+            _ if failing && !p.awaiting() => (
+                format!(
+                    "{boss}'s plan is paused: {}",
+                    failed.unwrap_or_else(|| "a ticket keeps failing to start".into())
+                ),
+                Some("Continue tries it again; or edit or drop the ticket first.".into()),
+            ),
             None => (
                 format!("Approve {boss}'s plan: {}", crew::one_line(&p.goal, 160)),
                 summary.as_ref().map(|r| plan_why(&r.snapshot, p.parallel)),
@@ -453,8 +502,9 @@ impl Desk {
         by: &By,
     ) -> Result<PlanDetail, DeskError> {
         let _write = self.0.plan_write.lock().await;
-        let s =
+        let mut s =
             plan::snapshot_of(&new.draft, None, new.engine, &mut Uuid::new_v4).map_err(problems)?;
+        s.parallel = new.parallel;
         plan::validate(&s, &self.engines(), &|f| Path::new(f).is_dir()).map_err(problems)?;
         if new.parallel.is_some_and(|p| !(1..=12).contains(&p)) {
             return Err(DeskError::Invalid(
@@ -488,16 +538,68 @@ impl Desk {
             created_at: at,
             updated_at: at,
         };
-        self.0.store.put_plan(&p).await.map_err(internal)?;
-        self.plan_rows_follow(&p, &Snapshot::default(), &s, TicketState::Backlog, by)
-            .await?;
         let summary = format!(
             "Proposed {} tickets for “{}”",
             s.tickets.len(),
             crew::one_line(&s.goal, 120)
         );
-        self.add_revision(&p, 1, by, Change::Scope, &summary, &s)
+        // The plan, its tickets and its first revision, in one write.
+        let mut rank = self
+            .end_rank(b.id, TicketState::Backlog, Uuid::nil())
             .await?;
+        let mut rows: Vec<(Ticket, Runs)> = Vec::with_capacity(s.tickets.len());
+        for t in &s.tickets {
+            rows.push((
+                Ticket {
+                    id: t.id,
+                    board: b.id,
+                    number: 0,
+                    title: t.title.clone(),
+                    body: t.body.clone(),
+                    state: TicketState::Backlog,
+                    rank,
+                    assignee: None,
+                    needs: t.needs.clone(),
+                    links: vec![],
+                    created_by: by.party.clone(),
+                    pinned: false,
+                    snoozed_until: None,
+                    snoozed_at: None,
+                    state_at: at,
+                    created_at: at,
+                    updated_at: at,
+                    version: 0,
+                },
+                Runs {
+                    plan: Some(p.id),
+                    engine: Some(t.engine),
+                    folder: Some(t.folder.clone()),
+                    view: t.view,
+                },
+            ));
+            rank += RANK_STEP;
+        }
+        let r = Revision {
+            plan: p.id,
+            revision: 1,
+            at,
+            by: by.party.clone(),
+            change: Change::Scope,
+            summary,
+            snapshot: s.clone(),
+        };
+        self.0
+            .store
+            .add_plan(&p, &mut rows, &r)
+            .await
+            .map_err(internal)?;
+        for (t, _) in rows {
+            if let Ok(v) = self.view_ticket(t).await {
+                self.announce(DeskEvent::Ticket {
+                    ticket: Box::new(v),
+                });
+            }
+        }
         self.plan_note(
             &p,
             by,
@@ -760,6 +862,13 @@ impl Desk {
         if edit.revision.is_some_and(|r| r != p.revision) {
             return Err(stale_plan(&p, &boss));
         }
+        // The person's edit never approves, by the way, a change the boss is
+        // waiting on them for.
+        if by.party.kind == PartyKind::You && p.approved_revision.is_some_and(|a| a != p.revision) {
+            return Err(DeskError::Conflict(format!(
+                "Approve or reject {boss}'s change first."
+            )));
+        }
         if let Some(Some(n)) = edit.parallel {
             if !(1..=12).contains(&n) {
                 return Err(DeskError::Invalid(
@@ -785,12 +894,14 @@ impl Desk {
         if let Some(goal) = &edit.goal {
             next.goal = goal.trim().to_string();
         }
+        if let Some(par) = edit.parallel {
+            next.parallel = par;
+        }
         plan::validate(&next, &self.engines(), &|f| Path::new(f).is_dir()).map_err(problems)?;
         let started = self.started(&p).await?;
         let change = plan::plan_change(&applied, &next, &started)
             .map_err(|e| DeskError::Conflict(e.to_string()))?;
-        let parallel_changed = edit.parallel.is_some_and(|n| n != p.parallel);
-        if change.is_none() && next == newest && !parallel_changed {
+        if change.is_none() && next == newest {
             let detail = self.plan_detail(p).await?;
             return Ok(Changed {
                 plan: detail,
@@ -800,16 +911,6 @@ impl Desk {
             });
         }
         let mut summary = plan::describe(&applied, &next);
-        if parallel_changed {
-            let said = match edit.parallel.flatten() {
-                Some(n) => format!("runs at most {n} at once"),
-                None => "runs as many at once as its boss may".into(),
-            };
-            summary = match change {
-                None => format!("It {said}"),
-                Some(_) => format!("{summary}; it {said}"),
-            };
-        }
         if let Some(why) = edit.why.as_deref().map(str::trim).filter(|w| !w.is_empty()) {
             summary = format!("{summary} ({})", crew::one_line(why, 160));
         }
@@ -832,9 +933,7 @@ impl Desk {
             if p.approved_revision.is_some() {
                 p.approved_revision = Some(n);
             }
-            if let Some(par) = edit.parallel {
-                p.parallel = par;
-            }
+            p.parallel = next.parallel;
             p.goal.clone_from(&next.goal);
         }
         p.updated_at = crew::now();
@@ -921,6 +1020,7 @@ impl Desk {
             }
         }
         p.approved_revision = Some(revision);
+        p.parallel = next.parallel;
         p.updated_at = crew::now();
         let text = match revision {
             1 => format!("approved the plan: {}", crew::one_line(&p.goal, 120)),
@@ -945,7 +1045,9 @@ impl Desk {
                 "Only a running plan can be paused.".into(),
             ));
         }
-        if p.paused == Some(why) {
+        // A pause of the person's stays theirs: Desk's own reasons never
+        // replace it.
+        if p.paused == Some(why) || (p.paused == Some(Paused::Person) && why != Paused::Person) {
             return self.plan_detail(p).await;
         }
         p.state = PlanState::Paused;
@@ -981,6 +1083,7 @@ impl Desk {
         };
         p.state = PlanState::Running;
         p.paused = None;
+        self.0.boss_plans.lock().failing.remove(&p.id);
         p.updated_at = crew::now();
         self.plan_note(
             &p,
@@ -991,14 +1094,124 @@ impl Desk {
         self.plan_saved(&p).await
     }
 
+    /// Pauses plan `id` because one of its tickets keeps failing to start,
+    /// `why` saying so in the person's words; they continue it from the
+    /// Floor.
+    pub async fn pause_plan_failing(
+        &self,
+        id: Uuid,
+        why: &str,
+        by: &By,
+    ) -> Result<PlanDetail, DeskError> {
+        self.0
+            .boss_plans
+            .lock()
+            .failing
+            .insert(id, crew::one_line(why, 300));
+        self.pause_plan(id, Paused::StartFailing, by).await
+    }
+
+    /// The person keeps plan `id` as approved and turns down the boss's
+    /// change waiting on them (`revision`): a new revision, as approved.
+    pub async fn reject_plan(
+        &self,
+        id: Uuid,
+        revision: i32,
+        by: &By,
+    ) -> Result<PlanDetail, DeskError> {
+        let _write = self.0.plan_write.lock().await;
+        if by.party.kind != PartyKind::You {
+            return Err(DeskError::Invalid(
+                "Only the person turns down a plan's change.".into(),
+            ));
+        }
+        let mut p = self.plan_of(id).await?;
+        if revision != p.revision {
+            return Err(stale_plan(&p, &self.plan_boss_name(&p)));
+        }
+        if p.approved_revision.is_none_or(|a| a == p.revision) {
+            return Err(DeskError::Conflict(
+                "No change waits on you; edit or drop the plan instead.".into(),
+            ));
+        }
+        let applied = self.applied(&p).await?;
+        let turned_down = self
+            .0
+            .store
+            .revision(p.id, p.revision)
+            .await
+            .map_err(internal)?
+            .map(|r| r.summary)
+            .unwrap_or_default();
+        let summary = format!(
+            "Kept as approved, not: {}",
+            crew::one_line(&turned_down, 200)
+        );
+        let n = p.revision + 1;
+        self.add_revision(&p, n, by, Change::Minor, &summary, &applied)
+            .await?;
+        p.revision = n;
+        p.approved_revision = Some(n);
+        p.updated_at = crew::now();
+        self.plan_note(
+            &p,
+            by,
+            Kind::PlanChanged,
+            format!(
+                "turned down the change to the plan: {}",
+                crew::one_line(&turned_down, 160)
+            ),
+        );
+        self.plan_saved(&p).await
+    }
+
+    /// The person's answer to plan `id`'s Floor need as of `revision`:
+    /// Allow approves what waits (or continues a plan paused for a ticket
+    /// failing to start); Deny turns down a change of a running plan, and
+    /// leaves one never approved as proposed, for them to open.
+    pub async fn decide_plan(
+        &self,
+        id: Uuid,
+        revision: i32,
+        allow: bool,
+        by: &By,
+    ) -> Result<PlanDetail, DeskError> {
+        let p = self.plan_of(id).await?;
+        if revision != p.revision {
+            return Err(stale_plan(&p, &self.plan_boss_name(&p)));
+        }
+        match (p.awaiting(), allow, p.approved_revision) {
+            (true, true, _) => self.approve_plan(id, revision, by).await,
+            (true, false, Some(_)) => self.reject_plan(id, revision, by).await,
+            (true, false, None) => self.plan_detail(p).await,
+            (false, true, _) if p.paused == Some(Paused::StartFailing) => {
+                self.resume_plan(id, &[Paused::StartFailing], by).await
+            }
+            (false, false, _) if p.paused == Some(Paused::StartFailing) => {
+                self.plan_detail(p).await
+            }
+            (false, _, _) => Err(DeskError::Conflict("Already answered.".into())),
+        }
+    }
+
     /// Drops plan `id`: its tickets not started are dropped; the sessions
     /// working on the rest are stopped, or left running as the person's
     /// own (`on`).
     pub async fn drop_plan(&self, id: Uuid, on: OnDrop, by: &By) -> Result<PlanDetail, DeskError> {
         let _write = self.0.plan_write.lock().await;
+        // No start is under way while it drops: one begun finished first.
+        let _one = self.0.plan_starting.lock().await;
         let mut p = self.plan_of(id).await?;
         if p.state == PlanState::Dropped {
             return self.plan_detail(p).await;
+        }
+        let rows = self.0.store.plan_tickets(p.id).await.map_err(internal)?;
+        // A start a stop cut off never starts now.
+        let ours: HashSet<Uuid> = rows.iter().map(|t| t.id).collect();
+        for s in self.0.store.starting().await.map_err(internal)? {
+            if ours.contains(&s.ticket) {
+                self.end_start_of(&s).await;
+            }
         }
         let rows = self.0.store.plan_tickets(p.id).await.map_err(internal)?;
         for t in rows {
@@ -1081,7 +1294,11 @@ impl Desk {
     /// `by`: the ticket moves to Doing with a `starting` link naming the
     /// session in one write, then that session starts, in the plan's group
     /// and in the boss's charge before it runs, and is linked to the
-    /// ticket. A ticket the person moved since it was read isn't started.
+    /// ticket. It starts in what the ticket's row says then, whatever `p`
+    /// and `start` were read as. A ticket the person moved since it was
+    /// read isn't started, and nothing starts once the plan is paused,
+    /// dropped or done, or while Desk's breaker holds new starts in its
+    /// group.
     pub async fn plan_start(
         &self,
         p: &Plan,
@@ -1089,8 +1306,11 @@ impl Desk {
         boss: &Party,
         by: &By,
     ) -> Result<SessionView, DeskError> {
-        if !p.runs() {
-            return Err(DeskError::Conflict("That plan isn't running.".into()));
+        let _one = self.0.plan_starting.lock().await;
+        if let Some(ask) = self.starts_held(p.group.as_deref()) {
+            return Err(DeskError::Conflict(format!(
+                "Desk's breaker holds new sessions: {ask} The person can say Continue on Desk's Floor."
+            )));
         }
         let mut t = self.ticket_of(start.ticket).await?;
         if t.state != TicketState::Todo || t.assignee.is_some() {
@@ -1113,37 +1333,37 @@ impl Desk {
         let session = Uuid::new_v4();
         let at = crew::now();
         let rank = self.end_rank(t.board, TicketState::Doing, t.id).await?;
-        self.0
+        let runs = self
+            .0
             .store
-            .begin_start(&mut t, rank, session, at)
+            .begin_start(&mut t, p.id, rank, session, at)
             .await
             .map_err(|e| match e {
-                TicketWrite::Stale => DeskError::Conflict(
+                BeginStart::Stale => DeskError::Conflict(
                     "That ticket changed as it was started; it is read again.".into(),
                 ),
-                TicketWrite::Other(e) => DeskError::Internal(e),
+                BeginStart::NotRunning => DeskError::Conflict(
+                    "That plan was paused or ended as its ticket was started.".into(),
+                ),
+                BeginStart::Other(e) => DeskError::Internal(e),
             })?;
-        let runs = Runs {
-            plan: Some(p.id),
-            engine: Some(start.engine),
-            folder: Some(start.folder.clone()),
-            view: start.view,
-        };
         self.plan_launch(p, t, session, &runs, start.worktree, boss, by)
             .await
     }
 
-    /// Finishes the start `s` that a stop cut off: its session runs (it is
-    /// linked to the ticket), or it never started (it is started now, as
-    /// the same session, run by `boss`; with no boss that may start it, the
-    /// ticket waits in To do again). A ticket the person moved meanwhile is
-    /// left as they put it. `None` when nothing was started.
+    /// Finishes the start `s` that a stop cut off: its session is known (it
+    /// is linked to the ticket; one the holder kept was adopted when Desk
+    /// started), or it never started (it is started now, as the same
+    /// session, run by `boss`; with no boss that may start it, the ticket
+    /// waits in To do again). A ticket the person moved meanwhile is left
+    /// as they put it. `None` when nothing was started.
     pub async fn plan_restart_start(
         &self,
         s: Starting,
         boss: Option<&Party>,
         by: &By,
     ) -> Result<Option<SessionView>, DeskError> {
+        let _one = self.0.plan_starting.lock().await;
         let t = match self.ticket_of(s.ticket).await {
             Ok(t) => t,
             Err(DeskError::NotFound) => {
@@ -1163,16 +1383,15 @@ impl Desk {
             None => None,
         };
         let still = t.state == TicketState::Doing && t.assignee.is_none();
-        let (Some(p), Some(boss)) = (p.filter(|p| still && p.runs()), boss) else {
-            // Moved, dropped or paused meanwhile: no session for it now. A
-            // ticket left in Doing with no one on it goes back to To do.
-            if still {
-                let mut back = t;
-                let at = crew::now();
-                self.to_column(&mut back, TicketState::Todo, at).await?;
-                self.save_ticket(&mut back).await?;
-            }
-            self.end_start_of(&s).await;
+        let held = p
+            .as_ref()
+            .and_then(|p| self.starts_held(p.group.as_deref()))
+            .is_some();
+        let (Some(p), Some(boss)) = (p.filter(|p| still && p.runs() && !held), boss) else {
+            // Moved, dropped, paused or held meanwhile, or no boss may
+            // start it: no session for it now. A ticket left in Doing with
+            // no one on it goes back to To do.
+            self.undo_start(&s).await;
             return Ok(None);
         };
         let runs = self
@@ -1197,15 +1416,55 @@ impl Desk {
             .map(Some)
     }
 
+    /// How many of `boss`'s plans' starts are under way with no session
+    /// yet: each holds one of its slots.
+    pub async fn starts_under_way(&self, boss: &str) -> usize {
+        let Ok(list) = self.0.store.starting().await else {
+            return 0;
+        };
+        let mut n = 0;
+        for s in list.iter().filter(|s| self.view(s.session).is_err()) {
+            let plan = match self.0.store.plan_of_ticket(s.ticket).await {
+                Ok(Some(id)) => self.0.store.plan(id).await.ok().flatten(),
+                _ => None,
+            };
+            if plan.is_some_and(|p| p.boss == boss) {
+                n += 1;
+            }
+        }
+        n
+    }
+
     async fn end_start_of(&self, s: &Starting) {
         if let Err(e) = self.0.store.end_start(s.ticket, s.session).await {
             tracing::warn!(ticket = %s.ticket, error = %e, "a start's link stays");
         }
     }
 
+    /// Undoes the start `s` that didn't happen: its ticket, still in Doing
+    /// with no one on it, waits in To do again (one the person moved stays
+    /// where they put it), and its link goes.
+    async fn undo_start(&self, s: &Starting) {
+        if let Ok(mut back) = self.ticket_of(s.ticket).await {
+            if back.state == TicketState::Doing && back.assignee.is_none() {
+                let at = crew::now();
+                if self
+                    .to_column(&mut back, TicketState::Todo, at)
+                    .await
+                    .is_ok()
+                {
+                    if let Err(e) = self.save_ticket(&mut back).await {
+                        tracing::info!(ticket = %s.ticket, error = %e, "a ticket that didn't start stays in Doing");
+                    }
+                }
+            }
+        }
+        self.end_start_of(s).await;
+    }
+
     /// Starts `session` for `t`, which is in Doing with its `starting`
-    /// link, and links them; a session that fails to start puts the ticket
-    /// back in To do, so the runner tries again later.
+    /// link, and links them; whatever keeps it from starting puts the
+    /// ticket back in To do, so the runner tries again later.
     #[allow(clippy::too_many_arguments)]
     async fn plan_launch(
         &self,
@@ -1222,10 +1481,38 @@ impl Desk {
             session,
             at: crew::now(),
         };
-        let key = self.key_of(&t).await?;
-        let needs = self.need_keys(&t).await?;
+        let started = self
+            .plan_spawn(p, &t, session, runs, worktree, boss, by)
+            .await;
+        let view = match started {
+            Ok(v) => v,
+            Err(e) => {
+                self.undo_start(&s).await;
+                self.plan_touched(p.id).await;
+                return Err(e);
+            }
+        };
+        self.plan_link(t, view.clone(), by).await;
+        self.end_start_of(&s).await;
+        self.plan_touched(p.id).await;
+        Ok(view)
+    }
+
+    /// The session for `t`, started as `session`.
+    #[allow(clippy::too_many_arguments)]
+    async fn plan_spawn(
+        &self,
+        p: &Plan,
+        t: &Ticket,
+        session: Uuid,
+        runs: &Runs,
+        worktree: bool,
+        boss: &Party,
+        by: &By,
+    ) -> Result<SessionView, DeskError> {
+        let key = self.key_of(t).await?;
+        let needs = self.need_keys(t).await?;
         let (Some(engine), Some(folder)) = (runs.engine, runs.folder.clone()) else {
-            self.end_start_of(&s).await;
             return Err(DeskError::Invalid(format!(
                 "{key} doesn't say where its session runs."
             )));
@@ -1256,40 +1543,14 @@ impl Desk {
             cwd,
             goal: board::goal_for(&key, &t.title),
             worktree: branch,
-            prompt: Some(board::handed_text(&key, &t, &needs)),
+            prompt: Some(board::handed_text(&key, t, &needs)),
             approvals: None,
             approve_for_me: false,
             account: None,
             env: BTreeMap::new(),
             group,
         };
-        let started = self.create_for_as(session, new, boss, by.clone()).await;
-        let view = match started {
-            Ok(v) => v,
-            Err(e) => {
-                // It didn't start: the ticket waits in To do again, unless
-                // the person moved it meanwhile.
-                if let Ok(mut back) = self.ticket_of(t.id).await {
-                    if back.state == TicketState::Doing && back.assignee.is_none() {
-                        let at = crew::now();
-                        if self
-                            .to_column(&mut back, TicketState::Todo, at)
-                            .await
-                            .is_ok()
-                        {
-                            let _ = self.save_ticket(&mut back).await;
-                        }
-                    }
-                }
-                self.end_start_of(&s).await;
-                self.plan_touched(p.id).await;
-                return Err(e);
-            }
-        };
-        self.plan_link(t, view.clone(), by).await;
-        self.end_start_of(&s).await;
-        self.plan_touched(p.id).await;
-        Ok(view)
+        self.create_for_as(session, new, boss, by.clone()).await
     }
 
     /// Gives `t` to the session started for it, as it is now: the person's
