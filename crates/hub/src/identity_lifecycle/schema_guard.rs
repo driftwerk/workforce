@@ -335,6 +335,12 @@ const CLAIMS: &[(&str, &str, &str, Claim)] = &[
         "subject",
         NotPersonal("the agent or Desk session a gist is of"),
     ),
+    (
+        "hub",
+        "gists_forgotten",
+        "subject",
+        NotPersonal("the Desk session whose memory the person had forgotten"),
+    ),
     ("hub", "summaries", "owner", By(C::Signals)),
     ("hub", "allows", "person", By(C::PermissionRules)),
     ("hub", "presence", "identity_id", By(C::Devices)),

@@ -104,7 +104,9 @@ pub use breaker::{
 };
 pub use ledger::{LedgerPage, SpendQuery};
 pub use line::{LineError, Sender, SessionMcp};
-pub use memory::{MemoryHitView, MemorySearch, SessionMemory};
+pub use memory::{
+    GroupMemoryChange, MemoryHitView, MemorySearch, MemorySettingsChange, SessionMemory,
+};
 pub use memory_derive::ItemChange;
 pub use terminals::{NewTerminal, TerminalPatch, TerminalRecord, TerminalState, TerminalView};
 
