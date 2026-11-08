@@ -517,20 +517,29 @@ impl Desk {
     /// ledger and, where it may be, for session memory.
     async fn read_spend(&self, id: Uuid) {
         let _reading = self.0.ledger.reading.lock().await;
-        self.read_spend_held(id, None).await;
+        if let Err(e) = self.read_spend_held(id, None).await {
+            tracing::warn!(session = %id, error = format!("{e:#}"), "couldn't read a session's record");
+        }
     }
 
     /// [`Self::read_spend`] with [`LedgerRun::reading`] already held; with
-    /// `forced`, every record is read so whatever the switches say now.
-    pub(super) async fn read_spend_held(&self, id: Uuid, forced: Option<Harvest>) {
+    /// `forced`, every record is read so whatever the switches say now, and
+    /// one that hasn't grown since it was read and harvested to its end is
+    /// passed over. The first record that couldn't be read, if any: the
+    /// others are read all the same.
+    pub(super) async fn read_spend_held(
+        &self,
+        id: Uuid,
+        forced: Option<Harvest>,
+    ) -> eyre::Result<()> {
         let Some(r) = self.session_record(id).await else {
-            return;
+            return Ok(());
         };
         // An agent's turn is its agent's spend, in its hub's own records.
         if self.0.opts.hub_internal.holds(std::path::Path::new(&r.cwd))
             || ledger::agent_turn(&r.cwd, &r.name)
         {
-            return;
+            return Ok(());
         }
         let known = self.0.ledger.projects.lock().get(&id).cloned();
         let (records, project) = {
@@ -550,11 +559,39 @@ impl Desk {
             Some(mode) => vec![mode; records.len()],
             None => self.harvest_modes(&r, &records).await,
         };
+        let mut failed = None;
         for (path, mode) in records.iter().zip(modes) {
+            if forced.is_some() && self.unchanged(id, path).await {
+                continue;
+            }
             if let Err(e) = self.read_record(&r, path, mode, ending, &project).await {
                 tracing::warn!(session = %id, error = %e, "couldn't read a session's record");
+                failed.get_or_insert(e);
             }
         }
+        failed.map_or(Ok(()), Err)
+    }
+
+    /// Whether `path`, one of `id`'s records, is as big as it was when last
+    /// read, and harvested (or passed over) to there: nothing in it to
+    /// read. Records only grow.
+    async fn unchanged(&self, id: Uuid, path: &Path) -> bool {
+        let Ok(Some(c)) = self
+            .0
+            .store
+            .ledger_cursor(id, &path.to_string_lossy())
+            .await
+        else {
+            return false;
+        };
+        let len = {
+            let path = path.to_path_buf();
+            tokio::task::spawn_blocking(move || std::fs::metadata(path).map(|m| m.len()))
+                .await
+                .ok()
+                .and_then(Result::ok)
+        };
+        len == Some(c.read_to) && c.harvested_to == c.read_to
     }
 
     /// Reads `path`, one of `r`'s records, from its cursor to its end.

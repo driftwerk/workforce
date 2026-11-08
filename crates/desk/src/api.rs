@@ -1507,11 +1507,11 @@ async fn switch_memory(
         Ok(b) => b,
         Err(e) => return DeskError::Invalid(e.body_text()).into_response(),
     };
-    s.desk
-        .set_session_memory(id, switch.on)
-        .await
-        .map(|()| StatusCode::NO_CONTENT)
-        .into_response()
+    match s.desk.set_session_memory(id, switch.on).await {
+        Ok(None) => StatusCode::NO_CONTENT.into_response(),
+        Ok(Some(notice)) => Json(serde_json::json!({ "notice": notice })).into_response(),
+        Err(e) => e.into_response(),
+    }
 }
 
 /// The person's memory settings, the install's limits, and what is kept.

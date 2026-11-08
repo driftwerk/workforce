@@ -320,7 +320,8 @@ pub enum TurnOp {
         subjects: Vec<SubjectKey>,
     },
     /// The person had Desk forget what it remembers of the subjects: their
-    /// gists go, their turns stay.
+    /// gists go, and their turns stay without what they were asked, did or
+    /// answered, so no gist is written from those again.
     ForgetGists {
         subjects: Vec<SubjectKey>,
     },
@@ -475,7 +476,16 @@ pub fn apply(mut turns: Vec<Turn>, op: &TurnOp) -> Vec<Turn> {
         }
         TurnOp::Settle { .. } => {}
         TurnOp::Forget { subjects } => turns.retain(|t| !subjects.contains(&t.subject.key())),
-        TurnOp::ForgetGists { .. } => {}
+        TurnOp::ForgetGists { subjects } => {
+            for t in turns
+                .iter_mut()
+                .filter(|t| subjects.contains(&t.subject.key()))
+            {
+                t.task = None;
+                t.doing = None;
+                t.answer = None;
+            }
+        }
     }
     turns
 }

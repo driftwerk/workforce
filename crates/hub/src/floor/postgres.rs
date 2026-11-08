@@ -614,19 +614,28 @@ async fn forget_subjects(
     Ok(owners.first().map(|row| row.get("owner")))
 }
 
-/// Deletes the subjects' gists alone; whose they were, if any.
+/// Deletes the subjects' gists, and what their turns were asked, did and
+/// answered, so none is written from those again; the turns themselves
+/// stay. Whose they were, if any.
 async fn forget_gists(
     db: &impl GenericClient,
     subjects: &[SubjectKey],
 ) -> Result<Option<Option<String>>> {
     let keys: Vec<&str> = subjects.iter().map(SubjectKey::as_str).collect();
-    let owners = db
+    let gists = db
         .query(
             "DELETE FROM gists WHERE subject = ANY($1) RETURNING owner",
             &[&keys],
         )
         .await?;
-    Ok(owners.first().map(|row| row.get("owner")))
+    let turns = db
+        .query(
+            "UPDATE turns SET task = NULL, doing = NULL, answer = NULL \
+             WHERE subject = ANY($1) RETURNING owner",
+            &[&keys],
+        )
+        .await?;
+    Ok(gists.first().or(turns.first()).map(|row| row.get("owner")))
 }
 
 /// Holds, to the end of the transaction, the questions of the owner and
@@ -1472,9 +1481,30 @@ mod tests {
                 .relevant(&personal, at("2026-10-29T00:00:00Z"))
                 .await
                 .unwrap();
+            let kept = turns
+                .iter()
+                .find(|t| t.subject.key() == SubjectKey::session(mine))
+                .expect("its turns stay");
+            assert_eq!(
+                (
+                    kept.task.as_deref(),
+                    kept.doing.as_deref(),
+                    kept.answer.as_deref()
+                ),
+                (None, None, None),
+                "nothing it was asked is left to write a gist from"
+            );
             assert!(turns
                 .iter()
-                .any(|t| t.subject.key() == SubjectKey::session(mine)));
+                .any(|t| t.subject.key() == SubjectKey::session(other) && t.task.is_some()));
+            // The Floor's tile says nothing of what it was asked.
+            let tile = workforce_desk::floor::working(&turns, &gists)
+                .into_iter()
+                .find(|w| w.who.id == mine.to_string())
+                .expect("its tile");
+            let said = serde_json::to_string(&tile).unwrap();
+            assert!(!said.contains("Making sign-in safe"), "{said}");
+            assert!(!said.contains("Compare spend."), "{said}");
         })
         .await;
     }

@@ -136,6 +136,27 @@ impl GroupMemory {
     }
 }
 
+/// A group's switches as a change left them, and what the person should
+/// know of it.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GroupMemoryChanged {
+    #[serde(flatten)]
+    pub switches: GroupMemory,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notice: Option<&'static str>,
+}
+
+/// Why remembering couldn't be turned on: a record couldn't be read to
+/// pass over what was said while it was off.
+pub const NOT_ON: &str = "Desk couldn't turn remembering on just now; try again.";
+/// Why not, while Desk holds what it can't keep yet.
+pub const HELD: &str = "Desk can't turn remembering on while it's holding conversations it can't keep yet (Desk Memory is full, or it can't hide secrets here). Try again once that's cleared.";
+/// Turned off, though what one session said last couldn't be read first.
+pub const OFF_UNREAD: &str = "Remembering is off, but Desk couldn't read what this session said last, so some of it may not have been kept.";
+/// The same, of several sessions.
+pub const SOME_UNREAD: &str = "Done, but Desk couldn't read what some sessions said last, so some of it may not have been kept.";
+
 /// The person's change to a group's switches: what it names changes.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -192,6 +213,9 @@ pub struct MemorySettings {
     pub limits: MemoryLimits,
     /// What is kept, by group (`group` none: ungrouped sessions').
     pub totals: Vec<GroupTotals>,
+    /// What the person should know of the change just made, if anything.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notice: Option<&'static str>,
 }
 
 /// What the panel says of a session past its cap.
@@ -544,45 +568,88 @@ impl Desk {
     }
 
     /// Reads `ids`' records before a switch turns their remembering on or
-    /// off, with the ledger's reads held until `store` has written it.
-    /// Turning on, what was said while it was off is passed over to the
-    /// records' ends first, so none of it is ever kept; turning off, what
-    /// was said until now is kept first.
-    async fn switching<T>(
+    /// off; the caller holds the ledger's reads from before it read the
+    /// switch until it has written it. Turning on, what was said while it
+    /// was off is passed over to the records' ends first, so none of it is
+    /// ever kept, and a record that can't be passed over refuses the switch;
+    /// turning off, what was said until now is kept first, and what may not
+    /// have been is said.
+    async fn switch_reads(
         &self,
         ids: &[Uuid],
         turning: Option<bool>,
-        store: impl std::future::Future<Output = Result<T, DeskError>>,
-    ) -> Result<T, DeskError> {
-        let _reading = self.0.ledger.reading.lock().await;
-        if let Some(on) = turning {
-            for id in ids {
-                self.read_spend_held(*id, on.then_some(Harvest::Skip)).await;
+        unread: &'static str,
+    ) -> Result<Option<&'static str>, DeskError> {
+        match turning {
+            None => Ok(None),
+            Some(true) => {
+                // Held text was said while it was on: passing over the
+                // records would lose it with the rest.
+                if self.0.ledger.redactor.is_none() || self.memory_full() {
+                    return Err(DeskError::Conflict(HELD.into()));
+                }
+                for id in ids {
+                    if self
+                        .read_spend_held(*id, Some(Harvest::Skip))
+                        .await
+                        .is_err()
+                    {
+                        return Err(DeskError::Conflict(NOT_ON.into()));
+                    }
+                }
+                Ok(None)
+            }
+            Some(false) => {
+                let mut failed = false;
+                for id in ids {
+                    failed |= self.read_spend_held(*id, None).await.is_err();
+                }
+                Ok(failed.then_some(unread))
             }
         }
-        store.await
+    }
+
+    /// Runs `work` on its own task, so a request that goes away can't leave
+    /// a switch half changed; what it answers.
+    async fn switch_apart<T: Send + 'static>(
+        &self,
+        work: impl std::future::Future<Output = Result<T, DeskError>> + Send + 'static,
+    ) -> Result<T, DeskError> {
+        tokio::spawn(work).await.map_err(|e| {
+            DeskError::Internal(eyre::eyre!("a memory switch's change stopped: {e}"))
+        })?
     }
 
     /// Turns session `id`'s own Remember switch on or off. Off, nothing it
     /// says meanwhile is ever kept; what it remembered already stays until
-    /// it is forgotten.
-    pub async fn set_session_memory(&self, id: Uuid, on: bool) -> Result<(), DeskError> {
-        let Some(was) = self.0.store.session_memory_on(id).await? else {
-            return Err(DeskError::NotFound);
-        };
-        let turning = (was != on).then_some(on);
-        self.switching(&[id], turning, async {
-            match self.0.store.set_session_memory(id, on).await? {
-                true => Ok(()),
-                false => Err(DeskError::NotFound),
-            }
+    /// it is forgotten. What the person should know of it, if anything.
+    pub async fn set_session_memory(
+        &self,
+        id: Uuid,
+        on: bool,
+    ) -> Result<Option<&'static str>, DeskError> {
+        let d = self.clone();
+        self.switch_apart(async move {
+            let notice = {
+                let _reading = d.0.ledger.reading.lock().await;
+                let Some(was) = d.0.store.session_memory_on(id).await? else {
+                    return Err(DeskError::NotFound);
+                };
+                let notice = d
+                    .switch_reads(&[id], (was != on).then_some(on), OFF_UNREAD)
+                    .await?;
+                if !d.0.store.set_session_memory(id, on).await? {
+                    return Err(DeskError::NotFound);
+                }
+                notice
+            };
+            d.announce(crate::model::DeskEvent::Setting {
+                key: format!("memory.session.{id}"),
+            });
+            d.derive_poke();
+            Ok(notice)
         })
-        .await?;
-        self.announce(crate::model::DeskEvent::Setting {
-            key: format!("memory.session.{id}"),
-        });
-        self.derive_poke();
-        Ok(())
+        .await
     }
 
     /// The person's memory settings, the install's limits, and what is
@@ -626,6 +693,7 @@ impl Desk {
                     .is_some_and(|d| d.written_by().fallback),
             },
             totals: self.0.store.memory_totals().await?,
+            notice: None,
         })
     }
 
@@ -635,27 +703,38 @@ impl Desk {
         &self,
         change: &MemorySettingsChange,
     ) -> Result<MemorySettings, DeskError> {
+        let mut notice = None;
         if let Some(paused) = change.paused {
-            let was = self
-                .0
-                .store
-                .setting(PAUSED)
-                .await?
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            let turning = (was != paused).then_some(!paused);
-            self.switching(&self.sessions_in(None).await?, turning, async {
-                Ok(self
-                    .0
-                    .store
-                    .put_setting(PAUSED, &serde_json::json!(paused))
-                    .await?)
-            })
-            .await?;
-            self.announce(crate::model::DeskEvent::Setting { key: PAUSED.into() });
-            self.derive_poke();
+            let d = self.clone();
+            notice = self
+                .switch_apart(async move {
+                    let notice = {
+                        let _reading = d.0.ledger.reading.lock().await;
+                        let was =
+                            d.0.store
+                                .setting(PAUSED)
+                                .await?
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(false);
+                        let ids = d.sessions_in(None).await?;
+                        let notice = d
+                            .switch_reads(&ids, (was != paused).then_some(!paused), SOME_UNREAD)
+                            .await?;
+                        d.0.store
+                            .put_setting(PAUSED, &serde_json::json!(paused))
+                            .await?;
+                        notice
+                    };
+                    d.announce(crate::model::DeskEvent::Setting { key: PAUSED.into() });
+                    d.derive_poke();
+                    Ok(notice)
+                })
+                .await?;
         }
-        self.memory_settings().await
+        Ok(MemorySettings {
+            notice,
+            ..self.memory_settings().await?
+        })
     }
 
     /// The person changes group `id`'s memory switches: what the change
@@ -664,7 +743,7 @@ impl Desk {
         &self,
         id: &str,
         change: &GroupMemoryChange,
-    ) -> Result<GroupMemory, DeskError> {
+    ) -> Result<GroupMemoryChanged, DeskError> {
         if self.group_name(id).is_none() {
             return Err(DeskError::NotFound);
         }
@@ -685,16 +764,25 @@ impl Desk {
                 fields.insert(k.into(), Value::Bool(v));
             }
         }
-        let was = GroupMemory::of(self.0.store.setting(&key).await?.as_ref());
-        let turning = change.harvest.filter(|h| *h != was.harvest);
-        let value = self
-            .switching(&self.sessions_in(Some(id)).await?, turning, async {
-                Ok(self.0.store.merge_setting(&key, &fields).await?)
+        let (d, id, harvest) = (self.clone(), id.to_string(), change.harvest);
+        self.switch_apart(async move {
+            let (value, notice) = {
+                let _reading = d.0.ledger.reading.lock().await;
+                let was = GroupMemory::of(d.0.store.setting(&key).await?.as_ref());
+                let ids = d.sessions_in(Some(&id)).await?;
+                let notice = d
+                    .switch_reads(&ids, harvest.filter(|h| *h != was.harvest), SOME_UNREAD)
+                    .await?;
+                (d.0.store.merge_setting(&key, &fields).await?, notice)
+            };
+            d.announce(crate::model::DeskEvent::Setting { key });
+            d.derive_poke();
+            Ok(GroupMemoryChanged {
+                switches: GroupMemory::of(Some(&value)),
+                notice,
             })
-            .await?;
-        self.announce(crate::model::DeskEvent::Setting { key });
-        self.derive_poke();
-        Ok(GroupMemory::of(Some(&value)))
+        })
+        .await
     }
 
     /// Forgets what Desk remembers of session `id`, whether or not Desk
@@ -1150,6 +1238,169 @@ mod tests {
                     .any(|op| matches!(op, crate::floor::TurnOp::Forget { .. }))))
                 .await,
                 "its gist goes, its turns stay"
+            );
+        })
+        .await;
+    }
+
+    /// A closed session of `name` whose record is the fixture's
+    /// conversation, kept; and a desk started on it, read through.
+    async fn started(
+        pool: &workforce_postgres::PostgresPool,
+        dir: &std::path::Path,
+        name: &str,
+        redactor: bool,
+    ) -> (Desk, SessionRecord) {
+        DeskStore::migrate(pool).await.unwrap();
+        let store = DeskStore::from_pool(pool.clone());
+        let t = dir.join(format!("{name}.jsonl"));
+        std::fs::write(&t, "").unwrap();
+        say(&t.to_string_lossy(), name);
+        let mut r = record_fixture(name);
+        r.cwd = dir.to_string_lossy().into_owned();
+        r.transcript = Some(t.to_string_lossy().into_owned());
+        r.state = crate::model::SessionState::Closed;
+        store.put(&r).await.unwrap();
+        let d = Desk::start(
+            DeskStore::from_pool(pool.clone()),
+            crate::testing::options(dir),
+            super::super::Floor {
+                redactor: redactor.then(|| Arc::new(Plain) as Arc<dyn crate::memory::Redactor>),
+                ..Default::default()
+            },
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        read_through(&d, r.id).await;
+        (d, r)
+    }
+
+    /// Makes `path` unreadable, or readable again.
+    fn readable(path: &str, yes: bool) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            path,
+            std::fs::Permissions::from_mode(if yes { 0o644 } else { 0o000 }),
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_switch_turned_on_fails_closed_when_what_was_said_meanwhile_cant_be_passed_over() {
+        with_test_pool(build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let (d, r) = started(&pool, dir.path(), "acme-web", true).await;
+            let path = r.transcript.clone().unwrap();
+            d.set_session_memory(r.id, false).await.unwrap();
+
+            // Unread, but it hasn't grown: there is nothing to pass over.
+            readable(&path, false);
+            assert_eq!(d.set_session_memory(r.id, true).await.unwrap(), None);
+            d.set_session_memory(r.id, false).await.unwrap();
+
+            // It grew, and can't be read: remembering stays off.
+            readable(&path, true);
+            say(&path, "off");
+            readable(&path, false);
+            match d.set_session_memory(r.id, true).await {
+                Err(DeskError::Conflict(why)) => assert_eq!(why, NOT_ON),
+                other => panic!("turned on: {other:?}"),
+            }
+            assert!(!d.session_memory(r.id).await.unwrap().memory_on);
+
+            // Resuming the pause fails closed the same way.
+            readable(&path, true);
+            d.set_session_memory(r.id, true).await.unwrap();
+            d.change_memory_settings(&MemorySettingsChange { paused: Some(true) })
+                .await
+                .unwrap();
+            say(&path, "paused");
+            readable(&path, false);
+            match d
+                .change_memory_settings(&MemorySettingsChange {
+                    paused: Some(false),
+                })
+                .await
+            {
+                Err(DeskError::Conflict(why)) => assert_eq!(why, NOT_ON),
+                other => panic!("resumed: {other:?}"),
+            }
+            assert_eq!(
+                d.0.store.setting(PAUSED).await.unwrap(),
+                Some(serde_json::json!(true))
+            );
+            readable(&path, true);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn turning_off_when_the_last_words_cant_be_read_still_turns_off_and_says_so() {
+        with_test_pool(build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let (d, r) = started(&pool, dir.path(), "acme-web", true).await;
+            let path = r.transcript.clone().unwrap();
+            say(&path, "last");
+            readable(&path, false);
+            assert_eq!(
+                d.set_session_memory(r.id, false).await.unwrap(),
+                Some(OFF_UNREAD)
+            );
+            assert!(!d.session_memory(r.id).await.unwrap().memory_on);
+            readable(&path, true);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn remembering_isnt_turned_on_while_desk_holds_what_it_cant_keep() {
+        with_test_pool(build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            // No redactor: what is said is held, not kept.
+            let (d, r) = started(&pool, dir.path(), "acme-web", false).await;
+            d.set_session_memory(r.id, false).await.unwrap();
+            match d.set_session_memory(r.id, true).await {
+                Err(DeskError::Conflict(why)) => assert_eq!(why, HELD),
+                other => panic!("turned on: {other:?}"),
+            }
+            let c = cursor_of(&d, r.id).await.unwrap();
+            assert_eq!(c.harvested_to, 0, "what was held is still held");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn switches_changed_at_once_each_see_the_other_and_nothing_said_while_off_is_kept() {
+        with_test_pool(build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let (d, r) = started(&pool, dir.path(), "acme-web", true).await;
+            let path = r.transcript.clone().unwrap();
+            for _ in 0..400 {
+                if d.session_memory(r.id).await.unwrap().counts.exchanges == 6 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            d.set_session_memory(r.id, false).await.unwrap();
+            say(&path, "off");
+            // On and off at once, many times: each reads the switch as the
+            // other left it.
+            for _ in 0..5 {
+                let (on, off) = tokio::join!(
+                    d.set_session_memory(r.id, true),
+                    d.set_session_memory(r.id, false)
+                );
+                on.unwrap();
+                off.unwrap();
+            }
+            d.set_session_memory(r.id, true).await.unwrap();
+            d.spend_read(r.id);
+            read_through(&d, r.id).await;
+            assert_eq!(
+                d.session_memory(r.id).await.unwrap().counts.exchanges,
+                6,
+                "nothing said while it was off"
             );
         })
         .await;
