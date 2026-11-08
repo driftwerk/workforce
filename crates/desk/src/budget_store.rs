@@ -11,6 +11,10 @@ use workforce_core::budget::{Budget, BudgetScope, OnExceed, Period, Unit};
 use crate::breaker;
 use crate::store::DeskStore;
 
+/// How long before a session is handed a plan's ticket what it spends with
+/// no ticket stamped still counts toward the plan: its first calls.
+pub const PLAN_GRACE: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
 /// What a set of sessions spent from a moment on: every token, and the
 /// dollars of the calls that have a price.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -214,6 +218,87 @@ impl DeskStore {
             }
         }
         Ok(spent)
+    }
+
+    /// What each of `plans` spent from `from` on: every ledger row stamped
+    /// with one of its tickets, and the rows no ticket was stamped on of a
+    /// session while it was handed one of them. Each hand-out is a window of
+    /// its own: from its start (or [`PLAN_GRACE`] before, when the session
+    /// had nothing just before it, for its first calls, but never back into
+    /// what it worked on before) until it ended. A row is the plan's of at
+    /// most one window, the latest begun; what the session did outside them
+    /// is not a plan's.
+    pub async fn ledger_used_by_plan(
+        &self,
+        from: DateTime<Utc>,
+        plans: &[Uuid],
+    ) -> Result<HashMap<Uuid, Used>> {
+        if plans.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let client = self.pool().get().await?;
+        let rows = client
+            .query(
+                "WITH ours AS (SELECT id, plan FROM tickets WHERE plan = ANY($2)), \
+                   spans AS (SELECT a.session, a.ticket, a.from_at, a.until_at, \
+                       LAG(COALESCE(a.until_at, 'infinity'::timestamptz)) \
+                         OVER (PARTITION BY a.session ORDER BY a.from_at) AS before \
+                     FROM ticket_assignments a WHERE a.session IN ( \
+                       SELECT b.session FROM ticket_assignments b JOIN ours o ON o.id = b.ticket)), \
+                   windows AS (SELECT s.session, o.plan, s.from_at, \
+                       LEAST(s.from_at, GREATEST(s.from_at - make_interval(secs => $3), \
+                         COALESCE(s.before, '-infinity'::timestamptz))) AS since, \
+                       COALESCE(s.until_at, 'infinity'::timestamptz) AS until \
+                     FROM spans s JOIN ours o ON o.id = s.ticket), \
+                   untagged AS (SELECT DISTINCT ON (l.engine, l.key) w.plan, \
+                       l.input + l.output + l.cache_read + l.cache_write AS tokens, l.usd \
+                     FROM ledger l JOIN windows w ON w.session = l.session \
+                       AND l.at >= w.since AND l.at < w.until \
+                     WHERE l.ticket IS NULL AND l.at >= $1 \
+                     ORDER BY l.engine, l.key, w.from_at DESC) \
+                 SELECT plan, SUM(tokens)::int8, COALESCE(SUM(usd), 0)::float8 FROM ( \
+                   SELECT o.plan, l.input + l.output + l.cache_read + l.cache_write AS tokens, \
+                     l.usd FROM ledger l JOIN ours o ON o.id = l.ticket WHERE l.at >= $1 \
+                   UNION ALL \
+                   SELECT plan, tokens, usd FROM untagged \
+                 ) spent GROUP BY plan",
+                &[&from, &plans, &(PLAN_GRACE.as_secs() as f64)],
+            )
+            .await
+            .context("summing the ledger for plans' budgets")?;
+        rows.iter()
+            .map(|r| {
+                Ok((
+                    r.try_get(0)?,
+                    Used {
+                        tokens: u64::try_from(r.try_get::<_, i64>(1)?).unwrap_or(0),
+                        usd: r.try_get(2)?,
+                    },
+                ))
+            })
+            .collect()
+    }
+
+    /// The plan each session works for now, of `plans`: the one whose
+    /// ticket it has. One whose ticket is done is no longer the plan's.
+    pub async fn plan_sessions(&self, plans: &[Uuid]) -> Result<HashMap<Uuid, Uuid>> {
+        if plans.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let client = self.pool().get().await?;
+        let rows = client
+            .query(
+                "SELECT DISTINCT ON (a.session) a.session, t.plan \
+                 FROM ticket_assignments a JOIN tickets t ON t.id = a.ticket \
+                 WHERE t.plan = ANY($1) AND a.until_at IS NULL \
+                 ORDER BY a.session, a.from_at DESC",
+                &[&plans],
+            )
+            .await
+            .context("reading the plans' sessions")?;
+        rows.iter()
+            .map(|r| Ok((r.try_get(0)?, r.try_get(1)?)))
+            .collect()
     }
 }
 

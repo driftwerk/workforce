@@ -256,7 +256,7 @@ impl CrewHub {
 
     /// Gives every question in `asks` (of `session`) to the person, saying
     /// `why`: as the overseer of its scope, when there is one.
-    async fn all_to_person(&self, session: Uuid, asks: &[LineMessage], why: &'static str) {
+    async fn all_to_person(&self, session: Uuid, asks: &[LineMessage], why: &str) {
         let by = match self.overseer_of_session(session) {
             Some((service, _)) => By::manager(service.agent_id.as_str(), &name_of(&service), why),
             None => By::you(),
@@ -287,6 +287,18 @@ impl CrewHub {
                 .await;
             return;
         };
+        // Held by Desk's breaker, it takes no turns: what its session asks
+        // goes straight to the person, saying why, and its turn's end waits
+        // for no one.
+        if let Some(held) = self.desk.agent_held_why(service.agent_id.as_str()) {
+            let asks: Vec<LineMessage> = messages
+                .into_iter()
+                .filter(|m| m.kind == LineKind::Ask)
+                .collect();
+            let why = format!("{} is {held}, so this came to you.", name_of(&service));
+            self.all_to_person(session, &asks, &why).await;
+            return;
+        }
         // Each read again as it is now: one the session's move (or anyone)
         // took from this overseer since it was gathered isn't its to read,
         // and a question so taken is the person's.
@@ -612,6 +624,15 @@ pub(super) async fn line_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
                     }
                 }
                 Ok(DeskEvent::Activity { event }) => {
+                    // What the breaker did to a session the overseer runs
+                    // outside a plan (a plan's go to its own turn).
+                    if let Some((session, line, None)) = crew.breaker_note(&event).await {
+                        gathering
+                            .entry(session)
+                            .or_insert_with(Gathered::new)
+                            .ended
+                            .push(line);
+                    }
                     if let Some((session, mut line)) = crew.work_line(&event) {
                         if super::watcher::finished_session(&event).is_some() {
                             line = crew.with_doing(session, line).await;

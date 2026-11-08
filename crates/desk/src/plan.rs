@@ -15,7 +15,7 @@ use std::collections::{HashMap, HashSet};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
-use workforce_core::budget::Status;
+use workforce_core::budget::{self, OnExceed, Period, Status, Unit, WARN_AT};
 
 use crate::board::{TicketState, BODY_MAX, TITLE_MAX};
 use crate::crew::Party;
@@ -171,8 +171,93 @@ pub struct Planned {
     pub needs: Vec<Uuid>,
 }
 
+/// What a plan may spend, as the person approves it: counted over every
+/// session working on its tickets. Over its whole run unless a period is
+/// said.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanBudget {
+    pub amount: f64,
+    #[serde(default = "usd")]
+    pub unit: Unit,
+    #[serde(default = "total")]
+    pub period: Period,
+    /// The share of `amount` at which it warns, between 0 and 1.
+    #[serde(default = "warn_at")]
+    pub warn_at: f64,
+    #[serde(default = "pause")]
+    pub on_exceed: OnExceed,
+}
+
+fn usd() -> Unit {
+    Unit::Usd
+}
+
+fn total() -> Period {
+    Period::Total
+}
+
+fn warn_at() -> f64 {
+    WARN_AT
+}
+
+fn pause() -> OnExceed {
+    OnExceed::Pause
+}
+
+impl PlanBudget {
+    /// A cap of `amount` dollars over the plan's whole run.
+    pub fn usd(amount: f64) -> Self {
+        Self {
+            amount,
+            unit: Unit::Usd,
+            period: Period::Total,
+            warn_at: WARN_AT,
+            on_exceed: OnExceed::Pause,
+        }
+    }
+
+    /// "a total budget of $40", "a day budget of 2M tokens".
+    pub fn words(&self) -> String {
+        let amount = match self.unit {
+            Unit::Usd => budget::usd(self.amount),
+            Unit::Tokens => format!("{} tokens", budget::tokens(self.amount)),
+        };
+        format!("a {} budget of {amount}", self.period.words())
+    }
+
+    /// Why it can't be kept, in plain words.
+    pub fn problem(&self) -> Option<String> {
+        if !(self.amount.is_finite() && self.amount > 0.0) {
+            return Some("A plan's budget is more than nothing.".into());
+        }
+        if !(self.warn_at > 0.0 && self.warn_at < 1.0) {
+            return Some("A plan's budget warns somewhere between 1% and 99% of it.".into());
+        }
+        if self.unit == Unit::Tokens && self.amount.fract() != 0.0 {
+            return Some("A token budget is a whole number of tokens.".into());
+        }
+        None
+    }
+
+    /// Whether going from `self` to `now` lets the plan spend more: no
+    /// budget, a higher amount, a later warning, one that only warns, or
+    /// one counted another way (which can't be compared, so the person
+    /// says).
+    pub fn loosened_by(&self, now: Option<&PlanBudget>) -> bool {
+        let Some(now) = now else {
+            return true;
+        };
+        now.unit != self.unit
+            || now.period != self.period
+            || now.amount > self.amount
+            || now.warn_at > self.warn_at
+            || (self.on_exceed == OnExceed::Pause && now.on_exceed == OnExceed::Warn)
+    }
+}
+
 /// A plan's goal and tickets as of one revision, in its order.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Snapshot {
     pub goal: String,
@@ -181,6 +266,9 @@ pub struct Snapshot {
     /// boss's; none is the boss's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parallel: Option<i16>,
+    /// What the plan may spend; none is no budget of its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget: Option<PlanBudget>,
 }
 
 impl Snapshot {
@@ -298,6 +386,8 @@ pub enum Problem {
         "{title:?} has started, so where it runs can't change; drop it and add another instead."
     )]
     Started { title: String },
+    #[error("{0}")]
+    Budget(String),
 }
 
 /// The problems as one message.
@@ -399,6 +489,7 @@ pub fn snapshot_of(
             goal: draft.goal.trim().to_string(),
             tickets,
             parallel: before.and_then(|b| b.parallel),
+            budget: before.and_then(|b| b.budget.clone()),
         }),
         false => Err(problems),
     }
@@ -426,6 +517,9 @@ pub fn validate(
         0 => problems.push(Problem::NoTickets),
         n if n > MAX_TICKETS => problems.push(Problem::TooMany(n)),
         _ => {}
+    }
+    if let Some(why) = s.budget.as_ref().and_then(PlanBudget::problem) {
+        problems.push(Problem::Budget(why));
     }
     let place: HashMap<Uuid, usize> = s
         .tickets
@@ -745,10 +839,11 @@ pub fn settled(tickets: &[PlanTicket]) -> bool {
 ///
 /// Minor, within what was approved: the order, needs and titles, a ticket
 /// not started moved to an engine and a folder the approved revision
-/// already uses, and a lower limit. Scope, which the person approves: the
-/// goal, a ticket added or dropped, what a ticket says (its session's first
-/// prompt), an engine or a folder the approved revision doesn't use, and a
-/// higher limit. Where a ticket that has `started` runs can't change.
+/// already uses, a lower limit, and a budget set or lowered. Scope, which
+/// the person approves: the goal, a ticket added or dropped, what a ticket
+/// says (its session's first prompt), an engine or a folder the approved
+/// revision doesn't use, a higher limit, and a budget raised or taken off.
+/// Where a ticket that has `started` runs can't change.
 pub fn plan_change(
     applied: &Snapshot,
     next: &Snapshot,
@@ -784,7 +879,11 @@ pub fn plan_change(
         || !next.dropped(applied).is_empty()
         || elsewhere
         || said
-        || raises(applied.parallel, next.parallel);
+        || raises(applied.parallel, next.parallel)
+        || applied
+            .budget
+            .as_ref()
+            .is_some_and(|b| b.loosened_by(next.budget.as_ref()));
     Ok(Some(match scope {
         true => Change::Scope,
         false => Change::Minor,
@@ -875,6 +974,12 @@ pub fn describe(before: &Snapshot, after: &Snapshot) -> String {
         if was.folder != t.folder || was.view != t.view {
             said.push(format!("moved {} to {}", q(t), t.folder));
         }
+    }
+    if before.budget != after.budget {
+        said.push(match &after.budget {
+            Some(b) => format!("capped it at {}", b.words()),
+            None => "took its budget off".into(),
+        });
     }
     if before.parallel != after.parallel {
         said.push(match after.parallel {

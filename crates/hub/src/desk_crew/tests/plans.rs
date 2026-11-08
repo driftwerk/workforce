@@ -80,6 +80,7 @@ async fn proposed(d: &Desk, dir: &Path, n: usize) -> workforce_desk::PlanDetail 
             parallel: None,
             engine: Engine::Claude,
             group: None,
+            budget: None,
         },
         &Party::manager("desk", "Desk"),
         &By::manager("desk", "Desk", "Sam asked for a green suite."),
@@ -683,6 +684,322 @@ async fn the_boss_is_told_in_plain_words_when_the_person_turns_its_change_down()
         .await;
         assert!(d.plan_needs().is_empty());
         assert_eq!(d.plan(id).await.unwrap().tickets.len(), 1);
+    })
+    .await;
+}
+
+/// How many of the boss's turns were prompted with `marker`: the newest
+/// message of each request, not the history it carries.
+async fn newly_said(llm: &wiremock::MockServer, marker: &str) -> usize {
+    llm.received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|r| {
+            let body: Value = serde_json::from_slice(&r.body).unwrap_or(Value::Null);
+            let last = body["messages"]
+                .as_array()
+                .and_then(|m| m.last())
+                .or_else(|| body["input"].as_array().and_then(|m| m.last()))
+                .map(Value::to_string)
+                .unwrap_or_else(|| String::from_utf8_lossy(&r.body).into_owned());
+            last.contains(marker)
+        })
+        .count()
+}
+
+/// `usd` spent by `session` now, and the budgets counted again.
+async fn spent(d: &Desk, session: uuid::Uuid, usd: f64) {
+    use workforce_desk::ledger::{Billing, Priced, Spend, Tokens};
+    use workforce_desk::ledger_store::Kept;
+    d.store()
+        .ledger_write(
+            session,
+            Engine::Claude,
+            None,
+            &[Kept {
+                spend: Spend {
+                    key: uuid::Uuid::new_v4().to_string(),
+                    at: chrono::Utc::now(),
+                    model: Some("claude-opus-5-5".into()),
+                    tokens: Tokens {
+                        input: 1000,
+                        ..Default::default()
+                    },
+                    usd: Some(usd),
+                    priced: Priced::Reported,
+                    billing: None,
+                },
+                billing: Billing::Plan,
+                account: None,
+            }],
+        )
+        .await
+        .unwrap();
+    d.count_spend_now().await;
+}
+
+/// A plan of `n` independent tickets, one at a time, approved by the
+/// person capped at `usd`.
+async fn capped(d: &Desk, dir: &Path, n: usize, usd: f64) -> uuid::Uuid {
+    let p = d
+        .propose_plan(
+            NewPlan {
+                parallel: Some(1),
+                ..proposal(dir, n)
+            },
+            &Party::manager("desk", "Desk"),
+            &By::manager("desk", "Desk", "Sam asked for a green suite."),
+        )
+        .await
+        .unwrap();
+    let id = p.summary.plan.id;
+    let budget = Some(Some(workforce_desk::plan::PlanBudget::usd(usd)));
+    d.decide_plan(id, 1, true, budget, &By::you())
+        .await
+        .unwrap();
+    id
+}
+
+fn proposal(dir: &Path, n: usize) -> NewPlan {
+    NewPlan {
+        draft: Draft {
+            goal: "Make the suite green".into(),
+            tickets: (1..=n)
+                .map(|i| DraftTicket {
+                    title: format!("Fix flaky test {i}"),
+                    folder: dir.to_string_lossy().into_owned(),
+                    ..Default::default()
+                })
+                .collect(),
+        },
+        board: None,
+        parallel: None,
+        engine: Engine::Claude,
+        group: None,
+        budget: None,
+    }
+}
+
+/// A plan stops starting at its budget's warning and its boss is told once;
+/// the person's Continue starts it again; over, it stops again. The boss
+/// can't let it go on: raising the budget waits for the person.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_plan_at_its_warning_stops_starting_until_the_person_says_continue_and_over_it_stops_again(
+) {
+    use workforce_desk::plan::Paused;
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, state, d, llm) = hub_with(dir.path(), pool, ACTS).await;
+        d.count_budgets_in(chrono_tz::UTC);
+        let crew = CrewHub::start(state, d.clone(), FAST, CancellationToken::new());
+        eventually("the plan tools", async || {
+            overseer.tools.has("crew.plan").then_some(())
+        })
+        .await;
+        let id = capped(&d, dir.path(), 3, 10.0).await;
+        let first = eventually("the first session", async || {
+            let s = started(&d);
+            (s.len() == 1).then(|| s[0].id)
+        })
+        .await;
+        // Handed its ticket (what its spend is counted by), it spends.
+        eventually("the first ticket handed to its session", async || {
+            d.plan(id)
+                .await
+                .unwrap()
+                .tickets
+                .iter()
+                .any(|t| t.ticket.ticket.session() == Some(first))
+                .then_some(())
+        })
+        .await;
+        spent(&d, first, 8.5).await;
+        let paused = eventually("the plan paused at its warning", async || {
+            let p = d.plan(id).await.unwrap().summary;
+            (p.plan.paused == Some(Paused::Budget)).then_some(p)
+        })
+        .await;
+        assert!(
+            paused
+                .held
+                .as_deref()
+                .unwrap()
+                .ends_with("Desk has stopped starting sessions."),
+            "{:?}",
+            paused.held
+        );
+        let subject = workforce_desk::plan_subject(id);
+        let needs: Vec<_> = d
+            .breaker_needs()
+            .into_iter()
+            .filter(|n| n.id == format!("breaker:{subject}"))
+            .collect();
+        assert_eq!(needs.len(), 1, "one need");
+        // Nor does a hand-out of one of its tickets to a new session.
+        let waiting = d
+            .plan(id)
+            .await
+            .unwrap()
+            .tickets
+            .into_iter()
+            .find(|t| t.ticket.ticket.state == TicketState::Todo)
+            .unwrap();
+        let handout = Action::AssignTicket {
+            ticket: waiting.ticket.key.clone().unwrap(),
+            id: Some(waiting.ticket.ticket.id),
+            text: String::new(),
+            to: super::super::actions::Handout::NewSession {
+                folder: dir.path().to_string_lossy().into_owned(),
+                engine: Some(Engine::Claude),
+            },
+            planned: true,
+        };
+        let refused = crew
+            .perform(&handout, By::manager("desk", "Desk", "Start the next."))
+            .await
+            .unwrap_err();
+        assert!(refused.contains("breaker"), "{refused}");
+        assert_eq!(started(&d).len(), 1);
+        // The first session finishes its turn, freeing its slot: nothing
+        // starts while the plan is held.
+        let key = d.view(first).unwrap().name;
+        let url = hook_url(dir.path(), first).await;
+        hook(
+            &url,
+            json!({"hook_event_name": "SessionStart", "session_id": first.to_string()}),
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        assert_eq!(started(&d).len(), 1, "held: no start");
+
+        // Its boss can't let it go on: no tool of its reaches the breaker,
+        // and a higher budget waits for the person.
+        let names: Vec<String> = overseer.tools.names();
+        assert!(
+            names
+                .iter()
+                .filter(|n| n.starts_with("crew."))
+                .all(|n| !n.contains("breaker")
+                    && !n.contains("budget")
+                    && !n.contains("continue")),
+            "{names:?}"
+        );
+        let r = overseer
+            .tools
+            .get("crew.plan_update")
+            .unwrap()
+            .execute(
+                json!({ "plan_id": id.to_string(), "budget": { "amount": 100 },
+                "why": "The suite needs more." }),
+            )
+            .await
+            .unwrap();
+        assert!(r.success, "{r:?}");
+        assert_eq!(r.output["applied"], false);
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert_eq!(
+            d.plan(id).await.unwrap().summary.plan.paused,
+            Some(Paused::Budget)
+        );
+        assert_eq!(started(&d).len(), 1);
+        // The boss was told of the hold once, in one plan turn.
+        tokio::time::sleep(Duration::from_millis(3500)).await;
+        assert_eq!(
+            newly_said(&llm, "Desk's breaker holds its new starts").await,
+            1
+        );
+
+        // The person says Continue: the next starts.
+        d.breaker_continue(&subject, By::you()).unwrap();
+        let second = eventually("the next session", async || {
+            let s: Vec<_> = started(&d).into_iter().filter(|v| v.id != first).collect();
+            (s.len() == 1).then(|| s[0].id)
+        })
+        .await;
+        assert_ne!(
+            d.view(second).unwrap().name,
+            key,
+            "a ticket of its own, not the one done"
+        );
+        assert_eq!(d.plan(id).await.unwrap().summary.plan.paused, None);
+
+        // Over: it stops again, and the hold is said again only once.
+        eventually("the next ticket handed to its session", async || {
+            d.plan(id)
+                .await
+                .unwrap()
+                .tickets
+                .iter()
+                .any(|t| t.ticket.ticket.session() == Some(second))
+                .then_some(())
+        })
+        .await;
+        spent(&d, second, 2.0).await;
+        eventually("the plan paused over its budget", async || {
+            let p = d.plan(id).await.unwrap().summary;
+            (p.plan.paused == Some(Paused::Budget)).then_some(())
+        })
+        .await;
+        for _ in 0..4 {
+            d.count_spend_now().await;
+        }
+        tokio::time::sleep(Duration::from_millis(4000)).await;
+        assert_eq!(started(&d).len(), 2);
+        assert_eq!(
+            newly_said(&llm, "Desk's breaker holds its new starts").await,
+            2,
+            "one turn a hold, however often it is counted"
+        );
+    })
+    .await;
+}
+
+/// A boss held by Desk's breaker takes no turns: its plans pause until the
+/// person lets it go on, and start again then.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_held_bosss_plans_pause_until_the_person_lets_it_go_on() {
+    use workforce_core::budget::{OnExceed, Period, Standing, Status, Unit};
+    use workforce_desk::plan::Paused;
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, state, d, _llm) = hub_with(dir.path(), pool, ACTS).await;
+        let _crew = CrewHub::start(state, d.clone(), FAST, CancellationToken::new());
+        eventually("the plan tools", async || {
+            overseer.tools.has("crew.plan").then_some(())
+        })
+        .await;
+        let now = chrono::Utc::now();
+        let over = Standing {
+            budget: uuid::Uuid::new_v4(),
+            period: Period::Day,
+            unit: Unit::Usd,
+            used: 12.0,
+            of: 11.0,
+            status: Status::Over,
+            on_exceed: OnExceed::Pause,
+            from: now - chrono::Duration::hours(1),
+            to: now + chrono::Duration::hours(10),
+            shared: false,
+        };
+        d.agent_stand("desk", "Desk", vec![over], false);
+        assert!(d.agent_held("desk").is_some());
+        let p = proposed(&d, dir.path(), 2).await;
+        let id = p.summary.plan.id;
+        d.approve_plan(id, 1, &By::you()).await.unwrap();
+        eventually("the plan paused for its boss", async || {
+            let p = d.plan(id).await.unwrap().summary;
+            (p.plan.paused == Some(Paused::BossHeld)).then_some(())
+        })
+        .await;
+        assert!(started(&d).is_empty());
+        d.breaker_continue(&workforce_desk::agent_subject("desk"), By::you())
+            .unwrap();
+        eventually("its sessions", async || {
+            (started(&d).len() == 2).then_some(())
+        })
+        .await;
+        assert_eq!(d.plan(id).await.unwrap().summary.plan.paused, None);
     })
     .await;
 }

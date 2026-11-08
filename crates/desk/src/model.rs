@@ -496,7 +496,7 @@ pub struct SessionPatch {
 }
 
 /// A field that may be absent (`None`), `null` (`Some(None)`) or a value.
-pub(crate) fn present<'de, D, T>(d: D) -> Result<Option<Option<T>>, D::Error>
+pub fn present<'de, D, T>(d: D) -> Result<Option<Option<T>>, D::Error>
 where
     D: serde::Deserializer<'de>,
     T: Deserialize<'de>,

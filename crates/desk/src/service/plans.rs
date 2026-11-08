@@ -25,10 +25,11 @@ use crate::engine::{Engine, View};
 use crate::floor::{Answer, DecideRef, Need, NeedKind, Place, Who};
 use crate::model::{DeskEvent, NewSession, SessionState, SessionView};
 use crate::plan::{
-    self, Change, Draft, DraftTicket, Paused, Plan, PlanState, PlanTicket, Planned, Problem,
-    Progress, Revision, Snapshot, Start,
+    self, Change, Draft, DraftTicket, Paused, Plan, PlanBudget, PlanState, PlanTicket, Planned,
+    Problem, Progress, Revision, Snapshot, Start,
 };
 use crate::plan_store::{BeginStart, Runs, Starting};
+use workforce_core::budget::{BudgetScope, Standing};
 
 /// What the desk keeps of plans in memory: the ones waiting on the person,
 /// for the Floor, which is read without waiting on Postgres.
@@ -53,6 +54,12 @@ pub struct PlanSummary {
     /// Why it is paused, in the person's words, while it is.
     pub paused_why: Option<String>,
     pub progress: Progress,
+    /// What it may spend, as approved (or as proposed, before it is).
+    pub budget: Option<PlanBudget>,
+    /// What holds its new starts, in the Floor's words, while Desk's
+    /// breaker does: its own budget, its group's or Desk's. The person
+    /// says Continue on the Floor.
+    pub held: Option<String>,
 }
 
 /// A plan's ticket as its card shows it.
@@ -66,6 +73,9 @@ pub struct PlanTicketView {
     pub view: Option<View>,
     /// Its session is being started.
     pub starting: bool,
+    /// What holds its session, while Desk's breaker does: the ticket is
+    /// blocked on the person, and nothing is started in its place.
+    pub held: Option<String>,
 }
 
 /// A plan in full: its tickets, its waves, and every revision.
@@ -77,6 +87,8 @@ pub struct PlanDetail {
     pub tickets: Vec<PlanTicketView>,
     pub waves: Vec<Vec<Uuid>>,
     pub revisions: Vec<Revision>,
+    /// Where its budget stands now, when it has one and it can be counted.
+    pub spend: Option<Standing>,
 }
 
 /// A plan a boss proposes.
@@ -90,6 +102,8 @@ pub struct NewPlan {
     pub engine: Engine,
     /// The boss's group; none is the main boss's.
     pub group: Option<String>,
+    /// What it may spend, as the boss proposes it.
+    pub budget: Option<PlanBudget>,
 }
 
 /// A change to a plan, by the boss or the person.
@@ -107,6 +121,9 @@ pub struct PlanEdit {
     /// Every ticket the plan is to have, in order; none leaves them.
     #[serde(default)]
     pub tickets: Option<Vec<DraftTicket>>,
+    /// What it may spend; `null` takes its budget off.
+    #[serde(default, deserialize_with = "crate::model::present")]
+    pub budget: Option<Option<PlanBudget>>,
     /// Why, in the boss's words.
     #[serde(default)]
     pub why: Option<String>,
@@ -189,6 +206,11 @@ impl Desk {
 
     /// What its boss is called, as the hub says now.
     fn plan_boss_name(&self, p: &Plan) -> String {
+        self.plan_boss_named(&p.boss)
+    }
+
+    /// What the boss `boss` of a plan is called, as the hub says now.
+    pub(super) fn plan_boss_named(&self, boss: &str) -> String {
         let crew = self
             .0
             .line_crew
@@ -196,13 +218,13 @@ impl Desk {
             .as_ref()
             .and_then(std::sync::Weak::upgrade);
         if let Some(n) = crew
-            .and_then(|c| c.agent_name(&p.boss))
-            .filter(|n| !n.trim().is_empty() && *n != p.boss)
+            .and_then(|c| c.agent_name(boss))
+            .filter(|n| !n.trim().is_empty() && *n != boss)
         {
             return n;
         }
         let plans = self.0.boss_plans.lock();
-        crew::shown_name(&p.boss, plans.names.get(&p.boss).map(String::as_str), true)
+        crew::shown_name(boss, plans.names.get(boss).map(String::as_str), true)
     }
 
     /// The engine `boss` starts a ticket on that names none: its default,
@@ -225,6 +247,14 @@ impl Desk {
         let why = p.paused?;
         let said = match why {
             Paused::StartFailing => self.0.boss_plans.lock().failing.get(&p.id).cloned(),
+            Paused::Budget => self
+                .plan_starts_held(p.group.as_deref(), p.id)
+                .map(|(_, ask)| ask)
+                .filter(|a| !a.is_empty()),
+            Paused::BossHeld => self
+                .agent_held(&p.boss)
+                .filter(|a| !a.is_empty())
+                .map(|a| format!("{} is held: {a}", self.plan_boss_name(p))),
             _ => None,
         };
         Some(said.unwrap_or_else(|| {
@@ -275,12 +305,24 @@ impl Desk {
 
     async fn plan_summary(&self, p: Plan) -> Result<PlanSummary, DeskError> {
         let tickets = self.plan_tickets(p.id).await?;
+        let budget = self.applied(&p).await?.budget;
         Ok(PlanSummary {
             boss_name: self.plan_boss_name(&p),
             paused_why: self.paused_why(&p),
             progress: plan::progress(&tickets),
+            budget,
+            held: self.plan_held(&p),
             plan: p,
         })
+    }
+
+    /// What holds `p`'s new starts now, while it is open.
+    fn plan_held(&self, p: &Plan) -> Option<String> {
+        if matches!(p.state, PlanState::Done | PlanState::Dropped) {
+            return None;
+        }
+        self.plan_starts_held(p.group.as_deref(), p.id)
+            .map(|(_, ask)| ask)
     }
 
     /// Every plan, newest first: those in `state`, and in `group` (`""`
@@ -317,7 +359,9 @@ impl Desk {
             .into_iter()
             .map(|v| {
                 let r = runs.get(&v.ticket.id).cloned().unwrap_or_default();
+                let held = v.ticket.session().and_then(|s| self.session_held(s));
                 PlanTicketView {
+                    held,
                     starting: starting.contains(&v.ticket.id),
                     engine: r.engine,
                     folder: r.folder,
@@ -345,16 +389,29 @@ impl Desk {
             .map(|t| plan_ticket(&t.ticket, runs.get(&t.ticket.ticket.id), t.starting))
             .collect();
         let revisions = self.0.store.revisions(p.id).await.map_err(internal)?;
+        // Its budget as kept, once approved, counted now.
+        let kept = self
+            .budget_list()
+            .into_iter()
+            .filter(|b| b.scope == BudgetScope::Plan(p.id))
+            .min_by_key(|b| b.updated_at);
+        let spend = match kept {
+            Some(b) => self.plan_standing(p.id, &b).await,
+            None => None,
+        };
         Ok(PlanDetail {
             waves: plan::waves(&rows),
             summary: PlanSummary {
                 boss_name: self.plan_boss_name(&p),
                 paused_why: self.paused_why(&p),
                 progress: plan::progress(&rows),
+                budget: applied.budget.clone(),
+                held: self.plan_held(&p),
                 plan: p,
             },
             tickets: shown,
             revisions,
+            spend,
         })
     }
 
@@ -519,6 +576,12 @@ impl Desk {
     }
 
     fn plan_note(&self, p: &Plan, by: &By, kind: Kind, text: String) {
+        self.plan_note_why(p, by, kind, text, None);
+    }
+
+    /// [`Self::plan_note`], saying why it paused or went on, when that is
+    /// what it is.
+    fn plan_note_why(&self, p: &Plan, by: &By, kind: Kind, text: String, why: Option<Paused>) {
         if by.party.kind == PartyKind::Manager && by.party.id == p.boss {
             self.0
                 .boss_plans
@@ -527,9 +590,11 @@ impl Desk {
                 .insert(p.boss.clone(), by.party.name.clone());
         }
         // Which plan, for whoever watches Desk's events live.
-        let mut e = by
-            .event(kind, None, text)
-            .detail(serde_json::json!({ "plan": p.id.to_string() }));
+        let mut detail = serde_json::json!({ "plan": p.id.to_string() });
+        if let Some(why) = why {
+            detail["paused"] = why.as_str().into();
+        }
+        let mut e = by.event(kind, None, text).detail(detail);
         e.group = p.group.clone();
         self.note(e);
     }
@@ -549,6 +614,7 @@ impl Desk {
         let mut s =
             plan::snapshot_of(&new.draft, None, new.engine, &mut Uuid::new_v4).map_err(problems)?;
         s.parallel = new.parallel;
+        s.budget = new.budget;
         plan::validate(&s, &self.engines(), &|f| Path::new(f).is_dir()).map_err(problems)?;
         if new.parallel.is_some_and(|p| !(1..=12).contains(&p)) {
             return Err(DeskError::Invalid(
@@ -941,6 +1007,9 @@ impl Desk {
         if let Some(par) = edit.parallel {
             next.parallel = par;
         }
+        if let Some(b) = edit.budget {
+            next.budget = b;
+        }
         plan::validate(&next, &self.engines(), &|f| Path::new(f).is_dir()).map_err(problems)?;
         let started = self.started(&p).await?;
         let change = plan::plan_change(&applied, &next, &started)
@@ -976,6 +1045,8 @@ impl Desk {
             self.plan_rows_follow(&p, &from, &next, column, by).await?;
             if p.approved_revision.is_some() {
                 p.approved_revision = Some(n);
+                // What it may spend is what applies now.
+                self.keep_plan_budget(&p, next.budget.as_ref(), by).await?;
             }
             p.parallel = next.parallel;
             p.goal.clone_from(&next.goal);
@@ -1005,6 +1076,20 @@ impl Desk {
         revision: i32,
         by: &By,
     ) -> Result<PlanDetail, DeskError> {
+        self.approve_plan_with(id, revision, None, by).await
+    }
+
+    /// [`Self::approve_plan`], with what it may spend as the person says
+    /// on approving (`budget`: `None` keeps what the revision says;
+    /// `Some(None)` takes it off). A budget other than the revision's is a
+    /// revision of the person's first, and that is what they approve.
+    pub async fn approve_plan_with(
+        &self,
+        id: Uuid,
+        revision: i32,
+        budget: Option<Option<PlanBudget>>,
+        by: &By,
+    ) -> Result<PlanDetail, DeskError> {
         let _write = self.0.plan_write.lock().await;
         if by.party.kind != PartyKind::You {
             return Err(DeskError::Invalid(
@@ -1021,10 +1106,31 @@ impl Desk {
         if revision != p.revision {
             return Err(stale_plan(&p, &self.plan_boss_name(&p)));
         }
+        if p.approved_revision == Some(revision) && budget.is_none() {
+            return self.plan_detail(p).await;
+        }
+        let mut next = self.newest(&p).await?;
+        let mut revision = revision;
+        if let Some(b) = budget.filter(|b| *b != next.budget) {
+            let before = next.clone();
+            next.budget = b;
+            if let Some(why) = next.budget.as_ref().and_then(PlanBudget::problem) {
+                return Err(DeskError::Invalid(why));
+            }
+            let summary = plan::describe(&before, &next);
+            let applied = self.applied(&p).await?;
+            let started = self.started(&p).await?;
+            let kind = plan::plan_change(&applied, &next, &started)
+                .map_err(|e| DeskError::Conflict(e.to_string()))?
+                .unwrap_or(Change::Minor);
+            revision = p.revision + 1;
+            self.add_revision(&p, revision, by, kind, &summary, &next)
+                .await?;
+            p.revision = revision;
+        }
         if p.approved_revision == Some(revision) {
             return self.plan_detail(p).await;
         }
-        let next = self.newest(&p).await?;
         match p.approved_revision {
             // Its tickets are what it says: they go to To do.
             None => {
@@ -1066,9 +1172,16 @@ impl Desk {
         p.approved_revision = Some(revision);
         p.parallel = next.parallel;
         p.updated_at = crew::now();
-        let text = match revision {
-            1 => format!("approved the plan: {}", crew::one_line(&p.goal, 120)),
-            n => format!("approved revision {n} of the plan"),
+        // What it may spend is what was approved.
+        self.keep_plan_budget(&p, next.budget.as_ref(), by).await?;
+        let text = match (revision, &next.budget) {
+            (1, None) => format!("approved the plan: {}", crew::one_line(&p.goal, 120)),
+            (1, Some(b)) => format!(
+                "approved the plan, capped at {}: {}",
+                b.words(),
+                crew::one_line(&p.goal, 120)
+            ),
+            (n, _) => format!("approved revision {n} of the plan"),
         };
         self.plan_note(&p, by, Kind::PlanApproved, text);
         self.plan_saved(&p).await
@@ -1097,11 +1210,12 @@ impl Desk {
         p.state = PlanState::Paused;
         p.paused = Some(why);
         p.updated_at = crew::now();
-        self.plan_note(
+        self.plan_note_why(
             &p,
             by,
             Kind::PlanPaused,
             format!("paused the plan: {}", why.why()),
+            Some(why),
         );
         self.plan_saved(&p).await
     }
@@ -1136,7 +1250,40 @@ impl Desk {
         by: &By,
     ) -> Result<PlanDetail, DeskError> {
         let _write = self.0.plan_write.lock().await;
-        let mut p = self.plan_of(id).await?;
+        let p = self.plan_of(id).await?;
+        self.resume_read(p, why, by).await
+    }
+
+    /// Resumes plan `id` if Desk paused it because its boss was held or the
+    /// breaker held its new starts, and that is over now: read again with
+    /// the plan's writes held, so a hold come back meanwhile keeps it
+    /// paused. `None` when it stays paused.
+    pub async fn resume_if_lifted(
+        &self,
+        id: Uuid,
+        by: &By,
+    ) -> Result<Option<PlanDetail>, DeskError> {
+        let _write = self.0.plan_write.lock().await;
+        let p = self.plan_of(id).await?;
+        let lifted = match p.paused {
+            Some(Paused::BossHeld) => self.agent_held(&p.boss).is_none(),
+            Some(Paused::Budget) => self.plan_starts_held(p.group.as_deref(), p.id).is_none(),
+            _ => false,
+        };
+        if !lifted {
+            return Ok(None);
+        }
+        self.resume_read(p, &[Paused::BossHeld, Paused::Budget], by)
+            .await
+            .map(Some)
+    }
+
+    async fn resume_read(
+        &self,
+        mut p: Plan,
+        why: &[Paused],
+        by: &By,
+    ) -> Result<PlanDetail, DeskError> {
         let Some(was) = p.paused.filter(|w| why.contains(w)) else {
             return match p.paused {
                 Some(other) => Err(DeskError::Conflict(format!(
@@ -1150,11 +1297,12 @@ impl Desk {
         p.paused = None;
         self.0.boss_plans.lock().failing.remove(&p.id);
         p.updated_at = crew::now();
-        self.plan_note(
+        self.plan_note_why(
             &p,
             by,
             Kind::Continued,
             format!("resumed the plan, paused because {}", was.why()),
+            Some(was),
         );
         self.plan_saved(&p).await
     }
@@ -1239,14 +1387,20 @@ impl Desk {
         id: Uuid,
         revision: i32,
         allow: bool,
+        budget: Option<Option<PlanBudget>>,
         by: &By,
     ) -> Result<PlanDetail, DeskError> {
         let p = self.plan_of(id).await?;
         if revision != p.revision {
             return Err(stale_plan(&p, &self.plan_boss_name(&p)));
         }
+        if budget.is_some() && !(allow && p.awaiting()) {
+            return Err(DeskError::Invalid(
+                "A budget goes with an approval; change a running plan's on the plan.".into(),
+            ));
+        }
         match (p.awaiting(), allow, p.approved_revision) {
-            (true, true, _) => self.approve_plan(id, revision, by).await,
+            (true, true, _) => self.approve_plan_with(id, revision, budget, by).await,
             (true, false, Some(_)) => self.reject_plan(id, revision, by).await,
             (true, false, None) => self.plan_detail(p).await,
             (false, true, _) if p.paused == Some(Paused::StartFailing) => {
@@ -1319,6 +1473,7 @@ impl Desk {
         p.state = PlanState::Dropped;
         p.paused = None;
         p.updated_at = crew::now();
+        self.plan_budget_ends(&p, by).await;
         self.plan_note(
             &p,
             by,
@@ -1344,6 +1499,7 @@ impl Desk {
         p.state = PlanState::Done;
         p.paused = None;
         p.updated_at = crew::now();
+        self.plan_budget_ends(&p, by).await;
         self.plan_note(
             &p,
             by,
@@ -1372,7 +1528,7 @@ impl Desk {
         by: &By,
     ) -> Result<SessionView, StartRefused> {
         let _one = self.0.plan_starting.lock().await;
-        if let Some(ask) = self.starts_held(p.group.as_deref()) {
+        if let Some((_, ask)) = self.plan_starts_held(p.group.as_deref(), p.id) {
             return Err(StartRefused::Skipped(format!(
                 "Desk's breaker holds new sessions: {ask} The person can say Continue on Desk's Floor."
             )));
@@ -1451,7 +1607,7 @@ impl Desk {
         let still = t.state == TicketState::Doing && t.assignee.is_none();
         let held = p
             .as_ref()
-            .and_then(|p| self.starts_held(p.group.as_deref()))
+            .and_then(|p| self.plan_starts_held(p.group.as_deref(), p.id))
             .is_some();
         let (Some(p), Some(boss)) = (p.filter(|p| still && p.runs() && !held), boss) else {
             // Moved, dropped, paused or held meanwhile, or no boss may

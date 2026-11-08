@@ -544,6 +544,7 @@ mod tests {
                 summary: "Proposed".into(),
                 snapshot: Snapshot {
                     parallel: None,
+                    budget: None,
                     goal: p.goal.clone(),
                     tickets: vec![Planned {
                         id: t.id,

@@ -120,7 +120,53 @@ impl CrewHub {
             o.level != Level::Watch
                 && self.runs(session, s.agent_id.as_str())
                 && self.desk.wheel_of(session) == Some(Wheel::Boss)
+                // Held by Desk's breaker, it takes no turns.
+                && self.desk.agent_held(s.agent_id.as_str()).is_none()
         })
+    }
+
+    /// What Desk's breaker did to a session a boss runs, as a line for the
+    /// boss, so it can help: the steer it gave it, or that it paused it
+    /// (which only the person lets go on). The session, the line, and the
+    /// plan whose ticket it works on, if one.
+    pub(crate) async fn breaker_note(&self, event: &Event) -> Option<(Uuid, String, Option<Uuid>)> {
+        if !matches!(event.kind, Kind::Steered | Kind::Paused)
+            || event.actor.kind != PartyKind::Desk
+            || event.actor.id != Party::breaker().id
+        {
+            return None;
+        }
+        let subject = event.subject.as_ref()?;
+        if subject.kind != PartyKind::Session {
+            return None;
+        }
+        let session: Uuid = subject.id.parse().ok()?;
+        let (service, o) = self.overseer_of_session(session)?;
+        if o.level == Level::Watch || !self.runs(session, service.agent_id.as_str()) {
+            return None;
+        }
+        let line = match event.kind {
+            Kind::Paused => format!(
+                "Desk's breaker {}: only the person lets it go on, on the Floor. Its ticket waits; \
+                 start nothing in its place.",
+                event.text
+            ),
+            _ => format!("Desk's breaker {}", event.text),
+        };
+        let mut plan = None;
+        for t in self
+            .desk
+            .store()
+            .linked_tickets(&[session])
+            .await
+            .unwrap_or_default()
+        {
+            if let Ok(Some(p)) = self.desk.store().plan_of_ticket(t.id).await {
+                plan = Some(p);
+                break;
+            }
+        }
+        Some((session, line, plan))
     }
 
     /// Spends one of the hour's work turns of the overseer that runs

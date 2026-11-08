@@ -837,6 +837,13 @@ pub(super) async fn wake_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
                 w.pending.clear();
                 continue;
             };
+            // Held by Desk's breaker, it takes no turns: what it would have
+            // checked in on is on the Floor for the person.
+            if crew.desk.agent_held(&id).is_some() {
+                w.window = None;
+                w.pending.clear();
+                continue;
+            }
             // What it gathered of a group that has since become another's
             // boundary is not its any more.
             let seen = crew.desk.seen_by(&o.scope);
