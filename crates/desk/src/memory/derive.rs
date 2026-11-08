@@ -471,12 +471,22 @@ pub struct Answered {
     pub model: String,
 }
 
-/// Who writes notes: the hub's cheap model, the one gists are written
+/// Whose model writes the notes, as the panel says it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WrittenBy {
+    /// The provider the floor's cheap model runs on (`anthropic`, ...).
+    pub provider: Option<String>,
+    /// It may fall back to another provider (`[floor] fallback_providers`).
+    pub fallback: bool,
+}
+
+/// Who writes notes: the floor's cheap model, the one gists are written
 /// with, and what the hub knows of a session's purpose.
 #[async_trait]
 pub trait Deriver: Send + Sync {
-    /// The model's answer to `system` and `user` for session `session`, on
-    /// the session's account where it has one, else the floor's.
+    /// The model's answer to `system` and `user` for session `session`:
+    /// the floor's cheap model, on the hub's own provider account (as a
+    /// Desk session's gist is written), not the session's engine account.
     async fn answer(
         &self,
         session: Uuid,
@@ -488,6 +498,11 @@ pub trait Deriver: Send + Sync {
     /// What session `session` is for, as its gist says; none before one is
     /// written.
     async fn purpose(&self, session: Uuid) -> Option<String>;
+
+    /// Whose model it is.
+    fn written_by(&self) -> WrittenBy {
+        WrittenBy::default()
+    }
 }
 
 /// A model for tests: it answers what it is given, in turn, and keeps what
@@ -548,6 +563,13 @@ pub mod fake {
 
         async fn purpose(&self, _session: Uuid) -> Option<String> {
             self.purpose.lock().clone()
+        }
+
+        fn written_by(&self) -> WrittenBy {
+            WrittenBy {
+                provider: Some("anthropic".into()),
+                fallback: false,
+            }
         }
     }
 }

@@ -20,6 +20,44 @@ use crate::store::DeskStore;
 /// as its turns end: at most every ten minutes.
 pub const DEBOUNCE_MINUTES: i32 = 10;
 
+/// An exchange `x` past where its session's reading of its group got to:
+/// each group is read on its own, so one whose sessions aren't read yet
+/// holds only its own place.
+const PAST_READ: &str = "x.seq > COALESCE((SELECT r.derived_to FROM memory_derive_reads r \
+    WHERE r.session = x.session AND r.group_key = COALESCE(x.group_id, '')), 0)";
+
+/// The key a group's reading is kept under: its id, or '' for ungrouped.
+pub fn read_key(group: Option<&str>) -> &str {
+    group.unwrap_or("")
+}
+
+/// The most of a model's name `memory_items.by` keeps after `model:`.
+pub const MODEL_NAME_MAX: usize = 64;
+
+/// A model's name as `by` keeps it: letters, digits and `.-_:/@`, at most
+/// [`MODEL_NAME_MAX`]; `unknown` when nothing of it is left.
+pub fn model_name(name: &str) -> String {
+    let kept: String = name
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ':' | '/' | '@'))
+        .take(MODEL_NAME_MAX)
+        .collect();
+    match kept.is_empty() {
+        true => "unknown".into(),
+        false => kept,
+    }
+}
+
+/// A group of a session with exchanges not yet read for notes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnreadGroup {
+    pub group: Option<String>,
+    /// How far it was read.
+    pub from: i32,
+    /// Its first closed exchange not yet read.
+    pub first: i32,
+}
+
 /// `memory_derive.due_at` as a turn's end sets it, in a transaction that
 /// wrote closed exchanges of session `$1`: due at once when it was last
 /// read [`DEBOUNCE_MINUTES`] or more ago, else when that is up; never later
@@ -84,8 +122,11 @@ pub struct Queued {
     pub derived_to: i32,
     pub due_at: Option<DateTime<Utc>>,
     pub failed: Option<String>,
-    /// Closed exchanges after `derived_to`, not flagged.
+    /// Closed exchanges not yet read in their group, not flagged.
     pub unread: i64,
+    /// The group the next reading is stamped with (`Some(None)`:
+    /// ungrouped); none when nothing waits.
+    pub next_group: Option<Option<String>>,
 }
 
 /// A note as the panel and the person's changes read it.
@@ -112,6 +153,8 @@ pub struct ItemRow {
 #[derive(Debug, Clone)]
 pub struct Apply<'a> {
     pub claim: &'a Claim,
+    /// How far the group was read when this read began.
+    pub from: i32,
     /// The last exchange this read covers.
     pub to: i32,
     /// More closed exchanges were waiting past it: due again at once.
@@ -236,23 +279,24 @@ impl DeskStore {
 
     /// Notes a failed reading of `claim`: tried again after `retry`, or
     /// (`gave_up`) not until the session says more, with `why` said.
-    /// `skip_to`: how far it was read regardless, when what it read can't
-    /// be noted from however often it is tried.
+    /// `skip`: a group, and how far it is read regardless, when what it
+    /// read can't be noted from however often it is tried.
     pub async fn derive_failed(
         &self,
         claim: &Claim,
         retry: std::time::Duration,
         gave_up: bool,
         why: &str,
-        skip_to: Option<i32>,
+        skip: Option<(Option<&str>, i32)>,
     ) -> Result<()> {
-        let client = self.pool().get().await?;
+        let mut client = self.pool().get().await?;
+        let tx = client.transaction().await?;
         let secs = retry.as_secs_f64();
-        client
+        let kept = tx
             .execute(
                 "UPDATE memory_derive SET tries = CASE WHEN $3 THEN 0 ELSE tries + 1 END, \
                    failed = CASE WHEN $3 THEN $4 END, \
-                   derived_to = COALESCE($5, derived_to), \
+                   derived_to = GREATEST(derived_to, COALESCE($5, derived_to)), \
                    due_at = CASE WHEN due_at IS DISTINCT FROM $2 THEN due_at \
                      WHEN $3 THEN NULL ELSE now() + make_interval(secs => $6) END \
                  WHERE session = $1",
@@ -261,12 +305,45 @@ impl DeskStore {
                     &claim.lease,
                     &gave_up,
                     &why,
-                    &skip_to,
+                    &skip.map(|(_, to)| to),
                     &secs,
                 ],
             )
             .await?;
+        if let (Some((group, to)), true) = (skip, kept > 0) {
+            move_read(&tx, claim.session, group, to).await?;
+        }
+        tx.commit().await?;
         Ok(())
+    }
+
+    /// `session`'s groups with closed exchanges not yet read for notes, the
+    /// one waiting longest first.
+    pub async fn derive_unread_groups(&self, session: Uuid) -> Result<Vec<UnreadGroup>> {
+        let client = self.pool().get().await?;
+        client
+            .query(
+                &format!(
+                    "SELECT x.group_id, COALESCE((SELECT r.derived_to FROM memory_derive_reads r \
+                       WHERE r.session = x.session AND r.group_key = COALESCE(x.group_id, '')), 0), \
+                       MIN(x.seq) \
+                     FROM memory_exchanges x WHERE x.session = $1 AND x.ended IS NOT NULL \
+                       AND {PAST_READ} \
+                     GROUP BY x.session, x.group_id ORDER BY 3"
+                ),
+                &[&session],
+            )
+            .await
+            .context("finding a session's groups to note decisions from")?
+            .iter()
+            .map(|r| {
+                Ok(UnreadGroup {
+                    group: r.try_get(0)?,
+                    from: r.try_get(1)?,
+                    first: r.try_get(2)?,
+                })
+            })
+            .collect()
     }
 
     /// Makes session `session`'s reading for notes due now, when it has
@@ -275,23 +352,26 @@ impl DeskStore {
         let client = self.pool().get().await?;
         Ok(client
             .execute(
-                "INSERT INTO memory_derive (session, due_at) \
+                &format!(
+                    "INSERT INTO memory_derive (session, due_at) \
                  SELECT $1, now() WHERE EXISTS (SELECT 1 FROM memory_exchanges x \
-                   WHERE x.session = $1 AND x.ended IS NOT NULL AND x.seq > COALESCE( \
-                     (SELECT derived_to FROM memory_derive WHERE session = $1), 0)) \
+                   WHERE x.session = $1 AND x.ended IS NOT NULL AND {PAST_READ}) \
                  ON CONFLICT (session) DO UPDATE SET \
                    due_at = LEAST(COALESCE(memory_derive.due_at, 'infinity'::timestamptz), now()), \
-                   tries = 0, failed = NULL",
+                   tries = 0, failed = NULL"
+                ),
                 &[&session],
             )
             .await?
             > 0)
     }
 
-    /// `session`'s exchanges after `after`, in order, at most `limit`.
+    /// `session`'s exchanges in `group` after `after`, in order, at most
+    /// `limit`.
     pub async fn derive_unread(
         &self,
         session: Uuid,
+        group: Option<&str>,
         after: i32,
         limit: i64,
     ) -> Result<Vec<Unread>> {
@@ -300,8 +380,9 @@ impl DeskStore {
             .query(
                 "SELECT id, seq, at, ended, engine, group_id, project, asker, ask, answer, steps, \
                    cardinality(flagged) > 0 \
-                 FROM memory_exchanges WHERE session = $1 AND seq > $2 ORDER BY seq LIMIT $3",
-                &[&session, &after, &limit],
+                 FROM memory_exchanges WHERE session = $1 AND group_id IS NOT DISTINCT FROM $4 \
+                   AND seq > $2 ORDER BY seq LIMIT $3",
+                &[&session, &after, &limit, &group],
             )
             .await
             .context("reading exchanges to note decisions from")?
@@ -403,18 +484,37 @@ impl DeskStore {
             &[&session],
         )
         .await?;
-        let read = tx
+        let queued = tx
             .query_opt(
-                "SELECT derived_to FROM memory_derive WHERE session = $1 FOR UPDATE",
+                "SELECT 1 FROM memory_derive WHERE session = $1 FOR UPDATE",
                 &[&session],
             )
             .await?
+            .is_some();
+        let read = tx
+            .query_opt(
+                "SELECT derived_to FROM memory_derive_reads \
+                 WHERE session = $1 AND group_key = $2 FOR UPDATE",
+                &[&session, &read_key(a.group)],
+            )
+            .await?
             .map(|r| r.try_get::<_, i32>(0))
-            .transpose()?;
-        if read != Some(a.claim.derived_to) {
+            .transpose()?
+            .unwrap_or(0);
+        if !queued || read != a.from {
             tx.rollback().await?;
             return Ok(false);
         }
+        // The notes it changes, locked in id order, as every write of many
+        // notes locks them.
+        let touched: Vec<Uuid> = a
+            .applied
+            .supersede
+            .iter()
+            .map(|s| s.id)
+            .chain(a.applied.close.iter().map(|c| c.id))
+            .collect();
+        tx.execute(ITEMS_LOCKED, &[&touched]).await?;
         for ((id, project), item) in a.ids.iter().zip(&a.applied.add) {
             insert_item(&tx, *id, session, a.group, project, item, a.by).await?;
         }
@@ -444,7 +544,7 @@ impl DeskStore {
         }
         tx.execute(
             &format!(
-                "UPDATE memory_derive SET derived_to = $2, derived_at = now(), tries = 0, \
+                "UPDATE memory_derive SET derived_to = GREATEST(derived_to, $2), derived_at = now(), tries = 0, \
                    failed = NULL, due_at = CASE WHEN $4 THEN now() \
                      WHEN due_at IS DISTINCT FROM $3 \
                        THEN GREATEST(due_at, now() + make_interval(mins => {DEBOUNCE_MINUTES})) \
@@ -455,6 +555,7 @@ impl DeskStore {
         )
         .await
         .context("moving how far a session was read for notes")?;
+        move_read(&tx, session, a.group, a.to).await?;
         tx.commit().await?;
         Ok(true)
     }
@@ -474,17 +575,33 @@ impl DeskStore {
         };
         let unread: i64 = client
             .query_one(
-                "SELECT COUNT(*) FROM memory_exchanges WHERE session = $1 AND seq > $2 \
-                   AND ended IS NOT NULL AND cardinality(flagged) = 0",
-                &[&session, &derived_to],
+                &format!(
+                    "SELECT COUNT(*) FROM memory_exchanges x WHERE x.session = $1 \
+                       AND x.ended IS NOT NULL AND cardinality(x.flagged) = 0 AND {PAST_READ}"
+                ),
+                &[&session],
             )
             .await?
             .try_get(0)?;
+        // The group the next reading is stamped with: its earliest exchange
+        // not yet read.
+        let next_group = client
+            .query_opt(
+                &format!(
+                    "SELECT x.group_id FROM memory_exchanges x WHERE x.session = $1 \
+                       AND x.ended IS NOT NULL AND {PAST_READ} ORDER BY x.seq LIMIT 1"
+                ),
+                &[&session],
+            )
+            .await?
+            .map(|r| r.try_get::<_, Option<String>>(0))
+            .transpose()?;
         Ok(Queued {
             derived_to,
             due_at,
             failed,
             unread,
+            next_group,
         })
     }
 
@@ -602,6 +719,30 @@ impl DeskStore {
     }
 }
 
+/// `$1`'s notes, locked in id order. Every write of many notes locks them
+/// so (forget, derivation, the index worker), so none waits on another
+/// that waits on it.
+pub(crate) const ITEMS_LOCKED: &str =
+    "SELECT id FROM memory_items WHERE id = ANY($1) ORDER BY id FOR UPDATE";
+
+/// Moves how far `session`'s reading of `group` got to `to`.
+async fn move_read(
+    tx: &tokio_postgres::Transaction<'_>,
+    session: Uuid,
+    group: Option<&str>,
+    to: i32,
+) -> Result<()> {
+    tx.execute(
+        "INSERT INTO memory_derive_reads (session, group_key, derived_to) VALUES ($1, $2, $3) \
+         ON CONFLICT (session, group_key) DO UPDATE \
+           SET derived_to = GREATEST(memory_derive_reads.derived_to, $3)",
+        &[&session, &read_key(group), &to],
+    )
+    .await
+    .context("moving how far a group was read for notes")?;
+    Ok(())
+}
+
 async fn insert_item(
     tx: &tokio_postgres::Transaction<'_>,
     id: Uuid,
@@ -631,4 +772,20 @@ async fn insert_item(
     .await
     .context("keeping a note")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_models_name_is_kept_plain_and_short() {
+        assert_eq!(
+            model_name("claude-haiku-4-5@20251001"),
+            "claude-haiku-4-5@20251001"
+        );
+        assert_eq!(model_name("gpt 5\n<b>mini</b>"), "gpt5bmini/b");
+        assert_eq!(model_name(&"x".repeat(200)).len(), MODEL_NAME_MAX);
+        assert_eq!(model_name("   "), "unknown");
+    }
 }

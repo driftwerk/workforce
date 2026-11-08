@@ -651,6 +651,13 @@ pub(crate) async fn forget_memory_in(
         &[&ids],
     )
     .await?;
+    // And their notes, in id order, as every write of many notes locks
+    // them.
+    tx.execute(
+        "SELECT 1 FROM memory_items WHERE session = ANY($1) ORDER BY id FOR UPDATE",
+        &[&ids],
+    )
+    .await?;
     // The exchanges' own keys too: a fork that copied them can't keep them
     // again.
     tx.execute(
@@ -707,6 +714,7 @@ pub(crate) async fn forget_memory_in(
         "memory_exchanges",
         "memory_items",
         "memory_derive",
+        "memory_derive_reads",
         "memory_sessions",
     ] {
         tx.execute(

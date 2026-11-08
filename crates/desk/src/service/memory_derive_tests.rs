@@ -118,6 +118,7 @@ async fn start(
         opts,
         super::Floor {
             deriver: Some(Arc::clone(deriver) as Arc<dyn crate::memory::derive::Deriver>),
+            redactor: Some(Arc::new(crate::memory::record::tests::Plain)),
             ..Default::default()
         },
         cancel.clone(),
@@ -188,6 +189,8 @@ async fn a_fake_models_notes_are_kept_only_as_the_record_bears_them_out_and_a_su
         let notes = d.session_memory(acme).await.unwrap().notes;
         assert_eq!(notes.counts.decisions, 1);
         assert!(notes.facts.is_empty(), "the note citing Globex's exchange is dropped");
+        assert_eq!(notes.provider.as_deref(), Some("anthropic"), "whose model writes them");
+        assert!(!notes.fallback_providers);
         let kept = &notes.decisions[0];
         assert_eq!(kept.text, "Keep the session token in an HttpOnly cookie.");
         assert!(kept.noted_by_desk && !kept.confirmed && !kept.source_gone);
@@ -524,6 +527,29 @@ async fn the_person_confirms_corrects_and_drops_notes_through_the_guarded_route(
             .0,
             400
         );
+        // A correction is kept and searched with its secrets hidden.
+        let (status, body) = patch(
+            app.clone(),
+            corrected,
+            json!({"action": "correct", "text": "Sessions live in Postgres, key SECRET-pg0xA1b2."}),
+        )
+        .await;
+        assert_eq!(status, 200);
+        let corrected: Uuid = body["item"]["id"].as_str().unwrap().parse().unwrap();
+        assert_eq!(
+            body["item"]["text"],
+            "Sessions live in Postgres, key [REDACTED TEST_KEY]."
+        );
+        assert_eq!(
+            q::<i64>(
+                &store,
+                "SELECT COUNT(*) FROM memory_items WHERE text LIKE '%pg0xA1b2%'",
+                &[]
+            )
+            .await,
+            0,
+            "no part of the secret is kept"
+        );
 
         assert_eq!(
             patch(app.clone(), todo, json!({"action": "drop"})).await.0,
@@ -569,7 +595,10 @@ async fn the_person_confirms_corrects_and_drops_notes_through_the_guarded_route(
             .unwrap();
         let notes = d.session_memory(s).await.unwrap().notes;
         assert!(notes.facts[0].source_gone);
-        assert_eq!(notes.facts[0].text, "Sessions live in Postgres.");
+        assert_eq!(
+            notes.facts[0].text,
+            "Sessions live in Postgres, key [REDACTED TEST_KEY]."
+        );
 
         // Forgetting the session forgets its notes and its queue.
         d.forget_memory(s).await.unwrap();
@@ -589,6 +618,76 @@ async fn the_person_confirms_corrects_and_drops_notes_through_the_guarded_route(
             d.change_memory_item(decision, &ItemChange::Confirm).await,
             Err(super::DeskError::NotFound)
         ));
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_group_not_read_yet_holds_only_its_own_place() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        DeskStore::migrate(&pool).await.unwrap();
+        let store = DeskStore::from_pool(pool.clone());
+        let s = session(&store, "acme-web").await;
+        // Its first work was in Acme's group, whose sessions aren't read
+        // yet; then it was moved out, and went on ungrouped.
+        said(&store, s, "a-1", "Rotate Acme's signing keys.", 30).await;
+        grouped(&store, s, "g-acme").await;
+        said(&store, s, "u-1", "Fix the flaky test.", 10).await;
+        let deriver = Arc::new(FakeDeriver::answering([json!({"add": [
+            {"kind": "fact", "text": "The test was flaky from a race.", "sources": ["x1"]},
+        ]})
+        .to_string()]));
+        let (d, _cancel) = start(&pool, dir.path(), &deriver, |_| {}).await;
+        until(&d, "its ungrouped work is noted", async || {
+            d.session_memory(s).await.unwrap().notes.counts.facts == 1
+        })
+        .await;
+        assert_eq!(deriver.calls(), 1);
+        assert!(
+            !deriver.asked.lock()[0].1.contains("signing keys"),
+            "Acme's exchange isn't sent"
+        );
+        let reads = |g: &'static str| {
+            let store = DeskStore::from_pool(pool.clone());
+            async move {
+                q::<Option<i32>>(
+                    &store,
+                    "SELECT (SELECT derived_to FROM memory_derive_reads WHERE session = $1 AND group_key = $2)",
+                    &[&s, &g],
+                )
+                .await
+            }
+        };
+        assert_eq!(reads("").await, Some(2));
+        assert_eq!(reads("g-acme").await, None, "Acme's place is where it was");
+        let notes = d.session_memory(s).await.unwrap().notes;
+        assert_eq!(
+            (notes.noting, notes.why.as_deref(), notes.unread),
+            (Noting::Off, Some(DERIVE_GROUP_OFF), 1),
+            "said of the group the next reading is in"
+        );
+
+        // Once Acme's are allowed, its exchange is read, on its own.
+        store
+            .put_setting(&group_key("g-acme"), &json!({"derive": true}))
+            .await
+            .unwrap();
+        deriver.answers.lock().push(Ok(json!({"add": [
+            {"kind": "todo", "text": "Rotate the signing keys.", "sources": ["x1"]},
+        ]})
+        .to_string()));
+        d.derive_now(s).await.unwrap();
+        until(&d, "Acme's is read", async || reads("g-acme").await == Some(1)).await;
+        assert!(deriver.asked.lock()[1].1.contains("signing keys"));
+        assert!(!deriver.asked.lock()[1].1.contains("flaky"));
+        let group: Option<String> = q(
+            &store,
+            "SELECT group_id FROM memory_items WHERE kind = 'todo' AND session = $1",
+            &[&s],
+        )
+        .await;
+        assert_eq!(group.as_deref(), Some("g-acme"));
     })
     .await;
 }
