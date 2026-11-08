@@ -3105,9 +3105,16 @@ async fn a_message_is_not_outward_for_its_sessions_name_or_a_negated_word() {
             things stand. Make no production changes until the person replies.";
         assert_eq!(crew.gate(&nudge(s.id, status), &o), Gate::Run);
         assert_eq!(
-            crew.gate(&nudge(deploy.id, "How is Acme Migration doing?"), &o),
+            crew.gate(&nudge(s.id, "Acme Migration, how is it going?"), &o),
             Gate::Run,
-            "another session's name"
+            "its name, as addressed"
+        );
+        assert!(
+            matches!(
+                crew.gate(&nudge(deploy.id, "Go ahead with Acme Migration"), &o),
+                Gate::Suggest(_)
+            ),
+            "a name with an outward word, not addressed"
         );
         for message in [
             "Go ahead and deploy",
@@ -3132,7 +3139,7 @@ async fn a_message_is_not_outward_for_its_sessions_name_or_a_negated_word() {
         let ask = uuid::Uuid::new_v4();
         crew.questions.lock().insert(
             ask,
-            "Acme Migration here: shall I make no production changes for now?".into(),
+            "Acme Migration: shall I make no production changes for now?".into(),
         );
         let answer = Action::Nudge {
             to: Target::Session(s.id),

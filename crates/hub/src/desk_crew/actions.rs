@@ -382,12 +382,19 @@ impl Action {
 
     /// What it says, as [`CrewHub::said_outward`] reads it for pushing
     /// code, deleting something, or reaching outside Desk.
-    fn said(&self) -> &str {
-        match self {
+    /// A session it starts is said by its name too, so a name it picks
+    /// ("The Release") is read as what it says.
+    fn said(&self) -> Cow<'_, str> {
+        Cow::Borrowed(match self {
             Self::Nudge { message, .. } => message.as_str(),
             Self::Resume { prompt, .. } | Self::Restart { prompt, .. } => {
                 prompt.as_deref().unwrap_or_default()
             }
+            Self::StartSession {
+                goal,
+                name: Some(name),
+                ..
+            } => return Cow::Owned(format!("{goal}.\n{name}")),
             Self::StartSession { goal, .. } => goal.as_str(),
             Self::Assign { task, .. } => task.as_str(),
             Self::AssignTicket { .. }
@@ -399,7 +406,7 @@ impl Action {
             | Self::Escalate { .. }
             | Self::TakeOn { .. }
             | Self::Release { .. } => "",
-        }
+        })
     }
 }
 
@@ -448,15 +455,20 @@ const OUTWARD_WORDS: &[&str] = &[
 /// Words that undo the outward word they come just before: "make no
 /// production changes", "don't push", "hold off on merging". Two cancel
 /// ("don't stop deploying" still deploys). Matched whole, apostrophes
-/// dropped.
+/// dropped; "no" only where it can't be an answer (see [`negation_at`]).
 const NEGATIONS: &[&str] = &["no", "not", "dont", "never", "without", "avoid", "stop"];
 
 /// Words that may stand between a negation and the word it undoes ("no
-/// more pushes", "don't do any deploys", "not merge the PR"). Any other word
-/// ends the negation's reach, so "don't wait push it" still pushes.
+/// more pushes", "don't do any deploys"). Any other word, an outward one
+/// too, ends the negation's reach: "don't wait push it" and "don't merge
+/// push to main" still push.
 const BETWEEN: &[&str] = &[
     "a", "an", "the", "any", "more", "ever", "further", "new", "yet", "do", "make", "to",
 ];
+
+/// Outward words that may come between a negation and the word it undoes,
+/// one at most and right before it: "no force-push", "no prod deploys".
+const MODIFIERS: &[&str] = &["force", "prod", "production"];
 
 /// Words before which a reply is the person's, not something to send:
 /// "until the person replies".
@@ -465,38 +477,104 @@ const UNTIL: &[&str] = &["until", "till", "unless"];
 /// How many words back a negation or an `UNTIL` may be.
 const REACH: usize = 4;
 
-/// The lowercased words of `text`, `None` where a clause ends (`.,;:!?`, a
+/// A word of a text, as matched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Word {
+    text: String,
+    /// Joined to the word before by a hyphen ("non-stop"), so it is no
+    /// negation of its own.
+    hyphened: bool,
+}
+
+/// Whether `c` is invisible formatting (zero-width spaces and joiners,
+/// direction marks, soft hyphens, variation selectors, tags), which could
+/// split a word so it isn't matched.
+fn formatting(c: char) -> bool {
+    matches!(c,
+        '\u{00AD}' | '\u{034F}' | '\u{061C}' | '\u{115F}' | '\u{1160}' | '\u{17B4}' | '\u{17B5}'
+        | '\u{180B}'..='\u{180F}' | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}'
+        | '\u{2060}'..='\u{206F}' | '\u{3164}' | '\u{FE00}'..='\u{FE0F}' | '\u{FEFF}'
+        | '\u{FFA0}' | '\u{E0000}'..='\u{E007F}')
+}
+
+/// The Latin letter a lowercase Cyrillic or Greek look-alike stands for.
+fn unconfused(c: char) -> char {
+    match c {
+        'а' | 'α' => 'a',
+        'с' | 'ϲ' => 'c',
+        'ԁ' => 'd',
+        'е' | 'ε' => 'e',
+        'һ' => 'h',
+        'і' | 'ι' => 'i',
+        'ј' => 'j',
+        'κ' => 'k',
+        'ӏ' => 'l',
+        'о' | 'ο' => 'o',
+        'р' | 'ρ' => 'p',
+        'ԛ' => 'q',
+        'ѕ' => 's',
+        'τ' => 't',
+        'ν' => 'v',
+        'ԝ' => 'w',
+        'х' | 'χ' => 'x',
+        'у' => 'y',
+        c => c,
+    }
+}
+
+/// The words of `text`, NFKC-normalised, lowercased, look-alikes read as
+/// the letters they look like; `None` where a clause ends (`.,;:!?`, a
 /// dash standing alone, a line break), so nothing reaches across one.
-fn words(text: &str) -> Vec<Option<String>> {
+fn words(text: &str) -> Vec<Option<Word>> {
+    use unicode_normalization::UnicodeNormalization;
     let chars: Vec<char> = text
         .chars()
-        .filter(|c| !matches!(c, '\'' | '\u{2019}'))
+        .filter(|c| !formatting(*c))
+        .nfkc()
+        .filter(|c| !formatting(*c) && !matches!(c, '\'' | '\u{2019}'))
+        .flat_map(char::to_lowercase)
+        .map(unconfused)
         .collect();
-    let mut out = Vec::new();
+    let mut out: Vec<Option<Word>> = Vec::new();
     let mut word = String::new();
+    let mut hyphened = false;
+    let mut joined = false;
     for (i, &c) in chars.iter().enumerate() {
         if c.is_alphanumeric() {
-            word.extend(c.to_lowercase());
+            if word.is_empty() {
+                hyphened = joined;
+            }
+            word.push(c);
             continue;
         }
         if !word.is_empty() {
-            out.push(Some(std::mem::take(&mut word)));
+            out.push(Some(Word {
+                text: std::mem::take(&mut word),
+                hyphened,
+            }));
         }
         let spaced = |j: Option<usize>| {
             j.and_then(|j| chars.get(j))
                 .is_none_or(|c| c.is_whitespace())
         };
-        let ends = match c {
-            '.' | ',' | ';' | ':' | '!' | '?' | '(' | ')' | '\n' | '\u{2014}' | '\u{2013}' => true,
-            '-' => spaced(i.checked_sub(1)) || spaced(Some(i + 1)),
-            _ => false,
+        let (ends, joins) = match c {
+            '.' | ',' | ';' | ':' | '!' | '?' | '(' | ')' | '\n' | '\u{2014}' | '\u{2013}' => {
+                (true, false)
+            }
+            '-' if spaced(i.checked_sub(1)) || spaced(Some(i + 1)) => (true, false),
+            '-' => (false, true),
+            _ => (false, false),
         };
+        joined = joins;
         if ends && out.last().is_some_and(Option::is_some) {
             out.push(None);
         }
     }
     if !word.is_empty() {
-        out.push(Some(word));
+        out.push(Some(Word {
+            text: word,
+            hyphened,
+        }));
     }
     out
 }
@@ -505,24 +583,32 @@ fn outward_word(w: &str) -> bool {
     OUTWARD_WORDS.contains(&w) || OUTWARD_STEMS.iter().any(|s| w.starts_with(s))
 }
 
+fn text_at(ws: &[Option<Word>], j: usize) -> Option<&str> {
+    ws.get(j)?.as_ref().map(|w| w.text.as_str())
+}
+
 /// Whether the word at `i` is undone by negations just before it, in its
-/// clause: an odd number of them, with only `BETWEEN` words, outward
-/// words and other negations between, and no other negation earlier in the
-/// clause ("no reason not to deploy" deploys).
-fn negated(ws: &[Option<String>], i: usize) -> bool {
-    let mut negations = 0;
+/// clause: an odd number of them, with only `BETWEEN` words, other
+/// negations and one `MODIFIERS` word right before it between, and no
+/// other negation earlier in the clause ("no reason not to deploy"
+/// deploys).
+fn negated(ws: &[Option<Word>], i: usize) -> bool {
     let mut j = i;
+    if j > 0 && text_at(ws, j - 1).is_some_and(|w| MODIFIERS.contains(&w)) {
+        j -= 1;
+    }
+    let mut negations = 0;
     let mut seen = 0;
     while j > 0 && seen < REACH {
         j -= 1;
-        let Some(w) = ws[j].as_deref() else { break };
+        let Some(w) = text_at(ws, j) else { break };
         seen += 1;
         if negation_at(ws, j) {
             negations += 1;
             if w == "on" {
                 j -= 2;
             }
-        } else if !BETWEEN.contains(&w) && !outward_word(w) {
+        } else if !BETWEEN.contains(&w) {
             break;
         }
     }
@@ -535,53 +621,76 @@ fn negated(ws: &[Option<String>], i: usize) -> bool {
     negations % 2 == 1 && !(clause..j).any(|k| negation_at(ws, k))
 }
 
-/// Whether a negation ends at `j`: one of `NEGATIONS`, or "hold off on".
-fn negation_at(ws: &[Option<String>], j: usize) -> bool {
-    match ws[j].as_deref() {
-        Some("on") => {
-            j >= 2 && ws[j - 1].as_deref() == Some("off") && ws[j - 2].as_deref() == Some("hold")
+/// Whether a negation ends at `j`: one of `NEGATIONS` standing alone (not
+/// "non-stop"), or "hold off on". "No" only where it can't be an answer:
+/// first in its clause, before a `BETWEEN` word ("no more"), or after
+/// "make" ("make no production changes"), never in "yes or no deploy?".
+fn negation_at(ws: &[Option<Word>], j: usize) -> bool {
+    let Some(w) = ws[j].as_ref() else {
+        return false;
+    };
+    if w.hyphened {
+        return false;
+    }
+    match w.text.as_str() {
+        "on" => j >= 2 && text_at(ws, j - 1) == Some("off") && text_at(ws, j - 2) == Some("hold"),
+        "no" => {
+            let before = j.checked_sub(1).and_then(|k| text_at(ws, k));
+            before.is_none_or(|b| b == "make")
+                || text_at(ws, j + 1).is_some_and(|n| BETWEEN.contains(&n))
         }
-        Some(w) => NEGATIONS.contains(&w),
-        None => false,
+        w => NEGATIONS.contains(&w),
     }
 }
 
 /// Whether the reply-word at `i` is a wait on someone's reply: an `UNTIL`
 /// a few words before it, in its clause ("until the person replies").
-fn awaited(ws: &[Option<String>], i: usize) -> bool {
-    matches!(ws[i].as_deref(), Some("reply" | "replies" | "replied"))
+fn awaited(ws: &[Option<Word>], i: usize) -> bool {
+    matches!(text_at(ws, i), Some("reply" | "replies" | "replied"))
         && ws[i.saturating_sub(REACH)..i]
             .iter()
             .rev()
-            .map_while(Option::as_deref)
-            .any(|w| UNTIL.contains(&w))
+            .map_while(Option::as_ref)
+            .any(|w| UNTIL.contains(&w.text.as_str()))
 }
 
 /// Whether `text` names something that pushes, deploys, deletes or sends.
 /// Words can't say all that a message leads to ("may I go on?" with the
 /// push only in what came before), so this only ever narrows what runs.
 ///
-/// What `names` call sessions and agents isn't read ("Acme Migration" is a
-/// name, not a migration), unless the name starts with an outward word: a
-/// session called "Release 4.2" can't hide "go ahead with Release 4.2". An outward word is let go only
-/// when clearly negated just before ("make no production changes") or a
-/// reply waited on ("until the person replies").
+/// What `names` call sessions and agents isn't read where it only names
+/// one. A name with no outward word is let go anywhere ("How is Acme
+/// doing?"); one with an outward word only when the message opens by
+/// addressing it ("Acme Migration: …"), and never one that starts with
+/// one ("Release 4.2: go ahead" releases), so "go ahead with the release"
+/// stays outward whatever a session is called. An outward word is let go
+/// only when clearly negated just before ("make no production changes") or
+/// a reply waited on ("until the person replies").
 pub(crate) fn outward_except(text: &str, names: &[String]) -> bool {
     let mut ws = words(text);
     let mut names: Vec<Vec<String>> = names
         .iter()
-        .map(|n| words(n).into_iter().flatten().collect::<Vec<_>>())
+        .map(|n| {
+            words(n)
+                .into_iter()
+                .flatten()
+                .map(|w| w.text)
+                .collect::<Vec<_>>()
+        })
         .filter(|n| n.first().is_some_and(|w| !outward_word(w)))
         .collect();
     names.sort_by_key(|n| std::cmp::Reverse(n.len()));
     for name in &names {
+        let inward = !name.iter().any(|w| outward_word(w));
         let mut i = 0;
         while i + name.len() <= ws.len() {
             let here = ws[i..i + name.len()]
                 .iter()
                 .zip(name)
-                .all(|(w, n)| w.as_deref() == Some(n.as_str()));
-            if here {
+                .all(|(w, n)| w.as_ref().is_some_and(|w| &w.text == n));
+            // Addressed: first in the message, a clause ending after it.
+            let addressed = i == 0 && ws.get(name.len()).is_some_and(Option::is_none);
+            if here && (inward || addressed) {
                 // A clause ends where it was, so no negation reaches across.
                 ws.splice(i..i + name.len(), [None]);
             }
@@ -589,9 +698,7 @@ pub(crate) fn outward_except(text: &str, names: &[String]) -> bool {
         }
     }
     (0..ws.len()).any(|i| {
-        ws[i]
-            .as_deref()
-            .is_some_and(|w| outward_word(w) && !negated(&ws, i) && !awaited(&ws, i))
+        text_at(&ws, i).is_some_and(|w| outward_word(w) && !negated(&ws, i) && !awaited(&ws, i))
     })
 }
 
@@ -672,7 +779,7 @@ impl CrewHub {
             }
             _ => false,
         };
-        if self.said_outward(action.said()) || asked_outward || self.ticket_outward(action) {
+        if self.said_outward(&action.said()) || asked_outward || self.ticket_outward(action) {
             return Gate::Suggest(
                 "anything that pushes, deletes or reaches outside Desk is the person's call".into(),
             );
@@ -869,7 +976,7 @@ impl CrewHub {
             } => {
                 let asked = self.questions.lock().get(ask).cloned();
                 let asked_outward = asked.is_none_or(|q| self.said_outward(&q));
-                if self.said_outward(action.said()) || asked_outward {
+                if self.said_outward(&action.said()) || asked_outward {
                     return outward_said();
                 }
                 Some(match o.act.answer_sessions {
@@ -1919,7 +2026,10 @@ mod tests {
             "Make no production changes",
             "Do not deploy yet",
             "Don't push anything",
-            "Don\u{2019}t merge the PR",
+            "Don\u{2019}t merge yet",
+            "No force-push",
+            "No prod deploys",
+            "No more force pushes",
             "Never force-push to main",
             "Look into it without deleting anything",
             "Avoid publishing for now",
@@ -1949,6 +2059,13 @@ mod tests {
             "No reason not to deploy",
             "No need to hold off on merging",
             "Never let them stop deploying",
+            "Don't merge the PR",
+            "Don't merge push to main",
+            "No reset push origin main",
+            "Do not reset deploy now",
+            "Do a non-stop deploy",
+            "Yes or no deploy now?",
+            "There are no deploys left to do",
         ] {
             assert!(outward(said), "{said}");
         }
@@ -1958,6 +2075,8 @@ mod tests {
     fn what_sessions_are_called_is_not_outward() {
         let names = [
             "Acme Migration".to_string(),
+            "Acme Web".to_string(),
+            "The Release".to_string(),
             "Deploy".to_string(),
             "Release 4.2".to_string(),
             "Deploy the docs".to_string(),
@@ -1967,9 +2086,10 @@ mod tests {
         assert!(outward(cufflink), "it is outward, read without the names");
         assert!(!outward_except(cufflink, &names), "{cufflink}");
         for said in [
-            "How is acme migration going?",
             "Acme-Migration: still stuck?",
-            "Ask Acme Migration for its status",
+            "ACME MIGRATION, how is it going?",
+            "How is Acme Web doing?",
+            "Acme Web: no production changes, please",
         ] {
             assert!(!outward_except(said, &names), "{said}");
         }
@@ -1983,9 +2103,45 @@ mod tests {
             "No Acme Migration deploys",
             "Go ahead with Release 4.2",
             "Deploy the docs now",
+            "Release 4.2: go ahead",
+            // A name with an outward word is let go only as addressed.
+            "How is Acme Migration going?",
+            "Go ahead with the release",
+            "Go ahead with The Release",
+            "The Release",
         ] {
             assert!(outward_except(said, &names), "{said}");
         }
+    }
+
+    #[test]
+    fn look_alike_and_hidden_letters_are_still_outward() {
+        for said in [
+            "D\u{0435}\u{0440}loy now",
+            "De\u{200B}ploy now",
+            "pu\u{00AD}sh it",
+            "\u{FF24}\u{FF45}\u{FF50}\u{FF4C}\u{FF4F}\u{FF59} now",
+            "m\u{0435}rge the PR",
+            "\u{0441}ommit it",
+        ] {
+            assert!(outward(said), "{said:?}");
+        }
+        assert!(!outward("Make n\u{043E} production changes"));
+    }
+
+    #[test]
+    fn a_session_started_is_outward_by_its_name_too() {
+        let start = |name: Option<&str>| Action::StartSession {
+            folder: "/work/acme".into(),
+            goal: "Tidy the date picker".into(),
+            name: name.map(Into::into),
+            engine: None,
+            view: None,
+            worktree: None,
+        };
+        assert!(!outward(&start(None).said()));
+        assert!(!outward(&start(Some("Acme Web")).said()));
+        assert!(outward(&start(Some("The Release")).said()));
     }
 
     #[test]
