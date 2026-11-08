@@ -186,6 +186,7 @@ fn a_draft_names_its_needs_by_place_and_gets_ids_and_the_default_engine() {
 #[test]
 fn a_draft_keeps_the_ids_of_the_tickets_it_changes_and_refuses_others() {
     let before = Snapshot {
+        parallel: None,
         goal: "Ship".into(),
         tickets: vec![planned(7, "Add the cart API", &[])],
     };
@@ -268,6 +269,7 @@ fn a_draft_refuses_a_subagent_an_unknown_engine_and_bad_needs() {
 #[test]
 fn a_plan_that_can_run_here_is_valid() {
     let s = Snapshot {
+        parallel: None,
         goal: "Ship the new checkout".into(),
         tickets: vec![
             planned(1, "Add the cart API", &[]),
@@ -297,6 +299,7 @@ fn each_thing_that_keeps_a_plan_from_running_is_said() {
     untitled.body = "x".repeat(BODY_MAX + 1);
     let outside = planned(10, "Outside", &[77]);
     let s = Snapshot {
+        parallel: None,
         goal: String::new(),
         tickets: vec![
             planned(1, "Fine", &[]),
@@ -358,6 +361,7 @@ fn each_thing_that_keeps_a_plan_from_running_is_said() {
 #[test]
 fn a_cycle_is_refused_naming_the_tickets_in_it() {
     let s = Snapshot {
+        parallel: None,
         goal: "g".into(),
         tickets: vec![
             planned(1, "a", &[]),
@@ -375,6 +379,7 @@ fn a_cycle_is_refused_naming_the_tickets_in_it() {
 #[test]
 fn a_plan_has_one_to_thirty_tickets_and_a_short_enough_goal() {
     let none = Snapshot {
+        parallel: None,
         goal: "g".into(),
         tickets: vec![],
     };
@@ -383,6 +388,7 @@ fn a_plan_has_one_to_thirty_tickets_and_a_short_enough_goal() {
         Err(vec![Problem::NoTickets])
     );
     let many = Snapshot {
+        parallel: None,
         goal: "x".repeat(GOAL_MAX + 1),
         tickets: (1..=31).map(|n| planned(n, "t", &[])).collect(),
     };
@@ -601,13 +607,17 @@ fn a_plan_is_settled_once_every_ticket_is_done_or_dropped() {
 // ── Changes ─────────────────────────────────────────────────────────────
 
 fn base() -> Snapshot {
+    let mut form = planned(2, "Wire the payment form", &[1]);
+    form.engine = Engine::Codex;
+    form.folder = "/work/acme-api".into();
     Snapshot {
         goal: "Ship the new checkout".into(),
         tickets: vec![
             planned(1, "Add the cart API", &[]),
-            planned(2, "Wire the payment form", &[1]),
+            form,
             planned(3, "Fix the flaky payment test", &[]),
         ],
+        parallel: Some(2),
     }
 }
 
@@ -631,20 +641,28 @@ fn plan_change_classifies_each_kind_of_edit() {
         ("title", &|s| {
             s.tickets[0].title = "Add the basket API".into()
         }),
-        ("body", &|s| s.tickets[0].body = "Use the v2 schema".into()),
-        ("engine", &|s| s.tickets[2].engine = Engine::Codex),
+        // Within the folders and engines it already uses.
         ("folder", &|s| s.tickets[2].folder = "/work/acme-api".into()),
+        ("engine", &|s| s.tickets[0].engine = Engine::Codex),
         ("view", &|s| s.tickets[2].view = Some(View::Terminal)),
+        ("lower limit", &|s| s.parallel = Some(1)),
     ];
     for (what, f) in edits {
         assert_eq!(minor(f), Ok(Some(Change::Minor)), "{what}");
     }
-    let scopes: [Edit; 3] = [
+    let scopes: [Edit; 8] = [
         ("goal", &|s| s.goal = "Ship checkout and refunds".into()),
         ("added", &|s| s.tickets.push(planned(4, "Refunds", &[]))),
         ("dropped", &|s| {
             s.tickets.pop();
         }),
+        ("body", &|s| s.tickets[0].body = "Use the v2 schema".into()),
+        ("new folder", &|s| {
+            s.tickets[0].folder = "/work/acme-docs".into()
+        }),
+        ("new engine", &|s| s.tickets[0].engine = Engine::Gemini),
+        ("higher limit", &|s| s.parallel = Some(3)),
+        ("no limit", &|s| s.parallel = None),
     ];
     for (what, f) in scopes {
         assert_eq!(minor(f), Ok(Some(Change::Scope)), "{what}");
@@ -717,4 +735,31 @@ fn a_without_last() -> Snapshot {
     let mut s = base();
     s.tickets.pop();
     s
+}
+
+#[test]
+fn a_draft_keeps_the_limit_of_what_it_changes_and_an_old_snapshot_reads_with_none() {
+    let before = base();
+    let draft = Draft {
+        goal: before.goal.clone(),
+        tickets: vec![DraftTicket {
+            id: Some(u(1)),
+            title: "Add the cart API".into(),
+            folder: "/work/acme-web".into(),
+            ..Default::default()
+        }],
+    };
+    let s = snapshot_of(&draft, Some(&before), Engine::Claude, &mut counter()).unwrap();
+    assert_eq!(s.parallel, Some(2));
+    let old: Snapshot =
+        serde_json::from_value(serde_json::json!({ "goal": "g", "tickets": [] })).unwrap();
+    assert_eq!(old.parallel, None);
+    assert!(describe(
+        &before,
+        &Snapshot {
+            parallel: Some(1),
+            ..base()
+        }
+    )
+    .contains("uns at most 1 at once"));
 }

@@ -15,7 +15,6 @@ use tokio_postgres::Row;
 use uuid::Uuid;
 
 use crate::board::{Ticket, TicketState};
-use crate::board_store::TicketWrite;
 use crate::engine::{Engine, View};
 use crate::plan::{Change, Paused, Plan, PlanState, Revision};
 use crate::store::DeskStore;
@@ -59,6 +58,61 @@ fn revision(row: &Row) -> Result<Revision> {
     })
 }
 
+/// Why a start wasn't begun.
+#[derive(Debug, thiserror::Error)]
+pub enum BeginStart {
+    /// The ticket changed since it was read.
+    #[error("the ticket changed since it was read")]
+    Stale,
+    /// Its plan doesn't run now: paused, dropped or done meanwhile.
+    #[error("the plan isn't running")]
+    NotRunning,
+    #[error(transparent)]
+    Other(#[from] eyre::Report),
+}
+
+impl From<tokio_postgres::Error> for BeginStart {
+    fn from(e: tokio_postgres::Error) -> Self {
+        Self::Other(eyre::Report::new(e).wrap_err("beginning a start"))
+    }
+}
+
+impl From<workforce_postgres::PostgresError> for BeginStart {
+    fn from(e: workforce_postgres::PostgresError) -> Self {
+        Self::Other(eyre::Report::new(e))
+    }
+}
+
+async fn put_plan_in<C: tokio_postgres::GenericClient>(client: &C, p: &Plan) -> Result<()> {
+    client
+        .execute(
+            &format!(
+                "INSERT INTO plans ({PLAN}) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) \
+                 ON CONFLICT (id) DO UPDATE SET board = EXCLUDED.board, group_id = EXCLUDED.group_id, \
+                 boss = EXCLUDED.boss, goal = EXCLUDED.goal, state = EXCLUDED.state, \
+                 paused = EXCLUDED.paused, parallel = EXCLUDED.parallel, \
+                 revision = EXCLUDED.revision, approved_revision = EXCLUDED.approved_revision, \
+                 updated_at = EXCLUDED.updated_at"
+            ),
+            &[
+                &p.id,
+                &p.board,
+                &p.group,
+                &p.boss,
+                &p.goal,
+                &p.state.as_str(),
+                &p.paused.map(Paused::as_str),
+                &p.parallel,
+                &p.revision,
+                &p.approved_revision,
+                &p.created_at,
+                &p.updated_at,
+            ],
+        )
+        .await?;
+    Ok(())
+}
+
 /// Where a plan's ticket runs, as its row says.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Runs {
@@ -80,33 +134,7 @@ impl DeskStore {
     /// Writes `p` whole, new or changed.
     pub async fn put_plan(&self, p: &Plan) -> Result<()> {
         let client = self.pool().get().await?;
-        client
-            .execute(
-                &format!(
-                    "INSERT INTO plans ({PLAN}) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) \
-                     ON CONFLICT (id) DO UPDATE SET board = EXCLUDED.board, group_id = EXCLUDED.group_id, \
-                     boss = EXCLUDED.boss, goal = EXCLUDED.goal, state = EXCLUDED.state, \
-                     paused = EXCLUDED.paused, parallel = EXCLUDED.parallel, \
-                     revision = EXCLUDED.revision, approved_revision = EXCLUDED.approved_revision, \
-                     updated_at = EXCLUDED.updated_at"
-                ),
-                &[
-                    &p.id,
-                    &p.board,
-                    &p.group,
-                    &p.boss,
-                    &p.goal,
-                    &p.state.as_str(),
-                    &p.paused.map(Paused::as_str),
-                    &p.parallel,
-                    &p.revision,
-                    &p.approved_revision,
-                    &p.created_at,
-                    &p.updated_at,
-                ],
-            )
-            .await?;
-        Ok(())
+        put_plan_in(&**client, p).await
     }
 
     pub async fn plan(&self, id: Uuid) -> Result<Option<Plan>> {
@@ -187,12 +215,14 @@ impl DeskStore {
             .transpose()
     }
 
-    /// Writes where `ticket` runs, and which plan it is in.
+    /// Writes where `ticket` runs, and which plan it is in. The ticket's
+    /// version moves on: a start read before is refused.
     pub async fn put_runs(&self, ticket: Uuid, runs: &Runs) -> Result<()> {
         let client = self.pool().get().await?;
         client
             .execute(
-                "UPDATE tickets SET plan = $2, engine = $3, folder = $4, view = $5 WHERE id = $1",
+                "UPDATE tickets SET plan = $2, engine = $3, folder = $4, view = $5, \
+                 version = version + 1 WHERE id = $1",
                 &[
                     &ticket,
                     &runs.plan,
@@ -243,27 +273,49 @@ impl DeskStore {
     }
 
     /// Moves `t`, as it was read, to Doing at `rank` with a `starting` link
-    /// to `session`, in one transaction: refused as stale when it changed
-    /// since it was read, so a ticket the person moved meanwhile is never
-    /// started.
+    /// to `session`, in one transaction, while its plan `plan` runs: what it
+    /// runs in, as the row says then. Refused as stale when the ticket
+    /// changed since it was read (the person moved it, or the boss changed
+    /// where it runs), and when the plan was paused, dropped or done
+    /// meanwhile: the plan's row is held until the link is written, so a
+    /// pause either comes first and nothing starts, or waits for this one.
     pub async fn begin_start(
         &self,
         t: &mut Ticket,
+        plan: Uuid,
         rank: f64,
         session: Uuid,
         at: DateTime<Utc>,
-    ) -> Result<(), TicketWrite> {
+    ) -> Result<Runs, BeginStart> {
         let mut client = self.pool().get().await?;
         let tx = client.transaction().await?;
+        let runs = tx
+            .query_opt(
+                "SELECT 1 FROM plans WHERE id = $1 AND state = 'running' AND paused IS NULL \
+                 AND approved_revision IS NOT NULL FOR SHARE",
+                &[&plan],
+            )
+            .await?;
+        if runs.is_none() {
+            return Err(BeginStart::NotRunning);
+        }
         let row = tx
             .query_opt(
                 "UPDATE tickets SET state = $3, rank = $4, state_at = $5, updated_at = $5, \
-                 version = version + 1 WHERE id = $1 AND version = $2 RETURNING version",
-                &[&t.id, &t.version, &TicketState::Doing.as_str(), &rank, &at],
+                 version = version + 1 WHERE id = $1 AND version = $2 AND plan = $6 \
+                 RETURNING version, engine, folder, view",
+                &[
+                    &t.id,
+                    &t.version,
+                    &TicketState::Doing.as_str(),
+                    &rank,
+                    &at,
+                    &plan,
+                ],
             )
             .await?;
         let Some(row) = row else {
-            return Err(TicketWrite::Stale);
+            return Err(BeginStart::Stale);
         };
         tx.execute(
             "INSERT INTO ticket_links (ticket, kind, target, at) VALUES ($1, $2, $3, $4)",
@@ -271,11 +323,79 @@ impl DeskStore {
         )
         .await?;
         tx.commit().await?;
+        let engine: Option<String> = row.try_get(1)?;
+        let view: Option<String> = row.try_get(3)?;
         t.version = row.try_get(0)?;
         t.state = TicketState::Doing;
         t.rank = rank;
         t.state_at = at;
         t.updated_at = at;
+        Ok(Runs {
+            plan: Some(plan),
+            engine: engine.as_deref().map(Engine::parse).transpose()?,
+            folder: row.try_get(2)?,
+            view: view.as_deref().map(View::parse).transpose()?,
+        })
+    }
+
+    /// Writes a new plan, its tickets (numbered on its board, with where
+    /// each runs and what each needs) and its first revision, at once: a
+    /// plan is never half there.
+    pub async fn add_plan(
+        &self,
+        p: &Plan,
+        tickets: &mut [(Ticket, Runs)],
+        r: &Revision,
+    ) -> Result<()> {
+        let mut client = self.pool().get().await?;
+        let tx = client.transaction().await?;
+        put_plan_in(&*tx, p).await?;
+        for (t, runs) in tickets.iter_mut() {
+            let row = tx
+                .query_one(
+                    "UPDATE boards SET next_number = next_number + 1 WHERE id = $1 \
+                     RETURNING next_number - 1",
+                    &[&t.board],
+                )
+                .await
+                .context("numbering a plan's ticket")?;
+            t.number = row.try_get(0)?;
+            crate::board_store::insert_ticket_in(&*tx, t).await?;
+            tx.execute(
+                "UPDATE tickets SET plan = $2, engine = $3, folder = $4, view = $5 WHERE id = $1",
+                &[
+                    &t.id,
+                    &runs.plan,
+                    &runs.engine.map(Engine::as_str),
+                    &runs.folder,
+                    &runs.view.map(View::as_str),
+                ],
+            )
+            .await?;
+        }
+        for (t, _) in tickets.iter() {
+            for n in &t.needs {
+                tx.execute(
+                    "INSERT INTO ticket_needs (ticket, needs) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+                    &[&t.id, n],
+                )
+                .await?;
+            }
+        }
+        tx.execute(
+            &format!("INSERT INTO plan_revisions ({REVISION}) VALUES ($1, $2, $3, $4, $5, $6, $7)"),
+            &[
+                &r.plan,
+                &r.revision,
+                &r.at,
+                &serde_json::to_value(&r.by)?,
+                &r.change.as_str(),
+                &r.summary,
+                &serde_json::to_value(&r.snapshot)?,
+            ],
+        )
+        .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -423,6 +543,7 @@ mod tests {
                 change: Change::Scope,
                 summary: "Proposed".into(),
                 snapshot: Snapshot {
+                    parallel: None,
                     goal: p.goal.clone(),
                     tickets: vec![Planned {
                         id: t.id,
@@ -458,17 +579,45 @@ mod tests {
         .await;
     }
 
+    /// A running plan with one ticket in it, read as it is now.
+    async fn running(s: &DeskStore, b: &Board) -> (Plan, Ticket) {
+        let mut p = new_plan(b);
+        p.state = PlanState::Running;
+        p.approved_revision = Some(1);
+        s.put_plan(&p).await.unwrap();
+        let t = ticket(s, b, "Add the cart API").await;
+        s.put_runs(
+            t.id,
+            &Runs {
+                plan: Some(p.id),
+                engine: Some(Engine::Claude),
+                folder: Some("/work/acme-web".into()),
+                view: None,
+            },
+        )
+        .await
+        .unwrap();
+        let t = s.ticket(t.id).await.unwrap().unwrap();
+        (p, t)
+    }
+
     #[tokio::test]
     async fn a_start_moves_its_ticket_and_links_its_session_at_once_or_not_at_all() {
         with_test_pool(crate::store::build_pool, |pool| async move {
             let s = DeskStore::with_pool(pool).await.unwrap();
             let b = board(&s).await;
-            let mut t = ticket(&s, &b, "Add the cart API").await;
+            let (p, mut t) = running(&s, &b).await;
             let read = t.clone();
             let session = Uuid::new_v4();
-            s.begin_start(&mut t, 4096.0, session, Utc::now())
+            let runs = s
+                .begin_start(&mut t, p.id, 4096.0, session, Utc::now())
                 .await
                 .unwrap();
+            assert_eq!(
+                runs.folder.as_deref(),
+                Some("/work/acme-web"),
+                "as the row says"
+            );
             assert_eq!(t.state, TicketState::Doing);
             let now = s.ticket(t.id).await.unwrap().unwrap();
             assert_eq!(now.state, TicketState::Doing);
@@ -487,13 +636,115 @@ mod tests {
             // From an older read: nothing is written.
             let mut stale = read;
             let again = s
-                .begin_start(&mut stale, 1.0, Uuid::new_v4(), Utc::now())
+                .begin_start(&mut stale, p.id, 1.0, Uuid::new_v4(), Utc::now())
                 .await;
-            assert!(matches!(again, Err(TicketWrite::Stale)));
+            assert!(matches!(again, Err(BeginStart::Stale)));
             assert_eq!(s.starting().await.unwrap().len(), 1);
 
             s.end_start(t.id, session).await.unwrap();
             assert!(s.starting().await.unwrap().is_empty());
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_ticket_moved_elsewhere_or_a_plan_paused_since_it_was_read_starts_nothing() {
+        with_test_pool(crate::store::build_pool, |pool| async move {
+            let s = DeskStore::with_pool(pool).await.unwrap();
+            let b = board(&s).await;
+            let (mut p, t) = running(&s, &b).await;
+            // Where it runs changed after the runner read it.
+            let mut read = t.clone();
+            s.put_runs(
+                t.id,
+                &Runs {
+                    plan: Some(p.id),
+                    engine: Some(Engine::Claude),
+                    folder: Some("/work/acme-api".into()),
+                    view: None,
+                },
+            )
+            .await
+            .unwrap();
+            assert!(matches!(
+                s.begin_start(&mut read, p.id, 1.0, Uuid::new_v4(), Utc::now())
+                    .await,
+                Err(BeginStart::Stale)
+            ));
+            // Paused meanwhile.
+            let mut now = s.ticket(t.id).await.unwrap().unwrap();
+            p.state = PlanState::Paused;
+            p.paused = Some(Paused::Person);
+            s.put_plan(&p).await.unwrap();
+            assert!(matches!(
+                s.begin_start(&mut now, p.id, 1.0, Uuid::new_v4(), Utc::now())
+                    .await,
+                Err(BeginStart::NotRunning)
+            ));
+            assert!(s.starting().await.unwrap().is_empty());
+            assert_eq!(
+                s.ticket(t.id).await.unwrap().unwrap().state,
+                TicketState::Todo
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_new_plan_its_tickets_and_its_first_revision_are_written_together() {
+        with_test_pool(crate::store::build_pool, |pool| async move {
+            let s = DeskStore::with_pool(pool).await.unwrap();
+            let b = board(&s).await;
+            let p = new_plan(&b);
+            let now = crate::crew::now();
+            let mk = |title: &str, needs: Vec<Uuid>| Ticket {
+                id: Uuid::new_v4(),
+                board: b.id,
+                number: 0,
+                title: title.into(),
+                body: String::new(),
+                state: TicketState::Backlog,
+                rank: RANK_STEP,
+                assignee: None,
+                needs,
+                links: vec![],
+                created_by: Party::manager("sarah", "Sarah"),
+                pinned: false,
+                snoozed_until: None,
+                snoozed_at: None,
+                state_at: now,
+                created_at: now,
+                updated_at: now,
+                version: 0,
+            };
+            let first = mk("a", vec![]);
+            let second = mk("b", vec![first.id]);
+            let runs = Runs {
+                plan: Some(p.id),
+                engine: Some(Engine::Claude),
+                folder: Some("/work".into()),
+                view: None,
+            };
+            let mut rows = vec![(first, runs.clone()), (second, runs)];
+            let r = Revision {
+                plan: p.id,
+                revision: 1,
+                at: now,
+                by: Party::manager("sarah", "Sarah"),
+                change: Change::Scope,
+                summary: "Proposed".into(),
+                snapshot: Snapshot::default(),
+            };
+            s.add_plan(&p, &mut rows, &r).await.unwrap();
+            assert_eq!(rows[1].0.number, 2);
+            assert_eq!(s.plan_runs(p.id).await.unwrap().len(), 2);
+            let b2 = s.ticket(rows[1].0.id).await.unwrap().unwrap();
+            assert_eq!(b2.needs, vec![rows[0].0.id]);
+            assert!(s.revision(p.id, 1).await.unwrap().is_some());
+            // The same again fails whole: nothing more is written.
+            let mut again = vec![(mk("c", vec![]), Runs::default())];
+            assert!(s.add_plan(&p, &mut again, &r).await.is_err());
+            assert!(s.ticket(again[0].0.id).await.unwrap().is_none());
         })
         .await;
     }
