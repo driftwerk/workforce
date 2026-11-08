@@ -171,6 +171,10 @@ pub struct Planned {
 pub struct Snapshot {
     pub goal: String,
     pub tickets: Vec<Planned>,
+    /// The plan's own limit of sessions at once, when lower than its
+    /// boss's; none is the boss's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parallel: Option<i16>,
 }
 
 impl Snapshot {
@@ -388,6 +392,7 @@ pub fn snapshot_of(
         true => Ok(Snapshot {
             goal: draft.goal.trim().to_string(),
             tickets,
+            parallel: before.and_then(|b| b.parallel),
         }),
         false => Err(problems),
     }
@@ -731,7 +736,13 @@ pub fn settled(tickets: &[PlanTicket]) -> bool {
 
 /// What changing the plan from `applied`, the revision the runner follows,
 /// to `next` is: nothing (`None`), a minor change, or a change of scope.
-/// Where a ticket that has `started` runs can't change.
+///
+/// Minor, within what was approved: the order, needs and titles, a ticket
+/// not started moved to an engine and a folder the approved revision
+/// already uses, and a lower limit. Scope, which the person approves: the
+/// goal, a ticket added or dropped, what a ticket says (its session's first
+/// prompt), an engine or a folder the approved revision doesn't use, and a
+/// higher limit. Where a ticket that has `started` runs can't change.
 pub fn plan_change(
     applied: &Snapshot,
     next: &Snapshot,
@@ -751,13 +762,37 @@ pub fn plan_change(
     if applied == next {
         return Ok(None);
     }
+    let engines: HashSet<Engine> = applied.tickets.iter().map(|t| t.engine).collect();
+    let folders: HashSet<&str> = applied.tickets.iter().map(|t| t.folder.as_str()).collect();
+    let elsewhere = next.tickets.iter().any(|t| {
+        applied.ticket(t.id).is_some()
+            && (!engines.contains(&t.engine) || !folders.contains(t.folder.as_str()))
+    });
+    let said = next.tickets.iter().any(|t| {
+        applied
+            .ticket(t.id)
+            .is_some_and(|was| was.body.trim() != t.body.trim())
+    });
     let scope = applied.goal.trim() != next.goal.trim()
         || !next.added(applied).is_empty()
-        || !next.dropped(applied).is_empty();
+        || !next.dropped(applied).is_empty()
+        || elsewhere
+        || said
+        || raises(applied.parallel, next.parallel);
     Ok(Some(match scope {
         true => Change::Scope,
         false => Change::Minor,
     }))
+}
+
+/// Whether a plan's limit going from `was` to `now` lets it run more at
+/// once: none is the boss's own limit, the most it can be.
+fn raises(was: Option<i16>, now: Option<i16>) -> bool {
+    match (was, now) {
+        (Some(_), None) => true,
+        (Some(a), Some(b)) => b > a,
+        (None, _) => false,
+    }
 }
 
 /// What changed from `before` to `after`, in a line the person reads:
@@ -834,6 +869,12 @@ pub fn describe(before: &Snapshot, after: &Snapshot) -> String {
         if was.folder != t.folder || was.view != t.view {
             said.push(format!("moved {} to {}", q(t), t.folder));
         }
+    }
+    if before.parallel != after.parallel {
+        said.push(match after.parallel {
+            Some(n) => format!("runs at most {n} at once"),
+            None => "runs as many at once as its boss may".into(),
+        });
     }
     match said.is_empty() {
         true => "No change".into(),
