@@ -549,6 +549,7 @@ mod tests {
             workspace_id: None,
             voice_channel: None,
             automated_origin: None,
+            memory_fence: None,
             active_mcp_envs: Default::default(),
             active_environment: None,
             active_skill_instances: Default::default(),

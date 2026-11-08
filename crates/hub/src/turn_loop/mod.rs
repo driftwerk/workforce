@@ -4136,7 +4136,16 @@ pub(crate) async fn run_isolated(
         ),
     );
     let (result, route) = match PRECURATED_TOOLSET
-        .scope(precurated, as_principal(principal, inner))
+        .scope(
+            precurated,
+            as_principal(
+                principal,
+                workforce_agent::runner::CURRENT_MEMORY_FENCE.scope(
+                    crate::memory_fence::turn_fence(&service.agent_id, &service.workspace),
+                    inner,
+                ),
+            ),
+        )
         .await?
     {
         crate::agent_turn::ChainOutcome::Served { result, route } => (*result, route),
@@ -5219,7 +5228,12 @@ pub(crate) async fn stream_admitted(
     // Made here and moved in, so a task aborted before it first runs still
     // drops it.
     let turn_over = turn_over.drop_guard();
-    let handle = tokio::spawn(workforce_agent::runner::with_desk(desk_scope_for_task, CURRENT_BILLING_IDENTITY.scope(
+    // What the turn remembers is its agent's scope as it begins (boss-gaps
+    // W8): a boss moved meanwhile tags none of this turn's writes as the
+    // new scope's.
+    let memory_fence_for_task =
+        crate::memory_fence::turn_fence(&service.agent_id, &service.workspace);
+    let handle = tokio::spawn(workforce_agent::runner::CURRENT_MEMORY_FENCE.scope(memory_fence_for_task, workforce_agent::runner::with_desk(desk_scope_for_task, CURRENT_BILLING_IDENTITY.scope(
         billing_identity_for_task.unwrap_or_default(),
         CURRENT_VOICE_CHANNEL.scope(
         voice_channel_for_task,
@@ -5744,7 +5758,7 @@ pub(crate) async fn stream_admitted(
     ),
     ),
     ),
-    )));
+    ))));
 
     // Everything downstream reads the reply without voice directions; they
     // travel beside it.

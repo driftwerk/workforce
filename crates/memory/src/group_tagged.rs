@@ -42,6 +42,10 @@ pub enum Fence {
     /// Not a boss: nothing is tagged, and no memory tagged for a scope is
     /// recalled.
     Open,
+    /// Its scope can't be told just now (its config doesn't read and none
+    /// read before): nothing is remembered, and no memory tagged for a scope
+    /// is recalled. Fails closed.
+    Unknown,
 }
 
 impl Fence {
@@ -57,7 +61,7 @@ impl Fence {
         let mut scoped = tags.iter().filter(|t| t.starts_with(GROUP_TAG_PREFIX));
         match self {
             Fence::Boss(own) => scoped.all(|t| t == own),
-            Fence::Open => scoped.next().is_none(),
+            Fence::Open | Fence::Unknown => scoped.next().is_none(),
         }
     }
 }
@@ -140,8 +144,15 @@ impl MemoryStore for GroupTagged {
 
     async fn remember(&self, mut memory: Memory) -> Result<MemoryId> {
         memory.tags = unscoped(std::mem::take(&mut memory.tags));
-        if let Fence::Boss(tag) = self.source.fence() {
-            memory.tags.push(tag);
+        match self.source.fence() {
+            Fence::Boss(tag) => memory.tags.push(tag),
+            Fence::Open => {}
+            Fence::Unknown => {
+                return Err(eyre!(
+                    "Desk can't tell which group this agent's memory belongs to just now, \
+                     so nothing was remembered"
+                ))
+            }
         }
         self.inner.remember(memory).await
     }
@@ -195,24 +206,18 @@ impl MemoryStore for GroupTagged {
         self.inner.share(id, visibility).await
     }
 
-    /// A boss's count is of what it may read; anyone else's is the store's,
-    /// which says no words of what it counts.
+    /// Of what it may read: a fenced-off memory is never counted.
     async fn count(&self, filter: MemoryFilter) -> Result<usize> {
         let fence = self.source.fence();
-        match fence {
-            Fence::Boss(_) => {
-                let (mut filter, _) = self.fenced(&fence, filter);
-                filter.limit = None;
-                Ok(self
-                    .inner
-                    .list(filter)
-                    .await?
-                    .iter()
-                    .filter(|m| fence.admits(&m.tags))
-                    .count())
-            }
-            Fence::Open => self.inner.count(filter).await,
-        }
+        let (mut filter, _) = self.fenced(&fence, filter);
+        filter.limit = None;
+        Ok(self
+            .inner
+            .list(filter)
+            .await?
+            .iter()
+            .filter(|m| fence.admits(&m.tags))
+            .count())
     }
 
     async fn list(&self, filter: MemoryFilter) -> Result<Vec<Memory>> {
@@ -423,6 +428,26 @@ mod tests {
         assert_eq!(
             contents(&sarah.recall("canary", free).await.unwrap()),
             ["acme canary of another agent"]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unknown_fence_remembers_nothing_and_counts_only_what_it_may_read() {
+        let inner: Arc<dyn MemoryStore> = Arc::new(InMemoryStore::new());
+        inner
+            .remember(mem("acme tagged", "sarah", &["desk-group:acme"]))
+            .await
+            .unwrap();
+        inner.remember(mem("plain", "sarah", &[])).await.unwrap();
+        let source = Arc::new(Switchable(Mutex::new(Fence::Unknown)));
+        let sarah = GroupTagged::new(Arc::clone(&inner), AgentId::new("sarah"), source.clone());
+        assert!(sarah.remember(mem("new", "sarah", &[])).await.is_err());
+        assert_eq!(sarah.count(filter()).await.unwrap(), 1);
+        *source.0.lock() = Fence::Open;
+        assert_eq!(
+            sarah.count(filter()).await.unwrap(),
+            1,
+            "a count under Open skips scoped ones"
         );
     }
 

@@ -956,7 +956,11 @@ impl MemoryStore for SqliteMemoryStore {
         };
         let mut tagged = Vec::new();
         for (id, tags_json) in held {
-            let mut tags: Vec<String> = serde_json::from_str(&tags_json).unwrap_or_default();
+            // Tags that don't read are left as they are, never replaced.
+            let Ok(mut tags) = serde_json::from_str::<Vec<String>>(&tags_json) else {
+                tracing::warn!(memory = %id, "a memory's tags don't read, so it isn't tagged");
+                continue;
+            };
             if tags.iter().any(|t| t.starts_with(unless_prefix)) {
                 continue;
             }
@@ -1564,6 +1568,45 @@ mod tests {
     #[tokio::test]
     async fn the_add_tag_contract_holds() {
         crate::store::add_tag_contract(&make_store()).await;
+    }
+
+    #[tokio::test]
+    async fn a_memory_whose_tags_dont_read_is_left_as_it_is() {
+        let store = make_store();
+        let owner = AgentId::new("sarah");
+        let id = store
+            .remember(Memory::new(
+                "acme note",
+                MemoryLayer::Episodic,
+                owner.clone(),
+            ))
+            .await
+            .unwrap();
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE memories SET tags = 'not json' WHERE id = ?1",
+                params![id.0],
+            )
+            .unwrap();
+        assert!(store
+            .add_tag(&owner, "desk-group:acme", "desk-group:")
+            .await
+            .unwrap()
+            .is_empty());
+        let kept: String = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT tags FROM memories WHERE id = ?1",
+                params![id.0],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(kept, "not json");
     }
 
     // ─── Forget (Soft Delete) ────────────────────────────────────────────
