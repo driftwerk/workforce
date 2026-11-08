@@ -504,6 +504,24 @@ impl WeaviateStore {
         }
     }
 
+    /// Sets object `object`'s tags: `false` when it is gone (404).
+    async fn patch_tags(&self, object: &str, tags: Vec<String>) -> Result<bool> {
+        let resp = self
+            .client
+            .patch(self.object_url(object))
+            .json(&serde_json::json!({ "properties": { "tags": tags } }))
+            .send()
+            .await?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(false);
+        }
+        if !resp.status().is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(eyre::eyre!("Weaviate tag update failed: {body}"));
+        }
+        Ok(true)
+    }
+
     /// The URL of one object of this collection.
     fn object_url(&self, object: &str) -> String {
         format!("{}/v1/objects/{}/{object}", self.base_url, self.collection)
@@ -1943,16 +1961,18 @@ impl MemoryStore for WeaviateStore {
         Ok(counts)
     }
 
-    /// The collection is walked by id, as `identity_counts` does (a filtered
-    /// read is capped), and each of the owner's objects with no tag of the
-    /// prefix is patched with its tags and the new one.
+    /// The collection is walked by id a page at a time, as
+    /// `identity_counts` does (a filtered read is capped), and each of the
+    /// owner's objects with no tag of the prefix is patched with its tags
+    /// and the new one before the next page is read. An object gone in
+    /// between (404) isn't counted as tagged.
     async fn add_tag(
         &self,
         owner: &AgentId,
         tag: &str,
         unless_prefix: &str,
     ) -> Result<Vec<MemoryId>> {
-        let mut targets: Vec<(String, String, Vec<String>)> = Vec::new();
+        let mut tagged = std::collections::BTreeSet::new();
         let mut after = String::new();
         loop {
             let page = self
@@ -1965,22 +1985,36 @@ impl MemoryStore for WeaviateStore {
                 .iter()
                 .filter(|item| item["owner"].as_str() == Some(owner.as_str()))
             {
-                let tags: Vec<String> = item["tags"]
-                    .as_array()
-                    .map(|t| {
-                        t.iter()
-                            .filter_map(|t| t.as_str().map(str::to_string))
-                            .collect()
-                    })
-                    .unwrap_or_default();
+                let Some(tags) = item["tags"].as_array().map(|t| {
+                    t.iter()
+                        .filter_map(|t| t.as_str().map(str::to_string))
+                        .collect::<Vec<String>>()
+                }) else {
+                    // No tags read (null or missing): nothing to keep, so it
+                    // is tagged as one with none.
+                    if let (Some(object), Some(memory)) = (
+                        item["_additional"]["id"].as_str(),
+                        item["memoryId"].as_str(),
+                    ) {
+                        if self.patch_tags(object, vec![tag.to_string()]).await? {
+                            tagged.insert(memory.to_string());
+                        }
+                    }
+                    continue;
+                };
                 if tags.iter().any(|t| t.starts_with(unless_prefix)) {
                     continue;
                 }
-                if let (Some(object), Some(memory)) = (
+                let (Some(object), Some(memory)) = (
                     item["_additional"]["id"].as_str(),
                     item["memoryId"].as_str(),
-                ) {
-                    targets.push((object.to_string(), memory.to_string(), tags));
+                ) else {
+                    continue;
+                };
+                let mut tags = tags;
+                tags.push(tag.to_string());
+                if self.patch_tags(object, tags).await? {
+                    tagged.insert(memory.to_string());
                 }
             }
             if page.len() < SCAN_PAGE {
@@ -1991,21 +2025,6 @@ impl MemoryStore for WeaviateStore {
                 .and_then(|item| item["_additional"]["id"].as_str())
                 .ok_or_else(|| eyre::eyre!("Weaviate page without an object id"))?;
             after = format!(r#", after: "{}""#, graphql_escape(last));
-        }
-        let mut tagged = std::collections::BTreeSet::new();
-        for (object, memory, mut tags) in targets {
-            tags.push(tag.to_string());
-            let resp = self
-                .client
-                .patch(self.object_url(&object))
-                .json(&serde_json::json!({ "properties": { "tags": tags } }))
-                .send()
-                .await?;
-            if !resp.status().is_success() && resp.status() != reqwest::StatusCode::NOT_FOUND {
-                let body = resp.text().await.unwrap_or_default();
-                return Err(eyre::eyre!("Weaviate tag update failed: {body}"));
-            }
-            tagged.insert(memory);
         }
         if let Some(previous) = self.previous.get() {
             previous.add_tag(owner, tag, unless_prefix).await?;
@@ -2550,6 +2569,99 @@ mod tests {
             .await
             .expect("import filters bad records, returns Ok(0)");
         assert_eq!(imported, 0);
+    }
+
+    /// `add_tag` walks the collection a page at a time, patches only the
+    /// owner's unfenced objects with their tags kept, and doesn't count one
+    /// gone in between.
+    #[tokio::test]
+    async fn add_tag_pages_through_and_skips_a_gone_object() {
+        use std::sync::Mutex as StdMutex;
+        #[derive(Default)]
+        struct Seen {
+            patched: StdMutex<Vec<(String, serde_json::Value)>>,
+            queries: StdMutex<Vec<String>>,
+        }
+        let seen = std::sync::Arc::new(Seen::default());
+        let row = |id: usize, owner: &str, tags: serde_json::Value| {
+            serde_json::json!({ "owner": owner, "memoryId": format!("m{id}"), "tags": tags,
+                "_additional": { "id": format!("o{id}") } })
+        };
+        // A full first page (one of Sarah's, unfenced, and fillers of Mia's),
+        // then a short second page.
+        let mut first: Vec<serde_json::Value> =
+            vec![row(0, "sarah", serde_json::json!(["topic:x"]))];
+        first.extend((1..SCAN_PAGE).map(|i| row(i, "mia", serde_json::json!([]))));
+        let second = vec![
+            row(SCAN_PAGE, "sarah", serde_json::json!(["desk-group:atlas"])),
+            row(SCAN_PAGE + 1, "sarah", serde_json::json!([])),
+            row(SCAN_PAGE + 2, "sarah", serde_json::json!([])),
+        ];
+        let gone = format!("o{}", SCAN_PAGE + 2);
+        let app = axum::Router::new()
+            .route(
+                "/v1/graphql",
+                axum::routing::post({
+                    let seen = std::sync::Arc::clone(&seen);
+                    move |axum::Json(body): axum::Json<serde_json::Value>| {
+                        let seen = std::sync::Arc::clone(&seen);
+                        let (first, second) = (first.clone(), second.clone());
+                        async move {
+                            let q = body["query"].as_str().unwrap_or_default().to_string();
+                            let rows = if q.contains("after:") { second } else { first };
+                            seen.queries.lock().unwrap().push(q);
+                            axum::Json(
+                                serde_json::json!({ "data": { "Get": { "Memories": rows } } }),
+                            )
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/v1/objects/{class}/{id}",
+                axum::routing::patch({
+                    let seen = std::sync::Arc::clone(&seen);
+                    move |axum::extract::Path((_class, id)): axum::extract::Path<(
+                        String,
+                        String,
+                    )>,
+                          axum::Json(body): axum::Json<serde_json::Value>| {
+                        let seen = std::sync::Arc::clone(&seen);
+                        let gone = gone.clone();
+                        async move {
+                            if id == gone {
+                                return axum::http::StatusCode::NOT_FOUND;
+                            }
+                            seen.patched.lock().unwrap().push((id, body));
+                            axum::http::StatusCode::NO_CONTENT
+                        }
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let store = WeaviateStore::new(&url, None).in_collection("Memories");
+        let tagged = store
+            .add_tag(&AgentId::new("sarah"), "desk-group:acme", "desk-group:")
+            .await
+            .unwrap();
+        assert_eq!(
+            tagged,
+            [
+                MemoryId("m0".into()),
+                MemoryId(format!("m{}", SCAN_PAGE + 1))
+            ],
+            "the owner's unfenced ones, never the gone one"
+        );
+        let patched = seen.patched.lock().unwrap().clone();
+        assert_eq!(patched.len(), 2);
+        assert_eq!(patched[0].0, "o0");
+        assert_eq!(
+            patched[0].1["properties"]["tags"],
+            serde_json::json!(["topic:x", "desk-group:acme"])
+        );
+        assert_eq!(seen.queries.lock().unwrap().len(), 2, "two pages");
     }
 
     /// A collection exists when its schema reads, does not when Weaviate
