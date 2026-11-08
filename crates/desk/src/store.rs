@@ -279,6 +279,12 @@ pub(crate) async fn forget_in(
 /// move after `at` took it from, else the group it is in now. A row read
 /// after a move about what happened before stays the old group's. Null is
 /// ungrouped.
+///
+/// Moves are timed by the database's clock; `at` is the engine's record of
+/// the call, made on this computer, which the hub runs on too. A clock that
+/// disagrees by more than the gap between a call and a move puts a call
+/// made just before the move in the group it moved to, or one made just
+/// after in the group it left: within that skew only, never more.
 pub(crate) fn group_at_sql(session: &str, at: &str) -> String {
     format!(
         "(CASE WHEN EXISTS (SELECT 1 FROM group_moves gm \

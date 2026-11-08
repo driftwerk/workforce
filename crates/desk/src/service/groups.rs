@@ -466,9 +466,11 @@ impl DeskStore {
         let (items, froms, tos) = moved_sessions(&before, layout);
         if moves && !items.is_empty() {
             tx.execute(
+                // The database's clock: the one the rows it stamps are
+                // compared with as they are written.
                 "INSERT INTO group_moves (item, from_group, to_group, at) \
-                 SELECT i, f, t, $4 FROM UNNEST($1::text[], $2::text[], $3::text[]) AS m(i, f, t)",
-                &[&items, &froms, &tos, &now],
+                 SELECT i, f, t, now() FROM UNNEST($1::text[], $2::text[], $3::text[]) AS m(i, f, t)",
+                &[&items, &froms, &tos],
             )
             .await?;
         }

@@ -225,6 +225,19 @@ impl DeskStore {
 }
 
 impl DeskStore {
+    /// Forgets previews that ran out a day ago or more, and their drafts.
+    /// A move made is kept: its notes are what was delivered.
+    pub async fn forget_old_moves(&self) -> Result<u64> {
+        let client = self.pool().get().await?;
+        Ok(client
+            .execute(
+                "DELETE FROM moves WHERE state <> 'done' \
+                 AND expires_at < now() - interval '1 day'",
+                &[],
+            )
+            .await?)
+    }
+
     /// Sets the move `id` aside, made or not, with its notes: it failed.
     pub async fn drop_move(&self, id: Uuid) -> Result<()> {
         let mut client = self.pool().get().await?;
@@ -339,6 +352,19 @@ mod tests {
             let (old, oh) = preview(now - chrono::Duration::minutes(11));
             store.add_move(&old, &[oh]).await.unwrap();
             assert!(store.finish_move(old.id, &[], now).await.unwrap().is_none());
+            // One that ran out a day ago goes, with its drafts.
+            let (ancient, ah) = preview(now - chrono::Duration::days(2));
+            store
+                .add_move(&ancient, std::slice::from_ref(&ah))
+                .await
+                .unwrap();
+            assert_eq!(store.forget_old_moves().await.unwrap(), 1);
+            assert!(store.move_row(ancient.id).await.unwrap().is_none());
+            assert!(store.handover(ah.id).await.unwrap().is_none());
+            assert!(
+                store.move_row(m.id).await.unwrap().is_some(),
+                "one made is kept"
+            );
         })
         .await;
     }

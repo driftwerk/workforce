@@ -325,6 +325,7 @@ fn kinds(p: &MovePreview) -> Vec<&'static str> {
             Effect::Handover { .. } => "handover",
             Effect::Tell => "tell",
             Effect::Refused { .. } => "refused",
+            Effect::NeedsKept { .. } => "needs_kept",
         })
         .collect()
 }
@@ -579,7 +580,11 @@ async fn a_session_moved_to_another_boss_takes_only_the_note_and_leaves_everythi
         let acme_rows = events_seen_by(&d, &acme()).await;
         assert!(acme_rows
             .iter()
-            .any(|e| e.kind == crew::Kind::Moved && e.text.contains("to Atlas")));
+            .any(|e| e.kind == crew::Kind::Moved && e.text.contains("to another group")));
+        assert!(
+            acme_rows.iter().all(|e| !e.text.contains("Atlas")),
+            "Acme's side never names where it went"
+        );
         // The session is told on its line, in Atlas.
         let thread = d.line_thread(a.session, None, None).await.unwrap();
         let told = thread
@@ -898,6 +903,33 @@ async fn a_boss_moved_into_a_bossed_group_asks_first_and_what_it_ran_passes_to_t
             .summary
             .plan
             .id;
+        // An Acme room Sarah is in, and a session Mia runs in Atlas.
+        let room = d
+            .create_room(crate::rooms::NewRoom {
+                name: "Acme launch".into(),
+                members: vec![crate::rooms::Member {
+                    hub: crate::rooms::LOCAL_HUB.into(),
+                    agent: "sarah".into(),
+                }],
+                default_member: None,
+                group: Some("acme".into()),
+                share_with: vec![],
+            })
+            .await
+            .unwrap();
+        let mias = new_session(&d, dir.path()).await;
+        d.change_layout(|l| l.put(&session_item(mias.id), "atlas", None))
+            .await
+            .unwrap();
+        d.take_on(
+            mias.id,
+            &Party::manager("mia", "Mia"),
+            How::Handed,
+            &atlas(),
+            &By::you(),
+        )
+        .await
+        .unwrap();
         let sarah = Item::Boss("sarah".into());
         let p = d.preview_move(to("atlas", sarah.clone())).await.unwrap();
         assert_eq!(kinds(&p), ["asks_to_replace"]);
@@ -965,6 +997,194 @@ async fn a_boss_moved_into_a_bossed_group_asks_first_and_what_it_ran_passes_to_t
         assert_eq!(delivered.len(), 1);
         assert_eq!(delivered[0].note, "Desk: the checkout plan is yours now.");
         assert_eq!(d.scope_of_boss("sarah"), Some(atlas()));
+        // Mia, replaced, let go of what she ran in the same move.
+        assert!(!d.charge_of(mias.id).unwrap().live());
+        // Sarah left Acme's room.
+        let r = d.store().room(room.id).await.unwrap().unwrap();
+        assert!(
+            r.members.iter().all(|m| m.agent != "sarah"),
+            "{:?}",
+            r.members
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn two_previews_of_one_item_never_both_go_through() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (d, hub) = desk_with_hub(pool, dir.path()).await;
+        let a = acme_session(&d, dir.path()).await;
+        let one = d
+            .preview_move(to("atlas", Item::Session(a.session)))
+            .await
+            .unwrap();
+        let two = d
+            .preview_move(to("infra", Item::Session(a.session)))
+            .await
+            .unwrap();
+        let commit = |p: &MovePreview| MoveCommit {
+            preview: p.id,
+            choices: Choices::default(),
+            note: Some("ok".into()),
+            notes: vec![],
+        };
+        let (r1, r2) = tokio::join!(d.commit_move(commit(&one)), d.commit_move(commit(&two)));
+        let made = [r1.is_ok(), r2.is_ok()];
+        assert_eq!(made.iter().filter(|m| **m).count(), 1, "{r1:?} {r2:?}");
+        assert!(matches!(
+            if made[0] { r2 } else { r1 },
+            Err(DeskError::Conflict(_))
+        ));
+        assert_eq!(hub.delivered.lock().len(), 1);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn nothing_is_granted_while_what_a_move_leaves_stands() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (d, _hub) = desk_with_hub(pool, dir.path()).await;
+        let a = acme_session(&d, dir.path()).await;
+        // A ticket to leave that can't be: it is gone.
+        let effects = [
+            Effect::StaysUnassigned {
+                ticket: Uuid::new_v4(),
+                synced: false,
+            },
+            Effect::ChargeTo { boss: "mia".into() },
+            Effect::Tell,
+        ];
+        let mut problems = Vec::new();
+        assert!(d
+            .move_session(
+                a.session,
+                Some("atlas"),
+                &effects,
+                &By::you(),
+                &mut problems
+            )
+            .await
+            .is_err());
+        assert_eq!(
+            d.view(a.session).unwrap().group.map(|g| g.id).as_deref(),
+            Some("acme"),
+            "still in Acme"
+        );
+        assert_eq!(d.charge_of(a.session).unwrap().boss, "sarah", "never Mia's");
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_ticket_moved_keeps_what_waits_on_it_waiting() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (d, _hub) = desk_with_hub(pool, dir.path()).await;
+        let a = acme_session(&d, dir.path()).await;
+        d.create_board(NewBoard {
+            name: "Atlas".into(),
+            group: Some("atlas".into()),
+            prefix: Some("ATL".into()),
+        })
+        .await
+        .unwrap();
+        let acme_board = d.ticket(a.ticket).await.unwrap().ticket.board;
+        let after = d
+            .create_ticket(
+                NewTicket {
+                    board: acme_board,
+                    title: "After the checkout".into(),
+                    body: String::new(),
+                    state: Some(TicketState::Todo),
+                    needs: vec![a.ticket],
+                },
+                &By::you(),
+            )
+            .await
+            .unwrap();
+        let p = d
+            .preview_move(to("atlas", Item::Ticket(a.ticket)))
+            .await
+            .unwrap();
+        let kept = p
+            .effects
+            .iter()
+            .find(|e| matches!(e.effect, Effect::NeedsKept { .. }))
+            .expect("said in the preview");
+        assert_eq!(
+            kept.text,
+            "1 ticket on Acme's board still wait on it, as a ticket now in another group."
+        );
+        d.commit_move(MoveCommit {
+            preview: p.id,
+            choices: Choices::default(),
+            note: Some("It goes to Atlas.".into()),
+            notes: vec![],
+        })
+        .await
+        .unwrap();
+        let waiting = d.ticket(after.ticket.id).await.unwrap();
+        assert_eq!(waiting.ticket.needs, vec![a.ticket]);
+        assert!(!waiting.ready, "still waits on it");
+    })
+    .await;
+}
+
+/// Previews and moves are the hub holder's alone, as deciding a need is.
+#[tokio::test]
+async fn only_the_person_who_holds_the_hub_previews_or_makes_a_move() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+    struct NotTheHolder;
+    #[async_trait::async_trait]
+    impl crate::api::Authorize for NotTheHolder {
+        async fn authorize(
+            &self,
+            _: &axum::http::HeaderMap,
+            _: Option<&str>,
+        ) -> Result<Option<String>, StatusCode> {
+            Ok(Some("another-admin".into()))
+        }
+        async fn authorize_holder(
+            &self,
+            _: &axum::http::HeaderMap,
+            _: Option<&str>,
+        ) -> Result<Option<String>, StatusCode> {
+            Err(StatusCode::FORBIDDEN)
+        }
+    }
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (d, _hub) = desk_with_hub(pool, dir.path()).await;
+        let a = acme_session(&d, dir.path()).await;
+        let app = crate::move_api::api_routes(d.clone(), Arc::new(NotTheHolder));
+        let body =
+            serde_json::json!({ "item": { "kind": "session", "id": a.session }, "to": "atlas" });
+        let commit = serde_json::json!({ "preview": Uuid::new_v4() });
+        for (uri, body) in [
+            ("/api/desk/moves/preview", &body),
+            ("/api/desk/moves", &commit),
+        ] {
+            let r = app
+                .clone()
+                .oneshot(
+                    Request::post(uri)
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(r.status(), StatusCode::FORBIDDEN, "{uri}");
+        }
+        assert_eq!(
+            d.view(a.session).unwrap().group.map(|g| g.id).as_deref(),
+            Some("acme")
+        );
     })
     .await;
 }

@@ -129,6 +129,9 @@ pub struct MoveContext {
     pub open_asks: usize,
     /// The ticket moved is assigned to a session, which stays.
     pub assigned: bool,
+    /// Of the ticket that goes: how many open tickets wait on it, and how
+    /// many it waits on.
+    pub needs: (usize, usize),
     /// The new scope's boss only watches: it runs nothing.
     pub to_boss_watches: bool,
     /// The item's own budget (`session:<id>`).
@@ -169,6 +172,9 @@ pub enum Effect {
     Unassigned { ticket: Uuid },
     /// What it spent so far stays in the old group's spend.
     LedgerStays { rows: u64, usd: f64 },
+    /// Tickets of the board it leaves wait on it (`waiting`), or it on them
+    /// (`waits_on`): each keeps waiting, on a ticket now in another group.
+    NeedsKept { waiting: usize, waits_on: usize },
     /// Its own budget goes with it.
     BudgetFollows { budget: Uuid },
     /// Its open questions to the old boss are withdrawn.
@@ -239,6 +245,12 @@ fn session_effects(ctx: &MoveContext, choices: &Choices) -> Vec<Effect> {
                     ticket: t.id,
                     board,
                 });
+                if ctx.needs != (0, 0) {
+                    out.push(Effect::NeedsKept {
+                        waiting: ctx.needs.0,
+                        waits_on: ctx.needs.1,
+                    });
+                }
             }
             _ => out.push(Effect::StaysUnassigned {
                 ticket: t.id,
@@ -313,6 +325,12 @@ fn ticket_effects(ctx: &MoveContext, to: Option<&str>, across: bool) -> Vec<Effe
         ticket: t.id,
         board,
     });
+    if ctx.needs != (0, 0) {
+        out.push(Effect::NeedsKept {
+            waiting: ctx.needs.0,
+            waits_on: ctx.needs.1,
+        });
+    }
     if across {
         let (rows, usd) = ctx.ledger;
         if rows > 0 {
@@ -440,6 +458,22 @@ pub fn effect_text(
             "What it spent so far (${usd:.2}) stays in {from}'s spend; what it spends from now on is {to}'s."
         ),
         Effect::BudgetFollows { .. } => "Its own budget goes with it.".into(),
+        Effect::NeedsKept { waiting, waits_on } => {
+            let mut parts = Vec::new();
+            if *waiting > 0 {
+                parts.push(format!(
+                    "{} on {from}'s board still wait on it",
+                    plural(*waiting, "ticket")
+                ));
+            }
+            if *waits_on > 0 {
+                parts.push(format!("it still waits on {}", plural(*waits_on, "ticket")));
+            }
+            format!(
+                "{}, as a ticket now in another group.",
+                capitalised(&parts.join(", and "))
+            )
+        }
         Effect::AsksWithdrawn { count: 1 } => "Its question to its boss is withdrawn.".into(),
         Effect::AsksWithdrawn { count } => format!("Its {count} questions to its boss are withdrawn."),
         Effect::Replaces { boss } => format!("{} stops overseeing {to}.", n.boss(boss)),
@@ -471,6 +505,14 @@ pub fn effect_text(
         ),
         Effect::Tell => format!("{item} is told on its line that it moved."),
         Effect::Refused { why } => why.clone(),
+    }
+}
+
+fn capitalised(s: &str) -> String {
+    let mut c = s.chars();
+    match c.next() {
+        Some(first) => first.to_uppercase().chain(c).collect(),
+        None => String::new(),
     }
 }
 

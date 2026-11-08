@@ -342,6 +342,14 @@ impl Desk {
                 return Ok(ctx);
             }
         }
+        // What waits on the ticket that would go, and what it waits on.
+        if let Some(t) = ctx.tickets.iter().find(|t| t.open) {
+            let edges = self.0.store.ticket_edges().await.map_err(internal)?;
+            ctx.needs = (
+                edges.iter().filter(|(_, needs)| *needs == t.id).count(),
+                edges.iter().filter(|(ticket, _)| *ticket == t.id).count(),
+            );
+        }
         ctx.from_boss = self.boss_ref(&scope_of(ctx.from.as_deref(), &bossed));
         let to_scope = scope_of(to, &bossed);
         ctx.to_boss = self.boss_ref(&to_scope);
@@ -462,6 +470,10 @@ impl Desk {
     /// asked of it. Nothing changes until the person makes the move.
     pub async fn preview_move(&self, ask: MoveAsk) -> Result<MovePreview, DeskError> {
         let to = self.move_target(ask.to.as_deref())?;
+        // Previews that ran out a day ago go, with their drafts.
+        if let Err(e) = self.0.store.forget_old_moves().await {
+            tracing::debug!(error = %e, "old move previews weren't cleared");
+        }
         let ctx = self.move_context(&ask.item, to.as_deref()).await?;
         let effects = moves::move_effects(&ask.item, to.as_deref(), &ctx, &ask.choices);
         let now = crew::now();
@@ -634,6 +646,7 @@ impl Desk {
     /// it ran out, was made, or what it does changed since. Each note goes
     /// as the person sent it, and only then.
     pub async fn commit_move(&self, c: MoveCommit) -> Result<MoveDone, DeskError> {
+        let _one = self.0.move_write.lock().await;
         let row = self
             .0
             .store
@@ -795,9 +808,12 @@ impl Desk {
             Item::Boss(agent) => Some(Party::manager(agent, &self.named_boss(agent))),
             _ => None,
         };
-        let there = to
-            .and_then(|g| self.group_name(g))
-            .unwrap_or_else(|| "no group".into());
+        // Each side reads only its own: the group it left never names the
+        // one it went to.
+        let there = match to {
+            None => "no group",
+            Some(_) => "another group",
+        };
         self.note(
             by.event(
                 Kind::Moved,
@@ -832,22 +848,16 @@ impl Desk {
     }
 
     /// Withdraws `asks`: their session moved from the boss they asked.
-    async fn withdraw_asks(&self, asks: Vec<LineMessage>) -> bool {
+    async fn withdraw_asks(&self, asks: Vec<LineMessage>) -> Result<bool, DeskError> {
         let mut withdrawn = false;
         for mut ask in asks {
             ask.asked = Some(Asked::Withdrawn);
             ask.updated_at = Utc::now();
-            match self.0.store.put_line(&ask).await {
-                Ok(()) => {
-                    self.line_announce(&ask);
-                    withdrawn = true;
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "couldn't withdraw a moved session's question")
-                }
-            }
+            self.0.store.put_line(&ask).await.map_err(internal)?;
+            self.line_announce(&ask);
+            withdrawn = true;
         }
-        withdrawn
+        Ok(withdrawn)
     }
 
     /// Ticket `id` goes to board `board`: a new key there, out of its plan,
@@ -886,7 +896,7 @@ impl Desk {
     }
 
     /// Session `id` moves to `to`, doing `effects`.
-    async fn move_session(
+    pub(super) async fn move_session(
         &self,
         id: Uuid,
         to: Option<&str>,
@@ -914,7 +924,7 @@ impl Desk {
                 }
                 Effect::AsksWithdrawn { .. } => {
                     let asks = self.asks_to_boss(id).await?;
-                    if self.withdraw_asks(asks).await {
+                    if self.withdraw_asks(asks).await? {
                         said.push("Your questions to the boss you had are withdrawn.".into());
                     }
                     Ok(())
@@ -927,9 +937,11 @@ impl Desk {
                 }
                 _ => Ok(()),
             };
+            // What it leaves behind is left first: nothing is granted
+            // while any of it stands.
             if let Err(e) = done {
-                tracing::warn!(%id, error = %e, "part of a session's move wasn't done");
-                problems.push(e.to_string());
+                tracing::warn!(%id, error = %e, "a session's move stopped: what it leaves wasn't left");
+                return Err(e);
             }
         }
         // The sidebar: from now on it is the new group's.
@@ -1005,6 +1017,40 @@ impl Desk {
         }
     }
 
+    /// The boss `agent` leaves every room of `group`: that group's talk
+    /// stays with it.
+    async fn leave_rooms_of(&self, agent: &str, group: &str) -> Result<(), DeskError> {
+        let me = format!("{}/{agent}", crate::rooms::LOCAL_HUB);
+        let rooms: Vec<crate::rooms::Room> = self
+            .0
+            .store
+            .rooms()
+            .await
+            .map_err(internal)?
+            .into_iter()
+            .filter(|r| {
+                r.group.as_deref() == Some(group) && r.members.iter().any(|m| m.key() == me)
+            })
+            .collect();
+        for r in rooms {
+            let members = r
+                .members
+                .iter()
+                .filter(|m| m.key() != me)
+                .cloned()
+                .collect();
+            self.update_room(
+                r.id,
+                crate::rooms::RoomPatch {
+                    members: Some(members),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
     /// Ticket `id` moves to `to`'s board, doing `effects`.
     async fn move_ticket_to(
         &self,
@@ -1012,7 +1058,7 @@ impl Desk {
         _to: Option<&str>,
         effects: &[Effect],
         by: &By,
-        problems: &mut Vec<String>,
+        _problems: &mut Vec<String>,
     ) -> Result<(), DeskError> {
         for e in effects {
             let done = match e {
@@ -1025,8 +1071,8 @@ impl Desk {
                 _ => Ok(()),
             };
             if let Err(e) = done {
-                tracing::warn!(%id, error = %e, "part of a ticket's move wasn't done");
-                problems.push(e.to_string());
+                tracing::warn!(%id, error = %e, "a ticket's move stopped: what it leaves wasn't left");
+                return Err(e);
             }
         }
         for e in effects {
@@ -1087,6 +1133,27 @@ impl Desk {
             if let Err(e) = self.release(*s, by).await {
                 problems.push(e.to_string());
             }
+        }
+        // The boss it replaces lets go of what it ran, in this same move.
+        for e in effects {
+            if let Effect::Replaces { boss } = e {
+                let theirs: Vec<Uuid> = self
+                    .charges()
+                    .iter()
+                    .filter(|c| c.boss == *boss && c.released_at.is_none())
+                    .map(|c| c.session)
+                    .collect();
+                for s in theirs {
+                    self.release(s, by).await?;
+                }
+            }
+        }
+        // It leaves the rooms of the scope it leaves.
+        let old = self
+            .scope_of_boss(agent)
+            .and_then(|s| s.group().map(str::to_string));
+        if let Some(old) = old.as_deref() {
+            self.leave_rooms_of(agent, old).await?;
         }
         crew.move_boss(agent, to, choices.replace)
             .await
