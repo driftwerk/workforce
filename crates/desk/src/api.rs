@@ -1486,6 +1486,39 @@ async fn forget_memory(State(s): S, h: HeaderMap, Query(q): Q, Path(id): Path<Uu
         .into_response()
 }
 
+/// Reads one session's new exchanges for decisions, facts and to-dos now,
+/// as its memory panel opens.
+async fn derive_memory(State(s): S, h: HeaderMap, Query(q): Q, Path(id): Path<Uuid>) -> Response {
+    guarded!(s, h, q);
+    s.desk
+        .derive_now(id)
+        .await
+        .map(|()| StatusCode::ACCEPTED)
+        .into_response()
+}
+
+/// The person confirms, corrects or drops a note Desk keeps:
+/// `{"action": "confirm"}`, `{"action": "correct", "text": "…"}` or
+/// `{"action": "drop"}`. The note as it now stands; nothing once dropped.
+async fn change_memory_item(
+    State(s): S,
+    h: HeaderMap,
+    Query(q): Q,
+    Path(id): Path<Uuid>,
+    body: Result<Json<crate::service::ItemChange>, JsonRejection>,
+) -> Response {
+    guarded!(s, h, q);
+    let Json(change) = match body {
+        Ok(b) => b,
+        Err(e) => return DeskError::Invalid(e.body_text()).into_response(),
+    };
+    match s.desk.change_memory_item(id, &change).await {
+        Ok(Some(item)) => Json(serde_json::json!({ "item": item })).into_response(),
+        Ok(None) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
 /// Starts Desk Memory's search index again from what Desk keeps: the
 /// person's alone.
 async fn rebuild_memory_index(State(s): S, h: HeaderMap, Query(q): Q) -> Response {
@@ -1556,6 +1589,8 @@ pub fn sessions_router(desk: Desk, auth: Arc<dyn Authorize>) -> Router {
             "/api/desk/sessions/{id}/memory",
             get(session_memory).delete(forget_memory),
         )
+        .route("/api/desk/sessions/{id}/memory/derive", post(derive_memory))
+        .route("/api/desk/memory/items/{id}", patch(change_memory_item))
         .route("/api/desk/budgets", get(budgets).post(put_budget))
         .route(
             "/api/desk/budgets/{id}",

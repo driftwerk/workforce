@@ -12,6 +12,7 @@ use std::sync::LazyLock;
 
 use regex::{Regex, RegexSet};
 use workforce_common::secret_marker::{parse_markers_spanned, NAMED_LABEL};
+use workforce_desk::memory::derive::{Answered, Deriver};
 use workforce_desk::memory::{Redacted, Redactor};
 
 /// A marker the grammar doesn't parse (a torn or hand-made one) is still a
@@ -197,6 +198,62 @@ impl Redactor for HubRedactor {
         categories.sort();
         categories.dedup();
         categories
+    }
+}
+
+/// Who notes decisions, facts and to-dos from Desk's sessions: the floor's
+/// cheap model, as a session's gist is written (on the session's account
+/// where it has one, else the floor's), and the purpose its gist says.
+pub(crate) struct HubDeriver {
+    pub model: crate::floor::gists::HubModel,
+}
+
+#[async_trait::async_trait]
+impl Deriver for HubDeriver {
+    async fn answer(
+        &self,
+        session: uuid::Uuid,
+        engine: workforce_desk::engine::Engine,
+        system: &str,
+        user: &str,
+    ) -> eyre::Result<Answered> {
+        let subject = workforce_desk::floor::Subject::Session {
+            id: session,
+            engine,
+        };
+        let (text, model) = self
+            .model
+            .answer_for(
+                Some(&subject),
+                None,
+                system,
+                user,
+                crate::floor::gists::Call {
+                    max_tokens: workforce_desk::memory::derive::ANSWER_TOKENS,
+                    task: "desk_memory_derive",
+                    description: "desk:memory-notes",
+                },
+            )
+            .await?;
+        Ok(Answered { text, model })
+    }
+
+    async fn purpose(&self, session: uuid::Uuid) -> Option<String> {
+        let floor = crate::floor::installed()?;
+        // A Desk session's gist has no owner: the Desk is its person's own.
+        floor
+            .store
+            .gist(None, &workforce_desk::floor::SubjectKey::session(session))
+            .await
+            .inspect_err(|e| {
+                tracing::debug!(
+                    error = format!("{e:#}"),
+                    "couldn't read a session's purpose to note decisions with"
+                )
+            })
+            .ok()
+            .flatten()?
+            .purpose
     }
 }
 
