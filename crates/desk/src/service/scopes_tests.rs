@@ -9,6 +9,7 @@ use chrono::Utc;
 use uuid::Uuid;
 use workforce_postgres::test_support::with_test_pool;
 
+use super::groups::CROSSES_A_BOSS;
 use super::tests::desk;
 use super::*;
 use crate::crew::{Event, Kind, Party};
@@ -1013,6 +1014,63 @@ async fn reads_at_once_start_one_count_and_a_count_begun_before_the_budgets_chan
         tokio::time::sleep(Duration::from_millis(1500)).await;
         assert_eq!(spend_of(&spends(&d).await, "sarah"), Some((0.0, 50.0)));
         assert_eq!(d.group_counts() - before, 3);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn the_sidebars_routes_never_take_a_session_to_another_boss() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        groups(&d).await;
+        let s = super::tests::new_session(&d, dir.path()).await;
+        let item = session_item(s.id);
+        d.change_layout(|l| l.put(&item, "acme", None))
+            .await
+            .unwrap();
+        let crosses = |r: Result<Layout, DeskError>| {
+            matches!(r, Err(DeskError::Conflict(why)) if why == CROSSES_A_BOSS)
+        };
+        // Into Atlas (Mia's), into Infra and out to Ungrouped (both the main
+        // boss's): each crosses from Sarah, so each is refused.
+        for to in ["atlas", "infra", UNGROUPED] {
+            let r = d
+                .change_layout_by_person(|l| l.put(&item, to, None))
+                .await;
+            assert!(crosses(r), "put into {to}");
+        }
+        let r = d.change_layout_by_person(|l| l.remove(&item)).await;
+        assert!(crosses(r), "taken out of Acme");
+        let r = d
+            .change_layout_by_person(|l| l.create("new", "New", std::slice::from_ref(&item), None))
+            .await;
+        assert!(crosses(r), "a new group made with it");
+        assert_eq!(
+            d.layout().group_of(&item).map(|g| g.id.clone()),
+            Some("acme".into()),
+            "nothing moved"
+        );
+
+        // Within one boss's part, as before: Infra to Ungrouped and back.
+        d.change_layout(|l| l.put(&item, "infra", None))
+            .await
+            .unwrap();
+        d.change_layout_by_person(|l| l.put(&item, UNGROUPED, None))
+            .await
+            .unwrap();
+        d.change_layout_by_person(|l| l.put(&item, "infra", None))
+            .await
+            .unwrap();
+        // And everything else the person does still goes: an agent moves
+        // as the sidebar has it.
+        d.change_layout_by_person(|l| l.put("agent:local/scout", "atlas", None))
+            .await
+            .unwrap();
+        assert_eq!(
+            d.layout().group_of(&item).map(|g| g.id.clone()),
+            Some("infra".into())
+        );
     })
     .await;
 }

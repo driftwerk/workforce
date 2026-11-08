@@ -1168,7 +1168,7 @@ async fn create_group(State(s): S, h: HeaderMap, Query(q): Q, Json(g): Json<NewG
     guarded!(s, h, q);
     let id = g.id.unwrap_or_else(|| Uuid::new_v4().to_string());
     s.desk
-        .change_layout(|l| l.create(&id, &g.name, &g.items, g.before.as_deref()))
+        .change_layout_by_person(|l| l.create(&id, &g.name, &g.items, g.before.as_deref()))
         .await
         .map(Json)
         .into_response()
