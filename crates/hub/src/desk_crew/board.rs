@@ -179,7 +179,42 @@ impl CrewHub {
                 "blocked": count(Column::Blocked),
             },
             "table": reported(&out, "the board's tickets"),
+            "plans": self.plans_seen(seen).await,
         }))
+    }
+
+    /// The plans `seen` sees that haven't ended, with where they stand.
+    pub(super) async fn plans_seen(&self, seen: &Seen) -> Value {
+        let plans = match self.desk.plans(None, None).await {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(error = %e, "reading the plans for the overseer failed");
+                return json!([]);
+            }
+        };
+        let shown: Vec<Value> = plans
+            .into_iter()
+            .filter(|s| seen.sees(s.plan.group.as_deref()))
+            .filter(|s| {
+                !matches!(
+                    s.plan.state,
+                    workforce_desk::plan::PlanState::Done
+                        | workforce_desk::plan::PlanState::Dropped
+                )
+            })
+            .map(|s| {
+                json!({
+                    "plan_id": s.plan.id.to_string(),
+                    "goal": reported(&s.plan.goal, "a plan's goal"),
+                    "state": s.plan.state.as_str(),
+                    "paused": s.plan.paused.map(|p| p.as_str()),
+                    "revision": s.plan.revision,
+                    "approved_revision": s.plan.approved_revision,
+                    "progress": s.progress,
+                })
+            })
+            .collect();
+        json!(shown)
     }
 
     /// `line`, the wake for `session`'s turn ending, with its ticket if that
@@ -206,6 +241,13 @@ impl CrewHub {
         let Ok(boards) = self.desk.boards().await else {
             return Vec::new();
         };
+        // A plan's tickets are started by its runner, never handed out.
+        let planned = self
+            .desk
+            .store()
+            .planned_tickets()
+            .await
+            .unwrap_or_default();
         let mut out = Vec::new();
         for b in boards {
             let Ok(views) = self.desk.tickets(b.id, &TicketQuery::default()).await else {
@@ -214,6 +256,7 @@ impl CrewHub {
             let unhanded: Vec<&TicketView> = views
                 .iter()
                 .filter(|v| v.ready && v.ticket.assignee.is_none() && !v.snoozed)
+                .filter(|v| !planned.contains(&v.ticket.id))
                 .collect();
             let known = seen.entry(b.id).or_default();
             let fresh: Vec<&TicketView> = unhanded

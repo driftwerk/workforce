@@ -28,6 +28,8 @@ struct Client {
     boss: &'static str,
     ticket: String,
     ask: uuid::Uuid,
+    /// A plan its boss proposed, on its board.
+    plan: uuid::Uuid,
 }
 
 struct Clients {
@@ -97,12 +99,37 @@ async fn client(
         Some(Party::session(&session)),
         format!("started “the {secret} work”"),
     ));
+    let plan = d
+        .propose_plan(
+            workforce_desk::NewPlan {
+                draft: workforce_desk::plan::Draft {
+                    goal: format!("{name} goal {secret}"),
+                    tickets: vec![workforce_desk::plan::DraftTicket {
+                        title: format!("{name} step {secret}"),
+                        folder: dir.to_string_lossy().into_owned(),
+                        ..Default::default()
+                    }],
+                },
+                board: Some(board.id),
+                parallel: None,
+                engine: Engine::Claude,
+                group: Some(group.into()),
+            },
+            &Party::manager(boss, boss),
+            &By::manager(boss, boss, "For the test."),
+        )
+        .await
+        .unwrap()
+        .summary
+        .plan
+        .id;
     Client {
         session,
         agent,
         boss,
         ticket,
         ask: ask.id,
+        plan,
     }
 }
 
@@ -264,6 +291,18 @@ fn pointed_at(name: &str, other: &Client, dir: &Path) -> Vec<(Value, bool)> {
         ],
         "crew.move_ticket" => vec![(
             json!({ "ticket": other.ticket, "state": "done", "reason": r }),
+            true,
+        )],
+        "crew.plan" => vec![(
+            json!({
+                "goal": "Ship it",
+                "board": other.ticket.split('-').next().unwrap_or_default(),
+                "tickets": [{ "title": "Look around", "folder": dir.to_string_lossy() }],
+            }),
+            true,
+        )],
+        "crew.plan_update" => vec![(
+            json!({ "plan_id": other.plan.to_string(), "goal": "Ship it", "why": r }),
             true,
         )],
         other => {

@@ -33,7 +33,7 @@ pub const READ: [&str; 5] = [
     super::spend::NAME,
     super::board::NAME,
 ];
-pub const ACT: [&str; 14] = [
+pub const ACT: [&str; 16] = [
     "crew.nudge",
     "crew.escalate",
     "crew.approve",
@@ -48,6 +48,8 @@ pub const ACT: [&str; 14] = [
     "crew.move_ticket",
     "crew.take_on",
     "crew.release",
+    super::plan::NAME,
+    super::plan::UPDATE,
 ];
 
 pub struct CrewTool {
@@ -251,6 +253,7 @@ impl CrewTool {
                     "counts": o.counts,
                     "table": reported(&table(&o.items, &o.groups, &charged), "the crew's sessions and agents"),
                     "slots": { "busy": crew.desk.charges_busy(&boss), "parallel": parallel },
+                    "plans": crew.plans_seen(seen).await,
                 }))
             }
             "crew.activity" => {
@@ -371,7 +374,12 @@ impl CrewTool {
         // a suggestion keeps its id and its key, so it is that ticket that
         // is shown and acted on. One on another scope's board is refused
         // as one that isn't there.
-        crew.resolve_ticket(&mut action, Some(&b.seen)).await?;
+        crew.resolve_ticket(
+            &mut action,
+            Some(&b.seen),
+            Some(b.service.agent_id.as_str()),
+        )
+        .await?;
         if let (Some(id), Some(key), Some(o)) = (
             action.ticket_id(),
             action.ticket_key(),
@@ -420,6 +428,8 @@ impl Tool for CrewTool {
             "crew.overview" => "Everyone on the crew now: the person's agents and their Claude Code and Codex sessions, each with its state (needs you, working, quiet, done today, idle, failed, stopped), what it's doing, what it asks (with approval ids), since when, and whether you run it for the person (and whether they are driving it now). slots says how many of the sessions you run are starting or working, of the most you may run at once. For what sessions spent (tokens, cost), use crew.spend.",
             super::spend::NAME => super::spend::DESCRIPTION,
             super::board::NAME => super::board::DESCRIPTION,
+            super::plan::NAME => super::plan::DESCRIPTION,
+            super::plan::UPDATE => super::plan::UPDATE_DESCRIPTION,
             "crew.activity" => "What happened on the crew, newest first: turns started and finished, questions, requests, failures, and what you and the person did. Filter to one agent or session with subject_id.",
             "crew.history" => "The recent messages of one agent's Desk DM with the person (agent_id), or one session's last prompt, reply, pending request and terminal (session_id).",
             "crew.nudge" => "Send a short message to an agent's DM (agent_id) or to a session on its Desk line (session_id): a check-in, a hint, a correction. A session gets it once its turn ends (crew.interrupt stops a turn now). With reply_to (a question's message id), it is your answer to what that session asked you.",
@@ -452,6 +462,8 @@ impl Tool for CrewTool {
             "crew.overview" => json!({ "type": "object", "properties": {} }),
             super::spend::NAME => super::spend::schema(),
             super::board::NAME => super::board::schema(),
+            super::plan::NAME => super::plan::schema(),
+            super::plan::UPDATE => super::plan::update_schema(),
             "crew.activity" => json!({ "type": "object", "properties": {
                 "subject_id": { "type": "string", "description": "An agent or session id" },
                 "limit": { "type": "integer", "minimum": 1, "maximum": 100 }
@@ -583,6 +595,8 @@ impl Tool for CrewTool {
         };
         let result = if READ.contains(&self.name) {
             self.read(&crew, &bound, &input).await
+        } else if [super::plan::NAME, super::plan::UPDATE].contains(&self.name) {
+            crew.plan_tool(self.name, &bound, &input).await
         } else {
             self.act(&crew, &bound, &input).await
         };

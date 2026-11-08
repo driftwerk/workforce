@@ -60,6 +60,9 @@ pub enum Paused {
     /// Its group has no boss now; the main boss takes it on once the person
     /// has read the handover.
     NoBoss,
+    /// One of its tickets failed to start again and again: the person
+    /// looks at why before it is tried again.
+    StartFailing,
 }
 
 impl Paused {
@@ -70,6 +73,7 @@ impl Paused {
             Self::BossHeld => "boss_held",
             Self::Restoring => "restoring",
             Self::NoBoss => "no_boss",
+            Self::StartFailing => "start_failing",
         }
     }
 
@@ -80,6 +84,7 @@ impl Paused {
             "boss_held" => Ok(Self::BossHeld),
             "restoring" => Ok(Self::Restoring),
             "no_boss" => Ok(Self::NoBoss),
+            "start_failing" => Ok(Self::StartFailing),
             other => Err(eyre::eyre!("unknown Paused {other:?}")),
         }
     }
@@ -92,6 +97,7 @@ impl Paused {
             Self::BossHeld => "its boss is held",
             Self::Restoring => "Desk is resuming its sessions",
             Self::NoBoss => "its group has no boss",
+            Self::StartFailing => "a ticket of it keeps failing to start",
         }
     }
 }

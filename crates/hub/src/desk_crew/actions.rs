@@ -107,6 +107,9 @@ pub(crate) enum Action {
         /// whoever gets it.
         text: String,
         to: Handout,
+        /// It is a ticket of a plan the person approved, which is the
+        /// authority for handing it out.
+        planned: bool,
     },
     /// Move a ticket on the board (by its key) to a column.
     MoveTicket {
@@ -118,6 +121,8 @@ pub(crate) enum Action {
         /// Whether the move takes it off a session started in another
         /// terminal, which is then told.
         off_external: bool,
+        /// It is a ticket of a plan the person approved.
+        planned: bool,
     },
     /// Run a session for the person: it wakes the overseer at each turn's
     /// end, and waits for it while the person isn't driving.
@@ -317,6 +322,7 @@ impl Action {
                 id: ticket_id(i.ticket_id)?,
                 text: String::new(),
                 to: handout(i.to)?,
+                planned: false,
             },
             "crew.move_ticket" => Self::MoveTicket {
                 ticket: ticket_key(i.ticket)?,
@@ -326,6 +332,7 @@ impl Action {
                     .ok_or("Say which column: backlog, todo, doing, review, done or dropped.")?,
                 was: None,
                 off_external: false,
+                planned: false,
             },
             "crew.take_on" => Self::TakeOn {
                 session: session()?,
@@ -542,6 +549,19 @@ impl CrewHub {
                 );
             }
         }
+        // A ticket that has run goes back in the queue only by the person.
+        if let Action::MoveTicket {
+            state: TicketState::Backlog | TicketState::Todo,
+            was: Some(TicketState::Doing | TicketState::Review | TicketState::Done),
+            planned: true,
+            ..
+        } = action
+        {
+            return Gate::Suggest(
+                "putting a ticket of the plan that has run back in the queue is the person's call"
+                    .into(),
+            );
+        }
         if let Action::MoveTicket {
             off_external: true, ..
         } = action
@@ -562,8 +582,11 @@ impl CrewHub {
             Action::Assign { .. } => true,
             Action::Resume { .. } | Action::Restart { .. } => o.act.resume_restart,
             Action::StartSession { .. } => o.act.hand_out_work,
-            Action::AssignTicket { .. } => o.act.hand_out_work,
-            Action::MoveTicket { .. } => o.act.hand_out_work,
+            // The person's approval of its plan is the authority for its
+            // tickets' sessions and moves, whatever `hand_out_work` says.
+            Action::AssignTicket { planned, .. } | Action::MoveTicket { planned, .. } => {
+                *planned || o.act.hand_out_work
+            }
             Action::Approve { session, approval } => {
                 // Codex's requests are to leave its sandbox, and what it says
                 // of them isn't what runs: the person's alone.
@@ -1283,17 +1306,43 @@ impl CrewHub {
     /// Fills in the ticket `action` is about, before it is gated: its id
     /// (the suggestion keeps that, not the key), its words, and where it
     /// stands. With `seen`, a ticket on a board outside that scope is
-    /// refused. Other actions are left as they are.
+    /// refused. A ticket of a plan starts a session only where the plan
+    /// says it runs. `boss` is the overseer acting: the approval of a plan
+    /// of its own that runs now is the authority for starting its tickets'
+    /// sessions and moving them on, and nothing else is. Other actions are
+    /// left as they are.
     pub(crate) async fn resolve_ticket(
         &self,
         action: &mut Action,
         seen: Option<&Seen>,
+        boss: Option<&str>,
     ) -> Result<(), String> {
         match action {
             Action::AssignTicket {
-                ticket, id, text, ..
+                ticket,
+                id,
+                text,
+                planned,
+                to,
             } => {
                 let t = self.ticket_named(ticket, *id, seen).await?;
+                let key = t.key.clone().unwrap_or_else(|| ticket.clone());
+                if let Handout::NewSession { folder, engine } = to {
+                    if let Some(runs) = self.plan_runs_of(t.ticket.id).await {
+                        let (Some(wants), Some(at)) = (runs.engine, runs.folder) else {
+                            return Err(format!("{key} doesn't say where its session runs."));
+                        };
+                        if *folder != at || engine.is_some_and(|e| e != wants) {
+                            return Err(format!(
+                                "{key} runs in {at} on {}, as its plan says; start it there, or change the plan with crew.plan_update.",
+                                wants.title()
+                            ));
+                        }
+                        *engine = Some(wants);
+                    }
+                }
+                *planned = matches!(to, Handout::NewSession { .. })
+                    && self.planned_by(t.ticket.id, boss).await;
                 *id = Some(t.ticket.id);
                 if let Some(key) = &t.key {
                     ticket.clone_from(key);
@@ -1306,8 +1355,10 @@ impl CrewHub {
                 state,
                 was,
                 off_external,
+                planned,
             } => {
                 let t = self.ticket_named(ticket, *id, seen).await?;
+                *planned = self.planned_by(t.ticket.id, boss).await;
                 *id = Some(t.ticket.id);
                 if let Some(key) = &t.key {
                     ticket.clone_from(key);
@@ -1322,6 +1373,37 @@ impl CrewHub {
             _ => {}
         }
         Ok(())
+    }
+
+    /// Where `ticket` runs, when it is a plan's.
+    async fn plan_runs_of(&self, ticket: Uuid) -> Option<workforce_desk::plan_store::Runs> {
+        let plan = self.desk.store().plan_of_ticket(ticket).await.ok()??;
+        self.desk
+            .store()
+            .plan_runs(plan)
+            .await
+            .ok()?
+            .into_iter()
+            .find(|(id, _)| *id == ticket)
+            .map(|(_, r)| r)
+    }
+
+    /// Whether `ticket` is in a plan of `boss`'s that runs now: approved,
+    /// and neither paused nor ended.
+    async fn planned_by(&self, ticket: Uuid, boss: Option<&str>) -> bool {
+        let Some(boss) = boss else {
+            return false;
+        };
+        let Ok(Some(plan)) = self.desk.store().plan_of_ticket(ticket).await else {
+            return false;
+        };
+        self.desk
+            .store()
+            .plan(plan)
+            .await
+            .ok()
+            .flatten()
+            .is_some_and(|p| p.runs() && p.boss == boss)
     }
 
     /// Hands the ticket `action` names to a session, an agent, or a session
@@ -1449,7 +1531,11 @@ impl CrewHub {
     /// its scope's group for a group's boss; for the main overseer, the
     /// group its agent sits in when that group has no boss of its own
     /// (which is still its scope), else none.
-    fn boss_group(&self, service: &crate::serve::AgentService, o: &Oversight) -> Option<String> {
+    pub(crate) fn boss_group(
+        &self,
+        service: &crate::serve::AgentService,
+        o: &Oversight,
+    ) -> Option<String> {
         if let Some(g) = o.scope.group() {
             return Some(g.to_string());
         }

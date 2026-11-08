@@ -348,6 +348,19 @@ impl DeskStore {
         rows.iter().map(suggestion).collect()
     }
 
+    /// Every suggestion `agent_id` made to use `tool`, newest first.
+    pub async fn suggestions_for(&self, agent_id: &str, tool: &str) -> Result<Vec<Suggestion>> {
+        let client = self.pool().get().await?;
+        let rows = client
+            .query(
+                "SELECT * FROM suggestions WHERE agent_id = $1 AND action ->> 'tool' = $2 \
+                 ORDER BY at DESC, id DESC",
+                &[&agent_id, &tool],
+            )
+            .await?;
+        rows.iter().map(suggestion).collect()
+    }
+
     /// How many of `agent_id`'s suggestions to use `tool` are still open.
     pub async fn open_suggestions(&self, agent_id: &str, tool: &str) -> Result<i64> {
         let client = self.pool().get().await?;
