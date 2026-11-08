@@ -2510,6 +2510,11 @@ impl Stores {
             }
         }
 
+        // The agent's own handle on memory: fenced to its scope while it is
+        // a boss, read live from its config (boss-gaps W8). The cleanup
+        // sweep above keeps the hub's.
+        let memory_store = crate::memory_fence::fenced(memory_store, agent_id, workspace);
+
         // Open the self-learning store eagerly only when the resolved (per-agent
         // → global) self_learning is enabled; otherwise leave None and open it
         // lazily on a hot-enable (see `ensure_self_learning_store`). One concrete

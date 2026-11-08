@@ -144,6 +144,22 @@ impl MemoryStore for InMemoryStore {
         Ok(())
     }
 
+    async fn add_tag(
+        &self,
+        owner: &workforce_core::types::AgentId,
+        tag: &str,
+        unless_prefix: &str,
+    ) -> Result<Vec<MemoryId>> {
+        let mut tagged = Vec::new();
+        for m in self.memories.write().values_mut() {
+            if &m.owner == owner && !m.tags.iter().any(|t| t.starts_with(unless_prefix)) {
+                m.tags.push(tag.to_string());
+                tagged.push(m.id.clone());
+            }
+        }
+        Ok(tagged)
+    }
+
     async fn identity_memories(
         &self,
         owner: &workforce_core::types::AgentId,
@@ -310,6 +326,11 @@ mod tests {
     #[tokio::test]
     async fn identity_memories_are_reassigned_and_purged_forgotten_ones_included() {
         crate::store::identity_operations_contract(&InMemoryStore::new()).await;
+    }
+
+    #[tokio::test]
+    async fn the_add_tag_contract_holds() {
+        crate::store::add_tag_contract(&InMemoryStore::new()).await;
     }
 
     #[tokio::test]

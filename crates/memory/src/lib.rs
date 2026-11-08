@@ -5,6 +5,7 @@ pub mod audit;
 pub mod consolidation;
 pub mod edge_owner;
 pub mod embedding;
+pub mod group_tagged;
 pub mod in_memory;
 pub mod layers;
 pub mod schema;

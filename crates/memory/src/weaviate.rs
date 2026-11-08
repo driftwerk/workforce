@@ -1943,6 +1943,76 @@ impl MemoryStore for WeaviateStore {
         Ok(counts)
     }
 
+    /// The collection is walked by id, as `identity_counts` does (a filtered
+    /// read is capped), and each of the owner's objects with no tag of the
+    /// prefix is patched with its tags and the new one.
+    async fn add_tag(
+        &self,
+        owner: &AgentId,
+        tag: &str,
+        unless_prefix: &str,
+    ) -> Result<Vec<MemoryId>> {
+        let mut targets: Vec<(String, String, Vec<String>)> = Vec::new();
+        let mut after = String::new();
+        loop {
+            let page = self
+                .get_rows(format!(
+                    r#"{{ Get {{ {collection}(limit: {SCAN_PAGE}{after}) {{ owner memoryId tags _additional {{ id }} }} }} }}"#,
+                    collection = self.collection,
+                ))
+                .await?;
+            for item in page
+                .iter()
+                .filter(|item| item["owner"].as_str() == Some(owner.as_str()))
+            {
+                let tags: Vec<String> = item["tags"]
+                    .as_array()
+                    .map(|t| {
+                        t.iter()
+                            .filter_map(|t| t.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if tags.iter().any(|t| t.starts_with(unless_prefix)) {
+                    continue;
+                }
+                if let (Some(object), Some(memory)) = (
+                    item["_additional"]["id"].as_str(),
+                    item["memoryId"].as_str(),
+                ) {
+                    targets.push((object.to_string(), memory.to_string(), tags));
+                }
+            }
+            if page.len() < SCAN_PAGE {
+                break;
+            }
+            let last = page
+                .last()
+                .and_then(|item| item["_additional"]["id"].as_str())
+                .ok_or_else(|| eyre::eyre!("Weaviate page without an object id"))?;
+            after = format!(r#", after: "{}""#, graphql_escape(last));
+        }
+        let mut tagged = std::collections::BTreeSet::new();
+        for (object, memory, mut tags) in targets {
+            tags.push(tag.to_string());
+            let resp = self
+                .client
+                .patch(self.object_url(&object))
+                .json(&serde_json::json!({ "properties": { "tags": tags } }))
+                .send()
+                .await?;
+            if !resp.status().is_success() && resp.status() != reqwest::StatusCode::NOT_FOUND {
+                let body = resp.text().await.unwrap_or_default();
+                return Err(eyre::eyre!("Weaviate tag update failed: {body}"));
+            }
+            tagged.insert(memory);
+        }
+        if let Some(previous) = self.previous.get() {
+            previous.add_tag(owner, tag, unless_prefix).await?;
+        }
+        Ok(tagged.into_iter().map(MemoryId).collect())
+    }
+
     async fn reassign_identity(&self, owner: &AgentId, from: &str, to: &str) -> Result<usize> {
         let moved = self
             .drain_identity(owner, from, |object| {
