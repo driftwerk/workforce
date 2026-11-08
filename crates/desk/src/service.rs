@@ -82,8 +82,12 @@ mod memory_index;
 #[cfg(test)]
 mod memory_index_tests;
 mod memory_recall;
+mod moves;
+#[cfg(test)]
+mod moves_tests;
 #[cfg(test)]
 mod rooms_tests;
+pub use moves::{EffectView, HandoverView, MoveAsk, MoveCommit, MoveDone, MovePreview, SentNote};
 mod scopes;
 pub use scopes::Boss;
 #[cfg(test)]
@@ -3675,6 +3679,18 @@ impl Desk {
             room.default_member = d;
         }
         if let Some(g) = patch.group {
+            // A room is its conversation: it never crosses to another
+            // boss's scope (boss-gaps W8).
+            let bossed = self.bossed();
+            if crate::scope::scope_of(room.group.as_deref(), &bossed)
+                != crate::scope::scope_of(g.as_deref(), &bossed)
+            {
+                return Err(DeskError::Conflict(
+                    "A room keeps its conversation, so it can't move to a group another boss \
+                     oversees. Start a new room there instead."
+                        .into(),
+                ));
+            }
             room.group = g;
         }
         room.updated_at = Utc::now();

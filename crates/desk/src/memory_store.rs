@@ -222,33 +222,37 @@ impl DeskStore {
                 )
                 .await?
                 .try_get(0)?;
+            // Each exchange is the group's its session was in when it began,
+            // so one read after a move stays where it was said.
+            let insert = format!(
+                "INSERT INTO memory_exchanges (id, engine, key, session, group_id, project, \
+                   folder, seq, at, ended, asker, ask, answer, steps, files, commands, \
+                   errors, compaction, redacted, flagged) \
+                 SELECT gen_random_uuid(), $1, $2, $3, {group}, $4, $5, $6, $7, $8, $9, \
+                   $10, $11, $12, $13, $14, $15, $16, $17, $18 \
+                 WHERE NOT EXISTS (SELECT 1 FROM memory_forgotten f \
+                   WHERE f.engine = $1 AND f.ref = 'key:' || $2) \
+                 ON CONFLICT (engine, key) DO UPDATE SET ended = EXCLUDED.ended, \
+                   ask = EXCLUDED.ask, answer = EXCLUDED.answer, steps = EXCLUDED.steps, \
+                   files = EXCLUDED.files, commands = EXCLUDED.commands, \
+                   errors = EXCLUDED.errors, redacted = EXCLUDED.redacted, \
+                   flagged = EXCLUDED.flagged, \
+                   indexed_at = CASE WHEN (memory_exchanges.ask, memory_exchanges.answer, \
+                     memory_exchanges.steps) IS DISTINCT FROM (EXCLUDED.ask, EXCLUDED.answer, \
+                     EXCLUDED.steps) THEN NULL ELSE memory_exchanges.indexed_at END, \
+                   index_tries = CASE WHEN (memory_exchanges.ask, memory_exchanges.answer, \
+                     memory_exchanges.steps) IS DISTINCT FROM (EXCLUDED.ask, EXCLUDED.answer, \
+                     EXCLUDED.steps) THEN 0 ELSE memory_exchanges.index_tries END \
+                 WHERE memory_exchanges.session = EXCLUDED.session",
+                group = crate::store::group_at_sql("$3::uuid", "$7::timestamptz"),
+            );
             for (i, x) in w.closed.iter().chain(w.open).enumerate() {
                 let seq = base + i32::try_from(i).unwrap_or(i32::MAX - base) + 1;
                 let steps = serde_json::to_value(&x.steps)?;
                 let files: Vec<&str> = x.files.iter().map(String::as_str).collect();
                 let flagged: Vec<&str> = x.flagged.iter().map(String::as_str).collect();
                 tx.execute(
-                    "INSERT INTO memory_exchanges (id, engine, key, session, group_id, project, \
-                       folder, seq, at, ended, asker, ask, answer, steps, files, commands, \
-                       errors, compaction, redacted, flagged) \
-                     SELECT gen_random_uuid(), $1, $2, $3, ( \
-                       SELECT NULLIF(g.group_id, 'ungrouped') FROM group_members g \
-                       WHERE g.item = 'session:' || $3::uuid::text), $4, $5, $6, $7, $8, $9, \
-                       $10, $11, $12, $13, $14, $15, $16, $17, $18 \
-                     WHERE NOT EXISTS (SELECT 1 FROM memory_forgotten f \
-                       WHERE f.engine = $1 AND f.ref = 'key:' || $2) \
-                     ON CONFLICT (engine, key) DO UPDATE SET ended = EXCLUDED.ended, \
-                       ask = EXCLUDED.ask, answer = EXCLUDED.answer, steps = EXCLUDED.steps, \
-                       files = EXCLUDED.files, commands = EXCLUDED.commands, \
-                       errors = EXCLUDED.errors, redacted = EXCLUDED.redacted, \
-                       flagged = EXCLUDED.flagged, \
-                       indexed_at = CASE WHEN (memory_exchanges.ask, memory_exchanges.answer, \
-                         memory_exchanges.steps) IS DISTINCT FROM (EXCLUDED.ask, EXCLUDED.answer, \
-                         EXCLUDED.steps) THEN NULL ELSE memory_exchanges.indexed_at END, \
-                       index_tries = CASE WHEN (memory_exchanges.ask, memory_exchanges.answer, \
-                         memory_exchanges.steps) IS DISTINCT FROM (EXCLUDED.ask, EXCLUDED.answer, \
-                         EXCLUDED.steps) THEN 0 ELSE memory_exchanges.index_tries END \
-                     WHERE memory_exchanges.session = EXCLUDED.session",
+                    insert.as_str(),
                     &[
                         &w.engine.as_str(),
                         &x.key,

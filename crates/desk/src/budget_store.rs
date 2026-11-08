@@ -19,6 +19,26 @@ pub struct Used {
     pub usd: f64,
 }
 
+/// What one session spent: in all, and in each group, by the group each
+/// ledger row was stamped with when written. A group's budgets count what
+/// was spent in the group, so a session moved in brings none of its past.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SessionSpend {
+    pub all: Used,
+    pub groups: HashMap<String, Used>,
+}
+
+impl SessionSpend {
+    /// What counts toward `b`: a group's budget its group's part, any
+    /// other the whole.
+    pub fn toward(&self, b: &Budget) -> Used {
+        match &b.group {
+            Some(g) => self.groups.get(g).copied().unwrap_or_default(),
+            None => self.all,
+        }
+    }
+}
+
 impl Used {
     pub fn add(&mut self, other: Used) {
         self.tokens += other.tokens;
@@ -167,30 +187,33 @@ impl DeskStore {
         Ok(())
     }
 
-    /// What each session spent from `from` on.
-    pub async fn ledger_used(&self, from: DateTime<Utc>) -> Result<HashMap<Uuid, Used>> {
+    /// What each session spent from `from` on, in all and in each group its
+    /// rows were stamped with.
+    pub async fn ledger_used(&self, from: DateTime<Utc>) -> Result<HashMap<Uuid, SessionSpend>> {
         let client = self.pool().get().await?;
         let rows = client
             .query(
-                "SELECT session, \
+                "SELECT session, group_id, \
                    SUM(input + output + cache_read + cache_write)::int8, \
                    COALESCE(SUM(usd), 0)::float8 \
-                 FROM ledger WHERE at >= $1 GROUP BY session",
+                 FROM ledger WHERE at >= $1 GROUP BY session, group_id",
                 &[&from],
             )
             .await
             .context("summing the ledger for budgets")?;
-        rows.iter()
-            .map(|r| {
-                Ok((
-                    r.try_get(0)?,
-                    Used {
-                        tokens: u64::try_from(r.try_get::<_, i64>(1)?).unwrap_or(0),
-                        usd: r.try_get(2)?,
-                    },
-                ))
-            })
-            .collect()
+        let mut spent: HashMap<Uuid, SessionSpend> = HashMap::new();
+        for r in &rows {
+            let used = Used {
+                tokens: u64::try_from(r.try_get::<_, i64>(2)?).unwrap_or(0),
+                usd: r.try_get(3)?,
+            };
+            let s = spent.entry(r.try_get(0)?).or_default();
+            s.all.add(used);
+            if let Some(g) = r.try_get::<_, Option<String>>(1)? {
+                s.groups.entry(g).or_default().add(used);
+            }
+        }
+        Ok(spent)
     }
 }
 

@@ -418,6 +418,10 @@ pub enum DeskEvent {
     Plan {
         plan: Box<crate::service::PlanSummary>,
     },
+    /// A handover note's draft changed: its old boss wrote it.
+    Handover {
+        handover: Box<crate::moves::Handover>,
+    },
     /// A board's ticket was made or changed.
     Ticket {
         ticket: Box<crate::service::TicketView>,

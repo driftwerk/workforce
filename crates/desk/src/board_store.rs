@@ -259,6 +259,57 @@ impl DeskStore {
         Ok(())
     }
 
+    /// Moves ticket `id` to board `to` under that board's next number, in
+    /// one step: out of any plan, and with none of its needs either way,
+    /// which were its old board's. Its links, history and assignment stay.
+    /// `None` when there's no such ticket.
+    pub async fn move_ticket_board(&self, id: Uuid, to: Uuid) -> Result<Option<Ticket>> {
+        let mut client = self.pool().get().await?;
+        let tx = client.transaction().await?;
+        let number: i32 = tx
+            .query_one(
+                "UPDATE boards SET next_number = next_number + 1 WHERE id = $1 \
+                 RETURNING next_number - 1",
+                &[&to],
+            )
+            .await
+            .context("numbering a moved ticket")?
+            .try_get(0)?;
+        let moved = tx
+            .execute(
+                "UPDATE tickets SET board = $2, number = $3, plan = NULL, \
+                   updated_at = now(), version = version + 1 WHERE id = $1",
+                &[&id, &to, &number],
+            )
+            .await?;
+        if moved == 0 {
+            return Ok(None);
+        }
+        tx.execute(
+            "DELETE FROM ticket_needs WHERE ticket = $1 OR needs = $1",
+            &[&id],
+        )
+        .await?;
+        tx.commit()
+            .await
+            .context("moving a ticket to another board")?;
+        drop(client);
+        self.ticket(id).await
+    }
+
+    /// Takes ticket `id` out of its plan; whether it was in one.
+    pub async fn leave_plan(&self, id: Uuid) -> Result<bool> {
+        let client = self.pool().get().await?;
+        Ok(client
+            .execute(
+                "UPDATE tickets SET plan = NULL, updated_at = now(), version = version + 1 \
+                 WHERE id = $1 AND plan IS NOT NULL",
+                &[&id],
+            )
+            .await?
+            > 0)
+    }
+
     pub async fn delete_ticket(&self, id: Uuid) -> Result<()> {
         let client = self.pool().get().await?;
         client

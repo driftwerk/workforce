@@ -316,6 +316,29 @@ impl DeskStore {
 
     /// Every session the registry has, closed ones too, oldest first: whose
     /// records the ledger reads back.
+    /// How many ledger rows `session`'s calls (or, with `ticket`, the
+    /// ticket's) are, and what they cost.
+    pub async fn ledger_total(
+        &self,
+        session: Option<Uuid>,
+        ticket: Option<Uuid>,
+    ) -> Result<(u64, f64)> {
+        let client = self.pool().get().await?;
+        let row = client
+            .query_one(
+                "SELECT COUNT(*)::int8, COALESCE(SUM(usd), 0)::float8 FROM ledger \
+                 WHERE ($1::uuid IS NULL OR session = $1) AND ($2::uuid IS NULL OR ticket = $2) \
+                   AND ($1::uuid IS NOT NULL OR $2::uuid IS NOT NULL)",
+                &[&session, &ticket],
+            )
+            .await
+            .context("summing an item's ledger")?;
+        Ok((
+            u64::try_from(row.try_get::<_, i64>(0)?).unwrap_or(0),
+            row.try_get(1)?,
+        ))
+    }
+
     pub async fn every_session(&self) -> Result<Vec<SessionRecord>> {
         let client = self.pool().get().await?;
         let rows = client
@@ -352,18 +375,18 @@ pub(crate) async fn ledger_write_in(
         let priced: Vec<&str> = rows.iter().map(|r| r.spend.priced.as_str()).collect();
         let billing: Vec<&str> = rows.iter().map(|r| r.billing.as_str()).collect();
         let accounts: Vec<Option<&str>> = rows.iter().map(|r| r.account.as_deref()).collect();
-        changed = tx
-            .execute(
-                "INSERT INTO ledger (engine, key, session, at, model, input, output, \
+        // Each row is the group's the session was in when it was made, so a
+        // call read after a move stays where it happened.
+        let group = crate::store::group_at_sql("$2::uuid", "a");
+        let sql = format!(
+            "INSERT INTO ledger (engine, key, session, at, model, input, output, \
                      cache_read, cache_write, reasoning, usd, priced, billing, account, ticket, \
                      group_id) \
                      SELECT $1, k, $2, a, m, i, o, cr, cw, r, u, p, b, acc, ( \
                        SELECT w.ticket FROM ticket_assignments w \
                        WHERE w.session = $2::uuid AND w.from_at <= a \
                          AND (w.until_at IS NULL OR a < w.until_at) \
-                       ORDER BY w.from_at DESC LIMIT 1), ( \
-                       SELECT NULLIF(g.group_id, 'ungrouped') FROM group_members g \
-                       WHERE g.item = 'session:' || $2::uuid::text) FROM UNNEST( \
+                       ORDER BY w.from_at DESC LIMIT 1), {group} FROM UNNEST( \
                        $3::text[], $4::timestamptz[], $5::text[], $6::int8[], $7::int8[], \
                        $8::int8[], $9::int8[], $10::int8[], $11::float8[], $12::text[], \
                        $13::text[], $14::text[]) AS t(k, a, m, i, o, cr, cw, r, u, p, b, acc) \
@@ -386,7 +409,11 @@ pub(crate) async fn ledger_write_in(
                         OR EXCLUDED.cache_read > ledger.cache_read \
                         OR EXCLUDED.cache_write > ledger.cache_write \
                         OR (ledger.billing = 'unknown' AND EXCLUDED.billing <> 'unknown') \
-                        OR (ledger.account IS NULL AND EXCLUDED.account IS NOT NULL)",
+                        OR (ledger.account IS NULL AND EXCLUDED.account IS NOT NULL)"
+        );
+        changed = tx
+            .execute(
+                sql.as_str(),
                 &[
                     &engine.as_str(),
                     &session,

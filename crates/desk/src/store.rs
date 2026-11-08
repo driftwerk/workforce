@@ -274,6 +274,23 @@ pub(crate) async fn forget_in(
         .await?)
 }
 
+/// The group session `session` (a SQL expression of a uuid) was in at
+/// `at` (a SQL timestamp), for a row about it written now: where the first
+/// move after `at` took it from, else the group it is in now. A row read
+/// after a move about what happened before stays the old group's. Null is
+/// ungrouped.
+pub(crate) fn group_at_sql(session: &str, at: &str) -> String {
+    format!(
+        "(CASE WHEN EXISTS (SELECT 1 FROM group_moves gm \
+           WHERE gm.item = 'session:' || ({session})::text AND gm.at > {at}) \
+         THEN (SELECT gm.from_group FROM group_moves gm \
+           WHERE gm.item = 'session:' || ({session})::text AND gm.at > {at} \
+           ORDER BY gm.at LIMIT 1) \
+         ELSE (SELECT NULLIF(g.group_id, 'ungrouped') FROM group_members g \
+           WHERE g.item = 'session:' || ({session})::text) END)"
+    )
+}
+
 pub(crate) fn record(row: &Row) -> Result<SessionRecord> {
     Ok(SessionRecord {
         id: row.try_get("id")?,

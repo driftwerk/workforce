@@ -170,7 +170,9 @@ async fn the_ledger_is_kept_by_group_and_spend_splits_by_group() {
         .await
         .unwrap();
         d.set_bosses(bosses());
-        let at = Utc::now() - chrono::Duration::minutes(5);
+        // Made in Acme: after it was put there.
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let at = Utc::now();
         for (session, usd) in [(web, 2.0), (web, 1.0), (api, 4.0), (loose, 0.5)] {
             d.store()
                 .ledger_write(
