@@ -65,10 +65,12 @@ pub struct MemoryQuery {
     /// Only one group's (`Some(None)`: only ungrouped sessions').
     pub group: Option<Option<String>>,
     pub session: Option<Uuid>,
+    /// Only these kinds of exchanges and notes; all when none.
+    pub kinds: Option<Vec<crate::memory::passage::PassageKind>>,
     pub limit: i64,
 }
 
-/// An exchange a search found.
+/// An exchange or a note a search found.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MemoryHit {
@@ -77,9 +79,23 @@ pub struct MemoryHit {
     pub project: String,
     pub at: DateTime<Utc>,
     pub asker: Asker,
+    /// A note's is empty.
     pub ask: String,
+    /// A note's text.
     pub answer: String,
     pub compaction: bool,
+    /// `exchange`, `compaction`, `decision`, `fact` or `todo`.
+    pub kind: &'static str,
+    /// A note Desk's model wrote, which may be wrong.
+    pub noted_by_desk: bool,
+    /// A note the person confirmed or wrote.
+    pub confirmed: bool,
+    /// A note another replaced.
+    pub superseded: bool,
+}
+
+fn exchange_kind() -> &'static str {
+    "exchange"
 }
 
 /// An exchange as a session's memory lists it.
@@ -256,6 +272,13 @@ impl DeskStore {
                 )
                 .await
                 .context("keeping an exchange")?;
+            }
+            // Exchanges that closed are to be read for notes: due as the
+            // turn ends, at most every ten minutes.
+            if !w.closed.is_empty() {
+                tx.execute(&crate::memory_derive_store::arm_sql(), &[&w.session])
+                    .await
+                    .context("queueing a session to note decisions from")?;
             }
         }
         // A session forgotten meanwhile keeps no cursor: its harvest's state
@@ -520,6 +543,10 @@ impl DeskStore {
                     ask: r.try_get(5)?,
                     answer: r.try_get(6)?,
                     compaction: r.try_get(7)?,
+                    kind: exchange_kind(),
+                    noted_by_desk: false,
+                    confirmed: false,
+                    superseded: false,
                 })
             })
             .collect()
@@ -630,10 +657,24 @@ pub(crate) async fn forget_memory_in(
         &[&ids],
     )
     .await?;
+    // Then their derivation queue, as writing what was noted locks it
+    // before their notes.
+    tx.execute(
+        "SELECT 1 FROM memory_derive WHERE session = ANY($1) ORDER BY session FOR UPDATE",
+        &[&ids],
+    )
+    .await?;
     // Their exchanges are locked in id order, as every write of many
     // exchanges locks them.
     tx.execute(
         "SELECT 1 FROM memory_exchanges WHERE session = ANY($1) ORDER BY id FOR UPDATE",
+        &[&ids],
+    )
+    .await?;
+    // And their notes, in id order, as every write of many notes locks
+    // them.
+    tx.execute(
+        "SELECT 1 FROM memory_items WHERE session = ANY($1) ORDER BY id FOR UPDATE",
         &[&ids],
     )
     .await?;
@@ -693,6 +734,7 @@ pub(crate) async fn forget_memory_in(
         "memory_exchanges",
         "memory_items",
         "memory_derive",
+        "memory_derive_reads",
         "memory_sessions",
     ] {
         tx.execute(

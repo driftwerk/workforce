@@ -183,8 +183,11 @@ impl Desk {
 
     /// `group` was closed for a boss whose config was then not written, and
     /// no config names it: it is as it was, open, its past too.
-    pub fn forget_bound(&self, group: &str) {
-        self.0.scopes.lock().bounded.remove(group);
+    pub async fn forget_bound(&self, group: &str) {
+        let removed = self.0.scopes.lock().bounded.remove(group);
+        if removed {
+            self.scopes_keep().await;
+        }
     }
 
     /// The groups closed to everyone but the person: named for a boss, with

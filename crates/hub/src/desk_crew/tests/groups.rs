@@ -1196,3 +1196,134 @@ async fn a_group_whose_boss_is_off_but_still_named_is_sealed() {
     })
     .await;
 }
+
+/// A workspace beside the served agents', of an agent the hub doesn't serve
+/// now, its config naming `group` for a boss, switched off.
+fn ghost(c: &Clients, group: &str) -> std::path::PathBuf {
+    let ws = c.mia.workspace.parent().unwrap().join("ghost");
+    std::fs::create_dir_all(&ws).unwrap();
+    std::fs::write(
+        ws.join("config.toml"),
+        format!("[oversight]\nenabled = false\ngroup = \"{group}\"\n"),
+    )
+    .unwrap();
+    ws
+}
+
+fn names(ws: &std::path::Path) -> Option<String> {
+    super::super::group_named_in(&std::fs::read_to_string(ws.join("config.toml")).unwrap())
+}
+
+/// An agent the hub doesn't serve can't keep a group sealed: a new boss of
+/// the group takes its name off that agent's config too, so taking the new
+/// boss off leaves the group open.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_new_boss_takes_the_group_off_an_unserved_agents_config_too() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let c = clients(dir.path(), pool).await;
+        let ws = ghost(&c, "infra");
+        super::super::config_saved(&c.mia);
+        eventually("Infra sealed by the unserved agent", async || {
+            (c.d.sealed() == ["infra".to_string()]).then_some(())
+        })
+        .await;
+        person_saves(
+            &c.mia,
+            &format!("[oversight]\nenabled = true\ngroup = \"infra\"\n{ACTS}"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(names(&ws), None);
+        person_saves(&c.mia, &format!("[oversight]\nenabled = false\n{ACTS}"))
+            .await
+            .unwrap();
+        eventually("Infra open to the main overseer", async || {
+            main_overview(&c).await.contains("infra-web").then_some(())
+        })
+        .await;
+        assert!(c.d.sealed().is_empty(), "{:?}", c.d.sealed());
+    })
+    .await;
+}
+
+/// Deleting a group takes its name off an unserved agent's config too, and
+/// opens it, even with no served boss.
+#[tokio::test(flavor = "multi_thread")]
+async fn releasing_a_group_takes_it_off_an_unserved_agents_config() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let c = clients(dir.path(), pool).await;
+        let ws = ghost(&c, "infra");
+        super::super::config_saved(&c.mia);
+        eventually("Infra sealed", async || {
+            c.d.bossed().contains("infra").then_some(())
+        })
+        .await;
+        c.d.release_group("infra").await.unwrap();
+        assert_eq!(names(&ws), None);
+        assert!(!c.d.bossed().contains("infra"));
+        assert!(c.d.sealed().is_empty());
+    })
+    .await;
+}
+
+/// Only agents' folders beside the served ones are walked, and each is known
+/// by its folder's name, as the served agents' folders are named after
+/// their ids.
+#[tokio::test(flavor = "multi_thread")]
+async fn unserved_folders_are_agents_only_and_known_by_their_ids() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let c = clients(dir.path(), pool).await;
+        let ws = ghost(&c, "infra");
+        let beside = ws.parent().unwrap();
+        std::fs::create_dir_all(beside.join("notes")).unwrap();
+        std::fs::write(beside.join("notes").join("config.toml"), "not [ toml").unwrap();
+        std::fs::create_dir_all(beside.join("empty")).unwrap();
+        let services = c.crew.state.registry.all_services();
+        for s in &services {
+            if s.workspace.parent() == Some(beside) {
+                assert_eq!(
+                    s.workspace.file_name().unwrap().to_string_lossy(),
+                    s.agent_id.as_str(),
+                    "a served agent's folder is named after its id"
+                );
+            }
+        }
+        let found = crate::agent_config_write::unserved_beside(&services);
+        assert_eq!(
+            found,
+            [crate::agent_config_write::Unserved {
+                workspace: ws.clone(),
+                id: Some("ghost".into()),
+            }]
+        );
+    })
+    .await;
+}
+
+/// A group whose unserved agent's config can't be switched off isn't
+/// deleted, and says which agent's settings to fix.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_release_refused_names_the_agent_whose_settings_to_fix() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let c = clients(dir.path(), pool).await;
+        let ws = ghost(&c, "infra");
+        let path = ws.join("config.toml");
+        workforce_common::config_files::guard(&path).unwrap();
+        std::fs::write(
+            &path,
+            "[oversight]\nenabled = false\ngroup = \"infra\"\n# by hand\n",
+        )
+        .unwrap();
+        let why = c.d.release_group("infra").await.unwrap_err();
+        assert!(
+            why.starts_with("ghost still names this group for its boss: "),
+            "{why}"
+        );
+        assert_eq!(names(&ws).as_deref(), Some("infra"));
+    })
+    .await;
+}

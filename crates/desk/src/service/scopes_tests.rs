@@ -584,3 +584,24 @@ async fn a_session_moved_across_bosses_leaves_its_ticket_questions_and_boss_behi
     })
     .await;
 }
+
+#[tokio::test]
+async fn a_group_closed_for_a_write_that_didnt_happen_is_forgotten_across_a_restart() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        d.bound_groups(["acme".to_string()]).await;
+        let kept = || async {
+            d.store()
+                .state("desk.groups.bounded")
+                .await
+                .unwrap()
+                .map(|e| e.value)
+        };
+        assert_eq!(kept().await, Some(serde_json::json!(["acme"])));
+        d.forget_bound("acme").await;
+        assert!(!d.bossed().contains("acme"));
+        assert_eq!(kept().await, Some(serde_json::json!([])), "kept forgotten");
+    })
+    .await;
+}

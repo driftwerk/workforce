@@ -1422,8 +1422,7 @@ struct MemoryParams {
     /// A group's id, or `ungrouped`.
     group: Option<String>,
     session: Option<Uuid>,
-    /// `exchanges` or `all`; decisions, todos and facts are noted once Desk
-    /// writes them, and none are kept yet.
+    /// `decisions`, `todos`, `facts`, `exchanges` or `all`.
     kind: Option<String>,
     limit: Option<i64>,
 }
@@ -1441,16 +1440,20 @@ async fn memory_search(
         Err(e) => return DeskError::Invalid(e.body_text()).into_response(),
     };
     let run = async {
-        let exchanges = match p.kind.as_deref().unwrap_or("all") {
-            "all" | "exchanges" => true,
-            "decisions" | "todos" | "facts" => false,
+        use crate::memory::passage::PassageKind;
+        let kinds = match p.kind.as_deref().unwrap_or("all") {
+            "all" => None,
+            "exchanges" => Some(PassageKind::EXCHANGES.to_vec()),
+            "decisions" => Some(vec![PassageKind::Decision]),
+            "todos" => Some(vec![PassageKind::Todo]),
+            "facts" => Some(vec![PassageKind::Fact]),
             _ => {
                 return Err(DeskError::Invalid(
                     "kind is decisions, todos, facts, exchanges or all".into(),
                 ))
             }
         };
-        let mut found = s
+        let found = s
             .desk
             .memory_search(&crate::memory_store::MemoryQuery {
                 q: p.q,
@@ -1458,12 +1461,10 @@ async fn memory_search(
                     .group
                     .map(|g| Some(g).filter(|g| g != crate::service::UNGROUPED)),
                 session: p.session,
+                kinds,
                 limit: p.limit.unwrap_or(20),
             })
             .await?;
-        if !exchanges {
-            found.hits.clear();
-        }
         Ok(found)
     };
     run.await.map(Json).into_response()
@@ -1484,6 +1485,39 @@ async fn forget_memory(State(s): S, h: HeaderMap, Query(q): Q, Path(id): Path<Uu
         .await
         .map(|()| StatusCode::NO_CONTENT)
         .into_response()
+}
+
+/// Reads one session's new exchanges for decisions, facts and to-dos now,
+/// as its memory panel opens.
+async fn derive_memory(State(s): S, h: HeaderMap, Query(q): Q, Path(id): Path<Uuid>) -> Response {
+    guarded!(s, h, q);
+    s.desk
+        .derive_now(id)
+        .await
+        .map(|()| StatusCode::ACCEPTED)
+        .into_response()
+}
+
+/// The person confirms, corrects or drops a note Desk keeps:
+/// `{"action": "confirm"}`, `{"action": "correct", "text": "…"}` or
+/// `{"action": "drop"}`. The note as it now stands; nothing once dropped.
+async fn change_memory_item(
+    State(s): S,
+    h: HeaderMap,
+    Query(q): Q,
+    Path(id): Path<Uuid>,
+    body: Result<Json<crate::service::ItemChange>, JsonRejection>,
+) -> Response {
+    guarded!(s, h, q);
+    let Json(change) = match body {
+        Ok(b) => b,
+        Err(e) => return DeskError::Invalid(e.body_text()).into_response(),
+    };
+    match s.desk.change_memory_item(id, &change).await {
+        Ok(Some(item)) => Json(serde_json::json!({ "item": item })).into_response(),
+        Ok(None) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => e.into_response(),
+    }
 }
 
 /// Starts Desk Memory's search index again from what Desk keeps: the
@@ -1556,6 +1590,8 @@ pub fn sessions_router(desk: Desk, auth: Arc<dyn Authorize>) -> Router {
             "/api/desk/sessions/{id}/memory",
             get(session_memory).delete(forget_memory),
         )
+        .route("/api/desk/sessions/{id}/memory/derive", post(derive_memory))
+        .route("/api/desk/memory/items/{id}", patch(change_memory_item))
         .route("/api/desk/budgets", get(budgets).post(put_budget))
         .route(
             "/api/desk/budgets/{id}",
@@ -2295,6 +2331,91 @@ mod tests {
             assert_eq!(status, 400);
             let (status, _) = call(&app, "GET", "/api/desk/ledger?before=nonsense", None).await;
             assert_eq!(status, 400);
+        })
+        .await;
+    }
+
+    /// A crew that notes, as it takes each group's boss off, whether the
+    /// group was still there; and refuses `g-stuck`'s.
+    struct Releasing {
+        desk: crate::Desk,
+        seen: parking_lot::Mutex<Vec<(String, bool)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::crew::Crew for Releasing {
+        fn overseer(&self) -> Option<crate::crew::Overseer> {
+            None
+        }
+        fn agents(&self) -> Vec<crate::crew::CrewAgent> {
+            vec![]
+        }
+        fn midnight(&self) -> chrono::DateTime<chrono::Utc> {
+            chrono::Utc::now()
+        }
+        async fn accept(&self, _: &crate::crew::Suggestion) -> Result<(), String> {
+            Ok(())
+        }
+        async fn release_group(&self, group: &str) -> Result<(), String> {
+            let there = self.desk.layout().groups.iter().any(|g| g.id == group);
+            self.seen.lock().push((group.to_string(), there));
+            if group == "g-stuck" {
+                return Err("Sarah still oversees this group: busy".into());
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn deleting_a_group_takes_its_boss_off_first_and_keeps_it_when_that_fails() {
+        with_test_pool(build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            DeskStore::migrate(&pool).await.unwrap();
+            let desk = crate::Desk::start(
+                DeskStore::from_pool(pool),
+                options(dir.path()),
+                Default::default(),
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            let crew = std::sync::Arc::new(Releasing {
+                desk: desk.clone(),
+                seen: Default::default(),
+            });
+            let as_crew: std::sync::Arc<dyn crate::crew::Crew> = crew.clone();
+            desk.answer_lines_with(&as_crew);
+            let app = super::sessions_router(desk.clone(), allow_all());
+            call(
+                &app,
+                "POST",
+                "/api/desk/groups",
+                Some(json!({ "id": "g-acme", "name": "Acme" })),
+            )
+            .await;
+            call(
+                &app,
+                "POST",
+                "/api/desk/groups",
+                Some(json!({ "id": "g-stuck", "name": "Globex" })),
+            )
+            .await;
+
+            let (status, l) = call(&app, "DELETE", "/api/desk/groups/g-acme", None).await;
+            assert_eq!(status, 200);
+            assert_eq!(l["groups"].as_array().unwrap().len(), 1);
+            let (status, body) = call(&app, "DELETE", "/api/desk/groups/g-stuck", None).await;
+            assert_eq!(status, 409);
+            assert_eq!(body["error"], "Sarah still oversees this group: busy");
+            assert!(
+                desk.layout().groups.iter().any(|g| g.id == "g-stuck"),
+                "kept"
+            );
+            assert_eq!(
+                *crew.seen.lock(),
+                [("g-acme".to_string(), true), ("g-stuck".to_string(), true)],
+                "each boss taken off while its group was still there"
+            );
         })
         .await;
     }

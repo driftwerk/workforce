@@ -4,6 +4,7 @@
 //! shapes and rules here are pure; the desk's I/O shell reads, stores and
 //! searches.
 
+pub mod derive;
 pub mod harvest;
 pub mod index;
 pub mod passage;
@@ -38,6 +39,12 @@ pub struct MemoryOptions {
     pub index_per_minute: u32,
     /// The most a session's recall may cover within its group.
     pub session_reach: reach::Reach,
+    /// Whether the hub's cheap model notes decisions, facts and to-dos from
+    /// sessions (`derive = "cheap"`); off, nothing of a session is sent to
+    /// it.
+    pub derive: bool,
+    /// The most calls it makes a day.
+    pub derive_calls_per_day: u32,
 }
 
 impl Default for MemoryOptions {
@@ -50,6 +57,8 @@ impl Default for MemoryOptions {
             max_disk_mb: 4096,
             index_per_minute: 600,
             session_reach: reach::Reach::Project,
+            derive: true,
+            derive_calls_per_day: 200,
         }
     }
 }
