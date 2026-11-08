@@ -514,6 +514,44 @@ async fn a_session_moved_to_another_boss_takes_only_the_note_and_leaves_everythi
             exchange_group(&d, "x-after").await.as_deref(),
             Some("atlas")
         );
+        // Session memory as Atlas's boss, and an Atlas session, reads none
+        // of it; Acme's boss still does.
+        let recall = crate::service::memory_recall::Recall {
+            q: "canary".into(),
+            limit: 10,
+            tool: "test",
+            ..Default::default()
+        };
+        let atlas_session = crate::memory::reach::Reader::Session {
+            id: Uuid::new_v4(),
+            group: Some("atlas".into()),
+            project: "/dev/acme-api".into(),
+            work: vec![],
+        };
+        for reader in [
+            crate::memory::reach::Reader::Overseer(d.seen_by(&atlas())),
+            atlas_session,
+        ] {
+            let found = d.memory_recall(&reader, &recall).await.unwrap();
+            assert!(
+                found.hits.is_empty(),
+                "{:?} read {:?}",
+                reader.label(),
+                found.hits
+            );
+        }
+        let acme_found = d
+            .memory_recall(
+                &crate::memory::reach::Reader::Overseer(d.seen_by(&acme())),
+                &recall,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            acme_found.hits.len(),
+            2,
+            "Acme's boss reads what was said in Acme"
+        );
         let page = d
             .ledger_page(
                 before - chrono::Duration::minutes(1),
@@ -968,6 +1006,10 @@ async fn a_boss_moved_into_a_bossed_group_asks_first_and_what_it_ran_passes_to_t
             "{:?}",
             r.members
         );
+        // Nor is she let into it whatever a Desk app sends; a room this
+        // desk doesn't keep is another's to bound.
+        assert!(!d.agent_reaches_room(room.id, "sarah").await);
+        assert!(d.agent_reaches_room(Uuid::new_v4(), "sarah").await);
     })
     .await;
 }

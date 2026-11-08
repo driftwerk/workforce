@@ -1124,15 +1124,16 @@ impl Desk {
             .crew()
             .ok_or_else(|| DeskError::Conflict("Desk can't move a boss on this hub.".into()))?;
         // Nothing of the old scope's runs on under it meanwhile.
+        // Nothing of the old scope's runs on under it meanwhile; if any of
+        // it can't be stopped, the boss isn't moved.
         for p in &plans {
-            if let Err(e) = self.pause_plan(*p, crate::plan::Paused::NoBoss, by).await {
-                tracing::debug!(plan = %p, error = %e, "a plan of a moving boss wasn't paused");
+            let running = self.0.store.plan(*p).await.map_err(internal)?;
+            if running.is_some_and(|p| p.state == PlanState::Running) {
+                self.pause_plan(*p, crate::plan::Paused::NoBoss, by).await?;
             }
         }
         for s in &charges {
-            if let Err(e) = self.release(*s, by).await {
-                problems.push(e.to_string());
-            }
+            self.release(*s, by).await?;
         }
         // The boss it replaces lets go of what it ran, in this same move.
         for e in effects {

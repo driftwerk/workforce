@@ -30,6 +30,8 @@ struct Client {
     ask: uuid::Uuid,
     /// A plan its boss proposed, on its board.
     plan: uuid::Uuid,
+    /// A handover note its boss is asked to write.
+    handover: uuid::Uuid,
 }
 
 struct Clients {
@@ -123,6 +125,7 @@ async fn client(
         .summary
         .plan
         .id;
+    let handover = asked_handover(d, &session, group, boss).await;
     Client {
         session,
         agent,
@@ -130,7 +133,50 @@ async fn client(
         ticket,
         ask: ask.id,
         plan,
+        handover,
     }
+}
+
+/// A move of `session` out of `group` previewed, its note asked of `boss`.
+async fn asked_handover(d: &Desk, session: &SessionView, group: &str, boss: &str) -> uuid::Uuid {
+    use workforce_desk::moves::{
+        Choices, Effect, Handover, HandoverState, Item, MoveRow, MoveState,
+    };
+    let now = workforce_desk::crew::now();
+    let item = Item::Session(session.id);
+    let m = MoveRow {
+        id: uuid::Uuid::new_v4(),
+        item: item.clone(),
+        from_group: Some(group.into()),
+        to_group: None,
+        choices: Choices::default(),
+        effects: vec![Effect::Tell],
+        state: MoveState::Previewed,
+        expires_at: now + workforce_desk::moves::PREVIEW_FOR,
+        created_at: now,
+        done_at: None,
+    };
+    let h = Handover {
+        id: uuid::Uuid::new_v4(),
+        move_id: m.id,
+        item: item.key(),
+        from_group: Some(group.into()),
+        to_group: None,
+        from_boss: Some(boss.into()),
+        to_boss: Some("desk".into()),
+        note: "Handing over.".into(),
+        drafted_by: Party::desk(),
+        asked_until: Some(now + chrono::Duration::minutes(5)),
+        edited: false,
+        state: HandoverState::Draft,
+        created_at: now,
+        delivered_at: None,
+    };
+    d.store()
+        .add_move(&m, std::slice::from_ref(&h))
+        .await
+        .unwrap();
+    h.id
 }
 
 async fn clients(dir: &Path, pool: workforce_postgres::PostgresPool) -> Clients {
@@ -305,6 +351,16 @@ fn pointed_at(name: &str, other: &Client, dir: &Path) -> Vec<(Value, bool)> {
             json!({ "plan_id": other.plan.to_string(), "goal": "Ship it", "why": r }),
             true,
         )],
+        "crew.handover" => vec![
+            (
+                json!({ "handover_id": other.handover.to_string(), "note": "Mine now." }),
+                true,
+            ),
+            (
+                json!({ "handover_id": uuid::Uuid::new_v4().to_string(), "note": "Mine now." }),
+                true,
+            ),
+        ],
         other => {
             panic!("{other} is a crew tool with no case here: say how it is kept to its scope")
         }

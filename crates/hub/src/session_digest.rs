@@ -65,6 +65,7 @@ pub fn digest_source_eligible(
         && !crate::turn_extraction::leaves_no_memory(&s.channel)
         && !predecessor_ids.contains(&s.id) // already in the target's carry-over
         && !successor_prevs.contains(&s.id) // its successor candidate holds the carry-over
+        && !crate::memory_fence::left_behind(s) // a scope a boss left keeps its talk
 }
 
 /// Channel-type label — never raw ids ("where" attribution).

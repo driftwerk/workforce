@@ -818,7 +818,13 @@ impl Tool for NotesTool {
 
             "list_all_tasks" => {
                 let include_completed = input.include_completed.unwrap_or(false);
-                let all = mgr.list_all_session_tasks()?;
+                let mut all = mgr.list_all_session_tasks()?;
+                // A boss's tasks in a group it has left stay with that group.
+                if let Some(sessions) = &self.sessions {
+                    all.retain(|(sid, _)| {
+                        !matches!(sessions.get(sid), Ok(Some(s)) if s.left_behind())
+                    });
+                }
                 let mut visible_total = 0usize;
                 let mut total = 0usize;
                 let sessions: Vec<serde_json::Value> = all
@@ -1835,6 +1841,38 @@ mod tests {
         assert!(path.exists(), "daily note file should exist");
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(content.contains("Session notes without vector store"));
+    }
+
+    #[tokio::test]
+    async fn list_all_tasks_leaves_out_a_session_its_boss_left_behind() {
+        use workforce_common::session::{InMemorySessionStore, SessionStore as _};
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = Arc::new(InMemorySessionStore::new());
+        let mut left = sessions.get_or_create("desk", "u1", "sarah").unwrap();
+        left.metadata =
+            serde_json::json!({ workforce_common::session::LEFT_SCOPE_KEY: "desk-group:acme" });
+        sessions.save(&left).unwrap();
+        let kept = sessions.get_or_create("slack:C1", "u1", "sarah").unwrap();
+        let mgr = MemoryManager::new(dir.path());
+        let task = |d: &str| crate::hub_core::memory::SessionTask {
+            id: "1".into(),
+            description: d.into(),
+            status: crate::hub_core::memory::SessionTaskStatus::Active,
+            created_at: chrono::Utc::now(),
+            completed_at: None,
+        };
+        mgr.save_session_tasks(&left.id, &[task("acmecanary task")])
+            .unwrap();
+        mgr.save_session_tasks(&kept.id, &[task("atlas task")])
+            .unwrap();
+        let tool = NotesTool::new(dir.path().to_path_buf()).with_sessions(sessions.clone());
+        let out = tool
+            .execute(serde_json::json!({ "action": "list_all_tasks" }))
+            .await
+            .unwrap();
+        let said = out.output.to_string();
+        assert!(said.contains("atlas task"), "{said}");
+        assert!(!said.contains("acmecanary"), "{said}");
     }
 
     #[tokio::test]

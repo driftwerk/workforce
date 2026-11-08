@@ -3099,9 +3099,16 @@ pub(crate) async fn process_turn(
     // Everything after admission runs as the principal, so the post-run
     // tail (grounding, extraction, lessons, background compaction) and
     // its spawns see who the turn was for.
+    // Counted while it runs, and remembering under the scope its agent
+    // oversees as it begins (boss-gaps W8), whatever surface started it.
+    let _in_flight = crate::memory_fence::TurnInFlight::begin(&service.workspace);
     SessionContext {
         user_id: Some(principal.to_string()),
         agent_id: Some(service.agent_id.as_str().to_string()),
+        memory_fence: Some(crate::memory_fence::fence_for_turn(
+            &service.agent_id,
+            &service.workspace,
+        )),
         ..SessionContext::capture()
     }
     .scope(Box::pin(process_admitted(
@@ -5232,7 +5239,8 @@ pub(crate) async fn stream_admitted(
     // W8): a boss moved meanwhile tags none of this turn's writes as the
     // new scope's.
     let memory_fence_for_task =
-        crate::memory_fence::turn_fence(&service.agent_id, &service.workspace);
+        crate::memory_fence::fence_for_turn(&service.agent_id, &service.workspace);
+    let in_flight_for_task = crate::memory_fence::TurnInFlight::begin(&service.workspace);
     let handle = tokio::spawn(workforce_agent::runner::CURRENT_MEMORY_FENCE.scope(memory_fence_for_task, workforce_agent::runner::with_desk(desk_scope_for_task, CURRENT_BILLING_IDENTITY.scope(
         billing_identity_for_task.unwrap_or_default(),
         CURRENT_VOICE_CHANNEL.scope(
@@ -5254,6 +5262,7 @@ pub(crate) async fn stream_admitted(
                 // until every exit path of this task has run.
                 let _turn_claim = turn_claim;
                 let _turn_over = turn_over;
+                let _in_flight = in_flight_for_task;
                 let started_at = chrono::Utc::now();
                 // Cloned before the run consumes the runner's sender: the
                 // answer streams during the run, so the grounding block (nag

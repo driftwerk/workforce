@@ -611,6 +611,17 @@ impl Desk {
         self.change_layout_as(f, true).await
     }
 
+    /// [`Self::change_layout`] as the person asks it from the sidebar: one at
+    /// a time with confirmed moves, so a drag never lands in the middle of
+    /// one.
+    pub async fn change_layout_by_person(
+        &self,
+        f: impl FnOnce(&Layout) -> Result<Layout, DeskError>,
+    ) -> Result<Layout, DeskError> {
+        let _one = self.0.move_write.lock().await;
+        self.change_layout(f).await
+    }
+
     /// As [`Self::change_layout`]; with `fresh_ids`, a group new to the
     /// layout may not take an id a group had before. Only Desk's own first
     /// push of its layout may bring back ids it already had.

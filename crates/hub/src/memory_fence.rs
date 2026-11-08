@@ -128,6 +128,86 @@ impl FenceSource for ConfigFence {
     }
 }
 
+/// The turns running now, by their agent's workspace: every admitted turn
+/// (a person's, a heartbeat's, a monitor's, a scheduled job's, a check-in),
+/// whatever surface started it. A boss is moved only once its count is 0.
+static IN_FLIGHT: std::sync::LazyLock<Mutex<std::collections::HashMap<PathBuf, usize>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// One turn of the agent of a workspace, counted while it lives.
+pub(crate) struct TurnInFlight(PathBuf);
+
+impl TurnInFlight {
+    pub(crate) fn begin(workspace: &Path) -> Self {
+        *IN_FLIGHT.lock().entry(workspace.to_path_buf()).or_default() += 1;
+        Self(workspace.to_path_buf())
+    }
+}
+
+impl Drop for TurnInFlight {
+    fn drop(&mut self) {
+        let mut all = IN_FLIGHT.lock();
+        if let Some(n) = all.get_mut(&self.0) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                all.remove(&self.0);
+            }
+        }
+    }
+}
+
+/// How many turns the agent of `workspace` is running now.
+pub(crate) fn turns_in_flight(workspace: &Path) -> usize {
+    IN_FLIGHT.lock().get(workspace).copied().unwrap_or(0)
+}
+
+/// The fence a turn of `agent` starting now carries: the one it is inside
+/// already (a turn that runs another for the same agent), else its config's.
+pub(crate) fn fence_for_turn(agent: &AgentId, workspace: &Path) -> String {
+    workforce_agent::runner::CURRENT_MEMORY_FENCE
+        .try_with(|s| s.clone())
+        .ok()
+        .filter(|s| decode(s, agent).is_some())
+        .unwrap_or_else(|| turn_fence(agent, workspace))
+}
+
+/// The session metadata key a boss's conversations carry once it left the
+/// scope they were had in: the scope's tag.
+pub(crate) const LEFT_SCOPE: &str = workforce_common::session::LEFT_SCOPE_KEY;
+
+/// Whether `s` was had while its agent was the boss of a scope it has left
+/// since: never read again, nor recalled in a digest.
+pub(crate) fn left_behind(s: &workforce_common::session::Session) -> bool {
+    s.left_behind()
+}
+
+/// Every conversation of `sessions`' agent is left with the scope `tag` it
+/// leaves: marked as that scope's, and each one still open sealed with a
+/// fresh one in its place, so nothing said there is replayed in the next
+/// scope's turns. Returns how many were marked.
+pub(crate) fn leave_sessions(
+    sessions: &dyn workforce_common::session::SessionStore,
+    agent_id: &str,
+    tag: &str,
+) -> eyre::Result<usize> {
+    let mut marked = 0;
+    for shell in sessions.list(None, 100_000)? {
+        if shell.agent_id != agent_id || left_behind(&shell) {
+            continue;
+        }
+        // Only the mark is written: a turn's own save of the session never
+        // races a whole-session save of ours.
+        let mut mark = serde_json::Map::new();
+        mark.insert(LEFT_SCOPE.into(), serde_json::json!(tag));
+        sessions.merge_metadata(&shell.id, mark, &[])?;
+        if !shell.is_sealed() {
+            sessions.start_fresh(&shell.channel, &shell.owner, agent_id)?;
+        }
+        marked += 1;
+    }
+    Ok(marked)
+}
+
 /// `store` as the agent `agent` of `workspace` is handed it: fenced to its
 /// scope while it oversees.
 pub(crate) fn fenced(
@@ -145,6 +225,72 @@ pub(crate) fn fenced(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use workforce_agent::tools::Tool as _;
+    use workforce_common::session::{
+        InMemorySessionStore, Session, SessionContextType, SessionStore as _,
+    };
+
+    #[tokio::test]
+    async fn a_boss_leaving_a_scope_leaves_its_conversations_there_unread() {
+        let store = Arc::new(InMemorySessionStore::new());
+        let mut dm = store.get_or_create("desk", "person-1", "sarah").unwrap();
+        dm.context_type = Some(SessionContextType::Dm);
+        dm.add_user_message("the acmecanary pricing", None);
+        store.save(&dm).unwrap();
+        let mut slack = store
+            .get_or_create("slack:C1:T1", "person-1", "sarah")
+            .unwrap();
+        slack.add_user_message("acmecanary in Slack too", None);
+        store.save(&slack).unwrap();
+        let mut theirs = store.get_or_create("desk", "person-2", "mia").unwrap();
+        theirs.add_user_message("Mia's own", None);
+        store.save(&theirs).unwrap();
+
+        assert_eq!(
+            leave_sessions(store.as_ref(), "sarah", "desk-group:acme").unwrap(),
+            2
+        );
+        assert_eq!(
+            leave_sessions(store.as_ref(), "sarah", "desk-group:acme").unwrap(),
+            2,
+            "the fresh ones are marked on a second leave, never the old twice"
+        );
+        let old = store.get(&dm.id).unwrap().unwrap();
+        assert!(old.is_sealed() && left_behind(&old));
+        let now = store.find("desk", "person-1").unwrap();
+        let now = now.filter(|s| s.agent_id == "sarah");
+        // The DM goes on in a fresh conversation, with none of Acme's.
+        if let Some(fresh) = now {
+            assert_ne!(fresh.id, dm.id);
+            assert!(fresh
+                .messages
+                .iter()
+                .all(|m| !m.content.contains("acmecanary")));
+        }
+        assert!(
+            !left_behind(&store.get(&theirs.id).unwrap().unwrap()),
+            "only Sarah's"
+        );
+        // Never digested into the next DM, nor found by her own search.
+        let target = Session::new("desk", "person-1", "sarah");
+        assert!(!crate::session_digest::digest_source_eligible(
+            &old,
+            &target,
+            "sarah",
+            chrono::DateTime::<chrono::Utc>::MIN_UTC,
+            &Default::default(),
+            &Default::default(),
+        ));
+        let tool = crate::sessions_tool::SessionsTool::new(store.clone());
+        let out = workforce_agent::runner::CURRENT_USER_ID
+            .scope("person-1".to_string(), async {
+                tool.execute(serde_json::json!({ "action": "search", "query": "acmecanary" }))
+                    .await
+                    .unwrap()
+            })
+            .await;
+        assert_eq!(out.output["count"].as_u64(), Some(0), "{}", out.output);
+    }
 
     #[test]
     fn a_boss_is_fenced_to_its_scope_and_anyone_else_is_open() {
@@ -203,6 +349,23 @@ mod tests {
             .scope(began.clone(), async { fence.fence() })
             .await;
         assert_eq!(seen, Fence::Boss("desk-group:g-acme".into()));
+        // A turn begun inside another of the same agent's keeps the outer
+        // one's fence; one begun fresh reads the config.
+        let inner = workforce_agent::runner::CURRENT_MEMORY_FENCE
+            .scope(began.clone(), async { fence_for_turn(&sarah, dir.path()) })
+            .await;
+        assert_eq!(inner, began);
+        assert_eq!(
+            fence_for_turn(&sarah, dir.path()),
+            encode(&sarah, &Fence::Boss("desk-group:g-atlas".into()))
+        );
+        // A turn counts while it lives.
+        {
+            let _one = TurnInFlight::begin(dir.path());
+            let _two = TurnInFlight::begin(dir.path());
+            assert_eq!(turns_in_flight(dir.path()), 2);
+        }
+        assert_eq!(turns_in_flight(dir.path()), 0);
         // Another agent's turn says nothing of this one's.
         let mias = encode(&AgentId::new("mia"), &Fence::Open);
         let seen = workforce_agent::runner::CURRENT_MEMORY_FENCE
