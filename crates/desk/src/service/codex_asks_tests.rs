@@ -113,6 +113,7 @@ async fn codex_asks_are_answered_from_desk_and_go_when_answered_anywhere() {
                 pricer: None,
                 redactor: None,
                 index: None,
+                deriver: None,
             },
             CancellationToken::new(),
         )
@@ -271,6 +272,7 @@ async fn a_codex_question_shows_its_words_until_the_terminal_answers_it() {
                 pricer: None,
                 redactor: None,
                 index: None,
+                deriver: None,
             },
             CancellationToken::new(),
         )

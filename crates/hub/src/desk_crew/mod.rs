@@ -228,10 +228,10 @@ pub(crate) fn closing(service: &AgentService, body: &str) -> Option<String> {
 
 /// The write [`closing`] closed `group` for didn't happen: opened again,
 /// past and all, unless a config names it.
-pub(crate) fn not_closed(service: &AgentService, group: &str) {
+pub(crate) async fn not_closed(service: &AgentService, group: &str) {
     if let Some(crew) = for_service(service) {
         if !crew.named_on_disk(None).iter().any(|g| g == group) {
-            crew.desk.forget_bound(group);
+            crew.desk.forget_bound(group).await;
         }
     }
 }
@@ -593,6 +593,19 @@ impl Crew for CrewHub {
     /// admission, hot reload), so the group opens to the main overseer from
     /// now on: before it is deleted.
     async fn release_group(&self, group: &str) -> Result<(), String> {
+        // First agents the hub doesn't serve now whose config still names
+        // it, so taking a served boss off below finds nothing else naming it.
+        for u in crate::agent_config_write::unserved_beside(&self.services()) {
+            crate::agent_config_write::unname_unserved(&u, self.state.def_store.as_deref(), group)
+                .await
+                .map_err(|e| {
+                    if e.starts_with(&format!("{}'s", u.who())) {
+                        e
+                    } else {
+                        format!("{} still names this group for its boss: {e}", u.who())
+                    }
+                })?;
+        }
         for s in self.services() {
             if named_group(&s.workspace).as_deref() != Some(group) {
                 continue;
@@ -620,6 +633,10 @@ impl Crew for CrewHub {
             )
             .await
             .map_err(|e| format!("{} still oversees this group: {e}", name_of(&s)))?;
+        }
+        // Named by no one now: open from now on, whoever was its boss.
+        if !self.named_on_disk(None).iter().any(|g| g == group) {
+            self.desk.unbound_group(group).await;
         }
         Ok(())
     }

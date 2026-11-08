@@ -110,7 +110,7 @@ async fn save_over(
     #[cfg(feature = "postgres")]
     if saved.is_err() {
         if let Some(g) = &closed {
-            crate::desk_crew::not_closed(service, g);
+            crate::desk_crew::not_closed(service, g).await;
         }
     }
     let saved = saved?;
@@ -235,6 +235,191 @@ pub(crate) async fn one_overseer(keep: &AgentService, store: Option<&WorkflowSto
             Err(e) => tracing::warn!(agent_id = %id, error = %e, "Could not switch oversight off"),
         }
     }
+    // An agent the hub doesn't serve now, whose config still names the
+    // group, would keep it closed to everyone: its name goes too.
+    if let workforce_common::oversight::Scope::Group(g) = &mine {
+        for u in unserved_beside(&registry.all_services()) {
+            if let Err(e) = unname_unserved(&u, store, g).await {
+                tracing::warn!(workspace = %u.workspace.display(), error = %e, "Could not take a group off an agent's config");
+            }
+        }
+    }
+}
+
+/// An agent workspace beside the served ones that the hub doesn't serve
+/// now, and the agent's id when it can be told.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Unserved {
+    pub workspace: std::path::PathBuf,
+    /// From the hub's own config when it lists an agent there; else the
+    /// folder's name where the folders beside it are named after their
+    /// agents (`{data_dir}/agents/{id}`); else unknown.
+    pub id: Option<String>,
+}
+
+impl Unserved {
+    /// What the agent is called in words: its id, else its folder's name.
+    pub fn who(&self) -> String {
+        self.id.clone().unwrap_or_else(|| {
+            self.workspace
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        })
+    }
+}
+
+/// Every agent workspace beside the `served` agents' (the folders they sit
+/// in, as Desk's crew scans for the groups named for a boss), the served
+/// ones left out, and only folders holding an agent's config, so nothing
+/// else there is touched.
+pub(crate) fn unserved_beside(served: &[std::sync::Arc<AgentService>]) -> Vec<Unserved> {
+    let workspaces: Vec<&Path> = served.iter().map(|s| s.workspace.as_path()).collect();
+    let mut dirs: Vec<&Path> = workspaces.iter().filter_map(|w| w.parent()).collect();
+    dirs.sort();
+    dirs.dedup();
+    let mut out = Vec::new();
+    for dir in dirs {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            let path = e.path();
+            if !path.is_dir() || workspaces.contains(&path.as_path()) || !agent_config_in(&path) {
+                continue;
+            }
+            let id = agent_id_of(&path, served);
+            out.push(Unserved {
+                workspace: path,
+                id,
+            });
+        }
+    }
+    out.sort_by(|a, b| a.workspace.cmp(&b.workspace));
+    out
+}
+
+/// Whether `workspace` holds an agent's config.toml: a TOML table. Not
+/// whether the agent would load it: one that wouldn't still keeps a group it
+/// names closed (as Desk's crew reads it), so it must still be found.
+fn agent_config_in(workspace: &Path) -> bool {
+    let path = workspace.join(config_files::WORKSPACE_CONFIG);
+    config_files::read(&path)
+        .ok()
+        .flatten()
+        .is_some_and(|body| toml::from_str::<toml::Table>(&body).is_ok())
+}
+
+/// The agent id of the unserved workspace `path`: the hub's config's agent
+/// whose workspace it is; else its folder's name, where every served agent
+/// in the same folder is named after its id.
+pub(crate) fn agent_id_of(path: &Path, served: &[std::sync::Arc<AgentService>]) -> Option<String> {
+    let same = |a: &Path, b: &Path| match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    };
+    for s in served {
+        let base = s
+            .config_path
+            .as_deref()
+            .and_then(Path::parent)
+            .unwrap_or(Path::new("."));
+        for a in &s.config.agents {
+            if let Some(w) = &a.workspace {
+                let w = Path::new(w);
+                let w = if w.is_absolute() {
+                    w.to_path_buf()
+                } else {
+                    base.join(w)
+                };
+                if same(&w, path) {
+                    return Some(a.id.clone());
+                }
+            }
+        }
+    }
+    let dir = path.parent()?;
+    let beside: Vec<_> = served
+        .iter()
+        .filter(|s| s.workspace.parent() == Some(dir))
+        .collect();
+    let named_after_ids = !beside.is_empty()
+        && beside.iter().all(|s| {
+            s.workspace
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .as_deref()
+                == Some(s.agent_id.as_str())
+        });
+    named_after_ids
+        .then(|| path.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .flatten()
+}
+
+/// Why the config at `path` can't be written now: it was changed outside
+/// the hub and that change waits on the person, or it changed since `seen`
+/// was read.
+fn unchanged_since(path: &Path, seen: &str) -> Result<(), String> {
+    if config_files::changed_elsewhere(path)
+        .map_err(|e| e.to_string())?
+        .is_some()
+    {
+        return Err("it was changed outside the hub, and that change waits on you".into());
+    }
+    if config_files::read(path).ok().flatten().as_deref() != Some(seen) {
+        return Err("it changed meanwhile".into());
+    }
+    Ok(())
+}
+
+/// The config of `u`, an agent the hub doesn't serve, switched off and
+/// naming no group when it names `group`. Checked unchanged (and with no
+/// change waiting from outside the hub) before anything is recorded, then
+/// recorded as a revision under its agent id when that is known, then
+/// written under the workspace's lock, only over what was read.
+pub(crate) async fn unname_unserved(
+    u: &Unserved,
+    store: Option<&WorkflowStore>,
+    group: &str,
+) -> Result<bool, String> {
+    use workforce_common::settings::AgentWorkspaceConfig;
+    let path = u.workspace.join(config_files::WORKSPACE_CONFIG);
+    let Some(current) = config_files::read(&path).map_err(|e| e.to_string())? else {
+        return Ok(false);
+    };
+    if named_in(&current).as_deref() != Some(group) {
+        return Ok(false);
+    }
+    let off = oversight_off(&current).ok_or_else(|| {
+        format!(
+            "{}'s settings file ({}) has a mistake in it. Fix its [oversight] section, or take the group out of it, and try again.",
+            u.who(),
+            path.display()
+        )
+    })?;
+    AgentWorkspaceConfig::locked(&u.workspace, || unchanged_since(&path, &current))?;
+    match &u.id {
+        Some(id) => {
+            record_revision(
+                store,
+                KIND_AGENT_CONFIG,
+                id,
+                &path,
+                &off,
+                EditContext::new("oversight", None),
+            )
+            .await?;
+        }
+        None => {
+            tracing::warn!(workspace = %u.workspace.display(), "No agent id for this workspace: its change is not kept as a revision")
+        }
+    }
+    AgentWorkspaceConfig::locked(&u.workspace, || {
+        unchanged_since(&path, &current)?;
+        config_files::replace_over(&path, off.as_bytes(), Over::Ours).map_err(|e| e.to_string())
+    })?;
+    tracing::info!(workspace = %u.workspace.display(), group, "A group's name taken off an agent the hub doesn't serve");
+    Ok(true)
 }
 
 async fn save_one(
@@ -666,6 +851,95 @@ pub async fn record_revision(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn with_store<F, Fut>(test: F)
+    where
+        F: FnOnce(std::sync::Arc<WorkflowStore>) -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        workforce_postgres::test_support::with_test_pool(
+            WorkflowStore::build_pool,
+            |pool| async move { test(WorkflowStore::new(pool).await.expect("store")).await },
+        )
+        .await;
+    }
+
+    fn unserved(dir: &Path, id: Option<&str>, body: &str) -> Unserved {
+        let workspace = dir.join("ghost");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(workspace.join(config_files::WORKSPACE_CONFIG), body).unwrap();
+        Unserved {
+            workspace,
+            id: id.map(str::to_string),
+        }
+    }
+
+    const NAMES_ACME: &str = "[oversight]\nenabled = false\ngroup = \"g-acme\"\nlevel = \"act\"\n";
+
+    #[tokio::test]
+    async fn an_unserved_agents_group_is_taken_off_as_a_revision_under_its_id() {
+        with_store(|store| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let u = unserved(dir.path(), Some("ghost"), NAMES_ACME);
+            assert_eq!(
+                unname_unserved(&u, Some(&store), "g-other").await,
+                Ok(false)
+            );
+            assert_eq!(unname_unserved(&u, Some(&store), "g-acme").await, Ok(true));
+            let now =
+                std::fs::read_to_string(u.workspace.join(config_files::WORKSPACE_CONFIG)).unwrap();
+            assert_eq!(named_in(&now), None);
+            assert!(now.contains("level = \"act\""));
+            let latest = store
+                .latest_revision_hash(KIND_AGENT_CONFIG, "ghost", None)
+                .await
+                .unwrap();
+            assert_eq!(latest, Some(content_hash(&now)));
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_refused_write_to_an_unserved_agent_leaves_no_revision() {
+        with_store(|store| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let u = unserved(dir.path(), Some("ghost"), NAMES_ACME);
+            let path = u.workspace.join(config_files::WORKSPACE_CONFIG);
+            // The hub holds the file as it read it; a change made outside
+            // it waits on the person.
+            config_files::guard(&path).unwrap();
+            std::fs::write(&path, format!("{NAMES_ACME}# edited by hand\n")).unwrap();
+            let refused = unname_unserved(&u, Some(&store), "g-acme")
+                .await
+                .unwrap_err();
+            assert!(refused.contains("changed outside the hub"), "{refused}");
+            assert!(store
+                .list_revisions(KIND_AGENT_CONFIG, "ghost", None)
+                .await
+                .unwrap()
+                .is_empty());
+            assert!(std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("edited by hand"));
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn an_unserved_agent_whose_id_isnt_known_is_written_without_a_revision() {
+        with_store(|store| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let u = unserved(dir.path(), None, NAMES_ACME);
+            assert_eq!(u.who(), "ghost");
+            assert_eq!(unname_unserved(&u, Some(&store), "g-acme").await, Ok(true));
+            assert!(store
+                .list_revisions(KIND_AGENT_CONFIG, "ghost", None)
+                .await
+                .unwrap()
+                .is_empty());
+        })
+        .await;
+    }
 
     #[test]
     fn a_change_to_the_agents_connectors_is_in_the_revision_details() {

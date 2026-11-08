@@ -71,6 +71,9 @@ mod ledger;
 #[cfg(test)]
 mod lifecycle_tests;
 mod memory;
+mod memory_derive;
+#[cfg(test)]
+mod memory_derive_tests;
 mod memory_index;
 #[cfg(test)]
 mod memory_index_tests;
@@ -98,6 +101,7 @@ pub use breaker::{
 pub use ledger::{LedgerPage, SpendQuery};
 pub use line::{LineError, Sender, SessionMcp};
 pub use memory::{MemoryHitView, MemorySearch, SessionMemory};
+pub use memory_derive::ItemChange;
 pub use terminals::{NewTerminal, TerminalPatch, TerminalRecord, TerminalState, TerminalView};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -717,6 +721,9 @@ pub struct Floor {
     /// Session memory's search index: the hub's vellev node. Without one,
     /// what Desk remembers is searched by keyword only.
     pub index: Option<Arc<dyn crate::memory::index::MemoryIndex>>,
+    /// Notes decisions, facts and to-dos from sessions: the hub's cheap
+    /// model. Without one, nothing is noted.
+    pub deriver: Option<Arc<dyn crate::memory::derive::Deriver>>,
 }
 
 /// How long the hub's model may take to read whether a turn's reply asks
@@ -802,6 +809,8 @@ struct Inner {
     ledger: ledger::LedgerRun,
     /// Session memory's search index and its worker.
     index: memory_index::IndexRun,
+    /// Session memory's notes and their worker.
+    derive: memory_derive::DeriveRun,
     /// Reads a turn's last reply where the rules can't tell whether it
     /// asks: the hub's crew, once its routes are mounted.
     reader: Mutex<Option<Weak<dyn crew::Crew>>>,
@@ -1452,6 +1461,7 @@ impl Desk {
             restoring_since: Mutex::new(restoring_since),
             ledger,
             index: memory_index::IndexRun::new(floor.index.clone()),
+            derive: memory_derive::DeriveRun::new(floor.deriver.clone()),
             reader: Mutex::new(None),
             read_wait: Mutex::new(READ_LATER),
             accounts_moving: tokio::sync::Mutex::new(()),
@@ -1472,6 +1482,7 @@ impl Desk {
         tokio::spawn(desk.clone().look_for_sign_ins());
         tokio::spawn(desk.clone().ledger_loop(ledger_jobs));
         tokio::spawn(desk.clone().index_loop());
+        tokio::spawn(desk.clone().derive_loop());
         desk.breaker_load().await;
         tokio::spawn(desk.clone().breaker_loop());
         desk.charge_load().await;
@@ -6610,6 +6621,7 @@ mod tests {
                     pricer: None,
                     redactor: None,
                     index: None,
+                    deriver: None,
                 },
                 CancellationToken::new(),
             )
@@ -6770,6 +6782,7 @@ mod tests {
                     pricer: None,
                     redactor: None,
                     index: None,
+                    deriver: None,
                 },
                 CancellationToken::new(),
             )
@@ -6898,6 +6911,7 @@ mod tests {
                 pricer: None,
                 redactor: None,
                 index: None,
+                deriver: None,
             };
             let d = Desk::start(
                 DeskStore::from_pool(pool.clone()),
@@ -7012,6 +7026,7 @@ mod tests {
                     pricer: None,
                     redactor: None,
                     index: None,
+                    deriver: None,
                 },
                 CancellationToken::new(),
             )
@@ -7136,6 +7151,7 @@ mod tests {
                     pricer: None,
                     redactor: None,
                     index: None,
+                    deriver: None,
                 },
                 CancellationToken::new(),
             )
@@ -7451,6 +7467,7 @@ mod tests {
                     pricer: None,
                     redactor: None,
                     index: None,
+                    deriver: None,
                 },
                 CancellationToken::new(),
             )
@@ -8235,6 +8252,7 @@ mod tests {
                     pricer: None,
                     redactor: None,
                     index: None,
+                    deriver: None,
                 },
                 CancellationToken::new(),
             )
@@ -8297,6 +8315,7 @@ mod tests {
                     pricer: None,
                     redactor: None,
                     index: None,
+                    deriver: None,
                 },
                 CancellationToken::new(),
             )
@@ -8364,6 +8383,7 @@ mod tests {
                 pricer: None,
                 redactor: None,
                 index: None,
+                deriver: None,
             },
             CancellationToken::new(),
         )

@@ -75,6 +75,9 @@ pub struct SessionMemory {
     /// What else the person should know of it, in plain words: that its
     /// oldest exchanges are past what the search index holds.
     pub notice: Option<String>,
+    /// Its decisions, facts and to-dos still held, and whether Desk is
+    /// noting them.
+    pub notes: super::memory_derive::Notes,
 }
 
 /// What the panel says of a session past its cap.
@@ -246,6 +249,7 @@ impl Desk {
                     q: q.q.clone(),
                     group: q.group.clone(),
                     session: q.session,
+                    kinds: q.kinds.clone(),
                     limit: usize::try_from(q.limit.clamp(1, SEARCH_MAX)).unwrap_or(1),
                     tool: "search",
                     ..Default::default()
@@ -256,6 +260,14 @@ impl Desk {
             .hits
             .into_iter()
             .map(|(r, _)| MemoryHit {
+                kind: match (&r.item, r.compaction) {
+                    (Some(i), _) => i.kind.as_str(),
+                    (None, true) => "compaction",
+                    (None, false) => "exchange",
+                },
+                noted_by_desk: r.item.as_ref().is_some_and(|i| i.noted),
+                confirmed: r.item.as_ref().is_some_and(|i| i.confirmed),
+                superseded: r.item.as_ref().is_some_and(|i| i.superseded),
                 session: r.session,
                 group: r.group,
                 project: r.project,
@@ -329,7 +341,9 @@ impl Desk {
             if self.0.store.memory_names(&[id]).await?.is_empty() && counts.exchanges == 0 {
                 return Err(DeskError::NotFound);
             }
+            let group = self.0.store.latest_group(id).await?;
             return Ok(SessionMemory {
+                notes: self.session_notes(id, group.as_deref()).await?,
                 exchanges,
                 notice: past_cap_notice(&counts),
                 counts,
@@ -353,6 +367,9 @@ impl Desk {
             self.why_not(&r, &records).await.err().map(Why::said)
         };
         Ok(SessionMemory {
+            notes: self
+                .session_notes(id, self.notes_group(id).as_deref())
+                .await?,
             exchanges,
             notice: past_cap_notice(&counts),
             counts,
