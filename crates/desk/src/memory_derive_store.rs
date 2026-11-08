@@ -553,6 +553,14 @@ impl DeskStore {
     pub async fn correct_item(&self, id: Uuid, text: &str) -> Result<Option<Uuid>> {
         let mut client = self.pool().get().await?;
         let tx = client.transaction().await?;
+        // As forgetting locks: the session's queue row before its notes, so
+        // a correction is either seen by a forget or finds its note gone.
+        tx.execute(
+            "SELECT 1 FROM memory_derive WHERE session = \
+               (SELECT session FROM memory_items WHERE id = $1) FOR SHARE",
+            &[&id],
+        )
+        .await?;
         let held = tx
             .query_opt(
                 "SELECT 1 FROM memory_items WHERE id = $1 AND valid_to IS NULL FOR UPDATE",
