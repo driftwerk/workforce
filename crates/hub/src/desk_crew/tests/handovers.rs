@@ -99,6 +99,14 @@ async fn a_moved_boss_keeps_its_old_groups_memories_out_of_the_new_one_and_repla
             .any(|m| m.content == "acmecanary learned in Acme"
                 && m.tags.contains(&group_tag(Some("acme")))));
 
+        // Her DM with the person holds Acme's talk.
+        let mut dm = sarah
+            .sessions
+            .get_or_create(DESK_CHANNEL, PERSON, "sarah")
+            .unwrap();
+        dm.add_user_message("acmecanary: the Acme pricing", None);
+        sarah.sessions.save(&dm).unwrap();
+
         // Into Atlas, which has Mia: refused until the person says replace.
         let refused =
             workforce_desk::crew::Crew::move_boss(crew.as_ref(), "sarah", Some("atlas"), false)
@@ -113,6 +121,15 @@ async fn a_moved_boss_keeps_its_old_groups_memories_out_of_the_new_one_and_repla
         })
         .await;
         assert!(d.scope_of_boss("mia").is_none(), "Mia stops overseeing");
+        // Her DM goes on fresh: Acme's talk stays behind, unread.
+        let now = sarah.sessions.find(DESK_CHANNEL, PERSON).unwrap();
+        assert!(now.as_ref().is_none_or(|s| s.id != dm.id));
+        assert!(now
+            .iter()
+            .flat_map(|s| s.messages.iter())
+            .all(|m| !m.content.contains("acmecanary")));
+        let old = sarah.sessions.get(&dm.id).unwrap().unwrap();
+        assert!(old.is_sealed() && crate::memory_fence::left_behind(&old));
         // Nothing of Acme's, tagged or from before, reaches her in Atlas.
         assert!(recalled(&sarah, "acmecanary").await.is_empty());
         assert!(raw

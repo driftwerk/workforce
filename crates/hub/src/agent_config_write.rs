@@ -225,7 +225,13 @@ async fn keep_memory_to_scope(
         return Ok(());
     }
     let Some(store) = service.memory_store.as_ref() else {
-        return Ok(());
+        return crate::memory_fence::leave_sessions(
+            service.sessions.as_ref(),
+            service.agent_id.as_str(),
+            &left,
+        )
+        .map(drop)
+        .map_err(|e| Refused::Io(format!("{e:#}")));
     };
     match store
         .add_tag(&service.agent_id, &left, GROUP_TAG_PREFIX)
@@ -233,7 +239,20 @@ async fn keep_memory_to_scope(
     {
         Ok(tagged) => {
             tracing::info!(agent_id = %service.agent_id, scope = %left, tagged = tagged.len(), "A boss's memory is kept to the scope it leaves");
-            Ok(())
+            // Its conversations too: none is carried on, digested or
+            // searched in the next scope.
+            crate::memory_fence::leave_sessions(
+                service.sessions.as_ref(),
+                service.agent_id.as_str(),
+                &left,
+            )
+            .map(drop)
+            .map_err(|e| {
+                Refused::Io(format!(
+                    "{}'s conversations couldn't be left with the group it leaves, so its settings weren't changed: {e:#}",
+                    service.agent_id
+                ))
+            })
         }
         Err(e) => Err(Refused::Io(format!(
             "what {} remembered couldn't be kept to the group it leaves, so its settings weren't changed: {e:#}",

@@ -266,10 +266,13 @@ impl SessionsTool {
     }
 
     /// The one scope rule both actions apply: the caller's own sessions,
-    /// never an eval's.
+    /// never an eval's, nor one a boss left behind in a scope it no longer
+    /// oversees.
     fn scope(&self, session_id: &str, identity_id: &str) -> Scope {
         match self.sessions.get(session_id) {
             Ok(Some(s)) if crate::turn_extraction::is_eval_channel(&s.channel) => Scope::Eval,
+            // Had while a boss in a scope it has left: that scope's.
+            Ok(Some(s)) if crate::memory_fence::left_behind(&s) => Scope::Eval,
             Ok(Some(s)) if s.owner == identity_id => Scope::Visible,
             Ok(Some(_)) => Scope::OtherUser,
             _ => Scope::Missing,
