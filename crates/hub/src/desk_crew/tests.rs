@@ -2019,6 +2019,7 @@ mod floor {
                         pricer: None,
                         redactor: None,
                         index: None,
+                        deriver: None,
                     },
                 )
                 .await;
