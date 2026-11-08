@@ -65,10 +65,12 @@ pub struct MemoryQuery {
     /// Only one group's (`Some(None)`: only ungrouped sessions').
     pub group: Option<Option<String>>,
     pub session: Option<Uuid>,
+    /// Only these kinds of exchanges and notes; all when none.
+    pub kinds: Option<Vec<crate::memory::passage::PassageKind>>,
     pub limit: i64,
 }
 
-/// An exchange a search found.
+/// An exchange or a note a search found.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MemoryHit {
@@ -77,9 +79,23 @@ pub struct MemoryHit {
     pub project: String,
     pub at: DateTime<Utc>,
     pub asker: Asker,
+    /// A note's is empty.
     pub ask: String,
+    /// A note's text.
     pub answer: String,
     pub compaction: bool,
+    /// `exchange`, `compaction`, `decision`, `fact` or `todo`.
+    pub kind: &'static str,
+    /// A note Desk's model wrote, which may be wrong.
+    pub noted_by_desk: bool,
+    /// A note the person confirmed or wrote.
+    pub confirmed: bool,
+    /// A note another replaced.
+    pub superseded: bool,
+}
+
+fn exchange_kind() -> &'static str {
+    "exchange"
 }
 
 /// An exchange as a session's memory lists it.
@@ -527,6 +543,10 @@ impl DeskStore {
                     ask: r.try_get(5)?,
                     answer: r.try_get(6)?,
                     compaction: r.try_get(7)?,
+                    kind: exchange_kind(),
+                    noted_by_desk: false,
+                    confirmed: false,
+                    superseded: false,
                 })
             })
             .collect()

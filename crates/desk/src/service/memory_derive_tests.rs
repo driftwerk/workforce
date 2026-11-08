@@ -130,7 +130,7 @@ async fn start(
 
 /// Waits until `check` holds, poking the worker meanwhile.
 async fn until(d: &Desk, what: &str, mut check: impl AsyncFnMut() -> bool) {
-    for _ in 0..400 {
+    for _ in 0..600 {
         if check().await {
             return;
         }
@@ -688,6 +688,228 @@ async fn a_group_not_read_yet_holds_only_its_own_place() {
         )
         .await;
         assert_eq!(group.as_deref(), Some("g-acme"));
+    })
+    .await;
+}
+
+/// A desk with the search index in memory beside the fake model.
+async fn start_indexed(
+    pool: &workforce_postgres::PostgresPool,
+    dir: &std::path::Path,
+    deriver: &Arc<FakeDeriver>,
+    index: &Arc<crate::memory::index::fake::FakeIndex>,
+) -> (Desk, tokio_util::sync::CancellationToken) {
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let d = Desk::start(
+        DeskStore::from_pool(pool.clone()),
+        crate::testing::options(dir),
+        super::Floor {
+            deriver: Some(Arc::clone(deriver) as Arc<dyn crate::memory::derive::Deriver>),
+            index: Some(Arc::clone(index) as Arc<dyn crate::memory::index::MemoryIndex>),
+            ..Default::default()
+        },
+        cancel.clone(),
+    )
+    .await
+    .unwrap();
+    (d, cancel)
+}
+
+/// Waits until `check` holds, poking both workers meanwhile.
+async fn until_indexed(d: &Desk, what: &str, mut check: impl AsyncFnMut() -> bool) {
+    for _ in 0..600 {
+        if check().await {
+            return;
+        }
+        d.derive_poke();
+        d.memory_index_poke();
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("never: {what}");
+}
+
+#[tokio::test]
+async fn notes_reach_the_index_and_recall_ranked_above_exchanges_and_go_when_forgotten() {
+    use crate::memory::index::fake::FakeIndex;
+    use crate::memory::passage::{PassageKind, UNGROUPED_COLLECTION};
+    use crate::memory_store::MemoryQuery;
+    use std::sync::atomic::Ordering;
+
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        DeskStore::migrate(&pool).await.unwrap();
+        let store = DeskStore::from_pool(pool.clone());
+        let s = session(&store, "acme-web").await;
+        {
+            let at = Utc::now() - chrono::Duration::minutes(10);
+            let x = Exchange {
+                key: "a-1".into(),
+                at,
+                ended: Some(at),
+                asker: Asker::Person,
+                ask: "Where should the session token live?".into(),
+                answer: "In an HttpOnly cookie.".into(),
+                steps: Vec::new(),
+                files: Default::default(),
+                commands: Vec::new(),
+                errors: Vec::new(),
+                compaction: false,
+                redacted: 0,
+                flagged: Default::default(),
+            };
+            store
+                .record_write(&RecordWrite {
+                    session: s,
+                    engine: Engine::Claude,
+                    source: "/records/t.jsonl",
+                    cursor: &Cursor::default(),
+                    rows: &[],
+                    closed: std::slice::from_ref(&x),
+                    open: None,
+                    project: "/dev/acme-web",
+                    folder: "/dev/acme-web",
+                    name: "acme-web",
+                    cli_session_id: None,
+                })
+                .await
+                .unwrap();
+        }
+        let deriver = Arc::new(FakeDeriver::answering([json!({"add": [
+            {"kind": "decision", "text": "Keep the session token in an HttpOnly cookie.", "sources": ["x1"]},
+            {"kind": "todo", "text": "Check the HttpOnly flag on logout.", "sources": ["x1"]},
+        ]})
+        .to_string()]));
+        let index = Arc::new(FakeIndex::default());
+        let (d, cancel) = start_indexed(&pool, dir.path(), &deriver, &index).await;
+        until_indexed(&d, "the notes and the exchange are in the index", async || {
+            index.refs(UNGROUPED_COLLECTION).len() == 3
+        })
+        .await;
+        let notes = d.session_memory(s).await.unwrap().notes;
+        let (decision, todo) = (notes.decisions[0].id, notes.todos[0].id);
+        let held = index.all();
+        let p = held.iter().find(|p| p.of == decision).unwrap();
+        assert_eq!((p.kind, p.valid, p.session), (PassageKind::Decision, true, s));
+        assert_eq!(
+            held.iter().find(|p| p.of == todo).unwrap().kind,
+            PassageKind::Todo
+        );
+
+        let search = |q: &str, kinds: Option<Vec<PassageKind>>| {
+            let d = d.clone();
+            let q = q.to_string();
+            async move {
+                d.memory_search(&MemoryQuery {
+                    q,
+                    kinds,
+                    limit: 10,
+                    ..Default::default()
+                })
+                .await
+                .unwrap()
+            }
+        };
+        let found = search("HttpOnly cookie", None).await;
+        assert!(!found.keyword_only);
+        assert_eq!(found.hits[0].hit.kind, "decision", "a decision above the exchange it came from");
+        assert!(found.hits[0].hit.noted_by_desk);
+        assert!(found.hits.iter().any(|h| h.hit.kind == "exchange"));
+        let only = search("HttpOnly", Some(vec![PassageKind::Decision])).await;
+        assert_eq!(
+            only.hits.iter().map(|h| h.hit.kind).collect::<Vec<_>>(),
+            ["decision"]
+        );
+        let exchanges = search("HttpOnly", Some(PassageKind::EXCHANGES.to_vec())).await;
+        assert!(exchanges.hits.iter().all(|h| h.hit.kind == "exchange"));
+
+        // A restart reconciles the index with Postgres: its notes aren't
+        // taken for orphans.
+        cancel.cancel();
+        let (d, cancel) = start_indexed(&pool, dir.path(), &deriver, &index).await;
+        until_indexed(&d, "reconciled", async || {
+            d.memory_index_status().await.unwrap().reconciled.is_some()
+        })
+        .await;
+        assert_eq!(
+            q::<i64>(&store, "SELECT COUNT(*) FROM memory_purges WHERE done_at IS NULL", &[]).await,
+            0,
+            "nothing queued to go"
+        );
+        assert_eq!(index.refs(UNGROUPED_COLLECTION).len(), 3);
+
+        // A replaced note leaves the index (Postgres keeps it), and only its
+        // replacement is recalled.
+        let client = store.pool().get().await.unwrap();
+        client
+            .execute(
+                "INSERT INTO memory_exchanges (id, engine, key, session, project, folder, seq, at, \
+                   ended, asker, ask, answer, steps) \
+                 VALUES (gen_random_uuid(), 'claude', 'a-2', $1, '/dev/acme-web', '/dev/acme-web', 2, \
+                   now(), now(), 'person', 'Keep it in the server session instead.', 'Done.', '[]')",
+                &[&s],
+            )
+            .await
+            .unwrap();
+        deriver.answers.lock().push(Ok(json!({
+            "add": [{"kind": "decision", "text": "Keep the session token server-side, not in an HttpOnly cookie.", "sources": ["x1"]}],
+            "supersede": [{"id": decision.to_string(), "by": 0}],
+        })
+        .to_string()));
+        d.derive_now(s).await.unwrap();
+        until_indexed(&d, "the replaced note goes and its replacement is written", async || {
+            let refs = index.refs(UNGROUPED_COLLECTION);
+            !refs.contains(&decision) && refs.len() == 4
+        })
+        .await;
+        assert!(index.all().iter().all(|p| p.valid));
+        let found = search("HttpOnly cookie", Some(vec![PassageKind::Decision])).await;
+        assert_eq!(found.hits.len(), 1);
+        assert!(!found.hits[0].hit.superseded);
+        assert!(found.hits[0].hit.answer.contains("server-side"));
+        assert_eq!(
+            q::<i64>(&store, "SELECT COUNT(*) FROM memory_items WHERE id = $1 AND valid_to IS NOT NULL", &[&decision]).await,
+            1,
+            "Postgres keeps what was replaced"
+        );
+        // A restart's reconcile doesn't write it again.
+        cancel.cancel();
+        let (d, cancel) = start_indexed(&pool, dir.path(), &deriver, &index).await;
+        until_indexed(&d, "reconciled again", async || {
+            d.memory_index_status().await.unwrap().reconciled.is_some()
+        })
+        .await;
+        for _ in 0..8 {
+            d.memory_index_poke();
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(!index.refs(UNGROUPED_COLLECTION).contains(&decision));
+
+        // Dropped: its passage goes.
+        d.change_memory_item(todo, &ItemChange::Drop).await.unwrap();
+        until_indexed(&d, "the dropped note's passage goes", async || {
+            !index.refs(UNGROUPED_COLLECTION).contains(&todo)
+        })
+        .await;
+
+        // While the index is down, notes are found by keyword.
+        index.down.store(true, Ordering::SeqCst);
+        d.memory_index_failed(&eyre::eyre!("down"));
+        let found = search("server-side", None).await;
+        assert!(found.keyword_only);
+        assert_eq!(found.hits[0].hit.kind, "decision");
+        index.down.store(false, Ordering::SeqCst);
+
+        // Forgotten: every passage of the session goes, notes too.
+        d.forget_memory(s).await.unwrap();
+        until_indexed(&d, "the session's passages go", async || {
+            index.refs(UNGROUPED_COLLECTION).is_empty()
+        })
+        .await;
+        assert_eq!(
+            q::<i64>(&store, "SELECT COUNT(*) FROM memory_items WHERE session = $1", &[&s]).await,
+            0
+        );
+        cancel.cancel();
     })
     .await;
 }

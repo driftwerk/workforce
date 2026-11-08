@@ -471,6 +471,7 @@ mod tests {
             answer: answer.into(),
             steps: Vec::new(),
             compaction: false,
+            item: None,
         }
     }
 
